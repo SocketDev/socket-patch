@@ -12,6 +12,12 @@
 //! npm and yarn also match extglobs (`@(a|b)`, `?(..)`, `*(..)`, `+(..)`,
 //! `!(..)`) within one component, and yarn classic ignores `!` patterns;
 //! [`WorkspacesDialect`] names what each package manager reads (#1097).
+//! yarn berry's picomatch further reads regex groups (`(a|b)`), POSIX
+//! classes (`[[:alpha:]]`) and `..` segments (#1490).
+
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 /// How one package manager reads `package.json` (or `vlt.json`)
 /// `workspaces`, probed on npm 10.9, yarn 1.22.22, yarn 4.10, Bun 1.2.23
@@ -24,6 +30,10 @@ pub(crate) struct WorkspacesDialect {
     /// micromatch). Off, they are literal characters (Bun fails its
     /// install on one, so its lock never lists such a member).
     pub(crate) extglob: bool,
+    /// The pattern is read by globby / fast-glob / picomatch (yarn
+    /// berry), which also take regex groups, POSIX classes and `..`
+    /// segments ([`Picomatch`], #1490).
+    pub(crate) picomatch: bool,
 }
 
 /// What a `workspaces` pattern with a leading `!` does.
@@ -45,31 +55,37 @@ impl WorkspacesDialect {
     pub(crate) const NPM: Self = Self {
         negation: Negation::LastMatchWins,
         extglob: true,
+        picomatch: false,
     };
     /// yarn classic (a `yarn.lock` without berry's `__metadata`).
     pub(crate) const YARN_CLASSIC: Self = Self {
         negation: Negation::Ignored,
         extglob: true,
+        picomatch: false,
     };
     /// yarn berry (a `yarn.lock` with `__metadata`).
     pub(crate) const YARN_BERRY: Self = Self {
         negation: Negation::Unordered,
         extglob: true,
+        picomatch: true,
     };
     /// Bun 1.3 and later (a `bun.lock` with `configVersion`).
     pub(crate) const BUN: Self = Self {
         negation: Negation::LastMatchWins,
         extglob: false,
+        picomatch: false,
     };
     /// Bun before 1.3: it lists `!`-negated directories anyway.
     pub(crate) const BUN_PRE_1_3: Self = Self {
         negation: Negation::Ignored,
         extglob: false,
+        picomatch: false,
     };
     /// vlt, as #942 read it.
     pub(crate) const VLT: Self = Self {
         negation: Negation::LastMatchWins,
         extglob: false,
+        picomatch: false,
     };
     /// Every dialect, for a root whose package manager is unknown: it lists
     /// a directory when any of them does.
@@ -100,13 +116,16 @@ pub(crate) fn workspaces_include_as(
     if rel.is_empty() {
         return false;
     }
-    let matches = |pattern: &str| pattern_matches(pattern, rel, true, dialect.extglob);
+    let matches = |pattern: &str, negated: bool| {
+        let picomatch = dialect.picomatch.then_some(Picomatch { negated });
+        pattern_matches(pattern, rel, true, dialect.extglob, picomatch)
+    };
     match dialect.negation {
         Negation::LastMatchWins => {
             let mut included = false;
             for pattern in patterns {
                 let (negated, pattern) = split_negation(pattern);
-                if matches(pattern) {
+                if matches(pattern, negated) {
                     included = !negated;
                 }
             }
@@ -117,16 +136,16 @@ pub(crate) fn workspaces_include_as(
             for pattern in patterns {
                 match split_negation(pattern) {
                     (true, rest) if !(dialect.extglob && rest.starts_with('(')) => {
-                        excluded |= matches(rest)
+                        excluded |= matches(rest, true)
                     }
-                    _ => listed |= matches(pattern),
+                    _ => listed |= matches(pattern, false),
                 }
             }
             listed && !excluded
         }
         Negation::Ignored => patterns
             .iter()
-            .any(|pattern| !pattern.starts_with('!') && matches(pattern)),
+            .any(|pattern| !pattern.starts_with('!') && matches(pattern, false)),
     }
 }
 
@@ -141,7 +160,7 @@ pub(crate) fn split_negation(pattern: &str) -> (bool, &str) {
 /// Whether one (un-negated) pattern matches `rel`. A pattern with no
 /// components left (`""`, `.`, `./`) matches nothing.
 pub(crate) fn glob_matches(pattern: &str, rel: &[String]) -> bool {
-    pattern_matches(pattern, rel, true, false)
+    pattern_matches(pattern, rel, true, false, None)
 }
 
 /// [`glob_matches`] the way pnpm's globber reads `packages:` (`dot: false`,
@@ -150,19 +169,276 @@ pub(crate) fn glob_matches(pattern: &str, rel: &[String]) -> bool {
 /// `packages/*` does not list `packages/.hidden`. A pattern component that
 /// itself starts with `.` (`.github/**`) still matches it.
 pub(crate) fn glob_matches_no_dot(pattern: &str, rel: &[String]) -> bool {
-    pattern_matches(pattern, rel, false, false)
+    pattern_matches(pattern, rel, false, false, None)
 }
 
-fn pattern_matches(pattern: &str, rel: &[String], dot: bool, extglob: bool) -> bool {
+/// How yarn berry's fast-glob / picomatch read a pattern beyond the shared
+/// grammar (#1490, probed on yarn 4.0.2 and 4.18.1 and fast-glob 3.3.3):
+/// a parenthesised group not led by an extglob character is a regex group
+/// (`packages/(a|b)`), `?` and `+` after a group, `+` after a class and
+/// `+` inside a group are regex quantifiers, a bracket class may hold
+/// POSIX classes (`[[:alpha:]]`), and a `..` segment after a static
+/// prefix steps back over the segment before it (`packages/a/../b` lists
+/// `packages/b`).
+#[derive(Debug, Clone, Copy)]
+struct Picomatch {
+    /// The pattern is a `!` one, which fast-glob matches as an ignore:
+    /// every group is one, and a `..` segment is literal (so it excludes
+    /// nothing).
+    negated: bool,
+}
+
+/// fast-glob's `isDynamicPattern`: whether it matches a (brace-expanded)
+/// pattern with picomatch rather than reading it as a literal path.
+fn fast_glob_dynamic(pattern: &str) -> bool {
+    static DYNAMIC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"[*?\\]|^!|\[[^\[]*\]",
+            r"|(?:^|[^!*+?@])\([^(]*\|[^|]*\)",
+            r"|[!*+?@]\([^(]*\)",
+            r"|\{[^{}]*(?:,|\.\.)[^{}]*\}",
+        ))
+        .expect("static regex")
+    });
+    DYNAMIC.is_match(pattern)
+}
+
+fn pattern_matches(
+    pattern: &str,
+    rel: &[String],
+    dot: bool,
+    extglob: bool,
+    picomatch: Option<Picomatch>,
+) -> bool {
     let rel: Vec<Vec<char>> = rel.iter().map(|c| c.chars().collect()).collect();
-    expand_braces(pattern.trim()).iter().any(|alternative| {
-        let segments: Vec<Vec<char>> = alternative
+    let matches = |alternative: &[char], static_path: bool| {
+        let alternative: String = alternative.iter().collect();
+        let mut segments: Vec<Vec<char>> = Vec::new();
+        for segment in alternative
             .split(['/', '\\'])
             .filter(|s| !s.is_empty() && *s != ".")
-            .map(|s| s.chars().collect())
-            .collect();
-        !segments.is_empty() && path_glob_matches(&segments, &rel, dot, extglob)
+        {
+            if picomatch.is_some_and(|p| !p.negated) && segment == ".." {
+                // fast-glob resolves `..` in a static pattern (a literal
+                // path) and otherwise only through a static prefix; a `..`
+                // above the workspace root lists nothing in it.
+                let globbed = |s: &Vec<char>| s.iter().any(|c| "*?[(".contains(*c));
+                if (!static_path && segments.iter().any(globbed)) || segments.pop().is_none() {
+                    return false;
+                }
+                continue;
+            }
+            segments.push(segment.chars().collect());
+        }
+        !segments.is_empty()
+            && path_glob_matches(&segments, &rel, dot, extglob, picomatch.is_some())
+    };
+    expand_braces(pattern.trim()).iter().any(|alternative| {
+        let chars: Vec<char> = alternative.chars().collect();
+        let Some(p) = picomatch else {
+            return matches(&chars, false);
+        };
+        // fast-glob reads a static pattern as a literal path, where a
+        // group without `|` is plain text.
+        let static_path = !p.negated && !fast_glob_dynamic(alternative);
+        let mut spelled = Vec::new();
+        if !expand_slash_groups(&chars, !static_path, &mut spelled) {
+            // A shape this matcher cannot read fails closed: it lists
+            // every directory and, as a `!` pattern, excludes none.
+            return !p.negated;
+        }
+        spelled.iter().any(|spelling| {
+            picomatch_as_extglob(spelling, !static_path, false)
+                .is_some_and(|rewritten| matches(&rewritten, static_path))
+        })
     })
+}
+
+/// The spellings of a picomatch pattern with every group whose
+/// alternatives hold a `/` (`(packages/ui|apps/web)`) expanded in place,
+/// as brace sets are, so each alternative is matched across its path
+/// components, each read as inside a group (`x+` repeats `x`). Groups
+/// without a `/` are left for [`picomatch_as_extglob`]. `false` when a
+/// `?` or `+` quantifies such a group: the repeated or skipped `/` cannot
+/// be read component by component, so the caller fails closed.
+fn expand_slash_groups(p: &[char], every_group: bool, out: &mut Vec<Vec<char>>) -> bool {
+    if out.len() >= MAX_BRACE_EXPANSIONS {
+        return true;
+    }
+    let mut i = 0;
+    while i < p.len() {
+        if p[i] == '[' {
+            if let Some((_, after)) = char_class(&p[i + 1..], true) {
+                i = p.len() - after.len();
+                continue;
+            }
+        }
+        let led = i > 0 && matches!(p[i - 1], '@' | '?' | '*' | '+' | '!');
+        if p[i] == '(' && !led {
+            if let Some((close, alternatives)) = group_alternatives(p, i) {
+                if (alternatives.len() > 1 || every_group)
+                    && alternatives.iter().any(|a| a.contains(&'/'))
+                {
+                    let rest = close + 1;
+                    if matches!(p.get(rest), Some('?' | '+')) && p.get(rest + 1) != Some(&'(') {
+                        return false;
+                    }
+                    let mut fills: Vec<Vec<char>> = Vec::new();
+                    for alternative in alternatives {
+                        let mut inner = Vec::new();
+                        if !expand_slash_groups(alternative, every_group, &mut inner) {
+                            return false;
+                        }
+                        fills.extend(
+                            inner
+                                .iter()
+                                .filter_map(|a| picomatch_as_extglob(a, every_group, true)),
+                        );
+                    }
+                    for fill in fills {
+                        let mut spelling = p[..i].to_vec();
+                        spelling.extend(fill);
+                        spelling.extend_from_slice(&p[rest..]);
+                        if !expand_slash_groups(&spelling, every_group, out) {
+                            return false;
+                        }
+                        if out.len() >= MAX_BRACE_EXPANSIONS {
+                            return true;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    out.push(p.to_vec());
+    true
+}
+
+/// A picomatch pattern rewritten into the extglob grammar
+/// [`ExtglobMatcher`] reads: a regex group (`(a|b)`, or any group with
+/// `every_group`) becomes `@(a|b)`, `?(a|b)` when a `?` follows it and
+/// `+(a|b)` when a `+` does; `[ab]+` becomes `+([ab])`, and inside a
+/// group (`in_group`) `x+` becomes `+(x)`. [`expand_slash_groups`] has
+/// already spelled out regex groups holding a `/`; one left inside an
+/// extglob group can never match one component, so it is dropped, and
+/// `None` when a group has no alternative left (the pattern lists
+/// nothing).
+fn picomatch_as_extglob(p: &[char], every_group: bool, in_group: bool) -> Option<Vec<char>> {
+    let mut out: Vec<char> = Vec::with_capacity(p.len());
+    let mut i = 0;
+    while i < p.len() {
+        match p[i] {
+            '[' => {
+                let Some((_, after)) = char_class(&p[i + 1..], true) else {
+                    out.push('[');
+                    i += 1;
+                    continue;
+                };
+                let end = p.len() - after.len();
+                // `+(` after a class opens an extglob, not a quantifier.
+                if after.first() == Some(&'+') && after.get(1) != Some(&'(') {
+                    out.extend(['+', '(']);
+                    out.extend_from_slice(&p[i..end]);
+                    out.push(')');
+                    i = end + 1;
+                } else {
+                    out.extend_from_slice(&p[i..end]);
+                    i = end;
+                }
+            }
+            '(' => {
+                let led = i > 0 && matches!(p[i - 1], '@' | '?' | '*' | '+' | '!');
+                let Some((close, alternatives)) = group_alternatives(p, i) else {
+                    out.push('(');
+                    i += 1;
+                    continue;
+                };
+                if !led && alternatives.len() < 2 && !every_group {
+                    out.push('(');
+                    i += 1;
+                    continue;
+                }
+                let mut rewritten = Vec::new();
+                for alternative in alternatives {
+                    if !alternative.contains(&'/') {
+                        rewritten.push(picomatch_as_extglob(alternative, every_group, true)?);
+                    }
+                }
+                if rewritten.is_empty() {
+                    return None;
+                }
+                let mut next = close + 1;
+                if !led {
+                    // `?(` / `+(` after the group opens an extglob instead.
+                    let kind = match p.get(next) {
+                        Some(&q @ ('?' | '+')) if p.get(next + 1) != Some(&'(') => {
+                            next += 1;
+                            q
+                        }
+                        _ => '@',
+                    };
+                    out.push(kind);
+                }
+                out.push('(');
+                for (n, alternative) in rewritten.into_iter().enumerate() {
+                    if n > 0 {
+                        out.push('|');
+                    }
+                    out.extend(alternative);
+                }
+                out.push(')');
+                i = next;
+            }
+            '+' if in_group
+                && p.get(i + 1) != Some(&'(')
+                && out.last().is_some_and(|c| !"*?)]/|+".contains(*c)) =>
+            {
+                let repeated = out.pop().expect("checked above");
+                out.extend(['+', '(', repeated, ')']);
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The `)` closing the `(` at `open`, and the group's top-level
+/// `|`-separated alternatives. Classes are skipped whole, so a `)` or `|`
+/// inside `[...]` is a member, as picomatch reads it.
+fn group_alternatives(p: &[char], open: usize) -> Option<(usize, Vec<&[char]>)> {
+    let (mut depth, mut start, mut i) = (0usize, open + 1, open);
+    let mut alternatives = Vec::new();
+    while i < p.len() {
+        match p[i] {
+            '[' => {
+                if let Some((_, after)) = char_class(&p[i + 1..], true) {
+                    i = p.len() - after.len();
+                    continue;
+                }
+            }
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    alternatives.push(&p[start..i]);
+                    return Some((i, alternatives));
+                }
+            }
+            '|' if depth == 1 => {
+                alternatives.push(&p[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Cap on the alternatives one pattern expands to, so a pathological
@@ -299,22 +575,34 @@ fn brace_sequence(body: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// `dot: false` keeps wildcards off components starting with `.`.
-fn path_glob_matches(pattern: &[Vec<char>], path: &[Vec<char>], dot: bool, ext: bool) -> bool {
+/// `dot: false` keeps wildcards off components starting with `.`; `posix`
+/// reads POSIX classes inside brackets.
+fn path_glob_matches(
+    pattern: &[Vec<char>],
+    path: &[Vec<char>],
+    dot: bool,
+    ext: bool,
+    posix: bool,
+) -> bool {
     let hidden = |component: &Vec<char>| !dot && component.first() == Some(&'.');
     match pattern.split_first() {
         None => path.is_empty(),
         Some((first, rest)) if first.as_slice() == ['*', '*'] => (0..=path.len())
             .take_while(|&skip| skip == 0 || !hidden(&path[skip - 1]))
-            .any(|skip| path_glob_matches(rest, &path[skip..], dot, ext)),
+            .any(|skip| path_glob_matches(rest, &path[skip..], dot, ext, posix)),
         Some((first, rest)) => path.split_first().is_some_and(|(head, tail)| {
             (!hidden(head) || first.first() == Some(&'.'))
-                && if ext {
-                    ExtglobMatcher::default().segment(first, head)
+                && if ext || posix {
+                    ExtglobMatcher {
+                        extglob: ext,
+                        posix,
+                        ..ExtglobMatcher::default()
+                    }
+                    .segment(first, head)
                 } else {
                     segment_glob_matches(first, head)
                 }
-                && path_glob_matches(rest, tail, dot, ext)
+                && path_glob_matches(rest, tail, dot, ext, posix)
         }),
     }
 }
@@ -325,7 +613,7 @@ pub(crate) fn segment_glob_matches(pattern: &[char], name: &[char]) -> bool {
         None => name.is_empty(),
         Some(('*', rest)) => (0..=name.len()).any(|skip| segment_glob_matches(rest, &name[skip..])),
         Some(('?', rest)) => !name.is_empty() && segment_glob_matches(rest, &name[1..]),
-        Some(('[', rest)) => match char_class(rest) {
+        Some(('[', rest)) => match char_class(rest, false) {
             Some((class, after)) => name
                 .split_first()
                 .is_some_and(|(c, tail)| class.matches(*c) && segment_glob_matches(after, tail)),
@@ -341,6 +629,10 @@ pub(crate) fn segment_glob_matches(pattern: &[char], name: &[char]) -> bool {
 /// (`*(a|aa)`) costs polynomial time, not exponential.
 #[derive(Default)]
 struct ExtglobMatcher {
+    /// Extglob groups match; off, they are literal.
+    extglob: bool,
+    /// Brackets read POSIX classes (picomatch, #1490).
+    posix: bool,
     memo: std::collections::HashMap<(usize, usize, usize, usize), bool>,
 }
 
@@ -361,14 +653,14 @@ impl ExtglobMatcher {
     }
 
     fn segment_uncached(&mut self, pattern: &[char], name: &[char]) -> bool {
-        if let Some(group) = extglob_group(pattern) {
+        if let Some(group) = extglob_group(pattern, self.posix).filter(|_| self.extglob) {
             return self.group(&group, name);
         }
         match pattern.split_first() {
             None => name.is_empty(),
             Some(('*', rest)) => (0..=name.len()).any(|skip| self.segment(rest, &name[skip..])),
             Some(('?', rest)) => !name.is_empty() && self.segment(rest, &name[1..]),
-            Some(('[', rest)) => match char_class(rest) {
+            Some(('[', rest)) => match char_class(rest, self.posix) {
                 Some((class, after)) => name
                     .split_first()
                     .is_some_and(|(c, tail)| class.matches(*c) && self.segment(after, tail)),
@@ -451,8 +743,9 @@ struct ExtglobGroup<'a> {
 
 /// The group starting `pattern`, or `None` when it starts no group or the
 /// group never closes (its characters are then read as usual, as in
-/// minimatch).
-fn extglob_group(pattern: &[char]) -> Option<ExtglobGroup<'_>> {
+/// minimatch). A class is skipped whole, so a `)` or `|` inside `[...]`
+/// is a member.
+fn extglob_group(pattern: &[char], posix: bool) -> Option<ExtglobGroup<'_>> {
     let kind = *pattern.first()?;
     if !matches!(kind, '@' | '?' | '*' | '+' | '!') || pattern.get(1) != Some(&'(') {
         return None;
@@ -460,7 +753,15 @@ fn extglob_group(pattern: &[char]) -> Option<ExtglobGroup<'_>> {
     let body = &pattern[2..];
     let (mut depth, mut start) = (0usize, 0usize);
     let mut alternatives = Vec::new();
-    for (i, &c) in body.iter().enumerate() {
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        if c == '[' {
+            if let Some((_, after)) = char_class(&body[i + 1..], posix) {
+                i = body.len() - after.len();
+                continue;
+            }
+        }
         match c {
             '(' => depth += 1,
             ')' if depth == 0 => {
@@ -478,6 +779,7 @@ fn extglob_group(pattern: &[char]) -> Option<ExtglobGroup<'_>> {
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -495,9 +797,10 @@ impl CharClass {
 }
 
 /// The class after a `[`, and the pattern after its closing `]`. A `!` or
-/// `^` first negates it; a `]` right after that is a member. `None` when
-/// the class never closes (the `[` is then literal).
-fn char_class(pattern: &[char]) -> Option<(CharClass, &[char])> {
+/// `^` first negates it; a `]` right after that is a member. With `posix`,
+/// a `[:name:]` member adds that POSIX class, as picomatch reads it.
+/// `None` when the class never closes (the `[` is then literal).
+fn char_class(pattern: &[char], posix: bool) -> Option<(CharClass, &[char])> {
     let (negated, mut i) = match pattern.first() {
         Some('!' | '^') => (true, 1),
         _ => (false, 0),
@@ -509,6 +812,17 @@ fn char_class(pattern: &[char]) -> Option<(CharClass, &[char])> {
         if c == ']' && i > first {
             return Some((CharClass { negated, ranges }, &pattern[i + 1..]));
         }
+        if posix && c == '[' && pattern.get(i + 1) == Some(&':') {
+            let name_end = (i + 2..pattern.len().saturating_sub(1))
+                .find(|&j| pattern[j] == ':' && pattern[j + 1] == ']');
+            if let Some(end) = name_end {
+                if let Some(class) = posix_class(&pattern[i + 2..end].iter().collect::<String>()) {
+                    ranges.extend_from_slice(class);
+                    i = end + 2;
+                    continue;
+                }
+            }
+        }
         if pattern.get(i + 1) == Some(&'-') && pattern.get(i + 2).is_some_and(|&h| h != ']') {
             ranges.push((c, pattern[i + 2]));
             i += 3;
@@ -518,6 +832,27 @@ fn char_class(pattern: &[char]) -> Option<(CharClass, &[char])> {
         }
     }
     None
+}
+
+/// The members of a POSIX class, as picomatch defines them.
+fn posix_class(name: &str) -> Option<&'static [(char, char)]> {
+    Some(match name {
+        "alnum" => &[('a', 'z'), ('A', 'Z'), ('0', '9')],
+        "alpha" => &[('a', 'z'), ('A', 'Z')],
+        "ascii" => &[('\0', '\x7f')],
+        "blank" => &[(' ', ' '), ('\t', '\t')],
+        "cntrl" => &[('\0', '\x1f'), ('\x7f', '\x7f')],
+        "digit" => &[('0', '9')],
+        "graph" => &[('!', '~')],
+        "lower" => &[('a', 'z')],
+        "print" => &[(' ', '~')],
+        "punct" => &[('!', '/'), (':', '@'), ('[', '`'), ('{', '~')],
+        "space" => &[(' ', ' '), ('\t', '\r')],
+        "upper" => &[('A', 'Z')],
+        "word" => &[('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
+        "xdigit" => &[('a', 'f'), ('A', 'F'), ('0', '9')],
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -650,6 +985,10 @@ mod tests {
         yes("packages/@(pkg-*|[xy])", "packages/y");
         yes("packages/@(a|@(b|c))d", "packages/cd");
         yes("packages/pre-@(a|b)-post", "packages/pre-b-post");
+        // A `)` or `|` inside a class is a member, not the group's end.
+        yes("packages/@(a|[)|])", "packages/a");
+        yes("packages/@(a|[)|])", "packages/)");
+        no("packages/@(a|[)|])", "packages/b");
         // An unclosed group is literal; braces expand around a group.
         yes("packages/@(a", "packages/@(a");
         yes("{apps,packages}/@(a|b)", "apps/b");
@@ -664,6 +1003,126 @@ mod tests {
             &rel("packages/a"),
             WorkspacesDialect::BUN
         ));
+    }
+
+    /// #1490: yarn berry reads `workspaces` with globby / fast-glob /
+    /// picomatch, which also take regex groups, POSIX classes and `..`
+    /// segments; probed on yarn 4.0.2 and 4.18.1.
+    #[test]
+    fn yarn_berry_reads_picomatch_syntax() {
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let berry = WorkspacesDialect::YARN_BERRY;
+        let yes = |p: &[&str], r: &str| {
+            assert!(
+                workspaces_include_as(&pats(p), &rel(r), berry),
+                "{p:?} ~ {r}"
+            )
+        };
+        let no = |p: &[&str], r: &str| {
+            assert!(
+                !workspaces_include_as(&pats(p), &rel(r), berry),
+                "{p:?} !~ {r}"
+            )
+        };
+        // Regex groups with alternatives.
+        yes(&["packages/(a|b)"], "packages/a");
+        yes(&["packages/(a|b)"], "packages/b");
+        no(&["packages/(a|b)"], "packages/c");
+        no(&["packages/(a|b)"], "packages/(a|b)");
+        yes(&["packages/pkg-(a|b)"], "packages/pkg-a");
+        no(&["packages/pkg-(a|b)"], "packages/pkg-c");
+        yes(&["(packages|apps)/x"], "apps/x");
+        yes(&["packages/(a*|z)"], "packages/abc");
+        yes(&["packages/((a|b)|c)"], "packages/b");
+        yes(&["packages/(a|[)])"], "packages/a");
+        yes(&["packages/(a|)"], "packages/a");
+        no(&["packages/(a|)"], "packages");
+        // An alternative holding `/` matches across components (Bugbot on
+        // #1493: listing it fails closed).
+        yes(&["packages/(a/b|c)"], "packages/c");
+        yes(&["packages/(a/b|c)"], "packages/a/b");
+        yes(&["(packages/ui|packages/core)"], "packages/core");
+        no(&["(packages/ui|packages/core)"], "packages/web");
+        // An in-group `+` still reads as picomatch's; a quantified one
+        // fails closed (Bugbot on #1493): it lists every directory, and
+        // as a `!` pattern excludes none.
+        yes(&["(packages/a|apps/b)?x"], "x");
+        yes(&["(packages/a|apps/b)?x"], "elsewhere");
+        yes(&["(a|b/c)+"], "a/a");
+        yes(&["packages/*", "!(packages/a|apps/b)?"], "packages/a");
+        yes(&["(packages/a+|apps/b)"], "packages/aaa");
+        no(&["(packages/a+|apps/b)"], "packages/a+");
+        yes(&["(packages/(x|y)|apps/b)"], "packages/y");
+        // Regex quantifiers after a group or class, and inside a group.
+        yes(&["packages/(a|b)?"], "packages/a");
+        no(&["packages/(a|b)?"], "packages/ab");
+        yes(&["packages/(a|b)+"], "packages/ab");
+        yes(&["packages/[ab]+"], "packages/abba");
+        no(&["packages/[ab]+"], "packages/abc");
+        yes(&["packages/(a+|c)"], "packages/aaa");
+        no(&["packages/(a+|c)"], "packages/a+");
+        // `?(` / `+(` right after a group or class opens an extglob.
+        yes(&["packages/(a|b)?(c|d)"], "packages/a");
+        yes(&["packages/(a|b)?(c|d)"], "packages/ac");
+        yes(&["packages/(a|b)?(c|d)"], "packages/bd");
+        yes(&["packages/(a|b)+(c)"], "packages/acc");
+        yes(&["packages/[ab]+(c)"], "packages/bc");
+        no(&["packages/[ab]+(c)"], "packages/b");
+        no(&["packages/*", "!packages/(a|b)?(c)"], "packages/ac");
+        // A group without `|` in a static pattern (fast-glob reads it as
+        // a path) never lists the directory its group names; listing the
+        // literal `(a)` fails closed. In a dynamic one it is a group.
+        no(&["packages/(a)"], "packages/a");
+        yes(&["packages/(a)"], "packages/(a)");
+        yes(&["packages/*/(a)"], "packages/x/a");
+        // fast-glob decides that per brace alternative.
+        no(&["packages/{(a),c}"], "packages/a");
+        yes(&["packages/{(a),c}"], "packages/c");
+        // A negated group excludes what it matches.
+        no(&["packages/*", "!packages/(b|c)"], "packages/b");
+        yes(&["packages/*", "!packages/(b|c)"], "packages/a");
+        // Extglobs still read as before.
+        yes(&["packages/@(a|b)"], "packages/a");
+        yes(&["packages/!(z)"], "packages/a");
+        no(&["packages/!(z)"], "packages/z");
+        // POSIX classes, alone or beside other members.
+        yes(&["packages/[[:alpha:]]"], "packages/a");
+        no(&["packages/[[:alpha:]]"], "packages/1");
+        yes(&["packages/[[:digit:]]x"], "packages/1x");
+        no(&["packages/[[:digit:]]x"], "packages/ax");
+        yes(&["packages/[[:upper:]0-9]"], "packages/7");
+        yes(&["packages/[![:alpha:]]"], "packages/1");
+        no(&["packages/[![:alpha:]]"], "packages/a");
+        yes(&["packages/[[:alnum:]_]*"], "packages/_x");
+        yes(&["packages/[[:punct:]]a"], "packages/-a");
+        // `..` segments resolve against the segment before them.
+        yes(&["packages/a/../b"], "packages/b");
+        no(&["packages/a/../b"], "packages/a/b");
+        no(&["packages/a/../b"], "packages/a");
+        yes(&["packages/a/b/../../c"], "packages/c");
+        no(&["../b"], "b");
+        // A static pattern is a literal path, `(a)` included.
+        yes(&["packages/(a)/../b"], "packages/b");
+        // Only through a static prefix, and never in an ignore.
+        no(&["packages/*/../b"], "packages/b");
+        yes(&["packages/*", "!packages/a/../b"], "packages/b");
+        // The plain shapes keep matching.
+        yes(&["packages/[a-c]"], "packages/b");
+        yes(&["packages/./a"], "packages/a");
+        // Other dialects keep their grammar.
+        for dialect in [
+            WorkspacesDialect::NPM,
+            WorkspacesDialect::YARN_CLASSIC,
+            WorkspacesDialect::BUN,
+            WorkspacesDialect::VLT,
+        ] {
+            assert!(
+                !workspaces_include_as(&pats(&["packages/(a|b)"]), &rel("packages/a"), dialect),
+                "{dialect:?}"
+            );
+        }
+        assert!(!glob_matches("packages/(a|b)", &rel("packages/a")));
     }
 
     /// #1097: yarn classic and Bun before 1.3 ignore `!` patterns, so a

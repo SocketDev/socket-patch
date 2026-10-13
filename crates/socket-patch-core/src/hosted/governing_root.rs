@@ -1255,6 +1255,29 @@ mod tests {
                 None,
             ),
             (r#"["packages/@(a|b)"]"#, &[("bun.lock", BUN_13)][..], None),
+            // #1490: yarn berry's picomatch also reads regex groups, POSIX
+            // classes and `..` segments.
+            (
+                r#"["packages/(a|b)"]"#,
+                &[("yarn.lock", BERRY)][..],
+                refused,
+            ),
+            (
+                r#"["packages/[[:alpha:]]"]"#,
+                &[("yarn.lock", BERRY)][..],
+                refused,
+            ),
+            (
+                r#"["packages/a/../b"]"#,
+                &[("yarn.lock", BERRY)][..],
+                refused,
+            ),
+            (
+                r#"["packages/*","!packages/(b|c)"]"#,
+                &[("yarn.lock", BERRY)][..],
+                None,
+            ),
+            (r#"["packages/(b)"]"#, &[("yarn.lock", BERRY)][..], None),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             write(

@@ -440,26 +440,34 @@ jobs:
       - name: Stage-publish platform packages
         id: stage-platform
         run: |
-          : > "${RUNNER_TEMP}/staged-packages.txt"
-          for pkg_dir in npm/socket-patch-*/; do
-            pkg_name="@socketsecurity/$(basename "$pkg_dir")"
-            echo "Staging ${pkg_name}..."
-            if npm stage publish "./${pkg_dir}" --access public; then
+          # Stage one package, tolerating a version an earlier attempt already
+          # staged or published, so "Re-run failed jobs" and npm-retry-version
+          # retries can finish a partial publish. The registry answers a
+          # repeat stage of a staged-but-unapproved version with `409 Cannot
+          # stage previously published version`, and staged versions are
+          # invisible to `npm view`; `npm stage list` would show them but
+          # can't authenticate here (OIDC is exchanged only on publish), so
+          # the 409 message is the signal. Inline, not a script: this job
+          # checks out the release tag, which may predate any new script.
+          stage() {
+            local pkg_dir="$1" pkg_name="$2" out rc=0
+            echo "Staging ${pkg_name}@${VERSION}..."
+            out=$(npm stage publish "$pkg_dir" --access public 2>&1) || rc=$?
+            printf '%s\n' "$out"
+            if [ "$rc" -eq 0 ]; then
               echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
             elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
-              # Already fully published (approved) — a clean re-run.
               echo "Already published, skipping."
-            elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
-              # Staged but not yet 2FA-approved: `npm view` can't see staged
-              # versions, so without this check a re-run after a mid-job
-              # failure could never succeed. Best-effort match on the stage
-              # listing (format unverified against a live staged state — if it
-              # misses we still fail loudly below).
+            elif printf '%s' "$out" | grep -qF 'Cannot stage previously published version'; then
               echo "Already staged awaiting approval, skipping."
               echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
             else
-              exit 1
+              return "$rc"
             fi
+          }
+          : > "${RUNNER_TEMP}/staged-packages.txt"
+          for pkg_dir in npm/socket-patch-*/; do
+            stage "./${pkg_dir}" "@socketsecurity/$(basename "$pkg_dir")"
           done
 
       - name: Copy README for npm package
@@ -483,19 +491,24 @@ jobs:
 
       - name: Stage-publish main package
         run: |
-          pkg_name="@socketsecurity/socket-patch"
-          if npm stage publish ./npm/socket-patch --access public; then
-            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
-          elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
-            echo "Already published, skipping."
-          elif npm stage list 2>/dev/null | grep -qF "${pkg_name}@${VERSION}"; then
-            # See the platform-package step: staged-not-approved versions are
-            # invisible to `npm view`; tolerate them so re-runs can succeed.
-            echo "Already staged awaiting approval, skipping."
-            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
-          else
-            exit 1
-          fi
+          # Same as the platform-package step's stage() (see there).
+          stage() {
+            local pkg_dir="$1" pkg_name="$2" out rc=0
+            echo "Staging ${pkg_name}@${VERSION}..."
+            out=$(npm stage publish "$pkg_dir" --access public 2>&1) || rc=$?
+            printf '%s\n' "$out"
+            if [ "$rc" -eq 0 ]; then
+              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+            elif npm view "${pkg_name}@${VERSION}" version >/dev/null 2>&1; then
+              echo "Already published, skipping."
+            elif printf '%s' "$out" | grep -qF 'Cannot stage previously published version'; then
+              echo "Already staged awaiting approval, skipping."
+              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+            else
+              return "$rc"
+            fi
+          }
+          stage ./npm/socket-patch "@socketsecurity/socket-patch"
 
       - name: Summarize staged versions awaiting approval
         if: always()

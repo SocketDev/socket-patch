@@ -278,6 +278,20 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   unpatched artifact. The reverse shape — an alias of the patched NAME pointing at a
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
+- **yarn copies under another dependency name (classic & berry)** — yarn keys a `file:`
+  tarball or directory, a URL tarball and a berry `portal:` / `link:` dependency by the
+  name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as `lp2@file:…`,
+  while `node_modules/lp2` is left-pad@1.3.0. No pin or vendored wiring of `left-pad`
+  reaches that copy, so it stays unpatched. Which package such a copy is comes from the
+  copy itself (the tarball's or directory's `package.json`, or the registry package a
+  URL's path names; a berry `portal:` / `link:` target's `package.json` also gives the
+  version, since the lock records `0.0.0-use.local`). Hosted mode still pins the
+  registry entry and names the copy (`redirect_copy_unpatched`, unless a yarn classic
+  skip warning already names it); vendored mode still wires the registry entry and names
+  it (`vendor_copy_unpatched` for berry; the yarn classic codes below for classic); and
+  `vex` never attests the package from that lock while the copy is there. When the
+  package is installed only through such copies, vendoring refuses with
+  `vendor_lock_entry_not_rewritable` naming them, since `yarn install` can't help.
 - **yarn classic and yarn 2+** — installing with yarn 2+ (berry) migrates a classic (v1)
   `yarn.lock` and re-resolves every entry from the registry, dropping hosted pins and
   vendored wiring alike, so the packages install unpatched. A run that leaves such a pin
@@ -325,9 +339,10 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   that copy stays unpatched; `vex` never attests the package from that lock while the
   copy is there. This holds whatever dependency name the project gives the copy: yarn 1
   locks `"lp2": "file:./lpdir"` as `lp2@file:./lpdir`, so which package it is comes from
-  the directory's `package.json` (and, for `vex`, a `file:` tarball's manifest or a
-  registry tarball URL's path; hosted and vendored scans name a URL copy with
-  `redirect_yarn_classic_non_registry_entry_skipped` /
+  the directory's `package.json` (or a `file:` tarball's manifest, or a registry tarball
+  URL's path; hosted scans name a URL copy with
+  `redirect_yarn_classic_non_registry_entry_skipped` and a `file:` tarball copy with
+  `redirect_copy_unpatched`, and vendored scans name either with
   `vendor_yarn_classic_non_registry_entry_skipped`). A git copy under another name
   records no package name in the lock and is not detected. When every entry of the package is such a copy (git, `file:` directory,
   non-registry tarball or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,

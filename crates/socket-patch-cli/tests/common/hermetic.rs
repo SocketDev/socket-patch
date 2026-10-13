@@ -89,6 +89,12 @@ pub fn command(bin: &Path) -> Command {
         cmd.env_remove(k);
     }
     cmd.env_remove("SOCKET_API_TOKEN");
+    // The `SOCKET_CLI_*` peer names too: the binary promotes each onto its
+    // canonical `SOCKET_*` name, so a peer token set mid-run would put the
+    // child on the authenticated path.
+    for (_, peer) in socket_patch_core::utils::env_compat::PEER_ENV_ALIASES {
+        cmd.env_remove(peer);
+    }
     scrub_socket_vars(&mut cmd);
     // Belt-and-braces on top of the `.cargo/config.toml` `[env]` defaults
     // (see `FORCED_OPT_OUTS`): a developer's real `socket login` would flip
