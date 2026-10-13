@@ -48,8 +48,9 @@ async fn start_proxy() -> MockServer {
 /// `--proxy-url` pins). The scans are unscoped, so an activated venv is
 /// scrubbed and `HOME` points at a stand-in (`jvm_env::isolate_cli`): the
 /// developer's venv, `~/.m2` or user site-packages would add packages to
-/// the counts these tests assert. An ambient `COMPOSER_VENDOR_DIR` would
-/// move the vendor directory the crawler reads off the fixture's.
+/// the counts these tests assert. `Extra::Composer` keeps an ambient
+/// `COMPOSER_VENDOR_DIR` or user-level Composer config from moving the
+/// vendor directory the crawler reads off the fixture's.
 async fn run(args: &[&str], cwd: &std::path::Path, proxy_url: &str) -> Output {
     let mut args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     args.extend(["--proxy-url".to_string(), proxy_url.to_string()]);
@@ -57,11 +58,13 @@ async fn run(args: &[&str], cwd: &std::path::Path, proxy_url: &str) -> Output {
     tokio::task::spawn_blocking(move || {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut cmd = hermetic::command(&binary());
-        hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+        hermetic::scrub_extra(
+            &mut cmd,
+            &[hermetic::Extra::Venv, hermetic::Extra::Composer],
+        );
         common::jvm_env::isolate_cli(&mut cmd);
         cmd.args(&arg_refs)
             .current_dir(&cwd)
-            .env_remove("COMPOSER_VENDOR_DIR")
             .output()
             .expect("Failed to run socket-patch binary")
     })

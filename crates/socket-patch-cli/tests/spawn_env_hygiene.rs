@@ -456,6 +456,39 @@ fn bundle_extra_sweeps_every_bundler_override() {
 
 #[test]
 #[serial]
+fn composer_extra_sweeps_overrides_and_pins_an_empty_home() {
+    with_ambient(
+        &[
+            ("COMPOSER_VENDOR_DIR", "third"),
+            ("COMPOSER_HOME", "/ambient/composer"),
+            ("COMPOSER_CACHE_DIR", "/ambient/composer-cache"),
+            ("XDG_CONFIG_HOME", "/ambient/config"),
+        ],
+        || {
+            let mut cmd = Command::new("socket-patch");
+            hermetic::scrub_extra(&mut cmd, &[Extra::Composer]);
+            let env = effective_env(&cmd);
+            assert_eq!(get(&env, "COMPOSER_VENDOR_DIR"), None);
+            assert_eq!(get(&env, "COMPOSER_CACHE_DIR"), None);
+            // The pin outranks XDG_CONFIG_HOME in the Composer home lookup.
+            assert_eq!(
+                get(&env, "COMPOSER_HOME"),
+                Some("/nonexistent/composer-home")
+            );
+            assert_eq!(get(&env, "XDG_CONFIG_HOME"), Some("/ambient/config"));
+
+            // A suite's own COMPOSER_HOME, set after the scrub, survives.
+            cmd.env("COMPOSER_HOME", "/fixture/home");
+            assert_eq!(
+                get(&effective_env(&cmd), "COMPOSER_HOME"),
+                Some("/fixture/home")
+            );
+        },
+    );
+}
+
+#[test]
+#[serial]
 fn extra_seeds_are_scrubbed_whatever_the_ambient_value() {
     let mut cmd = Command::new("tool");
     hermetic::scrub_extra(&mut cmd, &[Extra::Yarn, Extra::Pnpm, Extra::Bundle]);
