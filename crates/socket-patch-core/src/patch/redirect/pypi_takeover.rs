@@ -120,7 +120,7 @@ fn recorded_unit_version(unit: &str) -> Option<String> {
 /// Hosted mode refuses every Poetry 0.x lock (Poetry 0.12 ignores URL
 /// sources), which vendored mode supports (#945), and a package the
 /// pyproject pins to a named source over a lock Poetry 1.3 – 2.2 wrote or
-/// one older than format 2.1 (#1282, #1503). The revert never changes the lock's format, stamp or the
+/// a lock-version 1.0 / 1.1 one (#1282, #1503). The revert never changes the lock's format, stamp or the
 /// pyproject, so the files on disk decide.
 async fn preflight_poetry_takeover(root: &Path, entry: &VendorEntry) -> Result<(), RewriteWarning> {
     let lock_file = entry
@@ -358,7 +358,7 @@ mod tests {
     }
 
     /// #1282: hosted mode refuses a source-pinned package over a lock
-    /// Poetry 1.3 – 2.2 wrote, or one older than format 2.1 (#1503), so the
+    /// Poetry 1.3 – 2.2 wrote, or a lock-version 1.0 / 1.1 one (#1503), so the
     /// takeover must keep it vendored rather
     /// than revert it into neither mode. Other writers are admitted.
     #[tokio::test]

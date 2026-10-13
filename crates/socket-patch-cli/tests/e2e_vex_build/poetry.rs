@@ -1180,7 +1180,7 @@ fn poetry_vendored_revendors_to_a_superseding_patch() {
 /// lock, and Poetry 1.3 – 2.2 refuse to install a lock that then sources six
 /// from a URL or file ("Repository \"pypi\" does not exist."; 1.3 and 1.4
 /// report a solver failure), and every Poetry 1.3+ re-solves, then refuses,
-/// a lock older than format 2.1 (1.1 and 1.2 write 1.1). Over such a lock
+/// a lock-version 1.0 / 1.1 lock (Poetry 1.0 – 1.2 write those). Over such a lock
 /// both modes refuse and leave the lock installable; 2.3+ install the
 /// rewired lock, with a warning (#1282, #1447, #1503).
 #[test]
@@ -1249,7 +1249,7 @@ fn poetry_source_pypi_constraint_never_breaks_install() {
             assert_ne!(lock, pristine_lock, "{mode}: rewired: {env}");
             assert!(
                 report.contains("source_constraint"),
-                "{mode}: warns about Poetry 1.3 – 2.2: {env}"
+                "{mode}: warns about Poetry 2.0 – 2.2: {env}"
             );
         }
         // Either way a fresh install works, and installs the patch whenever

@@ -381,10 +381,12 @@ pub enum SourcePinBreak {
     /// Poetry 1.3 – 2.2 wrote it, and their installer refuses the
     /// constraint.
     Writer,
-    /// The lock's format (the `lock-version`, `"0"` for the legacy layout)
-    /// is older than 2.1, which every Poetry from 1.3 on re-solves on
-    /// install (they trust the lock as is only from 2.1); the solve refuses
-    /// the constraint. Only Poetry 1.1 – 1.2 install such a lock (#1503).
+    /// The lock's `lock-version` is 1.0 or 1.1 (Poetry 1.0 – 1.2), which
+    /// every Poetry from 1.3 on re-solves on install (they trust the lock
+    /// as is only from format 2.1); the solve refuses the constraint. Only
+    /// the old Poetry that wrote such a lock installs it (#1503). The
+    /// legacy 0.x layout is not judged here: hosted refuses it outright,
+    /// and vendored mode keeps admitting it.
     Format(String),
 }
 
@@ -394,15 +396,23 @@ pub enum SourcePinBreak {
 /// is Poetry 1.3 – 2.2 ([`lock_writer_version`]), or its format is older
 /// than 2.1. Poetry 2.3+'s own locks install it. The writer is usually but
 /// not always the installer, so a 2.1 lock is admitted (with the
-/// [`source_constraint_advisory`]); an older one is refused whichever
-/// Poetry installs it, since only 1.1 – 1.2 would.
+/// [`source_constraint_advisory`]); a 1.0 / 1.1 lock is refused whichever
+/// Poetry installs it, since only Poetry 1.0 – 1.2 would.
+///
+/// A versioned stamp decides without parsing (only 1.4+ write one, and
+/// none of them writes a format older than 2.0); otherwise the lock is
+/// parsed once for its `lock-version`, which also names Poetry 1.3 (the
+/// only unstamped writer of 2.0, as [`lock_writer_version`] reads it).
 pub fn source_constraint_break(lock_text: &str) -> Option<SourcePinBreak> {
-    if matches!(lock_writer_version(lock_text), Some(v) if ((1, 3)..(2, 3)).contains(&v)) {
-        return Some(SourcePinBreak::Writer);
+    if let Some(writer) = generated_by_version(lock_text) {
+        return ((1, 3)..(2, 3))
+            .contains(&writer)
+            .then_some(SourcePinBreak::Writer);
     }
     let lock = lock_text.parse::<DocumentMut>().ok()?;
     match lock_version(&lock).ok()? {
-        format @ ("0" | "1.0" | "1.1" | "2.0") => Some(SourcePinBreak::Format(format.into())),
+        "2.0" => Some(SourcePinBreak::Writer),
+        format @ ("1.0" | "1.1") => Some(SourcePinBreak::Format(format.into())),
         _ => None,
     }
 }
@@ -957,11 +967,12 @@ grouped = {version = "*", source = "pypi"}
 
         // Poetry 1.3 writes the stamp without a version (#1447). Its lock is
         // still recognizable: only 1.3 – 1.8 write `lock-version = "2.0"`,
-        // and 1.4 – 1.8 stamp their version. Locks older than format 2.1
-        // break on every Poetry 1.3+, which re-solves them (#1503).
+        // and 1.4 – 1.8 stamp their version. Lock-version 1.0 / 1.1 locks
+        // break on every Poetry 1.3+, which re-solves them (#1503). The 0.x
+        // layout is left to the callers (hosted refuses it outright).
         let format = |f: &str| Some(Format(f.into()));
         for (version, want) in [
-            ("0.12.17", format("0")),
+            ("0.12.17", None),
             ("1.0.10", format("1.0")),
             ("1.1.15", format("1.1")),
             ("1.2.2", format("1.1")),
@@ -987,8 +998,6 @@ grouped = {version = "*", source = "pypi"}
             // A 2.0 lock whose stamp was edited away is still 1.3 – 1.8's.
             ("", "2.0", Some(Writer)),
             ("# a comment above the stamp\n", "2.0", Some(Writer)),
-            // A 2.0 lock under a 2.3+ stamp is still re-solved.
-            (&stamp("2.3.0"), "2.0", format("2.0")),
             (versionless, "1.1", format("1.1")),
             ("", "1.1", format("1.1")),
             ("", "1.0", format("1.0")),
@@ -1008,11 +1017,10 @@ grouped = {version = "*", source = "pypi"}
                 "CRLF {header:?} {lock_version}"
             );
         }
-        // The legacy layout (no lock-version, `[metadata.hashes]`) reads as
-        // format "0".
+        // The legacy layout (no lock-version, `[metadata.hashes]`).
         assert_eq!(
             source_constraint_break("[metadata]\ncontent-hash = \"x\"\n\n[metadata.hashes]\n"),
-            format("0")
+            None
         );
     }
 
