@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-12 (run 38), main `4e146dd`, latest release 5.0.0, latest Bun 1.4.3 (stable since 2026-10-10).
+Last updated: 2026-10-13 (run 39), main `15c2c83`, latest release 5.0.0, latest Bun 1.4.3 (stable since 2026-10-10).
 
 Method (run 36 note: the authenticated routes work too: `--api-url <mock> --org o --api-token fake` serves `/v0/orgs/o/patches/{batch,by-package,package,view}`; still set `SOCKET_PATCH_SERVER_URL` to the mock origin or hosted pins aren't recognized and `rollback` exits `manifest_not_found`. Run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` and `SOCKET_PROXY_URL` to the mock (run 32: without a token the CLI uses the public-proxy routes `/patch/batch`, `/patch/by-package/<purl>`, `/patch/view/<uuid>`, `/patch/blob/<hash>` and `POST /patch/package`, and `patch.socket.dev` returns 403 through the sandbox proxy). Test repos need `node_modules/` in `.gitignore`, or the fresh-clone oracle reads committed store entries. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -61,6 +61,8 @@ Run 34 (new main `793edd4`: #1147 vendored revert of a removed dependency, #1051
 Run 37 (new main `9ab72d4`: release 5.0.0, #1034 target grammar, #989 shared vendored revert; no Bun fix): no new bugs. Verified fixed on Linux: #1101 (#1161: member with a stray lock refuses `redirect_workspace_lockfile_elsewhere`), #861, #784, #599, #735, #443, #635 (agent refuses the global store), #371 (documented `*_bun_default_trust_lost` warning) and #764 (`*_bun_reinstall_required`, and `bun install --force` restores the bytes). Passing: #1034 names / version-less purls / two pinned versions, `get <uuid> --mode vendored` on lockb workspaces, a vendored → hosted (superseding) → vendored → revert chain, unicode / space paths, dev / optional deps with `--production`, warm shared caches, and concurrent runs (`lock_held`). #1276 / #1243 fixes are in open PRs #1283 / #1247. See the run 37 section below.
 
 Run 38 (new main `4e146dd`: #1317 mode from project state, #1283 (#1276), #1187 (#1155), #1247 (#1243), #1279): new **#1437**. A bare `scan` / `get` on a project holding vendored entries plus hosted pins converts every hosted pin to vendored (exit 0, no JSON warning), which also undoes a partial #1039 hosted takeover. It's generic (npm too), and the first bad commit is #1317. #1116 and #1019 still reproduce, now also on Bun 1.4.3 (commented). #1155 is verified fixed on Bun text + lockb. Bun 1.4.3 passes hosted / vendored / agent, the takeover chain, workspaces and the unwinds. See the run 38 section below.
+
+Run 39 (new main `15c2c83`: #1440 (#1437) `mode_ambiguous` for vendored + hosted, #1442 (#1116) committable lockb member mirrors, #1444 (#1220) capped upstream-restore lookups): new **#1467**. `vendor --check` prints a missing or corrupt artifact as a raw Rust `Debug` value (`Corrupt { reason: "vendor_workspace_artifact_missing" }`, `Missing`) with no path and no remedy, though `repair` fixes it. The member-mirror rows are Bun-only; the root rows are generic. Verified fixed on Linux: #1437 (text + lockb, bare `scan` / `get` → `mode_ambiguous`, nothing written), #1116 (1.2.23 / 1.4.3 lockb, plus the un-overridable member-ignore refusal), #1276 (`~/.npmrc` / `~/.bunfig.toml` / `$XDG_CONFIG_HOME/.bunfig.toml` scope × rollback / remove / takeover / revert, 1.2.23 / 1.4.3, text byte-exact), #1243 (lockb + text, 1.2.23 / 1.4.3) and #1084 (1.4.3 isolated, rollback + remove). After the #1243 takeover, the vendored state hits the open #1232 (`vendor --check` "wiring missing"; Bun is already commented there). Passing: 11-pin rollback / lockb takeover under the #1444 cap (`ulimit -n 64` → concurrency 1), `globalStore` hosted / vendored / agent-refusal on 1.4.3, agent manifest + hosted pins under a bare scan, member mirror cleanup on takeover and revert, and `repair` of a lost member mirror. See the run 39 section below.
 
 ## Coverage matrix
 
@@ -542,6 +544,24 @@ Other passes (Linux, 1.4.2 unless noted):
 | #1116 nested lockb workspace with `*.tgz` ignored | 1.2.23 / 1.4.3 | fail #1116 (open) |
 | #1019 post-rewire `bun patch` + superseding hosted re-run | 1.4.3 | fail #1019 (open) |
 
+### Run 39 (main `15c2c83`, Linux)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| #1437 re-check: bare `scan` / `get` on vendored + hosted mixed | 1.4.3 text + lockb | pass (`mode_ambiguous`, exit 2, locks byte-identical); explicit `--mode hosted` takeover still works |
+| Bare `scan` after the vendored ledger is emptied (`remove` / `vendor --revert`) + hosted pins | 1.4.3 text | pass (stays hosted) |
+| Root vendored + stray member `bun.lock` holding a hosted pin, bare scan / get | 1.4.3 | pass (vendored, no spurious `mode_ambiguous`) |
+| Agent manifest + hosted pins, bare `scan` / `get` / `--prune` / `repair` / `vex` | 1.4.3 text + lockb | pass (agent with documented `hosted_wiring_retained`; no double patch) |
+| #1116 re-check: lockb workspace, root `*.tgz`, member resolves its own copy, fresh frozen clone + `vendor --check` | 1.2.23 / 1.4.3 | pass (fixed by #1442) |
+| Member `.socket/` ignore rule (member `.gitignore` or root `packages/a/.socket`) | 1.4.3 lockb | pass (`vendor_artifact_gitignored`, nothing wired) |
+| Member mirror cleanup: vendored → hosted takeover / `vendor --revert`, 2 members × 2 pins | 1.2.23 / 1.4.3 lockb | pass (member `.socket/` pruned; frozen clone clean) |
+| Member mirror deleted → `vendor --check` → `repair` | 1.2.23 / 1.4.3 lockb | check red as it should be, but **#1467** (Debug reason, no remedy); `repair` restores it plus the metadata |
+| #1276 re-check: private scope only in `~/.npmrc` / `~/.bunfig.toml` / `$XDG_CONFIG_HOME/.bunfig.toml`; rollback, `remove`, vendored takeover (text + lockb) → `vendor --revert` | 1.2.23 / 1.4.3 | pass (authenticated lookup on the private registry, nothing sent to the public stand-in, byte-exact, private bytes in fresh clones) |
+| `NPM_CONFIG_USERCONFIG` scope | 1.4.3 | n/a (Bun itself ignores it: `bun install` 404s on npmjs) |
+| #1243 re-check: lockb / text record shared with a bundled copy; hosted → `list` → vendored takeover → revert | 1.2.23 / 1.4.3 | pass; the vendored end state hits open #1232 (Bun already commented) |
+| #1444 cap: 11 hosted pins, text rollback / lockb vendored takeover, `ulimit -n` 1024 and 64 | 1.4.3 | pass (no hang, byte-exact rollback, 11/11 patched after the takeover) |
+| #1084 re-check: isolated agent A → hosted B → `bun install` → rollback / `remove` | 1.4.3 | pass (orphan `.bun/minimist@1.2.2` restored, then dropped) |
+| `globalStore = true` isolated: hosted / vendored / agent, sibling project sharing the store | 1.4.3 | pass (sibling untouched, `vex` `not_affected`; agent refuses the global store, #635) |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
@@ -552,17 +572,19 @@ Other passes (Linux, 1.4.2 unless noted):
 5. macOS/Windows re-runs of the #366 / #405 / #469 / #803 fixes (Windows isolated uses junctions).
 6. #497 `github:` tuples (needs a probe).
 7. Hosted rollback on real macOS and Windows checkouts.
-8. Bun 1.4.3 stable: core hosted / vendored / agent / workspace cells pass (run 38); still to do on 1.4.3: `globalStore`, the #1084 isolated shape, Windows/macOS. #992: re-test when fixed, including `[install.scopes]` and `NPM_CONFIG_REGISTRY` variants and the 1.1.45 `remove` / takeover cells. (Lifecycle scripts and scoped packages with scripts on `bun.lockb`: pass, run 27.) (Mixed modes, `globalStore` + vendored workspace lockb: pass, run 25. Superseding uuids in mixed modes, explicit `trustedDependencies`, `bun pm trust`, `--filter`: pass, run 26.)
+8. Bun 1.4.3 stable: core hosted / vendored / agent / workspace cells pass (run 38); `globalStore` and the #1084 isolated shape pass (run 39); still to do on 1.4.3: Windows/macOS. #992: re-test when fixed, including `[install.scopes]` and `NPM_CONFIG_REGISTRY` variants and the 1.1.45 `remove` / takeover cells. (Lifecycle scripts and scoped packages with scripts on `bun.lockb`: pass, run 27.) (Mixed modes, `globalStore` + vendored workspace lockb: pass, run 25. Superseding uuids in mixed modes, explicit `trustedDependencies`, `bun pm trust`, `--filter`: pass, run 26.)
 9. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
-10. #1101: verified fixed on Linux (run 37); macOS/Windows untested; the root `bun.lockb` variant is covered (run 31). #1097 Bun < 1.3 negation: re-test when fixed. #1084: a workspace (isolated by default on Bun ≥ 1.3), macOS/Windows; re-test when fixed. (Symlinked `bun.lockb` vendored dry vs wet: pass, run 34.)
+10. #1101: verified fixed on Linux (run 37); macOS/Windows untested; the root `bun.lockb` variant is covered (run 31). #1097 Bun < 1.3 negation: re-test when fixed. #1084: verified fixed on 1.4.3 single-project isolated (run 39); still to do: a workspace, macOS/Windows. (Symlinked `bun.lockb` vendored dry vs wet: pass, run 34.)
 11. #1155: verified fixed on Bun text + lockb (run 38). `apply --check` with `globalStore` (#635 shape). Hosted `redirect.patches[]` rows on `bun.lockb` workspaces and the #1101 shape.
 
-12. #1276: PR #1283 merged; verify on Bun (needs a private-registry mock) (also the `bun.lockb` takeover restore, which shares `BunRegistrySettings`, `NPM_CONFIG_USERCONFIG`, `$XDG_CONFIG_HOME/.bunfig.toml`, and a mirror `registry=` in `~/.npmrc` on Bun ≤ 1.3.6). #1243: PR #1247 merged; verify on Bun (needs a bundled-dep fixture) (also `remove`, `vendor --revert` after the takeover, and a lockb workspace). #1232 on Bun when fixed. #1116 still reproduces on `60300b8` (run 35).
+12. #1276 and #1243 verified on Bun (run 39). Left: #1276 with project `.npmrc` overriding a user-level scope, and a lockb hosted rollback (documented refusal); #1243 with `remove`. Old note: #1276: PR #1283 merged; verify on Bun (needs a private-registry mock) (also the `bun.lockb` takeover restore, which shares `BunRegistrySettings`, `NPM_CONFIG_USERCONFIG`, `$XDG_CONFIG_HOME/.bunfig.toml`, and a mirror `registry=` in `~/.npmrc` on Bun ≤ 1.3.6). #1243: PR #1247 merged; verify on Bun (needs a bundled-dep fixture) (also `remove`, `vendor --revert` after the takeover, and a lockb workspace). #1232 on Bun when fixed. #1116 still reproduces on `60300b8` (run 35).
 13. More #1008-refactor regression cells: vendored `bun patch`ed packages through the new driver, `get <uuid> --mode vendored` on lockb workspaces, and the #898 redownloaded-artifact refusal on Bun.
 
 14. #1039 takeover follow-ups still open: takeover with `globalStore`, and takeovers in workspaces with member mirrors under a superseding uuid. (Superseding uuid and multi-lock write-failure atomicity: pass, run 34.)
 
-15. #1437: re-test when fixed; also agent manifest + hosted pins under a bare scan (is that 'agent' and does it re-patch hosted packages in place?).
+15. #1437: verified fixed (run 39). Agent manifest + hosted pins under a bare scan is covered (Known non-bugs).
+16. #1467: re-test when fixed (member + root artifact reasons, `--json` reason text).
+17. #1444 cap under real 429s from a registry (a mock that throttles), and a 40+ pin workspace.
 ## Known non-bugs
 
 - A bare `scan` from a workspace member whose root is vendored refuses `redirect_workspace_lockfile_elsewhere` (its message says "a hosted run", since the member itself has no state). It writes nothing and points to the root, so it's fine (run 38).
@@ -664,3 +686,6 @@ Other passes (Linux, 1.4.2 unless noted):
 - `bun install --save-text-lockfile` on 1.4.2 deletes `bun.lockb`; `bun bun.lockb` prints the ACTIVE lock (the text one when both exist). Inspect a stale binary with `strings` (run 21).
 - `vex` exit 2 `manifest_not_found` ("nothing to attest") after every patch is rolled back or reverted is correct (run 25).
 - `get --mode agent` on an already-vendored package doesn't take it over: the manifest and the vendored ledger coexist, and a scoped `rollback` unwinds both (run 25).
+- A bare `scan` / `get` on a project with an agent manifest plus hosted pins runs agent mode. It adds the hosted packages to the manifest and warns `hosted_wiring_retained` (documented: agent runs don't unwind hosted wiring). It doesn't double-patch, and only vendored + hosted is `mode_ambiguous` (run 39).
+- Bun ignores `NPM_CONFIG_USERCONFIG`, so a scope configured only there isn't a valid #1276 cell (run 39).
+- Vendoring on a `bun.lockb` workspace writes every patched tarball's mirror under every member, including members that don't depend on it. That's harmless (run 39).
