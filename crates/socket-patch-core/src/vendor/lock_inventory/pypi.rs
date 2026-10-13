@@ -326,7 +326,7 @@ pub(super) fn portable_wheel_artifact(
 }
 
 pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
-    let document = read_only_toml(&text)?;
+    let document = read_only_toml(text)?;
     let (collection, pep751) = lock_package_collection(&document);
     // Only the lock formats the fetch layer understands.
     let supported = if pep751 {
