@@ -41,8 +41,9 @@ and `vendor` (committed patched packages), with `list` for inspection. See the
   selects vendored mode and an agent manifest selects agent mode, so the quick
   start no longer converts an existing project to hosted in place. Switching
   modes (in either direction) takes an explicit `--mode`; a project holding
-  both kinds of state is a usage error (`mode_ambiguous`, exit 2). Human runs
-  print a note naming the mode kept (#1088).
+  both kinds of state, or vendored packages beside hosted pins, is a usage
+  error (`mode_ambiguous`, exit 2) that names the packages. Human runs print
+  a note naming the mode kept (#1088, #1437).
 - Every command's `--json` output is one envelope: `command`, `status`,
   `dryRun`, `events`, `summary`, `warnings`, plus `error: {code, message}` on
   failure and `gc` when a sweep ran. `scan`, `get` and `rollback` drop their
@@ -352,6 +353,9 @@ limits, and required install commands.
 - The `apply --check` drift remedy repeats the check's own `--cwd`,
   `--manifest-path`, `-g` / `--global-prefix` and `--ecosystems` flags,
   instead of a bare `socket-patch apply` that acts on another tree (#1219).
+- Hosted `rollback` / `remove`, takeover and eject look up upstream registry
+  entries a few at a time instead of all at once, so many pins no longer
+  trip registry rate limits or `EMFILE` (#1220).
 - The OpenVEX document is written with stage + rename, so a failed write no
   longer leaves a truncated document behind (#1144).
 - Vendored Maven, Gradle and NuGet artifacts are protected from `.gitignore`
@@ -880,6 +884,9 @@ limits, and required install commands.
     be listed and unwound (#1243).
   - Upgrading or downgrading a vendored npm or Bun package reverts cleanly
     instead of being kept as drift (#1155).
+  - Vendored `bun.lockb` workspaces check that git would commit the
+    member-relative tarball mirrors, as the root artifact already was, so a
+    `*.tgz` ignore rule can't break fresh frozen installs (#1116).
   - Hosted mode leaves pnpm locks alone when pnpm's `lockfile` setting is
     off (`lockfile=false`, `lockfile: false` or `package-lock=false`), since
     pnpm then installs from the registry; it warns
@@ -1035,6 +1042,13 @@ limits, and required install commands.
     written by Poetry 1.4–2.2, which can't install the rewired lock
     (`redirect_poetry_lock_unsupported` / `pypi_poetry_source_constraint`);
     other Poetry versions are rewired with a warning (#1282).
+  - Venvs created with `--system-site-packages` (including Poetry's and
+    Pipenv's options for it) are crawled through to the base interpreter's
+    packages, so `vex` no longer attests a lock pin while an unpatched base
+    copy is imported, and stale-install guards warn about it (#409).
+  - Hosted and vendored uv refuse to wire through `[tool.uv.sources]` when
+    `no-sources = true` or `no-sources-package` makes uv ignore it
+    (`redirect_uv_project_unsupported`, `pypi_uv_no_sources`) (#564).
   - Vendored Hatch refuses (`pypi_hatch_unsupported`) a checkout whose path
     contains `%`, `#`, `;` or `?`, which Hatch's `{root:uri}` turns into a
     broken file URL (#547).
