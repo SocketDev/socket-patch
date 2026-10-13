@@ -17,8 +17,8 @@ use super::RewriteWarning;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::read_regular_to_string;
 use crate::utils::poetry_lock::{
-    lock_version, pyproject_source_constraints, source_constraint_breaks_writer,
-    source_constraint_refusal, Wired,
+    lock_version, pyproject_source_constraints, source_constraint_break, source_constraint_refusal,
+    Wired,
 };
 use crate::vendor::state::VendorEntry;
 
@@ -119,8 +119,8 @@ fn recorded_unit_version(unit: &str) -> Option<String> {
 
 /// Hosted mode refuses every Poetry 0.x lock (Poetry 0.12 ignores URL
 /// sources), which vendored mode supports (#945), and a package the
-/// pyproject pins to a named source over a lock Poetry 1.3 – 2.2 wrote
-/// (#1282). The revert never changes the lock's format, stamp or the
+/// pyproject pins to a named source over a lock Poetry 1.3 – 2.2 wrote or
+/// one older than format 2.1 (#1282, #1503). The revert never changes the lock's format, stamp or the
 /// pyproject, so the files on disk decide.
 async fn preflight_poetry_takeover(root: &Path, entry: &VendorEntry) -> Result<(), RewriteWarning> {
     let lock_file = entry
@@ -152,16 +152,16 @@ async fn preflight_poetry_takeover(root: &Path, entry: &VendorEntry) -> Result<(
 }
 
 /// The hosted rewriter's source-pin refusal (#1282), predicted from the
-/// pyproject beside the lock and the lock's writer stamp.
+/// pyproject beside the lock and the lock's writer stamp and format.
 async fn preflight_poetry_source_constraint(
     root: &Path,
     lock_file: &str,
     lock_text: &str,
     entry: &VendorEntry,
 ) -> Result<(), RewriteWarning> {
-    if !source_constraint_breaks_writer(lock_text) {
+    let Some(why) = source_constraint_break(lock_text) else {
         return Ok(());
-    }
+    };
     let pyproject_file = format!(
         "{}pyproject.toml",
         lock_file.strip_suffix("poetry.lock").unwrap_or("")
@@ -191,7 +191,8 @@ async fn preflight_poetry_source_constraint(
                 version,
                 &source,
                 "URL",
-                Wired::Vendored
+                Wired::Vendored,
+                &why,
             ),
         ),
     })

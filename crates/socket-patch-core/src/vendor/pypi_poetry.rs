@@ -196,10 +196,10 @@ fn source_constraint(p: &PoetryProject, canon_name: &str) -> Option<String> {
     poetry_lock::pyproject_source_constraints(p.pyproject_text.as_deref()?).remove(canon_name)
 }
 
-/// The advisory for a source-constrained package wired over a lock that a
-/// Poetry outside 1.3 – 2.2 wrote: the writer installs it, but a 1.3 – 2.2
-/// installer would refuse it. [`check_target_guards`] refuses the 1.3 – 2.2
-/// writers outright.
+/// The advisory for a source-constrained package wired over a lock Poetry
+/// 2.3+ wrote: the writer installs it, but a 2.0 – 2.2 installer would
+/// refuse it. [`check_target_guards`] refuses the locks every 1.3+ (or the
+/// 1.3 – 2.2 writer) would refuse outright.
 pub(super) fn source_constraint_warning(
     p: &PoetryProject,
     canon_name: &str,
@@ -212,16 +212,20 @@ pub(super) fn source_constraint_warning(
 }
 
 /// Refuse a source-constrained package over a lock written by Poetry
-/// 1.3 – 2.2: its installer fails every install once the lock sources the
-/// package from the vendored wheel (#1282).
+/// 1.3 – 2.2, or one older than format 2.1: a Poetry 1.3+ installer fails
+/// every install once the lock sources the package from the vendored wheel
+/// (#1282, #1503).
 fn source_constraint_guard(
     p: &PoetryProject,
     canon_name: &str,
     version: &str,
     wired: poetry_lock::Wired,
 ) -> Result<(), (&'static str, String)> {
-    match source_constraint(p, canon_name) {
-        Some(source) if poetry_lock::source_constraint_breaks_writer(&p.lock_text) => Err((
+    let Some(source) = source_constraint(p, canon_name) else {
+        return Ok(());
+    };
+    match poetry_lock::source_constraint_break(&p.lock_text) {
+        Some(why) => Err((
             "pypi_poetry_source_constraint",
             poetry_lock::source_constraint_refusal(
                 "pyproject.toml",
@@ -231,9 +235,10 @@ fn source_constraint_guard(
                 &source,
                 "file",
                 wired,
+                &why,
             ),
         )),
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 
@@ -319,7 +324,8 @@ pub(super) fn check_target_guards(
         ));
     }
     // A pyproject `source = "…"` pin breaks every install of the wired lock
-    // on Poetry 1.3 – 2.2; refuse when one of those wrote the lock.
+    // on Poetry 1.3 – 2.2, and on every 1.3+ when the lock is older than
+    // format 2.1; refuse those locks.
     source_constraint_guard(p, canon_name, version, poetry_lock::Wired::No)?;
     Ok(PoetryTarget::Fresh)
 }

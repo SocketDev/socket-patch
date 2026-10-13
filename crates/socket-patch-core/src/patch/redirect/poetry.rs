@@ -11,8 +11,8 @@ use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::poetry_lock::{
     generated_by_version, lock_version, lock_wiring, pyproject_source_constraints,
-    rewrite_poetry_lock_all_with_version, source_constraint_advisory,
-    source_constraint_breaks_writer, source_constraint_refusal, LockBatch, LockStep, PoetryLockDep,
+    rewrite_poetry_lock_all_with_version, source_constraint_advisory, source_constraint_break,
+    source_constraint_refusal, LockBatch, LockStep, PoetryLockDep,
 };
 
 /// Whether the lock was written by a Poetry release older than 1.4. Those
@@ -71,8 +71,9 @@ pub(super) fn rewrite_poetry(
     for (path, original) in locks {
         // A pyproject `source = "…"` constraint on the dep (#1282). Poetry
         // 1.3 – 2.2 fail every install of a lock that sources it from a URL,
-        // so a lock one of them wrote is refused; other writers are warned.
-        // The constraint lives in the pyproject beside the lock.
+        // and every 1.3+ fails one older than format 2.1 (#1503), so such a
+        // lock is refused; Poetry 2.3+'s are warned. The constraint lives in
+        // the pyproject beside the lock.
         let pyproject_path = format!(
             "{}pyproject.toml",
             path.strip_suffix("poetry.lock").unwrap_or("")
@@ -83,7 +84,12 @@ pub(super) fn rewrite_poetry(
             .unwrap_or_default();
         let constraint = |dep: &DepOverride| constraints.get(&canonicalize_pypi_name(&dep.name));
         let mut usable = usable.clone();
-        if !constraints.is_empty() && source_constraint_breaks_writer(original) {
+        let breaks = if constraints.is_empty() {
+            None
+        } else {
+            source_constraint_break(original)
+        };
+        if let Some(why) = &breaks {
             usable.retain(|&(dep, _)| {
                 // A dep the lock doesn't list keeps its `entry_not_found`
                 // report; one it lists (even already redirected) is refused.
@@ -108,6 +114,7 @@ pub(super) fn rewrite_poetry(
                             source,
                             "URL",
                             wired,
+                            why,
                         )
                     ),
                 });
