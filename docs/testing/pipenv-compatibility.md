@@ -64,9 +64,12 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   venv, counts it as installed, so the lock protects no install on that
   host. For a stale copy there the warning instead prints `pipenv
   requirements > pipenv-locked.txt && pipenv run pip install --no-deps
-  --ignore-installed -r pipenv-locked.txt` (Pipenv 2022.4+, with the same
-  category arguments), which installs the locked release inside the venv
-  and leaves the base copy untouched (#1450).
+  --ignore-installed -r pipenv-locked.txt` (Pipenv 2022.4+), which installs
+  the locked release inside the venv and leaves the base copy untouched
+  (#1450). The export takes `--dev` like `sync`, but names categories as
+  comma-joined lock keys (`--categories "default,docs"`, Pipenv 2022.12+):
+  2022.12.x–2023.2.4 split the list on commas and look each name up in the
+  lock, so `sync`'s `"packages docs"` exports nothing there (#1507).
 - **Relocking drops the reference.** `pipenv lock` (and `update`, and
   `install <other>` on releases before 2024, where it is a full relock)
   regenerates the redirected entry to its registry reference on every major,
