@@ -27,7 +27,9 @@ use crate::formats::text::strip_bom;
 use crate::formats::yarn::berry_gates::YARN_LOCK;
 use crate::formats::yarn::is_berry_lock;
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
-use crate::utils::fs::{open_regular_file, read_regular_to_string, read_regular_to_string_sync};
+use crate::utils::fs::{
+    open_regular_file, open_regular_file_sync, read_regular_to_string, read_regular_to_string_sync,
+};
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::workspace_globs::{workspaces_include, workspaces_include_as, WorkspacesDialect};
 use crate::vendor::bun_lockb;
@@ -588,21 +590,19 @@ async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
     }
 }
 
-/// The `configVersion` a binary `bun.lockb` carries in its trailing
-/// `cNfGvRsN` extension (#1492): reads the header and those 16 bytes
-/// only, through the FIFO-safe opener. `None` when the lock is not
-/// readable, not a binary lock, or untagged (written before Bun wrote
-/// `configVersion`).
+/// The `configVersion` a binary `bun.lockb` carries in its `cNfGvRsN`
+/// extension (#1492), read through the FIFO-safe opener on the blocking
+/// pool. `None` when the lock is unreadable, not a binary lock, or
+/// untagged (written before Bun wrote `configVersion`).
 async fn bun_lockb_config_version(path: &Path) -> Option<u64> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let (mut file, _) = open_regular_file(path).await.ok()?;
-    let mut head = vec![0; bun_lockb::CONFIG_HEAD_LEN];
-    file.read_exact(&mut head).await.ok()?;
-    let at = bun_lockb::config_version_offset(&head)?;
-    file.seek(std::io::SeekFrom::Start(at as u64)).await.ok()?;
-    let mut extension = [0; 16];
-    file.read_exact(&mut extension).await.ok()?;
-    bun_lockb::config_version(&extension)
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let (mut file, _) = open_regular_file_sync(&path).ok()?;
+        bun_lockb::read_config_version(&mut file)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// How much of a lock [`lock_dialect`] reads: the yarn berry and Bun keys
@@ -1411,10 +1411,14 @@ mod tests {
         // catalog extensions.
         const BUN_1_4_2_WORKSPACE: &[u8] =
             include_bytes!("../../tests/fixtures/bun-lockb/1.4.2-extensions/bun.lockb");
+        // Scoped overrides: Bun writes their extension after the tag.
+        const BUN_1_4_2_SCOPED: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/1.4.2-scoped-overrides/bun.lockb");
         let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
         for (lock, expected) in [
             (BUN_1_3_14, None),
             (BUN_1_4_2_WORKSPACE, None),
+            (BUN_1_4_2_SCOPED, None),
             (BUN_1_2_23, refused),
             (&b"\0"[..], refused),
         ] {

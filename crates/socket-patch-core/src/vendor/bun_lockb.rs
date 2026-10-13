@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha512_256};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
 const HEADER: &[u8] = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n";
@@ -49,32 +50,89 @@ pub(crate) const NORMALIZED_FORMAT_1: u8 = 1;
 /// Workspace dependency behaviors were normalized (not invertible).
 pub(crate) const NORMALIZED_WORKSPACE: u8 = 2;
 
-/// How many leading bytes of a `bun.lockb` [`config_version_offset`] reads.
-pub(crate) const CONFIG_HEAD_LEN: usize = PACKAGES_AT;
-
-/// Where the 16-byte `cNfGvRsN` extension (the tag, then Bun's
-/// `configVersion` as a u64) would start: Bun writes it last, right
-/// before the lock's `total` byte length (every Bun 1.3.9–1.4.2 fixture,
-/// workspace and catalog locks included). `None` when `head` is not a
-/// binary lock header. Reading only these 16 bytes keeps the check
-/// independent of the package records and of extensions this codec does
-/// not know (#1492).
-pub(crate) fn config_version_offset(head: &[u8]) -> Option<usize> {
+/// Bun's `configVersion` from a binary lock's `cNfGvRsN` extension (the
+/// twin of the text lock's top-level key, #1492), or `None` for a lock
+/// that is not binary, is untagged (Bun 1.3.0 and earlier) or does not
+/// hold together. Walks only the structure (the header, the six buffer
+/// descriptors and the extension tags), seeking past every array, so
+/// neither package records nor the order of the extensions matters (Bun
+/// writes `sCoPdOvR` after the tag), and a large lock costs a few small
+/// reads. Like [`BunLockb::parse`], it stops at an unknown tag.
+pub(crate) fn read_config_version<R: Read + Seek>(lock: &mut R) -> Option<u64> {
+    let mut head = [0; PACKAGES_AT + 40];
+    lock.read_exact(&mut head).ok()?;
     if !head.starts_with(HEADER) {
         return None;
     }
-    let total = usize_at(head, TOTAL_AT).ok()?;
-    total.checked_sub(16).filter(|at| *at >= PACKAGES_AT)
-}
-
-/// Bun's `configVersion` from the 16 bytes at [`config_version_offset`]:
-/// the binary twin of the text lock's top-level key, written only by the
-/// Bun releases that write `configVersion` (1.3.0 does not).
-pub(crate) fn config_version(extension: &[u8]) -> Option<u64> {
-    if extension.len() != 16 || &extension[..8] != b"cNfGvRsN" {
+    let total = usize_at(&head, TOTAL_AT).ok()?;
+    let mut pos = usize_at(&head, PACKAGES_AT + 32).ok()?;
+    for _ in 0..6 {
+        pos = skip_array(lock, pos, total)?.end;
+    }
+    if read_u64(lock, pos, total)? != 0 {
         return None;
     }
-    u64_at(extension, 8).ok()
+    pos += 8;
+    while pos.checked_add(8).is_some_and(|end| end <= total) {
+        let mut tag = [0; 8];
+        read_at(lock, pos, &mut tag, total)?;
+        let n = match &tag {
+            b"wOrKsPaC" => 4,
+            b"tRuStEDd" => 1,
+            b"eMpTrUsT" => 0,
+            b"oVeRriDs" | b"pAtChEdD" => 2,
+            b"sCoPdOvR" => 3,
+            b"cNfGvRsN" => return read_u64(lock, pos + 8, total),
+            b"cAtAlOgS" => {
+                pos += 8;
+                let mut groups = 0;
+                for _ in 0..3 {
+                    let array = skip_array(lock, pos, total)?;
+                    groups = array.len() / 8;
+                    pos = array.end;
+                }
+                for _ in 0..groups * 2 {
+                    pos = skip_array(lock, pos, total)?.end;
+                }
+                continue;
+            }
+            _ => return None,
+        };
+        pos += 8;
+        for _ in 0..n {
+            pos = skip_array(lock, pos, total)?.end;
+        }
+    }
+    None
+}
+
+fn read_at<R: Read + Seek>(lock: &mut R, at: usize, buf: &mut [u8], total: usize) -> Option<()> {
+    if at.checked_add(buf.len())? > total {
+        return None;
+    }
+    lock.seek(SeekFrom::Start(at as u64)).ok()?;
+    lock.read_exact(buf).ok()
+}
+
+fn read_u64<R: Read + Seek>(lock: &mut R, at: usize, total: usize) -> Option<u64> {
+    let mut bytes = [0; 8];
+    read_at(lock, at, &mut bytes, total)?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// The data range of the array whose descriptor is at `descriptor`, with
+/// [`read_array`]'s checks; each array starts past its descriptor, so a
+/// walk over them always moves forward.
+fn skip_array<R: Read + Seek>(
+    lock: &mut R,
+    descriptor: usize,
+    total: usize,
+) -> Option<Range<usize>> {
+    let mut bytes = [0; 16];
+    read_at(lock, descriptor, &mut bytes, total)?;
+    let start = usize_at(&bytes, 0).ok()?;
+    let end = usize_at(&bytes, 8).ok()?;
+    (start >= descriptor + 16 && start <= end && end <= total).then_some(start..end)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2308,26 +2366,26 @@ mod tests {
         format!("sha512-{}", STANDARD.encode([42; 64]))
     }
 
-    fn read_config_version(lock: &[u8]) -> Option<u64> {
-        let at = config_version_offset(&lock[..CONFIG_HEAD_LEN.min(lock.len())])?;
-        config_version(lock.get(at..at + 16)?)
+    fn config_version_of(lock: &[u8]) -> Option<u64> {
+        read_config_version(&mut std::io::Cursor::new(lock))
     }
 
     /// #1492: Bun writes a `cNfGvRsN` config-version extension (the twin
-    /// of the text lock's `configVersion`) since a 1.3 patch release, last
-    /// in the extension list, also after the workspace and catalog
-    /// extensions of a workspace root; 1.3.0 and earlier writers do not.
+    /// of the text lock's `configVersion`) since a 1.3 patch release, after
+    /// the workspace and catalog extensions of a workspace root and before
+    /// the scoped-overrides one; 1.3.0 and earlier writers do not.
     #[test]
     fn config_version_is_read_from_tagged_locks_only() {
         let extra = [
             "prerelease-pair-1.3.14",
             "1.4.2-extensions",
+            "1.4.2-scoped-overrides",
             "1.2.23-extensions",
         ];
         for version in VERSIONS.iter().chain(&extra) {
             let lock = fixture(version);
             let tagged = version.contains("1.3.14") || version.starts_with("1.4.2");
-            assert_eq!(read_config_version(&lock), tagged.then_some(1), "{version}");
+            assert_eq!(config_version_of(&lock), tagged.then_some(1), "{version}");
         }
         for name in ["1.3.9-ws-deps-late.lockb", "1.4.2-ws-adder.lockb"] {
             let lock = std::fs::read(
@@ -2336,11 +2394,11 @@ mod tests {
                     .join(name),
             )
             .unwrap();
-            assert_eq!(read_config_version(&lock), Some(1), "{name}");
+            assert_eq!(config_version_of(&lock), Some(1), "{name}");
         }
-        // Not a binary lock, or too short to hold the extension.
-        assert_eq!(read_config_version(b"\0"), None);
-        assert_eq!(read_config_version(HEADER), None);
+        // Not a binary lock, or a header with nothing after it.
+        assert_eq!(config_version_of(b"\0"), None);
+        assert_eq!(config_version_of(HEADER), None);
     }
 
     #[test]
