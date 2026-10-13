@@ -794,12 +794,16 @@ async fn restore_berry(
             // The selectors are all dropped below either way. A lock that
             // declares none of them (a spelling not read here) keeps every
             // selector's descriptor, as before.
-            let declared = declared.get_or_insert_with(|| berry_declared_descriptors(&blocks));
+            let declared = declared.get_or_insert_with(|| {
+                crate::formats::yarn::berry_prune::declared_descriptors(&blocks)
+            });
             if descriptors
                 .iter()
-                .any(|d| berry_descriptor_declared(declared, d))
+                .any(|d| crate::formats::yarn::berry_prune::descriptor_declared(declared, d))
             {
-                descriptors.retain(|d| berry_descriptor_declared(declared, d));
+                descriptors.retain(|d| {
+                    crate::formats::yarn::berry_prune::descriptor_declared(declared, d)
+                });
             }
             if descriptors.is_empty() {
                 result.refuse(
@@ -1025,52 +1029,6 @@ async fn restore_berry(
     }
     doc.stanzas = blocks;
     view.write(rel, doc.render(&moved));
-}
-
-/// The descriptors a berry lock's `stanzas` still declare: every
-/// entry's `dependencies:` map, plus the descriptor a `patch:` descriptor
-/// wraps (`name@patch:name@npm%3A1.3.0#…` wraps `name@npm:1.3.0`), in
-/// either a dependency map or a key. Yarn 4 spells a registry range
-/// `npm:range`, yarn 2 and 3 a bare `range`; see
-/// [`berry_descriptor_declared`].
-fn berry_declared_descriptors(stanzas: &[String]) -> BTreeSet<String> {
-    use crate::formats::yarn::berry_prune::dependency_descriptors;
-    use crate::formats::yarn::patterns::split_berry_key_patterns;
-    use crate::formats::yarn::stanzas::stanza_key;
-
-    let mut out = BTreeSet::new();
-    for stanza in stanzas {
-        let keys = stanza_key(stanza)
-            .map(split_berry_key_patterns)
-            .unwrap_or_default();
-        for descriptor in dependency_descriptors(stanza) {
-            if let Some(inner) = berry_patch_inner(&descriptor) {
-                out.insert(inner);
-            }
-            out.insert(descriptor);
-        }
-        out.extend(keys.iter().filter_map(|k| berry_patch_inner(k)));
-    }
-    out
-}
-
-/// The descriptor a `name@patch:<inner>#<patch>` descriptor wraps, with
-/// yarn's percent-encoding of the inner `:` undone.
-fn berry_patch_inner(descriptor: &str) -> Option<String> {
-    let (_, rest) = descriptor.split_once("@patch:")?;
-    let inner = rest.split('#').next().unwrap_or(rest);
-    Some(inner.replace("%3A", ":"))
-}
-
-/// Whether the `name@npm:range` `descriptor` is in `declared`
-/// ([`berry_declared_descriptors`]), in yarn 4's spelling or yarn 2/3's
-/// bare `name@range`.
-fn berry_descriptor_declared(declared: &BTreeSet<String>, descriptor: &str) -> bool {
-    use crate::formats::yarn::patterns::split_pattern;
-    declared.contains(descriptor)
-        || split_pattern(descriptor)
-            .and_then(|(name, range)| Some(format!("{name}@{}", range.strip_prefix("npm:")?)))
-            .is_some_and(|bare| declared.contains(&bare))
 }
 
 /// Retire the leftover hosted `resolutions` selectors of a yarn berry root
@@ -2788,7 +2746,10 @@ mod tests {
     fn berry_descriptor_declared_reads_what_the_lock_still_uses() {
         let declared = |stanzas: &[&str], d: &str| {
             let stanzas: Vec<String> = stanzas.iter().map(|s| s.to_string()).collect();
-            super::berry_descriptor_declared(&super::berry_declared_descriptors(&stanzas), d)
+            crate::formats::yarn::berry_prune::descriptor_declared(
+                &crate::formats::yarn::berry_prune::declared_descriptors(&stanzas),
+                d,
+            )
         };
         let url_entry = "\"left-pad@http://patch.test/left-pad-1.3.0.tgz\":\n  version: 1.3.0\n  \
                          resolution: \"left-pad@http://patch.test/left-pad-1.3.0.tgz\"";

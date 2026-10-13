@@ -25,6 +25,47 @@ pub(crate) struct Pruned {
     pub after: Option<String>,
 }
 
+/// The descriptors a berry lock's `stanzas` still declare: every
+/// entry's `dependencies:` map, plus the descriptor a `patch:` descriptor
+/// wraps (`name@patch:name@npm%3A1.3.0#…` wraps `name@npm:1.3.0`), in
+/// either a dependency map or a key. Yarn 4 spells a registry range
+/// `npm:range`, yarn 2 and 3 a bare `range`; see
+/// [`descriptor_declared`].
+pub(crate) fn declared_descriptors(stanzas: &[String]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for stanza in stanzas {
+        let keys = stanza_key(stanza)
+            .map(split_berry_key_patterns)
+            .unwrap_or_default();
+        for descriptor in dependency_descriptors(stanza) {
+            if let Some(inner) = patch_inner(&descriptor) {
+                out.insert(inner);
+            }
+            out.insert(descriptor);
+        }
+        out.extend(keys.iter().filter_map(|k| patch_inner(k)));
+    }
+    out
+}
+
+/// The descriptor a `name@patch:<inner>#<patch>` descriptor wraps, with
+/// yarn's percent-encoding of the inner `:` undone.
+fn patch_inner(descriptor: &str) -> Option<String> {
+    let (_, rest) = descriptor.split_once("@patch:")?;
+    let inner = rest.split('#').next().unwrap_or(rest);
+    Some(inner.replace("%3A", ":"))
+}
+
+/// Whether the `name@npm:range` `descriptor` is in `declared`
+/// ([`declared_descriptors`]), in yarn 4's spelling or yarn 2/3's
+/// bare `name@range`.
+pub(crate) fn descriptor_declared(declared: &BTreeSet<String>, descriptor: &str) -> bool {
+    declared.contains(descriptor)
+        || split_pattern(descriptor)
+            .and_then(|(name, range)| Some(format!("{name}@{}", range.strip_prefix("npm:")?)))
+            .is_some_and(|bare| declared.contains(&bare))
+}
+
 /// The descriptors (`name@range`) an entry's `dependencies:` map names.
 pub(crate) fn dependency_descriptors(stanza: &str) -> Vec<String> {
     let mut out = Vec::new();

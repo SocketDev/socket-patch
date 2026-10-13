@@ -38,6 +38,7 @@
 //! (`vendor_yarn_berry_mixed_line_endings`, see
 //! [`refuse_mixed_line_endings`]); a revert never refuses on line endings.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde_json::Value;
@@ -46,10 +47,14 @@ use sha2::{Digest, Sha256, Sha512};
 use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::berry_entry::{render_pinned_entry, Pin};
 use crate::formats::yarn::berry_gates::{self, BerryGate, Yarnrc, SUPPORTED_CACHE_KEY};
-use crate::formats::yarn::berry_prune::{cut_descriptors, prune_unreferenced};
-use crate::formats::yarn::blocks::{berry_field, block_eol, replace_block, scan_blocks, LockBlock};
+use crate::formats::yarn::berry_prune::{
+    cut_descriptors, declared_descriptors, descriptor_declared, prune_unreferenced,
+};
+use crate::formats::yarn::blocks::{
+    berry_field, block_eol, replace_block, scan_blocks, with_body_field, LockBlock,
+};
 use crate::formats::yarn::patterns::{pattern_real_name, split_berry_key_patterns, split_pattern};
-use crate::formats::yarn::stanzas::{stanza_key, BerryStanzas};
+use crate::formats::yarn::stanzas::{stanza_key, stanza_lines, BerryStanzas};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{
@@ -762,13 +767,21 @@ pub async fn revert_yarn_berry_opts(
         match read_regular_to_string(&lock_path).await {
             Ok(mut text) => {
                 let mut changed = false;
-                let restored_entries: Vec<String> = lock_recs
-                    .iter()
-                    .filter(|rec| rec.kind == KIND_LOCK_ENTRY || rec.kind == KIND_LOCK_ENTRY_PRUNED)
-                    .filter_map(|rec| rec.original.as_ref())
-                    .filter_map(super::yarn_classic_lock::json_to_lines)
-                    .map(|lines| lines.join("\n"))
-                    .collect();
+                // The checksum spelling the lock uses now, which a yarn
+                // upgrade since vendoring may have changed (#759).
+                let bare = lock_spells_bare_checksums(&text);
+                let restored_of = |kind: &str| -> Vec<String> {
+                    lock_recs
+                        .iter()
+                        .filter(|rec| rec.kind == kind)
+                        .filter_map(|rec| rec.original.as_ref())
+                        .filter_map(super::yarn_classic_lock::json_to_lines)
+                        .map(|lines| lines.join("\n"))
+                        .collect()
+                };
+                let restored_main = restored_of(KIND_LOCK_ENTRY);
+                let mut restored_entries = restored_of(KIND_LOCK_ENTRY_PRUNED);
+                restored_entries.extend(restored_main.iter().cloned());
                 for rec in lock_recs {
                     if rec.kind == KIND_LOCK_ENTRY_PRUNED {
                         changed |= restore_pruned_entry(&mut text, rec, &mut outcome.warnings);
@@ -785,20 +798,39 @@ pub async fn revert_yarn_berry_opts(
                     );
                 }
                 if changed {
-                    // The restored entries rejoin any registry entry added
-                    // since with the same resolution (#1082).
                     let mut doc = BerryStanzas::parse(&text);
                     let restored: Vec<usize> = (0..doc.stanzas.len())
                         .filter(|&i| restored_entries.contains(&doc.stanzas[i]))
                         .collect();
                     let mut moved = Vec::new();
-                    if !crate::formats::yarn::stanzas::merge_same_resolution(
+                    // The recorded entries are what yarn wrote at vendor
+                    // time; the lock has moved on since, so each follows
+                    // what it declares and spells now (#759).
+                    let declared = declared_descriptors(&doc.stanzas);
+                    let mut rebased = false;
+                    for &i in &restored {
+                        let rekey = restored_main.contains(&doc.stanzas[i]);
+                        if let Some(stanza) = rebase_restored_entry(
+                            &doc.stanzas,
+                            i,
+                            rekey.then_some(&declared),
+                            bare,
+                            &mut moved,
+                            &mut outcome.warnings,
+                        ) {
+                            doc.stanzas[i] = stanza;
+                            rebased = true;
+                        }
+                    }
+                    // The restored entries rejoin any registry entry added
+                    // since with the same resolution (#1082).
+                    let merged = !crate::formats::yarn::stanzas::merge_same_resolution(
                         &mut doc.stanzas,
                         &restored,
                         &mut moved,
                     )
-                    .is_empty()
-                    {
+                    .is_empty();
+                    if rebased || merged {
                         text = doc.render(&moved);
                     }
                     forget_block_scans();
@@ -1429,6 +1461,183 @@ pub(crate) fn checksum_in_lock_spelling(lock_text: &str, checksum: &str) -> Stri
     match checksum.split_once('/') {
         Some((_, hex)) if lock_spells_bare_checksums(lock_text) => hex.to_string(),
         _ => checksum.to_string(),
+    }
+}
+
+/// A pre-vendor entry the revert put back (`stanzas[idx]`), re-derived
+/// from the live lock (#759), or `None` when it already matches it:
+///
+/// - its `checksum:` in the lock's current spelling (`bare`, read before
+///   the restore): a yarn 4.0.x lock upgraded to 4.1+ since vendoring
+///   respells every checksum `10c0/<hex>`;
+/// - with `declared` ([`declared_descriptors`]), its key: the package's
+///   registry descriptors the lock still declares, plus any added since
+///   vendoring (the `resolutions` pin routed them to the vendored entry,
+///   so none has an entry of its own) that its version satisfies. A
+///   descriptor it does not satisfy needs an entry only `yarn install`
+///   can resolve, which is warned about. Yarn keys an entry by exactly
+///   the descriptors resolved to it, and `--immutable` rejects any other
+///   key (YN0028).
+fn rebase_restored_entry(
+    stanzas: &[String],
+    idx: usize,
+    declared: Option<&BTreeSet<String>>,
+    bare: bool,
+    moved: &mut Vec<String>,
+    warnings: &mut Vec<VendorWarning>,
+) -> Option<String> {
+    let mut lines = stanza_lines(&stanzas[idx]);
+    let mut changed = false;
+
+    if let Some(checksum) = berry_field(&lines, "checksum").filter(|c| !c.contains('"')) {
+        let full = match checksum.contains('/') {
+            true => checksum.to_string(),
+            false => format!("{SUPPORTED_CACHE_KEY}/{checksum}"),
+        };
+        let spelled = match full.split_once('/') {
+            Some((_, hex)) if bare => hex.to_string(),
+            _ => full.clone(),
+        };
+        if spelled != checksum {
+            if let Some(respelled) =
+                with_body_field(&lines, "checksum", &format!("  checksum: {spelled}"))
+            {
+                lines = respelled;
+                changed = true;
+            }
+        }
+    }
+
+    if let Some(declared) = declared {
+        if let Some(key) = rekeyed(stanzas, idx, &lines, declared, warnings) {
+            lines[0] = format!("{key}:");
+            moved.push(key);
+            changed = true;
+        }
+    }
+
+    changed.then(|| lines.join("\n"))
+}
+
+/// The key [`rebase_restored_entry`] gives a restored entry, or `None` to
+/// keep the recorded one.
+fn rekeyed(
+    stanzas: &[String],
+    idx: usize,
+    lines: &[String],
+    declared: &BTreeSet<String>,
+    warnings: &mut Vec<VendorWarning>,
+) -> Option<String> {
+    let recorded = stanza_key(&stanzas[idx])?;
+    let patterns = split_berry_key_patterns(recorded);
+    let version = berry_field(lines, "version")?;
+    let mut names = patterns
+        .iter()
+        .filter_map(|p| split_pattern(p).map(|(n, _)| n));
+    let name = names.next()?;
+    if names.any(|n| n != name) {
+        return None;
+    }
+    // The package's plain registry descriptors (`name@npm:range`) the lock
+    // declares, in yarn 4's key spelling whatever the dependency map's.
+    let live: BTreeSet<String> = declared
+        .iter()
+        .filter_map(|d| {
+            let (n, range) = split_pattern(d)?;
+            let range = range.strip_prefix("npm:").unwrap_or(range);
+            (n == name && plain_npm_range(range)).then(|| format!("{name}@npm:{range}"))
+        })
+        .collect();
+    // A lock that declares none of them (a spelling not read here) keeps
+    // the recorded key, as before.
+    if live.is_empty() {
+        return None;
+    }
+    let registry = |p: &str| {
+        split_pattern(p).is_some_and(|(_, r)| r.strip_prefix("npm:").is_some_and(plain_npm_range))
+    };
+    let keyed_elsewhere: BTreeSet<String> = stanzas
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != idx)
+        .filter_map(|(_, s)| stanza_key(s))
+        .flat_map(split_berry_key_patterns)
+        .collect();
+    let mut key: Vec<String> = patterns
+        .iter()
+        .filter(|p| !registry(p) || descriptor_declared(declared, p))
+        .cloned()
+        .collect();
+    for descriptor in &live {
+        if key.contains(descriptor) || keyed_elsewhere.contains(descriptor) {
+            continue;
+        }
+        let range = &descriptor[name.len() + "@npm:".len()..];
+        if npm_range_admits(range, version) == Some(true) {
+            key.push(descriptor.clone());
+        } else {
+            warnings.push(VendorWarning::new(
+                "vendor_lock_descriptor_unlocked",
+                format!(
+                    "`{descriptor}` was added while {name} was vendored and has no \
+                     {YARN_LOCK} entry now that {name}@{version} is restored; run \
+                     `yarn install` and commit {YARN_LOCK}"
+                ),
+            ));
+        }
+    }
+    if !key.iter().any(|p| registry(p)) {
+        return None;
+    }
+    key.sort();
+    key.dedup();
+    (key != patterns).then(|| format!("\"{}\"", key.join(", ")))
+}
+
+/// Whether `range` is a plain npm semver range (no protocol, alias, path,
+/// URL or git spec), the kind yarn resolves against the registry.
+fn plain_npm_range(range: &str) -> bool {
+    !range.contains([':', '@', '/', '#'])
+}
+
+/// Whether the npm semver `range` admits `version`; `None` for a range
+/// this reader does not decide (a hyphen range, a dist-tag).
+fn npm_range_admits(range: &str, version: &str) -> Option<bool> {
+    let version = semver::Version::parse(version).ok()?;
+    let mut admits = false;
+    for alternative in range.split("||") {
+        if alternative.contains(" - ") {
+            return None;
+        }
+        let comparators: Vec<String> = alternative
+            .split_whitespace()
+            .map(npm_comparator)
+            .collect::<Option<_>>()?;
+        let req = match comparators.is_empty() {
+            true => "*".to_string(),
+            false => comparators.join(", "),
+        };
+        admits |= semver::VersionReq::parse(&req).ok()?.matches(&version);
+    }
+    Some(admits)
+}
+
+/// One npm comparator in the `semver` crate's syntax, which differs for a
+/// bare version: npm's `1.3.0` is exact and `1.3` means `~1.3`, where the
+/// crate reads both as caret ranges.
+fn npm_comparator(comparator: &str) -> Option<String> {
+    if comparator.starts_with(['^', '~', '>', '<', '=']) {
+        return Some(comparator.to_string());
+    }
+    let parts: Vec<&str> = comparator.split('.').collect();
+    let wildcard = |p: &&str| matches!(*p, "*" | "x" | "X");
+    if parts.iter().any(wildcard) {
+        return Some(comparator.to_string());
+    }
+    match parts.len() {
+        3 => Some(format!("={comparator}")),
+        1 | 2 => Some(format!("~{comparator}")),
+        _ => None,
     }
 }
 
@@ -2585,6 +2794,223 @@ __metadata:
         assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
     }
 
+    // ── #759: the restored entry follows the live lock ────────────────────
+
+    const LP_CHECKSUM_HEX: &str = "3fb59c76e281a2f5c810ad71dbbb8eba8b10c6cf94733dc7f27b8c516a5376cacea53543e76f6ae477d866c8954b27f1e15ca349424c2542474eb5bb1d2b6955";
+
+    const WS_PKG: &str = r#"{
+  "name": "root",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "dependencies": {
+    "left-pad": "^1.3.0"
+  }
+}
+"#;
+
+    /// A two-workspace lock: the root declares `left-pad@^1.3.0`, member
+    /// `b` declares `b_dep` (nothing, or its own left-pad range), and the
+    /// left-pad entry is keyed by `key`.
+    fn ws_lock(key: &str, b_dep: Option<&str>) -> String {
+        let b_deps = b_dep
+            .map(|r| format!("  dependencies:\n    left-pad: \"npm:{r}\"\n"))
+            .unwrap_or_default();
+        format!(
+            "# This file is generated by running \"yarn install\" inside your project.\n\
+             # Manual changes might be lost - proceed with caution!\n\n\
+             __metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"b@workspace:packages/b\":\n  version: 0.0.0-use.local\n  \
+             resolution: \"b@workspace:packages/b\"\n{b_deps}  languageName: unknown\n  \
+             linkType: soft\n\n\
+             \"{key}\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  \
+             checksum: 10c0/{LP_CHECKSUM_HEX}\n  languageName: node\n  linkType: hard\n\n\
+             \"root@workspace:.\":\n  version: 0.0.0-use.local\n  \
+             resolution: \"root@workspace:.\"\n  dependencies:\n    \
+             left-pad: \"npm:^1.3.0\"\n  languageName: unknown\n  linkType: soft\n"
+        )
+    }
+
+    /// Member `b`'s dependency edit, made by `yarn install` while vendored:
+    /// only the workspace stanza changes (the `resolutions` pin routes
+    /// every left-pad descriptor to the vendored entry).
+    async fn set_member_dep(fx: &Fixture, from: Option<&str>, to: Option<&str>) {
+        let deps = |r: Option<&str>| {
+            r.map(|r| format!("  dependencies:\n    left-pad: \"npm:{r}\"\n"))
+                .unwrap_or_default()
+        };
+        let stanza = |r: Option<&str>| {
+            format!(
+                "\"b@workspace:packages/b\":\n  version: 0.0.0-use.local\n  \
+                 resolution: \"b@workspace:packages/b\"\n{}  languageName: unknown\n",
+                deps(r)
+            )
+        };
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let edited = text.replacen(&stanza(from), &stanza(to), 1);
+        assert_ne!(edited, text, "member stanza edited");
+        tokio::fs::write(fx.lock_path(), edited).await.unwrap();
+    }
+
+    /// #759: vendored under yarn 4.0.x (bare checksums), then a yarn 4.1+
+    /// install respells every checksum `10c0/<hex>`. The revert writes the
+    /// restored entry in the lock's current spelling, not the recorded one;
+    /// a bare line among prefixed ones fails every `--immutable` (YN0028).
+    #[tokio::test]
+    async fn issue_759_revert_follows_a_checksum_respelling_since_vendoring() {
+        let bare_before = B3_BEFORE_LOCK.replace("checksum: 10c0/", "checksum: ");
+        let fx = fixture_with(B3_BEFORE_PKG, &bare_before).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let vendored = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        assert!(lock_spells_bare_checksums(&vendored));
+        // `yarn set version 4.18` + `yarn install`.
+        let upgraded: String = vendored
+            .lines()
+            .map(|l| match l.strip_prefix("  checksum: ") {
+                Some(hex) => format!("  checksum: 10c0/{hex}"),
+                None => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        tokio::fs::write(fx.lock_path(), &upgraded).await.unwrap();
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            B3_BEFORE_LOCK,
+            "the restored checksum is prefixed like every other entry"
+        );
+
+        // The reverse (a lock respelled bare since) follows the lock too.
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let vendored = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        tokio::fs::write(
+            fx.lock_path(),
+            vendored.replace("checksum: 10c0/", "checksum: "),
+        )
+        .await
+        .unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            bare_before
+        );
+    }
+
+    /// #759: a workspace member adds a descriptor of the vendored package
+    /// while it is vendored. The `resolutions` pin routes it to the
+    /// vendored entry, so the lock gets no entry for it; the revert keys
+    /// the restored entry by it too, the way yarn writes it.
+    #[tokio::test]
+    async fn issue_759_revert_keys_a_descriptor_added_since_vendoring() {
+        let before = ws_lock("left-pad@npm:^1.3.0", None);
+        let fx = fixture_with(WS_PKG, &before).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        set_member_dep(&fx, None, Some("1.3.0")).await;
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            ws_lock("left-pad@npm:1.3.0, left-pad@npm:^1.3.0", Some("1.3.0")),
+        );
+        assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
+    }
+
+    /// #759: a workspace member removes its descriptor of the vendored
+    /// package while it is vendored (another keeps one). The revert drops
+    /// the removed descriptor from the restored key, as yarn would; the
+    /// vendored twin of the hosted #1435.
+    #[tokio::test]
+    async fn issue_759_revert_drops_a_descriptor_removed_since_vendoring() {
+        let before = ws_lock("left-pad@npm:1.3.0, left-pad@npm:^1.3.0", Some("1.3.0"));
+        let fx = fixture_with(WS_PKG, &before).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        set_member_dep(&fx, Some("1.3.0"), None).await;
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            ws_lock("left-pad@npm:^1.3.0", None),
+        );
+    }
+
+    /// #759: a descriptor added since vendoring that the restored version
+    /// does not satisfy needs its own entry, which only `yarn install` can
+    /// resolve: the restored key stays as recorded, and the revert says so.
+    #[tokio::test]
+    async fn issue_759_revert_warns_about_a_descriptor_it_cannot_lock() {
+        let before = ws_lock("left-pad@npm:^1.3.0", None);
+        let fx = fixture_with(WS_PKG, &before).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        set_member_dep(&fx, None, Some("^2.0.0")).await;
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(
+            codes,
+            ["vendor_lock_descriptor_unlocked"],
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            outcome.warnings[0].detail.contains("left-pad@npm:^2.0.0"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            ws_lock("left-pad@npm:^1.3.0", Some("^2.0.0")),
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    #[test]
+    fn npm_range_admits_reads_npm_semantics() {
+        for (range, version, want) in [
+            ("1.3.0", "1.3.0", Some(true)),
+            ("1.3.0", "1.3.1", Some(false)),
+            ("^1.3.0", "1.9.0", Some(true)),
+            ("^1.3.0", "2.0.0", Some(false)),
+            ("~1.3.0", "1.3.5", Some(true)),
+            ("~1.3.0", "1.4.0", Some(false)),
+            ("1.3", "1.3.9", Some(true)),
+            ("1.3", "1.4.0", Some(false)),
+            ("1", "1.9.0", Some(true)),
+            ("1.x", "1.9.0", Some(true)),
+            ("*", "4.0.0", Some(true)),
+            ("", "4.0.0", Some(true)),
+            (">=1.2.0 <1.4.0", "1.3.0", Some(true)),
+            (">=1.2.0 <1.3.0", "1.3.0", Some(false)),
+            ("^2.0.0 || ^1.3.0", "1.3.0", Some(true)),
+            ("1.0.0 - 2.0.0", "1.3.0", None),
+            ("latest", "1.3.0", None),
+        ] {
+            assert_eq!(
+                npm_range_admits(range, version),
+                want,
+                "{range} vs {version}"
+            );
+        }
+    }
     #[tokio::test]
     async fn revert_leaves_drifted_fragments_alone_with_warnings() {
         // Lock drift: the user re-resolved our entry back to the registry.
