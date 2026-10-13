@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, VLT_LOCK};
 use crate::formats::governing_locks::{npm_lock_files, NpmLockFamily};
 use crate::formats::text::strip_bom;
+use crate::formats::yarn::berry_gates::YARN_LOCK;
+use crate::formats::yarn::is_berry_lock;
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
 use crate::utils::pnpm_workspace::governing_workspace_file;
@@ -494,6 +496,15 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
+        // #1097: each package manager reads `workspaces` its own way. The
+        // widest reading goes first, so a root that cannot list the member
+        // costs no lock reads.
+        if !WorkspacesDialect::ALL
+            .iter()
+            .any(|&dialect| workspaces_include_as(&patterns, &rel, dialect))
+        {
+            continue;
+        }
         let mut locks: Vec<&'static str> = WORKSPACE_ROOT_FAMILIES
             .iter()
             .flat_map(|family| family.files().iter().copied())
@@ -505,16 +516,19 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         if ancestor.join(VLT_LOCK).is_file() && !vlt_json_declares_workspaces(ancestor).await {
             locks.push(VLT_LOCK);
         }
-        // #1097: each package manager reads `workspaces` its own way. A
-        // root holding several locks governs the member when any of them
-        // lists it; a lockless one reads the widest member set.
-        let dialects = workspace_dialects(ancestor, &locks).await;
-        if !dialects
-            .iter()
-            .any(|&dialect| workspaces_include_as(&patterns, &rel, dialect))
-        {
+        // Only the locks whose package manager lists the member govern it;
+        // a root none of them lists the member under is not its root.
+        let found = !locks.is_empty();
+        let mut governing = Vec::new();
+        for lock in locks {
+            if workspaces_include_as(&patterns, &rel, lock_dialect(ancestor, lock).await) {
+                governing.push(lock);
+            }
+        }
+        if found && governing.is_empty() {
             continue;
         }
+        let locks = governing;
         if locks.is_empty() {
             // Rush keeps its locks under common/config: the rewriters own
             // a run from the Rush root.
@@ -529,49 +543,55 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
     None
 }
 
-/// The `package.json` `workspaces` dialects of the package managers whose
-/// locks (`locks`, from [`package_json_workspace_root`]) sit at `root`:
-/// yarn classic and berry tell apart by berry's `__metadata` key (an
-/// empty or unreadable `yarn.lock` reads as classic, the wider set), and
-/// Bun 1.3+ by the `configVersion` it writes into `bun.lock` (a lock
-/// without it, or only a binary `bun.lockb`, reads as older Bun, the wider
-/// set). No locks: [`WorkspacesDialect::ANY`].
-async fn workspace_dialects(root: &Path, locks: &[&str]) -> Vec<WorkspacesDialect> {
-    let mut dialects = Vec::new();
-    for &lock in locks {
-        let dialect = match lock {
-            "yarn.lock" => {
-                let text = read_regular_to_string(&root.join(lock))
-                    .await
-                    .unwrap_or_default();
-                if text.lines().any(|line| line.starts_with("__metadata:")) {
-                    WorkspacesDialect::YARN_BERRY
-                } else {
-                    WorkspacesDialect::YARN_CLASSIC
-                }
+/// The `package.json` `workspaces` dialect of the package manager that
+/// reads `lock` at `root` (#1097). yarn classic and berry tell apart by
+/// berry's `__metadata` key ([`is_berry_lock`]; an empty or unreadable
+/// `yarn.lock` reads as classic, the wider set), and Bun 1.3+ by the
+/// top-level `configVersion` it writes into `bun.lock` (a lock without
+/// it, or a binary `bun.lockb` with no `bun.lock` beside it, reads as
+/// older Bun, the wider set). Only the head of a lock is read: both keys
+/// come first.
+async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
+    match lock {
+        YARN_LOCK => {
+            if is_berry_lock(&read_head(&root.join(lock)).await) {
+                WorkspacesDialect::YARN_BERRY
+            } else {
+                WorkspacesDialect::YARN_CLASSIC
             }
-            BUN_LOCK => {
-                let text = read_regular_to_string(&root.join(lock))
-                    .await
-                    .unwrap_or_default();
-                if text.contains("\"configVersion\"") {
-                    WorkspacesDialect::BUN
-                } else {
-                    WorkspacesDialect::BUN_PRE_1_3
-                }
+        }
+        BUN_LOCK => {
+            let head = read_head(&root.join(lock)).await;
+            if strip_bom(&head)
+                .lines()
+                .any(|line| line.starts_with("  \"configVersion\""))
+            {
+                WorkspacesDialect::BUN
+            } else {
+                WorkspacesDialect::BUN_PRE_1_3
             }
-            // Bun reads the text lock when both exist.
-            BUN_LOCKB if locks.contains(&BUN_LOCK) => continue,
-            BUN_LOCKB => WorkspacesDialect::BUN_PRE_1_3,
-            VLT_LOCK => WorkspacesDialect::VLT,
-            _ => WorkspacesDialect::NPM,
-        };
-        dialects.push(dialect);
+        }
+        // Bun reads the text lock when both exist.
+        BUN_LOCKB if root.join(BUN_LOCK).is_file() => Box::pin(lock_dialect(root, BUN_LOCK)).await,
+        BUN_LOCKB => WorkspacesDialect::BUN_PRE_1_3,
+        VLT_LOCK => WorkspacesDialect::VLT,
+        _ => WorkspacesDialect::NPM,
     }
-    if dialects.is_empty() {
-        dialects.push(WorkspacesDialect::ANY);
+}
+
+/// How much of a lock [`lock_dialect`] reads: the yarn berry and Bun keys
+/// it looks for sit in the first lines.
+const LOCK_HEAD_BYTES: u64 = 4096;
+
+/// The first [`LOCK_HEAD_BYTES`] of a file, lossily decoded; empty when it
+/// cannot be read.
+async fn read_head(path: &Path) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::new();
+    if let Ok(file) = tokio::fs::File::open(path).await {
+        let _ = file.take(LOCK_HEAD_BYTES).read_to_end(&mut head).await;
     }
-    dialects
+    String::from_utf8_lossy(&head).into_owned()
 }
 
 /// #942: the project directory is a member of a vlt workspace, whose
@@ -1225,6 +1245,83 @@ mod tests {
                 "{workspaces} with {locks:?}"
             );
         }
+    }
+
+    /// #1097 (review on #1480): only the locks whose package manager lists
+    /// the member govern it. The refusal names those alone, and a member's
+    /// own lock is stray only when its own manager lists the member.
+    #[tokio::test]
+    async fn only_the_locks_whose_manager_lists_the_member_govern_it() {
+        const CLASSIC: &str = "# yarn lockfile v1\n";
+        const BUN_13: &str = "{\n  \"lockfileVersion\": 1,\n  \"configVersion\": 1,\n}\n";
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
+        );
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "yarn.lock", CLASSIC);
+        write(tmp.path(), "packages/b/package.json", "{}");
+        let member = tmp.path().join("packages/b");
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("yarn classic installs packages/b from the root");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        assert!(refusal.message.contains("yarn.lock"), "{}", refusal.message);
+        assert!(
+            !refusal.message.contains("package-lock.json"),
+            "npm excludes packages/b: {}",
+            refusal.message
+        );
+
+        // npm excludes packages/b, so its own npm lock is the one npm
+        // reads, not a stray.
+        write(tmp.path(), "packages/b/package-lock.json", "{}");
+        assert_eq!(member_stray_lock(&member).await, None);
+        // Likewise Bun 1.3 and vlt (no `vlt.json` workspaces).
+        std::fs::remove_file(member.join("package-lock.json")).unwrap();
+        std::fs::remove_file(tmp.path().join("package-lock.json")).unwrap();
+        write(tmp.path(), "bun.lock", BUN_13);
+        write(tmp.path(), "packages/b/bun.lock", BUN_13);
+        assert_eq!(member_stray_lock(&member).await, None);
+        std::fs::remove_file(member.join("bun.lock")).unwrap();
+        std::fs::remove_file(tmp.path().join("bun.lock")).unwrap();
+        write(tmp.path(), "vlt-lock.json", "{}");
+        write(tmp.path(), "packages/b/vlt-lock.json", "{}");
+        assert_eq!(member_stray_lock(&member).await, None);
+        // Under a classic yarn.lock alone the member is listed, and its own
+        // npm lock is not npm's to ignore.
+        std::fs::remove_file(tmp.path().join("vlt-lock.json")).unwrap();
+        std::fs::remove_file(member.join("vlt-lock.json")).unwrap();
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(tmp.path(), "packages/a/package-lock.json", "{}");
+        assert!(member_stray_lock(&tmp.path().join("packages/a"))
+            .await
+            .is_some());
+    }
+
+    /// #1097 (review on #1480): only a top-level `configVersion` marks Bun
+    /// 1.3+; the same key deeper in a pre-1.3 lock does not.
+    #[tokio::test]
+    async fn bun_config_version_is_read_at_the_top_level_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
+        );
+        write(
+            tmp.path(),
+            "bun.lock",
+            "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"configVersion\": \"1\",\n    },\n  },\n}\n",
+        );
+        write(tmp.path(), "packages/b/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("packages/b"), "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
     }
 
     /// #1097: a lockless intermediate root reads its `workspaces` in the
