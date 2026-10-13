@@ -964,7 +964,20 @@ fn without_package(text: &str, name: &str) -> Result<String, String> {
 /// declaration still agrees, and every other entry, come back unchanged,
 /// so an untouched script still reverts byte for byte. `Err` when the
 /// declaration changed but uv's spelling of it isn't derivable.
-fn respell_script_lock(original: &str, script: &str, name: &str) -> Result<String, String> {
+fn respell_script_lock(
+    original: &str,
+    rel: &str,
+    script: &str,
+    vendored_script: Option<&str>,
+    name: &str,
+) -> Result<String, String> {
+    // A script whose declarations are the ones it had right after
+    // vendoring still matches the recorded lock: nothing to re-derive, and
+    // an ambiguous declaration match below must not turn that into drift.
+    let declarations = script_declarations(script);
+    if declarations.is_some() && vendored_script.map(script_declarations) == Some(declarations) {
+        return Ok(original.to_string());
+    }
     let (Ok((_, metadata)), Ok(mut doc)) =
         (script_metadata(script), original.parse::<DocumentMut>())
     else {
@@ -998,6 +1011,7 @@ fn respell_script_lock(original: &str, script: &str, name: &str) -> Result<Strin
                 let (specifier, marker) = (field("specifier"), field("marker"));
                 let Some(spec) = respell_lock_specifier(
                     &metadata,
+                    rel,
                     LockRequirementArray::Manifest(&key),
                     name,
                     specifier.as_deref(),
@@ -1046,6 +1060,57 @@ fn respell_script_lock(original: &str, script: &str, name: &str) -> Result<Strin
     } else {
         original.to_string()
     })
+}
+
+/// The script text vendoring wrote for the script `lock` pairs with (its
+/// `python_script_metadata` record's `new`).
+fn vendored_script<'e>(entry: &'e VendorEntry, lock: &str) -> Option<&'e str> {
+    let script = script_of_lock(lock)?;
+    entry
+        .wiring
+        .iter()
+        .find(|record| record.kind == SCRIPT_KIND && record.file == script)?
+        .new
+        .as_ref()?
+        .as_str()
+}
+
+/// Every requirement a script's PEP 723 block declares that its lock's
+/// `[manifest]` mirrors (`dependencies` and the `[tool.uv]` constraint,
+/// build-constraint and override lists), keyed by list; `None` when the
+/// block doesn't parse.
+fn script_declarations(script: &str) -> Option<Vec<(&'static str, String)>> {
+    let (_, metadata) = script_metadata(script).ok()?;
+    let doc = metadata.parse::<DocumentMut>().ok()?;
+    let uv = doc
+        .get("tool")
+        .and_then(|tool| tool.get("uv"))
+        .and_then(Item::as_table_like);
+    let mut out = Vec::new();
+    for (key, item) in [
+        ("dependencies", doc.get("dependencies")),
+        (
+            "constraint-dependencies",
+            uv.and_then(|uv| uv.get("constraint-dependencies")),
+        ),
+        (
+            "build-constraint-dependencies",
+            uv.and_then(|uv| uv.get("build-constraint-dependencies")),
+        ),
+        (
+            "override-dependencies",
+            uv.and_then(|uv| uv.get("override-dependencies")),
+        ),
+    ] {
+        out.extend(
+            item.and_then(Item::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|spec| (key, spec.to_string())),
+        );
+    }
+    Some(out)
 }
 
 pub(super) async fn revert_python_locks(
@@ -1206,7 +1271,13 @@ pub(super) async fn revert_python_locks(
             script_texts.get(record.file.as_str()),
             package_name.as_deref(),
         ) {
-            (true, Some(script), Some(name)) => match respell_script_lock(original, script, name) {
+            (true, Some(script), Some(name)) => match respell_script_lock(
+                original,
+                pair_of(&record.file),
+                script,
+                vendored_script(entry, &record.file),
+                name,
+            ) {
                 Ok(text) => {
                     respelled = text;
                     respelled.as_str()
@@ -2161,7 +2232,7 @@ mod tests {
     /// Vendor `one==1` into a PEP 723 script and its `.py.lock`; returns the
     /// ledger entry and the wired script and lock texts.
     async fn vendor_script_pair(root: &Path) -> (VendorEntry, String, String) {
-        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"one\", specifier = \"==1\"}]\n\n[[package]]\nname = \"one\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        let lock = SCRIPT_LOCK;
         let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"one==1\", \"attrs>=20\"]\n# ///\nimport one\n";
         write_pylock(root, "job.py.lock", lock).await;
         tokio::fs::write(root.join("job.py"), script).await.unwrap();
@@ -2407,7 +2478,7 @@ mod tests {
     fn respell_script_lock_inserts_a_specifier_where_uv_writes_it() {
         let original = "version = 1\r\nrevision = 3\r\n\r\n[manifest]\r\nrequirements = [\r\n    { name = \"attrs\", specifier = \">=20\" },\r\n    { name = \"six\" },\r\n    { name = \"six\", marker = \"sys_platform == 'win32'\", specifier = \"==1.16.0\" },\r\n]\r\n";
         let script = "# /// script\n# dependencies = [\"attrs>=20\", \"six>=1.15\", \"six==1.16.*; sys_platform == 'win32'\"]\n# ///\n";
-        let respelled = respell_script_lock(original, script, "six").unwrap();
+        let respelled = respell_script_lock(original, "s.py", script, None, "six").unwrap();
         assert_eq!(
             respelled,
             original
@@ -2419,12 +2490,28 @@ mod tests {
         );
         let bare = "# /// script\n# dependencies = [\"attrs>=20\", \"six\", \"six; sys_platform == 'win32'\"]\n# ///\n";
         assert_eq!(
-            respell_script_lock(original, bare, "six").unwrap(),
+            respell_script_lock(original, "s.py", bare, None, "six").unwrap(),
             original.replace(", specifier = \"==1.16.0\" }", " }")
         );
         let unchanged = "# /// script\n# dependencies = [\"attrs>=20\", \"six\", \"six==1.16.0; sys_platform == 'win32'\"]\n# ///\n";
         assert_eq!(
-            respell_script_lock(original, unchanged, "six").unwrap(),
+            respell_script_lock(original, "s.py", unchanged, None, "six").unwrap(),
+            original
+        );
+    }
+
+    /// A script whose declarations are unchanged since vendoring keeps the
+    /// recorded lock even when which declaration an entry mirrors is
+    /// ambiguous (uv reordered an `or` marker): that is no edit, so it
+    /// must not become drift.
+    #[test]
+    fn respell_script_lock_keeps_an_unchanged_ambiguous_script() {
+        let original = "version = 1\n\n[manifest]\nrequirements = [\n    { name = \"six\", marker = \"sys_platform == 'darwin' or sys_platform == 'win32'\", specifier = \"==1.16.0\" },\n    { name = \"six\", marker = \"sys_platform == 'linux'\", specifier = \">=1.15\" },\n]\n";
+        let script = "# /// script\n# dependencies = [\"six==1.16.0; sys_platform == 'win32' or sys_platform == 'darwin'\", \"six>=1.15; sys_platform == 'linux'\"]\n# ///\n";
+        let vendored = format!("{script}# vendored\n");
+        assert!(respell_script_lock(original, "s.py", script, None, "six").is_err());
+        assert_eq!(
+            respell_script_lock(original, "s.py", script, Some(&vendored), "six").unwrap(),
             original
         );
     }
@@ -2435,7 +2522,6 @@ mod tests {
     async fn script_revert_with_an_unchanged_requirement_is_byte_exact() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let lock = "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{name = \"one\", specifier = \"==1\"}]\n\n[[package]]\nname = \"one\"\nversion = \"1\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
         let (entry, ..) = vendor_script_pair(root).await;
 
         let outcome = revert_python_locks(&entry, root, false).await;
@@ -2443,7 +2529,7 @@ mod tests {
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         assert_eq!(
             std::fs::read_to_string(root.join("job.py.lock")).unwrap(),
-            lock
+            SCRIPT_LOCK
         );
     }
 

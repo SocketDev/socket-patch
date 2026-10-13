@@ -1313,8 +1313,7 @@ fn uv_vendor_script_revert_after_declaration_edit() {
     let Some((uv, python)) = capstone_uv(TAG) else {
         return;
     };
-    let help = tool(&uv, Path::new("."), &["lock", "--help"], &[]);
-    if !String::from_utf8_lossy(&help.stdout).contains("--script") {
+    if !uv_vex::uv_under_test().is_ok_and(|uv| uv.help_has(&["lock"], "--script")) {
         println!("UV-VEX lane=script({TAG}) step=all result=n/a (no `uv lock --script`)");
         return;
     }

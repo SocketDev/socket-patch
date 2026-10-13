@@ -1272,7 +1272,9 @@ pub(crate) enum LockRequirementArray<'a> {
 }
 
 /// The `specifier` a vendored revert should restore for `name`'s entry
-/// in `array`, given the one it recorded when vendoring (`None` when the
+/// in `array` of the lock paired with `pyproject_text` (the metadata
+/// document `rel` names: pyproject.toml, or a script's PEP 723 block),
+/// given the one it recorded when vendoring (`None` when the
 /// entry had none) and the entry's `marker`.
 ///
 /// A path source records no specifier, so a user who changes the
@@ -1292,6 +1294,7 @@ pub(crate) enum LockRequirementArray<'a> {
 ///   mirrors is ambiguous, so restoring any spelling may break `--locked`.
 pub(crate) fn respell_lock_specifier(
     pyproject_text: &str,
+    rel: &str,
     array: LockRequirementArray<'_>,
     name: &str,
     recorded: Option<&str>,
@@ -1301,7 +1304,7 @@ pub(crate) fn respell_lock_specifier(
         return Ok(None);
     };
     let meta = Metadata {
-        rel: "pyproject.toml".to_string(),
+        rel: rel.to_string(),
         text: String::new(),
         script: false,
         doc,
@@ -1354,8 +1357,8 @@ pub(crate) fn respell_lock_specifier(
         // longer shows this entry's spelling, so any guess may break
         // `--locked`.
         _ => Err(format!(
-            "pyproject.toml now declares {name} with a multi-clause specifier, whose \
-             spelling in uv.lock is not derivable"
+            "{rel} now declares {name} with a multi-clause specifier, whose spelling in \
+             the lock is not derivable"
         )),
     }
 }
