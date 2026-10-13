@@ -1254,10 +1254,10 @@ async fn run_check(args: &VendorArgs) -> i32 {
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
-            Some(record) => match vendor::check_vendored_artifact(root, entry, record).await {
-                vendor::ArtifactHealth::Healthy => None,
-                health => Some(format!("artifact verification failed: {health:?}")),
-            },
+            Some(record) => {
+                let health = vendor::check_vendored_artifact(root, entry, record).await;
+                vendor::describe_artifact_failure(root, entry, &health).await
+            }
             None => Some("patch record missing; restore the manifest or vendor ledger".to_string()),
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {

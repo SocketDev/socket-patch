@@ -62,19 +62,29 @@ fn required_mirrors(
 
 /// Check every location an older Bun workspace reader can install from.
 pub(super) async fn verify(root: &Path, entry: &VendorEntry) -> Result<(), String> {
-    let mirrors = required_mirrors(root, entry).map_err(|_| "vendor_workspace_artifact_invalid")?;
+    check(root, entry).await.map_err(|(tag, _)| tag.to_string())
+}
+
+/// The project-relative path of the first workspace copy [`verify`] rejects,
+/// so a failure can name the member copy that is off.
+pub(super) async fn failing_mirror(root: &Path, entry: &VendorEntry) -> Option<String> {
+    check(root, entry).await.err().and_then(|(_, rel)| rel)
+}
+
+async fn check(root: &Path, entry: &VendorEntry) -> Result<(), (&'static str, Option<String>)> {
+    let mirrors =
+        required_mirrors(root, entry).map_err(|_| ("vendor_workspace_artifact_invalid", None))?;
     if mirrors.is_empty() {
         return Ok(());
     }
     let expected = super::verify::file_sha256_hex(&root.join(&entry.artifact.path))
         .await
-        .ok_or("vendor_artifact_unreadable")?;
-    for (_, _, path) in mirrors {
+        .ok_or(("vendor_artifact_unreadable", None))?;
+    for (_, rel, path) in mirrors {
         match super::verify::file_sha256_hex(&path).await {
             Some(actual) if actual == expected => {}
-            Some(_) => return Err("vendor_workspace_artifact_corrupt".into()),
-            None if !path.exists() => return Err("vendor_workspace_artifact_missing".into()),
-            None => return Err("vendor_workspace_artifact_corrupt".into()),
+            None if !path.exists() => return Err(("vendor_workspace_artifact_missing", Some(rel))),
+            _ => return Err(("vendor_workspace_artifact_corrupt", Some(rel))),
         }
     }
     Ok(())
