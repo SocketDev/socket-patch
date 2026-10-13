@@ -642,6 +642,31 @@ fn inherited_base_site_dirs_sync(
         .collect()
 }
 
+/// The base interpreter site dir holding `name` at `version` that the
+/// `--system-site-packages` venv owning `site` would fall back to once its
+/// own copy is gone. pip and Pipenv count that copy as installed, so
+/// removing the venv's copy exposes the base one instead of reinstalling.
+pub async fn inherited_same_release(site: &Path, name: &str, version: &str) -> Option<PathBuf> {
+    let var = |name: &str| std::env::var(name).ok();
+    let (site, name, version) = (
+        site.to_path_buf(),
+        canonicalize_pypi_name(name),
+        version.to_string(),
+    );
+    run_blocking(move || {
+        let root = venv_root_of_site(&site)?;
+        system_site_dirs_of_venv(&root, &site, &var)
+            .into_iter()
+            .find_map(|base| {
+                list_dist_info_packages_sync(&base)
+                    .into_iter()
+                    .any(|(n, v)| n == name && v == version)
+                    .then_some(base)
+            })
+    })
+    .await
+}
+
 /// Find local virtual environment `site-packages` directories.
 ///
 /// Checks (in order):

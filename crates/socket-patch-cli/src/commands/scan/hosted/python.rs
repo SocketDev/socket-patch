@@ -131,7 +131,7 @@ pub(super) async fn stale_install_warnings(
             }
         }
     }
-    for ((site, _, _), judgment) in judgments {
+    for ((site, _, version), judgment) in judgments {
         if judgment.patched || !judgment.stale {
             continue;
         }
@@ -156,6 +156,23 @@ pub(super) async fn stale_install_warnings(
                             pipenv_lock.as_ref(),
                             &name,
                             &site.display().to_string(),
+                        );
+                    format!(
+                        "{remedy}; then `socket-patch vex --product <purl>` re-verifies the \
+                         installed files."
+                    )
+                } else if let Some(base) =
+                    socket_patch_core::crawlers::python_crawler::inherited_same_release(
+                        &site, &name, &version,
+                    )
+                    .await
+                {
+                    let remedy =
+                        socket_patch_core::vendor::pypi_pipenv::shadowing_stale_install_remedy(
+                            pipenv_lock.as_ref(),
+                            &name,
+                            &site.display().to_string(),
+                            &base.display().to_string(),
                         );
                     format!(
                         "{remedy}; then `socket-patch vex --product <purl>` re-verifies the \
@@ -477,8 +494,9 @@ mod tests {
             assert!(!detail.contains(broken), "{broken}: {detail}");
         }
 
-        // The venv's own stale copy hides the base one and keeps the usual
-        // remedy, which does replace it.
+        // The venv's own stale copy hides the same release in the base dir:
+        // uninstalling it would only expose the base copy to `pipenv sync`,
+        // so it gets the install-over remedy too.
         let dist = venv_site.join("six-1.16.0.dist-info");
         std::fs::create_dir_all(&dist).unwrap();
         std::fs::write(dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
@@ -487,9 +505,30 @@ mod tests {
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
+            detail.contains(&format!(
+                "hides the same release in {}",
+                base_site.display()
+            )),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("pipenv run pip install --no-deps --ignore-installed"),
+            "{detail}"
+        );
+        assert!(!detail.contains("pip uninstall -y six"), "{detail}");
+
+        // A different release in the base dir is not one `pipenv sync`
+        // counts as installed: the usual remedy replaces the venv's copy.
+        let base_dist = base_site.join("six-1.16.0.dist-info");
+        std::fs::write(base_dist.join("METADATA"), "Name: six\nVersion: 1.15.0\n").unwrap();
+        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        assert_eq!(out.warnings.len(), 1);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(
             detail.contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
             "{detail}"
         );
+        std::fs::write(base_dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
 
         // A `.venv` Pipenv shares with Hatch (`path = ".venv"`) is still
         // Pipenv's: its inherited base copy keeps the install-over remedy.

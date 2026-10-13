@@ -840,6 +840,37 @@ fn lock_sections<'a>(lock: Option<&'a Value>, name: &str) -> (Vec<&'a str>, Vec<
 /// `pipenv requirements` arguments follow the categories that pin `name`,
 /// as [`stale_install_remedy`]'s `sync` ones do.
 pub fn base_site_stale_install_remedy(lock: Option<&Value>, name: &str, dir: &str) -> String {
+    format!(
+        "The upstream {name} in {dir} belongs to the base interpreter this `--site-packages` \
+         virtualenv inherits: pip refuses to uninstall it from the virtualenv, and `pipenv \
+         sync` (also in a recreated `--site-packages` virtualenv) counts it as installed, so \
+         Pipfile.lock does not protect installs on this host. Install the locked release \
+         over it inside the virtualenv, leaving the base interpreter untouched: {}",
+        install_over_command(lock, name)
+    )
+}
+
+/// The remedy for a venv's own stale copy of a release its base interpreter
+/// also holds (see [`base_site_stale_install_remedy`]): uninstalling the
+/// venv copy would leave `pipenv sync` counting the base copy as installed.
+pub fn shadowing_stale_install_remedy(
+    lock: Option<&Value>,
+    name: &str,
+    dir: &str,
+    base: &str,
+) -> String {
+    format!(
+        "The upstream {name} in {dir} hides the same release in {base}, which belongs to the \
+         base interpreter this `--site-packages` virtualenv inherits: removing the virtualenv's \
+         copy leaves `pipenv sync` counting the base one as installed, so Pipfile.lock does not \
+         protect installs on this host. Install the locked release over the virtualenv's copy, \
+         leaving the base interpreter untouched: {}",
+        install_over_command(lock, name)
+    )
+}
+
+/// The install-over command both base-interpreter remedies share.
+fn install_over_command(lock: Option<&Value>, name: &str) -> String {
     let (package, _) = lock_sections(lock, name);
     let categories = sync_args(&package);
     // `pipenv requirements` arrived in 2022.4; its `--categories` later
@@ -850,16 +881,11 @@ pub fn base_site_stale_install_remedy(lock: Option<&Value>, name: &str, dir: &st
         "2022.4"
     };
     format!(
-        "The upstream {name} in {dir} belongs to the base interpreter this `--site-packages` \
-         virtualenv inherits: pip refuses to uninstall it from the virtualenv, and `pipenv \
-         sync` (also in a recreated `--site-packages` virtualenv) counts it as installed, so \
-         Pipfile.lock does not protect installs on this host. Install the locked release \
-         over it inside the virtualenv, leaving the base interpreter untouched: `pipenv \
-         requirements{categories} > pipenv-locked.txt && pipenv run pip install --no-deps \
-         --ignore-installed -r pipenv-locked.txt` (Pipenv {since}+; it reinstalls every \
-         package of those lock categories into the virtualenv at its locked version), then \
-         delete pipenv-locked.txt — NOT `pipenv uninstall`, which rewrites the Pipfile and \
-         re-locks the patch away"
+        "`pipenv requirements{categories} > pipenv-locked.txt && pipenv run pip install \
+         --no-deps --ignore-installed -r pipenv-locked.txt` (Pipenv {since}+; it reinstalls \
+         every package of those lock categories into the virtualenv at its locked version), \
+         then delete pipenv-locked.txt — NOT `pipenv uninstall`, which rewrites the Pipfile \
+         and re-locks the patch away"
     )
 }
 
