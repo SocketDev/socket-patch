@@ -60,21 +60,10 @@ fn go_env<'a>(modcache: &'a str, proxy_url: &'a str) -> Vec<(&'a str, &'a str)> 
     ]
 }
 
-/// Run socket-patch with the hermetic `SOCKET_*` environment + the fixture
-/// GOMODCACHE (the go crawler resolves installed modules through it). Every
-/// global flag is env-backed (`SOCKET_DRY_RUN`, `SOCKET_GLOBAL`,
-/// `SOCKET_MANIFEST_PATH`, …), so an unscrubbed ambient value would silently
-/// reconfigure `apply` / `--check` out from under the assertions.
+/// Run socket-patch through the shared hermetic runner with the fixture
+/// GOMODCACHE (the go crawler resolves installed modules through it).
 fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, String) {
-    let mut cmd = common::hermetic::command(&binary());
-    cmd.args(args).current_dir(cwd);
-    cmd.env("GOMODCACHE", modcache);
-    let out = cmd.output().expect("failed to run socket-patch binary");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    common::run_with_env(cwd, args, &[("GOMODCACHE", modcache.to_str().unwrap())])
 }
 
 /// Run `go` with its caches sandboxed, then the fixture's own env on top.
@@ -201,14 +190,12 @@ fn go_build_links_patch_via_replace_redirect() {
     if !golang_e2e_matrix::toolchain_ready("e2e_golang_build") {
         return;
     }
-    // RED guards for the hermeticity pins: bake the hostile ambient values in
-    // so this suite fails deterministically if either leak returns.
-    // `GOTOOLCHAIN` must lose to go_env's `local` pin (or every `go` command
-    // chases a nonexistent toolchain through the file proxy); `SOCKET_DRY_RUN`
-    // must be scrubbed by `run_socket` (or every apply is a no-op that still
-    // exits 0 and the patched-symbol assert sees PRISTINE).
+    // RED guard for the toolchain pin: bake the hostile ambient value in so
+    // this suite fails deterministically if the leak returns. `GOTOOLCHAIN`
+    // must lose to go_env's `local` pin (or every `go` command chases a
+    // nonexistent toolchain through the file proxy). `SOCKET_DRY_RUN` needs
+    // no guard here: `hermetic::command` seeds and scrubs it itself.
     std::env::set_var("GOTOOLCHAIN", "go1.99.99");
-    std::env::set_var("SOCKET_DRY_RUN", "true");
     let tmp = tempfile::tempdir().unwrap();
     let (consumer, modcache, proxy_url) = stage(tmp.path());
     let cs = consumer.to_str().unwrap();

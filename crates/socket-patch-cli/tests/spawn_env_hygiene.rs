@@ -301,6 +301,11 @@ fn command_drops_flag_bound_vars_set_after_it_is_built() {
             ("SOCKET_DEBUG", "1"),
             ("SOCKET_PROXY_URL", "http://ambient.invalid"),
             ("SOCKET_SKIP_ROLLBACK", "true"),
+            // Peer aliases the binary promotes onto `SOCKET_API_TOKEN` & co.
+            ("SOCKET_CLI_API_TOKEN", "late-token"),
+            ("SOCKET_CLI_ORG_SLUG", "late-org"),
+            ("SOCKET_CLI_API_BASE_URL", "http://ambient.invalid"),
+            ("SOCKET_CLI_NO_API_TOKEN", "1"),
         ],
         || {
             let env = effective_env(&cmd);
@@ -309,6 +314,10 @@ fn command_drops_flag_bound_vars_set_after_it_is_built() {
                 "SOCKET_DEBUG",
                 "SOCKET_PROXY_URL",
                 "SOCKET_SKIP_ROLLBACK",
+                "SOCKET_CLI_API_TOKEN",
+                "SOCKET_CLI_ORG_SLUG",
+                "SOCKET_CLI_API_BASE_URL",
+                "SOCKET_CLI_NO_API_TOKEN",
             ] {
                 assert_eq!(get(&env, key), None, "{key} set after build leaked");
             }

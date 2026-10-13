@@ -64,8 +64,8 @@ fn stage(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (gomodcache, cache_dir)
 }
 
-/// Run the CLI binary with the hermetic `SOCKET_*` environment. Its hostile
-/// seeds cover the vars verified to break this suite when inherited:
+/// Run the CLI binary through the shared hermetic runner. Its hostile seeds
+/// cover the vars verified to break this suite when inherited:
 /// `SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX` take the redirect backend out of
 /// local scope (apply patches the fake module cache IN PLACE and `--check`
 /// exits 0 having checked nothing), `SOCKET_DRY_RUN` makes every apply a
@@ -74,17 +74,7 @@ fn stage(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 /// which outrank env, so their env twins can't bite; `GOMODCACHE` pins the
 /// crawl root (so `GOPATH` is never consulted).
 fn run_cli(root: &Path, gomodcache: &Path, args: &[&str]) -> (i32, String, String) {
-    let out = common::hermetic::command(&binary())
-        .args(args)
-        .current_dir(root)
-        .env("GOMODCACHE", gomodcache)
-        .output()
-        .expect("failed to execute socket-patch binary");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
+    common::run_with_env(root, args, &[("GOMODCACHE", gomodcache.to_str().unwrap())])
 }
 
 fn apply(root: &Path, gomodcache: &Path) -> (i32, String, String) {
