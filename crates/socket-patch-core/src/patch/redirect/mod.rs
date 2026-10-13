@@ -4098,13 +4098,24 @@ fn rewrite_yarn_classic_with(
                 result
                     .refused_yarn_classic_uuids
                     .insert(dep.patch_uuid.clone());
+                // A pin an earlier release wrote without this check (#1462)
+                // is left as found, but never confirmed: yarn installs the
+                // patched package from it without these dependencies.
+                let outcome = if blocks.iter().any(|b| {
+                    classic_field(&b.lines, "resolved")
+                        .is_some_and(|r| r.split('#').next() == Some(dep.artifact_url.as_str()))
+                }) {
+                    "an earlier run's pin of it is not confirmed: yarn 1 installs only what the \
+                     lock names, so it installs the patched package without them"
+                } else {
+                    "yarn 1 installs only what the lock names, so it is not pinned and stays \
+                     unpatched"
+                };
                 result.warnings.push(RewriteWarning {
                     code: "redirect_yarn_classic_dep_manifest_unlocked".into(),
                     detail: format!(
                         "the patched {fname}@{} depends on {}, which yarn.lock does not lock; \
-                         yarn 1 installs only what the lock names, so it is not pinned and \
-                         stays unpatched. Lock them first (for example `yarn add {}`), then \
-                         re-run",
+                         {outcome}. Lock them first (for example `yarn add {}`), then re-run",
                         dep.version,
                         missing.join(", "),
                         missing.join(" ")

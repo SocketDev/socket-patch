@@ -672,6 +672,52 @@ fn hosted_lockfile_only_matrix() {
     }
 }
 
+/// #1462: a hosted pin an earlier release wrote for a patch whose
+/// package.json adds a dependency (`is-odd`) the lock never locked. yarn
+/// installs the patched bytes without that dependency, so although every
+/// patched file verifies, the patch is omitted until the dependency is
+/// installed beside it.
+#[test]
+fn hosted_patch_adding_an_uninstalled_dependency_is_omitted() {
+    const MANIFEST: &str = "package/package.json";
+    let pristine_manifest = format!(r#"{{"name":"{NAME}","version":"{VERSION}"}}"#);
+    let patched_manifest = format!(
+        r#"{{"name":"{NAME}","version":"{VERSION}","dependencies":{{"is-odd":"^3.0.0"}}}}"#
+    );
+    let mut view = patch_view(UUID, PURL);
+    view["files"][MANIFEST] = serde_json::json!({
+        "beforeHash": compute_git_sha256_from_bytes(pristine_manifest.as_bytes()),
+        "afterHash": compute_git_sha256_from_bytes(patched_manifest.as_bytes()),
+    });
+    let (rt, server) = serve_patch_views(vec![(UUID, view)]);
+    for flavor in FLAVORS {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        hosted_checkout(cwd, flavor);
+        install(cwd, PATCHED);
+        put(
+            cwd,
+            "node_modules/left-pad/package.json",
+            patched_manifest.as_bytes(),
+        );
+
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        let cell = format!("{flavor:?} dependency not installed");
+        assert_omitted(cwd, code, &env, "dependency_not_installed", &cell);
+
+        // Hoisted beside it, the dependency resolves: attested.
+        put(
+            cwd,
+            "node_modules/is-odd/package.json",
+            br#"{"name":"is-odd","version":"3.0.1"}"#,
+        );
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        let cell = format!("{flavor:?} dependency installed");
+        assert_attested(cwd, code, &env, UUID, "redirected", &cell);
+    }
+    drop(rt);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // VENDORED — lockfile only (cells a, b, e)
 // ──────────────────────────────────────────────────────────────────────

@@ -479,7 +479,73 @@ async fn verify_hosted_copies(
         }
         None => record,
     };
-    verify_every_copy(&copies.paths, record).await
+    verify_every_copy(&copies.paths, record).await?;
+    if Ecosystem::from_purl(purl) == Some(Ecosystem::Npm) && touches_npm_manifest(record) {
+        for path in &copies.paths {
+            if unresolved_npm_dependency(path).await.is_some() {
+                return Err(DEPENDENCY_NOT_INSTALLED.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The omission tag of a hosted npm copy that carries the patched bytes
+/// but whose patched `package.json` declares a dependency node cannot
+/// resolve from it (#1462): the lock never locked it, so the package was
+/// installed without it.
+pub const DEPENDENCY_NOT_INSTALLED: &str = "dependency_not_installed";
+
+/// Whether an npm `record` patches the package's own `package.json`, the
+/// only way a patch changes the dependencies its package declares.
+fn touches_npm_manifest(record: &PatchRecord) -> bool {
+    record
+        .files
+        .keys()
+        .any(|key| key.strip_prefix("package/").unwrap_or(key) == "package.json")
+}
+
+/// The first `dependencies` entry of the installed npm copy at `pkg_path`
+/// that node cannot resolve from it: no `node_modules/<name>` in the copy
+/// or in any directory above its real path (node's lookup, which also
+/// finds a bundled, hoisted or pnpm/bun store-sibling copy behind a
+/// root-linked symlink). Optional dependencies may be absent, and a copy
+/// outside a `node_modules` tree (a Plug'n'Play install), an unreadable
+/// manifest or a name that is not a safe package name is never evidence.
+async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
+    let pkg_path = pkg_path.to_path_buf();
+    crate::utils::fs::run_blocking(move || {
+        if !pkg_path
+            .components()
+            .any(|c| c.as_os_str() == "node_modules")
+        {
+            return None;
+        }
+        let text =
+            crate::utils::fs::read_regular_to_string_sync(&pkg_path.join("package.json")).ok()?;
+        let pkg: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let real = std::fs::canonicalize(&pkg_path).ok()?;
+        let optional = pkg
+            .get("optionalDependencies")
+            .and_then(serde_json::Value::as_object);
+        pkg.get("dependencies")?
+            .as_object()?
+            .keys()
+            .filter(|name| optional.is_none_or(|o| !o.contains_key(*name)))
+            .filter(|name| crate::vendor::npm_common::is_safe_npm_name(name))
+            .find(|name| !node_resolves(&real, name))
+            .cloned()
+    })
+    .await
+}
+
+/// Whether node resolves the package `name` from the package directory
+/// `from`: `<dir>/node_modules/<name>` exists for `from` or an ancestor
+/// that is not itself a `node_modules` directory.
+fn node_resolves(from: &Path, name: &str) -> bool {
+    from.ancestors()
+        .filter(|dir| dir.file_name().is_none_or(|n| n != "node_modules"))
+        .any(|dir| dir.join("node_modules").join(name).exists())
 }
 
 /// Whether `rest` (what follows a matched `from` prefix) starts a new name
@@ -1866,6 +1932,78 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("index.js"), bytes).await.unwrap();
         dir
+    }
+
+    /// #1462: node's lookup from an installed copy finds a bundled,
+    /// hoisted or pnpm-sibling dependency, also through a root-linked
+    /// symlink; an optional one may be absent, and a copy outside
+    /// `node_modules` is no evidence.
+    #[tokio::test]
+    async fn unresolved_npm_dependency_follows_node_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let manifest = r#"{"name":"lp","dependencies":{"a":"1","@s/b":"1","opt":"1",
+            "../../escape":"1"},"optionalDependencies":{"opt":"1"}}"#;
+
+        // Hoisted layout: `a` and `@s/b` at the root; `@s/b` missing first.
+        put("node_modules/lp/package.json", manifest);
+        put("node_modules/a/package.json", "{}");
+        let hoisted = root.join("node_modules/lp");
+        assert_eq!(
+            unresolved_npm_dependency(&hoisted).await.as_deref(),
+            Some("@s/b")
+        );
+        // Bundled inside the package itself.
+        put("node_modules/lp/node_modules/@s/b/package.json", "{}");
+        assert_eq!(unresolved_npm_dependency(&hoisted).await, None);
+
+        // pnpm's isolated store: dependencies are siblings of the package.
+        let store = "node_modules/.pnpm/lp@1.0.0/node_modules";
+        put(&format!("{store}/lp/package.json"), manifest);
+        put(&format!("{store}/a/package.json"), "{}");
+        let isolated = root.join(store).join("lp");
+        assert_eq!(
+            unresolved_npm_dependency(&isolated).await.as_deref(),
+            Some("@s/b")
+        );
+        put(&format!("{store}/@s/b/package.json"), "{}");
+        assert_eq!(unresolved_npm_dependency(&isolated).await, None);
+
+        // Not in a node_modules tree: never evidence.
+        put("unplugged/lp/package.json", manifest);
+        assert_eq!(
+            unresolved_npm_dependency(&root.join("unplugged/lp")).await,
+            None
+        );
+
+        // A FIFO where the manifest should be is never opened (it would
+        // block): no evidence.
+        #[cfg(unix)]
+        {
+            let fifo_dir = root.join("node_modules/fifo");
+            std::fs::create_dir_all(&fifo_dir).unwrap();
+            let c =
+                std::ffi::CString::new(fifo_dir.join("package.json").to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+            assert_eq!(unresolved_npm_dependency(&fifo_dir).await, None);
+        }
+
+        // A root-linked symlink into the store (pnpm, bun isolated, npm
+        // linked): the lookup starts from the real path.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join(store).join("lp"), root.join("node_modules/lp2"))
+                .unwrap();
+            assert_eq!(
+                unresolved_npm_dependency(&root.join("node_modules/lp2")).await,
+                None
+            );
+        }
     }
 
     fn hosted_ctx(purl: &str, copies: HostedCopies) -> VendorContext {
