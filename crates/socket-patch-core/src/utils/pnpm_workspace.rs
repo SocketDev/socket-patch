@@ -169,11 +169,20 @@ async fn view_setting(
     if let Some(found) = pnpm_setting(workspace, npmrc, yaml_key, npmrc_key) {
         return Some(found);
     }
-    if matches!(view, ProjectView::Memory(_)) {
+    let env = |var: &str| std::env::var(var).ok();
+    if matches!(view, ProjectView::Memory(_)) || !env_any(&[npmrc_key], env) {
         return None;
     }
     let major = pnpm_major(view).await;
-    env_setting(npmrc_key, major, |var| std::env::var(var).ok())
+    env_setting(npmrc_key, major, env)
+}
+
+/// Whether `env` sets any of `npmrc_keys` in either variable family: only
+/// then is the pnpm major worth reading for [`env_setting`].
+fn env_any(npmrc_keys: &[&str], env: impl Fn(&str) -> Option<String>) -> bool {
+    npmrc_keys
+        .iter()
+        .any(|key| env_setting(key, None, &env).is_some())
 }
 
 /// Whether the workspace turned the shared lock off:
@@ -632,7 +641,9 @@ async fn lockfile_disabled_in(
     let npmrc = view.read_text(".npmrc").await.ok();
     let yaml = lockfile_off(|key, _| pnpm_setting(workspace.as_deref(), None, key, key));
     let rc = lockfile_off(|_, key| pnpm_setting(None, npmrc.as_deref(), key, key));
-    let env = env.filter(|_| !matches!(view, ProjectView::Memory(_)));
+    let env = env.filter(|env| {
+        !matches!(view, ProjectView::Memory(_)) && env_any(&["lockfile", "package-lock"], env)
+    });
     if yaml.is_none() && rc.is_none() && env.is_none() {
         return None;
     }
@@ -803,6 +814,15 @@ mod tests {
     use super::*;
     use crate::formats::pnpm::workspace::package_globs;
 
+    /// An environment lookup over `vars` alone.
+    fn env(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |var: &str| {
+            vars.iter()
+                .find(|(name, _)| *name == var)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
     fn write(root: &Path, rel: &str, text: &str) {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -868,13 +888,6 @@ mod tests {
 
     #[test]
     fn the_environment_spells_a_setting_with_underscores() {
-        let env = |vars: &'static [(&'static str, &'static str)]| {
-            move |var: &str| {
-                vars.iter()
-                    .find(|(name, _)| *name == var)
-                    .map(|(_, value)| value.to_string())
-            }
-        };
         let found = env_setting(
             "shared-workspace-lockfile",
             None,
@@ -903,13 +916,6 @@ mod tests {
     /// older only `npm_config_*`.
     #[test]
     fn the_environment_family_follows_the_pnpm_major() {
-        let env = |vars: &'static [(&'static str, &'static str)]| {
-            move |var: &str| {
-                vars.iter()
-                    .find(|(name, _)| *name == var)
-                    .map(|(_, value)| value.to_string())
-            }
-        };
         const NPM: &[(&str, &str)] = &[("npm_config_lockfile", "false")];
         const PNPM: &[(&str, &str)] = &[("pnpm_config_lockfile", "false")];
         for major in [11, 12] {
@@ -941,13 +947,6 @@ mod tests {
     /// nothing to pnpm 11+.
     #[tokio::test]
     async fn the_environment_disables_the_lockfile_only_for_its_pnpm_major() {
-        let lookup = |vars: &'static [(&'static str, &'static str)]| {
-            Some(move |var: &str| {
-                vars.iter()
-                    .find(|(name, _)| *name == var)
-                    .map(|(_, value)| value.to_string())
-            })
-        };
         const NPM_LOCKFILE: &[(&str, &str)] = &[("npm_config_lockfile", "false")];
         const PNPM_LOCKFILE: &[(&str, &str)] = &[("pnpm_config_lockfile", "false")];
         const NPM_PACKAGE_LOCK: &[(&str, &str)] = &[("npm_config_package_lock", "")];
@@ -991,7 +990,7 @@ mod tests {
 ",
             );
             let view = ProjectView::Disk(root);
-            let found = lockfile_disabled_in(&view, lookup(vars)).await;
+            let found = lockfile_disabled_in(&view, Some(env(vars))).await;
             match off {
                 Some(var) => assert!(
                     found.as_deref().is_some_and(|source| source.contains(var)),

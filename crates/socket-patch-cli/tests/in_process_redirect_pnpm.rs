@@ -1064,30 +1064,7 @@ fn scrubbed_cli() -> std::process::Command {
 /// Run `scan --mode hosted --json` as a subprocess against `cwd` and parse
 /// the stdout envelope (exit code, parsed JSON).
 fn run_hosted_json(cwd: &Path, api_url: &str) -> (Option<i32>, serde_json::Value) {
-    let out = scrubbed_cli()
-        .args([
-            "scan",
-            "--mode",
-            "hosted",
-            "--json",
-            "--yes",
-            "--cwd",
-            cwd.to_str().unwrap(),
-            "--api-url",
-            api_url,
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
-        ])
-        .output()
-        .expect("run socket-patch");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let doc = serde_json::from_str(&stdout).unwrap_or_else(|e| {
-        panic!("stdout must be the JSON envelope ({e});\nstdout=\n{stdout}\nstderr=\n{stderr}")
-    });
-    (out.status.code(), doc)
+    run_hosted_json_env(cwd, api_url, &[])
 }
 
 /// Legacy shrinkwrap projects support both installed discovery and the
@@ -2444,7 +2421,7 @@ async fn hosted_scan_refuses_a_git_branch_lockfile_project() {
     }
 }
 
-/// Like [`run_hosted_json`], with pnpm's `lockfile` / `package-lock` /
+/// [`run_hosted_json`] with pnpm's `lockfile` / `package-lock` /
 /// `git-branch-lockfile` environment spellings cleared and then `env` set.
 fn run_hosted_json_env(
     cwd: &Path,
