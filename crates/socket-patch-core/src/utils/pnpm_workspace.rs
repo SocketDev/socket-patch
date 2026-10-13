@@ -122,13 +122,29 @@ pub fn pnpm_setting(
     })
 }
 
-/// `npmrc_key` from the environment (`pnpm_config_<key>`, then
-/// `npm_config_<key>`, dashes as underscores), looked up through `env`:
-/// what a CI job sets when neither settings file does.
-fn env_setting(npmrc_key: &str, env: impl Fn(&str) -> Option<String>) -> Option<PnpmSetting> {
+/// `npmrc_key` from the environment (dashes as underscores), looked up
+/// through `env`: what a CI job sets when neither settings file does.
+///
+/// Each pnpm major reads one family of variables (#1460): pnpm 11 and
+/// newer `pnpm_config_<key>`, pnpm 10 and older `npm_config_<key>`, so the
+/// `npm_config_package_lock=` that `npm exec` / `npx` export from an npm-era
+/// `.npmrc` means nothing to pnpm 11. With `major` unknown both count, the
+/// pnpm spelling first, as for the settings files (see
+/// [`lockfile_disabled`]).
+fn env_setting(
+    npmrc_key: &str,
+    major: Option<u32>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<PnpmSetting> {
     let key = npmrc_key.replace('-', "_");
-    [format!("pnpm_config_{key}"), format!("npm_config_{key}")]
-        .into_iter()
+    let prefixes: &[&str] = match major {
+        Some(major) if major >= 11 => &["pnpm_config_"],
+        Some(_) => &["npm_config_"],
+        None => &["pnpm_config_", "npm_config_"],
+    };
+    prefixes
+        .iter()
+        .map(|prefix| format!("{prefix}{key}"))
         .find_map(|var| {
             let value = env(&var)?.trim().to_string();
             let source = format!("`{var}={value}` in the environment");
@@ -140,21 +156,33 @@ fn env_setting(npmrc_key: &str, env: impl Fn(&str) -> Option<String>) -> Option<
         })
 }
 
-/// [`pnpm_setting`], falling back to the environment ([`env_setting`]) on
-/// disk, where the CLI runs pnpm's environment.
-fn view_setting(
+/// [`pnpm_setting`], falling back to the environment ([`env_setting`],
+/// for the project's pnpm major) on disk, where the CLI runs pnpm's
+/// environment.
+async fn view_setting(
     view: &ProjectView<'_>,
     workspace: Option<&str>,
     npmrc: Option<&str>,
     yaml_key: &str,
     npmrc_key: &str,
 ) -> Option<PnpmSetting> {
-    pnpm_setting(workspace, npmrc, yaml_key, npmrc_key).or_else(|| {
-        if matches!(view, ProjectView::Memory(_)) {
-            return None;
-        }
-        env_setting(npmrc_key, |var| std::env::var(var).ok())
-    })
+    if let Some(found) = pnpm_setting(workspace, npmrc, yaml_key, npmrc_key) {
+        return Some(found);
+    }
+    let env = |var: &str| std::env::var(var).ok();
+    if matches!(view, ProjectView::Memory(_)) || !env_any(&[npmrc_key], env) {
+        return None;
+    }
+    let major = pnpm_major(view).await;
+    env_setting(npmrc_key, major, env)
+}
+
+/// Whether `env` sets any of `npmrc_keys` in either variable family: only
+/// then is the pnpm major worth reading for [`env_setting`].
+fn env_any(npmrc_keys: &[&str], env: impl Fn(&str) -> Option<String>) -> bool {
+    npmrc_keys
+        .iter()
+        .any(|key| env_setting(key, None, &env).is_some())
 }
 
 /// Whether the workspace turned the shared lock off:
@@ -376,7 +404,8 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
         npmrc.as_deref(),
         "sharedWorkspaceLockfile",
         "shared-workspace-lockfile",
-    );
+    )
+    .await;
     if shared.is_none_or(|setting| setting.as_bool() != Some(false)) {
         return Members::Shared;
     }
@@ -525,9 +554,10 @@ pub fn is_git_branch_lock_name(name: &str) -> bool {
 /// project's own `pnpm-workspace.yaml` / `.npmrc`; on disk, a project with
 /// no `pnpm-workspace.yaml` of its own (a workspace member) also reads the
 /// governing ancestor's and the `.npmrc` beside it
-/// ([`governing_workspace_file`]), and the
-/// `npm_config_git_branch_lockfile` / `pnpm_config_git_branch_lockfile`
-/// environment spellings count too.
+/// ([`governing_workspace_file`]), and the environment spelling the
+/// project's pnpm major reads counts too (`pnpm_config_git_branch_lockfile`
+/// on pnpm 11+, `npm_config_git_branch_lockfile` on pnpm 10 and older,
+/// see [`env_setting`]).
 pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> {
     let mut locks = branch_lock_names(view, "").await;
     let mut members_unlisted = None;
@@ -562,8 +592,10 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
                 });
         }
     }
-    let setting =
-        git_branch_on(setting.or_else(|| view_setting(view, None, None, KEYS.0, KEYS.1)))?;
+    if setting.is_none() {
+        setting = view_setting(view, None, None, KEYS.0, KEYS.1).await;
+    }
+    let setting = git_branch_on(setting)?;
     Some(GitBranchLocks {
         setting,
         locks,
@@ -586,25 +618,34 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
 /// the one package.json pins, else what the root lock's grammar implies
 /// (`pnpm_settings_major`). When none says, either source turning the
 /// setting off counts: withholding a pin is the safe side. With `env`, on
-/// disk, `pnpm_config_lockfile` / `npm_config_lockfile` count too (the
-/// hosted engine runs in the install's environment; `vex` need not).
+/// disk, the environment counts too, in the variable family that major
+/// reads (`pnpm_config_lockfile` on pnpm 11+, `npm_config_lockfile` on
+/// pnpm 10 and older, see [`env_setting`]; the hosted engine runs in the
+/// install's environment, `vex` need not).
 ///
 /// Only the project's own files are read, through the view's
 /// fingerprinted reader, so a re-scan read cache stays valid; a workspace
 /// member with no settings file of its own is not related to its root's.
 pub async fn lockfile_disabled(view: &ProjectView<'_>, env: bool) -> Option<String> {
+    let env = env.then_some(|var: &str| std::env::var(var).ok());
+    lockfile_disabled_in(view, env).await
+}
+
+/// [`lockfile_disabled`], with `env` (when given, on disk) looking the
+/// environment up.
+async fn lockfile_disabled_in(
+    view: &ProjectView<'_>,
+    env: Option<impl Fn(&str) -> Option<String>>,
+) -> Option<String> {
     let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
     let npmrc = view.read_text(".npmrc").await.ok();
     let yaml = lockfile_off(|key, _| pnpm_setting(workspace.as_deref(), None, key, key));
     let rc = lockfile_off(|_, key| pnpm_setting(None, npmrc.as_deref(), key, key));
-    let env = match view {
-        ProjectView::Disk(_) | ProjectView::Snapshot(_) if env => {
-            lockfile_off(|_, key| env_setting(key, |var| std::env::var(var).ok()))
-        }
-        _ => None,
-    };
-    if yaml.is_none() && rc.is_none() {
-        return env;
+    let env = env.filter(|env| {
+        !matches!(view, ProjectView::Memory(_)) && env_any(&["lockfile", "package-lock"], env)
+    });
+    if yaml.is_none() && rc.is_none() && env.is_none() {
+        return None;
     }
     let major = pnpm_major(view).await;
     match major {
@@ -612,7 +653,10 @@ pub async fn lockfile_disabled(view: &ProjectView<'_>, env: bool) -> Option<Stri
         Some(_) => rc,
         None => yaml.or(rc),
     }
-    .or(env)
+    .or_else(|| {
+        let env = env?;
+        lockfile_off(|_, key| env_setting(key, major, &env))
+    })
 }
 
 /// Where one settings source turns pnpm's lock off: its `lockfile` when
@@ -770,6 +814,15 @@ mod tests {
     use super::*;
     use crate::formats::pnpm::workspace::package_globs;
 
+    /// An environment lookup over `vars` alone.
+    fn env(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |var: &str| {
+            vars.iter()
+                .find(|(name, _)| *name == var)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
     fn write(root: &Path, rel: &str, text: &str) {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -835,15 +888,9 @@ mod tests {
 
     #[test]
     fn the_environment_spells_a_setting_with_underscores() {
-        let env = |vars: &'static [(&'static str, &'static str)]| {
-            move |var: &str| {
-                vars.iter()
-                    .find(|(name, _)| *name == var)
-                    .map(|(_, value)| value.to_string())
-            }
-        };
         let found = env_setting(
             "shared-workspace-lockfile",
+            None,
             env(&[("npm_config_shared_workspace_lockfile", " false ")]),
         )
         .unwrap();
@@ -851,9 +898,10 @@ mod tests {
         assert!(found
             .source
             .contains("npm_config_shared_workspace_lockfile"));
-        // The pnpm spelling wins over npm's.
+        // With no major known, the pnpm spelling wins over npm's.
         let found = env_setting(
             "git-branch-lockfile",
+            None,
             env(&[
                 ("npm_config_git_branch_lockfile", "false"),
                 ("pnpm_config_git_branch_lockfile", "TRUE"),
@@ -861,7 +909,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.as_bool(), Some(true));
-        assert_eq!(env_setting("git-branch-lockfile", env(&[])), None);
+        assert_eq!(env_setting("git-branch-lockfile", None, env(&[])), None);
+    }
+
+    /// #1460: pnpm 11 and newer read only `pnpm_config_*`, pnpm 10 and
+    /// older only `npm_config_*`.
+    #[test]
+    fn the_environment_family_follows_the_pnpm_major() {
+        const NPM: &[(&str, &str)] = &[("npm_config_lockfile", "false")];
+        const PNPM: &[(&str, &str)] = &[("pnpm_config_lockfile", "false")];
+        for major in [11, 12] {
+            assert_eq!(env_setting("lockfile", Some(major), env(NPM)), None);
+            let found = env_setting("lockfile", Some(major), env(PNPM)).unwrap();
+            assert!(found.source.contains("pnpm_config_lockfile"), "{major}");
+        }
+        for major in [8, 9, 10] {
+            assert_eq!(env_setting("lockfile", Some(major), env(PNPM)), None);
+            let found = env_setting("lockfile", Some(major), env(NPM)).unwrap();
+            assert!(found.source.contains("`npm_config_lockfile"), "{major}");
+        }
+        // pnpm 10 ignores the pnpm spelling even beside npm's.
+        let found = env_setting(
+            "git-branch-lockfile",
+            Some(10),
+            env(&[
+                ("npm_config_git_branch_lockfile", "false"),
+                ("pnpm_config_git_branch_lockfile", "true"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(found.as_bool(), Some(false));
+    }
+
+    /// #1460: the environment turns the lock off only in the variable family
+    /// the project's pnpm major reads; `npm_config_package_lock=` (what
+    /// `npm exec` exports from `.npmrc`'s `package-lock=false`) means
+    /// nothing to pnpm 11+.
+    #[tokio::test]
+    async fn the_environment_disables_the_lockfile_only_for_its_pnpm_major() {
+        const NPM_LOCKFILE: &[(&str, &str)] = &[("npm_config_lockfile", "false")];
+        const PNPM_LOCKFILE: &[(&str, &str)] = &[("pnpm_config_lockfile", "false")];
+        const NPM_PACKAGE_LOCK: &[(&str, &str)] = &[("npm_config_package_lock", "")];
+        for (pm, vars, off) in [
+            (Some("pnpm@12.11.2"), NPM_PACKAGE_LOCK, None),
+            (Some("pnpm@12.11.2"), NPM_LOCKFILE, None),
+            (Some("pnpm@11.28.3"), NPM_LOCKFILE, None),
+            (Some("pnpm@10.34.6"), PNPM_LOCKFILE, None),
+            (Some("pnpm@9.15.9"), PNPM_LOCKFILE, None),
+            (
+                Some("pnpm@11.28.3"),
+                PNPM_LOCKFILE,
+                Some("pnpm_config_lockfile"),
+            ),
+            (
+                Some("pnpm@10.34.6"),
+                NPM_LOCKFILE,
+                Some("npm_config_lockfile"),
+            ),
+            (
+                Some("pnpm@10.34.6"),
+                NPM_PACKAGE_LOCK,
+                Some("npm_config_package_lock"),
+            ),
+            // No major known: either family counts.
+            (None, NPM_LOCKFILE, Some("npm_config_lockfile")),
+            (None, PNPM_LOCKFILE, Some("pnpm_config_lockfile")),
+            (None, &[], None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let manifest = match pm {
+                Some(pm) => format!(r#"{{"name":"app","packageManager":"{pm}"}}"#),
+                None => r#"{"name":"app"}"#.to_string(),
+            };
+            write(root, "package.json", &manifest);
+            write(
+                root,
+                PNPM_LOCK,
+                "lockfileVersion: '9.0'
+",
+            );
+            let view = ProjectView::Disk(root);
+            let found = lockfile_disabled_in(&view, Some(env(vars))).await;
+            match off {
+                Some(var) => assert!(
+                    found.as_deref().is_some_and(|source| source.contains(var)),
+                    "{pm:?} {vars:?}: {found:?}"
+                ),
+                None => assert_eq!(found, None, "{pm:?} {vars:?}"),
+            }
+        }
     }
 
     #[test]
