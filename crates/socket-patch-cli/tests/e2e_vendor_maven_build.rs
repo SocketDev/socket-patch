@@ -51,7 +51,6 @@ mod prebuilt_common;
 mod vex_e2e_common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use maven_build_common::*;
 use vex_e2e_common::*;
@@ -95,15 +94,11 @@ fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed and the per-test
+/// `socket-patch <args>` in the hermetic environment and the per-test
 /// local repository as the crawler's maven repo.
 fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
-    let mut cmd = Command::new(binary());
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     let _fixture = prebuilt_common::prepare_command(
         &mut cmd,
         cwd,
@@ -112,11 +107,8 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
     );
     let out = cmd
         .current_dir(cwd)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("MAVEN_REPO_LOCAL", m2)
         .env_remove("M2_HOME")
-        .env_remove("VIRTUAL_ENV")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

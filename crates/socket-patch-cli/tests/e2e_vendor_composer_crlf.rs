@@ -8,6 +8,8 @@
 //! the pre-vendor bytes exactly. Each test runs the built binary; the
 //! discovery/view routes are a wiremock API, so no composer and no network.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -168,16 +170,9 @@ async fn mount_api(server: &MockServer) {
         .await;
 }
 
+/// The built binary in the hermetic environment (`tests/common/hermetic.rs`).
 fn cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-    cmd
+    hermetic::binary_command()
 }
 
 fn run_json(root: &Path, args: &[&str]) -> (i32, Value) {
