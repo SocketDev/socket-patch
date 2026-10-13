@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-12 (run 38), main `6ad6add`, latest release v5.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
+Last updated: 2026-10-13 (run 39), main `15c2c83`, latest release v5.0.0 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.22.
 
 ## Coverage matrix
 
@@ -360,6 +360,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | #1056 gap: `v = if … end` / `v = case … end` inside the user's `source … do` block → unwind drops `!` | fail (#1056 comment; exit 16 with CHECKSUMS) | fail (×2) | fail | — | — |
 | macOS / Windows probe (#952 backslash spelling, #1092 ucrt pair, #1295) | blocked: probe branch pushed, no Actions run triggered | | | | |
 
+### Run 39 (main `15c2c83`, v5.0.0; Linux Ruby 3.3.6; scratch copies of `e2e_redirect_gem_build.rs`, real `bundle install`)
+
+| Cell | 4.0.22 | 4.0.18 |
+| --- | --- | --- |
+| `v = if … end` in the user's `source … do` block → `rollback` keeps the `!` | **fail #1476** | **fail #1476** |
+| Same → frozen install of the restored pair | **fail #1476** (exit 16) | pass (warning only) |
+| Gemfile `lockfile "custom.lock"` DSL → hosted scan refused | **fail #1477** | **fail #1477** |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -382,11 +390,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Windows / macOS probe (Actions did not trigger in run 38; retry): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1295 warning with `D:/…` plugin paths, the #1260 stale-cache warning.
-2. #1056 gap follow-up: re-run the assignment-form shapes when a fix lands (also `x = begin … end`, endless `def x = 1` inside a source block).
+1. #1477 neighbour: vendored mode with the Gemfile `lockfile` DSL, and `lockfile false`.
+2. #1476 neighbours: `x = while/until/unless … end`, endless `def x = 1`, one-line `x = if c then 1 else 2 end` inside a source block.
 3. H→V takeover with the hosted patched archive in `vendor/cache`, then `vendor --revert` / `remove` (no stale-cache check on that path).
-4. #749 DSL gap: vendored DSL `lockfile`, and `lockfile false`.
-5. Re-run #985 / #1109 (`.bundle`-default part, `agent:needs-human`) when fixes merge.
+4. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1295 warning with `D:/…` plugin paths, the #1260 stale-cache warning.
+5. Re-run #985 / #1109 (`agent:needs-human`) when fixes merge.
 
 ## Known non-bugs
 
@@ -499,3 +507,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - `gem_bundler_plugin_stale` reads only `<root>/.bundle/plugin/index` (or `BUNDLE_APP_CONFIG`), not the moved `gemfiles/.bundle` under a `BUNDLE_GEMFILE` Appraisal layout. It's warning-only, so a miss there isn't filed (run 38).
 - `scan --mode agent` with an unreachable API returns `status: error` with no warnings, so the #1295 warning isn't shown on that path. That's expected; `apply --offline` shows it (run 38).
 - `bughunt/bundler/20261012-win-mac-recheck` is also left behind (`git push --delete` hangs up), and no run ever triggered on it; its workflow is push-triggered only.
+- Bundler 4.0.18 only warns ("Cannot write a changed lockfile while frozen.", exit 0) when a source-block gem's DEPENDENCIES `!` is missing. 4.0.19+ fails with exit 16. Use 4.0.22 to show the frozen-install impact of `!` bugs (run 39).
+- The `bundle` / `bundle_env` helpers in `e2e_redirect_gem_build.rs` strip `GEM_*`, so a Bundler installed into a scratch `GEM_HOME` is silently not used. `gem install bundler -v <v>` into the system gems, then set `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION` (run 39).
