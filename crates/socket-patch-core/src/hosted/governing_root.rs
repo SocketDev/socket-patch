@@ -27,9 +27,12 @@ use crate::formats::text::strip_bom;
 use crate::formats::yarn::berry_gates::YARN_LOCK;
 use crate::formats::yarn::is_berry_lock;
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
-use crate::utils::fs::{open_regular_file, read_regular_to_string, read_regular_to_string_sync};
+use crate::utils::fs::{
+    open_regular_file, read_regular_to_bytes, read_regular_to_string, read_regular_to_string_sync,
+};
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::workspace_globs::{workspaces_include, workspaces_include_as, WorkspacesDialect};
+use crate::vendor::bun_lockb::BunLockb;
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
 use crate::vendor::lock_inventory::ProjectView;
@@ -547,10 +550,10 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
 /// reads `lock` at `root` (#1097). yarn classic and berry tell apart by
 /// berry's `__metadata` key ([`is_berry_lock`]; an empty or unreadable
 /// `yarn.lock` reads as classic, the wider set), and Bun 1.3+ by the
-/// top-level `configVersion` it writes into `bun.lock` (a lock without
-/// it, or a binary `bun.lockb` with no `bun.lock` beside it, reads as
-/// older Bun, the wider set). Only the head of a lock is read: both keys
-/// come first.
+/// top-level `configVersion` it writes into `bun.lock`, or the
+/// `cNfGvRsN` tag that carries it in a binary `bun.lockb` (#1492; a lock
+/// without it reads as older Bun, the wider set). Only the head of a text
+/// lock is read: both keys come first.
 async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
     match lock {
         YARN_LOCK => {
@@ -573,7 +576,14 @@ async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
         }
         // Bun reads the text lock when both exist.
         BUN_LOCKB if root.join(BUN_LOCK).is_file() => Box::pin(lock_dialect(root, BUN_LOCK)).await,
-        BUN_LOCKB => WorkspacesDialect::BUN_PRE_1_3,
+        // Bun 1.3+ marks a binary lock with its config version too
+        // (#1492); one that does not parse reads as older Bun.
+        BUN_LOCKB => match read_regular_to_bytes(&root.join(lock)).await {
+            Ok(bytes) if BunLockb::parse(&bytes).is_ok_and(|l| l.config_version().is_some()) => {
+                WorkspacesDialect::BUN
+            }
+            _ => WorkspacesDialect::BUN_PRE_1_3,
+        },
         VLT_LOCK => WorkspacesDialect::VLT,
         _ => WorkspacesDialect::NPM,
     }
