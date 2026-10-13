@@ -49,6 +49,34 @@ pub(crate) const NORMALIZED_FORMAT_1: u8 = 1;
 /// Workspace dependency behaviors were normalized (not invertible).
 pub(crate) const NORMALIZED_WORKSPACE: u8 = 2;
 
+/// How many leading bytes of a `bun.lockb` [`config_version_offset`] reads.
+pub(crate) const CONFIG_HEAD_LEN: usize = PACKAGES_AT;
+
+/// Where the 16-byte `cNfGvRsN` extension (the tag, then Bun's
+/// `configVersion` as a u64) would start: Bun writes it last, right
+/// before the lock's `total` byte length (every Bun 1.3.9–1.4.2 fixture,
+/// workspace and catalog locks included). `None` when `head` is not a
+/// binary lock header. Reading only these 16 bytes keeps the check
+/// independent of the package records and of extensions this codec does
+/// not know (#1492).
+pub(crate) fn config_version_offset(head: &[u8]) -> Option<usize> {
+    if !head.starts_with(HEADER) {
+        return None;
+    }
+    let total = usize_at(head, TOTAL_AT).ok()?;
+    total.checked_sub(16).filter(|at| *at >= PACKAGES_AT)
+}
+
+/// Bun's `configVersion` from the 16 bytes at [`config_version_offset`]:
+/// the binary twin of the text lock's top-level key, written only by the
+/// Bun releases that write `configVersion` (1.3.0 does not).
+pub(crate) fn config_version(extension: &[u8]) -> Option<u64> {
+    if extension.len() != 16 || &extension[..8] != b"cNfGvRsN" {
+        return None;
+    }
+    u64_at(extension, 8).ok()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BinaryPackage {
     pub(crate) id: usize,
@@ -88,9 +116,6 @@ pub(crate) struct BunLockb {
     extensions: Vec<Array>,
     total: usize,
     unknown_extension: bool,
-    /// The `cNfGvRsN` extension's value: Bun's `configVersion`, which
-    /// Bun 1.3+ writes (#1492).
-    config_version: Option<u64>,
 }
 
 impl BunLockb {
@@ -155,7 +180,6 @@ impl BunLockb {
         }
         pos += 8;
         let mut extensions = Vec::new();
-        let mut config_version = None;
         // These are the append-only extension tags understood by Bun 1.x.
         // Unknown suffixes are retained verbatim instead of being discarded.
         while pos.checked_add(8).is_some_and(|end| end <= total) {
@@ -169,7 +193,6 @@ impl BunLockb {
                     if pos + 16 > total {
                         return Err("bun.lockb: truncated config extension".into());
                     }
-                    config_version = Some(u64_at(input, pos + 8)?);
                     pos += 16;
                     continue;
                 }
@@ -216,18 +239,11 @@ impl BunLockb {
             extensions,
             total,
             unknown_extension: pos < total,
-            config_version,
         };
         // All strings exposed to inventory/editing must be valid before a
         // caller can stage any changes to the lockfile.
         lock.packages()?;
         Ok(lock)
-    }
-
-    /// Bun's `configVersion` (the binary twin of the text lock's
-    /// top-level key): set only in locks written by Bun 1.3+.
-    pub(crate) fn config_version(&self) -> Option<u64> {
-        self.config_version
     }
 
     pub(crate) fn bytes(&self) -> Vec<u8> {
@@ -2292,16 +2308,39 @@ mod tests {
         format!("sha512-{}", STANDARD.encode([42; 64]))
     }
 
-    /// #1492: Bun writes a `cNfGvRsN` config-version extension (the
-    /// twin of the text lock's `configVersion`) since a 1.3 patch
-    /// release; 1.3.0 and earlier writers do not.
+    fn read_config_version(lock: &[u8]) -> Option<u64> {
+        let at = config_version_offset(&lock[..CONFIG_HEAD_LEN.min(lock.len())])?;
+        config_version(lock.get(at..at + 16)?)
+    }
+
+    /// #1492: Bun writes a `cNfGvRsN` config-version extension (the twin
+    /// of the text lock's `configVersion`) since a 1.3 patch release, last
+    /// in the extension list, also after the workspace and catalog
+    /// extensions of a workspace root; 1.3.0 and earlier writers do not.
     #[test]
     fn config_version_is_read_from_tagged_locks_only() {
-        for version in VERSIONS.iter().chain(&["prerelease-pair-1.3.14"]) {
-            let lock = BunLockb::parse(&fixture(version)).unwrap();
-            let tagged = version.ends_with("1.3.14") || *version == "1.4.2";
-            assert_eq!(lock.config_version().is_some(), tagged, "{version}");
+        let extra = [
+            "prerelease-pair-1.3.14",
+            "1.4.2-extensions",
+            "1.2.23-extensions",
+        ];
+        for version in VERSIONS.iter().chain(&extra) {
+            let lock = fixture(version);
+            let tagged = version.contains("1.3.14") || version.starts_with("1.4.2");
+            assert_eq!(read_config_version(&lock), tagged.then_some(1), "{version}");
         }
+        for name in ["1.3.9-ws-deps-late.lockb", "1.4.2-ws-adder.lockb"] {
+            let lock = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/bun-lockb/late-dependent")
+                    .join(name),
+            )
+            .unwrap();
+            assert_eq!(read_config_version(&lock), Some(1), "{name}");
+        }
+        // Not a binary lock, or too short to hold the extension.
+        assert_eq!(read_config_version(b"\0"), None);
+        assert_eq!(read_config_version(HEADER), None);
     }
 
     #[test]

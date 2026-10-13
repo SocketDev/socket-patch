@@ -27,12 +27,10 @@ use crate::formats::text::strip_bom;
 use crate::formats::yarn::berry_gates::YARN_LOCK;
 use crate::formats::yarn::is_berry_lock;
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
-use crate::utils::fs::{
-    open_regular_file, read_regular_to_bytes, read_regular_to_string, read_regular_to_string_sync,
-};
+use crate::utils::fs::{open_regular_file, read_regular_to_string, read_regular_to_string_sync};
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::workspace_globs::{workspaces_include, workspaces_include_as, WorkspacesDialect};
-use crate::vendor::bun_lockb::BunLockb;
+use crate::vendor::bun_lockb;
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
 use crate::vendor::lock_inventory::ProjectView;
@@ -550,10 +548,11 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
 /// reads `lock` at `root` (#1097). yarn classic and berry tell apart by
 /// berry's `__metadata` key ([`is_berry_lock`]; an empty or unreadable
 /// `yarn.lock` reads as classic, the wider set), and Bun 1.3+ by the
-/// top-level `configVersion` it writes into `bun.lock`, or the
-/// `cNfGvRsN` tag that carries it in a binary `bun.lockb` (#1492; a lock
-/// without it reads as older Bun, the wider set). Only the head of a text
-/// lock is read: both keys come first.
+/// top-level `configVersion` it writes into `bun.lock`, or the trailing
+/// `cNfGvRsN` extension that carries it in a binary `bun.lockb` (#1492;
+/// a lock without it, as Bun 1.3.0 and earlier write, reads as older Bun,
+/// the wider set). Only the head of a text lock is read: both keys come
+/// first.
 async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
     match lock {
         YARN_LOCK => {
@@ -576,17 +575,34 @@ async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
         }
         // Bun reads the text lock when both exist.
         BUN_LOCKB if root.join(BUN_LOCK).is_file() => Box::pin(lock_dialect(root, BUN_LOCK)).await,
-        // Bun 1.3+ marks a binary lock with its config version too
-        // (#1492); one that does not parse reads as older Bun.
-        BUN_LOCKB => match read_regular_to_bytes(&root.join(lock)).await {
-            Ok(bytes) if BunLockb::parse(&bytes).is_ok_and(|l| l.config_version().is_some()) => {
+        // Bun marks a binary lock with its config version too (#1492).
+        BUN_LOCKB => {
+            if bun_lockb_config_version(&root.join(lock)).await.is_some() {
                 WorkspacesDialect::BUN
+            } else {
+                WorkspacesDialect::BUN_PRE_1_3
             }
-            _ => WorkspacesDialect::BUN_PRE_1_3,
-        },
+        }
         VLT_LOCK => WorkspacesDialect::VLT,
         _ => WorkspacesDialect::NPM,
     }
+}
+
+/// The `configVersion` a binary `bun.lockb` carries in its trailing
+/// `cNfGvRsN` extension (#1492): reads the header and those 16 bytes
+/// only, through the FIFO-safe opener. `None` when the lock is not
+/// readable, not a binary lock, or untagged (written before Bun wrote
+/// `configVersion`).
+async fn bun_lockb_config_version(path: &Path) -> Option<u64> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let (mut file, _) = open_regular_file(path).await.ok()?;
+    let mut head = vec![0; bun_lockb::CONFIG_HEAD_LEN];
+    file.read_exact(&mut head).await.ok()?;
+    let at = bun_lockb::config_version_offset(&head)?;
+    file.seek(std::io::SeekFrom::Start(at as u64)).await.ok()?;
+    let mut extension = [0; 16];
+    file.read_exact(&mut extension).await.ok()?;
+    bun_lockb::config_version(&extension)
 }
 
 /// How much of a lock [`lock_dialect`] reads: the yarn berry and Bun keys
@@ -1358,19 +1374,24 @@ mod tests {
     }
 
     /// #1492: Bun 1.2+ still writes a binary `bun.lockb` under
-    /// `saveTextLockfile = false`, and Bun 1.3+ marks it with a
+    /// `saveTextLockfile = false`, and Bun 1.3.x+ marks it with a
     /// `cNfGvRsN` config-version tag (the twin of the text lock's
     /// `configVersion`). A tagged lone `bun.lockb` honours `!`, so the
     /// excluded member's own lock is the one Bun reads; an untagged one
-    /// (Bun 1.2.23 here) or one that does not parse keeps the wider
+    /// (Bun 1.2.23 here) or one that is not a binary lock keeps the wider
     /// pre-1.3 reading.
     #[tokio::test]
     async fn bun_lockb_with_a_config_version_tag_honours_negated_workspaces() {
         const BUN_1_3_14: &[u8] = include_bytes!("../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
         const BUN_1_2_23: &[u8] = include_bytes!("../../tests/fixtures/bun-lockb/1.2.23/bun.lockb");
+        // A workspace root's lock: the tag follows its workspace and
+        // catalog extensions.
+        const BUN_1_4_2_WORKSPACE: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/1.4.2-extensions/bun.lockb");
         let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
         for (lock, expected) in [
             (BUN_1_3_14, None),
+            (BUN_1_4_2_WORKSPACE, None),
             (BUN_1_2_23, refused),
             (&b"\0"[..], refused),
         ] {

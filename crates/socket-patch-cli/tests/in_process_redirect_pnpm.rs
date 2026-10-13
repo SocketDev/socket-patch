@@ -1837,7 +1837,8 @@ async fn hosted_scan_from_brace_or_class_glob_workspace_member_refuses() {
 /// #1097: the member matcher read every root's `workspaces` the npm way.
 /// yarn classic ignores `!` patterns (`packages/a` stays a member of
 /// `["packages/*", "!packages/a"]`), as does Bun before 1.3 (a `bun.lock`
-/// with no `configVersion`, or a binary `bun.lockb`), and npm and yarn
+/// with no `configVersion`, or a binary `bun.lockb` without its
+/// `cNfGvRsN` twin, #1492), and npm and yarn
 /// match extglobs (`packages/@(a|b)`). The matcher dropped those members,
 /// so a hosted `scan` / `get` from one pinned nothing and exited 0.
 #[tokio::test]
