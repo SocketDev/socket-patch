@@ -4780,6 +4780,57 @@ async fn vendor_check_fails_when_lock_no_longer_wires_artifact() {
     );
 }
 
+/// REGRESSION (#1467): a missing or changed committed artifact failed
+/// `vendor --check` with the Rust Debug text of the health state
+/// (`Missing`, `Corrupt { reason: "vendor_sha256_mismatch" }`): no path,
+/// no remedy. The reason must name the artifact and point at `repair`;
+/// restoring the committed bytes turns the check green again.
+#[tokio::test]
+async fn vendor_check_names_damaged_artifact_and_repair_remedy() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+    let rel = fx
+        .tgz_path()
+        .strip_prefix(fx.root())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let good = std::fs::read(fx.tgz_path()).unwrap();
+
+    let mut changed = good.clone();
+    changed.extend_from_slice(b"drift");
+    std::fs::write(fx.tgz_path(), &changed).unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 1, "{env:#}");
+    let event = find_event(&env, "failed", Some("vendor_check_failed"));
+    assert_eq!(
+        event["reason"],
+        format!(
+            "committed artifact {rel} does not match the sha256 in the vendor ledger \
+             (vendor_sha256_mismatch); run `socket-patch repair` to restore it, then commit it"
+        ),
+        "{env:#}"
+    );
+
+    std::fs::remove_file(fx.tgz_path()).unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 1, "{env:#}");
+    let event = find_event(&env, "failed", Some("vendor_check_failed"));
+    assert_eq!(
+        event["reason"],
+        format!(
+            "committed artifact {rel} is missing (vendor_artifact_missing); run \
+             `socket-patch repair` to restore it, then commit it"
+        ),
+        "{env:#}"
+    );
+
+    std::fs::write(fx.tgz_path(), &good).unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "verified", Some("vendor_check_ok"));
+}
+
 /// REGRESSION (#969): npm >= 11.14 refuses a vendored `file:` tarball
 /// (EALLOWFILE) under a project `allow-file=none`, so every install of the
 /// lock fails — but `vendor --check` verified it. It must fail the entry,

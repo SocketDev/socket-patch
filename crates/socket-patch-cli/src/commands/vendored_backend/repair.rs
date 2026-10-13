@@ -760,8 +760,7 @@ impl VendoredBackend<'_> {
 }
 
 fn workspace_copy_issue(health: &ArtifactHealth) -> bool {
-    matches!(health, ArtifactHealth::Corrupt { reason }
-        if reason == "vendor_workspace_artifact_missing" || reason == "vendor_workspace_artifact_corrupt")
+    health.is_workspace_copy_issue()
 }
 
 /// Preserve package originals while adopting/rebuilding every member-relative
