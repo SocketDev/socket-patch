@@ -1050,6 +1050,9 @@ pub(crate) fn npm_paths_by_identity_in(
 /// [`find_packages_for_rollback_reusing`]. Only the root discovery is
 /// reused: each root is still searched by `find_by_purls`, so copy choice
 /// and order are unchanged. A snapshot taken with other options is ignored.
+/// An npm purl with no copy can still be reached through a workspace
+/// member's alias link (#1494), so `apply --check` and `vex` see the copy
+/// `apply` patched.
 ///
 /// Read-only by contract (its one caller is `vex`), so it also searches the
 /// gem stores under a refused out-of-tree `.bundle/config` path
@@ -1063,13 +1066,13 @@ pub async fn find_manifest_package_copies_reusing(
 ) -> HashMap<String, Vec<PathBuf>> {
     let partitioned = partition_purls(purls, common.ecosystems.as_deref());
     let crawler_options = common.crawler_options();
-    let npm_roots = prior.and_then(|p| p.roots_for(&crawler_options));
-    let mut copies = dispatch_find(
+    let mut copies = dispatch_find_with_npm_links(
         &partitioned,
         &crawler_options,
         quiet,
         merge_qualified,
-        npm_roots,
+        prior,
+        NpmLinks::ForUnresolved,
     )
     .await;
     // `apply` also writes every store variant of each npm copy (a pnpm peer

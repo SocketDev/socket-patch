@@ -890,6 +890,16 @@ fn apply_and_rollback_reach_a_member_alias_link_from_the_member() {
             "{store}: member apply; envelope={v}"
         );
 
+        // `apply --check` (and `vex`, through the same lookup) must see the
+        // copy apply just patched, not report it missing.
+        let (code, v) = run_apply_with(&member, &["--check".as_ref()]);
+        assert_eq!(code, 0, "{store}: member check; envelope={v}");
+        assert_eq!(
+            dupvuln_events(&v),
+            vec![("skipped".to_string(), "already_patched".to_string())],
+            "{store}: member check; envelope={v}"
+        );
+
         let (code, v) = run_apply(&member);
         assert_eq!(code, 0, "{store}: member re-apply; envelope={v}");
         assert_eq!(
