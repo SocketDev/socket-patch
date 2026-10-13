@@ -62,14 +62,16 @@ fn git_sha256_file(path: &Path) -> String {
 
 /// Run the binary with the hermetic `SOCKET_*` environment (no token, so the
 /// scans take the public-proxy path `--proxy-url` pins). The gem crawler
-/// reads `BUNDLE_PATH`, `BUNDLE_APP_CONFIG` and the user's
-/// `~/.bundle/config`, and the scans are unscoped, so every `BUNDLE_*` var
-/// and an activated venv are scrubbed and `HOME` points at a stand-in
+/// reads `BUNDLE_PATH`, `BUNDLE_APP_CONFIG`, the user's `~/.bundle/config`
+/// and the `gem env` homes (`GEM_HOME`, `GEM_PATH`, `~/.gem`), and the scans
+/// are unscoped, so every `BUNDLE_*` var, both gem-home vars and an
+/// activated venv are scrubbed and `HOME` points at a stand-in
 /// (`jvm_env::isolate_cli`): any of them would add the developer's gems or
 /// packages to the exact purl sets these tests assert.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic::command(&binary());
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle, hermetic::Extra::Venv]);
+    cmd.env_remove("GEM_HOME").env_remove("GEM_PATH");
     common::jvm_env::isolate_cli(&mut cmd);
     cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");

@@ -67,10 +67,10 @@ fn write_manifest(root: &Path, purl: &str, uuid: &str, file: &str, before: &[u8]
 }
 
 /// `vendor --json --vendor-source service` through the built binary with
-/// the hermetic `SOCKET_*` environment, an activated venv and every
-/// ambient `BUNDLE_*` var scrubbed (they move the Python and gem stores the
-/// crawlers read), the API and every registry base pointed at `dead`, and
-/// `env` on top.
+/// the hermetic `SOCKET_*` environment, an activated venv, the gem homes
+/// and every ambient `BUNDLE_*` var scrubbed and `HOME` on a stand-in (they
+/// move the Python and gem stores the crawlers read), the API and every
+/// registry base pointed at `dead`, and `env` on top.
 fn run_vendor(
     root: &Path,
     dead: &str,
@@ -79,6 +79,7 @@ fn run_vendor(
 ) -> (i32, serde_json::Value, String) {
     let mut cmd = hermetic::command(&binary());
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle, hermetic::Extra::Venv]);
+    crate::common::jvm_env::isolate_cli(&mut cmd);
     cmd.args([
         "vendor",
         "--json",
@@ -95,7 +96,7 @@ fn run_vendor(
     ])
     .args(extra)
     .current_dir(root);
-    for var in ["CONDA_PREFIX", "GEM_HOME"] {
+    for var in ["CONDA_PREFIX", "GEM_HOME", "GEM_PATH"] {
         cmd.env_remove(var);
     }
     cmd.env("SOCKET_CRATES_REGISTRY", dead)
