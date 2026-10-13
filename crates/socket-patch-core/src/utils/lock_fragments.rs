@@ -18,6 +18,19 @@ thread_local! {
     /// Whole-lock renders this thread's rewrites took, each followed by a
     /// full re-parse: what a hosted rewrite of N deps must not pay N times.
     pub(crate) static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whole-lock parses at the instrumented sites: [`rewrite_batch`]'s
+    /// parse of the original and of its rendering, and the Poetry
+    /// redirect's stale-install check when it has to parse for itself.
+    pub(crate) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whole-text fragment searches [`rewrite_batch`] took to find or count
+    /// its changed fragments: what a batch of N deps must not pay N times.
+    pub(crate) static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one tick of a test counter ([`RENDERS`], [`PARSES`], [`SCANS`]).
+#[cfg(test)]
+pub(crate) fn tick(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
+    counter.with(|count| count.set(count.get() + 1));
 }
 
 /// Takes `name`'s fragments of `text` from its (spanned) parse.
@@ -220,7 +233,7 @@ pub(crate) fn finish<'a>(
     fragments_in: FragmentsIn,
 ) -> Result<FragmentRewrite<'a>, String> {
     #[cfg(test)]
-    RENDERS.with(|renders| renders.set(renders.get() + 1));
+    tick(&RENDERS);
     let before = before?;
     let rendered = crate::utils::python_lock::preserve_line_endings(text, rendered);
     let after_doc = toml_edit::Document::parse(rendered).map_err(|e| e.to_string())?;
@@ -271,6 +284,45 @@ pub(crate) fn finish<'a>(
     })
 }
 
+/// The start of each of `needles` in `haystack`, found in one pass; `None`
+/// unless every needle occurs exactly once.
+///
+/// The pass looks for each needle's first [`PREFIX`] bytes (a small
+/// automaton, where the whole fragments would make a large one) and checks
+/// the full needle at every place its prefix occurs. Every occurrence starts
+/// with its prefix, so none is missed. They are counted overlapping, so a
+/// needle that overlaps itself may count more than its non-overlapping
+/// `matches` would; that only ever sends the batch to the step-by-step
+/// rewrite, never accepts one that path would refuse.
+fn sole_occurrences(haystack: &str, needles: &[&str]) -> Option<Vec<usize>> {
+    /// Enough of a lock fragment to name its package.
+    const PREFIX: usize = 64;
+    if needles.is_empty() {
+        return Some(Vec::new());
+    }
+    if needles.iter().any(|needle| needle.is_empty()) {
+        return None;
+    }
+    #[cfg(test)]
+    tick(&SCANS);
+    let prefixes = needles
+        .iter()
+        .map(|needle| &needle.as_bytes()[..needle.len().min(PREFIX)]);
+    let finder = aho_corasick::AhoCorasick::new(prefixes).ok()?;
+    let haystack = haystack.as_bytes();
+    let mut starts: Vec<Option<usize>> = vec![None; needles.len()];
+    for found in finder.find_overlapping_iter(haystack) {
+        let index = found.pattern().as_usize();
+        if !haystack[found.start()..].starts_with(needles[index].as_bytes()) {
+            continue;
+        }
+        if starts[index].replace(found.start()).is_some() {
+            return None;
+        }
+    }
+    starts.into_iter().collect()
+}
+
 /// What one dep's rewrite did to a lock, whether it ran in a
 /// [`rewrite_batch`] or step by step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +370,8 @@ pub(crate) fn rewrite_batch<P>(
     if text.contains("\r\n") && text.replace("\r\n", "").contains('\n') {
         return None;
     }
+    #[cfg(test)]
+    tick(&PARSES);
     let original = toml_edit::Document::parse(text.to_owned()).ok()?;
     let mut lock = original.clone().into_mut();
     let mut steps = Vec::with_capacity(names.len());
@@ -347,14 +401,13 @@ pub(crate) fn rewrite_batch<P>(
         });
     }
     #[cfg(test)]
-    RENDERS.with(|renders| renders.set(renders.get() + 1));
+    tick(&RENDERS);
     let rendered = crate::utils::python_lock::preserve_line_endings(text, lock.to_string());
+    #[cfg(test)]
+    tick(&PARSES);
     let after_doc = toml_edit::Document::parse(rendered).ok()?;
     let rendered = after_doc.raw();
     let file_terminator = majority_terminator(text);
-    // Each changed fragment as the byte range of `text` it replaces (trimmed
-    // to what differs) and the replacement.
-    let mut splices: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
     let mut edits_of: Vec<(usize, Vec<(String, String)>)> = Vec::new();
     for (index, before) in &rewritten {
         let after = fragments_in(&after_doc, rendered, names[*index]).ok()?;
@@ -364,40 +417,42 @@ pub(crate) fn rewrite_batch<P>(
         let mut edits = Vec::new();
         for (old, new) in before.iter().zip(after) {
             let new = respell(old, &new, file_terminator);
-            if *old == new {
-                continue;
+            if *old != new {
+                edits.push((old.clone(), new));
             }
-            if text.matches(old.as_str()).count() != 1 {
-                return None;
-            }
-            edits.push((old.clone(), new));
         }
         edits_of.push((*index, edits));
     }
-    for (_, edits) in &edits_of {
-        for (old, new) in edits {
-            let at = text.find(old.as_str())?;
-            // Only the bytes that differ are replaced, so the units' shared
-            // boundaries (a unit's fragment ends at the next unit's header)
-            // never overlap.
-            let common =
-                |a: &mut dyn Iterator<Item = (u8, u8)>| a.take_while(|(x, y)| x == y).count();
-            let mut prefix = common(&mut old.bytes().zip(new.bytes()));
-            while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
-                prefix -= 1;
-            }
-            let mut suffix =
-                common(&mut old[prefix..].bytes().rev().zip(new[prefix..].bytes().rev()));
-            while !old.is_char_boundary(old.len() - suffix)
-                || !new.is_char_boundary(new.len() - suffix)
-            {
-                suffix -= 1;
-            }
-            splices.push((
-                at + prefix..at + old.len() - suffix,
-                &new[prefix..new.len() - suffix],
-            ));
+    // Where each changed fragment sits in `text`, all found in one pass; a
+    // fragment that is not there exactly once ends the batch, as it refuses
+    // the step-by-step rewrite.
+    let olds: Vec<&str> = edits_of
+        .iter()
+        .flat_map(|(_, edits)| edits.iter().map(|(old, _)| old.as_str()))
+        .collect();
+    let starts = sole_occurrences(text, &olds)?;
+    // Each changed fragment as the byte range of `text` it replaces (trimmed
+    // to what differs) and the replacement.
+    let mut splices: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    let edits = edits_of.iter().flat_map(|(_, edits)| edits);
+    for ((old, new), at) in edits.zip(starts) {
+        // Only the bytes that differ are replaced, so the units' shared
+        // boundaries (a unit's fragment ends at the next unit's header)
+        // never overlap.
+        let common = |a: &mut dyn Iterator<Item = (u8, u8)>| a.take_while(|(x, y)| x == y).count();
+        let mut prefix = common(&mut old.bytes().zip(new.bytes()));
+        while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+            prefix -= 1;
         }
+        let mut suffix = common(&mut old[prefix..].bytes().rev().zip(new[prefix..].bytes().rev()));
+        while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix)
+        {
+            suffix -= 1;
+        }
+        splices.push((
+            at + prefix..at + old.len() - suffix,
+            &new[prefix..new.len() - suffix],
+        ));
     }
     splices.sort_by_key(|(range, _)| (range.start, range.end));
     let mut result = String::with_capacity(rendered.len());
@@ -414,13 +469,14 @@ pub(crate) fn rewrite_batch<P>(
     if result != rendered {
         return None;
     }
+    // Every replacement must be unique in the result too, so its rollback
+    // can't hit the wrong place.
+    let news: Vec<&str> = edits_of
+        .iter()
+        .flat_map(|(_, edits)| edits.iter().map(|(_, new)| new.as_str()))
+        .collect();
+    sole_occurrences(&result, &news)?;
     for (index, edits) in edits_of {
-        if edits
-            .iter()
-            .any(|(_, new)| result.matches(new.as_str()).count() != 1)
-        {
-            return None;
-        }
         if !edits.is_empty() {
             steps[index] = LockStep::Rewritten(edits);
         }
@@ -448,6 +504,26 @@ mod tests {
         let mut span = span;
         extend_span(lock["unit"].as_table().unwrap(), &mut span);
         Ok(vec![text[span].to_string()])
+    }
+
+    #[test]
+    fn sole_occurrences_finds_each_needle_once_or_refuses() {
+        // Long needles sharing their first 64+ bytes are told apart by the
+        // full comparison.
+        let shared = "x".repeat(80);
+        let (a, b) = (format!("{shared}A"), format!("{shared}B"));
+        let haystack = format!("[{a}]\n[{b}]\n");
+        assert_eq!(
+            sole_occurrences(&haystack, &[&b, &a, "]\n["]),
+            Some(vec![haystack.find(&b).unwrap(), 1, a.len() + 1])
+        );
+        assert_eq!(sole_occurrences(&haystack, &[]), Some(vec![]));
+        // Missing, repeated, empty and self-overlapping needles all refuse.
+        assert_eq!(sole_occurrences(&haystack, &[&a, "missing"]), None);
+        assert_eq!(sole_occurrences(&haystack, &[&shared]), None);
+        assert_eq!(sole_occurrences(&haystack, &["]\n"]), None);
+        assert_eq!(sole_occurrences(&haystack, &[""]), None);
+        assert_eq!(sole_occurrences("aaa", &["aa"]), None);
     }
 
     #[test]
