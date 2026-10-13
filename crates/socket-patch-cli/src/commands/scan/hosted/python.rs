@@ -72,19 +72,17 @@ pub(super) async fn stale_install_warnings(
         // A `--system-site-packages` venv's own copy hides its base
         // interpreter's (#409).
         crawler.set_search_order(&sites).await;
-        // Only Pipenv's remedy reads this, and only for Pipenv's own venvs:
-        // a base dir only a Hatch env reaches is not one `pipenv run` fixes.
+        // Only Pipenv's remedy reads this, over the venvs Pipenv itself
+        // resolves (a `.venv` it shares with Hatch included): a base dir
+        // only a Hatch env reaches is not one `pipenv run` fixes.
         let inherited = if pipenv_uuids.is_empty() {
             Default::default()
         } else {
-            let pipenv_sites: Vec<_> = sites
-                .iter()
-                .filter(|site| {
-                    socket_patch_core::crawlers::hatch_env::environment_of(&hatch_envs, site)
-                        .is_none()
-                })
-                .cloned()
-                .collect();
+            let pipenv_sites =
+                socket_patch_core::crawlers::python_crawler::non_hatch_local_venv_site_packages(
+                    &common.cwd,
+                )
+                .await;
             socket_patch_core::crawlers::python_crawler::inherited_base_site_dirs(&pipenv_sites)
                 .await
         };
@@ -490,6 +488,23 @@ mod tests {
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
             detail.contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
+            "{detail}"
+        );
+
+        // A `.venv` Pipenv shares with Hatch (`path = ".venv"`) is still
+        // Pipenv's: its inherited base copy keeps the install-over remedy.
+        std::fs::remove_file(venv_site.join("six.py")).unwrap();
+        std::fs::remove_dir_all(venv_site.join("six-1.16.0.dist-info")).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\npath = \".venv\"\n",
+        )
+        .unwrap();
+        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        assert_eq!(out.warnings.len(), 1);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("pipenv run pip install --no-deps --ignore-installed"),
             "{detail}"
         );
     }

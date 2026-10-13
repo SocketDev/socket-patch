@@ -856,8 +856,9 @@ pub fn base_site_stale_install_remedy(lock: Option<&Value>, name: &str, dir: &st
          Pipfile.lock does not protect installs on this host. Install the locked release \
          over it inside the virtualenv, leaving the base interpreter untouched: `pipenv \
          requirements{categories} > pipenv-locked.txt && pipenv run pip install --no-deps \
-         --ignore-installed -r pipenv-locked.txt` (Pipenv {since}+), then delete \
-         pipenv-locked.txt — NOT `pipenv uninstall`, which rewrites the Pipfile and \
+         --ignore-installed -r pipenv-locked.txt` (Pipenv {since}+; it reinstalls every \
+         package of those lock categories into the virtualenv at its locked version), then \
+         delete pipenv-locked.txt — NOT `pipenv uninstall`, which rewrites the Pipfile and \
          re-locks the patch away"
     )
 }
@@ -2337,6 +2338,10 @@ mod tests {
         );
         assert!(remedy.contains(dir), "{remedy}");
         assert!(remedy.contains("NOT `pipenv uninstall`"), "{remedy}");
+        assert!(
+            remedy.contains("reinstalls every package of those lock categories"),
+            "{remedy}"
+        );
         for broken in [
             "pip uninstall",
             "pipenv --rm",
@@ -2361,7 +2366,7 @@ mod tests {
             remedy.contains("`pipenv requirements --categories \"packages docs\" > "),
             "{remedy}"
         );
-        assert!(remedy.contains("(Pipenv 2022.12+)"), "{remedy}");
+        assert!(remedy.contains("(Pipenv 2022.12+;"), "{remedy}");
         let remedy = base_site_stale_install_remedy(None, "six", dir);
         assert!(remedy.contains("`pipenv requirements > "), "{remedy}");
     }
