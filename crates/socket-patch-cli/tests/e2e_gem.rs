@@ -20,7 +20,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -60,20 +60,20 @@ fn git_sha256_file(path: &Path) -> String {
     git_sha256(&content)
 }
 
+/// Run the binary with the hermetic `SOCKET_*` environment (no token, so the
+/// scans take the public-proxy path `--proxy-url` pins). The gem crawler
+/// reads `BUNDLE_PATH`, `BUNDLE_APP_CONFIG`, the user's `~/.bundle/config`
+/// and the `gem env` homes (`GEM_HOME`, `GEM_PATH`, `~/.gem`), and the scans
+/// are unscoped, so every `BUNDLE_*` var, both gem-home vars and an
+/// activated venv are scrubbed and `HOME` points at a stand-in
+/// (`jvm_env::isolate_cli`): any of them would add the developer's gems or
+/// packages to the exact purl sets these tests assert.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle, hermetic::Extra::Venv]);
+    cmd.env_remove("GEM_HOME").env_remove("GEM_PATH");
+    common::jvm_env::isolate_cli(&mut cmd);
     cmd.args(args).current_dir(cwd);
-    // Hermeticity, mirroring the production e2e suites: scrub every ambient
-    // `SOCKET_*` (token, api/proxy URL, org, legacy aliases — not just the
-    // two token vars) and block the socket-cli config.json, so a developer's
-    // login or configured apiBaseUrl cannot silently repoint or re-tier
-    // these runs.
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env("SOCKET_NO_CONFIG", "true");
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
 
     let code = out.status.code().unwrap_or(-1);
@@ -94,6 +94,11 @@ fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, String) {
 fn bundle_run(cwd: &Path, args: &[&str]) {
     let mut cmd = Command::new("bundle");
     cmd.args(args).current_dir(cwd);
+    // Scrub first: the sweeps would otherwise remove the BUNDLE_PATH below,
+    // and an ambient `BUNDLE_*` (frozen, deployment, without, ...) would
+    // change what this install does.
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle]);
     // Bundler 4 removed `bundle install --path`; BUNDLE_PATH is honored by
     // bundler 2 through 4 and keeps the vendor/bundle/ruby/*/gems layout
     // `find_gem_dir` expects. It also upholds cache_env's hermeticity

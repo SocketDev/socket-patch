@@ -19,10 +19,9 @@
 //! Hermetic: every registry base and the patch API point at a
 //! guaranteed-dead local endpoint, and patch staging reads `.socket/blobs`.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic};
 
 use std::path::Path;
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
@@ -67,16 +66,20 @@ fn write_manifest(root: &Path, purl: &str, uuid: &str, file: &str, before: &[u8]
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
 }
 
-/// `vendor --json --vendor-source build` through the built binary with
-/// every ambient `SOCKET_*` var scrubbed, the API and every registry base
-/// pointed at `dead`, and `env` on top.
+/// `vendor --json --vendor-source service` through the built binary with
+/// the hermetic `SOCKET_*` environment, an activated venv, the gem homes
+/// and every ambient `BUNDLE_*` var scrubbed and `HOME` on a stand-in (they
+/// move the Python and gem stores the crawlers read), the API and every
+/// registry base pointed at `dead`, and `env` on top.
 fn run_vendor(
     root: &Path,
     dead: &str,
     extra: &[&str],
     env: &[(&str, &str)],
 ) -> (i32, serde_json::Value, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle, hermetic::Extra::Venv]);
+    crate::common::jvm_env::isolate_cli(&mut cmd);
     cmd.args([
         "vendor",
         "--json",
@@ -93,16 +96,10 @@ fn run_vendor(
     ])
     .args(extra)
     .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    for var in ["VIRTUAL_ENV", "CONDA_PREFIX", "BUNDLE_PATH", "GEM_HOME"] {
+    for var in ["CONDA_PREFIX", "GEM_HOME", "GEM_PATH"] {
         cmd.env_remove(var);
     }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_CRATES_REGISTRY", dead)
+    cmd.env("SOCKET_CRATES_REGISTRY", dead)
         .env("SOCKET_GOPROXY", dead)
         .env("SOCKET_PYPI_JSON_API", dead)
         .env("SOCKET_NPM_REGISTRY", dead)
@@ -850,7 +847,7 @@ async fn cargo_service_vendor_never_downloads_the_pristine_crate() {
     let empty_home = tmp.path().join("cargo-home");
     std::fs::create_dir_all(&empty_home).unwrap();
 
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.args([
         "vendor",
         "--json",
@@ -864,13 +861,7 @@ async fn cargo_service_vendor_never_downloads_the_pristine_crate() {
         "acme",
     ])
     .current_dir(&root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
     let out = cmd
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .env("SOCKET_CRATES_REGISTRY", registry.uri())
         .env("CARGO_HOME", &empty_home)
         .output()
@@ -975,7 +966,7 @@ async fn cargo_service_never_vendors_a_git_or_custom_registry_crate() {
         let empty_home = tmp.path().join("cargo-home");
         std::fs::create_dir_all(&empty_home).unwrap();
 
-        let mut cmd = Command::new(binary());
+        let mut cmd = hermetic::command(&binary());
         cmd.args([
             "vendor",
             "--json",
@@ -989,13 +980,7 @@ async fn cargo_service_never_vendors_a_git_or_custom_registry_crate() {
             "acme",
         ])
         .current_dir(&root);
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-                cmd.env_remove(key);
-            }
-        }
         let out = cmd
-            .env("SOCKET_TELEMETRY_DISABLED", "1")
             .env("SOCKET_CRATES_REGISTRY", registry.uri())
             .env("CARGO_HOME", &empty_home)
             .output()
