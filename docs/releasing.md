@@ -59,24 +59,22 @@ once with `dry-run: true` — that builds all 14 targets but skips tagging and
 publishing.
 
 The real run: re-verifies the release gate → builds the matrix → creates and
-pushes `v<version>` → creates the GitHub release with `SHA256SUMS` → fans out
-to crates.io and npm in parallel (both use OIDC trusted
-publishing; no long-lived registry secrets). Each registry leg is its own
-workflow (`publish-cargo.yml`, `publish-npm.yml`), dispatched at the release
-tag by the release run and watched to completion, so the job graph still reflects
-each registry's outcome (its step summaries link both leg runs) — and
-each leg can equally be dispatched by hand (see "If a job fails
-mid-release"). The `release.yml` header records why the legs are dispatched
-runs rather than reusable workflows (registry trusted-publisher filename
-matching; npm allows one publisher per package).
+pushes `v<version>` → creates the GitHub release with `SHA256SUMS` → publishes
+to crates.io and npm in parallel (both use OIDC trusted publishing; no
+long-lived registry secrets). The npm publish is the release run's own
+`npm-publish` job. The crates.io leg is its own workflow (`publish-cargo.yml`),
+dispatched at the release tag by the release run and watched to completion,
+so the job graph still reflects its outcome (the `cargo-publish` step summary
+links the leg run). The `release.yml` header records why npm runs inline and
+crates.io is dispatched (registries match the trusted publisher on the
+top-level workflow filename; npm allows one publisher per package).
 
 ## 4. Approve npm (the one manual step)
 
 The npm leg *stages* rather than publishes. Approve with 2FA — **platform
 packages first, then `@socketsecurity/socket-patch`** — so
 optionalDependencies resolution never sees the main package without its
-binaries. Approve from the **Publish npm** run's step summary links (the
-release run's `npm-publish` job summary links to that run), the
+binaries. Approve from the release run's `npm-publish` job summary links, the
 [org staged-packages dashboard](https://www.npmjs.com/settings/socketsecurity/staged-packages),
 or the CLI (`npm stage list` / `npm stage approve <stage-id>`, npm 11.15+).
 
@@ -106,21 +104,25 @@ partial release never requires deleting tags or re-bumping.
 
 1. **"Re-run failed jobs"** on the release run — right when the failure was
    transient (network, registry hiccup) and no workflow change is needed.
-   Re-running a failed fan-out job dispatches a fresh run of that registry's
-   publish workflow *as of the tag* (a re-run never picks up workflow edits).
-2. **Dispatch the failed registry's own workflow** — right when the fix
-   needed a change (registry-side config such as a trusted publisher, or a
-   workflow edit landed on the default branch): Actions → **Publish
-   crates.io** / **Publish npm** →
-   Run workflow, entering the release version (`X.Y.Z`, no `v`) and leaving
-   the other inputs blank. This runs the publish workflow as it exists on the
-   dispatched branch (default: the default branch), so workflow fixes apply.
-   Nothing rebuilds: each publish workflow checks out the `v<version>` tag
-   and npm takes the prebuilt binaries from the GitHub release's
-   assets, verified against `SHA256SUMS` — the same inputs the release run
-   would have published. The GitHub release must exist with all assets, so
-   failures in `build`, `tag`, or `github-release` itself are still fixed
-   via the release run.
+   Re-running `npm-publish` re-stages from the same run; re-running
+   `cargo-publish` dispatches a fresh run of `publish-cargo.yml` *as of the
+   tag*. A re-run never picks up workflow edits.
+2. **Retry just the failed registry** — right when the fix needed a change
+   (registry-side config such as a trusted publisher, or a workflow edit
+   landed on the default branch), or the release run is gone:
+   - **npm:** Actions → **Release** → Run workflow with `npm-retry-version`
+     set to the release version (`X.Y.Z`, no `v`). Every other job is
+     skipped; `npm-publish` re-stages from the existing release.
+   - **crates.io:** Actions → **Publish crates.io** → Run workflow, entering
+     the release version and leaving `distinct-id` blank.
+
+   Both run the workflow as it exists on the dispatched branch (default: the
+   default branch), so workflow fixes apply. Nothing rebuilds: each checks
+   out the `v<version>` tag, and npm takes the prebuilt binaries from the
+   GitHub release's assets, verified against `SHA256SUMS` — the same inputs
+   the release run would have published. The GitHub release must exist with
+   all assets, so failures in `build`, `tag`, or `github-release` itself are
+   still fixed via the release run.
 
 ## One-time registry setup
 
@@ -128,24 +130,18 @@ Both registries authenticate via OIDC trusted publishing, so a missing or
 misconfigured trusted publisher **fails that channel's job** — configure it
 before dispatching a real release. Neither workflow uses a deployment environment.
 
-Since the publish legs moved into their own workflow files, each trusted
-publisher is registered against repo `SocketDev/socket-patch` + **the
-publish workflow's filename** (not `release.yml`). The legs only ever run
-as top-level `workflow_dispatch` runs of their own file — whether the
-release run dispatched them or a maintainer did — so the OIDC token's
-`workflow_ref` and `job_workflow_ref` claims both name that file, and one
-registration per package satisfies both registries' top-level workflow matching.
+Each trusted publisher is registered against repo `SocketDev/socket-patch` +
+the filename of the **top-level** workflow that publishes, because both
+registries match the OIDC token's `workflow_ref` claim:
 
 | Registry | Publisher workflow |
 |----------|--------------------|
 | crates.io (`socket-patch-core`, `socket-patch-cli`) | `publish-cargo.yml` |
-| npm (main + 14 platform packages) | `publish-npm.yml` |
+| npm (main + 14 platform packages) | `release.yml` |
 
-**Migration from the `release.yml` publishers:** crates.io can carry the
-old `release.yml` publisher alongside the new one until every
-release run predating this split — whose re-run legs still authenticate as
-`release.yml` — has fully landed; then delete the `release.yml` publishers.
-npm allows only **one** trusted publisher per package, so its cutover is
-atomic: edit each package's publisher from `release.yml` to
-`publish-npm.yml` once no pre-split npm job may need re-running (approving
-already-staged versions needs no OIDC, only re-staging does).
+npm allows only **one** trusted publisher per package, so npm publishes from
+a job of `release.yml` itself — the release run and an `npm-retry-version`
+retry both run as `release.yml`. The crates.io leg always runs as a
+top-level `workflow_dispatch` run of `publish-cargo.yml`, whether the release
+run dispatched it or a maintainer did. crates.io allows several publishers
+per crate, so an old `release.yml` registration there can stay or go.

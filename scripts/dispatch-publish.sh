@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
 # Dispatches one registry publish workflow (publish-*.yml) at the release tag
 # and waits for the dispatched run to finish, propagating its conclusion.
-# Used by the publish fan-out jobs in release.yml — see that file's header
-# for why the legs run as separate workflow_dispatch runs rather than
-# reusable-workflow calls (registry trusted publishers match the TOP-LEVEL
-# workflow filename on npm/crates.io, and npm allows only one publisher per
-# package).
+# Used by release.yml's cargo-publish job — see that file's header for why
+# the crates.io leg runs as a separate workflow_dispatch run rather than a
+# reusable-workflow call (registry trusted publishers match the TOP-LEVEL
+# workflow filename).
 #
 # Usage: dispatch-publish.sh <workflow-file> <version> [key=value]...
-#   <workflow-file>  e.g. publish-npm.yml (must have a workflow_dispatch
+#   <workflow-file>  e.g. publish-cargo.yml (must have a workflow_dispatch
 #                    trigger with `version` and `distinct-id` inputs)
 #   <version>        X.Y.Z; the tag v<version> must exist (the dispatch runs
 #                    the workflow file as of that tag)
 #   [key=value]...   extra workflow inputs, passed through as `-f key=value`
-#                    (e.g. sums-digest=<sha256> for the npm leg)
 #
 # Requires: gh authenticated via GH_TOKEN with actions:write on
 # $GITHUB_REPOSITORY; GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT for run correlation.
