@@ -98,6 +98,7 @@ fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 /// local repository as the crawler's maven repo.
 fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
     let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     let _fixture = prebuilt_common::prepare_command(
         &mut cmd,
         cwd,
@@ -108,7 +109,6 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
         .current_dir(cwd)
         .env("MAVEN_REPO_LOCAL", m2)
         .env_remove("M2_HOME")
-        .env_remove("VIRTUAL_ENV")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

@@ -32,7 +32,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, hermetic_command};
+use common::{binary, git_sha256, hermetic, hermetic_command};
 
 #[path = "maven_build_common/mod.rs"]
 mod maven_build_common;
@@ -75,6 +75,7 @@ fn socket_in(
     args: &[&str],
 ) -> (Option<i32>, serde_json::Value, String) {
     let mut cmd = hermetic_command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     let mut caches = vec![("MAVEN_REPO_LOCAL", m2.to_str().unwrap())];
     if let Some(home) = gradle_home {
         caches.push(("GRADLE_USER_HOME", home.to_str().unwrap()));
@@ -84,7 +85,6 @@ fn socket_in(
         .current_dir(cwd)
         .env("MAVEN_REPO_LOCAL", m2)
         .env_remove("M2_HOME")
-        .env_remove("VIRTUAL_ENV")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

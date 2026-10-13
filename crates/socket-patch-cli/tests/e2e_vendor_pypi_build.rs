@@ -114,11 +114,12 @@ const ORACLE: &str = "import six; print(six.SOCKET_PATCHED)";
 // ── self-contained helpers ────────────────────────────────────────────
 
 /// Run socket-patch in the hermetic environment (`tests/common/hermetic.rs`)
-/// with `VIRTUAL_ENV` removed (a python-crawler discovery input that must
-/// not leak from the developer's shell).
+/// with `VIRTUAL_ENV` and `UV_PROJECT_ENVIRONMENT` removed: both are
+/// python-crawler discovery inputs that must not leak from the developer's
+/// shell, and `bake_leak_guards` sets the latter in this process.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pdm]);
     cmd.current_dir(cwd);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
