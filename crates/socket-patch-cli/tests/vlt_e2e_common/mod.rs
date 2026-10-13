@@ -1758,24 +1758,22 @@ pub fn urlencode(s: &str) -> String {
 
 // ── socket-patch ──────────────────────────────────────────────────────────
 
-/// The socket-patch binary with the ambient `SOCKET_*`, `VLT_*`, npm and
-/// proxy environment scrubbed.
+/// The socket-patch binary with the hermetic `SOCKET_*` environment (see
+/// `common::hermetic::command`) and the ambient `VLT_*`, npm and proxy
+/// environment scrubbed.
 pub fn socket_cmd() -> Command {
-    let mut cmd = Command::new(socket_bin());
+    let mut cmd = common::hermetic::command(&socket_bin());
     cache_env::scrub_ambient_vlt_env(&mut cmd);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if ["http_proxy", "https_proxy", "all_proxy", "no_proxy"]
             .iter()
             .any(|p| name.eq_ignore_ascii_case(p))
-            || name.starts_with("SOCKET_PATCH_VLT_E2E_")
         {
             cmd.env_remove(&key);
         }
     }
-    cmd.env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_NO_UPDATE_CHECK", "1")
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
+    cmd.envs(common::hermetic::FORCED_OPT_OUTS.iter().copied())
         .env("VLT_TELEMETRY", "0")
         .env("LANG", "C")
         .env("LC_ALL", "C");

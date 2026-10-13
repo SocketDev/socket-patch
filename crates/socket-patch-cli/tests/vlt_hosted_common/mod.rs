@@ -91,6 +91,8 @@ pub fn with_flags(line: &str, flags: u8) -> String {
     line.replacen("[0,", &format!("[{flags},"), 1)
 }
 
+#[path = "../common/hermetic.rs"]
+mod hermetic;
 #[path = "../common/oracle.rs"]
 mod oracle;
 
@@ -418,32 +420,19 @@ pub fn ledger_path(root: &Path) -> PathBuf {
     root.join(".socket/vendor/redirect-state.json")
 }
 
-/// The `socket-patch` binary with the ambient `SOCKET_*` and proxy
-/// environment scrubbed (telemetry opt-outs kept).
+/// The `socket-patch` binary with the hermetic `SOCKET_*` environment (see
+/// `hermetic::command`) and the ambient proxy environment scrubbed.
 pub fn scrubbed_cli() -> std::process::Command {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_OFFLINE", "true")
-        .env("SOCKET_NO_VLT_INSTALL_CLEANUP", "true")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_OFFLINE")
-        .env_remove("SOCKET_NO_VLT_INSTALL_CLEANUP");
+    let mut cmd = hermetic::binary_command();
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        let proxy = name.eq_ignore_ascii_case("http_proxy")
-            || name.eq_ignore_ascii_case("https_proxy")
-            || name.eq_ignore_ascii_case("all_proxy")
-            || name.eq_ignore_ascii_case("no_proxy");
-        if proxy
-            || (name.starts_with("SOCKET_")
-                && !name.contains("TELEMETRY")
-                && name != "SOCKET_NO_CONFIG")
+        if ["http_proxy", "https_proxy", "all_proxy", "no_proxy"]
+            .iter()
+            .any(|p| name.eq_ignore_ascii_case(p))
         {
             cmd.env_remove(&key);
         }
     }
-    cmd.env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_NO_UPDATE_CHECK", "1");
     cmd
 }
 
