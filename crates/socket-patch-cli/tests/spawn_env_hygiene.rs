@@ -30,9 +30,6 @@ use serial_test::serial;
 /// scrubs by hand.
 const PENDING_RAW_SPAWNS: &[&str] = &[
     "apply/apply_network.rs",
-    "e2e_cargo.rs",
-    "e2e_composer.rs",
-    "e2e_composer_version_identity.rs",
     "e2e_gem.rs",
     "e2e_hosted_production.rs",
     "e2e_maven.rs",
