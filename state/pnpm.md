@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-13 (run 39), main `15c2c83`, latest release 5.0.0. (main was force-pushed since run 38, so older SHAs in this ledger may not resolve any more.)
+Last updated: 2026-10-13 (run 40), main `4353a7c`, latest release 5.0.0. (main was force-pushed before run 39, so older SHAs in this ledger may not resolve any more.)
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -441,9 +441,18 @@ Run 39 additions (main `15c2c83`, release 5.0.0, Linux; #1074 `lockfile`-off ref
 | 11.28.3 | pass (pnpm ignores `.npmrc` `lockfile` / `package-lock`) | fail #1460 (false refusal) | correct refusal | — | — | — |
 | 12.11.2 | pass | fail #1460 | — | fail #1460 (2×, direct and via `npm exec`; a fresh frozen install with that env is patched) | fail #1460 (comment) | fail #935 (silent pin, regression since f3c6313a / #1008; good at 4d06019b) |
 
+Run 40 additions (main `4353a7c`, release 5.0.0, Linux; mock serves `left-pad@1.3.0` + `is-number@7.0.0`):
+
+| pnpm | #1460 env × major (4 vars) | Metadata-only mirror: hosted rollback / remove | Vendored A + hosted B: bare scan / remove A / remove B | Lockfile-only, major unknown + `npm_config_package_lock` | bundledDependencies: hosted (bundled only / + registry copy) / agent | `#1268` | `#935` `file:` dir |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 9.15.9 | pass ×4 (#1460 fixed) | pass / — | `mode_ambiguous` pass / pass / pass | refusal (by design) | pass / documented (vex declines) / pass | — | fail #935 |
+| 10.34.6 | pass ×4 | — | — / pass / — | — | — | — | — |
+| 11.28.3 | pass ×4 | — | — / pass / — | — | — | — | — |
+| 12.11.2 | pass ×4 | pass / pass | `mode_ambiguous` pass / pass / pass | refusal (by design); `devEngines` install → two-doc lock → pass | pass / documented / pass | fail #1268 | fail #935 |
+
 ## Backlog
 
-0w. **#1460 follow-ups**: re-verify once fixed (all four majors, both env families, and the `package-lock` fallback), and `sharedWorkspaceLockfile` via `npm_config_shared_workspace_lockfile` on 11/12 (same `view_setting` root cause, not yet verified). Also #1437 `mode_ambiguous` over pnpm vendored + hosted state (needs a second patched package in the mock).
+0w. #1460 is verified fixed (run 40, all 16 env × major cells). Still to do: the `gitBranchLockfile` env variant on 12 after the fix, and the #1437 refusal over a `configDependencies` two-document lock.
 0x. **#935 regression** (hosted silent pin over a `file:` copy, first bad f3c6313a): re-verify once fixed, also for `git+` copies. #1268 still reproduces on 12.11.2 (run 39).
 0y. #1266 (npm handover, pnpm cells commented in run 38): a scoped alias, a transitive alias and the hoisted linker.
 0z. Post-#1007 follow-ups: #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
@@ -484,6 +493,10 @@ Run 39 additions (main `15c2c83`, release 5.0.0, Linux; #1074 `lockfile`-off ref
 
 ## Known non-bugs
 
+- Lockfile-only pnpm checkout with no `packageManager`, no `node_modules/.modules.yaml` and a single-document lock: the pnpm major is unknown, so both `npm_config_*` and `pnpm_config_*` (and both settings files) are read, and `npm_config_package_lock=false` refuses even on a pnpm 12 lock. #1460 asked for exactly that ("both only when the major is unknown"). A real pnpm 11/12 install pinned by `packageManager` or `devEngines.packageManager` writes the two-document lock, so the major is detected (run 40).
+- Hosted scan beside a pnpm `bundledDependencies` copy of the same package pins the registry copy without a warning. CLI_CONTRACT puts pnpm bundled copies under "Unattested references": only `vex` omits them (`vex_pnpm_bundled_copy`), and agent mode patches the bundled copy (run 40).
+- pnpm 9.15.9 in the same checkout after a hosted pin: `pnpm install --frozen-lockfile` (with or without `--prefer-offline`) says "Already up to date", keeps the upstream bytes and only updates `node_modules/.pnpm/lock.yaml`. pnpm 10/11/12 refetch. This is the documented "Reinstall after redirecting" limitation (docs/testing/pnpm-compatibility.md, "Reliable installation"; run 40).
+- After `get A --mode vendored` + `get B --mode hosted`, `remove A` leaves an empty `overrides:` key in `pnpm-workspace.yaml` on 10/11/12. That's cosmetic: install, re-vendor and fresh frozen installs all work (run 40).
 - pnpm's `lockfile` setting: pnpm 10.34.6 ignores `lockfile: false` in `pnpm-workspace.yaml` (`pnpm config get` says false, but it writes and uses the lock); pnpm 11.28.3 / 12.11.2 ignore `lockfile=false` and `package-lock=false` in `.npmrc`; pnpm 9/10 ignore YAML `packageLock: false`. socket-patch's file-based reading matches all of this (run 39). Global `~/.npmrc` / `config.yaml` aren't read; that's documented ("only the project's own files").
 - `npm run` / `npm exec` export `npm_config_package_lock=` (empty = false) only when an npmrc sets `package-lock=false`; with no setting, nothing is exported. pnpm 10 `pnpm run` exports `npm_config_lockfile=true` only when the YAML sets it.
 
