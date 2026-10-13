@@ -82,8 +82,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::vex_e2e_common::{
-    assert_attested, assert_not_attested, binary, git_sha256, patch_view, run_vex, statements_for,
-    strip_ledgers, strip_manifest, Marker, PatchApi, VexOutcome, VexRun, VexVia,
+    assert_attested, assert_not_attested, binary, git_sha256, hermetic, patch_view, run_vex,
+    statements_for, strip_ledgers, strip_manifest, Marker, PatchApi, VexOutcome, VexRun, VexVia,
 };
 
 /// Appended to the installed module by the synthetic patch.
@@ -196,7 +196,7 @@ impl Uv {
     /// oracle), the cache sandbox applied, then `cache` as `UV_CACHE_DIR`.
     fn command(&self, cwd: &Path, args: &[OsString], cache: &Path) -> Command {
         let mut cmd = Command::new(&self.exe);
-        scrub_python_env(&mut cmd);
+        scrub_tool_env(&mut cmd);
         cmd.args(args).current_dir(cwd);
         crate::cache_env::isolate(&mut cmd);
         cmd.env("UV_CACHE_DIR", cache);
@@ -231,14 +231,21 @@ impl Uv {
     }
 }
 
+/// [`scrub_python_env`] plus the ambient `SOCKET_*` sweep, for the uv /
+/// python / pip children.
+fn scrub_tool_env(cmd: &mut Command) {
+    hermetic::scrub_socket_vars(cmd);
+    scrub_python_env(cmd);
+}
+
+/// Remove the ambient python / uv / pip config and `VIRTUAL_ENV`. `SOCKET_*`
+/// is left to the caller: `hermetic::command` for the binary (sweeping it
+/// here would drop the opt-outs that builder forces on) and
+/// [`scrub_tool_env`] for everything else.
 fn scrub_python_env(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("PYTHON")
-            || name.starts_with("UV_")
-            || name.starts_with("PIP_")
-            || name.starts_with("SOCKET_")
-        {
+        if name.starts_with("PYTHON") || name.starts_with("UV_") || name.starts_with("PIP_") {
             cmd.env_remove(&key);
         }
     }
@@ -690,17 +697,13 @@ impl ScanApi {
     }
 }
 
-/// Run `socket-patch <args>` with the ambient `SOCKET_*` / python env
-/// scrubbed.
+/// Run `socket-patch <args>` with the hermetic `SOCKET_*` environment and
+/// the ambient python env scrubbed.
 fn socket_patch(cwd: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     scrub_python_env(&mut cmd);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .current_dir(cwd)
-        .output()
-        .expect("spawn socket-patch")
+    cmd.current_dir(cwd).output().expect("spawn socket-patch")
 }
 
 fn envelope(out: &Output, what: &str) -> Value {
@@ -865,7 +868,7 @@ fn build(uv: &Uv, lane: Lane, mode: Mode, tmp: &Path) -> Result<Built, String> {
                 Mode::Vendored => &["six==1.16.0"],
             };
             let mut cmd = Command::new(host_python());
-            scrub_python_env(&mut cmd);
+            scrub_tool_env(&mut cmd);
             crate::cache_env::isolate(&mut cmd);
             let out = cmd
                 .args(["-m", "pip", "lock"])
@@ -1063,7 +1066,7 @@ fn install(uv: &Uv, lane: Lane, dir: &Path, cache: &Path, offline: bool, frozen:
 
 fn oracle(_uv: &Uv, dir: &Path, _cache: &Path) -> String {
     let mut cmd = Command::new(venv_python(dir));
-    scrub_python_env(&mut cmd);
+    scrub_tool_env(&mut cmd);
     let out = cmd
         .args(["-c", ORACLE])
         .current_dir(dir)
@@ -2207,7 +2210,7 @@ pub fn production_manifestless(p: &Production<'_>) {
     strip_manifest(&fresh);
     let sync = |dir: &Path, cache: &Path, offline: bool| {
         let mut cmd = Command::new(p.uv);
-        scrub_python_env(&mut cmd);
+        scrub_tool_env(&mut cmd);
         crate::cache_env::isolate(&mut cmd);
         if let Some(py) = std::env::var_os("SOCKET_PATCH_UV_E2E_PYTHON").filter(|p| !p.is_empty()) {
             cmd.env("UV_PYTHON", py);

@@ -55,9 +55,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "vendor/in_process_vendor_bun.rs",
     "vendor/vendor_gem_lockfile_only_e2e.rs",
     "vendor/vendor_rerun_no_network_e2e.rs",
-    "vex_e2e_common/uv.rs",
-    "vex_pdm_hatch_common/mod.rs",
-    "vex_pipenv_pip_common/mod.rs",
 ];
 
 /// The environment `cmd`'s child would see: the parent environment with
