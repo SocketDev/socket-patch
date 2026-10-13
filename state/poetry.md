@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-13 (run 19), main `15c2c83` (includes #1419, the #409 fix; #1440, the #1437 fix; #1444, the #1220 fix), latest tag **v5.0.0** (published 2026-10-12). Run 9 re-measured the cells marked "r9". Runs 10–19 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136 and #1282 are closed. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-13 (run 20), main `aa85c6c` (includes #1451, the #1447 fix; #1475 / #1486, the #1473 batched-rewrite and read-only VEX parse), latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–20 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282 and #1447 are closed. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -197,7 +197,7 @@ Global installs aren't Poetry-specific (Poetry never installs globally unless `v
 | 2.5.1 | same | pass (rewired + `*_source_constraint` advisory, installs patched) |
 | 1.5.1, 2.2.1, 2.5.1 | `source = "PyPI"` spelling | same as `"pypi"` (pass) |
 | 1.2.2 | `source = "pypi"`, hosted + vendored | pass (installs patched) |
-| 1.3.0, 1.3.1, 1.3.2 | `source = "pypi"`, hosted + vendored | **fail #1447** (versionless stamp: guard skipped, install solver failure); control without `source` passes |
+| 1.3.0, 1.3.1, 1.3.2 | `source = "pypi"`, hosted + vendored | **fail #1447** (versionless stamp: guard skipped, install solver failure); 1.3.2 r20 pass (fixed by #1451); control without `source` passes |
 | 2.2.1, 1.8.5 | Explicit `[[tool.poetry.source]] name = "PyPI"` primary + `source = "PyPI"` | guard correct (forced rewrite still fails "Repository \"pypi\" does not exist.") |
 | 2.2.1 | Path dep (`develop = true`) whose own pyproject pins six `source = "pypi"`, hosted | pass (transitive pin doesn't break install) |
 | 2.2.1 | PEP 621 `[project]` deps + `[tool.poetry.dependencies] six = {source = "pypi"}` | pass (refused) |
@@ -230,15 +230,33 @@ Mock now serves two packages: six (patches A, B) and toml 0.10.2 (patch T).
 | 2.5.1, 1.8.5 | `name = "PyPI" priority = "primary"` + supplemental mirror, hosted + vendored | pass |
 | 2.5.1 | #1220: 2-pin hosted rollback / takeover under `ulimit -n 100` | pass |
 
+### Run 20 cells (Linux, main `aa85c6c`)
+
+Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3, charset-normalizer), each a real wheel with a marker appended to one module.
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 1.3.2 | #1447 re-check (`source = "pypi"`), hosted + vendored | pass (refused before any write; fixed by #1451) |
+| 1.2.2 | same | pass (rewritten, installs patched with 1.2.2) |
+| writer 1.1.15 / 1.2.2 (lock 1.1) → installer 1.3.2, 2.0.1, 2.2.1, 2.3.4, 2.4.3, 2.5.1 | `source = "pypi"` rewrite, hosted + vendored, fresh install | **fail #1503** (`Repository "pypi" does not exist.`; advisory says 2.3+ install it) |
+| writer 2.3.4 / 2.5.1 (lock 2.1) → installer 2.3.4 / 2.5.1 | same | pass (installs patched) |
+| 1.1.15, 1.8.5, 2.5.1 (LF + CRLF) | #1475 batch: 8 hosted pins in one lock, byte-compared to release v5.0.0 | pass (byte-identical) |
+| 1.1.15, 1.8.5, 2.5.1 (LF + CRLF) | same, fresh install (8/8 patched), vex (1 statement, 8 subcomponents), rollback byte-identical | pass |
+| 1.1.15 (CRLF) | Lock-only hosted vex over `[metadata.files]` lock (#1486 read-only parse) | pass (8 subcomponents) |
+| 1.1.15, 2.5.1 (LF + CRLF) | Vendored 8-package batch: install, `vendor --check`, `--revert` byte-identical | pass |
+| 2.5.1 | Interrupted vendored scan (SIGKILL at 0.5–11 s, right after the lock write, right after `state.json`): check, rescan, revert, fresh install | pass (partial wheels harmless; rescan converges; stale `apply.lock` doesn't block) |
+| 2.5.1, 1.8.5 | Hosted rollback, then `poetry sync` / `install --sync`: upstream bytes back, vex refuses (`manifest_not_found`) | pass |
+| 2.5.1 | #450 | still fails |
+
 ## Backlog
 
-1. Re-check #1447 once #1451 merges: Poetry 1.3.0–1.3.2 locks with `source = "pypi"` must be refused; 1.2.2 and 2.3+ keep rewriting. Also try a 1.3-written lock installed by 1.2 / 2.5 (writer ≠ installer).
+1. Re-check #1503 once fixed: lock 1.0 / 1.1 with a `source = "pypi"` dep must be refused (or the advisory corrected); lock 2.1 from 2.3+ keeps rewriting.
 2. Re-check #1105 (hosted A → vendored B, warm venv), #1184 (export residual keep) and #450 once fixed.
 3. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy. That follows from #538's "patch every copy" design and needs a maintainer call before anyone files it. Since #409 (#1419), a system-site venv that imports a base copy also patches that base copy, on purpose.
-4. Interrupted vendored / hosted runs (kill between the lock write and the ledger write), using a slow-mock delay; concurrent `poetry install` during a scan.
+4. Concurrent `poetry install` during a scan; interrupted hosted runs (vendored done in run 20).
 5. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
-6. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 19 (runs 9–19). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
-7. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). Line 43 says 1.1 – 1.3 install a `source = "pypi"` rewrite (1.3 doesn't, #1447). CLI_CONTRACT's error-code row for `mode_ambiguous` still names only agent + vendored state (the mode-resolution paragraph has the #1437 hosted-pin case).
+6. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 20 (runs 9–20). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+7. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's error-code row for `mode_ambiguous` still names only agent + vendored state (the mode-resolution paragraph has the #1437 hosted-pin case).
 
 ## Known non-bugs
 
@@ -308,3 +326,5 @@ Mock now serves two packages: six (patches A, B) and toml 0.10.2 (patch T).
 - six as a git dependency (`[package.source] type = "git"`): hosted (`redirect_poetry_lock_unsupported`) and vendored (`pypi_poetry_source_already_exists`, exit 1) refuse it before any write. Documented user-authored-source refusal.
 - `rollback` / `vendor --revert` exit 1 with `vendor_revert_kept` / `vendor_revert_residual_reference` when another `poetry.lock` under the project tree (e.g. a test copy in a subdirectory) still references the vendored wheel. That's the guard working, so keep scratch copies outside the project.
 - After `remove` of one package in a vendored + hosted project, a bare `scan` follows the remaining state and re-adds patches the service still offers. `remove` isn't an ignore rule; use `socket.yml` `ignorePackages`.
+- Poetry 1.0.10 can't lock a `source = "pypi"` dependency at all ("doesn't exist, version solving failed"), so the source-pin guard has no lock-format-1.0 case.
+- A vendored scan killed partway leaves `.socket/apply.lock` and some wheels under `.socket/vendor/pypi` with the lock untouched; the next scan proceeds and converges. Not a bug.
