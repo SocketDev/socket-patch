@@ -502,13 +502,13 @@ fn provably_appended(text: &str, block: &Block) -> bool {
 /// The blank line + indent to put before a declaration restored in place of
 /// `block`. The rewriter's `^\s*gem` match swallowed whatever whitespace
 /// preceded the original line, which no file records, so this re-derives the
-/// conventional layout from the neighbors: right after another declaration
-/// or a comment, the neighbor's indent and no blank line; anywhere else
-/// inside a block (right after its `group … do`, after an `end` or a
-/// statement, #1476), the indent of the line that opened the enclosing
-/// block + 2 and no blank line; after anything else at the top level
-/// (`source`, `ruby`, `end`, …) one blank line and the indent of the
-/// declaration that follows, if any.
+/// conventional layout from the neighbors: right after the line that opens
+/// the enclosing block (`group … do`), that line's indent + 2; right after
+/// another declaration or a comment, the neighbor's indent and no blank
+/// line; before another declaration, one blank line and that declaration's
+/// indent; anywhere else inside a block (after an `end` or a statement,
+/// #1476), the enclosing block's indent + 2 and no blank line; anywhere
+/// else at the top level (after `source`, `ruby`, `end`, …) one blank line.
 fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
     let Some(prev) = line_before(text, block.start) else {
         return String::new();
@@ -517,26 +517,25 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let enclosing = block_stack(text, block.start)
+    let stack = block_stack(text, block.start);
+    let enclosing = stack.last().map(|f| indent_of(&text[f.line..]));
+    if stack
         .last()
-        .map(|&(_, indent)| indent);
-    let opened_by_prev = || {
-        block_stack(text, block.start).len()
-            > block_stack(text, line_before_start(text, block.start)).len()
-    };
-    if (trimmed.starts_with('#') || gem_declaration_any(trimmed).is_some()) && !opened_by_prev() {
+        .is_some_and(|f| f.line == line_before_start(text, block.start))
+    {
+        return format!("{}  ", indent_of(prev));
+    }
+    if trimmed.starts_with('#') || gem_declaration_any(trimmed).is_some() {
         return indent_of(prev).to_string();
     }
-    if let Some(indent) = enclosing {
-        return format!("{indent}  ");
-    }
     let next = text[block.end..].split('\n').next().unwrap_or_default();
-    let indent = if gem_declaration_any(next.trim()).is_some() {
-        indent_of(next)
-    } else {
-        ""
-    };
-    format!("{eol}{indent}")
+    if gem_declaration_any(next.trim()).is_some() {
+        return format!("{eol}{}", indent_of(next));
+    }
+    match enclosing {
+        Some(indent) => format!("{indent}  "),
+        None => eol.to_string(),
+    }
 }
 
 /// Whether byte `at` of the manifest sits inside a `source "<url>" do`
@@ -544,59 +543,102 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
 /// Bundler records a dependency declared there with a `!` source pin in the
 /// lock's `DEPENDENCIES`, whichever URL the block names (#1056).
 fn in_source_block(text: &str, at: usize) -> bool {
-    block_stack(text, at).iter().any(|&(source, _)| source)
+    block_stack(text, at).iter().any(|f| f.source)
 }
 
-/// The Ruby constructs still open at byte `at` of the manifest, outermost
-/// first, each with the indent of the line that opened it: `true` for a
-/// `source … do` block, `false` for anything else that Ruby closes with
-/// `end` (`group … do`, `if`, `case`, `def`, …). A
-/// word-level count over each line's code: a construct opened and closed
-/// on one line nets out, and a keyword opens one wherever it starts an
-/// expression (`v = if …`, `(case …`, #1476), not only at the start of a
-/// line, so its `end` never closes an enclosing block.
-fn block_stack(text: &str, at: usize) -> Vec<(bool, &str)> {
-    let mut open: Vec<(bool, &str)> = Vec::new();
-    for line in text[..at].lines() {
-        let code = masked_ruby_code(line);
-        let code = code.trim();
-        let source_line = code
+/// A Ruby construct still open at some point of the manifest.
+struct Frame {
+    /// A `source … do` block (anything else Ruby closes with `end`:
+    /// `group … do`, `if`, `case`, `def`, … is not).
+    source: bool,
+    /// Byte offset of the start of the line that opened it.
+    line: usize,
+}
+
+/// The Ruby constructs still open at byte `at` (a line start) of the
+/// manifest, outermost first. A word-level count over each line's code:
+/// a construct opened and closed on one line nets out, and a keyword opens
+/// one wherever it starts an expression (`v = if …`, `require: case …`,
+/// #1476), not only at the start of a line, so its `end` never closes an
+/// enclosing block. String, `%w[]`, regexp and backtick literals,
+/// comments, `=begin` … `=end` blocks and heredoc bodies are not code.
+fn block_stack(text: &str, at: usize) -> Vec<Frame> {
+    let mut open: Vec<Frame> = Vec::new();
+    let mut block_comment = false;
+    // Pending heredoc terminators: (identifier, may be indented).
+    let mut heredocs: std::collections::VecDeque<(String, bool)> = Default::default();
+    let mut start = 0;
+    for raw in text[..at].split_inclusive('\n') {
+        let line_start = start;
+        start += raw.len();
+        let line = raw.trim_end_matches(['\n', '\r']);
+        // `=begin` / `=end` start at column 0 and are followed by
+        // whitespace or the end of the line (Ruby's own rule).
+        let marker = |word: &str| {
+            line.strip_prefix(word)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        };
+        if block_comment {
+            block_comment = !marker("=end");
+            continue;
+        }
+        if let Some((id, indented)) = heredocs.front() {
+            let body = if *indented { line.trim_start() } else { line };
+            if body == id {
+                heredocs.pop_front();
+            }
+            continue;
+        }
+        if marker("=begin") {
+            block_comment = true;
+            continue;
+        }
+        let code = ruby_code(line);
+        let masked = masked_ruby_code(code);
+        heredocs.extend(heredoc_openers(code, &masked));
+        let masked = masked.trim();
+        let mut source_do = masked
             .strip_prefix("source")
             .is_some_and(|rest| rest.starts_with([' ', '\t', '(']));
-        let mut source_do = source_line;
-        // A `while`/`until`/`for` opened on this line takes its optional
-        // `do` as part of the loop, not as a block of its own.
-        let mut loop_do = false;
-        for (word, start, end) in ruby_words(code) {
-            let opens = match word {
-                "do" if loop_do => {
-                    loop_do = false;
-                    false
+        for statement in masked.split(';') {
+            // A `while`/`until`/`for` takes its optional `do` as part of
+            // the loop, not as a block of its own.
+            let mut loop_do = false;
+            // The word after `def` is the method's name (`def begin`).
+            let mut method_name = false;
+            for (word, start, end) in ruby_words(statement) {
+                if std::mem::take(&mut method_name) {
+                    continue;
                 }
-                "do" => true,
-                "if" | "unless" => starts_expression(&code[..start]),
-                "while" | "until" => {
-                    let opens = starts_expression(&code[..start]);
-                    loop_do |= opens;
-                    opens
+                let opens = match word {
+                    "do" => !std::mem::take(&mut loop_do),
+                    "if" | "unless" => starts_expression(&statement[..start]),
+                    "while" | "until" => {
+                        let opens = starts_expression(&statement[..start]);
+                        loop_do |= opens;
+                        opens
+                    }
+                    "for" => {
+                        loop_do = true;
+                        true
+                    }
+                    "def" => {
+                        method_name = true;
+                        !endless_def(&statement[end..])
+                    }
+                    "case" | "begin" | "class" | "module" => true,
+                    "end" => {
+                        open.pop();
+                        false
+                    }
+                    _ => false,
+                };
+                if opens {
+                    open.push(Frame {
+                        source: word == "do" && std::mem::take(&mut source_do),
+                        line: line_start,
+                    });
                 }
-                "for" => {
-                    loop_do = true;
-                    true
-                }
-                "def" => !endless_def(&code[end..]),
-                "case" | "begin" | "class" | "module" => true,
-                "end" => {
-                    open.pop();
-                    false
-                }
-                _ => false,
-            };
-            if opens {
-                open.push((
-                    word == "do" && std::mem::take(&mut source_do),
-                    indent_of(line),
-                ));
             }
         }
     }
@@ -608,16 +650,15 @@ fn block_stack(text: &str, at: usize) -> Vec<(bool, &str)> {
 /// so are a predicate or bang (`begin?`) and a hash label (`if:`).
 fn ruby_words(code: &str) -> impl Iterator<Item = (&str, usize, usize)> {
     let bytes = code.as_bytes();
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut i = 0;
     std::iter::from_fn(move || {
         while i < bytes.len() {
-            if !is_ident(bytes[i]) {
+            if !is_ident_byte(bytes[i]) {
                 i += 1;
                 continue;
             }
             let start = i;
-            while i < bytes.len() && is_ident(bytes[i]) {
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
                 i += 1;
             }
             let prev_ok = start == 0 || !matches!(bytes[start - 1], b':' | b'.' | b'@' | b'$');
@@ -634,18 +675,56 @@ fn ruby_words(code: &str) -> impl Iterator<Item = (&str, usize, usize)> {
     })
 }
 
-/// Whether a keyword after `before` (the code before it on its line)
-/// starts an expression, as opposed to modifying the statement before it
-/// (`gem "x" if cond`, `x.save! if y`).
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii()
+}
+
+/// Whether a keyword or literal after `before` (the masked code before it
+/// in its statement) starts an expression, as opposed to modifying the
+/// statement before it (`gem "x" if cond`, `x.save! if y`) or dividing.
 fn starts_expression(before: &str) -> bool {
     let before = before.trim_end();
-    match before.as_bytes().last() {
-        None => true,
-        Some(b'=' | b'(' | b'[' | b'{' | b',' | b';' | b'|' | b'&') => true,
-        Some(_) => before
-            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .next()
-            .is_some_and(|w| matches!(w, "then" | "else" | "do" | "begin" | "ensure")),
+    let Some(last) = before.bytes().next_back() else {
+        return true;
+    };
+    match last {
+        b'=' | b'(' | b'[' | b'{' | b',' | b'|' | b'&' | b'>' | b'<' | b'+' | b'-' | b'*'
+        | b'~' => true,
+        // A unary `!`, not a bang method (`x.save! if y`).
+        b'!' => before.len() == 1 || !is_ident_byte(before.as_bytes()[before.len() - 2]),
+        // A label (`require: if …`) or a ternary's `:`, not `Foo::`.
+        b':' => !before.ends_with("::"),
+        // A ternary's `?`, not a predicate (`x.empty? if y`).
+        b'?' => before[..before.len() - 1].ends_with(char::is_whitespace),
+        b if is_ident_byte(b) => {
+            let word_start = before
+                .bytes()
+                .rposition(|b| !is_ident_byte(b))
+                .map_or(0, |i| i + 1);
+            let called = word_start > 0
+                && matches!(before.as_bytes()[word_start - 1], b'.' | b':' | b'@' | b'$');
+            !called
+                && matches!(
+                    &before[word_start..],
+                    "then"
+                        | "else"
+                        | "elsif"
+                        | "do"
+                        | "begin"
+                        | "ensure"
+                        | "and"
+                        | "or"
+                        | "not"
+                        | "when"
+                        | "in"
+                        | "if"
+                        | "unless"
+                        | "while"
+                        | "until"
+                        | "case"
+                )
+        }
+        _ => false,
     }
 }
 
@@ -655,7 +734,7 @@ fn starts_expression(before: &str) -> bool {
 fn endless_def(rest: &str) -> bool {
     let rest = rest.trim_start();
     let name_len = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '?' | '!')))
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '?' | '!')))
         .unwrap_or(rest.len());
     let (name, mut tail) = rest.split_at(name_len);
     if name.is_empty() {
@@ -674,35 +753,115 @@ fn endless_def(rest: &str) -> bool {
         .is_some_and(|t| !t.starts_with(['=', '~', '>']))
 }
 
-/// [`ruby_code`] with every quoted string's contents masked (`x`), so a
-/// keyword inside a string literal never counts as code.
-fn masked_ruby_code(line: &str) -> String {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    ruby_code(line)
-        .chars()
-        .map(|c| match quote {
-            Some(_) if escaped => {
-                escaped = false;
-                'x'
-            }
-            Some(_) if c == '\\' => {
-                escaped = true;
-                'x'
-            }
-            Some(q) if c == q => {
-                quote = None;
-                c
-            }
-            Some(_) => 'x',
-            None => {
-                if c == '"' || c == '\'' {
-                    quote = Some(c);
+/// `code` (a comment-stripped line) with the contents of every string,
+/// backtick, `%`-literal (`%w[…]`, `%i(…)`, `%q{…}`, …) and regexp literal
+/// masked as `x`, byte for byte, so a keyword inside one never counts as
+/// code. The delimiters stay.
+fn masked_ruby_code(code: &str) -> String {
+    let bytes = code.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let (open, close, body) = match b {
+            b'"' | b'\'' | b'`' => (b, b, i + 1),
+            b'/' if starts_expression(&code[..i]) => (b, b, i + 1),
+            b'%' if starts_expression(&code[..i]) => {
+                let mut j = i + 1;
+                if matches!(
+                    bytes.get(j),
+                    Some(b'w' | b'W' | b'i' | b'I' | b'q' | b'Q' | b'r')
+                ) {
+                    j += 1;
                 }
-                c
+                let Some(&open) = bytes.get(j) else {
+                    break;
+                };
+                if open.is_ascii_alphanumeric() || open.is_ascii_whitespace() || !open.is_ascii() {
+                    i += 1;
+                    continue;
+                }
+                let close = match open {
+                    b'(' => b')',
+                    b'[' => b']',
+                    b'{' => b'}',
+                    b'<' => b'>',
+                    _ => open,
+                };
+                (open, close, j + 1)
             }
-        })
-        .collect()
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut depth = 0usize;
+        let mut j = body;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if c == b'\\' {
+                out[j] = b'x';
+                if j + 1 < bytes.len() {
+                    out[j + 1] = b'x';
+                }
+                j += 2;
+                continue;
+            }
+            if c == close && depth == 0 {
+                break;
+            }
+            if open != close && c == open {
+                depth += 1;
+            } else if open != close && c == close {
+                depth -= 1;
+            }
+            out[j] = b'x';
+            j += 1;
+        }
+        i = j + 1;
+    }
+    // The delimiters are ASCII, so a masked run never cuts a multi-byte
+    // character: the result is still UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| code.to_string())
+}
+
+/// The heredocs a line opens (`<<~EOS`, `<<-"EOS"`, `<<EOS`), in order, as
+/// (terminator, may be indented). `masked` is `code` through
+/// [`masked_ruby_code`], so an opener inside a literal does not count; an
+/// append (`list << x`, `a<<B`) is not an opener.
+fn heredoc_openers(code: &str, masked: &str) -> Vec<(String, bool)> {
+    let bytes = masked.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(at) = masked[i..].find("<<").map(|p| p + i) {
+        i = at + 2;
+        if at > 0 && (is_ident_byte(bytes[at - 1]) || matches!(bytes[at - 1], b')' | b']' | b'}')) {
+            continue;
+        }
+        let mut j = at + 2;
+        let indented = matches!(bytes.get(j), Some(b'~' | b'-'));
+        if indented {
+            j += 1;
+        }
+        let id = match bytes.get(j) {
+            Some(&q @ (b'"' | b'\'' | b'`')) => code[j + 1..]
+                .find(q as char)
+                .map(|end| &code[j + 1..j + 1 + end]),
+            Some(&b) if b.is_ascii_alphabetic() || b == b'_' => {
+                let len = masked[j..]
+                    .bytes()
+                    .position(|b| !is_ident_byte(b))
+                    .unwrap_or(masked.len() - j);
+                Some(&code[j..j + len])
+            }
+            _ => None,
+        };
+        if let Some(id) = id.filter(|id| !id.is_empty()) {
+            out.push((id.to_string(), indented));
+            i = j + 1;
+        }
+    }
+    out
 }
 
 /// `line` without its trailing `#` comment. A `#` inside a quoted string
@@ -1239,6 +1398,19 @@ mod tests {
         // only the block goes.
         let t = format!("gem \"puma\"\n{block}\n");
         assert_eq!(run(&t, &Decl::Transitive), "gem \"puma\"\n");
+        // After an inner `end` inside a block (#1476): the block's indent +
+        // 2, a blank line only when another declaration follows.
+        let t = format!("group :test do\n  if x\n    gem \"a\"\n  end\n{block}\nend\n");
+        assert_eq!(
+            run(&t, &direct),
+            "group :test do\n  if x\n    gem \"a\"\n  end\n  gem \"rails\", \"7.0.0\"\nend\n"
+        );
+        let t =
+            format!("group :test do\n  if x\n    gem \"a\"\n  end\n{block}\n  gem \"b\"\nend\n");
+        assert_eq!(
+            run(&t, &direct),
+            "group :test do\n  if x\n    gem \"a\"\n  end\n\n  gem \"rails\", \"7.0.0\"\n  gem \"b\"\nend\n"
+        );
         let t = format!("gem \"puma\"\n{block}\n");
         assert_eq!(
             run(&t, &Decl::Direct(constraint_args("rails (>= 6, ~> 7.0)"))),
@@ -1601,6 +1773,10 @@ mod tests {
             "foo(1, if true",
             "x = 1; if true",
             "v = [case 1\n  when 1 then 2",
+            "gem \"foo\", require: if ENV[\"A\"]",
+            "gem \"foo\", :require => case ENV[\"A\"]\n  when \"x\" then 1",
+            "v = c ? case x\n  when 1 then 2",
+            "v = a and if b",
             "v = for x in [] do",
             "if a then 1 else\n  2 end; v = (if true",
         ] {
@@ -1638,6 +1814,13 @@ mod tests {
             "def x = 1",
             "def x(a) = a",
             "v = loop { break }",
+            "v = compute.then if ENV[\"X\"]",
+            "gem \"a\", require: %w[active_support/core_ext/class]",
+            "gem \"a\", platforms: %i[mri case]",
+            "gem \"a\" if RUBY_PLATFORM =~ /linux|case/",
+            "v = `echo if`",
+            "v = a / b if c",
+            "v = a % b if c",
         ] {
             let t = format!("source \"https://x\" do\n  {line}\nend\ngem \"rails\"\n");
             assert!(!at(&t), "{t}");
@@ -1645,6 +1828,28 @@ mod tests {
         // A `while … do` loop takes one `end`, not two.
         assert!(!at(
             "source \"https://x\" do\n  while false do\n  end\nend\ngem \"rails\"\n"
+        ));
+        // A `;` ends the loop's statement: a later `do` opens a block.
+        assert!(at(
+            "source \"https://x\" do\n  while q.any?; q.each do |x|\n  end\n  end\n  gem \"rails\"\nend\n"
+        ));
+        // A method named like a keyword is a name (`def begin`).
+        assert!(!at(
+            "source \"https://x\" do\n  def begin\n    1\n  end\nend\ngem \"rails\"\n"
+        ));
+        // `=begin` … `=end` comments and heredoc bodies are not code.
+        assert!(!at(
+            "source \"https://x\" do\n=begin\nGems for the CI box\n=end\nend\ngem \"rails\"\n"
+        ));
+        assert!(at(
+            "source \"https://x\" do\n  NOTE = <<~EOS\n    the end\n    end\n  EOS\n  gem \"rails\"\nend\n"
+        ));
+        assert!(at(
+            "source \"https://x\" do\n  NOTE = <<-'EOS' + <<B\n  if case\n  EOS\nend\nB\n  gem \"rails\"\nend\n"
+        ));
+        // An append is not a heredoc.
+        assert!(at(
+            "source \"https://x\" do\n  list << FOO\n  end_marker = 1\n  gem \"rails\"\nend\n"
         ));
         // A setter `def x=(v)` still needs its `end`.
         assert!(at(
