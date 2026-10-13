@@ -131,7 +131,7 @@ pub(super) fn rewrite_poetry(
                 text: content,
                 steps,
             },
-            lock_version,
+            batch_lock_version,
         ) = rewrite_poetry_lock_all_with_version(original, &deps);
         let mut stale_warned = false;
         // `pre_1_4_writer` reads only the first line and `[metadata]
@@ -167,7 +167,7 @@ pub(super) fn rewrite_poetry(
                     }
                     if !stale_warned {
                         if let Some(format) = *writer_format.get_or_insert_with(|| {
-                            pre_1_4_writer(&content, lock_version.as_deref())
+                            pre_1_4_writer(&content, batch_lock_version.as_deref())
                         }) {
                             stale_warned = true;
                             // Poetry 1.0 installs url sources through pip, which reads
@@ -515,10 +515,10 @@ mod equivalence_tests {
                     1,
                     "{version} crlf={crlf}"
                 );
-                // The batch parses the lock and its rendering, and nothing
-                // else re-parses it (the stale-install check reads the
-                // batch's parse); its fragments are found and counted in
-                // one pass over the original and one over the result (#1473).
+                // The batch parses the lock and its rendering, and the
+                // stale-install check reads the batch's parse instead of its
+                // own; the fragments are found and counted in one pass over
+                // the original and one over the result (#1473).
                 assert_eq!(
                     PARSES.with(|parses| parses.get()),
                     2,

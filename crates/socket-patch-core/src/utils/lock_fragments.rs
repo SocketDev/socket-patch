@@ -18,15 +18,16 @@ thread_local! {
     /// Whole-lock renders this thread's rewrites took, each followed by a
     /// full re-parse: what a hosted rewrite of N deps must not pay N times.
     pub(crate) static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Whole-lock parses this thread's hosted rewrites took (the batch's
-    /// parse of the original and of its rendering, and any reader's).
+    /// Whole-lock parses at the instrumented sites: [`rewrite_batch`]'s
+    /// parse of the original and of its rendering, and the Poetry
+    /// redirect's stale-install check when it has to parse for itself.
     pub(crate) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Passes over a whole lock text that [`rewrite_batch`] took to find or
-    /// count fragments: what a batch of N deps must not pay N times.
+    /// Whole-text fragment searches [`rewrite_batch`] took to find or count
+    /// its changed fragments: what a batch of N deps must not pay N times.
     pub(crate) static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Count one [`PARSES`] / [`SCANS`] tick (tests only).
+/// Count one tick of a test counter ([`RENDERS`], [`PARSES`], [`SCANS`]).
 #[cfg(test)]
 pub(crate) fn tick(counter: &'static std::thread::LocalKey<std::cell::Cell<usize>>) {
     counter.with(|count| count.set(count.get() + 1));
@@ -232,7 +233,7 @@ pub(crate) fn finish<'a>(
     fragments_in: FragmentsIn,
 ) -> Result<FragmentRewrite<'a>, String> {
     #[cfg(test)]
-    RENDERS.with(|renders| renders.set(renders.get() + 1));
+    tick(&RENDERS);
     let before = before?;
     let rendered = crate::utils::python_lock::preserve_line_endings(text, rendered);
     let after_doc = toml_edit::Document::parse(rendered).map_err(|e| e.to_string())?;
@@ -400,7 +401,7 @@ pub(crate) fn rewrite_batch<P>(
         });
     }
     #[cfg(test)]
-    RENDERS.with(|renders| renders.set(renders.get() + 1));
+    tick(&RENDERS);
     let rendered = crate::utils::python_lock::preserve_line_endings(text, lock.to_string());
     #[cfg(test)]
     tick(&PARSES);

@@ -574,8 +574,8 @@ pub fn rewrite_poetry_lock_all(text: &str, deps: &[PoetryLockDep]) -> LockBatch 
 /// [`rewrite_poetry_lock_all`], plus the lock's `lock_version` when the
 /// batch read it from its own parse (`None` when it went step by step, or
 /// the lock has no supported version), so a caller needn't parse the lock
-/// again for it. No package rewrite touches `[metadata]`, so it is the
-/// rewritten lock's version too.
+/// again for it. No package rewrite touches `[metadata] lock-version`, so
+/// it is the rewritten lock's version too.
 pub fn rewrite_poetry_lock_all_with_version(
     text: &str,
     deps: &[PoetryLockDep],
