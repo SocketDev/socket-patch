@@ -456,16 +456,9 @@ fn registry_derives_tarball(
     use crate::vendor::registry_fetch::{
         npm_registry_base, npm_tarball_is_conventional, DEFAULT_NPM_REGISTRY,
     };
-    let project = project_registry.unwrap_or(DEFAULT_NPM_REGISTRY);
-    let default = npm_registry_base();
-    let bases = if from_project {
-        vec![project]
-    } else {
-        vec![default.as_str(), project]
-    };
-    bases
-        .iter()
-        .any(|base| npm_tarball_is_conventional(base, name, version, tarball))
+    let conventional = |base: &str| npm_tarball_is_conventional(base, name, version, tarball);
+    conventional(project_registry.unwrap_or(DEFAULT_NPM_REGISTRY))
+        || (!from_project && conventional(&npm_registry_base()))
 }
 
 /// The `npm:` locator yarn berry writes for `name@version` resolved from the
@@ -912,14 +905,14 @@ async fn restore_berry(
         let Some(found) = dists.get(&(name.clone(), version.clone())) else {
             continue;
         };
+        let dist = &found.dist;
         let locator = berry_registry_locator(
             registries.get(&name).and_then(Option::as_deref),
             found.from_project,
             &name,
             &version,
-            &found.dist.tarball,
+            &dist.tarball,
         );
-        let dist = &found.dist;
         let resolution = format!("  resolution: \"{locator}\"");
         let mut lines = stanza_lines(&blocks[idx]);
         if let Some(pinned) = with_body_field(&lines, "resolution", &resolution) {
@@ -1496,14 +1489,11 @@ fn pnpm_lock_tarball_evidence(
                 // No document was read: the lock's URL came from the
                 // registry pnpm names, the default one when it names none.
                 let registry = registry(name);
-                let own = registry.as_deref().and_then(non_default_registry);
-                derived |= registry_derives_tarball(
-                    registry.as_deref(),
-                    own.is_some(),
-                    name,
-                    version,
-                    tarball,
-                );
+                let own = registry
+                    .as_deref()
+                    .is_some_and(|r| non_default_registry(r).is_some());
+                derived |=
+                    registry_derives_tarball(registry.as_deref(), own, name, version, tarball);
             }
         }
     }
@@ -2763,9 +2753,10 @@ mod tests {
     use super::{
         berry_lookup_registry, berry_registry_locator, bun_env_registry, bun_lookup_registry,
         bun_registry_slot, bun_tarball_url, expand_url_env, modules_yaml_pnpm_major,
-        non_default_registry, package_json_pnpm_major, pnpm_include_tarball, pnpm_lookup_registry,
-        pnpm_tarball_guess_warning, registry_derives_tarball, rush_json_pnpm_major, rush_lock_root,
-        split_userinfo, yaml_top_level_value, yarn_expand_env, PnpmTarballGuess, ProjectDist,
+        non_default_registry, package_json_pnpm_major, pnpm_include_tarball,
+        pnpm_lock_tarball_evidence, pnpm_lookup_registry, pnpm_tarball_guess_warning,
+        registry_derives_tarball, rush_json_pnpm_major, rush_lock_root, split_userinfo,
+        yaml_top_level_value, yarn_expand_env, PnpmTarballGuess, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
@@ -4133,6 +4124,23 @@ mod tests {
             "1.0.0",
             "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
         ));
+    }
+
+    /// #1465: behind a mirror that passes npmjs's documents through, pnpm
+    /// records the npmjs URLs as `tarball:` because it cannot derive them
+    /// from the mirror, so they say nothing about
+    /// lockfile-include-tarball-url. Without the mirror they prove it on.
+    #[test]
+    fn npmjs_tarballs_behind_a_mirror_are_no_tarball_setting_evidence() {
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  a@1.0.0:\n    \
+                    resolution: {integrity: sha512-AAAA, tarball: \
+                    https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n";
+        let mirror = |_: &str| Some("https://r.example/npm".to_string());
+        assert_eq!(pnpm_lock_tarball_evidence(lock, mirror, |_| false), None);
+        assert_eq!(
+            pnpm_lock_tarball_evidence(lock, |_| None, |_| false),
+            Some(true)
+        );
     }
 
     #[test]
