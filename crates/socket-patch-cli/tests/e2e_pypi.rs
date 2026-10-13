@@ -20,8 +20,6 @@ use common::{binary, git_sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
-
 use common::cache_env;
 
 // ---------------------------------------------------------------------------
@@ -52,30 +50,18 @@ fn git_sha256_file(path: &Path) -> String {
 
 /// Run the CLI binary with the given args, setting `cwd` as the working dir.
 ///
-/// The environment is pinned hard: every env var the CLI binds (the canonical
-/// `GLOBAL_ARG_ENV_VARS` / `LOCAL_ARG_ENV_VARS` lists) is scrubbed so ambient
-/// developer/CI configuration can't change the lifecycle under test. Scrubbing `SOCKET_API_TOKEN` also forces the
+/// The child gets the hermetic `SOCKET_*` environment, which forces the
 /// public-proxy (free-tier) path this suite relies on. The stakes are higher
 /// here than in the offline suites: an inherited `SOCKET_GLOBAL=true` takes
 /// `get`/`apply` out of the temp venv and patches the host's real
 /// site-packages, while `SOCKET_MANIFEST_PATH` relocates `.socket/` (verified
 /// to fail `get` outright) and `SOCKET_DRY_RUN` / `SOCKET_SAVE_ONLY` turn the
-/// apply steps into silent no-ops. The hostile seeds below are cleared by the
-/// scrub loop — the child never sees them — but if the scrub is ever dropped
-/// the seeds (rather than a developer's ambient shell, which this suite can't
-/// rely on) turn the tests red immediately.
+/// apply steps into silent no-ops. An activated venv is scrubbed too, so the
+/// crawler patches the suite's own `.venv` rather than the developer's.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("SOCKET_GLOBAL", "true")
-        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
-        .env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_SAVE_ONLY", "true")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json");
-    for var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS) {
-        cmd.env_remove(var);
-    }
+    let mut cmd = common::hermetic_command(&binary());
+    common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Venv]);
+    cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
 
     let code = out.status.code().unwrap_or(-1);

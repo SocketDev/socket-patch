@@ -15,10 +15,10 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic};
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -46,11 +46,12 @@ async fn start_proxy() -> MockServer {
 /// Run the binary as a blocking subprocess (off the async runtime so the
 /// in-test proxy can service its requests concurrently), pinned to `proxy_url`.
 ///
-/// `SOCKET_API_TOKEN` is stripped so the binary deterministically takes the
-/// public-proxy path (an ambient token would flip it onto the authenticated
-/// API, bypassing `--proxy-url`), and every other variable that could
-/// redirect the API elsewhere or disable it is scrubbed so an ambient value
-/// can't quietly change what the scan reports.
+/// The child gets the hermetic `SOCKET_*` environment (no token, so the
+/// binary deterministically takes the public-proxy path `--proxy-url`
+/// pins). The scans are unscoped, so an activated venv is scrubbed and
+/// `HOME` points at a stand-in (`jvm_env::isolate_cli`): the developer's
+/// venv, `~/.m2` or user site-packages would add packages to the counts
+/// these tests assert.
 async fn run(args: &[&str], cwd: &Path, nuget_packages: &Path, proxy_url: &str) -> Output {
     let mut args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     args.extend(["--proxy-url".to_string(), proxy_url.to_string()]);
@@ -58,16 +59,12 @@ async fn run(args: &[&str], cwd: &Path, nuget_packages: &Path, proxy_url: &str) 
     let nuget_packages = nuget_packages.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        Command::new(binary())
-            .args(&arg_refs)
+        let mut cmd = common::hermetic_command(&binary());
+        hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+        common::jvm_env::isolate_cli(&mut cmd);
+        cmd.args(&arg_refs)
             .current_dir(&cwd)
             .env("NUGET_PACKAGES", &nuget_packages)
-            .env_remove("SOCKET_API_TOKEN")
-            .env_remove("SOCKET_CLI_API_TOKEN")
-            .env_remove("SOCKET_API_URL")
-            .env_remove("SOCKET_OFFLINE")
-            .env_remove("SOCKET_PROXY_URL")
-            .env_remove("SOCKET_BATCH_SIZE")
             .output()
             .expect("Failed to run socket-patch binary")
     })

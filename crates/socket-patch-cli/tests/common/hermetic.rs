@@ -39,6 +39,7 @@ const HOSTILE_SEEDS: &[(&str, &str)] = &[
     ("SOCKET_GLOBAL", "true"),
     ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
     ("SOCKET_DRY_RUN", "true"),
+    ("SOCKET_SAVE_ONLY", "true"),
     ("SOCKET_ECOSYSTEMS", "cargo"),
     ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
     ("SOCKET_JSON", "true"),

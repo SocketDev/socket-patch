@@ -16,7 +16,6 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 
@@ -48,19 +47,11 @@ const DISCOVERY_VARS: &[&str] = &[
 /// Run the binary in `cwd` with the `SOCKET_*` and discovery env scrubbed
 /// and exactly `env` added.
 fn run(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(common::binary());
+    let mut cmd = common::hermetic_command(&common::binary());
     cmd.args(args).current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") {
-            cmd.env_remove(&key);
-        }
-    }
     for name in DISCOVERY_VARS {
         cmd.env_remove(name);
     }
-    cmd.env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_NO_UPDATE_CHECK", "1");
     for (k, v) in env {
         cmd.env(k, v);
     }
