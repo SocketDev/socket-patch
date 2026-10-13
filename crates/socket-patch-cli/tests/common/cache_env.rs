@@ -318,8 +318,9 @@ fn scrub_parent_vars(cmd: &mut Command, parent: Vec<OsString>, ambient: fn(&str)
 
 // ── Ambient-env scrub for the vlt suites ──────────────────────────────
 
-/// True for an ambient variable the real-vlt suites strip from every child
-/// (vlt and the CLI under test) before [`isolate`]:
+/// True for an ambient variable the real-vlt suites strip from every vlt
+/// child before [`isolate`] (a `socket-patch` child built with
+/// `hermetic::command` takes [`scrub_ambient_vlt_tool_env`] instead):
 ///
 /// * every `VLT_*` — vlt reads each config option from `VLT_<OPTION>`
 ///   (`VLT_REGISTRY`, `VLT_REGISTRIES`, `VLT_CACHE`, `VLT_STORE_LINKER`);
@@ -341,6 +342,18 @@ pub fn is_ambient_vlt_var(name: &str) -> bool {
 /// from `cmd` (call it before [`isolate`], see the module docs).
 pub fn scrub_ambient_vlt_env(cmd: &mut Command) {
     scrub_parent_vars(cmd, parent_var_names(), is_ambient_vlt_var);
+}
+
+/// [`is_ambient_vlt_var`] minus `SOCKET_*`.
+fn is_ambient_vlt_tool_var(name: &str) -> bool {
+    !name.starts_with("SOCKET_") && is_ambient_vlt_var(name)
+}
+
+/// [`scrub_ambient_vlt_env`] minus `SOCKET_*`, for a `socket-patch` child
+/// built with `hermetic::command`: the builder already handled `SOCKET_*`,
+/// and removing them again would undo the opt-outs it forces on.
+pub fn scrub_ambient_vlt_tool_env(cmd: &mut Command) {
+    scrub_parent_vars(cmd, parent_var_names(), is_ambient_vlt_tool_var);
 }
 
 // ── Self-tests ────────────────────────────────────────────────────────
@@ -451,6 +464,24 @@ mod cache_env_selftests {
             "NODE_OPTIONS_X",
         ] {
             assert!(!is_ambient_vlt_var(name), "{name} must survive the scrub");
+        }
+    }
+
+    /// The CLI-child variant keeps every `SOCKET_*`, so it never undoes
+    /// the opt-outs `hermetic::command` forces on, and still strips the
+    /// vlt, npm and Python config.
+    #[test]
+    fn ambient_vlt_tool_scrub_leaves_socket_vars_to_the_hermetic_builder() {
+        for name in [
+            "SOCKET_TELEMETRY_DISABLED",
+            "SOCKET_NO_UPDATE_CHECK",
+            "SOCKET_NO_CONFIG",
+            "SOCKET_API_TOKEN",
+        ] {
+            assert!(!is_ambient_vlt_tool_var(name), "{name} must survive");
+        }
+        for name in ["VLT_REGISTRY", "npm_config_registry", "VIRTUAL_ENV"] {
+            assert!(is_ambient_vlt_tool_var(name), "{name} must be scrubbed");
         }
     }
 
