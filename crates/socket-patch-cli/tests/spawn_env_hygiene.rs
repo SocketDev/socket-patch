@@ -34,9 +34,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_composer.rs",
     "e2e_composer_version_identity.rs",
     "e2e_gem.rs",
-    "e2e_golang.rs",
-    "e2e_golang_build.rs",
-    "e2e_golang_workspace_build.rs",
     "e2e_hosted_production.rs",
     "e2e_maven.rs",
     "e2e_npm.rs",
@@ -51,7 +48,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_vendored_production.rs",
     "e2e_vex_vendor.rs",
     "rollback/rollback_multicopy_blob_gate.rs",
-    "vendor/e2e_golang_redirect.rs",
     "vendor/in_process_vendor_bun.rs",
     "vendor/vendor_gem_lockfile_only_e2e.rs",
     "vendor/vendor_rerun_no_network_e2e.rs",
@@ -305,6 +301,11 @@ fn command_drops_flag_bound_vars_set_after_it_is_built() {
             ("SOCKET_DEBUG", "1"),
             ("SOCKET_PROXY_URL", "http://ambient.invalid"),
             ("SOCKET_SKIP_ROLLBACK", "true"),
+            // Peer aliases the binary promotes onto `SOCKET_API_TOKEN` & co.
+            ("SOCKET_CLI_API_TOKEN", "late-token"),
+            ("SOCKET_CLI_ORG_SLUG", "late-org"),
+            ("SOCKET_CLI_API_BASE_URL", "http://ambient.invalid"),
+            ("SOCKET_CLI_NO_API_TOKEN", "1"),
         ],
         || {
             let env = effective_env(&cmd);
@@ -313,6 +314,10 @@ fn command_drops_flag_bound_vars_set_after_it_is_built() {
                 "SOCKET_DEBUG",
                 "SOCKET_PROXY_URL",
                 "SOCKET_SKIP_ROLLBACK",
+                "SOCKET_CLI_API_TOKEN",
+                "SOCKET_CLI_ORG_SLUG",
+                "SOCKET_CLI_API_BASE_URL",
+                "SOCKET_CLI_NO_API_TOKEN",
             ] {
                 assert_eq!(get(&env, key), None, "{key} set after build leaked");
             }
