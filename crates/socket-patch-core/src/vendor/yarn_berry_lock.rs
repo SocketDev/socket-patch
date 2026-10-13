@@ -236,6 +236,23 @@ impl NpmLockBackend for YarnBerryBackend {
                 ),
             ));
         }
+        // A `file:` / url / `portal:` / `link:` copy of the package under
+        // ANOTHER dependency name (`lp2@file:…`, #939): the name-keyed
+        // resolutions entry never moves it, so it keeps installing the
+        // unpatched bytes. Named, like the alias entries above.
+        for (key, source) in
+            super::yarn_copies::other_name_copies(project_root, &lock_text, name, version).await
+        {
+            warnings.push(VendorWarning::new(
+                "vendor_copy_unpatched",
+                format!(
+                    "{YARN_LOCK} entry `{key}` installs {name}@{version} under another \
+                     dependency name, from {}; the name-keyed resolutions entry vendoring \
+                     writes never reaches it, so that copy stays UNPATCHED",
+                    super::yarn_copies::copy_origin(&source)
+                ),
+            ));
+        }
         let (target_idx, target_is_ours) = target_gate(&scan, name, version)?;
         Ok(YarnBerryPlan {
             lock_text,
@@ -2398,6 +2415,104 @@ __metadata:
                 .any(|w| w.code == "vendor_alias_entry_skipped"),
             "{warnings:?}"
         );
+    }
+
+    /// #939: yarn berry keys a `file:` tarball / directory, a url tarball
+    /// and a `portal:` / `link:` dependency by the DEPENDENCY name
+    /// (`lp2@…`), so a copy of left-pad@1.3.0 under another name escapes the
+    /// name-keyed resolutions entry and installs unpatched. Vendoring still
+    /// wires the registry entry, names that copy (`vendor_copy_unpatched`),
+    /// and leaves it byte-untouched. Control: a `file:` / `portal:` copy
+    /// holding another package is not named.
+    #[tokio::test]
+    async fn issue_939_other_name_copies_are_named() {
+        let ws = "vendor-spike%40workspace%3A.";
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let cases = [
+            (
+                "file: tarball",
+                format!("lp2@file:./forks/left-pad-1.3.0.tgz::locator={ws}"),
+                "1.3.0",
+                format!(
+                    "lp2@file:./forks/left-pad-1.3.0.tgz#./forks/left-pad-1.3.0.tgz::hash=5c8e4c&locator={ws}"
+                ),
+            ),
+            (
+                "file: directory",
+                format!("lp2@file:./forks/left-pad::locator={ws}"),
+                "1.3.0",
+                format!("lp2@file:./forks/left-pad#./forks/left-pad::hash=1a2b3c&locator={ws}"),
+            ),
+            (
+                "registry tarball url",
+                format!("lp2@{url}"),
+                "1.3.0",
+                format!("lp2@{url}"),
+            ),
+            (
+                "portal:",
+                format!("lp2@portal:./forks/left-pad::locator={ws}"),
+                "0.0.0-use.local",
+                format!("lp2@portal:./forks/left-pad::locator={ws}"),
+            ),
+            (
+                "link:",
+                format!("lp2@link:./forks/left-pad::locator={ws}"),
+                "0.0.0-use.local",
+                format!("lp2@link:./forks/left-pad::locator={ws}"),
+            ),
+        ];
+        for (case, key, version, resolution) in &cases {
+            for fork in ["left-pad", "other-pkg"] {
+                let named = fork == "left-pad" || case.contains("url");
+                let block = format!(
+                    "\n\"{key}\":\n  version: {version}\n  resolution: \"{resolution}\"\n  \
+                     languageName: node\n  linkType: hard\n"
+                );
+                let lock = format!("{B3_BEFORE_LOCK}{block}");
+                let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+                let forks = fx.tmp.path().join("forks");
+                tokio::fs::create_dir_all(forks.join("left-pad"))
+                    .await
+                    .unwrap();
+                tokio::fs::write(
+                    forks.join("left-pad-1.3.0.tgz"),
+                    crate::vex::discover::testing::npm_tgz(fork, "1.3.0"),
+                )
+                .await
+                .unwrap();
+                tokio::fs::write(
+                    forks.join("left-pad/package.json"),
+                    format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+                )
+                .await
+                .unwrap();
+
+                let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{case}: {:?}", result.error);
+                assert!(entry.is_some(), "{case}: the registry entry still vendors");
+                let copies: Vec<&VendorWarning> = warnings
+                    .iter()
+                    .filter(|w| w.code == "vendor_copy_unpatched")
+                    .collect();
+                assert_eq!(
+                    copies.len(),
+                    usize::from(named),
+                    "{case}/{fork}: {warnings:?}"
+                );
+                if named {
+                    assert!(
+                        copies[0].detail.contains(&format!("`\"{key}\"`"))
+                            && copies[0].detail.contains("UNPATCHED"),
+                        "{case}: {}",
+                        copies[0].detail
+                    );
+                }
+                let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+                assert!(text.contains("left-pad@file:./"), "{case}: rewired: {text}");
+                assert!(text.contains(&block), "{case}: copy byte-untouched: {text}");
+            }
+        }
     }
 
     /// When the ONLY entry for the patched version is an alias descriptor,
