@@ -14,7 +14,8 @@ and an empty `BUN_INSTALL_CACHE_DIR` to regenerate. Bun 1.2+ fixtures include
 - 1.3.14 / 1.4.2: current optional configuration extensions.
 - `*-extensions`: root and workspace scripts, a GitHub resolution, and
   catalogs on 1.2.23 and 1.4.2.
-- `1.4.2-scoped-overrides`: a nested `overrides` entry, whose `sCoPdOvR`
+- `1.4.2-scoped-overrides`: a nested `overrides` entry (unused by the
+  installed packages), whose `sCoPdOvR`
   extension Bun writes after `cNfGvRsN`, and a `!` workspace pattern
   (#1492); written on Linux x64.
 - `0.8.1-production` / `1.0.0-production`: a production dependency and a

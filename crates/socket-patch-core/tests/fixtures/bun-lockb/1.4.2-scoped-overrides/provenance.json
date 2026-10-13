@@ -3,5 +3,5 @@
   "os": "linux",
   "arch": "x86_64",
   "command": "bun install --ignore-scripts",
-  "sha256": "8457e49fdea55b978377ab1eb478156328079765db4206abe297003bf780d817"
+  "sha256": "b5b1bcb3da1c54bc439014d0e1cbe3d214af5cbb7412a9060a46d7e7404655a6"
 }
