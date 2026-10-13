@@ -581,3 +581,241 @@ async fn restore_retires_a_leftover_berry_selector() {
         );
     }
 }
+
+// ── #1445: a uv override pin `uv remove` / `uv lock -P` left behind ──────
+// Hosted uv wires a TRANSITIVE package with an `override-dependencies`
+// entry (under the rewrite's ownership comment) plus a `[tool.uv.sources]`
+// URL, which uv.lock records under `[manifest] overrides`. Once the parent
+// stops depending on it (`uv remove <parent>`, `uv lock --upgrade-package
+// <parent>`), uv drops its `[[package]]` but never edits the override or
+// the source, so both lines (and the manifest record) are left behind.
+// That is Socket's own leftover pin, not contested state.
+
+const SIX_PATCH: &str = "66666666-6666-4666-8666-666666666666";
+
+fn six_hosted_url() -> String {
+    format!(
+        "https://patch.socket.dev/patch/pypi/six/1.16.0/{GRANT}/{SIX_PATCH}/six-1.16.0-py2.py3-none-any.whl"
+    )
+}
+
+/// The pristine project: `isodate` is the only declared dependency.
+const UV_ORPHAN_PYPROJECT_PRISTINE: &str = "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\
+     requires-python = \">=3.9\"\ndependencies = [\"isodate>=0.6\"]\n";
+
+/// The uv.lock real uv (0.11) writes for the leftover wiring after `uv lock
+/// --upgrade-package isodate` (0.7.2 no longer depends on six), with the
+/// `[manifest]` block `manifest` (`None`: no manifest record).
+fn uv_orphan_lock(manifest: Option<&str>) -> String {
+    let manifest = manifest.map(|m| format!("{m}\n\n")).unwrap_or_default();
+    format!(
+        "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n{manifest}\
+         [[package]]\nname = \"demo\"\nversion = \"0.1.0\"\nsource = {{ virtual = \".\" }}\n\
+         dependencies = [\n    {{ name = \"isodate\" }},\n]\n\n\
+         [package.metadata]\nrequires-dist = [{{ name = \"isodate\", specifier = \">=0.6\" }}]\n\n\
+         [[package]]\nname = \"isodate\"\nversion = \"0.7.2\"\n\
+         source = {{ registry = \"https://pypi.org/simple\" }}\n\
+         sdist = {{ url = \"https://files.pythonhosted.org/packages/54/4d/e940025e2ce31a8ce1202635910747e5a87cc3a6a6bb2d00973375014749/isodate-0.7.2.tar.gz\", hash = \"sha256:4cd1aa0f43ca76f4a6c6c0292a85f40b35ec2e43e315b59f06e6d32171a953e6\", size = 29705, upload-time = \"2024-10-08T23:04:11.5Z\" }}\n\
+         wheels = [\n    {{ url = \"https://files.pythonhosted.org/packages/15/aa/0aca39a37d3c7eb941ba736ede56d689e7be91cab5d9ca846bde3999eba6/isodate-0.7.2-py3-none-any.whl\", hash = \"sha256:28009937d8031054830160fce6d409ed342816b543597cece116d966c6d99e15\", size = 22320, upload-time = \"2024-10-08T23:04:09.501Z\" }},\n]\n"
+    )
+}
+
+/// A uv project whose hosted six pin (a transitive of isodate 0.6.1) was
+/// left behind by `uv lock --upgrade-package isodate`. `marked`: the
+/// override carries the hosted rewrite's ownership comment (else it is the
+/// user's own pin).
+fn write_uv_override_left_by_relock(root: &std::path::Path, marked: bool) {
+    let mark = if marked {
+        "    # socket-patch hosted: pins a patched transitive dependency; rollback removes it\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        root.join("pyproject.toml"),
+        format!(
+            "{UV_ORPHAN_PYPROJECT_PRISTINE}\n[tool.uv]\noverride-dependencies = [\n{mark}    \
+             \"six==1.16.0\",\n]\n\n[tool.uv.sources]\nsix = {{ url = \"{}\" }}\n",
+            six_hosted_url()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("uv.lock"),
+        uv_orphan_lock(Some(&format!(
+            "[manifest]\noverrides = [{{ name = \"six\", url = \"{}\" }}]",
+            six_hosted_url()
+        ))),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn uv_override_left_by_relock_is_stale_not_contested() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_uv_override_left_by_relock(tmp.path(), true);
+    let inv = inventory(tmp.path()).await;
+    assert!(
+        inv.contested.is_empty(),
+        "a leftover override pin is not contested: {inv:?}"
+    );
+    assert!(inv.contested_refusal().is_none());
+    assert!(inv.pins.is_empty(), "{inv:?}");
+    assert_eq!(inv.stale.len(), 1, "{inv:?}");
+    assert_eq!(inv.stale[0].purl, "pkg:pypi/six@1.16.0");
+    assert_eq!(inv.stale[0].uuid, SIX_PATCH);
+    assert_eq!(inv.stale[0].files, vec!["uv.lock".to_string()]);
+    assert!(!inv.is_empty(), "the leftover override is hosted state");
+}
+
+#[tokio::test]
+async fn uv_override_left_beside_a_live_hosted_pin_is_stale() {
+    // Another package is still hosted-pinned in the same lock: that one is a
+    // pin, the leftover six override is stale, and nothing is contested.
+    let tmp = tempfile::tempdir().unwrap();
+    write_uv_project(tmp.path(), PATCH, None);
+    let pyproject = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    // The live pin is six 1.17.0; the leftover is `other` 1.0.0.
+    let other = format!(
+        "https://patch.socket.dev/patch/pypi/other/1.0.0/{GRANT}/{SIX_PATCH}/other-1.0.0-py3-none-any.whl"
+    );
+    let pyproject = pyproject.replace(
+        "override-dependencies = [\"six==1.17.0\"]",
+        "override-dependencies = [\"six==1.17.0\",\n    \
+             # socket-patch hosted: pins a patched transitive dependency; rollback removes it\n    \
+             \"other==1.0.0\",\n]",
+    ) + &format!("other = {{ url = \"{other}\" }}\n");
+    std::fs::write(tmp.path().join("pyproject.toml"), pyproject).unwrap();
+    let lock = std::fs::read_to_string(tmp.path().join("uv.lock")).unwrap();
+    let lock = lock.replacen(
+        "\n\n[[package]]",
+        &format!("\n\n[manifest]\noverrides = [{{ name = \"other\", url = \"{other}\" }}]\n\n[[package]]"),
+        1,
+    );
+    std::fs::write(tmp.path().join("uv.lock"), lock).unwrap();
+    let inv = inventory(tmp.path()).await;
+    assert!(inv.contested.is_empty(), "{inv:?}");
+    let pinned: Vec<&str> = inv.pins.iter().map(|p| p.uuid.as_str()).collect();
+    assert_eq!(pinned, vec![PATCH], "{inv:?}");
+    assert_eq!(inv.stale.len(), 1, "{inv:?}");
+    assert_eq!(inv.stale[0].purl, "pkg:pypi/other@1.0.0");
+    assert_eq!(inv.stale[0].uuid, SIX_PATCH);
+}
+
+#[tokio::test]
+async fn users_own_uv_override_left_by_relock_stays_contested() {
+    // Without the hosted rewrite's ownership comment the override is the
+    // user's own pin: nothing says the wiring is Socket's to retire.
+    let tmp = tempfile::tempdir().unwrap();
+    write_uv_override_left_by_relock(tmp.path(), false);
+    let inv = inventory(tmp.path()).await;
+    assert!(inv.stale.is_empty(), "{inv:?}");
+    assert!(inv.contested_refusal().is_some(), "{inv:?}");
+}
+
+#[tokio::test]
+async fn uv_override_still_in_the_lock_is_not_stale() {
+    // The lock still resolves six from the registry while the metadata
+    // routes it to the hosted wheel: the pair disagrees (half reverted),
+    // which stays contested.
+    let tmp = tempfile::tempdir().unwrap();
+    write_uv_override_left_by_relock(tmp.path(), true);
+    let lock = std::fs::read_to_string(tmp.path().join("uv.lock")).unwrap();
+    std::fs::write(
+        tmp.path().join("uv.lock"),
+        lock + "\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n\
+                source = { registry = \"https://pypi.org/simple\" }\n",
+    )
+    .unwrap();
+    let inv = inventory(tmp.path()).await;
+    assert!(inv.stale.is_empty(), "{inv:?}");
+    assert!(inv.contested_refusal().is_some(), "{inv:?}");
+}
+
+#[tokio::test]
+async fn restore_retires_a_leftover_uv_override() {
+    use socket_patch_core::patch::redirect::upstream::{
+        restore_upstream, PinStatus, RestoreOptions,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write_uv_override_left_by_relock(tmp.path(), true);
+    let inv = inventory(tmp.path()).await;
+    // Offline: retiring a leftover needs no registry lookup.
+    let opts = RestoreOptions {
+        offline: true,
+        ..Default::default()
+    };
+    let outcome = restore_upstream(tmp.path(), &inv.stale, &opts).await;
+    assert_eq!(outcome.pins.len(), 1);
+    assert_eq!(
+        outcome.pins[0].status,
+        PinStatus::Restored,
+        "{:?}",
+        outcome.pins
+    );
+    assert_eq!(
+        outcome.reverted_files,
+        vec!["pyproject.toml".to_string(), "uv.lock".to_string()]
+    );
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|(code, detail)| *code == "hosted_resolution_orphaned"
+                && detail.contains("six==1.16.0")),
+        "{:?}",
+        outcome.warnings
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap(),
+        UV_ORPHAN_PYPROJECT_PRISTINE,
+        "the override and the source go, and the emptied [tool.uv] with them"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("uv.lock")).unwrap(),
+        uv_orphan_lock(None),
+        "the `[manifest] overrides` record goes, as `uv lock` would drop it"
+    );
+    let after = inventory(tmp.path()).await;
+    assert!(after.is_empty(), "{after:?}");
+}
+
+#[tokio::test]
+async fn leftover_uv_override_is_not_retired_against_another_patchs_record() {
+    use socket_patch_core::patch::redirect::upstream::{
+        restore_upstream, PinStatus, RestoreOptions,
+    };
+    // The lock's `[manifest] overrides` record names another patch than
+    // the metadata's source: removing the override and source alone would
+    // leave a lock uv rejects, so the pin is refused and nothing is written.
+    let tmp = tempfile::tempdir().unwrap();
+    write_uv_override_left_by_relock(tmp.path(), true);
+    let lock = std::fs::read_to_string(tmp.path().join("uv.lock"))
+        .unwrap()
+        .replace(SIX_PATCH, OTHER_PATCH);
+    std::fs::write(tmp.path().join("uv.lock"), &lock).unwrap();
+    let pyproject = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    let inv = inventory(tmp.path()).await;
+    assert_eq!(inv.stale.len(), 1, "{inv:?}");
+    assert!(
+        inv.contested_refusal().is_some(),
+        "the other patch's record is contested: {inv:?}"
+    );
+    let opts = RestoreOptions {
+        offline: true,
+        ..Default::default()
+    };
+    let outcome = restore_upstream(tmp.path(), &inv.stale, &opts).await;
+    match &outcome.pins[0].status {
+        PinStatus::Refused(why) => assert!(why.contains("[manifest] overrides"), "{why}"),
+        other => panic!("must refuse: {other:?}"),
+    }
+    assert!(outcome.reverted_files.is_empty(), "{outcome:?}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("uv.lock")).unwrap(),
+        lock
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap(),
+        pyproject
+    );
+}

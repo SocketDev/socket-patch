@@ -61,7 +61,7 @@ use super::pypi::{
 };
 use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::python_lock::{paired_metadata_rel, preserve_line_endings, UvSource};
+use crate::utils::python_lock::{paired_metadata_path, preserve_line_endings, UvSource};
 use crate::vendor::common::pep508_name;
 
 /// One hosted entry of a lock.
@@ -111,8 +111,185 @@ pub(crate) async fn restore(
     let pins = by_uuid(pins);
     for rel in files {
         restore_lock(view, rel, &pins, ctx, &mut result).await;
+        retire_orphaned_overrides(view, rel, &pins, ctx, &mut result).await;
     }
     result
+}
+
+/// Whether a leftover override's `[tool.uv.sources]` entry and the lock's
+/// `[manifest]` records of the package all route it to `hit`'s patch.
+fn orphan_wiring_names(
+    doc: &DocumentMut,
+    meta: &Metadata,
+    hit: &Hit,
+    ctx: &Ctx<'_>,
+) -> Result<(), String> {
+    let names_hit = |url: Option<&str>| {
+        url.and_then(|u| ctx.hosted_uuid(u))
+            .is_some_and(|u| u == hit.uuid)
+    };
+    let source = tool_uv(&meta.doc)
+        .and_then(|uv| uv.get("sources"))
+        .and_then(Item::as_table_like)
+        .and_then(|sources| {
+            sources
+                .iter()
+                .find(|(k, _)| canonicalize_pypi_name(k) == hit.name)
+                .map(|(_, v)| v)
+        })
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get("url"))
+        .and_then(Item::as_str);
+    if !names_hit(source) {
+        return Err(format!(
+            "{}'s `[tool.uv.sources]` entry for {} no longer routes it to this patch",
+            meta.rel, hit.name
+        ));
+    }
+    let manifest = doc.get("manifest").and_then(Item::as_table_like);
+    for key in [
+        "requirements",
+        "constraints",
+        "build-constraints",
+        "overrides",
+    ] {
+        for entry in manifest
+            .and_then(|m| m.get(key))
+            .and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_inline_table)
+        {
+            let names_package = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| canonicalize_pypi_name(n) == hit.name);
+            if names_package
+                && entry.get("url").is_some()
+                && !names_hit(entry.get("url").and_then(Value::as_str))
+            {
+                return Err(format!(
+                    "its `[manifest] {key}` record of {} routes it to another artifact",
+                    hit.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retire each pin `rel` no longer locks that its paired metadata still
+/// wires through a hosted override (#1445): the `override-dependencies`
+/// entry the hosted run added for a transitive package, its
+/// `[tool.uv.sources]` URL, and the lock's `[manifest]` record of them,
+/// which `uv remove <parent>` / `uv lock --upgrade-package <parent>` leave
+/// behind (uv never edits either line). Removing all three is what `uv
+/// lock` itself writes once the lines are gone, so the lock stays
+/// `--locked`-clean; nothing is fetched. A pin with no such override left
+/// is not handled here, so it is refused like any unrestorable pin.
+async fn retire_orphaned_overrides(
+    view: &mut View<'_>,
+    rel: &str,
+    pins: &BTreeMap<&str, &HostedPin>,
+    ctx: &Ctx<'_>,
+    result: &mut FormatResult,
+) {
+    let pending: Vec<&HostedPin> = pins
+        .values()
+        .filter(|p| p.files.iter().any(|f| f == rel))
+        .filter(|p| !result.handled.contains(&p.uuid) && !result.refused.contains_key(&p.uuid))
+        .copied()
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let Ok(Some(text)) = view.read(rel).await else {
+        return;
+    };
+    let Ok(mut doc) = text.parse::<DocumentMut>() else {
+        return;
+    };
+    let (collection, pep751) = crate::utils::python_lock::lock_package_collection(&doc);
+    if pep751 {
+        return;
+    }
+    let locked: BTreeSet<String> = doc
+        .get(collection)
+        .and_then(Item::as_array_of_tables)
+        .into_iter()
+        .flat_map(|p| p.iter())
+        .filter_map(|p| p.get("name").and_then(Item::as_str))
+        .map(canonicalize_pypi_name)
+        .collect();
+    let Some(metadata_rel) = paired_metadata_path(rel) else {
+        return;
+    };
+    let script = crate::utils::python_lock::is_script_lock_name(rel);
+    let mut meta = match load_metadata(view, &metadata_rel, script).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return,
+        // The metadata is where a leftover override lives: say why it
+        // cannot be read rather than that no wiring was found.
+        Err(why) => {
+            for pin in &pending {
+                result.refuse(&pin.uuid, format!("{rel}: {why}"));
+            }
+            return;
+        }
+    };
+    let styles = SpecStyle::learn(&doc, Some(&meta));
+    let mut retired: BTreeSet<String> = BTreeSet::new();
+    for pin in pending {
+        let Some((name, version)) = pin.name_version() else {
+            continue;
+        };
+        let hit = Hit {
+            index: usize::MAX,
+            uuid: pin.uuid.clone(),
+            name: canonicalize_pypi_name(&name),
+            version,
+        };
+        if locked.contains(&hit.name) || pushed_override(&meta, &hit).is_none() {
+            continue;
+        }
+        // Retire the trio only as one: the source and every `[manifest]`
+        // record of the package must still name this pin's patch, or
+        // removing the override alone would leave a lock uv rejects.
+        if let Err(why) = orphan_wiring_names(&doc, &meta, &hit, ctx) {
+            result.refuse(&hit.uuid, format!("{rel}: {why}"));
+            continue;
+        }
+        let before = doc.clone();
+        if let Err(why) = restore_requirements(&mut doc, &hit, Some(&meta), &styles, ctx) {
+            doc = before;
+            result.refuse(&hit.uuid, format!("{rel}: {why}"));
+            continue;
+        }
+        restore_metadata(&mut meta, &hit, ctx);
+        result.warnings.push((
+            "hosted_resolution_orphaned",
+            format!(
+                "{}: removed the hosted `override-dependencies` entry `{}=={}` and its \
+                 `[tool.uv.sources]` URL; no {rel} entry installs it any more (the package \
+                 that depended on it was removed or upgraded)",
+                meta.rel, hit.name, hit.version
+            ),
+        ));
+        retired.insert(hit.uuid);
+    }
+    if retired.is_empty() {
+        return;
+    }
+    let next = preserve_line_endings(&text, doc.to_string());
+    if next != text {
+        view.write(rel, next);
+    }
+    if let Some(next) = meta.render() {
+        if next != meta.text {
+            view.write(&meta.rel, next);
+        }
+    }
+    result.handled.extend(retired);
 }
 
 async fn restore_lock(
@@ -177,12 +354,7 @@ async fn restore_lock(
     let metadata_rel = if pep751 {
         None
     } else {
-        paired_metadata_rel(rel.rsplit('/').next().unwrap_or(rel)).map(|leaf| {
-            match rel.rsplit_once('/') {
-                Some((dir, _)) => format!("{dir}/{leaf}"),
-                None => leaf.to_string(),
-            }
-        })
+        paired_metadata_path(rel)
     };
     let script = crate::utils::python_lock::is_script_lock_name(rel);
     let mut metadata = match &metadata_rel {
@@ -1592,21 +1764,6 @@ fn restore_requirements(
 
 // ── paired metadata ──────────────────────────────────────────────────────────
 
-/// Whether the metadata declares `hit` directly (the rewrite adds an
-/// override only for a transitive dependency).
-fn declares_directly(meta: &Metadata, hit: &Hit) -> bool {
-    let names = |spec: &&str| canonicalize_pypi_name(pep508_name(spec)) == hit.name;
-    if meta.script {
-        return strings(meta.doc.get("dependencies")).iter().any(names);
-    }
-    crate::vendor::common::pyproject_dependency_specs(&meta.doc)
-        .iter()
-        .any(|(_, spec)| names(spec))
-        || strings(tool_uv(&meta.doc).and_then(|u| u.get("dev-dependencies")))
-            .iter()
-            .any(names)
-}
-
 /// The index of the `override-dependencies` entry the rewrite added for a
 /// transitive `hit` (`<name>==<version>` under
 /// [`HOSTED_OVERRIDE_MARK`](crate::utils::python_script::HOSTED_OVERRIDE_MARK)),
@@ -1615,23 +1772,10 @@ fn declares_directly(meta: &Metadata, hit: &Hit) -> bool {
 /// user's own pin (the rewrite reuses it rather than adding one) and stays,
 /// along with the lock's `[manifest] overrides` record of it (#411).
 fn pushed_override(meta: &Metadata, hit: &Hit) -> Option<usize> {
-    if declares_directly(meta, hit) {
-        return None;
-    }
-    let want = format!("{}=={}", hit.name, hit.version);
-    tool_uv(&meta.doc)
-        .and_then(|u| u.get("override-dependencies"))
-        .and_then(Item::as_array)?
-        .iter()
-        .position(|value| {
-            let Some(spec) = value.as_str() else {
-                return false;
-            };
-            let compact: String = spec.chars().filter(|c| !c.is_whitespace()).collect();
-            canonicalize_pypi_name(pep508_name(&compact)) == hit.name
-                && compact[pep508_name(&compact).len()..] == want[hit.name.len()..]
-                && crate::utils::python_script::is_hosted_override(value)
-        })
+    crate::utils::python_script::hosted_override_pins(&meta.doc, meta.script)
+        .into_iter()
+        .find(|pin| pin.name == hit.name && pin.version == hit.version)
+        .map(|pin| pin.index)
 }
 
 /// Remove the metadata's hosted `[tool.uv.sources]` entry for `hit` and,

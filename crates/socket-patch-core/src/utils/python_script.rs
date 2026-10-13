@@ -275,6 +275,81 @@ pub(crate) fn is_hosted_override(value: &Value) -> bool {
         .is_some_and(|prefix| prefix.contains(HOSTED_OVERRIDE_MARK))
 }
 
+/// One `override-dependencies` entry the hosted rewrite added for a
+/// transitive dependency ([`hosted_override_pins`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostedOverridePin {
+    /// Its index in the `override-dependencies` array.
+    pub index: usize,
+    /// PEP 503 canonical name.
+    pub name: String,
+    pub version: String,
+}
+
+/// The `<name>==<version>` entries of the metadata's `[tool.uv]
+/// override-dependencies` that the hosted rewrite added
+/// ([`HOSTED_OVERRIDE_MARK`]) for a package the metadata does not declare
+/// directly (`script`: `doc` is a PEP 723 block, whose own requirements are
+/// its `dependencies`). The rewrite adds an override only for a transitive
+/// dependency, so a marked entry for a direct one is not its own. Hosted
+/// mode keeps no ledger: these are the only overrides socket-patch may
+/// remove (#411), and the only ones a relock can leave behind as Socket's
+/// own wiring (#1445).
+pub(crate) fn hosted_override_pins(doc: &DocumentMut, script: bool) -> Vec<HostedOverridePin> {
+    let uv = doc
+        .get("tool")
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get("uv"))
+        .and_then(Item::as_table_like);
+    let Some(overrides) = uv
+        .and_then(|u| u.get("override-dependencies"))
+        .and_then(Item::as_array)
+    else {
+        return Vec::new();
+    };
+    let strings = |item: Option<&Item>| -> Vec<String> {
+        item.and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|spec| canonicalize_pypi_name(pep508_name(spec)))
+            .collect()
+    };
+    let direct: Vec<String> = if script {
+        strings(doc.get("dependencies"))
+    } else {
+        pyproject_dependency_specs(doc)
+            .iter()
+            .map(|(_, spec)| canonicalize_pypi_name(pep508_name(spec)))
+            .chain(strings(uv.and_then(|u| u.get("dev-dependencies"))))
+            .collect()
+    };
+    overrides
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| is_hosted_override(value))
+        .filter_map(|(index, value)| {
+            let compact: String = value
+                .as_str()?
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let raw = pep508_name(&compact);
+            let version = compact[raw.len()..].strip_prefix("==")?;
+            let exact = !version.is_empty()
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '-' | '_'));
+            let name = canonicalize_pypi_name(raw);
+            (exact && !raw.is_empty() && !direct.contains(&name)).then(|| HostedOverridePin {
+                index,
+                name,
+                version: version.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Append `specifier` to `overrides` on its own line, under
 /// [`HOSTED_OVERRIDE_MARK`]. An array the rewrite just created (empty) is
 /// laid out multi-line with a trailing comma; an existing array keeps its

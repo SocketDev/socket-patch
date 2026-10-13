@@ -622,8 +622,10 @@ pub struct Discovery {
     pub withheld: Vec<Recognized>,
     /// Hosted `resolutions` selectors a yarn berry project's root
     /// `package.json` still carries although its lock no longer installs
-    /// them ([`StaleSelector`], #1203). Not refs and not contested wiring:
-    /// the management commands retire them. Sorted, deduped.
+    /// them (#1203), and hosted uv `override-dependencies` pins a lock's
+    /// paired metadata still carries for a package the lock no longer holds
+    /// (#1445) ([`StaleSelector`]). Not refs and not contested wiring: the
+    /// management commands retire them. Sorted, deduped.
     pub stale_selectors: Vec<StaleSelector>,
 }
 
@@ -633,13 +635,21 @@ pub struct Discovery {
 /// `resolutions`, so the selector is left routing a descriptor nothing
 /// depends on (see
 /// [`crate::vendor::lock_inventory::yarn::berry_selector_routes_nothing`]).
+///
+/// The uv twin (#1445): a hosted `override-dependencies` pin (under the
+/// rewrite's ownership comment) plus its `[tool.uv.sources]` URL, for a
+/// transitive package `uv remove <parent>` / `uv lock --upgrade-package
+/// <parent>` dropped from the lock; uv never edits either line. `file` is
+/// then the lock (the restore retires the pair from its paired metadata
+/// and the lock's `[manifest]` record), `selector` the canonical package
+/// name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StaleSelector {
-    /// Root-relative manifest carrying the selector.
+    /// Root-relative manifest carrying the selector (uv: the lock).
     pub file: PathBuf,
-    /// The `resolutions` key.
+    /// The `resolutions` key (uv: the canonical package name).
     pub selector: String,
-    /// The hosted tarball URL it routes to.
+    /// The hosted artifact URL it routes to.
     pub url: String,
     /// The package version the URL's artifact is (canonical base purl).
     pub purl: String,
