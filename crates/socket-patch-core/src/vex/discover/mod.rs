@@ -2245,13 +2245,24 @@ pub(crate) enum TomlDiag {
 
 /// Parse `text` as TOML, recording [`DIAG_LOCKFILE_UNPARSEABLE`] for
 /// root-relative `file` (in `style`) on failure.
-pub(crate) fn toml_or_diag(
+///
+/// Discovery only reads, so this is toml_edit's read-only parse: the
+/// document keeps byte spans into `text` instead of copying every key,
+/// value and comment out of it the way a [`toml_edit::DocumentMut`] does.
+/// On a large `poetry.lock` that copy, and freeing it, cost more than the
+/// parse itself (#1473). Values read the same either way (`as_str` and
+/// friends return the decoded value); only an item's layout (its raw
+/// decor, as `poetry_lock::is_multiline_array` reads) needs the source.
+/// The PyPI lock extractors read this document directly; the cargo and
+/// pyproject/hatch readers still convert it with `into_mut`, as their
+/// helpers take a `DocumentMut`.
+pub(crate) fn toml_or_diag<S: AsRef<str>>(
     file: &str,
-    text: &str,
+    text: S,
     style: TomlDiag,
     out: &mut Discovery,
-) -> Option<toml_edit::DocumentMut> {
-    match text.parse::<toml_edit::DocumentMut>() {
+) -> Option<toml_edit::Document<S>> {
+    match toml_edit::Document::parse(text) {
         Ok(doc) => Some(doc),
         Err(e) => {
             let reason = match style {
@@ -3157,6 +3168,63 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    /// The read-only parse [`toml_or_diag`] hands extractors reads every
+    /// value the way the `DocumentMut` it replaced did (#1473): escaped,
+    /// literal and multi-line strings decode, quoted and dotted keys
+    /// resolve, CRLF and a comment between entries change nothing.
+    #[test]
+    fn read_only_toml_reads_values_like_a_mutable_parse() {
+        let text = "# lock\r\n\
+            [[package]]\r\n\
+            name = \"a\\u0062c\"  # escaped\r\n\
+            version = '1.0'\r\n\
+            \"quoted key\" = \"\"\"\r\nmulti\r\nline\"\"\"\r\n\
+            source.url = 'https://h/x\\y.whl'\r\n\
+            files = [\r\n  {file = \"x.whl\", hash = \"sha256:ab\"}, # one\r\n]\r\n\
+            \r\n\
+            [metadata.files]\r\n\
+            abc = [{file = \"x.whl\", hash = \"sha256:ab\"}]\r\n";
+        let mutable: toml_edit::DocumentMut = text.parse().unwrap();
+        let mut out = Discovery::default();
+        let read_only = toml_or_diag("poetry.lock", text, TomlDiag::Raw, &mut out).unwrap();
+        assert!(out.diagnostics.is_empty());
+        let package = |t: &toml_edit::Table| {
+            t["package"]
+                .as_array_of_tables()
+                .unwrap()
+                .get(0)
+                .cloned()
+                .unwrap()
+        };
+        let (a, b) = (package(&mutable), package(&read_only));
+        for key in ["name", "version", "quoted key"] {
+            assert_eq!(a[key].as_str(), b[key].as_str(), "{key}");
+        }
+        assert_eq!(b["name"].as_str(), Some("abc"));
+        assert_eq!(b["quoted key"].as_str(), Some("multi\r\nline"));
+        assert_eq!(b["source"]["url"].as_str(), Some("https://h/x\\y.whl"));
+        let hash = |p: &toml_edit::Table| {
+            p["files"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_inline_table()
+                .unwrap()["hash"]
+                .as_str()
+                .map(str::to_string)
+        };
+        assert_eq!(hash(&a), hash(&b));
+        assert_eq!(
+            crate::utils::poetry_lock::metadata_files(&read_only, "ABC").len(),
+            crate::utils::poetry_lock::metadata_files(&mutable, "ABC").len(),
+        );
+        assert_eq!(
+            crate::utils::poetry_lock::metadata_files(&read_only, "ABC").len(),
+            1
+        );
+    }
 
     /// A pyproject-only pypi project (hatch, or any flavor before its first
     /// lock) has no install-deciding file: `pyproject.toml` / `hatch.toml`
