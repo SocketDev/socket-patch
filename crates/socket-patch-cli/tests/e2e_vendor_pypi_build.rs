@@ -1300,6 +1300,136 @@ fn uv_vendor_revert_after_dev_group_declaration_edit() {
     );
 }
 
+/// #869, the PEP 723 script-lock twin of #840: `uv add --script s.py
+/// "six>=1.15"` while six is vendored rewrites the script but leaves
+/// `s.py.lock` byte-identical (a path source records no specifier). The
+/// revert must write the script's NEW specifier into the lock's
+/// `[manifest] requirements`, not the recorded `==1.16.0` that leaves
+/// `uv run --locked --script` red while the revert reports success.
+#[test]
+#[serial_test::serial]
+fn uv_vendor_script_revert_after_declaration_edit() {
+    const TAG: &str = "uv-script-declaration-edit";
+    let Some((uv, python)) = capstone_uv(TAG) else {
+        return;
+    };
+    let help = tool(&uv, Path::new("."), &["lock", "--help"], &[]);
+    if !String::from_utf8_lossy(&help.stdout).contains("--script") {
+        println!("UV-VEX lane=script({TAG}) step=all result=n/a (no `uv lock --script`)");
+        return;
+    }
+    bake_leak_guards();
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cache = tmp.path().join("uv-cache");
+    let venv = proj.join(".venv");
+    let mut cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+    if let Some(py) = python.as_deref() {
+        cache_env.push(("UV_PYTHON", py));
+    }
+    let mut venv_env = cache_env.clone();
+    venv_env.push(("VIRTUAL_ENV", venv.to_str().unwrap()));
+    std::fs::write(
+        proj.join("s.py"),
+        "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\n#     \"six==1.16.0\",\n#     \"attrs>=20\",\n# ]\n# ///\nimport six\n",
+    )
+    .unwrap();
+    // uv runs a script in a cache env the crawlers cannot see; the
+    // developer's in-project venv holds the copy the writers read.
+    for (step, env) in [
+        (&["lock", "-q", "--script", "s.py"][..], &cache_env),
+        (&["venv", "-q", ".venv"][..], &cache_env),
+        (&["pip", "install", "-q", "six==1.16.0"][..], &venv_env),
+    ] {
+        let out = tool(&uv, &proj, step, env);
+        if !out.status.success() {
+            println!(
+                "SKIP e2e_vendor_pypi_build({TAG}): `uv {}` failed (PyPI unreachable?):\n{}",
+                step.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+    }
+    stage_patch(&proj, &site_packages(&venv).join("six.py"));
+
+    let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_vendored_applied(&parse_envelope(&stdout));
+    let check = &["lock", "--script", "s.py", "--check"][..];
+    assert_tool_ok(
+        &tool(&uv, &proj, check, &cache_env),
+        "`uv lock --script --check` on the wired pair",
+    );
+    let wired = std::fs::read_to_string(proj.join("s.py.lock")).unwrap();
+
+    let out = tool(
+        &uv,
+        &proj,
+        &["add", "-q", "--script", "s.py", "six>=1.15"],
+        &cache_env,
+    );
+    if !out.status.success() {
+        println!(
+            "SKIP e2e_vendor_pypi_build({TAG}): `uv add --script` failed (PyPI unreachable?):\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let script = std::fs::read_to_string(proj.join("s.py")).unwrap();
+    assert!(script.contains("six>=1.15"), "{script}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("s.py.lock")).unwrap(),
+        wired,
+        "uv leaves the vendored script lock byte-identical"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["status"], "success", "revert envelope: {renv}");
+    assert!(
+        !stdout.contains("vendor_lock_entry_drifted"),
+        "a single-clause declaration edit is not drift: {renv}"
+    );
+    for file in ["s.py", "s.py.lock"] {
+        let text = std::fs::read_to_string(proj.join(file)).unwrap();
+        assert!(
+            !text.contains(".socket/vendor"),
+            "{file} must be fully unwired:\n{text}"
+        );
+    }
+    let lock = std::fs::read_to_string(proj.join("s.py.lock")).unwrap();
+    assert!(
+        lock.contains("{ name = \"six\", specifier = \">=1.15\" }"),
+        "the restored lock carries the script's specifier:\n{lock}"
+    );
+    assert_tool_ok(
+        &tool(&uv, &proj, check, &cache_env),
+        "`uv lock --script --check` after the revert",
+    );
+    assert!(
+        !proj.join(".socket/vendor").exists(),
+        ".socket/vendor must be fully removed after revert"
+    );
+}
+
 /// `get <uuid> --mode vendored` twin of the uv capstone above (v3.6): the
 /// SAME vendor engine and wiring, driven through get's uuid path — exempt
 /// from installed narrowing, so only the mocked `view/{uuid}` route is
