@@ -71,24 +71,6 @@ impl CopyRef {
         Some((name, lock_version.to_string()))
     }
 
-    /// [`CopyRef::identity`] off the async runtime when it unpacks a
-    /// tarball (a user's `file:` tarball can be large).
-    pub(crate) async fn identity_of(
-        &self,
-        lock_version: &str,
-        bytes: Option<Vec<u8>>,
-    ) -> Option<(String, String)> {
-        if !matches!(self, CopyRef::Tarball(_)) {
-            return self.identity(lock_version, bytes.as_deref());
-        }
-        let copy = self.clone();
-        let lock_version = lock_version.to_string();
-        tokio::task::spawn_blocking(move || copy.identity(&lock_version, bytes.as_deref()))
-            .await
-            .ok()
-            .flatten()
-    }
-
     /// Where the copy installs from, for a warning or diagnostic: "installs
     /// it from …" / "links it to …". A url is redacted, since the phrase
     /// may be published (a VEX document, a JSON envelope).

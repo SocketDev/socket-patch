@@ -1910,12 +1910,7 @@ async fn unattributed_pins(
                 )
         }) {
             copy_shadowed.insert(r.uuid.clone());
-            let entry = format!("`{}`", c.key);
-            if done
-                .rewrite
-                .warnings
-                .iter()
-                .any(|w| w.detail.contains(&entry))
+            if yarn_rewriter_named(&done.rewrite.warnings, &c.file, &c.key)
                 || !named.insert((c.file.as_path(), c.key.as_str()))
             {
                 continue;
@@ -2008,6 +2003,20 @@ async fn unattributed_pins(
         copy_shadowed,
         discovery,
     }
+}
+
+/// Whether a yarn rewriter's own warning already names lock entry `key` of
+/// the root `yarn.lock` (the only yarn lock the rewriters read): the yarn
+/// classic `file:` directory / url / alias skips name the entry by its raw
+/// key, exactly as discovery records it.
+fn yarn_rewriter_named(warnings: &[RewriteWarning], file: &std::path::Path, key: &str) -> bool {
+    if file != std::path::Path::new("yarn.lock") {
+        return false;
+    }
+    let entry = format!("`{key}`");
+    warnings
+        .iter()
+        .any(|w| w.code.starts_with("redirect_yarn_") && w.detail.contains(&entry))
 }
 
 /// What [`unattributed_pins`] decided for one pass.

@@ -865,7 +865,9 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
             Some(rel) => ctx.read_advisory_bytes(&rel).await,
             None => None,
         };
-        let Some((name, version)) = copy.source.identity_of(&copy.version, bytes).await else {
+        let Some((name, version)) =
+            crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
+        else {
             continue;
         };
         out.unpatched_copy(

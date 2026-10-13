@@ -69,12 +69,25 @@ pub(crate) async fn other_name_copies(
     };
     let mut out = Vec::new();
     for (key, source, lock_version) in candidates {
+        // Only a `portal:` / `link:` copy needs its manifest for the
+        // version; any other copy of another version is no copy of this
+        // one, and is never read (a `file:` tarball is unpacked to read).
+        if !matches!(source, CopyRef::Linked(_)) && lock_version != version {
+            continue;
+        }
+        // A path into `.socket/` is socket-patch's own wiring, which
+        // discovery attributes as such, never a user's copy.
+        if source
+            .read_path()
+            .is_some_and(|rel| rel.starts_with(".socket/"))
+        {
+            continue;
+        }
         let bytes = match source.read_path() {
             Some(rel) => read_regular_to_bytes(&project_root.join(rel)).await.ok(),
             None => None,
         };
-        if source
-            .identity_of(&lock_version, bytes)
+        if copy_identity(&source, &lock_version, bytes)
             .await
             .is_some_and(|(n, v)| n == name && v == version)
         {
@@ -82,6 +95,25 @@ pub(crate) async fn other_name_copies(
         }
     }
     out
+}
+
+/// [`CopyRef::identity`] off the async runtime when it unpacks a tarball (a
+/// user's `file:` tarball can be large); lockfile discovery reads copies
+/// through it too.
+pub(crate) async fn copy_identity(
+    source: &CopyRef,
+    lock_version: &str,
+    bytes: Option<Vec<u8>>,
+) -> Option<(String, String)> {
+    if !matches!(source, CopyRef::Tarball(_)) {
+        return source.identity(lock_version, bytes.as_deref());
+    }
+    let source = source.clone();
+    let lock_version = lock_version.to_string();
+    tokio::task::spawn_blocking(move || source.identity(&lock_version, bytes.as_deref()))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Where a copy installs from, for a vendored warning.

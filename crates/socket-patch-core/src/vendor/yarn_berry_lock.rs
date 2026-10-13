@@ -240,9 +240,24 @@ impl NpmLockBackend for YarnBerryBackend {
         // ANOTHER dependency name (`lp2@file:…`, #939): the name-keyed
         // resolutions entry never moves it, so it keeps installing the
         // unpatched bytes. Named, like the alias entries above.
-        for (key, source) in
-            super::yarn_copies::other_name_copies(project_root, &lock_text, name, version).await
-        {
+        let other_name =
+            super::yarn_copies::other_name_copies(project_root, &lock_text, name, version).await;
+        // The package IS installed, only under other names, and `yarn
+        // install` can't re-lock those copies: not "not found" (#939).
+        if scan.target.is_none() && scan.alias_keys.is_empty() && !other_name.is_empty() {
+            let keys: Vec<&str> = other_name.iter().map(|(key, _)| key.as_str()).collect();
+            return Err(Box::new(refused(
+                "vendor_lock_entry_not_rewritable",
+                format!(
+                    "{YARN_LOCK} installs {name}@{version} only under other dependency names \
+                     ({}), which the name-keyed resolutions entry vendoring writes can never \
+                     reach (`yarn install` will not help); depend on `{name}` from the \
+                     registry to vendor it",
+                    keys.join(", ")
+                ),
+            )));
+        }
+        for (key, source) in other_name {
             warnings.push(VendorWarning::new(
                 "vendor_copy_unpatched",
                 format!(
@@ -631,6 +646,7 @@ fn target_gate(
 pub(super) struct BerryProject {
     blocks: std::sync::Arc<Vec<LockBlock>>,
     pkg: Value,
+    lock_text: std::sync::Arc<str>,
 }
 
 /// Read the project as [`vendor_yarn_berry`]'s steps 2–5 do — the lock
@@ -666,7 +682,11 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BerryProject, &'
     if !pkg.is_object() {
         return Err("vendor_yarn_berry_manifest_unreadable");
     }
-    Ok(BerryProject { blocks, pkg })
+    Ok(BerryProject {
+        blocks,
+        pkg,
+        lock_text: std::sync::Arc::from(lock_text.as_str()),
+    })
 }
 
 /// Which of `packages` [`vendor_yarn_berry`] would refuse before its first
@@ -677,24 +697,53 @@ pub(crate) async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Result<(), &'static str>> {
-    super::npm_common::gate_packages(
-        read_project(project_root).await,
-        packages,
-        |project, coords| {
-            let (name, version) = (coords.name.as_str(), coords.version.as_str());
-            let pkg_obj = project
-                .pkg
-                .as_object()
-                .ok_or("vendor_yarn_berry_manifest_unreadable")?;
-            resolutions_gate(pkg_obj, name, version)
-                .map_err(|o| super::npm_common::refusal_code(&o))?;
-            let scan =
-                scan_berry_target(&project.blocks, name, version).map_err(|(code, _)| code)?;
-            target_gate(&scan, name, version)
-                .map(drop)
-                .map_err(|o| super::npm_common::refusal_code(&o))
-        },
-    )
+    let project = read_project(project_root).await;
+    let lock_text = project
+        .as_ref()
+        .ok()
+        .map(|p| std::sync::Arc::clone(&p.lock_text));
+    let mut gated = super::npm_common::gate_packages(project, packages, |project, coords| {
+        let (name, version) = (coords.name.as_str(), coords.version.as_str());
+        let pkg_obj = project
+            .pkg
+            .as_object()
+            .ok_or("vendor_yarn_berry_manifest_unreadable")?;
+        resolutions_gate(pkg_obj, name, version)
+            .map_err(|o| super::npm_common::refusal_code(&o))?;
+        let scan = scan_berry_target(&project.blocks, name, version).map_err(|(code, _)| code)?;
+        target_gate(&scan, name, version)
+            .map(drop)
+            .map_err(|o| super::npm_common::refusal_code(&o))
+    });
+    // The loop's step 6 turns "not found" into "not rewritable" when the
+    // package's only copies are locked under other names; so does the plan.
+    // ("Not found" with alias entries is the alias refusal, left as is.)
+    if let Some(lock_text) = lock_text {
+        for ((purl, record), gate) in packages.iter().zip(gated.iter_mut()) {
+            if *gate != Err("vendor_lock_entry_not_found") {
+                continue;
+            }
+            let Ok(coords) = super::npm_common::guard_coordinates(purl, record) else {
+                continue;
+            };
+            let blocks = scan_blocks_shared(&lock_text);
+            let aliased = scan_berry_target(&blocks, &coords.name, &coords.version)
+                .is_ok_and(|scan| !scan.alias_keys.is_empty());
+            if !aliased
+                && !super::yarn_copies::other_name_copies(
+                    project_root,
+                    &lock_text,
+                    &coords.name,
+                    &coords.version,
+                )
+                .await
+                .is_empty()
+            {
+                *gate = Err("vendor_lock_entry_not_rewritable");
+            }
+        }
+    }
+    gated
 }
 
 /// Undo one yarn-berry vendored package: restore the recorded lock entry,
@@ -2512,6 +2561,51 @@ __metadata:
                 assert!(text.contains("left-pad@file:./"), "{case}: rewired: {text}");
                 assert!(text.contains(&block), "{case}: copy byte-untouched: {text}");
             }
+        }
+    }
+
+    /// #939 (review): when left-pad@1.3.0 is locked ONLY under another
+    /// dependency name, vendoring refuses `vendor_lock_entry_not_rewritable`
+    /// naming that copy, in the loop and in the download plan alike, not
+    /// `vendor_lock_entry_not_found` with a `yarn install` remedy that can't
+    /// help. Control: a copy holding another package is still "not found".
+    #[tokio::test]
+    async fn issue_939_only_other_name_copies_are_refused_as_not_rewritable() {
+        let ws = "vendor-spike%40workspace%3A.";
+        let key = format!("lp2@file:./forks/left-pad::locator={ws}");
+        let lock = B3_BEFORE_LOCK.replace(
+            "\"left-pad@npm:1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n",
+            &format!(
+                "\"{key}\":\n  version: 1.3.0\n  \
+                 resolution: \"lp2@file:./forks/left-pad#./forks/left-pad::hash=1a2b3c&locator={ws}\"\n"
+            ),
+        );
+        assert!(
+            lock.contains(&key) && !lock.contains("left-pad@npm:"),
+            "{lock}"
+        );
+        for (fork, code) in [
+            ("left-pad", "vendor_lock_entry_not_rewritable"),
+            ("other-pkg", "vendor_lock_entry_not_found"),
+        ] {
+            let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+            let dir = fx.tmp.path().join("forks/left-pad");
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(
+                dir.join("package.json"),
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            )
+            .await
+            .unwrap();
+            let detail = expect_refused(fx.vendor(false).await, code);
+            if code == "vendor_lock_entry_not_rewritable" {
+                assert!(detail.contains(&key), "{detail}");
+                assert!(detail.contains("yarn install` will not help"), "{detail}");
+            }
+            fx.assert_untouched().await;
+            let pre =
+                preflight_packages(fx.tmp.path(), &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+            assert_eq!(pre, vec![Err(code)], "{fork}");
         }
     }
 
