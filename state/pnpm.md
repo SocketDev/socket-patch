@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-09 (run 38), main `9ab72d4`, latest release 5.0.0.
+Last updated: 2026-10-13 (run 39), main `15c2c83`, latest release 5.0.0. (main was force-pushed since run 38, so older SHAs in this ledger may not resolve any more.)
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -432,8 +432,19 @@ Run 38 additions (main `9ab72d4`, release 5.0.0, Linux):
 | 10.34.6 | fail #1266 / fail #1266 | — | — | — | — |
 | 12.11.2 | fail #1266 / fail #1266 (plain-name control pass) | both member locks restored (documented); `trustLockfile` left = #1268 | pass / pass | pass | pass ×3 |
 
+Run 39 additions (main `15c2c83`, release 5.0.0, Linux; #1074 `lockfile`-off refusal from e8b6adc7):
+
+| pnpm | Hosted, `lockfile`/`packageLock` off in the file its major reads | Hosted, env `npm_config_lockfile=false` | Hosted, env `pnpm_config_lockfile=false` | Hosted, env `npm_config_package_lock=` (e.g. `npm exec` + `.npmrc package-lock=false`) | Hosted, env `npm_config_git_branch_lockfile=true` + leftover branch lock | Hosted, `file:` copy beside the registry copy (#935) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 9.15.9 | (pnpm behaviour verified) | — | fail #1460 (false refusal) | — | — | fail #935 (silent pin, regression) |
+| 10.34.6 | pass (pnpm ignores the YAML key; `.npmrc` is honoured) | correct refusal | fail #1460 (false refusal) | — | — | — |
+| 11.28.3 | pass (pnpm ignores `.npmrc` `lockfile` / `package-lock`) | fail #1460 (false refusal) | correct refusal | — | — | — |
+| 12.11.2 | pass | fail #1460 | — | fail #1460 (2×, direct and via `npm exec`; a fresh frozen install with that env is patched) | fail #1460 (comment) | fail #935 (silent pin, regression since f3c6313a / #1008; good at 4d06019b) |
+
 ## Backlog
 
+0w. **#1460 follow-ups**: re-verify once fixed (all four majors, both env families, and the `package-lock` fallback), and `sharedWorkspaceLockfile` via `npm_config_shared_workspace_lockfile` on 11/12 (same `view_setting` root cause, not yet verified). Also #1437 `mode_ambiguous` over pnpm vendored + hosted state (needs a second patched package in the mock).
+0x. **#935 regression** (hosted silent pin over a `file:` copy, first bad f3c6313a): re-verify once fixed, also for `git+` copies. #1268 still reproduces on 12.11.2 (run 39).
 0y. #1266 (npm handover, pnpm cells commented in run 38): a scoped alias, a transitive alias and the hoisted linker.
 0z. Post-#1007 follow-ups: #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
 00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
@@ -472,6 +483,9 @@ Run 38 additions (main `9ab72d4`, release 5.0.0, Linux):
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
+
+- pnpm's `lockfile` setting: pnpm 10.34.6 ignores `lockfile: false` in `pnpm-workspace.yaml` (`pnpm config get` says false, but it writes and uses the lock); pnpm 11.28.3 / 12.11.2 ignore `lockfile=false` and `package-lock=false` in `.npmrc`; pnpm 9/10 ignore YAML `packageLock: false`. socket-patch's file-based reading matches all of this (run 39). Global `~/.npmrc` / `config.yaml` aren't read; that's documented ("only the project's own files").
+- `npm run` / `npm exec` export `npm_config_package_lock=` (empty = false) only when an npmrc sets `package-lock=false`; with no setting, nothing is exported. pnpm 10 `pnpm run` exports `npm_config_lockfile=true` only when the YAML sets it.
 
 - `patches-api.socket.dev` and (for the Rust client) `registry.npmjs.org` are unreachable from the sandbox. Mock the API and point `SOCKET_NPM_REGISTRY` at a mirror.
 - v5 recognises hosted pins only on the configured patch server. Against a mock without `SOCKET_PATCH_SERVER_URL`, `rollback` says "Manifest not found". That's a fixture artifact.
