@@ -23,6 +23,95 @@ a version without a non-empty section in this file.
 
 ## [Unreleased]
 
+## [5.0.1] — 2026-10-13
+
+A bug-fix release. Some of these fixes were already in the 5.0.0 build
+but were missing from its notes; the PR numbers are listed below either way.
+
+### Fixed
+
+- **npm family.**
+  - Hosted mode leaves pnpm locks alone when pnpm's `lockfile` setting is
+    off (`lockfile=false`, `lockfile: false` or `package-lock=false`), since
+    pnpm then installs from the registry; it warns
+    `redirect_pnpm_lockfile_disabled` and suggests vendored mode, and
+    lock-only `vex` no longer attests those pins (#1074).
+  - pnpm settings from the environment are read the way the project's pnpm
+    major reads them (`npm_config_*` on pnpm 10 and older, `pnpm_config_*`
+    on 11 and newer). An `npx socket-patch scan --mode hosted` in a pnpm 11+
+    project with an npm-era `package-lock=false` no longer refuses with a
+    false `redirect_pnpm_lockfile_disabled`, and `git-branch-lockfile` /
+    `shared-workspace-lockfile` are read the same way (#1460).
+  - Yarn Berry rollback / remove after a `yarn remove` in one workspace
+    member restore the registry entry keyed only by the descriptors still
+    declared, so `yarn install --immutable` passes (#1435).
+  - Vendored Yarn Berry `vendor --revert`, `rollback` and `remove` rebuild
+    the `yarn.lock` entry from the current lock instead of splicing back the
+    one recorded at vendor time, so a yarn 4.0 → 4.1+ checksum respelling or
+    a member adding or removing a descriptor no longer leaves a lock that
+    fails `yarn install --immutable` (YN0028) (#759).
+  - Hosted `rollback` and `remove` behind a registry mirror that passes npmjs
+    tarball URLs through keep Berry's `::__archiveUrl=` binding and pnpm's
+    `tarball:` field instead of dropping them (#1465).
+  - Hosted yarn classic rescans read the patched `package.json` of a pin
+    written by v4, so a patch that adds a dependency the lock never locked
+    is reported, and `vex` no longer attests `not_affected` while that
+    dependency is missing (#1462).
+  - `.yarnrc.yml` settings are read the way yarn reads them, including
+    `${VAR:-default}` and quoted YAML values, so a PnP project configured
+    through a variable is refused as PnP (#1100).
+  - Appending `allow-remote=all` to a CRLF `.npmrc` with no final newline
+    keeps its line endings intact (#1196).
+- **Cargo.**
+  - Cargo source replacement (`[source.crates-io] replace-with` to a
+    directory source) is followed through every config cargo reads, so
+    agent mode patches, and `vex` / rollback judge, the copy cargo builds
+    from instead of assuming `<cwd>/vendor`. A `vendor/` that no
+    `replace-with` wires is no longer crawled. Hosted mode skips every crate
+    when crates.io is replaced by an on-disk source
+    (`redirect_cargo_directory_source`) (#338, #455).
+  - Hosted mode pins a dependency declared with an explicit
+    `registry = "crates-io"` instead of skipping it (#386).
+- **PyPI.**
+  - A Poetry dependency pinned to `source = "pypi"` is refused in a lock
+    written by Poetry 1.3–2.2, which can't install the rewired lock
+    (`redirect_poetry_lock_unsupported` / `pypi_poetry_source_constraint`);
+    other Poetry versions are rewired with a warning. Poetry 1.3 locks,
+    which carry no version stamp, are now recognized (#1282, #1447).
+  - Removing or upgrading the parent of a transitive uv package that hosted
+    mode pinned no longer locks the project out with
+    `hosted_wiring_contested`: the leftover override counts as Socket's own,
+    and `list` warns `hosted_resolution_orphaned` (#1445).
+  - Reverting a vendored PEP 723 script lock restores the `[manifest]`
+    specifier the script declares at revert time, not the one recorded when
+    vendoring, so `uv run --locked --script` keeps working (#869).
+  - The stale-install warning for a `--site-packages` Pipenv venv that
+    imports a package from its base interpreter suggests an install inside
+    the venv instead of the usual Pipenv remedy (#1450).
+  - Vendored Hatch refuses (`pypi_hatch_unsupported`) a checkout whose path
+    contains `%`, `#`, `;` or `?`, which Hatch's `{root:uri}` turns into a
+    broken file URL (#547).
+- **RubyGems.**
+  - With `BUNDLE_GEMFILE` pointing into another directory (Appraisal-style
+    `gemfiles/rails_7.gemfile`), agent mode, `vex` and the stale-install
+    check probe the stores Bundler actually uses (#952).
+  - Vendored revert no longer half-reverts when the wired Gemfile line was
+    commented out (#988).
+- **Composer.**
+  - `scan -g` and agent-mode scans find installs whose `vendor-dir` is set
+    in the global or another inherited config, not only the project's
+    `composer.json` (#439, #686).
+  - Global discovery finds a Composer 2 home in the XDG config dir even when
+    an old `~/.composer` directory remains (#586).
+- **Go.** `vex` attests an applied agent-mode patch for a `+incompatible`
+  module instead of reporting `not_applied` (#484).
+- **Vendoring.** `vendor --check` names the missing or changed artifact and
+  the step that fixes it, instead of printing an internal Rust value (#1467).
+
+### Maintenance
+
+- Release builds use one codegen unit, giving a smaller binary (#1449).
+
 ## [5.0.0] — 2026-10-12
 
 v5 centers the workflow on `scan` (hosted patches), `vex` (OpenVEX attestations),
