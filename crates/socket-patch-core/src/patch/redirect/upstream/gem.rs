@@ -1361,6 +1361,17 @@ mod tests {
             // Nested in a group inside the source block, parenthesized opener.
             "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource(\"https://rubygems.org\") do\n  \
              group :web do\n    gem \"rails\", \"7.0.0\"\n  end\nend\n",
+            // Assignment-form keyword constructs before the declaration
+            // (#1476): their `end`s close them, not the source block, and
+            // the declaration comes back at the block's indent.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource \"https://rubygems.org\" do\n  \
+             v = if ENV[\"ZZ\"]\n    \"a\"\n  else\n    \"b\"\n  end\n  gem \"rails\", \"7.0.0\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource \"https://rubygems.org\" do\n  \
+             v = case ENV[\"ZZ\"]\n      when \"x\" then \"a\"\n      else \"b\"\n      end\n  \
+             w = begin\n    1\n  rescue\n    2\n  end\n  gem \"rails\", \"7.0.0\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource \"https://rubygems.org\" do\n  \
+             x ||= unless ENV[\"ZZ\"]\n    1\n  end\n  y = (while false\n  end)\n  \
+             gem \"rails\", \"7.0.0\"\nend\n",
         ] {
             let lock = format!(
                 "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    \
@@ -1441,6 +1452,68 @@ mod tests {
         // A modifier `if` opens nothing.
         assert!(!at(
             "source \"https://x\" do\n  gem \"a\" if true\nend\ngem \"rails\"\n"
+        ));
+        // An assignment-form construct (#1476) opens one too, whichever
+        // keyword, operator or expression position introduces it.
+        for opener in [
+            "v = if ENV[\"A\"]",
+            "v = unless ENV[\"A\"]",
+            "v = case ENV[\"A\"]\n  when \"x\" then 1",
+            "v = begin\n  1\n  rescue\n  2",
+            "v ||= while false",
+            "v += until true",
+            "v = (if true",
+            "foo(1, if true",
+            "x = 1; if true",
+            "v = [case 1\n  when 1 then 2",
+            "v = for x in [] do",
+            "if a then 1 else\n  2 end; v = (if true",
+        ] {
+            let t = format!(
+                "source \"https://x\" do\n  {opener}\n    1\n  end\n  gem \"rails\"\nend\n"
+            );
+            assert!(at(&t), "{t}");
+        }
+        // Closed on its own line, it nets out.
+        assert!(at(
+            "source \"https://x\" do\n  v = if a then 1 else 2 end\n  gem \"rails\"\nend\n"
+        ));
+        assert!(at(
+            "source \"https://x\" do\n  v = (case a when 1 then 2 end).to_s\n  gem \"rails\"\nend\n"
+        ));
+        assert!(!at(
+            "v = if a then 1 else 2 end\nsource \"https://x\" do\n  gem \"a\"\nend\ngem \"rails\"\n"
+        ));
+        // Modifiers after a value, names that only look like keywords
+        // (`x.class`, `:if`, `if:`, `begin?`, `"if"`), and an endless
+        // `def` open nothing, so the source block's `end` still closes it.
+        for line in [
+            "v = 1 if true",
+            "v = x unless y",
+            "x.save! if y",
+            "x.empty? while y",
+            "return if y",
+            "v = x =~ /re/ if y",
+            "v = x.class",
+            "v = range.begin",
+            "v = [:if, :case]",
+            "foo(if: 1, case: 2)",
+            "v = x.begin?",
+            "v = \"if case begin\"",
+            "def x = 1",
+            "def x(a) = a",
+            "v = loop { break }",
+        ] {
+            let t = format!("source \"https://x\" do\n  {line}\nend\ngem \"rails\"\n");
+            assert!(!at(&t), "{t}");
+        }
+        // A `while … do` loop takes one `end`, not two.
+        assert!(!at(
+            "source \"https://x\" do\n  while false do\n  end\nend\ngem \"rails\"\n"
+        ));
+        // A setter `def x=(v)` still needs its `end`.
+        assert!(at(
+            "source \"https://x\" do\n  def x=(v)\n  end\n  gem \"rails\"\nend\n"
         ));
         assert!(!at("if true\n  gem \"a\"\nend\ngem \"rails\"\n"));
         // A `#` inside a string (`#{}` interpolation) is no comment: the

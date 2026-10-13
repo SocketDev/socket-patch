@@ -444,6 +444,10 @@ enum Driver {
     /// `source "<upstream>" do` block (#1056): bundler locks it with a `!`
     /// source pin, which the unwind must keep.
     ScanVexSourceBlock,
+    /// [`Driver::ScanVexSourceBlock`] with assignment-form keyword
+    /// constructs (`v = if … end`, `w = case … end`) before the gem
+    /// (#1476): their `end`s must not close the user's source block.
+    ScanVexSourceBlockAssignment,
     /// A heredoc option continues beyond the declaration's physical line.
     ScanVexHeredocDeclaration,
     /// A double-quoted interpolation can itself contain a heredoc opener.
@@ -526,6 +530,9 @@ impl Driver {
             Driver::ScanVexTwin => "scan --mode hosted (Gemfile + gems.rb twin)",
             Driver::ScanVexGroupBlock => "scan --mode hosted (gem in a group block)",
             Driver::ScanVexSourceBlock => "scan --mode hosted (gem in a source block)",
+            Driver::ScanVexSourceBlockAssignment => {
+                "scan --mode hosted (gem in a source block after `v = if … end`)"
+            }
             Driver::ScanVexSemicolonJoinedDeclaration => {
                 "scan --mode hosted (two `;`-joined gem declarations)"
             }
@@ -823,6 +830,12 @@ async fn redirect_scanned_project(
             "source \"{up}/upstream\"\n\nsource \"{up}/upstream\" do\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
             up = server.uri()
         ),
+        Driver::ScanVexSourceBlockAssignment => format!(
+            "source \"{up}/upstream\"\n\nsource \"{up}/upstream\" do\n  v = if ENV[\"ZZ\"]\n    \"a\"\n  \
+             else\n    \"b\"\n  end\n  w = case ENV[\"ZZ\"]\n      when \"x\" then \"a\"\n      \
+             else \"b\"\n      end\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
+            up = server.uri()
+        ),
         Driver::ScanVexEvalGemfile => {
             std::fs::write(proj.join("Gemfile.common"), format!("gem \"{DEP}\"\n")).unwrap();
             format!(
@@ -1071,6 +1084,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexEvalGemfile
         | Driver::ScanVexGroupBlock
         | Driver::ScanVexSourceBlock
+        | Driver::ScanVexSourceBlockAssignment
         | Driver::ScanVexCustomGitSource
         | Driver::ScanVexMultiLineDeclaration
         | Driver::ScanVexConditionalDeclaration
@@ -1275,6 +1289,7 @@ async fn redirect_scanned_project(
         Driver::ScanVex
         | Driver::ScanVexGroupBlock
         | Driver::ScanVexSourceBlock
+        | Driver::ScanVexSourceBlockAssignment
         | Driver::ScanVexTrailingSemicolonDeclaration => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert!(
@@ -2342,18 +2357,29 @@ async fn gem_hosted_group_block_pin_survives_a_refused_vendored_takeover() {
 /// pre-scan pair, `!` included, so a FROZEN install of the restored pair
 /// still succeeds (it exited 16 when the unwind dropped the `!`).
 /// Converged without CHECKSUMS so the restore needs no rubygems.org sha.
+/// #1476: the same holds when assignment-form `v = if … end` /
+/// `w = case … end` constructs precede the gem inside the block.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_unwind_keeps_a_source_block_bang() {
-    for command in ["rollback", "remove"] {
+    for (driver, command) in [
+        (Driver::ScanVexSourceBlock, "rollback"),
+        (Driver::ScanVexSourceBlock, "remove"),
+        (Driver::ScanVexSourceBlockAssignment, "rollback"),
+        (Driver::ScanVexSourceBlockAssignment, "remove"),
+    ] {
+        let label = match driver {
+            Driver::ScanVexSourceBlockAssignment => "source-block-assignment",
+            _ => "source-block",
+        };
         let Some(fx) = redirect_scanned_project(
-            &format!("source-block {command}"),
+            &format!("{label} {command}"),
             Spelling::Gemfile,
             false,
             true,
             None,
-            Driver::ScanVexSourceBlock,
+            driver,
         )
         .await
         else {
@@ -2416,7 +2442,7 @@ async fn gem_hosted_unwind_keeps_a_source_block_bang() {
             fx.pristine_gemfile,
             "{command}: the Gemfile comes back byte for byte"
         );
-        let fresh = stage_fresh_checkout(&fx, &format!("source-block-{command}"));
+        let fresh = stage_fresh_checkout(&fx, &format!("{label}-{command}"));
         let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
         assert!(
             install.status.success(),
