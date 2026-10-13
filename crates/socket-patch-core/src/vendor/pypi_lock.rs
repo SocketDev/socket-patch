@@ -10,7 +10,8 @@ use crate::utils::python_lock::{
     is_python_lock_name, python_lock_paths, rewrite_python_lock, script_of_lock, ArtifactSource,
 };
 use crate::utils::python_script::{
-    refuse_uv_no_sources, replace_script_metadata, rewrite_script_metadata, script_metadata,
+    find_ancestor_uv_config, refuse_uv_script_no_sources, replace_script_metadata,
+    rewrite_script_metadata, script_metadata, UvConfig,
 };
 
 use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
@@ -183,7 +184,7 @@ async fn load_listed_locks(
     let mut pin = None;
     // The project's pyproject.toml and uv.toml, read once on the first
     // script lock for the no-sources check (#564).
-    let mut project_config: Option<(Option<String>, Option<String>)> = None;
+    let mut project_config: Option<(Option<String>, Option<String>, Option<UvConfig>)> = None;
     for path in paths.into_iter().filter(|path| path != "uv.lock") {
         let text = read_file(&root.join(&path)).await?;
         let rewritten = rewrite_python_lock(
@@ -246,20 +247,24 @@ async fn load_listed_locks(
                 return Err(("pypi_script_multiple_versions", format!("{path} resolves multiple versions of {name}; a script source override cannot select only {version}")));
             }
             let script = read_file(&root.join(script_name)).await?;
-            let (pyproject, uv_toml) = match &project_config {
+            let (pyproject, uv_toml, ancestor) = match &project_config {
                 Some(config) => config,
                 None => project_config.insert((
                     read_regular_to_string(&root.join("pyproject.toml"))
                         .await
                         .ok(),
                     super::pypi_uv::read_uv_toml(root).await,
+                    // uv applies a parent's settings to the script when
+                    // the root holds none (#1501).
+                    find_ancestor_uv_config(root),
                 )),
             };
-            refuse_uv_no_sources(
+            refuse_uv_script_no_sources(
                 name,
-                Some(&script),
+                &script,
                 pyproject.as_deref(),
                 uv_toml.as_deref(),
+                ancestor.as_ref(),
             )
             .map_err(|detail| ("pypi_uv_no_sources", format!("{script_name}: {detail}")))?;
             let script_wheel = source_path(package).unwrap_or(&placeholder);
@@ -1493,6 +1498,41 @@ mod tests {
                     .unwrap(),
                 script
             );
+        }
+    }
+
+    /// #1501: a script scanned from a subdirectory takes the parent
+    /// project's settings when its own directory sets none, so the parent's
+    /// `no-sources = true` refuses it the same way.
+    #[tokio::test]
+    async fn script_no_sources_in_a_parent_refuses_before_writing() {
+        let lock = "version = 1\n[[package]]\nname = \"two\"\nversion = \"2\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        let script = "# /// script\n# dependencies = [\"two==2\"]\n# ///\n";
+        for (file, config) in [
+            ("uv.toml", "no-sources = true\n"),
+            ("pyproject.toml", "[tool.uv]\nno-sources = true\n"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("scripts");
+            tokio::fs::create_dir(&root).await.unwrap();
+            tokio::fs::write(temp.path().join(file), config)
+                .await
+                .unwrap();
+            // A root pyproject without [tool.uv] does not stop uv's lookup.
+            tokio::fs::write(root.join("pyproject.toml"), "[project]\nname = \"s\"\n")
+                .await
+                .unwrap();
+            tokio::fs::write(root.join("job.py.lock"), lock)
+                .await
+                .unwrap();
+            tokio::fs::write(root.join("job.py"), script).await.unwrap();
+            let Err(error) =
+                load_python_locks(&root, "two", "2", "11111111-1111-4111-8111-111111111111").await
+            else {
+                panic!("a parent {file} must refuse");
+            };
+            assert_eq!(error.0, "pypi_uv_no_sources", "{}", error.1);
+            assert!(error.1.contains(&format!("../{file}")), "{}", error.1);
         }
     }
 
