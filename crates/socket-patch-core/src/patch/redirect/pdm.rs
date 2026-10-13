@@ -480,7 +480,7 @@ mod parse_reuse_equivalence_tests {
     /// re-parse, not one per package (#762).
     #[test]
     fn many_patches_render_the_lock_once() {
-        use crate::utils::lock_fragments::RENDERS;
+        use crate::utils::lock_fragments::{RENDERS, SCANS};
         let url = |name: &str| {
             format!("https://patch.socket.dev/patch/pypi/{name}/a/{name}-1.26.18-py3-none-any.whl")
         };
@@ -512,6 +512,7 @@ mod parse_reuse_equivalence_tests {
                     .collect();
                 let files = BTreeMap::from([("pdm.lock".to_string(), lock)]);
                 RENDERS.with(|renders| renders.set(0));
+                SCANS.with(|scans| scans.set(0));
                 let mut got = RewriteResult::default();
                 rewrite(&files, &deps, &mut got);
                 if got.confirmed_pdm_uuids.len() != 12 {
@@ -523,6 +524,9 @@ mod parse_reuse_equivalence_tests {
                     1,
                     "{fixture} crlf={crlf}"
                 );
+                // One pass over the original and one over the result find
+                // and count every dep's fragments (#1473).
+                assert_eq!(SCANS.with(|scans| scans.get()), 2, "{fixture} crlf={crlf}");
             }
         }
         assert!(checked >= 16, "only {checked} locks landed every dep");

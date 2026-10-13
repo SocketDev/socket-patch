@@ -568,17 +568,40 @@ pub struct PoetryLockDep<'a> {
 /// them when the batch can vouch for the step-by-step result, else step by
 /// step.
 pub fn rewrite_poetry_lock_all(text: &str, deps: &[PoetryLockDep]) -> LockBatch {
-    rewrite_poetry_lock_batch(text, deps).unwrap_or_else(|| rewrite_poetry_lock_steps(text, deps))
+    rewrite_poetry_lock_all_with_version(text, deps).0
+}
+
+/// [`rewrite_poetry_lock_all`], plus the lock's `lock_version` when the
+/// batch read it from its own parse (`None` when it went step by step, or
+/// the lock has no supported version), so a caller needn't parse the lock
+/// again for it. No package rewrite touches `[metadata]`, so it is the
+/// rewritten lock's version too.
+pub fn rewrite_poetry_lock_all_with_version(
+    text: &str,
+    deps: &[PoetryLockDep],
+) -> (LockBatch, Option<String>) {
+    let mut version = None;
+    match rewrite_poetry_lock_batch(text, deps, &mut version) {
+        Some(batch) => (batch, version),
+        None => (rewrite_poetry_lock_steps(text, deps), None),
+    }
 }
 
 /// [`rewrite_poetry_lock_all`] over one parse and one render, or `None` (see
-/// [`rewrite_batch`]).
-fn rewrite_poetry_lock_batch(text: &str, deps: &[PoetryLockDep]) -> Option<LockBatch> {
+/// [`rewrite_batch`]); `version` gets the parse's `lock_version`.
+fn rewrite_poetry_lock_batch(
+    text: &str,
+    deps: &[PoetryLockDep],
+    version: &mut Option<String>,
+) -> Option<LockBatch> {
     let names: Vec<&str> = deps.iter().map(|dep| dep.name).collect();
     rewrite_batch(
         text,
         &names,
         |index, lock| {
+            if version.is_none() {
+                *version = lock_version_of(lock).ok().map(str::to_string);
+            }
             let dep = &deps[index];
             let sha256 = checked_sha256(
                 dep.name,
@@ -1635,10 +1658,20 @@ mod batch_equivalence_tests {
                         {
                             cases += 1;
                             let steps = rewrite_poetry_lock_steps(&text, &deps);
-                            let batch = rewrite_poetry_lock_batch(&text, &deps);
+                            let mut read_version = None;
+                            let batch = rewrite_poetry_lock_batch(&text, &deps, &mut read_version);
                             if let Some(batch) = &batch {
                                 batched += 1;
                                 assert_eq!(batch, &steps, "{what}");
+                                // The version the batch read is the output's.
+                                if read_version.is_some() {
+                                    let output = batch.text.parse::<DocumentMut>().unwrap();
+                                    assert_eq!(
+                                        read_version.as_deref(),
+                                        lock_version(&output).ok(),
+                                        "{what}"
+                                    );
+                                }
                             }
                             assert_eq!(rewrite_poetry_lock_all(&text, &deps), steps, "{what}");
                             // Poetry 0.12 refuses every URL source: nothing to
