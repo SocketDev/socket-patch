@@ -68,10 +68,10 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use sha2::{Digest, Sha256};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -107,18 +107,13 @@ const PATCH_SUFFIX: &str =
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-/// Run socket-patch with ambient `SOCKET_*` vars scrubbed and the fixture's
-/// private CARGO_HOME injected (the cargo crawler resolves the registry
-/// source tree through it).
+/// Run socket-patch in the hermetic environment (`tests/common/hermetic.rs`)
+/// with the fixture's private CARGO_HOME injected (the cargo crawler
+/// resolves the registry source tree through it).
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
     cmd.env("CARGO_HOME", cargo_home);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (

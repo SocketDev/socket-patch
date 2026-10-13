@@ -63,10 +63,10 @@ mod rollback_json;
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use sha2::{Digest, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -107,18 +107,13 @@ const PURL_UNINSTALLED: &str = "pkg:npm/left-pad@9.9.9";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-/// Run the socket-patch binary with a scrubbed environment: every ambient
-/// `SOCKET_*` var is removed (so a developer's `SOCKET_DRY_RUN=1` etc. can't
-/// flip behavior) along with `VIRTUAL_ENV` (crawler discovery input).
+/// Run the socket-patch binary in the hermetic environment
+/// (`tests/common/hermetic.rs`: a developer's `SOCKET_DRY_RUN=1` etc. can't
+/// flip behavior) with `VIRTUAL_ENV` (crawler discovery input) removed.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
