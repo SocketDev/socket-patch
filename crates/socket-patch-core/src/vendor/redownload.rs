@@ -52,6 +52,20 @@ const NO_FILE_INVENTORY: &str = "the ledger has no complete file inventory; rest
      version control, or re-run the vendoring command (`socket-patch vendor`, or `scan --mode \
      vendored`) to rebuild it from a verified download";
 
+/// Why [`restore`] refuses this entry before downloading anything: the
+/// ledger records nothing to check a fresh download against.
+pub(super) fn ledger_blocks_restore(entry: &VendorEntry) -> Option<String> {
+    let file_shaped = !super::verify::is_vlt_dir_entry(entry)
+        && super::verify::artifact_is_file_shaped(&entry.artifact.path);
+    if file_shaped && entry.artifact.sha256.is_empty() {
+        return Some(no_archive_sha256());
+    }
+    if !file_shaped && entry.artifact.file_inventory.is_none() {
+        return Some(NO_FILE_INVENTORY.into());
+    }
+    None
+}
+
 /// Restore only the recorded artifact. Project wiring and ledger are never written.
 pub async fn restore(
     root: &Path,
@@ -101,14 +115,11 @@ pub async fn restore(
     if crate::utils::containment::linked_level(root, &root.join(&entry.artifact.path)).is_some() {
         return Err("vendor_path_unsafe: artifact path contains a symlink".into());
     }
+    if let Some(detail) = ledger_blocks_restore(entry) {
+        return Err(detail);
+    }
     let file_shaped = !super::verify::is_vlt_dir_entry(entry)
         && super::verify::artifact_is_file_shaped(&entry.artifact.path);
-    if file_shaped && entry.artifact.sha256.is_empty() {
-        return Err(no_archive_sha256());
-    }
-    if !file_shaped && entry.artifact.file_inventory.is_none() {
-        return Err(NO_FILE_INVENTORY.into());
-    }
     let socket = root.join(".socket");
     tokio::fs::create_dir_all(&socket)
         .await

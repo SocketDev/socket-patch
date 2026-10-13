@@ -788,17 +788,23 @@ pub async fn describe_artifact_failure(
     entry: &VendorEntry,
     health: &ArtifactHealth,
 ) -> Option<String> {
-    const REPAIR: &str = "run `socket-patch repair` to restore it, then commit it";
     let path = &entry.artifact.path;
+    // `repair` restores a damaged artifact from a verified download (or,
+    // for a Bun member copy, from the verified canonical tarball); with
+    // nothing in the ledger to verify against, it refuses.
+    let repair = match super::redownload::ledger_blocks_restore(entry) {
+        Some(detail) => format!("`socket-patch repair` cannot restore it: {detail}"),
+        None => "run `socket-patch repair` to restore it, then commit it".to_string(),
+    };
     Some(match health {
         ArtifactHealth::Healthy => return None,
         // A JVM tree also counts as missing when only its marker is gone.
         ArtifactHealth::Missing if super::jvm::apply::is_jvm_entry(entry) => format!(
             "committed artifact {path} or its tree marker is missing (vendor_artifact_missing); \
-             {REPAIR}"
+             {repair}"
         ),
         ArtifactHealth::Missing => {
-            format!("committed artifact {path} is missing (vendor_artifact_missing); {REPAIR}")
+            format!("committed artifact {path} is missing (vendor_artifact_missing); {repair}")
         }
         ArtifactHealth::Corrupt { reason } if health.is_workspace_copy_issue() => {
             let mirror = super::bun_workspace::failing_mirror(project_root, entry)
@@ -816,7 +822,7 @@ pub async fn describe_artifact_failure(
             } else {
                 format!("; the committed artifact {path} it mirrors is intact")
             };
-            format!("Bun workspace copy {mirror} {cause} ({reason}){canonical}; {REPAIR}")
+            format!("Bun workspace copy {mirror} {cause} ({reason}){canonical}; {repair}")
         }
         ArtifactHealth::Corrupt { reason } => {
             let cause = match reason.as_str() {
@@ -827,7 +833,7 @@ pub async fn describe_artifact_failure(
                 "vendor_inventory_mismatch" => "has files that differ from its recorded inventory",
                 _ => "failed verification",
             };
-            format!("committed artifact {path} {cause} ({reason}); {REPAIR}")
+            format!("committed artifact {path} {cause} ({reason}); {repair}")
         }
         ArtifactHealth::StaleUuid => format!(
             "the vendor ledger and the patch manifest name different patches for {path} \
@@ -836,10 +842,11 @@ pub async fn describe_artifact_failure(
         ArtifactHealth::Unverifiable { reason }
             if reason == "vendor_workspace_artifact_invalid" =>
         {
+            let detail = super::bun_workspace::mirror_list_error(project_root, entry)
+                .unwrap_or_else(|| "the workspace copies could not be listed".into());
             format!(
-                "the Bun workspace copies of {path} cannot be checked because bun.lockb cannot be \
-                 read or names an unsafe path ({reason}); restore bun.lockb from version control \
-                 or re-run `socket-patch vendor`"
+                "the Bun workspace copies of {path} cannot be checked: {detail} ({reason}); \
+                 `socket-patch repair` will not rebuild them until that is fixed"
             )
         }
         ArtifactHealth::Unverifiable { reason } => format!(
@@ -1106,7 +1113,8 @@ mod tests {
     async fn describe_artifact_failure_names_path_and_remedy() {
         let root = tempfile::tempdir().unwrap();
         let rel = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
-        let entry = entry("npm", UUID, &rel);
+        let mut entry = entry("npm", UUID, &rel);
+        entry.artifact.sha256 = "ab".repeat(32);
         let describe = |health: ArtifactHealth| {
             let (root, entry) = (root.path().to_path_buf(), entry.clone());
             async move { describe_artifact_failure(&root, &entry, &health).await }
@@ -1161,22 +1169,71 @@ mod tests {
         for (health, want) in cases {
             assert_eq!(describe(health).await.unwrap(), want);
         }
-        // Without a bun.lockb there is no member copy to name: the text
-        // still reads as words.
-        let text = describe(ArtifactHealth::Corrupt {
-            reason: "vendor_workspace_artifact_missing".into(),
-        })
+
+        // With no recorded sha256, repair has nothing to verify a download
+        // (or the canonical tarball) against and refuses, so the text says
+        // so instead of sending the user to it. Without a bun.lockb there is
+        // no member copy to name, and the canonical is not claimed intact.
+        entry.artifact.sha256.clear();
+        let no_sha = describe_artifact_failure(
+            root.path(),
+            &entry,
+            &ArtifactHealth::Corrupt {
+                reason: "vendor_workspace_artifact_missing".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            no_sha,
+            format!(
+                "Bun workspace copy of {rel} is missing (vendor_workspace_artifact_missing); \
+                 `socket-patch repair` cannot restore it: {}",
+                super::super::redownload::ledger_blocks_restore(&entry).unwrap()
+            )
+        );
+        assert!(no_sha.contains("no archive SHA-256"), "{no_sha}");
+        // A dir-shaped artifact with no file inventory: the same refusal.
+        let dir = entry_dir_no_inventory();
+        let text = describe_artifact_failure(root.path(), &dir, &ArtifactHealth::Missing)
+            .await
+            .unwrap();
+        assert!(
+            text.contains("`socket-patch repair` cannot restore it: the ledger has no complete file inventory"),
+            "{text}"
+        );
+
+        // An unreadable bun.lockb: the workspace copies can't be listed, and
+        // the text carries the real cause rather than a guess.
+        entry.flavor = Some("bun".into());
+        std::fs::write(root.path().join("bun.lockb"), b"not a lockb").unwrap();
+        let detail = super::super::bun_workspace::mirror_list_error(root.path(), &entry).unwrap();
+        let text = describe_artifact_failure(
+            root.path(),
+            &entry,
+            &ArtifactHealth::Unverifiable {
+                reason: "vendor_workspace_artifact_invalid".into(),
+            },
+        )
         .await
         .unwrap();
         assert_eq!(
             text,
             format!(
-                "Bun workspace copy of {rel} is missing (vendor_workspace_artifact_missing); run \
-                 `socket-patch repair` to restore it, then commit it"
-            ),
-            "no recorded sha256: the canonical tarball is not claimed intact"
+                "the Bun workspace copies of {rel} cannot be checked: {detail} \
+                 (vendor_workspace_artifact_invalid); `socket-patch repair` will not rebuild \
+                 them until that is fixed"
+            )
         );
-        assert!(!text.contains('{') && !text.contains('"'), "{text}");
+        assert!(!text.contains("Corrupt {"), "{text}");
+    }
+
+    fn entry_dir_no_inventory() -> VendorEntry {
+        entry(
+            "cargo",
+            UUID,
+            &format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.4"),
+        )
     }
 
     /// A cargo copy's inventory taken before tagged versions keeps

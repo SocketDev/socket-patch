@@ -71,6 +71,12 @@ pub(super) async fn failing_mirror(root: &Path, entry: &VendorEntry) -> Option<S
     check(root, entry).await.err().and_then(|(_, rel)| rel)
 }
 
+/// Why the workspace copies cannot be listed at all (the detail behind
+/// `vendor_workspace_artifact_invalid`).
+pub(super) fn mirror_list_error(root: &Path, entry: &VendorEntry) -> Option<String> {
+    required_mirrors(root, entry).err()
+}
+
 async fn check(root: &Path, entry: &VendorEntry) -> Result<(), (&'static str, Option<String>)> {
     let mirrors =
         required_mirrors(root, entry).map_err(|_| ("vendor_workspace_artifact_invalid", None))?;
