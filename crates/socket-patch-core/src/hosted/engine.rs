@@ -1745,7 +1745,7 @@ pub async fn rewrite(
 /// the management commands read it ([`HostedInventory`]): the skips for
 /// the confirmed candidates whose pin would be contested wiring, a
 /// [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin, and a
-/// [`REDIRECT_COPY_UNPATCHED`] warning per pnpm `file:` copy a pin's own
+/// [`REDIRECT_COPY_UNPATCHED`] warning per pnpm or yarn copy a pin's own
 /// lock installs beside it. A lockless NuGet /
 /// Cargo pin ([`UnlockedPin`]) is written as before — whether such a pin
 /// may be written at all is the open hosted-rollback decision (E45) — but
@@ -1879,14 +1879,17 @@ async fn unattributed_pins(
             )
         })
         .collect();
-    // A pin whose own pnpm lock also installs an unpatched copy of the same
-    // `name@version` from a `file:` directory or tarball dependency (#935)
-    // is written: the registry copy is patched, and discovery withholds the
-    // pin from attestation but still manages it ([`Discovery::shadowed`],
-    // #828). The pnpm rewriter cannot see such a copy (a directory's
-    // version lives in its own package.json), so the run names it here, and
-    // keeps the in-run VEX from assuming the uuid applied, as the yarn
-    // classic rewriter does for the `file:` copies it reports itself.
+    // A pin whose own pnpm or yarn lock also installs an unpatched copy of
+    // the same `name@version` is written: the registry copy is patched, and
+    // discovery withholds the pin from attestation but still manages it
+    // ([`Discovery::shadowed`], #828). The rewriters cannot see every such
+    // copy: a pnpm `file:` directory's version lives in its own package.json
+    // (#935), and yarn keys a `file:` / url / `portal:` copy by the
+    // DEPENDENCY name (`lp2@file:…`), so which package it holds is read from
+    // the copy itself (#939, #1236). The run names each one here, and keeps
+    // the in-run VEX from assuming the uuid applied. A copy a rewriter
+    // already named (the yarn classic `file:` directory skip) is not named
+    // twice.
     //
     // [`Discovery::shadowed`]: crate::vex::discover::Discovery::shadowed
     let mut copy_left: Vec<RewriteWarning> = Vec::new();
@@ -1903,11 +1906,13 @@ async fn unattributed_pins(
                 && c.file == r.source_file
                 && matches!(
                     c.file.file_name().and_then(|n| n.to_str()),
-                    Some("pnpm-lock.yaml" | "shrinkwrap.yaml")
+                    Some("pnpm-lock.yaml" | "shrinkwrap.yaml" | "yarn.lock")
                 )
         }) {
             copy_shadowed.insert(r.uuid.clone());
-            if !named.insert((c.file.as_path(), c.key.as_str())) {
+            if yarn_rewriter_named(&done.rewrite.warnings, &c.file, &c.key)
+                || !named.insert((c.file.as_path(), c.key.as_str()))
+            {
                 continue;
             }
             copy_left.push(warning(
@@ -1915,7 +1920,7 @@ async fn unattributed_pins(
                 format!(
                     "{}: {} is pinned to patch {}, but lock entry `{}` {}; that copy stays \
                      UNPATCHED, so `vex` attests nothing for {}. Depend on the registry \
-                     release instead of that file: copy to patch it",
+                     release instead of that copy to patch it",
                     c.file.display(),
                     r.purl,
                     r.uuid,
@@ -2000,6 +2005,20 @@ async fn unattributed_pins(
     }
 }
 
+/// Whether a yarn rewriter's own warning already names lock entry `key` of
+/// the root `yarn.lock` (the only yarn lock the rewriters read): the yarn
+/// classic `file:` directory / url / alias skips name the entry by its raw
+/// key, exactly as discovery records it.
+fn yarn_rewriter_named(warnings: &[RewriteWarning], file: &std::path::Path, key: &str) -> bool {
+    if file != std::path::Path::new("yarn.lock") {
+        return false;
+    }
+    let entry = format!("`{key}`");
+    warnings
+        .iter()
+        .any(|w| w.code.starts_with("redirect_yarn_") && w.detail.contains(&entry))
+}
+
 /// What [`unattributed_pins`] decided for one pass.
 #[derive(Default)]
 struct Gated {
@@ -2007,7 +2026,7 @@ struct Gated {
     vetoed: Vec<SkippedPatch>,
     /// A [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin.
     lockless: Vec<RewriteWarning>,
-    /// A [`REDIRECT_COPY_UNPATCHED`] warning per pnpm `file:` copy a pin's
+    /// A [`REDIRECT_COPY_UNPATCHED`] warning per pnpm or yarn copy a pin's
     /// own lock installs beside it.
     copy_left: Vec<RewriteWarning>,
     /// The uuids of those pins, which the in-run VEX must not assume
@@ -2037,9 +2056,11 @@ fn reusable_prior(
 /// NuGet / Cargo redirect), which no later command can attribute.
 pub const REDIRECT_PIN_LOCKLESS: &str = "redirect_pin_lockless";
 
-/// Warning: a confirmed pin's own pnpm lock also installs an unpatched copy
-/// of the same `name@version` from a `file:` directory or tarball
-/// dependency (#935), which no rewrite reaches.
+/// Warning: a confirmed pin's own pnpm or yarn lock also installs an
+/// unpatched copy of the same `name@version` from a `file:` directory or
+/// tarball dependency (#935), or, in a yarn lock, from a `file:` / url /
+/// berry `portal:` / `link:` dependency declared under another name (#939,
+/// #1236), which no rewrite reaches.
 pub const REDIRECT_COPY_UNPATCHED: &str = "redirect_copy_unpatched";
 
 /// `skipped[].reason` of a candidate whose pin lockfile discovery would not

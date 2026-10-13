@@ -6,7 +6,8 @@
 //! * a classic block's dependency sub-maps against a patched manifest
 //!   ([`classic_deps`]);
 //! * key, descriptor and locator patterns ([`patterns`]);
-//! * where yarn 1 installs a block's copy from ([`source`]);
+//! * where yarn 1 installs a block's copy from ([`source`]), and which
+//!   package a copy keyed by another dependency name holds ([`copy`]);
 //! * the stanza view the hosted berry writers re-key and re-order
 //!   entries in ([`stanzas`]);
 //! * a `.yarnrc.yml` setting as yarn resolves it ([`rc`]);
@@ -23,6 +24,7 @@ pub mod berry_gates;
 pub(crate) mod berry_prune;
 pub(crate) mod blocks;
 pub(crate) mod classic_deps;
+pub(crate) mod copy;
 pub(crate) mod patterns;
 pub mod rc;
 pub(crate) mod source;

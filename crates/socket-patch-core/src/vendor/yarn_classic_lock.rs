@@ -121,7 +121,7 @@ impl NpmLockBackend for YarnClassicBackend {
         // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────
         let blocks = scan_blocks_shared(&text);
         let other_name =
-            other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version).await;
+            other_name_copy_warnings(project_root, &text, &coords.name, &coords.version).await;
         let (candidate_keys, skipped) =
             rewritable_candidates(&blocks, &coords.name, &coords.version).map_err(|o| {
                 only_other_name_copies(o, &blocks, &coords.name, &coords.version, &other_name)
@@ -379,65 +379,36 @@ fn rewritable_candidates(
 }
 
 /// A named warning for each block that installs `name@version` under
-/// ANOTHER dependency name (#1236): yarn 1 keys a `file:` directory or url
-/// copy by the name the depender gave it (`"lp2@file:./lpdir"`), so which
-/// package it is comes from the copy itself (the directory's
-/// `package.json`, the registry url's path). No re-lock of `name` reaches
-/// that copy, so it stays unpatched; the registry blocks are still wired.
+/// ANOTHER dependency name (#1236): yarn 1 keys a `file:` tarball or
+/// directory or a url copy by the name the depender gave it
+/// (`"lp2@file:./lpdir"`), so which package it is comes from the copy
+/// itself ([`super::yarn_copies::other_name_copies`]). No re-lock of `name`
+/// reaches that copy, so it stays unpatched; the registry blocks are still
+/// wired.
 async fn other_name_copy_warnings(
     project_root: &Path,
-    blocks: &[LockBlock],
+    lock_text: &str,
     name: &str,
     version: &str,
 ) -> Vec<VendorWarning> {
-    let mut out = Vec::new();
-    for block in blocks {
-        let patterns = split_key_patterns(&block.key);
-        if classic_key_real_name(&patterns) == Some(name)
-            || classic_field(&block.lines, "version") != Some(version)
-        {
-            continue;
-        }
-        let manifest = crate::formats::yarn::source::classic_file_directory(&patterns).map(|dir| {
-            if dir.is_empty() {
-                "package.json".to_string()
-            } else {
-                format!("{dir}/package.json")
-            }
-        });
-        let text = match manifest {
-            Some(rel) => read_regular_to_string(&project_root.join(&rel)).await.ok(),
-            None => None,
-        };
-        let copy = crate::formats::yarn::source::classic_copy_real_name(
-            &patterns,
-            classic_field(&block.lines, "resolved"),
-            version,
-            |_| text.clone(),
-        );
-        let Some((_, source)) = copy.filter(|(n, _)| n == name) else {
-            continue;
-        };
-        let (code, from) = match source {
-            CopySource::Directory => (
-                "vendor_link_entry_skipped",
-                "a file: directory, which yarn copies into node_modules",
-            ),
-            _ => (
-                "vendor_yarn_classic_non_registry_entry_skipped",
-                "a URL tarball",
-            ),
-        };
-        out.push(VendorWarning::new(
-            code,
-            format!(
-                "lock entry `{}` installs {name}@{version} under another dependency name, \
-                 from {from}; vendoring can't rewire it, so this copy stays UNPATCHED",
-                block.key
-            ),
-        ));
-    }
-    out
+    super::yarn_copies::other_name_copies(project_root, lock_text, name, version)
+        .await
+        .into_iter()
+        .map(|(key, source)| {
+            let code = match source {
+                crate::formats::yarn::copy::CopyRef::Directory(_) => "vendor_link_entry_skipped",
+                _ => "vendor_yarn_classic_non_registry_entry_skipped",
+            };
+            VendorWarning::new(
+                code,
+                format!(
+                    "lock entry `{key}` installs {name}@{version} under another dependency \
+                     name, from {}; vendoring can't rewire it, so this copy stays UNPATCHED",
+                    super::yarn_copies::copy_origin(&source)
+                ),
+            )
+        })
+        .collect()
 }
 
 /// A `vendor_lock_entry_not_found` refusal of a package whose only copies
@@ -486,6 +457,7 @@ fn has_own_name_block(blocks: &[LockBlock], name: &str, version: &str) -> bool {
 /// per package.
 pub(super) struct ClassicProject {
     blocks: Arc<Vec<LockBlock>>,
+    text: Arc<str>,
 }
 
 /// Read the lock as [`vendor_yarn_classic`]'s step 2 does — read,
@@ -498,6 +470,7 @@ pub(super) async fn read_project(project_root: &Path) -> Result<ClassicProject, 
     refuse_berry_lock(&text).map_err(|o| super::npm_common::refusal_code(&o))?;
     Ok(ClassicProject {
         blocks: scan_blocks_shared(&text),
+        text: Arc::from(text.as_str()),
     })
 }
 
@@ -511,7 +484,10 @@ pub(crate) async fn preflight_packages(
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Result<(), &'static str>> {
     let project = read_project(project_root).await;
-    let blocks = project.as_ref().ok().map(|p| Arc::clone(&p.blocks));
+    let lock = project
+        .as_ref()
+        .ok()
+        .map(|p| (Arc::clone(&p.blocks), Arc::clone(&p.text)));
     let mut gated = super::npm_common::gate_packages(project, packages, |project, coords| {
         let (name, version) = (coords.name.as_str(), coords.version.as_str());
         rewritable_candidates(&project.blocks, name, version)
@@ -520,7 +496,7 @@ pub(crate) async fn preflight_packages(
     });
     // The loop's step 3 turns "not found" into "not rewritable" when the
     // package's only copies are locked under another name; so does the plan.
-    if let Some(blocks) = blocks {
+    if let Some((blocks, text)) = lock {
         for ((purl, record), gate) in packages.iter().zip(gated.iter_mut()) {
             if *gate != Err("vendor_lock_entry_not_found") {
                 continue;
@@ -529,7 +505,7 @@ pub(crate) async fn preflight_packages(
                 continue;
             };
             if !has_own_name_block(&blocks, &coords.name, &coords.version)
-                && !other_name_copy_warnings(project_root, &blocks, &coords.name, &coords.version)
+                && !other_name_copy_warnings(project_root, &text, &coords.name, &coords.version)
                     .await
                     .is_empty()
             {
@@ -1931,6 +1907,42 @@ wow@^1.0.0:
             assert_eq!(url.len(), 1, "{fork}: {warnings:?}");
             let text = fx.lock_text().await;
             assert!(text.contains("\"lp2@file:./lpdir\":\n  version \"1.3.0\""));
+        }
+    }
+
+    /// #1236 follow-up: a `file:` TARBALL declared under another dependency
+    /// name (`"lp2": "file:./forks/left-pad-1.3.0.tgz"`) is read from the
+    /// tarball's own `package.json` and named too; the registry block is
+    /// still wired. Control: a tarball holding another package is not named.
+    #[tokio::test]
+    async fn issue_1236_other_name_file_tarball_copy_is_named() {
+        let extra = "\n\"lp2@file:./forks/left-pad-1.3.0.tgz\":\n  version \"1.3.0\"\n  \
+                     resolved \"file:./forks/left-pad-1.3.0.tgz#cccc\"\n";
+        let lock = format!("{Y2_BEFORE}{extra}");
+        for (fork, named) in [("left-pad", true), ("other-pkg", false)] {
+            let fx = fixture_with_lock(&lock).await;
+            tokio::fs::create_dir_all(fx.root().join("forks"))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                fx.root().join("forks/left-pad-1.3.0.tgz"),
+                crate::vex::discover::testing::npm_tgz(fork, "1.3.0"),
+            )
+            .await
+            .unwrap();
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(entry.unwrap().wiring.len(), 1, "the registry block");
+            let tarball: Vec<&VendorWarning> = warnings
+                .iter()
+                .filter(|w| {
+                    w.code == "vendor_yarn_classic_non_registry_entry_skipped"
+                        && w.detail.contains("lp2@")
+                        && w.detail.contains("file: tarball")
+                })
+                .collect();
+            assert_eq!(tarball.len(), usize::from(named), "{fork}: {warnings:?}");
+            assert!(fx.lock_text().await.contains(extra.trim_start()));
         }
     }
 
