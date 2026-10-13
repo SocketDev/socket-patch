@@ -360,12 +360,13 @@ fn bun(cwd: &Path, args: &[&str], bun_home: &Path) -> Output {
 /// `#[serial]`, so one slot is enough.
 static ONLINE_ENV: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
-/// The real binary with `--no-telemetry` appended: nothing in this suite
-/// should ever post a telemetry event, mocked API or not.
+/// The real binary in the hermetic environment (`tests/common/hermetic.rs`)
+/// with `--no-telemetry` appended: nothing in this suite should ever post a
+/// telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = common::hermetic_command(&binary());
     cmd.args(args).arg("--no-telemetry").current_dir(cwd);
-    scrub_env(&mut cmd);
+    cache_env::scrub_ambient_bun_tool_env(&mut cmd);
     for (k, v) in ONLINE_ENV.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         cmd.env(k, v);
     }

@@ -48,6 +48,21 @@ const HOSTILE_SEEDS: &[(&str, &str)] = &[
     ("SOCKET_UPDATE_STATE_DIR", "/nonexistent"),
 ];
 
+/// The opt-outs [`command`] forces on in every child: the config layer
+/// (a developer's real `socket login` must never authenticate a test
+/// child), the passive update notifier (no child may fetch release metadata
+/// from real GitHub; the PTY suites hand the binary a real terminal, so the
+/// stderr-TTY guard doesn't hold there) and telemetry (an unauthenticated
+/// child would POST to the real public proxy; the workspace `[env]` default
+/// can be overridden by the developer's shell). Suites that clear the
+/// environment re-apply these after the clear. Notifier and telemetry
+/// suites opt back in via caller env, which lands last.
+pub const FORCED_OPT_OUTS: &[(&str, &str)] = &[
+    ("SOCKET_NO_CONFIG", "1"),
+    ("SOCKET_NO_UPDATE_CHECK", "1"),
+    ("SOCKET_TELEMETRY_DISABLED", "1"),
+];
+
 /// A `Command` for `bin` with the hermetic `SOCKET_*` environment: the
 /// hostile seeds scrubbed, every flag-bound `SOCKET_*` and every other
 /// ambient `SOCKET_*` removed (removing `SOCKET_API_TOKEN` also forces the
@@ -75,23 +90,12 @@ pub fn command(bin: &Path) -> Command {
     }
     cmd.env_remove("SOCKET_API_TOKEN");
     scrub_socket_vars(&mut cmd);
-    // Belt-and-braces on top of the `.cargo/config.toml` `[env]` default:
-    // a developer's real `socket login` (the socket-cli config.json token
-    // fallback) must never authenticate a test child — it would flip every
-    // "no token → public proxy" assertion onto the authed path.
-    cmd.env("SOCKET_NO_CONFIG", "1");
-    // Same posture for the passive update notifier: no test child may ever
-    // fetch release metadata from real GitHub. The stderr-TTY guard covers
-    // piped children, but the PTY suites hand the binary a real terminal —
-    // this force-set is the layer that holds there. Notifier tests opt back
-    // in via caller env (which lands last).
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
-    // And for telemetry: an unauthenticated child POSTs its events to the
-    // real public proxy unless a suite points it at a mock. The workspace
-    // `[env]` default can be overridden by the developer's shell, so force
-    // it here too. Telemetry suites opt back in via caller env with
-    // `SOCKET_TELEMETRY_DISABLED=0` and a wiremock endpoint.
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    // Belt-and-braces on top of the `.cargo/config.toml` `[env]` defaults
+    // (see `FORCED_OPT_OUTS`): a developer's real `socket login` would flip
+    // every "no token → public proxy" assertion onto the authed path.
+    // Telemetry suites opt back in with `SOCKET_TELEMETRY_DISABLED=0` and a
+    // wiremock endpoint.
+    cmd.envs(FORCED_OPT_OUTS.iter().copied());
     cmd
 }
 
@@ -192,6 +196,13 @@ pub enum Extra {
     /// `BUNDLE_APP_CONFIG` and then scrubbed; run it before the suite sets
     /// its own `BUNDLE_*` values.
     Bundle,
+    /// Every `PDM_*` var plus `UV_PROJECT_ENVIRONMENT`: PDM reads any
+    /// setting from `PDM_<NAME>`, and its uv backend follows
+    /// `UV_PROJECT_ENVIRONMENT` to a different venv.
+    Pdm,
+    /// Every `POETRY_*` var: Poetry reads any config key from
+    /// `POETRY_<KEY>` (`POETRY_VIRTUALENVS_PATH`, repository URLs, ...).
+    Poetry,
 }
 
 /// Apply each of `extras` to `cmd` (see [`Extra`]). Run it before
@@ -246,6 +257,21 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                     }
                 }
                 cmd.env_remove("BUNDLE_APP_CONFIG");
+            }
+            Extra::Pdm => {
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().starts_with("PDM_") {
+                        cmd.env_remove(&key);
+                    }
+                }
+                cmd.env_remove("UV_PROJECT_ENVIRONMENT");
+            }
+            Extra::Poetry => {
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().starts_with("POETRY_") {
+                        cmd.env_remove(&key);
+                    }
+                }
             }
         }
     }

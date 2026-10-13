@@ -18,6 +18,9 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+#[path = "../common/hermetic.rs"]
+pub mod hermetic;
+
 pub const ORG: &str = "test-org";
 
 pub fn fixtures_root() -> PathBuf {
@@ -405,8 +408,12 @@ fn disk_command(
     // The checkout is its own repo: no socket.yml above the temp dir applies.
     std::fs::create_dir_all(checkout.path().join(".git")).unwrap();
     let cwd = checkout.path().join(cwd_rel);
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    // A cleared environment: the disk scan must see none of the host's tool
+    // state either, so only the vars set below reach the child, including
+    // the hermetic builder's forced opt-outs, re-applied after the clear.
+    let mut cmd = hermetic::binary_command();
     cmd.env_clear();
+    cmd.envs(hermetic::FORCED_OPT_OUTS.iter().copied());
     for keep in [
         "SYSTEMROOT",
         "SystemRoot",
@@ -431,10 +438,7 @@ fn disk_command(
         .env("GOPATH", empty("go"))
         .env("GOMODCACHE", empty("gomodcache"))
         .env("GEM_HOME", empty("gem"))
-        .env("XDG_CONFIG_HOME", empty("xdg"))
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_UPDATE_CHECK", "1");
+        .env("XDG_CONFIG_HOME", empty("xdg"));
     cmd.args([
         "scan",
         "--mode",

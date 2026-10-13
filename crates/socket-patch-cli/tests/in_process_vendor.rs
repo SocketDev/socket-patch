@@ -22,6 +22,8 @@
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -32,7 +34,6 @@ async fn vendor_run(mut args: VendorArgs) -> i32 {
 }
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -237,34 +238,16 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
 
 // ───────────────────────── subprocess runner ─────────────────────────
 
-/// Run the built `socket-patch` binary with every ambient `SOCKET_*` env var
-/// scrubbed from the child (env-robustness: the assertions must reflect the
-/// argv, not the developer's shell) and telemetry hard-disabled. Returns
-/// `(exit_code, stdout, stderr)`.
+/// Run the built `socket-patch` binary in the hermetic environment
+/// (`tests/common/hermetic.rs`): the assertions must reflect the argv, not
+/// the developer's shell. The builder also removes every flag-bound
+/// `SOCKET_*` by name, so a toggle a parallel in-process test's
+/// `apply_env_toggles` sets before the spawn is not inherited either (seen
+/// on test-release: a hosted scan inherited SOCKET_OFFLINE=1 and refused to
+/// run). Returns `(exit_code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).current_dir(cwd);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    // The in-process tests in this binary run `apply_env_toggles`, which
-    // `std::env::set_var`s these on the shared test process. A toggle set
-    // by a parallel test after the scan above but before the spawn would
-    // be inherited, so remove them unconditionally: `Command` applies the
-    // removals to the environment captured at spawn time. Seen on
-    // test-release: a hosted scan here inherited SOCKET_OFFLINE=1 and
-    // refused to run ("cannot run with --offline/SOCKET_OFFLINE").
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
-    ] {
-        cmd.env_remove(key);
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

@@ -30,6 +30,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 use vex_e2e_common::{
@@ -667,26 +669,21 @@ async fn assert_relock_roundtrip(lock: &str, relocked: &str) {
     );
 }
 
-/// Spawn `scan --mode hosted --json` on `root` with a scrubbed environment
-/// (no ambient `SOCKET_*`, `PDM_*` or `VIRTUAL_ENV`).
+/// Spawn `scan --mode hosted --json` on `root` in the hermetic environment,
+/// with no ambient `PDM_*`, `VIRTUAL_ENV` or `UV_PROJECT_ENVIRONMENT` either.
 async fn scan_json(
     root: &Path,
     server: &MockServer,
     extra: &[&str],
 ) -> (Option<i32>, serde_json::Value) {
-    let mut cmd = tokio::process::Command::new(binary());
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_")
-            || name.starts_with("PDM_")
-            || name == "VIRTUAL_ENV"
-            || name == "UV_PROJECT_ENVIRONMENT"
-        {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .args(["scan", "--mode", "hosted", "--yes", "--json", "--cwd"])
+    let mut std_cmd = hermetic::binary_command();
+    hermetic::scrub_extra(&mut std_cmd, &[hermetic::Extra::Venv, hermetic::Extra::Pdm]);
+    // The #[serial] in-process tests here `set_var` this for their own
+    // mock; a non-serial scan building its command meanwhile would inherit
+    // it, so remove it by name rather than only via the builder's sweep.
+    std_cmd.env_remove("SOCKET_PYPI_JSON_API");
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(["scan", "--mode", "hosted", "--yes", "--json", "--cwd"])
         .arg(root)
         .args([
             "--api-url",

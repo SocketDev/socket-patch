@@ -13,12 +13,14 @@
 
 use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:pypi/six@1.16.0";
@@ -110,13 +112,13 @@ async fn offer(server: &MockServer, uuid: &str, grant: &str, generation: u8) -> 
     hosted_url
 }
 
-/// `scan --mode hosted --json` with every ambient `SOCKET_*` var scrubbed.
+/// `scan --mode hosted --json` in the hermetic environment.
 /// `VIRTUAL_ENV` points at the fixture venv ([`project`]), which keeps the
 /// installed-tree probes off the host's Python.
 fn hosted_scan(root: &Path, server: &MockServer) -> (i32, Value) {
     let venv = root.join("../venv");
     let uri = server.uri();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args([
         "scan",
         "--mode",
@@ -136,14 +138,8 @@ fn hosted_scan(root: &Path, server: &MockServer) -> (i32, Value) {
     ])
     .arg("--cwd")
     .arg(root)
-    .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("VIRTUAL_ENV", &venv);
+    .current_dir(root)
+    .env("VIRTUAL_ENV", &venv);
     let out = cmd.output().expect("spawn socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let env = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
