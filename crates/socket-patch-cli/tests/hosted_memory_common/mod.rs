@@ -253,8 +253,8 @@ pub fn read_tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// `files` added to a session (`bun.lockb` as bytes, the rest as text)
-/// plus presence-only markers.
+/// `files` added to a session (`bun.lockb` and `.tgz` tarballs as bytes,
+/// the rest as text) plus presence-only markers.
 pub fn build_input(
     files: &BTreeMap<String, Vec<u8>>,
     present: &[&str],
@@ -262,7 +262,7 @@ pub fn build_input(
 ) -> socket_patch_cli::hosted_memory::HostedScanInput {
     let mut builder = SessionBuilder::new(options).expect("valid options");
     for (path, bytes) in files {
-        if path.ends_with("bun.lockb") {
+        if path.ends_with("bun.lockb") || path.ends_with(".tgz") {
             builder.add_binary(path, bytes).unwrap();
         } else {
             builder.push_chunk(path, bytes).unwrap();
