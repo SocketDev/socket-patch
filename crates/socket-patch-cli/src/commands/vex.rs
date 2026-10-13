@@ -23,6 +23,7 @@ use clap::Args;
 use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
+use socket_patch_core::vex::verify::DEPENDENCY_NOT_INSTALLED;
 use socket_patch_core::vex::{
     build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
     VerifyOutcome,
@@ -1781,6 +1782,10 @@ fn omission_phrase(reason: &str) -> &'static str {
              against"
         }
         "stale_install" => "the installed copy is not patched",
+        DEPENDENCY_NOT_INSTALLED => {
+            "the patched package.json declares a dependency that is not installed (the \
+             lockfile does not lock it)"
+        }
         "mirror_overrides_source" => {
             "a Bundler mirror overrides the hosted source and installed bytes were not verified"
         }
@@ -1986,6 +1991,7 @@ mod tests {
             "vendor_manifest_unverifiable",
             "stale_install",
             "mirror_overrides_source",
+            DEPENDENCY_NOT_INSTALLED,
             RECORD_UNAVAILABLE,
             RECORD_MISMATCH,
             VENDOR_UNWIRED,

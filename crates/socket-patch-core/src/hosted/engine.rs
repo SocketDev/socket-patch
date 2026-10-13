@@ -1260,10 +1260,12 @@ pub fn yarn_berry_manifest_targets<'a>(
 
 /// The npm deps whose yarn classic pin reads the served tarball, one per
 /// distinct artifact URL: the project's `yarn.lock` is a classic lock that
-/// names the package, the grant carries a sha512, and either the grant has
-/// no sha1 for the `resolved` fragment yarn 1 keys its cache slot on
-/// (#558), or the lock doesn't pin this artifact yet, so the tarball's own
-/// dependencies must be checked against the lock (#591).
+/// pins the artifact already or locks the package as a registry copy, and
+/// the grant carries a sha512. The tarball gives the sha1 for the
+/// `resolved` fragment yarn 1 keys its cache slot on when the grant has
+/// none (#558), and its own dependencies are checked against the lock
+/// (#591) on every run: a pin an earlier release wrote was never checked
+/// (#1462).
 /// A lock the project's offline mirror refuses outright (`yarn_outer`: the
 /// mirror settings outside the project files) needs none.
 pub fn yarn_classic_artifact_targets<'a>(
@@ -1285,11 +1287,10 @@ pub fn yarn_classic_artifact_targets<'a>(
 
 /// [`yarn_classic_artifact_targets`] over a classic `lock`, reading its
 /// registry copies through `read_copies`. The lock is read in one pass for
-/// the artifacts it pins already, once a dep with a sha1 asks; the
-/// registry-copy test reads every block, so it runs after that, at most
-/// once per lock, and only when some dep still needs it (#1423): a rescan
-/// whose grants all carry a sha1 and are pinned already never reads the
-/// blocks.
+/// the artifacts it pins already; the registry-copy test reads every
+/// block, so it runs after that, at most once per lock, and only when some
+/// dep is not pinned yet (#1423): a rescan whose deps are all pinned
+/// already never reads the blocks.
 fn select_classic_artifacts<'a>(
     candidates: &'a [Candidate],
     lock: &str,
@@ -1304,15 +1305,14 @@ fn select_classic_artifacts<'a>(
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
         .filter(|dep| {
-            dep.integrity.sha1.is_none()
-                || !pinned
-                    .get_or_insert_with(|| quoted_fragment_urls(lock))
-                    .contains(dep.artifact_url.as_str())
-        })
-        .filter(|dep| {
-            registry_copies
-                .get_or_insert_with(|| read_copies.take().map_or_else(HashSet::new, |r| r(lock)))
-                .contains(&(crate::patch::redirect::full_name(dep), dep.version.clone()))
+            pinned
+                .get_or_insert_with(|| quoted_fragment_urls(lock))
+                .contains(dep.artifact_url.as_str())
+                || registry_copies
+                    .get_or_insert_with(|| {
+                        read_copies.take().map_or_else(HashSet::new, |r| r(lock))
+                    })
+                    .contains(&(crate::patch::redirect::full_name(dep), dep.version.clone()))
         })
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
@@ -3250,10 +3250,10 @@ mod tests {
         );
     }
 
-    /// #1423: the served tarball is read only for a dep the lock locks as
-    /// a registry copy and doesn't pin to the artifact yet. The lock's
-    /// blocks are read at most once however many deps there are, and not
-    /// at all on a rescan whose deps are all pinned already.
+    /// #1423: the served tarball is read only for a dep the lock pins to
+    /// the artifact or locks as a registry copy. The lock's blocks are
+    /// read at most once however many deps there are, and not at all on a
+    /// rescan whose deps are all pinned already.
     #[test]
     fn classic_artifact_targets_read_the_lock_blocks_at_most_once() {
         let mut lock = String::from("# yarn lockfile v1\n\n");
@@ -3277,13 +3277,17 @@ mod tests {
             classic_registry_copies(lock)
         };
 
-        // Every dep pinned to its artifact already: nothing to fetch, and
-        // the blocks are never read.
+        // Every dep pinned to its artifact already: each tarball is still
+        // read, since an earlier release pinned it without checking its
+        // dependencies (#1462), but the blocks are never read.
         let mut pinned = lock.clone();
         for c in &candidates {
             pinned.push_str(&format!("# \"{}#s1\"\n", c.dep.artifact_url));
         }
-        assert!(select_classic_artifacts(&candidates, &pinned, counted).is_empty());
+        assert_eq!(
+            select_classic_artifacts(&candidates, &pinned, counted).len(),
+            n
+        );
         assert_eq!(reads.get(), 0);
 
         // Unpinned: every registry copy is selected once per artifact; a

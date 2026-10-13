@@ -479,7 +479,85 @@ async fn verify_hosted_copies(
         }
         None => record,
     };
-    verify_every_copy(&copies.paths, record).await
+    verify_every_copy(&copies.paths, record).await?;
+    if Ecosystem::from_purl(purl) == Some(Ecosystem::Npm) && touches_npm_manifest(record) {
+        for path in &copies.paths {
+            if unresolved_npm_dependency(path).await.is_some() {
+                return Err(DEPENDENCY_NOT_INSTALLED.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The omission tag of a hosted npm copy that carries the patched bytes
+/// but whose patched `package.json` declares a dependency node cannot
+/// resolve from it (#1462): the lock never locked it, so the package was
+/// installed without it.
+pub const DEPENDENCY_NOT_INSTALLED: &str = "dependency_not_installed";
+
+/// Whether an npm `record` patches the package's own `package.json`, the
+/// only way a patch changes the dependencies its package declares.
+fn touches_npm_manifest(record: &PatchRecord) -> bool {
+    record
+        .files
+        .keys()
+        .any(|key| key.strip_prefix("package/").unwrap_or(key) == "package.json")
+}
+
+/// The first `dependencies` entry of the installed npm copy at `pkg_path`
+/// that node cannot resolve from it: no `node_modules/<name>` in the copy
+/// or in any directory above it (node's lookup, which also finds a
+/// bundled, hoisted or pnpm-sibling copy). Optional dependencies may be
+/// absent, and a copy outside a `node_modules` tree (a Plug'n'Play
+/// install), an unreadable manifest or a name that is not a plain package
+/// name is never evidence.
+async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
+    if !pkg_path
+        .components()
+        .any(|c| c.as_os_str() == "node_modules")
+    {
+        return None;
+    }
+    let text = tokio::fs::read_to_string(pkg_path.join("package.json"))
+        .await
+        .ok()?;
+    let pkg: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let optional = pkg
+        .get("optionalDependencies")
+        .and_then(serde_json::Value::as_object);
+    pkg.get("dependencies")?
+        .as_object()?
+        .keys()
+        .filter(|name| optional.is_none_or(|o| !o.contains_key(*name)))
+        .filter(|name| plain_npm_name(name))
+        .find(|name| !node_resolves(pkg_path, name))
+        .cloned()
+}
+
+/// `name` is `pkg` or `@scope/pkg`, with no empty, `.` or `..` component
+/// and no backslash, so joining it under `node_modules` stays there.
+fn plain_npm_name(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    let shape_ok = match parts.as_slice() {
+        [_] => true,
+        [scope, _] => scope.starts_with('@') && scope.len() > 1,
+        _ => false,
+    };
+    shape_ok
+        && !name.contains('\\')
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && *p != "." && *p != "..")
+}
+
+/// Whether node resolves the package `name` from the package directory
+/// `from`: `<dir>/node_modules/<name>` exists for `from` or an ancestor
+/// that is not itself a `node_modules` directory.
+fn node_resolves(from: &Path, name: &str) -> bool {
+    from.ancestors()
+        .filter(|dir| dir.file_name().is_none_or(|n| n != "node_modules"))
+        .any(|dir| dir.join("node_modules").join(name).exists())
 }
 
 /// Whether `rest` (what follows a matched `from` prefix) starts a new name
