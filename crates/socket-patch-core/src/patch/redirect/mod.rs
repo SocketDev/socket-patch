@@ -1056,27 +1056,45 @@ fn rewrite_hatch(
             .extend(result.confirmed_requirements_uuids.iter().cloned());
         return;
     }
-    // Overlay only the two documents the hatch planner reads, so the second
-    // pypi dep sees the first dep's rewritten pyproject — without cloning
-    // every candidate lockfile in `files` for it.
-    let mut current: BTreeMap<String, String> = crate::utils::hatch::HATCH_FILES
-        .into_iter()
-        .filter_map(|k| files.get(k).map(|v| (k.to_owned(), v.clone())))
+    // Every dep is wired over one parse and one render of the Hatch
+    // documents (#1471); each step is what rewriting that dep after the
+    // ones before it would give.
+    let pypi: Vec<(&DepOverride, Option<String>)> = overrides
+        .iter()
+        .filter(|dep| dep.ecosystem == "pypi")
+        .map(|dep| {
+            let url = dep
+                .integrity
+                .sha256
+                .as_ref()
+                .filter(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .map(|hash| format!("{}#sha256={hash}", dep.artifact_url));
+            (dep, url)
+        })
         .collect();
-    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
-        let Some(hash) =
-            dep.integrity.sha256.as_ref().filter(|hash| {
-                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    let deps: Vec<crate::utils::hatch::HatchDep> = pypi
+        .iter()
+        .filter_map(|(dep, url)| {
+            url.as_deref().map(|url| crate::utils::hatch::HatchDep {
+                name: &dep.name,
+                version: &dep.version,
+                url,
             })
-        else {
+        })
+        .collect();
+    let batch = crate::utils::hatch::rewrite_all(files, &deps);
+    let mut steps = batch.steps.into_iter();
+    for (dep, url) in &pypi {
+        if url.is_none() {
             result.warnings.push(RewriteWarning {
                 code: "redirect_hatch_missing_sha256".into(),
                 detail: format!("{} has no valid wheel digest", dep.name),
             });
             continue;
-        };
-        let url = format!("{}#sha256={hash}", dep.artifact_url);
-        match crate::utils::hatch::rewrite(&current, &dep.name, &dep.version, &url) {
+        }
+        match steps.next().expect("one step per hatch dep") {
             Ok(edits) => {
                 result.confirmed_hatch_uuids.insert(dep.patch_uuid.clone());
                 if !edits.is_empty() && !hatch_locks.is_empty() {
@@ -1093,17 +1111,20 @@ fn rewrite_hatch(
                         ),
                     });
                 }
-                for (path, new) in edits {
+                for edit in edits {
                     result.edits.push(FileEdit {
-                        path: path.clone(),
-                        kind: "redirect_hatch_document".into(),
+                        path: edit.file,
+                        kind: if edit.permission {
+                            "redirect_hatch_permission"
+                        } else {
+                            "redirect_hatch_requirement"
+                        }
+                        .into(),
                         action: "rewritten".into(),
                         key: Some(format!("{}@{}", dep.name, dep.version)),
-                        original: current.get(&path).cloned().map(Value::String),
-                        new: Some(Value::String(new.clone())),
+                        original: Some(Value::String(edit.original)),
+                        new: Some(Value::String(edit.new)),
                     });
-                    current.insert(path.clone(), new.clone());
-                    result.files.insert(path, new);
                 }
             }
             Err(detail) => result.warnings.push(RewriteWarning {
@@ -1112,6 +1133,7 @@ fn rewrite_hatch(
             }),
         }
     }
+    result.files.extend(batch.files);
 }
 
 // ── npm package-lock.json / npm-shrinkwrap.json ─────────────────────────────
