@@ -1912,6 +1912,73 @@ async fn hosted_run_from_negated_or_extglob_workspace_member_refuses() {
     }
 }
 
+/// #1490: yarn berry matches `workspaces` with picomatch, which also reads
+/// regex groups, POSIX classes and `..` segments. The matcher read them as
+/// literal text, so a hosted `scan` / `get` from such a member pinned
+/// nothing and exited 0.
+#[tokio::test]
+#[serial]
+async fn hosted_run_from_berry_picomatch_workspace_member_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    const BERRY: &str = "__metadata:\n  version: 8\n  cacheKey: 10c0\n";
+    for workspaces in [
+        r#"["packages/(a|b)"]"#,
+        r#"["packages/pkg-(x|y)", "packages/(a|z)?"]"#,
+        r#"["packages/[[:alpha:]]"]"#,
+        r#"["packages/b/../a"]"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let member = write_workspace_member(
+            tmp.path(),
+            "package.json",
+            &format!(r#"{{ "name": "root", "private": true, "workspaces": {workspaces} }}"#),
+            "yarn.lock",
+        );
+        let lock = tmp.path().join("yarn.lock");
+        std::fs::write(&lock, BERRY).unwrap();
+        let (code, doc) = run_hosted_json(&member, &server.uri());
+        assert_refused_workspace_lock_elsewhere(workspaces, code, &doc, &lock, BERRY, &member);
+
+        let out = scrubbed_cli()
+            .args([
+                "get",
+                UUID,
+                "--mode",
+                "hosted",
+                "--json",
+                "--yes",
+                "--cwd",
+                member.to_str().unwrap(),
+                "--api-url",
+                &server.uri(),
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+            ])
+            .output()
+            .expect("run socket-patch");
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{workspaces}: get --json output is not JSON ({e}):\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_refused_workspace_lock_elsewhere(
+            &format!("get: {workspaces}"),
+            out.status.code(),
+            &doc,
+            &lock,
+            BERRY,
+            &member,
+        );
+    }
+}
+
 /// #942: vlt reads its workspaces from `vlt.json` and keeps one
 /// `vlt-lock.json` at that root, so a hosted run from a member found the
 /// member's copy, read no lock, pinned nothing and exited 0. It now
