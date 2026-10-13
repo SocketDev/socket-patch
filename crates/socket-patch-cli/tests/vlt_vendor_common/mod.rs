@@ -18,6 +18,8 @@
 
 #![allow(dead_code)]
 
+#[path = "../common/hermetic.rs"]
+mod hermetic;
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -347,34 +349,20 @@ pub fn capture_project(root: &Path, case: &Case) {
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
-/// The `socket-patch` binary with the ambient `SOCKET_*`, `VLT_*` and proxy
-/// environment scrubbed (telemetry disabled).
+/// The `socket-patch` binary with the hermetic `SOCKET_*` environment (see
+/// `hermetic::command`) and the ambient `VLT_*` and proxy environment
+/// scrubbed.
 pub fn cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy().to_string();
+        let name = key.to_string_lossy();
         let proxy = ["http_proxy", "https_proxy", "all_proxy", "no_proxy"]
             .iter()
             .any(|p| name.eq_ignore_ascii_case(p));
-        if proxy
-            || name.starts_with("VLT_")
-            || (name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG")
-        {
+        if proxy || name.starts_with("VLT_") {
             cmd.env_remove(&key);
         }
     }
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DRY_RUN",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
-        "SOCKET_NO_VLT_INSTALL_CLEANUP",
-    ] {
-        cmd.env_remove(key);
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_NO_UPDATE_CHECK", "1");
     cmd
 }
 

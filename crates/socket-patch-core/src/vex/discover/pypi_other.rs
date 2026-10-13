@@ -343,7 +343,7 @@ async fn extract_hatch(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 async fn read_toml(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) -> Option<DocumentMut> {
     let text = ctx.read_text(file, out).await?;
     // The TOML lexer skips one leading BOM itself (`formats::text`'s rule).
-    toml_or_diag(file, &text, TomlDiag::BomFlattened, out)
+    toml_or_diag(file, &text, TomlDiag::BomFlattened, out).map(toml_edit::Document::into_mut)
 }
 
 /// One PEP 508 dependency string. `root_uri_expanded`: whether Hatch

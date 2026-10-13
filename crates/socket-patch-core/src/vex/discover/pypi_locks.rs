@@ -297,7 +297,7 @@ fn str_of<'t>(table: &'t dyn TableLike, key: &str) -> Option<&'t str> {
 fn package_tables<'d>(
     out: &mut Discovery,
     file: &str,
-    doc: &'d DocumentMut,
+    doc: &'d Table,
     collection: &str,
 ) -> Option<&'d toml_edit::ArrayOfTables> {
     let item = doc.get(collection)?;
@@ -874,7 +874,7 @@ async fn extract_poetry(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 
 /// The pin Poetry verifies `filename` against (see the module docs).
 fn poetry_pin(
-    doc: &DocumentMut,
+    doc: &Table,
     package: &Table,
     name: &str,
     filename: &str,

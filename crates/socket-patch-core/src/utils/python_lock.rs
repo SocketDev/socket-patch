@@ -34,7 +34,7 @@ impl ArtifactSource<'_> {
 /// (uv 0.2.x) or `package` (uv ≥ 0.2.35 and PEP 723 script locks). The
 /// lock inventory, lockfile discovery and `lock_inventory::
 /// wired_vendor_integrity` all pick the array with this one rule.
-pub(crate) fn lock_package_collection(doc: &DocumentMut) -> (&'static str, bool) {
+pub(crate) fn lock_package_collection(doc: &Table) -> (&'static str, bool) {
     if doc.contains_key("lock-version") {
         ("packages", true)
     } else if doc.contains_key("distribution") {
