@@ -16,7 +16,6 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,8 +27,10 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 
-/// Build a `Command` for the CLI with the entire `SOCKET_*` environment
-/// scrubbed from the child process.
+/// Build a `Command` for the CLI with the hermetic `SOCKET_*` environment of
+/// `tests/common/hermetic.rs`: ambient `SOCKET_*` vars (other than a
+/// telemetry opt-out) are removed from the child, and the config,
+/// update-check and telemetry opt-outs are forced on.
 ///
 /// Every flag these tests rely on has an env fallback: `--product`/
 /// `SOCKET_VEX_PRODUCT`, `--no-verify`/`SOCKET_VEX_NO_VERIFY`, `--doc-id`/
@@ -46,13 +47,7 @@ use socket_patch_core::manifest::schema::{
 /// (the parent env is never mutated, so tests stay independent and need no
 /// serialization) makes the explicit CLI flags the sole source of truth.
 fn cli() -> Command {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
+    common::hermetic::binary_command()
 }
 
 /// Write `manifest` to `<cwd>/.socket/manifest.json`.

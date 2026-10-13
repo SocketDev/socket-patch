@@ -545,10 +545,13 @@ fn socket_patch(
     service: &PatchService,
     args: &[&str],
 ) -> (Option<i32>, Value) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = crate::vex_e2e_common::hermetic::binary_command();
+    crate::vex_e2e_common::hermetic::scrub_extra(
+        &mut cmd,
+        &[crate::vex_e2e_common::hermetic::Extra::Venv],
+    );
     for (key, _) in std::env::vars_os() {
-        let k = key.to_string_lossy();
-        if k.starts_with("SOCKET_") || k.starts_with("POETRY_") || k == "VIRTUAL_ENV" {
+        if key.to_string_lossy().starts_with("POETRY_") {
             cmd.env_remove(&key);
         }
     }
@@ -556,8 +559,6 @@ fn socket_patch(
         cmd.env(key, value);
     }
     let out = cmd
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .current_dir(project)
         .args(args)
         .args(["--json", "--yes", "--cwd"])

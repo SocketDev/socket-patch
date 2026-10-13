@@ -454,15 +454,8 @@ fn standalone_vex_dry_run_and_stdout_output_work_without_a_manifest() {
     assert_no_manifest_or_ledgers(p);
 
     // `-O -`: the document is stdout.
-    let mut cmd = std::process::Command::new(binary());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = crate::hermetic::binary_command();
     let out = cmd
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("SOCKET_NO_API_TOKEN", "1")
         .current_dir(p)
         .args(["vex", "--cwd"])
@@ -700,15 +693,8 @@ fn manifestless_apply_prints_its_summary_before_vex_warnings() {
     std::fs::write(p.join("package-lock.json"), "not json").unwrap();
     let log = p.join("combined.log");
     let file = std::fs::File::create(&log).unwrap();
-    let mut cmd = std::process::Command::new(binary());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = crate::hermetic::binary_command();
     let status = cmd
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("SOCKET_NO_API_TOKEN", "1")
         .current_dir(p)
         .args(["apply", "--offline", "--cwd"])

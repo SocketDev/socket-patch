@@ -12,7 +12,6 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,8 +23,10 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 
-/// Build a `Command` for the CLI with the entire `SOCKET_*` environment
-/// scrubbed from the child process.
+/// Build a `Command` for the CLI with the hermetic `SOCKET_*` environment of
+/// `tests/common/hermetic.rs`: ambient `SOCKET_*` vars (other than a
+/// telemetry opt-out) are removed from the child, and the config,
+/// update-check and telemetry opt-outs are forced on.
 ///
 /// Every embedded-VEX flag has an env fallback (`--vex`/`SOCKET_VEX`,
 /// `--vex-product`/`SOCKET_VEX_PRODUCT`, `--vex-no-verify`/
@@ -41,13 +42,7 @@ use socket_patch_core::manifest::schema::{
 /// need no serialization) makes the explicit CLI flags the sole source of
 /// truth.
 fn cli() -> Command {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
+    common::hermetic::binary_command()
 }
 
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
