@@ -438,11 +438,17 @@ async fn restore_classic(
 
 /// Whether a package manager derives `tarball` for `name@version` itself,
 /// and so leaves it out of the lock: it is the conventional URL under the
-/// registry the version document came from, or under the project's
-/// configured registry (`project_registry`; npmjs when unset), which is
-/// the one the package manager compares against.
+/// project's configured registry (`project_registry`; npmjs when unset),
+/// the only one yarn and pnpm compare against. `from_project` says the
+/// version document came from that registry. When it did not (the project
+/// resolves from the default registry, or its own could not be read), the
+/// default registry's base counts too: `SOCKET_NPM_REGISTRY` stands in for
+/// npmjs, and a fallback document is read as the project registry's. A
+/// mirror that passes npmjs's URLs through hands out URLs it does not
+/// derive, so yarn binds them and pnpm records them (#1465).
 fn registry_derives_tarball(
     project_registry: Option<&str>,
+    from_project: bool,
     name: &str,
     version: &str,
     tarball: &str,
@@ -450,24 +456,22 @@ fn registry_derives_tarball(
     use crate::vendor::registry_fetch::{
         npm_registry_base, npm_tarball_is_conventional, DEFAULT_NPM_REGISTRY,
     };
-    [
-        npm_registry_base().as_str(),
-        project_registry.unwrap_or(DEFAULT_NPM_REGISTRY),
-    ]
-    .iter()
-    .any(|base| npm_tarball_is_conventional(base, name, version, tarball))
+    let conventional = |base: &str| npm_tarball_is_conventional(base, name, version, tarball);
+    conventional(project_registry.unwrap_or(DEFAULT_NPM_REGISTRY))
+        || (!from_project && conventional(&npm_registry_base()))
 }
 
 /// The `npm:` locator yarn berry writes for `name@version` resolved from the
 /// registry: bare when yarn derives `tarball` itself, else bound to it with
-/// `::__archiveUrl=<encodeURIComponent>`.
+/// `::__archiveUrl=<encodeURIComponent>` ([`registry_derives_tarball`]).
 fn berry_registry_locator(
     project_registry: Option<&str>,
+    from_project: bool,
     name: &str,
     version: &str,
     tarball: &str,
 ) -> String {
-    if registry_derives_tarball(project_registry, name, version, tarball) {
+    if registry_derives_tarball(project_registry, from_project, name, version, tarball) {
         format!("{name}@npm:{version}")
     } else {
         format!(
@@ -902,11 +906,13 @@ async fn restore_berry(
                 continue;
             }
         };
-        let Some(dist) = dists.get(&(name.clone(), version.clone())).map(|d| &d.dist) else {
+        let Some(found) = dists.get(&(name.clone(), version.clone())) else {
             continue;
         };
+        let dist = &found.dist;
         let locator = berry_registry_locator(
             registries.get(&name).and_then(Option::as_deref),
+            found.from_project,
             &name,
             &version,
             &dist.tarball,
@@ -1438,8 +1444,14 @@ fn pnpm_lock_tarball_evidence(
             None => return Some(false),
             Some(tarball) if tarball.starts_with("file:") || is_hosted(tarball) => {}
             Some(tarball) => {
+                // No document was read: the lock's URL came from the
+                // registry pnpm names, the default one when it names none.
+                let registry = registry(name);
+                let own = registry
+                    .as_deref()
+                    .is_some_and(|r| non_default_registry(r).is_some());
                 derived |=
-                    registry_derives_tarball(registry(name).as_deref(), name, version, tarball);
+                    registry_derives_tarball(registry.as_deref(), own, name, version, tarball);
             }
         }
     }
@@ -1789,9 +1801,10 @@ pub(crate) async fn restore_pnpm_locks(
             if result.refused.contains_key(uuid) {
                 continue;
             }
-            let Some(dist) = dists.get(&(name.clone(), version.clone())).map(|d| &d.dist) else {
+            let Some(found) = dists.get(&(name.clone(), version.clone())) else {
                 continue;
             };
+            let dist = &found.dist;
             let Some(integrity) = dist.integrity.as_deref() else {
                 result.refuse(
                     uuid,
@@ -1803,6 +1816,7 @@ pub(crate) async fn restore_pnpm_locks(
             // a URL it cannot derive from the registry (#557).
             let derived = registry_derives_tarball(
                 policy.registry(name).as_deref(),
+                found.from_project,
                 name,
                 version,
                 &dist.tarball,
@@ -2697,9 +2711,10 @@ mod tests {
     use super::{
         berry_lookup_registry, berry_registry_locator, bun_env_registry, bun_lookup_registry,
         bun_registry_slot, bun_tarball_url, expand_url_env, modules_yaml_pnpm_major,
-        non_default_registry, package_json_pnpm_major, pnpm_include_tarball, pnpm_lookup_registry,
-        pnpm_tarball_guess_warning, registry_derives_tarball, rush_json_pnpm_major, rush_lock_root,
-        split_userinfo, yaml_top_level_value, yarn_expand_env, PnpmTarballGuess, ProjectDist,
+        non_default_registry, package_json_pnpm_major, pnpm_include_tarball,
+        pnpm_lock_tarball_evidence, pnpm_lookup_registry, pnpm_tarball_guess_warning,
+        registry_derives_tarball, rush_json_pnpm_major, rush_lock_root, split_userinfo,
+        yaml_top_level_value, yarn_expand_env, PnpmTarballGuess, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
@@ -3745,6 +3760,7 @@ mod tests {
         let scope = rc_lookup(Some(rc), "@s/a");
         assert!(registry_derives_tarball(
             scope.as_deref(),
+            true,
             "@s/a",
             "1.0.0",
             "https://s.example/@s/a/-/a-1.0.0.tgz"
@@ -4014,6 +4030,7 @@ mod tests {
         // the package manager derives them, so they stay out of the lock.
         assert!(registry_derives_tarball(
             Some("https://r.example/npm/"),
+            true,
             "a",
             "1.0.0",
             "https://r.example/npm/a/-/a-1.0.0.tgz"
@@ -4021,16 +4038,70 @@ mod tests {
         // No configured registry means npmjs (yarnpkg is its alias).
         assert!(registry_derives_tarball(
             None,
+            false,
             "@s/p",
             "2.0.0",
             "https://registry.yarnpkg.com/@s%2fp/-/p-2.0.0.tgz"
         ));
         assert!(!registry_derives_tarball(
             Some("https://r.example/npm"),
+            true,
             "a",
             "1.0.0",
             "https://cdn.example/files/a-1.0.0.tgz"
         ));
+        // #1465: a mirror passing npmjs documents through hands out npmjs
+        // URLs; the package manager compares only against the mirror, so
+        // it does not derive them (yarn binds them, pnpm records them).
+        assert!(!registry_derives_tarball(
+            Some("https://r.example/npm"),
+            true,
+            "a",
+            "1.0.0",
+            "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+        assert!(!registry_derives_tarball(
+            Some("https://r.example/npm"),
+            true,
+            "@s/p",
+            "2.0.0",
+            "https://registry.npmjs.org/@s/p/-/p-2.0.0.tgz"
+        ));
+        // A fallback to the default registry's document (the mirror could
+        // not be read) guesses the mirror serves the conventional path.
+        assert!(registry_derives_tarball(
+            Some("https://r.example/npm"),
+            false,
+            "a",
+            "1.0.0",
+            "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+        // A project that names npmjs (or yarn's alias for it) explicitly
+        // resolves from the default registry.
+        assert!(registry_derives_tarball(
+            Some("https://registry.yarnpkg.com"),
+            false,
+            "a",
+            "1.0.0",
+            "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+    }
+
+    /// #1465: behind a mirror that passes npmjs's documents through, pnpm
+    /// records the npmjs URLs as `tarball:` because it cannot derive them
+    /// from the mirror, so they say nothing about
+    /// lockfile-include-tarball-url. Without the mirror they prove it on.
+    #[test]
+    fn npmjs_tarballs_behind_a_mirror_are_no_tarball_setting_evidence() {
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  a@1.0.0:\n    \
+                    resolution: {integrity: sha512-AAAA, tarball: \
+                    https://registry.npmjs.org/a/-/a-1.0.0.tgz}\n";
+        let mirror = |_: &str| Some("https://r.example/npm".to_string());
+        assert_eq!(pnpm_lock_tarball_evidence(lock, mirror, |_| false), None);
+        assert_eq!(
+            pnpm_lock_tarball_evidence(lock, |_| None, |_| false),
+            Some(true)
+        );
     }
 
     #[test]
@@ -4038,6 +4109,7 @@ mod tests {
         assert_eq!(
             berry_registry_locator(
                 Some("https://r.example"),
+                true,
                 "a",
                 "1.0.0",
                 "https://r.example/a/-/a-1.0.0.tgz"
@@ -4047,11 +4119,23 @@ mod tests {
         assert_eq!(
             berry_registry_locator(
                 Some("https://r.example"),
+                true,
                 "a",
                 "1.0.0",
                 "https://cdn.example/f/a.tgz"
             ),
             "a@npm:1.0.0::__archiveUrl=https%3A%2F%2Fcdn.example%2Ff%2Fa.tgz"
+        );
+        // #1465: npmjs's URL behind a mirror stays bound.
+        assert_eq!(
+            berry_registry_locator(
+                Some("https://r.example"),
+                true,
+                "a",
+                "1.0.0",
+                "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+            ),
+            "a@npm:1.0.0::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2Fa%2F-%2Fa-1.0.0.tgz"
         );
     }
 

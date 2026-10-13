@@ -5548,6 +5548,86 @@ async fn yarn_berry_rollback_reads_the_tarball_from_the_project_registry() {
     );
 }
 
+/// #1465: a metadata mirror that passes the default registry's documents
+/// through unchanged hands out tarball URLs conventional under the default
+/// registry (npmjs normally, `SOCKET_NPM_REGISTRY` here), not under itself.
+/// Yarn compares only against the package's own registry, so it binds them
+/// with `::__archiveUrl=`; rollback and remove must keep that binding, or
+/// yarn fetches the conventional path under the mirror, which 404s.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_unwind_keeps_a_default_registry_url_behind_a_mirror() {
+    for command in ["rollback", "remove"] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+        mock_reference_with_berry_url(&server, &hosted_url).await;
+        mock_view(&server).await;
+        let integrity = vlt_hosted_common::sha512_sri(&upstream_tarball());
+        let advertised = format!(
+            "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+            server.uri()
+        );
+        mock_npm_registry_advertising(&server, &integrity, &advertised).await;
+        // The project's mirror passes the default registry's document
+        // through, tarball URL and all.
+        let mirror = format!("{}/mirror", server.uri());
+        Mock::given(method("GET"))
+            .and(path(format!("/mirror/{NAME}/{VERSION}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": NAME,
+                "version": VERSION,
+                "dist": { "tarball": advertised, "integrity": integrity },
+            })))
+            .mount(&server)
+            .await;
+        let binding = |t: &str| {
+            t.replace(
+                &format!("resolution: \"{NAME}@npm:{VERSION}\""),
+                &format!(
+                    "resolution: \"{NAME}@npm:{VERSION}::__archiveUrl={}\"",
+                    socket_patch_core::utils::uri::encode_uri_component(&advertised)
+                ),
+            )
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_berry_project_spelled(tmp.path(), binding);
+        std::fs::write(
+            tmp.path().join(".yarnrc.yml"),
+            format!("nodeLinker: node-modules\nnpmRegistryServer: \"{mirror}\"\n"),
+        )
+        .unwrap();
+        let lock_path = tmp.path().join("yarn.lock");
+        let pristine = std::fs::read_to_string(&lock_path).unwrap();
+
+        let env = run_redirect_subprocess_with(
+            tmp.path(),
+            &server.uri(),
+            &["--patch-server-url", &server.uri()],
+        );
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
+
+        let args: &[&str] = if command == "rollback" {
+            &["rollback"]
+        } else {
+            &["remove", PURL]
+        };
+        let (code, env) = hosted_unwind_json(tmp.path(), &server, &server.uri(), args);
+        assert_eq!(code, Some(0), "{command}: {env:#}");
+        let restored = std::fs::read_to_string(&lock_path).unwrap();
+        let checksum = berry_checksum_of(&restored);
+        assert_eq!(
+            restored,
+            pristine.replace(
+                &format!("10c0/{}", "3".repeat(128)),
+                &format!("10c0/{checksum}")
+            ),
+            "{command} keeps the mirror's __archiveUrl binding"
+        );
+    }
+}
+
 /// A pnpm project whose lock records the patched entry as
 /// `{integrity, tarball: <tarball>}` — what pnpm writes under
 /// `lockfile-include-tarball-url`, or for a tarball URL the registry
@@ -5686,6 +5766,30 @@ async fn pnpm_rollback_reads_the_npmrc_mirror_document_for_an_offpath_tarball() 
     mock_view(&server).await;
     mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
     let advertised = format!("{}/cdn/files/{NAME}-{VERSION}.tgz", server.uri());
+    let mirror = mock_pnpm_mirror(&server, &advertised).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
+    std::fs::write(tmp.path().join(".npmrc"), format!("registry={mirror}\n")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #1465 for pnpm: a mirror that passes the default registry's documents
+/// through hands out URLs conventional under the default registry, not
+/// under the mirror. pnpm compares only against the package's own
+/// registry, so it records them as `tarball:`; rollback must keep it.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_a_default_registry_tarball_behind_a_mirror() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let advertised = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
     let mirror = mock_pnpm_mirror(&server, &advertised).await;
 
     let tmp = tempfile::tempdir().unwrap();
