@@ -1763,7 +1763,7 @@ pub fn urlencode(s: &str) -> String {
 /// environment scrubbed.
 pub fn socket_cmd() -> Command {
     let mut cmd = common::hermetic::command(&socket_bin());
-    cache_env::scrub_ambient_vlt_env(&mut cmd);
+    cache_env::scrub_ambient_vlt_tool_env(&mut cmd);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if ["http_proxy", "https_proxy", "all_proxy", "no_proxy"]
@@ -1773,8 +1773,7 @@ pub fn socket_cmd() -> Command {
             cmd.env_remove(&key);
         }
     }
-    cmd.envs(common::hermetic::FORCED_OPT_OUTS.iter().copied())
-        .env("VLT_TELEMETRY", "0")
+    cmd.env("VLT_TELEMETRY", "0")
         .env("LANG", "C")
         .env("LC_ALL", "C");
     cmd
