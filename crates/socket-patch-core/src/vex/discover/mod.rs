@@ -2976,6 +2976,12 @@ pub(crate) mod testing {
     /// A minimal npm tarball (`package/package.json` naming
     /// `name@version`) — a user's `file:` tarball copy.
     pub(crate) fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+        npm_tgz_rooted("package", name, version)
+    }
+
+    /// [`npm_tgz`] with the manifest under `root/` instead of `package/`
+    /// (a `git archive --prefix` or GitHub release tarball, #1516).
+    pub(crate) fn npm_tgz_rooted(root: &str, name: &str, version: &str) -> Vec<u8> {
         let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
@@ -2985,7 +2991,7 @@ pub(crate) mod testing {
         header.set_size(manifest.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar.append_data(&mut header, "package/package.json", manifest.as_bytes())
+        tar.append_data(&mut header, format!("{root}/package.json"), manifest.as_bytes())
             .unwrap();
         tar.into_inner().unwrap().finish().unwrap()
     }
@@ -3018,14 +3024,26 @@ pub(crate) mod testing {
 
     /// A throwaway project root.
     pub(crate) struct Project {
-        dir: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+        root: PathBuf,
         origins: Vec<String>,
     }
 
     impl Project {
         pub(crate) fn new() -> Self {
+            Self::nested("")
+        }
+
+        /// A project rooted at `sub/` inside the throwaway directory, so a
+        /// fixture can write files beside it (`../ext/…`) without leaving
+        /// the tempdir (#1516).
+        pub(crate) fn nested(sub: &str) -> Self {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let root = dir.path().join(sub);
+            std::fs::create_dir_all(&root).expect("create project root");
             Project {
-                dir: tempfile::tempdir().expect("create tempdir"),
+                _dir: dir,
+                root,
                 origins: Vec::new(),
             }
         }
@@ -3038,7 +3056,7 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn root(&self) -> &Path {
-            self.dir.path()
+            &self.root
         }
 
         /// Write `content` at root-relative `rel`, creating parents.

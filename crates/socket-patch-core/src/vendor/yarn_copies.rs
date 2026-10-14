@@ -21,16 +21,34 @@ use crate::utils::fs::read_regular_to_bytes;
 
 use super::lock_inventory::yarn::{berry_entries, classic_entries};
 
-/// `(lock key, copy)` of every live entry of `lock_text` (either grammar)
-/// that installs `name@version` under another dependency name, in lock
-/// order. A copy whose package cannot be read (a missing directory, an
-/// unreadable tarball, a non-registry url) is left out.
+/// A lock entry under another dependency name that installs, or may
+/// install, `name@version` ([`other_name_copies`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OtherNameCopy {
+    /// The lock entry's key, as the lock spells it.
+    pub(crate) key: String,
+    pub(crate) source: CopyRef,
+    /// The copy itself says it is `name@version`. `false` for a copy of
+    /// that version whose package cannot be read (a missing directory, a
+    /// tarball with no readable `package.json`, a non-registry url): it may
+    /// be `name`, so it is named, but never taken as proof that `name` is
+    /// installed (#1516).
+    pub(crate) identified: bool,
+}
+
+/// Every live entry of `lock_text` (either grammar) that installs
+/// `name@version` under another dependency name, in lock order. A copy of
+/// that version whose package cannot be read is kept, unidentified: it
+/// may hold `name`, and leaving it out would let the scan and `vex` vouch
+/// for a lock that installs it unpatched (#1516). A `portal:` / `link:`
+/// copy whose manifest cannot be read is left out: its version is that
+/// manifest's, so nothing ties it to `version`.
 pub(crate) async fn other_name_copies(
     project_root: &Path,
     lock_text: &str,
     name: &str,
     version: &str,
-) -> Vec<(String, CopyRef)> {
+) -> Vec<OtherNameCopy> {
     let candidates: Vec<(String, CopyRef, String)> = if is_berry_lock(lock_text) {
         berry_entries(lock_text)
             .entries
@@ -87,12 +105,17 @@ pub(crate) async fn other_name_copies(
             Some(rel) => read_regular_to_bytes(&project_root.join(rel)).await.ok(),
             None => None,
         };
-        if copy_identity(&source, &lock_version, bytes)
-            .await
-            .is_some_and(|(n, v)| n == name && v == version)
-        {
-            out.push((key, source));
-        }
+        let identified = match copy_identity(&source, &lock_version, bytes).await {
+            Some((n, v)) if n == name && v == version => true,
+            Some(_) => continue,
+            None if matches!(source, CopyRef::Linked(_)) => continue,
+            None => false,
+        };
+        out.push(OtherNameCopy {
+            key,
+            source,
+            identified,
+        });
     }
     out
 }

@@ -82,6 +82,9 @@
 //! (a sibling checkout's artifacts) and is skipped silently, as in the npm
 //! extractor.
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
 use serde_json::Value;
 
 use super::{
@@ -857,8 +860,13 @@ struct LockCopy {
 /// the name the depender gave it, so `"lp2": "file:left-pad-1.3.0.tgz"`
 /// locks as `lp2@…` while `node_modules/lp2` IS left-pad@1.3.0, and no pin
 /// of `left-pad` reaches it. The real package comes from the copy itself
-/// ([`CopyRef::identity`]); a copy whose package cannot be read is left
-/// alone.
+/// ([`CopyRef::identity`]). A copy whose package cannot be read (a
+/// missing directory, a tarball with no readable `package.json`, a
+/// non-registry url) may be any package at its lock version, so it is
+/// recorded as a copy of every package this lock wires at that version:
+/// vouching for those would rest on a copy nobody read (#1516). A
+/// `portal:` / `link:` copy with no readable manifest has no version, and
+/// is left alone.
 async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut Discovery) {
     for copy in copies {
         let bytes = match copy.source.read_path() {
@@ -868,6 +876,9 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
         let Some((name, version)) =
             crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
         else {
+            if !matches!(copy.source, CopyRef::Linked(_)) {
+                record_unidentified_copy(&copy, out);
+            }
             continue;
         };
         out.unpatched_copy(
@@ -877,6 +888,31 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
             &format!(
                 "{}, which no Socket wiring of {name} reaches (yarn keys it by the \
                  dependency name)",
+                copy.source.how()
+            ),
+        );
+    }
+}
+
+/// [`record_copies`] for a copy whose package cannot be read: an unpatched
+/// copy of each package [`YARN_LOCK`] wires at the copy's lock version
+/// (#1516).
+fn record_unidentified_copy(copy: &LockCopy, out: &mut Discovery) {
+    let suffix = format!("@{}", copy.version);
+    let wired: BTreeSet<String> = out
+        .refs
+        .iter()
+        .filter(|r| r.source_file == Path::new(YARN_LOCK) && r.purl.ends_with(&suffix))
+        .map(|r| r.purl.clone())
+        .collect();
+    for purl in wired {
+        out.unpatched_copy(
+            YARN_LOCK,
+            Some(purl),
+            &copy.key,
+            &format!(
+                "{}, whose package can't be read, so it may be this version of any package \
+                 (yarn keys it by the dependency name)",
                 copy.source.how()
             ),
         );
@@ -1393,6 +1429,102 @@ mod tests {
                 let out = run(&project(&[wired.clone(), copy.clone()], "other-pkg")).await;
                 assert_eq!(out.refs.len(), 1, "{mode} {case}: {:#?}", out.diagnostics);
             }
+        }
+    }
+
+    /// #1516: three renamed classic copies #1236's reader could not read,
+    /// so each was taken for "not left-pad" and the wiring was attested
+    /// while `node_modules/lp2` installed left-pad@1.3.0 unpatched: a
+    /// `file:` directory or tarball outside the root (yarn installs it all
+    /// the same), a tarball whose root directory is not `package/` (yarn
+    /// strips the first segment whatever it is), and a non-registry url.
+    /// Each now contests the ref. Controls: an outside-root copy holding
+    /// another package, and an unreadable url copy of another version, do
+    /// not.
+    #[tokio::test]
+    async fn issue_1516_unread_classic_copies_contest_the_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wirings = [
+            (
+                "hosted",
+                classic_block("left-pad@1.3.0", "1.3.0", &hosted, Some(SRI)),
+            ),
+            (
+                "vendored",
+                classic_block(
+                    "left-pad@1.3.0",
+                    "1.3.0",
+                    &format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz#{SHA1}"),
+                    Some(SRI),
+                ),
+            ),
+        ];
+        let url_copy = |version: &str| {
+            classic_block(
+                "\"lp2@http://127.0.0.1:8799/lp.tgz\"",
+                version,
+                &format!("http://127.0.0.1:8799/lp.tgz#{SHA1}"),
+                None,
+            )
+        };
+        let copies = [
+            (
+                "outside-root file: directory",
+                "\"lp2@file:../ext/lpdir\":\n  version \"1.3.0\"\n\n".to_string(),
+            ),
+            (
+                "outside-root file: tarball",
+                classic_block(
+                    "\"lp2@file:../ext/left-pad-1.3.0.tgz\"",
+                    "1.3.0",
+                    &format!("file:../ext/left-pad-1.3.0.tgz#{SHA1}"),
+                    None,
+                ),
+            ),
+            (
+                "tarball rooted at left-pad-1.3.0/",
+                classic_block(
+                    "\"lp2@file:./lp.tgz\"",
+                    "1.3.0",
+                    &format!("file:./lp.tgz#{SHA1}"),
+                    None,
+                ),
+            ),
+            ("non-registry url", url_copy("1.3.0")),
+        ];
+        let project = |blocks: &[String], fork: &str| {
+            let p = Project::nested("p");
+            p.write("yarn.lock", classic(blocks));
+            p.write(
+                "../ext/lpdir/package.json",
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            );
+            p.write("../ext/left-pad-1.3.0.tgz", npm_tgz(fork, "1.3.0"));
+            p.write("lp.tgz", npm_tgz_rooted("left-pad-1.3.0", fork, "1.3.0"));
+            p
+        };
+        for (mode, wired) in &wirings {
+            for (case, copy) in &copies {
+                let out = run(&project(&[wired.clone(), copy.clone()], "left-pad")).await;
+                assert!(out.refs.is_empty(), "{mode} {case}: {:#?}", out.refs);
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains("lp2@")
+                            && d.detail.contains("UNPATCHED")),
+                    "{mode} {case}: {:#?}",
+                    out.diagnostics
+                );
+            }
+            // The readable copies hold another package: not left-pad.
+            for (case, copy) in &copies[..3] {
+                let out = run(&project(&[wired.clone(), copy.clone()], "other-pkg")).await;
+                assert_eq!(out.refs.len(), 1, "{mode} {case}: {:#?}", out.diagnostics);
+            }
+            // An unreadable copy of another version can't be left-pad@1.3.0.
+            let out = run(&project(&[wired.clone(), url_copy("2.0.0")], "left-pad")).await;
+            assert_eq!(out.refs.len(), 1, "{mode} url 2.0.0: {:#?}", out.diagnostics);
         }
     }
 
