@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-14 (run 41), main `887a5f7`, latest release 5.0.1. (main was force-pushed before run 39, so older SHAs in this ledger may not resolve any more.)
+Last updated: 2026-10-14 (run 42), main `9a5929a`, latest release 5.0.1. (main was force-pushed before run 39, so older SHAs in this ledger may not resolve any more.)
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -462,18 +462,28 @@ Run 41 additions (main `887a5f7`, release 5.0.1, Linux; mock rebuilt from scratc
 
 Also run 41 on 12.11.2: hosted trust edit over `---` doc start, `...` doc end, YAML anchors: pass. Flow-style file root: loud documented refusal. Quoted / next-line `trustLockfile: false`: respected. Symlinked `pnpm-workspace.yaml` / `pnpm-lock.yaml`: loud `redirect_symlinked_file_unsupported`.
 
+Run 42 additions (main `9a5929a`, Linux; transitive `npm:` alias = registry package `sp-wrap@1.0.0` depending on `"lp": "npm:left-pad@1.3.0"`; bundled = `sp-bundle@1.0.0` bundling left-pad 1.3.0):
+
+| pnpm (lock) | Hosted: transitive alias (pin, fresh frozen, vex, rollback) | Agent: transitive alias (scan, vex, rollback) | Vendored: transitive alias | Agent: bundled copy (± registry copy) | Hosted / vendored: bundled-only |
+| --- | --- | --- | --- | --- | --- |
+| 7.33.7 (5.4) | pass | untested | untested | untested | untested |
+| 8.15.9 (6.0) | pass (rollback byte-exact) | untested | untested | untested | untested |
+| 9.15.9 (9.0) | pass (rollback byte-exact) | pass | loud refusal `vendor_lock_entry_unsupported` | pass | untested |
+| 10.34.6 | pass | untested | loud refusal | pass | untested |
+| 12.11.2 | pass (rollback byte-exact, workspace file removed) | pass | loud refusal | pass | hosted `redirect_pnpm_entry_not_found` (skip); vendored `vendor_lock_entry_not_found` (fail) |
+
 ## Backlog
 
 0w. #1460 is verified fixed (run 40, all 16 env × major cells). Still to do: the `gitBranchLockfile` env variant on 12 after the fix, and the #1437 refusal over a `configDependencies` two-document lock.
 0x. #935: hosted half fixed by #1469 (run 41, 8/9/10/12). Still open for the vendored scan warning; re-verify once fixed. Was: **#935 regression** (hosted silent pin over a `file:` copy, first bad f3c6313a): re-verify once fixed, also for `git+` copies. #1268 still reproduces on 12.11.2 (run 39).
-0y. #1266 / #1494: scoped alias, custom virtualStoreDir and member rollback done in run 41 (pass). Still to do: a transitive alias (needs a registry package with an `npm:` alias dependency).
+0y. #1266 / #1494: scoped alias, custom virtualStoreDir and member rollback done in run 41 (pass). Transitive alias done in run 42 (hosted 7/8/9/10/12 pass, agent 9/12 pass; the mock registry serves `sp-wrap@1.0.0` with an `npm:` alias dep). Still to do: transitive alias in a workspace member, and a scoped transitive alias (`npm:@scope/x@…`).
 0v. #1514 (env `pnpm_config_trust_lockfile=false`): re-verify once fixed, also the `--no-trust-lockfile-config` and Rush texts with the env set.
 0z. Post-#1007 follow-ups: #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
 00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
 00b. #1039 follow-ups: the takeover over a `pnpm patch`-ed vendored package, and a takeover on Windows (CRLF autocrlf checkout). The interrupted takeover is #1157. (Interrupted vendored-only commit: done in run 35, pass.)
 00c. #1197 follow-ups: a workspace member's orphan, and re-verification on 7–12 once fixed. (Upgrade orphan on 12 and agent `vex` over an orphan: done in run 36.)
 00e. #1155 (pnpm half): re-verify on 8 (legacy) and 9–12 once a fix covers `pnpm_lock.rs` / `pnpm_lock_legacy.rs`. Also an upgrade to a version that has its own patch (needs a second left-pad patch in the mock).
-00f. Not yet covered: `bundledDependencies` (`vex_pnpm_bundled_copy`) end to end, `pnpm update` after a hosted pin, and `prefer-offline` with a warm store.
+00f. `bundledDependencies` end to end done in run 42 (agent 9/10/12 pass, hosted/vendored vex honest). Not yet covered: `pnpm update` after a hosted pin, and `prefer-offline` with a warm store (likely the documented warm-store limitation).
 00d. #1058 follow-ups: Rush / subspace locks and `sharedWorkspaceLockfile: false` through the new ProjectView discovery, a `git+` copy beside a registry copy (expect `redirect_unattributable`), and in-memory engine parity (`get <uuid> --mode hosted`).
 
 000. #1111 follow-ups: the passive update-notifier text on a real newer release, and a pnpm global install on Windows (`%LOCALAPPDATA%\pnpm`) and macOS. Needs a probe. #1096: marker-only files are done (run 32, commented); vendored on 10.4.1 with a comment-only file is still to do.
@@ -600,3 +610,6 @@ Also run 41 on 12.11.2: hosted trust edit over `---` doc start, `...` doc end, Y
 - Fixture note (run 38): corepack on Node 22 can't launch pnpm 12.11.x. Install pnpm with `npm i -g --prefix <dir> pnpm@<v>`.
 - Agent `scan` from a workspace member under `node-linker=hoisted` finds nothing (exit 0, no events), even for a direct `npm:` alias dep: the dep is a real directory in the root `node_modules`, outside the cwd-scoped crawl. That's the same documented cwd scoping as the member-transitive entry above; run from the root (run 41).
 - `pnpm_pnp_unsupported` on pnpm 11/12 says `node-linker=pnp` is "in .npmrc" and to "switch .npmrc", but pnpm 11+ reads `nodeLinker` only from `pnpm-workspace.yaml`. Cosmetic: agent mode still patches the store copy that `.pnp.cjs` loads (run 41).
+- Vendored mode refuses a transitive `npm:` alias of the patched package (`"lp": "npm:left-pad@1.3.0"` inside a registry dependency) with `vendor_lock_entry_unsupported` ("an aliased snapshot reference ... not supported yet"), exit 1, lock untouched. Loud refusal by design (`vendor/pnpm_lock.rs` refuse path); hosted and agent handle the same tree (run 42).
+- With a bundled copy as the only instance, vendored fails with `vendor_lock_entry_not_found`, whose remedy ("make sure the package is installed and locked") is misleading because the package is installed, just bundled. Cosmetic: the failure is loud and nothing is written; hosted skips with `redirect_pnpm_entry_not_found` (run 42).
+- Agent `rollback` empties `.socket/manifest.json`, so a following `apply` is a no-op success. That's the v5 rollback semantics, not a lost patch (run 42).
