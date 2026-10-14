@@ -295,7 +295,7 @@ fn has_command(cmd: &str) -> bool {
     } else {
         &["--version"]
     };
-    let mut probe_cmd = Command::new(cmd);
+    let mut probe_cmd = pm_command(cmd);
     probe_cmd
         .args(probe)
         .stdout(std::process::Stdio::null())
@@ -307,7 +307,7 @@ fn has_command(cmd: &str) -> bool {
 /// `corepack <pm> --version` succeeds — the liveness probe for a specific yarn
 /// flavor (also the call that downloads it the first time, kept in the sandbox).
 fn has_corepack_pm(pm: &str) -> bool {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = pm_command("corepack");
     cmd.args([pm, "--version"])
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     cache_env::isolate(&mut cmd);
@@ -497,18 +497,46 @@ fn vendor_revert(cwd: &Path, leg: &str) -> u64 {
 // Toolchain invocation
 // ---------------------------------------------------------------------------
 
+/// Every ambient tool config a package-manager child must not inherit: an
+/// activated venv (uv/pip would install into the wrong interpreter), the
+/// yarn and pnpm/npm linker and mirror overrides (a node-linker override
+/// breaks yarn/pnpm), bundler, PDM, Poetry and Composer settings. See
+/// [`hermetic::Extra`].
+const PM_EXTRAS: &[hermetic::Extra] = &[
+    hermetic::Extra::Venv,
+    hermetic::Extra::Yarn,
+    hermetic::Extra::YarnClassic,
+    hermetic::Extra::Pnpm,
+    hermetic::Extra::Bundle,
+    hermetic::Extra::Pdm,
+    hermetic::Extra::Poetry,
+    hermetic::Extra::Composer,
+];
+
+/// A package-manager child (and its liveness probes) with the shared
+/// hermetic scrubs: every ambient `SOCKET_*` and every [`PM_EXTRAS`] config.
+/// Callers run `cache_env::isolate` next and their own env last.
+fn pm_command(program: &str) -> Command {
+    let mut cmd = hermetic::tool_command(program);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, PM_EXTRAS);
+    cmd
+}
+
 /// Run `bundle <args>` with the ambient `BUNDLE_*`/`GEM_*`/`RUBYOPT` state
 /// scrubbed first (a developer's global bundler config — frozen mode, a
 /// custom BUNDLE_PATH or gem home, a RUBYOPT require — must not leak into a
 /// leg that hard-asserts bundler outcomes; mirrors e2e_vendor_gem_build.rs).
-/// The cache sandbox re-pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after
-/// the scrub, and the per-leg `env` is applied last so the leg's pins win.
+/// `pm_command` sweeps `BUNDLE_*`; the gem home and `RUBYOPT` are this
+/// helper's own. The cache sandbox re-pins its own
+/// BUNDLE_USER_HOME/GEM_SPEC_CACHE after the scrub, and the per-leg `env`
+/// is applied last so the leg's pins win.
 fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("bundle");
+    let mut cmd = pm_command("bundle");
     cmd.args(args).current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         let key = k.to_string_lossy().into_owned();
-        if key.starts_with("BUNDLE_") || key.starts_with("GEM_") || key == "RUBYOPT" {
+        if key.starts_with("GEM_") || key == "RUBYOPT" {
             cmd.env_remove(&k);
         }
     }
@@ -525,17 +553,12 @@ fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
 /// during fixture setup) from "the install of the vendored lock failed" (always
 /// a hard failure — that is the thing under test).
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(program);
+    let mut cmd = pm_command(program);
     cmd.args(args).current_dir(cwd);
     cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // A `VIRTUAL_ENV` inherited from the developer's shell makes uv/pip install
-    // into the wrong interpreter; a node-linker override breaks yarn/pnpm.
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
-    cmd.env_remove("npm_config_node_linker");
     cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"))
 }
@@ -543,12 +566,10 @@ fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Outpu
 /// Run `corepack <pm> <args>` in `cwd` with the download prompt disabled and
 /// the shared cache sandbox applied (per-leg `env` wins, applied last).
 fn corepack(cwd: &Path, pm: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = pm_command("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
     cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
     for (k, v) in env {
         cmd.env(k, v);
     }

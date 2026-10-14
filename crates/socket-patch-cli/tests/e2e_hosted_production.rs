@@ -281,7 +281,7 @@ fn has_command(cmd: &str) -> bool {
     } else {
         &["--version"]
     };
-    let mut probe_cmd = Command::new(cmd);
+    let mut probe_cmd = pm_command(cmd);
     probe_cmd
         .args(probe)
         .stdout(std::process::Stdio::null())
@@ -433,12 +433,37 @@ fn hosted_pin_count(env: &serde_json::Value) -> u64 {
 // Toolchain invocation
 // ---------------------------------------------------------------------------
 
+/// Every ambient tool config a package-manager child must not inherit: an
+/// activated venv (uv would install into the wrong interpreter), the yarn
+/// and pnpm/npm linker and mirror overrides, bundler, PDM, Poetry and
+/// Composer settings. See [`hermetic::Extra`].
+const PM_EXTRAS: &[hermetic::Extra] = &[
+    hermetic::Extra::Venv,
+    hermetic::Extra::Yarn,
+    hermetic::Extra::YarnClassic,
+    hermetic::Extra::Pnpm,
+    hermetic::Extra::Bundle,
+    hermetic::Extra::Pdm,
+    hermetic::Extra::Poetry,
+    hermetic::Extra::Composer,
+];
+
+/// A package-manager child (and its `has_command` probe) with the shared
+/// hermetic scrubs: every ambient `SOCKET_*` and every [`PM_EXTRAS`] config.
+/// Callers run `cache_env::isolate` next and their own env last.
+fn pm_command(program: &str) -> Command {
+    let mut cmd = hermetic::tool_command(program);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, PM_EXTRAS);
+    cmd
+}
+
 /// Run an external package manager. Returns the `Output` without asserting, so
 /// callers can distinguish "the registry was unreachable" (soft-skip material
 /// during fixture setup) from "the install of the redirected lock failed"
 /// (always a hard failure — that is the thing under test).
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(program);
+    let mut cmd = pm_command(program);
     cmd.args(args).current_dir(cwd);
     // Sandbox everything the per-leg `env` below does not name — corepack's
     // downloaded package managers most of all — so a run leaves the caller's
@@ -446,13 +471,11 @@ fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Outpu
     cache_env::isolate(&mut cmd);
     // Keep every toolchain's cache inside the fixture so the reinstall leg
     // starts genuinely cold and cannot be satisfied from a warm host cache
-    // holding the *pristine* artifact.
+    // holding the *pristine* artifact. Applied last, so a leg's own pin
+    // (the uv legs' `VIRTUAL_ENV`) survives the scrub.
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // A `VIRTUAL_ENV` inherited from the developer's shell makes uv install
-    // into the wrong interpreter.
-    cmd.env_remove("VIRTUAL_ENV");
     cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"))
 }
