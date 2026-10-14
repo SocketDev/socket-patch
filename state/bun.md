@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-14 (run 41), main `bb73e2f`, latest release 5.0.1, latest Bun 1.4.3 (stable since 2026-10-10).
+Last updated: 2026-10-14 (run 42), main `a3f56f7`, latest release 5.0.1, latest Bun 1.4.3 (stable since 2026-10-10; canary `1.4.3-canary.20261014.1` = `1.4.4-canary.1`).
 
 Method (run 36 note: the authenticated routes work too: `--api-url <mock> --org o --api-token fake` serves `/v0/orgs/o/patches/{batch,by-package,package,view}`; still set `SOCKET_PATCH_SERVER_URL` to the mock origin or hosted pins aren't recognized and `rollback` exits `manifest_not_found`. Run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` and `SOCKET_PROXY_URL` to the mock (run 32: without a token the CLI uses the public-proxy routes `/patch/batch`, `/patch/by-package/<purl>`, `/patch/view/<uuid>`, `/patch/blob/<hash>` and `POST /patch/package`, and `patch.socket.dev` returns 403 through the sandbox proxy). Test repos need `node_modules/` in `.gitignore`, or the fresh-clone oracle reads committed store entries. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -67,6 +67,8 @@ Run 39 (new main `15c2c83`: #1440 (#1437) `mode_ambiguous` for vendored + hosted
 Run 40 (new main `49847ef`, release 5.0.1: #1468 (#1467), #1480 (#1097 workspace dialects), #1470 (#1266), #1482 / #1469 (`file:` copies)): new **#1492**. A Bun ≥ 1.3 `bun.lockb` root is read as pre-1.3, so a member excluded with `!` (which has its own lock) is refused in hosted mode (false `redirect_workspace_lockfile_elsewhere`) and in vendored mode (`vendor_lockfile_missing`), and the root run skips it with `success`. Regression since 5.0.0 from #1480. Bun 1.3+ lockb files carry a `cNfGvRsN` trailer. #1467 verified fixed on Bun lockb workspaces. #1019 still reproduces on 1.4.3. #1266 member alias path scoping passes on the 1.4.3 isolated linker.
 
 Run 41 (new main `bb73e2f`: #1496 for #1492): new **#1521**. Bun 1.3.0 / 1.3.1 honour `!` but write no `configVersion` / `cNfGvRsN` (1.3.2 is the first that does), so their text and lockb locks are still read as pre-1.3 and the `!`-excluded member is refused (first bad #1480). #1492 verified fixed for 1.3.2+ writers (1.3.9 / 1.4.3) and for a 1.2 lockb upgraded by 1.4.3. #1019 still reproduces. Bun refuses extglob workspace patterns outright (pass). Root vendored scans exit 1 on nested independent projects' packages (generic, handed to npm). 1.3.2 hosted / vendored / takeover / revert pass.
+
+Run 42 (new main `a3f56f7`: #1523 for #1521): new **#1541**. When the repo's `.gitattributes` LFS-tracks `*.tgz`, vendored tarballs and `bun.lockb` member mirrors are committed as LFS objects (the uuid `.gitattributes` is only `* -text`). The scan exits 0, and a checkout without LFS smudge fails the frozen install (1.2.23 / 1.3.9 / 1.4.3, text + lockb, single + workspace). #1521 verified fixed (1.3.0 / 1.3.1 text + lockb, hosted + vendored). Also passing: `--cwd` / `SOCKET_CWD` / symlinked cwd, an env-only registry (`BUN_CONFIG_REGISTRY`) rollback across 1.3.6 / 1.3.7, a non-canonical CDN tarball registry through rollback / takeover / revert, and today's canary on hosted / vendored / agent workspaces.
 
 ## Coverage matrix
 
@@ -576,12 +578,22 @@ Other passes (Linux, 1.4.2 unless noted):
 | Hosted → rollback; vendored → hosted takeover → vendored → revert | 1.3.2 text + lockb | pass (lockb: documented refusal / semantic) |
 | #1019 | 1.4.3 | fail #1019 (open) |
 
+### Run 42 (main `a3f56f7`, Linux)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| #1521 re-check: `!`-excluded member with its own lock, hosted + vendored | 1.3.0 / 1.3.1 text + lockb | pass (fixed by #1523; a 1.3.0 lock read by 1.4.3 is patched too) |
+| `--cwd` relative / symlinked / `SOCKET_CWD` / PATH arg; vex, revert, rollback via `--cwd` | 1.4.3 text + lockb | pass |
+| `BUN_CONFIG_REGISTRY`-only registry, hosted → rollback | 1.3.6 / 1.3.7 / 1.4.3 | pass (env set at rollback: byte-exact) |
+| Non-canonical CDN `dist.tarball` registry: rollback; hosted → vendored → revert | 1.2.23 / 1.3.6 / 1.3.9 / 1.4.3 text + lockb | pass |
+| Canary `1.4.4-canary.1`: hosted / vendored / agent workspace (hoisted + isolated), takeover chain, rollback | canary text + lockb | pass |
+| Vendored + root `.gitattributes` `*.tgz filter=lfs` | 1.2.23 / 1.3.9 / 1.4.3 text + lockb, single + workspace | **fail #1541** |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
 1. A maintainer needs to delete the probe branches `bughunt/bun/20260930-default-trust`, `bughunt/bun/20260930-isolated-bunpatch`, `bughunt/bun/20261001-vex-isolated` and `bughunt/bun/20261001-global-dirs`. Deletion is still refused from the sandbox (runs 7–26; run 26: blocked by the session permission classifier), so no new probes until then. They still existed in run 31 (run 32 made no new probes).
 2. **#1009 closures verified on Linux (run 37)**: #861 (+ fold → revert / supersede), #784, #764, #735, #635, #599, #443, #371. Still to do: #497 (`github:` / URL tuples) and macOS/Windows for all of them; #371 with `trustedDependencies` only in a member, and a transitive default-trusted package. #1019: workspace members, Bun 1.4.0-written keys, macOS/Windows; re-test when fixed.
-3. #831: verified on Bun 1.4.2 text + `bun.lockb` (run 28). The workspace cell is now #1116; re-test it when fixed (also on the isolated linker, and with a `.gitattributes` / LFS rule). `vendor --check` after `bun remove` (#970). #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
+3. #831: verified on Bun 1.4.2 text + `bun.lockb` (run 28). The workspace cell is now #1116; re-test it when fixed (also on the isolated linker). The `.gitattributes` / LFS rule is #1541 (run 42). `vendor --check` after `bun remove` (#970). #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
 4. #861, #831, #784, #764, #635, #599 and #497: re-test when fixed. #626 on Bun once PR #634 merges. Also `globalStore` + workspaces and `globalStore` on macOS/Windows. (#605/#774 store copies on Bun peer-variant entries: pass, run 21.)
 5. macOS/Windows re-runs of the #366 / #405 / #469 / #803 fixes (Windows isolated uses junctions).
 6. #497 `github:` tuples (needs a probe).
@@ -598,9 +610,13 @@ Other passes (Linux, 1.4.2 unless noted):
 
 15. #1437: verified fixed (run 39). Agent manifest + hosted pins under a bare scan is covered (Known non-bugs).
 16. #1467: re-test when fixed (member + root artifact reasons, `--json` reason text).
-18. #1492: verified fixed for 1.3.2+ writers (run 41). #1521: re-test when fixed (1.3.0 / 1.3.1 text + lockb, and a 1.3.0 lock frozen-installed by 1.4.3). (#1097 extglobs on real Bun: Bun refuses them, pass, run 41.)
+18. #1492 / #1521: verified fixed (runs 41 / 42).
+19. #1541: re-test when fixed (root + member mirrors, hosted → vendored takeover, `repair` in a no-LFS clone). Other `.gitattributes` rules on vendored artifacts: `export-ignore`, custom `filter=` smudge, `eol=crlf`. (#1097 extglobs on real Bun: Bun refuses them, pass, run 41.)
 17. #1444 cap under real 429s from a registry (a mock that throttles), and a 40+ pin workspace.
 ## Known non-bugs
+
+- A hosted `rollback` run without the `BUN_CONFIG_REGISTRY` / `NPM_CONFIG_REGISTRY` that the original install used restores `""` in the registry slot rather than the full mirror URL. That's what Bun writes in the same environment. With the env set at rollback time, the restore is byte-exact (run 42).
+- A patch that edits `package.json` (adds a dependency or a `bin`) installs the patched bytes, but Bun's frozen install uses the lock's metadata, so the new dependency and bin aren't installed. Agent mode is the same. Real Socket patches are source fixes, so not filed (run 42).
 
 - A root `scan --mode vendored` exits 1 `vendor_lock_entry_not_found` for packages crawled from a nested independent (or `!`-excluded) project with its own lock, while hosted only warns. It's generic to the npm family, so it was handed to npm (run 41). Scan the nested project by PATH.
 
