@@ -1502,6 +1502,7 @@ async fn classic_outside_root_copy_under_another_name_is_named_and_not_attested(
     let proj = tmp.path().join("proj");
     let copy = tmp.path().join("ext").join("lpdir");
     std::fs::create_dir_all(&copy).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
     std::fs::write(
         copy.join("package.json"),
         format!(r#"{{"name":"{DEP}","version":"{DEP_VERSION}","main":"index.js"}}"#),
