@@ -6,6 +6,7 @@
 //! project and the PATH to pass) instead of failing every run with
 //! `vendor_lock_entry_not_found`, and the in-run VEX is still written.
 
+use crate::common::envelope::{all_codes, parse_json_envelope};
 use crate::common::{binary, git_sha256, hermetic_command};
 
 #[path = "../prebuilt_common/mod.rs"]
@@ -223,25 +224,6 @@ fn run_scan(root: &Path, mock_uri: &str, mode: &str, extra: &[&str]) -> (i32, St
     )
 }
 
-fn envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout must be one JSON envelope ({e}): {stdout}"))
-}
-
-/// Every event in the envelope (top level and the nested vendor block).
-fn events(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for key in ["patches", "events"] {
-        if let Some(list) = v[key].as_array() {
-            out.extend(list.iter().cloned());
-        }
-        if let Some(list) = v["vendor"][key].as_array() {
-            out.extend(list.iter().cloned());
-        }
-    }
-    out
-}
-
 fn warning<'a>(v: &'a serde_json::Value, code: &str) -> Option<&'a serde_json::Value> {
     v["warnings"].as_array()?.iter().find(|w| w["code"] == code)
 }
@@ -255,11 +237,12 @@ fn assert_nested_skipped(v: &serde_json::Value) {
         detail.contains("scan --mode vendored tools/x"),
         "names the PATH to pass: {detail}"
     );
-    let failed: Vec<_> = events(v)
-        .into_iter()
-        .filter(|e| e["action"] == "failed")
-        .collect();
-    assert!(failed.is_empty(), "no failed event: {failed:#?}\n{v:#}");
+    assert!(
+        !all_codes(v)
+            .iter()
+            .any(|c| c == "vendor_lock_entry_not_found"),
+        "no failed event: {v:#}"
+    );
 }
 
 /// The bug: run 1 (and every later run) ended `partialFailure`, exit 1,
@@ -275,7 +258,7 @@ async fn root_vendored_scan_warns_about_a_nested_projects_copies() {
 
     for run in 1..=2 {
         let (code, stdout, stderr) = run_scan(root, &mock.uri(), "vendored", &[]);
-        let v = envelope(&stdout);
+        let v = parse_json_envelope(&stdout);
         assert_eq!(
             code, 0,
             "run {run}: exit 0\nstdout={stdout}\nstderr={stderr}"
@@ -310,7 +293,7 @@ async fn root_vendored_scan_with_vex_writes_the_document() {
         &["--vex", out_arg, "--vex-product", "pkg:npm/root@1.0.0"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
-    assert_nested_skipped(&envelope(&stdout));
+    assert_nested_skipped(&parse_json_envelope(&stdout));
     let doc = std::fs::read_to_string(&out).expect("the in-run VEX is written");
     assert!(
         !doc.contains("left-pad"),
@@ -369,7 +352,7 @@ async fn package_the_root_also_locks_is_still_vendored_at_the_root() {
     mount_offers(&mock, &[(NESTED_PURL, NESTED_UUID)]).await;
 
     let (code, stdout, stderr) = run_scan(root, &mock.uri(), "vendored", &[]);
-    let v = envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(warning(&v, WARNING).is_none(), "{v:#}");
     let root_lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
@@ -415,6 +398,31 @@ async fn workspace_member_with_stray_lock_is_not_a_nested_project() {
     mount_offers(&mock, &[(NESTED_PURL, NESTED_UUID)]).await;
 
     let (_, stdout, _) = run_scan(root, &mock.uri(), "vendored", &[]);
-    let v = envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(warning(&v, WARNING).is_none(), "{v:#}");
+}
+
+/// The PATH the warning names is relative to where the command runs, not
+/// to `--cwd`: re-running it from the same shell reaches the project.
+#[tokio::test]
+async fn warning_names_the_path_from_the_shells_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    write_repo(&root);
+    let mock = MockServer::start().await;
+    mount_api(&mock).await;
+
+    let root_arg = root.to_str().unwrap();
+    let (code, stdout, stderr) =
+        run_scan(tmp.path(), &mock.uri(), "vendored", &["--cwd", root_arg]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_json_envelope(&stdout);
+    let detail = warning(&v, WARNING).unwrap()["detail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        detail.contains("scan --mode vendored repo/tools/x`"),
+        "{detail}"
+    );
 }
