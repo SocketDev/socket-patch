@@ -8,8 +8,11 @@
 //!   `SOCKET_NO_CONFIG` survived, whether `SOCKET_NO_UPDATE_CHECK` was
 //!   forced, which package-manager vars were swept, case of `npm_config_*`);
 //! * a ratchet over the test tree: no private `scrub_socket_env` copy, and
-//!   no file that spawns the binary with a bare `Command::new`; every spawn
-//!   goes through `hermetic::command` / `common::run*`.
+//!   no file that spawns the binary with a bare `Command::new`; spawns go
+//!   through `hermetic::command` / `common::run*`. The detector matches the
+//!   spellings in `has_raw_spawn`, not a path bound to a local first, and
+//!   doesn't see `portable_pty::CommandBuilder` spawns, which keep their
+//!   own scrubs.
 
 #[path = "common/hermetic.rs"]
 mod hermetic;

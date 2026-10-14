@@ -1854,7 +1854,8 @@ fn pypi_requirements_txt_vendored_install_proof() {
     );
     let reqs_before = std::fs::read(proj.join("requirements.txt")).unwrap();
 
-    // Discovery reads the venv via VIRTUAL_ENV.
+    // Discovery finds the `.venv` under the cwd (`run_socket` scrubs
+    // VIRTUAL_ENV).
     let env_json = scan_vendored(&proj, &["--ecosystems", "pypi"]);
     assert_vendor_applied(&env_json, "urllib3@1.26.18", LEG);
     assert_download_uuid(&env_json, PYPI_UUIDS, LEG);
