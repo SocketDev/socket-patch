@@ -251,9 +251,13 @@ pub enum Extra {
     /// Every `BUNDLE_*` var. Bundler lets any `.bundle/config` setting be
     /// overridden by env, and the gem crawler reads `BUNDLE_PATH`,
     /// `BUNDLE_APP_CONFIG` and friends, so an ambient value moves the gem
-    /// store the suite points it at. Seeded with a bogus
-    /// `BUNDLE_APP_CONFIG` and then scrubbed; run it before the suite sets
-    /// its own `BUNDLE_*` values.
+    /// store the suite points it at. Also `RUBYOPT` and `RUBYLIB`: under
+    /// `bundle exec` they carry `-rbundler/setup` and the outer bundler's
+    /// lib dir, which pin every child ruby to the outer Gemfile and bundler.
+    /// `GEM_HOME`/`GEM_PATH` are kept on purpose: rvm/chruby
+    /// export them and `bundle` itself resolves through them (see
+    /// `cache_env.rs`). Seeded with a bogus `BUNDLE_APP_CONFIG` and then
+    /// scrubbed; run it before the suite sets its own `BUNDLE_*` values.
     Bundle,
     /// Every `PDM_*` var plus `UV_PROJECT_ENVIRONMENT`: PDM reads any
     /// setting from `PDM_<NAME>`, and its uv backend follows
@@ -270,6 +274,30 @@ pub enum Extra {
     /// fixture's `vendor/`. The pin outranks `XDG_CONFIG_HOME` and holds
     /// no config. Run it before the suite sets its own `COMPOSER_*` values.
     Composer,
+}
+
+/// The [`Extra`] scrubs for a `socket-patch` child that crawls a real
+/// project tree: the binary's own crawlers read `VIRTUAL_ENV`, bundler's
+/// `BUNDLE_PATH`/`BUNDLE_APP_CONFIG`/`BUNDLE_GEMFILE` and Composer's vendor
+/// dir and home, so an ambient value moves discovery (and the installed
+/// evidence `vex` hashes) off the fixture. Any env the test sets after the
+/// scrub still wins. Apply it with [`scrub_crawler_inputs`].
+pub const CRAWLER_EXTRAS: [Extra; 3] = [Extra::Venv, Extra::Bundle, Extra::Composer];
+
+/// Where [`scrub_crawler_inputs`] points `BUNDLE_USER_CONFIG`.
+pub const NO_BUNDLE_USER_CONFIG: &str = "/nonexistent/bundle-user-config";
+
+/// Apply [`CRAWLER_EXTRAS`] to a `socket-patch` child, and pin
+/// `BUNDLE_USER_CONFIG` to a missing file. Without the pin the ruby
+/// crawler falls back to `$HOME/.bundle/config`, the developer's global
+/// bundler config (a `path` or `gemfile` there moves the gem crawl), the
+/// same way `Extra::Composer` pins `COMPOSER_HOME`. The pin lives here,
+/// not in `Extra::Bundle`, because `bundle` children get their own
+/// `BUNDLE_USER_HOME` from `cache_env::isolate`, which the pin would
+/// shadow. A test that sets `BUNDLE_USER_CONFIG` afterwards still wins.
+pub fn scrub_crawler_inputs(cmd: &mut Command) {
+    scrub_extra(cmd, &CRAWLER_EXTRAS);
+    cmd.env("BUNDLE_USER_CONFIG", NO_BUNDLE_USER_CONFIG);
 }
 
 /// Apply each of `extras` to `cmd` (see [`Extra`]). Run it before
@@ -324,6 +352,8 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                     }
                 }
                 cmd.env_remove("BUNDLE_APP_CONFIG");
+                cmd.env_remove("RUBYOPT");
+                cmd.env_remove("RUBYLIB");
             }
             Extra::Pdm => {
                 for (key, _) in std::env::vars_os() {

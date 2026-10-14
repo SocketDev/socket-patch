@@ -152,9 +152,9 @@ const TINY_LIB: &str = "module TinyDep\n  VALUE = \"tiny-ok\"\nend\n";
 
 /// Run the socket-patch binary in the hermetic environment
 /// (`tests/common/hermetic.rs`: a developer's `SOCKET_DRY_RUN=1` must not
-/// steer the assertions) with `VIRTUAL_ENV` (crawler discovery input) and
-/// every ambient `BUNDLE_*` var (the crawler reads `BUNDLE_GEMFILE`,
-/// `BUNDLE_PATH`, mirrors, ...) removed.
+/// steer the assertions) with the crawler's discovery inputs scrubbed
+/// (`hermetic::scrub_crawler_inputs`: `VIRTUAL_ENV`, every `BUNDLE_*` the
+/// crawler reads, and `~/.bundle/config` via a pinned `BUNDLE_USER_CONFIG`).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     run_socket_env(cwd, args, &[])
 }
@@ -162,7 +162,7 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// [`run_socket`] with extra environment on top of the scrubbed surface.
 fn run_socket_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.args(args).current_dir(cwd);
     for (k, v) in envs {
         cmd.env(k, v);
@@ -175,8 +175,10 @@ fn run_socket_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, Str
     )
 }
 
-/// Run `bundle <args>` in `cwd`: ambient `BUNDLE_*`/`GEM_*` scrubbed, caches
-/// isolated, `BUNDLE_APP_CONFIG` pinned to the project's own `.bundle/`, and
+/// Run `bundle <args>` in `cwd`: ambient `SOCKET_*` and bundler config
+/// scrubbed ([`hermetic::Extra::Bundle`]; `GEM_HOME`/`GEM_PATH` stay, see
+/// `cache_env.rs`, and every install here uses the project-local `path`
+/// config), caches isolated, `BUNDLE_APP_CONFIG` pinned to the project's own `.bundle/`, and
 /// a PER-PROJECT `BUNDLE_USER_HOME` so each stage's compact-index cache is
 /// cold (the fresh-checkout install must be forced through the wiremock
 /// registry, never satisfied from the scan project's cache).
@@ -190,12 +192,8 @@ fn bundle(cwd: &Path, args: &[&str]) -> Output {
 fn bundle_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("bundle");
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy().into_owned();
-        if key.starts_with("BUNDLE_") || key.starts_with("GEM_") {
-            cmd.env_remove(&k);
-        }
-    }
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle]);
     cache_env::isolate(&mut cmd);
     cmd.env("BUNDLE_APP_CONFIG", cwd.join(".bundle"));
     cmd.env("BUNDLE_USER_HOME", cwd.join(".bundle-user-home"));

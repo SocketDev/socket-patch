@@ -459,6 +459,9 @@ fn bundle_extra_sweeps_every_bundler_override() {
             ("BUNDLE_APP_CONFIG", "/ambient/.bundle"),
             ("BUNDLE_GEMFILE", "/ambient/Gemfile"),
             ("GEM_HOME", "/ambient/gems"),
+            ("GEM_PATH", "/ambient/gems"),
+            ("RUBYOPT", "-rbundler/setup"),
+            ("RUBYLIB", "/ambient/bundler/lib"),
         ],
         || {
             let mut cmd = Command::new("bundle");
@@ -467,7 +470,11 @@ fn bundle_extra_sweeps_every_bundler_override() {
             assert_eq!(get(&env, "BUNDLE_PATH"), None);
             assert_eq!(get(&env, "BUNDLE_APP_CONFIG"), None);
             assert_eq!(get(&env, "BUNDLE_GEMFILE"), None);
+            assert_eq!(get(&env, "RUBYOPT"), None);
+            assert_eq!(get(&env, "RUBYLIB"), None);
+            // rvm/chruby homes stay: `bundle` resolves through them.
             assert_eq!(get(&env, "GEM_HOME"), Some("/ambient/gems"));
+            assert_eq!(get(&env, "GEM_PATH"), Some("/ambient/gems"));
 
             // A suite's own BUNDLE_PATH, set after the scrub, survives.
             cmd.env("BUNDLE_PATH", "/store");
@@ -612,6 +619,71 @@ fn no_scrub_socket_env_copies() {
          Spawn through `tests/common/hermetic.rs` instead (hermetic::command \
          for the binary, scrub_socket_vars + scrub_extra for package-manager \
          children; add an `Extra` variant for a new tool's config)."
+    );
+}
+
+#[test]
+#[serial]
+fn crawler_inputs_sweep_bundler_and_composer_overrides() {
+    with_ambient(
+        &[
+            ("VIRTUAL_ENV", "/ambient/venv"),
+            ("BUNDLE_PATH", "/ambient/bundle"),
+            ("BUNDLE_GEMFILE", "/ambient/Gemfile"),
+            ("BUNDLE_USER_CONFIG", "/ambient/bundle-config"),
+            ("RUBYOPT", "-rbundler/setup"),
+            ("RUBYLIB", "/ambient/bundler/lib"),
+            ("COMPOSER_VENDOR_DIR", "/ambient/vendor"),
+            ("COMPOSER_HOME", "/ambient/composer"),
+        ],
+        || {
+            let mut cmd = hermetic::binary_command();
+            hermetic::scrub_crawler_inputs(&mut cmd);
+            let env = effective_env(&cmd);
+            assert_eq!(get(&env, "VIRTUAL_ENV"), None);
+            assert_eq!(get(&env, "BUNDLE_PATH"), None);
+            assert_eq!(get(&env, "BUNDLE_GEMFILE"), None);
+            assert_eq!(get(&env, "RUBYOPT"), None);
+            assert_eq!(get(&env, "RUBYLIB"), None);
+            assert_eq!(get(&env, "COMPOSER_VENDOR_DIR"), None);
+            // Global configs are pinned to missing files, not left to fall
+            // back to the developer's `~/.bundle/config` / composer home.
+            assert_eq!(
+                get(&env, "BUNDLE_USER_CONFIG"),
+                Some(hermetic::NO_BUNDLE_USER_CONFIG)
+            );
+            assert_eq!(
+                get(&env, "COMPOSER_HOME"),
+                Some("/nonexistent/composer-home")
+            );
+
+            // A test's own pin, set after the scrub, survives.
+            cmd.env("BUNDLE_USER_CONFIG", "/fixture/bundle-config");
+            let env = effective_env(&cmd);
+            assert_eq!(
+                get(&env, "BUNDLE_USER_CONFIG"),
+                Some("/fixture/bundle-config")
+            );
+        },
+    );
+}
+
+#[test]
+fn no_private_bundler_sweeps() {
+    let found: Vec<String> = test_sources()
+        .into_iter()
+        .filter(|(rel, text)| {
+            rel != "spawn_env_hygiene.rs"
+                && rel != "common/hermetic.rs"
+                && text.contains("starts_with(\"BUNDLE_\")")
+        })
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(
+        found.is_empty(),
+        "these test files sweep `BUNDLE_*` by hand: {found:?}. Use \
+         `hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle])`, \
+         which also keeps rvm/chruby's GEM_HOME/GEM_PATH (see cache_env.rs)."
     );
 }
 

@@ -51,8 +51,9 @@
 //! Notes:
 //! - Every run is hermetic: ambient `SOCKET_*` is scrubbed, telemetry and
 //!   the socket-cli config are off, ambient API tokens are vetoed (only
-//!   [`VexRun::api_token`] authenticates) and `VIRTUAL_ENV` is removed.
-//!   Package-manager homes/caches the installed-tree lookups need go in
+//!   [`VexRun::api_token`] authenticates) and the crawler's ambient inputs
+//!   (`VIRTUAL_ENV`, `BUNDLE_*`, `COMPOSER_*`; `hermetic::CRAWLER_EXTRAS`)
+//!   are removed. Package-manager homes/caches the installed-tree lookups need go in
 //!   [`VexRun::envs`].
 //! - `--json` is the default ([`VexRun::human`] opts out), so
 //!   [`VexOutcome::envelope`] is always the parsed stdout object.
@@ -425,7 +426,7 @@ pub fn run_vex(bin: &Path, project: &Path, run: &VexRun) -> VexOutcome {
     args.extend(run.extra_args.iter().map(OsString::from));
 
     let mut cmd = hermetic::command(bin);
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.env("SOCKET_NO_API_TOKEN", "1");
     for (key, value) in &run.envs {
         cmd.env(key, value);
