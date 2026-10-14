@@ -309,7 +309,7 @@ fn has_command(cmd: &str) -> bool {
 /// `COMPOSER_*`): the hosted scan discovers packages unscoped under the cwd.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic::binary_command();
-    hermetic::scrub_extra(&mut cmd, &hermetic::CRAWLER_EXTRAS);
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     (

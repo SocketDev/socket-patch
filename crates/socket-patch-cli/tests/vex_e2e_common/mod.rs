@@ -426,7 +426,7 @@ pub fn run_vex(bin: &Path, project: &Path, run: &VexRun) -> VexOutcome {
     args.extend(run.extra_args.iter().map(OsString::from));
 
     let mut cmd = hermetic::command(bin);
-    hermetic::scrub_extra(&mut cmd, &hermetic::CRAWLER_EXTRAS);
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.env("SOCKET_NO_API_TOKEN", "1");
     for (key, value) in &run.envs {
         cmd.env(key, value);

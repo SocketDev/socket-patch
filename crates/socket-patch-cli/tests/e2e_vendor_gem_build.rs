@@ -104,12 +104,13 @@ fn argv(args: &[String]) -> Vec<&str> {
 
 /// Run the socket-patch binary in the hermetic environment
 /// (`tests/common/hermetic.rs`: no ambient `SOCKET_*`, so a developer's
-/// `SOCKET_DRY_RUN=1` etc. can't flip behavior) with `VIRTUAL_ENV` and every
-/// `BUNDLE_*` (crawler discovery inputs: an ambient `BUNDLE_PATH` or
-/// `BUNDLE_GEMFILE` would point the crawler away from the fixture) removed.
+/// `SOCKET_DRY_RUN=1` etc. can't flip behavior) with the crawler's discovery
+/// inputs scrubbed (`hermetic::scrub_crawler_inputs`: an ambient
+/// `BUNDLE_PATH`, `BUNDLE_GEMFILE` or `~/.bundle/config` would point the
+/// crawler away from the fixture).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.current_dir(cwd);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");

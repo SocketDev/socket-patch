@@ -152,9 +152,9 @@ const TINY_LIB: &str = "module TinyDep\n  VALUE = \"tiny-ok\"\nend\n";
 
 /// Run the socket-patch binary in the hermetic environment
 /// (`tests/common/hermetic.rs`: a developer's `SOCKET_DRY_RUN=1` must not
-/// steer the assertions) with `VIRTUAL_ENV` (crawler discovery input) and
-/// every ambient `BUNDLE_*` var (the crawler reads `BUNDLE_GEMFILE`,
-/// `BUNDLE_PATH`, mirrors, ...) removed.
+/// steer the assertions) with the crawler's discovery inputs scrubbed
+/// (`hermetic::scrub_crawler_inputs`: `VIRTUAL_ENV`, every `BUNDLE_*` the
+/// crawler reads, and `~/.bundle/config` via a pinned `BUNDLE_USER_CONFIG`).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     run_socket_env(cwd, args, &[])
 }
@@ -162,7 +162,7 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// [`run_socket`] with extra environment on top of the scrubbed surface.
 fn run_socket_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.args(args).current_dir(cwd);
     for (k, v) in envs {
         cmd.env(k, v);

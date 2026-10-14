@@ -333,7 +333,7 @@ fn has_corepack_pm(pm: &str) -> bool {
 /// `vendor/bundle`.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic::binary_command();
-    hermetic::scrub_extra(&mut cmd, &hermetic::CRAWLER_EXTRAS);
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     (
@@ -525,7 +525,7 @@ fn pm_command(program: &str) -> Command {
 /// RUBYOPT require) must not leak into a leg that hard-asserts bundler
 /// outcomes. `GEM_HOME`/`GEM_PATH` stay, since `bundle` resolves through
 /// them under rvm/chruby; every install here pins BUNDLE_PATH. The cache
-/// sandbox re-pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after the scrub,
+/// sandbox pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after the scrub,
 /// and the per-leg `env` is applied last so the leg's pins win.
 fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = pm_command("bundle");
