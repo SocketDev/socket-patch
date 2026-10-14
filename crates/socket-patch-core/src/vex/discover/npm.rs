@@ -69,7 +69,7 @@ use crate::vendor::lock_inventory::{
     NpmLockNode,
 };
 use crate::vendor::npm_origin::{
-    npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+    npm_link_source_identity, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
 };
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
@@ -464,16 +464,27 @@ fn drop_non_registry_installs(
     let mut unpatched: Vec<(String, &str, &str)> = Vec::new();
     for (key, why) in &elsewhere {
         let entry = &doc["packages"][key.as_str()];
-        let key_name = key.rsplit_once("node_modules/").map_or("", |(_, n)| n);
-        let name = entry
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(key_name);
-        let Some(purl) = entry
-            .get("version")
-            .and_then(Value::as_str)
-            .and_then(|v| npm_purl(name, v))
-        else {
+        let identity = match entry.get("version").and_then(Value::as_str) {
+            Some(version) => {
+                let key_name = key.rsplit_once("node_modules/").map_or("", |(_, n)| n);
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(key_name);
+                Some((name.to_string(), version.to_string()))
+            }
+            // A `file:` directory dependency is a versionless link entry
+            // whose source directory's own entry carries the package
+            // (#1511), as the hosted rewriter reads it (#1481).
+            None if foreign.contains(key)
+                && entry.get("link").and_then(Value::as_bool) == Some(true) =>
+            {
+                npm_link_source_identity(doc, entry)
+            }
+            None => None,
+        };
+        let purl = identity.and_then(|(name, version)| npm_purl(&name, &version));
+        let Some(purl) = purl else {
             continue;
         };
         read.mentioned.insert(purl.clone());
@@ -2450,6 +2461,104 @@ mod tests {
             })),
         );
         assert_eq!(run(&p).await.refs.len(), 1);
+    }
+
+    /// #1511: npm records a `file:` DIRECTORY dependency as a versionless
+    /// link entry whose source directory's own entry carries the package.
+    /// Under `install-strategy=nested` one workspace member's registry copy
+    /// is wired while another member's `file:` directory copy of the same
+    /// release installs from that directory, unpatched: the ref is withheld
+    /// (#1482 is the hosted rewriter's half). Controls: a directory holding
+    /// ANOTHER version, and a workspace member linked without a `file:`
+    /// spec, contest nothing.
+    #[tokio::test]
+    async fn a_file_directory_link_copy_of_the_same_release_is_not_attested() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let lock = |resolved: &str, source: serde_json::Value| {
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "version": "1.0.0", "workspaces": ["packages/*"] },
+                "lpdir": source,
+                "node_modules/a": { "resolved": "packages/a", "link": true },
+                "node_modules/b": { "resolved": "packages/b", "link": true },
+                "packages/a": { "name": "a", "version": "1.0.0",
+                                "dependencies": { "left-pad": "1.3.0" } },
+                "packages/a/node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": resolved, "integrity": SRI
+                },
+                "packages/b": { "name": "b", "version": "1.0.0",
+                                "dependencies": { "left-pad": "file:../../lpdir" } },
+                "packages/b/node_modules/left-pad": { "resolved": "lpdir", "link": true },
+            }))
+        };
+        // npm omits the source's `name` when it matches the folder name, so
+        // both spellings are covered.
+        let named = serde_json::json!({ "name": "left-pad", "version": "1.3.0" });
+        let unnamed = serde_json::json!({ "version": "1.3.0" });
+        for (wiring, resolved) in [("hosted", &hosted), ("vendored", &vendored)] {
+            for (label, source) in [("named", &named), ("folder-named", &unnamed)] {
+                let p = Project::new();
+                let text = lock(resolved, source.clone());
+                // The folder-named source spells its identity by the
+                // directory, so name the directory after the package.
+                let text = if label == "folder-named" {
+                    text.replace("lpdir", "left-pad")
+                } else {
+                    text
+                };
+                p.write("package-lock.json", text);
+                let out = run(&p).await;
+                assert!(
+                    out.refs.is_empty(),
+                    "{wiring} / {label}: {} refs",
+                    out.refs.len()
+                );
+                let diag = out
+                    .diagnostics
+                    .iter()
+                    .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                    .unwrap_or_else(|| panic!("{wiring} / {label}: {:?}", out.diagnostics));
+                assert!(
+                    diag.detail.contains("packages/b/node_modules/left-pad"),
+                    "{wiring} / {label}: {}",
+                    diag.detail
+                );
+                // The registry copy's wiring is the rewriters' own output
+                // beside a copy they skip: still unwound (#828).
+                assert_eq!(out.shadowed.len(), 1, "{wiring} / {label}");
+            }
+        }
+        // Control: the directory holds another release.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock(
+                &vendored,
+                serde_json::json!({ "name": "left-pad", "version": "1.2.0" }),
+            ),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 1, "{:?}", out.diagnostics);
+        assert!(!diag_codes(&out).contains(&DIAG_REF_UNATTRIBUTABLE));
+        // Control: a workspace member that is itself `left-pad@1.3.0`,
+        // linked by the workspace (no `file:` spec), is first-party source.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "version": "1.0.0", "workspaces": ["packages/*"] },
+                "node_modules/a": { "resolved": "packages/a", "link": true },
+                "node_modules/left-pad": { "resolved": "packages/left-pad", "link": true },
+                "packages/a": { "name": "a", "version": "1.0.0",
+                                "dependencies": { "left-pad": "1.3.0" } },
+                "packages/a/node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": vendored, "integrity": SRI
+                },
+                "packages/left-pad": { "name": "left-pad", "version": "1.3.0" },
+            })),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 1, "{:?}", out.diagnostics);
     }
 
     /// Negative shapes: a uuid on a foreign host, a placeholder token, the

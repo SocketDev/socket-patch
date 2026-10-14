@@ -464,6 +464,23 @@ async fn unwired_check_failure(
             c.other.display(),
         );
     }
+    if let Some((r, diag)) = discovery.vendored_shadow(&entry.base_purl, &entry.uuid) {
+        // Re-vendoring cannot reach that copy: name it instead (#1511).
+        let copy = diag.map_or_else(
+            || {
+                format!(
+                    "{} wires {dir}, but the build also installs an unpatched copy of the \
+                     same version",
+                    r.source_file.display()
+                )
+            },
+            |d| d.detail.clone(),
+        );
+        return format!(
+            "copy unpatched: {copy}; re-vendoring cannot reach that copy, so depend on the \
+             registry release there (or remove that copy) to have it patched"
+        );
+    }
     // Only the npm-family and Python extractors record every lock entry
     // (`resolved_elsewhere`), so only there does "no lock resolves it"
     // prove the dependency is gone rather than unreadable.

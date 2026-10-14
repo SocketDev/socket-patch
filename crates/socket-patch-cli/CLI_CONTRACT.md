@@ -2023,7 +2023,10 @@ wiring: an entry whose lockfile or config no longer references its
 `npm install` re-resolved it) fails by the same liveness rule as `vex`'s
 `vendor_unwired`. The reason names the cause: another lock resolving the same
 version from elsewhere (`wiring contested`, naming both locks; delete the one
-the project does not install from), or, for npm and PyPI, a dependency no lock
+the project does not install from), an unpatched copy of the same version
+that no rewire reaches installing beside the wiring, such as a bundled copy or
+an npm git / url / `file:` dependency (`copy unpatched`, naming that lock
+entry; re-vendoring cannot reach it, #1511), or, for npm and PyPI, a dependency no lock
 resolves any more (`dependency removed`; `scan --mode vendored --prune` reverts
 the entry), or, for PyPI, a project file that still names the artifact while
 nothing installs from it (`wiring incomplete`, naming the file; re-lock, then

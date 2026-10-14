@@ -1048,6 +1048,26 @@ impl Discovery {
         })
     }
 
+    /// The withholding that killed a VENDORED ledger claim because the
+    /// build also installs an unpatched copy of the same version that no
+    /// rewire reaches (a bundled copy, or one npm installs from a git /
+    /// url / `file:` spec): the wiring ref moved to [`Discovery::shadowed`],
+    /// with the [`DIAG_REF_UNATTRIBUTABLE`] diagnostic naming that copy
+    /// when one does. Lets a reader of a dead claim name the copy instead
+    /// of saying nothing wires the artifact (#1511).
+    pub fn vendored_shadow(&self, purl: &str, uuid: &str) -> Option<(&PatchedRef, Option<&Diag>)> {
+        let key = canonical_base_purl(purl);
+        let shadowed = self.shadowed.iter().find(|r| {
+            r.uuid == uuid && r.mode == WiringMode::Vendored && PurlKey::same(&r.purl, &key)
+        })?;
+        let diag = self.diagnostics.iter().find(|d| {
+            d.code == DIAG_REF_UNATTRIBUTABLE
+                && d.file == shadowed.source_file
+                && d.detail.contains(shadowed.purl.as_str())
+        });
+        Some((shadowed, diag))
+    }
+
     /// Whether any lock discovery read resolves `purl` (any spelling) at
     /// all: wired to a Socket patch, contested, or from elsewhere
     /// ([`Discovery::resolved_elsewhere`]).
