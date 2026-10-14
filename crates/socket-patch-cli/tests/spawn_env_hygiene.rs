@@ -10,9 +10,9 @@
 //! * a ratchet over the test tree: no private `scrub_socket_env` copy, and
 //!   no file that spawns the binary with a bare `Command::new`; spawns go
 //!   through `hermetic::command` / `common::run*`. The detector matches the
-//!   spellings in `has_raw_spawn`, not a path bound to a local first, and
-//!   doesn't see `portable_pty::CommandBuilder` spawns, which keep their
-//!   own scrubs.
+//!   spellings in `has_raw_spawn` (for `Command::new` and the PTY suites'
+//!   `portable_pty::CommandBuilder::new`), not a path bound to a local
+//!   first.
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
@@ -285,6 +285,66 @@ fn command_drops_flag_bound_vars_set_after_it_is_built() {
     );
 }
 
+/// The `SOCKET_*` part of the environment a PTY child would see.
+fn pty_socket_env(cmd: &portable_pty::CommandBuilder) -> BTreeMap<String, String> {
+    cmd.iter_full_env_as_str()
+        .filter(|(k, _)| k.starts_with("SOCKET_"))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
+
+/// The PTY suites used to hand-roll their scrubs, and the copies drifted.
+/// `pty_command` must give a PTY child exactly the `SOCKET_*` environment
+/// `command` gives a piped one, whatever the ambient shell holds.
+#[test]
+#[serial]
+fn pty_command_carries_the_same_socket_env_as_command() {
+    with_ambient(
+        &[
+            ("SOCKET_YES", "true"),
+            ("SOCKET_JSON", "true"),
+            ("SOCKET_DRY_RUN", "true"),
+            ("SOCKET_API_TOKEN", "ambient-token"),
+            ("SOCKET_CLI_API_TOKEN", "ambient-peer-token"),
+            ("SOCKET_SOME_FUTURE_FLAG", "1"),
+            ("SOCKET_NO_CONFIG", "0"),
+            ("SOCKET_NO_UPDATE_CHECK", "0"),
+            ("SOCKET_TELEMETRY_DISABLED", "0"),
+        ],
+        || {
+            let piped: BTreeMap<String, String> =
+                effective_env(&hermetic::command(Path::new("socket-patch")))
+                    .into_iter()
+                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                    .filter(|(k, _)| k.starts_with("SOCKET_"))
+                    .collect();
+            let pty = pty_socket_env(&hermetic::pty_command("socket-patch"));
+            assert_eq!(pty, piped);
+            assert_eq!(pty.get("SOCKET_YES"), None);
+            assert_eq!(
+                pty.get("SOCKET_NO_UPDATE_CHECK").map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                pty.get("SOCKET_TELEMETRY_DISABLED").map(String::as_str),
+                Some("1")
+            );
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn pty_command_never_leaks_its_hostile_seeds_and_keeps_caller_env() {
+    let mut cmd = hermetic::pty_binary_command();
+    let env = pty_socket_env(&cmd);
+    for (key, _) in hermetic::HOSTILE_SEEDS {
+        assert_eq!(env.get(*key), None, "{key} seed must be scrubbed");
+    }
+    cmd.env("SOCKET_NO_UPDATE_CHECK", "0");
+    assert_eq!(cmd.get_env("SOCKET_NO_UPDATE_CHECK"), Some("0".as_ref()));
+}
+
 #[test]
 #[serial]
 fn caller_env_set_after_command_survives_the_scrub() {
@@ -493,10 +553,14 @@ fn test_sources() -> Vec<(String, String)> {
 }
 
 /// Whether `text` spawns the `socket-patch` binary with a bare
-/// `Command::new`: `binary()` (any path prefix), the `CARGO_BIN_EXE_*`
-/// literal, `socket_bin()` or a `BINARY` const.
+/// `Command::new` or `CommandBuilder::new`: `binary()` (any path prefix),
+/// the `CARGO_BIN_EXE_*` literal, `socket_bin()` or a `BINARY` const.
 fn has_raw_spawn(text: &str) -> bool {
-    text.split("Command::new(").skip(1).any(|rest| {
+    let mut spawns = text
+        .split("Command::new(")
+        .skip(1)
+        .chain(text.split("CommandBuilder::new(").skip(1));
+    spawns.any(|rest| {
         let arg = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
         let head = &rest[..rest.len() - arg.len()];
         let name = head.rsplit("::").next().unwrap_or(head);
@@ -515,6 +579,9 @@ fn raw_spawn_detector_matches_the_spellings_in_the_tree() {
         "Command::new(env!(\"CARGO_BIN_EXE_socket-patch\"))",
         "Command::new(socket_bin())",
         "Command::new(BINARY)",
+        "CommandBuilder::new(binary())",
+        "portable_pty::CommandBuilder::new(common::binary())",
+        "CommandBuilder::new(env!(\"CARGO_BIN_EXE_socket-patch\"))",
     ] {
         assert!(has_raw_spawn(spawn), "{spawn}");
     }
@@ -524,6 +591,8 @@ fn raw_spawn_detector_matches_the_spellings_in_the_tree() {
         "Command::new(bin)",
         "Command::new(binary_path)",
         "Command::new(BINARY_DIR)",
+        "hermetic::pty_binary_command()",
+        "CommandBuilder::new(\"/bin/sh\")",
     ] {
         assert!(!has_raw_spawn(ok), "{ok}");
     }
@@ -556,9 +625,11 @@ fn no_new_bare_binary_spawns() {
         .collect();
     assert!(
         found.is_empty(),
-        "these test files spawn the binary with a bare Command::new: \
+        "these test files spawn the binary with a bare Command::new or \
+         CommandBuilder::new: \
          {found:?}. Use `hermetic::command(&bin)` / \
-         `hermetic::binary_command()` or `common::run*` (tests/common/) so the \
-         child gets the hermetic SOCKET_* environment."
+         `hermetic::binary_command()` or `common::run*` (tests/common/), or \
+         `hermetic::pty_command` / `hermetic::pty_binary_command()` for a PTY \
+         child, so the child gets the hermetic SOCKET_* environment."
     );
 }

@@ -594,13 +594,13 @@ async fn update_command_never_notifies() {
 #[cfg(unix)]
 mod pty {
     use super::*;
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
     use std::io::Read;
 
     /// Minimal PTY runner (same shape as `interactive_prompts_e2e.rs`):
     /// reader thread to EOF, detached SIGKILL watchdog, no input. This
-    /// bypasses `run_installed`, so the hermetic scrub and the update kit
-    /// are reproduced by hand.
+    /// bypasses `run_installed`, so the update kit is applied by hand on
+    /// top of `hermetic::pty_command`.
     fn run_in_pty(
         bin: &Path,
         cwd: &Path,
@@ -617,22 +617,11 @@ mod pty {
             })
             .expect("openpty");
 
-        let mut cmd = CommandBuilder::new(bin);
+        // The hermetic environment, then the caller's kit, which lands last
+        // (its `SOCKET_NO_UPDATE_CHECK=0` turns the notifier back on).
+        let mut cmd = common::hermetic::pty_command(bin);
         cmd.arg("apply");
         cmd.cwd(cwd);
-        // Prefix-scrub the ambient SOCKET_* surface (keep telemetry
-        // opt-outs and the no-config hermeticity default), then land the
-        // caller's kit — mirrors run_bin_with_env for a PTY child.
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy().into_owned();
-            if name.starts_with("SOCKET_")
-                && !name.contains("TELEMETRY")
-                && name != "SOCKET_NO_CONFIG"
-            {
-                cmd.env_remove(name);
-            }
-        }
-        cmd.env("SOCKET_NO_CONFIG", "1");
         for (k, v) in env {
             cmd.env(k, v);
         }

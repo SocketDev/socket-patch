@@ -7,12 +7,10 @@
 
 #![cfg(unix)]
 
-use crate::common::binary;
-
 use std::path::Path;
 use std::time::Duration;
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, PtySize};
 
 /// Spawn the socket-patch binary inside a PTY, send `input`, and
 /// collect all output until the child exits. Returns `(exit_code,
@@ -52,49 +50,17 @@ fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) 
         })
         .expect("openpty");
 
-    let mut cmd = CommandBuilder::new(binary());
+    // The hermetic environment (`tests/common/hermetic.rs`): an ambient
+    // SOCKET_YES=true would skip the very confirm prompts this file exists
+    // to drive, and SOCKET_SILENT=true would suppress the output the
+    // oracles match. It also forces the update notifier off: this suite
+    // hands the child a REAL terminal, so the stderr-TTY guard does not
+    // protect it.
+    let mut cmd = crate::common::hermetic::pty_binary_command();
     for a in args {
         cmd.arg(a);
     }
     cmd.cwd(cwd);
-    // The binary binds a wide `SOCKET_*` env surface (SOCKET_YES,
-    // SOCKET_JSON, SOCKET_DRY_RUN, SOCKET_SILENT, SOCKET_MANIFEST_PATH,
-    // ...). An ambient value silently reroutes what these tests exercise —
-    // SOCKET_YES=true skips the very confirm prompts this file exists to
-    // drive, and SOCKET_SILENT=true suppresses the output the oracles
-    // match. The highest-risk vars are seeded with hostile values and then
-    // scrubbed — `env_remove` clears the seed too, so the child never sees
-    // it, but if a scrub line is ever dropped the seed (rather than a
-    // developer's ambient shell, which this suite can't rely on) turns the
-    // tests red immediately.
-    cmd.env("SOCKET_YES", "true");
-    cmd.env("SOCKET_JSON", "true");
-    cmd.env("SOCKET_DRY_RUN", "true");
-    cmd.env("SOCKET_SILENT", "true");
-    cmd.env_remove("SOCKET_YES");
-    cmd.env_remove("SOCKET_JSON");
-    cmd.env_remove("SOCKET_DRY_RUN");
-    cmd.env_remove("SOCKET_SILENT");
-    // Prefix-scrub whatever else the ambient shell carries (SOCKET_CWD,
-    // SOCKET_MANIFEST_PATH, SOCKET_API_TOKEN — removing the token also
-    // forces the public proxy). Telemetry opt-outs are deliberately kept
-    // so an opted-out dev stays opted out.
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_")
-            && !name.contains("TELEMETRY")
-            && name != "SOCKET_NO_CONFIG"
-            && name != "SOCKET_NO_UPDATE_CHECK"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    // This suite is the one place test children get a REAL terminal, so the
-    // update notifier's stderr-TTY guard does not protect it. Force the
-    // kill-switch (mirroring the `.cargo/config.toml` `[env]` default the
-    // prefix scrub would otherwise strip) so no PTY child ever fetches
-    // release metadata mid-prompt.
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
 
     let mut child = pair
         .slave
