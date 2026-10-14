@@ -24,10 +24,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{
-    common, events_of, mount_patch_api, parse_env, run_cli, AFTER, BEFORE, DEP, DEP_VERSION, PURL,
-    UUID,
-};
+use super::{common, mount_patch_api, run_cli, AFTER, BEFORE, DEP, DEP_VERSION, PURL, UUID};
+use crate::common::envelope::{events, parse_json_envelope};
 
 #[derive(Clone, Copy, Debug)]
 enum VltLock {
@@ -99,11 +97,11 @@ fn state(root: &Path) -> serde_json::Value {
 fn repair(root: &Path, uri: &str) -> serde_json::Value {
     let (code, stdout, stderr) = run_cli(root, uri, &["repair"]);
     assert_eq!(code, 0, "repair: {stdout}\n{stderr}");
-    parse_env(&stdout)
+    parse_json_envelope(&stdout)
 }
 
 fn rebuilt(v: &serde_json::Value) -> bool {
-    events_of(v)
+    events(v)
         .iter()
         .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL)
 }
@@ -181,7 +179,7 @@ async fn vlt_repair_rebuilds_over_a_planted_file() {
         std::fs::create_dir_all(dir.join("node_modules")).unwrap();
         std::fs::write(dir.join("node_modules/evil.js"), b"planted\n").unwrap();
         let (_, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["repair", "--dry-run"]);
-        let dry = parse_env(&stdout);
+        let dry = parse_json_envelope(&stdout);
         assert!(
             dry.to_string().contains("vendor_artifact_corrupt"),
             "{lock:?}: {dry}"
@@ -205,9 +203,9 @@ async fn vlt_repair_reports_a_missing_ledger() {
         std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
         let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
         assert_eq!(code, 1, "{lock:?}: {stdout}\n{stderr}");
-        let v = parse_env(&stdout);
+        let v = parse_json_envelope(&stdout);
         assert!(
-            events_of(&v).iter().any(|e| e["action"] == "failed"
+            events(&v).iter().any(|e| e["action"] == "failed"
                 && e["errorCode"] == "vendor_ledger_missing"
                 && e["uuid"] == UUID),
             "{lock:?}: {v}"
@@ -362,9 +360,9 @@ async fn vlt_lock_only_reference_is_kept_and_judged() {
         std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
         let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
         assert_eq!(code, 1, "{lock:?}: {stdout}\n{stderr}");
-        let v = parse_env(&stdout);
+        let v = parse_json_envelope(&stdout);
         assert!(
-            events_of(&v).iter().any(|e| e["action"] == "failed"
+            events(&v).iter().any(|e| e["action"] == "failed"
                 && e["uuid"] == UUID
                 && e["errorCode"] == "vendor_ledger_missing"),
             "{lock:?}: the lock-only reference is found and reported: {v}"
@@ -409,9 +407,9 @@ async fn vlt_wiring_files_are_untouched_by_a_ledger_less_repair() {
 
     let (code, stdout, stderr) = run_cli(root, &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "{stdout}\n{stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_ledger_missing"),
         "{v}"

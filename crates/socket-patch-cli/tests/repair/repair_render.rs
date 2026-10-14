@@ -373,8 +373,13 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
         !stdout.contains("unused blob"),
         "no archive line may use the blob wording; stdout=\n{stdout}"
     );
-    // The download phase checks blobs only: the referenced one stays.
+    // The download phase checks blobs only: the referenced one stays, and
+    // its summary keeps the blob noun.
     assert!(socket.join("blobs").join(REFERENCED_HASH).exists());
+    assert!(
+        stdout.contains("All blobs are present locally."),
+        "the referenced blob is present; stdout=\n{stdout}"
+    );
     // Disk effects: every obsolete archive is gone.
     assert!(
         !socket
@@ -467,8 +472,8 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
     assert_eq!(json_string(&v, "status"), Some("success"), "envelope={v}");
     let skip = find_event(&v, "skipped", Some("cleanup_failed"));
     assert!(
-        skip["reason"].as_str().unwrap_or("").contains("diff"),
-        "the skip must name the failing archive pass; got {skip}"
+        skip["reason"].as_str().unwrap_or("").starts_with("diff "),
+        "the skip must be labeled with the failing archive pass; got {skip}"
     );
     // The packages pass still swept its orphan: `gc` reports it (the
     // failed diffs pass counts as empty).

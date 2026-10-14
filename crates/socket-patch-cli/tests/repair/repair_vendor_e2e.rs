@@ -9,6 +9,7 @@
 //! empty-wiring revert refusal. Their fixture pair is hand-written, modeled
 //! byte-for-byte on real `bundle lock` output (bundler 4.0.15).
 
+use crate::common::envelope::{events, parse_json_envelope};
 use crate::common::{binary, git_sha256};
 
 use std::path::{Path, PathBuf};
@@ -212,14 +213,6 @@ fn vendor_project(root: &Path, mock_uri: &str, extra: &[&str]) -> PathBuf {
     tgz
 }
 
-fn parse_env(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("bad JSON ({e}): {stdout}"))
-}
-
-fn events_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    v["events"].as_array().cloned().unwrap_or_default()
-}
-
 /// 1. Deleted tarball → `repair` rebuilds it byte-identically (installed
 ///    copy + view-fetched patch content), lockfile and ledger untouched.
 #[tokio::test]
@@ -241,10 +234,10 @@ async fn repair_rebuilds_deleted_vendored_tarball() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
         "envelope={v}"
@@ -268,7 +261,7 @@ async fn repair_rebuilds_deleted_vendored_tarball() {
     // Healthy re-run: nothing to rebuild.
     let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0);
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
         v["summary"]["rebuilt"].is_null() || v["summary"]["rebuilt"] == 0,
         "healthy ledger rebuilds nothing: {v}"
@@ -298,7 +291,7 @@ async fn repair_offline_refuses_even_with_installed_tree_and_blobs() {
     let before_reqs = mock.received_requests().await.unwrap().len();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["summary"]["failed"], 1, "envelope={v}");
     assert!(!tgz.exists(), "no local rebuild");
     let after_reqs = mock.received_requests().await.unwrap().len();
@@ -327,7 +320,7 @@ async fn repair_rebuilds_corrupt_vendored_tarball() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
     assert_eq!(
         std::fs::read(&tgz).unwrap(),
@@ -367,9 +360,9 @@ async fn repair_keeps_corrupt_artifact_when_no_rebuild_source_exists() {
     // nothing to rebuild from.
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
+        events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == PURL
             && e["error"].as_str().unwrap_or("").contains("--offline")),
         "the failure names the purl and the offline cause: {v}"
@@ -388,9 +381,9 @@ async fn repair_keeps_corrupt_artifact_when_no_rebuild_source_exists() {
     std::fs::write(blobs.join(git_sha256(AFTER)), AFTER).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
+        events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == PURL
             && e["error"].as_str().unwrap_or("").contains("--offline")),
         "the failure names the purl and the offline cause: {v}"
@@ -429,9 +422,9 @@ async fn repair_fails_closed_on_tampered_ledger_sha() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let env = parse_env(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert!(
-        events_of(&env)
+        events(&env)
             .iter()
             .any(|e| e["action"] == "failed"
                 && e["errorCode"] == "vendor_artifact_redownload_failed"),
@@ -476,16 +469,16 @@ async fn vendor_rerun_is_a_noop_and_repair_recovers_registry_resolution_from_led
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["vendor"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "noManifest", "envelope={v}");
-    assert!(events_of(&v).is_empty(), "envelope={v}");
+    assert!(events(&v).is_empty(), "envelope={v}");
     assert!(!tgz.exists(), "`vendor` never re-vendors from the ledger");
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
         "the missing artifact is rebuilt from the recovered fetch: {v}"
@@ -519,7 +512,7 @@ async fn repair_rebuilds_detached_entry_without_manifest() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
     assert!(tgz.is_file());
     assert_socket_dir_lean(tmp.path());
@@ -580,8 +573,8 @@ async fn repair_reports_missing_ledger_for_nuget_maven_and_hatch_wiring() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    let mut missing: Vec<(String, String, String)> = events_of(&v)
+    let v = parse_json_envelope(&stdout);
+    let mut missing: Vec<(String, String, String)> = events(&v)
         .into_iter()
         .filter(|e| e["errorCode"] == "vendor_ledger_missing")
         .map(|e| {
@@ -676,8 +669,8 @@ async fn repair_reports_missing_ledger_instead_of_reconstructing() {
             code, 1,
             "wholesale={wholesale} stdout={stdout} stderr={stderr}"
         );
-        let v = parse_env(&stdout);
-        let missing: Vec<_> = events_of(&v)
+        let v = parse_json_envelope(&stdout);
+        let missing: Vec<_> = events(&v)
             .into_iter()
             .filter(|e| e["errorCode"] == "vendor_ledger_missing")
             .collect();
@@ -722,9 +715,9 @@ async fn repair_reports_missing_ledger_instead_of_reconstructing() {
         std::fs::write(&state_path, &state1).unwrap();
         let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
         assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-        let v = parse_env(&stdout);
+        let v = parse_json_envelope(&stdout);
         assert!(
-            !events_of(&v).iter().any(|e| e["action"] == "failed"),
+            !events(&v).iter().any(|e| e["action"] == "failed"),
             "restored ledger repairs clean: {v}"
         );
     }
@@ -746,9 +739,9 @@ async fn repair_dry_run_previews_rebuild() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "verified"
+        events(&v).iter().any(|e| e["action"] == "verified"
             && e["details"]["wouldRedownload"] == true
             && e["purl"] == PURL),
         "envelope={v}"
@@ -968,8 +961,8 @@ async fn revert_of_empty_wiring_gem_entry_fails_loudly() {
 
     let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["vendor", "--revert"]);
     assert_eq!(code, 1, "empty-wiring revert must fail: {stdout}");
-    let v = parse_env(&stdout);
-    let failed = events_of(&v)
+    let v = parse_json_envelope(&stdout);
+    let failed = events(&v)
         .into_iter()
         .find(|e| e["action"] == "failed" && e["purl"] == GEM_PURL)
         .unwrap_or_else(|| panic!("expected a failed event: {v}"));
@@ -1046,9 +1039,9 @@ async fn repair_gem_dir_tamper_matrix_and_vex_refusal() {
             ],
         );
         assert_eq!(code, 1, "arm {i}: tampered dir must not attest: {stdout}");
-        let venv = parse_env(&stdout);
+        let venv = parse_json_envelope(&stdout);
         assert!(
-            events_of(&venv)
+            events(&venv)
                 .iter()
                 .any(|e| e["action"] == "skipped" && e["errorCode"] == "vendor_inventory_mismatch"),
             "arm {i}: envelope={venv}"
@@ -1058,9 +1051,9 @@ async fn repair_gem_dir_tamper_matrix_and_vex_refusal() {
         // Repair heals: Corrupt → deterministic rebuild of the recorded tree.
         let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
         assert_eq!(code, 0, "arm {i}: stdout={stdout} stderr={stderr}");
-        let v = parse_env(&stdout);
+        let v = parse_json_envelope(&stdout);
         assert!(
-            events_of(&v).iter().any(|e| e["action"] == "rebuilt"
+            events(&v).iter().any(|e| e["action"] == "rebuilt"
                 && e["purl"] == GEM_PURL
                 && e["details"]["reason"] == "vendor_artifact_corrupt"),
             "arm {i}: envelope={v}"
@@ -1131,7 +1124,7 @@ async fn repair_refuses_changed_service_inventory() {
     // Anti-vacuity: the simulated service state is self-consistent.
     let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{stdout}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
         v["summary"]["rebuilt"].is_null() || v["summary"]["rebuilt"] == 0,
         "the simulated service tree must be healthy: {v}"
@@ -1177,12 +1170,12 @@ async fn repair_warns_on_legacy_gem_entry_without_inventory() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
         v["summary"]["rebuilt"].is_null() || v["summary"]["rebuilt"] == 0,
         "legacy entries keep member-only behavior (no rebuild): {v}"
     );
-    let missing: Vec<_> = events_of(&v)
+    let missing: Vec<_> = events(&v)
         .into_iter()
         .filter(|e| e["errorCode"] == "vendor_inventory_missing")
         .collect();
@@ -1193,7 +1186,7 @@ async fn repair_warns_on_legacy_gem_entry_without_inventory() {
     );
     assert_eq!(missing[0]["purl"], GEM_PURL, "envelope={v}");
     assert!(
-        !events_of(&v).iter().any(|e| e["purl"] == CARGO_PURL),
+        !events(&v).iter().any(|e| e["purl"] == CARGO_PURL),
         "the healthy inventory-less cargo entry stays silent: {v}"
     );
     assert_eq!(
@@ -1207,9 +1200,9 @@ async fn repair_warns_on_legacy_gem_entry_without_inventory() {
     std::fs::remove_dir_all(&cargo_dir).unwrap();
     let (code, stdout, _) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "a missing cargo artifact must fail: {stdout}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "failed" && e["purl"] == CARGO_PURL),
         "the cargo entry is live in pass 1: {v}"
@@ -1235,8 +1228,8 @@ async fn repair_offline_without_sources_fails_loudly() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    let failed: Vec<_> = events_of(&v)
+    let v = parse_json_envelope(&stdout);
+    let failed: Vec<_> = events(&v)
         .into_iter()
         .filter(|e| e["action"] == "failed")
         .collect();
@@ -1403,7 +1396,7 @@ async fn repair_offline_never_repacks_verified_members() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["summary"]["failed"], 1, "envelope={v}");
     assert_eq!(
         std::fs::read(&tgz).unwrap(),
@@ -1483,7 +1476,7 @@ async fn identity_kept_over_different_service_bytes(symlinked_lock: bool) {
     std::fs::remove_file(&tgz).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
     assert_eq!(
         std::fs::read(&tgz).unwrap(),

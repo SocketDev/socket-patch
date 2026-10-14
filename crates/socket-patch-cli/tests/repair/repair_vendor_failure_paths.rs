@@ -7,10 +7,12 @@
 //!
 //! The `--json` tests read the envelope through `common::envelope` and
 //! check `errorCode`s, events and bytes on disk (#1089). A message is read
-//! only for what it must name: a flag, a patch uuid, the file to fix.
+//! only for what it must name: a flag, a patch uuid, the file to fix, or,
+//! where several arms share one `errorCode`, the phrase that says which
+//! arm fired (see [`ARM_MOVED_ON`] and its siblings).
 //!
-//! Fixtures and helpers mirror `repair_vendor_e2e.rs` (this suite owns its
-//! own copies).
+//! Fixtures mirror `repair_vendor_e2e.rs` (this suite owns its own
+//! copies); envelope reads go through `common::envelope`.
 //!
 //! A vendored run (`scan --mode vendored`) is manifest-free: every ledger entry is
 //! `detached` with its record embedded and `.socket/manifest.json` is never
@@ -414,6 +416,14 @@ fn vendor_gem_project(root: &Path, mock_uri: &str, expected_after: &[u8]) -> Pat
     copy
 }
 
+// `vendor_uuid_mismatch` is shared by the moved-on manifest record and the
+// StaleUuid health arm, and `vendor_artifact_unrepairable` by six arms.
+// Until those arms get codes of their own, these phrases are what tell
+// the tests which arm fired.
+const ARM_MOVED_ON: &str = "moved on";
+const ARM_STALE_UUID: &str = "re-vendor is pending";
+const ARM_BAD_IDENTITY: &str = "ledger package identity";
+
 fn read_state(root: &Path) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap())
         .unwrap()
@@ -596,6 +606,7 @@ async fn repair_skips_when_manifest_uuid_moved_on() {
         events(&v).iter().any(|e| e["action"] == "skipped"
             && e["purl"] == PURL
             && e["errorCode"] == "vendor_uuid_mismatch"
+            && e["reason"].as_str().unwrap_or("").contains(ARM_MOVED_ON)
             && e["reason"]
                 .as_str()
                 .unwrap_or("")
@@ -649,7 +660,8 @@ async fn repair_prefers_the_moved_on_manifest_over_an_embedded_record() {
     assert!(
         events(&v).iter().any(|e| e["action"] == "skipped"
             && e["purl"] == PURL
-            && e["errorCode"] == "vendor_uuid_mismatch"),
+            && e["errorCode"] == "vendor_uuid_mismatch"
+            && e["reason"].as_str().unwrap_or("").contains(ARM_MOVED_ON)),
         "envelope={v}"
     );
     assert_eq!(
@@ -759,8 +771,8 @@ async fn repair_recovers_record_by_uuid_without_manifest_then_fails_offline() {
 
 /// `state.json`'s artifact.path edited to a DIFFERENT (valid) uuid dir
 /// while entry.uuid still matches the record: the health check reports
-/// StaleUuid and repair skips with "a re-vendor is pending" — never
-/// rebuilds at the stale path.
+/// StaleUuid and repair skips with [`ARM_STALE_UUID`] — never rebuilds at
+/// the stale path.
 #[tokio::test]
 async fn repair_skips_stale_uuid_artifact_path() {
     let mock = MockServer::start().await;
@@ -786,7 +798,8 @@ async fn repair_skips_stale_uuid_artifact_path() {
     assert!(
         events(&v).iter().any(|e| e["action"] == "skipped"
             && e["purl"] == PURL
-            && e["errorCode"] == "vendor_uuid_mismatch"),
+            && e["errorCode"] == "vendor_uuid_mismatch"
+            && e["reason"].as_str().unwrap_or("").contains(ARM_STALE_UUID)),
         "envelope={v}"
     );
     assert_eq!(
@@ -1409,7 +1422,7 @@ async fn repair_tampered_base_purl_surfaces_precise_unverifiable_detail() {
         failed["error"]
             .as_str()
             .unwrap_or("")
-            .contains("ledger package identity"),
+            .contains(ARM_BAD_IDENTITY),
         "the missing source is named: {failed}"
     );
     assert!(
@@ -1556,7 +1569,8 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
     assert!(
         events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == JSR_PURL
-            && e["errorCode"] == "vendor_artifact_unrepairable"),
+            && e["errorCode"] == "vendor_artifact_unrepairable"
+            && e["error"].as_str().unwrap_or("").contains(ARM_BAD_IDENTITY)),
         "envelope={v}"
     );
     assert_eq!(
@@ -1587,7 +1601,8 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
     assert!(
         events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == JSR_PURL
-            && e["errorCode"] == "vendor_artifact_unrepairable"),
+            && e["errorCode"] == "vendor_artifact_unrepairable"
+            && e["error"].as_str().unwrap_or("").contains(ARM_BAD_IDENTITY)),
         "envelope={v}"
     );
     assert!(
