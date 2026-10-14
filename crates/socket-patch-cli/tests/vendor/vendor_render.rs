@@ -367,10 +367,10 @@ fn human_corrupt_manifest_prints_could_not_read() {
 }
 
 /// Human corrupt-committed-artifact surface (fresh clone, ledger sha
-/// mismatch): the `Cannot vendor …` stderr line still carries the
-/// `socket-patch repair` remedy.
+/// mismatch, `--offline`): the stderr line names the purl and the
+/// `--offline` conflict that stops the redownload.
 #[tokio::test]
-async fn human_corrupt_committed_artifact_prints_repair_hint() {
+async fn human_corrupt_committed_artifact_prints_the_offline_conflict() {
     let fx = npm_fixture();
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
     std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
@@ -383,8 +383,8 @@ async fn human_corrupt_committed_artifact_prints_repair_hint() {
         "stderr names the purl: {stderr}"
     );
     assert!(
-        stderr.contains("offline"),
-        "the human line must carry the repair remedy: {stderr}"
+        stderr.contains("--vendor-source=service needs the network"),
+        "the human line names the --offline conflict: {stderr}"
     );
     assert!(
         stdout.contains("Vendored 0 packages; 1 failed."),
@@ -441,6 +441,26 @@ async fn human_fetch_failure_prints_fetch_failed() {
     assert!(
         !fx.vendor_dir().exists(),
         "nothing may be vendored from a failed fetch"
+    );
+}
+
+/// Human stale-ledger surface: a malformed pre-v5 redirect ledger is
+/// ignored — the run vendors normally and prints no refusal.
+#[test]
+fn human_corrupt_pre_v5_redirect_ledger_vendors_normally() {
+    let fx = npm_fixture();
+    std::fs::create_dir_all(fx.vendor_dir()).unwrap();
+    std::fs::write(fx.redirect_state_path(), b"garbage").unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("Vendored 1 package."),
+        "the stale ledger does not block the run: {stdout}"
+    );
+    assert!(
+        !stderr.contains("Cannot vendor"),
+        "no refusal is printed: {stderr}"
     );
 }
 

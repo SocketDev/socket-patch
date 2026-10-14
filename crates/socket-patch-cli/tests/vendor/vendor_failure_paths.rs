@@ -5,7 +5,8 @@
 //! unix fault-injection paths for the state-write failure events, and the
 //! service-outage re-runs. A message is read only for what it must name
 //! (a lockfile, a remedy command, an ecosystem). The human output lives in
-//! `vendor_render.rs`.
+//! `vendor_render.rs`; the refusal tests here also run the human mode once,
+//! to check it claims no vendored package.
 
 use std::path::{Path, PathBuf};
 
@@ -87,11 +88,11 @@ fn corrupt_manifest_fails_closed() {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Fresh-clone re-vendor over a PRESENT-but-corrupt committed artifact
-/// (ledger sha mismatch): a loud `vendor_fetch_failed` failure carrying the
-/// `socket-patch repair` hint — silently re-vendoring over it would mask
-/// the corruption.
+/// (ledger sha mismatch) under `--offline`: a loud `vendor_redownload_failed`
+/// failure naming the `--offline` conflict (the redownload needs the patch
+/// service) — silently re-vendoring over it would mask the corruption.
 #[tokio::test]
-async fn corrupt_committed_artifact_fails_with_repair_hint() {
+async fn corrupt_committed_artifact_offline_fails_the_redownload() {
     let fx = npm_fixture();
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
     // Fresh-clone shape: no installed tree, only the committed artifacts.
@@ -105,17 +106,17 @@ async fn corrupt_committed_artifact_fails_with_repair_hint() {
     assert!(
         failed["error"]
             .as_str()
-            .is_some_and(|d| d.contains("offline")),
-        "the failure must advise `socket-patch repair`: {env:#}"
+            .is_some_and(|d| d.contains("--offline")),
+        "the failure names the --offline conflict: {env:#}"
     );
 }
 
 /// A legacy ledger with NO recorded artifact sha cannot verify the
-/// committed artifact (`Unverifiable`) and must fall through to the
-/// registry ladder — under `--offline` that lands in the calm
-/// `package_not_installed` skip, never a loud `vendor_fetch_failed`.
+/// committed artifact (`Unverifiable`), so the run redownloads it: with no
+/// installed copy that is a `vendor_redownload_failed` failure (exit 1),
+/// never a `vendor_fetch_failed`, and the committed artifact is left alone.
 #[tokio::test]
-async fn legacy_ledger_without_sha_falls_through_to_calm_offline_skip() {
+async fn legacy_ledger_without_sha_fails_the_redownload_not_a_fetch() {
     let fx = npm_fixture();
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
     std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
@@ -127,8 +128,8 @@ async fn legacy_ledger_without_sha_falls_through_to_calm_offline_skip() {
 
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 1, "{env:#}");
-    let skipped = find_event(&env, "failed", Some("vendor_redownload_failed"));
-    assert_eq!(skipped["purl"], PURL);
+    let failed = find_event(&env, "failed", Some("vendor_redownload_failed"));
+    assert_eq!(failed["purl"], PURL);
     assert!(
         events(&env)
             .iter()
@@ -142,12 +143,12 @@ async fn legacy_ledger_without_sha_falls_through_to_calm_offline_skip() {
 }
 
 /// `PristineFetch::NoSource` in the auto-fetch loop: manifest purl, nothing
-/// installed, no lockfile, no ledger — a NON-offline run still skips calmly
-/// with the plain not-installed detail (the ladder returns before any
-/// network I/O; `SOCKET_NO_API_TOKEN` keeps the run anonymous so no other
-/// network path opens either).
+/// installed, no lockfile, no ledger — a NON-offline run fails the purl
+/// with `vendor_lockfile_missing` before any network I/O, never a
+/// `vendor_fetch_failed` (`SOCKET_NO_API_TOKEN` keeps the run anonymous so
+/// no other network path opens either).
 #[test]
-fn missing_package_with_no_lock_and_no_ledger_is_calm_skip() {
+fn missing_package_with_no_lock_and_no_ledger_fails_before_any_fetch() {
     let fx = npm_fixture();
     std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
     std::fs::remove_file(fx.lock_path()).unwrap();
@@ -164,14 +165,14 @@ fn missing_package_with_no_lock_and_no_ledger_is_calm_skip() {
         code, 1,
         "an unvendorable manifest purl fails the run: {env:#}"
     );
-    let skipped = find_event(&env, "failed", Some("vendor_lockfile_missing"));
-    assert_eq!(skipped["purl"], PURL);
+    let failed = find_event(&env, "failed", Some("vendor_lockfile_missing"));
+    assert_eq!(failed["purl"], PURL);
 
     assert!(
         events(&env)
             .iter()
             .all(|e| e["errorCode"] != "vendor_fetch_failed"),
-        "NoSource is a calm skip, not a fetch failure: {env:#}"
+        "NoSource is not a fetch failure: {env:#}"
     );
 }
 
@@ -387,8 +388,9 @@ async fn reconcile_unknown_ecosystem_entry_fails_closed_and_keeps_entry() {
 }
 
 /// A manifest record with a patch-target file ABSENT from the installed
-/// copy (non-empty beforeHash, no --force) still vendors the package, and
-/// the installed tree is never written to.
+/// copy (non-empty beforeHash, no --force) still vendors the package: the
+/// artifact is the patch service's build, which carries the patched file,
+/// and the installed tree is never written to.
 #[test]
 fn patch_target_absent_from_the_install_still_vendors() {
     let fx = npm_fixture();
@@ -407,7 +409,23 @@ fn patch_target_absent_from_the_install_still_vendors() {
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 0, "{env:#}");
     assert_eq!(find_event(&env, "applied", None)["purl"], PURL, "{env:#}");
-    assert!(fx.tgz_path().is_file());
+    let tgz = std::fs::read(fx.tgz_path()).unwrap();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&tgz[..]));
+    let absent = archive
+        .entries()
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|e| e.path().unwrap().as_os_str() == "package/absent.js")
+        .map(|mut e| {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut e, &mut bytes).unwrap();
+            bytes
+        });
+    assert_eq!(
+        absent.as_deref(),
+        Some(PATCHED_INDEX),
+        "the artifact carries the patched file"
+    );
     assert!(!fx.root().join("node_modules/left-pad/absent.js").exists());
 }
 
@@ -425,6 +443,17 @@ fn chmod(path: &Path, mode: u32) {
 /// an assertion panics first.
 #[cfg(unix)]
 struct RestorePerms(PathBuf);
+/// Is the test process running as root? Read-only directories are inert
+/// under euid 0, so the fault-injection tests skip themselves.
+#[cfg(unix)]
+fn is_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
 #[cfg(unix)]
 impl Drop for RestorePerms {
     fn drop(&mut self) {
@@ -441,6 +470,10 @@ impl Drop for RestorePerms {
 #[cfg(unix)]
 #[tokio::test]
 async fn revert_state_write_failure_reports_failed_after_removal() {
+    if is_root() {
+        eprintln!("skipped: chmod cannot make a directory read-only for root");
+        return;
+    }
     let fx = npm_fixture();
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
     chmod(&fx.vendor_dir(), 0o555);
@@ -472,6 +505,10 @@ async fn revert_state_write_failure_reports_failed_after_removal() {
 #[cfg(unix)]
 #[tokio::test]
 async fn reconcile_state_write_failure_reports_failed_after_removal() {
+    if is_root() {
+        eprintln!("skipped: chmod cannot make a directory read-only for root");
+        return;
+    }
     let fx = npm_fixture();
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
     std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
@@ -511,6 +548,10 @@ async fn reconcile_state_write_failure_reports_failed_after_removal() {
 #[cfg(unix)]
 #[tokio::test]
 async fn vendor_state_write_failure_reports_failed_event() {
+    if is_root() {
+        eprintln!("skipped: chmod cannot make a directory read-only for root");
+        return;
+    }
     let fx = npm_fixture();
     // The backend's artifact home stays writable; only the ledger's own
     // directory refuses writes.
@@ -645,10 +686,12 @@ fn yarn_classic_check_and_repair_flag_a_dangling_dependency_descriptor() {
 
     let (code, env) = vendor_cli(fx.root(), &["--check"]);
     assert_eq!(code, 1, "{env:#}");
-    let failed = find_event(&env, "failed", None).to_string();
+    let failed = find_event(&env, "failed", Some("vendor_check_failed"));
     assert!(
-        failed.contains("vendor_check_failed") && failed.contains("is-number@^7.0.0"),
-        "{env:#}"
+        failed["reason"]
+            .as_str()
+            .is_some_and(|m| m.contains("is-number@^7.0.0")),
+        "the check names the dangling descriptor: {env:#}"
     );
 
     let cwd = fx.root().to_str().unwrap();
@@ -659,8 +702,13 @@ fn yarn_classic_check_and_repair_flag_a_dangling_dependency_descriptor() {
     );
     assert_ne!(code, 0, "{stdout}\n{stderr}");
     let env: Value = serde_json::from_str(&stdout).unwrap();
-    let failed = find_event(&env, "failed", Some("vendor_dep_manifest_unlocked")).to_string();
-    assert!(failed.contains("is-number@^7.0.0"), "{env:#}");
+    let failed = find_event(&env, "failed", Some("vendor_dep_manifest_unlocked"));
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("is-number@^7.0.0")),
+        "{env:#}"
+    );
     assert_eq!(
         std::fs::read_to_string(&yarn_lock).unwrap(),
         dangling,
@@ -765,10 +813,7 @@ async fn vendor_refuses_a_symlinked_lock_instead_of_replacing_it() {
             &[],
         );
         assert_eq!(code, 1, "{linked}: {stdout}\n{stderr}");
-        assert!(
-            stderr.contains(&format!("{linked} is a symbolic link")),
-            "{linked}: {stdout}\n{stderr}"
-        );
+        assert!(stderr.contains(linked), "{linked}: {stdout}\n{stderr}");
         assert!(
             !stdout.contains("Vendored 1 package") && !stdout.contains("Next steps"),
             "{linked}: {stdout}\n{stderr}"

@@ -147,7 +147,7 @@ pub(crate) fn npm_fixture() -> NpmFixture {
     npm_fixture_with_purls(&[PURL])
 }
 
-/// In-process `VendorArgs` (json+silent+offline), for staging a vendored
+/// In-process `VendorArgs` (json+silent), for staging a vendored
 /// state a subsequent subprocess run asserts against.
 pub(crate) fn vendor_args(cwd: &Path) -> VendorArgs {
     VendorArgs {
@@ -210,7 +210,8 @@ pub(crate) fn run_cli(
     )
 }
 
-/// `vendor --json --offline --cwd <cwd> <extra...>` through the binary.
+/// `vendor --json --cwd <cwd> <extra...>` through the binary, served by
+/// the fixture patch service (pass `--offline` in `extra` for an offline run).
 pub(crate) fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
     let mut args = vec!["vendor", "--json", "--cwd", cwd.to_str().unwrap()];
     args.extend_from_slice(extra);
