@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::path::{Component, Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
@@ -383,6 +384,93 @@ fn contains_dependency(item: Option<&Item>, name: &str) -> bool {
 /// beside a PEP 723 script, from uv's working directory).
 pub const UV_TOML: &str = "uv.toml";
 
+/// A uv settings file above the scanned root that uv applies to a PEP 723
+/// script there (#1501), found by [`find_ancestor_uv_config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UvConfig {
+    /// The file relative to the scanned root, e.g. `../uv.toml`.
+    pub rel: String,
+    pub text: String,
+}
+
+impl UvConfig {
+    /// Whether the file is a `uv.toml` (settings at its top level) rather
+    /// than a `pyproject.toml` (settings under `[tool.uv]`).
+    pub fn is_uv_toml(&self) -> bool {
+        Path::new(&self.rel).file_name() == Some(UV_TOML.as_ref())
+    }
+}
+
+/// Whether a PEP 723 script in a root holding `pyproject` and `uv_toml`
+/// takes uv's settings from the root itself, so uv looks no further up.
+pub fn root_governs_script(pyproject: Option<&str>, uv_toml: Option<&str>) -> bool {
+    uv_toml.is_some() || pyproject.is_some_and(pyproject_has_uv_settings)
+}
+
+/// Whether uv takes a script's settings from `pyproject`: it has a
+/// `[tool.uv]` table. One that does not parse does not: uv warns and goes
+/// on to the parent directory.
+fn pyproject_has_uv_settings(pyproject: &str) -> bool {
+    pyproject.parse::<DocumentMut>().is_ok_and(|document| {
+        document
+            .get("tool")
+            .and_then(Item::as_table_like)
+            .and_then(|tool| tool.get("uv"))
+            .is_some()
+    })
+}
+
+/// The uv settings file above `root` that uv applies to a PEP 723 script
+/// in `root`, when `root` itself holds none.
+///
+/// uv reads a script's settings from the nearest directory at or above the
+/// script's that holds a `uv.toml`, or a `pyproject.toml` with a `[tool.uv]`
+/// table, with `uv.toml` first in each directory. A project stops that
+/// lookup at itself, so only the script lane asks. A user-level `uv.toml`
+/// (`~/.config/uv`) is the installing machine's and is not looked up.
+pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
+    for (rel, path) in ancestor_uv_config_files(root) {
+        let text = match crate::utils::fs::read_regular_to_string_sync(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // uv stops at a settings file it cannot read and reports it.
+            Err(_) => return None,
+        };
+        let config = UvConfig { rel, text };
+        if config.is_uv_toml() || pyproject_has_uv_settings(&config.text) {
+            return Some(config);
+        }
+    }
+    None
+}
+
+/// The files [`find_ancestor_uv_config`] may read, in lookup order, as
+/// (path relative to `root`, absolute path).
+pub fn ancestor_uv_config_files(root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(root) = std::path::absolute(root) else {
+        return Vec::new();
+    };
+    let mut normalized = PathBuf::new();
+    for component in root.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+    let mut up = String::new();
+    let mut files = Vec::new();
+    for dir in normalized.ancestors().skip(1) {
+        up.push_str("../");
+        for name in [UV_TOML, "pyproject.toml"] {
+            files.push((format!("{up}{name}"), dir.join(name)));
+        }
+    }
+    files
+}
+
 /// Refuse to wire a `[tool.uv.sources]` entry for `name` that uv would
 /// ignore (#564).
 ///
@@ -403,12 +491,60 @@ pub fn refuse_uv_no_sources(
     pyproject: Option<&str>,
     uv_toml: Option<&str>,
 ) -> Result<(), String> {
+    let project = match uv_toml {
+        Some(text) => Some((UV_TOML.to_string(), text, &[][..])),
+        None => pyproject.map(|text| {
+            (
+                "pyproject.toml [tool.uv]".to_string(),
+                text,
+                &["tool", "uv"][..],
+            )
+        }),
+    };
+    refuse_no_sources(name, script, project)
+}
+
+/// [`refuse_uv_no_sources`] for a PEP 723 script in a root whose own
+/// `pyproject` and `uv_toml` may not govern it: when neither sets uv's
+/// settings, `ancestor` (the [`find_ancestor_uv_config`] above the root)
+/// does (#1501).
+pub fn refuse_uv_script_no_sources(
+    name: &str,
+    script: &str,
+    pyproject: Option<&str>,
+    uv_toml: Option<&str>,
+    ancestor: Option<&UvConfig>,
+) -> Result<(), String> {
+    match ancestor {
+        Some(config) if !root_governs_script(pyproject, uv_toml) => {
+            let project = if config.is_uv_toml() {
+                (config.rel.clone(), config.text.as_str(), &[][..])
+            } else {
+                (
+                    format!("{} [tool.uv]", config.rel),
+                    config.text.as_str(),
+                    &["tool", "uv"][..],
+                )
+            };
+            refuse_no_sources(name, Some(script), Some(project))
+        }
+        _ => refuse_uv_no_sources(name, Some(script), pyproject, uv_toml),
+    }
+}
+
+/// The check behind [`refuse_uv_no_sources`]: `project` is the governing
+/// settings file as (label, text, path of its settings table).
+fn refuse_no_sources(
+    name: &str,
+    script: Option<&str>,
+    project: Option<(String, &str, &[&str])>,
+) -> Result<(), String> {
     struct Settings {
-        file: &'static str,
+        file: String,
         no_sources: Option<bool>,
         packages: Vec<String>,
     }
-    fn settings(file: &'static str, toml: &str, path: &[&str]) -> Option<Settings> {
+    fn settings(file: String, toml: &str, path: &[&str]) -> Option<Settings> {
         let document: DocumentMut = toml.parse().ok()?;
         let mut table = document.as_table() as &dyn TableLike;
         for key in path {
@@ -429,14 +565,13 @@ pub fn refuse_uv_no_sources(
     }
     let script = script.and_then(|text| {
         let (_, metadata) = script_metadata(text).ok()?;
-        settings("the script's [tool.uv]", &metadata, &["tool", "uv"])
+        settings(
+            "the script's [tool.uv]".to_string(),
+            &metadata,
+            &["tool", "uv"],
+        )
     });
-    let project = match uv_toml {
-        Some(text) => settings(UV_TOML, text, &[]),
-        None => {
-            pyproject.and_then(|text| settings("pyproject.toml [tool.uv]", text, &["tool", "uv"]))
-        }
-    };
+    let project = project.and_then(|(file, text, path)| settings(file, text, path));
     let levels = [script, project];
     let levels = levels.iter().flatten();
     let refusal = |file: &str, setting: &str| {
@@ -448,7 +583,7 @@ pub fn refuse_uv_no_sources(
     };
     match levels
         .clone()
-        .find_map(|level| Some((level.file, level.no_sources?)))
+        .find_map(|level| Some((level.file.as_str(), level.no_sources?)))
     {
         Some((file, true)) => return refusal(file, "no-sources = true"),
         Some((_, false)) => return Ok(()),
@@ -459,7 +594,7 @@ pub fn refuse_uv_no_sources(
         .into_iter()
         .find(|level| level.packages.contains(&name))
     {
-        Some(level) => refusal(level.file, &format!("no-sources-package naming {name}")),
+        Some(level) => refusal(&level.file, &format!("no-sources-package naming {name}")),
         None => Ok(()),
     }
 }
@@ -1190,5 +1325,118 @@ mod rendering_tests {
                 "{out}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ancestor_config_tests {
+    use super::*;
+
+    const SCRIPT: &str = "# /// script\n# dependencies = [\"six==1.16.0\"]\n# ///\n";
+    const PYPROJECT: &str = "[project]\nname = \"root\"\nversion = \"0\"\n";
+
+    /// #1501: uv takes a script's settings from the nearest directory above
+    /// it that holds a uv.toml, or a pyproject.toml with `[tool.uv]`; uv.toml
+    /// first in each directory, and a pyproject without `[tool.uv]` skipped.
+    #[test]
+    fn find_ancestor_uv_config_follows_uvs_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("a/b/scripts");
+        std::fs::create_dir_all(&root).unwrap();
+        // Beside the root: never an ancestor.
+        std::fs::write(root.join(UV_TOML), "no-sources = true\n").unwrap();
+        assert_eq!(find_ancestor_uv_config(&root), None);
+
+        // A pyproject without [tool.uv] does not stop the walk.
+        std::fs::write(temp.path().join("a/b/pyproject.toml"), PYPROJECT).unwrap();
+        let with_uv = format!("{PYPROJECT}[tool.uv]\nno-sources = true\n");
+        std::fs::write(temp.path().join("a/pyproject.toml"), &with_uv).unwrap();
+        assert_eq!(
+            find_ancestor_uv_config(&root),
+            Some(UvConfig {
+                rel: "../../pyproject.toml".into(),
+                text: with_uv.clone(),
+            })
+        );
+        // uv.toml wins over pyproject.toml in the same directory, and a
+        // `..` in the root is resolved before walking.
+        std::fs::write(temp.path().join("a/uv.toml"), "offline = true\n").unwrap();
+        assert_eq!(
+            find_ancestor_uv_config(&root.join("../scripts")),
+            Some(UvConfig {
+                rel: "../../uv.toml".into(),
+                text: "offline = true\n".into(),
+            })
+        );
+        // A pyproject that does not parse is skipped, as uv warns and walks
+        // on to the parent.
+        std::fs::write(temp.path().join("a/b/pyproject.toml"), "[project\n").unwrap();
+        assert_eq!(
+            find_ancestor_uv_config(&root.join("../scripts")).map(|config| config.rel),
+            Some("../../uv.toml".into())
+        );
+        // uv stops at a settings file it cannot read (here a directory),
+        // so the farther one is never reached.
+        std::fs::create_dir(temp.path().join("a/b/uv.toml")).unwrap();
+        assert_eq!(find_ancestor_uv_config(&root), None);
+    }
+
+    #[test]
+    fn script_takes_an_ancestor_only_when_the_root_sets_nothing() {
+        let ancestor = |rel: &str, text: &str| UvConfig {
+            rel: rel.into(),
+            text: text.into(),
+        };
+        let parent_uv = ancestor("../uv.toml", "no-sources = true\n");
+        let error =
+            refuse_uv_script_no_sources("six", SCRIPT, None, None, Some(&parent_uv)).unwrap_err();
+        assert!(
+            error.starts_with("../uv.toml sets no-sources = true"),
+            "{error}"
+        );
+        let parent_pyproject = ancestor(
+            "../pyproject.toml",
+            "[tool.uv]\nno-sources-package = [\"Six\"]\n",
+        );
+        let error = refuse_uv_script_no_sources(
+            "six",
+            SCRIPT,
+            Some(PYPROJECT),
+            None,
+            Some(&parent_pyproject),
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("../pyproject.toml [tool.uv] sets no-sources-package naming six"),
+            "{error}"
+        );
+
+        // A root pyproject that does not parse does not govern either.
+        assert!(refuse_uv_script_no_sources(
+            "six",
+            SCRIPT,
+            Some("[project\n"),
+            None,
+            Some(&parent_uv)
+        )
+        .is_err());
+
+        // The root's own settings stop uv's lookup at the root.
+        let root_uv = format!("{PYPROJECT}[tool.uv]\noffline = true\n");
+        assert_eq!(
+            refuse_uv_script_no_sources("six", SCRIPT, Some(&root_uv), None, Some(&parent_uv)),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_uv_script_no_sources("six", SCRIPT, None, Some(""), Some(&parent_uv)),
+            Ok(())
+        );
+        // The script's own setting still wins.
+        let script_false =
+            SCRIPT.replace("# ///\n", "#\n# [tool.uv]\n# no-sources = false\n# ///\n");
+        assert_eq!(
+            refuse_uv_script_no_sources("six", &script_false, None, None, Some(&parent_uv)),
+            Ok(())
+        );
     }
 }

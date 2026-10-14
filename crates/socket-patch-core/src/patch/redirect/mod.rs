@@ -5948,16 +5948,29 @@ fn plan_python_metadata_with(
     };
     source_scope().map_err(unsupported)?;
     let project_file = |rel: &str| files.get(rel).map(String::as_str);
-    crate::utils::python_script::refuse_uv_no_sources(
-        &dep.name,
-        script.then_some(original.as_str()),
-        if script {
-            project_file("pyproject.toml")
-        } else {
-            Some(&original)
-        },
-        project_file(crate::utils::python_script::UV_TOML),
-    )
+    if script {
+        let ancestor = files.get(UV_ANCESTOR_CONFIG_KEY).and_then(|value| {
+            let (rel, text) = value.split_once('\n')?;
+            Some(crate::utils::python_script::UvConfig {
+                rel: rel.to_string(),
+                text: text.to_string(),
+            })
+        });
+        crate::utils::python_script::refuse_uv_script_no_sources(
+            &dep.name,
+            &original,
+            project_file("pyproject.toml"),
+            project_file(crate::utils::python_script::UV_TOML),
+            ancestor.as_ref(),
+        )
+    } else {
+        crate::utils::python_script::refuse_uv_no_sources(
+            &dep.name,
+            None,
+            Some(&original),
+            project_file(crate::utils::python_script::UV_TOML),
+        )
+    }
     .map_err(unsupported)?;
     let rewritten = if script {
         rewrite_script_metadata(
@@ -6348,6 +6361,15 @@ pub const NUGET_INHERITED_MAPPING_KEY: &str = "<socket-patch:nuget-inherited-map
 /// A config with no sources, the base of a fresh one when the inherited
 /// configs dropped nuget.org.
 const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
+
+/// The synthetic candidate key carrying the uv settings file above the
+/// root that uv applies to a PEP 723 script there (#1501), as
+/// `<rel>\n<text>` ([`find_ancestor_uv_config`]). Absent (the in-memory
+/// engine, unit tests, no such file), only the root's own files are read.
+/// Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
+///
+/// [`find_ancestor_uv_config`]: crate::utils::python_script::find_ancestor_uv_config
+pub const UV_ANCESTOR_CONFIG_KEY: &str = "<socket-patch:uv-ancestor-config>";
 
 /// The synthetic candidate key carrying the locks the engine found every
 /// project under the root restoring into (#353, #514), one per line:
@@ -25987,6 +26009,69 @@ mod python_metadata_pairing_tests {
             &[
                 ("tool.py", &script_false),
                 ("uv.toml", "no-sources-package = [\"click\"]\n"),
+            ],
+        );
+    }
+
+    /// #1501: a script takes uv's settings from above the root when the
+    /// root sets none; the engine hands that file over under
+    /// [`UV_ANCESTOR_CONFIG_KEY`]. The root's own settings stop the lookup,
+    /// and a project lane never reads it.
+    #[test]
+    fn no_sources_above_the_root_refuses_a_script() {
+        let parent = |rel: &str, text: &str| format!("{rel}\n{text}");
+        let uv_toml = parent("../uv.toml", "no-sources = true\n");
+        let Err(warning) = plan(
+            "tool.py.lock",
+            &[("tool.py", SCRIPT), (UV_ANCESTOR_CONFIG_KEY, &uv_toml)],
+            &[],
+        ) else {
+            panic!("a parent uv.toml must refuse");
+        };
+        assert_eq!(warning.code, "redirect_uv_script_unsupported");
+        assert!(
+            warning.detail.contains("../uv.toml sets no-sources = true"),
+            "{}",
+            warning.detail
+        );
+        let pyproject = parent("../../pyproject.toml", "[tool.uv]\nno-sources = true\n");
+        let Err(warning) = plan(
+            "tool.py.lock",
+            &[
+                ("tool.py", SCRIPT),
+                ("pyproject.toml", PYPROJECT),
+                (UV_ANCESTOR_CONFIG_KEY, &pyproject),
+            ],
+            &[],
+        ) else {
+            panic!("a parent pyproject [tool.uv] must refuse");
+        };
+        assert!(
+            warning
+                .detail
+                .contains("../../pyproject.toml [tool.uv] sets no-sources = true"),
+            "{}",
+            warning.detail
+        );
+
+        let wired = |path: &str, files: &[(&str, &str)]| {
+            let (edit, _) =
+                plan(path, files, &[]).unwrap_or_else(|w| panic!("{}: {}", w.code, w.detail));
+            assert!(edit.is_some(), "{path} with {files:?} must be wired");
+        };
+        wired(
+            "tool.py.lock",
+            &[
+                ("tool.py", SCRIPT),
+                ("uv.toml", "offline = false\n"),
+                (UV_ANCESTOR_CONFIG_KEY, &uv_toml),
+            ],
+        );
+        wired(
+            "uv.lock",
+            &[
+                ("pyproject.toml", PYPROJECT),
+                (UV_ANCESTOR_CONFIG_KEY, &uv_toml),
             ],
         );
     }

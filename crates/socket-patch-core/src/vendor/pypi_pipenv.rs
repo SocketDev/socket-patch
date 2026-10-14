@@ -760,6 +760,21 @@ fn sync_args(sections: &[&str]) -> String {
     }
 }
 
+/// The `pipenv requirements` arguments that export every lock section in
+/// `sections`. Plain `requirements` exports `default` and `--dev` adds
+/// `develop`, as for `sync`, but its `--categories` differs: Pipenv
+/// 2022.12–2023.2.4 split it on commas and look each name up as a lock
+/// key, so `sync`'s space-joined Pipfile names (`"packages docs"`) export
+/// nothing (#1507). Comma-joined lock keys (`"default,docs"`) work on
+/// every release that has `--categories`.
+fn requirements_args(sections: &[&str]) -> String {
+    if sections.iter().all(|s| *s == "default" || *s == "develop") {
+        sync_args(sections)
+    } else {
+        format!(" --categories \"{}\"", sections.join(","))
+    }
+}
+
 /// `default`, then `develop`, then named categories in lock order — so the
 /// rendered `--categories` list is stable.
 fn ordered_sections(mut sections: Vec<&str>) -> Vec<&str> {
@@ -872,7 +887,7 @@ pub fn shadowing_stale_install_remedy(
 /// The install-over command both base-interpreter remedies share.
 fn install_over_command(lock: Option<&Value>, name: &str) -> String {
     let (package, _) = lock_sections(lock, name);
-    let categories = sync_args(&package);
+    let categories = requirements_args(&package);
     // `pipenv requirements` arrived in 2022.4; its `--categories` later
     // (present in 2022.12).
     let since = if categories.starts_with(" --categories") {
@@ -2389,11 +2404,71 @@ mod tests {
         ));
         let remedy = base_site_stale_install_remedy(Some(&named), "six", dir);
         assert!(
-            remedy.contains("`pipenv requirements --categories \"packages docs\" > "),
+            remedy.contains("`pipenv requirements --categories \"default,docs\" > "),
             "{remedy}"
         );
         assert!(remedy.contains("(Pipenv 2022.12+;"), "{remedy}");
         let remedy = base_site_stale_install_remedy(None, "six", dir);
         assert!(remedy.contains("`pipenv requirements > "), "{remedy}");
+    }
+
+    /// #1507: Pipenv 2022.12.x–2023.2.4 `requirements` split `--categories`
+    /// on commas and look each name up as a lock key, so the space-joined
+    /// Pipfile names `sync` takes (`"packages docs"`) export nothing. The
+    /// export spells comma-joined lock keys, which every release reads,
+    /// while the sync remedies keep the Pipfile names.
+    #[test]
+    fn base_site_remedy_exports_comma_joined_lock_keys() {
+        let lock = |body: &str| -> Value {
+            serde_json::from_str(&format!(r#"{{"_meta": {{"pipfile-spec": 6}}, {body}}}"#)).unwrap()
+        };
+        let six = r#"{"version": "==1.16.0"}"#;
+        let dir = "/usr/lib/python3/dist-packages";
+        for (body, export) in [
+            (
+                format!(r#""default": {{"idna": {six}, "six": {six}}}, "docs": {{"six": {six}}}"#),
+                "--categories \"default,docs\"",
+            ),
+            (
+                format!(
+                    r#""default": {{"idna": {six}}}, "develop": {{"six": {six}}}, "docs": {{"six": {six}}}"#
+                ),
+                "--categories \"develop,docs\"",
+            ),
+            (
+                format!(
+                    r#""default": {{"six": {six}}}, "develop": {{"six": {six}}}, "docs": {{"six": {six}}}, "tests": {{"six": {six}}}"#
+                ),
+                "--categories \"default,develop,docs,tests\"",
+            ),
+            (
+                format!(r#""default": {{"idna": {six}}}, "docs": {{"six": {six}}}"#),
+                "--categories \"docs\"",
+            ),
+        ] {
+            let lock = lock(&body);
+            for remedy in [
+                base_site_stale_install_remedy(Some(&lock), "six", dir),
+                shadowing_stale_install_remedy(Some(&lock), "six", dir, dir),
+            ] {
+                assert!(
+                    remedy.contains(&format!("`pipenv requirements {export} > ")),
+                    "{export}: {remedy}"
+                );
+                for pipfile_name in ["packages docs", "dev-packages"] {
+                    assert!(!remedy.contains(pipfile_name), "{remedy}");
+                }
+                assert!(remedy.contains("(Pipenv 2022.12+;"), "{remedy}");
+            }
+        }
+        // `sync` still takes the Pipfile names.
+        let named = lock(&format!(
+            r#""default": {{"six": {six}}}, "docs": {{"six": {six}}}"#
+        ));
+        let remedy = stale_install_remedy(Some(&named), "six");
+        assert!(
+            remedy.contains("pipenv sync --categories \"packages docs\"`"),
+            "{remedy}"
+        );
     }
 }

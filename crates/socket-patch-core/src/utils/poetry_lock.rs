@@ -284,11 +284,13 @@ pub fn lock_wiring(lock_text: &str, name: &str, version: &str) -> Option<Wired> 
 }
 
 /// The refusal detail for a source-pinned package over a lock that
-/// [`source_constraint_breaks_writer`] flags; `kind` is how the rewrite
+/// [`source_constraint_break`] flags (`why`); `kind` is how the rewrite
 /// would source it (`URL` hosted, `file` vendored). Dropping the key or
-/// upgrading Poetry both mean re-locking, which discards whatever the lock
-/// already wires: `wired` (the lock still carries a vendored or hosted pin
-/// for the package) puts `socket-patch vendor --revert` or `rollback` first.
+/// re-locking with Poetry >= 2.3 both mean re-locking, which discards
+/// whatever the lock already wires: `wired` (the lock still carries a
+/// vendored or hosted pin for the package) puts `socket-patch vendor
+/// --revert` or `rollback` first.
+#[allow(clippy::too_many_arguments)]
 pub fn source_constraint_refusal(
     pyproject_path: &str,
     lock_path: &str,
@@ -297,6 +299,7 @@ pub fn source_constraint_refusal(
     source: &str,
     kind: &str,
     wired: Wired,
+    why: &SourcePinBreak,
 ) -> String {
     let first = match wired {
         Wired::No => "",
@@ -309,12 +312,22 @@ pub fn source_constraint_refusal(
              hosted pin; a bare `rollback` undoes every patch in the project), then "
         ),
     };
+    let lock = match why {
+        SourcePinBreak::Writer => format!(
+            "{lock_path} was written by Poetry 1.3 – 2.2, whose installer refuses that \
+             constraint on a package the lock sources from a {kind}: every `poetry install` \
+             would fail"
+        ),
+        SourcePinBreak::Format(format) => format!(
+            "{lock_path} has lock-version {format:?}, which every Poetry from 1.3 on \
+             re-solves on install, and that solve refuses the constraint on a package the \
+             lock sources from a {kind}: `poetry install` would fail on any of them"
+        ),
+    };
     format!(
         "{pyproject_path} pins {name} to the {source:?} source (`source = {source:?}`), and \
-         {lock_path} was written by Poetry 1.3 – 2.2, whose installer refuses that constraint \
-         on a package the lock sources from a {kind}: every `poetry install` would fail. To \
-         patch it, {first}drop the `source` key or upgrade to Poetry >= 2.3, re-lock, and \
-         re-run"
+         {lock}. To patch it, {first}drop the `source` key or upgrade to Poetry >= 2.3, \
+         re-lock, and re-run"
     )
 }
 
@@ -330,8 +343,10 @@ pub enum Wired {
     Hosted,
 }
 
-/// The advisory for a source-pinned package rewired over a lock that a
-/// Poetry outside 1.3 – 2.2 wrote.
+/// The advisory for a source-pinned package rewired over a lock that
+/// [`source_constraint_break`] admits: lock format 2.1+, not written by
+/// Poetry 1.3 – 2.2. Poetry 1.3 – 1.8 also read a 2.1 lock (with a
+/// compatibility warning) and refuse the constraint like 2.0 – 2.2 do.
 pub fn source_constraint_advisory(
     pyproject_path: &str,
     lock_path: &str,
@@ -340,8 +355,8 @@ pub fn source_constraint_advisory(
 ) -> String {
     format!(
         "{pyproject_path} pins {name} to the {source:?} source (`source = {source:?}`): \
-         Poetry 1.3 – 2.2 refuse to install {lock_path} with that constraint (1.1 – 1.2 and \
-         2.3+ install it); drop the `source` key if this project is installed with one of them"
+         Poetry 1.3 – 2.2 refuse to install {lock_path} with that constraint (2.3+ install \
+         it); drop the `source` key if this project is installed with one of them"
     )
 }
 
@@ -360,15 +375,47 @@ pub fn lock_writer_version(lock_text: &str) -> Option<(u64, u64)> {
     (lock_version(&lock).ok()? == "2.0").then_some((1, 3))
 }
 
-/// Whether the lock's writer is a Poetry release (1.3 – 2.2) whose installer
-/// refuses a pyproject `source = "…"` constraint on a package the lock
-/// sources from a URL or file: every `poetry install` fails ("Repository
-/// \"pypi\" does not exist."; 1.3 and 1.4 report a solver failure). 1.1 –
-/// 1.2 and 2.3+ install it. Keyed on the lock's header
-/// ([`lock_writer_version`]), so it judges the writer, which is usually but
-/// not always the installer.
-pub fn source_constraint_breaks_writer(lock_text: &str) -> bool {
-    matches!(lock_writer_version(lock_text), Some(v) if ((1, 3)..(2, 3)).contains(&v))
+/// Why a lock can't source a pyproject-source-pinned package from a URL or
+/// file: see [`source_constraint_break`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourcePinBreak {
+    /// Poetry 1.3 – 2.2 wrote it, and their installer refuses the
+    /// constraint.
+    Writer,
+    /// The lock's `lock-version` is 1.0 or 1.1 (Poetry 1.0 – 1.2), which
+    /// every Poetry from 1.3 on re-solves on install (they trust the lock
+    /// as is only from format 2.1); the solve refuses the constraint. Only
+    /// the old Poetry that wrote such a lock installs it (#1503). The
+    /// legacy 0.x layout is not judged here: hosted refuses it outright,
+    /// and vendored mode keeps admitting it.
+    Format(String),
+}
+
+/// Whether a lock that sources a pyproject `source = "…"`-pinned package
+/// from a URL or file breaks `poetry install` ("Repository \"pypi\" does
+/// not exist."; 1.3 and 1.4 report a solver failure), and why: its writer
+/// is Poetry 1.3 – 2.2 ([`lock_writer_version`]), or its format is older
+/// than 2.1. Poetry 2.3+'s own locks install it. The writer is usually but
+/// not always the installer, so a 2.1 lock is admitted (with the
+/// [`source_constraint_advisory`]); a 1.0 / 1.1 lock is refused whichever
+/// Poetry installs it, since only Poetry 1.0 – 1.2 would.
+///
+/// A versioned stamp decides without parsing (only 1.4+ write one, and
+/// none of them writes a format older than 2.0); otherwise the lock is
+/// parsed once for its `lock-version`, which also names Poetry 1.3 (the
+/// only unstamped writer of 2.0, as [`lock_writer_version`] reads it).
+pub fn source_constraint_break(lock_text: &str) -> Option<SourcePinBreak> {
+    if let Some(writer) = generated_by_version(lock_text) {
+        return ((1, 3)..(2, 3))
+            .contains(&writer)
+            .then_some(SourcePinBreak::Writer);
+    }
+    let lock = lock_text.parse::<DocumentMut>().ok()?;
+    match lock_version(&lock).ok()? {
+        "2.0" => Some(SourcePinBreak::Writer),
+        format @ ("1.0" | "1.1") => Some(SourcePinBreak::Format(format.into())),
+        _ => None,
+    }
 }
 
 /// Rewrite the `[[package]]` for `name`@`version` to install the wheel at
@@ -901,30 +948,44 @@ grouped = {version = "*", source = "pypi"}
     }
 
     #[test]
-    fn source_constraint_breaks_only_poetry_1_3_to_2_2_writers() {
+    fn source_constraint_breaks_1_3_to_2_2_writers_and_pre_2_1_locks() {
+        use SourcePinBreak::{Format, Writer};
         let stamp = |v: &str| {
             format!("# This file is automatically @generated by Poetry {v} and should not be changed by hand.\n")
         };
         for (v, want) in [
-            ("1.2.2", false),
-            ("1.3.0", true),
-            ("1.4.0", true),
-            ("1.8.5", true),
-            ("2.2.1", true),
-            ("2.3.0", false),
-            ("2.4.3", false),
+            ("1.2.2", None),
+            ("1.3.0", Some(Writer)),
+            ("1.4.0", Some(Writer)),
+            ("1.8.5", Some(Writer)),
+            ("2.2.1", Some(Writer)),
+            ("2.3.0", None),
+            ("2.4.3", None),
         ] {
-            assert_eq!(source_constraint_breaks_writer(&stamp(v)), want, "{v}");
+            assert_eq!(source_constraint_break(&stamp(v)), want, "{v}");
         }
-        assert!(!source_constraint_breaks_writer("[[package]]\n"));
+        assert_eq!(source_constraint_break("[[package]]\n"), None);
 
         // Poetry 1.3 writes the stamp without a version (#1447). Its lock is
         // still recognizable: only 1.3 – 1.8 write `lock-version = "2.0"`,
-        // and 1.4 – 1.8 stamp their version.
-        assert!(source_constraint_breaks_writer(&fixture("1.3.2")));
-        for version in ["0.12.17", "1.0.10", "1.1.15", "1.2.2", "2.3.4", "2.4.3"] {
-            assert!(
-                !source_constraint_breaks_writer(&fixture(version)),
+        // and 1.4 – 1.8 stamp their version. Lock-version 1.0 / 1.1 locks
+        // break on every Poetry 1.3+, which re-solves them (#1503). The 0.x
+        // layout is left to the callers (hosted refuses it outright).
+        let format = |f: &str| Some(Format(f.into()));
+        for (version, want) in [
+            ("0.12.17", None),
+            ("1.0.10", format("1.0")),
+            ("1.1.15", format("1.1")),
+            ("1.2.2", format("1.1")),
+            ("1.3.2", Some(Writer)),
+            ("1.8.5", Some(Writer)),
+            ("2.2.1", Some(Writer)),
+            ("2.3.4", None),
+            ("2.4.3", None),
+        ] {
+            assert_eq!(
+                source_constraint_break(&fixture(version)),
+                want,
                 "{version}"
             );
         }
@@ -934,28 +995,66 @@ grouped = {version = "*", source = "pypi"}
             format!("[metadata]\nlock-version = \"{lock_version}\"\npython-versions = \"*\"\ncontent-hash = \"x\"\n")
         };
         for (header, lock_version, want) in [
-            (versionless, "2.0", true),
+            (versionless, "2.0", Some(Writer)),
             // A 2.0 lock whose stamp was edited away is still 1.3 – 1.8's.
-            ("", "2.0", true),
-            ("# a comment above the stamp\n", "2.0", true),
-            // The versionless stamp judges nothing over other formats.
-            (versionless, "1.1", false),
-            (versionless, "2.1", false),
-            ("", "1.1", false),
-            ("", "2.1", false),
+            ("", "2.0", Some(Writer)),
+            ("# a comment above the stamp\n", "2.0", Some(Writer)),
+            (versionless, "1.1", format("1.1")),
+            ("", "1.1", format("1.1")),
+            ("", "1.0", format("1.0")),
+            (versionless, "2.1", None),
+            ("", "2.1", None),
+            ("", "2.2", None),
         ] {
             let lock = format!("{header}{}", lock_body(lock_version));
             assert_eq!(
-                source_constraint_breaks_writer(&lock),
+                source_constraint_break(&lock),
                 want,
                 "{header:?} {lock_version}"
             );
             assert_eq!(
-                source_constraint_breaks_writer(&lock.replace('\n', "\r\n")),
+                source_constraint_break(&lock.replace('\n', "\r\n")),
                 want,
                 "CRLF {header:?} {lock_version}"
             );
         }
+        // The legacy layout (no lock-version, `[metadata.hashes]`).
+        assert_eq!(
+            source_constraint_break("[metadata]\ncontent-hash = \"x\"\n\n[metadata.hashes]\n"),
+            None
+        );
+    }
+
+    /// The refusal names why: the 1.3 – 2.2 writer, or the old format.
+    #[test]
+    fn source_constraint_refusal_names_the_writer_or_the_format() {
+        let refusal = |why| {
+            source_constraint_refusal(
+                "pyproject.toml",
+                "poetry.lock",
+                "six",
+                "1.16.0",
+                "pypi",
+                "URL",
+                Wired::No,
+                &why,
+            )
+        };
+        let writer = refusal(SourcePinBreak::Writer);
+        assert!(writer.contains("written by Poetry 1.3 – 2.2"), "{writer}");
+        let format = refusal(SourcePinBreak::Format("1.1".into()));
+        assert!(format.contains("lock-version \"1.1\""), "{format}");
+        assert!(format.contains("every Poetry from 1.3 on"), "{format}");
+        for detail in [writer, format] {
+            assert!(detail.contains("`source = \"pypi\"`"), "{detail}");
+            assert!(
+                detail.contains("upgrade to Poetry >= 2.3, re-lock"),
+                "{detail}"
+            );
+        }
+        let advisory = source_constraint_advisory("pyproject.toml", "poetry.lock", "six", "pypi");
+        assert!(advisory.contains("Poetry 1.3 – 2.2 refuse"), "{advisory}");
+        assert!(!advisory.contains("1.1 – 1.2"), "{advisory}");
     }
 
     const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";

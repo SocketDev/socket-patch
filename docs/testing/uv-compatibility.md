@@ -185,7 +185,11 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   0.11): a project `uv.toml` replaces pyproject's `[tool.uv]` outright; a
   PEP 723 script's own `no-sources` wins over the project's, while the two
   `no-sources-package` lists combine; and an explicit `no-sources = false`
-  disables the list. `UV_NO_SOURCES`, `UV_NO_SOURCES_PACKAGE`, the matching
+  disables the list. A script's project settings come from the nearest
+  directory at or above it holding a `uv.toml` or a `pyproject.toml` with
+  `[tool.uv]` (`uv.toml` first), so a script scanned from `scripts/` under
+  a project that sets `no-sources` is refused too, with the parent file
+  named (#1501); a project stops that lookup at itself. `UV_NO_SOURCES`, `UV_NO_SOURCES_PACKAGE`, the matching
   flags and a user-level `uv.toml` belong to the machine that installs,
   which the scan cannot see.
 - Native projects and scripts resolving multiple versions of the same package

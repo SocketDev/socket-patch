@@ -30,7 +30,6 @@ use serial_test::serial;
 /// scrubs by hand.
 const PENDING_RAW_SPAWNS: &[&str] = &[
     "apply/apply_network.rs",
-    "e2e_gem.rs",
     "e2e_hosted_production.rs",
     "e2e_maven.rs",
     "e2e_redirect_cargo_shapes.rs",
@@ -39,8 +38,6 @@ const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_vendored_production.rs",
     "e2e_vex_vendor.rs",
     "rollback/rollback_multicopy_blob_gate.rs",
-    "vendor/vendor_gem_lockfile_only_e2e.rs",
-    "vendor/vendor_rerun_no_network_e2e.rs",
 ];
 
 /// The environment `cmd`'s child would see: the parent environment with
