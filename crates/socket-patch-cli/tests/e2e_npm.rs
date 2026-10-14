@@ -96,6 +96,7 @@ fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, String) {
 fn npm_run(cwd: &Path, args: &[&str]) {
     let mut cmd = Command::new("npm");
     cmd.args(args).current_dir(cwd);
+    hermetic::scrub_socket_vars(&mut cmd);
     cache_env::isolate(&mut cmd);
     let out = cmd.output().expect("failed to run npm");
     assert!(
@@ -345,6 +346,7 @@ fn test_npm_global_lifecycle() {
     ]);
     // `--prefix` is a flag, so it still decides where the package lands; the
     // sandbox only moves the download cache off the caller's home.
+    hermetic::scrub_socket_vars(&mut cmd);
     cache_env::isolate(&mut cmd);
     let out = cmd.output().expect("failed to run npm install -g");
     assert!(
