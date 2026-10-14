@@ -421,6 +421,12 @@ pub(super) fn is_lock_record(record: &WiringRecord) -> bool {
     record.kind == KIND
 }
 
+/// Whether `record` is one the python-lock revert owns: a PEP 751 lock
+/// document or a script's inline metadata.
+pub(super) fn is_python_lock_kind_record(record: &WiringRecord) -> bool {
+    record.kind == KIND || record.kind == SCRIPT_KIND
+}
+
 pub(super) async fn wire_python_locks(
     project: &PythonLocks,
     root: &Path,

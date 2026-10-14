@@ -390,13 +390,41 @@ async fn detect_pypi_flavor(
         if exists(PYPI_REQUIREMENTS).await {
             present.push(PYPI_REQUIREMENTS);
         }
-        if !present.is_empty() {
+        // #1524: a file an earlier run already vendored keeps that wiring,
+        // and its records stay in the ledger entry, so say so rather than
+        // lumping it in with the registry-sourced files.
+        let mut vendored = Vec::new();
+        let mut unchanged = Vec::new();
+        for file in present {
+            let wired = tokio::fs::read_to_string(project_root.join(file))
+                .await
+                .is_ok_and(|text| text.contains(".socket/vendor/pypi/"));
+            if wired {
+                vendored.push(file);
+            } else {
+                unchanged.push(file);
+            }
+        }
+        let mut clauses = Vec::new();
+        if !unchanged.is_empty() {
+            clauses.push(format!(
+                "installs driven by {} retain their existing sources",
+                unchanged.join(", ")
+            ));
+        }
+        if !vendored.is_empty() {
+            clauses.push(format!(
+                "{} stay wired to the vendored wheel and revert with it",
+                vendored.join(", ")
+            ));
+        }
+        if !clauses.is_empty() {
             warnings.push(VendorWarning::new(
                 "pypi_multiple_lockfiles",
                 format!(
-                    "wiring {}; installs driven by {} retain their existing sources",
+                    "wiring {}; {}",
                     additional_locks.join(", "),
-                    present.join(", ")
+                    clauses.join("; ")
                 ),
             ));
         }
@@ -2996,10 +3024,11 @@ async fn wire_pipenv_pylocks(
     }
 }
 
-/// Revert a Pipenv or uv entry: the exported requirements lines wired with
-/// it (#612, #1368) through the requirements backend, and a Pipenv entry's
-/// pylocks (#1368) through the python-lock backend, then its lock records
-/// through the flavor's backend. Those files go first and are put back if
+/// Revert a lock-flavor entry: the requirements lines wired with it (a
+/// Pipenv or uv export, #612 and #1368, or a requirements.txt vendored
+/// before the lock appeared, #1524) through the requirements backend, and
+/// a Pipenv entry's pylocks (#1368) through the python-lock backend, then
+/// its lock records through the flavor's backend. Those files go first and are put back if
 /// a later revert then fails, so a failure on any side leaves every file
 /// wired to the vendored wheel (and the entry kept) instead of half
 /// reverted.
@@ -3020,10 +3049,17 @@ async fn revert_with_sibling(
             PypiFlavor::Pipenv => {
                 super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await
             }
-            other => RevertOutcome::failed(format!(
-                "no exported-requirements revert for the {} flavor",
-                other.as_str()
-            )),
+            PypiFlavor::PythonLocks => {
+                super::pypi_lock::revert_python_locks(entry, project_root, dry_run).await
+            }
+            PypiFlavor::Hatch => super::pypi_hatch::revert(entry, project_root, dry_run).await,
+            PypiFlavor::Poetry => {
+                super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await
+            }
+            PypiFlavor::Pdm => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
+            PypiFlavor::Requirements => {
+                RevertOutcome::failed("no exported-requirements revert for the requirements flavor")
+            }
         }
     }
     let (lines, rest): (Vec<_>, Vec<_>) = entry
@@ -3192,13 +3228,31 @@ pub async fn revert_pypi_opts(
             Some("uv") => {
                 revert_with_sibling(entry, project_root, PypiFlavor::UvProject, dry_run).await
             }
+            // #1524: a re-run that wires a lock beside an already vendored
+            // requirements.txt restamps the flavor but carries the
+            // `requirements_line` records forward, so every lock flavor
+            // reverts those lines too instead of calling them drift.
             Some("python-lock") => {
-                super::pypi_lock::revert_python_locks(entry, project_root, dry_run).await
+                revert_with_sibling(entry, project_root, PypiFlavor::PythonLocks, dry_run).await
             }
-            Some("hatch") => super::pypi_hatch::revert(entry, project_root, dry_run).await,
+            Some("hatch") => {
+                revert_with_sibling(entry, project_root, PypiFlavor::Hatch, dry_run).await
+            }
+            // ... and the other way round: a pylock wired by an earlier run
+            // stays recorded when the next run wires requirements.txt.
+            Some("requirements")
+                if entry
+                    .wiring
+                    .iter()
+                    .any(super::pypi_lock::is_python_lock_kind_record) =>
+            {
+                revert_with_sibling(entry, project_root, PypiFlavor::PythonLocks, dry_run).await
+            }
             Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
-            Some("poetry") => super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await,
-            Some("pdm") => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
+            Some("poetry") => {
+                revert_with_sibling(entry, project_root, PypiFlavor::Poetry, dry_run).await
+            }
+            Some("pdm") => revert_with_sibling(entry, project_root, PypiFlavor::Pdm, dry_run).await,
             Some("pipenv") => {
                 revert_with_sibling(entry, project_root, PypiFlavor::Pipenv, dry_run).await
             }
@@ -10777,6 +10831,86 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hashes = {sha256 = "u
         for name in ["pylock.toml", "pylock.production.toml"] {
             full_cycle_lock_flavor("python-lock", name, original, "python_lock_document").await;
         }
+    }
+
+    /// #1524: requirements.txt is vendored, then a `pylock.toml` pinning the
+    /// same release appears and the next vendored run wires it too. The
+    /// entry's flavor becomes `python-lock` while the carried-forward
+    /// `requirements_line` record stays, so the revert must restore both
+    /// files and delete the wheel, not call the CLI's own requirements
+    /// wiring drift and keep everything.
+    #[tokio::test]
+    async fn requirements_then_pylock_entry_reverts_both_files() {
+        const PYLOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"pip\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\nindex = \"https://pypi.org/simple\"\nwheels = [{ name = \"six-1.16.0-py2.py3-none-any.whl\", url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hashes = { sha256 = \"8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" } }]\n";
+        let key = "pkg:pypi/six@1.16.0";
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let (result, entry, _) =
+            crate::vendor::test_support::expect_done(vendor_six(&fx, &sources, None).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("entry on success");
+        assert_eq!(entry.flavor.as_deref(), Some("requirements"));
+        crate::vendor::test_support::persist(&fx.root, key, entry).await;
+        assert_ne!(read_requirements(&fx).await, "six==1.16.0\n");
+
+        touch(&fx.root, "pylock.toml", PYLOCK).await;
+        let (result, entry, warnings) =
+            crate::vendor::test_support::expect_done(vendor_six(&fx, &sources, None).await);
+        assert!(result.success, "{:?}", result.error);
+        // The routing note names requirements.txt as still vendored, not
+        // as a file left on its registry source.
+        let routing: Vec<&str> = warnings
+            .iter()
+            .filter(|w| w.code == "pypi_multiple_lockfiles")
+            .map(|w| w.detail.as_str())
+            .collect();
+        assert!(
+            routing.iter().any(|d| d
+                .contains("requirements.txt stay wired to the vendored wheel and revert with it"))
+                && routing
+                    .iter()
+                    .all(|d| !d.contains("retain their existing sources")),
+            "{routing:?}"
+        );
+        crate::vendor::test_support::persist(&fx.root, key, entry.expect("entry on success")).await;
+        let state = crate::vendor::state::load_state(&fx.root).await.unwrap();
+        let entry = state.entries.get(key).expect("ledger entry").clone();
+        assert_eq!(entry.flavor.as_deref(), Some("python-lock"));
+        let kinds: Vec<(&str, &str)> = entry
+            .wiring
+            .iter()
+            .map(|r| (r.file.as_str(), r.kind.as_str()))
+            .collect();
+        assert!(
+            kinds.contains(&("pylock.toml", "python_lock_document"))
+                && kinds.contains(&("requirements.txt", "requirements_line")),
+            "{kinds:?}"
+        );
+
+        let preview = revert_pypi_opts(
+            &entry,
+            &fx.root,
+            RevertOpts {
+                dry_run: true,
+                keep_artifact: false,
+            },
+        )
+        .await;
+        assert!(preview.success, "{:?}", preview.error);
+        assert!(!preview.drift_skipped(), "{:?}", preview.warnings);
+
+        let reverted = revert_pypi(&entry, &fx.root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert!(!reverted.kept_artifact, "{:?}", reverted.warnings);
+        assert!(reverted.warnings.is_empty(), "{:?}", reverted.warnings);
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.root.join("pylock.toml"))
+                .await
+                .unwrap(),
+            PYLOCK
+        );
+        assert!(!uuid_dir_of(&fx).exists());
     }
 
     #[tokio::test]
