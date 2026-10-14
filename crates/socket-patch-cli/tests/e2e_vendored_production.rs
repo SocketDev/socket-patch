@@ -497,29 +497,20 @@ fn vendor_revert(cwd: &Path, leg: &str) -> u64 {
 // Toolchain invocation
 // ---------------------------------------------------------------------------
 
-/// Every ambient tool config a package-manager child must not inherit: an
-/// activated venv (uv/pip would install into the wrong interpreter), the
-/// yarn and pnpm/npm linker and mirror overrides (a node-linker override
-/// breaks yarn/pnpm), bundler, PDM, Poetry and Composer settings. See
-/// [`hermetic::Extra`].
-const PM_EXTRAS: &[hermetic::Extra] = &[
-    hermetic::Extra::Venv,
-    hermetic::Extra::Yarn,
-    hermetic::Extra::YarnClassic,
-    hermetic::Extra::Pnpm,
-    hermetic::Extra::Bundle,
-    hermetic::Extra::Pdm,
-    hermetic::Extra::Poetry,
-    hermetic::Extra::Composer,
-];
-
-/// A package-manager child (and its liveness probes) with the shared
-/// hermetic scrubs: every ambient `SOCKET_*` and every [`PM_EXTRAS`] config.
-/// Callers run `cache_env::isolate` next and their own env last.
+/// A package-manager child (and its liveness probe) with the shared
+/// hermetic scrubs, applied before `cache_env::isolate` and the leg's own
+/// env so a leg's pins (the uv legs' `VIRTUAL_ENV`) survive: every ambient
+/// `SOCKET_*` ([`hermetic::scrub_socket_vars`]), an activated venv (uv/pip
+/// would install into the wrong interpreter) and the yarn/pnpm node-linker
+/// overrides. Deliberately not the full `Extra::Yarn` / `Extra::Pnpm`
+/// sweeps: those remove every `YARN_*` / `npm_config_*`, including the
+/// proxy and CA settings these live-registry suites need behind a proxy.
 fn pm_command(program: &str) -> Command {
-    let mut cmd = hermetic::tool_command(program);
+    let mut cmd = Command::new(program);
     hermetic::scrub_socket_vars(&mut cmd);
-    hermetic::scrub_extra(&mut cmd, PM_EXTRAS);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.env_remove("YARN_NODE_LINKER");
+    cmd.env_remove("npm_config_node_linker");
     cmd
 }
 
@@ -527,16 +518,14 @@ fn pm_command(program: &str) -> Command {
 /// scrubbed first (a developer's global bundler config — frozen mode, a
 /// custom BUNDLE_PATH or gem home, a RUBYOPT require — must not leak into a
 /// leg that hard-asserts bundler outcomes; mirrors e2e_vendor_gem_build.rs).
-/// `pm_command` sweeps `BUNDLE_*`; the gem home and `RUBYOPT` are this
-/// helper's own. The cache sandbox re-pins its own
-/// BUNDLE_USER_HOME/GEM_SPEC_CACHE after the scrub, and the per-leg `env`
-/// is applied last so the leg's pins win.
+/// The cache sandbox re-pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after
+/// the scrub, and the per-leg `env` is applied last so the leg's pins win.
 fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = pm_command("bundle");
     cmd.args(args).current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         let key = k.to_string_lossy().into_owned();
-        if key.starts_with("GEM_") || key == "RUBYOPT" {
+        if key.starts_with("BUNDLE_") || key.starts_with("GEM_") || key == "RUBYOPT" {
             cmd.env_remove(&k);
         }
     }

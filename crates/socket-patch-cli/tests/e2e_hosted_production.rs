@@ -433,28 +433,20 @@ fn hosted_pin_count(env: &serde_json::Value) -> u64 {
 // Toolchain invocation
 // ---------------------------------------------------------------------------
 
-/// Every ambient tool config a package-manager child must not inherit: an
-/// activated venv (uv would install into the wrong interpreter), the yarn
-/// and pnpm/npm linker and mirror overrides, bundler, PDM, Poetry and
-/// Composer settings. See [`hermetic::Extra`].
-const PM_EXTRAS: &[hermetic::Extra] = &[
-    hermetic::Extra::Venv,
-    hermetic::Extra::Yarn,
-    hermetic::Extra::YarnClassic,
-    hermetic::Extra::Pnpm,
-    hermetic::Extra::Bundle,
-    hermetic::Extra::Pdm,
-    hermetic::Extra::Poetry,
-    hermetic::Extra::Composer,
-];
-
-/// A package-manager child (and its `has_command` probe) with the shared
-/// hermetic scrubs: every ambient `SOCKET_*` and every [`PM_EXTRAS`] config.
-/// Callers run `cache_env::isolate` next and their own env last.
+/// A package-manager child (and its liveness probe) with the shared
+/// hermetic scrubs, applied before `cache_env::isolate` and the leg's own
+/// env so a leg's pins (the uv legs' `VIRTUAL_ENV`) survive: every ambient
+/// `SOCKET_*` ([`hermetic::scrub_socket_vars`]), an activated venv (uv
+/// would install into the wrong interpreter) and the yarn/pnpm node-linker
+/// overrides. Deliberately not the full `Extra::Yarn` / `Extra::Pnpm`
+/// sweeps: those remove every `YARN_*` / `npm_config_*`, including the
+/// proxy and CA settings these live-registry suites need behind a proxy.
 fn pm_command(program: &str) -> Command {
-    let mut cmd = hermetic::tool_command(program);
+    let mut cmd = Command::new(program);
     hermetic::scrub_socket_vars(&mut cmd);
-    hermetic::scrub_extra(&mut cmd, PM_EXTRAS);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.env_remove("YARN_NODE_LINKER");
+    cmd.env_remove("npm_config_node_linker");
     cmd
 }
 
