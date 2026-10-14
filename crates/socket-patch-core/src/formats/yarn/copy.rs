@@ -36,7 +36,17 @@ impl CopyRef {
     /// The root-relative file to read for [`CopyRef::identity`]: the tarball
     /// itself, or the directory's `package.json`. `None` for a url, which
     /// names its package in its path.
+    ///
+    /// `None` too for an absolute path: a lock is untrusted input, and an
+    /// absolute spelling can name any file on the machine, or (a Windows
+    /// UNC path) a network share. Such a copy is never read, so its package
+    /// stays unknown (#1516).
     pub(crate) fn read_path(&self) -> Option<String> {
+        if let CopyRef::Tarball(rel) | CopyRef::Directory(rel) | CopyRef::Linked(rel) = self {
+            if crate::utils::relpath::is_anchored(rel) {
+                return None;
+            }
+        }
         match self {
             CopyRef::Tarball(rel) => Some(rel.clone()),
             CopyRef::Directory(dir) | CopyRef::Linked(dir) => Some(if dir.is_empty() {
@@ -69,6 +79,17 @@ impl CopyRef {
             CopyRef::Url(url) => registry_tarball_name(url, lock_version)?,
         };
         Some((name, lock_version.to_string()))
+    }
+
+    /// The copy's path leaves the project root (`../shared/left-pad`) or
+    /// is absolute.
+    fn leaves_root(&self) -> bool {
+        match self {
+            CopyRef::Tarball(rel) | CopyRef::Directory(rel) | CopyRef::Linked(rel) => {
+                rel == ".." || rel.starts_with("../") || crate::utils::relpath::is_anchored(rel)
+            }
+            CopyRef::Url(_) => false,
+        }
     }
 
     /// Where the copy installs from, for a warning or diagnostic: "installs
@@ -118,6 +139,44 @@ pub(crate) fn classic_copy_ref(patterns: &[String], resolved: Option<&str>) -> O
                 .then(|| CopyRef::Url(url.to_string()))
         }
     }
+}
+
+/// [`classic_copy_ref`] for a block of the lock at the root whose
+/// `package.json` is `root_manifest`. yarn 1 writes a `file:` path as the
+/// declaring `package.json` spelled it, relative to that package: the
+/// root's for the root's own dependencies, a member's for a workspace
+/// member's (`"b": "file:../b"` in `packages/a` is `packages/b`). A path
+/// that leaves the root is therefore only taken as root-relative when the
+/// root `package.json` declares exactly that pattern; any other such path
+/// was resolved against a member and is left alone, as it was before
+/// #1516.
+pub(crate) fn classic_copy_ref_at_root(
+    patterns: &[String],
+    resolved: Option<&str>,
+    root_manifest: Option<&[u8]>,
+) -> Option<CopyRef> {
+    let copy = classic_copy_ref(patterns, resolved)?;
+    if copy.leaves_root() && !root_declares(root_manifest, patterns) {
+        return None;
+    }
+    Some(copy)
+}
+
+/// Whether the `package.json` bytes `root_manifest` declare one of the
+/// classic key `patterns` (`lp2@file:../ext/lpdir`) as an installed
+/// dependency of their own.
+fn root_declares(root_manifest: Option<&[u8]>, patterns: &[String]) -> bool {
+    let Some(manifest) = root_manifest.and_then(parse_manifest) else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .iter()
+        .filter_map(|section| manifest.get(section)?.as_object())
+        .flatten()
+        .any(|(name, spec)| {
+            spec.as_str()
+                .is_some_and(|spec| patterns.iter().any(|p| *p == format!("{name}@{spec}")))
+        })
 }
 
 /// The copy a berry locator `reference` installs from: a `file:` tarball or
@@ -253,9 +312,36 @@ mod tests {
             ),
             Some(CopyRef::Tarball("../shared/lp.tgz".into()))
         );
+        let abs = classic_copy_ref(&pats(&["lp2@file:/abs/lpdir"]), None);
+        assert_eq!(abs, Some(CopyRef::Directory("/abs/lpdir".into())));
         assert_eq!(
-            classic_copy_ref(&pats(&["lp2@file:/abs/lpdir"]), None),
-            Some(CopyRef::Directory("/abs/lpdir".into()))
+            abs.unwrap().read_path(),
+            None,
+            "an absolute path is never read"
+        );
+    }
+
+    /// #1516: a classic `file:` path that leaves the root is the root's own
+    /// only when the root `package.json` declares exactly that pattern;
+    /// otherwise yarn resolved it against a workspace member.
+    #[test]
+    fn classic_paths_leaving_the_root_need_a_root_declaration() {
+        let manifest = br#"{"dependencies":{"lp2":"file:../ext/lpdir"},"devDependencies":{"lp3":"file:./in"}}"#;
+        let at_root = |p: &str| classic_copy_ref_at_root(&pats(&[p]), None, Some(manifest));
+        assert_eq!(
+            at_root("lp2@file:../ext/lpdir"),
+            Some(CopyRef::Directory("../ext/lpdir".into()))
+        );
+        assert_eq!(at_root("b@file:../b"), None, "a member's path");
+        assert_eq!(
+            classic_copy_ref_at_root(&pats(&["lp2@file:../ext/lpdir"]), None, None),
+            None,
+            "no root manifest"
+        );
+        assert_eq!(
+            at_root("lp4@file:./other"),
+            Some(CopyRef::Directory("other".into())),
+            "an in-root path needs no declaration"
         );
     }
 

@@ -135,6 +135,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
         stale_selectors,
         // Already folded into `unattested` by the time a run returns.
         unwired_copies: _,
+        // Already folded into `unpatched_copies` by the time a run returns.
+        unidentified_copies: _,
     } = out;
     let render_ref = |r: &PatchedRef| {
         let PatchedRef {

@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use crate::formats::yarn::blocks::{berry_field, classic_field};
-use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref, CopyRef};
+use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref_at_root, CopyRef};
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::classic_key_real_name;
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
@@ -49,7 +49,17 @@ pub(crate) async fn other_name_copies(
     name: &str,
     version: &str,
 ) -> Vec<OtherNameCopy> {
-    let candidates: Vec<(String, CopyRef, String)> = if is_berry_lock(lock_text) {
+    let berry = is_berry_lock(lock_text);
+    // Says which classic `file:` paths that leave the root are the root's
+    // own ([`classic_copy_ref_at_root`]).
+    let root_manifest = if berry {
+        None
+    } else {
+        read_regular_to_bytes(&project_root.join("package.json"))
+            .await
+            .ok()
+    };
+    let candidates: Vec<(String, CopyRef, String)> = if berry {
         berry_entries(lock_text)
             .entries
             .into_iter()
@@ -79,7 +89,8 @@ pub(crate) async fn other_name_copies(
                 ) {
                     return None;
                 }
-                let source = classic_copy_ref(&e.patterns, resolved)?;
+                let source =
+                    classic_copy_ref_at_root(&e.patterns, resolved, root_manifest.as_deref())?;
                 let lock_version = classic_field(&e.block.lines, "version")?.to_string();
                 Some((e.block.key.clone(), source, lock_version))
             })

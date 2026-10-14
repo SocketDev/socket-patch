@@ -2008,6 +2008,21 @@ wow@^1.0.0:
             )
             .await
             .unwrap();
+            // The root declares the outside-root path, so it is root-relative.
+            tokio::fs::write(
+                fx.root().join("package.json"),
+                serde_json::json!({
+                    "name": "app",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "left-pad": "1.3.0",
+                        "lp2": format!("file:../{ext_name}/lpdir"),
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
             let (result, entry, warnings) = expect_done(fx.vendor(false).await);
             assert!(result.success, "{:?}", result.error);
             assert_eq!(entry.unwrap().wiring.len(), 1, "the registry block");
