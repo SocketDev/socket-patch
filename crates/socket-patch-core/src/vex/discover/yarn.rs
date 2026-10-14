@@ -86,8 +86,8 @@ use serde_json::Value;
 
 use super::{
     npm_purl, npm_vendored_tarball_names, parse_json, root_anchored_spelling, vendor_ref_decorated,
-    DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired, DIAG_LOCKFILE_UNPARSEABLE,
-    DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    ClassicPinnedBlock, DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired,
+    DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::yarn::blocks::{berry_field, classic_field};
 use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref, CopyRef};
@@ -142,9 +142,15 @@ fn stray_top_level_line(text: &str) -> Option<&str> {
 
 async fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Discovery) {
     let mut copies: Vec<LockCopy> = Vec::new();
-    for entry in entries {
+    // Every pattern a live block's key holds: what the lock resolves.
+    let locked: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.live)
+        .flat_map(|e| e.patterns.iter().map(String::as_str))
+        .collect();
+    for entry in &entries {
         if entry.live && !entry.patterns.is_empty() {
-            classic_block(ctx, &entry, &mut copies, out);
+            classic_block(ctx, entry, &locked, &mut copies, out);
         }
     }
     record_copies(ctx, copies, out).await;
@@ -186,6 +192,7 @@ fn classic_block_purl(entry: &YarnEntry) -> Option<String> {
 fn classic_block(
     ctx: &DiscoverCtx<'_>,
     entry: &YarnEntry,
+    locked: &std::collections::HashSet<&str>,
     copies: &mut Vec<LockCopy>,
     out: &mut Discovery,
 ) {
@@ -305,7 +312,12 @@ fn classic_block(
         .filter(|sri| is_sri_pin(sri))
         .map(|sri| LockIntegrity::Sri(sri.to_string()))
         .or_else(|| split_resolved_sha1(resolved).1.map(LockIntegrity::Sha1Hex));
-    emit(name, version, resolved, wiring, integrity, &block.key, out);
+    // A hosted pin's sub-maps decide what installs beside it (#1538).
+    let pinned =
+        matches!(wiring, Wired::Hosted(_)).then(|| ClassicPinnedBlock::new(&block.lines, locked));
+    emit(
+        name, version, resolved, wiring, integrity, &block.key, pinned, out,
+    );
 }
 
 // ── berry ────────────────────────────────────────────────────────────────
@@ -467,6 +479,7 @@ async fn confirm_berry_hosted_keyed(
                 entry.wiring,
                 entry.integrity,
                 &entry.key,
+                None,
                 out,
             );
         } else {
@@ -631,7 +644,9 @@ fn berry_block(
                 key: block.key.clone(),
             });
         }
-        hosted => emit(name, version, spec, hosted, integrity, &block.key, out),
+        hosted => emit(
+            name, version, spec, hosted, integrity, &block.key, None, out,
+        ),
     }
 }
 
@@ -804,7 +819,9 @@ fn checked_purl(name: &str, version: &str, key: &str, out: &mut Discovery) -> Op
     purl
 }
 
-/// Push the ref for a classic block or a berry hosted entry.
+/// Push the ref for a classic block or a berry hosted entry; `classic_block`
+/// is a hosted classic pin's block ([`ClassicPinnedBlock`]).
+#[allow(clippy::too_many_arguments)]
 fn emit(
     name: &str,
     version: &str,
@@ -812,6 +829,7 @@ fn emit(
     wiring: Wired,
     integrity: Option<LockIntegrity>,
     key: &str,
+    classic_block: Option<ClassicPinnedBlock>,
     out: &mut Discovery,
 ) {
     match wiring {
@@ -827,14 +845,10 @@ fn emit(
             } else {
                 std::borrow::Cow::Borrowed(spec)
             };
-            out.push(PatchedRef::hosted(
-                purl,
-                uuid,
-                YARN_LOCK,
-                Some(&url),
-                integrity,
-                true,
-            ));
+            out.push(PatchedRef {
+                yarn_classic_block: classic_block,
+                ..PatchedRef::hosted(purl, uuid, YARN_LOCK, Some(&url), integrity, true)
+            });
         }
         Wired::Vendored(vref) => {
             let Some(purl) = vendored_purl(name, version, spec, &vref, key, out) else {

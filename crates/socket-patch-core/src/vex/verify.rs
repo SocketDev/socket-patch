@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::crawlers::Ecosystem;
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
+use crate::utils::npm_range::npm_range_admits;
 use crate::vendor::state::{lookup_entry, VendorEntry};
 use crate::vendor::verify::{
     is_vlt_dir_entry, verify_vendored_patch_record, vlt_installed_copy_matches,
@@ -499,53 +500,195 @@ pub const DEPENDENCY_NOT_INSTALLED: &str = "dependency_not_installed";
 /// Whether an npm `record` patches the package's own `package.json`, the
 /// only way a patch changes the dependencies its package declares.
 fn touches_npm_manifest(record: &PatchRecord) -> bool {
-    record
-        .files
-        .keys()
-        .any(|key| key.strip_prefix("package/").unwrap_or(key) == "package.json")
+    npm_manifest_after_hash(record).is_some()
 }
 
-/// The first `dependencies` entry of the installed npm copy at `pkg_path`
-/// that node cannot resolve from it: no `node_modules/<name>` in the copy
-/// or in any directory above its real path (node's lookup, which also
-/// finds a bundled, hoisted or pnpm/bun store-sibling copy behind a
-/// root-linked symlink). Optional dependencies may be absent, and a copy
-/// outside a `node_modules` tree (a Plug'n'Play install), an unreadable
-/// manifest or a name that is not a safe package name is never evidence.
+/// The patched `package.json`'s afterHash when an npm `record` patches it.
+pub fn npm_manifest_after_hash(record: &PatchRecord) -> Option<&str> {
+    record
+        .files
+        .iter()
+        .find(|(key, _)| key.strip_prefix("package/").unwrap_or(key) == "package.json")
+        .map(|(_, info)| info.after_hash.as_str())
+}
+
+/// The first dependency of the installed npm copy at `pkg_path` that node
+/// cannot resolve from it: no `node_modules/<name>` in the copy or in any
+/// directory above its real path (node's lookup, which also finds a
+/// bundled, hoisted or pnpm/bun store-sibling copy behind a root-linked
+/// symlink), or the nearest such copy's version is outside the range the
+/// manifest declares (a patch that changed a range the lock never locked
+/// installs beside the old dependency, #1538). An optional dependency may
+/// be absent, but an installed one is range-checked too. A dependency the
+/// project forces itself (npm `overrides`, pnpm `pnpm.overrides`, yarn
+/// `resolutions` in the project's `package.json`) is not range-checked:
+/// its version is the user's choice. A copy outside a `node_modules` tree
+/// (a Plug'n'Play install), an unreadable manifest, a name that is not a
+/// safe package name, or a range or installed version this reader does
+/// not decide is never evidence.
 async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
     let pkg_path = pkg_path.to_path_buf();
     crate::utils::fs::run_blocking(move || {
-        if !pkg_path
+        // The project whose `node_modules` holds the copy.
+        let project: PathBuf = pkg_path
             .components()
-            .any(|c| c.as_os_str() == "node_modules")
-        {
+            .take_while(|c| c.as_os_str() != "node_modules")
+            .collect();
+        if project == pkg_path {
             return None;
         }
         let text =
             crate::utils::fs::read_regular_to_string_sync(&pkg_path.join("package.json")).ok()?;
         let pkg: serde_json::Value = serde_json::from_str(&text).ok()?;
         let real = std::fs::canonicalize(&pkg_path).ok()?;
-        let optional = pkg
-            .get("optionalDependencies")
-            .and_then(serde_json::Value::as_object);
-        pkg.get("dependencies")?
-            .as_object()?
-            .keys()
-            .filter(|name| optional.is_none_or(|o| !o.contains_key(*name)))
-            .filter(|name| crate::vendor::npm_common::is_safe_npm_name(name))
-            .find(|name| !node_resolves(&real, name))
-            .cloned()
+        let map = |field: &str| pkg.get(field).and_then(serde_json::Value::as_object);
+        let optional = map("optionalDependencies");
+        let overrides = project_overrides(&project);
+        let owner = pkg.get("name").and_then(serde_json::Value::as_str);
+        let required = map("dependencies")
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| optional.is_none_or(|o| !o.contains_key(*name)))
+            .map(|entry| (entry, false));
+        let optional = optional.into_iter().flatten().map(|entry| (entry, true));
+        required
+            .chain(optional)
+            .filter(|((name, _), _)| crate::vendor::npm_common::is_safe_npm_name(name))
+            .find(|((name, spec), optional)| match node_resolve(&real, name) {
+                None => !optional,
+                Some(_) if forces(&overrides, owner, name) => false,
+                Some(copy) => spec
+                    .as_str()
+                    .and_then(declared_npm_range)
+                    .is_some_and(|range| !copy_admitted(&copy, range)),
+            })
+            .map(|((name, _), _)| name.clone())
     })
     .await
 }
 
-/// Whether node resolves the package `name` from the package directory
-/// `from`: `<dir>/node_modules/<name>` exists for `from` or an ancestor
-/// that is not itself a `node_modules` directory.
-fn node_resolves(from: &Path, name: &str) -> bool {
+/// The version overrides the project's own `package.json` declares, as
+/// `(parent, target)` package names: npm `overrides`, pnpm
+/// `pnpm.overrides` and yarn `resolutions`, each forcing a version (not
+/// `*` or empty). `parent` is the package an override is scoped under
+/// (npm nesting, pnpm `parent>target`, yarn `parent/target`), `None` for
+/// one that applies wherever the target installs (`target`, `**/target`).
+/// A nested npm override's parent is itself forced only by its `"."`.
+fn project_overrides(project: &Path) -> Vec<(Option<String>, String)> {
+    use crate::formats::yarn::patterns::resolution_selector_target as target_of;
+    // `*` and an empty value keep the declared range; `$name` pins the
+    // root's own spec, which is still the user's choice.
+    fn pins(value: &serde_json::Value) -> bool {
+        value
+            .as_str()
+            .is_some_and(|v| !matches!(v.trim(), "" | "*"))
+    }
+    fn npm(
+        value: &serde_json::Value,
+        parent: Option<&str>,
+        out: &mut Vec<(Option<String>, String)>,
+    ) {
+        for (key, nested) in value.as_object().into_iter().flatten() {
+            let Some(name) = (key != ".").then(|| target_of(key)).flatten() else {
+                continue;
+            };
+            if pins(nested) || nested.get(".").is_some_and(pins) {
+                out.push((parent.map(str::to_string), name.to_string()));
+            }
+            npm(nested, Some(name), out);
+        }
+    }
+    let mut out = Vec::new();
+    let Some(pkg) = crate::utils::fs::read_regular_to_string_sync(&project.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    else {
+        return out;
+    };
+    if let Some(overrides) = pkg.get("overrides") {
+        npm(overrides, None, &mut out);
+    }
+    let selectors = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, v)| pins(v))
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<String>>()
+    };
+    for key in selectors(pkg.pointer("/pnpm/overrides")) {
+        let mut chain = key.rsplit('>');
+        if let Some(target) = chain.next().and_then(target_of) {
+            let parent = chain.next().and_then(target_of).map(str::to_string);
+            out.push((parent, target.to_string()));
+        }
+    }
+    for key in selectors(pkg.get("resolutions")) {
+        let mut chain = yarn_selector_segments(&key).into_iter().rev();
+        if let Some(target) = chain.next().and_then(target_of) {
+            // `parent/**/target` is scoped under `parent` like
+            // `parent/target`; only a leading `**/` applies everywhere.
+            let parent = chain.find(|s| *s != "**").and_then(target_of);
+            out.push((parent.map(str::to_string), target.to_string()));
+        }
+    }
+    out
+}
+
+/// A yarn `resolutions` selector's `/`-separated segments, a scope's own
+/// separator kept inside its segment (`a/@s/b@1` → `a`, `@s/b@1`).
+fn yarn_selector_segments(selector: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, _) in selector.match_indices('/') {
+        if !selector[start..i].starts_with('@') || selector[start..i].contains('/') {
+            out.push(&selector[start..i]);
+            start = i + 1;
+        }
+    }
+    out.push(&selector[start..]);
+    out
+}
+
+/// Whether an override of `overrides` forces the dependency `name` of the
+/// package `owner`: one that applies everywhere, or one scoped under
+/// `owner` itself.
+fn forces(overrides: &[(Option<String>, String)], owner: Option<&str>, name: &str) -> bool {
+    overrides.iter().any(|(parent, target)| {
+        target == name && parent.as_deref().is_none_or(|p| Some(p) == owner)
+    })
+}
+
+/// The copy of the package `name` node resolves from the package directory
+/// `from`: `<dir>/node_modules/<name>` for the nearest of `from` and its
+/// ancestors that is not itself a `node_modules` directory.
+fn node_resolve(from: &Path, name: &str) -> Option<PathBuf> {
     from.ancestors()
         .filter(|dir| dir.file_name().is_none_or(|n| n != "node_modules"))
-        .any(|dir| dir.join("node_modules").join(name).exists())
+        .map(|dir| dir.join("node_modules").join(name))
+        .find(|copy| copy.exists())
+}
+
+/// The registry semver range of a `dependencies` value: the value itself,
+/// or an `npm:<name>@<range>` alias's range. `None` for any other spec (a
+/// path, url, git or workspace dependency, a bare alias).
+fn declared_npm_range(spec: &str) -> Option<&str> {
+    let range = match spec.strip_prefix("npm:") {
+        Some(target) => &target[target.get(1..)?.find('@')? + 2..],
+        None => spec,
+    };
+    (!range.contains([':', '/', '#', '@'])).then_some(range.trim())
+}
+
+/// Whether the installed copy's `package.json` version is in `range`; a
+/// version or range [`npm_range_admits`] does not decide admits it.
+fn copy_admitted(copy: &Path, range: &str) -> bool {
+    let version = crate::utils::fs::read_regular_to_string_sync(&copy.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|pkg| pkg.get("version")?.as_str().map(str::to_string));
+    version.is_none_or(|v| npm_range_admits(range, &v) != Some(false))
 }
 
 /// Whether `rest` (what follows a matched `from` prefix) starts a new name
@@ -2003,6 +2146,164 @@ mod tests {
                 unresolved_npm_dependency(&root.join("node_modules/lp2")).await,
                 None
             );
+        }
+    }
+
+    /// A patch that changes a dependency's range (#1538): the copy node
+    /// resolves (the NEAREST `node_modules/<name>`) must satisfy the range
+    /// the patched `package.json` declares, not merely exist.
+    #[tokio::test]
+    async fn unresolved_npm_dependency_checks_the_declared_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let lp = root.join("node_modules/lp");
+        put(
+            "node_modules/lp/package.json",
+            r#"{"name":"lp","dependencies":{"is-number":"^7.0.0"}}"#,
+        );
+
+        // The old dependency the lock still installs: not the declared range.
+        put(
+            "node_modules/is-number/package.json",
+            r#"{"name":"is-number","version":"6.0.0"}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&lp).await.as_deref(),
+            Some("is-number")
+        );
+        // A nested copy that satisfies it is the one node loads.
+        put(
+            "node_modules/lp/node_modules/is-number/package.json",
+            r#"{"name":"is-number","version":"7.0.0"}"#,
+        );
+        assert_eq!(unresolved_npm_dependency(&lp).await, None);
+        // ...and a nested copy that does not hides a hoisted one that does.
+        put(
+            "node_modules/is-number/package.json",
+            r#"{"name":"is-number","version":"7.1.0"}"#,
+        );
+        put(
+            "node_modules/lp/node_modules/is-number/package.json",
+            r#"{"name":"is-number","version":"6.0.0"}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&lp).await.as_deref(),
+            Some("is-number")
+        );
+
+        // An `npm:` alias is checked against its target's range.
+        let alias = root.join("alias/node_modules/lp");
+        put(
+            "alias/node_modules/lp/package.json",
+            r#"{"name":"lp","dependencies":{"num":"npm:is-number@^7.0.0"}}"#,
+        );
+        put(
+            "alias/node_modules/num/package.json",
+            r#"{"name":"is-number","version":"6.0.0"}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&alias).await.as_deref(),
+            Some("num")
+        );
+        put(
+            "alias/node_modules/num/package.json",
+            r#"{"name":"is-number","version":"7.0.0"}"#,
+        );
+        assert_eq!(unresolved_npm_dependency(&alias).await, None);
+
+        // A range this reader does not decide, a non-registry spec or a
+        // copy without a readable version is never evidence.
+        let other = root.join("other/node_modules/lp");
+        put(
+            "other/node_modules/lp/package.json",
+            r#"{"name":"lp","dependencies":{"a":"latest","b":"file:../b",
+                "c":"github:o/c","d":"^2.0.0"}}"#,
+        );
+        for dep in ["a", "b", "c"] {
+            put(
+                &format!("other/node_modules/{dep}/package.json"),
+                r#"{"version":"1.0.0"}"#,
+            );
+        }
+        put("other/node_modules/d/package.json", r#"{"name":"d"}"#);
+        assert_eq!(unresolved_npm_dependency(&other).await, None);
+
+        // An optional dependency may be absent, but an installed one must
+        // be in range.
+        let opt = root.join("opt/node_modules/lp");
+        put(
+            "opt/node_modules/lp/package.json",
+            r#"{"name":"lp","optionalDependencies":{"fsevents":"^2.0.0"}}"#,
+        );
+        assert_eq!(unresolved_npm_dependency(&opt).await, None);
+        put(
+            "opt/node_modules/fsevents/package.json",
+            r#"{"name":"fsevents","version":"1.2.0"}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&opt).await.as_deref(),
+            Some("fsevents")
+        );
+
+        // A version the project forces itself is the user's choice.
+        let forced = root.join("forced/node_modules/lp");
+        put(
+            "forced/node_modules/lp/package.json",
+            r#"{"name":"lp","dependencies":{"minimist":"^0.2.0","@s/b":"^2.0.0"}}"#,
+        );
+        put(
+            "forced/node_modules/minimist/package.json",
+            r#"{"name":"minimist","version":"1.2.8"}"#,
+        );
+        put(
+            "forced/node_modules/@s/b/package.json",
+            r#"{"name":"@s/b","version":"1.0.0"}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&forced).await.as_deref(),
+            Some("minimist")
+        );
+        for project in [
+            r#"{"overrides":{"minimist":"1.2.8","@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"lp":{"minimist":"1.2.8","@s/b":"1.0.0"}}}"#,
+            r#"{"pnpm":{"overrides":{"minimist@<1":"1.2.8","lp>@s/b@^2":"1.0.0"}}}"#,
+            r#"{"resolutions":{"**/minimist":"1.2.8","lp/@s/b":"1.0.0"}}"#,
+            r#"{"resolutions":{"lp/**/minimist":"1.2.8","@s/b":"1.0.0"}}"#,
+        ] {
+            put("forced/package.json", project);
+            assert_eq!(unresolved_npm_dependency(&forced).await, None, "{project}");
+        }
+        // Not `minimist` of `lp`: another package, another parent's copy,
+        // a nested override's parent (only `"."` forces it), or a no-op.
+        for unforced in [
+            r#"{"overrides":{"minimist-x":"1","@types/minimist":"1","@s/b":"1.0.0"}}"#,
+            r#"{"pnpm":{"overrides":{"lp>minimist-x@1":"1","mkdirp>minimist":"1","@s/b":"1"}}}"#,
+            r#"{"resolutions":{"lp/@types/minimist@1":"1","mkdirp/minimist":"1","@s/b":"1"}}"#,
+            r#"{"resolutions":{"mkdirp/**/minimist":"1","@s/b":"1"}}"#,
+            r#"{"overrides":{"mkdirp":{"minimist":"1.2.8"},"@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"minimist":{"x":"1.0.0"},"@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"minimist":{".":"*"},"@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"minimist":" * ","@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"minimist":"","@s/b":"1.0.0"}}"#,
+        ] {
+            put("forced/package.json", unforced);
+            assert_eq!(
+                unresolved_npm_dependency(&forced).await.as_deref(),
+                Some("minimist"),
+                "{unforced}"
+            );
+        }
+        for forcing in [
+            r#"{"overrides":{"minimist":{".":"1.2.8"},"@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"minimist":"$minimist","@s/b":"1.0.0"}}"#,
+        ] {
+            put("forced/package.json", forcing);
+            assert_eq!(unresolved_npm_dependency(&forced).await, None, "{forcing}");
         }
     }
 
