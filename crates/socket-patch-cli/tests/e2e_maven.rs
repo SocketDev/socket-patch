@@ -15,7 +15,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, hermetic};
+use common::hermetic;
 
 use std::path::Path;
 use std::process::Output;
@@ -50,8 +50,10 @@ async fn start_proxy() -> MockServer {
 /// binary deterministically takes the public-proxy path `--proxy-url`
 /// pins, and no ambient variable can redirect or disable the API). The
 /// scans are unscoped, so an activated venv is scrubbed and the JVM env is
-/// isolated (`jvm_env::isolate_cli`); `HOME` then moves to a sibling of the
-/// fixture repo so no Coursier / Ivy cache exists below it.
+/// isolated (`jvm_env::isolate_cli`). The home pins below must stay after
+/// that call (the last write for a name wins): they replace its shared
+/// stand-in home with siblings of this fixture's repo, so no Coursier, Ivy
+/// or Gradle cache exists below them.
 async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Output {
     let mut args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     args.extend(["--proxy-url".to_string(), proxy_url.to_string()]);
@@ -59,7 +61,7 @@ async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Outp
     let m2_repo = m2_repo.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut cmd = hermetic::command(&binary());
+        let mut cmd = hermetic::binary_command();
         hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
         common::jvm_env::isolate_cli(&mut cmd);
         cmd.args(&arg_refs)
@@ -73,6 +75,7 @@ async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Outp
             .env("USERPROFILE", m2_repo.with_file_name("no-home"))
             .env("XDG_CACHE_HOME", m2_repo.with_file_name("no-xdg-cache"))
             .env("LOCALAPPDATA", m2_repo.with_file_name("no-localappdata"))
+            .env("GRADLE_USER_HOME", m2_repo.with_file_name("no-gradle"))
             .env_remove("M2_HOME")
             .output()
             .expect("Failed to run socket-patch binary")
