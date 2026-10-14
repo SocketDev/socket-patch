@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-14 (run 41), main `a8da202`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23.
+Last updated: 2026-10-14 (run 42), main `015e871`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23.
 
 ## Coverage matrix
 
@@ -387,6 +387,15 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Vendored + Gemfile `lockfile "custom.lock"` / `lockfile false` | pass (refused `gemfile_not_loaded`) |
 | Vendored + `lockfile "Gemfile.lock"` | pass |
 
+### Run 42 (main `015e871`, v5.0.1; Linux Ruby 3.3.6; scratch copies of `gem_hosted_unwind_keeps_a_source_block_bang`, real `bundle install`)
+
+| Cell | 4.1.0.beta2 | 4.0.23 | 2.6.9 | 2.4.22 |
+| --- | --- | --- | --- | --- |
+| Repo gem e2e suites (redirect 51 / stale 42 / vendor 43) | — | pass | — | — |
+| #1531 fix + all 10 source-block unwind shapes → frozen install | pass | pass | pass | pass |
+| #1531 neighbours: `;`-opener inside `group … do`, `source … do end; source … do`, `if true; source … do` | — | pass | — | — |
+| `in_source_block` unit probe, 64 shapes | 63 pass (`self.source` miss, see Known non-bugs) | | | |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -409,11 +418,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. #1531 once it's fixed: `source` after `;` inside a `group … do` block, and two `;`-joined `source … do … end` one-liners.
-2. H→V takeover with the hosted patched archive in `vendor/cache`, then `vendor --revert` / `remove` (no stale-cache check on that path).
-3. Bundler 2.6.9 / 2.4.22 coverage of the #1476 / #1509 / #1531 unwind shapes (`gem install bundler -v <v>` into the system gems; see the run-39 note).
-4. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
-5. Re-run #985 / #1109 (`agent:needs-human`) when fixes merge.
+1. H→V takeover with the hosted patched archive in `vendor/cache`, end to end, then `vendor --revert` / `remove`. Both takeover paths forward `upstream_gem_stale_cache` (`vendor.rs:1958`, `:3270`), so this is lower priority.
+2. Re-run #985 / #1109 (`agent:needs-human`) when fixes merge.
+3. Docker-style `BUNDLE_APP_CONFIG=/usr/local/bundle` + `GEM_HOME=/usr/local/bundle` with a committed project `.bundle/config`: agent `apply` / `vex` and the hosted stale guard.
+4. The gemspec product probe (`vex/product.rs` `parse_gemspec`) on real-world gemspec shapes (`.freeze`, commented-out `name =` lines, `Gem::Specification.new "name", "1.0"`).
+5. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
 
 ## Known non-bugs
 
@@ -533,3 +542,4 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - gemfile(5) lists `BUNDLE_LOCKFILE` env above the Gemfile `lockfile` DSL, but `Dsl#to_definition` lets the DSL win for `install` (4.0.23 changes only `bundle lock`, #9661). socket-patch follows the install order and refuses any DSL lock other than the default one, so the mismatch can't mislead an install (run 41).
 - The vendored `gemfile_not_loaded` message for `lockfile false` reads "bundler reads the lockfile `lockfile false`". That's cosmetic (run 41).
 - Wait loops like `while pgrep -f "cargo test …"` match their own shell and never exit. Wait on an output file instead (run 41 near-miss).
+- `zz = 1; self.source "…" do` isn't seen as a source block by the #1531 fix, which deliberately excludes receiver calls (`x.source`). An explicit `self.` on a Gemfile DSL call is contrived, so it's not filed (run 42).
