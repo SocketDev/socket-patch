@@ -627,8 +627,10 @@ fn project_overrides(project: &Path) -> Vec<(Option<String>, String)> {
     for key in selectors(pkg.get("resolutions")) {
         let mut chain = yarn_selector_segments(&key).into_iter().rev();
         if let Some(target) = chain.next().and_then(target_of) {
-            let parent = chain.next().and_then(target_of).map(str::to_string);
-            out.push((parent, target.to_string()));
+            // `parent/**/target` is scoped under `parent` like
+            // `parent/target`; only a leading `**/` applies everywhere.
+            let parent = chain.find(|s| *s != "**").and_then(target_of);
+            out.push((parent.map(str::to_string), target.to_string()));
         }
     }
     out
@@ -2271,6 +2273,7 @@ mod tests {
             r#"{"overrides":{"lp":{"minimist":"1.2.8","@s/b":"1.0.0"}}}"#,
             r#"{"pnpm":{"overrides":{"minimist@<1":"1.2.8","lp>@s/b@^2":"1.0.0"}}}"#,
             r#"{"resolutions":{"**/minimist":"1.2.8","lp/@s/b":"1.0.0"}}"#,
+            r#"{"resolutions":{"lp/**/minimist":"1.2.8","@s/b":"1.0.0"}}"#,
         ] {
             put("forced/package.json", project);
             assert_eq!(unresolved_npm_dependency(&forced).await, None, "{project}");
@@ -2281,6 +2284,7 @@ mod tests {
             r#"{"overrides":{"minimist-x":"1","@types/minimist":"1","@s/b":"1.0.0"}}"#,
             r#"{"pnpm":{"overrides":{"lp>minimist-x@1":"1","mkdirp>minimist":"1","@s/b":"1"}}}"#,
             r#"{"resolutions":{"lp/@types/minimist@1":"1","mkdirp/minimist":"1","@s/b":"1"}}"#,
+            r#"{"resolutions":{"mkdirp/**/minimist":"1","@s/b":"1"}}"#,
             r#"{"overrides":{"mkdirp":{"minimist":"1.2.8"},"@s/b":"1.0.0"}}"#,
             r#"{"overrides":{"minimist":{"x":"1.0.0"},"@s/b":"1.0.0"}}"#,
             r#"{"overrides":{"minimist":{".":"*"},"@s/b":"1.0.0"}}"#,
