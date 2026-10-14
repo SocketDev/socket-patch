@@ -30,7 +30,6 @@ use serial_test::serial;
 /// scrubs by hand.
 const PENDING_RAW_SPAWNS: &[&str] = &[
     "e2e_hosted_production.rs",
-    "e2e_redirect_cargo_shapes.rs",
     "e2e_vendored_production.rs",
 ];
 
