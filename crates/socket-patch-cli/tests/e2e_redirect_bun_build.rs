@@ -92,7 +92,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -306,11 +306,13 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     run_socket_env(cwd, args, &[])
 }
 
-/// [`run_socket`] with extra env applied after the scrub.
+/// [`run_socket`] with extra env applied after the scrub: the hermetic
+/// `SOCKET_*` environment (`hermetic::command`) plus the bun suites' shared
+/// scrub of every other ambient bun / npm registry setting.
 fn run_socket_env(cwd: &Path, args: &[&str], env: &[(String, String)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.args(args).arg("--no-telemetry").current_dir(cwd);
-    cache_env::scrub_ambient_bun_env(&mut cmd);
+    cache_env::scrub_ambient_bun_tool_env(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }
