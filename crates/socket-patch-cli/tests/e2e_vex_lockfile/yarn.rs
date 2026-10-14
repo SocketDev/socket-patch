@@ -705,6 +705,17 @@ fn hosted_patch_adding_an_uninstalled_dependency_is_omitted() {
         let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
         let cell = format!("{flavor:?} dependency installed");
         assert_attested(cwd, code, &env, UUID, "redirected", &cell);
+
+        // #1538: installed, but outside the range the patched package.json
+        // declares (the old dependency a pre-v5 pin's lock still installs).
+        put(
+            cwd,
+            "node_modules/is-odd/package.json",
+            br#"{"name":"is-odd","version":"2.0.0"}"#,
+        );
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        let cell = format!("{flavor:?} dependency out of range");
+        assert_omitted(cwd, code, &env, "dependency_not_installed", &cell);
     }
     drop(rt);
 }

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::crawlers::Ecosystem;
 use crate::manifest::schema::{PatchManifest, PatchRecord};
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
+use crate::utils::npm_range::npm_range_admits;
 use crate::vendor::state::{lookup_entry, VendorEntry};
 use crate::vendor::verify::{
     is_vlt_dir_entry, verify_vendored_patch_record, vlt_installed_copy_matches,
@@ -509,9 +510,13 @@ fn touches_npm_manifest(record: &PatchRecord) -> bool {
 /// that node cannot resolve from it: no `node_modules/<name>` in the copy
 /// or in any directory above its real path (node's lookup, which also
 /// finds a bundled, hoisted or pnpm/bun store-sibling copy behind a
-/// root-linked symlink). Optional dependencies may be absent, and a copy
-/// outside a `node_modules` tree (a Plug'n'Play install), an unreadable
-/// manifest or a name that is not a safe package name is never evidence.
+/// root-linked symlink), or the nearest such copy's version is outside the
+/// range the manifest declares (a patch that changed a range the lock never
+/// locked installs beside the old dependency, #1538). Optional dependencies
+/// may be absent, and a copy outside a `node_modules` tree (a Plug'n'Play
+/// install), an unreadable manifest, a name that is not a safe package
+/// name, or a range or installed version this reader does not decide is
+/// never evidence.
 async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
     let pkg_path = pkg_path.to_path_buf();
     crate::utils::fs::run_blocking(move || {
@@ -530,22 +535,50 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
             .and_then(serde_json::Value::as_object);
         pkg.get("dependencies")?
             .as_object()?
-            .keys()
-            .filter(|name| optional.is_none_or(|o| !o.contains_key(*name)))
-            .filter(|name| crate::vendor::npm_common::is_safe_npm_name(name))
-            .find(|name| !node_resolves(&real, name))
-            .cloned()
+            .iter()
+            .filter(|(name, _)| optional.is_none_or(|o| !o.contains_key(*name)))
+            .filter(|(name, _)| crate::vendor::npm_common::is_safe_npm_name(name))
+            .find(|(name, spec)| match node_resolve(&real, name) {
+                None => true,
+                Some(copy) => spec
+                    .as_str()
+                    .and_then(declared_npm_range)
+                    .is_some_and(|range| !copy_admitted(&copy, range)),
+            })
+            .map(|(name, _)| name.clone())
     })
     .await
 }
 
-/// Whether node resolves the package `name` from the package directory
-/// `from`: `<dir>/node_modules/<name>` exists for `from` or an ancestor
-/// that is not itself a `node_modules` directory.
-fn node_resolves(from: &Path, name: &str) -> bool {
+/// The copy of the package `name` node resolves from the package directory
+/// `from`: `<dir>/node_modules/<name>` for the nearest of `from` and its
+/// ancestors that is not itself a `node_modules` directory.
+fn node_resolve(from: &Path, name: &str) -> Option<PathBuf> {
     from.ancestors()
         .filter(|dir| dir.file_name().is_none_or(|n| n != "node_modules"))
-        .any(|dir| dir.join("node_modules").join(name).exists())
+        .map(|dir| dir.join("node_modules").join(name))
+        .find(|copy| copy.exists())
+}
+
+/// The registry semver range of a `dependencies` value: the value itself,
+/// or an `npm:<name>@<range>` alias's range. `None` for any other spec (a
+/// path, url, git or workspace dependency, a bare alias).
+fn declared_npm_range(spec: &str) -> Option<&str> {
+    let range = match spec.strip_prefix("npm:") {
+        Some(target) => &target[target.get(1..)?.find('@')? + 2..],
+        None => spec,
+    };
+    (!range.contains([':', '/', '#', '@'])).then_some(range.trim())
+}
+
+/// Whether the installed copy's `package.json` version is in `range`; a
+/// version or range [`npm_range_admits`] does not decide admits it.
+fn copy_admitted(copy: &Path, range: &str) -> bool {
+    let version = crate::utils::fs::read_regular_to_string_sync(&copy.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|pkg| pkg.get("version")?.as_str().map(str::to_string));
+    version.is_none_or(|v| npm_range_admits(range, &v) != Some(false))
 }
 
 /// Whether `rest` (what follows a matched `from` prefix) starts a new name
@@ -2004,6 +2037,91 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// A patch that changes a dependency's range (#1538): the copy node
+    /// resolves (the NEAREST `node_modules/<name>`) must satisfy the range
+    /// the patched `package.json` declares, not merely exist.
+    #[tokio::test]
+    async fn unresolved_npm_dependency_checks_the_declared_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let lp = root.join("node_modules/lp");
+        put(
+            "node_modules/lp/package.json",
+            r#"{"name":"lp","dependencies":{"is-number":"^7.0.0"}}"#,
+        );
+
+        // The old dependency the lock still installs: not the declared range.
+        put(
+            "node_modules/is-number/package.json",
+            r#"{"name":"is-number","version":"6.0.0"}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&lp).await.as_deref(),
+            Some("is-number")
+        );
+        // A nested copy that satisfies it is the one node loads.
+        put(
+            "node_modules/lp/node_modules/is-number/package.json",
+            r#"{"name":"is-number","version":"7.0.0"}"#,
+        );
+        assert_eq!(unresolved_npm_dependency(&lp).await, None);
+        // ...and a nested copy that does not hides a hoisted one that does.
+        put(
+            "node_modules/is-number/package.json",
+            r#"{"name":"is-number","version":"7.1.0"}"#,
+        );
+        put(
+            "node_modules/lp/node_modules/is-number/package.json",
+            r#"{"name":"is-number","version":"6.0.0"}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&lp).await.as_deref(),
+            Some("is-number")
+        );
+
+        // An `npm:` alias is checked against its target's range.
+        let alias = root.join("alias/node_modules/lp");
+        put(
+            "alias/node_modules/lp/package.json",
+            r#"{"name":"lp","dependencies":{"num":"npm:is-number@^7.0.0"}}"#,
+        );
+        put(
+            "alias/node_modules/num/package.json",
+            r#"{"name":"is-number","version":"6.0.0"}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&alias).await.as_deref(),
+            Some("num")
+        );
+        put(
+            "alias/node_modules/num/package.json",
+            r#"{"name":"is-number","version":"7.0.0"}"#,
+        );
+        assert_eq!(unresolved_npm_dependency(&alias).await, None);
+
+        // A range this reader does not decide, a non-registry spec or a
+        // copy without a readable version is never evidence.
+        let other = root.join("other/node_modules/lp");
+        put(
+            "other/node_modules/lp/package.json",
+            r#"{"name":"lp","dependencies":{"a":"latest","b":"file:../b",
+                "c":"github:o/c","d":"^2.0.0"}}"#,
+        );
+        for dep in ["a", "b", "c"] {
+            put(
+                &format!("other/node_modules/{dep}/package.json"),
+                r#"{"version":"1.0.0"}"#,
+            );
+        }
+        put("other/node_modules/d/package.json", r#"{"name":"d"}"#);
+        assert_eq!(unresolved_npm_dependency(&other).await, None);
     }
 
     fn hosted_ctx(purl: &str, copies: HostedCopies) -> VendorContext {
