@@ -1,9 +1,14 @@
-//! Coverage-gap tests for `commands/remove.rs`: the lock-contention
-//! return, the vendor-ledger hard-failure
-//! aborts, the hosted-redirect leg's dry-run / preserve-state / refusal /
-//! failure branches, the drift-keep exclusion arms, the mixed drift-keep
-//! partial failure, and the human-mode output surfaces that were only ever
-//! exercised in JSON mode.
+//! Failure paths of `commands/remove.rs`: the lock-contention return, the
+//! vendor-ledger hard-failure aborts, the hosted-redirect leg's dry-run /
+//! preserve-state / refusal / failure branches, the drift-keep exclusion
+//! arms, the mixed drift-keep partial failure, and the human-mode output
+//! surfaces.
+//!
+//! `--json` tests assert behavior (exit, `error.code`, events, summary
+//! counts, bytes on disk) through `common::envelope`, never message
+//! sentences; where a message must name something, they check that token
+//! (a purl, a flag, a path). Human-mode tests are the render checks: one
+//! assertion per message family (#1089).
 //!
 //! Binary-driven (spawns `CARGO_BIN_EXE_socket-patch` through
 //! `common::run_with_env`, which scrubs the ambient `SOCKET_*` env): every
@@ -16,6 +21,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::common;
+use crate::common::envelope::{
+    event_purls, event_triples, events, parse_json_envelope, warning_codes,
+};
 use crate::vlt_hosted_common;
 use crate::vlt_vendored;
 
@@ -33,23 +41,11 @@ fn read_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-fn parse_envelope(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout)
-        .unwrap_or_else(|e| panic!("stdout must be a JSON envelope: {e}\nstdout:\n{stdout}"))
-}
-
-/// Events carrying the given action and a string purl.
-fn event_purls(v: &serde_json::Value, action: &str) -> Vec<String> {
-    v["events"]
-        .as_array()
-        .map(|events| {
-            events
-                .iter()
-                .filter(|e| e["action"] == action && e["purl"].is_string())
-                .filter_map(|e| e["purl"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Whether `v` has an `action` event for `purl` with `errorCode == code`.
+fn has_event(v: &serde_json::Value, action: &str, code: &str, purl: &str) -> bool {
+    event_triples(v)
+        .iter()
+        .any(|(p, a, c)| p == purl && a == action && c == code)
 }
 
 /// One hand-written camelCase manifest with a single `files: {}` patch —
@@ -284,14 +280,10 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
         code, 1,
         "remove under contention must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["command"], "remove");
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "lock_held", "envelope={v}");
-    assert_eq!(
-        v["error"]["message"], "another socket-patch process is operating in this directory",
-        "lock_held message must be the stable contention string; envelope={v}"
-    );
     assert_eq!(
         v["summary"]["removed"], 0,
         "nothing may be removed while the lock is held; envelope={v}"
@@ -311,7 +303,7 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
         &[],
     );
     assert_eq!(code2, 0, "stdout=\n{stdout2}\nstderr=\n{stderr2}");
-    let v2 = parse_envelope(&stdout2);
+    let v2 = parse_json_envelope(&stdout2);
     assert_eq!(v2["status"], "success");
     assert_eq!(
         event_purls(&v2, "removed"),
@@ -345,7 +337,7 @@ fn remove_corrupt_vendor_ledger_fails_closed_json() {
         code, 1,
         "a corrupt vendor ledger must fail the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(
         v["error"]["code"], "vendor_state_unreadable",
@@ -353,7 +345,7 @@ fn remove_corrupt_vendor_ledger_fails_closed_json() {
     );
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("cannot read .socket/vendor/state.json"),
+        msg.contains(".socket/vendor/state.json"),
         "the error must name the unreadable ledger; got: {msg}"
     );
     assert_eq!(v["summary"]["removed"], 0);
@@ -380,7 +372,9 @@ fn remove_corrupt_vendor_ledger_fails_closed_human() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--offline"], &[]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("Error: Cannot read .socket/vendor/state.json"),
+        stderr
+            .lines()
+            .any(|l| l.starts_with("Error:") && l.contains(".socket/vendor/state.json")),
         "human mode must put the error line on stderr; got:\n{stderr}"
     );
     assert!(
@@ -427,13 +421,13 @@ fn remove_unknown_vendor_flavor_fails_closed_before_manifest_mutation() {
         code, 1,
         "an unrevertable flavor must fail the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "vendor_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("no-such-flavor") && msg.contains("The manifest was not modified."),
-        "the error must name the flavor and promise the manifest is intact; got: {msg}"
+        msg.contains("no-such-flavor"),
+        "the error must name the flavor; got: {msg}"
     );
     assert_eq!(v["summary"]["removed"], 0);
 
@@ -441,7 +435,7 @@ fn remove_unknown_vendor_flavor_fails_closed_before_manifest_mutation() {
     assert_eq!(
         read_bytes(&socket.join("manifest.json")),
         manifest_before,
-        "the manifest was not modified (the error message promises it)"
+        "the manifest must not be modified"
     );
     assert_eq!(
         read_bytes(&ledger_path),
@@ -476,7 +470,7 @@ fn remove_detached_unknown_vendor_flavor_fails_closed() {
     let (code, stdout, stderr) =
         run_remove(tmp.path(), &[purl, "--json", "--yes", "--offline"], &[]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "vendor_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
@@ -564,7 +558,7 @@ fn remove_vendor_state_write_failure_aborts_before_manifest_mutation() {
         code, 1,
         "a failed ledger write must abort the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(
         v["error"]["code"], "vendor_state_write_failed",
@@ -606,7 +600,7 @@ fn remove_detached_vendor_state_write_failure_fails_with_code() {
         run_remove(tmp.path(), &[purl, "--json", "--yes", "--offline"], &[]);
 
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(
         v["error"]["code"], "vendor_state_write_failed",
@@ -692,17 +686,15 @@ fn remove_hosted_dry_run_leaves_lock_untouched() {
         &registry,
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["dryRun"], true);
     assert_eq!(
         v["summary"]["removed"], 0,
         "a preview must not count as a removal; envelope={v}"
     );
-    let events = v["events"].as_array().expect("events array");
+    let events = events(&v);
     assert!(
-        events.iter().any(|e| e["action"] == "verified"
-            && e["purl"] == NPM_PURL
-            && e["errorCode"] == "hosted_reverted"),
+        has_event(&v, "verified", "hosted_reverted", NPM_PURL),
         "the hosted restore preview must be a verified/hosted_reverted event: {events:?}"
     );
     assert!(
@@ -736,18 +728,16 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
     let (code, stdout, stderr) =
         run_remove_online(tmp.path(), &[NPM_PURL, "--json", "--dry-run"], &registry);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["dryRun"], true);
     assert_eq!(
         v["summary"]["verified"], 1,
         "the preview must count the would-be restore; envelope={v}"
     );
     assert_eq!(v["summary"]["removed"], 0);
-    let events = v["events"].as_array().expect("events array");
+    let events = events(&v);
     assert!(
-        events.iter().any(|e| e["action"] == "verified"
-            && e["purl"] == NPM_PURL
-            && e["errorCode"] == "hosted_reverted"),
+        has_event(&v, "verified", "hosted_reverted", NPM_PURL),
         "expected a verified/hosted_reverted preview event: {events:?}"
     );
     assert_eq!(read_bytes(&lock_path), lock_before, "lock byte-identical");
@@ -819,12 +809,9 @@ fn remove_hosted_preserve_state_json_warns_no_preservable_state() {
         &registry,
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
-    let warnings = v["warnings"].as_array().expect("warnings array");
+    let v = parse_json_envelope(&stdout);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w["code"] == "hosted_state_not_preservable"),
+        warning_codes(&v).contains(&"hosted_state_not_preservable".to_string()),
         "expected a hosted_state_not_preservable warning; envelope={v}"
     );
 }
@@ -868,12 +855,9 @@ fn remove_hosted_only_preserve_state_notes_no_preservable_state() {
         !stderr.contains("no preservable local state"),
         "--json keeps the note off stderr; got:\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
-    let warnings = v["warnings"].as_array().expect("warnings array");
+    let v = parse_json_envelope(&stdout);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w["code"] == "hosted_state_not_preservable"),
+        warning_codes(&v).contains(&"hosted_state_not_preservable".to_string()),
         "expected a hosted_state_not_preservable warning; envelope={v}"
     );
     assert_eq!(
@@ -887,11 +871,9 @@ fn remove_hosted_only_preserve_state_notes_no_preservable_state() {
     let (code, stdout, stderr) =
         run_remove_online(tmp.path(), &[NPM_PURL, "--json", "--yes"], &registry);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        !v["warnings"].as_array().is_some_and(|ws| ws
-            .iter()
-            .any(|w| w["code"] == "hosted_state_not_preservable")),
+        !warning_codes(&v).contains(&"hosted_state_not_preservable".to_string()),
         "a plain remove must not warn about preserve-state; envelope={v}"
     );
 }
@@ -921,10 +903,6 @@ fn remove_corrupt_legacy_hosted_ledger_is_ignored_human() {
         !stderr.contains("redirect") && !stderr.contains("ledger"),
         "the pre-v5 ledger is never read, so nothing warns about it; got:\n{stderr}"
     );
-    assert!(
-        stdout.contains("Removed 1 patch from manifest:"),
-        "the removal must still report; got:\n{stdout}"
-    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
             .unwrap();
@@ -952,7 +930,7 @@ fn remove_corrupt_legacy_hosted_ledger_is_ignored_json() {
     let (code, stdout, stderr) =
         run_remove(tmp.path(), &[purl, "--json", "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["removed"], 1, "envelope={v}");
     assert_eq!(event_purls(&v, "removed"), vec![purl]);
@@ -987,7 +965,7 @@ fn remove_hosted_only_skip_rollback_refused() {
         &[],
     );
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "hosted_state_retained", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
@@ -1067,17 +1045,14 @@ fn remove_hosted_revert_failure_fails_closed() {
         code, 1,
         "a refused hosted restore must abort the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("cannot restore pkg:npm/left-pad@1.3.0 to its upstream registry entry")
-            && msg.contains("404")
-            && msg.contains("git checkout -- package-lock.json")
-            && msg.contains("The manifest was not modified."),
-        "the error must name the purl, the cause, the remedy and promise the manifest is \
-         intact; got: {msg}"
+        msg.contains(NPM_PURL) && msg.contains("404") && msg.contains("package-lock.json"),
+        "the error must name the purl, the registry status and the lockfile to restore; \
+         got: {msg}"
     );
     assert_eq!(v["summary"]["removed"], 0);
 
@@ -1099,13 +1074,12 @@ fn remove_hosted_only_revert_failure_fails_closed() {
     let (code, stdout, stderr) =
         run_remove(tmp.path(), &[NPM_PURL, "--json", "--yes", "--offline"], &[]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("cannot restore pkg:npm/left-pad@1.3.0 to its upstream registry entry")
-            && msg.contains("this run is offline"),
+        msg.contains(NPM_PURL) && msg.contains("offline"),
         "the error must name the purl and the offline cause; got: {msg}"
     );
     assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
@@ -1176,13 +1150,13 @@ fn remove_hosted_lockfile_write_failure_fails_closed() {
         run_remove_online(&root, &[NPM_PURL, "--json", "--yes"], &registry);
 
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("writing the restored lockfiles failed"),
-        "the error must name the write failure; got: {msg}"
+        msg.contains("restored lockfiles"),
+        "the error must name the lockfile write as the cause; got: {msg}"
     );
     assert_eq!(
         read_bytes(&socket.join("manifest.json")),
@@ -1219,13 +1193,13 @@ fn remove_hosted_only_lockfile_write_failure_fails_closed() {
         run_remove_online(&root, &[NPM_PURL, "--json", "--yes"], &registry);
 
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("writing the restored lockfiles failed"),
-        "the error must name the write failure; got: {msg}"
+        msg.contains("restored lockfiles"),
+        "the error must name the lockfile write as the cause; got: {msg}"
     );
     assert_eq!(
         read_bytes(&lock_path),
@@ -1285,7 +1259,7 @@ fn remove_mixed_drift_keep_is_partial_failure_json() {
         code, 1,
         "a partially drift-kept remove must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "partialFailure", "envelope={v}");
     assert!(
         v["error"].is_null(),
@@ -1301,11 +1275,9 @@ fn remove_mixed_drift_keep_is_partial_failure_json() {
         vec![MIXED_REMOVED_PURL],
         "the removed event must name the sibling; envelope={v}"
     );
-    let events = v["events"].as_array().expect("events array");
+    let events = events(&v);
     assert!(
-        events.iter().any(|e| e["action"] == "skipped"
-            && e["errorCode"] == "vendor_revert_kept"
-            && e["purl"] == MIXED_KEPT_PURL),
+        has_event(&v, "skipped", "vendor_revert_kept", MIXED_KEPT_PURL),
         "expected a skipped/vendor_revert_kept event for the kept purl: {events:?}"
     );
 
@@ -1347,10 +1319,6 @@ fn remove_mixed_drift_keep_is_partial_failure_human() {
         stderr.contains("re-run `scan --mode vendored`"),
         "the error must carry the normalize remedy; got:\n{stderr}"
     );
-    assert!(
-        stdout.contains("Removed 1 patch from manifest:"),
-        "the partial removal must still report; got:\n{stdout}"
-    );
 }
 
 /// Qualifier-stripped exclusion arm: a drift-kept ledger
@@ -1390,7 +1358,7 @@ fn remove_drift_keep_excludes_sibling_variants_by_stripped_key() {
         code, 1,
         "an all-kept remove is a partial failure; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "partialFailure", "envelope={v}");
     assert_eq!(v["error"]["code"], "vendor_revert_kept", "envelope={v}");
     assert_eq!(v["summary"]["removed"], 0);
@@ -1432,16 +1400,14 @@ fn remove_drift_keep_excludes_manifest_entry_by_base_purl() {
     let (code, stdout, stderr) =
         run_remove(tmp.path(), &[target, "--json", "--yes", "--offline"], &[]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "partialFailure", "envelope={v}");
     assert_eq!(v["error"]["code"], "vendor_revert_kept", "envelope={v}");
     assert_eq!(v["summary"]["removed"], 0);
     // The kept event names the LEDGER key (the base_purl arm matched it).
-    let events = v["events"].as_array().expect("events array");
+    let events = events(&v);
     assert!(
-        events.iter().any(|e| e["action"] == "skipped"
-            && e["errorCode"] == "vendor_revert_kept"
-            && e["purl"] == alias_key),
+        has_event(&v, "skipped", "vendor_revert_kept", alias_key),
         "expected the kept event to carry the ledger key: {events:?}"
     );
     assert_eq!(
@@ -1513,7 +1479,7 @@ fn remove_matches_detached_entry_by_base_purl() {
         code, 0,
         "the decoded identifier must match through basePurl; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["dryRun"], true);
     assert_eq!(
         v["summary"]["verified"], 1,
@@ -1560,7 +1526,7 @@ fn remove_detached_skip_rollback_refused() {
         &[],
     );
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "vendor_state_retained", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
@@ -1671,10 +1637,6 @@ fn remove_already_original_human_prints_count_line() {
         stdout.contains("1 package already in original state"),
         "the already-original count line must print; got:\n{stdout}"
     );
-    assert!(
-        stdout.contains("Removed 1 patch from manifest:"),
-        "the removal must still report; got:\n{stdout}"
-    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
             .unwrap();
@@ -1773,22 +1735,14 @@ fn remove_cleanup_failures_warn_not_fatal() {
         code, 0,
         "cleanup failures must never fail the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    assert!(
-        stdout.contains("Removed 1 patch from manifest:"),
-        "the removal must succeed; got:\n{stdout}"
-    );
-    assert!(
-        stderr.contains("Warning: blob cleanup failed"),
-        "the blob-sweep failure must warn; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Warning: diffs cleanup failed"),
-        "the diffs-sweep failure must warn; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Warning: packages cleanup failed"),
-        "the packages-sweep failure must warn; got:\n{stderr}"
-    );
+    for store in ["blob", "diffs", "packages"] {
+        assert!(
+            stderr
+                .lines()
+                .any(|l| l.starts_with("Warning:") && l.contains(&format!("{store} cleanup"))),
+            "the {store}-sweep failure must warn; got:\n{stderr}"
+        );
+    }
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
             .unwrap();
@@ -1861,7 +1815,7 @@ fn remove_rollback_infrastructure_error_surfaces_rollback_failed() {
         code, 1,
         "a rollback infrastructure error must abort remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "rollback_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
@@ -2015,18 +1969,16 @@ fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
         &[],
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "success", "envelope={v}");
     assert_eq!(
         v["summary"]["removed"], 0,
         "nothing is removed under --preserve-state; envelope={v}"
     );
     assert!(event_purls(&v, "removed").is_empty(), "envelope={v}");
-    let events = v["events"].as_array().expect("events array");
+    let events = events(&v);
     assert!(
-        events.iter().any(|e| e["action"] == "skipped"
-            && e["errorCode"] == "vendor_state_preserved"
-            && e["purl"] == purl),
+        has_event(&v, "skipped", "vendor_state_preserved", purl),
         "expected a skipped/vendor_state_preserved event: {events:?}"
     );
     assert_eq!(
@@ -2108,18 +2060,16 @@ fn remove_detached_drift_keep_holds_ledger_entry_and_exits_one() {
         code, 1,
         "an all-kept remove is a partial failure; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "partialFailure", "envelope={v}");
     assert_eq!(
         v["error"]["code"], "vendor_revert_kept",
         "every match kept → top-level error; envelope={v}"
     );
     assert_eq!(v["summary"]["removed"], 0, "envelope={v}");
-    let events = v["events"].as_array().expect("events array");
+    let events = events(&v);
     assert!(
-        events.iter().any(|e| e["action"] == "skipped"
-            && e["errorCode"] == "vendor_revert_kept"
-            && e["purl"] == purl),
+        has_event(&v, "skipped", "vendor_revert_kept", purl),
         "expected a skipped/vendor_revert_kept event: {events:?}"
     );
     assert!(
@@ -2186,7 +2136,7 @@ fn remove_ledger_only_entry_without_detached_flag_reverts() {
     let (code, stdout, stderr) =
         run_remove(tmp.path(), &[purl, "--json", "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    let v = parse_envelope(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "success", "envelope={v}");
     assert_eq!(
         v["summary"]["removed"], 1,

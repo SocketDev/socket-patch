@@ -64,6 +64,15 @@ pub fn event_triples(envelope: &Value) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// The string `purl` of every `action` event, in order.
+pub fn event_purls(envelope: &Value, action: &str) -> Vec<String> {
+    events(envelope)
+        .iter()
+        .filter(|e| e["action"] == action)
+        .filter_map(|e| e["purl"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// The `errorCode` of every event that has one; empty when `events` is
 /// missing.
 pub fn event_codes(envelope: &Value) -> Vec<String> {
