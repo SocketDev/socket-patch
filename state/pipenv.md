@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-14 ~06:30Z, main `4a29912` (5.0.1). Verified #1507 fixed by #1508 (comma-joined lock keys in the install-over export; 2022.12.19 / 2023.2.4 / 2026.9.1, hosted + vendored). New, all pass: concurrent scans (`lock_held`), SIGKILL-interrupted scans, #1050 GC on `use_pylock` (removed, and pylock-only wiring kept), GC with a named category left, CRLF-lock GC. Previous run: 2026-10-13 ~21:35Z.
+Last run: 2026-10-14 ~21:20Z, main `015e871` (5.0.1, no new tag). Filed #1549 (a non-Socket `file` / `path` / `name @ url` reference in Pipfile.lock or requirements.txt doesn't contest a vendored reference in the other file: check green, false vex `not_affected`, sync UPSTREAM; 2022.12.19 / 2023.12.1 / 2026.9.1). New, all pass: #1524 / #1526 mixed requirements.txt + Pipfile.lock vendored entry (revert, remove, rollback, lock-drift keep with requirements.txt put back, hosted takeover + rollback). Previous run: 2026-10-14 ~06:30Z.
 
 ## Coverage matrix
 
@@ -109,6 +109,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 
 ## Backlog
 
+0000000000000000. #1549: re-verify once fixed (Pipfile.lock `file` URL / `path` wheel and requirements `six @ url` beside the other file's vendored wiring, plus the hosted-pin twin, which is untested). (#1524 / #1526 mixed requirements.txt + Pipfile.lock entry: done 2026-10-14 21:20Z, pass.) Still to do: the mixed entry with a `use_pylock` pylock.toml as the third file; interrupted mixed revert (SIGKILL sweep).
 000000000000000. (#1507 verified fixed on `4a29912`, 2026-10-14.) (Concurrent / interrupted scans and #1050 GC on `use_pylock`: done 2026-10-14, pass.) Still to do: hosted sdist artifact under 2026.9.x `resolver_backend = "pure-python"` (mock needs an sdist route); standalone `vendor` from an agent manifest on a `use_pylock` project (mock needs the blob route); interrupted `vendor --revert` / `rollback`; `pylock_name` GC.
 00000000000000. (#1450 re-verified fixed on `aa85c6c`, 2026-10-13 21:35Z.) (#1437 / #1440 on Pipenv and the #409 diff-version / shadowed / uv-base lanes: done 2026-10-13, pass. 2024.4.1 stray venv/ + VIRTUAL_ENV: done 2026-10-13, pass.)
 0000000000000. #1127 (human `scan --mode vendored --prune` skips the vendored GC when no remaining package has a patch; Pipenv evidence added 2026-10-09 15:40Z): re-verify once fixed, for `[packages]`, named categories and `use_pylock`. Until then, test #1050 GC lanes with `--json --prune`. Still to do: #1050 GC on `use_pylock` / `pylock_name`; vendored undo on 2022 / 2025 after #1245; hosted rollback of a valid hand-written pylock entry.
@@ -139,6 +140,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 
 ## Known non-bugs
 
+- A vendored Pipfile.lock entry whose `file` key was renamed to `path` (same `./.socket/vendor/...` string) isn't drift: revert restores the registry original (`reserialized_around_reference`). Only a reference to a different location is drift-kept (2026-10-14).
 - Harness note (2026-10-14): a batch mock that ignores the requested purls makes a removed-and-pruned package look like a `pypi_pipenv_lock_package_missing` failure (exit 1, partialFailure) that `--dry-run` doesn't show. It's the mock: with purl filtering the same scan exits 0 with `vendor_ledger_entry_unwired`. Filter the batch by `components[].purl`.
 - socket-patch run from a project subdirectory finds nothing ("No packages found"), so it never prints the #1450 remedy there; documented CLI scope (`<cwd>/Pipfile.lock`, use `--cwd`). Pipenv 2026.9.1 exports a vendored wheel as relative `./.socket/vendor/...`, 2022.12 / 2023.2 as an absolute `file://` URL; both work from the project root.
 - Pipenv 2026.9.1 can't install from a UTF-8 BOM-prefixed Pipfile.lock (`No matching distribution found for six====1.16.0`) and renames it to `Pipfile.lock.bak`, even with no socket-patch involved. BOM-lock cells only check that socket-patch preserves the bytes (it does); a failed install afterwards is Pipenv's.
