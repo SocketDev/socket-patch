@@ -588,7 +588,8 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
     // Each open `{`: a hash (counted in `depth`) or a block (a frame).
     let mut braces: Vec<bool> = Vec::new();
     // A `source` call whose block has not opened yet: the number of brace
-    // blocks open around it (a `}` closing one of them ends the call).
+    // blocks open around it (a `}` closing one of them ends the call, and
+    // only a `do` or `{` at that level is its block).
     let mut source_pending: Option<usize> = None;
     // The `source(` call's argument list: (it is open, it has closed or
     // there is none).
@@ -657,7 +658,9 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                 }
                 let expression = || starts_expression(&format!("{lead} {}", &statement[..start]));
                 let (opens, source) = match word {
-                    "source" if depth == 0 && expression() => {
+                    // One in a brace block of an outer call's arguments
+                    // does not replace that call.
+                    "source" if depth == 0 && source_pending.is_none() && expression() => {
                         if let Some(parenthesized) = source_call_args(&statement[end..]) {
                             source_pending = Some(braces.len());
                             source_call = (false, !parenthesized);
@@ -689,7 +692,11 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                     // the one right after `source(…)` is the source's.
                     "{" => {
                         braces.push(false);
-                        (true, closed_source_call && source_pending.take().is_some())
+                        (
+                            true,
+                            closed_source_call
+                                && take_source(&mut source_pending, braces.len() - 1),
+                        )
                     }
                     "}" => {
                         match braces.pop() {
@@ -709,7 +716,7 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                         let opens = !std::mem::take(&mut loop_do);
                         (
                             opens,
-                            opens && depth == 0 && source_pending.take().is_some(),
+                            opens && depth == 0 && take_source(&mut source_pending, braces.len()),
                         )
                     }
                     "if" | "unless" => (expression(), false),
@@ -756,6 +763,12 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
         };
     }
     open
+}
+
+/// Whether the pending `source` call (see [`block_stack`]) sits at brace
+/// level `level`, in which case the block opening there is its block.
+fn take_source(pending: &mut Option<usize>, level: usize) -> bool {
+    pending.take_if(|l| *l == level).is_some()
 }
 
 /// Whether `rest`, what follows the word `source` that starts an
@@ -1995,6 +2008,10 @@ mod tests {
             "if true then source \"https://x\" do",
             "a = [1,\n  2]; source \"https://x\" do",
             "source ENV.fetch(\"S\") { warn \"x\"; \"https://x\" } do",
+            // A `source` call or a `do` block inside the arguments' own
+            // brace block leaves the outer call's `do` its block.
+            "source ENV.fetch(\"S\") { source \"https://y\" } do",
+            "source ENV.fetch(\"S\") { [1].each do |v| v end; \"https://x\" } do",
         ] {
             let close = if opener.ends_with('{') { "}" } else { "end" };
             let t =
