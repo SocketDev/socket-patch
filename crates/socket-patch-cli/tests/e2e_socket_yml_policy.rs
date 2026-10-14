@@ -3,6 +3,8 @@
 //! scanned through the real binary in hosted, agent and vendored mode
 //! against a mock patch API that serves a small catalog.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -403,18 +405,14 @@ impl Repo {
     }
 }
 
-/// Run the binary with ambient `SOCKET_*` scrubbed; `(code, stdout, stderr)`.
+/// Run the binary with the hermetic `SOCKET_*` environment (ambient values
+/// scrubbed, config layer, update check and telemetry forced off);
+/// `(code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).current_dir(cwd);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
+    cmd.env_remove("GIT_CEILING_DIRECTORIES");
     // The fixture's hosted pins name this origin; it makes them recorded.
     cmd.env("SOCKET_PATCH_SERVER_URL", "http://patch.test");
     let absent = cwd.join(".absent-npm-config");

@@ -29,12 +29,9 @@ use serial_test::serial;
 /// children see whatever `SOCKET_*` the ambient shell exports unless the file
 /// scrubs by hand.
 const PENDING_RAW_SPAWNS: &[&str] = &[
-    "apply/apply_network.rs",
     "e2e_hosted_production.rs",
     "e2e_maven.rs",
     "e2e_redirect_cargo_shapes.rs",
-    "e2e_scan.rs",
-    "e2e_socket_yml_policy.rs",
     "e2e_vendored_production.rs",
     "e2e_vex_vendor.rs",
     "rollback/rollback_multicopy_blob_gate.rs",

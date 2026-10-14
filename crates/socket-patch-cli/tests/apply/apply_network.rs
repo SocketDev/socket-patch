@@ -11,12 +11,11 @@
 //!     node_modules and leaves `.socket/` byte-identical.
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic};
 
 const ORG_SLUG: &str = "test-org";
 
@@ -79,7 +78,7 @@ fn run_apply(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String)
     // --api-url/--api-token/--org flags).
     let mut argv: Vec<&str> = vec!["apply", "--json"];
     argv.extend_from_slice(extra);
-    let out = Command::new(binary())
+    let out = hermetic::command(&binary())
         .args(&argv)
         .current_dir(cwd)
         .env("SOCKET_API_URL", api_url)
@@ -323,10 +322,9 @@ async fn apply_dry_run_emits_verified_event_without_writing() {
     std::fs::write(blobs.join(&after_hash), after).unwrap();
 
     // No mock needed — apply finds everything locally.
-    let out = Command::new(binary())
+    let out = hermetic::command(&binary())
         .args(["apply", "--json", "--dry-run", "--offline"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -403,10 +401,9 @@ async fn apply_with_force_overrides_hash_mismatch() {
 
     // Without --force apply should fail (hash mismatch). With --force it
     // should bypass the verification and write the patched content.
-    let out = Command::new(binary())
+    let out = hermetic::command(&binary())
         .args(["apply", "--json", "--offline", "--force"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -467,10 +464,9 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
     // DEFAULT: the mismatch is overwritten with the full verified patched
     // content (the blob is hash-gated to afterHash) and surfaced as a warning event — exit 0.
     let tmp = fixture();
-    let out = Command::new(binary())
+    let out = hermetic::command(&binary())
         .args(["apply", "--json", "--offline"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -500,10 +496,9 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
 
     // The human run logs the warning to stderr.
     let tmp = fixture();
-    let out = Command::new(binary())
+    let out = hermetic::command(&binary())
         .args(["apply", "--offline", "--yes"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -515,10 +510,9 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
 
     // --strict: fail closed — exit 1, failed event, file untouched.
     let tmp = fixture();
-    let out = Command::new(binary())
+    let out = hermetic::command(&binary())
         .args(["apply", "--json", "--offline", "--strict"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -591,15 +585,13 @@ async fn apply_pypi_package_uses_python_crawler() {
     // Run apply restricted to pypi. With the venv staged on disk and the
     // after-blob pre-cached, this must locate the package via the python
     // crawler and patch it — exercising the pypi dispatch branch end to
-    // end, not just "without panicking". `VIRTUAL_ENV` is cleared so an
-    // ambient venv in CI can't redirect discovery away from our `.venv`.
-    let out = Command::new(binary())
-        .args(["apply", "--json", "--offline", "--ecosystems", "pypi"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("VIRTUAL_ENV")
-        .output()
-        .expect("run socket-patch");
+    // end, not just "without panicking". An ambient venv is scrubbed so CI
+    // can't redirect discovery away from our `.venv`.
+    let mut cmd = hermetic::command(&binary());
+    cmd.args(["apply", "--json", "--offline", "--ecosystems", "pypi"])
+        .current_dir(tmp.path());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    let out = cmd.output().expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -655,15 +647,14 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
 
     // No mock server. If apply tries to hit the network, the test will
     // fail (connection refused) — proving the local-blob fast path is
-    // taken when sources are already on disk.
-    let out = Command::new(binary())
+    // taken when sources are already on disk. Both URLs are pinned: with
+    // no token the child takes the public-proxy path.
+    let out = hermetic::command(&binary())
         .args(["apply", "--json"])
         .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env(
-            "SOCKET_API_URL",
-            "http://127.0.0.1:1", // unreachable port — should never be contacted
-        )
+        // Unreachable port: should never be contacted.
+        .env("SOCKET_API_URL", "http://127.0.0.1:1")
+        .env("SOCKET_PROXY_URL", "http://127.0.0.1:1")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -819,19 +810,18 @@ async fn offline_apply_with_token_makes_zero_network_requests() {
     std::fs::create_dir_all(&blobs).expect("create blobs");
     std::fs::write(blobs.join(&after_hash), after).expect("stage blob");
 
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     cmd.args(["apply", "--json", "--offline"])
         .current_dir(tmp.path());
-    // Scrub ambient SOCKET_* (an ambient SOCKET_ORG_SLUG would skip the
-    // auto-resolution and make this test vacuously green), then seed only
-    // what the scenario needs: token set, org absent, both URLs pinned to
-    // the mock so any traffic — API or proxy path — is captured.
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env("SOCKET_API_URL", mock.uri())
+    // The builder scrubs ambient SOCKET_* (an ambient SOCKET_ORG_SLUG would
+    // skip the auto-resolution and make this test vacuously green) and
+    // keeps the config layer off; seed only what the scenario needs: token
+    // set, org absent, both URLs pinned to the mock so any traffic — API or
+    // proxy path — is captured. Telemetry is switched back on (the builder
+    // forces it off) so only `--offline` can keep the telemetry POST away
+    // from the mock.
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0")
+        .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_PROXY_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token-for-test");
     let out = cmd.output().expect("run socket-patch");
