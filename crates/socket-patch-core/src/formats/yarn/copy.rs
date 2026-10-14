@@ -36,7 +36,17 @@ impl CopyRef {
     /// The root-relative file to read for [`CopyRef::identity`]: the tarball
     /// itself, or the directory's `package.json`. `None` for a url, which
     /// names its package in its path.
+    ///
+    /// `None` too for an absolute path: a lock is untrusted input, and an
+    /// absolute spelling can name any file on the machine, or (a Windows
+    /// UNC path) a network share. Such a copy is never read, so its package
+    /// stays unknown (#1516).
     pub(crate) fn read_path(&self) -> Option<String> {
+        if let CopyRef::Tarball(rel) | CopyRef::Directory(rel) | CopyRef::Linked(rel) = self {
+            if crate::utils::relpath::is_anchored(rel) {
+                return None;
+            }
+        }
         match self {
             CopyRef::Tarball(rel) => Some(rel.clone()),
             CopyRef::Directory(dir) | CopyRef::Linked(dir) => Some(if dir.is_empty() {
@@ -93,9 +103,10 @@ impl CopyRef {
 
 /// The copy a classic block installs from its key patterns and `resolved`:
 /// a `file:` path in a key pattern (relative to the root, where yarn 1
-/// writes it), else an http(s) `resolved`. `None` for anything else, or a
-/// `file:` path that leaves the root. The caller decides which blocks are
-/// copies at all ([`super::source::classic_copy_source`]).
+/// writes it, and read there even when it leaves the root: yarn installs
+/// `file:../shared/left-pad` all the same, #1516), else an http(s)
+/// `resolved`. `None` for anything else. The caller decides which blocks
+/// are copies at all ([`super::source::classic_copy_source`]).
 pub(crate) fn classic_copy_ref(patterns: &[String], resolved: Option<&str>) -> Option<CopyRef> {
     let file = patterns.iter().find_map(|p| {
         let (_, range) = split_classic_pattern(p)?;
@@ -104,7 +115,7 @@ pub(crate) fn classic_copy_ref(patterns: &[String], resolved: Option<&str>) -> O
     match file {
         Some(path) => {
             let path = path.split('#').next().unwrap_or_default();
-            let rel = crate::utils::cargo_workspace::normalize_rel("", path)?;
+            let rel = copy_path("", path)?;
             Some(if is_tarball_path(path) {
                 CopyRef::Tarball(rel)
             } else {
@@ -122,8 +133,8 @@ pub(crate) fn classic_copy_ref(patterns: &[String], resolved: Option<&str>) -> O
 /// The copy a berry locator `reference` installs from: a `file:` tarball or
 /// directory, a `portal:` / `link:` directory (each relative to the
 /// workspace its `locator=` binding names), or an http(s) url. `None` for
-/// any other protocol (`npm:`, `workspace:`, `patch:`, `exec:`, git), or a
-/// path that leaves the root.
+/// any other protocol (`npm:`, `workspace:`, `patch:`, `exec:`, git). A
+/// path that leaves the root is still read there ([`copy_path`]).
 pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
     if reference.starts_with("http") {
         return Some(CopyRef::Url(
@@ -153,8 +164,8 @@ pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
 
 /// The root-relative path a berry `file:` / `portal:` / `link:` reference
 /// names: relative to the workspace in its `locator=` binding
-/// (`b@workspace:packages/b`), or to the root when it has none. `None` when
-/// it leaves the root.
+/// (`b@workspace:packages/b`), or to the root when it has none
+/// ([`copy_path`]).
 fn berry_copy_path(reference: &str, path: &str) -> Option<String> {
     let workspace = reference
         .split_once("::")
@@ -171,7 +182,31 @@ fn berry_copy_path(reference: &str, path: &str) -> Option<String> {
     } else {
         workspace
     };
-    crate::utils::cargo_workspace::normalize_rel(&workspace, path)
+    copy_path(&workspace, path)
+}
+
+/// Where a copy's `path`, relative to the root-relative directory `base`,
+/// is read from: normalized and root-relative, keeping one leading `../`
+/// per level it climbs above the root (`../shared/left-pad`), or as
+/// spelled when it is absolute. yarn installs a copy from outside the
+/// project as readily as one inside it, so dropping such a path would
+/// leave the copy unread and its package unattributed (#1516). `None`
+/// only for an empty path.
+fn copy_path(base: &str, path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    if crate::utils::relpath::is_anchored(path) {
+        return Some(path.to_string());
+    }
+    let joined = if base.is_empty() {
+        path.to_string()
+    } else {
+        format!("{base}/{path}")
+    };
+    Some(crate::utils::relpath::normalize_rel_keeping_escapes(
+        &joined,
+    ))
 }
 
 fn parse_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
@@ -181,7 +216,7 @@ fn parse_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
 
 /// `name` of the `package.json` inside an npm tarball.
 fn tarball_manifest_name(bytes: &[u8]) -> Option<String> {
-    let map = crate::patch::package::read_archive_bytes_to_map(bytes).ok()?;
+    let map = crate::patch::package::read_archive_bytes_to_map_any_root(bytes).ok()?;
     manifest_name(map.get("package.json")?)
 }
 
@@ -215,7 +250,42 @@ mod tests {
                 "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz".into()
             ))
         );
-        assert_eq!(classic_copy_ref(&pats(&["lp2@file:../out"]), None), None);
+        // #1516: yarn installs a copy from outside the root all the same,
+        // so it is read there, not dropped.
+        assert_eq!(
+            classic_copy_ref(&pats(&["lp2@file:../ext/lpdir"]), None),
+            Some(CopyRef::Directory("../ext/lpdir".into()))
+        );
+        assert_eq!(
+            classic_copy_ref(
+                &pats(&["lp2@file:../shared/lp.tgz"]),
+                Some("file:../shared/lp.tgz#abc")
+            ),
+            Some(CopyRef::Tarball("../shared/lp.tgz".into()))
+        );
+        let abs = classic_copy_ref(&pats(&["lp2@file:/abs/lpdir"]), None);
+        assert_eq!(abs, Some(CopyRef::Directory("/abs/lpdir".into())));
+        assert_eq!(
+            abs.unwrap().read_path(),
+            None,
+            "an absolute path is never read"
+        );
+    }
+
+    /// #1516: yarn strips a `file:` tarball's first path segment whatever
+    /// its name, so a `git archive --prefix=left-pad-1.3.0/` tarball names
+    /// its package like a `package/` one.
+    #[test]
+    fn tarball_identity_reads_any_root_directory() {
+        let tarball = CopyRef::Tarball("lp.tgz".into());
+        for root in ["package", "left-pad-1.3.0"] {
+            let bytes = crate::vex::discover::testing::npm_tgz_rooted(root, "left-pad", "1.3.0");
+            assert_eq!(
+                tarball.identity("1.3.0", Some(&bytes)),
+                Some(("left-pad".into(), "1.3.0".into())),
+                "{root}/"
+            );
+        }
     }
 
     #[test]
@@ -227,8 +297,8 @@ mod tests {
         );
         assert_eq!(
             berry_copy_ref(&format!("file:../../../lp.tgz#../../../lp.tgz{ws}")),
-            None,
-            "three levels up from packages/b leaves the root"
+            Some(CopyRef::Tarball("../lp.tgz".into())),
+            "three levels up from packages/b leaves the root, and is read there (#1516)"
         );
         assert_eq!(
             berry_copy_ref(&format!("file:../forks/lp.tgz#../forks/lp.tgz{ws}")),

@@ -244,8 +244,14 @@ impl NpmLockBackend for YarnBerryBackend {
             super::yarn_copies::other_name_copies(project_root, &lock_text, name, version).await;
         // The package IS installed, only under other names, and `yarn
         // install` can't re-lock those copies: not "not found" (#939).
-        if scan.target.is_none() && scan.alias_keys.is_empty() && !other_name.is_empty() {
-            let keys: Vec<&str> = other_name.iter().map(|(key, _)| key.as_str()).collect();
+        // Only a copy that says it is `name@version` proves that; an
+        // unreadable one may be another package (#1516).
+        let keys: Vec<&str> = other_name
+            .iter()
+            .filter(|c| c.identified)
+            .map(|c| c.key.as_str())
+            .collect();
+        if scan.target.is_none() && scan.alias_keys.is_empty() && !keys.is_empty() {
             return Err(Box::new(refused(
                 "vendor_lock_entry_not_rewritable",
                 format!(
@@ -257,15 +263,25 @@ impl NpmLockBackend for YarnBerryBackend {
                 ),
             )));
         }
-        for (key, source) in other_name {
+        for copy in other_name {
+            let key = &copy.key;
+            let origin = super::yarn_copies::copy_origin(&copy.source);
             warnings.push(VendorWarning::new(
                 "vendor_copy_unpatched",
-                format!(
-                    "{YARN_LOCK} entry `{key}` installs {name}@{version} under another \
-                     dependency name, from {}; the name-keyed resolutions entry vendoring \
-                     writes never reaches it, so that copy stays UNPATCHED",
-                    super::yarn_copies::copy_origin(&source)
-                ),
+                if copy.identified {
+                    format!(
+                        "{YARN_LOCK} entry `{key}` installs {name}@{version} under another \
+                         dependency name, from {origin}; the name-keyed resolutions entry \
+                         vendoring writes never reaches it, so that copy stays UNPATCHED"
+                    )
+                } else {
+                    format!(
+                        "{YARN_LOCK} entry `{key}` installs version {version} under another \
+                         dependency name, from {origin}, whose package can't be read, so it \
+                         may be {name}@{version}; the name-keyed resolutions entry vendoring \
+                         writes never reaches it, so if it is, that copy stays UNPATCHED"
+                    )
+                },
             ));
         }
         let (target_idx, target_is_ours) = target_gate(&scan, name, version)?;
@@ -730,14 +746,15 @@ pub(crate) async fn preflight_packages(
             let aliased = scan_berry_target(&blocks, &coords.name, &coords.version)
                 .is_ok_and(|scan| !scan.alias_keys.is_empty());
             if !aliased
-                && !super::yarn_copies::other_name_copies(
+                && super::yarn_copies::other_name_copies(
                     project_root,
                     &lock_text,
                     &coords.name,
                     &coords.version,
                 )
                 .await
-                .is_empty()
+                .iter()
+                .any(|c| c.identified)
             {
                 *gate = Err("vendor_lock_entry_not_rewritable");
             }

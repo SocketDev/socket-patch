@@ -127,7 +127,7 @@ impl NpmLockBackend for YarnClassicBackend {
                 only_other_name_copies(o, &blocks, &coords.name, &coords.version, &other_name)
             })?;
         warnings.extend(skipped);
-        warnings.extend(other_name);
+        warnings.extend(other_name.into_iter().map(|(w, _)| w));
         Ok(YarnClassicPlan {
             text,
             candidate_keys,
@@ -384,29 +384,39 @@ fn rewritable_candidates(
 /// (`"lp2@file:./lpdir"`), so which package it is comes from the copy
 /// itself ([`super::yarn_copies::other_name_copies`]). No re-lock of `name`
 /// reaches that copy, so it stays unpatched; the registry blocks are still
-/// wired.
+/// wired. Each warning comes with whether the copy was identified as
+/// `name@version`; one whose package cannot be read is named as a copy it
+/// may be (#1516).
 async fn other_name_copy_warnings(
     project_root: &Path,
     lock_text: &str,
     name: &str,
     version: &str,
-) -> Vec<VendorWarning> {
+) -> Vec<(VendorWarning, bool)> {
     super::yarn_copies::other_name_copies(project_root, lock_text, name, version)
         .await
         .into_iter()
-        .map(|(key, source)| {
-            let code = match source {
+        .map(|copy| {
+            let code = match copy.source {
                 crate::formats::yarn::copy::CopyRef::Directory(_) => "vendor_link_entry_skipped",
                 _ => "vendor_yarn_classic_non_registry_entry_skipped",
             };
-            VendorWarning::new(
-                code,
+            let key = &copy.key;
+            let origin = super::yarn_copies::copy_origin(&copy.source);
+            let detail = if copy.identified {
                 format!(
                     "lock entry `{key}` installs {name}@{version} under another dependency \
-                     name, from {}; vendoring can't rewire it, so this copy stays UNPATCHED",
-                    super::yarn_copies::copy_origin(&source)
-                ),
-            )
+                     name, from {origin}; vendoring can't rewire it, so this copy stays UNPATCHED"
+                )
+            } else {
+                format!(
+                    "lock entry `{key}` installs version {version} under another dependency \
+                     name, from {origin}, whose package can't be read, so it may be \
+                     {name}@{version}; vendoring can't rewire it, so if it is, this copy stays \
+                     UNPATCHED"
+                )
+            };
+            (VendorWarning::new(code, detail), copy.identified)
         })
         .collect()
 }
@@ -423,15 +433,21 @@ fn only_other_name_copies(
     blocks: &[LockBlock],
     name: &str,
     version: &str,
-    other_name: &[VendorWarning],
+    other_name: &[(VendorWarning, bool)],
 ) -> Box<VendorOutcome> {
-    if other_name.is_empty()
+    // Only a copy that says it is `name@version` proves the package is
+    // installed; an unreadable one keeps the "not found" remedy.
+    let details: Vec<&str> = other_name
+        .iter()
+        .filter(|(_, identified)| *identified)
+        .map(|(w, _)| w.detail.as_str())
+        .collect();
+    if details.is_empty()
         || has_own_name_block(blocks, name, version)
         || super::npm_common::refusal_code(&refusal) != "vendor_lock_entry_not_found"
     {
         return refusal;
     }
-    let details: Vec<&str> = other_name.iter().map(|w| w.detail.as_str()).collect();
     Box::new(refused(
         "vendor_lock_entry_not_rewritable",
         format!(
@@ -505,9 +521,10 @@ pub(crate) async fn preflight_packages(
                 continue;
             };
             if !has_own_name_block(&blocks, &coords.name, &coords.version)
-                && !other_name_copy_warnings(project_root, &text, &coords.name, &coords.version)
+                && other_name_copy_warnings(project_root, &text, &coords.name, &coords.version)
                     .await
-                    .is_empty()
+                    .iter()
+                    .any(|(_, identified)| *identified)
             {
                 *gate = Err("vendor_lock_entry_not_rewritable");
             }
@@ -1944,6 +1961,96 @@ wow@^1.0.0:
             assert_eq!(tarball.len(), usize::from(named), "{fork}: {warnings:?}");
             assert!(fx.lock_text().await.contains(extra.trim_start()));
         }
+    }
+
+    /// #1516: renamed copies #1236's reader could not read were taken for
+    /// "not left-pad" and vendoring reported success without naming them,
+    /// while `node_modules/lp2` installed left-pad@1.3.0 unpatched: a
+    /// `file:` directory outside the root, a tarball whose root directory
+    /// is not `package/`, and a non-registry url. Each is named now (the
+    /// url one as a copy it may be). Control: the outside-root directory
+    /// holding another package is not named.
+    #[tokio::test]
+    async fn issue_1516_unread_other_name_copies_are_named() {
+        // A sibling directory of the project, spelled `../<name>/lpdir`
+        // the way yarn records it.
+        let ext = tempfile::tempdir().unwrap();
+        let ext_name = ext
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let extra = format!(
+            "\n\"lp2@file:../{ext_name}/lpdir\":\n  version \"1.3.0\"\n\n\
+             \"lp3@file:./lp.tgz\":\n  version \"1.3.0\"\n  resolved \"file:./lp.tgz#cccc\"\n\n\
+             \"lp4@http://127.0.0.1:8799/lp.tgz\":\n  version \"1.3.0\"\n  \
+             resolved \"http://127.0.0.1:8799/lp.tgz#dddd\"\n"
+        );
+        let lock = format!("{Y2_BEFORE}{extra}");
+        for (fork, named) in [("left-pad", true), ("other-pkg", false)] {
+            let fx = fixture_with_lock(&lock).await;
+            // Same-parent tempdirs: `../<ext_name>` from the root is `ext`.
+            assert_eq!(fx.root().parent(), ext.path().parent());
+            tokio::fs::create_dir_all(ext.path().join("lpdir"))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                ext.path().join("lpdir/package.json"),
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(
+                fx.root().join("lp.tgz"),
+                crate::vex::discover::testing::npm_tgz_rooted("left-pad-1.3.0", fork, "1.3.0"),
+            )
+            .await
+            .unwrap();
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(entry.unwrap().wiring.len(), 1, "the registry block");
+            let count = |code: &str, key: &str| {
+                warnings
+                    .iter()
+                    .filter(|w| w.code == code && w.detail.contains(key))
+                    .count()
+            };
+            assert_eq!(
+                count("vendor_link_entry_skipped", "lp2@"),
+                usize::from(named),
+                "{fork} outside-root dir: {warnings:?}"
+            );
+            assert_eq!(
+                count("vendor_yarn_classic_non_registry_entry_skipped", "lp3@"),
+                usize::from(named),
+                "{fork} left-pad-1.3.0/ tarball: {warnings:?}"
+            );
+            // The url names no package: named as a copy it may be, either way.
+            assert!(
+                warnings.iter().any(|w| {
+                    w.code == "vendor_yarn_classic_non_registry_entry_skipped"
+                        && w.detail.contains("lp4@")
+                        && w.detail.contains("may be left-pad@1.3.0")
+                }),
+                "{fork} url: {warnings:?}"
+            );
+            assert!(fx.lock_text().await.contains(extra.trim_start()));
+        }
+    }
+
+    /// #1516: a copy whose package can't be read is never proof that the
+    /// package is installed, so a lock whose only other-name entry is an
+    /// unreadable url copy keeps the "not found" refusal and its remedy.
+    #[tokio::test]
+    async fn issue_1516_unread_copy_alone_is_not_found() {
+        let lock = "# yarn lockfile v1\n\n\n\"lp4@http://127.0.0.1:8799/lp.tgz\":\n  \
+                    version \"1.3.0\"\n  resolved \"http://127.0.0.1:8799/lp.tgz#dddd\"\n";
+        let fx = fixture_with_lock(lock).await;
+        expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
+        let pre = preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await;
+        assert_eq!(pre, vec![Err("vendor_lock_entry_not_found")]);
     }
 
     /// #1236 (review): when left-pad@1.3.0 is locked ONLY under another

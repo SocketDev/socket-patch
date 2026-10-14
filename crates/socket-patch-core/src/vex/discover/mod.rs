@@ -435,6 +435,21 @@ pub struct UnpatchedCopy {
     pub how: String,
 }
 
+/// A lock entry that installs SOME package at `version` under another
+/// dependency name, from a copy whose package can't be read
+/// ([`Discovery::unidentified_copy`], #1516).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnidentifiedCopy {
+    /// Root-relative lock file.
+    pub file: PathBuf,
+    /// The lock entry's version.
+    pub version: String,
+    /// The lock entry's key, as the lock spells it.
+    pub key: String,
+    /// How that entry installs, completing "lock entry `<key>` …".
+    pub how: String,
+}
+
 /// A ref another lock contests ([`Discovery::contest_across_locks`]): it
 /// was dropped from `refs` and diagnosed [`DIAG_REF_UNATTRIBUTABLE`]. Kept
 /// so a ledger reader can name the contesting lock instead of reporting the
@@ -563,6 +578,10 @@ pub struct Discovery {
     /// Same-lock copies that contest that lock's own refs
     /// ([`Discovery::unpatched_copy`]).
     pub unpatched_copies: Vec<UnpatchedCopy>,
+    /// Same-lock copies whose package can't be read, pending
+    /// [`Discovery::contest_within_locks`] ([`Discovery::unidentified_copy`]);
+    /// always empty once discovery returns (folded into `unpatched_copies`).
+    pub unidentified_copies: Vec<UnidentifiedCopy>,
     /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
     pub unattested: Vec<Unattested>,
     /// Copies no wiring reaches, pending [`Discovery::unattest_unwired_copies`];
@@ -868,12 +887,63 @@ impl Discovery {
         });
     }
 
+    /// A lock entry of `file` that installs a copy of some package at
+    /// `version` whose package can't be read (a non-registry url, a missing
+    /// directory, a tarball with no readable `package.json`). It may be any
+    /// package at that version, so [`Discovery::contest_within_locks`]
+    /// takes it as an unpatched copy of every package `file` wires at
+    /// `version`: vouching for one would rest on a copy nobody read
+    /// (#1516). Matched there, once every extractor has pushed its refs.
+    pub(crate) fn unidentified_copy(&mut self, file: &str, version: &str, key: &str, how: &str) {
+        self.unidentified_copies.push(UnidentifiedCopy {
+            file: PathBuf::from(file),
+            version: version.to_string(),
+            key: key.to_string(),
+            how: how.to_string(),
+        });
+    }
+
+    /// Fold [`Discovery::unidentified_copies`] into `unpatched_copies`: one
+    /// copy per ref of the same file at the same version.
+    fn expand_unidentified_copies(&mut self) {
+        if self.unidentified_copies.is_empty() {
+            return;
+        }
+        let mut wired: BTreeMap<(&Path, &str), BTreeSet<&str>> = BTreeMap::new();
+        for r in &self.refs {
+            if let Some((_, version)) = r.purl.rsplit_once('@') {
+                wired
+                    .entry((r.source_file.as_path(), version))
+                    .or_default()
+                    .insert(r.purl.as_str());
+            }
+        }
+        let mut expanded = Vec::new();
+        for u in &self.unidentified_copies {
+            for purl in wired
+                .get(&(u.file.as_path(), u.version.as_str()))
+                .into_iter()
+                .flatten()
+            {
+                expanded.push(UnpatchedCopy {
+                    purl: purl.to_string(),
+                    file: u.file.clone(),
+                    key: u.key.clone(),
+                    how: u.how.clone(),
+                });
+            }
+        }
+        self.unidentified_copies.clear();
+        self.unpatched_copies.extend(expanded);
+    }
+
     /// Drop every ref whose OWN lock also installs an unpatched copy of the
     /// same `name@version` ([`Discovery::unpatched_copy`]): the build ships
     /// that copy whatever the wiring does, so the ref is diagnosed
     /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted, but
     /// [`Discovery::shadowed`]. Its uuid stays recognized (rule 11).
     fn contest_within_locks(&mut self) {
+        self.expand_unidentified_copies();
         if self.unpatched_copies.is_empty() {
             return;
         }
@@ -2976,6 +3046,12 @@ pub(crate) mod testing {
     /// A minimal npm tarball (`package/package.json` naming
     /// `name@version`) — a user's `file:` tarball copy.
     pub(crate) fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+        npm_tgz_rooted("package", name, version)
+    }
+
+    /// [`npm_tgz`] with the manifest under `root/` instead of `package/`
+    /// (a `git archive --prefix` or GitHub release tarball, #1516).
+    pub(crate) fn npm_tgz_rooted(root: &str, name: &str, version: &str) -> Vec<u8> {
         let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
@@ -2985,8 +3061,12 @@ pub(crate) mod testing {
         header.set_size(manifest.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar.append_data(&mut header, "package/package.json", manifest.as_bytes())
-            .unwrap();
+        tar.append_data(
+            &mut header,
+            format!("{root}/package.json"),
+            manifest.as_bytes(),
+        )
+        .unwrap();
         tar.into_inner().unwrap().finish().unwrap()
     }
 
@@ -3018,14 +3098,26 @@ pub(crate) mod testing {
 
     /// A throwaway project root.
     pub(crate) struct Project {
-        dir: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+        root: PathBuf,
         origins: Vec<String>,
     }
 
     impl Project {
         pub(crate) fn new() -> Self {
+            Self::nested("")
+        }
+
+        /// A project rooted at `sub/` inside the throwaway directory, so a
+        /// fixture can write files beside it (`../ext/…`) without leaving
+        /// the tempdir (#1516).
+        pub(crate) fn nested(sub: &str) -> Self {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let root = dir.path().join(sub);
+            std::fs::create_dir_all(&root).expect("create project root");
             Project {
-                dir: tempfile::tempdir().expect("create tempdir"),
+                _dir: dir,
+                root,
                 origins: Vec::new(),
             }
         }
@@ -3038,7 +3130,7 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn root(&self) -> &Path {
-            self.dir.path()
+            &self.root
         }
 
         /// Write `content` at root-relative `rel`, creating parents.
