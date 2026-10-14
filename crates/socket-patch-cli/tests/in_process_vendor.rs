@@ -3123,6 +3123,133 @@ async fn vendor_json_vex_warnings_ride_in_envelope() {
     );
 }
 
+/// REGRESSION (#1511): vendored npm's half of #1481. Under
+/// `install-strategy=nested` one workspace member's registry copy is
+/// vendored while another member depends on a `file:` directory holding
+/// the same release. npm links that directory in place of a registry
+/// copy, so it stays unpatched: neither the run's `--vex` nor a standalone
+/// `vex` may attest the purl.
+#[tokio::test]
+async fn vendor_npm_file_directory_copy_is_not_attested() {
+    let fx = npm_fixture();
+    // VEX refuses a metadata-less patch, so give it a vulnerability.
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    for (_, patch) in manifest["patches"].as_object_mut().unwrap() {
+        patch["vulnerabilities"] = json!({
+            "GHSA-file-dir-copy": {
+                "cves": ["CVE-2024-15110"],
+                "summary": "file: directory copy fixture",
+                "severity": "high",
+                "description": "d",
+            }
+        });
+    }
+    std::fs::write(
+        fx.manifest_path(),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    // npm 10's nested-workspace lock: `a`'s registry copy, and `b`'s
+    // versionless link to `lpdir`, whose own entry carries the release.
+    let mut lock = fx.lock_value();
+    let packages = lock["packages"].as_object_mut().unwrap();
+    let registry = packages.remove("node_modules/left-pad").unwrap();
+    packages.insert(
+        "".into(),
+        json!({
+            "name": "fixture", "version": "1.0.0", "workspaces": ["packages/*"]
+        }),
+    );
+    packages.insert(
+        "lpdir".into(),
+        json!({ "name": "left-pad", "version": "1.3.0" }),
+    );
+    packages.insert(
+        "node_modules/a".into(),
+        json!({ "resolved": "packages/a", "link": true }),
+    );
+    packages.insert(
+        "node_modules/b".into(),
+        json!({ "resolved": "packages/b", "link": true }),
+    );
+    packages.insert(
+        "packages/a".into(),
+        json!({
+            "name": "a", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" }
+        }),
+    );
+    packages.insert("packages/a/node_modules/left-pad".into(), registry);
+    packages.insert(
+        "packages/b".into(),
+        json!({
+            "name": "b", "version": "1.0.0", "dependencies": { "left-pad": "file:../../lpdir" }
+        }),
+    );
+    packages.insert(
+        "packages/b/node_modules/left-pad".into(),
+        json!({ "resolved": "lpdir", "link": true }),
+    );
+    std::fs::write(fx.lock_path(), serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+    // The installed tree: `a`'s registry copy, `b`'s link target.
+    for dir in ["packages/a/node_modules/left-pad", "lpdir"] {
+        let pkg = fx.root().join(dir);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            br#"{"name":"left-pad","version":"1.3.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
+    }
+
+    let vex_path = fx.root().join("vendored.vex.json");
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &["--vex", vex_path.to_str().expect("vex path is UTF-8")],
+    );
+    let wired = fx.lock_value();
+    assert_eq!(
+        wired["packages"]["packages/a/node_modules/left-pad"]["resolved"],
+        json!(format!("file:{}", rel_tgz())),
+        "the registry copy is still vendored: {env}"
+    );
+    // No document is written when no statement survives, so a missing
+    // file is the expected "attests nothing" outcome.
+    let attested = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|doc| doc.to_string().contains(PURL))
+    };
+    assert!(
+        !attested(&vex_path),
+        "in-run VEX must not attest a purl whose file: directory copy stays unpatched \
+         (exit {code}): {env}"
+    );
+
+    let standalone = fx.root().join("standalone.vex.json");
+    let (_, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "vex",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+            "--output",
+            standalone.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        !attested(&standalone),
+        "standalone vex must not attest it either\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`packages/b/node_modules/left-pad`") && stderr.contains("UNPATCHED"),
+        "the unpatched copy is named\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 12. fail-closed --vendor-source=service refuses --offline
 // ─────────────────────────────────────────────────────────────────────

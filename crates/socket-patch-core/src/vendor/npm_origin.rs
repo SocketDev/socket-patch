@@ -412,6 +412,29 @@ pub(crate) fn npm_non_registry_entries(
     out
 }
 
+/// The `(name, version)` of the source directory an npm `packages` link
+/// entry points at: the entry its `resolved` path names,
+/// by that entry's `name` field, else its folder name, which keeps an
+/// `@scope/` parent as npm's `nameFromFolder` does (npm omits `name` when
+/// they agree). `None` when the lock records no version.
+pub(crate) fn npm_link_source_identity(lock: &Value, link: &Value) -> Option<(String, String)> {
+    let resolved = link.get("resolved")?.as_str()?;
+    let source = lock.get("packages")?.get(resolved)?;
+    let version = source.get("version")?.as_str()?;
+    let name = match source.get("name").and_then(Value::as_str) {
+        Some(name) => name.to_string(),
+        None => {
+            let mut segments = resolved.rsplit('/');
+            let base = segments.next().unwrap_or(resolved);
+            match segments.next() {
+                Some(scope) if scope.starts_with('@') => format!("{scope}/{base}"),
+                _ => base.to_string(),
+            }
+        }
+    };
+    Some((name, version.to_string()))
+}
+
 /// Every `packages` key installed beneath a package that ships its own
 /// `npm-shrinkwrap.json` (the lock marks that ancestor `"hasShrinkwrap":
 /// true`, e.g. `firebase-tools`, `netlify-cli`), mapped to the outermost

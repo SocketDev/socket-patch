@@ -30,7 +30,7 @@ use crate::utils::line_endings::LineEndings;
 use crate::vendor::common::{parse_json_text, JsonLayout};
 use crate::vendor::lock_inventory::{npm_lock_entries, NpmLockEntry, NpmLockSection};
 use crate::vendor::npm_origin::{
-    npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+    npm_link_source_identity, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
 };
 
 mod bun_binary;
@@ -1404,29 +1404,6 @@ impl From<NpmLockEntry<'_>> for NpmLockTarget {
     }
 }
 
-/// The `(name, version)` of the source directory an npm `packages` link
-/// entry (at `pointer`) points at: the entry its `resolved` path names,
-/// by that entry's `name` field, else its folder name, which keeps an
-/// `@scope/` parent as npm's `nameFromFolder` does (npm omits `name` when
-/// they agree). `None` when the lock records no version.
-fn npm_link_source_identity(lock: &Value, pointer: &str) -> Option<(String, String)> {
-    let resolved = lock.pointer(pointer)?.get("resolved")?.as_str()?;
-    let source = lock.get("packages")?.get(resolved)?;
-    let version = source.get("version")?.as_str()?;
-    let name = match source.get("name").and_then(Value::as_str) {
-        Some(name) => name.to_string(),
-        None => {
-            let mut segments = resolved.rsplit('/');
-            let base = segments.next().unwrap_or(resolved);
-            match segments.next() {
-                Some(scope) if scope.starts_with('@') => format!("{scope}/{base}"),
-                _ => base.to_string(),
-            }
-        }
-    };
-    Some((name, version.to_string()))
-}
-
 /// Rewrite a single npm lockfile (`package-lock.json` or `npm-shrinkwrap.json`)
 /// in place. Factored out of `rewrite_npm_lock` so co-present locks each get
 /// the identical override rewrite (see the dual-lock note there).
@@ -1470,7 +1447,10 @@ fn rewrite_one_npm_lock(
         .iter_mut()
         .filter(|t| t.link && t.version.is_none() && non_registry.contains_key(&t.key))
     {
-        if let Some((name, version)) = npm_link_source_identity(&lock, &target.pointer) {
+        if let Some((name, version)) = lock
+            .pointer(&target.pointer)
+            .and_then(|link| npm_link_source_identity(&lock, link))
+        {
             target.name = name;
             target.version = Some(version);
         }
