@@ -479,6 +479,30 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "bun-lockb/negated-workspace": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "bun-lockb/negated-workspace/packages/a": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "bun-lockb/negated-workspace/packages/b": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "bun-lockb/prerelease-pair-0.8.1": {
     "refs": [],
     "diagnostics": [],

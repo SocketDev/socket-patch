@@ -1477,6 +1477,15 @@ mod tests {
                 r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
             );
             std::fs::write(tmp.path().join(name), lock).unwrap();
+            // The verdict comes from the list each lock holds, not from a
+            // lock that failed to read.
+            let listed = bun_workspace_dirs(tmp.path(), name).await;
+            assert_eq!(
+                listed.map(|dirs| dirs.contains(&"packages/b".to_string())),
+                Some(expected.is_some()),
+                "{name} of {} bytes",
+                lock.len()
+            );
             write(tmp.path(), "packages/a/package.json", "{}");
             write(tmp.path(), "packages/b/package.json", "{}");
             let member = tmp.path().join("packages/b");
