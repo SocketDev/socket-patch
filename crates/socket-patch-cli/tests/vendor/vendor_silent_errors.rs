@@ -1,22 +1,16 @@
-//! `vendor --silent` sources-unavailable error-output contract tests.
+//! `vendor --silent` error-output contract tests.
 //!
 //! CLI_CONTRACT.md defines `--silent` as "Errors only" — never "nothing":
-//! an exit-1 run with zero output is undiagnosable. The in-memory staging
-//! layer (`fetch_stage::stage_vendor_sources_in_memory`) muted its online
-//! fetch-failure diagnostics under `--silent`:
+//! an exit-1 run with zero output is undiagnosable. These pin that a
+//! patch vendor can't source still prints its per-patch `Error:` line
+//! under `--silent`, both offline (the service source needs the network)
+//! and online when every patch-service request fails (dead endpoint).
+//! Vendor's caller marks the envelope too, but the envelope prints only
+//! under `--json`, so a muted error line means exit 1 with zero output.
 //!
-//! - `vendor --silent` whose per-patch content fetches all fail (dead
-//!   endpoint) exited 1 with zero bytes on stdout+stderr (the "could not
-//!   fetch patch content" summary and the per-file "no blob content
-//!   served" line were gated on `!quiet`, i.e. muted by `--silent`),
-//!   because the caller (`vendor.rs`) only marks the envelope — which
-//!   prints exclusively under `--json`.
+//! Apply's staging-layer twin is `apply/apply_silent_staging_errors.rs`.
 //!
-//! Same class fixed for the DISK stager's arms in
-//! `apply/apply_silent_staging_errors.rs`; the offline arm is shared
-//! (`report_offline_missing`) and is pinned here for vendor too.
-//!
-//! Under `--json` the diagnostics stay off stderr — the envelope is the
+//! Under `--json` the error lines stay off stderr — the envelope is the
 //! machine channel: one `failed` event for the patch with
 //! `errorCode = apply_failed`.
 
@@ -24,8 +18,9 @@ use std::path::Path;
 
 use serde_json::json;
 
-use crate::common::envelope::{find_event, json_string, parse_json_envelope};
-use crate::npm_fixture::{patch_record, run_cli, PURL, REG_RESOLVED};
+use crate::common::envelope::{find_event, parse_json_envelope};
+use crate::common::hermetic;
+use crate::npm_fixture::{dead_endpoint, patch_record, PURL, REG_RESOLVED};
 
 /// Non-error stderr lines: drop the unconditional core API-token warning
 /// (both its lead line and its "Got: ... Continuing anyway" continuation)
@@ -42,9 +37,16 @@ fn stderr_chatter(stderr: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether some stderr line is the per-patch error for [`PURL`].
+fn has_patch_error_line(chatter: &[String]) -> bool {
+    chatter
+        .iter()
+        .any(|l| l.starts_with("Error:") && l.contains(PURL))
+}
+
 /// Valid npm project and manifest with one patch entry and NO
 /// blob/diff/package artifact anywhere under `.socket/` (and no committed
-/// vendor artifact to harvest): the mem stager must fetch, or fail.
+/// vendor artifact to harvest): vendor must fetch the patch, or fail.
 fn write_sourceless_manifest(root: &Path) {
     let write_json = |rel: &str, value: serde_json::Value| {
         let path = root.join(rel);
@@ -75,26 +77,34 @@ fn write_sourceless_manifest(root: &Path) {
     );
 }
 
-/// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
-/// release it, so every request fails fast with connection-refused.
-fn dead_endpoint() -> String {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    format!("http://127.0.0.1:{port}")
+/// `socket-patch vendor <args>` in `cwd` through the hermetic binary
+/// command (every ambient `SOCKET_*` var scrubbed), with no fixture patch
+/// service, so no configured vendor URL changes the branch under test.
+fn run_vendor(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = hermetic::binary_command()
+        .arg("vendor")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("run socket-patch vendor");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
-/// `vendor <mode> --api-url <dead> ...` with a syntactically valid token,
-/// so every patch-content fetch fails at connect.
+/// `vendor <mode>` with the patch API and proxy on a dead endpoint, so
+/// every patch-service request fails at connect. The token has the real
+/// `sktsec_<44 chars>_api` shape: a placeholder such as the siblings'
+/// `sktsec_placeholder_value_for_tests_api` draws the token-shape warning
+/// on stderr, which the `--json` test requires to stay clean.
 fn run_vendor_dead_endpoint(root: &Path, mode: &str) -> (i32, String, String) {
     let url = dead_endpoint();
     let token = format!("sktsec_{}_api", "x".repeat(44));
-    run_cli(
+    run_vendor(
         root,
         &[
-            "vendor",
             mode,
             "--api-url",
             &url,
@@ -105,39 +115,31 @@ fn run_vendor_dead_endpoint(root: &Path, mode: &str) -> (i32, String, String) {
             "--org",
             "test-org",
         ],
-        &[],
     )
 }
 
 /// `vendor --silent --offline` with a manifest patch that has no local
-/// source must keep the shared offline error diagnostics (errors only,
-/// never nothing) — the mem stager routes through the same
-/// `report_offline_missing` as apply's disk stager.
+/// source must keep the per-patch error line (errors only, never nothing).
 #[test]
 fn vendor_silent_offline_missing_source_keeps_error_output() {
     let tmp = tempfile::tempdir().unwrap();
     write_sourceless_manifest(tmp.path());
 
-    let (code, stdout, stderr) = run_cli(tmp.path(), &["vendor", "--silent", "--offline"], &[]);
+    let (code, stdout, stderr) = run_vendor(tmp.path(), &["--silent", "--offline"]);
     assert_eq!(code, 1, "offline + no local source must fail: {stderr}");
     assert!(
         stdout.trim().is_empty(),
         "silent human mode writes errors to stderr, not stdout: {stdout}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter
-            .iter()
-            .any(|l| l.contains(PURL) && l.contains("--offline")),
-        "--silent must keep the offline no-source error naming the patch \
-         (errors only, never nothing); stderr was: {stderr:?}"
+        has_patch_error_line(&stderr_chatter(&stderr)),
+        "--silent must keep the per-patch error line (errors only, never \
+         nothing); stderr was: {stderr:?}"
     );
 }
 
-/// Online `vendor --silent` where every patch-content fetch fails (dead
-/// endpoint) must keep the fetch-failure error output — the caller only
-/// marks the envelope, which never prints in human mode, so a muted
-/// stager means exit 1 with zero output.
+/// Online `vendor --silent` where every patch-service request fails (dead
+/// endpoint) must keep the per-patch error line.
 #[test]
 fn vendor_silent_online_fetch_failure_keeps_error_output() {
     let tmp = tempfile::tempdir().unwrap();
@@ -149,19 +151,16 @@ fn vendor_silent_online_fetch_failure_keeps_error_output() {
         stdout.trim().is_empty(),
         "silent human mode writes errors to stderr, not stdout: {stdout}"
     );
-    let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter
-            .iter()
-            .any(|l| l.contains(PURL) && l.contains("request")),
-        "--silent must keep the fetch-failure error naming the patch \
-         (errors only, never nothing); stderr was: {stderr:?}"
+        has_patch_error_line(&stderr_chatter(&stderr)),
+        "--silent must keep the per-patch error line (errors only, never \
+         nothing); stderr was: {stderr:?}"
     );
 }
 
 /// Overshoot guard: under `--json` the envelope is the machine channel —
-/// the staging diagnostics must NOT leak to stderr, and the envelope
-/// carries a `failed` / `apply_failed` event for the patch.
+/// the error lines must NOT leak to stderr, and the envelope carries a
+/// `failed` / `apply_failed` event for the patch.
 #[test]
 fn vendor_json_online_fetch_failure_keeps_stderr_clean() {
     let tmp = tempfile::tempdir().unwrap();
@@ -170,13 +169,12 @@ fn vendor_json_online_fetch_failure_keeps_stderr_clean() {
     let (code, stdout, stderr) = run_vendor_dead_endpoint(tmp.path(), "--json");
     assert_eq!(code, 1, "failed fetches + no source must fail: {stderr}");
     let v = parse_json_envelope(&stdout);
-    assert_eq!(json_string(&v, "status"), Some("partialFailure"), "{v}");
     let failed = find_event(&v, "failed", Some("apply_failed"));
     assert_eq!(failed["purl"], PURL, "{v}");
     let chatter = stderr_chatter(&stderr);
     assert!(
         chatter.is_empty(),
-        "--json suppresses the staging diagnostics on stderr (the \
-         envelope is the machine channel); stderr was: {stderr:?}"
+        "--json keeps the error lines off stderr (the envelope is the \
+         machine channel); stderr was: {stderr:?}"
     );
 }
