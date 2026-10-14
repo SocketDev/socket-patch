@@ -251,9 +251,12 @@ pub enum Extra {
     /// Every `BUNDLE_*` var. Bundler lets any `.bundle/config` setting be
     /// overridden by env, and the gem crawler reads `BUNDLE_PATH`,
     /// `BUNDLE_APP_CONFIG` and friends, so an ambient value moves the gem
-    /// store the suite points it at. Seeded with a bogus
-    /// `BUNDLE_APP_CONFIG` and then scrubbed; run it before the suite sets
-    /// its own `BUNDLE_*` values.
+    /// store the suite points it at. Also `RUBYOPT`: under `bundle exec` it
+    /// carries `-rbundler/setup`, which pins every child ruby to the outer
+    /// Gemfile. `GEM_HOME`/`GEM_PATH` are kept on purpose: rvm/chruby
+    /// export them and `bundle` itself resolves through them (see
+    /// `cache_env.rs`). Seeded with a bogus `BUNDLE_APP_CONFIG` and then
+    /// scrubbed; run it before the suite sets its own `BUNDLE_*` values.
     Bundle,
     /// Every `PDM_*` var plus `UV_PROJECT_ENVIRONMENT`: PDM reads any
     /// setting from `PDM_<NAME>`, and its uv backend follows
@@ -271,6 +274,14 @@ pub enum Extra {
     /// no config. Run it before the suite sets its own `COMPOSER_*` values.
     Composer,
 }
+
+/// The [`Extra`] scrubs for a `socket-patch` child that crawls a real
+/// project tree: the binary's own crawlers read `VIRTUAL_ENV`, bundler's
+/// `BUNDLE_PATH`/`BUNDLE_APP_CONFIG`/`BUNDLE_GEMFILE` and Composer's vendor
+/// dir and home, so an ambient value moves discovery (and the installed
+/// evidence `vex` hashes) off the fixture. Any env the test sets after the
+/// scrub still wins.
+pub const CRAWLER_EXTRAS: [Extra; 3] = [Extra::Venv, Extra::Bundle, Extra::Composer];
 
 /// Apply each of `extras` to `cmd` (see [`Extra`]). Run it before
 /// `cache_env::isolate`, which sets some of the same names.
@@ -324,6 +335,7 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                     }
                 }
                 cmd.env_remove("BUNDLE_APP_CONFIG");
+                cmd.env_remove("RUBYOPT");
             }
             Extra::Pdm => {
                 for (key, _) in std::env::vars_os() {

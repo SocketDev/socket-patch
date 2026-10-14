@@ -327,10 +327,13 @@ fn has_corepack_pm(pm: &str) -> bool {
 /// every ambient `SOCKET_*`, seeds those three with hostile values and removes
 /// them (so a dropped scrub reddens the suite instead of leaking a developer's
 /// shell), and forces `SOCKET_NO_CONFIG=1` to block the socket-cli
-/// config.json. An activated venv is scrubbed too.
+/// config.json. The crawler's own ambient inputs are scrubbed too
+/// (`hermetic::CRAWLER_EXTRAS`: an activated venv, `BUNDLE_*`, `COMPOSER_*`),
+/// so an ambient BUNDLE_PATH can't move the gem leg's crawl off
+/// `vendor/bundle`.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = hermetic::binary_command();
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    hermetic::scrub_extra(&mut cmd, &hermetic::CRAWLER_EXTRAS);
     cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     (
@@ -501,34 +504,32 @@ fn vendor_revert(cwd: &Path, leg: &str) -> u64 {
 /// hermetic scrubs, applied before `cache_env::isolate` and the leg's own
 /// env so a leg's pins (the uv legs' `VIRTUAL_ENV`) survive: every ambient
 /// `SOCKET_*` ([`hermetic::scrub_socket_vars`]), an activated venv (uv/pip
-/// would install into the wrong interpreter) and the yarn/pnpm node-linker
-/// overrides. Deliberately not the full `Extra::Yarn` / `Extra::Pnpm`
+/// would install into the wrong interpreter), bundler's `BUNDLE_*` and
+/// `RUBYOPT` ([`hermetic::Extra::Bundle`]; an ambient BUNDLE_PATH or frozen
+/// mode changes what `bundle` installs and where) and the yarn/pnpm
+/// node-linker overrides. Deliberately not the full `Extra::Yarn` / `Extra::Pnpm`
 /// sweeps: those remove every `YARN_*` / `npm_config_*`, including the
 /// proxy and CA settings these live-registry suites need behind a proxy.
 fn pm_command(program: &str) -> Command {
     let mut cmd = Command::new(program);
     hermetic::scrub_socket_vars(&mut cmd);
-    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
     cmd.env_remove("YARN_NODE_LINKER");
     cmd.env_remove("npm_config_node_linker");
     cmd
 }
 
-/// Run `bundle <args>` with the ambient `BUNDLE_*`/`GEM_*`/`RUBYOPT` state
-/// scrubbed first (a developer's global bundler config — frozen mode, a
-/// custom BUNDLE_PATH or gem home, a RUBYOPT require — must not leak into a
-/// leg that hard-asserts bundler outcomes; mirrors e2e_vendor_gem_build.rs).
-/// The cache sandbox re-pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after
-/// the scrub, and the per-leg `env` is applied last so the leg's pins win.
+/// Run `bundle <args>` with the ambient bundler config scrubbed first
+/// ([`hermetic::Extra::Bundle`]: every `BUNDLE_*` and `RUBYOPT`). A
+/// developer's global bundler config (frozen mode, a custom BUNDLE_PATH, a
+/// RUBYOPT require) must not leak into a leg that hard-asserts bundler
+/// outcomes. `GEM_HOME`/`GEM_PATH` stay, since `bundle` resolves through
+/// them under rvm/chruby; every install here pins BUNDLE_PATH. The cache
+/// sandbox re-pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after the scrub,
+/// and the per-leg `env` is applied last so the leg's pins win.
 fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = pm_command("bundle");
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy().into_owned();
-        if key.starts_with("BUNDLE_") || key.starts_with("GEM_") || key == "RUBYOPT" {
-            cmd.env_remove(&k);
-        }
-    }
     cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
