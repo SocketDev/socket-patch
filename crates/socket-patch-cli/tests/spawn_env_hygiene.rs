@@ -8,11 +8,8 @@
 //!   `SOCKET_NO_CONFIG` survived, whether `SOCKET_NO_UPDATE_CHECK` was
 //!   forced, which package-manager vars were swept, case of `npm_config_*`);
 //! * a ratchet over the test tree: no private `scrub_socket_env` copy, and
-//!   no new file that spawns the binary with a bare `Command::new`. The
-//!   `PENDING_RAW_SPAWNS` list below only shrinks — move a file onto
-//!   `hermetic::command` / `common::run*` and delete its entry. (The copy
-//!   check matches that one name; files that still sweep `SOCKET_*` by hand
-//!   under another name are the bare spawns that list tracks.)
+//!   no file that spawns the binary with a bare `Command::new`; every spawn
+//!   goes through `hermetic::command` / `common::run*`.
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
@@ -24,11 +21,6 @@ use std::process::Command;
 
 use hermetic::Extra;
 use serial_test::serial;
-
-/// Files that still spawn the binary with a bare `Command::new`, so their
-/// children see whatever `SOCKET_*` the ambient shell exports unless the file
-/// scrubs by hand.
-const PENDING_RAW_SPAWNS: &[&str] = &["e2e_hosted_production.rs", "e2e_vendored_production.rs"];
 
 /// The environment `cmd`'s child would see: the parent environment with
 /// `cmd`'s explicit sets and removals applied.
@@ -559,27 +551,11 @@ fn no_new_bare_binary_spawns() {
         .filter(|(rel, text)| rel != "spawn_env_hygiene.rs" && has_raw_spawn(text))
         .map(|(rel, _)| rel)
         .collect();
-    let unexpected: Vec<&String> = found
-        .iter()
-        .filter(|f| !PENDING_RAW_SPAWNS.contains(&f.as_str()))
-        .collect();
     assert!(
-        unexpected.is_empty(),
+        found.is_empty(),
         "these test files spawn the binary with a bare Command::new: \
-         {unexpected:?}. Use `hermetic::command(&bin)` / \
+         {found:?}. Use `hermetic::command(&bin)` / \
          `hermetic::binary_command()` or `common::run*` (tests/common/) so the \
-         child gets the hermetic SOCKET_* environment. Do not add them to \
-         PENDING_RAW_SPAWNS."
-    );
-    let stale: Vec<&&str> = PENDING_RAW_SPAWNS
-        .iter()
-        .filter(|f| !found.iter().any(|g| g == *f))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "these files no longer spawn the binary bare: {stale:?}. Delete them \
-         from PENDING_RAW_SPAWNS in \
-         crates/socket-patch-cli/tests/spawn_env_hygiene.rs (another PR may \
-         have migrated them; rebase and drop the entries)."
+         child gets the hermetic SOCKET_* environment."
     );
 }

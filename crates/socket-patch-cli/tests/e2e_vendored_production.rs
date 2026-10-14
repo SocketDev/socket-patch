@@ -102,7 +102,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -323,30 +323,15 @@ fn has_corepack_pm(pm: &str) -> bool {
 /// The scrub is load-bearing. An ambient `SOCKET_PROXY_URL`/`SOCKET_API_URL`
 /// would silently point the run at staging; an ambient `SOCKET_API_TOKEN` (or a
 /// socket-cli login on disk) would move it off the free public proxy this suite
-/// exists to cover. Every ambient `SOCKET_*` is removed (except the config
-/// kill-switch), hostile seeds are planted and then removed on the adjacent
-/// line so a dropped scrub reddens the suite instead of leaking a developer's
-/// shell, and `SOCKET_NO_CONFIG=true` blocks the socket-cli config.json.
+/// exists to cover. The shared builder (`hermetic::binary_command`) removes
+/// every ambient `SOCKET_*`, seeds those three with hostile values and removes
+/// them (so a dropped scrub reddens the suite instead of leaking a developer's
+/// shell), and forces `SOCKET_NO_CONFIG=1` to block the socket-cli
+/// config.json. An activated venv is scrubbed too.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
-    cmd.args(args)
-        .current_dir(cwd)
-        // Seed hostile values, then remove them (adjacent, so deleting a remove
-        // line leaves the seed and breaks the suite rather than passing vacuously).
-        .env("SOCKET_API_TOKEN", "hostile-seed-must-be-scrubbed")
-        .env("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile")
-        .env("SOCKET_API_URL", "http://127.0.0.1:1/hostile")
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_PROXY_URL")
-        .env_remove("SOCKET_API_URL");
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_NO_CONFIG", "true");
+    let mut cmd = hermetic::binary_command();
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -1688,15 +1673,7 @@ fn bun_manifestless_vex_production(
     let vex = |extra: &[&str]| -> (Option<i32>, serde_json::Value, Option<serde_json::Value>) {
         let out_path = checkout.join("out.vex.json");
         let _ = std::fs::remove_file(&out_path);
-        let mut cmd = Command::new(binary());
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(key);
-            }
-        }
-        let out = cmd
-            .env("SOCKET_TELEMETRY_DISABLED", "1")
-            .env("SOCKET_NO_CONFIG", "1")
+        let out = hermetic::binary_command()
             .env("SOCKET_NO_API_TOKEN", "1")
             .current_dir(checkout)
             .args(["vex", "--json", "--output"])
