@@ -435,9 +435,9 @@ pub struct UnpatchedCopy {
     pub how: String,
 }
 
-/// A lock entry that installs SOME package at `version` under another
-/// dependency name, from a copy whose package can't be read
-/// ([`Discovery::unidentified_copy`], #1516).
+/// A lock entry that installs SOME package (at `version`, when known) under
+/// another dependency name, from a copy whose package can't be read
+/// ([`Discovery::unidentified_copy`], #1516, #1540).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnidentifiedCopy {
     /// Root-relative lock file.
@@ -916,36 +916,18 @@ impl Discovery {
     /// copy per ref of the same file at the same version (at any version
     /// for a copy with none).
     fn expand_unidentified_copies(&mut self) {
-        if self.unidentified_copies.is_empty() {
-            return;
-        }
-        let mut wired: BTreeMap<&Path, BTreeMap<&str, BTreeSet<&str>>> = BTreeMap::new();
-        for r in &self.refs {
-            if let Some((_, version)) = r.purl.rsplit_once('@') {
-                wired
-                    .entry(r.source_file.as_path())
-                    .or_default()
-                    .entry(version)
-                    .or_default()
-                    .insert(r.purl.as_str());
-            }
-        }
         let mut expanded = Vec::new();
         for u in &self.unidentified_copies {
-            let by_version = wired.get(u.file.as_path());
-            let purls: BTreeSet<&str> = match &u.version {
-                Some(v) => by_version
-                    .and_then(|m| m.get(v.as_str()))
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .collect(),
-                None => by_version
-                    .into_iter()
-                    .flat_map(|m| m.values().flatten())
-                    .copied()
-                    .collect(),
-            };
+            let purls: BTreeSet<&str> = self
+                .refs
+                .iter()
+                .filter(|r| r.source_file == u.file)
+                .filter(|r| match &u.version {
+                    Some(v) => r.purl.rsplit_once('@').is_some_and(|(_, rv)| rv == v),
+                    None => true,
+                })
+                .map(|r| r.purl.as_str())
+                .collect();
             for purl in purls {
                 expanded.push(UnpatchedCopy {
                     purl: purl.to_string(),

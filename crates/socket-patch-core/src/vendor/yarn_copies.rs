@@ -42,9 +42,9 @@ pub(crate) struct OtherNameCopy {
 /// that version whose package cannot be read is kept, unidentified: it
 /// may hold `name`, and leaving it out would let the scan and `vex` vouch
 /// for a lock that installs it unpatched (#1516). So is a `portal:` /
-/// `link:` copy whose manifest cannot be read (an absolute path is never
-/// read): its version is that manifest's, so it may be `version` too
-/// (#1540).
+/// `link:` copy that is never read (an absolute path): its version is its
+/// manifest's, so it may be `version` too (#1540). One read and found to
+/// hold no versioned package (a `link:` to a plain directory) is left out.
 pub(crate) async fn other_name_copies(
     project_root: &Path,
     lock_text: &str,
@@ -110,6 +110,7 @@ pub(crate) async fn other_name_copies(
         let identified = match copy_identity(&source, &lock_version, bytes).await {
             Some((n, v)) if n == name && v == version => true,
             Some(_) => continue,
+            None if matches!(source, CopyRef::Linked(_)) && !source.is_unread_linked() => continue,
             None => false,
         };
         out.push(OtherNameCopy {
