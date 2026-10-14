@@ -624,17 +624,24 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
         let masked = masked_ruby_code(line, &mut literal);
         heredocs.extend(heredoc_openers(line, &masked));
         let masked = masked.trim();
+        // Whether a statement opens with a `source` call, and how: sets
+        // `source_pending` and `source_call` for it.
+        let begin_statement = |statement: &str, pending: &mut bool, call: &mut (bool, bool)| {
+            let rest = statement.trim_start().strip_prefix("source").unwrap_or("-");
+            *pending = rest.starts_with([' ', '\t', '(']);
+            *call = (false, !rest.starts_with('('));
+        };
         if !continues {
             depth = 0;
             statement_line = line_start;
-            let rest = masked.strip_prefix("source").unwrap_or("-");
-            source_pending = rest.starts_with([' ', '\t', '(']);
-            source_call = (false, !rest.starts_with('('));
+            begin_statement(masked, &mut source_pending, &mut source_call);
         }
         for (n, statement) in masked.split(';').enumerate() {
             let lead = if n == 0 { carried.as_str() } else { "" };
+            // A statement after a top-level `;` starts afresh, and may be
+            // a `source` call of its own (`x = 1; source "…" do`, #1531).
             if n > 0 && depth == 0 {
-                source_pending = false;
+                begin_statement(statement, &mut source_pending, &mut source_call);
             }
             // A `while`/`until`/`for` takes its optional `do` as part of
             // the loop, not as a block of its own.
@@ -1941,6 +1948,47 @@ mod tests {
             assert_eq!(next_manifest.as_deref(), Some(manifest));
             assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
         }
+    }
+
+    #[test]
+    fn source_block_after_semicolon() {
+        // #1531: a `source` statement after a `;` on its line opens a
+        // source block just as a line-leading one does.
+        let at = |text: &str| in_source_block(text, text.find("gem \"rails\"").unwrap());
+        for opener in [
+            "zz = 1; source \"https://x\" do",
+            "zz = 1;source \"https://x\" do",
+            "a = 1; b = 2; source \"https://x\" do",
+            "zz = 1; source(\"https://x\") do",
+            "zz = 1; source(\"https://x\") {",
+            "zz = 1; source(\n  \"https://x\"\n) do",
+            "zz = 1; source \"https://x\",\n  type: :rubygems do",
+            "git_source(:gh) { |r| \"https://github.com/#{r}.git\" }; source \"https://x\" do",
+        ] {
+            let close = if opener.ends_with('{') { "}" } else { "end" };
+            let t =
+                format!("source \"https://rubygems.org\"\n\n{opener}\n  gem \"rails\"\n{close}\n");
+            assert!(at(&t), "{t}");
+            let t = format!(
+                "source \"https://rubygems.org\"\n\n{opener}\n  gem \"a\"\n{close}\ngem \"rails\"\n"
+            );
+            assert!(!at(&t), "{t}");
+        }
+        // Only a statement that begins with `source` is one.
+        for line in [
+            "zz = 1; group :t do",
+            "zz = 1; x.source \"https://x\" do",
+            "zz = 1; sources \"https://x\" do",
+            "foo(1; source \"https://x\") do",
+        ] {
+            let t = format!("{line}\n  gem \"rails\"\nend\n");
+            assert!(!at(&t), "{t}");
+        }
+        // A `;` statement that is not a source call clears a line-leading
+        // `source` without a block.
+        assert!(!at(
+            "source \"https://x\"; group :t do\n  gem \"rails\"\nend\n"
+        ));
     }
 
     #[test]
