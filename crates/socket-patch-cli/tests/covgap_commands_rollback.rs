@@ -2377,7 +2377,7 @@ fn manifest_write_failure_warns_and_exits_one() {
 #[cfg(unix)]
 mod interactive {
     use super::*;
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
     use std::time::Duration;
 
     /// Spawn the binary inside a PTY, send `input`, collect all output —
@@ -2393,32 +2393,13 @@ mod interactive {
             })
             .expect("openpty");
 
-        let mut cmd = CommandBuilder::new(common::binary());
+        // The hermetic environment: SOCKET_YES would skip the very prompt
+        // under test.
+        let mut cmd = common::hermetic::pty_binary_command();
         for a in args {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
-        // Seed-then-scrub the highest-risk vars (SOCKET_YES would skip the
-        // very prompt under test), then prefix-scrub the rest.
-        cmd.env("SOCKET_YES", "true");
-        cmd.env("SOCKET_JSON", "true");
-        cmd.env("SOCKET_DRY_RUN", "true");
-        cmd.env("SOCKET_SILENT", "true");
-        cmd.env_remove("SOCKET_YES");
-        cmd.env_remove("SOCKET_JSON");
-        cmd.env_remove("SOCKET_DRY_RUN");
-        cmd.env_remove("SOCKET_SILENT");
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("SOCKET_")
-                && !name.contains("TELEMETRY")
-                && name != "SOCKET_NO_CONFIG"
-                && name != "SOCKET_NO_UPDATE_CHECK"
-            {
-                cmd.env_remove(&key);
-            }
-        }
-        cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
 
         let mut child = pair
             .slave

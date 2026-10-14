@@ -19,7 +19,7 @@ use crate::common::binary;
 use std::path::Path;
 use std::time::Duration;
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, PtySize};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -104,58 +104,24 @@ fn run_in_pty_inner(
         })
         .expect("openpty");
 
+    // The hermetic environment (`tests/common/hermetic.rs`): an ambient
+    // SOCKET_YES=true would skip the confirm prompt the bare-Enter test
+    // drives, and SOCKET_JSON=true flips select_one onto its
+    // JsonModeNeedsExplicit branch before the dialoguer menu renders. The
+    // `sh` wrapper `exec`s the binary, which inherits the same environment.
     let mut cmd = if sigint == Sigint::Ignored {
-        let mut cmd = CommandBuilder::new("/bin/sh");
+        let mut cmd = common::hermetic::pty_command("/bin/sh");
         cmd.arg("-c");
         cmd.arg("trap '' INT; exec \"$0\" \"$@\"");
         cmd.arg(binary());
         cmd
     } else {
-        CommandBuilder::new(binary())
+        common::hermetic::pty_binary_command()
     };
     for a in args {
         cmd.arg(a);
     }
     cmd.cwd(cwd);
-    // The binary binds a wide `SOCKET_*` env surface. An ambient value
-    // silently reroutes what these tests exercise — SOCKET_YES=true skips
-    // the very confirm prompt the bare-Enter test exists to drive, and
-    // SOCKET_JSON=true flips select_one onto its JsonModeNeedsExplicit
-    // branch before the dialoguer menu ever renders. The highest-risk vars
-    // are seeded with hostile values and then scrubbed — `env_remove`
-    // clears the seed too, so the child never sees it, but if a scrub line
-    // is ever dropped the seed (rather than a developer's ambient shell,
-    // which this suite can't rely on) turns the tests red immediately.
-    cmd.env("SOCKET_YES", "true");
-    cmd.env("SOCKET_JSON", "true");
-    cmd.env("SOCKET_DRY_RUN", "true");
-    cmd.env("SOCKET_SILENT", "true");
-    cmd.env_remove("SOCKET_YES");
-    cmd.env_remove("SOCKET_JSON");
-    cmd.env_remove("SOCKET_DRY_RUN");
-    cmd.env_remove("SOCKET_SILENT");
-    // Prefix-scrub whatever else the ambient shell carries (SOCKET_CWD,
-    // SOCKET_MANIFEST_PATH, SOCKET_API_TOKEN, SOCKET_PROXY_URL — the get
-    // tests pin their API endpoint by flag and must not be rerouted).
-    // Telemetry opt-outs are deliberately kept so an opted-out dev stays
-    // opted out.
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_")
-            && !name.contains("TELEMETRY")
-            && name != "SOCKET_NO_CONFIG"
-            && name != "SOCKET_NO_UPDATE_CHECK"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    // A developer's real `socket login` (the socket-cli config.json token
-    // fallback) must never authenticate a test child.
-    cmd.env("SOCKET_NO_CONFIG", "1");
-    // This suite hands children a REAL terminal, so the update notifier's
-    // stderr-TTY guard does not protect it. Force the kill-switch so no PTY
-    // child ever fetches release metadata mid-prompt.
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
     // `dialoguer`/`console` key handling needs a terminal type; pin one so
     // an unset ambient TERM (bare CI shells) can't skew rendering.
     cmd.env("TERM", "xterm-256color");

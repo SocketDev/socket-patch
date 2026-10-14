@@ -13,8 +13,6 @@
 //! remove_invariants.rs / remove_duality_invariants.rs /
 //! interactive_prompts_e2e.rs.
 
-use crate::common::binary;
-
 use std::path::{Path, PathBuf};
 
 use crate::common;
@@ -1892,7 +1890,7 @@ fn remove_rollback_infrastructure_error_surfaces_rollback_failed() {
 #[cfg(unix)]
 mod pty {
     use super::*;
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
     use std::time::Duration;
 
     /// Spawn the binary inside a PTY, send `input`, collect all output
@@ -1908,26 +1906,13 @@ mod pty {
             })
             .expect("openpty");
 
-        let mut cmd = CommandBuilder::new(binary());
+        // The hermetic environment: SOCKET_YES would skip the very prompt
+        // this test drives.
+        let mut cmd = common::hermetic::pty_binary_command();
         for a in args {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
-        // Scrub the ambient SOCKET_* surface (SOCKET_YES would skip the
-        // very prompt this test drives); keep telemetry opt-outs.
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("SOCKET_")
-                && !name.contains("TELEMETRY")
-                && name != "SOCKET_NO_CONFIG"
-                && name != "SOCKET_NO_UPDATE_CHECK"
-            {
-                cmd.env_remove(&key);
-            }
-        }
-        cmd.env("SOCKET_NO_CONFIG", "1");
-        cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
 
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);

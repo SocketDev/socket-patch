@@ -1581,7 +1581,7 @@ mod pty {
     use super::*;
     use std::time::Duration;
 
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
 
     /// Spawn the binary in a PTY, send `input`, and collect all output
     /// until exit (the `interactive_prompts_e2e.rs` harness pattern:
@@ -1611,37 +1611,16 @@ mod pty {
             })
             .expect("openpty");
 
-        let mut cmd = CommandBuilder::new(binary());
+        // The hermetic environment (`tests/common/hermetic.rs`), which also
+        // forces the update notifier off: this child gets a REAL terminal,
+        // so the stderr-TTY guard does not protect it.
+        let mut cmd = common::hermetic::pty_binary_command();
         for a in args {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
         // These tests assert VT rendering, even when the parent has TERM=dumb.
         cmd.env("TERM", "xterm-256color");
-        // Scrub the flag-bound SOCKET_* surface so ambient configuration
-        // cannot reroute the run; keep telemetry disabled and the
-        // update notifier off — this child gets a REAL terminal, so the
-        // stderr-TTY guard does not protect it.
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("SOCKET_") {
-                cmd.env_remove(&key);
-            }
-        }
-        // In-process tests in this binary `std::env::set_var` these via
-        // `apply_env_toggles`; one set by a parallel test between the scan
-        // above and the spawn would be inherited, so remove them
-        // unconditionally (see in_process_vendor.rs `run_cli`).
-        for key in [
-            "SOCKET_OFFLINE",
-            "SOCKET_DEBUG",
-            "SOCKET_API_URL",
-            "SOCKET_PROXY_URL",
-        ] {
-            cmd.env_remove(key);
-        }
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-        cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
         for (k, v) in env {
             cmd.env(k, v);
         }

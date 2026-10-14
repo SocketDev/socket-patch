@@ -11,6 +11,8 @@
 //!
 //! [`command`] (and [`binary_command`] for the built binary) is the only way
 //! a test spawns `socket-patch`; `common::run_bin_with_env` is built on it.
+//! PTY suites use [`pty_command`] / [`pty_binary_command`], which carry the
+//! same environment onto a `portable_pty::CommandBuilder`.
 //! Package-manager children the same tests spawn get [`scrub_socket_vars`]
 //! plus whichever [`Extra`] scrubs their tool needs.
 //!
@@ -40,6 +42,8 @@ pub const HOSTILE_SEEDS: &[(&str, &str)] = &[
     ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
     ("SOCKET_DRY_RUN", "true"),
     ("SOCKET_SAVE_ONLY", "true"),
+    // Skips every confirm prompt the PTY suites exist to drive.
+    ("SOCKET_YES", "true"),
     ("SOCKET_ECOSYSTEMS", "cargo"),
     ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
     ("SOCKET_JSON", "true"),
@@ -131,21 +135,62 @@ pub fn tool_command(name: &str) -> Command {
     )
 }
 
+/// [`command`] for a PTY child: the same hermetic environment on a
+/// `portable_pty::CommandBuilder` for `program`. The PTY suites hand the
+/// binary a real terminal, so they can't use `std::process::Command`;
+/// before this they each hand-rolled a scrub, and the copies drifted (one
+/// stripped the opt-outs, several didn't force them, none removed the
+/// flag-bound vars by name). `program` is usually the binary, or a shell
+/// that `exec`s it, which inherits the same environment.
+///
+/// The builder's environment is replaced outright with what [`command`]'s
+/// child would see. The copy here and [`command`]'s own sweep each read the
+/// process environment, so a var a parallel in-process test clears between
+/// the two reads would survive the plan; the copy is swept once more with
+/// the same rule. Callers add args, cwd and env
+/// afterwards, as with [`command`].
+pub fn pty_command(program: impl AsRef<std::ffi::OsStr>) -> portable_pty::CommandBuilder {
+    let program = program.as_ref();
+    let mut env: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+    for (key, value) in command(Path::new(program)).get_envs() {
+        match value {
+            Some(value) => env.insert(key.to_owned(), value.to_owned()),
+            None => env.remove(key),
+        };
+    }
+    env.retain(|key, _| !is_scrubbed_socket_var(key));
+    let mut pty = portable_pty::CommandBuilder::new(program);
+    pty.env_clear();
+    for (key, value) in env {
+        pty.env(key, value);
+    }
+    pty
+}
+
+/// [`pty_command`] for the `socket-patch` binary cargo built for this run.
+pub fn pty_binary_command() -> portable_pty::CommandBuilder {
+    pty_command(env!("CARGO_BIN_EXE_socket-patch"))
+}
+
 /// Remove every ambient `SOCKET_*` var from `cmd`, except the telemetry
 /// opt-outs (an opted-out developer stays opted out), `SOCKET_NO_CONFIG`
 /// and `SOCKET_NO_UPDATE_CHECK`. [`command`] runs this; package-manager
 /// children call it directly.
 pub fn scrub_socket_vars(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_")
-            && !name.contains("TELEMETRY")
-            && name != "SOCKET_NO_CONFIG"
-            && name != "SOCKET_NO_UPDATE_CHECK"
-        {
+        if is_scrubbed_socket_var(&key) {
             cmd.env_remove(&key);
         }
     }
+}
+
+/// Whether [`scrub_socket_vars`] removes the var `key`.
+fn is_scrubbed_socket_var(key: &std::ffi::OsStr) -> bool {
+    let name = key.to_string_lossy();
+    name.starts_with("SOCKET_")
+        && !name.contains("TELEMETRY")
+        && name != "SOCKET_NO_CONFIG"
+        && name != "SOCKET_NO_UPDATE_CHECK"
 }
 
 /// The in-process half, for test binaries that only parse argv with clap:
