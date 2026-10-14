@@ -1,5 +1,5 @@
-//! The offline npm fixture and runners `vendor_failure_paths.rs` and
-//! `vendor_render.rs` share: a self-contained npm project with a staged
+//! The offline npm fixture and runners `vendor_failure_paths.rs`,
+//! `vendor_render.rs` and `vendor_silent_errors.rs` share: a self-contained npm project with a staged
 //! patch blob, driven either in-process (`vendor_run`) or through the built
 //! binary with a scrubbed child environment (`run_cli` / `vendor_cli`). No
 //! test mutates this process's environment.
@@ -220,6 +220,17 @@ pub(crate) fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
         panic!("vendor --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
     });
     (code, env)
+}
+
+/// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
+/// release it, so every request fails fast with connection-refused.
+pub(crate) fn dead_endpoint() -> String {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    format!("http://127.0.0.1:{port}")
 }
 
 /// A synthetic ledger with one entry of `eco` for [`PURL`], written via the

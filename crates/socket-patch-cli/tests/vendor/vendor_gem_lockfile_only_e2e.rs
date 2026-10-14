@@ -1,6 +1,7 @@
 //! Service vendoring of portable gems without a local install or registry fetch.
 
 use crate::common::{binary, git_sha256, hermetic};
+use crate::npm_fixture::dead_endpoint;
 
 use std::path::Path;
 
@@ -159,17 +160,6 @@ fn run_vendor(root: &Path, source: &str, api_url: &str) -> (i32, serde_json::Val
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("vendor --json must emit JSON: {e}\n{stdout}\n{stderr}"));
     (out.status.code().unwrap_or(-1), v, stderr)
-}
-
-/// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
-/// release it, so every request fails fast with connection-refused.
-fn dead_endpoint() -> String {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    format!("http://127.0.0.1:{port}")
 }
 
 fn failed_event(v: &serde_json::Value) -> &serde_json::Value {

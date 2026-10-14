@@ -18,7 +18,8 @@
 //! Under `--json` both diagnostics stay off stderr — the envelope is the
 //! machine channel, and `apply_invariants.rs` pins its exact shape for
 //! this path (partialFailure, empty events, NO top-level error record —
-//! deliberately distinct from vendor's `no_local_source` hard error).
+//! unlike vendor, which records a `failed` / `apply_failed` event for the
+//! patch; see `vendor/vendor_silent_errors.rs`).
 
 use std::path::Path;
 

@@ -20,21 +20,11 @@
 //! guaranteed-dead local endpoint, and patch staging reads `.socket/blobs`.
 
 use crate::common::{binary, git_sha256, hermetic};
+use crate::npm_fixture::dead_endpoint;
 
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
-
-/// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
-/// release it, so every request fails fast with connection-refused.
-fn dead_endpoint() -> String {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    format!("http://127.0.0.1:{port}")
-}
 
 /// `.socket/manifest.json` with one patch and its after-blob.
 fn write_manifest(root: &Path, purl: &str, uuid: &str, file: &str, before: &[u8], after: &[u8]) {
