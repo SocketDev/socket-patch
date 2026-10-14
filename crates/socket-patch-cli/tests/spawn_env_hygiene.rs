@@ -285,20 +285,19 @@ fn command_drops_flag_bound_vars_set_after_it_is_built() {
     );
 }
 
-/// The `SOCKET_*` part of the environment a PTY child would see.
-fn pty_socket_env(cmd: &portable_pty::CommandBuilder) -> BTreeMap<String, String> {
+/// The environment a PTY child would see.
+fn pty_env(cmd: &portable_pty::CommandBuilder) -> BTreeMap<String, String> {
     cmd.iter_full_env_as_str()
-        .filter(|(k, _)| k.starts_with("SOCKET_"))
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect()
 }
 
 /// The PTY suites used to hand-roll their scrubs, and the copies drifted.
-/// `pty_command` must give a PTY child exactly the `SOCKET_*` environment
-/// `command` gives a piped one, whatever the ambient shell holds.
+/// `pty_command` must give a PTY child exactly the environment `command`
+/// gives a piped one, whatever the ambient shell holds.
 #[test]
 #[serial]
-fn pty_command_carries_the_same_socket_env_as_command() {
+fn pty_command_carries_the_same_env_as_command() {
     with_ambient(
         &[
             ("SOCKET_YES", "true"),
@@ -316,11 +315,11 @@ fn pty_command_carries_the_same_socket_env_as_command() {
                 effective_env(&hermetic::command(Path::new("socket-patch")))
                     .into_iter()
                     .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-                    .filter(|(k, _)| k.starts_with("SOCKET_"))
                     .collect();
-            let pty = pty_socket_env(&hermetic::pty_command("socket-patch"));
+            let pty = pty_env(&hermetic::pty_command("socket-patch"));
             assert_eq!(pty, piped);
             assert_eq!(pty.get("SOCKET_YES"), None);
+            assert_eq!(pty.get("SOCKET_SOME_FUTURE_FLAG"), None);
             assert_eq!(
                 pty.get("SOCKET_NO_UPDATE_CHECK").map(String::as_str),
                 Some("1")
@@ -337,7 +336,7 @@ fn pty_command_carries_the_same_socket_env_as_command() {
 #[serial]
 fn pty_command_never_leaks_its_hostile_seeds_and_keeps_caller_env() {
     let mut cmd = hermetic::pty_binary_command();
-    let env = pty_socket_env(&cmd);
+    let env = pty_env(&cmd);
     for (key, _) in hermetic::HOSTILE_SEEDS {
         assert_eq!(env.get(*key), None, "{key} seed must be scrubbed");
     }
