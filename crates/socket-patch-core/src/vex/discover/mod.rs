@@ -317,7 +317,8 @@ impl ClassicPinnedBlock {
     /// maps the patched package's `package.json` (`pkg`) declares, each
     /// one locked.
     pub fn installs_dependencies_of(&self, pkg: &serde_json::Value) -> bool {
-        self.sub_maps_locked && crate::formats::yarn::classic_deps::dep_maps_match(&self.lines, pkg)
+        self.sub_maps_locked
+            && crate::formats::yarn::classic_deps::dep_maps_declare(&self.lines, pkg)
     }
 }
 

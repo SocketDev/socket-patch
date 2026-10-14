@@ -749,15 +749,8 @@ fn hosted_classic_lock_only_checks_the_pinned_dependency_maps() {
         "beforeHash": compute_git_sha256_from_bytes(pristine.as_bytes()),
         "afterHash": after_hash,
     });
-    let (rt, server) = serve_patch_views(vec![(UUID, view)]);
-    let (rt_no_blob, server_no_blob) = serve_patch_views(vec![(UUID, {
-        let mut v = patch_view(UUID, PURL);
-        v["files"][MANIFEST] = serde_json::json!({
-            "beforeHash": compute_git_sha256_from_bytes(pristine.as_bytes()),
-            "afterHash": after_hash,
-        });
-        v
-    })]);
+    let (rt, server) = serve_patch_views(vec![(UUID, view.clone())]);
+    let (rt_no_blob, server_no_blob) = serve_patch_views(vec![(UUID, view.clone())]);
     rt.block_on(
         Mock::given(method("GET"))
             .and(path(format!("/patch/blob/{after_hash}")))

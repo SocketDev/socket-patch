@@ -16,14 +16,14 @@
 //! * `--json` (requires `--output`): VEX JSON to file, envelope JSON
 //!   to stdout. This is the CI integration shape.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use clap::Args;
 use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
-use socket_patch_core::vex::verify::DEPENDENCY_NOT_INSTALLED;
+use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
 use socket_patch_core::vex::{
     build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
     VerifyOutcome,
@@ -565,13 +565,12 @@ async fn yarn_classic_lock_dependency_gaps(
             .flat_map(|wiring| &wiring.refs)
             .filter_map(|r| r.yarn_classic_block.as_ref())
             .collect();
-        let Some(after_hash) = plan.view.patches.get(*purl).and_then(|record| {
-            record
-                .files
-                .iter()
-                .find(|(key, _)| key.strip_prefix("package/").unwrap_or(key) == "package.json")
-                .map(|(_, info)| info.after_hash.as_str())
-        }) else {
+        let Some(after_hash) = plan
+            .view
+            .patches
+            .get(*purl)
+            .and_then(npm_manifest_after_hash)
+        else {
             continue;
         };
         if blocks.is_empty() {
@@ -610,17 +609,26 @@ async fn patched_blob(
     after_hash: &str,
 ) -> Option<Vec<u8>> {
     use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+    // A record's hash names a file in the blob store: never a path.
+    if after_hash.len() != 64 || !after_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let intact = |bytes: &Vec<u8>| {
         bytes.len() <= MAX_PATCHED_MANIFEST_BYTES
             && compute_git_sha256_from_bytes(bytes).eq_ignore_ascii_case(after_hash)
     };
-    let local = common.cwd.join(".socket/blobs").join(after_hash);
-    if let Some(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&local)
+    let local = common.socket_dir().join("blobs").join(after_hash);
+    let small = tokio::fs::metadata(&local)
         .await
-        .ok()
-        .filter(intact)
-    {
-        return Some(bytes);
+        .is_ok_and(|meta| meta.len() <= MAX_PATCHED_MANIFEST_BYTES as u64);
+    if small {
+        if let Some(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&local)
+            .await
+            .ok()
+            .filter(intact)
+        {
+            return Some(bytes);
+        }
     }
     if common.offline {
         return None;
@@ -842,26 +850,26 @@ async fn generate_vex(
         };
         let hidden =
             |purl: &str| purl.starts_with("pkg:npm/") && (npm_store_hidden || pnp_unconsumed(purl));
-        let excusable = |f: &FailedPatch| {
-            f.reason == "package_not_found"
-                && plan.lockfile_basis.contains(&f.purl)
-                && !mirror_refused(&f.purl)
-                && crawled(&f.purl)
-                && !hidden(&f.purl)
-        };
-        // A yarn classic pin attests from the lock only when the lock
-        // installs the patched package's dependencies with it (#1538).
-        let excusable_purls: Vec<&str> = outcome
+        let excusable: HashSet<String> = outcome
             .failed
             .iter()
-            .filter(|f| excusable(f))
-            .map(|f| f.purl.as_str())
+            .filter(|f| {
+                f.reason == "package_not_found"
+                    && plan.lockfile_basis.contains(&f.purl)
+                    && !mirror_refused(&f.purl)
+                    && crawled(&f.purl)
+                    && !hidden(&f.purl)
+            })
+            .map(|f| f.purl.clone())
             .collect();
+        // A yarn classic pin attests from the lock only when the lock
+        // installs the patched package's dependencies with it (#1538).
+        let excusable_purls: Vec<&str> = excusable.iter().map(String::as_str).collect();
         let dependency_gaps =
             yarn_classic_lock_dependency_gaps(common, params, &plan, &excusable_purls).await;
         let mut lockfile_attested = Vec::new();
         outcome.failed.retain_mut(|f| {
-            if !excusable(f) {
+            if f.reason != "package_not_found" || !excusable.contains(&f.purl) {
                 return true;
             }
             if let Some(gap) = dependency_gaps.get(&f.purl) {
