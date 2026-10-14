@@ -543,7 +543,8 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
         let real = std::fs::canonicalize(&pkg_path).ok()?;
         let map = |field: &str| pkg.get(field).and_then(serde_json::Value::as_object);
         let optional = map("optionalDependencies");
-        let forced = project_forced_names(&project);
+        let overrides = project_overrides(&project);
+        let owner = pkg.get("name").and_then(serde_json::Value::as_str);
         let required = map("dependencies")
             .into_iter()
             .flatten()
@@ -555,7 +556,7 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
             .filter(|((name, _), _)| crate::vendor::npm_common::is_safe_npm_name(name))
             .find(|((name, spec), optional)| match node_resolve(&real, name) {
                 None => !optional,
-                Some(_) if forced.iter().any(|key| forces(key, name)) => false,
+                Some(_) if forces(&overrides, owner, name) => false,
                 Some(copy) => spec
                     .as_str()
                     .and_then(declared_npm_range)
@@ -566,24 +567,35 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
     .await
 }
 
-/// The keys of the version overrides the project's own `package.json`
-/// declares: npm `overrides`, pnpm `pnpm.overrides` and yarn
-/// `resolutions`, each forcing a version (not `*` or empty). A nested npm
-/// override's parent key only scopes the overrides under it, so it counts
-/// only when its `"."` entry forces the parent itself.
-fn project_forced_names(project: &Path) -> Vec<String> {
-    fn keys(value: &serde_json::Value, out: &mut Vec<String>) {
+/// The version overrides the project's own `package.json` declares, as
+/// `(parent, target)` package names: npm `overrides`, pnpm
+/// `pnpm.overrides` and yarn `resolutions`, each forcing a version (not
+/// `*` or empty). `parent` is the package an override is scoped under
+/// (npm nesting, pnpm `parent>target`, yarn `parent/target`), `None` for
+/// one that applies wherever the target installs (`target`, `**/target`).
+/// A nested npm override's parent is itself forced only by its `"."`.
+fn project_overrides(project: &Path) -> Vec<(Option<String>, String)> {
+    use crate::formats::yarn::patterns::resolution_selector_target as target_of;
+    // `*` and an empty value keep the declared range; `$name` pins the
+    // root's own spec, which is still the user's choice.
+    fn pins(value: &serde_json::Value) -> bool {
+        value
+            .as_str()
+            .is_some_and(|v| !matches!(v.trim(), "" | "*"))
+    }
+    fn npm(
+        value: &serde_json::Value,
+        parent: Option<&str>,
+        out: &mut Vec<(Option<String>, String)>,
+    ) {
         for (key, nested) in value.as_object().into_iter().flatten() {
-            if key == "." {
+            let Some(name) = (key != ".").then(|| target_of(key)).flatten() else {
                 continue;
-            }
-            // `*` and an empty value keep the declared range; `$name`
-            // pins the root's own spec, which is still the user's choice.
-            let pins = |v: &serde_json::Value| v.as_str().is_some_and(|v| !matches!(v, "" | "*"));
+            };
             if pins(nested) || nested.get(".").is_some_and(pins) {
-                out.push(key.clone());
+                out.push((parent.map(str::to_string), name.to_string()));
             }
-            keys(nested, out);
+            npm(nested, Some(name), out);
         }
     }
     let mut out = Vec::new();
@@ -593,25 +605,57 @@ fn project_forced_names(project: &Path) -> Vec<String> {
     else {
         return out;
     };
-    for value in [
-        pkg.get("overrides"),
-        pkg.get("resolutions"),
-        pkg.pointer("/pnpm/overrides"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        keys(value, &mut out);
+    if let Some(overrides) = pkg.get("overrides") {
+        npm(overrides, None, &mut out);
+    }
+    let selectors = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, v)| pins(v))
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<String>>()
+    };
+    for key in selectors(pkg.pointer("/pnpm/overrides")) {
+        let mut chain = key.rsplit('>');
+        if let Some(target) = chain.next().and_then(target_of) {
+            let parent = chain.next().and_then(target_of).map(str::to_string);
+            out.push((parent, target.to_string()));
+        }
+    }
+    for key in selectors(pkg.get("resolutions")) {
+        let mut chain = yarn_selector_segments(&key).into_iter().rev();
+        if let Some(target) = chain.next().and_then(target_of) {
+            let parent = chain.next().and_then(target_of).map(str::to_string);
+            out.push((parent, target.to_string()));
+        }
     }
     out
 }
 
-/// Whether the override key `key` (`name`, `name@range`, pnpm's
-/// `parent>name`, yarn's `**/name` / `parent/@scope/name`) forces the
-/// package `name`: the key's last selector names it.
-fn forces(key: &str, name: &str) -> bool {
-    let tail = key.rsplit('>').next().unwrap_or(key);
-    crate::formats::yarn::patterns::resolution_selector_target(tail) == Some(name)
+/// A yarn `resolutions` selector's `/`-separated segments, a scope's own
+/// separator kept inside its segment (`a/@s/b@1` → `a`, `@s/b@1`).
+fn yarn_selector_segments(selector: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, _) in selector.match_indices('/') {
+        if !selector[start..i].starts_with('@') || selector[start..i].contains('/') {
+            out.push(&selector[start..i]);
+            start = i + 1;
+        }
+    }
+    out.push(&selector[start..]);
+    out
+}
+
+/// Whether an override of `overrides` forces the dependency `name` of the
+/// package `owner`: one that applies everywhere, or one scoped under
+/// `owner` itself.
+fn forces(overrides: &[(Option<String>, String)], owner: Option<&str>, name: &str) -> bool {
+    overrides.iter().any(|(parent, target)| {
+        target == name && parent.as_deref().is_none_or(|p| Some(p) == owner)
+    })
 }
 
 /// The copy of the package `name` node resolves from the package directory
@@ -2224,29 +2268,23 @@ mod tests {
         );
         for project in [
             r#"{"overrides":{"minimist":"1.2.8","@s/b":"1.0.0"}}"#,
-            r#"{"overrides":{"lp":{"minimist":"1.2.8"},"lp>@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"lp":{"minimist":"1.2.8","@s/b":"1.0.0"}}}"#,
             r#"{"pnpm":{"overrides":{"minimist@<1":"1.2.8","lp>@s/b@^2":"1.0.0"}}}"#,
             r#"{"resolutions":{"**/minimist":"1.2.8","lp/@s/b":"1.0.0"}}"#,
         ] {
             put("forced/package.json", project);
             assert_eq!(unresolved_npm_dependency(&forced).await, None, "{project}");
         }
-        assert!(!forces("minimist-x", "minimist"));
-        assert!(!forces("lp>minimist-x@1", "minimist"));
-        assert!(!forces("@types/minimist", "minimist"));
-        assert!(!forces("lp/@types/minimist@1", "minimist"));
-        assert!(forces("lp/@s/b@^2", "@s/b"));
-        // A nested override's parent only scopes it; `"."` forces it.
-        put(
-            "forced/package.json",
-            r#"{"overrides":{"minimist":{"x":"1.0.0"},"@types/minimist":"1"}}"#,
-        );
-        assert_eq!(
-            unresolved_npm_dependency(&forced).await.as_deref(),
-            Some("minimist")
-        );
+        // Not `minimist` of `lp`: another package, another parent's copy,
+        // a nested override's parent (only `"."` forces it), or a no-op.
         for unforced in [
+            r#"{"overrides":{"minimist-x":"1","@types/minimist":"1","@s/b":"1.0.0"}}"#,
+            r#"{"pnpm":{"overrides":{"lp>minimist-x@1":"1","mkdirp>minimist":"1","@s/b":"1"}}}"#,
+            r#"{"resolutions":{"lp/@types/minimist@1":"1","mkdirp/minimist":"1","@s/b":"1"}}"#,
+            r#"{"overrides":{"mkdirp":{"minimist":"1.2.8"},"@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"minimist":{"x":"1.0.0"},"@s/b":"1.0.0"}}"#,
             r#"{"overrides":{"minimist":{".":"*"},"@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"minimist":" * ","@s/b":"1.0.0"}}"#,
             r#"{"overrides":{"minimist":"","@s/b":"1.0.0"}}"#,
         ] {
             put("forced/package.json", unforced);
