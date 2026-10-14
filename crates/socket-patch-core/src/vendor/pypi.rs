@@ -396,9 +396,12 @@ async fn detect_pypi_flavor(
         let mut vendored = Vec::new();
         let mut unchanged = Vec::new();
         for file in present {
-            let wired = tokio::fs::read_to_string(project_root.join(file))
-                .await
-                .is_ok_and(|text| text.contains(".socket/vendor/pypi/"));
+            let wired = match target {
+                Some((name, version)) => tokio::fs::read_to_string(project_root.join(file))
+                    .await
+                    .is_ok_and(|text| references_vendored_wheel(&text, name, version)),
+                None => false,
+            };
             if wired {
                 vendored.push(file);
             } else {
@@ -1430,6 +1433,22 @@ async fn pypi_prelude<'p>(
         expected_pin,
         reused_wheel,
         sibling_pending,
+    })
+}
+
+/// Whether `text` has a line pinning `name==version` to a wheel under
+/// `.socket/vendor/pypi/` (a wheel file name spells the project name with
+/// `_` for every run of `-`, `_` and `.`, PEP 427).
+fn references_vendored_wheel(text: &str, name: &str, version: &str) -> bool {
+    let wheel = format!(
+        "/{}-{}-",
+        canonicalize_pypi_name(name).replace('-', "_"),
+        version
+    )
+    .to_ascii_lowercase();
+    text.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains(".socket/vendor/pypi/") && line.contains(&wheel)
     })
 }
 
@@ -3028,8 +3047,8 @@ async fn wire_pipenv_pylocks(
 /// Pipenv or uv export, #612 and #1368, or a requirements.txt vendored
 /// before the lock appeared, #1524) through the requirements backend, and
 /// a Pipenv entry's pylocks (#1368) through the python-lock backend, then
-/// its lock records through the flavor's backend. Those files go first and are put back if
-/// a later revert then fails, so a failure on any side leaves every file
+/// its lock records through the flavor's backend. Those files go first and
+/// are put back if a later revert then fails, so a failure on any side leaves every file
 /// wired to the vendored wheel (and the entry kept) instead of half
 /// reverted.
 async fn revert_with_sibling(
@@ -10831,6 +10850,22 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hashes = {sha256 = "u
         for name in ["pylock.toml", "pylock.production.toml"] {
             full_cycle_lock_flavor("python-lock", name, original, "python_lock_document").await;
         }
+    }
+
+    /// #1524: only a line pinning this package's own vendored wheel counts
+    /// as "already vendored"; another package's vendored line does not.
+    #[test]
+    fn references_vendored_wheel_matches_only_this_package() {
+        let text = "./.socket/vendor/pypi/aaaa/zope_event-5.0-py3-none-any.whl\n";
+        assert!(references_vendored_wheel(text, "zope.event", "5.0"));
+        assert!(references_vendored_wheel(text, "Zope-Event", "5.0"));
+        assert!(!references_vendored_wheel(text, "zope.event", "5.1"));
+        assert!(!references_vendored_wheel(text, "six", "1.16.0"));
+        assert!(!references_vendored_wheel(
+            "zope.event==5.0\n",
+            "zope.event",
+            "5.0"
+        ));
     }
 
     /// #1524: requirements.txt is vendored, then a `pylock.toml` pinning the
