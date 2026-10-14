@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-14 (run 21), main `6a06ddd` (includes #1506, the #1503 fix), latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–21 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447 and #1503 are closed. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-14 (run 22), main `fc1b4f9` (includes #1529, the #1527 fix), latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–22 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503 and #1527 are closed. Open: #450, #1547. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -14,7 +14,7 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | Linux | 1.2.2 | untested | untested | n/a | untested | pass v5 (lock 1.1, extras + dev, warm-venv stale check) | untested | pass (lock 1.1) | untested | untested |
 | Linux | 1.8.5 | untested | pass; r9 `envs.toml` + custom path pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path) | pass r9 (#527) | pass v5 (LF + CRLF) | pass r5 (#330) | pass v5 (LF + CRLF, unicode/space path) | pass r14 (both ways, LF + CRLF) | pass v5 (#380 fixed) |
 | Linux | 2.0.1 | pass r17 | pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path, both names) | fixed by #527 (not re-run) | pass v5 (LF + CRLF); r17 `re-resolve=false` pass; `source = "pypi"` fixed by #1413 (r18 on 1.5–2.5; 2.0.1 not re-run) | pass r5 (#330) | pass r17 (LF + CRLF, `re-resolve=false`); `source = "pypi"` fixed by #1413 (r18 on 1.5–2.5; 2.0.1 not re-run) | pass r21 (both ways, LF + CRLF) | untested |
-| Linux | 2.1.1 | untested | untested | untested | untested | pass v5 (repo e2e, up to rollback) | untested | pass v5 (repo e2e) | untested | untested |
+| Linux | 2.1.1 / 2.1.4 | r22 pass (2.1.4: scan, re-run, vex) | r22 pass (2.1.4) | untested | untested | pass v5 (repo e2e, up to rollback); r22 2.1.4 pass (install, `sync`, rollback byte-identical) | untested | pass v5 (repo e2e); r22 2.1.4 pass (`vendor --check`) | r22 pass (2.1.4, both ways, fresh install after each, rollback) | r22 pass (2.1.4) |
 | Linux | 2.3.3 | pass | pass | pass r11 (all 3 layouts) | untested | pass (groups, markers, path/url deps, supersede, dry-run, get) | untested | pass (path/url deps) | fixed by #503 (not re-run) | fixed (#380) |
 | Linux | 2.4.3 | untested | pass | pass r11 (all 3 layouts) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF, CI) | untested | fixed (#380) |
 | Linux | 2.5.1 | pass v5 | pass r5 (full agent cycle incl. rollback + vex) | pass r5 (all 3 cases, plus long names, symlinked dir, relative / `{cache-dir}` / `~` virtualenvs.path, XDG_CACHE_HOME, `.venv` symlink) | pass r9 (#527) | pass v5 (LF + CRLF, PEP 621 extras/groups/markers, `sync`, `remove`, dry-run, `get`, relock/`add`, directory targets) | pass r5 (#330: stale check fires) | pass v5 (LF + CRLF, unicode/space path) | hosted→vendored pass r5; vendored→hosted pass r10 (#328 fixed by #503); r14 both ways LF + CRLF pass, mixed EOL → whole-file LF (#814) | pass v5 (#380 fixed) |
@@ -259,14 +259,26 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 | 2.0.1, 2.2.1, 2.5.1 | PEP 621 `dynamic = ["version"]` + `[tool.poetry] version`, no git remote: `vex` / `scan --vex` | **fail #1527** (`product_undetected`) |
 | 2.5.1 | #450 | still fails |
 
+### Run 22 cells (Linux, main `fc1b4f9`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 2.5.1 | #1527 re-check: `[project]` name + `dynamic = ["version"]` + `[tool.poetry].version`, `scan --mode hosted --vex` | pass (fixed by #1529; product `pkg:pypi/demo1527@0.3.0`, install patched) |
+| 2.5.1 | Same plus a stale `[tool.poetry].name` | `product_undetected` (deliberate: Poetry 1.x and 2.x build different names; see Known non-bugs) |
+| 2.1.4 | Full row: hosted, vendored, agent in-project + out-of-tree, takeovers both ways, `repair` with the wheel deleted, rollback | pass |
+| 1.8.5, 2.5.1 | `[[tool.poetry.source]]` with `priority = "explicit"` / `"supplemental"` that six doesn't come from: hosted + vendored, fresh install | pass (not refused, patched) |
+| 1.8.5, 2.5.1 | VEX product purl for a project named `My_Service` / `Demo_Pkg.Core` (hosted `--vex`, agent + `vex`) | **fail #1547** (raw name, not normalized) |
+| 2.5.1 | #450 | still fails |
+| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
+
 ## Backlog
 
-1. Re-check #1527 once fixed, plus the variant where `[tool.poetry]` also carries a stale `name` beside `[project].name` + dynamic version.
+1. Re-check #1547 once fixed (also the `[tool.poetry]` layout and a dotted name).
 2. Re-check #1105 (hosted A → vendored B, warm venv), #1184 (export residual keep) and #450 once fixed.
 3. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy. That follows from #538's "patch every copy" design and needs a maintainer call before anyone files it. Since #409 (#1419), a system-site venv that imports a base copy also patches that base copy, on purpose.
-4. Concurrent `poetry install` during a scan. Untested Linux cells: 1.2.2 agent, 2.1.x, 1.0.10 vendored repair, 2.4.3 mode switch.
+4. Concurrent `poetry install` during a scan. Untested Linux cells: 1.2.2 agent, 1.0.10 vendored repair, 2.4.3 mode switch, 2.1.x nameless / `[project].name` layouts.
 5. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
-6. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 21 (runs 9–21). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+6. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 22 (runs 9–22). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
 7. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's error-code row for `mode_ambiguous` still names only agent + vendored state (the mode-resolution paragraph has the #1437 hosted-pin case).
 
 ## Known non-bugs
@@ -341,3 +353,6 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 - A vendored scan killed partway leaves `.socket/apply.lock` and some wheels under `.socket/vendor/pypi` with the lock untouched; the next scan proceeds and converges. Not a bug.
 - A hosted scan of a one-package Poetry project finishes in under 50 ms, so a SIGKILL can't land mid-write. The lock is written by atomic replace (CLI_CONTRACT "Staged takeover"). Not a bug.
 - The source-pin guard (`pyproject_source_constraints`) reads `[tool.poetry.dependencies]`, `dev-dependencies` and every `group.*.dependencies`; a group-only pin is covered.
+- `[project].name` + `dynamic = ["version"]` + a different `[tool.poetry].name`: product detection returns `product_undetected` on purpose (`product.rs` `pyproject_name_version`), because Poetry 2 builds `[project].name` ("[tool.poetry.name] … will be ignored") and Poetry 1.x builds `[tool.poetry].name`. Use `--product`. Not filed.
+- `explicit` / `supplemental` `[[tool.poetry.source]]` entries that six doesn't resolve from are not refused by hosted or vendored (r22). The refusal only covers a source six actually uses.
+- Hosted → vendored takeover against a mock origin fails with "already declares a [package.source] for six; refusing to overwrite a user-authored source" unless `SOCKET_PATCH_SERVER_URL` names the mock (the hosted-origin rule). Harness artifact.
