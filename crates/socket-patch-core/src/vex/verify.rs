@@ -567,12 +567,19 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
 }
 
 /// The keys of the version overrides the project's own `package.json`
-/// declares: npm `overrides` (nested objects included), pnpm
-/// `pnpm.overrides` and yarn `resolutions`.
+/// declares: npm `overrides`, pnpm `pnpm.overrides` and yarn
+/// `resolutions`. A nested npm override's parent key only scopes the
+/// overrides under it, so it counts only when its `"."` entry forces the
+/// parent itself.
 fn project_forced_names(project: &Path) -> Vec<String> {
     fn keys(value: &serde_json::Value, out: &mut Vec<String>) {
         for (key, nested) in value.as_object().into_iter().flatten() {
-            out.push(key.clone());
+            if key == "." {
+                continue;
+            }
+            if nested.is_string() || nested.get(".").is_some() {
+                out.push(key.clone());
+            }
             keys(nested, out);
         }
     }
@@ -596,13 +603,12 @@ fn project_forced_names(project: &Path) -> Vec<String> {
     out
 }
 
-/// Whether the override key `key` (`name`, `name@range`, `parent>name`,
-/// `**/name`, `parent/name`) forces the package `name`.
+/// Whether the override key `key` (`name`, `name@range`, pnpm's
+/// `parent>name`, yarn's `**/name` / `parent/@scope/name`) forces the
+/// package `name`: the key's last selector names it.
 fn forces(key: &str, name: &str) -> bool {
     let tail = key.rsplit('>').next().unwrap_or(key);
-    std::iter::once(tail)
-        .chain(tail.match_indices('/').map(|(i, _)| &tail[i + 1..]))
-        .any(|c| c == name || c.strip_prefix(name).is_some_and(|r| r.starts_with('@')))
+    crate::formats::yarn::patterns::resolution_selector_target(tail) == Some(name)
 }
 
 /// The copy of the package `name` node resolves from the package directory
@@ -2224,6 +2230,23 @@ mod tests {
         }
         assert!(!forces("minimist-x", "minimist"));
         assert!(!forces("lp>minimist-x@1", "minimist"));
+        assert!(!forces("@types/minimist", "minimist"));
+        assert!(!forces("lp/@types/minimist@1", "minimist"));
+        assert!(forces("lp/@s/b@^2", "@s/b"));
+        // A nested override's parent only scopes it; `"."` forces it.
+        put(
+            "forced/package.json",
+            r#"{"overrides":{"minimist":{"x":"1.0.0"},"@types/minimist":"1"}}"#,
+        );
+        assert_eq!(
+            unresolved_npm_dependency(&forced).await.as_deref(),
+            Some("minimist")
+        );
+        put(
+            "forced/package.json",
+            r#"{"overrides":{"minimist":{".":"1.2.8"},"@s/b":"1.0.0"}}"#,
+        );
+        assert_eq!(unresolved_npm_dependency(&forced).await, None);
     }
 
     fn hosted_ctx(purl: &str, copies: HostedCopies) -> VendorContext {
