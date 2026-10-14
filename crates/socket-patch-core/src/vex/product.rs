@@ -157,12 +157,39 @@ fn parse_package_json(content: &str) -> Option<String> {
 fn parse_pyproject(content: &str) -> Option<String> {
     // No BOM strip here, unlike npm/cargo: tomllib (and pip's vendored
     // tomli) reject a BOM'd pyproject.toml outright, so such a file is
-    // not a buildable Python project and must keep yielding None.
-    // PEP 621 `[project]` takes precedence (newer projects favor it),
-    // then fall back to Poetry's `[tool.poetry]` for legacy layouts.
-    let (name, version) = scan_toml_section(content, "project")
-        .or_else(|| scan_toml_section(content, "tool.poetry"))?;
+    // not a buildable Python project and must keep yielding None. toml_edit
+    // accepts a BOM, so refuse one before parsing.
+    if content.starts_with('\u{feff}') {
+        return None;
+    }
+    let doc = content.parse::<toml_edit::DocumentMut>().ok()?;
+    let (name, version) = pyproject_name_version(&doc)?;
     Some(format!("pkg:pypi/{name}@{version}"))
+}
+
+/// The project's name and version, read the way its build backend reads
+/// them:
+///
+/// 1. PEP 621 `[project]` `name` + `version` (newer projects favor it).
+/// 2. `[project].name` with `version` listed in `[project].dynamic`: Poetry
+///    2 then takes the version from `[tool.poetry].version`.
+/// 3. The legacy tables that hold both keys: Poetry's `[tool.poetry]`,
+///    then PDM 0.x's `[tool.pdm]` (PDM 1.x migrates it to `[project]`).
+fn pyproject_name_version(doc: &toml_edit::DocumentMut) -> Option<(String, String)> {
+    if let Some(found) = toml_name_version(doc, "project") {
+        return Some(found);
+    }
+    let project_name = toml_str(doc, "project", "name");
+    let version_is_dynamic = toml_table(doc, "project")
+        .and_then(|t| t.get("dynamic"))
+        .and_then(|d| d.as_array())
+        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("version")));
+    if let (Some(name), true) = (project_name, version_is_dynamic) {
+        if let Some(version) = toml_str(doc, "tool.poetry", "version") {
+            return Some((name.to_string(), version.to_string()));
+        }
+    }
+    toml_name_version(doc, "tool.poetry").or_else(|| toml_name_version(doc, "tool.pdm"))
 }
 
 fn parse_cargo_toml(content: &str) -> Option<String> {
@@ -355,57 +382,34 @@ async fn single_root_file_with_extension(cwd: &Path, ext: &str) -> Option<String
     (found.len() == 1).then(|| found.remove(0))
 }
 
-/// Minimal line-based TOML scanner for `[<section>]` blocks. Reads
-/// `name = "..."` and `version = "..."` from the named section and
-/// stops at the next `[` header. Robust enough for the well-formed
-/// `pyproject.toml` files we expect at the top level — no full TOML
-/// parser dependency. (`Cargo.toml` reads through
-/// [`crate::formats::cargo::manifest`].)
-///
-/// Returns `None` if either key is missing, both keys appear outside
-/// the section, the value is empty, or the value is not a quoted
-/// string (`version.workspace = true`).
-fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
-    let mut in_section = false;
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
+/// The `name` and `version` of the dotted `section` table (`project`,
+/// `tool.poetry`), both non-empty strings. A non-string value
+/// (`version.workspace = true`, `version = 42`) yields None.
+fn toml_name_version(doc: &toml_edit::DocumentMut, section: &str) -> Option<(String, String)> {
+    let name = toml_str(doc, section, "name")?;
+    let version = toml_str(doc, section, "version")?;
+    Some((name.to_string(), version.to_string()))
+}
 
-    for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('[') {
-            // A header may carry a trailing comment (`[package] # x`)
-            // and whitespace inside the brackets (`[ package ]`) —
-            // both valid TOML that cargo and tomllib accept. Anything
-            // else after the closing bracket means a different (or
-            // malformed) section.
-            in_section = match rest.split_once(']') {
-                Some((inner, after)) => {
-                    let after = after.trim_start();
-                    (after.is_empty() || after.starts_with('#')) && inner.trim() == section
-                }
-                None => false,
-            };
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        if let Some(v) = parse_toml_string_kv(line, "name") {
-            name = Some(v);
-        } else if let Some(v) = parse_toml_string_kv(line, "version") {
-            version = Some(v);
-        }
-    }
+/// The non-empty string at `key` in the dotted `section` table.
+fn toml_str<'a>(doc: &'a toml_edit::DocumentMut, section: &str, key: &str) -> Option<&'a str> {
+    toml_table(doc, section)?
+        .get(key)?
+        .as_str()
+        .filter(|v| !v.is_empty())
+}
 
-    let name = name?;
-    let version = version?;
-    if name.is_empty() || version.is_empty() {
-        return None;
+/// The dotted `section` table (`tool.poetry`), whether it is written as a
+/// `[header]`, an inline table or dotted keys.
+fn toml_table<'a>(
+    doc: &'a toml_edit::DocumentMut,
+    section: &str,
+) -> Option<&'a dyn toml_edit::TableLike> {
+    let mut table: &dyn toml_edit::TableLike = doc.as_table();
+    for part in section.split('.') {
+        table = table.get(part)?.as_table_like()?;
     }
-    Some((name, version))
+    Some(table)
 }
 
 /// The `[remote "origin"] url = ...` of the git checkout enclosing
@@ -677,39 +681,20 @@ fn split_remote_host_path(url: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Parse `<key> = "<value>"` or `<key> = '<value>'`. Returns `None` if
-/// the key doesn't match, the value isn't a quoted string literal, or
-/// the value is empty. TOML permits BOTH double-quoted basic strings
-/// and single-quoted literal strings, so we accept either delimiter and
-/// terminate at the matching closing quote. Inline-table forms like
-/// `version = { workspace = true }` and bare values like `version = 42`
-/// fail this check and are skipped by the caller.
-fn parse_toml_string_kv(line: &str, key: &str) -> Option<String> {
-    let eq = line.find('=')?;
-    let (lhs, rhs) = line.split_at(eq);
-    if lhs.trim() != key {
-        return None;
-    }
-    // Drop the leading '=' and surrounding whitespace. The value must
-    // open with a string delimiter; match it to its twin. `'` is a
-    // literal string (no escapes), `"` a basic string — for our purposes
-    // (names/versions, which never contain escaped quotes) the first
-    // matching delimiter terminates the value in both cases.
-    let rhs = rhs[1..].trim();
-    let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-    let stripped = &rhs[quote.len_utf8()..];
-    let end = stripped.find(quote)?;
-    let value = &stripped[..end];
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `section`'s name and version, through the reader detection uses.
+    fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
+        toml_name_version(&content.parse().ok()?, section)
+    }
+
+    /// A single `key = value` line, read as an entry of a table.
+    fn parse_toml_string_kv(line: &str, key: &str) -> Option<String> {
+        let doc = format!("[t]\n{line}\n").parse().ok()?;
+        toml_str(&doc, "t", key).map(str::to_string)
+    }
 
     #[tokio::test]
     async fn detect_package_json() {
@@ -1243,6 +1228,86 @@ mod tests {
             .unwrap();
         let r = detect_product(dir.path()).await;
         assert_eq!(r.purl.as_deref(), Some("pkg:pypi/pep621-app@1.0.0"));
+    }
+
+    // ── Regression #1527: Poetry 2 dynamic version ────────────────
+    // Poetry 2 documents `[project].name` with `dynamic = ["version"]`
+    // and the version in `[tool.poetry].version`; `poetry version`
+    // reports `demo 0.3.0` for it. Neither table holds both keys.
+
+    #[tokio::test]
+    async fn detect_pyproject_poetry2_dynamic_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "[project]\nname = \"demo\"\ndynamic = [\"version\"]\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.poetry]\nversion = \"0.3.0\"\n\n[build-system]\nrequires = [\"poetry-core>=2.0.0\"]\nbuild-backend = \"poetry.core.masonry.api\"\n";
+        tokio::fs::write(dir.path().join("pyproject.toml"), content)
+            .await
+            .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/demo@0.3.0"));
+    }
+
+    /// The `dynamic` array may span lines (taplo and other formatters
+    /// expand it) and list other fields too.
+    #[test]
+    fn pyproject_poetry2_multiline_dynamic_version() {
+        let content = "[project]\nname = \"demo\"\ndynamic = [\n  \"readme\",\n  \"version\", # from tool.poetry\n]\n\n[tool.poetry]\nversion = \"0.3.0\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/demo@0.3.0")
+        );
+    }
+
+    /// A static `[project].version` wins over `[tool.poetry].version`:
+    /// Poetry reads the latter only when `version` is dynamic.
+    #[test]
+    fn pyproject_static_version_wins_over_tool_poetry_version() {
+        let content =
+            "[project]\nname = \"demo\"\nversion = \"1.0.0\"\n\n[tool.poetry]\nversion = \"0.3.0\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/demo@1.0.0")
+        );
+    }
+
+    /// Without `version` in `dynamic`, Poetry does not take the
+    /// version from `[tool.poetry]`, and neither does detection.
+    #[test]
+    fn pyproject_tool_poetry_version_needs_dynamic() {
+        let content = "[project]\nname = \"demo\"\ndynamic = [\"readme\"]\n\n[tool.poetry]\nversion = \"0.3.0\"\n";
+        assert!(parse_pyproject(content).is_none());
+    }
+
+    /// A dynamic version with no `[tool.poetry].version` (setuptools-scm,
+    /// hatch-vcs, PDM's scm source) has no static version to report.
+    #[test]
+    fn pyproject_dynamic_version_without_tool_poetry_is_none() {
+        let content =
+            "[project]\nname = \"demo\"\ndynamic = [\"version\"]\n\n[tool.setuptools_scm]\n";
+        assert!(parse_pyproject(content).is_none());
+    }
+
+    // ── Regression #642: PDM 0.x legacy `[tool.pdm]` metadata ─────
+
+    #[tokio::test]
+    async fn detect_pyproject_pdm_legacy_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "[tool.pdm]\nname = \"x\"\nversion = \"0.0.0\"\npython_requires = \">=3.8\"\n\n[tool.pdm.dependencies]\nurllib3 = \"==1.26.18\"\n\n[tool.pdm.dev-dependencies]\n\n[build-system]\nrequires = [\"pdm-pep517\"]\nbuild-backend = \"pdm.pep517.api\"\n";
+        tokio::fs::write(dir.path().join("pyproject.toml"), content)
+            .await
+            .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/x@0.0.0"));
+    }
+
+    /// PDM 1.x migrates `[tool.pdm]` to `[project]`; a file carrying
+    /// both reports the PEP 621 identity.
+    #[test]
+    fn pyproject_project_wins_over_tool_pdm() {
+        let content = "[project]\nname = \"new\"\nversion = \"1.0.0\"\n\n[tool.pdm]\nname = \"old\"\nversion = \"0.1.0\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/new@1.0.0")
+        );
     }
 
     /// Multi-manifest combo: pyproject + Cargo.toml present, no
