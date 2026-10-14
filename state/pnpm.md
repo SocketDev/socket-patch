@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-13 (run 40), main `4353a7c`, latest release 5.0.0. (main was force-pushed before run 39, so older SHAs in this ledger may not resolve any more.)
+Last updated: 2026-10-14 (run 41), main `887a5f7`, latest release 5.0.1. (main was force-pushed before run 39, so older SHAs in this ledger may not resolve any more.)
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -450,11 +450,24 @@ Run 40 additions (main `4353a7c`, release 5.0.0, Linux; mock serves `left-pad@1.
 | 11.28.3 | pass ×4 | — | — / pass / — | — | — | — | — |
 | 12.11.2 | pass ×4 | pass / pass | `mode_ambiguous` pass / pass / pass | refusal (by design); `devEngines` install → two-doc lock → pass | pass / documented / pass | fail #1268 | fail #935 |
 
+Run 41 additions (main `887a5f7`, release 5.0.1, Linux; mock rebuilt from scratch in the run, same contract):
+
+| pnpm | #935 hosted `file:` dir / tgz copy (post-#1469) | #935 vendored `file:` copy | Member-cwd agent: `npm:` alias isolated / hoisted (post-#1494) | Scoped alias + rollback from member | Alias member, custom `virtualStoreDir` | Hosted / vendored dev + optional deps | Agent `node-linker=pnp` | Hosted with `pnpm_config_trust_lockfile=false` env |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8.15.9 (6.0) | pass (`redirect_copy_unpatched`) | untested | untested | untested | untested | hosted pass | untested | n/a |
+| 9.15.9 | pass | fail #935 (no warning; vex honest) | pass / non-bug (cwd-scoped) | pass | pass | vendored pass, revert byte-exact | pass (patched; warns `pnpm_pnp_unsupported`) | n/a |
+| 10.34.6 | pass (rollback warns `pnpm_trust_lockfile_left`) | untested | pass / non-bug | untested | untested | untested | pass | pass (pnpm 10 doesn't verify) |
+| 11.28.3 | untested | untested | pass / non-bug | untested | untested | untested | untested | fail #1514 |
+| 12.11.2 | pass; in-run `--vex` declines; `link:` copy no warning | fail #935 | pass / non-bug | pass | pass | both pass | pass (remedy text names `.npmrc`) | fail #1514; global `config.yaml` false: pass |
+
+Also run 41 on 12.11.2: hosted trust edit over `---` doc start, `...` doc end, YAML anchors: pass. Flow-style file root: loud documented refusal. Quoted / next-line `trustLockfile: false`: respected. Symlinked `pnpm-workspace.yaml` / `pnpm-lock.yaml`: loud `redirect_symlinked_file_unsupported`.
+
 ## Backlog
 
 0w. #1460 is verified fixed (run 40, all 16 env × major cells). Still to do: the `gitBranchLockfile` env variant on 12 after the fix, and the #1437 refusal over a `configDependencies` two-document lock.
-0x. **#935 regression** (hosted silent pin over a `file:` copy, first bad f3c6313a): re-verify once fixed, also for `git+` copies. #1268 still reproduces on 12.11.2 (run 39).
-0y. #1266 (npm handover, pnpm cells commented in run 38): a scoped alias, a transitive alias and the hoisted linker.
+0x. #935: hosted half fixed by #1469 (run 41, 8/9/10/12). Still open for the vendored scan warning; re-verify once fixed. Was: **#935 regression** (hosted silent pin over a `file:` copy, first bad f3c6313a): re-verify once fixed, also for `git+` copies. #1268 still reproduces on 12.11.2 (run 39).
+0y. #1266 / #1494: scoped alias, custom virtualStoreDir and member rollback done in run 41 (pass). Still to do: a transitive alias (needs a registry package with an `npm:` alias dependency).
+0v. #1514 (env `pnpm_config_trust_lockfile=false`): re-verify once fixed, also the `--no-trust-lockfile-config` and Rush texts with the env set.
 0z. Post-#1007 follow-ups: #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
 00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
 00b. #1039 follow-ups: the takeover over a `pnpm patch`-ed vendored package, and a takeover on Windows (CRLF autocrlf checkout). The interrupted takeover is #1157. (Interrupted vendored-only commit: done in run 35, pass.)
@@ -585,3 +598,5 @@ Run 40 additions (main `4353a7c`, release 5.0.0, Linux; mock serves `left-pad@1.
 - A path-scoped hosted `rollback packages/a` in a `sharedWorkspaceLockfile: false` workspace also restores the other members' locks for the same purl. That's documented ("Rollback restores EVERY installed copy of a selected patch"; run 38).
 - `rollback left-pad@1.3.0` / `rollback lp` (an alias name) give `patch_not_found`: the #1034 grammar matches names exactly, and `name@version` isn't a target. Use a purl (run 38).
 - Fixture note (run 38): corepack on Node 22 can't launch pnpm 12.11.x. Install pnpm with `npm i -g --prefix <dir> pnpm@<v>`.
+- Agent `scan` from a workspace member under `node-linker=hoisted` finds nothing (exit 0, no events), even for a direct `npm:` alias dep: the dep is a real directory in the root `node_modules`, outside the cwd-scoped crawl. That's the same documented cwd scoping as the member-transitive entry above; run from the root (run 41).
+- `pnpm_pnp_unsupported` on pnpm 11/12 says `node-linker=pnp` is "in .npmrc" and to "switch .npmrc", but pnpm 11+ reads `nodeLinker` only from `pnpm-workspace.yaml`. Cosmetic: agent mode still patches the store copy that `.pnp.cjs` loads (run 41).
