@@ -21,6 +21,7 @@ mod hosted_yarn_classic_sha1;
 mod scan_batch_sizing_e2e;
 mod scan_ecosystems_scope_e2e;
 mod scan_invariants;
+mod scan_nested_project_e2e;
 mod scan_ordered_concurrency_e2e;
 mod scan_paths_e2e;
 mod scan_sync_e2e;
