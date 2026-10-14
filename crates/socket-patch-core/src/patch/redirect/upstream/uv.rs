@@ -1639,10 +1639,22 @@ fn restore_requirement_array(
             .and_then(Value::as_str)
             .and_then(|u| ctx.hosted_uuid(u))
             .is_some_and(|u| u == hit.uuid);
+        let rewrite_override =
+            matches!(declared, Declared::Manifest("overrides")) && transitive_override;
+        // uv before 0.5.6 records the rewrite's override without folding in
+        // its `[tool.uv.sources]` url: `{ name, specifier = "==<version>" }`.
+        let bare_pin = entry.get("url").is_none()
+            && entry.get("marker").is_none()
+            && entry.get("specifier").and_then(Value::as_str)
+                == Some(format!("=={}", hit.version).as_str());
+        if names_hit && rewrite_override && bare_pin {
+            drop.push(i);
+            continue;
+        }
         if !names_hit || !hosted {
             continue;
         }
-        if matches!(declared, Declared::Manifest("overrides")) && transitive_override {
+        if rewrite_override {
             drop.push(i);
             continue;
         }
@@ -2153,6 +2165,34 @@ mod declaration_tests {
         );
         let out = unwind(&added, &lock_text).unwrap();
         assert!(!out.contains("[manifest]"), "{out}");
+    }
+
+    /// uv before 0.5.6 records the rewrite's override as a bare
+    /// `{ name, specifier }` with no url: it is dropped with the marked pin,
+    /// while the same record of a user's own pin stays.
+    #[test]
+    fn bare_manifest_override_of_the_rewrite_is_dropped() {
+        let bare = spec("==1.16.0", None);
+        let lock_text = format!(
+            "{}\n[manifest]\noverrides = [{bare}]\n",
+            lock(
+                &[spec("==2.8.2", None).replace("six", "python-dateutil")],
+                &[]
+            )
+        );
+        let added = format!(
+            "{HEAD}dependencies = [\"python-dateutil==2.8.2\"]\n\n[tool.uv]\n\
+             override-dependencies = [\n    {}\n    \"six==1.16.0\",\n]\n",
+            crate::utils::python_script::HOSTED_OVERRIDE_MARK
+        );
+        let out = unwind(&added, &lock_text).unwrap();
+        assert!(!out.contains("[manifest]"), "{out}");
+        let user = format!(
+            "{HEAD}dependencies = [\"python-dateutil==2.8.2\"]\n\n[tool.uv]\n\
+             override-dependencies = [\"six==1.16.0\"]\n"
+        );
+        let out = unwind(&user, &lock_text).unwrap();
+        assert!(out.contains(&format!("overrides = [{bare}]")), "{out}");
     }
 
     /// #606 (a): a pin in `dependencies` and a floor in an extra.
