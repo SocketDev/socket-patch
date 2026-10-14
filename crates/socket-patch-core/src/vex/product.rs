@@ -159,7 +159,7 @@ fn parse_pyproject(content: &str) -> Option<String> {
     // tomli) reject a BOM'd pyproject.toml outright, so such a file is
     // not a buildable Python project and must keep yielding None. toml_edit
     // accepts a BOM, so refuse one before parsing.
-    if content.starts_with('\u{feff}') {
+    if content.starts_with(crate::formats::text::BOM) {
         return None;
     }
     let doc = content.parse::<toml_edit::DocumentMut>().ok()?;
