@@ -569,7 +569,9 @@ struct Frame {
 /// enclosing block. A `{` opens one that its `}` closes (a brace block or
 /// a hash). A statement runs on while a `(` or `[` is open, so a `source(`
 /// whose arguments span lines still owns the `do` or `{` that follows its
-/// `)` (#1509). String, `%w[]`, regexp and backtick literals, comments,
+/// `)` (#1509). A `source` call counts wherever it starts an expression,
+/// as a keyword does (`x = 1; source "…" do`, `… then source "…" do`,
+/// #1531). String, `%w[]`, regexp and backtick literals, comments,
 /// `=begin` … `=end` blocks and heredoc bodies are not code.
 fn block_stack(text: &str, at: usize) -> Vec<Frame> {
     let mut open: Vec<Frame> = Vec::new();
@@ -585,11 +587,13 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
     let mut depth = 0usize;
     // Each open `{`: a hash (counted in `depth`) or a block (a frame).
     let mut braces: Vec<bool> = Vec::new();
-    // The statement began with `source` and its block has not opened yet.
-    let mut source_pending = false;
-    // The statement began with `source(`: (its argument list is open, it
-    // has closed).
-    let mut source_call = (false, false);
+    // A `source` call whose block has not opened yet: the number of brace
+    // blocks open around it (a `}` closing one of them ends the call, and
+    // only a `do` or `{` at that level is its block).
+    let mut source_pending: Option<usize> = None;
+    // The `source(` call's argument list: (it is open, it has closed or
+    // there is none).
+    let mut source_call = (false, true);
     let mut statement_line = 0;
     let mut start = 0;
     for raw in text[..at].split_inclusive('\n') {
@@ -620,21 +624,25 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
         // An open bracket carries only a `source` statement on to its
         // block opener: elsewhere a bracket the masker missed (one in an
         // interpolation) must not swallow the rest of the file.
-        let continues = literal.is_some() || !carried.is_empty() || (depth > 0 && source_pending);
+        let continues =
+            literal.is_some() || !carried.is_empty() || (depth > 0 && source_pending.is_some());
         let masked = masked_ruby_code(line, &mut literal);
         heredocs.extend(heredoc_openers(line, &masked));
         let masked = masked.trim();
         if !continues {
             depth = 0;
             statement_line = line_start;
-            let rest = masked.strip_prefix("source").unwrap_or("-");
-            source_pending = rest.starts_with([' ', '\t', '(']);
-            source_call = (false, !rest.starts_with('('));
+            source_pending = None;
+            source_call = (false, true);
         }
         for (n, statement) in masked.split(';').enumerate() {
             let lead = if n == 0 { carried.as_str() } else { "" };
-            if n > 0 && depth == 0 {
-                source_pending = false;
+            // A top-level `;` starts a new statement, unless it sits in a
+            // brace block of the `source` call's own arguments.
+            if n > 0 && depth == 0 && source_pending.is_none_or(|level| braces.len() <= level) {
+                statement_line = line_start;
+                source_pending = None;
+                source_call = (false, true);
             }
             // A `while`/`until`/`for` takes its optional `do` as part of
             // the loop, not as a block of its own.
@@ -650,6 +658,15 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                 }
                 let expression = || starts_expression(&format!("{lead} {}", &statement[..start]));
                 let (opens, source) = match word {
+                    // One in a brace block of an outer call's arguments
+                    // does not replace that call.
+                    "source" if depth == 0 && source_pending.is_none() && expression() => {
+                        if let Some(parenthesized) = source_call_args(&statement[end..]) {
+                            source_pending = Some(braces.len());
+                            source_call = (false, !parenthesized);
+                        }
+                        (false, false)
+                    }
                     "(" | "[" => {
                         if depth == 0 && !source_call.1 {
                             source_call.0 = true;
@@ -677,7 +694,8 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                         braces.push(false);
                         (
                             true,
-                            closed_source_call && std::mem::take(&mut source_pending),
+                            closed_source_call
+                                && take_source(&mut source_pending, braces.len() - 1),
                         )
                     }
                     "}" => {
@@ -685,6 +703,10 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                             Some(true) => depth = depth.saturating_sub(1),
                             Some(false) => {
                                 open.pop();
+                                // A `source` call inside the block ends with it.
+                                if source_pending.is_some_and(|level| braces.len() < level) {
+                                    source_pending = None;
+                                }
                             }
                             None => {}
                         }
@@ -694,7 +716,7 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                         let opens = !std::mem::take(&mut loop_do);
                         (
                             opens,
-                            opens && depth == 0 && std::mem::take(&mut source_pending),
+                            opens && depth == 0 && take_source(&mut source_pending, braces.len()),
                         )
                     }
                     "if" | "unless" => (expression(), false),
@@ -741,6 +763,23 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
         };
     }
     open
+}
+
+/// Whether the pending `source` call (see [`block_stack`]) sits at brace
+/// level `level`, in which case the block opening there is its block.
+fn take_source(pending: &mut Option<usize>, level: usize) -> bool {
+    pending.take_if(|l| *l == level).is_some()
+}
+
+/// Whether `rest`, what follows the word `source` that starts an
+/// expression, makes it a call with arguments, and whether those are in
+/// parentheses (`source(…)`). `source = …` assigns a local variable.
+fn source_call_args(rest: &str) -> Option<bool> {
+    if rest.starts_with('(') {
+        return Some(true);
+    }
+    let args = rest.strip_prefix([' ', '\t'])?.trim_start();
+    (!args.is_empty() && !args.starts_with('=')).then_some(false)
 }
 
 /// [`ruby_words`] and the brackets (`(`, `)`, `[`, `]`, `{`, `}`) of a
@@ -1890,6 +1929,12 @@ mod tests {
             // comes back between the opener and the declaration.
             "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource(\n  \"https://rubygems.org\"\n) do\n  \
              gem \"rails\", \"7.0.0\"\n  gem \"rack\"\nend\n",
+            // #1531: an opener after a `;`, also on a statement's
+            // continuation line, whose own indent the declaration follows.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nzz = 1; source \"https://rubygems.org\" do\n  \
+             gem \"rails\", \"7.0.0\"\nend\n",
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\n    zz = [1,\n2]; source \"https://rubygems.org\" do\n  \
+             gem \"rails\", \"7.0.0\"\nend\n",
         ] {
             let lock = format!(
                 "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    \
@@ -1941,6 +1986,64 @@ mod tests {
             assert_eq!(next_manifest.as_deref(), Some(manifest));
             assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
         }
+    }
+
+    #[test]
+    fn source_block_opener_mid_line() {
+        // #1531: a `source` call after a `;` on its line, or anywhere else
+        // it starts an expression, opens a source block just as a
+        // line-leading one does.
+        let at = |text: &str| in_source_block(text, text.find("gem \"rails\"").unwrap());
+        for opener in [
+            "zz = 1; source \"https://x\" do",
+            "zz = 1;source \"https://x\" do",
+            "a = 1; b = 2; source \"https://x\" do",
+            "zz = 1; source(\"https://x\") do",
+            "zz = 1; source(\"https://x\") {",
+            "zz = 1; source(\n  \"https://x\"\n) do",
+            "zz = 1; source \"https://x\",\n  type: :rubygems do",
+            "git_source(:gh) { |r| \"https://github.com/#{r}.git\" }; source \"https://x\" do",
+            // Anywhere a `source` call starts an expression.
+            "x = source \"https://x\" do",
+            "if true then source \"https://x\" do",
+            "a = [1,\n  2]; source \"https://x\" do",
+            "source ENV.fetch(\"S\") { warn \"x\"; \"https://x\" } do",
+            // A `source` call or a `do` block inside the arguments' own
+            // brace block leaves the outer call's `do` its block.
+            "source ENV.fetch(\"S\") { source \"https://y\" } do",
+            "source ENV.fetch(\"S\") { [1].each do |v| v end; \"https://x\" } do",
+        ] {
+            let close = if opener.ends_with('{') { "}" } else { "end" };
+            let t =
+                format!("source \"https://rubygems.org\"\n\n{opener}\n  gem \"rails\"\n{close}\n");
+            assert!(at(&t), "{t}");
+            let t = format!(
+                "source \"https://rubygems.org\"\n\n{opener}\n  gem \"a\"\n{close}\ngem \"rails\"\n"
+            );
+            assert!(!at(&t), "{t}");
+        }
+        // Not a `source` call that starts an expression.
+        for line in [
+            "zz = 1; group :t do",
+            "zz = 1; x.source \"https://x\" do",
+            "zz = 1; sources \"https://x\" do",
+            "foo(1; source \"https://x\") do",
+            "zz = 1; source = mirrors.first do",
+            "source = mirrors.first do",
+            "source == x do",
+            // A `source` call inside a closed brace block does not own the
+            // `do` after it.
+            "urls.each { |u| log(u); source u }.then do",
+            "urls.each { |u| source u }.then do",
+        ] {
+            let t = format!("{line}\n  gem \"rails\"\nend\n");
+            assert!(!at(&t), "{t}");
+        }
+        // A `;` statement that is not a source call clears a line-leading
+        // `source` without a block.
+        assert!(!at(
+            "source \"https://x\"; group :t do\n  gem \"rails\"\nend\n"
+        ));
     }
 
     #[test]
