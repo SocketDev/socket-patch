@@ -2991,8 +2991,12 @@ pub(crate) mod testing {
         header.set_size(manifest.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar.append_data(&mut header, format!("{root}/package.json"), manifest.as_bytes())
-            .unwrap();
+        tar.append_data(
+            &mut header,
+            format!("{root}/package.json"),
+            manifest.as_bytes(),
+        )
+        .unwrap();
         tar.into_inner().unwrap().finish().unwrap()
     }
 

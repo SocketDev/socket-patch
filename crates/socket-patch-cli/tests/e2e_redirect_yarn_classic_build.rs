@@ -1490,9 +1490,12 @@ async fn classic_file_directory_copy_under_another_name_is_named_and_not_atteste
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_outside_root_copy_under_another_name_is_named_and_not_attested() {
-    if !require_yarn_classic("e2e_redirect_yarn_classic_build (outside-root other-name file:)", |c| {
-        cache_env::isolate(c);
-    }) {
+    if !require_yarn_classic(
+        "e2e_redirect_yarn_classic_build (outside-root other-name file:)",
+        |c| {
+            cache_env::isolate(c);
+        },
+    ) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

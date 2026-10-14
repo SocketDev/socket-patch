@@ -1524,7 +1524,12 @@ mod tests {
             }
             // An unreadable copy of another version can't be left-pad@1.3.0.
             let out = run(&project(&[wired.clone(), url_copy("2.0.0")], "left-pad")).await;
-            assert_eq!(out.refs.len(), 1, "{mode} url 2.0.0: {:#?}", out.diagnostics);
+            assert_eq!(
+                out.refs.len(),
+                1,
+                "{mode} url 2.0.0: {:#?}",
+                out.diagnostics
+            );
         }
     }
 

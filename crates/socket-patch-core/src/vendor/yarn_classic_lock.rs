@@ -1975,7 +1975,13 @@ wow@^1.0.0:
         // A sibling directory of the project, spelled `../<name>/lpdir`
         // the way yarn records it.
         let ext = tempfile::tempdir().unwrap();
-        let ext_name = ext.path().file_name().unwrap().to_str().unwrap().to_string();
+        let ext_name = ext
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let extra = format!(
             "\n\"lp2@file:../{ext_name}/lpdir\":\n  version \"1.3.0\"\n\n\
              \"lp3@file:./lp.tgz\":\n  version \"1.3.0\"\n  resolved \"file:./lp.tgz#cccc\"\n\n\

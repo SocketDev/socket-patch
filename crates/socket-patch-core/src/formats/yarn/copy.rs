@@ -194,7 +194,9 @@ fn copy_path(base: &str, path: &str) -> Option<String> {
     } else {
         format!("{base}/{path}")
     };
-    Some(crate::utils::relpath::normalize_rel_keeping_escapes(&joined))
+    Some(crate::utils::relpath::normalize_rel_keeping_escapes(
+        &joined,
+    ))
 }
 
 fn parse_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
