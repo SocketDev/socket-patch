@@ -6,6 +6,7 @@
 //! forensic bytes must come back. Gem fixtures modeled on
 //! repair_vendor_e2e's.
 
+use crate::common::envelope::{events, parse_json_envelope};
 use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::{Path, PathBuf};
@@ -156,14 +157,6 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
     )
 }
 
-fn parse_env(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("bad JSON ({e}): {stdout}"))
-}
-
-fn events_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    v["events"].as_array().cloned().unwrap_or_default()
-}
-
 /// `scan --mode vendored --yes` the gem fixture; returns the vendored copy dir.
 fn vendor_gem_project(root: &Path, mock_uri: &str) -> PathBuf {
     let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--mode", "vendored", "--yes"]);
@@ -208,9 +201,9 @@ async fn repair_keeps_corrupt_forensic_bytes_when_rebuild_dispatch_refuses() {
     mock.reset().await;
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "failed" && e["purl"] == GEM_PURL),
         "envelope={v}"

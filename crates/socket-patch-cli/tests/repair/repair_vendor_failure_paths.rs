@@ -1,9 +1,14 @@
-//! Coverage-gap tests for `repair`'s vendored-artifact phase
+//! Failure paths of `repair`'s vendored-artifact phase
 //! (`commands/vendored_backend/repair.rs`): record resolution (corrupt
 //! ledger, dropped/moved-on manifest records, API-recovered records), the
 //! tampered-state health arms (StaleUuid / Unverifiable), the re-vendor's
 //! failure arms and detail selection, `--ecosystems` scoping, and the
-//! human (non-`--json`) output lines.//!
+//! human (non-`--json`) output lines.
+//!
+//! The `--json` tests read the envelope through `common::envelope` and
+//! check `errorCode`s, events and bytes on disk (#1089). A message is read
+//! only for what it must name: a flag, a patch uuid, the file to fix.
+//!
 //! Fixtures and helpers mirror `repair_vendor_e2e.rs` (this suite owns its
 //! own copies).
 //!
@@ -15,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::common::envelope::{events, parse_json_envelope};
 use crate::common::{binary, git_sha256, hermetic_command};
 
 use wiremock::matchers::{method, path};
@@ -408,14 +414,6 @@ fn vendor_gem_project(root: &Path, mock_uri: &str, expected_after: &[u8]) -> Pat
     copy
 }
 
-fn parse_env(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("bad JSON ({e}): {stdout}"))
-}
-
-fn events_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    v["events"].as_array().cloned().unwrap_or_default()
-}
-
 fn read_state(root: &Path) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap())
         .unwrap()
@@ -506,12 +504,12 @@ async fn repair_fails_loudly_on_corrupt_vendor_state() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["status"], "partialFailure", "envelope={v}");
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
-            && e["errorCode"] == "vendor_state_unreadable"
-            && e["error"].as_str().unwrap_or("").contains("corrupt")),
+        events(&v)
+            .iter()
+            .any(|e| e["action"] == "failed" && e["errorCode"] == "vendor_state_unreadable"),
         "envelope={v}"
     );
     assert_eq!(
@@ -553,9 +551,9 @@ async fn repair_skips_entry_dropped_from_manifest() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        !events_of(&v).iter().any(|e| e["purl"] == PURL),
+        !events(&v).iter().any(|e| e["purl"] == PURL),
         "a manifest-dropped entry is the reconcile's call, not repair's: {v}"
     );
     assert!(
@@ -593,12 +591,15 @@ async fn repair_skips_when_manifest_uuid_moved_on() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
+        events(&v).iter().any(|e| e["action"] == "skipped"
             && e["purl"] == PURL
             && e["errorCode"] == "vendor_uuid_mismatch"
-            && e["reason"].as_str().unwrap_or("").contains("moved on")),
+            && e["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("socket-patch vendor")),
         "envelope={v}"
     );
     assert_eq!(
@@ -644,9 +645,9 @@ async fn repair_prefers_the_moved_on_manifest_over_an_embedded_record() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
+        events(&v).iter().any(|e| e["action"] == "skipped"
             && e["purl"] == PURL
             && e["errorCode"] == "vendor_uuid_mismatch"),
         "envelope={v}"
@@ -680,19 +681,18 @@ async fn repair_uses_the_embedded_record_without_manifest() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
+        events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == PURL
             && e["errorCode"] == "vendor_artifact_redownload_failed"
             && e["error"].as_str().unwrap_or("").contains("--offline")),
         "envelope={v}"
     );
     assert!(
-        !events_of(&v).iter().any(|e| e["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("no manifest record")),
+        !events(&v)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_artifact_unrepairable"),
         "the embedded record must stand in for the missing manifest: {v}"
     );
 }
@@ -721,16 +721,16 @@ async fn repair_recovers_record_by_uuid_without_manifest_then_fails_offline() {
     // Online: the (None, None) arm fetches the record by uuid and rebuilds.
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
         "envelope={v}"
     );
     // Vendored-phase events say so, as in every envelope.
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .all(|e| e["details"]["mode"] == "vendored"),
         "envelope={v}"
@@ -745,15 +745,12 @@ async fn repair_recovers_record_by_uuid_without_manifest_then_fails_offline() {
     std::fs::remove_file(&tgz).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
+        events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == PURL
             && e["errorCode"] == "vendor_artifact_unrepairable"
-            && e["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("no manifest record for patch")),
+            && e["error"].as_str().unwrap_or("").contains(UUID)),
         "envelope={v}"
     );
 }
@@ -785,15 +782,11 @@ async fn repair_skips_stale_uuid_artifact_path() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "skipped"
+        events(&v).iter().any(|e| e["action"] == "skipped"
             && e["purl"] == PURL
-            && e["errorCode"] == "vendor_uuid_mismatch"
-            && e["reason"]
-                .as_str()
-                .unwrap_or("")
-                .contains("re-vendor is pending")),
+            && e["errorCode"] == "vendor_uuid_mismatch"),
         "envelope={v}"
     );
     assert_eq!(
@@ -833,12 +826,12 @@ async fn repair_fails_closed_on_unsafe_ledger_artifact_path() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
+        events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == PURL
             && e["errorCode"] == "vendor_artifact_unrepairable"
-            && e["error"].as_str().unwrap_or("").contains("fix state.json")),
+            && e["error"].as_str().unwrap_or("").contains("state.json")),
         "envelope={v}"
     );
     assert_eq!(
@@ -881,9 +874,9 @@ async fn repair_rebuilds_via_ledger_recovered_registry_fetch() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
         "envelope={v}"
@@ -922,9 +915,9 @@ async fn repair_redownload_ignores_old_registry_failure() {
     let ledger_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{stdout} {stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["purl"] == PURL && e["details"]["redownloaded"] == true),
         "{v}"
@@ -959,9 +952,9 @@ async fn repair_redownload_leaves_missing_lockfile_missing() {
     let ledger_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{stdout} {stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["purl"] == PURL && e["details"]["redownloaded"] == true),
         "{v}"
@@ -997,9 +990,9 @@ async fn repair_redownload_does_not_require_installed_file() {
     let ledger_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{stdout} {stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["purl"] == PURL && e["details"]["redownloaded"] == true),
         "{v}"
@@ -1077,15 +1070,15 @@ async fn repair_rebuilds_qualified_ledger_key_from_installed_copy() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "rebuilt" && e["purl"] == GEM_PURL_QUALIFIED),
         "the installed copy must drive the rebuild of the qualified-keyed entry: {v}"
     );
     assert!(
-        !events_of(&v).iter().any(|e| e["action"] == "failed"
+        !events(&v).iter().any(|e| e["action"] == "failed"
             || e["errorCode"]
                 .as_str()
                 .is_some_and(|c| c.starts_with("vendor_fetch"))),
@@ -1153,9 +1146,9 @@ async fn repair_restores_crashed_set_aside_leftover_before_classifying() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        !events_of(&v).iter().any(|e| e["action"] == "failed"),
+        !events(&v).iter().any(|e| e["action"] == "failed"),
         "the restored bytes are healthy — nothing to rebuild, nothing failed: {v}"
     );
     assert_eq!(
@@ -1188,9 +1181,9 @@ async fn repair_redownloads_gem_without_registry_checksum() {
     let ledger_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{stdout} {stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["purl"] == GEM_PURL && e["details"]["redownloaded"] == true),
         "{v}"
@@ -1230,9 +1223,9 @@ async fn repair_redownload_ignores_drifted_installed_variant() {
     let ledger_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{stdout} {stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["purl"] == GEM_PURL && e["details"]["redownloaded"] == true),
         "{v}"
@@ -1265,9 +1258,9 @@ async fn repair_ecosystems_scope_skips_out_of_scope_entries() {
     let (code, stdout, stderr) =
         run_cli(tmp.path(), &mock.uri(), &["repair", "--ecosystems", "gem"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        !events_of(&v).iter().any(|e| e["purl"] == PURL),
+        !events(&v).iter().any(|e| e["purl"] == PURL),
         "an out-of-scope entry produces no events: {v}"
     );
     assert!(
@@ -1278,9 +1271,9 @@ async fn repair_ecosystems_scope_skips_out_of_scope_entries() {
     let (code, stdout, stderr) =
         run_cli(tmp.path(), &mock.uri(), &["repair", "--ecosystems", "npm"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
         "envelope={v}"
@@ -1365,9 +1358,9 @@ async fn repair_redownload_preserves_platform_locked_artifact() {
     let ledger_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{stdout} {stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["purl"] == PURL && e["details"]["redownloaded"] == true),
         "{v}"
@@ -1403,8 +1396,8 @@ async fn repair_tampered_base_purl_surfaces_precise_unverifiable_detail() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
-    let failed = events_of(&v)
+    let v = parse_json_envelope(&stdout);
+    let failed = events(&v)
         .into_iter()
         .find(|e| {
             e["action"] == "failed"
@@ -1462,10 +1455,10 @@ async fn repair_recovers_multiple_records_by_uuid_sharing_one_client() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     for purl in [PURL, GEM_PURL] {
         assert!(
-            events_of(&v)
+            events(&v)
                 .iter()
                 .any(|e| e["action"] == "rebuilt" && e["purl"] == purl),
             "both records must be recovered by uuid and rebuilt: {v}"
@@ -1559,15 +1552,11 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
         &[("DENO_DIR", deno_home.path().to_str().unwrap())],
     );
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
+        events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == JSR_PURL
-            && e["errorCode"] == "vendor_artifact_unrepairable"
-            && e["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("ledger package identity is invalid or unsupported")),
+            && e["errorCode"] == "vendor_artifact_unrepairable"),
         "envelope={v}"
     );
     assert_eq!(
@@ -1594,15 +1583,11 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
         &[("DENO_DIR", deno_home.path().to_str().unwrap())],
     );
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
+        events(&v).iter().any(|e| e["action"] == "failed"
             && e["purl"] == JSR_PURL
-            && e["errorCode"] == "vendor_artifact_unrepairable"
-            && e["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("ledger package identity is invalid or unsupported")),
+            && e["errorCode"] == "vendor_artifact_unrepairable"),
         "envelope={v}"
     );
     assert!(
@@ -1649,9 +1634,9 @@ async fn repair_set_aside_blocked_rename_degrades_to_removal() {
     // Restore perms first so the tempdir always cleans up.
     std::fs::set_permissions(&eco_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
         "the blocked set-aside must not block the rebuild: {v}"
@@ -1733,9 +1718,9 @@ async fn repair_refuses_changed_inventory_with_readonly_ledger() {
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     writable_vendor_dir(tmp.path());
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "failed"
                 && e["errorCode"] == "vendor_artifact_redownload_failed"),
