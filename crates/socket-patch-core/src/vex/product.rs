@@ -171,43 +171,50 @@ fn parse_pyproject(content: &str) -> Option<String> {
 /// them:
 ///
 /// 1. PEP 621 `[project]` `name` + `version` (newer projects favor it).
-/// 2. `[project].name` with `version` listed in `[project].dynamic`: Poetry
-///    2 then takes the version from `[tool.poetry].version`.
-/// 3. The legacy tables that hold both keys: Poetry's `[tool.poetry]`,
-///    then PDM 0.x's `[tool.pdm]` (PDM 1.x migrates it to `[project]`).
-///
-/// `[tool.poetry].version` counts only when Poetry builds the project and
-/// poetry-dynamic-versioning does not replace it at build time: under
-/// another backend (hatch-vcs, setuptools-scm) it is a leftover, and under
-/// the plugin it is a placeholder such as `0.0.0`.
+/// 2. When Poetry builds the project, poetry-core's own merge: the name is
+///    `[project].name` or else `[tool.poetry].name`, and the version is
+///    `[project].version` or else `[tool.poetry].version`. This covers
+///    Poetry 2's dynamic version and the legacy `[tool.poetry]` layout.
+/// 3. PDM 0.x's legacy `[tool.pdm]` table (PDM 1.x migrates it to
+///    `[project]`).
 fn pyproject_name_version(doc: &toml_edit::DocumentMut) -> Option<(String, String)> {
     let project = toml_table(doc, "project");
     let project_str = |key| project.and_then(|t| table_str(t, key));
-    if let Some(name) = project_str("name") {
-        if let Some(version) = project_str("version") {
-            return Some((name.to_string(), version.to_string()));
-        }
-        let version_is_dynamic = project
-            .and_then(|t| t.get("dynamic"))
-            .and_then(|d| d.as_array())
-            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("version")));
-        if version_is_dynamic && poetry_version_is_static(doc) {
-            if let Some(version) = toml_str(doc, "tool.poetry", "version") {
-                return Some((name.to_string(), version.to_string()));
+    let (project_name, project_version) = (project_str("name"), project_str("version"));
+    if let (Some(name), Some(version)) = (project_name, project_version) {
+        return Some((name.to_string(), version.to_string()));
+    }
+    if poetry_version_is_static(doc) {
+        let poetry_name = toml_str(doc, "tool.poetry", "name");
+        // Poetry 2 builds `[project].name`, Poetry 1.x ignores `[project]`
+        // and builds `[tool.poetry].name`: when they differ, the product
+        // depends on the Poetry line, so name none rather than guess.
+        if let (Some(a), Some(b)) = (project_name, poetry_name) {
+            if a != b {
+                return None;
             }
         }
+        let name = project_name.or(poetry_name);
+        let version = project_version.or_else(|| toml_str(doc, "tool.poetry", "version"));
+        if let (Some(name), Some(version)) = (name, version) {
+            return Some((name.to_string(), version.to_string()));
+        }
     }
-    let poetry = toml_name_version(doc, "tool.poetry").filter(|_| poetry_version_is_static(doc));
-    poetry.or_else(|| toml_name_version(doc, "tool.pdm"))
+    toml_name_version(doc, "tool.pdm")
 }
 
-/// Whether `[tool.poetry].version` is the version the build produces: no
-/// non-Poetry `[build-system].build-backend` (Poetry's own projects may
-/// omit the table), and poetry-dynamic-versioning not enabled.
+/// Whether Poetry builds the project from its static `[tool.poetry]`
+/// metadata: no non-Poetry `[build-system].build-backend` (Poetry's own
+/// projects may omit the table), and poetry-dynamic-versioning not
+/// enabled. Under another backend (hatch-vcs, setuptools-scm) the table is
+/// a leftover, and under the enabled plugin its version is a placeholder
+/// such as `0.0.0`. The plugin's backend re-exports poetry-core's and
+/// changes nothing until `enable = true`.
 fn poetry_version_is_static(doc: &toml_edit::DocumentMut) -> bool {
     // `poetry.core.masonry.api`, or `poetry.masonry.api` before poetry-core.
-    let poetry_backend = toml_str(doc, "build-system", "build-backend")
-        .is_none_or(|backend| backend.starts_with("poetry."));
+    let poetry_backend = toml_str(doc, "build-system", "build-backend").is_none_or(|backend| {
+        backend.starts_with("poetry.") || backend == "poetry_dynamic_versioning.backend"
+    });
     let dynamic_versioning = toml_table(doc, "tool.poetry-dynamic-versioning")
         .and_then(|t| t.get("enable"))
         .and_then(|e| e.as_bool())
@@ -1294,12 +1301,40 @@ mod tests {
         );
     }
 
-    /// Without `version` in `dynamic`, Poetry does not take the
-    /// version from `[tool.poetry]`, and neither does detection.
+    /// poetry-core takes `[tool.poetry].version` when `[project]` has
+    /// none, whether or not `dynamic` lists it (poetry-core 2.2
+    /// `Factory.create_poetry`): this builds `demo 0.3.0`.
     #[test]
-    fn pyproject_tool_poetry_version_needs_dynamic() {
-        let content = "[project]\nname = \"demo\"\ndynamic = [\"readme\"]\n\n[tool.poetry]\nversion = \"0.3.0\"\n";
+    fn pyproject_tool_poetry_version_without_dynamic() {
+        let content = "[project]\nname = \"demo\"\n\n[tool.poetry]\nversion = \"0.3.0\"\n\n[build-system]\nbuild-backend = \"poetry.core.masonry.api\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/demo@0.3.0")
+        );
+    }
+
+    /// `[project].name` and a different `[tool.poetry].name`: Poetry 2
+    /// builds `new`, Poetry 1.x builds `old`, so no product is named
+    /// rather than a guess.
+    #[test]
+    fn pyproject_conflicting_poetry_names_is_none() {
+        let content =
+            "[project]\nname = \"new\"\n\n[tool.poetry]\nname = \"old\"\nversion = \"1.0\"\n";
         assert!(parse_pyproject(content).is_none());
+        let same =
+            "[project]\nname = \"same\"\n\n[tool.poetry]\nname = \"same\"\nversion = \"1.0\"\n";
+        assert_eq!(parse_pyproject(same).as_deref(), Some("pkg:pypi/same@1.0"));
+    }
+
+    /// The plugin's backend re-exports poetry-core's and patches nothing
+    /// until `enable = true`, so the static version is what it builds.
+    #[test]
+    fn pyproject_dynamic_versioning_backend_disabled_keeps_static_version() {
+        let content = "[tool.poetry]\nname = \"demo\"\nversion = \"1.2.3\"\n\n[build-system]\nrequires = [\"poetry-core\", \"poetry-dynamic-versioning\"]\nbuild-backend = \"poetry_dynamic_versioning.backend\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/demo@1.2.3")
+        );
     }
 
     /// A dynamic version with no `[tool.poetry].version` (setuptools-scm,
