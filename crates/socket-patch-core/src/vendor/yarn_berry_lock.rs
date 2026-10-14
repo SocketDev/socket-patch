@@ -2581,6 +2581,50 @@ __metadata:
         }
     }
 
+    /// #1540: a `portal:` / `link:` copy with an ABSOLUTE path is never read
+    /// (#1516), so its package and version are unknown. It is named as a
+    /// possible unpatched copy (`vendor_copy_unpatched`, unidentified
+    /// wording) whatever its target holds, never taken as proof the package
+    /// is installed, and the registry entry still vendors. It was dropped
+    /// silently.
+    #[tokio::test]
+    async fn issue_1540_absolute_portal_and_link_copies_are_named() {
+        for protocol in ["portal", "link"] {
+            for fork in ["left-pad", "other-pkg"] {
+                let ext = tempfile::tempdir().unwrap();
+                tokio::fs::write(
+                    ext.path().join("package.json"),
+                    format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+                )
+                .await
+                .unwrap();
+                let abs = ext.path().to_string_lossy().replace('\\', "/");
+                let key = format!("lp2@{protocol}:{abs}::locator=vendor-spike%40workspace%3A.");
+                let block = format!(
+                    "\n\"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
+                     languageName: node\n  linkType: soft\n"
+                );
+                let lock = format!("{B3_BEFORE_LOCK}{block}");
+                let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+
+                let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{protocol}/{fork}: {:?}", result.error);
+                assert!(entry.is_some(), "{protocol}/{fork}: registry entry vendors");
+                let copies: Vec<&VendorWarning> = warnings
+                    .iter()
+                    .filter(|w| w.code == "vendor_copy_unpatched")
+                    .collect();
+                assert_eq!(copies.len(), 1, "{protocol}/{fork}: {warnings:?}");
+                assert!(
+                    copies[0].detail.contains(&format!("`\"{key}\"`"))
+                        && copies[0].detail.contains("can't be read"),
+                    "{protocol}/{fork}: {}",
+                    copies[0].detail
+                );
+            }
+        }
+    }
+
     /// #939 (review): when left-pad@1.3.0 is locked ONLY under another
     /// dependency name, vendoring refuses `vendor_lock_entry_not_rewritable`
     /// naming that copy, in the loop and in the download plan alike, not

@@ -864,8 +864,9 @@ struct LockCopy {
 /// non-registry url) may be any package at its lock version, so it is
 /// recorded as a copy of every package this lock wires at that version:
 /// vouching for those would rest on a copy nobody read (#1516). A
-/// `portal:` / `link:` copy with no readable manifest has no version, and
-/// is left alone.
+/// `portal:` / `link:` copy with no readable manifest (an absolute path,
+/// never read) has no version either, so it may be any version of any
+/// package, and contests every package this lock wires (#1540).
 async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut Discovery) {
     for copy in copies {
         let bytes = match copy.source.read_path() {
@@ -875,18 +876,22 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
         let Some((name, version)) =
             crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
         else {
-            if !matches!(copy.source, CopyRef::Linked(_)) {
-                out.unidentified_copy(
-                    YARN_LOCK,
-                    &copy.version,
-                    &copy.key,
-                    &format!(
-                        "{}, whose package can't be read, so it may be this version of any \
-                         package (yarn keys it by the dependency name)",
-                        copy.source.how()
-                    ),
-                );
-            }
+            let linked = matches!(copy.source, CopyRef::Linked(_));
+            out.unidentified_copy(
+                YARN_LOCK,
+                (!linked).then_some(copy.version.as_str()),
+                &copy.key,
+                &format!(
+                    "{}, whose package can't be read, so it may be {} of any package \
+                     (yarn keys it by the dependency name)",
+                    copy.source.how(),
+                    if linked {
+                        "any version"
+                    } else {
+                        "this version"
+                    }
+                ),
+            );
             continue;
         };
         out.unpatched_copy(
@@ -1873,6 +1878,57 @@ mod tests {
                 assert_refs(
                     &run(&project(protocol, other)).await,
                     &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+                );
+            }
+        }
+    }
+
+    /// #1540: a berry `portal:` / `link:` copy with an ABSOLUTE path is never
+    /// read (a lock is untrusted input, #1516), and its lock version is the
+    /// placeholder `0.0.0-use.local`, so it may be any version of any
+    /// package. It contests every ref its lock wires, whatever the target
+    /// holds, like an unread `file:` copy does at its lock version; it was
+    /// dropped, so `vex` attested `not_affected` while `node_modules/lp2`
+    /// held unpatched left-pad@1.3.0.
+    #[tokio::test]
+    async fn issue_1540_absolute_portal_and_link_copies_contest_every_ref() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        for protocol in ["portal", "link"] {
+            for manifest in [
+                r#"{"name":"left-pad","version":"1.3.0"}"#,
+                r#"{"name":"other-pkg","version":"9.9.9"}"#,
+            ] {
+                let p = Project::new();
+                p.write("ext/lp/package.json", manifest);
+                let abs = p.root().join("ext/lp").to_string_lossy().replace('\\', "/");
+                let descriptor = format!("lp2@{protocol}:{abs}::locator=app%40workspace%3A.");
+                p.write(
+                    "yarn.lock",
+                    berry(&[
+                        wired.clone(),
+                        berry_block(&descriptor, "0.0.0-use.local", &descriptor, None),
+                    ]),
+                );
+                p.write(
+                    "package.json",
+                    package_json_with_resolutions(serde_json::json!({
+                        "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                    })),
+                );
+                let out = run(&p).await;
+                assert!(
+                    out.refs.is_empty(),
+                    "{protocol} {manifest}: {:#?}",
+                    out.refs
+                );
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains(&format!("lp2@{protocol}:"))
+                            && d.detail.contains("can't be read")),
+                    "{protocol} {manifest}: {:#?}",
+                    out.diagnostics
                 );
             }
         }
