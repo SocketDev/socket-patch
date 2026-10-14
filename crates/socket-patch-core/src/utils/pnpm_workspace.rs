@@ -23,6 +23,7 @@
 //! installs from its own `pnpm-lock.<branch>.yaml`, which neither mode can
 //! pin, so both refuse ([`git_branch_locks`], #556).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::formats::pnpm::workspace::read_package_globs;
@@ -154,6 +155,30 @@ fn env_setting(
                 yaml: false,
             })
         })
+}
+
+/// pnpm's `trustLockfile` as the environment sets it, for a project on
+/// pnpm `major` (#1514): `pnpm_config_trust_lockfile`, or its uppercase
+/// spelling, which pnpm 11 and newer read ahead of pnpm-workspace.yaml.
+/// `None` on pnpm 10 and older, which never verify lock URLs, and for
+/// `npm_config_trust_lockfile`, which no pnpm reads.
+pub fn trust_lockfile_env(
+    major: Option<u32>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<PnpmSetting> {
+    if major.is_some_and(|major| major < 11) {
+        return None;
+    }
+    // pnpm 11's spelling, then the uppercase one pnpm 12 reads too.
+    env_setting("trust-lockfile", Some(major.unwrap_or(11)), &env).or_else(|| {
+        let var = "PNPM_CONFIG_TRUST_LOCKFILE";
+        let value = env(var)?.trim().to_string();
+        Some(PnpmSetting {
+            source: format!("`{var}={value}` in the environment"),
+            value,
+            yaml: false,
+        })
+    })
 }
 
 /// [`pnpm_setting`], falling back to the environment ([`env_setting`],
@@ -674,25 +699,35 @@ fn lockfile_off(setting: impl Fn(&str, &str) -> Option<PnpmSetting>) -> Option<S
 /// The pnpm major whose settings reading applies to the project at `view`
 /// (see [`lockfile_disabled`]).
 async fn pnpm_major(view: &ProjectView<'_>) -> Option<u32> {
+    let mut texts = BTreeMap::new();
+    for rel in [MODULES_YAML, "package.json", PNPM_LOCK] {
+        if let Ok(text) = view.read_text(rel).await {
+            texts.insert(rel, text);
+        }
+    }
+    pnpm_major_from(|rel| texts.get(rel).cloned())
+}
+
+/// The installed pnpm's record of the project.
+pub(crate) const MODULES_YAML: &str = "node_modules/.modules.yaml";
+
+/// The pnpm major whose settings reading applies to a project whose files
+/// `read` returns by project-relative path: the one that installed it
+/// ([`MODULES_YAML`]), else the one package.json pins, else what the root
+/// lock's grammar implies (`pnpm_settings_major`).
+pub(crate) fn pnpm_major_from(read: impl Fn(&str) -> Option<String>) -> Option<u32> {
     use crate::patch::redirect::upstream::npm::{
         modules_yaml_pnpm_major, package_json_pnpm_major, pnpm_settings_major,
     };
-    let installed = view
-        .read_text("node_modules/.modules.yaml")
-        .await
-        .ok()
+    let pinned = read(MODULES_YAML)
         .as_deref()
-        .and_then(modules_yaml_pnpm_major);
-    let pinned = match installed {
-        Some(major) => Some(major),
-        None => view
-            .read_text("package.json")
-            .await
-            .ok()
-            .as_deref()
-            .and_then(package_json_pnpm_major),
-    };
-    let lock = view.read_text(PNPM_LOCK).await.ok().unwrap_or_default();
+        .and_then(modules_yaml_pnpm_major)
+        .or_else(|| {
+            read("package.json")
+                .as_deref()
+                .and_then(package_json_pnpm_major)
+        });
+    let lock = read(PNPM_LOCK).unwrap_or_default();
     pnpm_settings_major(&lock, pinned)
 }
 
@@ -910,6 +945,31 @@ mod tests {
         .unwrap();
         assert_eq!(found.as_bool(), Some(true));
         assert_eq!(env_setting("git-branch-lockfile", None, env(&[])), None);
+    }
+
+    /// #1514: pnpm 11 and newer read `trustLockfile` from
+    /// `pnpm_config_trust_lockfile` (either case); pnpm 10 and older never
+    /// verify, and no pnpm reads `npm_config_trust_lockfile`.
+    #[test]
+    fn the_environment_sets_trust_lockfile_only_for_pnpm_11_and_newer() {
+        const LOWER: &[(&str, &str)] = &[("pnpm_config_trust_lockfile", "false")];
+        const UPPER: &[(&str, &str)] = &[("PNPM_CONFIG_TRUST_LOCKFILE", " false ")];
+        const NPM: &[(&str, &str)] = &[("npm_config_trust_lockfile", "false")];
+        for major in [Some(11), Some(12), None] {
+            let found = trust_lockfile_env(major, env(LOWER)).expect("lowercase");
+            assert_eq!(found.as_bool(), Some(false));
+            assert!(found.source.contains("pnpm_config_trust_lockfile=false"));
+            let found = trust_lockfile_env(major, env(UPPER)).expect("uppercase");
+            assert_eq!(found.as_bool(), Some(false));
+            assert!(found.source.contains("PNPM_CONFIG_TRUST_LOCKFILE=false"));
+            assert_eq!(trust_lockfile_env(major, env(NPM)), None);
+        }
+        assert_eq!(trust_lockfile_env(Some(10), env(LOWER)), None);
+        let on = &[("pnpm_config_trust_lockfile", "true")];
+        assert_eq!(
+            trust_lockfile_env(Some(11), env(on)).and_then(|s| s.as_bool()),
+            Some(true)
+        );
     }
 
     /// #1460: pnpm 11 and newer read only `pnpm_config_*`, pnpm 10 and
