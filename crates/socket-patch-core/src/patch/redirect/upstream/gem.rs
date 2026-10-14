@@ -519,11 +519,12 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
     }
     let stack = block_stack(text, block.start);
     let enclosing = stack.last().map(|f| indent_of(&text[f.line..]));
-    if stack
-        .last()
-        .is_some_and(|f| f.line == line_before_start(text, block.start))
-    {
-        return format!("{}  ", indent_of(prev));
+    if let Some(indent) = enclosing.filter(|_| {
+        stack
+            .last()
+            .is_some_and(|f| f.opener == line_before_start(text, block.start))
+    }) {
+        return format!("{indent}  ");
     }
     if trimmed.starts_with('#') || gem_declaration_any(trimmed).is_some() {
         return indent_of(prev).to_string();
@@ -553,8 +554,11 @@ struct Frame {
     /// with `end` or `}`: `group … do`, `if`, `case`, `def`, a hash, … is
     /// not).
     source: bool,
-    /// Byte offset of the start of the line that opened it.
+    /// Byte offset of the start of the line its statement began on.
     line: usize,
+    /// Byte offset of the start of the line holding its opener (the `do`,
+    /// `{` or keyword), below `line` when the statement spans lines.
+    opener: usize,
 }
 
 /// The Ruby constructs still open at byte `at` (a line start) of the
@@ -574,13 +578,18 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
     let mut heredocs: std::collections::VecDeque<(String, bool)> = Default::default();
     // A string or `%`-literal still open at the end of the last line.
     let mut literal: Option<Literal> = None;
-    // The code of the statement the last line left unfinished (a trailing
-    // `,`, `\`, `=`, …), and the start of the line it began on.
+    // The code the last line left unfinished (a trailing `,`, `\`, `=`,
+    // …): only its end matters, to tell what a keyword follows.
     let mut carried = String::new();
-    // `(` / `[` nesting of the unfinished statement.
+    // Open `(`, `[` and hash `{` of the unfinished statement.
     let mut depth = 0usize;
+    // Each open `{`: a hash (counted in `depth`) or a block (a frame).
+    let mut braces: Vec<bool> = Vec::new();
     // The statement began with `source` and its block has not opened yet.
     let mut source_pending = false;
+    // The statement began with `source(`: (its argument list is open, it
+    // has closed).
+    let mut source_call = (false, false);
     let mut statement_line = 0;
     let mut start = 0;
     for raw in text[..at].split_inclusive('\n') {
@@ -614,49 +623,75 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
         let masked = masked.trim();
         if !continues {
             statement_line = line_start;
-            source_pending = masked
-                .strip_prefix("source")
-                .is_some_and(|rest| rest.starts_with([' ', '\t', '(']));
+            let rest = masked.strip_prefix("source").unwrap_or("-");
+            source_pending = rest.starts_with([' ', '\t', '(']);
+            source_call = (false, !rest.starts_with('('));
         }
         for (n, statement) in masked.split(';').enumerate() {
             let lead = if n == 0 { carried.as_str() } else { "" };
-            if n > 0 {
+            if n > 0 && depth == 0 {
                 source_pending = false;
-                depth = 0;
             }
             // A `while`/`until`/`for` takes its optional `do` as part of
             // the loop, not as a block of its own.
             let mut loop_do = false;
             // The word after `def` is the method's name (`def begin`).
             let mut method_name = false;
+            // The last token closed the `source(…)` argument list.
+            let mut after_source_call = false;
             for (word, start, end) in ruby_tokens(statement) {
-                if word.starts_with(is_ident_char) && std::mem::take(&mut method_name) {
+                let closed_source_call = std::mem::take(&mut after_source_call);
+                if is_ident_byte(word.as_bytes()[0]) && std::mem::take(&mut method_name) {
                     continue;
                 }
                 let expression = || starts_expression(&format!("{lead} {}", &statement[..start]));
-                // The block of the `source` statement, outside its
-                // argument list.
-                let source_block =
-                    |depth: usize, pending: &mut bool| depth == 0 && std::mem::take(pending);
                 let (opens, source) = match word {
                     "(" | "[" => {
+                        if depth == 0 && !source_call.1 {
+                            source_call.0 = true;
+                        }
                         depth += 1;
                         (false, false)
                     }
                     ")" | "]" => {
                         depth = depth.saturating_sub(1);
+                        if depth == 0 && std::mem::take(&mut source_call.0) {
+                            source_call.1 = true;
+                            after_source_call = true;
+                        }
                         (false, false)
                     }
-                    // A brace block binds to the call before it, so a
-                    // `source(…)` call's own block follows its `)`.
-                    "{" => (
-                        true,
-                        statement[..start].trim_end().ends_with(')')
-                            && source_block(depth, &mut source_pending),
-                    ),
+                    // A hash literal, part of the statement.
+                    "{" if expression() => {
+                        braces.push(true);
+                        depth += 1;
+                        (false, false)
+                    }
+                    // A brace block binds to the call before it, so only
+                    // the one right after `source(…)` is the source's.
+                    "{" => {
+                        braces.push(false);
+                        (
+                            true,
+                            closed_source_call && std::mem::take(&mut source_pending),
+                        )
+                    }
+                    "}" => {
+                        match braces.pop() {
+                            Some(true) => depth = depth.saturating_sub(1),
+                            Some(false) => {
+                                open.pop();
+                            }
+                            None => {}
+                        }
+                        (false, false)
+                    }
                     "do" => {
                         let opens = !std::mem::take(&mut loop_do);
-                        (opens, opens && source_block(depth, &mut source_pending))
+                        (
+                            opens,
+                            opens && depth == 0 && std::mem::take(&mut source_pending),
+                        )
                     }
                     "if" | "unless" => (expression(), false),
                     "while" | "until" => {
@@ -673,7 +708,7 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                         (!endless_def(&statement[end..]), false)
                     }
                     "case" | "begin" | "class" | "module" => (true, false),
-                    "end" | "}" => {
+                    "end" => {
                         open.pop();
                         (false, false)
                     }
@@ -683,6 +718,7 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                     open.push(Frame {
                         source,
                         line: statement_line,
+                        opener: line_start,
                     });
                 }
             }
@@ -694,9 +730,7 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
             || masked.ends_with("&&");
         carried = if unfinished {
             let tail = masked.rsplit(';').next().unwrap_or_default();
-            format!("{carried} {}", tail.trim_end_matches('\\'))
-                .trim()
-                .to_string()
+            tail.trim_end_matches('\\').trim().to_string()
         } else {
             String::new()
         };
@@ -717,10 +751,6 @@ fn ruby_tokens(code: &str) -> impl Iterator<Item = (&str, usize, usize)> {
         (Some(_), _) => words.next(),
         (None, _) => brackets.next(),
     })
-}
-
-fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || !c.is_ascii()
 }
 
 /// The keyword-like words of a masked code line, with their byte range: a
@@ -858,7 +888,7 @@ struct Literal {
 }
 
 /// `line` up to its `#` comment, with the contents of every string,
-/// backtick, `%`-literal (`%w[…]`, `%i(…)`, `%q{…}`, …) and regexp literal
+/// character literal, backtick, `%`-literal (`%w[…]`, `%i(…)`, `%q{…}`, …) and regexp literal
 /// masked as `x`, byte for byte, so a keyword or `#` inside one never counts
 /// as code. The delimiters stay. A string or `%`-literal still open at the
 /// end of the line is carried in `literal` to mask the next line from its
@@ -883,6 +913,21 @@ fn masked_ruby_code(line: &str, literal: &mut Option<Literal>) -> String {
             b'#' => {
                 out.truncate(i);
                 break;
+            }
+            // A character literal (`?(`, `?}`, `?\n`): its character is
+            // not code.
+            b'?' if starts_expression(before) => {
+                let len = match bytes.get(i + 1) {
+                    Some(b'\\') => 2,
+                    Some(c) if c.is_ascii_punctuation() => 1,
+                    _ => 0,
+                };
+                let next = bytes.get(i + 1 + len).copied();
+                if len > 0 && !next.is_some_and(is_ident_byte) {
+                    out[i + 1..(i + 1 + len).min(bytes.len())].fill(b'x');
+                }
+                i += 1 + len;
+                continue;
             }
             b'"' | b'\'' | b'`' => (
                 Literal {
@@ -1836,6 +1881,10 @@ mod tests {
              gem \"rails\", \"7.0.0\"\nend\n",
             "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource(\"https://rubygems.org\") {\n  \
              gem \"rails\", \"7.0.0\"\n}\n",
+            // First of two in a multi-line opener's block: no blank line
+            // comes back between the opener and the declaration.
+            "source \"https://rubygems.org\"\n\ngem \"puma\"\nsource(\n  \"https://rubygems.org\"\n) do\n  \
+             gem \"rails\", \"7.0.0\"\n  gem \"rack\"\nend\n",
         ] {
             let lock = format!(
                 "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    \
@@ -1924,6 +1973,29 @@ mod tests {
         assert!(at(
             "source \"https://x\" do\n  gem \"a\", require: %w{b c}\n  gem \"rails\"\nend\n"
         ));
+        // Only the brace block right after the `source(…)` call is the
+        // source's: one on an argument's own call is not, and leaves the
+        // `do` that follows it the source's block.
+        assert!(at(
+            "source ENV.fetch(\"S\") { \"https://x\" } do\n  gem \"rails\"\nend\n"
+        ));
+        assert!(!at("source foo(\"https://x\") {\n  gem \"rails\"\n}\n"));
+        assert!(at(
+            "source(ENV.fetch(\"S\") { warn \"x\"; \"https://x\" }) do\n  gem \"rails\"\nend\n"
+        ));
+        // A hash argument spanning lines keeps the statement open.
+        assert!(at(
+            "source \"https://x\", opts: {\n  a: 1\n} do\n  gem \"rails\"\nend\n"
+        ));
+        // Character literals are not brackets.
+        assert!(at(
+            "x = ?(\nsource \"https://x\" do\n  gem \"rails\"\nend\n"
+        ));
+        assert!(at(
+            "source \"https://x\" do\n  sep = ?}\n  gem \"rails\"\nend\n"
+        ));
+        // A stray `}` never closes a `do` block.
+        assert!(at("source \"https://x\" do\n  }\n  gem \"rails\"\nend\n"));
         // A closed source block before the declaration does not count.
         assert!(!at(
             "source \"https://x\" do\n  gem \"a\"\nend\ngroup :t do |g|\n  gem \"rails\"\nend\n"
