@@ -29,7 +29,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic};
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -93,24 +93,13 @@ fn git_sha256_file(path: &Path) -> String {
 }
 
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    // The shared builder scrubs every ambient `SOCKET_*` (an ambient
+    // SOCKET_DRY_RUN would turn every `scan --mode agent` into a preview,
+    // SOCKET_GLOBAL would aim mutations at the host's real global
+    // node_modules) and forces the config layer and update check off;
+    // removing SOCKET_API_TOKEN also forces the public proxy (free-tier).
+    let mut cmd = hermetic::command(&binary());
     cmd.args(args).current_dir(cwd);
-    // The binary binds a wide `SOCKET_*` env surface (SOCKET_CWD,
-    // SOCKET_DRY_RUN, SOCKET_GLOBAL, SOCKET_GLOBAL_PREFIX, SOCKET_PROXY_URL,
-    // SOCKET_MANIFEST_PATH, ...). An ambient value silently changes what
-    // these tests exercise — SOCKET_DRY_RUN=true turns every `scan --mode agent`
-    // into a no-op preview, and SOCKET_GLOBAL aims mutations at the host's
-    // *real* global node_modules. Scrub the whole prefix so only the flags
-    // each test passes are in effect; removing SOCKET_API_TOKEN also forces
-    // the public proxy (free-tier). Telemetry opt-outs are deliberately kept
-    // so an opted-out dev stays opted out.
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -130,6 +119,7 @@ fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, String) {
 fn npm_run(cwd: &Path, args: &[&str]) {
     let mut cmd = Command::new("npm");
     cmd.args(args).current_dir(cwd);
+    hermetic::scrub_socket_vars(&mut cmd);
     cache_env::isolate(&mut cmd);
     let out = cmd.output().expect("failed to run npm");
     assert!(
