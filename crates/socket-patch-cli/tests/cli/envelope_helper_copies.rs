@@ -10,7 +10,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::common::envelope::{
-    all_codes, codes_in, event_codes, event_purls, event_triples, events, find_event,
+    all_codes, codes_in, event_codes, event_purls, event_triples, events, find_event, has_event,
     parse_json_envelope,
 };
 
@@ -55,6 +55,7 @@ const READER_NAMES: &[&str] = &[
     "event_codes",
     "event_triples",
     "event_purls",
+    "has_event",
     "warning_codes",
     "codes",
     "all_codes",
@@ -243,6 +244,37 @@ fn event_purls_lists_the_string_purls_of_one_action() {
     // The `skipped` event has no purl, so it lists nothing.
     assert!(event_purls(&env, "skipped").is_empty());
     assert!(event_purls(&env, "removed").is_empty());
+    // A null or numeric purl is not listed as text.
+    let odd = json!({"events": [
+        {"action": "removed", "purl": null},
+        {"action": "removed", "purl": 7},
+        {"action": "removed", "purl": "pkg:npm/c@1.0.0"},
+    ]});
+    assert_eq!(event_purls(&odd, "removed"), ["pkg:npm/c@1.0.0"]);
+}
+
+#[test]
+fn has_event_needs_action_code_and_purl_to_match() {
+    let env = sample();
+    assert!(has_event(
+        &env,
+        "failed",
+        "vendor_lock_drift",
+        "pkg:npm/b@1.0.0"
+    ));
+    assert!(!has_event(
+        &env,
+        "failed",
+        "vendor_lock_drift",
+        "pkg:npm/a@1.0.0"
+    ));
+    assert!(!has_event(
+        &env,
+        "skipped",
+        "vendor_lock_drift",
+        "pkg:npm/b@1.0.0"
+    ));
+    assert!(!has_event(&env, "vendored", "", "pkg:npm/a@1.0.0"));
 }
 
 #[test]

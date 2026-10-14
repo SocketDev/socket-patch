@@ -5,10 +5,11 @@
 //! surfaces.
 //!
 //! `--json` tests assert behavior (exit, `error.code`, events, summary
-//! counts, bytes on disk) through `common::envelope`, never message
-//! sentences; where a message must name something, they check that token
-//! (a purl, a flag, a path). Human-mode tests are the render checks: one
-//! assertion per message family (#1089).
+//! counts, bytes on disk) through `common::envelope`. They read the
+//! message only for what it must name: a purl, a flag, a path, a remedy
+//! command, the "manifest was not modified" promise, or the short phrase
+//! that tells two causes sharing one `error.code` apart. Human-mode tests
+//! are the render checks: one assertion per message family (#1089).
 //!
 //! Binary-driven (spawns `CARGO_BIN_EXE_socket-patch` through
 //! `common::run_with_env`, which scrubs the ambient `SOCKET_*` env): every
@@ -21,9 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::common;
-use crate::common::envelope::{
-    event_purls, event_triples, events, parse_json_envelope, warning_codes,
-};
+use crate::common::envelope::{event_purls, events, has_event, parse_json_envelope, warning_codes};
 use crate::vlt_hosted_common;
 use crate::vlt_vendored;
 
@@ -39,13 +38,6 @@ fn run_remove(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, 
 
 fn read_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-/// Whether `v` has an `action` event for `purl` with `errorCode == code`.
-fn has_event(v: &serde_json::Value, action: &str, code: &str, purl: &str) -> bool {
-    event_triples(v)
-        .iter()
-        .any(|(p, a, c)| p == purl && a == action && c == code)
 }
 
 /// One hand-written camelCase manifest with a single `files: {}` patch —
@@ -426,8 +418,8 @@ fn remove_unknown_vendor_flavor_fails_closed_before_manifest_mutation() {
     assert_eq!(v["error"]["code"], "vendor_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains("no-such-flavor"),
-        "the error must name the flavor; got: {msg}"
+        msg.contains("no-such-flavor") && msg.contains("The manifest was not modified."),
+        "the error must name the flavor and promise the manifest is intact; got: {msg}"
     );
     assert_eq!(v["summary"]["removed"], 0);
 
@@ -692,14 +684,13 @@ fn remove_hosted_dry_run_leaves_lock_untouched() {
         v["summary"]["removed"], 0,
         "a preview must not count as a removal; envelope={v}"
     );
-    let events = events(&v);
     assert!(
         has_event(&v, "verified", "hosted_reverted", NPM_PURL),
-        "the hosted restore preview must be a verified/hosted_reverted event: {events:?}"
+        "the hosted restore preview must be a verified/hosted_reverted event: envelope={v}"
     );
     assert!(
-        events.iter().all(|e| e["action"] != "removed"),
-        "dry-run must not emit Removed events: {events:?}"
+        events(&v).iter().all(|e| e["action"] != "removed"),
+        "dry-run must not emit Removed events: envelope={v}"
     );
 
     // Nothing on disk moved.
@@ -735,10 +726,9 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
         "the preview must count the would-be restore; envelope={v}"
     );
     assert_eq!(v["summary"]["removed"], 0);
-    let events = events(&v);
     assert!(
         has_event(&v, "verified", "hosted_reverted", NPM_PURL),
-        "expected a verified/hosted_reverted preview event: {events:?}"
+        "expected a verified/hosted_reverted preview event: envelope={v}"
     );
     assert_eq!(read_bytes(&lock_path), lock_before, "lock byte-identical");
     assert!(
@@ -811,7 +801,9 @@ fn remove_hosted_preserve_state_json_warns_no_preservable_state() {
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_json_envelope(&stdout);
     assert!(
-        warning_codes(&v).contains(&"hosted_state_not_preservable".to_string()),
+        warning_codes(&v)
+            .iter()
+            .any(|c| c == "hosted_state_not_preservable"),
         "expected a hosted_state_not_preservable warning; envelope={v}"
     );
 }
@@ -852,12 +844,14 @@ fn remove_hosted_only_preserve_state_notes_no_preservable_state() {
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        !stderr.contains("no preservable local state"),
+        !stderr.lines().any(|l| l.starts_with("Note:")),
         "--json keeps the note off stderr; got:\n{stderr}"
     );
     let v = parse_json_envelope(&stdout);
     assert!(
-        warning_codes(&v).contains(&"hosted_state_not_preservable".to_string()),
+        warning_codes(&v)
+            .iter()
+            .any(|c| c == "hosted_state_not_preservable"),
         "expected a hosted_state_not_preservable warning; envelope={v}"
     );
     assert_eq!(
@@ -873,7 +867,9 @@ fn remove_hosted_only_preserve_state_notes_no_preservable_state() {
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_json_envelope(&stdout);
     assert!(
-        !warning_codes(&v).contains(&"hosted_state_not_preservable".to_string()),
+        !warning_codes(&v)
+            .iter()
+            .any(|c| c == "hosted_state_not_preservable"),
         "a plain remove must not warn about preserve-state; envelope={v}"
     );
 }
@@ -1050,9 +1046,10 @@ fn remove_hosted_revert_failure_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains(NPM_PURL) && msg.contains("404") && msg.contains("package-lock.json"),
-        "the error must name the purl, the registry status and the lockfile to restore; \
-         got: {msg}"
+        msg.contains(NPM_PURL)
+            && msg.contains("404")
+            && msg.contains("git checkout -- package-lock.json"),
+        "the error must name the purl, the registry status and the checkout remedy; got: {msg}"
     );
     assert_eq!(v["summary"]["removed"], 0);
 
@@ -1275,10 +1272,9 @@ fn remove_mixed_drift_keep_is_partial_failure_json() {
         vec![MIXED_REMOVED_PURL],
         "the removed event must name the sibling; envelope={v}"
     );
-    let events = events(&v);
     assert!(
         has_event(&v, "skipped", "vendor_revert_kept", MIXED_KEPT_PURL),
-        "expected a skipped/vendor_revert_kept event for the kept purl: {events:?}"
+        "expected a skipped/vendor_revert_kept event for the kept purl: envelope={v}"
     );
 
     // The kept purl's manifest entry and ledger entry survive; the sibling
@@ -1307,7 +1303,7 @@ fn remove_mixed_drift_keep_is_partial_failure_json() {
 #[test]
 fn remove_mixed_drift_keep_is_partial_failure_human() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    make_mixed_drift_fixture(tmp.path());
+    let socket = make_mixed_drift_fixture(tmp.path());
 
     let (code, stdout, stderr) = run_remove(tmp.path(), &[MIXED_UUID, "--yes", "--offline"], &[]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
@@ -1318,6 +1314,14 @@ fn remove_mixed_drift_keep_is_partial_failure_human() {
     assert!(
         stderr.contains("re-run `scan --mode vendored`"),
         "the error must carry the normalize remedy; got:\n{stderr}"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .unwrap();
+    let patches = manifest["patches"].as_object().expect("patches object");
+    assert!(
+        patches.contains_key(MIXED_KEPT_PURL) && !patches.contains_key(MIXED_REMOVED_PURL),
+        "the kept entry must survive and the sibling must be removed; got: {patches:?}"
     );
 }
 
@@ -1405,10 +1409,9 @@ fn remove_drift_keep_excludes_manifest_entry_by_base_purl() {
     assert_eq!(v["error"]["code"], "vendor_revert_kept", "envelope={v}");
     assert_eq!(v["summary"]["removed"], 0);
     // The kept event names the LEDGER key (the base_purl arm matched it).
-    let events = events(&v);
     assert!(
         has_event(&v, "skipped", "vendor_revert_kept", alias_key),
-        "expected the kept event to carry the ledger key: {events:?}"
+        "expected the kept event to carry the ledger key: envelope={v}"
     );
     assert_eq!(
         read_bytes(&socket.join("manifest.json")),
@@ -1976,10 +1979,9 @@ fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
         "nothing is removed under --preserve-state; envelope={v}"
     );
     assert!(event_purls(&v, "removed").is_empty(), "envelope={v}");
-    let events = events(&v);
     assert!(
         has_event(&v, "skipped", "vendor_state_preserved", purl),
-        "expected a skipped/vendor_state_preserved event: {events:?}"
+        "expected a skipped/vendor_state_preserved event: envelope={v}"
     );
     assert_eq!(
         read_bytes(&ledger_path),
@@ -2067,10 +2069,9 @@ fn remove_detached_drift_keep_holds_ledger_entry_and_exits_one() {
         "every match kept → top-level error; envelope={v}"
     );
     assert_eq!(v["summary"]["removed"], 0, "envelope={v}");
-    let events = events(&v);
     assert!(
         has_event(&v, "skipped", "vendor_revert_kept", purl),
-        "expected a skipped/vendor_revert_kept event: {events:?}"
+        "expected a skipped/vendor_revert_kept event: envelope={v}"
     );
     assert!(
         event_purls(&v, "removed").is_empty(),
