@@ -949,11 +949,18 @@ async fn run_redirect_selected_untracked(
     // workspace / `lockfile-dir`, cargo workspace): the rewriters would
     // read only the member, so refuse before any takeover or write. The
     // same goes for a pnpm member whose `trustLockfile` setting lives in
-    // the workspace root's pnpm-workspace.yaml.
+    // the workspace root's pnpm-workspace.yaml, unless a
+    // `pnpm_config_trust_lockfile` in this environment overrides that file
+    // (#1514): adding the key there would not help, and the rewrite's
+    // trust warning names the variable instead.
+    let trust_env_off = socket_patch_core::utils::pnpm_workspace::trust_lockfile_env(None, |var| {
+        std::env::var(var).ok()
+    })
+    .is_some_and(|found| found.as_bool() != Some(true));
     if let Some(refusal) = socket_patch_core::hosted::governing_root::refusal(
         &view,
         &candidates,
-        !common.no_trust_lockfile_config,
+        !common.no_trust_lockfile_config && !trust_env_off,
     )
     .await
     {

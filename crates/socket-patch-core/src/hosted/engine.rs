@@ -2507,27 +2507,29 @@ fn pnpm_trust(
         pnpm_trust_rush_detail(&server)
     } else if !governing_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
-    } else if let Some(found) = pnpm_trust_env_override(view, files, options.pnpm_env) {
-        pnpm_trust_env_set_detail(&server, &found.source)
     } else if let Some(root_file) = governing_workspace(view) {
         // A workspace member with its own lock: pnpm reads `trustLockfile`
         // only from the workspace root's file, and a nested one would be
         // ignored (#880). The governing-root pre-check refused every root
         // file but these two, so nothing is written here.
         let root_file = root_file.display().to_string();
-        match read_workspace_for_trust(std::path::Path::new(&root_file))
-            .ok()
-            .flatten()
-            .map(|text| plan_workspace_trust(Some(&text)))
-        {
-            Some(TrustPlan::AlreadyTrue) => {
-                pnpm_rerun_only = spliced_pnpm_locks == 0;
-                pnpm_trust_already_true_detail(&server, &root_file)
+        if let Some(found) = pnpm_trust_env_override(view, files, options.pnpm_env) {
+            pnpm_trust_env_set_detail(&server, &found.source)
+        } else {
+            match read_workspace_for_trust(std::path::Path::new(&root_file))
+                .ok()
+                .flatten()
+                .map(|text| plan_workspace_trust(Some(&text)))
+            {
+                Some(TrustPlan::AlreadyTrue) => {
+                    pnpm_rerun_only = spliced_pnpm_locks == 0;
+                    pnpm_trust_already_true_detail(&server, &root_file)
+                }
+                Some(TrustPlan::UserSet(value)) => {
+                    pnpm_trust_user_set_detail(&server, &root_file, &value)
+                }
+                _ => pnpm_trust_manual_guidance(&server),
             }
-            Some(TrustPlan::UserSet(value)) => {
-                pnpm_trust_user_set_detail(&server, &root_file, &value)
-            }
-            _ => pnpm_trust_manual_guidance(&server),
         }
     } else {
         let (workspace, symlinked) = read_workspace(view);
@@ -2558,6 +2560,7 @@ fn pnpm_trust(
         // A keyless file the lock was installed from as a multi-package
         // workspace: only pnpm <= 10.4 reads one that way (every nested
         // package), and the root-only scaffold would drop those members.
+        let env_override = pnpm_trust_env_override(view, files, options.pnpm_env);
         let keyless_members = pinned_pre_10_5.is_none()
             && !symlinked
             && matches!(&workspace, Ok(Some(text)) if crate::formats::pnpm::workspace::is_keyless(text))
@@ -2568,6 +2571,16 @@ fn pnpm_trust(
                 &server,
                 pinned_pre_10_5.as_deref().unwrap_or_default(),
                 options.dry_run,
+            ),
+            // pnpm 11+ read the environment's `trustLockfile` ahead of
+            // the file (#1514): an explicit setting nothing written there
+            // could override.
+            Ok(_) if env_override.is_some() => pnpm_trust_env_set_detail(
+                &server,
+                &env_override
+                    .as_ref()
+                    .map(|found| found.source.clone())
+                    .unwrap_or_default(),
             ),
             // Present but UNREADABLE: never plan a Create (it would
             // overwrite the user's workspace file) — fall back to
@@ -2708,26 +2721,13 @@ fn pnpm_trust_env_override(
     files: &BTreeMap<String, String>,
     env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
 ) -> Option<crate::utils::pnpm_workspace::PnpmSetting> {
-    use crate::patch::redirect::upstream::npm::{
-        modules_yaml_pnpm_major, package_json_pnpm_major, pnpm_settings_major,
-    };
-    use crate::utils::pnpm_workspace::trust_lockfile_env;
+    use crate::utils::pnpm_workspace::{pnpm_major_from, trust_lockfile_env};
     let off = |major| trust_lockfile_env(major, env).filter(|found| found.as_bool() != Some(true));
     off(None)?;
-    let read = |rel: &str| read_advisory_text(view, rel);
-    let pinned = read("node_modules/.modules.yaml")
-        .as_deref()
-        .and_then(modules_yaml_pnpm_major)
-        .or_else(|| {
-            read(crate::hosted::memory::select::NPM_MANIFEST_REL)
-                .as_deref()
-                .and_then(package_json_pnpm_major)
-        });
-    let lock = files
-        .get("pnpm-lock.yaml")
-        .map(String::as_str)
-        .unwrap_or_default();
-    off(pnpm_settings_major(lock, pinned))
+    off(pnpm_major_from(|rel| match files.get(rel) {
+        Some(text) => Some(text.clone()),
+        None => read_advisory_text(view, rel),
+    }))
 }
 
 /// The trust detail for a `pnpm_config_trust_lockfile` override in the
