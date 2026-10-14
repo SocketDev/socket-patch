@@ -137,9 +137,10 @@ fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, Str
 /// [`run_socket`] with extra env applied after the scrub.
 ///
 /// The child gets the hermetic `SOCKET_*` environment
-/// (`hermetic::binary_command`), and an activated venv is scrubbed: the
-/// hosted scan is unscoped, so the developer's venv would add packages to
-/// it. `CARGO_HOME` is the leg's own, set after the scrubs.
+/// (`hermetic::binary_command`), and an activated venv is scrubbed on
+/// every call: `scan` and `vex` discover packages unscoped under `--cwd`,
+/// so the developer's venv would add packages to them. `CARGO_HOME` is the
+/// leg's own, set after the scrubs.
 fn run_socket_env(
     cwd: &Path,
     args: &[&str],

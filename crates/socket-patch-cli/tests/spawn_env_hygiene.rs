@@ -28,10 +28,7 @@ use serial_test::serial;
 /// Files that still spawn the binary with a bare `Command::new`, so their
 /// children see whatever `SOCKET_*` the ambient shell exports unless the file
 /// scrubs by hand.
-const PENDING_RAW_SPAWNS: &[&str] = &[
-    "e2e_hosted_production.rs",
-    "e2e_vendored_production.rs",
-];
+const PENDING_RAW_SPAWNS: &[&str] = &["e2e_hosted_production.rs", "e2e_vendored_production.rs"];
 
 /// The environment `cmd`'s child would see: the parent environment with
 /// `cmd`'s explicit sets and removals applied.
