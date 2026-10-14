@@ -3114,8 +3114,11 @@ async fn revert_by_record_kind(
         })
         .filter(|(_, records)| !records.is_empty())
         .collect();
+    // One owner: its backend reverts the whole entry, even when that owner
+    // is not the flavor the entry was last stamped with.
     if groups.len() <= 1 {
-        return revert_flavor_records(flavor, entry, project_root, dry_run).await;
+        let owner = groups.first().map_or(flavor, |(owner, _)| *owner);
+        return revert_flavor_records(owner, entry, project_root, dry_run).await;
     }
     // The files of every group but the last as they are now, to put back
     // if a later group fails or is drift-kept.
@@ -10998,6 +11001,31 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hashes = {sha256 = "u
                 .unwrap(),
             PYLOCK
         );
+    }
+
+    /// #1524: an entry stamped with one flavor whose records all belong to
+    /// another backend (the pylock record dropped, the carried-forward
+    /// requirements lines left) reverts through the backend that owns them.
+    #[tokio::test]
+    async fn entry_whose_records_all_belong_to_another_flavor_reverts() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let (_, entry, _) =
+            crate::vendor::test_support::expect_done(vendor_six(&fx, &sources, None).await);
+        let mut entry = entry.unwrap();
+        assert!(entry.wiring.iter().all(|r| r.kind == "requirements_line"));
+        for flavor in ["python-lock", "uv", "pipenv"] {
+            entry.flavor = Some(flavor.to_string());
+            let preview = revert_pypi(&entry, &fx.root, true).await;
+            assert!(preview.success, "{flavor}: {:?}", preview.error);
+            assert!(!preview.drift_skipped(), "{flavor}: {:?}", preview.warnings);
+        }
+        let reverted = revert_pypi(&entry, &fx.root, false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert!(!reverted.drift_skipped(), "{:?}", reverted.warnings);
+        assert!(!reverted.kept_artifact, "{:?}", reverted.warnings);
+        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+        assert!(!uuid_dir_of(&fx).exists());
     }
 
     #[tokio::test]
