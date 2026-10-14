@@ -17,28 +17,15 @@
 //! (`report_offline_missing`) and is pinned here for vendor too.
 //!
 //! Under `--json` the diagnostics stay off stderr — the envelope is the
-//! machine channel (`error.code = no_local_source`, as `in_process_vendor.rs`
-//! pins for the offline flavor).
-
-#[path = "common/mod.rs"]
-mod common;
-use common::{binary, hermetic_command};
+//! machine channel: one `failed` event for the patch with
+//! `errorCode = apply_failed`.
 
 use std::path::Path;
 
-/// Run `socket-patch vendor` in `cwd` with a scrubbed SOCKET_* environment
-/// so ambient developer/CI configuration (tokens, silent toggles) can't
-/// change the branch under test.
-fn run_vendor(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic_command(&binary());
-    cmd.arg("vendor").args(args).current_dir(cwd);
-    let out = cmd.output().expect("run socket-patch vendor");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
-}
+use serde_json::json;
+
+use crate::common::envelope::{find_event, json_string, parse_json_envelope};
+use crate::npm_fixture::{patch_record, run_cli, PURL, REG_RESOLVED};
 
 /// Non-error stderr lines: drop the unconditional core API-token warning
 /// (both its lead line and its "Got: ... Continuing anyway" continuation)
@@ -55,34 +42,37 @@ fn stderr_chatter(stderr: &str) -> Vec<String> {
         .collect()
 }
 
-/// Valid manifest with one npm patch entry and NO blob/diff/package
-/// artifact anywhere under `.socket/` (and no committed vendor artifact
-/// to harvest) — the mem stager must fetch, or fail.
+/// Valid npm project and manifest with one patch entry and NO
+/// blob/diff/package artifact anywhere under `.socket/` (and no committed
+/// vendor artifact to harvest): the mem stager must fetch, or fail.
 fn write_sourceless_manifest(root: &Path) {
-    std::fs::write(
-        root.join("package.json"),
-        r#"{"name":"fixture","version":"1.0.0"}"#,
-    )
-    .unwrap();
-    std::fs::write(root.join("package-lock.json"), r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/left-pad":{"version":"1.3.0","resolved":"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz","integrity":"sha512-original"}}}"#).unwrap();
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        r#"{ "patches": {
-            "pkg:npm/left-pad@1.3.0": {
-                "uuid": "11111111-1111-4111-8111-111111111111",
-                "exportedAt": "2026-01-01T00:00:00Z",
-                "files": { "index.js": {
-                    "beforeHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "afterHash":  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                }},
-                "vulnerabilities": {}, "description": "x",
-                "license": "MIT", "tier": "free"
+    let write_json = |rel: &str, value: serde_json::Value| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    };
+    write_json(
+        "package.json",
+        json!({ "name": "fixture", "version": "1.0.0" }),
+    );
+    write_json(
+        "package-lock.json",
+        json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {},
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-original"
+                }
             }
-        }}"#,
-    )
-    .unwrap();
+        }),
+    );
+    write_json(
+        ".socket/manifest.json",
+        json!({ "patches": { PURL: patch_record(&"a".repeat(64), &"b".repeat(64)) } }),
+    );
 }
 
 /// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
@@ -96,6 +86,29 @@ fn dead_endpoint() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// `vendor <mode> --api-url <dead> ...` with a syntactically valid token,
+/// so every patch-content fetch fails at connect.
+fn run_vendor_dead_endpoint(root: &Path, mode: &str) -> (i32, String, String) {
+    let url = dead_endpoint();
+    let token = format!("sktsec_{}_api", "x".repeat(44));
+    run_cli(
+        root,
+        &[
+            "vendor",
+            mode,
+            "--api-url",
+            &url,
+            "--proxy-url",
+            &url,
+            "--api-token",
+            &token,
+            "--org",
+            "test-org",
+        ],
+        &[],
+    )
+}
+
 /// `vendor --silent --offline` with a manifest patch that has no local
 /// source must keep the shared offline error diagnostics (errors only,
 /// never nothing) — the mem stager routes through the same
@@ -105,7 +118,7 @@ fn vendor_silent_offline_missing_source_keeps_error_output() {
     let tmp = tempfile::tempdir().unwrap();
     write_sourceless_manifest(tmp.path());
 
-    let (code, stdout, stderr) = run_vendor(tmp.path(), &["--silent", "--offline"]);
+    let (code, stdout, stderr) = run_cli(tmp.path(), &["vendor", "--silent", "--offline"], &[]);
     assert_eq!(code, 1, "offline + no local source must fail: {stderr}");
     assert!(
         stdout.trim().is_empty(),
@@ -113,9 +126,11 @@ fn vendor_silent_offline_missing_source_keeps_error_output() {
     );
     let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.iter().any(|l| l.contains("offline")),
-        "--silent must keep the offline no-source error (errors only, \
-         never nothing); stderr was: {stderr:?}"
+        chatter
+            .iter()
+            .any(|l| l.contains(PURL) && l.contains("--offline")),
+        "--silent must keep the offline no-source error naming the patch \
+         (errors only, never nothing); stderr was: {stderr:?}"
     );
 }
 
@@ -128,22 +143,7 @@ fn vendor_silent_online_fetch_failure_keeps_error_output() {
     let tmp = tempfile::tempdir().unwrap();
     write_sourceless_manifest(tmp.path());
 
-    let url = dead_endpoint();
-    let token = format!("sktsec_{}_api", "x".repeat(44));
-    let (code, stdout, stderr) = run_vendor(
-        tmp.path(),
-        &[
-            "--silent",
-            "--api-url",
-            &url,
-            "--proxy-url",
-            &url,
-            "--api-token",
-            &token,
-            "--org",
-            "test-org",
-        ],
-    );
+    let (code, stdout, stderr) = run_vendor_dead_endpoint(tmp.path(), "--silent");
     assert_eq!(code, 1, "failed fetches + no source must fail: {stderr}");
     assert!(
         stdout.trim().is_empty(),
@@ -151,43 +151,28 @@ fn vendor_silent_online_fetch_failure_keeps_error_output() {
     );
     let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.iter().any(|l| l.contains("request")),
-        "--silent must keep the fetch-failure error (errors only, \
-         never nothing); stderr was: {stderr:?}"
+        chatter
+            .iter()
+            .any(|l| l.contains(PURL) && l.contains("request")),
+        "--silent must keep the fetch-failure error naming the patch \
+         (errors only, never nothing); stderr was: {stderr:?}"
     );
 }
 
 /// Overshoot guard: under `--json` the envelope is the machine channel —
 /// the staging diagnostics must NOT leak to stderr, and the envelope
-/// carries vendor's pinned `no_local_source` hard error.
+/// carries a `failed` / `apply_failed` event for the patch.
 #[test]
 fn vendor_json_online_fetch_failure_keeps_stderr_clean() {
     let tmp = tempfile::tempdir().unwrap();
     write_sourceless_manifest(tmp.path());
 
-    let url = dead_endpoint();
-    let token = format!("sktsec_{}_api", "x".repeat(44));
-    let (code, stdout, stderr) = run_vendor(
-        tmp.path(),
-        &[
-            "--json",
-            "--api-url",
-            &url,
-            "--proxy-url",
-            &url,
-            "--api-token",
-            &token,
-            "--org",
-            "test-org",
-        ],
-    );
+    let (code, stdout, stderr) = run_vendor_dead_endpoint(tmp.path(), "--json");
     assert_eq!(code, 1, "failed fetches + no source must fail: {stderr}");
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).expect("vendor --json must emit valid JSON");
-    assert_eq!(
-        v["events"][0]["errorCode"], "apply_failed",
-        "the pinned envelope error for the unavailable bail, got {v}"
-    );
+    let v = parse_json_envelope(&stdout);
+    assert_eq!(json_string(&v, "status"), Some("partialFailure"), "{v}");
+    let failed = find_event(&v, "failed", Some("apply_failed"));
+    assert_eq!(failed["purl"], PURL, "{v}");
     let chatter = stderr_chatter(&stderr);
     assert!(
         chatter.is_empty(),
