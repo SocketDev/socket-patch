@@ -35,7 +35,7 @@
 use std::path::Path;
 
 // npm/Node strip a BOM from package.json, cargo accepts one in Cargo.toml, and
-// git reads a BOM'd `.git/config`, but serde_json and the line scanners all
+// git reads a BOM'd `.git/config`, but serde_json and the git config scanner
 // reject it — without this, files the user's own toolchain accepts yield no
 // PURL.
 use crate::formats::text::strip_bom;
@@ -175,21 +175,44 @@ fn parse_pyproject(content: &str) -> Option<String> {
 ///    2 then takes the version from `[tool.poetry].version`.
 /// 3. The legacy tables that hold both keys: Poetry's `[tool.poetry]`,
 ///    then PDM 0.x's `[tool.pdm]` (PDM 1.x migrates it to `[project]`).
+///
+/// `[tool.poetry].version` counts only when Poetry builds the project and
+/// poetry-dynamic-versioning does not replace it at build time: under
+/// another backend (hatch-vcs, setuptools-scm) it is a leftover, and under
+/// the plugin it is a placeholder such as `0.0.0`.
 fn pyproject_name_version(doc: &toml_edit::DocumentMut) -> Option<(String, String)> {
-    if let Some(found) = toml_name_version(doc, "project") {
-        return Some(found);
-    }
-    let project_name = toml_str(doc, "project", "name");
-    let version_is_dynamic = toml_table(doc, "project")
-        .and_then(|t| t.get("dynamic"))
-        .and_then(|d| d.as_array())
-        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("version")));
-    if let (Some(name), true) = (project_name, version_is_dynamic) {
-        if let Some(version) = toml_str(doc, "tool.poetry", "version") {
+    let project = toml_table(doc, "project");
+    let project_str = |key| project.and_then(|t| table_str(t, key));
+    if let Some(name) = project_str("name") {
+        if let Some(version) = project_str("version") {
             return Some((name.to_string(), version.to_string()));
         }
+        let version_is_dynamic = project
+            .and_then(|t| t.get("dynamic"))
+            .and_then(|d| d.as_array())
+            .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("version")));
+        if version_is_dynamic && poetry_version_is_static(doc) {
+            if let Some(version) = toml_str(doc, "tool.poetry", "version") {
+                return Some((name.to_string(), version.to_string()));
+            }
+        }
     }
-    toml_name_version(doc, "tool.poetry").or_else(|| toml_name_version(doc, "tool.pdm"))
+    let poetry = toml_name_version(doc, "tool.poetry").filter(|_| poetry_version_is_static(doc));
+    poetry.or_else(|| toml_name_version(doc, "tool.pdm"))
+}
+
+/// Whether `[tool.poetry].version` is the version the build produces: no
+/// non-Poetry `[build-system].build-backend` (Poetry's own projects may
+/// omit the table), and poetry-dynamic-versioning not enabled.
+fn poetry_version_is_static(doc: &toml_edit::DocumentMut) -> bool {
+    // `poetry.core.masonry.api`, or `poetry.masonry.api` before poetry-core.
+    let poetry_backend = toml_str(doc, "build-system", "build-backend")
+        .is_none_or(|backend| backend.starts_with("poetry."));
+    let dynamic_versioning = toml_table(doc, "tool.poetry-dynamic-versioning")
+        .and_then(|t| t.get("enable"))
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    poetry_backend && !dynamic_versioning
 }
 
 fn parse_cargo_toml(content: &str) -> Option<String> {
@@ -393,10 +416,12 @@ fn toml_name_version(doc: &toml_edit::DocumentMut, section: &str) -> Option<(Str
 
 /// The non-empty string at `key` in the dotted `section` table.
 fn toml_str<'a>(doc: &'a toml_edit::DocumentMut, section: &str, key: &str) -> Option<&'a str> {
-    toml_table(doc, section)?
-        .get(key)?
-        .as_str()
-        .filter(|v| !v.is_empty())
+    table_str(toml_table(doc, section)?, key)
+}
+
+/// The non-empty string at `key` in `table`.
+fn table_str<'a>(table: &'a dyn toml_edit::TableLike, key: &str) -> Option<&'a str> {
+    table.get(key)?.as_str().filter(|v| !v.is_empty())
 }
 
 /// The dotted `section` table (`tool.poetry`), whether it is written as a
@@ -1286,6 +1311,35 @@ mod tests {
         assert!(parse_pyproject(content).is_none());
     }
 
+    /// Under poetry-dynamic-versioning `[tool.poetry].version` is a
+    /// placeholder the plugin replaces at build time, so there is no
+    /// static version to report, in the Poetry 2 or the legacy layout.
+    #[test]
+    fn pyproject_poetry_dynamic_versioning_placeholder_is_none() {
+        let poetry2 = "[project]\nname = \"demo\"\ndynamic = [\"version\"]\n\n[tool.poetry]\nversion = \"0.0.0\"\n\n[tool.poetry-dynamic-versioning]\nenable = true\n\n[build-system]\nrequires = [\"poetry-core>=2.0.0\", \"poetry-dynamic-versioning>=1.0.0,<2.0.0\"]\nbuild-backend = \"poetry_dynamic_versioning.backend\"\n";
+        assert!(parse_pyproject(poetry2).is_none());
+        let legacy = "[tool.poetry]\nname = \"demo\"\nversion = \"0.0.0\"\n\n[tool.poetry-dynamic-versioning]\nenable = true\n\n[build-system]\nbuild-backend = \"poetry.core.masonry.api\"\n";
+        assert!(parse_pyproject(legacy).is_none());
+    }
+
+    /// A `[tool.poetry].version` left over after moving to another
+    /// backend is not what that backend builds (hatch-vcs reads git tags).
+    #[test]
+    fn pyproject_tool_poetry_version_ignored_under_other_backend() {
+        let content = "[project]\nname = \"app\"\ndynamic = [\"version\"]\n\n[tool.hatch.version]\nsource = \"vcs\"\n\n[tool.poetry]\nversion = \"0.1.0\"\n\n[build-system]\nrequires = [\"hatchling\", \"hatch-vcs\"]\nbuild-backend = \"hatchling.build\"\n";
+        assert!(parse_pyproject(content).is_none());
+    }
+
+    /// Pre-poetry-core projects name `poetry.masonry.api` as the backend.
+    #[test]
+    fn pyproject_tool_poetry_under_pre_core_backend() {
+        let content = "[tool.poetry]\nname = \"old-app\"\nversion = \"0.2.0\"\n\n[build-system]\nrequires = [\"poetry>=0.12\"]\nbuild-backend = \"poetry.masonry.api\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/old-app@0.2.0")
+        );
+    }
+
     // ── Regression #642: PDM 0.x legacy `[tool.pdm]` metadata ─────
 
     #[tokio::test]
@@ -1437,8 +1491,7 @@ mod tests {
         );
     }
 
-    /// `Cargo.toml` with `name` only (no `version`) → None. Exercises
-    /// the `version?` early-return path inside `scan_toml_section`.
+    /// `Cargo.toml` with `name` only (no `version`) → None.
     #[tokio::test]
     async fn cargo_toml_missing_version_returns_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -2390,9 +2443,8 @@ mod tests {
     }
 
     // ── Coverage: unclosed TOML table headers ─────────────────────
-    // A `[`-line with no closing `]` hits the `None => false` arm of
-    // the header match: it never OPENS a section, and — unlike the
-    // git scanner's fall-through — it safely CLOSES the current one.
+    // A `[`-line with no closing `]` is invalid TOML, so the document
+    // yields no name/version at all — never a misattributed one.
 
     /// `[package` (unclosed) must not open the section, so the
     /// name/version lines below it are never attributed.
