@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic_command};
 
 /// Minimal HTTP stub playing the authenticated API: serves `blob` bytes at
 /// any path ending in `/patches/blob/<hash>`, 404 otherwise, and records
@@ -161,19 +161,11 @@ fn build_diverged_two_copy_tree(root: &Path) -> (PathBuf, PathBuf, String, Vec<u
     (index_a, index_b, before_hash, original, patched)
 }
 
-/// A `rollback` command with the full `SOCKET_*` environment scrubbed and
-/// hermeticity vars pinned, so behavior is driven only by the flags under
-/// test (prefix scrub — an explicit list rots as flags are added).
+/// A `rollback` command through the shared hermetic builder, so behavior is
+/// driven only by the flags under test.
 fn rollback_cmd(cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.arg("rollback").current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_NO_CONFIG", "1");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     cmd
 }
 

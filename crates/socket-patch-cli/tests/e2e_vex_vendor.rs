@@ -41,19 +41,12 @@ const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic_command};
 
-/// CLI invocation with the ambient `SOCKET_*` environment scrubbed (same
-/// rationale as `e2e_vex.rs`: explicit flags must be the sole source of
-/// truth).
+/// CLI invocation through the shared hermetic builder (same rationale as
+/// `e2e_vex.rs`: explicit flags must be the sole source of truth).
 fn cli() -> Command {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
+    hermetic_command(&binary())
 }
 
 /// Write `manifest` to `<cwd>/.socket/manifest.json`.
@@ -2310,8 +2303,6 @@ fn vex_json(cwd: &Path, extra: &[&str]) -> (Option<i32>, Value) {
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
     let out = cli()
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("SOCKET_NO_API_TOKEN", "1")
         .args(&args)
         .output()
