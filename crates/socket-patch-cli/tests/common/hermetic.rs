@@ -144,10 +144,11 @@ pub fn tool_command(name: &str) -> Command {
 /// that `exec`s it, which inherits the same environment.
 ///
 /// The builder's environment is replaced outright with what [`command`]'s
-/// child would see. `CommandBuilder::new` snapshots the process
-/// environment, so editing that snapshot would miss a var a parallel
-/// in-process test removed between the snapshot and the scrub. Callers add
-/// args, cwd and env afterwards, as with [`command`].
+/// child would see. The copy here and [`command`]'s own sweep each read the
+/// process environment, so a var a parallel in-process test clears between
+/// the two reads would survive the plan; the copy is swept once more with
+/// the same rule. Callers add args, cwd and env
+/// afterwards, as with [`command`].
 pub fn pty_command(program: impl AsRef<std::ffi::OsStr>) -> portable_pty::CommandBuilder {
     let program = program.as_ref();
     let mut env: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
@@ -157,6 +158,7 @@ pub fn pty_command(program: impl AsRef<std::ffi::OsStr>) -> portable_pty::Comman
             None => env.remove(key),
         };
     }
+    env.retain(|key, _| !is_scrubbed_socket_var(key));
     let mut pty = portable_pty::CommandBuilder::new(program);
     pty.env_clear();
     for (key, value) in env {
@@ -176,15 +178,19 @@ pub fn pty_binary_command() -> portable_pty::CommandBuilder {
 /// children call it directly.
 pub fn scrub_socket_vars(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_")
-            && !name.contains("TELEMETRY")
-            && name != "SOCKET_NO_CONFIG"
-            && name != "SOCKET_NO_UPDATE_CHECK"
-        {
+        if is_scrubbed_socket_var(&key) {
             cmd.env_remove(&key);
         }
     }
+}
+
+/// Whether [`scrub_socket_vars`] removes the var `key`.
+fn is_scrubbed_socket_var(key: &std::ffi::OsStr) -> bool {
+    let name = key.to_string_lossy();
+    name.starts_with("SOCKET_")
+        && !name.contains("TELEMETRY")
+        && name != "SOCKET_NO_CONFIG"
+        && name != "SOCKET_NO_UPDATE_CHECK"
 }
 
 /// The in-process half, for test binaries that only parse argv with clap:
