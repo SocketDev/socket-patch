@@ -577,6 +577,117 @@ pub(super) fn severity_order(s: &str) -> u8 {
     socket_patch_core::api::ranking::severity_order(Some(s))
 }
 
+/// Warning code: a hosted or vendored scan left patched npm packages that
+/// only a nested, independent npm project installs (#1534).
+pub(crate) const NESTED_PROJECT_SKIPPED: &str = "nested_project_skipped";
+
+/// #1534: the patched npm packages a hosted or vendored scan of `cwd`
+/// must leave to a nested project. The crawl reads every `node_modules`
+/// below the root, including those of a nested project with its own lock
+/// (`tools/x/` holding `package-lock.json`), but such a run rewires only
+/// the root's locks. A package is left out when the root's lock inventory
+/// (`locked`) does not list it, its crawled copy sits in a nested
+/// project ([`nested_npm_project`]), and no `node_modules` of the root's
+/// own install holds another copy. Returns the purls to drop and one
+/// `(code, detail)` warning per nested project, naming the PATH to pass.
+///
+/// [`nested_npm_project`]: socket_patch_core::hosted::governing_root::nested_npm_project
+pub(crate) async fn nested_project_skips(
+    cwd: &std::path::Path,
+    mode: &str,
+    options: &socket_patch_core::crawlers::types::CrawlerOptions,
+    crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    locked: &[LockfileEntry],
+    with_patches: &[BatchPackagePatches],
+) -> (HashSet<PurlKey>, Vec<(String, String)>) {
+    use socket_patch_core::hosted::governing_root::nested_npm_project;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    let locked: HashSet<PurlKey> = locked
+        .iter()
+        .filter(|e| e.ecosystem == "npm")
+        .map(|e| PurlKey::new(&e.purl))
+        .collect();
+    let paths: HashMap<PurlKey, &std::path::Path> = crawled
+        .iter()
+        .filter(|p| p.purl.starts_with("pkg:npm/"))
+        .map(|p| (PurlKey::new(&p.purl), p.path.as_path()))
+        .collect();
+    // Candidate purl -> the nested project holding its crawled copy.
+    let mut candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for pkg in with_patches {
+        let key = PurlKey::new(&pkg.purl);
+        if !pkg.purl.starts_with("pkg:npm/") || locked.contains(&key) {
+            continue;
+        }
+        let Some(path) = paths.get(&key) else {
+            continue;
+        };
+        if let Some(project) = nested_npm_project(cwd, path).await {
+            candidates.insert(pkg.purl.clone(), project);
+        }
+    }
+    if candidates.is_empty() {
+        return Default::default();
+    }
+    // The crawl keeps one copy per purl: a copy in the root's own install
+    // keeps the package the root's, whatever copy the crawl kept.
+    let crawler = socket_patch_core::crawlers::NpmCrawler::new();
+    let wanted: Vec<String> = candidates.keys().cloned().collect();
+    for nm_root in crawler
+        .get_node_modules_paths(options)
+        .await
+        .unwrap_or_default()
+    {
+        if nested_npm_project(cwd, &nm_root).await.is_some() {
+            continue;
+        }
+        if let Ok(found) = crawler.find_by_purls(&nm_root, &wanted).await {
+            let rooted: HashSet<PurlKey> = found
+                .into_iter()
+                .filter(|(_, copies)| !copies.is_empty())
+                .map(|(purl, _)| PurlKey::new(&purl))
+                .collect();
+            candidates.retain(|purl, _| !rooted.contains(&PurlKey::new(purl)));
+        }
+    }
+    let canonical = std::fs::canonicalize(cwd).ok();
+    let mut by_project: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut skipped = HashSet::new();
+    for (purl, project) in candidates {
+        let rel = std::iter::once(cwd)
+            .chain(canonical.as_deref())
+            .find_map(|base| project.strip_prefix(base).ok())
+            .unwrap_or(&project)
+            .to_string_lossy()
+            .replace('\\', "/");
+        skipped.insert(PurlKey::new(&purl));
+        by_project.entry(rel).or_default().push(purl);
+    }
+    let warnings = by_project
+        .into_iter()
+        .map(|(rel, purls)| {
+            (
+                NESTED_PROJECT_SKIPPED.to_string(),
+                format!(
+                    "{} {} installed only by {rel}, a separate npm project with its own \
+                     lockfile; this run rewires only this directory's lockfile, so {} left \
+                     alone; run `socket-patch scan --mode {mode} {rel}` to patch that project",
+                    purls.join(", "),
+                    if purls.len() == 1 { "is" } else { "are" },
+                    if purls.len() == 1 {
+                        "it is"
+                    } else {
+                        "they are"
+                    },
+                ),
+            )
+        })
+        .collect();
+    (skipped, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

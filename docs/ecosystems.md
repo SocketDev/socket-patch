@@ -425,6 +425,15 @@ other tools that follow the convention: neither that directory's own
 crawled, even when it is tagged itself. A `CACHEDIR.TAG` that lacks the
 signature, is a directory or is a symlink prunes nothing.
 
+Agent and report-only scans patch every crawled copy in place. Hosted and
+vendored scans rewire only the scan root's lockfiles, so a patched package
+that only a nested, independent npm project installs (a directory below
+the root with its own lockfile, such as `tools/x/` holding
+`package-lock.json`, that is not a workspace member installed from the
+root's lock) is left alone with a `nested_project_skipped` warning. The
+warning names the project directory; pass it as a PATH
+(`socket-patch scan --mode vendored tools/x`) to patch that project.
+
 Inside each `node_modules`, the package stores of isolated layouts are
 walked too, since they are the only home of transitive dependencies:
 pnpm's virtual store (`node_modules/.pnpm`, pnpm <= 3's
