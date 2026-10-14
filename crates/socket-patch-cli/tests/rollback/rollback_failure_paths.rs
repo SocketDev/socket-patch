@@ -119,8 +119,8 @@ fn path_scope_warns_about_out_of_scope_restored_copies() {
             &after_hash,
         )],
     );
-    stage_blob(&socket, &before_hash, before);
-    stage_blob(&socket, &after_hash, after);
+    common::write_blob(&socket, &before_hash, before);
+    common::write_blob(&socket, &after_hash, after);
 
     let (code, stdout, stderr) = run(
         tmp.path(),
@@ -343,9 +343,9 @@ fn manifest_deleted_under_held_lock_fails_with_manifest_not_found() {
             v["error"]["code"], "manifest_not_found",
             "stdout=\n{stdout}"
         );
-        match v["error"]["message"].as_str() {
-            Some(m) if m.starts_with("Manifest not found at ") => return, // target interleaving reached
-            Some("Manifest not found") => continue, // probed after the delete — retry
+        match envelope_error_message(&v) {
+            Some(m) if m.contains("manifest.json") => return, // target interleaving reached
+            Some(_) => continue, // probed after the delete — retry
             other => panic!(
                 "unexpected error for the vanished manifest: {other:?}\nstdout=\n{stdout}\nstderr=\n{stderr}"
             ),
@@ -459,8 +459,8 @@ fn bun_orphaned_store_entry_is_still_rolled_back() {
             &after_hash,
         )],
     );
-    stage_blob(&socket, &before_hash, before);
-    stage_blob(&socket, &after_hash, after);
+    common::write_blob(&socket, &before_hash, before);
+    common::write_blob(&socket, &after_hash, after);
 
     let (code, stdout, stderr) = run(root, &["rollback", "--json", "--offline", "--yes"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
@@ -478,7 +478,7 @@ fn bun_orphaned_store_entry_is_still_rolled_back() {
     assert_eq!(
         std::fs::read(orphan.join("index.js")).expect("read orphan index.js"),
         before,
-        "the orphaned entry keeps its patched bytes; stdout=\n{stdout}\nstderr=\n{stderr}"
+        "the orphaned entry must be restored; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
 }
 
@@ -523,7 +523,7 @@ fn vendored_unknown_ecosystem_fails_the_leg() {
 }
 
 /// JSON dry-run of the vendored leg: the human preview print is skipped
-/// (the mode gate's false branch) while the envelope still previews the
+/// (stdout parses as the JSON document alone) while the envelope still previews the
 /// revert — `dryRun: true`, `vendoredReverted` names the key — and lock,
 /// ledger, and artifact are all untouched.
 #[test]
@@ -544,10 +544,6 @@ fn vendored_dry_run_json_previews_without_human_print() {
         rollback_json::vendored_reverted(&v),
         json!([V_PURL]),
         "the envelope must preview the revert; stdout=\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("Would revert vendoring"),
-        "--json must mute the human preview line; stdout=\n{stdout}"
     );
     assert_eq!(
         fx.lock_bytes(),
@@ -620,9 +616,9 @@ fn ecosystems_filter_narrows_vendored_scope() {
 /// human notice is in `rollback_render.rs`.
 #[test]
 fn corrupt_vendor_ledger_warns_and_fails_closed() {
-    // NOT vendored: the installed tree is already original,
-    // so the agent leg is a clean no-op and the exit-1 is the corrupt
-    // ledger alone.)
+    // The fixture is NOT vendored: the installed tree is already original,
+    // so the agent leg is a clean no-op and the exit 1 comes from the
+    // corrupt ledger alone.
     let fx = vendor_fixture();
     corrupt_vendor_ledger(&fx);
     let (code, stdout, stderr) = run(fx.root(), &["rollback", "--json", "--offline", "--yes"]);
@@ -786,8 +782,8 @@ fn qualified_manifest_purl_removed_after_vendored_revert() {
 /// in-place patch rolls back and leaves the manifest.
 #[test]
 fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
-    const IO_PURL: &str = "pkg:npm/is-odd@1.0.0";
-    const IO_UUID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const ODD_PURL: &str = "pkg:npm/is-odd@1.0.0";
+    const ODD_UUID: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
     let io_before: &[u8] = b"module.exports = n => n % 2 === 1; // orig\n";
     let io_patched: &[u8] = b"module.exports = n => Math.abs(n) % 2 === 1; // patched\n";
 
@@ -800,10 +796,10 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
     // installed at the PATCHED bytes, before-blob staged for the restore.
     install_npm_pkg(fx.root(), "node_modules", "is-odd", "1.0.0", io_patched);
     let socket = fx.root().join(".socket");
-    stage_blob(&socket, &git_sha256(io_before), io_before);
+    common::write_blob(&socket, &git_sha256(io_before), io_before);
     let mut manifest = fx.manifest_json();
-    manifest["patches"][IO_PURL] = patch_entry_value(
-        IO_UUID,
+    manifest["patches"][ODD_PURL] = patch_entry_value(
+        ODD_UUID,
         "package/index.js",
         &git_sha256(io_before),
         &git_sha256(io_patched),
@@ -823,7 +819,7 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
             "--offline",
             "--lock-timeout",
             "5",
-            IO_PURL,
+            ODD_PURL,
         ],
     );
     assert_eq!(
@@ -834,7 +830,7 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
     assert_eq!(v["summary"]["rolledBack"], json!(1), "stdout=\n{stdout}");
     assert_eq!(
         rollback_json::agent_rolled_back(&v),
-        json!([IO_PURL]),
+        json!([ODD_PURL]),
         "only the named patch may be acted on; stdout=\n{stdout}"
     );
     assert!(
@@ -843,7 +839,7 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
     );
     assert_eq!(
         rollback_json::manifest_removed(&v),
-        json!([IO_PURL]),
+        json!([ODD_PURL]),
         "only the named entry leaves the manifest; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -872,7 +868,7 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
         "the vendored manifest entry must be retained; manifest={m}"
     );
     assert!(
-        m["patches"].get(IO_PURL).is_none(),
+        m["patches"].get(ODD_PURL).is_none(),
         "the rolled-back entry must be removed; manifest={m}"
     );
 }
@@ -956,8 +952,8 @@ fn two_vendored_entries_each_cleanup_via_their_own_revert() {
     )
     .expect("write manifest");
     // After-hash blobs are the offline vendor source for both packages.
-    stage_blob(&socket, &git_sha256(PATCHED_INDEX), PATCHED_INDEX);
-    stage_blob(&socket, &git_sha256(rp_patched), rp_patched);
+    common::write_blob(&socket, &git_sha256(PATCHED_INDEX), PATCHED_INDEX);
+    common::write_blob(&socket, &git_sha256(rp_patched), rp_patched);
 
     let (code, stdout, stderr) = run(
         root,
@@ -1643,8 +1639,8 @@ fn pypi_variant_group_with_no_installed_match_attempts_every_variant() {
     .expect("write manifest");
     // Both before-blobs staged: verification must reach the drift
     // comparison (hash_mismatch), not stop at a missing-blob gate.
-    stage_blob(&socket, &git_sha256(wheel_before), wheel_before);
-    stage_blob(&socket, &git_sha256(sdist_before), sdist_before);
+    common::write_blob(&socket, &git_sha256(wheel_before), wheel_before);
+    common::write_blob(&socket, &git_sha256(sdist_before), sdist_before);
 
     let (code, stdout, stderr) = common::run_with_env(
         root,

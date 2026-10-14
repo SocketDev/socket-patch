@@ -123,12 +123,6 @@ pub fn write_root_package_json(root: &Path) {
     .expect("write root package.json");
 }
 
-pub fn stage_blob(socket: &Path, hash: &str, content: &[u8]) {
-    let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).expect("create blobs dir");
-    std::fs::write(blobs.join(hash), content).expect("stage blob");
-}
-
 /// Stage `<uuid>.tar.gz` in both archive stores so the GC has something
 /// sweepable to preview/free.
 pub fn stage_archives(socket: &Path, uuid: &str) {
@@ -167,8 +161,8 @@ pub fn patched_fixture() -> PatchedFixture {
         root.path(),
         &[manifest_entry(purl, uuid, &before_hash, &after_hash)],
     );
-    stage_blob(&socket, &before_hash, before);
-    stage_blob(&socket, &after_hash, after);
+    common::write_blob(&socket, &before_hash, before);
+    common::write_blob(&socket, &after_hash, after);
     stage_archives(&socket, uuid);
 
     PatchedFixture {

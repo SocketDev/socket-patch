@@ -16,6 +16,7 @@
 
 use serde_json::{json, Value};
 
+use crate::common;
 use crate::common::git_sha256;
 use crate::rollback_fixture::*;
 
@@ -149,7 +150,7 @@ fn human_verbose_hash_mismatch_details() {
     );
     // Before-blob staged so the missing-blob gate never trips: the failure
     // under test is the engine's hash-mismatch verification.
-    stage_blob(&socket, &before_hash, before);
+    common::write_blob(&socket, &before_hash, before);
 
     let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes", "--verbose"]);
     assert_eq!(
@@ -280,8 +281,8 @@ fn human_dry_run_summary_reports_already_original_and_failed() {
     );
     // Both before-blobs staged so the missing-blob gate never downloads:
     // the statuses under test are already_original and hash_mismatch.
-    stage_blob(&socket, &git_sha256(noop_before), noop_before);
-    stage_blob(&socket, &git_sha256(drift_before), drift_before);
+    common::write_blob(&socket, &git_sha256(noop_before), noop_before);
+    common::write_blob(&socket, &git_sha256(drift_before), drift_before);
     let manifest_bytes = std::fs::read(socket.join("manifest.json")).unwrap();
 
     let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--dry-run", "--offline"]);
@@ -757,9 +758,13 @@ fn per_purl_revert_failure_prints_human_stderr_line() {
 /// replayed) is in `rollback_failure_paths.rs`.
 #[test]
 fn legacy_ledger_retire_prints_human_line() {
+    // A `project/` subdirectory keeps the edit's `../evil.lock` target
+    // inside this test's own tempdir.
     let tmp = tempfile::tempdir().expect("tempdir");
-    write_legacy_ledger(tmp.path(), unsafe_legacy_edits());
-    let (code, stdout, stderr) = run_hosted(tmp.path(), &["rollback", "--yes"], None);
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    write_legacy_ledger(&project, unsafe_legacy_edits());
+    let (code, stdout, stderr) = run_hosted(&project, &["rollback", "--yes"], None);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
         stdout.contains(
@@ -768,7 +773,11 @@ fn legacy_ledger_retire_prints_human_line() {
         ),
         "the human retire line must print; stdout=\n{stdout}"
     );
-    assert!(!ledger_path(tmp.path()).exists());
+    assert!(!ledger_path(&project).exists());
+    assert!(
+        !tmp.path().join("evil.lock").exists(),
+        "a legacy ledger's edit is never replayed"
+    );
 }
 
 /// A dry run over a corrupt pre-v5 ledger previews its removal and deletes
