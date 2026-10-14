@@ -9,6 +9,9 @@
 //! endpoint at run time (500 on the authenticated API, 100 on the public
 //! proxy), so an explicit value must stay distinguishable from none.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
 use clap::Parser;
 use socket_patch_cli::commands::scan::{resolve_mode_flags, ScanArgs, ScanMode};
 use socket_patch_cli::{Cli, Commands};
@@ -438,22 +441,18 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // empty-scan JSON contract *exactly*, so a regression that drops/renames
     // a key, flips a default count, or leaks an unexpected `gc`/`apply`/`vex`
     // sub-object onto the hosted default path fails loudly.
-    let bin = env!("CARGO_BIN_EXE_socket-patch");
     let tmp = tempfile::tempdir().expect("tempdir");
     // Its own repo root, so no socket.yml above the temp dir leaks in.
     std::fs::create_dir(tmp.path().join(".git")).expect(".git");
-    let mut cmd = std::process::Command::new(bin);
+    // Spawn with the hermetic environment, which strips *every* ambient
+    // SOCKET_* override. It is not enough to drop the API creds: an ambient
+    // `SOCKET_VEX` would fold a `vex` object into the output,
+    // `SOCKET_OFFLINE`/`SOCKET_GLOBAL` would steer the crawl, and
+    // `SOCKET_JSON=false` would suppress JSON entirely — any of which would
+    // either spuriously fail the exact-shape lock or, worse, change the
+    // branch under test.
+    let mut cmd = hermetic::binary_command();
     cmd.args(["scan", "--json", "--cwd"]).arg(tmp.path());
-    // Strip *every* SOCKET_* override the child would otherwise inherit.
-    // It is not enough to drop the API creds: an ambient `SOCKET_VEX` would
-    // fold a `vex` object into the output, `SOCKET_OFFLINE`/`SOCKET_GLOBAL`
-    // would steer the crawl, and `SOCKET_JSON=false` would suppress JSON
-    // entirely — any of which would either spuriously fail the exact-shape
-    // lock or, worse, change the branch under test. Clear them all so the
-    // subprocess sees only the CLI args we pass.
-    for k in SCAN_ENV_VARS {
-        cmd.env_remove(k);
-    }
     let out = cmd.output().expect("spawn socket-patch");
 
     assert_eq!(

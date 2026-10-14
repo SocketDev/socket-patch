@@ -47,6 +47,13 @@ pub const HOSTILE_SEEDS: &[(&str, &str)] = &[
     ("SOCKET_VERBOSE", "true"),
     ("SOCKET_UPDATE_BASE_URL", "http://127.0.0.1:1"),
     ("SOCKET_UPDATE_STATE_DIR", "/nonexistent"),
+    // An ambient token or API/proxy URL would move a child off the public
+    // proxy, or point the production suites at staging while every
+    // assertion still passed.
+    ("SOCKET_API_TOKEN", "hostile-seed-must-be-scrubbed"),
+    ("SOCKET_API_URL", "http://127.0.0.1:1/hostile"),
+    ("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile"),
+    ("SOCKET_OFFLINE", "true"),
 ];
 
 /// The opt-outs [`command`] forces on in every child: the config layer

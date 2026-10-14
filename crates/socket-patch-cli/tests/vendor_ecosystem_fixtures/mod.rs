@@ -13,7 +13,6 @@
 mod prebuilt_common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::Digest as _;
 
@@ -95,7 +94,8 @@ impl Fixture {
     }
 
     /// Run the built binary in the project with the fixture's environment,
-    /// every ambient `SOCKET_*` scrubbed and `extra_env` on top. Returns
+    /// the hermetic `SOCKET_*` environment (`hermetic::command`) and
+    /// `extra_env` on top. Returns
     /// the exit code, stdout and stderr.
     pub fn run(&self, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
         self.run_bin(env!("CARGO_BIN_EXE_socket-patch"), args, extra_env)
@@ -109,7 +109,7 @@ impl Fixture {
         args: &[&str],
         extra_env: &[(&str, &str)],
     ) -> (i32, String, String) {
-        let mut cmd = Command::new(bin);
+        let mut cmd = crate::common::hermetic::command(Path::new(bin));
         let args: Vec<_> = args
             .iter()
             .copied()
@@ -118,16 +118,10 @@ impl Fixture {
             })
             .collect();
         cmd.args(&args).current_dir(&self.root);
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-                cmd.env_remove(key);
-            }
-        }
         for var in ["VIRTUAL_ENV", "CONDA_PREFIX", "BUNDLE_PATH", "GEM_HOME"] {
             cmd.env_remove(var);
         }
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-            .env("HOME", self.store.join("home"))
+        cmd.env("HOME", self.store.join("home"))
             .env("CARGO_HOME", self.store.join("cargo-home"))
             .env("GOMODCACHE", self.store.join("modcache"))
             .env("MAVEN_REPO_LOCAL", self.store.join("m2"))
