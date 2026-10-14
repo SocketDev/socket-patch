@@ -281,6 +281,44 @@ pub struct PatchedRef {
     /// Hosted only: the Socket URL (artifact, registry index, or source url)
     /// the reference was recovered from, for diagnostics.
     pub url: Option<String>,
+    /// Hosted yarn classic only: the pinned block yarn 1 installs the
+    /// package from, whose dependency sub-maps decide which dependencies
+    /// install beside it (#1538).
+    pub yarn_classic_block: Option<ClassicPinnedBlock>,
+}
+
+/// A hosted yarn classic pin's lock block, as lock-only VEX reads it
+/// (#1538). Yarn 1 installs the dependencies the block's `dependencies:` /
+/// `optionalDependencies:` sub-maps name, each through a block of its own,
+/// not the ones the patched tarball's `package.json` declares: a pin an
+/// earlier release wrote without rewriting the sub-maps (#1462) installs
+/// the patched package beside the old dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassicPinnedBlock {
+    lines: Vec<String>,
+    /// Every descriptor the sub-maps name keys a block of the lock.
+    sub_maps_locked: bool,
+}
+
+impl ClassicPinnedBlock {
+    /// The block of `lines`, in a lock whose keys hold the patterns
+    /// `locked`.
+    pub(crate) fn new(lines: &[String], locked: &std::collections::HashSet<&str>) -> Self {
+        use crate::formats::yarn::classic_deps::block_dep_descriptors;
+        ClassicPinnedBlock {
+            lines: lines.to_vec(),
+            sub_maps_locked: block_dep_descriptors(lines)
+                .iter()
+                .all(|d| locked.contains(d.as_str())),
+        }
+    }
+
+    /// Whether yarn 1 installs, from this block, exactly the dependency
+    /// maps the patched package's `package.json` (`pkg`) declares, each
+    /// one locked.
+    pub fn installs_dependencies_of(&self, pkg: &serde_json::Value) -> bool {
+        self.sub_maps_locked && crate::formats::yarn::classic_deps::dep_maps_match(&self.lines, pkg)
+    }
 }
 
 impl PatchedRef {
@@ -303,6 +341,7 @@ impl PatchedRef {
             locked_integrity,
             integrity_required,
             url: url.map(str::to_string),
+            yarn_classic_block: None,
         }
     }
 
@@ -322,6 +361,7 @@ impl PatchedRef {
             locked_integrity,
             integrity_required: false,
             url: None,
+            yarn_classic_block: None,
         }
     }
 

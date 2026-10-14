@@ -541,6 +541,110 @@ async fn hosted_gem_mirror_captured(
     captured
 }
 
+/// Lock-only verdicts of hosted yarn classic pins (#1538): `purls` the
+/// plan may attest from the lock alone, mapped to the omission tag of each
+/// whose patch changes the package's `package.json` while the pinned
+/// block's dependency sub-maps are not exactly the ones that manifest
+/// declares, each locked. Yarn 1 installs what the lock names, so such a
+/// pin (one an earlier release wrote, #1462) installs the patched package
+/// without its patched dependencies: `dependency_not_installed`. A patched
+/// `package.json` that can be read neither from `.socket/blobs` nor from
+/// the patch API is `dependency_manifest_unverifiable`.
+async fn yarn_classic_lock_dependency_gaps(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    plan: &Plan,
+    purls: &[&str],
+) -> HashMap<String, &'static str> {
+    let mut gaps = HashMap::new();
+    for purl in purls {
+        let blocks: Vec<_> = plan
+            .hosted
+            .get(*purl)
+            .into_iter()
+            .flat_map(|wiring| &wiring.refs)
+            .filter_map(|r| r.yarn_classic_block.as_ref())
+            .collect();
+        let Some(after_hash) = plan.view.patches.get(*purl).and_then(|record| {
+            record
+                .files
+                .iter()
+                .find(|(key, _)| key.strip_prefix("package/").unwrap_or(key) == "package.json")
+                .map(|(_, info)| info.after_hash.as_str())
+        }) else {
+            continue;
+        };
+        if blocks.is_empty() {
+            continue;
+        }
+        let pkg = patched_blob(common, params, after_hash)
+            .await
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(serde_json::Value::is_object);
+        let gap = match pkg {
+            None => DEPENDENCY_MANIFEST_UNVERIFIABLE,
+            Some(pkg) if blocks.iter().any(|b| !b.installs_dependencies_of(&pkg)) => {
+                DEPENDENCY_NOT_INSTALLED
+            }
+            Some(_) => continue,
+        };
+        gaps.insert(purl.to_string(), gap);
+    }
+    gaps
+}
+
+/// Omission tag: a hosted yarn classic pin attested from the lock alone
+/// whose patch changes `package.json`, which could not be read to check
+/// the dependencies the lock installs beside it (#1538).
+const DEPENDENCY_MANIFEST_UNVERIFIABLE: &str = "dependency_manifest_unverifiable";
+
+/// Largest patched `package.json` blob [`patched_blob`] reads.
+const MAX_PATCHED_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// The patched file whose git-sha256 is `after_hash`: from the local
+/// `.socket/blobs` store, else (unless `--offline`) from the patch API.
+/// `None` when neither has it intact.
+async fn patched_blob(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    after_hash: &str,
+) -> Option<Vec<u8>> {
+    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+    let intact = |bytes: &Vec<u8>| {
+        bytes.len() <= MAX_PATCHED_MANIFEST_BYTES
+            && compute_git_sha256_from_bytes(bytes).eq_ignore_ascii_case(after_hash)
+    };
+    let local = common.cwd.join(".socket/blobs").join(after_hash);
+    if let Some(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(&local)
+        .await
+        .ok()
+        .filter(intact)
+    {
+        return Some(bytes);
+    }
+    if common.offline {
+        return None;
+    }
+    let overrides = common.api_client_overrides();
+    let client = params
+        .api_client
+        .get_or_init(|| async {
+            socket_patch_core::api::client::get_api_client_with_overrides(overrides)
+                .await
+                .0
+        })
+        .await;
+    let mut body = client.fetch_blob(after_hash).await.ok()??;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.chunk().await.ok()? {
+        bytes.extend_from_slice(chunk.as_ref());
+        if bytes.len() > MAX_PATCHED_MANIFEST_BYTES {
+            return None;
+        }
+    }
+    Some(bytes).filter(intact)
+}
+
 /// Core VEX pipeline shared by the standalone `vex` command and the
 /// embedded `apply`/`vendor`/`scan` `--vex` paths: resolve the product, verify the
 /// plan's record view against disk (unless `no_verify`), build the OpenVEX
@@ -738,17 +842,34 @@ async fn generate_vex(
         };
         let hidden =
             |purl: &str| purl.starts_with("pkg:npm/") && (npm_store_hidden || pnp_unconsumed(purl));
-        let mut lockfile_attested = Vec::new();
-        outcome.failed.retain(|f| {
-            let excused = f.reason == "package_not_found"
+        let excusable = |f: &FailedPatch| {
+            f.reason == "package_not_found"
                 && plan.lockfile_basis.contains(&f.purl)
                 && !mirror_refused(&f.purl)
                 && crawled(&f.purl)
-                && !hidden(&f.purl);
-            if excused {
-                lockfile_attested.push(f.purl.clone());
+                && !hidden(&f.purl)
+        };
+        // A yarn classic pin attests from the lock only when the lock
+        // installs the patched package's dependencies with it (#1538).
+        let excusable_purls: Vec<&str> = outcome
+            .failed
+            .iter()
+            .filter(|f| excusable(f))
+            .map(|f| f.purl.as_str())
+            .collect();
+        let dependency_gaps =
+            yarn_classic_lock_dependency_gaps(common, params, &plan, &excusable_purls).await;
+        let mut lockfile_attested = Vec::new();
+        outcome.failed.retain_mut(|f| {
+            if !excusable(f) {
+                return true;
             }
-            !excused
+            if let Some(gap) = dependency_gaps.get(&f.purl) {
+                f.reason = gap.to_string();
+                return true;
+            }
+            lockfile_attested.push(f.purl.clone());
+            false
         });
         outcome.applied.extend(lockfile_attested);
         withhold_unpatched_jvm_copies(
@@ -1786,6 +1907,11 @@ fn omission_phrase(reason: &str) -> &'static str {
             "the patched package.json declares a dependency that is not installed beside \
              the package"
         }
+        DEPENDENCY_MANIFEST_UNVERIFIABLE => {
+            "the patch changes package.json, and the patched package.json could be read \
+             neither from .socket/blobs nor from the patch API to check the dependencies the \
+             lockfile installs with it"
+        }
         "mirror_overrides_source" => {
             "a Bundler mirror overrides the hosted source and installed bytes were not verified"
         }
@@ -1992,6 +2118,7 @@ mod tests {
             "stale_install",
             "mirror_overrides_source",
             DEPENDENCY_NOT_INSTALLED,
+            DEPENDENCY_MANIFEST_UNVERIFIABLE,
             RECORD_UNAVAILABLE,
             RECORD_MISMATCH,
             VENDOR_UNWIRED,
