@@ -32,22 +32,32 @@ pub async fn preflight_pypi_takeover(
     if entry.ecosystem != "pypi" {
         return Ok(());
     }
+    // The revert sends each record to the backend that owns its kind,
+    // whatever flavor the entry was last stamped with (#1524), so each
+    // reach check runs for the records it is about, not for the flavor.
     preflight_sibling_requirements_takeover(entry)?;
-    match entry.flavor.as_deref() {
-        Some("requirements") => preflight_requirements_takeover(entry),
-        Some("uv") => preflight_uv_takeover(entry),
-        Some("poetry") => preflight_poetry_takeover(root, entry).await,
-        _ => Ok(()),
+    let has_kind = |prefix: &str| entry.wiring.iter().any(|r| r.kind.starts_with(prefix));
+    if entry.flavor.as_deref() == Some("requirements") {
+        preflight_requirements_takeover(entry)?;
     }
+    if entry.flavor.as_deref() == Some("uv") || has_kind("uv_") {
+        preflight_uv_takeover(entry)?;
+    }
+    if entry.flavor.as_deref() == Some("poetry") || has_kind("poetry_") {
+        preflight_poetry_takeover(root, entry).await?;
+    }
+    Ok(())
 }
 
-/// A Pipenv or uv entry also carries the `requirements_line` records of
-/// the exported requirements pin wired with its lock (#612, #1368). After
-/// the revert, the hosted requirements rewriter re-pins only the root
-/// requirements.txt, so a line wired in a `-r` include is refused exactly
-/// as for a requirements-flavor entry.
+/// An entry of any other flavor can also carry `requirements_line`
+/// records: the exported requirements pin wired with a Pipenv or uv lock
+/// (#612, #1368), or a requirements.txt vendored before a pylock, Poetry
+/// or PDM lock took over the entry (#1524). After the revert, the hosted
+/// requirements rewriter re-pins only the root requirements.txt, so a line
+/// wired in a `-r` include is refused exactly as for a requirements-flavor
+/// entry.
 fn preflight_sibling_requirements_takeover(entry: &VendorEntry) -> Result<(), RewriteWarning> {
-    if !matches!(entry.flavor.as_deref(), Some("uv" | "pipenv")) {
+    if entry.flavor.as_deref() == Some("requirements") {
         return Ok(());
     }
     let lines: Vec<_> = entry
@@ -295,6 +305,65 @@ mod tests {
             );
             assert!(err.detail.contains("req/base.txt"), "{}", err.detail);
         }
+    }
+
+    /// #1524: a requirements.txt vendored before a pylock, Poetry or PDM
+    /// lock took the entry over keeps its `requirements_line` records, and
+    /// the revert restores them, so a line in a `-r` include (or an
+    /// appended transitive line) is refused before the revert whatever the
+    /// entry's flavor.
+    #[tokio::test]
+    async fn requirements_lines_under_another_lock_flavor_are_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = |file: &str, kind: &str| WiringRecord {
+            file: file.into(),
+            kind: kind.into(),
+            action: WiringAction::Rewritten,
+            key: Some("six".into()),
+            original: None,
+            new: None,
+        };
+        for (flavor, lock) in [
+            ("python-lock", lock("pylock.toml", "python_lock_document")),
+            ("pdm", lock("pdm.lock", "pdm_lock_package")),
+            ("hatch", lock("pylock.toml", "hatch_document")),
+        ] {
+            let e = entry(
+                flavor,
+                vec![lock.clone(), requirements_line("requirements.txt")],
+            );
+            assert!(
+                preflight_pypi_takeover(root.path(), &e).await.is_ok(),
+                "{flavor}"
+            );
+            let e = entry(
+                flavor,
+                vec![lock.clone(), requirements_line("req/base.txt")],
+            );
+            let err = preflight_pypi_takeover(root.path(), &e).await.unwrap_err();
+            assert_eq!(
+                err.code, "redirect_requirements_takeover_unreachable",
+                "{flavor}"
+            );
+            let mut appended = requirements_line("requirements.txt");
+            appended.action = WiringAction::Added;
+            let e = entry(flavor, vec![lock, appended]);
+            let err = preflight_pypi_takeover(root.path(), &e).await.unwrap_err();
+            assert_eq!(
+                err.code, "redirect_requirements_takeover_unreachable",
+                "{flavor}"
+            );
+        }
+    }
+
+    /// #1524: a uv lock unit carried into an entry stamped with another
+    /// flavor is still checked for the #723 pinned-down version.
+    #[tokio::test]
+    async fn uv_records_under_another_flavor_are_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let e = entry("python-lock", vec![uv_package("1.17.0")]);
+        let err = preflight_pypi_takeover(root.path(), &e).await.unwrap_err();
+        assert_eq!(err.code, "redirect_uv_takeover_version_unreachable");
     }
 
     #[test]
