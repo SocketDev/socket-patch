@@ -39,6 +39,7 @@ const PENDING_PRIVATE_READERS: &[&str] = &[
     "in_process_vendor_pnpm_takeover.rs",
     "vendor_eject_bun_lockb.rs",
     "vendor_jvm_cli.rs",
+    "apply/in_process_gem_fallback_home.rs",
     "e2e_vex_lockfile/cargo.rs",
     "in_process_vendor_bun_takeover/vlt.rs",
     "scan/scan_paths_e2e.rs",
@@ -52,6 +53,8 @@ const READER_NAMES: &[&str] = &[
     "find_event",
     "parse_envelope",
     "parse_json_envelope",
+    "parse_env",
+    "events_of",
     "event_codes",
     "event_triples",
     "event_purls",
@@ -141,6 +144,8 @@ fn the_detector_sees_every_former_copy_shape() {
         "fn warning_codes(doc: &Value) -> Vec<&str> {",
         "fn event_codes(v: &Value) -> Vec<String> {",
         "fn event_purls(v: &serde_json::Value, action: &str) -> Vec<String> {",
+        "fn parse_env(stdout: &str) -> serde_json::Value {",
+        "fn events_of(v: &serde_json::Value) -> Vec<serde_json::Value> {",
     ] {
         assert!(defines_private_reader(copy), "missed: {copy}");
     }
@@ -149,6 +154,8 @@ fn the_detector_sees_every_former_copy_shape() {
         "    fn warning_codes(&self) -> Vec<String> {",
         "fn events_for_purl(env: &Value) -> Vec<Value> {",
         "fn codes_of_lock(lock: &str) -> Vec<String> {",
+        "fn parse_env_vars(text: &str) -> Vec<(String, String)> {",
+        "fn events_of_kind(v: &Value, kind: &str) -> Vec<Value> {",
         "let codes = codes_in(&env[\"warnings\"]);",
     ] {
         assert!(
