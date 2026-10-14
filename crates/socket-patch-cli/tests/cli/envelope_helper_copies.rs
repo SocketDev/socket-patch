@@ -10,7 +10,8 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::common::envelope::{
-    all_codes, codes_in, event_codes, event_triples, events, find_event, parse_json_envelope,
+    all_codes, codes_in, event_codes, event_purls, event_triples, events, find_event, has_event,
+    parse_json_envelope,
 };
 
 /// Files that still define a private envelope reader. Each is changed by an
@@ -40,7 +41,6 @@ const PENDING_PRIVATE_READERS: &[&str] = &[
     "vendor_jvm_cli.rs",
     "e2e_vex_lockfile/cargo.rs",
     "in_process_vendor_bun_takeover/vlt.rs",
-    "remove/covgap_commands_remove.rs",
     "scan/scan_paths_e2e.rs",
     "vlt_hosted_common/mod.rs",
     "vlt_vendor_common/mod.rs",
@@ -54,6 +54,8 @@ const READER_NAMES: &[&str] = &[
     "parse_json_envelope",
     "event_codes",
     "event_triples",
+    "event_purls",
+    "has_event",
     "warning_codes",
     "codes",
     "all_codes",
@@ -138,6 +140,7 @@ fn the_detector_sees_every_former_copy_shape() {
         "pub fn codes(env: &Value) -> Vec<String> {",
         "fn warning_codes(doc: &Value) -> Vec<&str> {",
         "fn event_codes(v: &Value) -> Vec<String> {",
+        "fn event_purls(v: &serde_json::Value, action: &str) -> Vec<String> {",
     ] {
         assert!(defines_private_reader(copy), "missed: {copy}");
     }
@@ -232,6 +235,46 @@ fn event_triples_fill_absent_fields_with_empty_strings() {
             (String::new(), "skipped".into(), "vendored".into()),
         ]
     );
+}
+
+#[test]
+fn event_purls_lists_the_string_purls_of_one_action() {
+    let env = sample();
+    assert_eq!(event_purls(&env, "vendored"), ["pkg:npm/a@1.0.0"]);
+    // The `skipped` event has no purl, so it lists nothing.
+    assert!(event_purls(&env, "skipped").is_empty());
+    assert!(event_purls(&env, "removed").is_empty());
+    // A null or numeric purl is not listed as text.
+    let odd = json!({"events": [
+        {"action": "removed", "purl": null},
+        {"action": "removed", "purl": 7},
+        {"action": "removed", "purl": "pkg:npm/c@1.0.0"},
+    ]});
+    assert_eq!(event_purls(&odd, "removed"), ["pkg:npm/c@1.0.0"]);
+}
+
+#[test]
+fn has_event_needs_action_code_and_purl_to_match() {
+    let env = sample();
+    assert!(has_event(
+        &env,
+        "failed",
+        "vendor_lock_drift",
+        "pkg:npm/b@1.0.0"
+    ));
+    assert!(!has_event(
+        &env,
+        "failed",
+        "vendor_lock_drift",
+        "pkg:npm/a@1.0.0"
+    ));
+    assert!(!has_event(
+        &env,
+        "skipped",
+        "vendor_lock_drift",
+        "pkg:npm/b@1.0.0"
+    ));
+    assert!(!has_event(&env, "vendored", "", "pkg:npm/a@1.0.0"));
 }
 
 #[test]

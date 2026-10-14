@@ -1350,6 +1350,84 @@ async fn pnpm11_no_trust_config_opt_out_frozen_install_needs_manual_trust_lockfi
     assert_fixture_manifestless_vex(&fx, &fresh, "pnpm11 --trust-lockfile");
 }
 
+/// #1514: pnpm 11+ read `pnpm_config_trust_lockfile` ahead of
+/// pnpm-workspace.yaml, so a scan whose environment sets it to `false` must
+/// not write a `trustLockfile: true` that installs there ignore, nor claim
+/// they need no extra flags. Over a lock the real pnpm 11 scan pinned
+/// without the trust config, a re-run in that environment (the heal path,
+/// which would otherwise write the key) writes no workspace file and names
+/// the variable in the trust warning.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm11_trust_lockfile_env_override_is_respected() {
+    let Some(fx) = redirect_scanned_pnpm_project(
+        PNPM_TERTIARY,
+        "pnpm11-trust-env",
+        false,
+        true,
+        HostedDriver::Scan,
+    )
+    .await
+    else {
+        return;
+    };
+    let ws_path = fx.proj.join("pnpm-workspace.yaml");
+    assert!(
+        !ws_path.exists(),
+        "the opted-out fixture scan wrote no workspace file"
+    );
+    let lock_path = fx.proj.join(&fx.lock_name);
+    let lock_wired = std::fs::read_to_string(&lock_path).unwrap();
+
+    let api_url = fx._server.uri();
+    let args = [
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        fx.proj.to_str().unwrap(),
+        "--api-url",
+        &api_url,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let env = [(
+        "pnpm_config_trust_lockfile".to_string(),
+        "false".to_string(),
+    )];
+    let (code, stdout, stderr) = run_socket_env(&fx.proj, &args, &env);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let envelope = parse_envelope(&stdout);
+    assert!(
+        !ws_path.exists(),
+        "a trustLockfile key the environment overrides must not be written:\n{envelope}"
+    );
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_wired);
+    let detail = envelope["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_else(|| panic!("redirect_pnpm_trust_lockfile:\n{envelope}"))
+        .to_string();
+    assert!(
+        detail.contains("`pnpm_config_trust_lockfile=false`") && !detail.contains("no extra flags"),
+        "{detail}"
+    );
+
+    // Control: the same re-run without the variable heals the config.
+    let (code, stdout, stderr) = run_socket_env(&fx.proj, &args, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let workspace = std::fs::read_to_string(&ws_path).unwrap_or_default();
+    assert!(workspace.contains("trustLockfile: true"), "{workspace}");
+}
+
 /// Legacy pnpm@7 leg: the fixture install emits a lockfileVersion 5.4 lock
 /// (`/name/version:` path-style key), the scan splices its resolution like
 /// any other grammar, and the fresh dead-registry frozen install proves
