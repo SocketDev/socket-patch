@@ -377,6 +377,8 @@ pub(crate) async fn rewrite(
             yarn_classic_outer: &yarn_classic_outer,
             // The in-memory engine has no project on disk to read.
             cargo_outer: &|| CratesIoSource::Registry,
+            // Nor the environment the project's installs run in.
+            pnpm_env: &|_| None,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),

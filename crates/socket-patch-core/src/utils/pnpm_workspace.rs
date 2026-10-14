@@ -156,6 +156,31 @@ fn env_setting(
         })
 }
 
+/// pnpm's `trustLockfile` as the environment sets it, for a project on
+/// pnpm `major` (#1514): `pnpm_config_trust_lockfile`, or its uppercase
+/// spelling, which pnpm 11 and newer read ahead of pnpm-workspace.yaml.
+/// `None` on pnpm 10 and older, which never verify lock URLs, and for
+/// `npm_config_trust_lockfile`, which no pnpm reads.
+pub fn trust_lockfile_env(
+    major: Option<u32>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<PnpmSetting> {
+    if major.is_some_and(|major| major < 11) {
+        return None;
+    }
+    ["pnpm_config_trust_lockfile", "PNPM_CONFIG_TRUST_LOCKFILE"]
+        .iter()
+        .find_map(|var| {
+            let value = env(var)?.trim().to_string();
+            let source = format!("`{var}={value}` in the environment");
+            Some(PnpmSetting {
+                value,
+                source,
+                yaml: false,
+            })
+        })
+}
+
 /// [`pnpm_setting`], falling back to the environment ([`env_setting`],
 /// for the project's pnpm major) on disk, where the CLI runs pnpm's
 /// environment.
@@ -910,6 +935,31 @@ mod tests {
         .unwrap();
         assert_eq!(found.as_bool(), Some(true));
         assert_eq!(env_setting("git-branch-lockfile", None, env(&[])), None);
+    }
+
+    /// #1514: pnpm 11 and newer read `trustLockfile` from
+    /// `pnpm_config_trust_lockfile` (either case); pnpm 10 and older never
+    /// verify, and no pnpm reads `npm_config_trust_lockfile`.
+    #[test]
+    fn the_environment_sets_trust_lockfile_only_for_pnpm_11_and_newer() {
+        const LOWER: &[(&str, &str)] = &[("pnpm_config_trust_lockfile", "false")];
+        const UPPER: &[(&str, &str)] = &[("PNPM_CONFIG_TRUST_LOCKFILE", " false ")];
+        const NPM: &[(&str, &str)] = &[("npm_config_trust_lockfile", "false")];
+        for major in [Some(11), Some(12), None] {
+            let found = trust_lockfile_env(major, env(LOWER)).expect("lowercase");
+            assert_eq!(found.as_bool(), Some(false));
+            assert!(found.source.contains("pnpm_config_trust_lockfile=false"));
+            let found = trust_lockfile_env(major, env(UPPER)).expect("uppercase");
+            assert_eq!(found.as_bool(), Some(false));
+            assert!(found.source.contains("PNPM_CONFIG_TRUST_LOCKFILE=false"));
+            assert_eq!(trust_lockfile_env(major, env(NPM)), None);
+        }
+        assert_eq!(trust_lockfile_env(Some(10), env(LOWER)), None);
+        let on = &[("pnpm_config_trust_lockfile", "true")];
+        assert_eq!(
+            trust_lockfile_env(Some(11), env(on)).and_then(|s| s.as_bool()),
+            Some(true)
+        );
     }
 
     /// #1460: pnpm 11 and newer read only `pnpm_config_*`, pnpm 10 and

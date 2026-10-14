@@ -1297,6 +1297,9 @@ async fn run_redirect_selected_untracked(
     // parent directory's and `$CARGO_HOME`'s): a directory source or local
     // registry in any of them refuses the cargo rewrite like a project one.
     let cargo_outer = || CargoCrawler::crates_io_source_for(&common.cwd);
+    // The scan runs in the install's environment: a pnpm setting there
+    // (`pnpm_config_trust_lockfile`) overrides the project's files.
+    let pnpm_env = |var: &str| std::env::var(var).ok();
     let rewrite_options = || {
         RewriteOptions {
         dry_run: common.dry_run,
@@ -1311,6 +1314,7 @@ async fn run_redirect_selected_untracked(
         npm_outer: &npm_outer,
         yarn_classic_outer: &yarn_classic_outer,
         cargo_outer: &cargo_outer,
+        pnpm_env: &pnpm_env,
         blocking: true,
         takeover_uuids: takeover_uuids.clone(),
         patch_server_origins: patch_server_origins.clone(),

@@ -1481,6 +1481,10 @@ pub struct RewriteOptions<'a> {
     /// resolved only when a cargo dep is rewritten (the cargo rewriter's
     /// offline-source refusal).
     pub cargo_outer: &'a (dyn Fn() -> CratesIoSource + Send + Sync),
+    /// A variable of the environment pnpm installs the project in, by
+    /// name: a `pnpm_config_trust_lockfile` there beats the
+    /// pnpm-workspace.yaml key the trust auto-config writes (#1514).
+    pub pnpm_env: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
@@ -2503,6 +2507,8 @@ fn pnpm_trust(
         pnpm_trust_rush_detail(&server)
     } else if !governing_lock_v9 || !options.trust_lockfile_config {
         pnpm_trust_manual_guidance(&server)
+    } else if let Some(found) = pnpm_trust_env_override(view, files, options.pnpm_env) {
+        pnpm_trust_env_set_detail(&server, &found.source)
     } else if let Some(root_file) = governing_workspace(view) {
         // A workspace member with its own lock: pnpm reads `trustLockfile`
         // only from the workspace root's file, and a nested one would be
@@ -2687,6 +2693,52 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
          and left untouched — install with `pnpm install --trust-lockfile`, or set \
          `trustLockfile: true` yourself so every install accepts the patched \
          artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// A `pnpm_config_trust_lockfile` variable of the install's environment
+/// (`env`) that the project's pnpm reads and that is not true (#1514). pnpm
+/// 11+ read it ahead of pnpm-workspace.yaml, so it is an explicit user
+/// setting a written key could not override: respected like a
+/// `trustLockfile: false` in the file. The project's files are read for
+/// its pnpm major only when such a variable is set.
+fn pnpm_trust_env_override(
+    view: &ProjectView<'_>,
+    files: &BTreeMap<String, String>,
+    env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+) -> Option<crate::utils::pnpm_workspace::PnpmSetting> {
+    use crate::patch::redirect::upstream::npm::{
+        modules_yaml_pnpm_major, package_json_pnpm_major, pnpm_settings_major,
+    };
+    use crate::utils::pnpm_workspace::trust_lockfile_env;
+    let off = |major| trust_lockfile_env(major, env).filter(|found| found.as_bool() != Some(true));
+    off(None)?;
+    let read = |rel: &str| read_advisory_text(view, rel);
+    let pinned = read("node_modules/.modules.yaml")
+        .as_deref()
+        .and_then(modules_yaml_pnpm_major)
+        .or_else(|| {
+            read(crate::hosted::memory::select::NPM_MANIFEST_REL)
+                .as_deref()
+                .and_then(package_json_pnpm_major)
+        });
+    let lock = files
+        .get("pnpm-lock.yaml")
+        .map(String::as_str)
+        .unwrap_or_default();
+    off(pnpm_settings_major(lock, pinned))
+}
+
+/// The trust detail for a `pnpm_config_trust_lockfile` override in the
+/// environment (`source`, as [`pnpm_trust_env_override`] names it).
+fn pnpm_trust_env_set_detail(server: &str, source: &str) -> String {
+    format!(
+        "{}. {source} sets pnpm's `trustLockfile`, which was respected: pnpm >=11 \
+         reads it ahead of {PNPM_WORKSPACE_REL}, so a `trustLockfile: true` there \
+         would not take effect in this environment, and nothing was written — unset \
+         the variable or set it to `true` wherever the project installs, or re-run \
+         the scan with `--mode vendored`. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
     )
 }
@@ -3250,6 +3302,10 @@ mod tests {
         CratesIoSource::Registry
     }
 
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
     const GRANT: &str = "GRANTTOKEN0123";
     const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
 
@@ -3511,6 +3567,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3583,6 +3640,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3877,6 +3935,15 @@ mod tests {
         view: &ProjectView<'_>,
         unreadable: &BTreeSet<String>,
     ) -> (CandidateFiles, Rewritten) {
+        npm_rewrite_in(view, unreadable, &no_env).await
+    }
+
+    /// [`npm_rewrite`] with pnpm's environment looked up through `env`.
+    async fn npm_rewrite_in(
+        view: &ProjectView<'_>,
+        unreadable: &BTreeSet<String>,
+        env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    ) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -3888,6 +3955,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -4065,6 +4133,101 @@ snapshots:
         );
     }
 
+    /// #1514: pnpm 11+ read a `pnpm_config_trust_lockfile` (or
+    /// `PNPM_CONFIG_TRUST_LOCKFILE`) variable ahead of pnpm-workspace.yaml.
+    /// One set to anything but true in the scan's environment is an
+    /// explicit user setting: nothing is written (a key the variable
+    /// overrides would not take effect) and the warning names the variable
+    /// and its remedies instead of claiming installs need no extra flags.
+    /// The member-lock branch respects it too; a true one, an npm-family
+    /// one, and a project on pnpm 10 keep the auto-config.
+    #[tokio::test]
+    async fn issue_1514_a_trust_lockfile_env_override_is_respected() {
+        fn off(var: &str) -> Option<String> {
+            (var == "pnpm_config_trust_lockfile").then(|| "false".to_string())
+        }
+        fn upper_off(var: &str) -> Option<String> {
+            (var == "PNPM_CONFIG_TRUST_LOCKFILE").then(|| "false".to_string())
+        }
+        fn on(var: &str) -> Option<String> {
+            (var == "pnpm_config_trust_lockfile").then(|| "true".to_string())
+        }
+        fn npm_off(var: &str) -> Option<String> {
+            (var == "npm_config_trust_lockfile").then(|| "false".to_string())
+        }
+        let mut root = MemoryProject::new();
+        root.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        for (env, var) in [
+            (
+                off as fn(&str) -> Option<String>,
+                "pnpm_config_trust_lockfile",
+            ),
+            (upper_off, "PNPM_CONFIG_TRUST_LOCKFILE"),
+        ] {
+            let (_, done) =
+                npm_rewrite_in(&ProjectView::Memory(&root), &BTreeSet::new(), &env).await;
+            assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+            assert!(
+                !done.rewrite.files.contains_key(PNPM_WORKSPACE_REL),
+                "{:?}",
+                done.rewrite.files.keys()
+            );
+            let detail = pnpm_trust_detail(&done);
+            assert!(detail.contains(&format!("`{var}=false`")), "{detail}");
+            assert!(!detail.contains("no extra flags"), "{detail}");
+            assert!(detail.contains("--mode vendored"), "{detail}");
+        }
+        // An existing `trustLockfile: true` is overridden all the same.
+        let mut trusted = root.clone();
+        trusted.insert_text(
+            PNPM_WORKSPACE_REL,
+            "packages:\n  - '.'\ntrustLockfile: true\n",
+        );
+        let (_, done) =
+            npm_rewrite_in(&ProjectView::Memory(&trusted), &BTreeSet::new(), &off).await;
+        assert!(!done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("`pnpm_config_trust_lockfile=false`"),
+            "{detail}"
+        );
+
+        // A true override, the npm spelling (no pnpm reads it) and a
+        // project installed by pnpm 10 (which never verifies) keep the write.
+        for env in [on as fn(&str) -> Option<String>, npm_off] {
+            let (_, done) =
+                npm_rewrite_in(&ProjectView::Memory(&root), &BTreeSet::new(), &env).await;
+            assert!(done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+            assert!(pnpm_trust_detail(&done).contains("no extra flags"));
+        }
+        let mut pnpm10 = root.clone();
+        pnpm10.insert_text(
+            "package.json",
+            r#"{"name":"app","packageManager":"pnpm@10.34.6"}"#,
+        );
+        let (_, done) = npm_rewrite_in(&ProjectView::Memory(&pnpm10), &BTreeSet::new(), &off).await;
+        assert!(done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+
+        // A workspace member's own lock (#880): the root file is not
+        // written either way, and the env override is what is reported.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(PNPM_WORKSPACE_REL),
+            "packages:\n  - 'app'\nsharedWorkspaceLockfile: false\ntrustLockfile: true\n",
+        )
+        .unwrap();
+        let member = tmp.path().join("app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("pnpm-lock.yaml"), LEFT_PAD_V9_LOCK).unwrap();
+        let (_, done) = npm_rewrite_in(&ProjectView::Disk(&member), &BTreeSet::new(), &off).await;
+        assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("`pnpm_config_trust_lockfile=false`"),
+            "{detail}"
+        );
+    }
+
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
     /// manifest is read for its `patchedDependencies`, and a package the
     /// project patches itself with `bun patch` keeps its registry record,
@@ -4123,6 +4286,7 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
+                pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
@@ -4227,6 +4391,7 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
+                pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
@@ -4402,6 +4567,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -4742,6 +4908,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
@@ -4957,6 +5124,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -5011,6 +5179,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -5507,6 +5676,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
