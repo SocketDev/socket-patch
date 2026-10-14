@@ -585,14 +585,13 @@ async fn apply_pypi_package_uses_python_crawler() {
     // Run apply restricted to pypi. With the venv staged on disk and the
     // after-blob pre-cached, this must locate the package via the python
     // crawler and patch it — exercising the pypi dispatch branch end to
-    // end, not just "without panicking". `VIRTUAL_ENV` is cleared so an
-    // ambient venv in CI can't redirect discovery away from our `.venv`.
-    let out = hermetic::command(&binary())
-        .args(["apply", "--json", "--offline", "--ecosystems", "pypi"])
-        .current_dir(tmp.path())
-        .env_remove("VIRTUAL_ENV")
-        .output()
-        .expect("run socket-patch");
+    // end, not just "without panicking". An ambient venv is scrubbed so CI
+    // can't redirect discovery away from our `.venv`.
+    let mut cmd = hermetic::command(&binary());
+    cmd.args(["apply", "--json", "--offline", "--ecosystems", "pypi"])
+        .current_dir(tmp.path());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    let out = cmd.output().expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -648,14 +647,14 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
 
     // No mock server. If apply tries to hit the network, the test will
     // fail (connection refused) — proving the local-blob fast path is
-    // taken when sources are already on disk.
+    // taken when sources are already on disk. Both URLs are pinned: with
+    // no token the child takes the public-proxy path.
     let out = hermetic::command(&binary())
         .args(["apply", "--json"])
         .current_dir(tmp.path())
-        .env(
-            "SOCKET_API_URL",
-            "http://127.0.0.1:1", // unreachable port — should never be contacted
-        )
+        // Unreachable port: should never be contacted.
+        .env("SOCKET_API_URL", "http://127.0.0.1:1")
+        .env("SOCKET_PROXY_URL", "http://127.0.0.1:1")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -818,8 +817,11 @@ async fn offline_apply_with_token_makes_zero_network_requests() {
     // skip the auto-resolution and make this test vacuously green) and
     // keeps the config layer off; seed only what the scenario needs: token
     // set, org absent, both URLs pinned to the mock so any traffic — API or
-    // proxy path — is captured.
-    cmd.env("SOCKET_API_URL", mock.uri())
+    // proxy path — is captured. Telemetry is switched back on (the builder
+    // forces it off) so only `--offline` can keep the telemetry POST away
+    // from the mock.
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0")
+        .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_PROXY_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token-for-test");
     let out = cmd.output().expect("run socket-patch");

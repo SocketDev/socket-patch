@@ -96,8 +96,9 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     // The shared builder scrubs every ambient `SOCKET_*` (an ambient
     // SOCKET_DRY_RUN would turn every `scan --mode agent` into a preview,
     // SOCKET_GLOBAL would aim mutations at the host's real global
-    // node_modules) and forces the config layer and update check off;
-    // removing SOCKET_API_TOKEN also forces the public proxy (free-tier).
+    // node_modules) and forces the config layer, update check and telemetry
+    // off; removing SOCKET_API_TOKEN also forces the public proxy
+    // (free-tier).
     let mut cmd = hermetic::command(&binary());
     cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
