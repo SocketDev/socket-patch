@@ -439,11 +439,15 @@ pub struct UnpatchedCopy {
 /// dependency name, from a copy whose package can't be read
 /// ([`Discovery::unidentified_copy`], #1516).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UnidentifiedCopy {
-    file: PathBuf,
-    version: String,
-    key: String,
-    how: String,
+pub struct UnidentifiedCopy {
+    /// Root-relative lock file.
+    pub file: PathBuf,
+    /// The lock entry's version.
+    pub version: String,
+    /// The lock entry's key, as the lock spells it.
+    pub key: String,
+    /// How that entry installs, completing "lock entry `<key>` …".
+    pub how: String,
 }
 
 /// A ref another lock contests ([`Discovery::contest_across_locks`]): it
@@ -577,7 +581,7 @@ pub struct Discovery {
     /// Same-lock copies whose package can't be read, pending
     /// [`Discovery::contest_within_locks`] ([`Discovery::unidentified_copy`]);
     /// always empty once discovery returns (folded into `unpatched_copies`).
-    pub(crate) unidentified_copies: Vec<UnidentifiedCopy>,
+    pub unidentified_copies: Vec<UnidentifiedCopy>,
     /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
     pub unattested: Vec<Unattested>,
     /// Copies no wiring reaches, pending [`Discovery::unattest_unwired_copies`];
