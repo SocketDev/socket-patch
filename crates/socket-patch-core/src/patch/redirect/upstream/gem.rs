@@ -581,7 +581,7 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
     // The code the last line left unfinished (a trailing `,`, `\`, `=`,
     // …): only its end matters, to tell what a keyword follows.
     let mut carried = String::new();
-    // Open `(`, `[` and hash `{` of the unfinished statement.
+    // Open `(`, `[` and hash `{` of the statement.
     let mut depth = 0usize;
     // Each open `{`: a hash (counted in `depth`) or a block (a frame).
     let mut braces: Vec<bool> = Vec::new();
@@ -617,11 +617,15 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
             block_comment = true;
             continue;
         }
-        let continues = literal.is_some() || !carried.is_empty() || depth > 0;
+        // An open bracket carries only a `source` statement on to its
+        // block opener: elsewhere a bracket the masker missed (one in an
+        // interpolation) must not swallow the rest of the file.
+        let continues = literal.is_some() || !carried.is_empty() || (depth > 0 && source_pending);
         let masked = masked_ruby_code(line, &mut literal);
         heredocs.extend(heredoc_openers(line, &masked));
         let masked = masked.trim();
         if !continues {
+            depth = 0;
             statement_line = line_start;
             let rest = masked.strip_prefix("source").unwrap_or("-");
             source_pending = rest.starts_with([' ', '\t', '(']);
@@ -662,7 +666,7 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                         (false, false)
                     }
                     // A hash literal, part of the statement.
-                    "{" if expression() => {
+                    "{" if expression() && !statement[..start].trim_end().ends_with("->") => {
                         braces.push(true);
                         depth += 1;
                         (false, false)
@@ -723,8 +727,9 @@ fn block_stack(text: &str, at: usize) -> Vec<Frame> {
                 }
             }
         }
+        // A line ending mid-expression; one that only leaves a bracket open
+        // starts a fresh expression on the next line.
         let unfinished = literal.is_some()
-            || depth > 0
             || masked.ends_with(['\\', ',', '(', '[', '+', '-', '*', '='])
             || masked.ends_with("||")
             || masked.ends_with("&&");
@@ -1993,6 +1998,21 @@ mod tests {
         ));
         assert!(at(
             "source \"https://x\" do\n  sep = ?}\n  gem \"rails\"\nend\n"
+        ));
+        // A keyword construct inside an open bracket or a stabby lambda
+        // opens a frame its `end` closes (not the source block).
+        assert!(at(
+            "source \"https://x\" do\n  install_if -> {\n    os = RbConfig::CONFIG[\"host_os\"]\n    \
+             if os =~ /darwin/\n      true\n    end\n  } do\n    gem \"a\"\n  end\n  gem \"rails\"\nend\n"
+        ));
+        assert!(at(
+            "source \"https://x\" do\n  gem \"a\", require: (\n    v = 1\n    if v then \"a\" end\n  )\n  \
+             gem \"b\", require: (\n    v = 1\n    if v\n      \"b\"\n    end\n  )\n  gem \"rails\"\nend\n"
+        ));
+        // A bracket the masker misses outside a `source` statement stays
+        // on its line.
+        assert!(at(
+            "gem \"a\", path: \"#{File.join(\"(\", \"b\")}\"\nsource \"https://x\" do\n  gem \"rails\"\nend\n"
         ));
         // A stray `}` never closes a `do` block.
         assert!(at("source \"https://x\" do\n  }\n  gem \"rails\"\nend\n"));
