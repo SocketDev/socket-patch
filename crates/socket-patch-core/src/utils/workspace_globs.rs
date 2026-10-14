@@ -69,13 +69,17 @@ impl WorkspacesDialect {
         extglob: true,
         picomatch: true,
     };
-    /// Bun 1.3 and later (a `bun.lock` with `configVersion`).
+    /// Bun 1.3 and later (a `bun.lock` with `configVersion`, or an
+    /// untagged 1.3.0/1.3.1 lock that leaves an excluded member out,
+    /// #1521).
     pub(crate) const BUN: Self = Self {
         negation: Negation::LastMatchWins,
         extglob: false,
         picomatch: false,
     };
-    /// Bun before 1.3: it lists `!`-negated directories anyway.
+    /// Bun before 1.3: it lists `!`-negated directories anyway. An
+    /// untagged lock reads this way until its workspace list shows it
+    /// is 1.3.0/1.3.1's (`hosted::governing_root`, #1521).
     pub(crate) const BUN_PRE_1_3: Self = Self {
         negation: Negation::Ignored,
         extglob: false,

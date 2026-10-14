@@ -28,7 +28,8 @@ use crate::formats::yarn::berry_gates::YARN_LOCK;
 use crate::formats::yarn::is_berry_lock;
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
 use crate::utils::fs::{
-    open_regular_file, open_regular_file_sync, read_regular_to_string, read_regular_to_string_sync,
+    open_regular_file, open_regular_file_sync, read_regular_to_bytes, read_regular_to_string,
+    read_regular_to_string_sync,
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::workspace_globs::{workspaces_include, workspaces_include_as, WorkspacesDialect};
@@ -552,8 +553,9 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
 /// honour `!` but write no config version (#1521). Only a directory that
 /// a `!` pattern excludes reads differently, and for it the lock's own
 /// workspace list decides: Bun before 1.3 lists every member it matched,
-/// 1.3.0/1.3.1 never list an excluded one. A list that cannot be read
-/// keeps the wider pre-1.3 reading.
+/// so a lock that lists the member, or any other `!`-excluded directory,
+/// is older Bun's; 1.3.0/1.3.1 never list an excluded one. A list that
+/// cannot be read keeps the wider pre-1.3 reading.
 async fn lock_lists_member(root: &Path, lock: &str, patterns: &[String], rel: &[String]) -> bool {
     let dialect = lock_dialect(root, lock).await;
     if !workspaces_include_as(patterns, rel, dialect) {
@@ -564,34 +566,44 @@ async fn lock_lists_member(root: &Path, lock: &str, patterns: &[String], rel: &[
     {
         return true;
     }
-    let dir = rel.join("/");
-    bun_workspace_dirs(root, lock)
-        .await
-        .is_none_or(|dirs| dirs.contains(&dir))
+    let Some(listed) = bun_workspace_dirs(root, lock).await else {
+        return true;
+    };
+    listed.iter().any(|dir| {
+        let dir: Vec<String> = dir.split('/').map(str::to_string).collect();
+        dir == rel
+            || (workspaces_include_as(patterns, &dir, WorkspacesDialect::BUN_PRE_1_3)
+                && !workspaces_include_as(patterns, &dir, WorkspacesDialect::BUN))
+    })
 }
 
 /// The member directories the Bun lock `lock` at `root` lists, relative to
-/// `root` with `/` separators; the text lock when both exist, as Bun
-/// reads it. `None` when the lock is unreadable or not in Bun's shape.
+/// `root` as `/`-separated plain components (a `./` prefix or `\`
+/// separators normalized, the root `""` left out); the text lock when both exist, as
+/// Bun reads it. `None` when the lock is unreadable or not in Bun's shape.
 async fn bun_workspace_dirs(root: &Path, lock: &str) -> Option<Vec<String>> {
-    if lock == BUN_LOCK || root.join(BUN_LOCK).is_file() {
+    let listed = if lock == BUN_LOCK || root.join(BUN_LOCK).is_file() {
         let text = read_regular_to_string(&root.join(BUN_LOCK)).await.ok()?;
         let lines: Vec<String> = strip_bom(&text).split('\n').map(str::to_string).collect();
-        return bun_lock_text::listed_workspace_dirs(&lines);
-    }
-    let path = root.join(BUN_LOCKB);
-    tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        let (mut file, _) = open_regular_file_sync(&path).ok()?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).ok()?;
+        bun_lock_text::listed_workspace_dirs(&lines)?
+    } else {
+        let bytes = read_regular_to_bytes(&root.join(BUN_LOCKB)).await.ok()?;
         bun_lockb::BunLockb::parse(&bytes)
             .and_then(|lock| lock.workspace_paths())
-            .ok()
-    })
-    .await
-    .ok()
-    .flatten()
+            .ok()?
+    };
+    Some(
+        listed
+            .iter()
+            .map(|dir| {
+                dir.split(['/', '\\'])
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .filter(|dir| !dir.is_empty())
+            .collect(),
+    )
 }
 
 /// The `package.json` `workspaces` dialect of the package manager that
@@ -1510,6 +1522,49 @@ mod tests {
                 refused,
                 "{name} of {} bytes",
                 lock.len()
+            );
+        }
+    }
+
+    /// #1521 (review): the version is read once per lock. An untagged lock
+    /// that lists one `!`-excluded directory is older Bun's, so another
+    /// excluded directory added since its last install is a member too;
+    /// and a member key spelled `./packages/b` is the same directory.
+    #[tokio::test]
+    async fn untagged_bun_lock_listing_any_excluded_dir_is_pre_1_3() {
+        let lock = |members: &[&str]| {
+            let mut text = String::from(
+                "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"root\",\n    },\n",
+            );
+            for member in members {
+                text.push_str(&format!(
+                    "    \"{member}\": {{\n      \"name\": \"m\",\n    }},\n"
+                ));
+            }
+            text.push_str("  },\n  \"packages\": {\n  }\n}\n");
+            text
+        };
+        let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
+        for (members, member, expected) in [
+            (&["packages/a", "packages/b"][..], "packages/c", refused),
+            (&["packages/a", "./packages/b"][..], "packages/b", refused),
+            (&["packages/a", "./packages/b"][..], "packages/c", refused),
+            (&["packages/a"][..], "packages/c", None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/*","!packages/b","!packages/c"]}"#,
+            );
+            write(tmp.path(), "bun.lock", &lock(members));
+            for dir in ["a", "b", "c"] {
+                write(tmp.path(), &format!("packages/{dir}/package.json"), "{}");
+            }
+            assert_eq!(
+                code(&tmp.path().join(member), "npm").await.as_deref(),
+                expected,
+                "{member} under a lock listing {members:?}"
             );
         }
     }
