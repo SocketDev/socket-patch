@@ -669,9 +669,15 @@ fn parse_workspaces_section(lines: &[String]) -> Option<WorkspacesSection> {
 /// the project root), in lock order. Empty when the section is absent or
 /// not in bun's emitted shape.
 pub(crate) fn workspace_member_dirs(lines: &[String]) -> Vec<String> {
+    listed_workspace_dirs(lines).unwrap_or_default()
+}
+
+/// [`workspace_member_dirs`], but `None` when the section is absent or not
+/// in bun's emitted shape, so a caller can tell "lists no such member"
+/// from "could not read the list".
+pub(crate) fn listed_workspace_dirs(lines: &[String]) -> Option<Vec<String>> {
     parse_workspaces_section(lines)
         .map(|section| section.members.into_iter().map(|(dir, _)| dir).collect())
-        .unwrap_or_default()
 }
 
 /// Whether a `workspaces` key is a plain relative directory (`""` is the

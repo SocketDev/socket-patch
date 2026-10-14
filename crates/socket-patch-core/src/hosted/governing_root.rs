@@ -32,10 +32,10 @@ use crate::utils::fs::{
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::workspace_globs::{workspaces_include, workspaces_include_as, WorkspacesDialect};
-use crate::vendor::bun_lockb;
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
 use crate::vendor::lock_inventory::ProjectView;
+use crate::vendor::{bun_lock_text, bun_lockb};
 
 use super::engine::{Candidate, Refusal};
 use super::guidance::{
@@ -524,7 +524,7 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         let found = !locks.is_empty();
         let mut governing = Vec::new();
         for lock in locks {
-            if workspaces_include_as(&patterns, &rel, lock_dialect(ancestor, lock).await) {
+            if lock_lists_member(ancestor, lock, &patterns, &rel).await {
                 governing.push(lock);
             }
         }
@@ -546,15 +546,63 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
     None
 }
 
+/// Whether the package manager that reads `lock` at `root` lists the
+/// member `rel` under the root's `workspaces` `patterns`. An untagged Bun
+/// lock (see [`lock_dialect`]) is ambiguous: Bun 1.3.0 and 1.3.1 already
+/// honour `!` but write no config version (#1521). Only a directory that
+/// a `!` pattern excludes reads differently, and for it the lock's own
+/// workspace list decides: Bun before 1.3 lists every member it matched,
+/// 1.3.0/1.3.1 never list an excluded one. A list that cannot be read
+/// keeps the wider pre-1.3 reading.
+async fn lock_lists_member(root: &Path, lock: &str, patterns: &[String], rel: &[String]) -> bool {
+    let dialect = lock_dialect(root, lock).await;
+    if !workspaces_include_as(patterns, rel, dialect) {
+        return false;
+    }
+    if dialect != WorkspacesDialect::BUN_PRE_1_3
+        || workspaces_include_as(patterns, rel, WorkspacesDialect::BUN)
+    {
+        return true;
+    }
+    let dir = rel.join("/");
+    bun_workspace_dirs(root, lock)
+        .await
+        .is_none_or(|dirs| dirs.contains(&dir))
+}
+
+/// The member directories the Bun lock `lock` at `root` lists, relative to
+/// `root` with `/` separators; the text lock when both exist, as Bun
+/// reads it. `None` when the lock is unreadable or not in Bun's shape.
+async fn bun_workspace_dirs(root: &Path, lock: &str) -> Option<Vec<String>> {
+    if lock == BUN_LOCK || root.join(BUN_LOCK).is_file() {
+        let text = read_regular_to_string(&root.join(BUN_LOCK)).await.ok()?;
+        let lines: Vec<String> = strip_bom(&text).split('\n').map(str::to_string).collect();
+        return bun_lock_text::listed_workspace_dirs(&lines);
+    }
+    let path = root.join(BUN_LOCKB);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let (mut file, _) = open_regular_file_sync(&path).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        bun_lockb::BunLockb::parse(&bytes)
+            .and_then(|lock| lock.workspace_paths())
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// The `package.json` `workspaces` dialect of the package manager that
 /// reads `lock` at `root` (#1097). yarn classic and berry tell apart by
 /// berry's `__metadata` key ([`is_berry_lock`]; an empty or unreadable
 /// `yarn.lock` reads as classic, the wider set), and Bun 1.3+ by the
 /// top-level `configVersion` it writes into `bun.lock`, or the trailing
 /// `cNfGvRsN` extension that carries it in a binary `bun.lockb` (#1492;
-/// a lock without it, as Bun 1.3.0 and earlier write, reads as older Bun,
-/// the wider set). Only the head of a text lock is read: both keys come
-/// first.
+/// a lock without it, as Bun 1.3.1 and earlier write, reads as older Bun,
+/// the wider set, which [`lock_lists_member`] narrows). Only the head of
+/// a text lock is read: both keys come first.
 async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
     match lock {
         YARN_LOCK => {
@@ -1387,13 +1435,74 @@ mod tests {
         write(
             tmp.path(),
             "bun.lock",
-            "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"configVersion\": \"1\",\n    },\n  },\n}\n",
+            "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"configVersion\": \"1\",\n    },\n    \"packages/b\": {\n      \"name\": \"b\",\n    },\n  },\n}\n",
         );
         write(tmp.path(), "packages/b/package.json", "{}");
         assert_eq!(
             code(&tmp.path().join("packages/b"), "npm").await.as_deref(),
             Some(WORKSPACE_LOCKFILE_ELSEWHERE)
         );
+    }
+
+    /// #1521: Bun 1.3.0 and 1.3.1 honour `!` but tag neither lock with a
+    /// config version, so an untagged lock is either theirs or older
+    /// Bun's. The lock's own workspace list tells them apart: Bun 1.2
+    /// lists the `!`-excluded member, 1.3.0/1.3.1 leave it out, and then
+    /// the member's own lock is the one Bun reads. These are the locks
+    /// each release writes for the same `["packages/*","!packages/b"]`
+    /// root (`tests/fixtures/bun-lockb/negated-workspace`).
+    #[tokio::test]
+    async fn untagged_bun_lock_reads_its_workspace_list() {
+        const TEXT_1_2_23: &str = "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"root\",\n    },\n    \"packages/a\": {\n      \"name\": \"a\",\n      \"version\": \"1.0.0\",\n    },\n    \"packages/b\": {\n      \"name\": \"b\",\n      \"version\": \"1.0.0\",\n    },\n  },\n  \"packages\": {\n    \"a\": [\"a@workspace:packages/a\"],\n\n    \"b\": [\"b@workspace:packages/b\"],\n  }\n}\n";
+        // Bun 1.3.1 writes the same bytes.
+        const TEXT_1_3_0: &str = "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"root\",\n    },\n    \"packages/a\": {\n      \"name\": \"a\",\n      \"version\": \"1.0.0\",\n    },\n  },\n  \"packages\": {\n    \"a\": [\"a@workspace:packages/a\"],\n  }\n}\n";
+        const BINARY_1_2_23: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/negated-workspace/1.2.23.lockb");
+        const BINARY_1_3_0: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/negated-workspace/1.3.0.lockb");
+        const BINARY_1_3_1: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/negated-workspace/1.3.1.lockb");
+        let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
+        for (name, lock, expected) in [
+            ("bun.lock", TEXT_1_2_23.as_bytes(), refused),
+            ("bun.lock", TEXT_1_3_0.as_bytes(), None),
+            ("bun.lockb", BINARY_1_2_23, refused),
+            ("bun.lockb", BINARY_1_3_0, None),
+            ("bun.lockb", BINARY_1_3_1, None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
+            );
+            std::fs::write(tmp.path().join(name), lock).unwrap();
+            write(tmp.path(), "packages/a/package.json", "{}");
+            write(tmp.path(), "packages/b/package.json", "{}");
+            let member = tmp.path().join("packages/b");
+            assert_eq!(
+                code(&member, "npm").await.as_deref(),
+                expected,
+                "{name} of {} bytes",
+                lock.len()
+            );
+            // The member's own lock is a stray only when the root's Bun
+            // lists the member.
+            std::fs::write(member.join(name), lock).unwrap();
+            assert_eq!(
+                member_stray_lock(&member).await.is_some(),
+                expected.is_some(),
+                "{name} of {} bytes",
+                lock.len()
+            );
+            // A member no `!` pattern excludes is governed either way.
+            assert_eq!(
+                code(&tmp.path().join("packages/a"), "npm").await.as_deref(),
+                refused,
+                "{name} of {} bytes",
+                lock.len()
+            );
+        }
     }
 
     /// #1492: Bun 1.2+ still writes a binary `bun.lockb` under
@@ -1406,7 +1515,9 @@ mod tests {
     #[tokio::test]
     async fn bun_lockb_with_a_config_version_tag_honours_negated_workspaces() {
         const BUN_1_3_14: &[u8] = include_bytes!("../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
-        const BUN_1_2_23: &[u8] = include_bytes!("../../tests/fixtures/bun-lockb/1.2.23/bun.lockb");
+        // The lock Bun 1.2.23 writes for this root: it lists `packages/b`.
+        const BUN_1_2_23: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/negated-workspace/1.2.23.lockb");
         // A workspace root's lock: the tag follows its workspace and
         // catalog extensions.
         const BUN_1_4_2_WORKSPACE: &[u8] =
