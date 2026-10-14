@@ -3214,6 +3214,22 @@ async fn vendor_npm_file_directory_copy_is_not_attested() {
         json!(format!("file:{}", rel_tgz())),
         "the registry copy is still vendored: {env}"
     );
+    // The in-run VEX ran and withheld the ref, naming the unpatched copy;
+    // with nothing left to attest it fails closed, as for a `file:`
+    // tarball or URL copy.
+    assert_eq!(code, 1, "{env}");
+    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| {
+                w["code"] == "patched_ref_unattributable"
+                    && w["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("`packages/b/node_modules/left-pad`"))
+            })),
+        "{env}"
+    );
     // No document is written when no statement survives, so a missing
     // file is the expected "attests nothing" outcome.
     let attested = |path: &Path| {
@@ -3224,10 +3240,21 @@ async fn vendor_npm_file_directory_copy_is_not_attested() {
     };
     assert!(
         !attested(&vex_path),
-        "in-run VEX must not attest a purl whose file: directory copy stays unpatched \
-         (exit {code}): {env}"
+        "in-run VEX must not attest a purl whose file: directory copy stays unpatched: {env}"
     );
 
+    // `vendor --check` fails, naming the copy rather than claiming nothing
+    // wires the artifact and prescribing a re-vendor that cannot reach it.
+    let (check, check_env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(check, 1, "{check_env}");
+    let reason = check_env["events"][0]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.starts_with("copy unpatched:")
+            && reason.contains("`packages/b/node_modules/left-pad`"),
+        "{check_env}"
+    );
     let standalone = fx.root().join("standalone.vex.json");
     let (_, stdout, stderr) = run_cli(
         fx.root(),

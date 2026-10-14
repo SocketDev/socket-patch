@@ -464,21 +464,26 @@ fn drop_non_registry_installs(
     let mut unpatched: Vec<(String, &str, &str)> = Vec::new();
     for (key, why) in &elsewhere {
         let entry = &doc["packages"][key.as_str()];
-        let key_name = key.rsplit_once("node_modules/").map_or("", |(_, n)| n);
-        let name = entry
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(key_name);
-        let purl = match entry.get("version").and_then(Value::as_str) {
-            Some(version) => npm_purl(name, version),
+        let identity = match entry.get("version").and_then(Value::as_str) {
+            Some(version) => {
+                let key_name = key.rsplit_once("node_modules/").map_or("", |(_, n)| n);
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(key_name);
+                Some((name.to_string(), version.to_string()))
+            }
             // A `file:` directory dependency is a versionless link entry
             // whose source directory's own entry carries the package
             // (#1511), as the hosted rewriter reads it (#1481).
-            None if entry.get("link").and_then(Value::as_bool) == Some(true) => {
-                npm_link_source_identity(doc, entry).and_then(|(n, v)| npm_purl(&n, &v))
+            None if foreign.contains(key)
+                && entry.get("link").and_then(Value::as_bool) == Some(true) =>
+            {
+                npm_link_source_identity(doc, entry)
             }
             None => None,
         };
+        let purl = identity.and_then(|(name, version)| npm_purl(&name, &version));
         let Some(purl) = purl else {
             continue;
         };
@@ -2464,7 +2469,8 @@ mod tests {
     /// is wired while another member's `file:` directory copy of the same
     /// release installs from that directory, unpatched: the ref is withheld
     /// (#1482 is the hosted rewriter's half). Controls: a directory holding
-    /// ANOTHER version, and a plain workspace-member link, contest nothing.
+    /// ANOTHER version, and a workspace member linked without a `file:`
+    /// spec, contest nothing.
     #[tokio::test]
     async fn a_file_directory_link_copy_of_the_same_release_is_not_attested() {
         let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
@@ -2534,6 +2540,25 @@ mod tests {
         let out = run(&p).await;
         assert_eq!(out.refs.len(), 1, "{:?}", out.diagnostics);
         assert!(!diag_codes(&out).contains(&DIAG_REF_UNATTRIBUTABLE));
+        // Control: a workspace member that is itself `left-pad@1.3.0`,
+        // linked by the workspace (no `file:` spec), is first-party source.
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "version": "1.0.0", "workspaces": ["packages/*"] },
+                "node_modules/a": { "resolved": "packages/a", "link": true },
+                "node_modules/left-pad": { "resolved": "packages/left-pad", "link": true },
+                "packages/a": { "name": "a", "version": "1.0.0",
+                                "dependencies": { "left-pad": "1.3.0" } },
+                "packages/a/node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": vendored, "integrity": SRI
+                },
+                "packages/left-pad": { "name": "left-pad", "version": "1.3.0" },
+            })),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 1, "{:?}", out.diagnostics);
     }
 
     /// Negative shapes: a uuid on a foreign host, a placeholder token, the
