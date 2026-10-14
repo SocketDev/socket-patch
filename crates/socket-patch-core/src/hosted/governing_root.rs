@@ -456,6 +456,41 @@ async fn vlt_lock_root(
     Some((ancestor, vec![VLT_LOCK]))
 }
 
+/// The independent npm-family project below `scan_root` whose
+/// `node_modules` holds the crawled copy at `copy` (#1534): the deepest
+/// directory between `scan_root` (exclusive) and the copy's first
+/// `node_modules` that holds an npm-family lock of its own and is not a
+/// workspace member whose package manager ignores that lock
+/// ([`member_stray_lock`]). `None` when the copy belongs to `scan_root`'s
+/// own install (its `node_modules`, or a workspace member without a lock
+/// of its own). `copy` is matched against `scan_root` as given and
+/// canonicalized.
+///
+/// A hosted or vendored run rewires only `scan_root`'s locks, so such a
+/// copy is reached by passing the nested project as a PATH instead.
+pub async fn nested_npm_project(scan_root: &Path, copy: &Path) -> Option<PathBuf> {
+    let canonical = tokio::fs::canonicalize(scan_root).await.ok();
+    let (base, rel) = std::iter::once(scan_root)
+        .chain(canonical.as_deref())
+        .find_map(|dir| copy.strip_prefix(dir).ok().map(|rel| (dir, rel)))?;
+    let parts: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map_while(|c| match c {
+            std::path::Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    let depth = parts.iter().position(|p| *p == "node_modules")?;
+    for k in (1..=depth).rev() {
+        let mut dir = base.to_path_buf();
+        dir.extend(&parts[..k]);
+        if has_own_npm_family_lock(&dir) && member_stray_lock(&dir).await.is_none() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
 /// The hosted refusal for [`member_stray_lock`].
 async fn member_stray_lock_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
     let stray = member_stray_lock(root).await?;
@@ -883,6 +918,66 @@ mod tests {
         refusal(&ProjectView::Disk(dir), &[candidate(ecosystem)], true)
             .await
             .map(|r| r.code)
+    }
+
+    /// #1534: a crawled copy belongs to the deepest directory below the
+    /// scan root that is an independent npm-family lock root; the root's
+    /// own `node_modules`, a lockless workspace member and a member whose
+    /// lock npm ignores all stay the root's.
+    #[tokio::test]
+    async fn nested_npm_project_finds_the_independent_lock_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "package.json",
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        );
+        write(root, "package-lock.json", "{}");
+        // An independent project, with a lockless sub-package of its own.
+        write(root, "tools/x/package.json", r#"{"name":"x"}"#);
+        write(root, "tools/x/package-lock.json", "{}");
+        write(root, "tools/x/sub/package.json", r#"{"name":"sub"}"#);
+        // A yarn project is independent too.
+        write(root, "examples/y/yarn.lock", "");
+        // Workspace members: one lockless, one with a stray npm lock.
+        write(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        write(root, "packages/b/package.json", r#"{"name":"b"}"#);
+        write(root, "packages/b/package-lock.json", "{}");
+
+        let owner = |rel: &str| {
+            let copy = root.join(rel);
+            async move { nested_npm_project(root, &copy).await }
+        };
+        assert_eq!(owner("node_modules/left-pad").await, None);
+        assert_eq!(
+            owner("node_modules/a/node_modules/left-pad").await,
+            None,
+            "inside a node_modules is a package, not a project"
+        );
+        assert_eq!(
+            owner("tools/x/node_modules/left-pad").await,
+            Some(root.join("tools/x"))
+        );
+        assert_eq!(
+            owner("tools/x/node_modules/.pnpm/left-pad@1.3.0/node_modules/left-pad").await,
+            Some(root.join("tools/x"))
+        );
+        assert_eq!(
+            owner("tools/x/sub/node_modules/left-pad").await,
+            Some(root.join("tools/x")),
+            "a lockless directory belongs to the nearest lock root"
+        );
+        assert_eq!(
+            owner("examples/y/node_modules/left-pad").await,
+            Some(root.join("examples/y"))
+        );
+        assert_eq!(owner("packages/a/node_modules/left-pad").await, None);
+        assert_eq!(owner("packages/b/node_modules/left-pad").await, None);
+        assert_eq!(
+            nested_npm_project(root, Path::new("/elsewhere/node_modules/x")).await,
+            None
+        );
     }
 
     /// #590: a pnpm workspace member has no lock; the root's lock governs it.

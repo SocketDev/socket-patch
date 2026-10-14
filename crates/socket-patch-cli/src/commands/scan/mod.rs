@@ -2503,6 +2503,32 @@ async fn run_scan(
         &all_purls,
         &mut lockfile_only.purls,
     );
+    // #1534: hosted and vendored runs rewire only this root's locks, so a
+    // patched copy only a nested npm project installs is left to that
+    // project's own run, with a warning, not handed to this root's backend.
+    if (hosted || vendor)
+        && !args.common.is_global()
+        && args.common.ecosystem_selected(Ecosystem::Npm)
+    {
+        let (skipped, warnings) = Box::pin(discovery::nested_project_skips(
+            &args.common.cwd,
+            if hosted { "hosted" } else { "vendored" },
+            &crawler_options,
+            &filtered_crawled,
+            &lockfile_only.entries,
+            &all_packages_with_patches,
+        ))
+        .await;
+        if !skipped.is_empty() {
+            all_packages_with_patches.retain(|p| !skipped.contains(&PurlKey::new(&p.purl)));
+            if !args.common.json {
+                for (_, detail) in &warnings {
+                    status.println(format!("Warning: {detail}"));
+                }
+            }
+            layout_refusals.extend(warnings);
+        }
+    }
 
     // If every batch errored, surface a full scan failure rather than
     // silently reporting zero patches.
