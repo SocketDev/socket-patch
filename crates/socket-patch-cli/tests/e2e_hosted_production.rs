@@ -281,7 +281,7 @@ fn has_command(cmd: &str) -> bool {
     } else {
         &["--version"]
     };
-    let mut probe_cmd = Command::new(cmd);
+    let mut probe_cmd = pm_command(cmd);
     probe_cmd
         .args(probe)
         .stdout(std::process::Stdio::null())
@@ -433,12 +433,29 @@ fn hosted_pin_count(env: &serde_json::Value) -> u64 {
 // Toolchain invocation
 // ---------------------------------------------------------------------------
 
+/// A package-manager child (and its liveness probe) with the shared
+/// hermetic scrubs, applied before `cache_env::isolate` and the leg's own
+/// env so a leg's pins (the uv legs' `VIRTUAL_ENV`) survive: every ambient
+/// `SOCKET_*` ([`hermetic::scrub_socket_vars`]), an activated venv (uv
+/// would install into the wrong interpreter) and the yarn/pnpm node-linker
+/// overrides. Deliberately not the full `Extra::Yarn` / `Extra::Pnpm`
+/// sweeps: those remove every `YARN_*` / `npm_config_*`, including the
+/// proxy and CA settings these live-registry suites need behind a proxy.
+fn pm_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.env_remove("YARN_NODE_LINKER");
+    cmd.env_remove("npm_config_node_linker");
+    cmd
+}
+
 /// Run an external package manager. Returns the `Output` without asserting, so
 /// callers can distinguish "the registry was unreachable" (soft-skip material
 /// during fixture setup) from "the install of the redirected lock failed"
 /// (always a hard failure — that is the thing under test).
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(program);
+    let mut cmd = pm_command(program);
     cmd.args(args).current_dir(cwd);
     // Sandbox everything the per-leg `env` below does not name — corepack's
     // downloaded package managers most of all — so a run leaves the caller's
@@ -446,13 +463,11 @@ fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Outpu
     cache_env::isolate(&mut cmd);
     // Keep every toolchain's cache inside the fixture so the reinstall leg
     // starts genuinely cold and cannot be satisfied from a warm host cache
-    // holding the *pristine* artifact.
+    // holding the *pristine* artifact. Applied last, so a leg's own pin
+    // (the uv legs' `VIRTUAL_ENV`) survives the scrub.
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // A `VIRTUAL_ENV` inherited from the developer's shell makes uv install
-    // into the wrong interpreter.
-    cmd.env_remove("VIRTUAL_ENV");
     cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"))
 }

@@ -295,7 +295,7 @@ fn has_command(cmd: &str) -> bool {
     } else {
         &["--version"]
     };
-    let mut probe_cmd = Command::new(cmd);
+    let mut probe_cmd = pm_command(cmd);
     probe_cmd
         .args(probe)
         .stdout(std::process::Stdio::null())
@@ -307,7 +307,7 @@ fn has_command(cmd: &str) -> bool {
 /// `corepack <pm> --version` succeeds — the liveness probe for a specific yarn
 /// flavor (also the call that downloads it the first time, kept in the sandbox).
 fn has_corepack_pm(pm: &str) -> bool {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = pm_command("corepack");
     cmd.args([pm, "--version"])
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     cache_env::isolate(&mut cmd);
@@ -497,6 +497,23 @@ fn vendor_revert(cwd: &Path, leg: &str) -> u64 {
 // Toolchain invocation
 // ---------------------------------------------------------------------------
 
+/// A package-manager child (and its liveness probe) with the shared
+/// hermetic scrubs, applied before `cache_env::isolate` and the leg's own
+/// env so a leg's pins (the uv legs' `VIRTUAL_ENV`) survive: every ambient
+/// `SOCKET_*` ([`hermetic::scrub_socket_vars`]), an activated venv (uv/pip
+/// would install into the wrong interpreter) and the yarn/pnpm node-linker
+/// overrides. Deliberately not the full `Extra::Yarn` / `Extra::Pnpm`
+/// sweeps: those remove every `YARN_*` / `npm_config_*`, including the
+/// proxy and CA settings these live-registry suites need behind a proxy.
+fn pm_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
+    cmd.env_remove("YARN_NODE_LINKER");
+    cmd.env_remove("npm_config_node_linker");
+    cmd
+}
+
 /// Run `bundle <args>` with the ambient `BUNDLE_*`/`GEM_*`/`RUBYOPT` state
 /// scrubbed first (a developer's global bundler config — frozen mode, a
 /// custom BUNDLE_PATH or gem home, a RUBYOPT require — must not leak into a
@@ -504,7 +521,7 @@ fn vendor_revert(cwd: &Path, leg: &str) -> u64 {
 /// The cache sandbox re-pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after
 /// the scrub, and the per-leg `env` is applied last so the leg's pins win.
 fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("bundle");
+    let mut cmd = pm_command("bundle");
     cmd.args(args).current_dir(cwd);
     for (k, _) in std::env::vars_os() {
         let key = k.to_string_lossy().into_owned();
@@ -525,17 +542,12 @@ fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
 /// during fixture setup) from "the install of the vendored lock failed" (always
 /// a hard failure — that is the thing under test).
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(program);
+    let mut cmd = pm_command(program);
     cmd.args(args).current_dir(cwd);
     cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // A `VIRTUAL_ENV` inherited from the developer's shell makes uv/pip install
-    // into the wrong interpreter; a node-linker override breaks yarn/pnpm.
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
-    cmd.env_remove("npm_config_node_linker");
     cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"))
 }
@@ -543,12 +555,10 @@ fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Outpu
 /// Run `corepack <pm> <args>` in `cwd` with the download prompt disabled and
 /// the shared cache sandbox applied (per-leg `env` wins, applied last).
 fn corepack(cwd: &Path, pm: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = pm_command("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
     cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
     for (k, v) in env {
         cmd.env(k, v);
     }
