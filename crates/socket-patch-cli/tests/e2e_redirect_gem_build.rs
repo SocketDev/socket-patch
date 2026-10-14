@@ -440,6 +440,12 @@ enum Driver {
     /// constructs (`v = if … end`, `w = case … end`) before the gem
     /// (#1476): their `end`s must not close the user's source block.
     ScanVexSourceBlockAssignment,
+    /// [`Driver::ScanVexSourceBlock`] whose `source(` opener spans lines
+    /// before its `do` (#1509).
+    ScanVexSourceBlockMultiLineOpener,
+    /// [`Driver::ScanVexSourceBlock`] as a `source(…) { … }` brace block
+    /// (#1509): bundler pins it with `!` too.
+    ScanVexSourceBlockBraces,
     /// A heredoc option continues beyond the declaration's physical line.
     ScanVexHeredocDeclaration,
     /// A double-quoted interpolation can itself contain a heredoc opener.
@@ -532,6 +538,12 @@ impl Driver {
             Driver::ScanVexSourceBlock => "scan --mode hosted (gem in a source block)",
             Driver::ScanVexSourceBlockAssignment => {
                 "scan --mode hosted (gem in a source block after `v = if … end`)"
+            }
+            Driver::ScanVexSourceBlockMultiLineOpener => {
+                "scan --mode hosted (gem in a multi-line `source(…) do` block)"
+            }
+            Driver::ScanVexSourceBlockBraces => {
+                "scan --mode hosted (gem in a `source(…) { }` block)"
             }
             Driver::ScanVexSemicolonJoinedDeclaration => {
                 "scan --mode hosted (two `;`-joined gem declarations)"
@@ -838,6 +850,16 @@ async fn redirect_scanned_project(
              else \"b\"\n      end\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
             up = server.uri()
         ),
+        Driver::ScanVexSourceBlockMultiLineOpener => format!(
+            "source \"{up}/upstream\"\n\nsource(\n  \"{up}/upstream\"\n) do\n  \
+             gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
+            up = server.uri()
+        ),
+        Driver::ScanVexSourceBlockBraces => format!(
+            "source \"{up}/upstream\"\n\nsource(\"{up}/upstream\") {{\n  \
+             gem \"{DEP}\", \"{DEP_VERSION}\"\n}}\n",
+            up = server.uri()
+        ),
         Driver::ScanVexEvalGemfile => {
             std::fs::write(proj.join("Gemfile.common"), format!("gem \"{DEP}\"\n")).unwrap();
             format!(
@@ -1098,6 +1120,8 @@ async fn redirect_scanned_project(
         | Driver::ScanVexGroupBlock
         | Driver::ScanVexSourceBlock
         | Driver::ScanVexSourceBlockAssignment
+        | Driver::ScanVexSourceBlockMultiLineOpener
+        | Driver::ScanVexSourceBlockBraces
         | Driver::ScanVexCustomGitSource
         | Driver::ScanVexMultiLineDeclaration
         | Driver::ScanVexConditionalDeclaration
@@ -1303,6 +1327,8 @@ async fn redirect_scanned_project(
         | Driver::ScanVexGroupBlock
         | Driver::ScanVexSourceBlock
         | Driver::ScanVexSourceBlockAssignment
+        | Driver::ScanVexSourceBlockMultiLineOpener
+        | Driver::ScanVexSourceBlockBraces
         | Driver::ScanVexTrailingSemicolonDeclaration => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert!(
@@ -2373,6 +2399,8 @@ async fn gem_hosted_group_block_pin_survives_a_refused_vendored_takeover() {
 /// Converged without CHECKSUMS so the restore needs no rubygems.org sha.
 /// #1476: the same holds when assignment-form `v = if … end` /
 /// `w = case … end` constructs precede the gem inside the block.
+/// #1509: and when the block's `source(` opener spans lines, or the block
+/// is a `source(…) { … }` brace block.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -2382,9 +2410,15 @@ async fn gem_hosted_unwind_keeps_a_source_block_bang() {
         (Driver::ScanVexSourceBlock, "remove"),
         (Driver::ScanVexSourceBlockAssignment, "rollback"),
         (Driver::ScanVexSourceBlockAssignment, "remove"),
+        (Driver::ScanVexSourceBlockMultiLineOpener, "rollback"),
+        (Driver::ScanVexSourceBlockMultiLineOpener, "remove"),
+        (Driver::ScanVexSourceBlockBraces, "rollback"),
+        (Driver::ScanVexSourceBlockBraces, "remove"),
     ] {
         let label = match driver {
             Driver::ScanVexSourceBlockAssignment => "source-block-assignment",
+            Driver::ScanVexSourceBlockMultiLineOpener => "source-block-multi-line-opener",
+            Driver::ScanVexSourceBlockBraces => "source-block-braces",
             _ => "source-block",
         };
         let Some(fx) = redirect_scanned_project(
