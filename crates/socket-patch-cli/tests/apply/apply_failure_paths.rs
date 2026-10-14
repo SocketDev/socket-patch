@@ -21,14 +21,10 @@ use serde_json::json;
 
 use crate::apply_fixture::*;
 use crate::common::envelope::{
-    envelope_error_code, event_triples, events, find_event, has_event, json_string,
+    envelope_error_code, event_purls, event_triples, events, find_event, has_event, json_string,
     parse_json_envelope,
 };
 use crate::common::git_sha256;
-
-/// The `reason` of an `OrphanReplace` drift event: it shares
-/// `go_redirect_drift` with the other drift arms.
-const ORPHAN_REPLACE: &str = "orphan go.mod `replace`";
 
 // ═══════════════════ 1. `--check --json` envelopes ═══════════════════
 
@@ -49,9 +45,9 @@ fn check_json_with_drift_emits_failed_events_envelope() {
         !triples.is_empty(),
         "drift must be reported as events: {env}"
     );
-    for (purl, action, code) in triples {
+    for (purl, action, err_code) in triples {
         assert_eq!(
-            (purl.as_str(), action.as_str(), code.as_str()),
+            (purl.as_str(), action.as_str(), err_code.as_str()),
             (GO_PURL, "failed", "go_redirect_drift"),
             "{env}"
         );
@@ -73,7 +69,8 @@ fn check_json_in_sync_emits_success_envelope() {
 }
 
 /// A socket-owned `replace` for a module the manifest no longer patches:
-/// the `OrphanReplace` arm. Its event is keyed by the module, not a purl.
+/// the `OrphanReplace` arm, the only drift keyed by the module instead of
+/// a purl.
 #[test]
 fn check_reports_orphan_replace_drift() {
     let tmp = tempfile::tempdir().unwrap();
@@ -97,8 +94,6 @@ fn check_reports_orphan_replace_drift() {
         )],
         "{env}"
     );
-    let reason = events(&env)[0]["reason"].as_str().unwrap_or_default();
-    assert!(reason.contains(ORPHAN_REPLACE), "{env}");
 }
 
 /// A healthy copy but a socket-owned `replace` pinned at the WRONG target
@@ -169,6 +164,9 @@ fn reconcile_prunes_stale_go_redirect() {
     );
     let env = parse_json_envelope(stdout.trim());
     assert_eq!(json_string(&env, "status"), Some("success"), "{env}");
+    // The pruning is announced only in human mode (`apply_render.rs`);
+    // the envelope carries no event for it.
+    assert!(events(&env).is_empty(), "{env}");
     let go_mod = std::fs::read_to_string(tmp.path().join("go.mod")).unwrap();
     assert!(
         !go_mod.contains("replace"),
@@ -194,6 +192,7 @@ fn reconcile_dry_run_touches_nothing() {
     );
     let env = parse_json_envelope(stdout.trim());
     assert_eq!(json_string(&env, "status"), Some("success"), "{env}");
+    assert!(events(&env).is_empty(), "{env}");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("go.mod")).unwrap(),
         original_go_mod,
@@ -499,9 +498,7 @@ fn qualified_singleton_with_only_new_files_is_attempted_and_applied() {
     );
     assert_eq!(json_string(&env, "status"), Some("success"), "{env}");
     assert!(
-        events(&env)
-            .iter()
-            .any(|e| e["action"] == "applied" && e["purl"] == GEM_QUALIFIED_PURL),
+        event_purls(&env, "applied").contains(&GEM_QUALIFIED_PURL.to_string()),
         "the qualified singleton must be reported applied: {env}"
     );
     assert_eq!(

@@ -48,8 +48,8 @@ pub fn one_file(path: &str, before: &[u8], after: &[u8]) -> Value {
     json!({ path: { "beforeHash": git_sha256(before), "afterHash": git_sha256(after) } })
 }
 
-/// Write `.socket/manifest.json` (creating `.socket/blobs/` alongside so
-/// blob-emptiness assertions have a stable target).
+/// Write `.socket/manifest.json`, creating `.socket/blobs/` alongside as
+/// a real project has it.
 pub fn write_manifest(root: &Path, patches: Value) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).expect("create .socket/blobs");

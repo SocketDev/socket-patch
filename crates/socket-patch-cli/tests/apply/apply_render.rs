@@ -204,7 +204,7 @@ fn bun_layout_prints_informational_note() {
     std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
     std::fs::write(tmp.path().join("bun.lock"), "{}\n").unwrap();
 
-    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
     assert_eq!(
         code, 0,
         "the bun note is informational only; stderr={stderr}"
@@ -215,6 +215,7 @@ fn bun_layout_prints_informational_note() {
         ),
         "stderr={stderr}"
     );
+    assert!(stdout.contains("No patches to apply."), "stdout={stdout}");
 }
 
 /// A vlt install (the `node_modules/.vlt` store) prints its note and never
@@ -227,7 +228,7 @@ fn vlt_layout_prints_informational_note_in_human_mode() {
     std::fs::create_dir_all(tmp.path().join("node_modules").join(".vlt")).unwrap();
     std::fs::write(tmp.path().join("bun.lock"), "{}\n").unwrap();
 
-    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
     assert_eq!(
         code, 0,
         "the vlt note is informational only; stderr={stderr}"
@@ -240,6 +241,7 @@ fn vlt_layout_prints_informational_note_in_human_mode() {
         "stderr={stderr}"
     );
     assert!(!stderr.contains("bun layout detected"), "stderr={stderr}");
+    assert!(stdout.contains("No patches to apply."), "stdout={stdout}");
 }
 
 /// The layout notes are human-only: `--json` and `--silent` runs (the
