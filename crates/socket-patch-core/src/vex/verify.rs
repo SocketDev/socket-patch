@@ -568,16 +568,19 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
 
 /// The keys of the version overrides the project's own `package.json`
 /// declares: npm `overrides`, pnpm `pnpm.overrides` and yarn
-/// `resolutions`. A nested npm override's parent key only scopes the
-/// overrides under it, so it counts only when its `"."` entry forces the
-/// parent itself.
+/// `resolutions`, each forcing a version (not `*` or empty). A nested npm
+/// override's parent key only scopes the overrides under it, so it counts
+/// only when its `"."` entry forces the parent itself.
 fn project_forced_names(project: &Path) -> Vec<String> {
     fn keys(value: &serde_json::Value, out: &mut Vec<String>) {
         for (key, nested) in value.as_object().into_iter().flatten() {
             if key == "." {
                 continue;
             }
-            if nested.is_string() || nested.get(".").is_some() {
+            // `*` and an empty value keep the declared range; `$name`
+            // pins the root's own spec, which is still the user's choice.
+            let pins = |v: &serde_json::Value| v.as_str().is_some_and(|v| !matches!(v, "" | "*"));
+            if pins(nested) || nested.get(".").is_some_and(pins) {
                 out.push(key.clone());
             }
             keys(nested, out);
@@ -2242,11 +2245,24 @@ mod tests {
             unresolved_npm_dependency(&forced).await.as_deref(),
             Some("minimist")
         );
-        put(
-            "forced/package.json",
+        for unforced in [
+            r#"{"overrides":{"minimist":{".":"*"},"@s/b":"1.0.0"}}"#,
+            r#"{"overrides":{"minimist":"","@s/b":"1.0.0"}}"#,
+        ] {
+            put("forced/package.json", unforced);
+            assert_eq!(
+                unresolved_npm_dependency(&forced).await.as_deref(),
+                Some("minimist"),
+                "{unforced}"
+            );
+        }
+        for forcing in [
             r#"{"overrides":{"minimist":{".":"1.2.8"},"@s/b":"1.0.0"}}"#,
-        );
-        assert_eq!(unresolved_npm_dependency(&forced).await, None);
+            r#"{"overrides":{"minimist":"$minimist","@s/b":"1.0.0"}}"#,
+        ] {
+            put("forced/package.json", forcing);
+            assert_eq!(unresolved_npm_dependency(&forced).await, None, "{forcing}");
+        }
     }
 
     fn hosted_ctx(purl: &str, copies: HostedCopies) -> VendorContext {
