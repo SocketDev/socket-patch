@@ -10,7 +10,7 @@
   "targets": {
     "api_retry_e2e": 2.01,
     "api_timeout_e2e": 4.29,
-    "apply": 10.48,
+    "apply": 14.53,
     "binary_fetch_error_classification_e2e": 0.01,
     "blob_fetcher_edges_e2e": 2.06,
     "child_deadline_guard": 0.25,
@@ -36,7 +36,6 @@
     "cli_sigpipe": 0.0,
     "command_module_layering": 0.11,
     "contract_gradle_codes": 0.93,
-    "coverage_fix_apply_silent_mute_exit": 4.05,
     "coverage_fix_rollback_ecosystem_scoped_hosted": 0.09,
     "coverage_fix_scan_hosted_dryrun_vendored": 1.61,
     "coverage_fix_vendor_silent_mute_exit": 7.4,

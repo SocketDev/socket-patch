@@ -20,11 +20,10 @@
 //! this path (partialFailure, empty events, NO top-level error record —
 //! deliberately distinct from vendor's `no_local_source` hard error).
 
-#[path = "common/mod.rs"]
-mod common;
-use common::{binary, hermetic_command};
-
 use std::path::Path;
+
+use crate::common::envelope::{json_string, parse_json_envelope};
+use crate::common::{binary, hermetic_command};
 
 /// Run `socket-patch apply` in `cwd` with a scrubbed SOCKET_* environment
 /// so ambient developer/CI configuration (tokens, silent toggles) can't
@@ -166,10 +165,10 @@ fn apply_json_offline_missing_source_keeps_stderr_clean() {
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline"]);
     assert_eq!(code, 1, "offline + no local source must fail: {stderr}");
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).expect("apply --json must emit valid JSON");
+    let v = parse_json_envelope(&stdout);
     assert_eq!(
-        v["status"], "partialFailure",
+        json_string(&v, "status"),
+        Some("partialFailure"),
         "the pinned envelope shape for the offline bail, got {v}"
     );
     let chatter = stderr_chatter(&stderr);
