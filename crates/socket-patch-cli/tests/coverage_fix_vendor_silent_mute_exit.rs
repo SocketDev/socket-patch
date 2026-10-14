@@ -13,7 +13,7 @@
 //!   prints exclusively under `--json`.
 //!
 //! Same class fixed for the DISK stager's arms in
-//! `coverage_fix_apply_silent_mute_exit.rs`; the offline arm is shared
+//! `apply/apply_silent_staging_errors.rs`; the offline arm is shared
 //! (`report_offline_missing`) and is pinned here for vendor too.
 //!
 //! Under `--json` the diagnostics stay off stderr — the envelope is the

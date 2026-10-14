@@ -20,25 +20,12 @@
 //! this path (partialFailure, empty events, NO top-level error record —
 //! deliberately distinct from vendor's `no_local_source` hard error).
 
-#[path = "common/mod.rs"]
-mod common;
-use common::{binary, hermetic_command};
-
 use std::path::Path;
 
-/// Run `socket-patch apply` in `cwd` with a scrubbed SOCKET_* environment
-/// so ambient developer/CI configuration (tokens, silent toggles) can't
-/// change the branch under test.
-fn run_apply(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic_command(&binary());
-    cmd.arg("apply").args(args).current_dir(cwd);
-    let out = cmd.output().expect("run socket-patch apply");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
-}
+use serde_json::json;
+
+use crate::apply_fixture::{patch_record, run_apply, write_manifest};
+use crate::common::envelope::{json_string, parse_json_envelope};
 
 /// Non-error stderr lines: drop the unconditional core API-token warning
 /// (both its lead line and its "Got: ... Continuing anyway" continuation)
@@ -56,26 +43,17 @@ fn stderr_chatter(stderr: &str) -> Vec<String> {
 }
 
 /// Valid manifest with one npm patch entry and NO blob/diff/package
-/// artifact anywhere under `.socket/` — staging has no usable source.
+/// artifact anywhere under `.socket/`: staging has no usable source.
 fn write_sourceless_manifest(root: &Path) {
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        r#"{ "patches": {
-            "pkg:npm/left-pad@1.3.0": {
-                "uuid": "11111111-1111-4111-8111-111111111111",
-                "exportedAt": "2026-01-01T00:00:00Z",
-                "files": { "index.js": {
-                    "beforeHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "afterHash":  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                }},
-                "vulnerabilities": {}, "description": "x",
-                "license": "MIT", "tier": "free"
-            }
-        }}"#,
-    )
-    .unwrap();
+    write_manifest(
+        root,
+        json!({
+            "pkg:npm/left-pad@1.3.0": patch_record(
+                "11111111-1111-4111-8111-111111111111",
+                json!({ "index.js": { "beforeHash": "a".repeat(64), "afterHash": "b".repeat(64) } }),
+            )
+        }),
+    );
 }
 
 /// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
@@ -98,7 +76,7 @@ fn apply_silent_offline_missing_source_keeps_error_output() {
     let tmp = tempfile::tempdir().unwrap();
     write_sourceless_manifest(tmp.path());
 
-    let (code, stdout, stderr) = run_apply(tmp.path(), &["--silent", "--offline"]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--silent", "--offline"], &[]);
     assert_eq!(code, 1, "offline + no local source must fail: {stderr}");
     assert!(
         stdout.trim().is_empty(),
@@ -134,6 +112,7 @@ fn apply_silent_online_download_failure_keeps_error_output() {
             "--org",
             "test-org",
         ],
+        &[],
     );
     assert_eq!(code, 1, "failed downloads + no source must fail: {stderr}");
     assert!(
@@ -164,12 +143,12 @@ fn apply_json_offline_missing_source_keeps_stderr_clean() {
     let tmp = tempfile::tempdir().unwrap();
     write_sourceless_manifest(tmp.path());
 
-    let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline"]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline"], &[]);
     assert_eq!(code, 1, "offline + no local source must fail: {stderr}");
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).expect("apply --json must emit valid JSON");
+    let v = parse_json_envelope(&stdout);
     assert_eq!(
-        v["status"], "partialFailure",
+        json_string(&v, "status"),
+        Some("partialFailure"),
         "the pinned envelope shape for the offline bail, got {v}"
     );
     let chatter = stderr_chatter(&stderr);
