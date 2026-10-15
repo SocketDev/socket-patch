@@ -565,13 +565,41 @@ async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
                 .and_then(|yaml| read_package_globs(&yaml).ok().flatten())
                 .is_some_and(|globs| {
                     crate::utils::pnpm_workspace::lists_member(&globs, &rel)
-                        .unwrap_or_else(|_| lists(&globs, &rel))
+                        .unwrap_or_else(|_| pnpm_lists_unmodeled(&globs, &rel))
                 });
         if listed {
             return Some(ancestor.to_path_buf());
         }
     }
     None
+}
+
+/// Whether pnpm lists `rel` under `packages:` globs that use syntax its
+/// own matcher here does not model (braces, classes): the shared workspace
+/// grammar matches each glob, read pnpm's way. A `!` glob excludes whatever
+/// its order, wildcards never match a dot directory, and `node_modules`,
+/// `test` and `tests` directories are never members.
+fn pnpm_lists_unmodeled(globs: &[String], rel: &[String]) -> bool {
+    use crate::utils::workspace_globs::Negation;
+    const PNPM: WorkspacesDialect = WorkspacesDialect {
+        negation: Negation::LastMatchWins,
+        extglob: false,
+        picomatch: false,
+        dot: false,
+    };
+    if rel
+        .iter()
+        .any(|seg| crate::utils::pnpm_workspace::MEMBER_SKIP.contains(&seg.as_str()))
+    {
+        return false;
+    }
+    let matches = |glob: &str| workspaces_include_as(&[glob.to_string()], rel, PNPM);
+    let (negated, listed): (Vec<&String>, Vec<&String>) =
+        globs.iter().partition(|glob| glob.starts_with('!'));
+    listed.iter().any(|glob| matches(glob))
+        && !negated
+            .iter()
+            .any(|glob| matches(glob.trim_start_matches('!')))
 }
 
 /// The hosted refusal for [`member_stray_lock`].
@@ -1271,8 +1299,11 @@ mod tests {
         write(
             root,
             "b/pnpm-workspace.yaml",
-            "packages:\n  - '{apps,libs}/*'\n",
+            "packages:\n  - '!apps/skip'\n  - '{apps,libs}/*'\n",
         );
+        write(root, "b/apps/skip/package.json", r#"{"name":"bs"}"#);
+        write(root, "b/apps/test/package.json", r#"{"name":"bt"}"#);
+        write(root, "b/apps/.hidden/package.json", r#"{"name":"bh"}"#);
         write(root, "b/apps/m/package.json", r#"{"name":"bm"}"#);
         write(root, "b/tools/x/package.json", r#"{"name":"bx"}"#);
         // A settings-only pnpm-workspace.yaml lists no member.
@@ -1325,6 +1356,15 @@ mod tests {
             owner("b/tools/x/node_modules/left-pad").await,
             Some(root.join("b/tools/x"))
         );
+        // pnpm's reading of such globs: a `!` glob excludes whatever its
+        // order, and neither `test` nor a dot directory is a member.
+        for dir in ["b/apps/skip", "b/apps/test", "b/apps/.hidden"] {
+            assert_eq!(
+                owner(&format!("{dir}/node_modules/left-pad")).await,
+                Some(root.join(dir)),
+                "{dir}"
+            );
+        }
         assert_eq!(
             owner("s/x/node_modules/left-pad").await,
             Some(root.join("s/x"))
