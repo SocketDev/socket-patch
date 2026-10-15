@@ -8,7 +8,9 @@
 //! be read back; no parent-process env is ever mutated, so no
 //! serialization is needed.
 
-#![allow(dead_code)]
+// Each suite uses a different subset, and some re-exports only from
+// `cfg(unix)` tests.
+#![allow(dead_code, unused_imports)]
 
 use std::path::Path;
 
