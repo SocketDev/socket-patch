@@ -2143,6 +2143,145 @@ mod tests {
         }
     }
 
+    /// #1542: vlt expands extglobs in `workspaces` (vlt 1.2.0 and 1.3.8
+    /// install `packages/a` as a member of `packages/+(a|b)` and
+    /// `packages/@(a|b)`), so a member listed through one is refused, with
+    /// or without a stray lock of its own, whether the patterns sit in
+    /// `vlt.json` or in the `package.json` fallback.
+    #[tokio::test]
+    async fn vlt_extglob_member_is_refused() {
+        for pattern in ["packages/+(a|b)", "packages/@(a|b)"] {
+            for package_json_fallback in [false, true] {
+                for stray in [false, true] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let list = serde_json::json!([pattern]).to_string();
+                    if package_json_fallback {
+                        write(
+                            tmp.path(),
+                            "package.json",
+                            &format!(r#"{{"private":true,"workspaces":{list}}}"#),
+                        );
+                        write(tmp.path(), "vlt.json", r#"{"registries":{}}"#);
+                    } else {
+                        write(tmp.path(), "package.json", r#"{"private":true}"#);
+                        write(tmp.path(), "vlt.json", &format!(r#"{{"workspaces":{list}}}"#));
+                    }
+                    write(tmp.path(), VLT_LOCK, "{}");
+                    write(tmp.path(), "packages/a/package.json", "{}");
+                    write(tmp.path(), "packages/c/package.json", "{}");
+                    if stray {
+                        write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+                        write(tmp.path(), "packages/c/vlt-lock.json", "{}");
+                    }
+                    let case = format!(
+                        "{pattern}, package.json fallback: {package_json_fallback}, stray: {stray}"
+                    );
+                    let member = tmp.path().join("packages/a");
+                    assert_eq!(
+                        code(&member, "npm").await.as_deref(),
+                        Some(WORKSPACE_LOCKFILE_ELSEWHERE),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        member_stray_lock(&member).await.is_some(),
+                        stray,
+                        "{case}"
+                    );
+                    // `packages/c` is not listed: its own lock governs it.
+                    let other = tmp.path().join("packages/c");
+                    assert_eq!(code(&other, "npm").await, None, "{case}");
+                    assert!(member_stray_lock(&other).await.is_none(), "{case}");
+                }
+            }
+        }
+    }
+
+    /// #1542: vlt 1.3 drops a `!`-excluded directory wherever the `!`
+    /// pattern sits, while vlt before 1.3 ignores `!` patterns and lists
+    /// it. Both write the same lock, so the root's `vlt-lock.json` decides:
+    /// vlt records an edge from every member it installed that has a
+    /// dependency, so a lock with edges from the excluded member, or from
+    /// any other directory only older vlt lists, is older vlt's and the
+    /// member is refused. A lock that cannot be read keeps the wider
+    /// reading.
+    #[tokio::test]
+    async fn vlt_negated_member_reads_the_root_lock() {
+        let lock = |from: &[&str]| {
+            let edges: Vec<String> = from
+                .iter()
+                .map(|id| format!(r#""{id} left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#))
+                .collect();
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{}},\n  \"edges\": {{\n    {}\n  }}\n}}\n",
+                edges.join(",\n    ")
+            )
+        };
+        for (workspaces, root_lock, refused) in [
+            // vlt 1.3: `packages/a` is excluded wherever the `!` sits.
+            (r#"["!packages/a","packages/*"]"#, lock(&[]), false),
+            (r#"["packages/*","!packages/a"]"#, lock(&[]), false),
+            (
+                r#"["packages/*","!packages/a"]"#,
+                lock(&["workspace~packages+b"]),
+                false,
+            ),
+            // A later pattern whose text the `!` matches lists it again.
+            (r#"["packages/*","!packages/a","packages/a"]"#, lock(&[]), true),
+            (r#"["!packages/*","packages/a"]"#, lock(&[]), true),
+            // vlt 1.2 installed the excluded member (or another one).
+            (
+                r#"["!packages/a","packages/*"]"#,
+                lock(&["workspace~packages+a"]),
+                true,
+            ),
+            (
+                r#"["packages/*","!packages/a","!packages/z"]"#,
+                lock(&["workspace~packages+z"]),
+                true,
+            ),
+            // An unreadable lock keeps the wider reading.
+            (r#"["!packages/a","packages/*"]"#, "not json".to_string(), true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), "package.json", r#"{"private":true}"#);
+            write(
+                tmp.path(),
+                "vlt.json",
+                &format!(r#"{{"workspaces":{workspaces}}}"#),
+            );
+            write(tmp.path(), VLT_LOCK, &root_lock);
+            write(tmp.path(), "packages/a/package.json", "{}");
+            write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+            let member = tmp.path().join("packages/a");
+            let case = format!("{workspaces} with {root_lock:?}");
+            assert_eq!(
+                code(&member, "npm").await.is_some(),
+                refused,
+                "{case}"
+            );
+            assert_eq!(member_stray_lock(&member).await.is_some(), refused, "{case}");
+        }
+    }
+
+    /// #1542: vlt globs each named `workspaces` group on its own, so a `!`
+    /// pattern in one group does not exclude what another group lists.
+    #[tokio::test]
+    async fn vlt_negation_stays_in_its_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            "vlt.json",
+            r#"{"workspaces":{"libs":["!packages/a"],"apps":["packages/*"]}}"#,
+        );
+        write(tmp.path(), VLT_LOCK, "{}");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("packages/a"), "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
+    }
+
     /// #1101: Bun installs every `package.json` workspace member from the
     /// root's `bun.lock` / `bun.lockb` and never reads a lock inside the
     /// member, so a stray member Bun lock does not make the member its own

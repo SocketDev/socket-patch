@@ -91,6 +91,8 @@ impl WorkspacesDialect {
         extglob: false,
         picomatch: false,
     };
+    #[allow(dead_code)]
+    pub(crate) const VLT_PRE_1_3: Self = Self::VLT;
     /// Every dialect, for a root whose package manager is unknown: it lists
     /// a directory when any of them does.
     pub(crate) const ALL: [Self; 6] = [
@@ -1145,7 +1147,8 @@ mod tests {
         for (dialect, last, first, again) in [
             (D::NPM, false, true, true),
             (D::BUN, false, true, true),
-            (D::VLT, false, true, true),
+            (D::VLT, false, false, true),
+            (D::VLT_PRE_1_3, true, true, true),
             (D::YARN_BERRY, false, false, false),
             (D::YARN_CLASSIC, true, true, true),
             (D::BUN_PRE_1_3, true, true, true),
@@ -1228,6 +1231,65 @@ mod tests {
             &rel(&long),
             WorkspacesDialect::NPM
         ));
+    }
+
+    /// #1542: vlt reads `workspaces` with node-glob / minimatch, probed on
+    /// vlt 1.2.0 and 1.3.8 (`vlt install` then `vlt query ':workspace'`
+    /// over `packages/{a,b,ab,c,.h}`): extglobs match, and wildcards skip a
+    /// component that starts with `.`. vlt 1.3 drops a `!` pattern's
+    /// directories wherever the pattern sits, until a later pattern whose
+    /// own text it matches lists them again (`splitNegatedPatterns`); vlt
+    /// before 1.3 reads a leading `!` literally, so `!x` lists nothing and
+    /// `!(..)` is an extglob.
+    #[test]
+    fn vlt_dialects_list_what_vlt_lists() {
+        use WorkspacesDialect as D;
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // (patterns, directory, vlt 1.3 lists it, vlt 1.2 lists it)
+        for (patterns, dir, current, pre_1_3) in [
+            (&["packages/+(a|b)"][..], "packages/a", true, true),
+            (&["packages/+(a|b)"], "packages/ab", true, true),
+            (&["packages/+(a|b)"], "packages/c", false, false),
+            (&["packages/@(a|b)"], "packages/b", true, true),
+            (&["packages/@(a|b)"], "packages/ab", false, false),
+            (&["packages/?(a)b"], "packages/ab", true, true),
+            (&["packages/*(a)"], "packages/a", true, true),
+            (&["packages/*(a)"], "packages/b", false, false),
+            (&["packages/!(a)"], "packages/b", true, true),
+            (&["packages/!(a)"], "packages/a", false, false),
+            (&["packages/(a|b)"], "packages/a", false, false),
+            (&["packages/{a,b}"], "packages/a", true, true),
+            (&["packages/[ab]"], "packages/b", true, true),
+            (&["packages/*"], "packages/.h", false, false),
+            (&["**"], ".gh/x", false, false),
+            (&["packages/.h"], "packages/.h", true, true),
+            (&["!packages/a", "packages/*"], "packages/a", false, true),
+            (&["!packages/a", "packages/*"], "packages/b", true, true),
+            (&["packages/*", "!packages/a"], "packages/a", false, true),
+            (&["packages/*", "!packages/a", "packages/a"], "packages/a", true, true),
+            (&["packages/*", "!packages/a", "packages/[a]"], "packages/a", false, true),
+            (&["!packages/*", "packages/a"], "packages/a", true, true),
+            (&["packages/a", "!packages/*"], "packages/a", false, true),
+            (&["!packages/a", "packages/@(a|b)"], "packages/a", false, true),
+            (&["!packages/@(a|b)", "packages/a"], "packages/a", true, true),
+            (&["!!packages/a"], "packages/a", true, false),
+            (&["!(apps)/a"], "packages/a", false, true),
+            (&["packages/*", "!(apps)/a"], "packages/a", true, true),
+        ] {
+            let patterns = pats(patterns);
+            let dir = rel(dir);
+            assert_eq!(
+                workspaces_include_as(&patterns, &dir, D::VLT),
+                current,
+                "vlt 1.3: {patterns:?} ~ {dir:?}"
+            );
+            assert_eq!(
+                workspaces_include_as(&patterns, &dir, D::VLT_PRE_1_3),
+                pre_1_3,
+                "vlt 1.2: {patterns:?} ~ {dir:?}"
+            );
+        }
     }
 
     #[test]
