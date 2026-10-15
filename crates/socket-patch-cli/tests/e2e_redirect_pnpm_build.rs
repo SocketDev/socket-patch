@@ -1451,9 +1451,10 @@ async fn pnpm11_trust_lockfile_env_override_is_respected() {
     assert!(workspace.contains("trustLockfile: true"), "{workspace}");
 }
 
-/// #1557: pnpm 11+ ignore a `pnpm_config_trust_lockfile` that is empty
-/// (what `${{ vars.X }}` exports when the repo variable is unset), `null`
-/// or `undefined`, and read pnpm-workspace.yaml instead. A scan whose
+/// #1557: pnpm 11+ ignore a `pnpm_config_trust_lockfile` that is not
+/// exactly `true` or `false`, such as the empty string `${{ vars.X }}`
+/// exports when the repo variable is unset, and read pnpm-workspace.yaml
+/// instead. A scan whose
 /// environment sets it so must heal the trust config as if it were unset,
 /// and a fresh frozen install in that same environment then lands the
 /// patched bytes from the written key.
@@ -1503,9 +1504,17 @@ async fn pnpm11_empty_trust_lockfile_env_is_ignored() {
         workspace.contains("trustLockfile: true"),
         "an empty variable pnpm ignores must not stop the write:\n{envelope}"
     );
+    let detail = envelope["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| w["code"] == "redirect_pnpm_trust_lockfile")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_else(|| panic!("redirect_pnpm_trust_lockfile:\n{envelope}"))
+        .to_string();
     assert!(
-        !stdout.contains("in the environment sets pnpm"),
-        "the warning must not claim the empty variable was respected:\n{envelope}"
+        detail.contains("no extra flags") && !detail.contains("in the environment"),
+        "the warning must not claim the empty variable was respected:\n{detail}"
     );
 
     // pnpm itself, run with the same empty variable, honours the key.

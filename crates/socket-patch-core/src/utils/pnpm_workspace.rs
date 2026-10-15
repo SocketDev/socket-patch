@@ -143,10 +143,11 @@ fn env_setting(
         Some(_) => &["npm_config_"],
         None => &["pnpm_config_", "npm_config_"],
     };
-    prefixes
-        .iter()
-        .map(|prefix| format!("{prefix}{key}"))
-        .find_map(|var| {
+    prefixes.iter().find_map(|prefix| {
+        let var = format!("{prefix}{key}");
+        if *prefix == "pnpm_config_" {
+            pnpm_env_setting(&var, &env)
+        } else {
             let value = env(&var)?.trim().to_string();
             let source = format!("`{var}={value}` in the environment");
             Some(PnpmSetting {
@@ -154,19 +155,30 @@ fn env_setting(
                 source,
                 yaml: false,
             })
-        })
+        }
+    })
+}
+
+/// A boolean setting from `var`, a variable of the `pnpm_config_*` family
+/// (either case) that pnpm 11 and newer read. pnpm takes only an exact
+/// `true` or `false` there and ignores any other value (empty, `null`,
+/// `undefined`, `0`, `FALSE`, ` false`), reading the settings file instead
+/// (#1557), so such a value sets nothing.
+fn pnpm_env_setting(var: &str, env: impl Fn(&str) -> Option<String>) -> Option<PnpmSetting> {
+    let value = env(var).filter(|value| matches!(value.as_str(), "true" | "false"))?;
+    Some(PnpmSetting {
+        source: format!("`{var}={value}` in the environment"),
+        value,
+        yaml: false,
+    })
 }
 
 /// pnpm's `trustLockfile` as the environment sets it, for a project on
 /// pnpm `major` (#1514): `pnpm_config_trust_lockfile`, or its uppercase
-/// spelling, which pnpm 11 and newer read ahead of pnpm-workspace.yaml.
-/// `None` on pnpm 10 and older, which never verify lock URLs, and for
+/// spelling, which pnpm 11 and newer read ahead of pnpm-workspace.yaml
+/// when it is `true` or `false` (see [`pnpm_env_setting`]). `None` on pnpm
+/// 10 and older, which never verify lock URLs, and for
 /// `npm_config_trust_lockfile`, which no pnpm reads.
-///
-/// pnpm ignores a variable that is empty, `null` or `undefined` and reads
-/// pnpm-workspace.yaml instead (#1557), so such a value sets nothing here
-/// either: only a literal `false` turns the setting off, and any other
-/// string is read as true ([`PnpmSetting::as_bool`]).
 pub fn trust_lockfile_env(
     major: Option<u32>,
     env: impl Fn(&str) -> Option<String>,
@@ -174,18 +186,9 @@ pub fn trust_lockfile_env(
     if major.is_some_and(|major| major < 11) {
         return None;
     }
-    let env =
-        |var: &str| env(var).filter(|value| !matches!(value.trim(), "" | "null" | "undefined"));
     // pnpm 11's spelling, then the uppercase one pnpm 12 reads too.
-    env_setting("trust-lockfile", Some(major.unwrap_or(11)), env).or_else(|| {
-        let var = "PNPM_CONFIG_TRUST_LOCKFILE";
-        let value = env(var)?.trim().to_string();
-        Some(PnpmSetting {
-            source: format!("`{var}={value}` in the environment"),
-            value,
-            yaml: false,
-        })
-    })
+    env_setting("trust-lockfile", Some(major.unwrap_or(11)), &env)
+        .or_else(|| pnpm_env_setting("PNPM_CONFIG_TRUST_LOCKFILE", &env))
 }
 
 /// [`pnpm_setting`], falling back to the environment ([`env_setting`],
@@ -946,7 +949,7 @@ mod tests {
             None,
             env(&[
                 ("npm_config_git_branch_lockfile", "false"),
-                ("pnpm_config_git_branch_lockfile", "TRUE"),
+                ("pnpm_config_git_branch_lockfile", "true"),
             ]),
         )
         .unwrap();
@@ -960,7 +963,7 @@ mod tests {
     #[test]
     fn the_environment_sets_trust_lockfile_only_for_pnpm_11_and_newer() {
         const LOWER: &[(&str, &str)] = &[("pnpm_config_trust_lockfile", "false")];
-        const UPPER: &[(&str, &str)] = &[("PNPM_CONFIG_TRUST_LOCKFILE", " false ")];
+        const UPPER: &[(&str, &str)] = &[("PNPM_CONFIG_TRUST_LOCKFILE", "false")];
         const NPM: &[(&str, &str)] = &[("npm_config_trust_lockfile", "false")];
         for major in [Some(11), Some(12), None] {
             let found = trust_lockfile_env(major, env(LOWER)).expect("lowercase");
@@ -979,18 +982,21 @@ mod tests {
         );
     }
 
-    /// #1557: pnpm 11 and newer ignore a `pnpm_config_trust_lockfile` (or
-    /// `PNPM_CONFIG_TRUST_LOCKFILE`) that is empty, `null` or `undefined`
-    /// and read `trustLockfile` from pnpm-workspace.yaml instead, so such a
-    /// value sets nothing. Only a literal `false` turns it off; any other
-    /// string (`0`, `no`, `FALSE`) is read as true.
+    /// #1557: pnpm 11 and newer read a `pnpm_config_*` boolean only when it
+    /// is exactly `true` or `false` and otherwise ignore it for the settings
+    /// file (measured with `pnpm config get` on pnpm 11.28.5), so any other
+    /// value (an unset CI variable's empty string, `null`, `undefined`,
+    /// `0`, `FALSE`, ` false`) sets nothing, for `trustLockfile` and every
+    /// other key alike. npm's family keeps its own coercion (pnpm 10 and
+    /// older, see [`PnpmSetting::as_bool`]).
     #[test]
-    fn an_empty_or_null_trust_lockfile_variable_sets_nothing() {
+    fn a_pnpm_config_variable_counts_only_as_true_or_false() {
         let one = |var: &'static str, value: &'static str| {
             move |name: &str| (name == var).then(|| value.to_string())
         };
+        const IGNORED: &[&str] = &["", "  ", "null", "undefined", "0", "FALSE", " false", "yes"];
         for var in ["pnpm_config_trust_lockfile", "PNPM_CONFIG_TRUST_LOCKFILE"] {
-            for value in ["", "  ", "null", "undefined"] {
+            for value in IGNORED {
                 for major in [Some(11), Some(12), None] {
                     assert_eq!(
                         trust_lockfile_env(major, one(var, value)),
@@ -999,12 +1005,31 @@ mod tests {
                     );
                 }
             }
-            for value in ["0", "no", "FALSE", "TRUE"] {
+            for (value, on) in [("true", true), ("false", false)] {
                 let found = trust_lockfile_env(Some(11), one(var, value)).unwrap();
-                assert_eq!(found.as_bool(), Some(true), "{var}={value}");
+                assert_eq!(found.as_bool(), Some(on), "{var}={value}");
             }
         }
-        // An ignored lowercase spelling does not hide the uppercase one.
+        for key in [
+            "lockfile",
+            "shared-workspace-lockfile",
+            "git-branch-lockfile",
+        ] {
+            let var: &'static str =
+                Box::leak(format!("pnpm_config_{}", key.replace('-', "_")).into_boxed_str());
+            for value in IGNORED {
+                for major in [Some(11), None] {
+                    assert_eq!(
+                        env_setting(key, major, one(var, value)),
+                        None,
+                        "{var}={value:?}"
+                    );
+                }
+            }
+            let found = env_setting(key, Some(11), one(var, "false")).unwrap();
+            assert_eq!(found.as_bool(), Some(false), "{var}");
+        }
+        // An ignored pnpm spelling does not hide the next one pnpm reads.
         let found = trust_lockfile_env(
             Some(12),
             env(&[
@@ -1013,6 +1038,20 @@ mod tests {
             ]),
         )
         .unwrap();
+        assert!(found.source.contains("PNPM_CONFIG_TRUST_LOCKFILE=false"));
+        // With no major known, an ignored pnpm spelling leaves npm's.
+        let found = env_setting(
+            "lockfile",
+            None,
+            env(&[
+                ("pnpm_config_lockfile", ""),
+                ("npm_config_lockfile", "false"),
+            ]),
+        )
+        .unwrap();
+        assert!(found.source.contains("`npm_config_lockfile=false`"));
+        // npm's family is unchanged: its empty value still reads as false.
+        let found = env_setting("lockfile", Some(10), env(&[("npm_config_lockfile", "")])).unwrap();
         assert_eq!(found.as_bool(), Some(false));
     }
 
