@@ -1,8 +1,8 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-15 (run 41), main `15db5c4`, release v5.0.1. Run 41 filed #1558, a regression from #1548 (`e719a9b`): lock-only yarn classic `vex` omits a correctly pinned, correctly installed patch with `dependency_not_installed` when the patched package.json has a `""` range (right after a clean hosted scan, because `block_dep_maps` skips empty ranges), or names a dependency in both `optionalDependencies` and `dependencies` (after any `yarn add`, because yarn's `cleanDependencies` keeps it only under optional). Reproduced ×2 on 1.7.0 / 1.10.1 / 1.22.22. #1538 is verified fixed on main (v4-pin changed-range and added-dep shapes are omitted by installed and lock-only VEX on 1.10.1 / 1.22.22). #1115 still reproduces (not re-commented).
+Last updated: 2026-10-15 (run 42), main `e76cb9b`, release v5.0.1. Run 42 filed #1578: hosted yarn classic refuses (`redirect_yarn_classic_dep_manifest_unlocked`, exit 0) a patch that changes no dependency whenever the packument's dependency ranges differ from the tarball's package.json. yarn 1 keys dependency blocks by the packument range (`url@*:`) but writes the sub-map from the tarball (`url "^0.11.0"`), and the #591 check compares tarball descriptors with lock keys. Real package meteor-node-stubs@1.2.3 (and 1.2.2) on 1.7.0 / 1.10.1 / 1.22.22. v5.0.1 is bad; v4.0.0 pins fine and main's VEX attests that pin. Git-dep packument normalisation (`user/repo` → `github:user/repo`) is the likely wider class (unproven: no codeload). Also verified: #1559 LFS fix (yarn classic vendored + `*.tgz filter=lfs`, legacy `* -text` upgrade + `git add --renormalize`), #1543 nested projects, SIGKILL at every point of hosted/vendored scans.
 
-Previous: 2026-10-14 (run 40), main `a3f56f7`, release v5.0.1. Run 40 filed #1538: VEX still attests a yarn.lock pin written by v4.0.0 that yarn installs without the patched package's dependencies. #1463's `dependency_not_installed` check only asks whether the dependency name resolves, so a patch that changes a range (is-odd `is-number ^6`→`^7`, lock has only ^6) is attested by `vex` AND by the in-run `scan --vex` that reported it `redirect_unconfirmed`. Lock-only `vex` attests both the changed-range and the original #1462 added-dependency shape. Reproduced on 1.7.0 / 1.10.1 / 1.22.22. #1516 is verified fixed on main by #1517 (outside-root dir/tgz, non-`package/` root, URL and absolute-path renamed copies all warn H/V and VEX refuses). #692 still reproduces (not re-commented). #991 is half-fixed: `vendor --check` now exits 1 `vendor_ledger_missing`, but `rollback` still exits 0 and deletes the ledger while the other branch's package stays wired (commented). CI's yarn-classic-matrix (1.0.2–1.22.22) is green on the 2026-10-14 scheduled run.
+Previous: 2026-10-15 (run 41), main `15db5c4`, release v5.0.1. Run 41 filed #1558, a regression from #1548 (`e719a9b`): lock-only yarn classic `vex` omits a correctly pinned, correctly installed patch with `dependency_not_installed` when the patched package.json has a `""` range (right after a clean hosted scan, because `block_dep_maps` skips empty ranges), or names a dependency in both `optionalDependencies` and `dependencies` (after any `yarn add`, because yarn's `cleanDependencies` keeps it only under optional). Reproduced ×2 on 1.7.0 / 1.10.1 / 1.22.22. #1538 is verified fixed on main (v4-pin changed-range and added-dep shapes are omitted by installed and lock-only VEX on 1.10.1 / 1.22.22). #1115 still reproduces (not re-commented).
 
 ## Coverage matrix
 
@@ -23,6 +23,15 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
 | macOS | 1.10.1 / 1.22.22 | pass (probe) | refused: user / prefix / parent / env / BOM layers (probe, run 31) | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
 | Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | refused: user / prefix (node dir) / parent / env / PS 5.1 BOM / backslash path (probe on 1.10.1 / 1.22.22, run 31) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
+
+### Run 42 cells (Linux, `e76cb9b`)
+| cell | 1.7.0 | 1.10.1 | 1.22.22 |
+| --- | --- | --- | --- |
+| H packument≠tarball deps (meteor-node-stubs@1.2.3) | fail #1578 | fail #1578 | fail #1578 (also v5.0.1; v4.0.0 pass) |
+| V same package (patch not touching package.json) | untested | untested | pass |
+| V LFS `*.tgz filter=lfs` clone w/o smudge (#1559) | untested | untested | pass (+ legacy pointer: check/vex refuse; re-vendor + renormalize fixes) |
+| H/V nested independent yarn project (#1543) | pass | pass | pass |
+| H/V SIGKILL at 5–60 ms, then frozen install + rerun | untested | untested | pass |
 
 ### Global mode (`-g`) on v5 `2463257` (rows marked run 10 re-measured on `045d7ec`)
 Report = `scan -g` report-only + no leakage; refusal = `scan -g/--global-prefix/SOCKET_GLOBAL --mode hosted` exits 2; A = agent apply + import + `vex -g` + `rollback -g` byte-exact; get-mode = `get -g --mode hosted|vendored` / `scan -g --mode vendored`; RO = read-only global folder fails loudly.
@@ -295,6 +304,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 
 ## Backlog
 
+000000000000. #1578 follow-ups: after a fix, re-run meteor-node-stubs@1.2.3 hosted (+ v4-pin rescan confirm). Prove the git-dep packument normalisation shape on a probe branch (grunt-webfonts@1.1.3 / gulp-webdriver@1.0.3 need codeload). Check vendored `vendor_dep_manifest_unlocked` with a patch that lists package/package.json on such a package. Ask npm / pnpm / bun whether their dep checks read the tarball vs the lock's own ranges.
 00000000000. #1558: after a fix, re-run the `""`-range, optional+dependencies dup and `*`+devDependencies shapes (lock-only, after `yarn add`, after a rescan). Also check whether the hosted writer's un-normalised sub-map makes every rescan after a `yarn add` rewrite the block (churn). Ask npm / pnpm / bun whether their lock-only dependency checks normalise manifests the way their PM does.
 0000000000. #1538: after a fix, re-run the v4-pin changed-range / added-dependency cells (installed, in-run, lock-only), plus `optionalDependencies` changes and a v4 vendored pin with a changed range. Ask npm / pnpm / bun whether their hosted VEX has the same name-only dependency check (hand over if it reproduces there).
 000000000. (#1516 verified fixed on main in run 40, Linux.) Still open: a Windows probe of `file:..\\x` spellings. Renamed copies under `resolutions` and in a transitive dep's manifest. (yarn-berry was handed the berry side.)
@@ -448,3 +458,6 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 - yarn 1 (1.7.0 to 1.22.22) locks a workspace member's `file:./x` dependency root-relative (`name@file:./packages/a/x`), so lock readers needn't resolve it relative to the member.
 - `"lp2": "file:./lp.tar"` (an uncompressed tar) isn't a yarn 1 shape: yarn 1.22.22 fails with ENOTDIR installing it.
 - Run-39 harness: `h/t.sh <shape> <yarn.js> <hosted|vendored>`, with shapes tgz / dir / outdir / outtgz / ghroot / url / custom (`PRE` / `PKG` / `MUT` hooks). The mock is the run-18 one from probe branch `20261008-grammar-xos`, given a local `lp.tgz`. Lock-only hosted `vex` needs `--patch-server-url`.
+- `scan --vex` exits 1 `manifest_not_found` when the only patched package is in a nested project skipped with `nested_project_skipped` (nothing to attest). That's the documented fail-the-command rule (CLI_CONTRACT `--vex`), not a #1543 regression.
+- A `.socket/** filter=lfs` rule makes the manifest / ledger LFS pointers in a smudge-less clone, so `vendor --check` / `vex` / `list` error. That's the user tracking metadata in LFS; the per-uuid `.gitattributes` still keeps the tarball real.
+- Run-42 harness: `h/mockg.py` = the run-18 mock with `MN` / `MV` / `MF` env (package, version, patched file key; tarball given as argv[2]); `h/nested.sh`, `h/kill.sh`; `cmp/cmp.py` compares packument vs tarball deps over npm search results. v4.0.0 / v5.0.1 binaries come from `@socketsecurity/socket-patch-linux-x64-gnu` on npm.
