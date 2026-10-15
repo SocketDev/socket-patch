@@ -1984,3 +1984,36 @@ async fn issue_1561_berry_missing_relative_portal_and_link_copies_are_named() {
         assert!(details.is_empty(), "{protocol}: {details:?}");
     }
 }
+
+/// #1579: a `portal:` target holding only a `.gitkeep` placeholder (yarn
+/// refuses a manifest-less portal, so it is not what gets installed), and a
+/// linked manifest with no `name`, may be any package; one naming left-pad
+/// with no version may be left-pad. The hosted scan pins the registry entry
+/// and names each as possibly unpatched; it reported a clean success.
+/// Controls: a `link:` to the placeholder (plain assets) and a versionless
+/// manifest naming another package are no copy of left-pad.
+#[tokio::test]
+async fn issue_1579_berry_portal_placeholder_and_versionless_copies_are_named() {
+    const UUID: &str = "15791579-1579-4579-8579-157915791579";
+    for protocol in ["portal", "link"] {
+        let spec = format!("{protocol}:./vend/lp");
+        for (file, text, named) in [
+            ("vend/lp/.gitkeep", "", protocol == "portal"),
+            ("vend/lp/package.json", r#"{"version":"1.3.0"}"#, true),
+            ("vend/lp/package.json", r#"{"name":"left-pad"}"#, true),
+            ("vend/lp/package.json", r#"{"name":"other-pkg"}"#, false),
+        ] {
+            let details = berry_linked_copy_details(UUID, &spec, &[(file, text)]).await;
+            if !named {
+                assert!(details.is_empty(), "{protocol} {text:?}: {details:?}");
+                continue;
+            }
+            assert_eq!(details.len(), 1, "{protocol} {text:?}: {details:?}");
+            assert!(
+                details[0].contains(&format!("lp2@{spec}::")) && details[0].contains("UNPATCHED"),
+                "{protocol} {text:?}: {}",
+                details[0]
+            );
+        }
+    }
+}

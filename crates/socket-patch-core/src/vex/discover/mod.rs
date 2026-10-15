@@ -511,6 +511,10 @@ pub struct UnidentifiedCopy {
     /// berry `portal:` / `link:` copy, whose version is its unread
     /// manifest's), so it may be any version (#1540).
     pub version: Option<String>,
+    /// The package the copy's manifest names when it names no version (a
+    /// berry `portal:` / `link:` copy, #1579): it may be any version of that
+    /// package only. `None` when it may be any package.
+    pub name: Option<String>,
     /// The lock entry's key, as the lock spells it.
     pub key: String,
     /// How that entry installs, completing "lock entry `<key>` …".
@@ -977,18 +981,21 @@ impl Discovery {
     /// directory, a tarball with no readable `package.json`). It may be any
     /// package at that version, so [`Discovery::contest_within_locks`]
     /// takes it as an unpatched copy of every package `file` wires at
-    /// `version` (at any version when `version` is `None`, #1540): vouching
+    /// `version` (at any version when `version` is `None`, #1540; of
+    /// package `name` only when the copy names one, #1579): vouching
     /// for one would rest on a copy nobody read (#1516). Matched there,
     /// once every extractor has pushed its refs.
     pub(crate) fn unidentified_copy(
         &mut self,
         file: &str,
+        name: Option<&str>,
         version: Option<&str>,
         key: &str,
         how: &str,
     ) {
         self.unidentified_copies.push(UnidentifiedCopy {
             file: PathBuf::from(file),
+            name: name.map(str::to_string),
             version: version.map(str::to_string),
             key: key.to_string(),
             how: how.to_string(),
@@ -1008,6 +1015,11 @@ impl Discovery {
                 .filter(|r| match &u.version {
                     Some(v) => r.purl.rsplit_once('@').is_some_and(|(_, rv)| rv == v),
                     None => true,
+                })
+                .filter(|r| {
+                    u.name.as_ref().is_none_or(|n| {
+                        crate::utils::purl::purl_parts(&r.purl).is_some_and(|(_, rn, _)| &rn == n)
+                    })
                 })
                 .map(|r| r.purl.as_str())
                 .collect();

@@ -302,9 +302,13 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   the lock is untrusted input; a `portal:` / `link:` copy whose `package.json` isn't
   read (an absolute path, or a relative target that is missing or empty, such as a git
   submodule CI didn't check out, or whose `package.json` is no JSON, such as a Git LFS
-  pointer) has no version either, so it may be any version of any package and `vex`
-  attests nothing that lock wires. A `link:` to a non-empty directory with no
-  `package.json` is not a package copy. Use a relative path to let the copy be read. Hosted mode still pins the
+  pointer, or whose `package.json` names no package) has no version either, so it may
+  be any version of any package and `vex` attests nothing that lock wires. One whose
+  `package.json` names a package but no version may be any version of that package. A
+  `portal:` to a directory with no `package.json` (a `.gitkeep` placeholder a fetch step
+  fills) is unknown too, since yarn refuses to install a portal without one; only a
+  `link:` to a non-empty directory with no `package.json` is not a package copy. Use a
+  relative path to let the copy be read. Hosted mode still pins the
   registry entry and names the copy (`redirect_copy_unpatched`, unless a yarn classic
   skip warning already names it); vendored mode still wires the registry entry and names
   it (`vendor_copy_unpatched` for berry; the yarn classic codes below for classic); and

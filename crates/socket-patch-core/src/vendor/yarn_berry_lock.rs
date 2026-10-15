@@ -275,11 +275,18 @@ impl NpmLockBackend for YarnBerryBackend {
                          dependency name, from {origin}; the name-keyed resolutions entry \
                          vendoring writes never reaches it, so that copy stays UNPATCHED"
                     )
+                } else if copy.versionless {
+                    format!(
+                        "{YARN_LOCK} entry `{key}` installs {name} under another dependency \
+                         name, from {origin}, whose package.json names no version, so it may \
+                         be {name}@{version}; the name-keyed resolutions entry vendoring \
+                         writes never reaches it, so if it is, that copy stays UNPATCHED"
+                    )
                 } else {
                     // An unidentified `portal:` / `link:` copy has no
                     // version to name (#1540, #1561).
                     let what =
-                        if matches!(copy.source, crate::formats::yarn::copy::CopyRef::Linked(_)) {
+                        if matches!(copy.source, crate::formats::yarn::copy::CopyRef::Linked(..)) {
                             "a package".to_string()
                         } else {
                             format!("version {version}")
@@ -2569,12 +2576,13 @@ __metadata:
     /// absolute one (#1540): named as a possible unpatched copy, while the
     /// registry entry still vendors. It was dropped silently. Control: a
     /// `link:` to an existing plain directory with no `package.json` is no
-    /// package copy and stays unnamed.
+    /// package copy and stays unnamed; a `portal:` to one is named, since
+    /// yarn refuses a manifest-less portal (#1579).
     #[tokio::test]
     async fn issue_1561_missing_relative_portal_and_link_targets_are_named() {
         for protocol in ["portal", "link"] {
             for target in ["missing", "empty", "lfs-pointer", "plain-dir"] {
-                let plain_dir = target == "plain-dir";
+                let plain_dir = target == "plain-dir" && protocol == "link";
                 let key = format!("lp2@{protocol}:./vend/lp::locator=vendor-spike%40workspace%3A.");
                 let block = format!(
                     "\n\"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
@@ -2619,6 +2627,67 @@ __metadata:
                     copies[0].detail.contains(&format!("`\"{key}\"`"))
                         && copies[0].detail.contains("installs a package under")
                         && copies[0].detail.contains("can't be read"),
+                    "{protocol}/{target}: {}",
+                    copies[0].detail
+                );
+            }
+        }
+    }
+
+    /// #1579: a `portal:` target with no `package.json` (a `.gitkeep`
+    /// placeholder; yarn refuses a manifest-less portal, so it is not what
+    /// gets installed) and a linked manifest with no `name` are unknown, and
+    /// one naming left-pad with no version may be left-pad: each is named as
+    /// a possible unpatched copy while the registry entry still vendors.
+    /// Controls: a `link:` to a placeholder directory (plain assets) and a
+    /// versionless manifest naming another package stay unnamed.
+    #[tokio::test]
+    async fn issue_1579_portal_placeholder_and_versionless_linked_manifests_are_named() {
+        for protocol in ["portal", "link"] {
+            for (target, named) in [
+                ("gitkeep", protocol == "portal"),
+                ("no-name", true),
+                ("no-version-left-pad", true),
+                ("no-version-other", false),
+            ] {
+                let key = format!("lp2@{protocol}:./vend/lp::locator=vendor-spike%40workspace%3A.");
+                let block = format!(
+                    "\n\"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
+                     languageName: node\n  linkType: soft\n"
+                );
+                let lock = format!("{B3_BEFORE_LOCK}{block}");
+                let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+                let dir = fx.tmp.path().join("vend/lp");
+                tokio::fs::create_dir_all(&dir).await.unwrap();
+                let (file, text) = match target {
+                    "gitkeep" => (".gitkeep", ""),
+                    "no-name" => ("package.json", r#"{"version":"1.3.0"}"#),
+                    "no-version-left-pad" => ("package.json", r#"{"name":"left-pad"}"#),
+                    _ => ("package.json", r#"{"name":"other-pkg"}"#),
+                };
+                tokio::fs::write(dir.join(file), text).await.unwrap();
+
+                let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{protocol}/{target}: {:?}", result.error);
+                assert!(entry.is_some(), "{protocol}/{target}: registry vendors");
+                let copies: Vec<&VendorWarning> = warnings
+                    .iter()
+                    .filter(|w| w.code == "vendor_copy_unpatched")
+                    .collect();
+                if !named {
+                    assert!(copies.is_empty(), "{protocol}/{target}: {warnings:?}");
+                    continue;
+                }
+                assert_eq!(copies.len(), 1, "{protocol}/{target}: {warnings:?}");
+                let (what, why) = if target == "no-version-left-pad" {
+                    ("installs left-pad under", "names no version")
+                } else {
+                    ("installs a package under", "can't be read")
+                };
+                assert!(
+                    copies[0].detail.contains(&format!("`\"{key}\"`"))
+                        && copies[0].detail.contains(what)
+                        && copies[0].detail.contains(why),
                     "{protocol}/{target}: {}",
                     copies[0].detail
                 );
