@@ -327,6 +327,9 @@ fn multi_manifest_auto_detect_warning_and_silent() {
             .any(|l| l.contains("Multiple project manifests") && l.contains("using package.json"));
         assert_eq!(warned, !silent, "silent={silent}: {err}");
         if silent {
+            // Any wording of the warning must stay suppressed, not just the
+            // line `warned` matches.
+            assert!(!err.contains("Multiple project manifests"), "{err}");
             assert!(o.stdout.is_empty(), "{}", stdout(&o));
         }
         assert_eq!(
