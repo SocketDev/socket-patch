@@ -1,50 +1,32 @@
-//! Coverage-gap tests for `commands/update.rs`: the pinned already-there
-//! message (a zero-network path), the
-//! already-latest `--json` envelope shape, the human-mode dry-run prints
-//! (both the `--force` "Would reinstall" wording and the plain
-//! "Update available" wording), and the PTY-driven interactive decline.
+//! Human output of `socket-patch --update`, one check per message
+//! family: the pinned already-there wording, the two dry-run reports and
+//! the interactive reinstall confirm (PTY). The behavior behind each is
+//! asserted through `--json` in `update_json_contracts.rs`; these tests
+//! only pin what a person reads.
 //!
-//! Every wet run drives a COPY of the built binary staged into a tempdir
-//! (`update_fixture::staged_install`) — `CARGO_BIN_EXE_socket-patch`
-//! itself must never be a swap target. Fixture shapes are copied from
-//! self_update_e2e.rs / interactive_prompts_e2e.rs.
+//! Every run drives a COPY of the built binary staged into a tempdir
+//! (`update_fixture::staged_install`): `CARGO_BIN_EXE_socket-patch`
+//! itself must never be a swap target.
 
-use crate::common;
 use crate::update_fixture;
+use crate::update_json_contracts::DEAD_ENDPOINT;
 
 use update_fixture::{make_served_binary, run_installed, staged_install, FakeReleaseBuilder};
 
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
-/// A TCP endpoint nothing listens on (port 9 = discard, never bound on a
-/// dev host): any request the child makes fails fast and loudly, so a
-/// "zero network" contract regressing into a fetch flips the exit code.
-const DEAD_ENDPOINT: &str = "http://127.0.0.1:9";
-
-/// `--update <CURRENT>`: an explicit pin equal to the compiled version is
-/// an informational no-op that never creates a network client — no
-/// latest-resolution, no sums, no download. It must use
-/// the PINNED wording ("already version X", not "already the latest": the
-/// pin path cannot know what the latest is), and it must NOT refresh the
-/// passive notifier cache (the `if !pinned` state-write gate in `run()` —
-/// a pin says nothing about the latest release, so caching it
-/// as `latestSeen` would poison the nag).
+/// The pinned already-there message names the pin, not "the latest": the
+/// pin path never resolves the latest release, so it can't claim it.
 #[test]
-fn update_pin_to_current_is_noop_zero_network() {
-    let real_hash = update_fixture::real_binary_hash();
+fn update_pin_to_current_human_says_already_version() {
     let install = staged_install();
 
-    // No fake release is mounted at all: the dead endpoint proves the
-    // pinned already-there path is decided entirely offline.
     let (code, stdout, stderr) = run_installed(
         &install,
         &["--update", CURRENT],
         &[("SOCKET_UPDATE_BASE_URL", DEAD_ENDPOINT)],
     );
-    assert_eq!(
-        code, 0,
-        "pin-to-current must be a clean no-op.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.contains(&format!("socket-patch is already version {CURRENT}.")),
         "must print the pinned already-there message: {stdout}"
@@ -53,77 +35,7 @@ fn update_pin_to_current_is_noop_zero_network() {
         !stdout.contains("already the latest"),
         "the pin path must not claim latest-knowledge it doesn't have: {stdout}"
     );
-
     install.assert_binary_intact();
-    install.assert_only_binary_present();
-    install.assert_workdir_untouched();
-    // Pinned runs skip the notifier state refresh entirely.
-    assert!(
-        !install.state_dir.join("update-check.json").exists(),
-        "a pinned run must not write the passive notifier cache"
-    );
-    update_fixture::StagedInstall::assert_build_artifact_untouched(&real_hash);
-}
-
-/// The already-latest `--json` envelope is a machine contract scripts
-/// branch on: exit 0, `status: success`, `dryRun: false`, exactly one
-/// skipped/already_latest event carrying `details.current`/`details.latest`,
-/// summary agreeing, and the empty `warnings` omitted (additive-only
-/// envelope contract). One resolve, zero sums, zero downloads.
-#[tokio::test]
-async fn update_already_latest_json_envelope_shape() {
-    let install = staged_install();
-    let (served, _) = make_served_binary();
-
-    let release = FakeReleaseBuilder::new(CURRENT)
-        .asset_for_current_target(&served)
-        .expect_resolves(1)
-        .expect_sums_fetches(0)
-        .expect_asset_downloads(0)
-        .mount()
-        .await;
-
-    let (code, stdout, stderr) = run_installed(
-        &install,
-        &["--update", "--json"],
-        &[("SOCKET_UPDATE_BASE_URL", &release.base_url)],
-    );
-    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
-
-    let env = common::parse_json_envelope(&stdout);
-    assert_eq!(common::json_string(&env, "command"), Some("update"));
-    assert_eq!(common::json_string(&env, "status"), Some("success"));
-    assert_eq!(
-        env["dryRun"], false,
-        "a wet already-latest run must not read as a dry run: {stdout}"
-    );
-
-    let events = env["events"].as_array().expect("events array");
-    assert_eq!(events.len(), 1, "exactly one skip event: {stdout}");
-    let event = &events[0];
-    assert_eq!(event["action"], "skipped");
-    assert_eq!(
-        event["errorCode"], "already_latest",
-        "the routing tag scripts branch on: {stdout}"
-    );
-    let reason = event["reason"].as_str().unwrap_or_default();
-    assert!(
-        reason.contains("already the latest"),
-        "the human message rides the event as its reason: {reason}"
-    );
-    assert_eq!(event["details"]["current"], CURRENT);
-    assert_eq!(event["details"]["latest"], CURRENT);
-    assert_eq!(env["summary"]["skipped"], 1);
-
-    // No advisories were raised, so `warnings` must be omitted (the
-    // skip_serializing_if contract keeps existing consumers byte-stable).
-    assert!(
-        env.get("warnings").is_none(),
-        "empty warnings must be omitted from the envelope: {stdout}"
-    );
-
-    install.assert_binary_intact();
-    release.verify_request_hygiene().await;
 }
 
 /// `--dry-run --force` when already up to date: the probe still reports
