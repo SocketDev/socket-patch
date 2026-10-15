@@ -20,7 +20,6 @@ use crate::common::envelope::{
 /// and delete its entry; a stale entry is not an error, so a PR that
 /// migrates one never turns another red.
 const PENDING_PRIVATE_READERS: &[&str] = &[
-    "covgap_commands_rollback.rs",
     "e2e_redirect_gradle_build.rs",
     "e2e_redirect_pnpm_build.rs",
     "e2e_socket_yml_policy.rs",

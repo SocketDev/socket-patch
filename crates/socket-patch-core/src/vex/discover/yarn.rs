@@ -878,8 +878,10 @@ struct LockCopy {
 /// non-registry url) may be any package at its lock version, so it is
 /// recorded as a copy of every package this lock wires at that version:
 /// vouching for those would rest on a copy nobody read (#1516). A
-/// `portal:` / `link:` copy with no readable manifest has no version, and
-/// is left alone.
+/// `portal:` / `link:` copy has no lock version: one never read (an
+/// absolute path) may be any version of any package, and contests every
+/// package this lock wires (#1540); one read and found to hold no
+/// versioned package (a `link:` to a plain directory) is left alone.
 async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut Discovery) {
     for copy in copies {
         let bytes = match copy.source.read_path() {
@@ -889,18 +891,25 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
         let Some((name, version)) =
             crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
         else {
-            if !matches!(copy.source, CopyRef::Linked(_)) {
-                out.unidentified_copy(
-                    YARN_LOCK,
-                    &copy.version,
-                    &copy.key,
-                    &format!(
-                        "{}, whose package can't be read, so it may be this version of any \
-                         package (yarn keys it by the dependency name)",
-                        copy.source.how()
-                    ),
-                );
+            let unread_linked = copy.source.is_unread_linked();
+            if matches!(copy.source, CopyRef::Linked(_)) && !unread_linked {
+                continue;
             }
+            out.unidentified_copy(
+                YARN_LOCK,
+                (!unread_linked).then_some(copy.version.as_str()),
+                &copy.key,
+                &format!(
+                    "{}, whose package can't be read, so it may be {} of any package \
+                     (yarn keys it by the dependency name)",
+                    copy.source.how(),
+                    if unread_linked {
+                        "any version"
+                    } else {
+                        "this version"
+                    }
+                ),
+            );
             continue;
         };
         out.unpatched_copy(
@@ -1890,6 +1899,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1540: a berry `portal:` / `link:` copy with an ABSOLUTE path is never
+    /// read (a lock is untrusted input, #1516), and its lock version is the
+    /// placeholder `0.0.0-use.local`, so it may be any version of any
+    /// package. It contests every ref its lock wires, whatever the target
+    /// holds, like an unread `file:` copy does at its lock version; it was
+    /// dropped, so `vex` attested `not_affected` while `node_modules/lp2`
+    /// held unpatched left-pad@1.3.0.
+    #[tokio::test]
+    async fn issue_1540_absolute_portal_and_link_copies_contest_every_ref() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        for protocol in ["portal", "link"] {
+            for manifest in [
+                r#"{"name":"left-pad","version":"1.3.0"}"#,
+                r#"{"name":"other-pkg","version":"9.9.9"}"#,
+            ] {
+                let p = Project::new();
+                p.write("ext/lp/package.json", manifest);
+                let abs = p.root().join("ext/lp").to_string_lossy().replace('\\', "/");
+                let descriptor = format!("lp2@{protocol}:{abs}::locator=app%40workspace%3A.");
+                p.write(
+                    "yarn.lock",
+                    berry(&[
+                        wired.clone(),
+                        berry_block(&descriptor, "0.0.0-use.local", &descriptor, None),
+                    ]),
+                );
+                p.write(
+                    "package.json",
+                    package_json_with_resolutions(serde_json::json!({
+                        "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                    })),
+                );
+                let out = run(&p).await;
+                assert!(
+                    out.refs.is_empty(),
+                    "{protocol} {manifest}: {:#?}",
+                    out.refs
+                );
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains(&format!("lp2@{protocol}:"))
+                            && d.detail.contains("can't be read")),
+                    "{protocol} {manifest}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
+    /// #1540 control: a RELATIVE `link:` to a plain directory (no
+    /// `package.json`, which `link:` allows) is read and holds no package,
+    /// so it contests nothing.
+    #[tokio::test]
+    async fn issue_1540_relative_link_to_a_plain_directory_contests_nothing() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        let descriptor = "assets@link:./assets::locator=app%40workspace%3A.";
+        let p = Project::new();
+        p.write("assets/logo.svg", "<svg/>");
+        p.write(
+            "yarn.lock",
+            berry(&[
+                wired,
+                berry_block(descriptor, "0.0.0-use.local", descriptor, None),
+            ]),
+        );
+        p.write(
+            "package.json",
+            package_json_with_resolutions(serde_json::json!({
+                "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+            })),
+        );
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+        );
     }
 
     /// A berry registry locator beside a hosted one of the same

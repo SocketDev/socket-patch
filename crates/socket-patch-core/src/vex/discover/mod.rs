@@ -476,15 +476,17 @@ pub struct UnpatchedCopy {
     pub how: String,
 }
 
-/// A lock entry that installs SOME package at `version` under another
-/// dependency name, from a copy whose package can't be read
-/// ([`Discovery::unidentified_copy`], #1516).
+/// A lock entry that installs SOME package (at `version`, when known) under
+/// another dependency name, from a copy whose package can't be read
+/// ([`Discovery::unidentified_copy`], #1516, #1540).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnidentifiedCopy {
     /// Root-relative lock file.
     pub file: PathBuf,
-    /// The lock entry's version.
-    pub version: String,
+    /// The lock entry's version; `None` when the lock does not say (a yarn
+    /// berry `portal:` / `link:` copy, whose version is its unread
+    /// manifest's), so it may be any version (#1540).
+    pub version: Option<String>,
     /// The lock entry's key, as the lock spells it.
     pub key: String,
     /// How that entry installs, completing "lock entry `<key>` …".
@@ -933,39 +935,41 @@ impl Discovery {
     /// directory, a tarball with no readable `package.json`). It may be any
     /// package at that version, so [`Discovery::contest_within_locks`]
     /// takes it as an unpatched copy of every package `file` wires at
-    /// `version`: vouching for one would rest on a copy nobody read
-    /// (#1516). Matched there, once every extractor has pushed its refs.
-    pub(crate) fn unidentified_copy(&mut self, file: &str, version: &str, key: &str, how: &str) {
+    /// `version` (at any version when `version` is `None`, #1540): vouching
+    /// for one would rest on a copy nobody read (#1516). Matched there,
+    /// once every extractor has pushed its refs.
+    pub(crate) fn unidentified_copy(
+        &mut self,
+        file: &str,
+        version: Option<&str>,
+        key: &str,
+        how: &str,
+    ) {
         self.unidentified_copies.push(UnidentifiedCopy {
             file: PathBuf::from(file),
-            version: version.to_string(),
+            version: version.map(str::to_string),
             key: key.to_string(),
             how: how.to_string(),
         });
     }
 
     /// Fold [`Discovery::unidentified_copies`] into `unpatched_copies`: one
-    /// copy per ref of the same file at the same version.
+    /// copy per ref of the same file at the same version (at any version
+    /// for a copy with none).
     fn expand_unidentified_copies(&mut self) {
-        if self.unidentified_copies.is_empty() {
-            return;
-        }
-        let mut wired: BTreeMap<(&Path, &str), BTreeSet<&str>> = BTreeMap::new();
-        for r in &self.refs {
-            if let Some((_, version)) = r.purl.rsplit_once('@') {
-                wired
-                    .entry((r.source_file.as_path(), version))
-                    .or_default()
-                    .insert(r.purl.as_str());
-            }
-        }
         let mut expanded = Vec::new();
         for u in &self.unidentified_copies {
-            for purl in wired
-                .get(&(u.file.as_path(), u.version.as_str()))
-                .into_iter()
-                .flatten()
-            {
+            let purls: BTreeSet<&str> = self
+                .refs
+                .iter()
+                .filter(|r| r.source_file == u.file)
+                .filter(|r| match &u.version {
+                    Some(v) => r.purl.rsplit_once('@').is_some_and(|(_, rv)| rv == v),
+                    None => true,
+                })
+                .map(|r| r.purl.as_str())
+                .collect();
+            for purl in purls {
                 expanded.push(UnpatchedCopy {
                     purl: purl.to_string(),
                     file: u.file.clone(),
