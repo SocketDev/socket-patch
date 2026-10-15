@@ -890,24 +890,23 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
             Some(rel) => ctx.read_advisory_bytes(&rel).await,
             None => None,
         };
-        let parsed = bytes
-            .as_deref()
-            .is_some_and(crate::formats::yarn::copy::is_json_manifest);
+        let linked_name = copy.source.linked_name(bytes.as_deref());
         let Some((name, version)) =
             crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
         else {
-            let linked = matches!(copy.source, CopyRef::Linked(_));
+            let linked = matches!(copy.source, CopyRef::Linked(..));
             if linked
-                && !crate::vendor::yarn_copies::linked_copy_unknown(ctx.view, &copy.source, parsed)
-                    .await
+                && !crate::vendor::yarn_copies::linked_copy_unknown(ctx.view, &copy.source).await
             {
                 continue;
             }
-            out.unidentified_copy(
-                YARN_LOCK,
-                (!linked).then_some(copy.version.as_str()),
-                &copy.key,
-                &format!(
+            let how = match &linked_name {
+                Some(name) => format!(
+                    "{}, whose package.json names {name} but no version, so it may be any \
+                     version of {name} (yarn keys it by the dependency name)",
+                    copy.source.how()
+                ),
+                None => format!(
                     "{}, whose package can't be read, so it may be {} of any package \
                      (yarn keys it by the dependency name)",
                     copy.source.how(),
@@ -917,6 +916,13 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
                         "this version"
                     }
                 ),
+            };
+            out.unidentified_copy(
+                YARN_LOCK,
+                linked_name.as_deref(),
+                (!linked).then_some(copy.version.as_str()),
+                &copy.key,
+                &how,
             );
             continue;
         };
@@ -2014,6 +2020,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1579: two more `portal:` / `link:` shapes whose package is unknown.
+    /// A `portal:` target with no `package.json` (a `.gitkeep` placeholder a
+    /// fetch step fills before the install) can't be what yarn installs,
+    /// since yarn refuses a manifest-less portal; and a manifest with no
+    /// `name` may hold any package. Both contest every ref the lock wires. A
+    /// manifest that names a package but no version may be any version of
+    /// THAT package: it contests left-pad when it names left-pad, and nothing
+    /// when it names another package. Both were dropped as "no package
+    /// copy", so `vex` attested `not_affected` while yarn linked unpatched
+    /// left-pad@1.3.0 as `node_modules/lp2`.
+    #[tokio::test]
+    async fn issue_1579_portal_placeholder_and_versionless_linked_manifests_contest() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        for protocol in ["portal", "link"] {
+            for (target, contested) in [
+                ("gitkeep", protocol == "portal"),
+                ("no-name", true),
+                ("no-version-left-pad", true),
+                ("no-version-other", false),
+            ] {
+                let p = Project::new();
+                let (file, text) = match target {
+                    "gitkeep" => ("vend/lp/.gitkeep", ""),
+                    "no-name" => ("vend/lp/package.json", r#"{"version":"1.3.0"}"#),
+                    "no-version-left-pad" => ("vend/lp/package.json", r#"{"name":"left-pad"}"#),
+                    _ => ("vend/lp/package.json", r#"{"name":"other-pkg"}"#),
+                };
+                p.write(file, text);
+                let descriptor = format!("lp2@{protocol}:./vend/lp::locator=app%40workspace%3A.");
+                p.write(
+                    "yarn.lock",
+                    berry(&[
+                        wired.clone(),
+                        berry_block(&descriptor, "0.0.0-use.local", &descriptor, None),
+                    ]),
+                );
+                p.write(
+                    "package.json",
+                    package_json_with_resolutions(serde_json::json!({
+                        "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                    })),
+                );
+                let out = run(&p).await;
+                if !contested {
+                    assert_refs(
+                        &out,
+                        &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+                    );
+                    continue;
+                }
+                assert!(out.refs.is_empty(), "{protocol} {target}: {:#?}", out.refs);
+                let why = if target == "no-version-left-pad" {
+                    "names left-pad but no version"
+                } else {
+                    "can't be read"
+                };
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains(&format!("lp2@{protocol}:"))
+                            && d.detail.contains(why)),
+                    "{protocol} {target}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
+    /// #1579: a copy whose manifest names a package but no version contests
+    /// every version of that package the lock wires, and no other package.
+    #[tokio::test]
+    async fn issue_1579_versionless_linked_manifest_contests_only_its_name() {
+        let descriptor = "lp2@portal:./vend/lp::locator=app%40workspace%3A.";
+        let p = Project::new();
+        p.write("vend/lp/package.json", r#"{"name":"left-pad"}"#);
+        p.write(
+            "yarn.lock",
+            berry(&[
+                berry_vendored_block("left-pad", "1.3.0", UUID_A),
+                berry_vendored_block("right-pad", "1.0.1", UUID_B),
+                berry_block(descriptor, "0.0.0-use.local", descriptor, None),
+            ]),
+        );
+        p.write(
+            "package.json",
+            package_json_with_resolutions(serde_json::json!({
+                "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                "right-pad": format!("file:./.socket/vendor/npm/{UUID_B}/right-pad-1.0.1.tgz"),
+            })),
+        );
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/right-pad@1.0.1", UUID_B, WiringMode::Vendored)],
+        );
     }
 
     /// #1540 control: a RELATIVE `link:` to a plain directory (no

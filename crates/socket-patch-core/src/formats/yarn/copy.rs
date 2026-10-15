@@ -26,10 +26,19 @@ pub(crate) enum CopyRef {
     /// `node_modules`: the lock records the placeholder version
     /// `0.0.0-use.local`, so the package's name AND version are its
     /// `package.json`'s.
-    Linked(String),
+    Linked(String, LinkKind),
     /// A url tarball (`#` fragment dropped): the package is the registry
     /// package its `/<name>/-/<leaf>-<version>.tgz` path names.
     Url(String),
+}
+
+/// Which berry protocol a [`CopyRef::Linked`] copy came from. yarn installs
+/// a `link:` to any directory, a package or plain assets, but refuses a
+/// `portal:` whose target has no `package.json` (#1579).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkKind {
+    Portal,
+    Link,
 }
 
 impl CopyRef {
@@ -42,14 +51,14 @@ impl CopyRef {
     /// UNC path) a network share. Such a copy is never read, so its package
     /// stays unknown (#1516).
     pub(crate) fn read_path(&self) -> Option<String> {
-        if let CopyRef::Tarball(rel) | CopyRef::Directory(rel) | CopyRef::Linked(rel) = self {
+        if let CopyRef::Tarball(rel) | CopyRef::Directory(rel) | CopyRef::Linked(rel, _) = self {
             if crate::utils::relpath::is_anchored(rel) {
                 return None;
             }
         }
         match self {
             CopyRef::Tarball(rel) => Some(rel.clone()),
-            CopyRef::Directory(dir) | CopyRef::Linked(dir) => Some(if dir.is_empty() {
+            CopyRef::Directory(dir) | CopyRef::Linked(dir, _) => Some(if dir.is_empty() {
                 "package.json".to_string()
             } else {
                 format!("{dir}/package.json")
@@ -70,7 +79,7 @@ impl CopyRef {
         let name = match self {
             CopyRef::Tarball(_) => tarball_manifest_name(bytes?)?,
             CopyRef::Directory(_) => manifest_name(bytes?)?,
-            CopyRef::Linked(_) => {
+            CopyRef::Linked(..) => {
                 let manifest = parse_manifest(bytes?)?;
                 let name = manifest.get("name")?.as_str()?.to_string();
                 let version = manifest.get("version")?.as_str()?.to_string();
@@ -81,6 +90,17 @@ impl CopyRef {
         Some((name, lock_version.to_string()))
     }
 
+    /// The package a [`CopyRef::Linked`] copy's manifest names when it
+    /// names no version, so [`CopyRef::identity`] can't say: the copy may
+    /// be any version of that package, and of no other (#1579). `None` for
+    /// any other copy, or a manifest that names no package.
+    pub(crate) fn linked_name(&self, bytes: Option<&[u8]>) -> Option<String> {
+        match self {
+            CopyRef::Linked(..) => manifest_name(bytes?),
+            _ => None,
+        }
+    }
+
     /// Where the copy installs from, for a warning or diagnostic: "installs
     /// it from …" / "links it to …". A url is redacted, since the phrase
     /// may be published (a VEX document, a JSON envelope).
@@ -89,7 +109,7 @@ impl CopyRef {
             CopyRef::Tarball(rel) | CopyRef::Directory(rel) => {
                 format!("installs it from the user's file:{rel}")
             }
-            CopyRef::Linked(rel) => {
+            CopyRef::Linked(rel, _) => {
                 let rel = if rel.is_empty() { "." } else { rel };
                 format!("links it to the user's directory {rel} (portal:/link:)")
             }
@@ -142,12 +162,11 @@ pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
         ));
     }
     let (path, linked) = if let Some(path) = reference.strip_prefix("file:") {
-        (path, false)
-    } else if let Some(path) = reference
-        .strip_prefix("portal:")
-        .or_else(|| reference.strip_prefix("link:"))
-    {
-        (path, true)
+        (path, None)
+    } else if let Some(path) = reference.strip_prefix("portal:") {
+        (path, Some(LinkKind::Portal))
+    } else if let Some(path) = reference.strip_prefix("link:") {
+        (path, Some(LinkKind::Link))
     } else {
         return None;
     };
@@ -156,8 +175,8 @@ pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
     let path = path.split("::").next().unwrap_or_default();
     let path = path.split('#').next().unwrap_or_default();
     let rel = berry_copy_path(reference, path)?;
-    Some(if linked {
-        CopyRef::Linked(rel)
+    Some(if let Some(kind) = linked {
+        CopyRef::Linked(rel, kind)
     } else if is_tarball_path(path) {
         CopyRef::Tarball(rel)
     } else {
@@ -210,13 +229,6 @@ fn copy_path(base: &str, path: &str) -> Option<String> {
     Some(crate::utils::relpath::normalize_rel_keeping_escapes(
         &joined,
     ))
-}
-
-/// Whether `bytes` parse as a JSON `package.json` (any content): a copy
-/// whose manifest doesn't (a Git LFS pointer, an encrypted blob) can't be
-/// read for its package (#1561).
-pub(crate) fn is_json_manifest(bytes: &[u8]) -> bool {
-    parse_manifest(bytes).is_some()
 }
 
 fn parse_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
@@ -320,11 +332,11 @@ mod tests {
         );
         assert_eq!(
             berry_copy_ref(&format!("portal:../lp{ws}")),
-            Some(CopyRef::Linked("packages/lp".into()))
+            Some(CopyRef::Linked("packages/lp".into(), LinkKind::Portal))
         );
         assert_eq!(
             berry_copy_ref("link:./vend/lp::locator=app%40workspace%3A."),
-            Some(CopyRef::Linked("vend/lp".into()))
+            Some(CopyRef::Linked("vend/lp".into(), LinkKind::Link))
         );
         assert_eq!(berry_copy_ref("npm:1.3.0"), None);
         assert_eq!(berry_copy_ref("workspace:packages/b"), None);
@@ -335,27 +347,43 @@ mod tests {
     #[test]
     fn absolute_linked_refs_keep_the_path_and_are_unread() {
         let ws = "::locator=app%40workspace%3A.";
-        for (reference, path) in [
-            (format!("portal:/home/me/lp{ws}"), "/home/me/lp"),
-            (format!("link:/home/me/lp{ws}"), "/home/me/lp"),
-            (format!("portal:C:/Users/me/lp{ws}"), "C:/Users/me/lp"),
+        for (reference, path, kind) in [
+            (
+                format!("portal:/home/me/lp{ws}"),
+                "/home/me/lp",
+                LinkKind::Portal,
+            ),
+            (
+                format!("link:/home/me/lp{ws}"),
+                "/home/me/lp",
+                LinkKind::Link,
+            ),
+            (
+                format!("portal:C:/Users/me/lp{ws}"),
+                "C:/Users/me/lp",
+                LinkKind::Portal,
+            ),
         ] {
             assert_eq!(
                 berry_copy_ref(&reference),
-                Some(CopyRef::Linked(path.into())),
+                Some(CopyRef::Linked(path.into(), kind)),
                 "{reference}"
             );
         }
-        assert!(CopyRef::Linked("/home/me/lp".into()).read_path().is_none());
+        assert!(CopyRef::Linked("/home/me/lp".into(), LinkKind::Portal)
+            .read_path()
+            .is_none());
         assert_eq!(
-            CopyRef::Linked("vend/lp".into()).read_path().as_deref(),
+            CopyRef::Linked("vend/lp".into(), LinkKind::Link)
+                .read_path()
+                .as_deref(),
             Some("vend/lp/package.json")
         );
     }
 
     #[test]
     fn linked_identity_reads_name_and_version_from_the_manifest() {
-        let linked = CopyRef::Linked("vend/lp".into());
+        let linked = CopyRef::Linked("vend/lp".into(), LinkKind::Portal);
         assert_eq!(linked.read_path().as_deref(), Some("vend/lp/package.json"));
         let manifest = br#"{"name":"left-pad","version":"1.3.0"}"#;
         assert_eq!(

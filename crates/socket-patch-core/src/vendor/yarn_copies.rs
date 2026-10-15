@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use crate::formats::yarn::blocks::{berry_field, classic_field};
-use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref, is_json_manifest, CopyRef};
+use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref, CopyRef, LinkKind};
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::classic_key_real_name;
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
@@ -94,7 +94,7 @@ pub(crate) async fn other_name_copies(
         // Only a `portal:` / `link:` copy needs its manifest for the
         // version; any other copy of another version is no copy of this
         // one, and is never read (a `file:` tarball is unpacked to read).
-        if !matches!(source, CopyRef::Linked(_)) && lock_version != version {
+        if !matches!(source, CopyRef::Linked(..)) && lock_version != version {
             continue;
         }
         // A path into `.socket/` is socket-patch's own wiring, which
@@ -109,15 +109,18 @@ pub(crate) async fn other_name_copies(
             Some(rel) => read_regular_to_bytes(&project_root.join(rel)).await.ok(),
             None => None,
         };
-        let parsed = bytes.as_deref().is_some_and(is_json_manifest);
+        let linked_name = source.linked_name(bytes.as_deref());
         let identified = match copy_identity(&source, &lock_version, bytes).await {
             Some((n, v)) if n == name && v == version => true,
             Some(_) => continue,
-            None if matches!(source, CopyRef::Linked(_))
-                && !linked_copy_unknown(ProjectView::Disk(project_root), &source, parsed).await =>
+            None if matches!(source, CopyRef::Linked(..))
+                && !linked_copy_unknown(ProjectView::Disk(project_root), &source).await =>
             {
                 continue
             }
+            // A manifest naming another package but no version is no copy
+            // of this one.
+            None if linked_name.is_some_and(|n| n != name) => continue,
             None => false,
         };
         out.push(OtherNameCopy {
@@ -130,31 +133,25 @@ pub(crate) async fn other_name_copies(
 }
 
 /// Whether a `portal:` / `link:` copy whose manifest named no versioned
-/// package may be any version of any package. Its lock version is the
+/// package may be a copy of some package. Its lock version is the
 /// placeholder `0.0.0-use.local`, so only its `package.json` says what it
-/// is; `manifest_parsed` says that file was read and parsed as JSON. A copy
-/// is unknown when it is never read (an absolute path, #1540) or its
-/// target can't be read (#1561): a missing directory, an EMPTY one (the
-/// placeholder git leaves for a submodule CI never checked out), or a
-/// `package.json` that is no readable regular file or no JSON (a Git LFS
-/// pointer, an encrypted blob). Only a non-empty directory with no
-/// `package.json` at all (a `link:` to plain assets), or a manifest parsed
-/// and found to name no versioned package, is no package copy.
-pub(crate) async fn linked_copy_unknown(
-    view: ProjectView<'_>,
-    source: &CopyRef,
-    manifest_parsed: bool,
-) -> bool {
-    let CopyRef::Linked(dir) = source else {
+/// is. A copy is unknown when it is never read (an absolute path, #1540),
+/// its target can't be read (#1561: a missing directory, an EMPTY one, a
+/// `package.json` that is no readable regular file or no JSON), or its
+/// manifest parses but names no package or no version (#1579): yarn links
+/// it all the same, so it may hold any code. A `portal:` with no
+/// `package.json` is unknown too: yarn refuses to install one, so the
+/// directory on disk (a `.gitkeep` placeholder a fetch step fills) is not
+/// what will be installed (#1579). Only a `link:` to a non-empty directory
+/// with no `package.json` at all (plain assets) is no package copy.
+pub(crate) async fn linked_copy_unknown(view: ProjectView<'_>, source: &CopyRef) -> bool {
+    let CopyRef::Linked(dir, kind) = source else {
         return false;
     };
-    if manifest_parsed {
-        return false;
-    }
     let Some(manifest) = source.read_path() else {
         return true;
     };
-    if !view.is_dir(dir) || view.exists_no_follow(&manifest).await {
+    if *kind == LinkKind::Portal || !view.is_dir(dir) || view.exists_no_follow(&manifest).await {
         return true;
     }
     view.list_dir(dir)
@@ -186,7 +183,7 @@ pub(crate) fn copy_origin(source: &CopyRef) -> &'static str {
     match source {
         CopyRef::Tarball(_) => "a file: tarball",
         CopyRef::Directory(_) => "a file: directory, which yarn copies into node_modules",
-        CopyRef::Linked(_) => "a portal:/link: directory, which yarn links into node_modules",
+        CopyRef::Linked(..) => "a portal:/link: directory, which yarn links into node_modules",
         CopyRef::Url(_) => "a URL tarball",
     }
 }
