@@ -596,10 +596,7 @@ fn pnpm_lists_unmodeled(globs: &[String], rel: &[String]) -> bool {
     let matches = |glob: &str| workspaces_include_as(&[glob.to_string()], rel, PNPM);
     let (negated, listed): (Vec<&String>, Vec<&String>) =
         globs.iter().partition(|glob| glob.starts_with('!'));
-    listed.iter().any(|glob| matches(glob))
-        && !negated
-            .iter()
-            .any(|glob| matches(glob.trim_start_matches('!')))
+    listed.iter().any(|glob| matches(glob)) && !negated.iter().any(|glob| matches(&glob[1..]))
 }
 
 /// The hosted refusal for [`member_stray_lock`].
