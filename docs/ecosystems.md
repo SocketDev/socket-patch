@@ -683,6 +683,15 @@ when every dependency is optional (0.0.0-30 … 1.0.4 install none from the lock
 optional dependency (a plain `vlt install` keeps the link to the removed vendored
 directory) or a link still into the vendored directory.
 
+**Workspace members.** vlt installs a workspace member from the root's `vlt-lock.json`
+and ignores any lock in the member, so a hosted or vendored run from a member is refused
+(`redirect_workspace_lockfile_elsewhere`, `vendor_lockfile_missing`) and names the root
+to run from. The root lists its members in `vlt.json` `workspaces`; when that field is
+absent, in `package.json` `workspaces`; and from vlt 1.4, when both are absent, in the
+`packages:` of `pnpm-workspace.yaml`. vlt 1.3.8 and older ignore `pnpm-workspace.yaml`,
+so its directories count as members only when the root lock has an edge from one of them,
+which only vlt 1.4 writes (#1564).
+
 **Agent mode.** `apply` and `rollback` patch every store copy of a `name@version`
 (legacy and tilde DepIDs, peer and modifier variants, transitive-only packages) and
 replace each file instead of writing through it, so vlt 1.2's shared store (hardlinked on

@@ -2,7 +2,8 @@
 //! a workspace member reads the member's directory only, while the package
 //! manager installs from a lock in an ancestor directory. Hosted mode then
 //! either pins nothing and reports success (pnpm, #590; npm, yarn and Bun
-//! `package.json` workspaces, #884; vlt `vlt.json` workspaces, #942) or
+//! `package.json` workspaces, #884; vlt `vlt.json` workspaces, #942, and
+//! vlt 1.4's `pnpm-workspace.yaml` fallback, #1564) or
 //! rewrites the member as a lockless project and breaks the workspace
 //! (cargo, #417; a uv workspace member with Hatch configuration, #1138).
 //!
@@ -23,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, VLT_LOCK};
 use crate::formats::governing_locks::{npm_lock_files, NpmLockFamily};
+use crate::formats::pnpm::workspace::read_package_globs;
 use crate::formats::text::strip_bom;
 use crate::formats::yarn::berry_gates::YARN_LOCK;
 use crate::formats::yarn::is_berry_lock;
@@ -50,8 +52,8 @@ use super::guidance::{
 pub const PNPM_LOCKFILE_ELSEWHERE: &str = "redirect_pnpm_lockfile_elsewhere";
 
 /// Refusal code for an npm, yarn, Bun or vlt workspace member: an ancestor
-/// `package.json` (or, for vlt, `vlt.json`) lists the project directory in
-/// its `workspaces`, and the workspace's lock lives at that root. Also a uv
+/// `package.json` (or, for vlt, `vlt.json` or `pnpm-workspace.yaml`) lists
+/// the project directory in its `workspaces`, and the workspace's lock lives at that root. Also a uv
 /// workspace member (`[tool.uv.workspace] members`, #1138).
 pub const WORKSPACE_LOCKFILE_ELSEWHERE: &str = "redirect_workspace_lockfile_elsewhere";
 
@@ -350,8 +352,9 @@ pub(crate) fn member_stray_lock_own_files() -> impl Iterator<Item = &'static str
 ///   member `bun.lock` / `bun.lockb` when the root holds a Bun lock.
 /// - vlt (#1134) resolves a member with no `vlt.json` of its own to the
 ///   workspace root (its `vlt.json` `workspaces`, or `package.json`
-///   `workspaces` when `vlt.json` declares none) and installs it from the
-///   root's `vlt-lock.json`.
+///   `workspaces` when `vlt.json` declares none, or on vlt 1.4 the
+///   `pnpm-workspace.yaml` `packages:` when neither does, #1564) and
+///   installs it from the root's `vlt-lock.json`.
 ///
 /// A member that also holds a lock its own manager does read (pnpm, yarn,
 /// or a family the root does not hold), or a Rush repo, keeps the
@@ -432,13 +435,14 @@ async fn cached_package_json_root<'a>(
 }
 
 /// The vlt workspace root that installs a member and its locks: the nearer
-/// of the `vlt.json` `workspaces` root and the `package.json` `workspaces`
-/// root whose `vlt-lock.json` vlt reads (see [`package_json_workspace_root`]).
+/// of the `vlt.json` (or `pnpm-workspace.yaml`) root and the `package.json`
+/// `workspaces` root whose `vlt-lock.json` vlt reads (see
+/// [`package_json_workspace_root`]).
 async fn vlt_lock_root(
     root: &Path,
     package_json_root: &mut Option<Option<(PathBuf, Vec<&'static str>)>>,
 ) -> Option<(PathBuf, Vec<&'static str>)> {
-    let from_vlt_json = vlt_workspace_root(root).await;
+    let from_vlt_json = vlt_workspace_root(root).await.map(|(ancestor, _)| ancestor);
     let from_package_json = cached_package_json_root(root, package_json_root)
         .await
         .clone()
@@ -723,25 +727,26 @@ async fn read_head(path: &Path) -> String {
 }
 
 /// #942: the project directory is a member of a vlt workspace, whose
-/// root `vlt.json` lists it under `workspaces` and holds `vlt-lock.json`.
-/// vlt reads workspaces only from `vlt.json` and keeps one lock at that
-/// root, so a hosted run here would find the member's copy, pin nothing
-/// and report success. The nearest ancestor `vlt.json` whose patterns
-/// match is the root; one without a lock (never installed) refuses
-/// nothing.
+/// root `vlt.json` lists it under `workspaces` (or, on vlt 1.4, whose
+/// root `pnpm-workspace.yaml` lists it under `packages:`, #1564) and holds
+/// `vlt-lock.json`. vlt keeps one lock at that root, so a hosted run here
+/// would find the member's copy, pin nothing and report success. The
+/// nearest ancestor whose patterns match is the root; one without a lock
+/// (never installed) refuses nothing.
 async fn vlt_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
-    let ancestor = vlt_workspace_root(root).await?;
+    let (ancestor, source) = vlt_workspace_root(root).await?;
     let lock = ancestor.join(VLT_LOCK);
     let refusal = Refusal {
         code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
         message: format!(
             "{} is a workspace member with no lockfile of its own: the workspace \
-             root {} lists it under \"workspaces\" in {} and installs it from {}, \
+             root {} lists it under \"{}\" in {} and installs it from {}, \
              which a hosted run here cannot see; run socket-patch from {} (the \
              workspace root); nothing was written",
             root.display(),
             ancestor.display(),
-            ancestor.join(VLT_JSON).display(),
+            source.field(),
+            ancestor.join(source.file()).display(),
             lock.display(),
             ancestor.display()
         ),
@@ -749,18 +754,41 @@ async fn vlt_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
     Some((ancestor, refusal))
 }
 
-/// The nearest ancestor `vlt.json` whose `workspaces` patterns match the
-/// project directory, when it holds `vlt-lock.json` (see
-/// [`vlt_workspace_refusal`]).
-async fn vlt_workspace_root(root: &Path) -> Option<PathBuf> {
+/// The file a vlt workspace root lists its members in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VltWorkspaceSource {
+    /// `vlt.json` `workspaces`.
+    VltJson,
+    /// `pnpm-workspace.yaml` `packages:`, which vlt 1.4 reads when neither
+    /// `vlt.json` nor `package.json` has a `workspaces` field (#1564).
+    PnpmWorkspace,
+}
+
+impl VltWorkspaceSource {
+    fn file(self) -> &'static str {
+        match self {
+            Self::VltJson => VLT_JSON,
+            Self::PnpmWorkspace => PNPM_WORKSPACE,
+        }
+    }
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::VltJson => "workspaces",
+            Self::PnpmWorkspace => "packages",
+        }
+    }
+}
+
+/// The nearest ancestor whose vlt workspace patterns ([`vlt_workspace_groups`])
+/// match the project directory, when it holds `vlt-lock.json` (see
+/// [`vlt_workspace_refusal`]), with the file that lists the member.
+async fn vlt_workspace_root(root: &Path) -> Option<(PathBuf, VltWorkspaceSource)> {
     let canonical = tokio::fs::canonicalize(root)
         .await
         .unwrap_or_else(|_| root.to_path_buf());
     for ancestor in canonical.ancestors().skip(1) {
-        let Ok(text) = read_regular_to_string(&ancestor.join(VLT_JSON)).await else {
-            continue;
-        };
-        let Some(groups) = vlt_workspace_patterns(&text) else {
+        let Some((groups, source)) = vlt_workspace_groups(ancestor).await else {
             continue;
         };
         let Ok(rel) = canonical.strip_prefix(ancestor) else {
@@ -782,12 +810,79 @@ async fn vlt_workspace_root(root: &Path) -> Option<PathBuf> {
             }
             continue;
         }
-        if !vlt_lists_member(ancestor, &groups, &rel).await {
+        let listed = match source {
+            VltWorkspaceSource::VltJson => vlt_lists_member(ancestor, &groups, &rel).await,
+            VltWorkspaceSource::PnpmWorkspace => {
+                groups
+                    .iter()
+                    .any(|group| workspaces_include_as(group, &rel, WorkspacesDialect::VLT))
+                    && vlt_lock_reads_pnpm_workspace(ancestor, &groups).await
+            }
+        };
+        if !listed {
             continue;
         }
-        return Some(ancestor.to_path_buf());
+        return Some((ancestor.to_path_buf(), source));
     }
     None
+}
+
+/// The workspace pattern groups vlt reads at the directory `dir`, and
+/// their file: `vlt.json` `workspaces` when it has the field; otherwise,
+/// when `package.json` has no `workspaces` field either (that fallback is
+/// [`package_json_workspace_root`]'s), the `packages:` of
+/// `pnpm-workspace.yaml`, which vlt 1.4 reads (#1564) without its `.`
+/// root entries, as long as a positive pattern remains.
+async fn vlt_workspace_groups(dir: &Path) -> Option<(Vec<Vec<String>>, VltWorkspaceSource)> {
+    if let Ok(text) = read_regular_to_string(&dir.join(VLT_JSON)).await {
+        if let Some(groups) = vlt_workspace_patterns(&text) {
+            return Some((groups, VltWorkspaceSource::VltJson));
+        }
+    }
+    let yaml = read_regular_to_string(&dir.join(PNPM_WORKSPACE))
+        .await
+        .ok()?;
+    if package_json_declares_workspaces(dir).await {
+        return None;
+    }
+    let globs: Vec<String> = read_package_globs(&yaml)
+        .ok()??
+        .into_iter()
+        .filter(|glob| glob != "." && glob != "./")
+        .collect();
+    globs
+        .iter()
+        .any(|glob| !glob.starts_with('!'))
+        .then(|| (vec![globs], VltWorkspaceSource::PnpmWorkspace))
+}
+
+/// Whether `<dir>/package.json` has a `workspaces` field, whatever its
+/// value: vlt keys its precedence on the field. An unreadable or
+/// unparseable manifest has none.
+async fn package_json_declares_workspaces(dir: &Path) -> bool {
+    read_regular_to_string(&dir.join("package.json"))
+        .await
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(strip_bom(&text)).ok())
+        .is_some_and(|doc| doc.get("workspaces").is_some())
+}
+
+/// Whether the vlt that wrote `root`'s `vlt-lock.json` read its
+/// `pnpm-workspace.yaml` `packages:` `groups` (#1564). Only vlt 1.4 and
+/// later do; older vlt installs each directory the file lists as its own
+/// project. vlt records an edge from every member it installed that has a
+/// dependency, so a lock with an edge from a listed directory is 1.4's,
+/// and one without is older vlt's (a member with no dependency has
+/// nothing to patch). A lock that cannot be read keeps the refusing side.
+async fn vlt_lock_reads_pnpm_workspace(root: &Path, groups: &[Vec<String>]) -> bool {
+    let Some(importers) = vlt_lock_workspace_dirs(root).await else {
+        return true;
+    };
+    importers.iter().any(|dir| {
+        groups
+            .iter()
+            .any(|group| workspaces_include_as(group, dir, WorkspacesDialect::VLT))
+    })
 }
 
 /// Whether vlt lists the member `rel` under the `workspaces` `groups` of
