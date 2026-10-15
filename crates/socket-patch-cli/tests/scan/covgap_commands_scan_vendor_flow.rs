@@ -285,7 +285,7 @@ fn assert_vendor_step_error(
 
 /// A lock failure happens BEFORE the step builds its envelope: no `vendor`
 /// sub-object may be fabricated for it (get's fold pins the same in
-/// `covgap_commands_get::vendored_lock_held_vendor_step_errors_without_vendor_envelope`).
+/// `get/get_failure_paths.rs::vendored_lock_held_vendor_step_errors_without_vendor_envelope`).
 fn assert_no_vendor_envelope(v: &serde_json::Value) {
     assert!(
         !v.as_object().unwrap().contains_key("vendor"),
