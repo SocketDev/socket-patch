@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-14 (run 42), main `9a5929a`, latest release 5.0.1. (main was force-pushed before run 39, so older SHAs in this ledger may not resolve any more.)
+Last updated: 2026-10-15 (run 43), main `75e49ae`, latest release 5.0.1. (main was force-pushed before runs 39 and 43, so older SHAs in this ledger may not resolve any more.)
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -477,7 +477,9 @@ Run 42 additions (main `9a5929a`, Linux; transitive `npm:` alias = registry pack
 0w. #1460 is verified fixed (run 40, all 16 env × major cells). Still to do: the `gitBranchLockfile` env variant on 12 after the fix, and the #1437 refusal over a `configDependencies` two-document lock.
 0x. #935: hosted half fixed by #1469 (run 41, 8/9/10/12). Still open for the vendored scan warning; re-verify once fixed. Was: **#935 regression** (hosted silent pin over a `file:` copy, first bad f3c6313a): re-verify once fixed, also for `git+` copies. #1268 still reproduces on 12.11.2 (run 39).
 0y. #1266 / #1494: scoped alias, custom virtualStoreDir and member rollback done in run 41 (pass). Transitive alias done in run 42 (hosted 7/8/9/10/12 pass, agent 9/12 pass; the mock registry serves `sp-wrap@1.0.0` with an `npm:` alias dep). Still to do: transitive alias in a workspace member, and a scoped transitive alias (`npm:@scope/x@…`).
-0v. #1514 (env `pnpm_config_trust_lockfile=false`): re-verify once fixed, also the `--no-trust-lockfile-config` and Rush texts with the env set.
+0v. #1514 verified fixed on 11.28.3 (run 43). Still to do: the `--no-trust-lockfile-config` and Rush texts with the env set.
+0u. **#1557** (an empty / `null` / `undefined` `pnpm_config_trust_lockfile` is read as false; pnpm reads only `false`): re-verify on 11/12 once fixed, including the workspace-member path (`trust_env_off` in `scan/hosted.rs`).
+0t. #1534 follow-up (`nested_project_skipped`, fc1b4f9): a `sharedWorkspaceLockfile: false` member under a root hosted scan passes on 9/10/12 (run 43). Still to do: an independent nested pnpm project under a pnpm root, and one inside a Rush repo.
 0z. Post-#1007 follow-ups: #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
 00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
 00b. #1039 follow-ups: the takeover over a `pnpm patch`-ed vendored package, and a takeover on Windows (CRLF autocrlf checkout). The interrupted takeover is #1157. (Interrupted vendored-only commit: done in run 35, pass.)
@@ -515,6 +517,8 @@ Run 42 additions (main `9a5929a`, Linux; transitive `npm:` alias = registry pack
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
+
+- pnpm 11/12 read `pnpm_config_trust_lockfile` (and `PNPM_CONFIG_TRUST_LOCKFILE`) as false only when it is exactly `false`. Every other value (`0`, `no`, `FALSE`, empty, `null`, `undefined`) falls back to the `pnpm-workspace.yaml` key, as `pnpm config get trustLockfile` shows (run 43). socket-patch matches this for `0` / `no` / `FALSE`, but not for empty / `null` / `undefined`, which is #1557.
 
 - Lockfile-only pnpm checkout with no `packageManager`, no `node_modules/.modules.yaml` and a single-document lock: the pnpm major is unknown, so both `npm_config_*` and `pnpm_config_*` (and both settings files) are read, and `npm_config_package_lock=false` refuses even on a pnpm 12 lock. #1460 asked for exactly that ("both only when the major is unknown"). A real pnpm 11/12 install pinned by `packageManager` or `devEngines.packageManager` writes the two-document lock, so the major is detected (run 40).
 - Hosted scan beside a pnpm `bundledDependencies` copy of the same package pins the registry copy without a warning. CLI_CONTRACT puts pnpm bundled copies under "Unattested references": only `vex` omits them (`vex_pnpm_bundled_copy`), and agent mode patches the bundled copy (run 40).
