@@ -90,6 +90,16 @@ fn write_manifest(root: &Path, purl: &str) {
 /// Run `socket-patch apply --offline --json --ecosystems <eco>` and return
 /// the exit code + parsed envelope.
 fn run_apply_for_ecosystem(cwd: &Path, ecosystem: &str) -> (i32, Value) {
+    run_apply_for_ecosystem_env(cwd, ecosystem, &[])
+}
+
+/// [`run_apply_for_ecosystem`] with `envs` set after the hermetic scrub
+/// (cache locations such as `DENO_DIR`).
+fn run_apply_for_ecosystem_env(
+    cwd: &Path,
+    ecosystem: &str,
+    envs: &[(&str, &Path)],
+) -> (i32, Value) {
     let mut cmd = hermetic::command(&binary());
     cmd.args([
         "apply",
@@ -100,6 +110,9 @@ fn run_apply_for_ecosystem(cwd: &Path, ecosystem: &str) -> (i32, Value) {
         "--silent",
     ])
     .current_dir(cwd);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     let out = cmd.output().expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let env: Value = serde_json::from_str(stdout.trim())
@@ -283,6 +296,25 @@ fn dispatch_branch_nuget() {
     assert_apply_dispatched(code, &env, "nuget", &[purl]);
 }
 
+/// deno is the one ecosystem whose PURL type (`jsr`) differs from its
+/// `--ecosystems` token, so this proves `partition_purls` maps `pkg:jsr/`
+/// to `Ecosystem::Deno`. The `deno.json` marker lets the local-mode gate in
+/// `get_jsr_cache_paths` probe cache paths, and the pinned empty `DENO_DIR`
+/// keeps that probe off the real user cache.
+#[test]
+fn dispatch_branch_deno() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    std::fs::write(tmp.path().join("deno.json"), "{}").unwrap();
+    let deno_dir = tmp.path().join("deno-cache");
+    std::fs::create_dir_all(&deno_dir).unwrap();
+    let purl = "pkg:jsr/@__dispatch_test__/pkg@1.0.0";
+    write_manifest(tmp.path(), purl);
+    let (code, env) =
+        run_apply_for_ecosystem_env(tmp.path(), "deno", &[("DENO_DIR", deno_dir.as_path())]);
+    assert_apply_dispatched(code, &env, "deno", &[purl]);
+}
+
 // ---------------------------------------------------------------------------
 // Multiple ecosystems in one CSV --ecosystems value. Each of the three
 // branches must fire: all three PURLs must surface as skipped events.
@@ -411,20 +443,22 @@ struct RollbackFixture {
     /// Extra env vars the crawler needs (cache locations such as GOMODCACHE /
     /// MAVEN_REPO_LOCAL).
     envs: Vec<(String, String)>,
-    /// Run the rollback in `--global` mode. Required for ecosystems whose
-    /// project-local backend is a *redirect* (golang): in local mode the
-    /// patched bytes live in a project-local copy and the module cache is left
-    /// pristine, so rollback drops the redirect rather than restoring the cache
-    /// file in place. Byte-restore — the contract `assert_rollback_restored`
-    /// verifies — only happens on the global/in-place path (the analog of
-    /// cargo's `vendor/` in-place layout). Defaults to local mode.
-    global: bool,
+    /// Scope flags for the rollback: empty for local mode, `--global` for
+    /// ecosystems whose project-local backend is a *redirect* (golang), or
+    /// `--global-prefix <dir>` to point the crawler at a staged cache (deno).
+    /// For golang, in local mode the patched bytes live in a project-local
+    /// copy and the module cache is left pristine, so rollback drops the
+    /// redirect rather than restoring the cache file in place. Byte-restore
+    /// — the contract `assert_rollback_restored` verifies — only happens on
+    /// the global/in-place path (the analog of cargo's `vendor/` in-place
+    /// layout).
+    scope_args: Vec<String>,
 }
 
 fn run_rollback(
     cwd: &Path,
     ecosystem: &str,
-    global: bool,
+    scope_args: &[String],
     envs: &[(String, String)],
 ) -> (i32, Value) {
     let mut cmd = hermetic::command(&binary());
@@ -436,9 +470,7 @@ fn run_rollback(
         ecosystem,
         "--silent",
     ]);
-    if global {
-        cmd.arg("--global");
-    }
+    cmd.args(scope_args);
     cmd.current_dir(cwd);
     // The hermetic command scrubbed BEFORE the fixture envs land, so a
     // fixture-supplied SOCKET_-prefixed var survives the prefix sweep
@@ -456,7 +488,7 @@ fn run_rollback(
 /// Drive a genuine rollback for `fixture` and assert it discovered the
 /// package, restored the file, and reported success for the exact PURL.
 fn assert_rollback_restored(cwd: &Path, ecosystem: &str, fixture: &RollbackFixture) {
-    let (code, env) = run_rollback(cwd, ecosystem, fixture.global, &fixture.envs);
+    let (code, env) = run_rollback(cwd, ecosystem, &fixture.scope_args, &fixture.envs);
     assert_eq!(
         code, 0,
         "rollback --ecosystems={ecosystem}: expected exit 0; env={env}"
@@ -530,7 +562,7 @@ fn assert_rollback_restored(cwd: &Path, ecosystem: &str, fixture: &RollbackFixtu
 /// file is left untouched (still PATCHED). Mirrors `assert_apply_not_dispatched`
 /// for the separate `find_packages_for_rollback` code path.
 fn assert_rollback_not_dispatched(cwd: &Path, ecosystem: &str, fixture: &RollbackFixture) {
-    let (code, env) = run_rollback(cwd, ecosystem, fixture.global, &fixture.envs);
+    let (code, env) = run_rollback(cwd, ecosystem, &fixture.scope_args, &fixture.envs);
     assert_eq!(
         code, 0,
         "rollback --ecosystems={ecosystem}: out-of-scope rollback should be a clean no-op (exit 0); env={env}"
@@ -585,7 +617,7 @@ fn fixture_npm(root: &Path) -> RollbackFixture {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
-        global: false,
+        scope_args: vec![],
     }
 }
 
@@ -617,7 +649,7 @@ fn fixture_pypi(root: &Path) -> RollbackFixture {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
-        global: false,
+        scope_args: vec![],
     }
 }
 
@@ -639,7 +671,7 @@ fn fixture_gem(root: &Path) -> RollbackFixture {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
-        global: false,
+        scope_args: vec![],
     }
 }
 
@@ -719,7 +751,7 @@ fn rollback_dispatch_branch_cargo() {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
-        global: false,
+        scope_args: vec![],
     };
     assert_rollback_restored(root, "cargo", &fixture);
 }
@@ -745,7 +777,7 @@ fn rollback_dispatch_branch_golang() {
         // and leaves the module cache pristine, so it never restores cache
         // bytes. Drive the global/in-place path to exercise byte-restore — the
         // go analog of the cargo test's `vendor/` in-place layout.
-        global: true,
+        scope_args: vec!["--global".to_string()],
     };
     assert_rollback_restored(root, "golang", &fixture);
 }
@@ -769,7 +801,7 @@ fn rollback_dispatch_branch_maven() {
         purl: purl.to_string(),
         verify_file,
         envs: vec![("MAVEN_REPO_LOCAL".to_string(), repo.display().to_string())],
-        global: false,
+        scope_args: vec![],
     };
     assert_rollback_restored(root, "maven", &fixture);
 }
@@ -797,7 +829,7 @@ fn rollback_dispatch_branch_composer() {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
-        global: false,
+        scope_args: vec![],
     };
     assert_rollback_restored(root, "composer", &fixture);
 }
@@ -936,7 +968,38 @@ fn rollback_dispatch_branch_nuget() {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
-        global: false,
+        scope_args: vec![],
     };
     assert_rollback_restored(root, "nuget", &fixture);
+}
+
+/// deno: a JSR cache layout (`<prefix>/@<scope>/<name>/<version>/`, the
+/// scope keeps its `@` on disk) reached through `--global-prefix`, which is
+/// how users point the deno crawler at a materialized JSR tree
+/// (`DenoCrawler::get_jsr_cache_paths` returns the prefix verbatim).
+#[test]
+fn rollback_dispatch_branch_deno() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_root_package_json(root);
+    let jsr_root = root.join("jsr-root");
+    let pkg = jsr_root
+        .join("@__rollback_dispatch__")
+        .join("pkg")
+        .join("1.0.0");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let verify_file = pkg.join("mod.ts");
+    std::fs::write(&verify_file, PATCHED).unwrap();
+    let purl = "pkg:jsr/@__rollback_dispatch__/pkg@1.0.0";
+    write_rollback_manifest(root, purl, "mod.ts");
+    let fixture = RollbackFixture {
+        purl: purl.to_string(),
+        verify_file,
+        envs: vec![],
+        scope_args: vec![
+            "--global-prefix".to_string(),
+            jsr_root.to_str().unwrap().to_string(),
+        ],
+    };
+    assert_rollback_restored(root, "deno", &fixture);
 }

@@ -8,6 +8,7 @@
 //! Modeled on `scan_vendor_e2e.rs` (mock API + real fixture through the
 //! built binary).
 
+use crate::common::envelope::parse_json_envelope;
 use crate::common::{binary, git_sha256, hermetic_command};
 
 use std::path::Path;
@@ -132,7 +133,7 @@ async fn corrupt_ledger_scan_prune_keeps_vendored_manifest_entry() {
         ],
     );
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let v = parse_json_envelope(stdout.trim());
 
     // The GC must not report the vendored entry as pruned…
     let pruned = v["gc"]["prunedManifestEntries"]

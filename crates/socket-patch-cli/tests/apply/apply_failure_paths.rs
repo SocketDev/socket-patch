@@ -15,14 +15,15 @@
 //!      installed tree PRESENT is skipped (not re-patched), a qualified
 //!      singleton whose record holds only NEW files is applied, and a
 //!      ledger-only vendored project is the `noManifest` no-op;
-//!   5. `apply --dry-run --vex` writes no attestation.
+//!   5. `apply --dry-run --vex` writes no attestation;
+//!   6. the `--offline` no-local-source bail.
 
 use serde_json::json;
 
 use crate::apply_fixture::*;
 use crate::common::envelope::{
-    envelope_error_code, event_purls, event_triples, events, find_event, has_event, json_string,
-    parse_json_envelope,
+    codes_in, envelope_error_code, event_purls, event_triples, events, find_event, has_event,
+    json_string, parse_json_envelope,
 };
 use crate::common::git_sha256;
 
@@ -553,4 +554,35 @@ fn dry_run_with_vex_writes_no_file() {
         GEM_PRISTINE,
         "a dry run must not modify the package"
     );
+}
+
+// ═══════════════════ 6. `--offline` with no local source ═══════════════════
+
+/// Sourceless patches under `--offline --json`: exit 1, nothing applied or
+/// written, and the `offline_missing_sources` run warning is the envelope's
+/// explanation (the human `Error:` block is muted under `--json`).
+#[test]
+fn offline_sourceless_patches_warn_offline_missing_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_sourceless_npm_patches(tmp.path(), 7);
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline", "--json"], &[]);
+    assert_eq!(code, 1, "sourceless patches must fail; stderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert_eq!(json_string(&env, "command"), Some("apply"), "env={env}");
+    assert_eq!(
+        codes_in(&env["warnings"]),
+        vec!["offline_missing_sources".to_string()],
+        "env={env}"
+    );
+    assert_eq!(env["summary"]["applied"], 0, "env={env}");
+    assert!(
+        event_purls(&env, "applied").is_empty(),
+        "nothing may be applied; env={env}"
+    );
+    assert!(
+        !stderr.contains("no local source"),
+        "--json mutes the human report; stderr={stderr}"
+    );
+    assert!(!tmp.path().join("node_modules/miss-0").exists());
 }
