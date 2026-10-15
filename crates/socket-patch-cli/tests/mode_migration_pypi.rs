@@ -922,6 +922,69 @@ async fn uv_script_no_sources_in_a_parent_is_refused_in_both_modes() {
     }
 }
 
+/// #1545: a uv project whose own pyproject has no `[tool.uv]` (and no
+/// `uv.toml` beside it) takes uv's settings from a parent `uv.toml` or
+/// `[tool.uv]`. The `[tool.uv]` table a wired source adds would shadow
+/// that parent, dropping its `resolution` / `exclude-newer`, so the
+/// lock written with them fails `uv sync --locked`. Both modes used to
+/// wire it and exit 0; they must refuse naming the parent and write
+/// nothing. A parent holding only a workspace root's own metadata sets
+/// nothing the project inherits, and the project is still wired.
+#[tokio::test]
+async fn uv_project_under_parent_settings_is_refused_in_both_modes() {
+    let parent_pyproject = "[project]\nname = \"mono\"\nversion = \"0.1.0\"\n";
+    for (file, setting, refused) in [
+        (
+            "uv.toml",
+            "resolution = \"lowest-direct\"\n".to_string(),
+            true,
+        ),
+        (
+            "pyproject.toml",
+            format!("{parent_pyproject}\n[tool.uv]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n"),
+            true,
+        ),
+        (
+            "pyproject.toml",
+            format!("{parent_pyproject}\n[tool.uv.workspace]\nmembers = []\n"),
+            false,
+        ),
+    ] {
+        let (_tmp, root) = project();
+        stage_uv(&root);
+        std::fs::write(root.parent().unwrap().join(file), &setting).unwrap();
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted {file}: {env:#}");
+        if refused {
+            assert_eq!(hosted_pinned(&env), 0, "hosted {file}: {env:#}");
+            assert!(
+                env.to_string().contains("redirect_uv_project_unsupported")
+                    && env.to_string().contains(&format!("../{file}")),
+                "hosted {file}: {env:#}"
+            );
+            assert_eq!(tree(&root), before, "hosted {file} wrote nothing");
+        } else {
+            assert_eq!(hosted_pinned(&env), 1, "hosted {file}: {env:#}");
+            continue;
+        }
+
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored {file}: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_ancestor_settings")
+                && env.to_string().contains(&format!("../{file}")),
+            "vendored {file}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "vendored {file} wrote nothing");
+    }
+}
+
 /// In a uv workspace, uv takes a member's script settings from the
 /// workspace root, so a member's own `[tool.uv]` does not shield the script
 /// from the root's `no-sources`. The #1138 workspace-member guard refuses

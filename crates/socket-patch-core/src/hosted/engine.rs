@@ -714,12 +714,13 @@ pub async fn read_candidate_files(
             out.files.insert(rel.to_string(), text);
         }
     }
-    // A PEP 723 script also takes uv's settings from above the root when
-    // the root holds none (#1501); only a disk view has an above.
+    // A PEP 723 script (#1501) or a project (#1545) also takes uv's
+    // settings from above the root when the root holds none; only a disk
+    // view has an above.
     if out
         .files
         .keys()
-        .any(|path| crate::utils::python_lock::is_script_lock_name(path))
+        .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path))
         && !crate::utils::python_script::root_governs_script(
             out.files.get("pyproject.toml").map(String::as_str),
             out.files

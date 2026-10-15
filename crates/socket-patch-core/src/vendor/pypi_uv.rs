@@ -37,7 +37,10 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::line_endings::terminator;
 use crate::utils::purl::purl_name_version;
 use crate::utils::python_lock::preserve_line_endings;
-use crate::utils::python_script::{refuse_uv_no_sources, UV_TOML};
+use crate::utils::python_script::{
+    find_ancestor_uv_config, refuse_uv_no_sources, refuse_uv_project_shadowing,
+    root_governs_script, UvConfig, UV_TOML,
+};
 
 use super::common::{
     ensure_unchanged, item_get, pep508_name, pyproject_dependency_specs, record, refuse_symlinked,
@@ -96,6 +99,10 @@ pub(super) struct UvProject {
     pub lock_revision: Option<u64>,
     /// The project's `uv.toml`, for the no-sources check (#564).
     pub uv_toml: Option<String>,
+    /// The uv settings file above the project that uv applies to it when
+    /// the project's own files set none, which a wired `[tool.uv]` would
+    /// shadow (#1545).
+    pub ancestor: Option<UvConfig>,
     /// Non-fatal advisories raised during load (untested lock revision).
     pub warnings: Vec<VendorWarning>,
 }
@@ -223,6 +230,9 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
     }
 
     let uv_toml = read_uv_toml(root).await;
+    let ancestor = (!root_governs_script(Some(&pyproject_text), uv_toml.as_deref()))
+        .then(|| find_ancestor_uv_config(root))
+        .flatten();
 
     // PEP 621 dynamic dependencies are resolved by a build backend at lock
     // time — there is no static dependency list to classify against.
@@ -275,6 +285,7 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
         lock,
         lock_revision,
         uv_toml,
+        ancestor,
         warnings,
     })
 }
@@ -342,6 +353,11 @@ pub(super) fn check_target_guards(
         p.uv_toml.as_deref(),
     )
     .map_err(|detail| ("pypi_uv_no_sources", detail))?;
+    // A parent uv.toml / [tool.uv] supplies the project's settings while
+    // the project sets none; the [tool.uv] table wired below would make
+    // uv drop them, failing `uv sync --locked` (#1545).
+    refuse_uv_project_shadowing(&p.pyproject_text, p.uv_toml.as_deref(), p.ancestor.as_ref())
+        .map_err(|detail| ("pypi_uv_ancestor_settings", detail))?;
     // The same name at multiple versions/sources (platform forks) means one
     // surgical [[package]] rewrite would mispin the other forks — refuse.
     let units = p
@@ -2836,6 +2852,55 @@ wheels = [
                 "uv_lock_manifest_overrides"
             ]
         );
+    }
+
+    /// #1545: a project whose own files set no uv settings takes them from
+    /// a parent `uv.toml` / `[tool.uv]`; the `[tool.uv]` table vendoring
+    /// adds would shadow that parent, so it is refused before any write.
+    #[tokio::test]
+    async fn guards_refuse_shadowing_a_parents_uv_settings() {
+        let target = |p: &UvProject| {
+            check_target_guards(p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f").map(|_| ())
+        };
+        let nested = |parent: &'static str, text: &'static str| async move {
+            let tmp = tempfile::tempdir().unwrap();
+            let app = tmp.path().join("app");
+            tokio::fs::create_dir(&app).await.unwrap();
+            for (name, body) in [
+                ("pyproject.toml", DIRECT_REGISTRY_PYPROJECT),
+                ("uv.lock", DIRECT_REGISTRY_LOCK),
+            ] {
+                tokio::fs::write(app.join(name), body).await.unwrap();
+            }
+            tokio::fs::write(tmp.path().join(parent), text)
+                .await
+                .unwrap();
+            (tmp, app)
+        };
+        for (parent, text, named) in [
+            ("uv.toml", "resolution = \"lowest-direct\"\n", "../uv.toml"),
+            (
+                "pyproject.toml",
+                "[tool.uv]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
+                "../pyproject.toml [tool.uv]",
+            ),
+        ] {
+            let (_tmp, app) = nested(parent, text).await;
+            let err = target(&load_uv_project(&app).await.unwrap()).unwrap_err();
+            assert_eq!(err.0, "pypi_uv_ancestor_settings", "{parent}: {}", err.1);
+            assert!(err.1.starts_with(named), "{}", err.1);
+            // The project's own settings stop uv's lookup at the project.
+            tokio::fs::write(
+                app.join("pyproject.toml"),
+                format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\nmanaged = true\n"),
+            )
+            .await
+            .unwrap();
+            target(&load_uv_project(&app).await.unwrap()).unwrap();
+        }
+        // A parent workspace root's own metadata is not inherited.
+        let (_tmp, app) = nested("pyproject.toml", "[tool.uv.workspace]\nmembers = []\n").await;
+        target(&load_uv_project(&app).await.unwrap()).unwrap();
     }
 
     #[tokio::test]
@@ -5752,6 +5817,7 @@ wheels = [
             lock: Arc::new(lock.parse().unwrap()),
             lock_revision: None,
             uv_toml: None,
+            ancestor: None,
             warnings: Vec::new(),
         }
     }

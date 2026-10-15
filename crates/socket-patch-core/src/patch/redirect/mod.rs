@@ -5928,14 +5928,14 @@ fn plan_python_metadata_with(
     };
     source_scope().map_err(unsupported)?;
     let project_file = |rel: &str| files.get(rel).map(String::as_str);
+    let ancestor = files.get(UV_ANCESTOR_CONFIG_KEY).and_then(|value| {
+        let (rel, text) = value.split_once('\n')?;
+        Some(crate::utils::python_script::UvConfig {
+            rel: rel.to_string(),
+            text: text.to_string(),
+        })
+    });
     if script {
-        let ancestor = files.get(UV_ANCESTOR_CONFIG_KEY).and_then(|value| {
-            let (rel, text) = value.split_once('\n')?;
-            Some(crate::utils::python_script::UvConfig {
-                rel: rel.to_string(),
-                text: text.to_string(),
-            })
-        });
         crate::utils::python_script::refuse_uv_script_no_sources(
             &dep.name,
             &original,
@@ -5950,6 +5950,13 @@ fn plan_python_metadata_with(
             Some(&original),
             project_file(crate::utils::python_script::UV_TOML),
         )
+        .and_then(|()| {
+            crate::utils::python_script::refuse_uv_project_shadowing(
+                &original,
+                project_file(crate::utils::python_script::UV_TOML),
+                ancestor.as_ref(),
+            )
+        })
     }
     .map_err(unsupported)?;
     let rewritten = if script {
@@ -6343,7 +6350,8 @@ pub const NUGET_INHERITED_MAPPING_KEY: &str = "<socket-patch:nuget-inherited-map
 const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
 
 /// The synthetic candidate key carrying the uv settings file above the
-/// root that uv applies to a PEP 723 script there (#1501), as
+/// root that uv applies to a PEP 723 script (#1501) or a project (#1545)
+/// there, as
 /// `<rel>\n<text>` ([`find_ancestor_uv_config`]). Absent (the in-memory
 /// engine, unit tests, no such file), only the root's own files are read.
 /// Never a path (see [`sbt::SYNTHETIC_KEY_PREFIX`]).
@@ -25995,8 +26003,7 @@ mod python_metadata_pairing_tests {
 
     /// #1501: a script takes uv's settings from above the root when the
     /// root sets none; the engine hands that file over under
-    /// [`UV_ANCESTOR_CONFIG_KEY`]. The root's own settings stop the lookup,
-    /// and a project lane never reads it.
+    /// [`UV_ANCESTOR_CONFIG_KEY`]. The root's own settings stop the lookup.
     #[test]
     fn no_sources_above_the_root_refuses_a_script() {
         let parent = |rel: &str, text: &str| format!("{rel}\n{text}");
@@ -26050,10 +26057,58 @@ mod python_metadata_pairing_tests {
         wired(
             "uv.lock",
             &[
-                ("pyproject.toml", PYPROJECT),
+                ("pyproject.toml", &format!("{PYPROJECT}[tool.uv]\n")),
                 (UV_ANCESTOR_CONFIG_KEY, &uv_toml),
             ],
         );
+    }
+
+    /// #1545: a project whose root sets no uv settings takes them from the
+    /// parent file the engine hands over; the `[tool.uv]` table the rewrite
+    /// adds would shadow it, so the project lane refuses before writing.
+    #[test]
+    fn ancestor_settings_refuse_a_project_that_would_shadow_them() {
+        let parent = |rel: &str, text: &str| format!("{rel}\n{text}");
+        for (ancestor, named) in [
+            (
+                parent("../uv.toml", "resolution = \"lowest-direct\"\n"),
+                "../uv.toml sets resolution",
+            ),
+            (
+                parent(
+                    "../pyproject.toml",
+                    "[tool.uv]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
+                ),
+                "../pyproject.toml [tool.uv] sets exclude-newer",
+            ),
+        ] {
+            let Err(warning) = plan(
+                "uv.lock",
+                &[
+                    ("pyproject.toml", PYPROJECT),
+                    (UV_ANCESTOR_CONFIG_KEY, &ancestor),
+                ],
+                &[],
+            ) else {
+                panic!("{ancestor} must refuse");
+            };
+            assert_eq!(warning.code, "redirect_uv_project_unsupported");
+            assert!(warning.detail.contains(named), "{}", warning.detail);
+        }
+        // A parent workspace root's own metadata is not inherited.
+        let (edit, _) = plan(
+            "uv.lock",
+            &[
+                ("pyproject.toml", PYPROJECT),
+                (
+                    UV_ANCESTOR_CONFIG_KEY,
+                    &parent("../pyproject.toml", "[tool.uv.workspace]\nmembers = []\n"),
+                ),
+            ],
+            &[],
+        )
+        .unwrap_or_else(|w| panic!("{}: {}", w.code, w.detail));
+        assert!(edit.is_some());
     }
 }
 
