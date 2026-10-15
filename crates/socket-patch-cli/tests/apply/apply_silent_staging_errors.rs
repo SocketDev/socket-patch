@@ -21,12 +21,8 @@
 //! unlike vendor, which records a `failed` / `apply_failed` event for the
 //! patch; see `vendor/vendor_silent_errors.rs`).
 
-use std::path::Path;
-
-use serde_json::json;
-
-use crate::apply_fixture::{patch_record, run_apply, write_manifest};
-use crate::common::envelope::{json_string, parse_json_envelope};
+use crate::apply_fixture::{run_apply, write_sourceless_npm_patches};
+use crate::common::envelope::{codes_in, json_string, parse_json_envelope};
 
 /// Non-error stderr lines: drop the unconditional core API-token warning
 /// (both its lead line and its "Got: ... Continuing anyway" continuation)
@@ -41,20 +37,6 @@ fn stderr_chatter(stderr: &str) -> Vec<String> {
         })
         .map(|l| l.to_string())
         .collect()
-}
-
-/// Valid manifest with one npm patch entry and NO blob/diff/package
-/// artifact anywhere under `.socket/`: staging has no usable source.
-fn write_sourceless_manifest(root: &Path) {
-    write_manifest(
-        root,
-        json!({
-            "pkg:npm/left-pad@1.3.0": patch_record(
-                "11111111-1111-4111-8111-111111111111",
-                json!({ "index.js": { "beforeHash": "a".repeat(64), "afterHash": "b".repeat(64) } }),
-            )
-        }),
-    );
 }
 
 /// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
@@ -75,7 +57,7 @@ fn dead_endpoint() -> String {
 #[test]
 fn apply_silent_offline_missing_source_keeps_error_output() {
     let tmp = tempfile::tempdir().unwrap();
-    write_sourceless_manifest(tmp.path());
+    write_sourceless_npm_patches(tmp.path(), 1);
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &["--silent", "--offline"], &[]);
     assert_eq!(code, 1, "offline + no local source must fail: {stderr}");
@@ -96,7 +78,7 @@ fn apply_silent_offline_missing_source_keeps_error_output() {
 #[test]
 fn apply_silent_online_download_failure_keeps_error_output() {
     let tmp = tempfile::tempdir().unwrap();
-    write_sourceless_manifest(tmp.path());
+    write_sourceless_npm_patches(tmp.path(), 1);
 
     let url = dead_endpoint();
     let token = format!("sktsec_{}_api", "x".repeat(44));
@@ -142,7 +124,8 @@ fn apply_silent_online_download_failure_keeps_error_output() {
 #[test]
 fn apply_json_offline_missing_source_keeps_stderr_clean() {
     let tmp = tempfile::tempdir().unwrap();
-    write_sourceless_manifest(tmp.path());
+    write_sourceless_npm_patches(tmp.path(), 1);
+    let manifest_before = std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap();
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline"], &[]);
     assert_eq!(code, 1, "offline + no local source must fail: {stderr}");
@@ -151,6 +134,26 @@ fn apply_json_offline_missing_source_keeps_stderr_clean() {
         json_string(&v, "status"),
         Some("partialFailure"),
         "the pinned envelope shape for the offline bail, got {v}"
+    );
+    // The run warning is the envelope's only explanation of the bail.
+    let warnings = codes_in(&v["warnings"]);
+    assert!(
+        warnings.iter().any(|c| c == "offline_missing_sources")
+            && !warnings.iter().any(|c| c == "sources_download_failed"),
+        "the offline bail reports offline_missing_sources, got {v}"
+    );
+    assert_eq!(v["summary"]["applied"], 0, "nothing is applied, got {v}");
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap(),
+        manifest_before,
+        "the bail must leave the manifest untouched"
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join(".socket/blobs"))
+            .unwrap()
+            .count(),
+        0,
+        "the bail must not stage anything into .socket/blobs"
     );
     let chatter = stderr_chatter(&stderr);
     assert!(

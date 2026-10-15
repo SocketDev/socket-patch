@@ -270,8 +270,7 @@ fn assert_vendor_step_error(
     expect_code: &str,
 ) -> serde_json::Value {
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout must be one JSON object ({e}); stdout={stdout}"));
+    let v = parse_json_envelope(stdout.trim());
     assert_eq!(v["status"], "error", "envelope={v}");
     assert_eq!(v["error"]["code"], expect_code, "envelope={v}");
     assert!(

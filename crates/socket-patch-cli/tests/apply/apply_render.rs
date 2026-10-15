@@ -450,11 +450,21 @@ fn offline_missing_report_caps_purls_and_names_repair() {
         stderr.contains("Error: 7 patches have no local source and --offline is set:"),
         "stderr={stderr}"
     );
-    let listed = stderr
-        .lines()
-        .filter(|l| l.starts_with("  - pkg:npm/miss-"))
-        .count();
-    assert_eq!(listed, 5, "the list is capped at five; stderr={stderr}");
+    // Five distinct fixture purls are listed (in no fixed order).
+    let fixture: Vec<String> = (0..7)
+        .map(|i| format!("  - pkg:npm/miss-{i}@1.0.0"))
+        .collect();
+    let listed: std::collections::BTreeSet<&str> =
+        stderr.lines().filter(|l| l.starts_with("  - ")).collect();
+    assert_eq!(
+        listed.len(),
+        5,
+        "the list is capped at five; stderr={stderr}"
+    );
+    assert!(
+        listed.iter().all(|l| fixture.iter().any(|f| f == l)),
+        "only the fixture purls are listed; stderr={stderr}"
+    );
     assert!(stderr.contains("  ... and 2 more"), "stderr={stderr}");
     assert!(
         stderr.contains("Run `socket-patch repair` to download missing artifacts."),

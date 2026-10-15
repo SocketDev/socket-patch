@@ -98,7 +98,7 @@ fn run_apply_for_ecosystem(cwd: &Path, ecosystem: &str) -> (i32, Value) {
 fn run_apply_for_ecosystem_env(
     cwd: &Path,
     ecosystem: &str,
-    envs: &[(&str, &Path)],
+    envs: &[(String, String)],
 ) -> (i32, Value) {
     let mut cmd = hermetic::command(&binary());
     cmd.args([
@@ -310,8 +310,11 @@ fn dispatch_branch_deno() {
     std::fs::create_dir_all(&deno_dir).unwrap();
     let purl = "pkg:jsr/@__dispatch_test__/pkg@1.0.0";
     write_manifest(tmp.path(), purl);
-    let (code, env) =
-        run_apply_for_ecosystem_env(tmp.path(), "deno", &[("DENO_DIR", deno_dir.as_path())]);
+    let envs = [(
+        "DENO_DIR".to_string(),
+        deno_dir.to_str().unwrap().to_string(),
+    )];
+    let (code, env) = run_apply_for_ecosystem_env(tmp.path(), "deno", &envs);
     assert_apply_dispatched(code, &env, "deno", &[purl]);
 }
 
