@@ -8,7 +8,7 @@
 //! "you configured the sha512- storage hash, not the token" hint and the
 //! token-shape warning), which only a spawned process can observe.
 
-use crate::common::envelope::{parse_json_envelope, warning_codes};
+use crate::common::envelope::{output_envelope, warning_codes};
 use crate::common::{binary, hermetic_command};
 
 use wiremock::matchers::{method, path};
@@ -16,16 +16,33 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 
-/// The command's stdout parsed as the `--json` envelope.
-fn envelope(out: &std::process::Output) -> serde_json::Value {
-    parse_json_envelope(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// `warnings[]` carries the startup downgrade to the public proxy.
+/// `warnings[]` carries the startup downgrade to the public proxy, and its
+/// detail still names the `--org` remedy agents act on.
 fn assert_api_auth_fallback(v: &serde_json::Value, context: &str) {
     assert!(
         warning_codes(v).iter().any(|c| c == "api_auth_fallback"),
         "[{context}] api_auth_fallback missing from warnings[]: {v}"
+    );
+    let detail = v["warnings"]
+        .as_array()
+        .and_then(|w| w.iter().find(|w| w["code"] == "api_auth_fallback"))
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_default();
+    assert!(
+        detail.contains("--org"),
+        "[{context}] the api_auth_fallback detail names the remedy: {v}"
+    );
+}
+
+/// The org fallback warning reaches stderr exactly once, in any output
+/// mode that doesn't mute warnings.
+fn assert_org_warning_once(stderr: &str, mode: &str) {
+    assert_eq!(
+        stderr
+            .matches("Could not determine your organization")
+            .count(),
+        1,
+        "[{mode}] the failed resolution warns once; stderr={stderr}"
     );
 }
 
@@ -88,12 +105,10 @@ async fn run_get_with_hash_shaped_token(extra: &[&str]) -> std::process::Output 
 /// naming the `sha512-` prefix and the flag the token came from, and the
 /// pre-flight token-shape warning.
 fn assert_hash_token_render(stderr: &str) {
-    assert_eq!(
-        stderr
-            .matches("Warning: Could not determine your organization")
-            .count(),
-        1,
-        "the failed resolution warns once; stderr={stderr}"
+    assert_org_warning_once(stderr, "human");
+    assert!(
+        stderr.contains("Warning: Could not determine your organization"),
+        "the fallback is printed as a warning; stderr={stderr}"
     );
     assert!(
         stderr.contains(
@@ -103,12 +118,16 @@ fn assert_hash_token_render(stderr: &str) {
         "the warning says what the run does and how to fix it; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Hint: --api-token starts with `sha512-`"),
-        "the 401 + hash-shaped token prints the stored-hash hint; stderr={stderr}"
+        stderr.contains("Hint: --api-token starts with `sha512-`")
+            && stderr.contains("Set it to the raw `sktsec_..._api` value instead."),
+        "the 401 + hash-shaped token prints the stored-hash hint and its \
+         remedy; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Warning: --api-token does not look like a Socket API token"),
-        "the shape warning names the flag, not SOCKET_API_TOKEN; stderr={stderr}"
+        stderr.contains("Warning: --api-token does not look like a Socket API token")
+            && stderr.contains("looks like an SRI-format hash"),
+        "the shape warning names the flag, not SOCKET_API_TOKEN, and says \
+         why; stderr={stderr}"
     );
 }
 
@@ -135,6 +154,7 @@ async fn get_with_hash_shaped_token_prints_stored_hash_hint_on_401() {
 async fn get_with_hash_shaped_token_under_json_keeps_warnings_and_envelope() {
     let out = run_get_with_hash_shaped_token(&["--json"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_org_warning_once(&stderr, "json");
     assert!(
         stderr.contains("Hint: --api-token") && stderr.contains("Warning: --api-token"),
         "--json must not mute the stderr warnings; stderr={stderr}"
@@ -144,7 +164,7 @@ async fn get_with_hash_shaped_token_under_json_keeps_warnings_and_envelope() {
         Some(0),
         "graceful not-found must exit 0; stderr={stderr}"
     );
-    let v = envelope(&out);
+    let v = output_envelope(&out);
     assert_eq!(
         v["status"], "notFound",
         "404 after failed org resolution maps to not_found, got: {v}"
@@ -166,11 +186,13 @@ async fn get_with_hash_shaped_token_under_silent_prints_no_warnings() {
     let out = run_get_with_hash_shaped_token(&["--json", "--silent"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("Warning:") && !stderr.contains("Hint:"),
+        !stderr.contains("Could not determine")
+            && !stderr.contains("SRI-format")
+            && !stderr.contains("Hint:"),
         "--silent must mute the org and token-shape warnings; stderr={stderr}"
     );
     assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
-    assert_eq!(envelope(&out)["status"], "notFound");
+    assert_eq!(output_envelope(&out)["status"], "notFound");
 }
 
 /// #648: the uuid path's agent `--dry-run` preview must report the
@@ -242,7 +264,7 @@ async fn unresolved_org_reaches_get_uuid_dry_run_json_warnings() {
         .output()
         .expect("run socket-patch get");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let v = envelope(&out);
+    let v = output_envelope(&out);
     assert_eq!(
         v["dryRun"], true,
         "the agent dry-run envelope: {v}; stderr={stderr}"
@@ -359,7 +381,7 @@ async fn unresolved_org_routes_the_whole_scan_vex_run_to_the_proxy_once() {
         .output()
         .expect("run socket-patch scan");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let v = envelope(&out);
+    let v = output_envelope(&out);
     assert_api_auth_fallback(&v, "scan --vex --json");
 
     let requests = mock.received_requests().await.unwrap();
@@ -447,7 +469,7 @@ async fn unresolved_org_reaches_apply_and_vendor_json_warnings() {
             .current_dir(cwd)
             .output()
             .unwrap_or_else(|e| panic!("run socket-patch {command}: {e}"));
-        let v = envelope(&out);
+        let v = output_envelope(&out);
         assert_eq!(v["command"], command, "{v}");
         assert_api_auth_fallback(&v, command);
     }
