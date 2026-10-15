@@ -522,11 +522,15 @@ async fn lockless_npm_project(base: &Path, mut dir: PathBuf) -> Option<PathBuf> 
 /// The nearest ancestor of `dir`, up to `base`, that installs it as a
 /// workspace member, whether or not it holds a lock: its `package.json` or
 /// `vlt.json` `workspaces` (in any package manager's reading) or its
-/// `pnpm-workspace.yaml` `packages:` ([`lists_as_member`], which errs
-/// toward "member") lists `dir`, or it is a Rush root (`rush.json` lists
-/// projects that keep no lock of their own).
+/// `pnpm-workspace.yaml` `packages:` lists `dir`, or it is a Rush root
+/// (`rush.json` lists projects that keep no lock of their own).
 ///
-/// [`lists_as_member`]: crate::utils::pnpm_workspace::lists_as_member
+/// Unlike the hosted refusals, this errs toward "not a member": a member's
+/// copies are in its workspace's lock, so they never get this far, while a
+/// project wrongly kept the scan root's fails that root's run. pnpm globs
+/// the pnpm matcher does not model (braces, classes) go through the
+/// shared workspace grammar; a `pnpm-workspace.yaml` that cannot be read,
+/// which pnpm cannot install from either, lists nothing.
 async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
     let lists = |patterns: &[String], rel: &[String]| {
         WorkspacesDialect::ALL
@@ -557,7 +561,12 @@ async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
                 .is_some_and(|groups| groups.iter().any(|group| lists(group, &rel)))
             || read_regular_to_string(&ancestor.join(PNPM_WORKSPACE))
                 .await
-                .is_ok_and(|yaml| crate::utils::pnpm_workspace::lists_as_member(&yaml, &rel));
+                .ok()
+                .and_then(|yaml| read_package_globs(&yaml).ok().flatten())
+                .is_some_and(|globs| {
+                    crate::utils::pnpm_workspace::lists_member(&globs, &rel)
+                        .unwrap_or_else(|_| lists(&globs, &rel))
+                });
         if listed {
             return Some(ancestor.to_path_buf());
         }
@@ -1254,9 +1263,18 @@ mod tests {
         write(root, "p/package.json", r#"{"name":"p"}"#);
         write(root, "p/pnpm-workspace.yaml", "packages:\n  - m\n");
         write(root, "p/m/package.json", r#"{"name":"pm"}"#);
-        // An unreadable pnpm-workspace.yaml keeps the copy the root's.
+        // An unreadable pnpm-workspace.yaml lists nothing; brace globs
+        // still list their members.
         write(root, "q/pnpm-workspace.yaml", "packages: [\n");
         write(root, "q/m/package.json", r#"{"name":"qm"}"#);
+        write(root, "b/package.json", r#"{"name":"b"}"#);
+        write(
+            root,
+            "b/pnpm-workspace.yaml",
+            "packages:\n  - '{apps,libs}/*'\n",
+        );
+        write(root, "b/apps/m/package.json", r#"{"name":"bm"}"#);
+        write(root, "b/tools/x/package.json", r#"{"name":"bx"}"#);
         // A settings-only pnpm-workspace.yaml lists no member.
         write(root, "s/pnpm-workspace.yaml", "onlyBuiltDependencies: []\n");
         write(root, "s/x/package.json", r#"{"name":"sx"}"#);
@@ -1295,7 +1313,18 @@ mod tests {
             owner("p/m/node_modules/left-pad").await,
             Some(root.join("p"))
         );
-        assert_eq!(owner("q/m/node_modules/left-pad").await, None);
+        assert_eq!(
+            owner("q/m/node_modules/left-pad").await,
+            Some(root.join("q/m"))
+        );
+        assert_eq!(
+            owner("b/apps/m/node_modules/left-pad").await,
+            Some(root.join("b"))
+        );
+        assert_eq!(
+            owner("b/tools/x/node_modules/left-pad").await,
+            Some(root.join("b/tools/x"))
+        );
         assert_eq!(
             owner("s/x/node_modules/left-pad").await,
             Some(root.join("s/x"))
