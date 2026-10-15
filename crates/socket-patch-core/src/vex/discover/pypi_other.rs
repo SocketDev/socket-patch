@@ -124,6 +124,7 @@ use crate::vendor::common::DeclTable;
 use crate::vendor::lock_inventory::pypi::{hosted_artifact_url, parse_pipfile_lock};
 use crate::vendor::lock_inventory::{pipfile_lock_entries, LockIntegrity};
 
+const PIPFILE: &str = "Pipfile";
 const PIPFILE_LOCK: &str = "Pipfile.lock";
 const ROOT_REQUIREMENTS: &str = "requirements.txt";
 const PYPROJECT: &str = "pyproject.toml";
@@ -169,6 +170,11 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         );
         return;
     };
+    // Pipenv installs from the lock only with its Pipfile beside it. A
+    // user's own reference in an abandoned lock (no Pipfile) installs
+    // nothing, so it contests no other lock's wiring (#333, #1549); the
+    // hosted planner leaves such an entry alone.
+    let live = ctx.exists(PIPFILE).await;
     for pkg in entries {
         let (category, name) = (pkg.category, pkg.name);
         let references = pkg.references();
@@ -178,7 +184,9 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 // another lock's wiring. A VCS / editable source names no
                 // release, so it may be any version (#1549).
                 if pkg.is_vcs() {
-                    out.resolved_elsewhere_any_version(PIPFILE_LOCK, pypi_name_purl(name));
+                    if live {
+                        out.resolved_elsewhere_any_version(PIPFILE_LOCK, pypi_name_purl(name));
+                    }
                 } else if let Some(version) = pkg.exact_pin() {
                     out.resolved_elsewhere(PIPFILE_LOCK, pypi_purl(name, version));
                 }
@@ -217,7 +225,7 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 pinned_version: pkg.exact_pin(),
                 tag: None,
                 root_uri: false,
-                foreign_is_evidence: true,
+                foreign_is_evidence: live,
             },
             location,
             integrity_of(location, hashes),
@@ -1725,7 +1733,9 @@ mod tests {
         ];
         for (name, wired, other) in cases {
             let p = Project::new();
-            p.write(wired.0, &wired.1).write(other.0, &other.1);
+            p.write(wired.0, &wired.1)
+                .write(other.0, &other.1)
+                .write("Pipfile", "[packages]\nsix = \"*\"\n");
             let out = p.discover().await;
             assert!(out.refs.is_empty(), "{name}: {:#?}", out.refs);
             assert!(
@@ -1782,7 +1792,8 @@ mod tests {
         ] {
             let p = Project::new();
             p.write("requirements.txt", &vendored_requirements)
-                .write("Pipfile.lock", &other);
+                .write("Pipfile.lock", &other)
+                .write("Pipfile", "[packages]\nsix = \"*\"\n");
             let out = p.discover().await;
             assert!(out.refs.is_empty(), "{name}: {:#?}", out.refs);
             assert!(
@@ -1844,9 +1855,25 @@ mod tests {
         ] {
             let p = Project::new();
             p.write("requirements.txt", &vendored_requirements)
-                .write("Pipfile.lock", &other);
+                .write("Pipfile.lock", &other)
+                .write("Pipfile", "[packages]\nsix = \"*\"\n");
             let out = p.discover().await;
             assert_eq!(out.refs.len(), 1, "{name}: {:#?}", out.diagnostics);
+        }
+
+        // #333: with no Pipfile beside it, Pipenv installs nothing from the
+        // lock, so a user's own reference there contests nothing.
+        for other in [
+            pipfile(serde_json::json!({
+                "file": "https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl",
+            })),
+            pipfile(serde_json::json!({ "git": "https://github.com/benjaminp/six.git" })),
+        ] {
+            let p = Project::new();
+            p.write("requirements.txt", &vendored_requirements)
+                .write("Pipfile.lock", &other);
+            let out = p.discover().await;
+            assert_eq!(out.refs.len(), 1, "abandoned: {:#?}", out.diagnostics);
         }
     }
 }

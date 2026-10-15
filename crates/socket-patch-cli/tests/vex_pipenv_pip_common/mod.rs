@@ -1353,7 +1353,8 @@ pub fn embedded_apply_and_vendor_vex_attest_a_manifest_less_checkout(flavors: &[
 /// #1549: beside the wired lock, ANOTHER install source (`other`, written
 /// to `other_rel`) resolves the same release from a non-Socket artifact (a
 /// Pipfile.lock `file` url / `path` wheel, a requirements `name @ url`
-/// line). Pipenv / pip install that upstream artifact, so the wiring is
+/// line; a contesting Pipfile.lock gets its Pipfile). Pipenv / pip install
+/// that upstream artifact, so the wiring is
 /// contested: never attested, `--no-verify` included, and the contest is
 /// explained. Without `other` the same checkout attests.
 pub fn contested_by_a_non_socket_direct_reference(
@@ -1370,6 +1371,10 @@ pub fn contested_by_a_non_socket_direct_reference(
             let api = api_with(mode.uuid(), PURL);
             assert_ok_attested(&vex(&cwd, &vex_run(Some(&api))), mode, &what);
             put(&cwd, other_rel, other.as_bytes());
+            if other_rel == "Pipfile.lock" {
+                // Pipenv installs from the lock only with its Pipfile.
+                put(&cwd, "Pipfile", PIPFILE.as_bytes());
+            }
             for no_verify in [false, true] {
                 let run = crate::vex_e2e_common::VexRun {
                     no_verify,
