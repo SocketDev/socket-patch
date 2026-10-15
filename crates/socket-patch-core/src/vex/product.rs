@@ -168,8 +168,8 @@ fn parse_pyproject(content: &str) -> Option<String> {
     let (name, version) = pyproject_name_version(&doc)?;
     // The purl carries the PEP 503 name, like every pypi component purl:
     // OpenVEX consumers match `My_Service` and `my-service` by exact purl
-    // (#1547).
-    crate::utils::purl::pypi_purl(&name, &version)
+    // (#1547). `packaging` strips a version's surrounding whitespace too.
+    crate::utils::purl::pypi_purl(&name, version.trim())
 }
 
 /// The project's name and version, read the way its build backend reads
@@ -1441,6 +1441,15 @@ mod tests {
         assert_eq!(
             parse_pyproject(content).as_deref(),
             Some("pkg:pypi/legacy-pdm-app@0.0.1")
+        );
+    }
+
+    #[test]
+    fn pyproject_trims_name_and_version() {
+        let content = "[project]\nname = \" My_Service \"\nversion = \" 1.2.0 \"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/my-service@1.2.0")
         );
     }
 
