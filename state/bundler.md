@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-14 (run 42), main `015e871`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23.
+Last updated: 2026-10-15 (run 43), main `e76cb9b`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23.
 
 ## Coverage matrix
 
@@ -396,6 +396,15 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | #1531 neighbours: `;`-opener inside `group … do`, `source … do end; source … do`, `if true; source … do` | — | pass | — | — |
 | `in_source_block` unit probe, 64 shapes | 63 pass (`self.source` miss, see Known non-bugs) | | | |
 
+### Run 43 (main `e76cb9b`, v5.0.1; Linux Ruby 3.3.6, Bundler 2.5.22; agent hand-written manifest + `apply --offline` / `vex`, real `bundle install`)
+
+| Cell | Result |
+| --- | --- |
+| Docker-style `GEM_HOME` = `BUNDLE_APP_CONFIG` = one dir, committed project `.bundle/config` `BUNDLE_PATH: vendor/bundle` (ignored by Bundler) → agent `apply` patches the `GEM_HOME` copy, `vex` attests | pass |
+| Same, `$BUNDLE_APP_CONFIG/config` sets a `BUNDLE_PATH` with no install → `vex` refuses | pass |
+| Gemspec product: commented `# spec.version = "…"` above `spec.version = Acme::VERSION` | **fail #1573** (`pkg:gem/acme@0.0.1`) |
+| Gemspec product: commented `# spec.name = "…"` above the real one | **fail #1573** |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -419,9 +428,9 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 ## Backlog
 
 1. H→V takeover with the hosted patched archive in `vendor/cache`, end to end, then `vendor --revert` / `remove`. Both takeover paths forward `upstream_gem_stale_cache` (`vendor.rs:1958`, `:3270`), so this is lower priority.
-2. Re-run #985 / #1109 (`agent:needs-human`) when fixes merge.
-3. Docker-style `BUNDLE_APP_CONFIG=/usr/local/bundle` + `GEM_HOME=/usr/local/bundle` with a committed project `.bundle/config`: agent `apply` / `vex` and the hosted stale guard.
-4. The gemspec product probe (`vex/product.rs` `parse_gemspec`) on real-world gemspec shapes (`.freeze`, commented-out `name =` lines, `Gem::Specification.new "name", "1.0"`).
+2. Re-run #985 / #1109 (`agent:needs-human`) and #1573 when fixes merge.
+3. Docker-style layout, hosted half: the stale-install guard with `GEM_HOME=BUNDLE_APP_CONFIG=/usr/local/bundle` and a committed project `.bundle/config` (the agent half passed in run 43).
+4. Gemspec product, remaining shapes: `Gem::Specification.new "name", "1.0"` constructor args with a stem that differs from the name, `=begin`/`=end` blocks.
 5. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
 
 ## Known non-bugs
@@ -543,3 +552,4 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - The vendored `gemfile_not_loaded` message for `lockfile false` reads "bundler reads the lockfile `lockfile false`". That's cosmetic (run 41).
 - Wait loops like `while pgrep -f "cargo test …"` match their own shell and never exit. Wait on an output file instead (run 41 near-miss).
 - `zz = 1; self.source "…" do` isn't seen as a source block by the #1531 fix, which deliberately excludes receiver calls (`x.source`). An explicit `self.` on a Gemfile DSL call is contrived, so it's not filed (run 42).
+- `vex --json` needs `--output` (`json_requires_output`); grep the human output instead in probes (run 43).
