@@ -18,7 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common;
 pub(crate) use crate::common::envelope::{
-    all_codes, codes_in, envelope_error_code, envelope_error_message,
+    all_codes, codes_in, envelope_error_code, envelope_error_message, hosted_pins,
 };
 
 /// The hosted `skipped` events as the pre-v5.0 `redirect.skipped[]` rows
@@ -37,19 +37,6 @@ pub(crate) fn hosted_skipped(doc: &Value) -> Vec<Value> {
             row
         })
         .collect()
-}
-
-/// How many pins a hosted run wrote (`applied`) or would write (`verified`).
-pub(crate) fn hosted_pinned(doc: &Value) -> u64 {
-    doc["events"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|e| {
-            e["details"]["mode"] == "hosted"
-                && (e["action"] == "applied" || e["action"] == "verified")
-        })
-        .count() as u64
 }
 
 pub(crate) const ORG: &str = "test-org";

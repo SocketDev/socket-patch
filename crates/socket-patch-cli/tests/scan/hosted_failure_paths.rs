@@ -63,7 +63,7 @@ async fn granted_reference_with_unparseable_purl_is_skipped_as_bad_purl() {
         json!([{ "purl": "not-a-purl", "uuid": UUID, "reason": "bad_purl" }]),
         "the skipped entry must carry the SERVED purl and the bad_purl reason: {doc:#}"
     );
-    assert_eq!(hosted_pinned(&doc), 0, "envelope: {doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 0, "envelope: {doc:#}");
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_before,
@@ -109,7 +109,7 @@ async fn granted_reference_without_url_is_skipped_as_no_url() {
         json!([{ "purl": PURL, "uuid": UUID, "reason": "no_url" }]),
         "the skipped entry must carry the no_url reason: {doc:#}"
     );
-    assert_eq!(hosted_pinned(&doc), 0, "envelope: {doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 0, "envelope: {doc:#}");
     assert_eq!(
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_before,
@@ -163,7 +163,7 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
         "the refusal must be accounted as skipped: {doc:#}"
     );
     assert_eq!(
-        hosted_pinned(&doc),
+        hosted_pins(&doc).len(),
         0,
         "a refused purl is never counted redirected: {doc:#}"
     );
@@ -347,11 +347,10 @@ async fn hosted_lock_held_refuses_before_any_write() {
     assert_eq!(code, 1, "a held lock refuses the wet run: {doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
     assert_eq!(doc["error"]["code"], "lock_held", "{doc:#}");
+    let message = envelope_error_message(&doc).unwrap_or_default();
     assert!(
-        !envelope_error_message(&doc)
-            .unwrap_or_default()
-            .contains("waited"),
-        "no --lock-timeout: no waited clause; {doc:#}"
+        !message.is_empty() && !message.contains("waited"),
+        "a contention message, and with no --lock-timeout no waited clause; {doc:#}"
     );
     assert_eq!(
         doc.get("redirect"),
@@ -364,12 +363,12 @@ async fn hosted_lock_held_refuses_before_any_write() {
     let (code, doc) = scan_hosted_json(root, &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "a dry run never contends: {doc:#}");
     assert_eq!(doc["dryRun"], true, "{doc:#}");
-    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 1, "{doc:#}");
 
     // Zero grants under the held lock: nothing to write, so no lock taken.
     let (code, doc) = scan_hosted_json(root, &no_grant.uri(), &[], &[]);
     assert_eq!(code, 0, "an all-skipped run never contends: {doc:#}");
-    assert_eq!(hosted_pinned(&doc), 0, "{doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 0, "{doc:#}");
     assert!(
         Some(&hosted_skipped(&doc)).is_some_and(|s| s.iter().any(|e| e["reason"] == "not_found")),
         "{doc:#}"
@@ -574,7 +573,7 @@ async fn successful_wet_hosted_run_leaves_nothing_under_socket() {
     write_npm_project(root, NAME);
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 1, "{doc:#}");
     assert!(
         !root.join(".socket/apply.lock").exists(),
         "apply.lock never outlives the run"
@@ -774,7 +773,7 @@ async fn ledgerless_cargo_wiring_refuses(manifest_wiring: bool) {
             .any(|e| e["purl"] == CPURL && e["reason"] == "vendored_revert_failed")),
         "the refusal must be accounted as skipped: {doc:#}"
     );
-    assert_eq!(hosted_pinned(&doc), 0, "envelope: {doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 0, "envelope: {doc:#}");
     assert_eq!(
         std::fs::read(root.join(".cargo/config.toml")).ok(),
         config_before,
@@ -834,7 +833,7 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
 
     let (code, preview) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &env);
     assert_eq!(code, 0, "{preview:#}");
-    assert_eq!(hosted_pinned(&preview), 1, "{preview:#}");
+    assert_eq!(hosted_pins(&preview).len(), 1, "{preview:#}");
     assert!(preview["redirect"]["rewrittenFiles"]
         .as_array()
         .unwrap()
@@ -850,7 +849,7 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
 
     let (code, applied) = scan_hosted_json(tmp.path(), &server.uri(), &[], &env);
     assert_eq!(code, 0, "{applied:#}");
-    assert_eq!(hosted_pinned(&applied), 1, "{applied:#}");
+    assert_eq!(hosted_pins(&applied).len(), 1, "{applied:#}");
     let patched = std::fs::read(tmp.path().join("bun.lockb")).unwrap();
     assert_ne!(patched, original);
     assert!(patched
@@ -865,7 +864,7 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
 
     let (code, rerun) = scan_hosted_json(tmp.path(), &server.uri(), &[], &env);
     assert_eq!(code, 0, "{rerun:#}");
-    assert_eq!(hosted_pinned(&rerun), 1, "{rerun:#}");
+    assert_eq!(hosted_pins(&rerun).len(), 1, "{rerun:#}");
     assert_eq!(
         std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
         patched
@@ -927,7 +926,7 @@ async fn malformed_bun_lockb_reports_format_error_without_spawning_bun() {
         let (code, doc) =
             scan_hosted_json(tmp.path(), &server.uri(), extra, &[("PATH", path.as_str())]);
         assert_eq!(code, 0, "{doc:#}");
-        assert_eq!(hosted_pinned(&doc), 0, "{doc:#}");
+        assert_eq!(hosted_pins(&doc).len(), 0, "{doc:#}");
         assert!(warning_detail(&doc, "redirect_bun_lockb_invalid").contains("bun.lockb"));
         assert_eq!(
             std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
@@ -960,7 +959,7 @@ async fn unreadable_bun_lockb_is_preserved_and_reports_the_io_error() {
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[("PATH", path.as_str())]);
     std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(hosted_pinned(&doc), 0, "{doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 0, "{doc:#}");
     assert!(warning_detail(&doc, "redirect_bun_lockb_invalid").contains("cannot read bun.lockb"));
     assert_eq!(std::fs::read(&lock).unwrap(), original);
     assert!(!tmp.path().join("bun.lock").exists());
@@ -996,7 +995,11 @@ async fn fifo_bun_lockb_refuses_before_spawning_bun_and_never_wedges() {
             "{extra:?}: the refusal is a warning, not an error: {doc:#}"
         );
         let detail = warning_detail(&doc, "redirect_bun_lockb_invalid");
-        assert!(detail.contains("bun.lockb"), "{extra:?}: {detail}");
+        // The FIFO-safe opener's refusal, not the generic format error.
+        assert!(
+            detail.contains("bun.lockb") && detail.contains("regular file"),
+            "{extra:?}: {detail}"
+        );
         let codes = codes_in(&doc["warnings"]);
         assert_eq!(
             codes
@@ -1010,7 +1013,7 @@ async fn fifo_bun_lockb_refuses_before_spawning_bun_and_never_wedges() {
             !codes.contains(&"redirect_npm_no_lockfile".to_string()),
             "{extra:?}: the existing binary lock must not be reported missing: {codes:?}"
         );
-        assert_eq!(hosted_pinned(&doc), 0, "{extra:?}: {doc:#}");
+        assert_eq!(hosted_pins(&doc).len(), 0, "{extra:?}: {doc:#}");
         assert!(
             !marker.exists(),
             "{extra:?}: bun must never be spawned on a FIFO bun.lockb (it blocks on it too)"
@@ -1041,7 +1044,7 @@ fn assert_sibling_lock_outcome(
     assert!(warning_detail(doc, "redirect_bun_lockb_invalid").contains("bun.lockb"));
     assert_eq!(doc["dryRun"], dry_run, "{doc:#}");
     assert_eq!(
-        hosted_pinned(doc),
+        hosted_pins(doc).len(),
         0,
         "a failed primary binary lock must never be confirmed by {sibling}: {doc:#}"
     );
@@ -1226,7 +1229,7 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
         lock.contains(&format!("tarball: {HOSTED_URL}")),
         "the redirect must land despite the workspace fallback:\n{lock}"
     );
-    assert_eq!(hosted_pinned(&doc), 1, "envelope: {doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 1, "envelope: {doc:#}");
     // FINDING-5 seam: the user's workspace file was NOT overwritten with the
     // root-only scaffold.
     assert_eq!(
@@ -1270,7 +1273,7 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
         "the overlap warning never flips the exit code: {doc:#}"
     );
     assert_eq!(
-        hosted_pinned(&doc),
+        hosted_pins(&doc).len(),
         1,
         "anchor: Y must redirect normally: {doc:#}"
     );
@@ -1456,7 +1459,7 @@ async fn vlt_takeover_refusal_before_revert() {
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
 
     assert_eq!(code, 0, "{doc:#}");
-    assert_eq!(hosted_pinned(&doc), 0, "{doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 0, "{doc:#}");
     assert!(
         Some(&hosted_skipped(&doc)).is_some_and(|s| s
             .iter()
@@ -1556,11 +1559,11 @@ async fn vlt_decides_before_binary_bun_and_a_refused_uuid_is_never_confirmed() {
             .contains(&json!("bun.lockb")),
         "the binary lock is still rewritten: {refused:#}"
     );
-    assert_eq!(hosted_pinned(&refused), 0, "{refused:#}");
+    assert_eq!(hosted_pins(&refused).len(), 0, "{refused:#}");
     drop(tmp);
 
     let (confirmed, _tmp) = run(false);
-    assert_eq!(hosted_pinned(&confirmed), 1, "{confirmed:#}");
+    assert_eq!(hosted_pins(&confirmed).len(), 1, "{confirmed:#}");
 }
 
 /// REGRESSION (#899): npm 12 never reads npm-shrinkwrap.json. A project
@@ -1597,7 +1600,7 @@ async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
         &[],
     );
     // Still redirected: npm <= 11 installs from the shrinkwrap.
-    assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
+    assert_eq!(hosted_pins(&doc).len(), 1, "{doc:#}");
     let lock = std::fs::read_to_string(tmp.path().join("npm-shrinkwrap.json")).unwrap();
     assert!(lock.contains(HOSTED_URL), "{lock}");
     assert!(
@@ -1605,7 +1608,7 @@ async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
         "no package-lock.json is invented"
     );
     let detail = warning_detail(&doc, "redirect_npm_shrinkwrap_only");
-    for needle in ["covgap-hosted@1.0.0", "npm >= 12", "package-lock.json"] {
+    for needle in ["covgap-hosted@1.0.0", "npm >= 12", "no package-lock.json"] {
         assert!(detail.contains(needle), "{needle}: {detail}");
     }
     // The in-run VEX omits it, so the requested VEX fails the run.

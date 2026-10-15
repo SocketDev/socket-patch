@@ -26,6 +26,7 @@ async fn human_takeover_refusal_lists_the_purl_and_the_revert_warning() {
         "33333333-3333-4333-8333-333333333333",
         "no-such-flavor",
     );
+    let state_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
     let lock_before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
 
     let (code, _stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
@@ -47,6 +48,11 @@ async fn human_takeover_refusal_lists_the_purl_and_the_revert_warning() {
         std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
         lock_before
     );
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+        state_before,
+        "a failed revert must leave the vendored ledger byte-identical"
+    );
 }
 
 /// The human twin of `hosted_lock_held_refuses_before_any_write`: a wet run
@@ -63,6 +69,7 @@ async fn human_lock_held_prints_the_contention_line_and_the_wait_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_npm_project(root, NAME);
+    let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
     let _holder =
         socket_patch_core::patch::apply_lock::acquire(&root.join(".socket"), Duration::ZERO)
             .unwrap();
@@ -76,6 +83,11 @@ async fn human_lock_held_prints_the_contention_line_and_the_wait_hint() {
     assert!(
         stderr.contains("--lock-timeout"),
         "the wait hint must accompany a live holder; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("package-lock.json")).unwrap(),
+        lock_before,
+        "the refused run never touches the lockfile"
     );
 }
 
@@ -91,7 +103,9 @@ async fn human_lock_io_prints_the_open_failure_without_the_wait_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_npm_project(root, NAME);
-    std::fs::write(root.join(".socket"), b"not a dir").unwrap();
+    const SQUATTER: &[u8] = b"not a dir";
+    std::fs::write(root.join(".socket"), SQUATTER).unwrap();
+    let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
 
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 1, "stderr=\n{stderr}");
@@ -102,6 +116,15 @@ async fn human_lock_io_prints_the_open_failure_without_the_wait_hint() {
     assert!(
         !stderr.contains("--lock-timeout"),
         "the wait hint belongs to a live holder only; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".socket")).unwrap(),
+        SQUATTER,
+        "the squatting file is never removed or truncated"
+    );
+    assert_eq!(
+        std::fs::read(root.join("package-lock.json")).unwrap(),
+        lock_before
     );
 }
 
@@ -451,8 +474,8 @@ async fn human_malformed_pre_v5_ledger_does_not_abort_the_run() {
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        engine_stdout(&stdout).starts_with("Would switch "),
-        "the dry run reaches the preview summary; stdout=\n{stdout}"
+        engine_stdout(&stdout).starts_with("Would switch 1 package "),
+        "the dry run still previews the grant; stdout=\n{stdout}"
     );
     assert!(
         !stderr.lines().any(|l| l.starts_with("Error:")) && !stderr.contains("malformed"),
@@ -531,7 +554,7 @@ async fn human_unconfirmed_purl_is_listed_with_a_headline() {
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
     assert_eq!(code, 0, "a no-op redirect still exits 0; stderr=\n{stderr}");
     assert!(
-        engine_stdout(&stdout).starts_with("Would switch "),
+        engine_stdout(&stdout).starts_with("Would switch 0 packages "),
         "stdout=\n{stdout}"
     );
     assert!(
