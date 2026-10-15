@@ -308,16 +308,19 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
     );
 }
 
-/// The location of an editable requirement (`-e <loc>`, `--editable <loc>`,
-/// `--editable=<loc>`).
+/// The location of an editable requirement (`-e <loc>`, `-e<loc>`,
+/// `--editable <loc>`, `--editable=<loc>`), as pip's option parser reads it.
 fn editable_location(code: &str) -> Option<&str> {
-    let rest = code
-        .strip_prefix("--editable")
-        .or_else(|| code.strip_prefix("-e"))?;
-    let rest = match rest.strip_prefix('=') {
-        Some(rest) => rest,
-        None if rest.starts_with(char::is_whitespace) => rest,
-        None => return None,
+    let rest = if let Some(rest) = code.strip_prefix("--editable") {
+        match rest.strip_prefix('=') {
+            Some(rest) => rest,
+            None if rest.starts_with(char::is_whitespace) => rest,
+            None => return None,
+        }
+    } else {
+        // A short option takes its value attached or after a space.
+        let rest = code.strip_prefix("-e")?;
+        rest.strip_prefix('=').unwrap_or(rest)
     };
     rest.split_whitespace().next()
 }
@@ -1826,6 +1829,7 @@ mod tests {
             ),
             ("editable dir", "--editable=./src/six#egg=Six\n"),
             ("editable dir, long flag", "--editable ./src/six#egg=six\n"),
+            ("editable dir, attached short flag", "-e./src/six#egg=six\n"),
             (
                 "legacy name-version egg",
                 "-e git+https://github.com/benjaminp/six.git#egg=six-1.16.0\n",
