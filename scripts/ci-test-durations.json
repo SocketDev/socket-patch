@@ -39,7 +39,6 @@
     "coverage_fix_scan_hosted_dryrun_vendored": 1.61,
     "covgap_api_blob_fetcher": 4.04,
     "covgap_commands_scan_mod": 1.81,
-    "covgap_commands_vex": 0.2,
     "covgap_crawlers_composer_crawler": 0.01,
     "covgap_crawlers_npm_crawler": 0.04,
     "covgap_patch_apply": 0.06,
@@ -240,7 +239,7 @@
     "vendor_jvm_cli": 6.72,
     "vendor_ledger_schema_e2e": 3.13,
     "vendor_partial_staging_e2e": 0.56,
-    "vex_terminal_output": 0.18,
+    "vex": 0.38,
     "vlt_locks": 16.39
   }
 }
