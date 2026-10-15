@@ -196,10 +196,10 @@ fn source_constraint(p: &PoetryProject, canon_name: &str) -> Option<String> {
     poetry_lock::pyproject_source_constraints(p.pyproject_text.as_deref()?).remove(canon_name)
 }
 
-/// The advisory for a source-constrained package wired over a lock that a
-/// Poetry outside 1.4 – 2.2 wrote: the writer installs it, but a 1.4 – 2.2
-/// installer would refuse it. [`check_target_guards`] refuses the 1.4 – 2.2
-/// writers outright.
+/// The advisory for a source-constrained package wired over a lock Poetry
+/// 2.3+ wrote: the writer installs it, but a 1.3 – 2.2 installer would
+/// refuse it. [`check_target_guards`] refuses the locks every 1.3+ (or the
+/// 1.3 – 2.2 writer) would refuse outright.
 pub(super) fn source_constraint_warning(
     p: &PoetryProject,
     canon_name: &str,
@@ -212,16 +212,20 @@ pub(super) fn source_constraint_warning(
 }
 
 /// Refuse a source-constrained package over a lock written by Poetry
-/// 1.4 – 2.2: its installer fails every install once the lock sources the
-/// package from the vendored wheel (#1282).
+/// 1.3 – 2.2, or a lock-version 1.0 / 1.1 one: a Poetry 1.3+ installer fails
+/// every install once the lock sources the package from the vendored wheel
+/// (#1282, #1503).
 fn source_constraint_guard(
     p: &PoetryProject,
     canon_name: &str,
     version: &str,
     wired: poetry_lock::Wired,
 ) -> Result<(), (&'static str, String)> {
-    match source_constraint(p, canon_name) {
-        Some(source) if poetry_lock::source_constraint_breaks_writer(&p.lock_text) => Err((
+    let Some(source) = source_constraint(p, canon_name) else {
+        return Ok(());
+    };
+    match poetry_lock::source_constraint_break(&p.lock_text) {
+        Some(why) => Err((
             "pypi_poetry_source_constraint",
             poetry_lock::source_constraint_refusal(
                 "pyproject.toml",
@@ -231,9 +235,10 @@ fn source_constraint_guard(
                 &source,
                 "file",
                 wired,
+                &why,
             ),
         )),
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 
@@ -319,7 +324,8 @@ pub(super) fn check_target_guards(
         ));
     }
     // A pyproject `source = "…"` pin breaks every install of the wired lock
-    // on Poetry 1.4 – 2.2; refuse when one of those wrote the lock.
+    // on Poetry 1.3 – 2.2, and on every 1.3+ when the lock is format 1.0 /
+    // 1.1; refuse those locks.
     source_constraint_guard(p, canon_name, version, poetry_lock::Wired::No)?;
     Ok(PoetryTarget::Fresh)
 }
@@ -892,18 +898,24 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
 
     /// A pyproject `source = "pypi"` constraint on the vendored package has
     /// no trace in the lock. Rewiring it to a file source breaks every
-    /// `poetry install` on Poetry 1.4 – 2.2, so a lock stamped by one of
-    /// those is refused before the wheel is built; other writers wire it with
-    /// a warning (#1282).
+    /// `poetry install` on Poetry 1.3 – 2.2, and on every Poetry 1.3+ over a
+    /// lock-version 1.0 / 1.1 lock, so such a lock is refused before the
+    /// wheel is built; Poetry 2.3+'s (and 0.x's) locks wire it with a warning
+    /// (#1282, #1447, #1503).
     #[tokio::test]
-    async fn source_constrained_dependency_is_refused_for_poetry_1_4_to_2_2() {
+    async fn source_constrained_dependency_is_refused_unless_poetry_2_3_installs_it() {
         const PYPROJECT: &str = "[tool.poetry.dependencies]\n\
             python = \">=3.8\"\n\
             urllib3 = {version = \"1.26.18\", source = \"pypi\"}\n";
         for (version, broken) in [
+            // Lock 1.0 / 1.1: every Poetry 1.3+ re-solves them on install
+            // and then refuses the constraint (#1503). The 0.x layout is
+            // still admitted, as before.
             ("0.12.17", false),
-            ("1.1.15", false),
-            ("1.3.2", false),
+            ("1.0.10", true),
+            ("1.1.15", true),
+            ("1.2.2", true),
+            ("1.3.2", true),
             ("1.4.2", true),
             ("1.6.1", true),
             ("1.8.5", true),

@@ -12,6 +12,8 @@
 
 #[path = "common/envelope.rs"]
 mod envelope;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 use envelope::codes_in;
@@ -216,10 +218,10 @@ fn seed_manifest_and_blob(root: &Path) {
     std::fs::write(socket.join("blobs").join(after_hash), PATCHED_INDEX).unwrap();
 }
 
-/// Run the built binary with ambient `SOCKET_*` scrubbed; `(code, stdout,
-/// stderr)`.
+/// Run the built binary in the hermetic env (ambient `SOCKET_*` scrubbed,
+/// telemetry off); `(code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     let fixture = (args.first() == Some(&"vendor")).then(|| prebuilt_common::Server::project(cwd));
     let args: Vec<_> = args
         .iter()
@@ -227,12 +229,6 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         .filter(|arg| fixture.is_none() || *arg != "--offline")
         .collect();
     cmd.args(&args).current_dir(cwd);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     // Isolate the npm config layers the hosted `.npmrc` auto-config
     // consults (an ambient explicit `allow-remote` would change the plan).
     let absent = cwd.join(".absent-npm-config");

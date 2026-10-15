@@ -760,6 +760,21 @@ fn sync_args(sections: &[&str]) -> String {
     }
 }
 
+/// The `pipenv requirements` arguments that export every lock section in
+/// `sections`. Plain `requirements` exports `default` and `--dev` adds
+/// `develop`, as for `sync`, but its `--categories` differs: Pipenv
+/// 2022.12–2023.2.4 split it on commas and look each name up as a lock
+/// key, so `sync`'s space-joined Pipfile names (`"packages docs"`) export
+/// nothing (#1507). Comma-joined lock keys (`"default,docs"`) work on
+/// every release that has `--categories`.
+fn requirements_args(sections: &[&str]) -> String {
+    if sections.iter().all(|s| *s == "default" || *s == "develop") {
+        sync_args(sections)
+    } else {
+        format!(" --categories \"{}\"", sections.join(","))
+    }
+}
+
 /// `default`, then `develop`, then named categories in lock order — so the
 /// rendered `--categories` list is stable.
 fn ordered_sections(mut sections: Vec<&str>) -> Vec<&str> {
@@ -784,29 +799,7 @@ fn ordered_sections(mut sections: Vec<&str>) -> Vec<&str> {
 /// category, so `--rm` drops nothing the project had installed. With no
 /// readable lock, falls back to the `default`-only commands.
 pub fn stale_install_remedy(lock: Option<&Value>, name: &str) -> String {
-    let canon = canonicalize_pypi_name(name);
-    let (package, all): (Vec<&str>, Vec<&str>) = match lock {
-        Some(lock) => (
-            ordered_sections(
-                find_entries(lock, &canon)
-                    .into_iter()
-                    .map(|(section, _, _)| section)
-                    .collect(),
-            ),
-            ordered_sections(
-                lock.as_object()
-                    .into_iter()
-                    .flat_map(|map| map.iter())
-                    .filter(|(section, value)| {
-                        section.as_str() != "_meta"
-                            && value.as_object().is_some_and(|m| !m.is_empty())
-                    })
-                    .map(|(section, _)| section.as_str())
-                    .collect(),
-            ),
-        ),
-        None => (Vec::new(), Vec::new()),
-    };
+    let (package, all) = lock_sections(lock, name);
     let reinstall = sync_args(&package);
     let clean = sync_args(&all);
     // Named categories arrived in Pipenv 2022, so the pre-2018 spelling only
@@ -821,6 +814,93 @@ pub fn stale_install_remedy(lock: Option<&Value>, name: &str) -> String {
          -y {name} && pipenv sync{reinstall}` (`pipenv install --deploy{legacy}` before \
          Pipenv 2018), or `pipenv --rm && pipenv sync{clean}` for a clean virtualenv — NOT \
          `pipenv uninstall`, which rewrites the Pipfile and re-locks the patch away"
+    )
+}
+
+/// The lock sections that pin `name`, and every non-empty section, each in
+/// [`ordered_sections`] order. Both are empty with no readable lock.
+fn lock_sections<'a>(lock: Option<&'a Value>, name: &str) -> (Vec<&'a str>, Vec<&'a str>) {
+    let canon = canonicalize_pypi_name(name);
+    let Some(lock) = lock else {
+        return (Vec::new(), Vec::new());
+    };
+    (
+        ordered_sections(
+            find_entries(lock, &canon)
+                .into_iter()
+                .map(|(section, _, _)| section)
+                .collect(),
+        ),
+        ordered_sections(
+            lock.as_object()
+                .into_iter()
+                .flat_map(|map| map.iter())
+                .filter(|(section, value)| {
+                    section.as_str() != "_meta" && value.as_object().is_some_and(|m| !m.is_empty())
+                })
+                .map(|(section, _)| section.as_str())
+                .collect(),
+        ),
+    )
+}
+
+/// The remedy for a stale `name` that a `--site-packages` virtualenv
+/// imports from its base interpreter's site dir `dir` (#1450), in place of
+/// [`stale_install_remedy`], whose commands both keep that copy: pip
+/// refuses to uninstall a release outside the virtualenv, and `pipenv
+/// sync` (in the same or a recreated `--site-packages` virtualenv) counts
+/// it as installed. Installing the lock with `--ignore-installed` puts the
+/// locked release in the virtualenv itself, ahead of the base copy on
+/// `sys.path`, and leaves the base interpreter untouched. The
+/// `pipenv requirements` arguments follow the categories that pin `name`,
+/// as [`stale_install_remedy`]'s `sync` ones do.
+pub fn base_site_stale_install_remedy(lock: Option<&Value>, name: &str, dir: &str) -> String {
+    format!(
+        "The upstream {name} in {dir} belongs to the base interpreter this `--site-packages` \
+         virtualenv inherits: pip refuses to uninstall it from the virtualenv, and `pipenv \
+         sync` (also in a recreated `--site-packages` virtualenv) counts it as installed, so \
+         Pipfile.lock does not protect installs on this host. Install the locked release \
+         over it inside the virtualenv, leaving the base interpreter untouched: {}",
+        install_over_command(lock, name)
+    )
+}
+
+/// The remedy for a venv's own stale copy of a release its base interpreter
+/// also holds (see [`base_site_stale_install_remedy`]): uninstalling the
+/// venv copy would leave `pipenv sync` counting the base copy as installed.
+pub fn shadowing_stale_install_remedy(
+    lock: Option<&Value>,
+    name: &str,
+    dir: &str,
+    base: &str,
+) -> String {
+    format!(
+        "The upstream {name} in {dir} hides the same release in {base}, which belongs to the \
+         base interpreter this `--site-packages` virtualenv inherits: removing the virtualenv's \
+         copy leaves `pipenv sync` counting the base one as installed, so Pipfile.lock does not \
+         protect installs on this host. Install the locked release over the virtualenv's copy, \
+         leaving the base interpreter untouched: {}",
+        install_over_command(lock, name)
+    )
+}
+
+/// The install-over command both base-interpreter remedies share.
+fn install_over_command(lock: Option<&Value>, name: &str) -> String {
+    let (package, _) = lock_sections(lock, name);
+    let categories = requirements_args(&package);
+    // `pipenv requirements` arrived in 2022.4; its `--categories` later
+    // (present in 2022.12).
+    let since = if categories.starts_with(" --categories") {
+        "2022.12"
+    } else {
+        "2022.4"
+    };
+    format!(
+        "`pipenv requirements{categories} > pipenv-locked.txt && pipenv run pip install \
+         --no-deps --ignore-installed -r pipenv-locked.txt` (Pipenv {since}+; it reinstalls \
+         every package of those lock categories into the virtualenv at its locked version), \
+         then delete pipenv-locked.txt — NOT `pipenv uninstall`, which rewrites the Pipfile \
+         and re-locks the patch away"
     )
 }
 
@@ -2276,5 +2356,119 @@ mod tests {
         let remedy = stale_install_remedy(None, "six");
         assert!(remedy.contains("-y six && pipenv sync` ("), "{remedy}");
         assert!(remedy.contains("NOT `pipenv uninstall`"), "{remedy}");
+    }
+
+    /// #1450: a base-interpreter copy a `--site-packages` virtualenv
+    /// inherits gets an install over it inside the virtualenv, never the
+    /// uninstall-and-sync or recreate-and-sync commands that both keep it.
+    #[test]
+    fn base_site_stale_install_remedy_installs_over_the_base_copy() {
+        let lock = |body: &str| -> Value {
+            serde_json::from_str(&format!(r#"{{"_meta": {{"pipfile-spec": 6}}, {body}}}"#)).unwrap()
+        };
+        let six = r#"{"version": "==1.16.0"}"#;
+        let dir = "/usr/lib/python3/dist-packages";
+        let only_default = lock(&format!(r#""default": {{"six": {six}}}, "develop": {{}}"#));
+        let remedy = base_site_stale_install_remedy(Some(&only_default), "six", dir);
+        assert!(
+            remedy.contains(
+                "`pipenv requirements > pipenv-locked.txt && pipenv run pip install --no-deps \
+                 --ignore-installed -r pipenv-locked.txt`"
+            ),
+            "{remedy}"
+        );
+        assert!(remedy.contains(dir), "{remedy}");
+        assert!(remedy.contains("NOT `pipenv uninstall`"), "{remedy}");
+        assert!(
+            remedy.contains("reinstalls every package of those lock categories"),
+            "{remedy}"
+        );
+        for broken in [
+            "pip uninstall",
+            "pipenv --rm",
+            "only protects fresh installs",
+        ] {
+            assert!(!remedy.contains(broken), "{broken}: {remedy}");
+        }
+        // The requirements export follows the categories that pin it.
+        let develop = lock(&format!(
+            r#""default": {{"requests": {six}}}, "develop": {{"six": {six}}}"#
+        ));
+        let remedy = base_site_stale_install_remedy(Some(&develop), "six", dir);
+        assert!(
+            remedy.contains("`pipenv requirements --dev > pipenv-locked.txt"),
+            "{remedy}"
+        );
+        let named = lock(&format!(
+            r#""default": {{"six": {six}}}, "docs": {{"six": {six}}}"#
+        ));
+        let remedy = base_site_stale_install_remedy(Some(&named), "six", dir);
+        assert!(
+            remedy.contains("`pipenv requirements --categories \"default,docs\" > "),
+            "{remedy}"
+        );
+        assert!(remedy.contains("(Pipenv 2022.12+;"), "{remedy}");
+        let remedy = base_site_stale_install_remedy(None, "six", dir);
+        assert!(remedy.contains("`pipenv requirements > "), "{remedy}");
+    }
+
+    /// #1507: Pipenv 2022.12.x–2023.2.4 `requirements` split `--categories`
+    /// on commas and look each name up as a lock key, so the space-joined
+    /// Pipfile names `sync` takes (`"packages docs"`) export nothing. The
+    /// export spells comma-joined lock keys, which every release reads,
+    /// while the sync remedies keep the Pipfile names.
+    #[test]
+    fn base_site_remedy_exports_comma_joined_lock_keys() {
+        let lock = |body: &str| -> Value {
+            serde_json::from_str(&format!(r#"{{"_meta": {{"pipfile-spec": 6}}, {body}}}"#)).unwrap()
+        };
+        let six = r#"{"version": "==1.16.0"}"#;
+        let dir = "/usr/lib/python3/dist-packages";
+        for (body, export) in [
+            (
+                format!(r#""default": {{"idna": {six}, "six": {six}}}, "docs": {{"six": {six}}}"#),
+                "--categories \"default,docs\"",
+            ),
+            (
+                format!(
+                    r#""default": {{"idna": {six}}}, "develop": {{"six": {six}}}, "docs": {{"six": {six}}}"#
+                ),
+                "--categories \"develop,docs\"",
+            ),
+            (
+                format!(
+                    r#""default": {{"six": {six}}}, "develop": {{"six": {six}}}, "docs": {{"six": {six}}}, "tests": {{"six": {six}}}"#
+                ),
+                "--categories \"default,develop,docs,tests\"",
+            ),
+            (
+                format!(r#""default": {{"idna": {six}}}, "docs": {{"six": {six}}}"#),
+                "--categories \"docs\"",
+            ),
+        ] {
+            let lock = lock(&body);
+            for remedy in [
+                base_site_stale_install_remedy(Some(&lock), "six", dir),
+                shadowing_stale_install_remedy(Some(&lock), "six", dir, dir),
+            ] {
+                assert!(
+                    remedy.contains(&format!("`pipenv requirements {export} > ")),
+                    "{export}: {remedy}"
+                );
+                for pipfile_name in ["packages docs", "dev-packages"] {
+                    assert!(!remedy.contains(pipfile_name), "{remedy}");
+                }
+                assert!(remedy.contains("(Pipenv 2022.12+;"), "{remedy}");
+            }
+        }
+        // `sync` still takes the Pipfile names.
+        let named = lock(&format!(
+            r#""default": {{"six": {six}}}, "docs": {{"six": {six}}}"#
+        ));
+        let remedy = stale_install_remedy(Some(&named), "six");
+        assert!(
+            remedy.contains("pipenv sync --categories \"packages docs\"`"),
+            "{remedy}"
+        );
     }
 }

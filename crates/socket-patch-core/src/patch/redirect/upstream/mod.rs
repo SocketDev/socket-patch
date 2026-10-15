@@ -181,8 +181,11 @@ pub struct HostedInventory {
     pub contested: Vec<ContestedWiring>,
     /// Leftover hosted wiring no lock installs any more: a yarn berry
     /// `resolutions` selector `yarn remove` / `yarn up` left behind
-    /// ([`crate::vex::discover::StaleSelector`], #1203), one pin per
-    /// package version and patch, wired in the manifest only. Never listed
+    /// (#1203), or a uv `override-dependencies` pin and its source a relock
+    /// left behind for a dropped transitive package (#1445)
+    /// ([`crate::vex::discover::StaleSelector`]), one pin per package
+    /// version and patch, wired in the manifest (resp. the lock's paired
+    /// metadata and its `[manifest]` record) only. Never listed
     /// as a patch; `rollback` and `remove` retire it with a
     /// `hosted_resolution_orphaned` warning ([`HostedInventory::unwindable`]).
     pub stale: Vec<HostedPin>,
@@ -251,7 +254,9 @@ impl HostedInventory {
             .map(|r| (norm(&r.file), r.uuid.as_str()))
             .collect();
         // A leftover selector's URL (its patch uuid and grant token) is
-        // retired wiring, not contested wiring, in the manifest naming it.
+        // retired wiring, not contested wiring, in the manifest naming it —
+        // and, for a uv lock's leftover override (#1445), in the paired
+        // metadata that carries the override and its source.
         let mut stale_excused: BTreeSet<(String, String)> = BTreeSet::new();
         let mut stale: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
         for selector in &discovery.stale_selectors {
@@ -259,8 +264,12 @@ impl HostedInventory {
                 continue;
             }
             let file = norm(&selector.file);
+            let paired = crate::utils::python_lock::paired_metadata_path(&file);
             for segment in url_uuid_segments(&selector.url) {
-                stale_excused.insert((file.clone(), segment));
+                stale_excused.insert((file.clone(), segment.clone()));
+                if let Some(paired) = &paired {
+                    stale_excused.insert((paired.clone(), segment));
+                }
             }
             stale
                 .entry((selector.purl.clone(), selector.uuid.clone()))

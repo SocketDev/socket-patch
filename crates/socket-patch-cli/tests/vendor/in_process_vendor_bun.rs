@@ -1619,21 +1619,10 @@ async fn scan_vendored_from_workspace_member_cwd_fetches_then_engine_refuses_loc
 fn run_with_deadline(root: &Path, argv: &[&str], deadline: Duration) -> (i32, String, String) {
     let out_path = root.join("child.stdout");
     let err_path = root.join("child.stderr");
-    let mut cmd = Command::new(common::binary());
-    cmd.args(argv).current_dir(root);
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_")
-            && !name.contains("TELEMETRY")
-            && name != "SOCKET_NO_CONFIG"
-            && name != "SOCKET_NO_UPDATE_CHECK"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_NO_UPDATE_CHECK", "1")
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
+    let mut cmd = common::hermetic_command(&common::binary());
+    common::jvm_env::isolate_cli(&mut cmd);
+    cmd.args(argv)
+        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(&out_path).unwrap())
         .stderr(std::fs::File::create(&err_path).unwrap());

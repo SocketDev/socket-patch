@@ -97,7 +97,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic, hermetic_command};
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -150,28 +150,20 @@ const TINY_LIB: &str = "module TinyDep\n  VALUE = \"tiny-ok\"\nend\n";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-/// Run the socket-patch binary with the ambient `SOCKET_*` surface scrubbed
-/// (a developer's `SOCKET_DRY_RUN=1` must not steer the assertions) and
-/// `VIRTUAL_ENV` (crawler discovery input) removed.
+/// Run the socket-patch binary in the hermetic environment
+/// (`tests/common/hermetic.rs`: a developer's `SOCKET_DRY_RUN=1` must not
+/// steer the assertions) with the crawler's discovery inputs scrubbed
+/// (`hermetic::scrub_crawler_inputs`: `VIRTUAL_ENV`, every `BUNDLE_*` the
+/// crawler reads, and `~/.bundle/config` via a pinned `BUNDLE_USER_CONFIG`).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     run_socket_env(cwd, args, &[])
 }
 
 /// [`run_socket`] with extra environment on top of the scrubbed surface.
 fn run_socket_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("BUNDLE_MIRROR__") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -183,8 +175,10 @@ fn run_socket_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> (i32, Str
     )
 }
 
-/// Run `bundle <args>` in `cwd`: ambient `BUNDLE_*`/`GEM_*` scrubbed, caches
-/// isolated, `BUNDLE_APP_CONFIG` pinned to the project's own `.bundle/`, and
+/// Run `bundle <args>` in `cwd`: ambient `SOCKET_*` and bundler config
+/// scrubbed ([`hermetic::Extra::Bundle`]; `GEM_HOME`/`GEM_PATH` stay, see
+/// `cache_env.rs`, and every install here uses the project-local `path`
+/// config), caches isolated, `BUNDLE_APP_CONFIG` pinned to the project's own `.bundle/`, and
 /// a PER-PROJECT `BUNDLE_USER_HOME` so each stage's compact-index cache is
 /// cold (the fresh-checkout install must be forced through the wiremock
 /// registry, never satisfied from the scan project's cache).
@@ -198,12 +192,8 @@ fn bundle(cwd: &Path, args: &[&str]) -> Output {
 fn bundle_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new("bundle");
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy().into_owned();
-        if key.starts_with("BUNDLE_") || key.starts_with("GEM_") {
-            cmd.env_remove(&k);
-        }
-    }
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle]);
     cache_env::isolate(&mut cmd);
     cmd.env("BUNDLE_APP_CONFIG", cwd.join(".bundle"));
     cmd.env("BUNDLE_USER_HOME", cwd.join(".bundle-user-home"));
@@ -444,6 +434,19 @@ enum Driver {
     /// `source "<upstream>" do` block (#1056): bundler locks it with a `!`
     /// source pin, which the unwind must keep.
     ScanVexSourceBlock,
+    /// [`Driver::ScanVexSourceBlock`] with assignment-form keyword
+    /// constructs (`v = if … end`, `w = case … end`) before the gem
+    /// (#1476): their `end`s must not close the user's source block.
+    ScanVexSourceBlockAssignment,
+    /// [`Driver::ScanVexSourceBlock`] whose `source(` opener spans lines
+    /// before its `do` (#1509).
+    ScanVexSourceBlockMultiLineOpener,
+    /// [`Driver::ScanVexSourceBlock`] as a `source(…) { … }` brace block
+    /// (#1509): bundler pins it with `!` too.
+    ScanVexSourceBlockBraces,
+    /// [`Driver::ScanVexSourceBlock`] whose `source … do` follows another
+    /// statement and a `;` on its line (#1531).
+    ScanVexSourceBlockAfterSemicolon,
     /// A heredoc option continues beyond the declaration's physical line.
     ScanVexHeredocDeclaration,
     /// A double-quoted interpolation can itself contain a heredoc opener.
@@ -466,6 +469,11 @@ enum Driver {
     /// run must redirect nothing and attest nothing. Bundler >= 4 only; the
     /// fixture asserts the contract itself and yields `None`.
     ScanVexCustomLockfile,
+    /// [`Driver::ScanVexCustomLockfile`] with the lock named by a
+    /// `lockfile "custom.lock"` call at the top of the Gemfile instead of
+    /// the config (#1477): bundler 4's DSL spelling, which outranks every
+    /// `BUNDLE_LOCKFILE` tier. Bundler >= 4 only.
+    ScanVexCustomLockfileDsl,
     /// [`Driver::ScanVex`] on a `Gemfile` + `gems.rb` twin (#751): bundler
     /// 1.x loads the `Gemfile` and >= 2 loads `gems.rb`, and the scan cannot
     /// see which runs, so it must redirect and attest nothing and leave all
@@ -523,9 +531,24 @@ impl Driver {
                 "scan --mode hosted (config Gemfile.next, env BUNDLE_GEMFILE=Gemfile)"
             }
             Driver::ScanVexCustomLockfile => "scan --mode hosted (lockfile custom.lock)",
+            Driver::ScanVexCustomLockfileDsl => {
+                "scan --mode hosted (Gemfile `lockfile \"custom.lock\"` call)"
+            }
             Driver::ScanVexTwin => "scan --mode hosted (Gemfile + gems.rb twin)",
             Driver::ScanVexGroupBlock => "scan --mode hosted (gem in a group block)",
             Driver::ScanVexSourceBlock => "scan --mode hosted (gem in a source block)",
+            Driver::ScanVexSourceBlockAssignment => {
+                "scan --mode hosted (gem in a source block after `v = if … end`)"
+            }
+            Driver::ScanVexSourceBlockMultiLineOpener => {
+                "scan --mode hosted (gem in a multi-line `source(…) do` block)"
+            }
+            Driver::ScanVexSourceBlockBraces => {
+                "scan --mode hosted (gem in a `source(…) { }` block)"
+            }
+            Driver::ScanVexSourceBlockAfterSemicolon => {
+                "scan --mode hosted (gem in a `x = 1; source … do` block)"
+            }
             Driver::ScanVexSemicolonJoinedDeclaration => {
                 "scan --mode hosted (two `;`-joined gem declarations)"
             }
@@ -641,7 +664,9 @@ async fn redirect_scanned_project(
     })?;
     // Drivers that only mean something on one bundler line.
     let only = match driver {
-        Driver::ScanVexCustomLockfile if !bundler.at_least(4, 0) => {
+        Driver::ScanVexCustomLockfile | Driver::ScanVexCustomLockfileDsl
+            if !bundler.at_least(4, 0) =>
+        {
             Some("custom lockfiles need bundler >= 4")
         }
         _ => None,
@@ -823,6 +848,27 @@ async fn redirect_scanned_project(
             "source \"{up}/upstream\"\n\nsource \"{up}/upstream\" do\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
             up = server.uri()
         ),
+        Driver::ScanVexSourceBlockAssignment => format!(
+            "source \"{up}/upstream\"\n\nsource \"{up}/upstream\" do\n  v = if ENV[\"ZZ\"]\n    \"a\"\n  \
+             else\n    \"b\"\n  end\n  w = case ENV[\"ZZ\"]\n      when \"x\" then \"a\"\n      \
+             else \"b\"\n      end\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
+            up = server.uri()
+        ),
+        Driver::ScanVexSourceBlockMultiLineOpener => format!(
+            "source \"{up}/upstream\"\n\nsource(\n  \"{up}/upstream\"\n) do\n  \
+             gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
+            up = server.uri()
+        ),
+        Driver::ScanVexSourceBlockBraces => format!(
+            "source \"{up}/upstream\"\n\nsource(\"{up}/upstream\") {{\n  \
+             gem \"{DEP}\", \"{DEP_VERSION}\"\n}}\n",
+            up = server.uri()
+        ),
+        Driver::ScanVexSourceBlockAfterSemicolon => format!(
+            "source \"{up}/upstream\"\n\nzz = 1; source \"{up}/upstream\" do\n  \
+             gem \"{DEP}\", \"{DEP_VERSION}\"\nend\n",
+            up = server.uri()
+        ),
         Driver::ScanVexEvalGemfile => {
             std::fs::write(proj.join("Gemfile.common"), format!("gem \"{DEP}\"\n")).unwrap();
             format!(
@@ -976,7 +1022,7 @@ async fn redirect_scanned_project(
     }
     // The pre-redirect (registry) pair — what reverting the patch commit
     // restores; the manifest-less VEX legs revert to it.
-    let pristine_gemfile = std::fs::read(proj.join(gemfile_name)).unwrap();
+    let mut pristine_gemfile = std::fs::read(proj.join(gemfile_name)).unwrap();
     let pristine_lock = lock_before.clone().into_bytes();
     // Drop the pristine materialization before redirecting: bundler never
     // refetches an already-installed gem, so with it in place the scan
@@ -1010,8 +1056,18 @@ async fn redirect_scanned_project(
             String::from_utf8_lossy(&cfg.stderr)
         );
     }
-    let custom_lockfile = driver == Driver::ScanVexCustomLockfile;
-    if custom_lockfile {
+    let custom_lockfile_dsl = driver == Driver::ScanVexCustomLockfileDsl;
+    if custom_lockfile_dsl {
+        // The Gemfile's own `lockfile "custom.lock"` call, as a bundler 4
+        // project writes it; the default lock stays behind as a leftover.
+        std::fs::copy(proj.join(lock_name), proj.join("custom.lock")).unwrap();
+        let mut gemfile = b"lockfile \"custom.lock\"\n".to_vec();
+        gemfile.extend_from_slice(&pristine_gemfile);
+        std::fs::write(proj.join(gemfile_name), &gemfile).unwrap();
+        pristine_gemfile = gemfile;
+    }
+    let custom_lockfile = driver == Driver::ScanVexCustomLockfile || custom_lockfile_dsl;
+    if driver == Driver::ScanVexCustomLockfile {
         // `bundle config set --local lockfile custom.lock`; the default
         // lock stays behind as a leftover bundler 4 ignores.
         std::fs::copy(proj.join(lock_name), proj.join("custom.lock")).unwrap();
@@ -1064,6 +1120,7 @@ async fn redirect_scanned_project(
         | Driver::ScanVexMirrorSourceEnv
         | Driver::ScanVexMirrorAllEnv
         | Driver::ScanVexCustomLockfile
+        | Driver::ScanVexCustomLockfileDsl
         | Driver::ScanVexTwin
         | Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
@@ -1071,6 +1128,10 @@ async fn redirect_scanned_project(
         | Driver::ScanVexEvalGemfile
         | Driver::ScanVexGroupBlock
         | Driver::ScanVexSourceBlock
+        | Driver::ScanVexSourceBlockAssignment
+        | Driver::ScanVexSourceBlockMultiLineOpener
+        | Driver::ScanVexSourceBlockBraces
+        | Driver::ScanVexSourceBlockAfterSemicolon
         | Driver::ScanVexCustomGitSource
         | Driver::ScanVexMultiLineDeclaration
         | Driver::ScanVexConditionalDeclaration
@@ -1275,6 +1336,10 @@ async fn redirect_scanned_project(
         Driver::ScanVex
         | Driver::ScanVexGroupBlock
         | Driver::ScanVexSourceBlock
+        | Driver::ScanVexSourceBlockAssignment
+        | Driver::ScanVexSourceBlockMultiLineOpener
+        | Driver::ScanVexSourceBlockBraces
+        | Driver::ScanVexSourceBlockAfterSemicolon
         | Driver::ScanVexTrailingSemicolonDeclaration => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert!(
@@ -1287,6 +1352,7 @@ async fn redirect_scanned_project(
         Driver::ScanVexDualBoot
         | Driver::ScanVexDualBootEnvGemfile
         | Driver::ScanVexCustomLockfile
+        | Driver::ScanVexCustomLockfileDsl
         | Driver::ScanVexTwin
         | Driver::ScanVexDuplicateDeclaration
         | Driver::ScanVexEvalGemfile
@@ -2342,18 +2408,41 @@ async fn gem_hosted_group_block_pin_survives_a_refused_vendored_takeover() {
 /// pre-scan pair, `!` included, so a FROZEN install of the restored pair
 /// still succeeds (it exited 16 when the unwind dropped the `!`).
 /// Converged without CHECKSUMS so the restore needs no rubygems.org sha.
+/// #1476: the same holds when assignment-form `v = if … end` /
+/// `w = case … end` constructs precede the gem inside the block.
+/// #1509: and when the block's `source(` opener spans lines, or the block
+/// is a `source(…) { … }` brace block.
+/// #1531: and when the `source … do` follows `x = 1;` on its line.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_unwind_keeps_a_source_block_bang() {
-    for command in ["rollback", "remove"] {
+    for (driver, command) in [
+        (Driver::ScanVexSourceBlock, "rollback"),
+        (Driver::ScanVexSourceBlock, "remove"),
+        (Driver::ScanVexSourceBlockAssignment, "rollback"),
+        (Driver::ScanVexSourceBlockAssignment, "remove"),
+        (Driver::ScanVexSourceBlockMultiLineOpener, "rollback"),
+        (Driver::ScanVexSourceBlockMultiLineOpener, "remove"),
+        (Driver::ScanVexSourceBlockBraces, "rollback"),
+        (Driver::ScanVexSourceBlockBraces, "remove"),
+        (Driver::ScanVexSourceBlockAfterSemicolon, "rollback"),
+        (Driver::ScanVexSourceBlockAfterSemicolon, "remove"),
+    ] {
+        let label = match driver {
+            Driver::ScanVexSourceBlockAssignment => "source-block-assignment",
+            Driver::ScanVexSourceBlockMultiLineOpener => "source-block-multi-line-opener",
+            Driver::ScanVexSourceBlockBraces => "source-block-braces",
+            Driver::ScanVexSourceBlockAfterSemicolon => "source-block-after-semicolon",
+            _ => "source-block",
+        };
         let Some(fx) = redirect_scanned_project(
-            &format!("source-block {command}"),
+            &format!("{label} {command}"),
             Spelling::Gemfile,
             false,
             true,
             None,
-            Driver::ScanVexSourceBlock,
+            driver,
         )
         .await
         else {
@@ -2416,7 +2505,7 @@ async fn gem_hosted_unwind_keeps_a_source_block_bang() {
             fx.pristine_gemfile,
             "{command}: the Gemfile comes back byte for byte"
         );
-        let fresh = stage_fresh_checkout(&fx, &format!("source-block-{command}"));
+        let fresh = stage_fresh_checkout(&fx, &format!("{label}-{command}"));
         let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
         assert!(
             install.status.success(),
@@ -2610,6 +2699,27 @@ async fn gem_hosted_bundler4_custom_lockfile_redirects_nothing() {
         true,
         None,
         Driver::ScanVexCustomLockfile,
+    )
+    .await;
+    assert!(fx.is_none(), "the custom-lockfile driver asserts in place");
+}
+
+/// #1477: bundler 4's Gemfile `lockfile "custom.lock"` call makes bundler
+/// read `custom.lock` just like the setting. The hosted scan used to pin
+/// the leftover `Gemfile.lock`, rewrite the Gemfile, leave `custom.lock`
+/// untouched and report no refusal, so every frozen install then failed;
+/// it must refuse, write nothing, and still install frozen.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 4.0 for this arm); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_bundler4_gemfile_lockfile_call_redirects_nothing() {
+    let fx = redirect_scanned_project(
+        "custom-lockfile-dsl",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVexCustomLockfileDsl,
     )
     .await;
     assert!(fx.is_none(), "the custom-lockfile driver asserts in place");

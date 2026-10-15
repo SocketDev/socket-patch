@@ -60,7 +60,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, parse_json_envelope};
+use common::{binary, git_sha256, hermetic, hermetic_command, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -102,18 +102,16 @@ fn argv(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
 }
 
-/// Run the socket-patch binary with a scrubbed environment: every ambient
-/// `SOCKET_*` var is removed (so a developer's `SOCKET_DRY_RUN=1` etc. can't
-/// flip behavior) along with `VIRTUAL_ENV` (crawler discovery input).
+/// Run the socket-patch binary in the hermetic environment
+/// (`tests/common/hermetic.rs`: no ambient `SOCKET_*`, so a developer's
+/// `SOCKET_DRY_RUN=1` etc. can't flip behavior) with the crawler's discovery
+/// inputs scrubbed (`hermetic::scrub_crawler_inputs`: an ambient
+/// `BUNDLE_PATH`, `BUNDLE_GEMFILE` or `~/.bundle/config` would point the
+/// crawler away from the fixture).
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
+    hermetic::scrub_crawler_inputs(&mut cmd);
     cmd.current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
@@ -123,22 +121,21 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// Run `bundle <args>` in `cwd` with the ambient `BUNDLE_*`/`GEM_*` state
-/// scrubbed (a developer's global bundler config — a different BUNDLE_PATH,
-/// frozen mode, a custom gem home — must not leak into the fixture) and
-/// `BUNDLE_APP_CONFIG` pinned to the project's own `.bundle/` so
-/// `bundle config set --local` writes a real committable file.
+/// Run `bundle <args>` in `cwd` with ambient `SOCKET_*` and bundler config
+/// scrubbed ([`hermetic::Extra::Bundle`]: a developer's global bundler
+/// config — a different BUNDLE_PATH, frozen mode, a RUBYOPT require — must
+/// not leak into the fixture) and `BUNDLE_APP_CONFIG` pinned to the
+/// project's own `.bundle/` so `bundle config set --local` writes a real
+/// committable file. `GEM_HOME`/`GEM_PATH` stay: `bundle` resolves through
+/// them under rvm/chruby, and every install here uses the project-local
+/// `path` config, so no gem lands in the ambient gem home.
 fn bundle(cwd: &Path, args: &[&str], frozen: bool) -> Output {
     let mut cmd = Command::new("bundle");
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy().into_owned();
-        if key.starts_with("BUNDLE_") || key.starts_with("GEM_") {
-            cmd.env_remove(&k);
-        }
-    }
-    // After the `BUNDLE_*`/`GEM_*` scrub, which would otherwise take the
-    // sandbox's own BUNDLE_USER_HOME / GEM_SPEC_CACHE straight back out.
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle]);
+    // After the scrub, which would otherwise take the sandbox's own
+    // BUNDLE_USER_HOME straight back out.
     cache_env::isolate(&mut cmd);
     cmd.env("BUNDLE_APP_CONFIG", cwd.join(".bundle"));
     if frozen {

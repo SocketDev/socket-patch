@@ -42,7 +42,6 @@ use crate::vex_e2e_common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1360,9 +1359,10 @@ impl ScanApi {
 /// An authenticated `socket-patch <args> --json --yes` in `p` against
 /// `api` → (exit, envelope).
 fn run_authed(p: &Proj, api: &ScanApi, args: &[&str]) -> (Option<i32>, Value) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = crate::hermetic::binary_command();
+    crate::hermetic::scrub_extra(&mut cmd, &[crate::hermetic::Extra::Venv]);
     for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") || key.starts_with("POETRY_") {
+        if key.starts_with("POETRY_") {
             cmd.env_remove(key);
         }
     }
@@ -1370,9 +1370,6 @@ fn run_authed(p: &Proj, api: &ScanApi, args: &[&str]) -> (Option<i32>, Value) {
         cmd.env(key, value);
     }
     let out = cmd
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env_remove("VIRTUAL_ENV")
         .current_dir(&p.root)
         .args(args)
         .args([

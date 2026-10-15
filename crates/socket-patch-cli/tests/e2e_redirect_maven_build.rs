@@ -52,6 +52,8 @@
 //! `SOCKET_PATCH_MAVEN_E2E_{MVN,VERSION,REQUIRED}` gates in
 //! `maven_build_common`.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
@@ -63,7 +65,6 @@ mod maven_build_common;
 mod vex_e2e_common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use hosted_maven_common::{Hosted, Server};
 use maven_build_common::*;
@@ -133,23 +134,17 @@ fn mount_api(s: &Server, jar: &[u8], pom: &[u8], view: &serde_json::Value) {
     hosted_maven_common::mount_api(s, &HOSTED, jar, pom, view);
 }
 
-/// `socket-patch <args>` with ambient `SOCKET_*` scrubbed and the per-test
-/// local repository as the crawler's maven repo.
+/// `socket-patch <args>` in the hermetic environment
+/// (`tests/common/hermetic.rs`) with the per-test local repository as the
+/// crawler's maven repo.
 fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
-    let mut cmd = Command::new(binary());
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     let out = cmd
         .args(args)
         .current_dir(cwd)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("MAVEN_REPO_LOCAL", m2)
         .env_remove("M2_HOME")
-        .env_remove("VIRTUAL_ENV")
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

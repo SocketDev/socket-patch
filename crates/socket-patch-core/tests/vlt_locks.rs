@@ -742,7 +742,7 @@ async fn vendored_wiring_matches_what_vlt_ci_writes_and_reverts_byte_exact() {
         );
         assert_eq!(
             fs::read_to_string(uuid_dir.join(".gitattributes")).unwrap(),
-            "* -text\n"
+            "* -text -filter -ident -working-tree-encoding\n"
         );
         let artifact = staged.root.join(&rel_dir);
         assert_eq!(

@@ -38,7 +38,7 @@ mod golang_e2e_matrix;
 mod vex_e2e_common;
 
 use golang_e2e_matrix::{manifestless_vex, ManifestlessGo};
-use vex_e2e_common::{binary, git_sha256, patch_view, Marker, VexVia};
+use vex_e2e_common::{binary, git_sha256, hermetic, patch_view, Marker, VexVia};
 
 const ORG: &str = "test-org";
 const UMOD: &str = "example.com/upstream";
@@ -292,20 +292,12 @@ fn move_replace_to_go_work(root: &Path, sums_of: Option<&str>) -> String {
     line
 }
 
-/// Run socket-patch (SOCKET_* scrubbed, hermetic config) in `cwd`.
+/// Run socket-patch (hermetic `SOCKET_*` environment) in `cwd`.
 fn socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, serde_json::Value, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("GOMODCACHE", modcache)
-        .env("GOFLAGS", "")
-        .env_remove("VIRTUAL_ENV");
+    cmd.env("GOMODCACHE", modcache).env("GOFLAGS", "");
     let _fixture = prebuilt_common::prepare_command(
         &mut cmd,
         cwd,

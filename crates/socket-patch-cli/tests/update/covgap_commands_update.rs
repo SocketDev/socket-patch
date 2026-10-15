@@ -212,7 +212,7 @@ async fn update_dry_run_human_reports_update_available() {
 #[cfg(unix)]
 mod pty {
     use super::*;
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
     use std::path::Path;
     use std::time::Duration;
 
@@ -237,29 +237,15 @@ mod pty {
             })
             .expect("openpty");
 
-        let mut cmd = CommandBuilder::new(bin);
+        // The hermetic environment: SOCKET_YES would skip the very prompt
+        // this test drives, and the update notifier is forced off (this
+        // suite hands the child a REAL terminal, so the stderr-TTY guard
+        // does not protect it).
+        let mut cmd = crate::common::hermetic::pty_command(bin);
         for a in args {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
-        // Scrub the ambient SOCKET_* surface (SOCKET_YES would skip the
-        // very prompt this test drives); keep telemetry opt-outs.
-        for (key, _) in std::env::vars_os() {
-            let name = key.to_string_lossy();
-            if name.starts_with("SOCKET_")
-                && !name.contains("TELEMETRY")
-                && name != "SOCKET_NO_CONFIG"
-                && name != "SOCKET_NO_UPDATE_CHECK"
-            {
-                cmd.env_remove(&key);
-            }
-        }
-        cmd.env("SOCKET_NO_CONFIG", "1");
-        // This suite hands the child a REAL terminal, so the update
-        // notifier's stderr-TTY guard does not protect it — force the
-        // kill-switch so no PTY child fetches release metadata mid-prompt.
-        cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
         // Caller env lands last so explicit injections survive the scrub.
         for (k, v) in env {
             cmd.env(k, v);

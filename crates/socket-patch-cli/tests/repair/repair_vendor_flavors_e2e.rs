@@ -21,6 +21,7 @@
 //! lockfile, so vendoring proceeds offline from the installed copy + the
 //! view-fetched patch content.
 
+use crate::common::envelope::{events, parse_json_envelope};
 use crate::common::git_sha256;
 
 use std::path::{Path, PathBuf};
@@ -437,14 +438,6 @@ fn vendor_project(root: &Path, mock_uri: &str, flavor: Flavor) -> PathBuf {
     tgz
 }
 
-fn parse_env(stdout: &str) -> serde_json::Value {
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("bad JSON ({e}): {stdout}"))
-}
-
-fn events_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    v["events"].as_array().cloned().unwrap_or_default()
-}
-
 /// Assert the flavor's install wiring survived: the post-repair lockfile still
 /// references the vendored tarball.
 fn assert_wiring_intact(root: &Path, flavor: Flavor) {
@@ -473,10 +466,10 @@ async fn deleted_tarball_rebuilds(flavor: Flavor) {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{}: stdout={stdout} stderr={stderr}", flavor.tag());
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "{}: envelope={v}", flavor.tag());
     assert!(
-        events_of(&v)
+        events(&v)
             .iter()
             .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
         "{}: envelope={v}",
@@ -569,7 +562,7 @@ async fn corrupt_tarball_rebuilds(flavor: Flavor) {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "{}: stdout={stdout} stderr={stderr}", flavor.tag());
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "{}: envelope={v}", flavor.tag());
     assert_eq!(
         std::fs::read(&tgz).unwrap(),
@@ -621,13 +614,13 @@ async fn repair_skips_an_entry_with_an_unknown_flavor() {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
-    let env = parse_env(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert!(
-        !events_of(&env).iter().any(|e| e["action"] == "rebuilt"),
+        !events(&env).iter().any(|e| e["action"] == "rebuilt"),
         "{env}"
     );
     assert!(
-        events_of(&env).iter().any(|e| e["action"] == "skipped"
+        events(&env).iter().any(|e| e["action"] == "skipped"
             && e["purl"] == PURL
             && e["errorCode"] == "vendor_wiring_unknown_revert_blocked"),
         "{env}"
@@ -660,9 +653,9 @@ async fn tampered_ledger_fails_closed(flavor: Flavor) {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "{}: stdout={stdout} stderr={stderr}", flavor.tag());
-    let env = parse_env(&stdout);
+    let env = parse_json_envelope(&stdout);
     assert!(
-        events_of(&env)
+        events(&env)
             .iter()
             .any(|e| e["action"] == "failed"
                 && e["errorCode"] == "vendor_artifact_redownload_failed"),
@@ -709,9 +702,9 @@ async fn ledger_gone_is_reported(flavor: Flavor) {
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "{}: stdout={stdout} stderr={stderr}", flavor.tag());
-    let v = parse_env(&stdout);
+    let v = parse_json_envelope(&stdout);
     assert!(
-        events_of(&v).iter().any(|e| e["action"] == "failed"
+        events(&v).iter().any(|e| e["action"] == "failed"
             && e["errorCode"] == "vendor_ledger_missing"
             && e["uuid"] == UUID),
         "{}: envelope={v}",

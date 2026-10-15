@@ -50,11 +50,11 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::hermetic;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use sha2::{Digest, Sha256};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -135,20 +135,21 @@ fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, Str
 }
 
 /// [`run_socket`] with extra env applied after the scrub.
+///
+/// The child gets the hermetic `SOCKET_*` environment
+/// (`hermetic::binary_command`), and an activated venv is scrubbed on
+/// every call: `scan` and `vex` discover packages unscoped under `--cwd`,
+/// so the developer's venv would add packages to them. `CARGO_HOME` is the
+/// leg's own, set after the scrubs.
 fn run_socket_env(
     cwd: &Path,
     args: &[&str],
     cargo_home: &Path,
     env: &[(&str, &str)],
 ) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::binary_command();
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env("SOCKET_NO_CONFIG", "1");
     cmd.env("CARGO_HOME", cargo_home);
     for (k, v) in env {
         cmd.env(k, v);

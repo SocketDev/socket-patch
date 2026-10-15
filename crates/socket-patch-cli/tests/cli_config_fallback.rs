@@ -25,7 +25,8 @@ use base64::Engine as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const BINARY: &str = env!("CARGO_BIN_EXE_socket-patch");
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
 /// The platform env var that positions the socket-cli data dir.
 const DATA_DIR_VAR: &str = if cfg!(windows) {
@@ -50,34 +51,26 @@ fn write_config(data_dir: &Path, json: &serde_json::Value) {
     std::fs::write(dir.join("config.json"), encoded).unwrap();
 }
 
-/// Build a hermetic human-mode `socket-patch scan -e npm --cwd <project>` command: every
-/// ambient `SOCKET_*` var is scrubbed (including the inherited
-/// `SOCKET_NO_CONFIG=1` guard — tests re-add exactly what they need), the
-/// data dir points at `data_dir`, and the project dir is an empty npm
-/// project so the crawl finds nothing and no batch request fires.
+/// Build a hermetic human-mode `socket-patch scan -e npm --cwd <project>`
+/// command: the shared hermetic env (every ambient `SOCKET_*` scrubbed,
+/// telemetry off) with the config layer re-enabled, the data dir pointed
+/// at `data_dir`, and the project dir an empty npm project so the crawl
+/// finds nothing and no batch request fires.
 fn scan_cmd(project: &Path, data_dir: &Path) -> Command {
-    let mut cmd = Command::new(BINARY);
+    let mut cmd = hermetic::binary_command();
     // Human mode: core's proxy advisory (the oracle below) is muted under
     // `--json`/`--silent`.
     cmd.args(["scan", "-e", "npm", "--cwd"]).arg(project);
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
     // Ambient VIRTUAL_ENV would be harmless under `-e npm`, but scrub it
     // anyway to mirror the other scan harnesses.
     cmd.env_remove("VIRTUAL_ENV");
     cmd.env(DATA_DIR_VAR, data_dir);
-    // Re-enable the config layer (the workspace-level SOCKET_NO_CONFIG=1
-    // guard was scrubbed above; set an explicit falsy value so the intent
-    // is visible). Gate tests override this with "1".
+    // Re-enable the config layer (the hermetic builder forces
+    // SOCKET_NO_CONFIG=1; caller env lands last). Gate tests override this
+    // with "1". Telemetry stays off (it is fire-and-forget to the *real*
+    // proxy when a run is unauthenticated); the one test that exercises
+    // telemetry-follows-config re-enables it explicitly.
     cmd.env("SOCKET_NO_CONFIG", "0");
-    // Telemetry is fire-and-forget to the *real* proxy when a run is
-    // unauthenticated — keep these tests off the network. The one test
-    // that exercises telemetry-follows-config re-enables it explicitly.
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     cmd
 }
 
@@ -441,23 +434,14 @@ fn write_empty_manifest(root: &Path) {
 
 /// `socket-patch list` against `project`, with the same hermetic env as
 /// [`scan_cmd`]: every ambient `SOCKET_*` scrubbed, the data dir pointed at
-/// the fixture, the config layer re-enabled, telemetry off by default.
+/// the fixture, the config layer re-enabled, telemetry off by default, and
+/// the passive update check off so the only request a run can make is the
+/// telemetry POST under test.
 fn list_cmd(project: &Path, data_dir: &Path) -> Command {
-    let mut cmd = Command::new(BINARY);
+    let mut cmd = hermetic::binary_command();
     cmd.arg("list").arg("--cwd").arg(project);
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") {
-            cmd.env_remove(&key);
-        }
-    }
     cmd.env(DATA_DIR_VAR, data_dir);
     cmd.env("SOCKET_NO_CONFIG", "0");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-    // The scrub above also dropped the workspace-level notifier guard; keep
-    // the passive update check off so the only request a run can make is the
-    // telemetry POST under test.
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
     cmd
 }
 

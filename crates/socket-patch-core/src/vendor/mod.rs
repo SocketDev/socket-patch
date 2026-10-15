@@ -111,6 +111,7 @@ pub mod vlt_lock;
 pub(crate) mod vlt_lock_text;
 pub(crate) mod yarn_berry_lock;
 pub(crate) mod yarn_classic_lock;
+pub(crate) mod yarn_copies;
 #[cfg(test)]
 mod yarn_layering_tests;
 
@@ -128,7 +129,7 @@ pub use state::{
 };
 pub use verify::{
     artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory,
-    compute_package_dir_inventory, file_sha256_hex, ArtifactHealth,
+    compute_package_dir_inventory, describe_artifact_failure, file_sha256_hex, ArtifactHealth,
 };
 // The hosted→vendored takeover refuses a berry project the backend would
 // refuse BEFORE it reverts the hosted redirect.

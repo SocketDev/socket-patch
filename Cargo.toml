@@ -14,13 +14,13 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-version = "5.0.0"
+version = "5.0.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/SocketDev/socket-patch"
 
 [workspace.dependencies]
-socket-patch-core = { path = "crates/socket-patch-core", version = "=5.0.0" }
+socket-patch-core = { path = "crates/socket-patch-core", version = "=5.0.1" }
 clap = { version = "=4.5.60", features = ["derive", "env"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.149", features = ["preserve_order", "raw_value"] }
@@ -75,17 +75,20 @@ ignore = "=0.4.33"
 strip = true
 lto = true
 opt-level = "s"
+codegen-units = 1
 
 # Test release semantics without the cost of full-LTO links for every test binary.
 # Shipped binaries still use [profile.release].
 [profile.ci-release]
 inherits = "release"
+codegen-units = 16
 lto = false
 strip = "none" # unstripped test binaries => usable backtraces on failure
 
 # Benchmark with release codegen, faster thin-LTO links, and profiler symbols.
 [profile.perf]
 inherits = "release"
+codegen-units = 16
 lto = "thin"
 strip = "none"
 
@@ -93,6 +96,7 @@ strip = "none"
 # in-process: release semantics without the slow full-LTO link.
 [profile.addon]
 inherits = "release"
+codegen-units = 16
 lto = "thin"
 
 # Optimize dependencies for test speed. Workspace crates stay unoptimized;

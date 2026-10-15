@@ -641,17 +641,21 @@ mod tests {
             ..GlobalArgs::default()
         };
         let purl = "pkg:npm/left-pad@1.3.0".to_string();
-        // The resolver never takes a link as a copy.
-        assert!(installed_copies(&common, &purl)
+        let mut expected = vec![alias.clone(), peers[1].clone()];
+        expected.sort();
+        // The resolver takes a root link only for a purl with no copy
+        // (#1494), and expands it to the same copies.
+        let mut resolved = installed_copies(&common, &purl)
             .await
-            .get(&purl)
-            .is_none_or(Vec::is_empty));
+            .remove(&purl)
+            .unwrap();
+        resolved.sort();
+        assert_eq!(resolved, expected, "the resolver's own copy set");
+        // An empty installed entry still falls back to the alias identity.
         let installed = HashMap::from([(purl, Vec::new())]);
         let (mut paths, calls) = tracked_npm_hosted(&common, &installed).await;
-        assert_eq!(calls, vec![vec![alias.clone()]]);
-        let mut expected = vec![alias, peers[1].clone()];
+        assert_eq!(calls, vec![vec![alias]]);
         paths.sort();
-        expected.sort();
         assert_eq!(paths, expected);
     }
 
@@ -746,9 +750,12 @@ mod tests {
             &purls[0],
         )
         .await;
-        assert!(
-            resolved.get(&purls[0]).is_none_or(Vec::is_empty),
-            "the resolver skips symlinks: {resolved:?}"
+        // The crawler skips symlinks; the resolver takes the root link
+        // only because the purl has no other copy (#1494).
+        assert_eq!(
+            resolved.get(&purls[0]),
+            Some(&vec![root.join("node_modules/lp")]),
+            "{resolved:?}"
         );
 
         let (_, _, _, snapshot) =

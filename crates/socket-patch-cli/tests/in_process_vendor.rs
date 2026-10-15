@@ -22,6 +22,8 @@
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -32,7 +34,6 @@ async fn vendor_run(mut args: VendorArgs) -> i32 {
 }
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -237,34 +238,16 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
 
 // ───────────────────────── subprocess runner ─────────────────────────
 
-/// Run the built `socket-patch` binary with every ambient `SOCKET_*` env var
-/// scrubbed from the child (env-robustness: the assertions must reflect the
-/// argv, not the developer's shell) and telemetry hard-disabled. Returns
-/// `(exit_code, stdout, stderr)`.
+/// Run the built `socket-patch` binary in the hermetic environment
+/// (`tests/common/hermetic.rs`): the assertions must reflect the argv, not
+/// the developer's shell. The builder also removes every flag-bound
+/// `SOCKET_*` by name, so a toggle a parallel in-process test's
+/// `apply_env_toggles` sets before the spawn is not inherited either (seen
+/// on test-release: a hosted scan inherited SOCKET_OFFLINE=1 and refused to
+/// run). Returns `(exit_code, stdout, stderr)`.
 fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).current_dir(cwd);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    // The in-process tests in this binary run `apply_env_toggles`, which
-    // `std::env::set_var`s these on the shared test process. A toggle set
-    // by a parallel test after the scan above but before the spawn would
-    // be inherited, so remove them unconditionally: `Command` applies the
-    // removals to the environment captured at spawn time. Seen on
-    // test-release: a hosted scan here inherited SOCKET_OFFLINE=1 and
-    // refused to run ("cannot run with --offline/SOCKET_OFFLINE").
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
-    ] {
-        cmd.env_remove(key);
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -3140,6 +3123,160 @@ async fn vendor_json_vex_warnings_ride_in_envelope() {
     );
 }
 
+/// REGRESSION (#1511): vendored npm's half of #1481. Under
+/// `install-strategy=nested` one workspace member's registry copy is
+/// vendored while another member depends on a `file:` directory holding
+/// the same release. npm links that directory in place of a registry
+/// copy, so it stays unpatched: neither the run's `--vex` nor a standalone
+/// `vex` may attest the purl.
+#[tokio::test]
+async fn vendor_npm_file_directory_copy_is_not_attested() {
+    let fx = npm_fixture();
+    // VEX refuses a metadata-less patch, so give it a vulnerability.
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    for (_, patch) in manifest["patches"].as_object_mut().unwrap() {
+        patch["vulnerabilities"] = json!({
+            "GHSA-file-dir-copy": {
+                "cves": ["CVE-2024-15110"],
+                "summary": "file: directory copy fixture",
+                "severity": "high",
+                "description": "d",
+            }
+        });
+    }
+    std::fs::write(
+        fx.manifest_path(),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    // npm 10's nested-workspace lock: `a`'s registry copy, and `b`'s
+    // versionless link to `lpdir`, whose own entry carries the release.
+    let mut lock = fx.lock_value();
+    let packages = lock["packages"].as_object_mut().unwrap();
+    let registry = packages.remove("node_modules/left-pad").unwrap();
+    packages.insert(
+        "".into(),
+        json!({
+            "name": "fixture", "version": "1.0.0", "workspaces": ["packages/*"]
+        }),
+    );
+    packages.insert(
+        "lpdir".into(),
+        json!({ "name": "left-pad", "version": "1.3.0" }),
+    );
+    packages.insert(
+        "node_modules/a".into(),
+        json!({ "resolved": "packages/a", "link": true }),
+    );
+    packages.insert(
+        "node_modules/b".into(),
+        json!({ "resolved": "packages/b", "link": true }),
+    );
+    packages.insert(
+        "packages/a".into(),
+        json!({
+            "name": "a", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" }
+        }),
+    );
+    packages.insert("packages/a/node_modules/left-pad".into(), registry);
+    packages.insert(
+        "packages/b".into(),
+        json!({
+            "name": "b", "version": "1.0.0", "dependencies": { "left-pad": "file:../../lpdir" }
+        }),
+    );
+    packages.insert(
+        "packages/b/node_modules/left-pad".into(),
+        json!({ "resolved": "lpdir", "link": true }),
+    );
+    std::fs::write(fx.lock_path(), serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+    // The installed tree: `a`'s registry copy, `b`'s link target.
+    for dir in ["packages/a/node_modules/left-pad", "lpdir"] {
+        let pkg = fx.root().join(dir);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            br#"{"name":"left-pad","version":"1.3.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
+    }
+
+    let vex_path = fx.root().join("vendored.vex.json");
+    let (code, env) = vendor_cli(
+        fx.root(),
+        &["--vex", vex_path.to_str().expect("vex path is UTF-8")],
+    );
+    let wired = fx.lock_value();
+    assert_eq!(
+        wired["packages"]["packages/a/node_modules/left-pad"]["resolved"],
+        json!(format!("file:{}", rel_tgz())),
+        "the registry copy is still vendored: {env}"
+    );
+    // The in-run VEX ran and withheld the ref, naming the unpatched copy;
+    // with nothing left to attest it fails closed, as for a `file:`
+    // tarball or URL copy.
+    assert_eq!(code, 1, "{env}");
+    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| {
+                w["code"] == "patched_ref_unattributable"
+                    && w["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("`packages/b/node_modules/left-pad`"))
+            })),
+        "{env}"
+    );
+    // No document is written when no statement survives, so a missing
+    // file is the expected "attests nothing" outcome.
+    let attested = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|doc| doc.to_string().contains(PURL))
+    };
+    assert!(
+        !attested(&vex_path),
+        "in-run VEX must not attest a purl whose file: directory copy stays unpatched: {env}"
+    );
+
+    // `vendor --check` fails, naming the copy rather than claiming nothing
+    // wires the artifact and prescribing a re-vendor that cannot reach it.
+    let (check, check_env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(check, 1, "{check_env}");
+    let reason = check_env["events"][0]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.starts_with("copy unpatched:")
+            && reason.contains("`packages/b/node_modules/left-pad`"),
+        "{check_env}"
+    );
+    let standalone = fx.root().join("standalone.vex.json");
+    let (_, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "vex",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+            "--output",
+            standalone.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        !attested(&standalone),
+        "standalone vex must not attest it either\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`packages/b/node_modules/left-pad`") && stderr.contains("UNPATCHED"),
+        "the unpatched copy is named\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 12. fail-closed --vendor-source=service refuses --offline
 // ─────────────────────────────────────────────────────────────────────
@@ -4778,6 +4915,57 @@ async fn vendor_check_fails_when_lock_no_longer_wires_artifact() {
             .is_some_and(|r| r.contains("wiring")),
         "{env:#}"
     );
+}
+
+/// REGRESSION (#1467): a missing or changed committed artifact failed
+/// `vendor --check` with the Rust Debug text of the health state
+/// (`Missing`, `Corrupt { reason: "vendor_sha256_mismatch" }`): no path,
+/// no remedy. The reason must name the artifact and point at `repair`;
+/// restoring the committed bytes turns the check green again.
+#[tokio::test]
+async fn vendor_check_names_damaged_artifact_and_repair_remedy() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+    let rel = fx
+        .tgz_path()
+        .strip_prefix(fx.root())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let good = std::fs::read(fx.tgz_path()).unwrap();
+
+    let mut changed = good.clone();
+    changed.extend_from_slice(b"drift");
+    std::fs::write(fx.tgz_path(), &changed).unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 1, "{env:#}");
+    let event = find_event(&env, "failed", Some("vendor_check_failed"));
+    assert_eq!(
+        event["reason"],
+        format!(
+            "committed artifact {rel} does not match the sha256 in the vendor ledger \
+             (vendor_sha256_mismatch); run `socket-patch repair` to restore it, then commit it"
+        ),
+        "{env:#}"
+    );
+
+    std::fs::remove_file(fx.tgz_path()).unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 1, "{env:#}");
+    let event = find_event(&env, "failed", Some("vendor_check_failed"));
+    assert_eq!(
+        event["reason"],
+        format!(
+            "committed artifact {rel} is missing (vendor_artifact_missing); run \
+             `socket-patch repair` to restore it, then commit it"
+        ),
+        "{env:#}"
+    );
+
+    std::fs::write(fx.tgz_path(), &good).unwrap();
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "verified", Some("vendor_check_ok"));
 }
 
 /// REGRESSION (#969): npm >= 11.14 refuses a vendored `file:` tarball

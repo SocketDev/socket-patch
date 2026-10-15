@@ -1,4 +1,4 @@
-//! `vendor`: lockfile-only gems, pristine fetch order, no-network re-runs, bun and the hosted redirects.
+//! `vendor`: lockfile-only gems, pristine fetch order, no-network re-runs, bun, the hosted redirects, the failure paths, the `--silent` error output and the human render.
 //!
 //! One test binary per command: each module was its own binary.
 
@@ -15,9 +15,17 @@ mod docker_vendor_common;
 mod docker_vendor_common_selftest;
 mod e2e_golang_redirect;
 mod in_process_vendor_bun;
+mod npm_fixture;
 mod redirect_npm_allow_remote;
+mod vendor_failure_paths;
 mod vendor_gem_lockfile_only_e2e;
+mod vendor_render;
 mod vendor_rerun_no_network_e2e;
+mod vendor_silent_errors;
 
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
+#[path = "../vlt_hosted_common/mod.rs"]
+mod vlt_hosted_common;
+#[path = "../vlt_hosted_common/vendored.rs"]
+mod vlt_vendored;

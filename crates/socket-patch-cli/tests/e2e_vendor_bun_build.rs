@@ -76,7 +76,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, parse_json_envelope};
+use common::{binary, git_sha256, hermetic_command, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -279,12 +279,13 @@ fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
     cmd.output().expect("failed to run bun")
 }
 
-/// The real binary with `--no-telemetry` appended: nothing in this suite
-/// should ever post a telemetry event, mocked API or not.
+/// The real binary in the hermetic environment (`tests/common/hermetic.rs`)
+/// plus the bun tool scrub, with `--no-telemetry` appended: nothing in this
+/// suite should ever post a telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.current_dir(cwd);
-    cache_env::scrub_ambient_bun_env(&mut cmd);
+    cache_env::scrub_ambient_bun_tool_env(&mut cmd);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
     cmd.arg("--no-telemetry");
     let out = cmd.output().expect("failed to run socket-patch binary");
@@ -1667,4 +1668,116 @@ fn bun_vendor_survives_a_digest_dropping_lock_resave() {
         "after revert bun installs the ORIGINAL bytes"
     );
     eprintln!("REVERT AFTER RESAVE OK (bun {})", fx.bun_raw);
+}
+
+// ── #1541: a repository that hands *.tgz to Git LFS ───────────────────
+
+/// `git` in `cwd` with no user or system config, so an ambient
+/// `filter.lfs` (or its absence) can't decide the outcome.
+fn git(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "init.defaultBranch=main",
+    ])
+    .args(args)
+    .current_dir(cwd)
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// #1541: the project's `.gitattributes` tracks `*.tgz` with Git LFS. The
+/// vendored tarball must still be committed as its own bytes, so a clone
+/// that does not smudge LFS (`actions/checkout` defaults, no git-lfs,
+/// `GIT_LFS_SKIP_SMUDGE=1`) frozen-installs the patched package.
+#[test]
+#[serial_test::serial]
+fn bun_vendor_tarball_is_not_committed_to_git_lfs() {
+    let lfs_installed = Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !lfs_installed {
+        println!("SKIP bun_vendor_tarball_is_not_committed_to_git_lfs: git-lfs is not installed");
+        return;
+    }
+    let Some(fx) = bun_project("vendor-lfs", Target::LeftPad, None) else {
+        return;
+    };
+    let proj = &fx.proj;
+    git(proj, &["init", "-q"], &[]);
+    git(proj, &["lfs", "install", "--local"], &[]);
+    std::fs::write(
+        proj.join(".gitattributes"),
+        "*.tgz filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .unwrap();
+    std::fs::write(proj.join(".gitignore"), "node_modules/\n").unwrap();
+    stage_and_vendor(&fx);
+    git(proj, &["add", "-A"], &[]);
+    git(proj, &["commit", "-qm", "vendored"], &[]);
+
+    let tgz_rel = vendored_tgz(&fx)
+        .strip_prefix(proj)
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let lfs_files = git(proj, &["lfs", "ls-files", "--name-only"], &[]);
+    assert!(
+        !String::from_utf8_lossy(&lfs_files.stdout).contains(&tgz_rel),
+        "the vendored tarball went into LFS: {}",
+        String::from_utf8_lossy(&lfs_files.stdout)
+    );
+
+    let clone = fx.tmp.path().join("lfs-less-clone");
+    git(
+        fx.tmp.path(),
+        &[
+            "clone",
+            "-q",
+            proj.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+        &[("GIT_LFS_SKIP_SMUDGE", "1")],
+    );
+    assert_eq!(
+        std::fs::read(clone.join(&tgz_rel)).unwrap(),
+        std::fs::read(vendored_tgz(&fx)).unwrap(),
+        "the clone must hold the tarball's bytes, not an LFS pointer"
+    );
+    let ci = bun(
+        &clone,
+        &["install", "--frozen-lockfile", "--ignore-scripts"],
+        &fx.tmp.path().join("lfs-less-bun-cache"),
+    );
+    assert!(
+        ci.status.success(),
+        "frozen install from the LFS-less clone failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fx.target.installed_dir(&clone).join("index.js")).unwrap(),
+        fx.patched,
+        "the clone installs the patched bytes"
+    );
 }

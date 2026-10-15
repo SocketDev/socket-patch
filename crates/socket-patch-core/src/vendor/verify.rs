@@ -692,6 +692,16 @@ pub enum ArtifactHealth {
     UnknownFlavor { flavor: String },
 }
 
+impl ArtifactHealth {
+    /// Only a Bun member-relative copy of the canonical tarball is off;
+    /// `repair` rewrites it from the committed tarball.
+    pub fn is_workspace_copy_issue(&self) -> bool {
+        matches!(self, ArtifactHealth::Corrupt { reason }
+            if reason == "vendor_workspace_artifact_missing"
+                || reason == "vendor_workspace_artifact_corrupt")
+    }
+}
+
 /// Health-check one vendored artifact against its patch record: the
 /// per-file afterHash verification of [`verify_vendored_patch_record`]
 /// (which for dir-shaped artifacts includes the whole-tree fileInventory
@@ -765,6 +775,90 @@ pub async fn check_vendored_artifact(
             }
         }
     }
+}
+
+/// Say in words why [`check_vendored_artifact`] failed: the cause, the
+/// committed path that is off and the step that fixes it, with the stable
+/// routing tag kept in parentheses for log searches. `None` for a healthy
+/// artifact. The remedy follows what `repair` does for each state: it
+/// restores a missing or corrupt artifact, skips a pending re-vendor, and
+/// refuses an entry it cannot verify.
+pub async fn describe_artifact_failure(
+    project_root: &Path,
+    entry: &VendorEntry,
+    health: &ArtifactHealth,
+) -> Option<String> {
+    let path = &entry.artifact.path;
+    // `repair` restores a damaged artifact from a verified download (or,
+    // for a Bun member copy, from the verified canonical tarball); with
+    // nothing in the ledger to verify against, it refuses.
+    let repair = match super::redownload::ledger_blocks_restore(entry) {
+        Some(detail) => format!("`socket-patch repair` cannot restore it: {detail}"),
+        None => "run `socket-patch repair` to restore it, then commit it".to_string(),
+    };
+    Some(match health {
+        ArtifactHealth::Healthy => return None,
+        // A JVM tree also counts as missing when only its marker is gone.
+        ArtifactHealth::Missing if super::jvm::apply::is_jvm_entry(entry) => format!(
+            "committed artifact {path} or its tree marker is missing (vendor_artifact_missing); \
+             {repair}"
+        ),
+        ArtifactHealth::Missing => {
+            format!("committed artifact {path} is missing (vendor_artifact_missing); {repair}")
+        }
+        ArtifactHealth::Corrupt { reason } if health.is_workspace_copy_issue() => {
+            let mirror = super::bun_workspace::failing_mirror(project_root, entry)
+                .await
+                .unwrap_or_else(|| format!("of {path}"));
+            let cause = if reason == "vendor_workspace_artifact_missing" {
+                "is missing"
+            } else {
+                "has different bytes"
+            };
+            // The canonical tarball was checked against the ledger only
+            // when the ledger records its sha256.
+            let canonical = if entry.artifact.sha256.is_empty() {
+                String::new()
+            } else {
+                format!("; the committed artifact {path} it mirrors is intact")
+            };
+            format!("Bun workspace copy {mirror} {cause} ({reason}){canonical}; {repair}")
+        }
+        ArtifactHealth::Corrupt { reason } => {
+            let cause = match reason.as_str() {
+                "vendor_sha256_mismatch" => "does not match the sha256 in the vendor ledger",
+                "vendor_hash_mismatch" => "has a patched file that does not match the patch",
+                "file_not_found" => "is missing a patched file",
+                "vendor_artifact_unreadable" => "cannot be read",
+                "vendor_inventory_mismatch" => "has files that differ from its recorded inventory",
+                _ => "failed verification",
+            };
+            format!("committed artifact {path} {cause} ({reason}); {repair}")
+        }
+        ArtifactHealth::StaleUuid => format!(
+            "the vendor ledger and the patch manifest name different patches for {path} \
+             (vendor_uuid_mismatch); a re-vendor is pending: run `socket-patch vendor`"
+        ),
+        ArtifactHealth::Unverifiable { reason }
+            if reason == "vendor_workspace_artifact_invalid" =>
+        {
+            let detail = super::bun_workspace::mirror_list_error(project_root, entry)
+                .unwrap_or_else(|| "the workspace copies could not be listed".into());
+            format!(
+                "the Bun workspace copies of {path} cannot be checked: {detail} ({reason}); \
+                 `socket-patch repair` will not rebuild them until that is fixed"
+            )
+        }
+        ArtifactHealth::Unverifiable { reason } => format!(
+            "committed artifact {path} cannot be verified ({reason}), so `socket-patch repair` \
+             will not rebuild it; restore .socket/vendor/state.json and .socket/manifest.json \
+             from version control, or re-run `socket-patch vendor`"
+        ),
+        ArtifactHealth::UnknownFlavor { flavor } => format!(
+            "{path} was vendored for the npm flavor `{flavor}`, which this socket-patch release \
+             does not understand; upgrade socket-patch"
+        ),
+    })
 }
 
 /// Plain sha256 hex of a regular file, size-capped; `None` on any read
@@ -939,11 +1033,28 @@ mod tests {
         );
         lock.set_package(id, &rel, &sri).unwrap();
         std::fs::write(root.path().join("bun.lockb"), lock.bytes()).unwrap();
+        let health = check_vendored_artifact(root.path(), &entry, &record).await;
         assert_eq!(
-            check_vendored_artifact(root.path(), &entry, &record).await,
+            health,
             ArtifactHealth::Corrupt {
                 reason: "vendor_workspace_artifact_missing".into()
             }
+        );
+        // #1467: the failure names the member copy, says the canonical
+        // artifact is fine and gives the remedy, never Rust Debug syntax.
+        let mirror = super::super::bun_workspace::failing_mirror(root.path(), &entry)
+            .await
+            .unwrap();
+        assert!(mirror.ends_with(&rel) && mirror != rel, "{mirror}");
+        assert_eq!(
+            describe_artifact_failure(root.path(), &entry, &health)
+                .await
+                .unwrap(),
+            format!(
+                "Bun workspace copy {mirror} is missing (vendor_workspace_artifact_missing); \
+                 the committed artifact {rel} it mirrors is intact; run `socket-patch repair` \
+                 to restore it, then commit it"
+            )
         );
         entry.wiring = super::super::bun_workspace::repair(root.path(), &entry, false)
             .await
@@ -960,6 +1071,18 @@ mod tests {
                 .unwrap_err(),
             "vendor_workspace_artifact_corrupt"
         );
+        let health = check_vendored_artifact(root.path(), &entry, &record).await;
+        assert_eq!(
+            describe_artifact_failure(root.path(), &entry, &health)
+                .await
+                .unwrap(),
+            format!(
+                "Bun workspace copy {} has different bytes (vendor_workspace_artifact_corrupt); \
+                 the committed artifact {rel} it mirrors is intact; run `socket-patch repair` \
+                 to restore it, then commit it",
+                entry.wiring[0].file
+            )
+        );
         // The archive's patched member remains readable, but the canonical
         // fingerprint must take precedence over the damaged member copy.
         let mut changed = bytes;
@@ -971,6 +1094,146 @@ mod tests {
                 reason: "vendor_sha256_mismatch".into()
             }
         );
+        let health = check_vendored_artifact(root.path(), &entry, &record).await;
+        assert_eq!(
+            describe_artifact_failure(root.path(), &entry, &health)
+                .await
+                .unwrap(),
+            format!(
+                "committed artifact {rel} does not match the sha256 in the vendor ledger \
+                 (vendor_sha256_mismatch); run `socket-patch repair` to restore it, then \
+                 commit it"
+            )
+        );
+    }
+
+    /// #1467: every failed health state reads as a cause, the committed
+    /// path and the step `repair` points at for it, never as Rust Debug.
+    #[tokio::test]
+    async fn describe_artifact_failure_names_path_and_remedy() {
+        let root = tempfile::tempdir().unwrap();
+        let rel = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        let mut entry = entry("npm", UUID, &rel);
+        entry.artifact.sha256 = "ab".repeat(32);
+        let describe = |health: ArtifactHealth| {
+            let (root, entry) = (root.path().to_path_buf(), entry.clone());
+            async move { describe_artifact_failure(&root, &entry, &health).await }
+        };
+        assert_eq!(describe(ArtifactHealth::Healthy).await, None);
+        let cases = [
+            (
+                ArtifactHealth::Missing,
+                format!(
+                    "committed artifact {rel} is missing (vendor_artifact_missing); run \
+                     `socket-patch repair` to restore it, then commit it"
+                ),
+            ),
+            (
+                ArtifactHealth::Corrupt {
+                    reason: "vendor_hash_mismatch".into(),
+                },
+                format!(
+                    "committed artifact {rel} has a patched file that does not match the patch \
+                     (vendor_hash_mismatch); run `socket-patch repair` to restore it, then \
+                     commit it"
+                ),
+            ),
+            (
+                ArtifactHealth::StaleUuid,
+                format!(
+                    "the vendor ledger and the patch manifest name different patches for {rel} \
+                     (vendor_uuid_mismatch); a re-vendor is pending: run `socket-patch vendor`"
+                ),
+            ),
+            (
+                ArtifactHealth::Unverifiable {
+                    reason: "vendor_artifact_path_invalid".into(),
+                },
+                format!(
+                    "committed artifact {rel} cannot be verified (vendor_artifact_path_invalid), \
+                     so `socket-patch repair` will not rebuild it; restore \
+                     .socket/vendor/state.json and .socket/manifest.json from version control, \
+                     or re-run `socket-patch vendor`"
+                ),
+            ),
+            (
+                ArtifactHealth::UnknownFlavor {
+                    flavor: "future".into(),
+                },
+                format!(
+                    "{rel} was vendored for the npm flavor `future`, which this socket-patch \
+                     release does not understand; upgrade socket-patch"
+                ),
+            ),
+        ];
+        for (health, want) in cases {
+            assert_eq!(describe(health).await.unwrap(), want);
+        }
+
+        // With no recorded sha256, repair has nothing to verify a download
+        // (or the canonical tarball) against and refuses, so the text says
+        // so instead of sending the user to it. Without a bun.lockb there is
+        // no member copy to name, and the canonical is not claimed intact.
+        entry.artifact.sha256.clear();
+        let no_sha = describe_artifact_failure(
+            root.path(),
+            &entry,
+            &ArtifactHealth::Corrupt {
+                reason: "vendor_workspace_artifact_missing".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            no_sha,
+            format!(
+                "Bun workspace copy of {rel} is missing (vendor_workspace_artifact_missing); \
+                 `socket-patch repair` cannot restore it: {}",
+                super::super::redownload::ledger_blocks_restore(&entry).unwrap()
+            )
+        );
+        assert!(no_sha.contains("no archive SHA-256"), "{no_sha}");
+        // A dir-shaped artifact with no file inventory: the same refusal.
+        let dir = entry_dir_no_inventory();
+        let text = describe_artifact_failure(root.path(), &dir, &ArtifactHealth::Missing)
+            .await
+            .unwrap();
+        assert!(
+            text.contains("`socket-patch repair` cannot restore it: the ledger has no complete file inventory"),
+            "{text}"
+        );
+
+        // An unreadable bun.lockb: the workspace copies can't be listed, and
+        // the text carries the real cause rather than a guess.
+        entry.flavor = Some("bun".into());
+        std::fs::write(root.path().join("bun.lockb"), b"not a lockb").unwrap();
+        let detail = super::super::bun_workspace::mirror_list_error(root.path(), &entry).unwrap();
+        let text = describe_artifact_failure(
+            root.path(),
+            &entry,
+            &ArtifactHealth::Unverifiable {
+                reason: "vendor_workspace_artifact_invalid".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "the Bun workspace copies of {rel} cannot be checked: {detail} \
+                 (vendor_workspace_artifact_invalid); `socket-patch repair` will not rebuild \
+                 them until that is fixed"
+            )
+        );
+        assert!(!text.contains("Corrupt {"), "{text}");
+    }
+
+    fn entry_dir_no_inventory() -> VendorEntry {
+        entry(
+            "cargo",
+            UUID,
+            &format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.4"),
+        )
     }
 
     /// A cargo copy's inventory taken before tagged versions keeps

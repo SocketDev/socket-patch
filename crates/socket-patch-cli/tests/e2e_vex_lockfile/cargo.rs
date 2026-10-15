@@ -51,8 +51,6 @@
 
 //! manifest-less lockfile-wired project.
 
-use crate::common::binary;
-
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -137,17 +135,10 @@ impl Fx {
     /// Hermetic child: ambient `SOCKET_*` scrubbed, no token / config /
     /// telemetry, the fixture's private caches.
     fn command(&self) -> Command {
-        let mut cmd = Command::new(binary());
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-                cmd.env_remove(key);
-            }
-        }
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-            .env("SOCKET_NO_CONFIG", "1")
-            .env("SOCKET_NO_API_TOKEN", "1")
-            .env("CARGO_HOME", &self.cargo_home)
-            .env_remove("VIRTUAL_ENV");
+        let mut cmd = crate::hermetic::binary_command();
+        crate::hermetic::scrub_extra(&mut cmd, &[crate::hermetic::Extra::Venv]);
+        cmd.env("SOCKET_NO_API_TOKEN", "1")
+            .env("CARGO_HOME", &self.cargo_home);
         cmd
     }
 

@@ -27,6 +27,8 @@
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -37,7 +39,6 @@ async fn vendor_run(mut args: VendorArgs) -> i32 {
 }
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde_json::{json, Value};
 use socket_patch_cli::args::GlobalArgs;
@@ -231,30 +232,12 @@ fn rollback_args(cwd: &Path, preserve_state: bool) -> RollbackArgs {
 
 // ───────────────────────── subprocess runner ─────────────────────────
 
-/// Run the built `socket-patch` binary with every ambient `SOCKET_*` env var
-/// scrubbed from the child (env-robustness: the assertions must reflect the
-/// argv, not the developer's shell) and telemetry hard-disabled.
+/// Run the built `socket-patch` binary in the hermetic environment
+/// (`tests/common/hermetic.rs`): the assertions must reflect the argv, not
+/// the developer's shell.
 fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).current_dir(cwd);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the scan
-    // above and the spawn would be inherited, so remove them
-    // unconditionally (see in_process_vendor.rs `run_cli`).
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
-    ] {
-        cmd.env_remove(key);
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),

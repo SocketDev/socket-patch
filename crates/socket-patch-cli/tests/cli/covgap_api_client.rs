@@ -6,9 +6,7 @@
 //! stderr *text* — the "you configured the sha512- storage hash, not the
 //! token" hint — which only a spawned process can observe.
 
-use crate::common::binary;
-
-use std::process::Command;
+use crate::common::{binary, hermetic_command};
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -73,14 +71,10 @@ async fn run_get_with_hash_shaped_token(extra: &[&str]) -> std::process::Output 
         "sha512-deadbeefdeadbeef",
     ]);
     // `mock` is dropped (and its `.expect(1)`s verified) on return.
-    Command::new(binary())
+    // Hermetic env: ambient state must not short-circuit auto-resolution
+    // (no env slug, no offline gate, no socket-cli config).
+    hermetic_command(&binary())
         .args(&args)
-        // Ambient state must not short-circuit auto-resolution: no env
-        // slug, no offline gate, no socket-cli config (`socket login`).
-        .env_remove("SOCKET_ORG_SLUG")
-        .env_remove("SOCKET_OFFLINE")
-        .env_remove("SOCKET_API_TOKEN")
-        .env("SOCKET_NO_CONFIG", "1")
         .current_dir(tmp.path())
         .output()
         .expect("run socket-patch get")
@@ -244,12 +238,7 @@ async fn unresolved_org_reaches_get_uuid_dry_run_json_warnings() {
     let cwd = tmp.path();
     let uri = mock.uri();
     let token = format!("sktsec_{}_api", "x".repeat(44));
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = hermetic_command(&binary());
     let out = cmd
         .args([
             "get",
@@ -268,7 +257,6 @@ async fn unresolved_org_reaches_get_uuid_dry_run_json_warnings() {
             "--api-token",
             &token,
         ])
-        .env("SOCKET_NO_CONFIG", "1")
         .current_dir(cwd)
         .output()
         .expect("run socket-patch get");
@@ -377,12 +365,7 @@ async fn unresolved_org_routes_the_whole_scan_vex_run_to_the_proxy_once() {
     let vex_path = cwd.join("out.vex.json");
     let uri = mock.uri();
     let token = format!("sktsec_{}_api", "x".repeat(44));
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = hermetic_command(&binary());
     let out = cmd
         .args([
             "scan",
@@ -400,7 +383,6 @@ async fn unresolved_org_routes_the_whole_scan_vex_run_to_the_proxy_once() {
             "--api-token",
             &token,
         ])
-        .env("SOCKET_NO_CONFIG", "1")
         .current_dir(cwd)
         .output()
         .expect("run socket-patch scan");
@@ -485,12 +467,7 @@ async fn unresolved_org_reaches_apply_and_vendor_json_warnings() {
         std::fs::write(cwd.join(".socket/manifest.json"), r#"{"patches":{}}"#).unwrap();
         let uri = mock.uri();
         let token = format!("sktsec_{}_api", "x".repeat(44));
-        let mut cmd = Command::new(binary());
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") {
-                cmd.env_remove(key);
-            }
-        }
+        let mut cmd = hermetic_command(&binary());
         let out = cmd
             .args([
                 command,
@@ -504,7 +481,6 @@ async fn unresolved_org_reaches_apply_and_vendor_json_warnings() {
                 "--api-token",
                 &token,
             ])
-            .env("SOCKET_NO_CONFIG", "1")
             .current_dir(cwd)
             .output()
             .unwrap_or_else(|e| panic!("run socket-patch {command}: {e}"));

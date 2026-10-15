@@ -1547,7 +1547,7 @@ mod tests {
 
     /// REGRESSION: the vendored repository is `checksumPolicy=fail`, so the
     /// jar's `.sha1` sidecar is part of the wiring. With it stale or gone,
-    /// real Maven (3.6.3 → 4.0.0-rc-6, `e2e_vendor_maven_build`) rejects the
+    /// real Maven (3.6.3 → 4.0.0-rc-7, `e2e_vendor_maven_build`) rejects the
     /// file:// copy and silently resolves Central's pristine jar — while the
     /// committed members still hash-verify, so the ref must not attest a
     /// build that no longer consumes the patch.

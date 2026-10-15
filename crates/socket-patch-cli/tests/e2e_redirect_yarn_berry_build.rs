@@ -885,6 +885,147 @@ async fn berry_get_uuid_hosted_fresh_checkout_installs() {
     hosted_manifestless_vex_matrix(&fx, HostedDriver::GetUuid);
 }
 
+/// #1465: a metadata mirror that passes npmjs packuments through unchanged
+/// (tarball URLs still on registry.npmjs.org) and 404s every `/-/` tarball
+/// path under itself. Real yarn locks the dependency behind it as
+/// `left-pad@npm:1.3.0::__archiveUrl=<npmjs url>`. A hosted pin then
+/// `rollback` must restore that binding: without it a cold install fetches
+/// the conventional path under the mirror and fails YN0035 (404).
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn berry_hosted_rollback_keeps_archive_url_behind_passthrough_mirror() {
+    let Some(fx) = berry_hosted_project("mirror-rollback", false, HostedDriver::Scan).await else {
+        return;
+    };
+    let server = &fx._server;
+
+    // The mirror: npmjs's packument verbatim; nothing mounted under `/-/`,
+    // so wiremock answers every tarball path under the mirror with 404.
+    let mut curl = Command::new("curl");
+    curl.args(["-fsSL", &format!("https://registry.npmjs.org/{DEP}")]);
+    let packument: serde_json::Value = match curl.output() {
+        Ok(out) if out.status.success() => {
+            serde_json::from_slice(&out.stdout).expect("packument JSON")
+        }
+        other => {
+            skip!("SKIP berry mirror rollback: npmjs packument unreachable: {other:?}");
+            return;
+        }
+    };
+    let version_doc = packument["versions"][DEP_VERSION].clone();
+    let npmjs_tarball = version_doc["dist"]["tarball"].as_str().unwrap().to_string();
+    assert!(
+        npmjs_tarball.starts_with("https://registry.npmjs.org/"),
+        "{npmjs_tarball}"
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/meta/{DEP}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&packument))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/meta/{DEP}/{DEP_VERSION}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&version_doc))
+        .mount(server)
+        .await;
+    let mirror_rc = format!(
+        "nodeLinker: node-modules\nenableGlobalCache: false\n\
+         unsafeHttpWhitelist:\n  - \"{}\"\n\
+         npmRegistryServer: \"{}/meta\"\n",
+        fx.host.split(':').next().unwrap_or("127.0.0.1"),
+        server.uri()
+    );
+
+    // What yarn itself locks behind the mirror (the restore's target).
+    let reference = fx.tmp.path().join("mirror-reference");
+    std::fs::create_dir_all(&reference).unwrap();
+    std::fs::write(reference.join("package.json"), &fx.registry_pkg).unwrap();
+    std::fs::write(reference.join(".yarnrc.yml"), &mirror_rc).unwrap();
+    let reference_global = fx.tmp.path().join("mirror-reference-global");
+    let install = corepack(
+        &reference,
+        yarn_berry(),
+        &["install"],
+        &[("YARN_GLOBAL_FOLDER", reference_global.to_str().unwrap())],
+    );
+    assert!(
+        install.status.success(),
+        "yarn install behind the mirror:\n{}",
+        yarn_berry_common::yarn_output(&install)
+    );
+    let mirror_lock = std::fs::read_to_string(reference.join("yarn.lock")).unwrap();
+    let bound = mirror_lock
+        .lines()
+        .find(|l| {
+            l.trim_start()
+                .starts_with(&format!("resolution: \"{DEP}@npm:"))
+        })
+        .unwrap_or_else(|| panic!("no {DEP} resolution in:\n{mirror_lock}"))
+        .to_string();
+    assert!(
+        bound.contains("::__archiveUrl="),
+        "yarn binds npmjs's URL behind the mirror: {bound}"
+    );
+
+    // The project now resolves through the mirror; the patch service
+    // supplies the upstream checksum the restore writes back.
+    std::fs::write(fx.proj.join(".yarnrc.yml"), &mirror_rc).unwrap();
+    let checksum = yarn_berry_common::yarn_written_checksum(&mirror_lock).unwrap();
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/npm/{UUID}.json")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": DEP,
+            "version": DEP_VERSION,
+            "integrity": version_doc["dist"]["integrity"],
+            "yarnBerry10c0": checksum,
+        })))
+        .mount(server)
+        .await;
+    let origin = server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &fx.proj,
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--patch-server-url",
+            &origin,
+            "--cwd",
+            fx.proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let restored = std::fs::read_to_string(fx.proj.join("yarn.lock")).unwrap();
+    assert!(
+        restored.lines().any(|l| l == bound),
+        "rollback restores yarn's own binding {bound:?}; got:\n{restored}"
+    );
+
+    // A cold, immutable install behind the mirror fetches the bound URL.
+    let fresh = fx.tmp.path().join("mirror-fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in ["package.json", "yarn.lock", ".yarnrc.yml"] {
+        std::fs::copy(fx.proj.join(file), fresh.join(file)).unwrap();
+    }
+    let fresh_global = fx.tmp.path().join("mirror-fresh-global");
+    let ci = corepack(
+        &fresh,
+        yarn_berry(),
+        &["install", "--immutable", "--check-cache"],
+        &[("YARN_GLOBAL_FOLDER", fresh_global.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "cold `yarn install --immutable` behind the mirror after rollback:\n{}",
+        yarn_berry_common::yarn_output(&ci)
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert_eq!(installed, fx.orig, "the upstream bytes are back");
+}
+
 /// Negative twin: the hosted URL serves a DIFFERENT tarball while the lock
 /// pins the real `10c0` checksum — the fresh `--check-cache` install must fail
 /// with YN0018.

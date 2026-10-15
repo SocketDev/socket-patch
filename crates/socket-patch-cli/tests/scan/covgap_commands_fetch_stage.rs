@@ -13,7 +13,7 @@
 //!
 //! The `--silent` variants of the offline / download-failure diagnostics
 //! (errors only, never nothing) are pinned by
-//! `coverage_fix_apply_silent_mute_exit.rs`; this suite covers the
+//! `apply/apply_silent_staging_errors.rs`; this suite covers the
 //! human-mode (non-quiet) output shape and the mem-stager arms.
 
 use std::path::Path;

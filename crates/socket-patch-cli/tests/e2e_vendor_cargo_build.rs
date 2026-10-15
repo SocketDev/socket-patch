@@ -81,7 +81,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256, parse_json_envelope};
+use common::{binary, git_sha256, hermetic, hermetic_command, parse_json_envelope};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -204,18 +204,13 @@ fn metadata_version(dir: &Path, cargo_home: &Path) -> String {
 
 // ── self-contained helpers ────────────────────────────────────────────
 
-/// Run socket-patch with ambient `SOCKET_*` vars scrubbed and the fixture's
-/// private CARGO_HOME injected (the cargo crawler resolves the registry
+/// Run socket-patch in the hermetic environment (`tests/common/hermetic.rs`)
+/// with the fixture's private CARGO_HOME injected (the cargo crawler resolves the registry
 /// source tree through it).
 fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
     cmd.env("CARGO_HOME", cargo_home);
     let _fixture = prebuilt_common::prepare_command(
         &mut cmd,

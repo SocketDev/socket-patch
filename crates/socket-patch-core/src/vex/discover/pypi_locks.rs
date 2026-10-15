@@ -96,6 +96,8 @@
 //! The native (registry) fixtures are rewired in the tests through the SAME
 //! rewriter functions the hosted and vendored backends call.
 
+use std::collections::BTreeSet;
+
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use super::{
@@ -295,7 +297,7 @@ fn str_of<'t>(table: &'t dyn TableLike, key: &str) -> Option<&'t str> {
 fn package_tables<'d>(
     out: &mut Discovery,
     file: &str,
-    doc: &'d DocumentMut,
+    doc: &'d Table,
     collection: &str,
 ) -> Option<&'d toml_edit::ArrayOfTables> {
     let item = doc.get(collection)?;
@@ -344,6 +346,17 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
     // A PEP 723 script lock is scoped to its script's own install: it is not
     // evidence against the project's locks (see `contest_across_locks`).
     let script_lock = is_script_lock_name(file);
+    // The packages a uv / script lock holds (a pylock has no paired
+    // metadata to leave an override behind in).
+    let locked: BTreeSet<String> = if pep751 {
+        BTreeSet::new()
+    } else {
+        packages
+            .iter()
+            .filter_map(|p| p.get("name").and_then(Item::as_str))
+            .map(canonicalize_pypi_name)
+            .collect()
+    };
     for package in packages.iter() {
         if pep751 {
             pylock_candidates(ctx, file, package, out, &mut candidates);
@@ -365,6 +378,9 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
         if !pep751 {
             if let Some(meta) = paired_metadata_rel(file) {
                 ctx.recognize_ignored(meta).await;
+                if let Some(doc) = quiet_metadata(ctx, meta, script_lock).await {
+                    record_orphaned_overrides(ctx, file, &locked, &doc, script_lock, out);
+                }
             }
         }
         return;
@@ -374,6 +390,9 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
     } else {
         load_pairing(ctx, file, out).await
     };
+    if let Pairing::Sources { doc, .. } = &pairing {
+        record_orphaned_overrides(ctx, file, &locked, doc, script_lock, out);
+    }
     for c in candidates {
         match &pairing {
             Pairing::LockOnly => emit(out, file, c),
@@ -409,6 +428,97 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
             }
         }
     }
+}
+
+/// The paired metadata document of a lock with no Socket entry, read
+/// without recording the read or diagnosing a failure (the half-reverted
+/// sweep above reads it the same way): only the leftover-override check
+/// looks at it. A script's document is its PEP 723 block.
+async fn quiet_metadata(ctx: &DiscoverCtx<'_>, rel: &str, script: bool) -> Option<DocumentMut> {
+    if ctx.is_ignored(rel) {
+        return None;
+    }
+    let bytes = ctx.view.read_bytes(rel).await.ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    if script {
+        let (_, block) = crate::utils::python_script::script_metadata(&text).ok()?;
+        block.parse().ok()
+    } else {
+        text.parse().ok()
+    }
+}
+
+/// Record each hosted override pin the paired metadata still carries for a
+/// package `file` no longer locks ([`StaleSelector`], #1445): the hosted
+/// rewrite wires a TRANSITIVE package with an `override-dependencies`
+/// entry under its ownership comment plus a `[tool.uv.sources]` URL, and
+/// once the parent stops depending on it (`uv remove <parent>`, `uv lock
+/// --upgrade-package <parent>`) uv drops its `[[package]]` but never edits
+/// either line. That is Socket's own leftover pin, which the management
+/// commands retire instead of refusing around it as contested wiring. A
+/// user's own (unmarked) override, a package the lock still holds, and a
+/// source that is not one unconditional hosted URL naming the pinned
+/// release's artifact are left to the contested path.
+///
+/// [`StaleSelector`]: super::StaleSelector
+fn record_orphaned_overrides(
+    ctx: &DiscoverCtx<'_>,
+    file: &str,
+    locked: &BTreeSet<String>,
+    doc: &DocumentMut,
+    script: bool,
+    out: &mut Discovery,
+) {
+    for pin in crate::utils::python_script::hosted_override_pins(doc, script) {
+        if locked.contains(&pin.name) {
+            continue;
+        }
+        let Some(source) = unconditional_source(doc, &pin.name) else {
+            continue;
+        };
+        let Some(url) = str_of(source, "url") else {
+            continue;
+        };
+        let Some(uuid) = ctx.hosted_uuid(url) else {
+            continue;
+        };
+        if !artifact_names_release(url, &pin.name, &pin.version) {
+            continue;
+        }
+        let Some(purl) = crate::utils::purl::pypi_purl(&pin.name, &pin.version) else {
+            continue;
+        };
+        out.stale_selectors.push(super::StaleSelector {
+            file: file.into(),
+            selector: pin.name,
+            url: url.to_string(),
+            purl: crate::utils::purl_key::canonical_base_purl(&purl),
+            uuid,
+        });
+    }
+}
+
+/// Whether `url`'s artifact (its last path segment: a wheel
+/// `<name>-<version>-….whl` or an sdist `<name>-<version>.tar.gz` / `.zip`)
+/// is release `version` of canonical package `name`.
+fn artifact_names_release(url: &str, name: &str, version: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let leaf = path.rsplit('/').next().unwrap_or("");
+    let stem_version = if let Some(stem) = leaf.strip_suffix(".whl") {
+        let mut parts = stem.split('-');
+        match (parts.next(), parts.next()) {
+            (Some(n), Some(v)) => Some((n, v)),
+            _ => None,
+        }
+    } else {
+        [".tar.gz", ".zip"]
+            .iter()
+            .find_map(|ext| leaf.strip_suffix(ext))
+            .and_then(|stem| stem.rsplit_once('-'))
+    };
+    stem_version.is_some_and(|(n, v)| {
+        canonicalize_pypi_name(n) == name && (v == version || v == version.replace('-', "_"))
+    })
 }
 
 /// The `pypi_purl` of a lock table's `name` + `version`.
@@ -643,34 +753,35 @@ fn unusable(file: &str, why: &str) -> Pairing {
     }
 }
 
-/// Whether `doc`'s `[tool.uv.sources]` routes canonical package `canon` to
-/// exactly `wired`'s patch: a single unconditional `{ url | path }` source
-/// (our writers' shape; a marker / extra / group split applies only to some
-/// installs, and an array of sources is such a split).
-fn sources_confirm(ctx: &DiscoverCtx<'_>, doc: &DocumentMut, canon: &str, wired: &Wired) -> bool {
-    let Some(sources) = doc
+/// `doc`'s `[tool.uv.sources]` entry for canonical package `canon` when it
+/// is a single unconditional table (our writers' shape; a marker / extra /
+/// group split applies only to some installs, and an array of sources is
+/// such a split).
+fn unconditional_source<'d>(doc: &'d DocumentMut, canon: &str) -> Option<&'d dyn TableLike> {
+    let source = doc
         .get("tool")
         .and_then(Item::as_table_like)
         .and_then(|tool| tool.get("uv"))
         .and_then(Item::as_table_like)
         .and_then(|uv| uv.get("sources"))
-        .and_then(Item::as_table_like)
-    else {
-        return false;
-    };
-    let Some(source) = sources
+        .and_then(Item::as_table_like)?
         .iter()
         .find(|(key, _)| canonicalize_pypi_name(key) == canon)
-        .and_then(|(_, item)| item.as_table_like())
-    else {
+        .and_then(|(_, item)| item.as_table_like())?;
+    (!["marker", "extra", "group"]
+        .iter()
+        .any(|key| source.contains_key(key)))
+    .then_some(source)
+}
+
+/// Whether `doc`'s `[tool.uv.sources]` routes canonical package `canon` to
+/// exactly `wired`'s patch: a single unconditional `{ url | path }` source
+/// (our writers' shape; a marker / extra / group split applies only to some
+/// installs, and an array of sources is such a split).
+fn sources_confirm(ctx: &DiscoverCtx<'_>, doc: &DocumentMut, canon: &str, wired: &Wired) -> bool {
+    let Some(source) = unconditional_source(doc, canon) else {
         return false;
     };
-    if ["marker", "extra", "group"]
-        .iter()
-        .any(|key| source.contains_key(key))
-    {
-        return false;
-    }
     let Some(location) = str_of(source, "url").or_else(|| str_of(source, "path")) else {
         return false;
     };
@@ -763,7 +874,7 @@ async fn extract_poetry(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 
 /// The pin Poetry verifies `filename` against (see the module docs).
 fn poetry_pin(
-    doc: &DocumentMut,
+    doc: &Table,
     package: &Table,
     name: &str,
     filename: &str,

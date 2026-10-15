@@ -33,8 +33,7 @@ use std::path::{Path, PathBuf};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{
-    crawl_ecosystems, crawl_ecosystems_with_npm, find_all_packages_for_rollback_reusing,
-    partition_purls,
+    crawl_ecosystems, crawl_ecosystems_with_npm, find_package_paths_for_path_scope, partition_purls,
 };
 use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction, PatchEvent,
@@ -2181,7 +2180,7 @@ async fn run_scan(
         unresolved.dedup();
         if !unresolved.is_empty() {
             let partitioned = partition_purls(&unresolved, args.common.ecosystems.as_deref());
-            let copies = find_all_packages_for_rollback_reusing(
+            let copies = find_package_paths_for_path_scope(
                 &partitioned,
                 &crawler_options,
                 true,
@@ -2504,6 +2503,32 @@ async fn run_scan(
         &all_purls,
         &mut lockfile_only.purls,
     );
+    // #1534: hosted and vendored runs rewire only this root's locks, so a
+    // patched copy only a nested npm project installs is left to that
+    // project's own run, with a warning, not handed to this root's backend.
+    if (hosted || vendor)
+        && !args.common.is_global()
+        && args.common.ecosystem_selected(Ecosystem::Npm)
+    {
+        let (skipped, warnings) = Box::pin(discovery::nested_project_skips(
+            &args.common.cwd,
+            if hosted { "hosted" } else { "vendored" },
+            &crawler_options,
+            &filtered_crawled,
+            &lockfile_only.entries,
+            &all_packages_with_patches,
+        ))
+        .await;
+        if !skipped.is_empty() {
+            all_packages_with_patches.retain(|p| !skipped.contains(&PurlKey::new(&p.purl)));
+            if !args.common.json {
+                for (_, detail) in &warnings {
+                    status.println(format!("Warning: {detail}"));
+                }
+            }
+            layout_refusals.extend(warnings);
+        }
+    }
 
     // If every batch errored, surface a full scan failure rather than
     // silently reporting zero patches.

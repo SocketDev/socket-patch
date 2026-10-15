@@ -34,7 +34,7 @@ impl ArtifactSource<'_> {
 /// (uv 0.2.x) or `package` (uv ≥ 0.2.35 and PEP 723 script locks). The
 /// lock inventory, lockfile discovery and `lock_inventory::
 /// wired_vendor_integrity` all pick the array with this one rule.
-pub(crate) fn lock_package_collection(doc: &DocumentMut) -> (&'static str, bool) {
+pub(crate) fn lock_package_collection(doc: &Table) -> (&'static str, bool) {
     if doc.contains_key("lock-version") {
         ("packages", true)
     } else if doc.contains_key("distribution") {
@@ -1201,6 +1201,20 @@ pub fn paired_metadata_rel(lock: &str) -> Option<&str> {
     script_of_lock(lock)
 }
 
+/// [`paired_metadata_rel`] for a root-relative lock path: the metadata file
+/// beside it (`sub/uv.lock` → `sub/pyproject.toml`).
+pub fn paired_metadata_path(lock: &str) -> Option<String> {
+    let (dir, leaf) = match lock.rsplit_once('/') {
+        Some((dir, leaf)) => (Some(dir), leaf),
+        None => (None, lock),
+    };
+    let paired = paired_metadata_rel(leaf)?;
+    Some(match dir {
+        Some(dir) => format!("{dir}/{paired}"),
+        None => paired.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod script_lock_name_tests {
     use super::*;
@@ -1216,6 +1230,15 @@ mod script_lock_name_tests {
         assert_eq!(paired_metadata_rel("uv.lock"), Some("pyproject.toml"));
         assert_eq!(paired_metadata_rel("tool.py.lock"), Some("tool.py"));
         assert_eq!(paired_metadata_rel("pylock.toml"), None);
+        assert_eq!(
+            paired_metadata_path("sub/uv.lock").as_deref(),
+            Some("sub/pyproject.toml")
+        );
+        assert_eq!(
+            paired_metadata_path("tool.py.lock").as_deref(),
+            Some("tool.py")
+        );
+        assert_eq!(paired_metadata_path("package.json"), None);
     }
 }
 

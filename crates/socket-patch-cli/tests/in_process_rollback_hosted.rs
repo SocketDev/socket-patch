@@ -27,6 +27,8 @@
 //! `#[serial]`: every command's `run` mirrors env toggles into
 //! process-global env vars (`apply_env_toggles`).
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
@@ -162,49 +164,16 @@ async fn rollback_online(cwd: &Path, server: &MockServer) -> i32 {
     code
 }
 
-/// A `socket-patch` Command with the ambient `SOCKET_*` env surface scrubbed
-/// (the `in_process_redirect.rs` seed-then-scrub pattern): hostile seeds
-/// never reach the child because `env_remove` clears them too, but if a
-/// scrub line is ever dropped the seed turns the suite red immediately.
-/// Telemetry opt-outs are deliberately kept so an opted-out dev stays
-/// opted out.
+/// A `socket-patch` Command in the hermetic environment
+/// (`tests/common/hermetic.rs`).
 fn scrubbed_cli() -> std::process::Command {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_OFFLINE", "true")
-        .env("SOCKET_ECOSYSTEMS", "cargo")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
-        .env("SOCKET_PRESERVE_STATE", "true")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_OFFLINE")
-        .env_remove("SOCKET_ECOSYSTEMS")
-        .env_remove("SOCKET_MANIFEST_PATH")
-        .env_remove("SOCKET_PRESERVE_STATE");
+    let mut cmd = hermetic::binary_command();
     // A registry exported by npm (`npm_config_registry`) or Bun would
     // steer the Bun restores off the fixtures' registry.
     for key in [
         "BUN_CONFIG_REGISTRY",
         "NPM_CONFIG_REGISTRY",
         "npm_config_registry",
-    ] {
-        cmd.env_remove(key);
-    }
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the scan
-    // above and the spawn would be inherited, so remove them
-    // unconditionally (see in_process_vendor.rs `run_cli`).
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
     ] {
         cmd.env_remove(key);
     }
@@ -2032,5 +2001,135 @@ fn remove_retires_a_berry_selector_left_by_yarn_remove() {
             BERRY_PKG_RETIRED,
             "remove {target}"
         );
+    }
+}
+
+// ── #1445: a uv override pin `uv remove` / `uv lock -P` left behind ─────────
+// Hosted uv wires a transitive package (six, through isodate 0.6.1) with a
+// marked `override-dependencies` entry plus a `[tool.uv.sources]` URL. After
+// `uv lock --upgrade-package isodate` (0.7.2 has no six) or `uv remove
+// isodate`, uv drops six from uv.lock but keeps both lines and the lock's
+// `[manifest] overrides` record. That used to read as contested wiring:
+// `list`, `rollback` and `remove` failed forever with
+// `hosted_wiring_contested`, and the printed re-scan remedy changed nothing.
+
+const SIX_PURL: &str = "pkg:pypi/six@1.16.0";
+const SIX_UUID: &str = "66666666-6666-4666-8666-666666666666";
+const SIX_HOSTED_URL: &str = "http://patch.test/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/66666666-6666-4666-8666-666666666666/six-1.16.0-py2.py3-none-any.whl";
+
+/// The project's pyproject.toml before the hosted run.
+const UV_PYPROJECT_PRISTINE: &str = "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\
+     requires-python = \">=3.9\"\ndependencies = [\"isodate>=0.6\"]\n";
+
+/// uv.lock as real uv writes it after the relock, with `manifest` (the
+/// leftover `[manifest]` block) or none.
+fn uv_lock_after_relock(manifest: Option<&str>) -> String {
+    let manifest = manifest.map(|m| format!("{m}\n\n")).unwrap_or_default();
+    format!(
+        "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n{manifest}\
+         [[package]]\nname = \"demo\"\nversion = \"0.1.0\"\nsource = {{ virtual = \".\" }}\n\
+         dependencies = [\n    {{ name = \"isodate\" }},\n]\n\n\
+         [package.metadata]\nrequires-dist = [{{ name = \"isodate\", specifier = \">=0.6\" }}]\n\n\
+         [[package]]\nname = \"isodate\"\nversion = \"0.7.2\"\n\
+         source = {{ registry = \"https://pypi.org/simple\" }}\n\
+         wheels = [\n    {{ url = \"https://files.pythonhosted.org/packages/15/aa/0aca39a37d3c7eb941ba736ede56d689e7be91cab5d9ca846bde3999eba6/isodate-0.7.2-py3-none-any.whl\", hash = \"sha256:28009937d8031054830160fce6d409ed342816b543597cece116d966c6d99e15\", size = 22320, upload-time = \"2024-10-08T23:04:09.501Z\" }},\n]\n"
+    )
+}
+
+fn write_uv_override_left_by_relock(root: &Path) {
+    std::fs::write(
+        root.join("pyproject.toml"),
+        format!(
+            "{UV_PYPROJECT_PRISTINE}\n[tool.uv]\noverride-dependencies = [\n    \
+             # socket-patch hosted: pins a patched transitive dependency; rollback removes it\n    \
+             \"six==1.16.0\",\n]\n\n[tool.uv.sources]\nsix = {{ url = \"{SIX_HOSTED_URL}\" }}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("uv.lock"),
+        uv_lock_after_relock(Some(&format!(
+            "[manifest]\noverrides = [{{ name = \"six\", url = \"{SIX_HOSTED_URL}\" }}]"
+        ))),
+    )
+    .unwrap();
+}
+
+/// Both files are back to what `uv lock` writes without the leftover.
+fn assert_uv_override_retired(root: &Path, context: &str) {
+    assert_eq!(
+        std::fs::read_to_string(root.join("pyproject.toml")).unwrap(),
+        UV_PYPROJECT_PRISTINE,
+        "{context}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("uv.lock")).unwrap(),
+        uv_lock_after_relock(None),
+        "{context}"
+    );
+}
+
+#[test]
+#[serial]
+fn uv_override_left_by_relock_is_listed_around() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_uv_override_left_by_relock(tmp.path());
+    let pyproject = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    let (code, envelope) = run_cli_json(tmp.path(), &["list"]);
+    assert_eq!(code, 0, "list must succeed: {envelope}");
+    let warnings = envelope["warnings"].as_array().cloned().unwrap_or_default();
+    let orphaned: Vec<&Value> = warnings
+        .iter()
+        .filter(|w| w["code"] == "hosted_resolution_orphaned")
+        .collect();
+    assert_eq!(orphaned.len(), 1, "{envelope}");
+    let detail = orphaned[0]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("pyproject.toml")
+            && detail.contains("override-dependencies")
+            && detail.contains(&format!("socket-patch remove {SIX_PURL}")),
+        "{detail}"
+    );
+    assert!(
+        !warning_codes(&envelope).contains(&"hosted_wiring_contested".to_string()),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap(),
+        pyproject,
+        "list writes nothing"
+    );
+}
+
+#[test]
+#[serial]
+fn rollback_retires_a_uv_override_left_by_relock() {
+    for scope in [&[][..], &[SIX_PURL][..]] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_uv_override_left_by_relock(tmp.path());
+        let (code, envelope) = run_rollback_subprocess(tmp.path(), scope);
+        assert_eq!(code, 0, "rollback {scope:?} must succeed: {envelope}");
+        assert_eq!(envelope["status"], "success", "{envelope}");
+        assert!(
+            warning_codes(&envelope).contains(&"hosted_resolution_orphaned".to_string()),
+            "{envelope}"
+        );
+        assert_uv_override_retired(tmp.path(), &format!("rollback {scope:?}"));
+        // Nothing hosted is left: list is clean.
+        let (code, envelope) = run_cli_json(tmp.path(), &["list"]);
+        assert_eq!(code, 0, "{envelope}");
+        assert!(warning_codes(&envelope).is_empty(), "{envelope}");
+    }
+}
+
+#[test]
+#[serial]
+fn remove_retires_a_uv_override_left_by_relock() {
+    for target in [SIX_UUID, SIX_PURL] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_uv_override_left_by_relock(tmp.path());
+        let (code, envelope) = run_cli_json(tmp.path(), &["remove", target, "--yes"]);
+        assert_eq!(code, 0, "remove {target} must succeed: {envelope}");
+        assert_uv_override_retired(tmp.path(), &format!("remove {target}"));
     }
 }

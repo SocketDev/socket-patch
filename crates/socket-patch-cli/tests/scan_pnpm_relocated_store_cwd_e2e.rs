@@ -11,10 +11,9 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic, hermetic_command};
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -68,18 +67,10 @@ async fn scan_bodies(cwd: &Path) -> String {
         })))
         .mount(&server)
         .await;
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.arg("scan").current_dir(cwd);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_")
-            && key.to_string_lossy() != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
     cmd.env("CARGO_HOME", cwd.join(".cargo-home"));
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd
         .args([
             "--json",

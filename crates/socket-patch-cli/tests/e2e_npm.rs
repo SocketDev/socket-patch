@@ -15,7 +15,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic};
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -58,24 +58,12 @@ fn git_sha256_file(path: &Path) -> String {
 /// Run the CLI binary with the given args, setting `cwd` as the working dir.
 /// Returns `(exit_code, stdout, stderr)`.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
+    // The hermetic `SOCKET_*` environment: no ambient value (SOCKET_DRY_RUN,
+    // SOCKET_GLOBAL_PREFIX, ...) changes what these tests exercise, no token
+    // (so the public proxy), and the config layer, update notifier and
+    // telemetry forced off.
+    let mut cmd = hermetic::command(&binary());
     cmd.args(args).current_dir(cwd);
-    // The binary binds a wide `SOCKET_*` env surface (SOCKET_CWD,
-    // SOCKET_DRY_RUN, SOCKET_STRICT, SOCKET_ECOSYSTEMS, SOCKET_GLOBAL_PREFIX,
-    // ...). An ambient value silently changes what these tests exercise —
-    // SOCKET_DRY_RUN=true turns every real apply into a no-op, and
-    // SOCKET_GLOBAL_PREFIX flips commands into global mode, aiming mutations
-    // at the host's *real* global node_modules. Scrub the whole prefix so
-    // only the flags each test passes are in effect; removing
-    // SOCKET_API_TOKEN also forces the public proxy (free-tier). Telemetry
-    // opt-outs are deliberately kept so an opted-out dev stays opted out.
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
     // Partial cache isolation only — the global auto-discovery test below
     // needs the binary's `npm root -g` / `yarn global dir` / `pnpm root -g`
     // probes to resolve the REAL prefixes, which come out of $HOME, so a full
@@ -108,6 +96,7 @@ fn assert_run_ok(cwd: &Path, args: &[&str], context: &str) -> (String, String) {
 fn npm_run(cwd: &Path, args: &[&str]) {
     let mut cmd = Command::new("npm");
     cmd.args(args).current_dir(cwd);
+    hermetic::scrub_socket_vars(&mut cmd);
     cache_env::isolate(&mut cmd);
     let out = cmd.output().expect("failed to run npm");
     assert!(
@@ -357,6 +346,7 @@ fn test_npm_global_lifecycle() {
     ]);
     // `--prefix` is a flag, so it still decides where the package lands; the
     // sandbox only moves the download cache off the caller's home.
+    hermetic::scrub_socket_vars(&mut cmd);
     cache_env::isolate(&mut cmd);
     let out = cmd.output().expect("failed to run npm install -g");
     assert!(

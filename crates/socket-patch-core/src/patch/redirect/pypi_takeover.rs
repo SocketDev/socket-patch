@@ -17,8 +17,8 @@ use super::RewriteWarning;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::read_regular_to_string;
 use crate::utils::poetry_lock::{
-    lock_version, pyproject_source_constraints, source_constraint_breaks_writer,
-    source_constraint_refusal, Wired,
+    lock_version, pyproject_source_constraints, source_constraint_break, source_constraint_refusal,
+    Wired,
 };
 use crate::vendor::state::VendorEntry;
 
@@ -32,22 +32,32 @@ pub async fn preflight_pypi_takeover(
     if entry.ecosystem != "pypi" {
         return Ok(());
     }
+    // The revert sends each record to the backend that owns its kind,
+    // whatever flavor the entry was last stamped with (#1524), so each
+    // reach check runs for the records it is about, not for the flavor.
     preflight_sibling_requirements_takeover(entry)?;
-    match entry.flavor.as_deref() {
-        Some("requirements") => preflight_requirements_takeover(entry),
-        Some("uv") => preflight_uv_takeover(entry),
-        Some("poetry") => preflight_poetry_takeover(root, entry).await,
-        _ => Ok(()),
+    let has_kind = |prefix: &str| entry.wiring.iter().any(|r| r.kind.starts_with(prefix));
+    if entry.flavor.as_deref() == Some("requirements") {
+        preflight_requirements_takeover(entry)?;
     }
+    if entry.flavor.as_deref() == Some("uv") || has_kind("uv_") {
+        preflight_uv_takeover(entry)?;
+    }
+    if entry.flavor.as_deref() == Some("poetry") || has_kind("poetry_") {
+        preflight_poetry_takeover(root, entry).await?;
+    }
+    Ok(())
 }
 
-/// A Pipenv or uv entry also carries the `requirements_line` records of
-/// the exported requirements pin wired with its lock (#612, #1368). After
-/// the revert, the hosted requirements rewriter re-pins only the root
-/// requirements.txt, so a line wired in a `-r` include is refused exactly
-/// as for a requirements-flavor entry.
+/// An entry of any other flavor can also carry `requirements_line`
+/// records: the exported requirements pin wired with a Pipenv or uv lock
+/// (#612, #1368), or a requirements.txt vendored before a pylock, Poetry
+/// or PDM lock took over the entry (#1524). After the revert, the hosted
+/// requirements rewriter re-pins only the root requirements.txt, so a line
+/// wired in a `-r` include is refused exactly as for a requirements-flavor
+/// entry.
 fn preflight_sibling_requirements_takeover(entry: &VendorEntry) -> Result<(), RewriteWarning> {
-    if !matches!(entry.flavor.as_deref(), Some("uv" | "pipenv")) {
+    if entry.flavor.as_deref() == Some("requirements") {
         return Ok(());
     }
     let lines: Vec<_> = entry
@@ -119,8 +129,8 @@ fn recorded_unit_version(unit: &str) -> Option<String> {
 
 /// Hosted mode refuses every Poetry 0.x lock (Poetry 0.12 ignores URL
 /// sources), which vendored mode supports (#945), and a package the
-/// pyproject pins to a named source over a lock Poetry 1.4 – 2.2 wrote
-/// (#1282). The revert never changes the lock's format, stamp or the
+/// pyproject pins to a named source over a lock Poetry 1.3 – 2.2 wrote or
+/// a lock-version 1.0 / 1.1 one (#1282, #1503). The revert never changes the lock's format, stamp or the
 /// pyproject, so the files on disk decide.
 async fn preflight_poetry_takeover(root: &Path, entry: &VendorEntry) -> Result<(), RewriteWarning> {
     let lock_file = entry
@@ -152,16 +162,16 @@ async fn preflight_poetry_takeover(root: &Path, entry: &VendorEntry) -> Result<(
 }
 
 /// The hosted rewriter's source-pin refusal (#1282), predicted from the
-/// pyproject beside the lock and the lock's writer stamp.
+/// pyproject beside the lock and the lock's writer stamp and format.
 async fn preflight_poetry_source_constraint(
     root: &Path,
     lock_file: &str,
     lock_text: &str,
     entry: &VendorEntry,
 ) -> Result<(), RewriteWarning> {
-    if !source_constraint_breaks_writer(lock_text) {
+    let Some(why) = source_constraint_break(lock_text) else {
         return Ok(());
-    }
+    };
     let pyproject_file = format!(
         "{}pyproject.toml",
         lock_file.strip_suffix("poetry.lock").unwrap_or("")
@@ -191,7 +201,8 @@ async fn preflight_poetry_source_constraint(
                 version,
                 &source,
                 "URL",
-                Wired::Vendored
+                Wired::Vendored,
+                &why,
             ),
         ),
     })
@@ -296,6 +307,65 @@ mod tests {
         }
     }
 
+    /// #1524: a requirements.txt vendored before a pylock, Poetry or PDM
+    /// lock took the entry over keeps its `requirements_line` records, and
+    /// the revert restores them, so a line in a `-r` include (or an
+    /// appended transitive line) is refused before the revert whatever the
+    /// entry's flavor.
+    #[tokio::test]
+    async fn requirements_lines_under_another_lock_flavor_are_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = |file: &str, kind: &str| WiringRecord {
+            file: file.into(),
+            kind: kind.into(),
+            action: WiringAction::Rewritten,
+            key: Some("six".into()),
+            original: None,
+            new: None,
+        };
+        for (flavor, lock) in [
+            ("python-lock", lock("pylock.toml", "python_lock_document")),
+            ("pdm", lock("pdm.lock", "pdm_lock_package")),
+            ("hatch", lock("pylock.toml", "hatch_document")),
+        ] {
+            let e = entry(
+                flavor,
+                vec![lock.clone(), requirements_line("requirements.txt")],
+            );
+            assert!(
+                preflight_pypi_takeover(root.path(), &e).await.is_ok(),
+                "{flavor}"
+            );
+            let e = entry(
+                flavor,
+                vec![lock.clone(), requirements_line("req/base.txt")],
+            );
+            let err = preflight_pypi_takeover(root.path(), &e).await.unwrap_err();
+            assert_eq!(
+                err.code, "redirect_requirements_takeover_unreachable",
+                "{flavor}"
+            );
+            let mut appended = requirements_line("requirements.txt");
+            appended.action = WiringAction::Added;
+            let e = entry(flavor, vec![lock, appended]);
+            let err = preflight_pypi_takeover(root.path(), &e).await.unwrap_err();
+            assert_eq!(
+                err.code, "redirect_requirements_takeover_unreachable",
+                "{flavor}"
+            );
+        }
+    }
+
+    /// #1524: a uv lock unit carried into an entry stamped with another
+    /// flavor is still checked for the #723 pinned-down version.
+    #[tokio::test]
+    async fn uv_records_under_another_flavor_are_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let e = entry("python-lock", vec![uv_package("1.17.0")]);
+        let err = preflight_pypi_takeover(root.path(), &e).await.unwrap_err();
+        assert_eq!(err.code, "redirect_uv_takeover_version_unreachable");
+    }
+
     #[test]
     fn uv_entry_at_the_patch_version_is_admitted() {
         assert!(preflight_uv_takeover(&entry("uv", vec![uv_package("1.16.0")])).is_ok());
@@ -357,18 +427,36 @@ mod tests {
     }
 
     /// #1282: hosted mode refuses a source-pinned package over a lock
-    /// Poetry 1.4 – 2.2 wrote, so the takeover must keep it vendored rather
+    /// Poetry 1.3 – 2.2 wrote, or a lock-version 1.0 / 1.1 one (#1503), so the
+    /// takeover must keep it vendored rather
     /// than revert it into neither mode. Other writers are admitted.
     #[tokio::test]
     async fn poetry_source_pinned_package_follows_the_writer() {
         const PYPROJECT: &str =
             "[tool.poetry.dependencies]\nsix = {version = \"1.16.0\", source = \"pypi\"}\n";
-        for (stamp, refused) in [("1.8.5", true), ("2.2.1", true), ("2.3.4", false)] {
+        let stamp = |version: &str| {
+            format!(
+                "# This file is automatically @generated by Poetry {version} and should not \
+                 be changed by hand.\n\n{POETRY_2}"
+            )
+        };
+        // Poetry 1.3 stamps no version and writes lock 2.0 (#1447).
+        let poetry_1_3 = format!(
+            "# This file is automatically @generated by Poetry and should not be changed \
+             by hand.\n\n{}",
+            POETRY_2.replace("lock-version = \"2.1\"", "lock-version = \"2.0\"")
+        );
+        // Poetry 1.1 / 1.2 stamp nothing and write lock 1.1, which every
+        // Poetry 1.3+ re-solves and refuses (#1503).
+        let poetry_1_2 = POETRY_2.replace("lock-version = \"2.1\"", "lock-version = \"1.1\"");
+        for (stamp, lock, refused) in [
+            ("1.2.2", poetry_1_2, true),
+            ("1.3.2", poetry_1_3, true),
+            ("1.8.5", stamp("1.8.5"), true),
+            ("2.2.1", stamp("2.2.1"), true),
+            ("2.3.4", stamp("2.3.4"), false),
+        ] {
             let tmp = tempfile::tempdir().unwrap();
-            let lock = format!(
-                "# This file is automatically @generated by Poetry {stamp} and should not be \
-                 changed by hand.\n\n{POETRY_2}"
-            );
             std::fs::write(tmp.path().join("poetry.lock"), lock).unwrap();
             std::fs::write(tmp.path().join("pyproject.toml"), PYPROJECT).unwrap();
             let got = preflight_pypi_takeover(tmp.path(), &poetry_entry()).await;

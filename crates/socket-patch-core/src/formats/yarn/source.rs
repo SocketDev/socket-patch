@@ -237,7 +237,7 @@ pub(crate) fn yarn_classic_range_is_git(range: &str) -> bool {
 }
 
 /// `file:` path → tarball or directory? Directories cannot be rewired.
-fn is_tarball_path(path: &str) -> bool {
+pub(crate) fn is_tarball_path(path: &str) -> bool {
     let path = path.split('#').next().unwrap_or(path).trim_end_matches('/');
     path.ends_with(".tgz") || path.ends_with(".tar.gz")
 }

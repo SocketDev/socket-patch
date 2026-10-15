@@ -86,12 +86,10 @@ mod rollback_json;
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-
-use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
 #[path = "npm_e2e_common/manifestless.rs"]
 mod npm_e2e_common;
@@ -283,7 +281,7 @@ fn has_command(cmd: &str) -> bool {
     } else {
         &["--version"]
     };
-    let mut probe_cmd = Command::new(cmd);
+    let mut probe_cmd = pm_command(cmd);
     probe_cmd
         .args(probe)
         .stdout(std::process::Stdio::null())
@@ -302,25 +300,17 @@ fn has_command(cmd: &str) -> bool {
 /// `SOCKET_PROXY_URL` or `SOCKET_API_URL` would silently point the run at
 /// staging — and every assertion below would still pass, proving nothing about
 /// production. An ambient `SOCKET_API_TOKEN` would move the run off the free
-/// public proxy that this suite exists to cover. The hostile seeds below are
-/// removed by the same loop that removes the real ones, so if the scrub is
-/// ever dropped the seeds turn the suite red immediately instead of letting a
-/// developer's ambient shell decide what got tested.
+/// public proxy that this suite exists to cover. The shared builder
+/// (`hermetic::binary_command`) seeds each of those with a hostile value and
+/// removes it, so if the scrub is ever dropped the seeds turn the suite red
+/// immediately instead of letting a developer's ambient shell decide what got
+/// tested. The crawler's own ambient inputs are scrubbed too
+/// (`hermetic::CRAWLER_EXTRAS`: an activated venv, `BUNDLE_*`,
+/// `COMPOSER_*`): the hosted scan discovers packages unscoped under the cwd.
 fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("SOCKET_GLOBAL", "true")
-        .env("SOCKET_GLOBAL_PREFIX", "/nonexistent")
-        .env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_SAVE_ONLY", "true")
-        .env("SOCKET_OFFLINE", "true")
-        .env("SOCKET_API_TOKEN", "hostile-seed-must-be-scrubbed")
-        .env("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json");
-    for var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS) {
-        cmd.env_remove(var);
-    }
+    let mut cmd = hermetic::binary_command();
+    hermetic::scrub_crawler_inputs(&mut cmd);
+    cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -444,12 +434,31 @@ fn hosted_pin_count(env: &serde_json::Value) -> u64 {
 // Toolchain invocation
 // ---------------------------------------------------------------------------
 
+/// A package-manager child (and its liveness probe) with the shared
+/// hermetic scrubs, applied before `cache_env::isolate` and the leg's own
+/// env so a leg's pins (the uv legs' `VIRTUAL_ENV`) survive: every ambient
+/// `SOCKET_*` ([`hermetic::scrub_socket_vars`]), an activated venv (uv
+/// would install into the wrong interpreter), bundler's `BUNDLE_*` and
+/// `RUBYOPT` ([`hermetic::Extra::Bundle`]; an ambient BUNDLE_PATH or frozen
+/// mode changes what `bundle` installs and where) and the yarn/pnpm
+/// node-linker overrides. Deliberately not the full `Extra::Yarn` / `Extra::Pnpm`
+/// sweeps: those remove every `YARN_*` / `npm_config_*`, including the
+/// proxy and CA settings these live-registry suites need behind a proxy.
+fn pm_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
+    cmd.env_remove("YARN_NODE_LINKER");
+    cmd.env_remove("npm_config_node_linker");
+    cmd
+}
+
 /// Run an external package manager. Returns the `Output` without asserting, so
 /// callers can distinguish "the registry was unreachable" (soft-skip material
 /// during fixture setup) from "the install of the redirected lock failed"
 /// (always a hard failure — that is the thing under test).
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(program);
+    let mut cmd = pm_command(program);
     cmd.args(args).current_dir(cwd);
     // Sandbox everything the per-leg `env` below does not name — corepack's
     // downloaded package managers most of all — so a run leaves the caller's
@@ -457,13 +466,11 @@ fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Outpu
     cache_env::isolate(&mut cmd);
     // Keep every toolchain's cache inside the fixture so the reinstall leg
     // starts genuinely cold and cannot be satisfied from a warm host cache
-    // holding the *pristine* artifact.
+    // holding the *pristine* artifact. Applied last, so a leg's own pin
+    // (the uv legs' `VIRTUAL_ENV`) survives the scrub.
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // A `VIRTUAL_ENV` inherited from the developer's shell makes uv install
-    // into the wrong interpreter.
-    cmd.env_remove("VIRTUAL_ENV");
     cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"))
 }
@@ -1736,15 +1743,7 @@ fn bun_manifestless_vex_production(
     let vex = |extra: &[&str]| -> (Option<i32>, serde_json::Value, Option<serde_json::Value>) {
         let out_path = checkout.join("out.vex.json");
         let _ = std::fs::remove_file(&out_path);
-        let mut cmd = Command::new(binary());
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(key);
-            }
-        }
-        let out = cmd
-            .env("SOCKET_TELEMETRY_DISABLED", "1")
-            .env("SOCKET_NO_CONFIG", "1")
+        let out = hermetic::binary_command()
             .env("SOCKET_NO_API_TOKEN", "1")
             .current_dir(checkout)
             .args(["vex", "--json", "--output"])

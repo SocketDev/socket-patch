@@ -92,7 +92,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -300,17 +300,23 @@ fn bun_env(cwd: &Path, args: &[&str], cache_dir: &Path, env: &[(String, String)]
     cmd.output().expect("failed to run bun")
 }
 
-/// The real binary with `--no-telemetry` appended: nothing in this suite
-/// should ever post a telemetry event, mocked API or not.
+/// The real binary. `hermetic::command` forces telemetry off: nothing in
+/// this suite should ever post a telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     run_socket_env(cwd, args, &[])
 }
 
-/// [`run_socket`] with extra env applied after the scrub.
+/// [`run_socket`] with extra env applied after the scrub: the hermetic
+/// `SOCKET_*` environment (`hermetic::command`), the bun suites' shared
+/// scrub of every other ambient bun / npm registry setting, and a stand-in
+/// `HOME` (`jvm_env::isolate_cli`). The `bun` fixture children run under the
+/// cache sandbox's home, so the CLI must not read the developer's real
+/// `~/.npmrc` either: a registry or scope there would make the two disagree.
 fn run_socket_env(cwd: &Path, args: &[&str], env: &[(String, String)]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
-    cmd.args(args).arg("--no-telemetry").current_dir(cwd);
-    cache_env::scrub_ambient_bun_env(&mut cmd);
+    let mut cmd = hermetic::command(&binary());
+    cmd.args(args).current_dir(cwd);
+    cache_env::scrub_ambient_bun_tool_env(&mut cmd);
+    common::jvm_env::isolate_cli(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }

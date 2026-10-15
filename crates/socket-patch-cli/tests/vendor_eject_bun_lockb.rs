@@ -24,11 +24,12 @@
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::Path;
-use std::process::Command;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -86,16 +87,11 @@ impl Project {
     }
 
     fn run_json(&self, args: &[&str]) -> (i32, Value) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        let mut cmd = hermetic::binary_command();
         cmd.args(args)
             .args(["--json", "--cwd"])
             .arg(self.root())
             .current_dir(self.root());
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") {
-                cmd.env_remove(key);
-            }
-        }
         // A registry exported by npm (`npm_config_registry`) or Bun would
         // steer the takeover's restore off the fixtures' registry (#992).
         for key in [
@@ -106,8 +102,7 @@ impl Project {
             cmd.env_remove(key);
         }
         let uri = self.server.uri();
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-            .env("SOCKET_API_URL", &uri)
+        cmd.env("SOCKET_API_URL", &uri)
             .env("SOCKET_API_TOKEN", "fake-token")
             .env("SOCKET_ORG_SLUG", ORG)
             .env("SOCKET_NPM_REGISTRY", &uri)

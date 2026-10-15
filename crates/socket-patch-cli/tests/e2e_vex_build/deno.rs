@@ -161,17 +161,9 @@ impl Deno {
 }
 
 fn socket_patch(cwd: &Path, deno_dir: &Path, args: &[&str]) -> (Option<i32>, Value, String) {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    let out = cmd
+    let out = crate::vex_e2e_common::hermetic::binary_command()
         .args(args)
         .current_dir(cwd)
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .env("DENO_DIR", deno_dir)
         .output()
         .expect("spawn socket-patch");

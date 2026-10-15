@@ -39,8 +39,6 @@
 //! Plus the embedded entry points (`scan --mode hosted --vex`, `scan --mode vendored
 //! --vex`, `apply --vex`).
 
-use crate::common::binary;
-
 use crate::vex_e2e_common;
 
 use std::collections::HashMap;
@@ -669,16 +667,14 @@ impl Api {
 /// The CLI with the ambient `SOCKET_*` / python / uv discovery environment
 /// scrubbed and uv's cache pointed into `p.home`.
 fn cli(p: &Proj) -> Command {
-    let mut cmd = Command::new(binary());
+    let mut cmd = crate::hermetic::binary_command();
+    crate::hermetic::scrub_extra(&mut cmd, &[crate::hermetic::Extra::Venv]);
     for (key, _) in std::env::vars() {
-        if (key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG") || key.starts_with("UV_") {
+        if key.starts_with("UV_") {
             cmd.env_remove(key);
         }
     }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env_remove("VIRTUAL_ENV")
-        .env("UV_CACHE_DIR", p.home.join("uv-cache"));
+    cmd.env("UV_CACHE_DIR", p.home.join("uv-cache"));
     cmd
 }
 

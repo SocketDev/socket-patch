@@ -143,6 +143,44 @@ pub fn read_archive_bytes_to_map_strict(
     read_archive_from_reader(bytes, true, true)
 }
 
+/// [`read_archive_bytes_to_map`] keyed the way npm-family installers
+/// extract a tarball: the first path segment stripped whatever its name
+/// (`package/`, `left-pad-1.3.0/` from `git archive --prefix`, a GitHub
+/// release's `<repo>-<tag>/`), where the lenient decoder strips only a
+/// literal `package/` (#1516). A member that two different roots both
+/// spell is dropped: which one the installer keeps depends on archive
+/// order, which the map does not record. Members directly at the archive
+/// root (no first segment to strip) are dropped too.
+pub(crate) fn read_archive_bytes_to_map_any_root(
+    bytes: &[u8],
+) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+    let raw = read_archive_from_reader(bytes, false, false)?;
+    let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut roots: HashMap<String, String> = HashMap::new();
+    for (path, data) in raw {
+        let path = path.trim_start_matches("./");
+        let Some((root, rest)) = path.split_once('/') else {
+            continue;
+        };
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() || ambiguous.contains(rest) {
+            continue;
+        }
+        match roots.get(rest) {
+            Some(seen) if seen != root => {
+                out.remove(rest);
+                ambiguous.insert(rest.to_string());
+            }
+            _ => {
+                roots.insert(rest.to_string(), root.to_string());
+                out.insert(rest.to_string(), data);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Read a source distribution without npm's `package/` prefix convention.
 /// Uses the same strict member checks and decompression limits.
 pub(crate) fn read_sdist_tar_bytes_to_map_strict(

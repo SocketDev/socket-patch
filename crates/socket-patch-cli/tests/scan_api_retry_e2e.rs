@@ -11,6 +11,9 @@
 //! retries without sleeping (the backoff arithmetic itself is pinned on a
 //! virtual clock in the core crate's `api_retry_e2e.rs`).
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -43,15 +46,8 @@ fn encode_purl(purl: &str) -> String {
 }
 
 fn scrubbed_cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let mut cmd = hermetic::binary_command();
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd
 }
 

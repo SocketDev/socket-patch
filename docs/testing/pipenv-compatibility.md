@@ -56,6 +56,20 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   re-syncs every non-empty category (#790). `pipenv uninstall <pkg>` is **not** a remedy:
   it rewrites the Pipfile and re-locks the patch away. `PIP_FORCE_REINSTALL=1
   pipenv sync` works on 2018 but is ignored by 2026.
+- **Base-interpreter copies survive both remedies.** A `--site-packages`
+  (`PIPENV_SITE_PACKAGES=1`) venv with no copy of its own imports the
+  release from its base interpreter (e.g. Debian's
+  `/usr/lib/python3/dist-packages`). pip refuses to uninstall it from the
+  venv, and `pipenv sync`, in the same or a recreated `--site-packages`
+  venv, counts it as installed, so the lock protects no install on that
+  host. For a stale copy there the warning instead prints `pipenv
+  requirements > pipenv-locked.txt && pipenv run pip install --no-deps
+  --ignore-installed -r pipenv-locked.txt` (Pipenv 2022.4+), which installs
+  the locked release inside the venv and leaves the base copy untouched
+  (#1450). The export takes `--dev` like `sync`, but names categories as
+  comma-joined lock keys (`--categories "default,docs"`, Pipenv 2022.12+):
+  2022.12.x–2023.2.4 split the list on commas and look each name up in the
+  lock, so `sync`'s `"packages docs"` exports nothing there (#1507).
 - **Relocking drops the reference.** `pipenv lock` (and `update`, and
   `install <other>` on releases before 2024, where it is a full relock)
   regenerates the redirected entry to its registry reference on every major,

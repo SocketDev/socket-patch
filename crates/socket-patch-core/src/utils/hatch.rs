@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use toml_edit::{DocumentMut, Item, Value};
 
@@ -7,8 +7,7 @@ use crate::utils::python_lock::preserve_line_endings;
 use crate::vendor::common::{pep508_name, pyproject_dependency_specs, DeclTable};
 
 /// The two documents the hatch planner reads and rewrites, in the order
-/// [`plan`] parses them. The redirect overlay (`redirect/mod.rs`) clones
-/// exactly these from the candidate set, so the lists cannot drift.
+/// [`plan`] and [`rewrite_all`] parse them.
 pub const HATCH_FILES: [&str; 2] = ["pyproject.toml", "hatch.toml"];
 
 /// The first character of `root`'s path that Hatch's `{root:uri}` expands
@@ -243,11 +242,84 @@ fn replacement(spec: &str, name: &str, version: &str, url: &str) -> Result<Optio
     Ok(Some(format!("{declared}{extras} @ {url}{suffix}")))
 }
 
-fn rewrite_array(item: &mut Item, name: &str, version: &str, url: &str) -> Result<usize, String> {
+/// One dependency of a [`rewrite_all`] batch: the arguments [`rewrite`]
+/// takes for a single one.
+pub struct HatchDep<'a> {
+    pub name: &'a str,
+    pub version: &'a str,
+    pub url: &'a str,
+}
+
+/// One requirement string a batch rewrote, in `file` (a [`HATCH_FILES`]
+/// entry): the declaration before and after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HatchEdit {
+    pub file: String,
+    pub original: String,
+    pub new: String,
+    /// The direct-reference permission a project-table reference needs
+    /// (`allow-direct-references = true`, see [`permission_keys`]) rather
+    /// than a requirement; `original` is the setting it replaced, empty
+    /// when there was none.
+    pub permission: bool,
+}
+
+/// What [`rewrite_all`] made of a batch: the Hatch files it changed (path →
+/// new text) and, per dependency in input order, the requirement strings it
+/// rewrote or why it refused that dependency.
+pub struct HatchBatch {
+    pub files: BTreeMap<String, String>,
+    pub steps: Vec<Result<Vec<HatchEdit>, String>>,
+}
+
+/// One dependency of a [`Round`] and what the walk found for it.
+struct Target<'a> {
+    /// Canonical PyPI name.
+    name: String,
+    version: &'a str,
+    url: &'a str,
+    error: Option<String>,
+    matched: usize,
+    project_matched: usize,
+    edits: Vec<HatchEdit>,
+}
+
+/// The dependencies one walk of the Hatch documents rewrites, at most one
+/// per canonical name. Requirements of different names never touch each
+/// other's strings, so each target's outcome is the one a [`plan`] of it
+/// alone would give. The walk runs twice: a check pass (`apply == false`)
+/// that counts matches and records errors without changing anything, then
+/// an apply pass that rewrites only the targets the check left error-free,
+/// so a target refused midway leaves none of its declarations rewritten.
+struct Round<'a> {
+    targets: Vec<Target<'a>>,
+    index: HashMap<String, usize>,
+    apply: bool,
+}
+
+impl Round<'_> {
+    /// A structural error stops the walk, as it stops a single [`plan`]:
+    /// every target that has not already failed fails with it.
+    fn fail_rest(&mut self, error: &str) {
+        for target in &mut self.targets {
+            target.error.get_or_insert_with(|| error.to_owned());
+        }
+    }
+}
+
+/// Rewrite `item`'s declarations of every live target. `Err` is a
+/// structural error (it applies to every target); a requirement a target
+/// cannot take is recorded on that target and the walk goes on.
+fn rewrite_array(
+    item: &mut Item,
+    round: &mut Round,
+    file: &str,
+    project: bool,
+) -> Result<Vec<usize>, String> {
     let array = item
         .as_array_mut()
         .ok_or("dependency declarations must be arrays")?;
-    let mut matched = 0;
+    let mut matched = Vec::new();
     for entry in array.iter_mut() {
         if entry.is_inline_table() {
             continue;
@@ -255,25 +327,43 @@ fn rewrite_array(item: &mut Item, name: &str, version: &str, url: &str) -> Resul
         let text = entry
             .as_str()
             .ok_or("dependency declarations must contain strings")?;
-        if let Some(rewritten) = replacement(text, name, version, url)? {
-            matched += 1;
-            if rewritten != text {
-                let decoration = entry.decor().clone();
-                *entry = Value::from(rewritten);
-                *entry.decor_mut() = decoration;
+        let Some(&index) = round
+            .index
+            .get(canonicalize_pypi_name(pep508_name(text)).as_str())
+        else {
+            continue;
+        };
+        let target = &mut round.targets[index];
+        if target.error.is_some() {
+            continue;
+        }
+        match replacement(text, &target.name, target.version, target.url) {
+            Err(error) => target.error = Some(error),
+            Ok(None) => {}
+            Ok(Some(rewritten)) => {
+                matched.push(index);
+                if !round.apply {
+                    target.matched += 1;
+                    target.project_matched += usize::from(project);
+                } else if rewritten != text {
+                    target.edits.push(HatchEdit {
+                        file: file.to_owned(),
+                        original: text.to_owned(),
+                        new: rewritten.clone(),
+                        permission: false,
+                    });
+                    let decoration = entry.decor().clone();
+                    *entry = Value::from(rewritten);
+                    *entry.decor_mut() = decoration;
+                }
             }
         }
     }
     Ok(matched)
 }
 
-fn rewrite_project(
-    document: &mut DocumentMut,
-    name: &str,
-    version: &str,
-    url: &str,
-) -> Result<usize, String> {
-    let mut matched = 0;
+fn rewrite_project(document: &mut DocumentMut, round: &mut Round) -> Result<(), String> {
+    let file = HATCH_FILES[0];
     if let Some(project) = document.get_mut("project") {
         if project
             .get("dynamic")
@@ -290,7 +380,7 @@ fn rewrite_project(
             .as_table_like_mut()
             .and_then(|table| table.get_mut("dependencies"))
         {
-            matched += rewrite_array(dependencies, name, version, url)?;
+            rewrite_array(dependencies, round, file, true)?;
         }
         if let Some(groups) = project
             .as_table_like_mut()
@@ -301,7 +391,7 @@ fn rewrite_project(
                 .ok_or("optional dependencies must be a table")?
                 .iter_mut()
             {
-                matched += rewrite_array(dependencies, name, version, url)?;
+                rewrite_array(dependencies, round, file, true)?;
             }
         }
     }
@@ -311,26 +401,21 @@ fn rewrite_project(
             .ok_or("dependency groups must be a table")?
             .iter_mut()
         {
-            let group_matches = rewrite_array(dependencies, name, version, url)?;
-            if group_matches > 0 && url.starts_with("{root:uri}") {
-                return Err("Hatch does not expand root placeholders in dependency groups; use environment dependencies or agent mode".into());
+            for index in rewrite_array(dependencies, round, file, true)? {
+                let target = &mut round.targets[index];
+                if target.url.starts_with("{root:uri}") {
+                    target.error.get_or_insert_with(|| "Hatch does not expand root placeholders in dependency groups; use environment dependencies or agent mode".into());
+                }
             }
-            matched += group_matches;
         }
     }
-    Ok(matched)
+    Ok(())
 }
 
-fn rewrite_environments(
-    hatch: &mut Item,
-    name: &str,
-    version: &str,
-    url: &str,
-) -> Result<usize, String> {
+fn rewrite_environments(hatch: &mut Item, round: &mut Round, file: &str) -> Result<(), String> {
     if hatch.get("sources").is_some() || hatch.get("env").is_some() {
         return Err("Hatch sources and environment plugins require agent mode".into());
     }
-    let mut matched = 0;
     if let Some(environments) = hatch
         .as_table_like_mut()
         .and_then(|table| table.get_mut("envs"))
@@ -356,12 +441,261 @@ fn rewrite_environments(
                     .as_table_like_mut()
                     .and_then(|table| table.get_mut(key))
                 {
-                    matched += rewrite_array(dependencies, name, version, url)?;
+                    rewrite_array(dependencies, round, file, false)?;
                 }
             }
         }
     }
-    Ok(matched)
+    Ok(())
+}
+
+/// One pass over every declaration Hatch installs, in the order a single
+/// [`plan`] walks them: pyproject's project tables, then the environments
+/// of the merged configuration.
+fn walk(
+    documents: &mut BTreeMap<&'static str, DocumentMut>,
+    round: &mut Round,
+) -> Result<(), String> {
+    if let Some(project) = documents.get_mut(HATCH_FILES[0]) {
+        rewrite_project(project, round)?;
+    }
+    // Hatch merges external configuration by top-level key, not recursively.
+    let external_keys = external_keys(documents);
+    if let Some(document) = documents.get_mut(HATCH_FILES[0]) {
+        if let Some(hatch) = document.get_mut("tool").and_then(|tool| {
+            tool.as_table_like_mut()
+                .and_then(|table| table.get_mut("hatch"))
+        }) {
+            let mut effective = hatch.clone();
+            if let Some(table) = effective.as_table_like_mut() {
+                for key in &external_keys {
+                    table.remove(key);
+                }
+            }
+            rewrite_environments(&mut effective, round, HATCH_FILES[0])?;
+            if round.apply {
+                if let Some(table) = effective.as_table_like() {
+                    for (key, item) in table.iter() {
+                        hatch[key] = item.clone();
+                    }
+                }
+            }
+        }
+    }
+    if let Some(document) = documents.get_mut(HATCH_FILES[1]) {
+        let mut hatch = Item::Table(document.as_table().clone());
+        rewrite_environments(&mut hatch, round, HATCH_FILES[1])?;
+        if round.apply {
+            *document.as_table_mut() = hatch
+                .as_table()
+                .ok_or("invalid Hatch configuration")?
+                .clone();
+        }
+    }
+    Ok(())
+}
+
+fn external_keys(documents: &BTreeMap<&'static str, DocumentMut>) -> Vec<String> {
+    documents
+        .get(HATCH_FILES[1])
+        .map(|d| d.iter().map(|(k, _)| k.to_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// Run one [`Round`] over `documents`: check, then apply what passed.
+fn run_round(documents: &mut BTreeMap<&'static str, DocumentMut>, round: &mut Round) {
+    if round
+        .targets
+        .iter()
+        .any(|t| t.url.starts_with("{root:uri}"))
+    {
+        if let Err(error) = require_pip_installer_documents(documents.values()) {
+            for target in &mut round.targets {
+                if target.url.starts_with("{root:uri}") {
+                    target.error = Some(error.clone());
+                }
+            }
+        }
+    }
+    round.apply = false;
+    if let Err(error) = walk(documents, round) {
+        round.fail_rest(&error);
+        return;
+    }
+    for target in &mut round.targets {
+        if target.error.is_none() && target.matched == 0 {
+            target.error = Some(format!("{}=={} has no explicit Hatch declaration; transitive-only dependencies require agent mode", target.name, target.version));
+        }
+    }
+    // A project-table match needs Hatch's direct-reference permission, which
+    // no requirement rewrite touches: whether it can be granted is judged
+    // once, on a copy.
+    let external = external_keys(documents).iter().any(|key| key == "metadata");
+    let permission_file = permission_file(external);
+    let needs_permission = |target: &Target| target.error.is_none() && target.project_matched > 0;
+    if round.targets.iter().any(needs_permission) {
+        let granted = documents
+            .get(permission_file)
+            .ok_or_else(|| "missing Hatch configuration".to_owned())
+            .and_then(|document| enable_permission(&mut document.clone(), external));
+        if let Err(error) = granted {
+            for target in &mut round.targets {
+                if needs_permission(target) {
+                    target.error = Some(error.clone());
+                }
+            }
+        }
+    }
+    if round.targets.iter().all(|target| target.error.is_some()) {
+        return;
+    }
+    round.apply = true;
+    // The check pass found every structural error, and the apply pass walks
+    // the same tables.
+    if let Err(error) = walk(documents, round) {
+        round.fail_rest(&error);
+        return;
+    }
+    let Some(index) = round.targets.iter().position(needs_permission) else {
+        return;
+    };
+    let Some(document) = documents.get_mut(permission_file) else {
+        return;
+    };
+    let previous = permission_setting(document, external);
+    if previous.as_ref().and_then(Item::as_bool) == Some(true) {
+        return;
+    }
+    // Judged grantable on the copy above, and no requirement rewrite
+    // touches these tables.
+    if enable_permission(document, external).is_ok() {
+        // Recorded on the first dep that needs it, the one a sequential
+        // run would have granted it for.
+        round.targets[index].edits.push(HatchEdit {
+            file: permission_file.to_owned(),
+            original: previous
+                .map(|item| format!("allow-direct-references = {}", item.to_string().trim()))
+                .unwrap_or_default(),
+            new: "allow-direct-references = true".into(),
+            permission: true,
+        });
+    }
+}
+
+/// The `allow-direct-references` item at [`permission_keys`]' table, if set.
+fn permission_setting(document: &DocumentMut, external: bool) -> Option<Item> {
+    let mut item = document.as_item();
+    for key in permission_keys(external) {
+        item = item.get(key)?;
+    }
+    item.get("allow-direct-references").cloned()
+}
+
+fn permission_file(external: bool) -> &'static str {
+    if external {
+        HATCH_FILES[1]
+    } else {
+        HATCH_FILES[0]
+    }
+}
+
+fn parse_documents(
+    files: &BTreeMap<String, String>,
+) -> Result<BTreeMap<&'static str, DocumentMut>, String> {
+    let mut documents = BTreeMap::new();
+    for file in HATCH_FILES {
+        if let Some(text) = files.get(file) {
+            documents.insert(
+                file,
+                text.parse::<DocumentMut>()
+                    .map_err(|error| format!("{file}: {error}"))?,
+            );
+        }
+    }
+    Ok(documents)
+}
+
+fn render(
+    files: &BTreeMap<String, String>,
+    documents: BTreeMap<&'static str, DocumentMut>,
+) -> BTreeMap<String, String> {
+    documents
+        .into_iter()
+        .filter_map(|(name, document)| {
+            let original = &files[name];
+            let new = preserve_line_endings(original, document.to_string());
+            (new != *original).then_some((name.to_owned(), new))
+        })
+        .collect()
+}
+
+/// [`rewrite`] every dependency of `deps` over one parse and one render of
+/// the Hatch documents. Each step is what [`rewrite`] would give for that
+/// dependency applied after the ones before it: dependencies of one name
+/// run in input order, one per round, and distinct names never interact.
+pub fn rewrite_all(files: &BTreeMap<String, String>, deps: &[HatchDep]) -> HatchBatch {
+    let mut documents = match parse_documents(files) {
+        Ok(documents) => documents,
+        Err(error) => {
+            return HatchBatch {
+                files: BTreeMap::new(),
+                steps: deps.iter().map(|_| Err(error.clone())).collect(),
+            }
+        }
+    };
+    let names: Vec<String> = deps
+        .iter()
+        .map(|dep| canonicalize_pypi_name(dep.name))
+        .collect();
+    let mut rounds: Vec<Vec<usize>> = Vec::new();
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for (position, name) in names.iter().enumerate() {
+        let occurrence = seen.entry(name.as_str()).or_default();
+        if rounds.len() <= *occurrence {
+            rounds.push(Vec::new());
+        }
+        rounds[*occurrence].push(position);
+        *occurrence += 1;
+    }
+    let mut steps: Vec<Result<Vec<HatchEdit>, String>> =
+        deps.iter().map(|_| Ok(Vec::new())).collect();
+    for positions in rounds {
+        let mut round = Round {
+            targets: positions
+                .iter()
+                .map(|&position| Target {
+                    name: names[position].clone(),
+                    version: deps[position].version,
+                    url: deps[position].url,
+                    error: None,
+                    matched: 0,
+                    project_matched: 0,
+                    edits: Vec::new(),
+                })
+                .collect(),
+            index: positions
+                .iter()
+                .enumerate()
+                .map(|(index, &position)| (names[position].clone(), index))
+                .collect(),
+            apply: false,
+        };
+        run_round(&mut documents, &mut round);
+        for (position, target) in positions.into_iter().zip(round.targets) {
+            steps[position] = match target.error {
+                Some(error) => Err(error),
+                None => Ok(target.edits),
+            };
+        }
+    }
+    // As with `rewrite`, a batch that wired no dep writes nothing: a render
+    // can differ from the original (line endings) with no edit made.
+    let files = if steps.iter().any(Result::is_ok) {
+        render(files, documents)
+    } else {
+        BTreeMap::new()
+    };
+    HatchBatch { files, steps }
 }
 
 pub struct HatchPermission {
@@ -503,71 +837,32 @@ pub fn plan(
     url: &str,
 ) -> Result<HatchPlan, String> {
     let name = canonicalize_pypi_name(name);
-    let mut documents = BTreeMap::new();
-    for file in HATCH_FILES {
-        if let Some(text) = files.get(file) {
-            documents.insert(
-                file,
-                text.parse::<DocumentMut>()
-                    .map_err(|error| format!("{file}: {error}"))?,
-            );
-        }
+    let mut documents = parse_documents(files)?;
+    let mut round = Round {
+        targets: vec![Target {
+            name: name.clone(),
+            version,
+            url,
+            error: None,
+            matched: 0,
+            project_matched: 0,
+            edits: Vec::new(),
+        }],
+        index: HashMap::from([(name, 0)]),
+        apply: false,
+    };
+    run_round(&mut documents, &mut round);
+    let target = round.targets.pop().ok_or("missing Hatch target")?;
+    if let Some(error) = target.error {
+        return Err(error);
     }
-    if url.starts_with("{root:uri}") {
-        require_pip_installer_documents(documents.values())?;
-    }
-    let mut matched = 0;
-    let mut project_matched = 0;
-    if let Some(project) = documents.get_mut("pyproject.toml") {
-        project_matched = rewrite_project(project, &name, version, url)?;
-        matched += project_matched;
-    }
-    // Hatch merges external configuration by top-level key, not recursively.
-    let external_keys: Vec<String> = documents
-        .get("hatch.toml")
-        .map(|d| d.iter().map(|(k, _)| k.to_owned()).collect())
-        .unwrap_or_default();
-    if let Some(document) = documents.get_mut("pyproject.toml") {
-        if let Some(hatch) = document.get_mut("tool").and_then(|tool| {
-            tool.as_table_like_mut()
-                .and_then(|table| table.get_mut("hatch"))
-        }) {
-            let mut effective = hatch.clone();
-            if let Some(table) = effective.as_table_like_mut() {
-                for key in &external_keys {
-                    table.remove(key);
-                }
-            }
-            matched += rewrite_environments(&mut effective, &name, version, url)?;
-            if let Some(table) = effective.as_table_like() {
-                for (key, item) in table.iter() {
-                    hatch[key] = item.clone();
-                }
-            }
-        }
-    }
-    if let Some(document) = documents.get_mut("hatch.toml") {
-        let mut hatch = Item::Table(document.as_table().clone());
-        matched += rewrite_environments(&mut hatch, &name, version, url)?;
-        *document.as_table_mut() = hatch
-            .as_table()
-            .ok_or("invalid Hatch configuration")?
-            .clone();
-    }
-    if matched == 0 {
-        return Err(format!("{name}=={version} has no explicit Hatch declaration; transitive-only dependencies require agent mode"));
-    }
-    let permission = if project_matched > 0 {
-        let external = external_keys.iter().any(|key| key == "metadata");
-        let file = if external {
-            "hatch.toml"
-        } else {
-            "pyproject.toml"
-        };
-        let document = documents
-            .get_mut(file)
-            .ok_or("missing Hatch configuration")?;
-        enable_permission(document, external)?;
+    // `run_round` granted the permission in the rewritten documents; the
+    // vendored ledger also records it alone over the original text.
+    let permission = if target.project_matched > 0 {
+        let external = external_keys(&documents)
+            .iter()
+            .any(|key| key == "metadata");
+        let file = permission_file(external);
         let original = files[file].clone();
         let mut permission_only = original
             .parse::<DocumentMut>()
@@ -581,15 +876,10 @@ pub fn plan(
     } else {
         None
     };
-    let files = documents
-        .into_iter()
-        .filter_map(|(name, document)| {
-            let original = &files[name];
-            let new = preserve_line_endings(original, document.to_string());
-            (new != *original).then_some((name.to_owned(), new))
-        })
-        .collect();
-    Ok(HatchPlan { files, permission })
+    Ok(HatchPlan {
+        files: render(files, documents),
+        permission,
+    })
 }
 
 #[cfg(test)]
@@ -922,5 +1212,338 @@ mod tests {
         )
         .unwrap_err()
         .contains("does not expand"));
+    }
+
+    /// Rewrite `deps` one at a time, each over the previous one's output:
+    /// the per-dependency contract [`rewrite_all`] must keep.
+    fn sequential(
+        files: &BTreeMap<String, String>,
+        deps: &[HatchDep],
+    ) -> (BTreeMap<String, String>, Vec<Result<(), String>>) {
+        let mut current = files.clone();
+        let steps = deps
+            .iter()
+            .map(|dep| {
+                rewrite(&current, dep.name, dep.version, dep.url).map(|changes| {
+                    current.extend(changes);
+                })
+            })
+            .collect();
+        (current, steps)
+    }
+
+    fn assert_batch_matches_sequential(files: &BTreeMap<String, String>, deps: &[HatchDep]) {
+        let (expected, expected_steps) = sequential(files, deps);
+        let batch = rewrite_all(files, deps);
+        let mut actual = files.clone();
+        actual.extend(batch.files.clone());
+        assert_eq!(actual, expected);
+        let steps: Vec<Result<(), String>> = batch
+            .steps
+            .iter()
+            .map(|step| step.as_ref().map(|_| ()).map_err(Clone::clone))
+            .collect();
+        assert_eq!(steps, expected_steps);
+        // Only the changed documents come back, as with `rewrite`.
+        for (path, text) in &batch.files {
+            assert_ne!(files.get(path), Some(text), "{path} is unchanged");
+        }
+        // Every recorded edit changes a requirement string of its file.
+        for edit in batch.steps.iter().flatten().flatten() {
+            assert_ne!(edit.original, edit.new);
+            assert!(files.contains_key(&edit.file), "{edit:?}");
+        }
+    }
+
+    const HOSTED_A: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/11111111-1111-4111-8111-111111111111/aaaaaaaa-0000-4000-8000-000000000001/six-1.16.0-py2.py3-none-any.whl#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HOSTED_B: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-0000-4000-8000-000000000004/six-1.16.0-py2.py3-none-any.whl#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// #1471: one batch over many deps gives exactly what rewriting them
+    /// one at a time gives — successes, per-dependency refusals (inexact
+    /// pin, no declaration), extras and markers, a name repeated with a
+    /// superseding url (runs after the first, in input order), and a name
+    /// spelled differently in the declaration.
+    #[test]
+    fn batch_rewrite_matches_sequential_rewrites() {
+        let pyproject = files(concat!(
+            "[project]\nname = \"app\"\n",
+            "dependencies = [\n  \"six==1.16.0\",\n  \"Requests[socks]==2.31.0 ; python_version >= '3.8'\",\n  \"idna>=3\",\n]\n",
+            "[project.optional-dependencies]\nextra = [\"six==1.16.0\", \"Zope.Interface==6.0\"]\n",
+            "[dependency-groups]\nqa = [\"pytest==8.0.0\"]\n",
+            "[tool.hatch.envs.default]\ndependencies = [\"urllib3==1.26.18\", \"zope-interface==6.0\"]\n",
+            "[tool.hatch.envs.lint]\nextra-dependencies = [\"idna==3.4\", \"six==1.16.0\"]\n",
+        ));
+        let deps = [
+            HatchDep {
+                name: "six",
+                version: "1.16.0",
+                url: HOSTED_A,
+            },
+            HatchDep {
+                name: "requests",
+                version: "2.31.0",
+                url: "https://patch.test/requests.whl#sha256=00",
+            },
+            HatchDep {
+                name: "idna",
+                version: "3.4",
+                url: "https://patch.test/idna.whl",
+            },
+            HatchDep {
+                name: "urllib3",
+                version: "1.26.18",
+                url: "https://patch.test/urllib3.whl",
+            },
+            HatchDep {
+                name: "absent",
+                version: "1.0",
+                url: "https://patch.test/absent.whl",
+            },
+            HatchDep {
+                name: "zope.interface",
+                version: "6.0",
+                url: "https://patch.test/zope.whl",
+            },
+            HatchDep {
+                name: "pytest",
+                version: "8.0.0",
+                url: "https://patch.test/pytest.whl",
+            },
+            HatchDep {
+                name: "SIX",
+                version: "1.16.0",
+                url: HOSTED_B,
+            },
+        ];
+        assert_batch_matches_sequential(&pyproject, &deps);
+        let batch = rewrite_all(&pyproject, &deps);
+        assert!(batch.steps[2].as_ref().unwrap_err().contains("exact"));
+        assert!(batch.steps[4].as_ref().unwrap_err().contains("no explicit"));
+        let wired = &batch.files["pyproject.toml"];
+        // The repeated name re-pinned all three six declarations to the
+        // superseding url; the refused idna kept every declaration.
+        assert_eq!(wired.matches(HOSTED_B).count(), 3, "{wired}");
+        assert!(!wired.contains(HOSTED_A), "{wired}");
+        assert!(
+            wired.contains("\"idna>=3\"") && wired.contains("\"idna==3.4\""),
+            "{wired}"
+        );
+        assert_eq!(batch.steps[7].as_ref().unwrap().len(), 3);
+        assert!(batch.steps.iter().filter(|s| s.is_ok()).count() == 6);
+        // An empty batch changes nothing.
+        let empty = rewrite_all(&pyproject, &[]);
+        assert!(empty.files.is_empty() && empty.steps.is_empty());
+    }
+
+    /// #1471: hatch.toml's `envs` replaces pyproject's, a refusal found in
+    /// a later table leaves that dep's earlier declarations untouched, and
+    /// a structural refusal fails every dep not already refused (each with
+    /// the message a lone `rewrite` gives it).
+    #[test]
+    fn batch_rewrite_follows_merges_and_refusal_order() {
+        let mut merged = files(concat!(
+            "[project]\nname = \"app\"\n",
+            "dependencies = [\"six==1.16.0\", \"attrs==23.1.0\"]\n",
+            "[tool.hatch.envs.default]\ndependencies = [\"click==8.1.7\"]\n",
+        ));
+        merged.insert(
+            "hatch.toml".into(),
+            "[envs.default]\ndependencies = [\"click==8.1.7\", \"attrs>=23\"]\n\r\n[envs.docs]\nextra-dependencies = [\"six==1.16.0\"]\r\n".into(),
+        );
+        let deps = [
+            HatchDep {
+                name: "six",
+                version: "1.16.0",
+                url: "https://patch.test/six.whl",
+            },
+            HatchDep {
+                name: "attrs",
+                version: "23.1.0",
+                url: "https://patch.test/attrs.whl",
+            },
+            HatchDep {
+                name: "click",
+                version: "8.1.7",
+                url: "https://patch.test/click.whl",
+            },
+        ];
+        assert_batch_matches_sequential(&merged, &deps);
+        let batch = rewrite_all(&merged, &deps);
+        // attrs is refused by its hatch.toml range, so its exact project pin
+        // stays as written.
+        assert!(batch.steps[1].is_err());
+        assert!(batch.files["pyproject.toml"].contains("\"attrs==23.1.0\""));
+        // Pinned output, independent of the shared walk: pyproject's
+        // shadowed environment is not rewritten, the project reference gets
+        // its permission, and hatch.toml keeps its majority line ending.
+        assert_eq!(
+            batch.files["pyproject.toml"],
+            "[project]\nname = \"app\"\ndependencies = [\"six @ https://patch.test/six.whl\", \"attrs==23.1.0\"]\n[tool.hatch.envs.default]\ndependencies = [\"click==8.1.7\"]\n\n[tool.hatch.metadata]\nallow-direct-references = true\n"
+        );
+        assert_eq!(
+            batch.files["hatch.toml"],
+            "[envs.default]\ndependencies = [\"click @ https://patch.test/click.whl\", \"attrs>=23\"]\n\n[envs.docs]\nextra-dependencies = [\"six @ https://patch.test/six.whl\"]\n"
+        );
+        let six = batch.steps[0].as_ref().unwrap();
+        assert_eq!(
+            six.iter()
+                .map(|edit| (edit.file.as_str(), edit.original.as_str(), edit.permission))
+                .collect::<Vec<_>>(),
+            [
+                ("pyproject.toml", "six==1.16.0", false),
+                ("hatch.toml", "six==1.16.0", false),
+                ("pyproject.toml", "", true),
+            ]
+        );
+        assert_eq!(batch.steps[2].as_ref().unwrap().len(), 1);
+
+        let structural = files(concat!(
+            "[project]\nname = \"app\"\n",
+            "dependencies = [\"six==1.16.0\", \"idna>=3\"]\n",
+            "[tool.hatch.envs.default]\ndependencies = [\"click==8.1.7\"]\n",
+            "[tool.hatch.envs.custom]\ntype = \"container\"\n",
+        ));
+        let deps = [
+            HatchDep {
+                name: "six",
+                version: "1.16.0",
+                url: "https://patch.test/six.whl",
+            },
+            HatchDep {
+                name: "idna",
+                version: "3.4",
+                url: "https://patch.test/idna.whl",
+            },
+            HatchDep {
+                name: "click",
+                version: "8.1.7",
+                url: "https://patch.test/click.whl",
+            },
+        ];
+        assert_batch_matches_sequential(&structural, &deps);
+        let batch = rewrite_all(&structural, &deps);
+        assert!(batch.files.is_empty());
+        assert!(batch.steps[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("custom environments"));
+        assert!(batch.steps[1].as_ref().unwrap_err().contains("exact"));
+
+        let mut broken = structural.clone();
+        broken.insert("hatch.toml".into(), "[envs\n".into());
+        assert_batch_matches_sequential(&broken, &deps);
+        assert!(rewrite_all(&broken, &deps)
+            .steps
+            .iter()
+            .all(|step| step.as_ref().unwrap_err().starts_with("hatch.toml:")));
+    }
+
+    /// #1471: a re-run whose only change is restoring the direct-reference
+    /// permission the user removed still rewrites the file and records the
+    /// permission edit, and an already-granted permission records nothing.
+    #[test]
+    fn batch_rewrite_records_a_permission_only_change() {
+        let wired = files(
+            "[project]\nname = \"app\"\ndependencies = [\"six @ https://patch.test/six.whl\"]\n",
+        );
+        let deps = [HatchDep {
+            name: "six",
+            version: "1.16.0",
+            url: "https://patch.test/six.whl",
+        }];
+        assert_batch_matches_sequential(&wired, &deps);
+        let batch = rewrite_all(&wired, &deps);
+        assert!(batch.files["pyproject.toml"]
+            .ends_with("[tool.hatch.metadata]\nallow-direct-references = true\n"));
+        assert_eq!(
+            batch.steps[0].as_ref().unwrap(),
+            &[HatchEdit {
+                file: "pyproject.toml".into(),
+                original: String::new(),
+                new: "allow-direct-references = true".into(),
+                permission: true,
+            }]
+        );
+        let mut granted = wired.clone();
+        granted.extend(batch.files);
+        let again = rewrite_all(&granted, &deps);
+        assert!(again.files.is_empty());
+        assert_eq!(again.steps, [Ok(Vec::new())]);
+        // A `false` the user set is replaced, and recorded as such.
+        let denied = files("[project]\nname = \"app\"\ndependencies = [\"six==1.16.0\"]\n[tool.hatch.metadata]\nallow-direct-references = false\n");
+        assert_batch_matches_sequential(&denied, &deps);
+        let batch = rewrite_all(&denied, &deps);
+        let edits = batch.steps[0].as_ref().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[1].original, "allow-direct-references = false");
+    }
+
+    /// #1471: when no dep is wired, nothing is written, even for a
+    /// hatch.toml whose render is not byte-identical (mixed line endings).
+    #[test]
+    fn batch_rewrite_writes_nothing_when_every_dep_is_refused() {
+        let mut mixed = files("[project]\nname = \"app\"\ndependencies = [\"six==1.16.0\"]\n");
+        mixed.insert(
+            "hatch.toml".into(),
+            "[envs.default]\ndependencies = [\"click==8.1.7\"]\n\r\n[envs.docs]\nextra-dependencies = [\"six==1.16.0\"]\r\n".into(),
+        );
+        let absent = [HatchDep {
+            name: "absent",
+            version: "1.0.0",
+            url: "https://patch.test/absent.whl",
+        }];
+        assert_batch_matches_sequential(&mixed, &absent);
+        assert!(rewrite_all(&mixed, &absent).files.is_empty());
+        assert!(rewrite_all(&mixed, &[]).files.is_empty());
+    }
+
+    /// #1471: vendored `{root:uri}` deps keep their pip-installer and
+    /// dependency-group refusals inside a batch, beside hosted deps that
+    /// still wire.
+    #[test]
+    fn batch_rewrite_keeps_root_placeholder_refusals() {
+        let inputs = files(concat!(
+            "[dependency-groups]\nqa = [\"urllib3==1.26.18\"]\n",
+            "[tool.hatch.envs.default]\ndependencies = [\"six==1.16.0\"]\n",
+        ));
+        let deps = [
+            HatchDep {
+                name: "urllib3",
+                version: "1.26.18",
+                url: "{root:uri}/.socket/vendor/u.whl",
+            },
+            HatchDep {
+                name: "six",
+                version: "1.16.0",
+                url: "https://patch.test/six.whl",
+            },
+        ];
+        assert_batch_matches_sequential(&inputs, &deps);
+        assert!(rewrite_all(&inputs, &deps).steps[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("does not expand"));
+        let mut uv = inputs.clone();
+        uv.insert(
+            "hatch.toml".into(),
+            "[envs.default]\ninstaller = \"uv\"\ndependencies = [\"six==1.16.0\"]\n".into(),
+        );
+        let deps = [
+            HatchDep {
+                name: "six",
+                version: "1.16.0",
+                url: "{root:uri}/.socket/vendor/six.whl",
+            },
+            HatchDep {
+                name: "urllib3",
+                version: "1.26.18",
+                url: "https://patch.test/u.whl",
+            },
+        ];
+        assert_batch_matches_sequential(&uv, &deps);
+        assert!(rewrite_all(&uv, &deps).steps[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("pip installer"));
     }
 }

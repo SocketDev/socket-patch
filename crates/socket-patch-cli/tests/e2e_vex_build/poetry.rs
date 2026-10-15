@@ -545,10 +545,13 @@ fn socket_patch(
     service: &PatchService,
     args: &[&str],
 ) -> (Option<i32>, Value) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = crate::vex_e2e_common::hermetic::binary_command();
+    crate::vex_e2e_common::hermetic::scrub_extra(
+        &mut cmd,
+        &[crate::vex_e2e_common::hermetic::Extra::Venv],
+    );
     for (key, _) in std::env::vars_os() {
-        let k = key.to_string_lossy();
-        if k.starts_with("SOCKET_") || k.starts_with("POETRY_") || k == "VIRTUAL_ENV" {
+        if key.to_string_lossy().starts_with("POETRY_") {
             cmd.env_remove(&key);
         }
     }
@@ -556,8 +559,6 @@ fn socket_patch(
         cmd.env(key, value);
     }
     let out = cmd
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
         .current_dir(project)
         .args(args)
         .args(["--json", "--yes", "--cwd"])
@@ -1176,10 +1177,12 @@ fn poetry_vendored_revendors_to_a_superseding_patch() {
 }
 
 /// `six = {version = "1.16.0", source = "pypi"}` leaves no trace in the
-/// lock, and Poetry 1.4 – 2.2 refuse to install a lock that then sources six
-/// from a URL or file ("Repository \"pypi\" does not exist."). Over a lock
-/// one of them wrote, both modes refuse and leave the lock installable;
-/// other releases install the rewired lock, with a warning (#1282).
+/// lock, and Poetry 1.3 – 2.2 refuse to install a lock that then sources six
+/// from a URL or file ("Repository \"pypi\" does not exist."; 1.3 and 1.4
+/// report a solver failure), and every Poetry 1.3+ re-solves, then refuses,
+/// a lock-version 1.0 / 1.1 lock (Poetry 1.0 – 1.2 write those). Over such a lock
+/// both modes refuse and leave the lock installable; 2.3+ install the
+/// rewired lock, with a warning (#1282, #1447, #1503).
 #[test]
 #[ignore = "real Poetry + PyPI; run by the CI e2e matrix per Poetry release"]
 fn poetry_source_pypi_constraint_never_breaks_install() {
@@ -1204,7 +1207,10 @@ fn poetry_source_pypi_constraint_never_breaks_install() {
         return;
     };
     // The lock was written by this Poetry, so it is also the installer.
-    let refused = ((1, 4)..(2, 3)).contains(&poetry.major_minor());
+    // 1.1 and 1.2 install their own lock, but they write lock format 1.1,
+    // which every Poetry 1.3+ re-solves and then refuses (#1503): refused
+    // too, since the installer usually outlives the lock.
+    let refused = poetry.major_minor() < (2, 3);
     let mut patched = pristine.clone();
     patched.extend_from_slice(MARKER);
     let wheel = build_wheel(&patched);
@@ -1243,7 +1249,7 @@ fn poetry_source_pypi_constraint_never_breaks_install() {
             assert_ne!(lock, pristine_lock, "{mode}: rewired: {env}");
             assert!(
                 report.contains("source_constraint"),
-                "{mode}: warns about Poetry 1.4 – 2.2: {env}"
+                "{mode}: warns about Poetry 1.3 – 2.2: {env}"
             );
         }
         // Either way a fresh install works, and installs the patch whenever

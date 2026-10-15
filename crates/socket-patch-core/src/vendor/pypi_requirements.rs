@@ -265,6 +265,12 @@ fn vendor_lines<'a>(
     })
 }
 
+/// Whether one file's content holds a socket vendor line for `canon_name`
+/// ([`vendor_lines`]).
+pub(super) fn has_vendor_line(content: &str, canon_name: &str) -> bool {
+    vendor_lines(content, canon_name).next().is_some()
+}
+
 /// Find a socket vendor line for `canon_name` in one file's content and
 /// return the patch uuid its wheel path names ([`vendor_lines`]).
 fn vendored_uuid_for(content: &str, canon_name: &str) -> Option<String> {

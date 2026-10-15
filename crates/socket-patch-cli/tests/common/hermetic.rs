@@ -11,6 +11,8 @@
 //!
 //! [`command`] (and [`binary_command`] for the built binary) is the only way
 //! a test spawns `socket-patch`; `common::run_bin_with_env` is built on it.
+//! PTY suites use [`pty_command`] / [`pty_binary_command`], which carry the
+//! same environment onto a `portable_pty::CommandBuilder`.
 //! Package-manager children the same tests spawn get [`scrub_socket_vars`]
 //! plus whichever [`Extra`] scrubs their tool needs.
 //!
@@ -34,10 +36,14 @@ use std::process::Command;
 /// never sees it, but if a scrub line is ever dropped the seed (rather than a
 /// developer's ambient shell, which the suites can't rely on) turns the tests
 /// red immediately.
-const HOSTILE_SEEDS: &[(&str, &str)] = &[
+pub const HOSTILE_SEEDS: &[(&str, &str)] = &[
+    ("SOCKET_CWD", "/nonexistent"),
     ("SOCKET_GLOBAL", "true"),
     ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
     ("SOCKET_DRY_RUN", "true"),
+    ("SOCKET_SAVE_ONLY", "true"),
+    // Skips every confirm prompt the PTY suites exist to drive.
+    ("SOCKET_YES", "true"),
     ("SOCKET_ECOSYSTEMS", "cargo"),
     ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
     ("SOCKET_JSON", "true"),
@@ -45,14 +51,37 @@ const HOSTILE_SEEDS: &[(&str, &str)] = &[
     ("SOCKET_VERBOSE", "true"),
     ("SOCKET_UPDATE_BASE_URL", "http://127.0.0.1:1"),
     ("SOCKET_UPDATE_STATE_DIR", "/nonexistent"),
+    // An ambient token or API/proxy URL would move a child off the public
+    // proxy, or point the production suites at staging while every
+    // assertion still passed.
+    ("SOCKET_API_TOKEN", "hostile-seed-must-be-scrubbed"),
+    ("SOCKET_API_URL", "http://127.0.0.1:1/hostile"),
+    ("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile"),
+    ("SOCKET_OFFLINE", "true"),
+];
+
+/// The opt-outs [`command`] forces on in every child: the config layer
+/// (a developer's real `socket login` must never authenticate a test
+/// child), the passive update notifier (no child may fetch release metadata
+/// from real GitHub; the PTY suites hand the binary a real terminal, so the
+/// stderr-TTY guard doesn't hold there) and telemetry (an unauthenticated
+/// child would POST to the real public proxy; the workspace `[env]` default
+/// can be overridden by the developer's shell). Suites that clear the
+/// environment re-apply these after the clear. Notifier and telemetry
+/// suites opt back in via caller env, which lands last.
+pub const FORCED_OPT_OUTS: &[(&str, &str)] = &[
+    ("SOCKET_NO_CONFIG", "1"),
+    ("SOCKET_NO_UPDATE_CHECK", "1"),
+    ("SOCKET_TELEMETRY_DISABLED", "1"),
 ];
 
 /// A `Command` for `bin` with the hermetic `SOCKET_*` environment: the
-/// hostile seeds scrubbed, every other ambient `SOCKET_*` removed (removing
-/// `SOCKET_API_TOKEN` also forces the public proxy), and the three opt-outs
-/// (config layer, update notifier, telemetry) forced on. Callers add args,
-/// cwd and their own env afterwards; caller env lands last, so explicit
-/// injections survive the scrub.
+/// hostile seeds scrubbed, every flag-bound `SOCKET_*` and every other
+/// ambient `SOCKET_*` removed (removing `SOCKET_API_TOKEN` also forces the
+/// public proxy), and the three opt-outs (config layer, update notifier,
+/// telemetry) forced on. Callers add args, cwd and their own env
+/// afterwards; caller env lands last, so explicit injections survive the
+/// scrub.
 pub fn command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     for (k, v) in HOSTILE_SEEDS {
@@ -61,25 +90,30 @@ pub fn command(bin: &Path) -> Command {
     for (k, _) in HOSTILE_SEEDS {
         cmd.env_remove(k);
     }
+    // The flag-bound vars are removed by name, not only when the sweep below
+    // finds them: in-process tests in the same binary set some of them
+    // (`apply_env_toggles`, env save/restore helpers), and one set between
+    // this sweep and the spawn would otherwise reach the child.
+    for k in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS
+        .iter()
+        .chain(socket_patch_cli::args::LOCAL_ARG_ENV_VARS)
+    {
+        cmd.env_remove(k);
+    }
     cmd.env_remove("SOCKET_API_TOKEN");
+    // The `SOCKET_CLI_*` peer names too: the binary promotes each onto its
+    // canonical `SOCKET_*` name, so a peer token set mid-run would put the
+    // child on the authenticated path.
+    for (_, peer) in socket_patch_core::utils::env_compat::PEER_ENV_ALIASES {
+        cmd.env_remove(peer);
+    }
     scrub_socket_vars(&mut cmd);
-    // Belt-and-braces on top of the `.cargo/config.toml` `[env]` default:
-    // a developer's real `socket login` (the socket-cli config.json token
-    // fallback) must never authenticate a test child — it would flip every
-    // "no token → public proxy" assertion onto the authed path.
-    cmd.env("SOCKET_NO_CONFIG", "1");
-    // Same posture for the passive update notifier: no test child may ever
-    // fetch release metadata from real GitHub. The stderr-TTY guard covers
-    // piped children, but the PTY suites hand the binary a real terminal —
-    // this force-set is the layer that holds there. Notifier tests opt back
-    // in via caller env (which lands last).
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
-    // And for telemetry: an unauthenticated child POSTs its events to the
-    // real public proxy unless a suite points it at a mock. The workspace
-    // `[env]` default can be overridden by the developer's shell, so force
-    // it here too. Telemetry suites opt back in via caller env with
-    // `SOCKET_TELEMETRY_DISABLED=0` and a wiremock endpoint.
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    // Belt-and-braces on top of the `.cargo/config.toml` `[env]` defaults
+    // (see `FORCED_OPT_OUTS`): a developer's real `socket login` would flip
+    // every "no token → public proxy" assertion onto the authed path.
+    // Telemetry suites opt back in with `SOCKET_TELEMETRY_DISABLED=0` and a
+    // wiremock endpoint.
+    cmd.envs(FORCED_OPT_OUTS.iter().copied());
     cmd
 }
 
@@ -101,21 +135,62 @@ pub fn tool_command(name: &str) -> Command {
     )
 }
 
+/// [`command`] for a PTY child: the same hermetic environment on a
+/// `portable_pty::CommandBuilder` for `program`. The PTY suites hand the
+/// binary a real terminal, so they can't use `std::process::Command`;
+/// before this they each hand-rolled a scrub, and the copies drifted (one
+/// stripped the opt-outs, several didn't force them, none removed the
+/// flag-bound vars by name). `program` is usually the binary, or a shell
+/// that `exec`s it, which inherits the same environment.
+///
+/// The builder's environment is replaced outright with what [`command`]'s
+/// child would see. The copy here and [`command`]'s own sweep each read the
+/// process environment, so a var a parallel in-process test clears between
+/// the two reads would survive the plan; the copy is swept once more with
+/// the same rule. Callers add args, cwd and env
+/// afterwards, as with [`command`].
+pub fn pty_command(program: impl AsRef<std::ffi::OsStr>) -> portable_pty::CommandBuilder {
+    let program = program.as_ref();
+    let mut env: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+    for (key, value) in command(Path::new(program)).get_envs() {
+        match value {
+            Some(value) => env.insert(key.to_owned(), value.to_owned()),
+            None => env.remove(key),
+        };
+    }
+    env.retain(|key, _| !is_scrubbed_socket_var(key));
+    let mut pty = portable_pty::CommandBuilder::new(program);
+    pty.env_clear();
+    for (key, value) in env {
+        pty.env(key, value);
+    }
+    pty
+}
+
+/// [`pty_command`] for the `socket-patch` binary cargo built for this run.
+pub fn pty_binary_command() -> portable_pty::CommandBuilder {
+    pty_command(env!("CARGO_BIN_EXE_socket-patch"))
+}
+
 /// Remove every ambient `SOCKET_*` var from `cmd`, except the telemetry
 /// opt-outs (an opted-out developer stays opted out), `SOCKET_NO_CONFIG`
 /// and `SOCKET_NO_UPDATE_CHECK`. [`command`] runs this; package-manager
 /// children call it directly.
 pub fn scrub_socket_vars(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_")
-            && !name.contains("TELEMETRY")
-            && name != "SOCKET_NO_CONFIG"
-            && name != "SOCKET_NO_UPDATE_CHECK"
-        {
+        if is_scrubbed_socket_var(&key) {
             cmd.env_remove(&key);
         }
     }
+}
+
+/// Whether [`scrub_socket_vars`] removes the var `key`.
+fn is_scrubbed_socket_var(key: &std::ffi::OsStr) -> bool {
+    let name = key.to_string_lossy();
+    name.starts_with("SOCKET_")
+        && !name.contains("TELEMETRY")
+        && name != "SOCKET_NO_CONFIG"
+        && name != "SOCKET_NO_UPDATE_CHECK"
 }
 
 /// The in-process half, for test binaries that only parse argv with clap:
@@ -176,10 +251,53 @@ pub enum Extra {
     /// Every `BUNDLE_*` var. Bundler lets any `.bundle/config` setting be
     /// overridden by env, and the gem crawler reads `BUNDLE_PATH`,
     /// `BUNDLE_APP_CONFIG` and friends, so an ambient value moves the gem
-    /// store the suite points it at. Seeded with a bogus
-    /// `BUNDLE_APP_CONFIG` and then scrubbed; run it before the suite sets
-    /// its own `BUNDLE_*` values.
+    /// store the suite points it at. Also `RUBYOPT` and `RUBYLIB`: under
+    /// `bundle exec` they carry `-rbundler/setup` and the outer bundler's
+    /// lib dir, which pin every child ruby to the outer Gemfile and bundler.
+    /// `GEM_HOME`/`GEM_PATH` are kept on purpose: rvm/chruby
+    /// export them and `bundle` itself resolves through them (see
+    /// `cache_env.rs`). Seeded with a bogus `BUNDLE_APP_CONFIG` and then
+    /// scrubbed; run it before the suite sets its own `BUNDLE_*` values.
     Bundle,
+    /// Every `PDM_*` var plus `UV_PROJECT_ENVIRONMENT`: PDM reads any
+    /// setting from `PDM_<NAME>`, and its uv backend follows
+    /// `UV_PROJECT_ENVIRONMENT` to a different venv.
+    Pdm,
+    /// Every `POETRY_*` var: Poetry reads any config key from
+    /// `POETRY_<KEY>` (`POETRY_VIRTUALENVS_PATH`, repository URLs, ...).
+    Poetry,
+    /// Every `COMPOSER_*` var, then `COMPOSER_HOME` pinned to a missing
+    /// directory. The crawler resolves a project's vendor directory from
+    /// `COMPOSER_VENDOR_DIR`, else the user-level `config.json` in the
+    /// Composer home, which it finds through `COMPOSER_HOME` or an
+    /// absolute `XDG_CONFIG_HOME`; any of them moves the crawl off the
+    /// fixture's `vendor/`. The pin outranks `XDG_CONFIG_HOME` and holds
+    /// no config. Run it before the suite sets its own `COMPOSER_*` values.
+    Composer,
+}
+
+/// The [`Extra`] scrubs for a `socket-patch` child that crawls a real
+/// project tree: the binary's own crawlers read `VIRTUAL_ENV`, bundler's
+/// `BUNDLE_PATH`/`BUNDLE_APP_CONFIG`/`BUNDLE_GEMFILE` and Composer's vendor
+/// dir and home, so an ambient value moves discovery (and the installed
+/// evidence `vex` hashes) off the fixture. Any env the test sets after the
+/// scrub still wins. Apply it with [`scrub_crawler_inputs`].
+pub const CRAWLER_EXTRAS: [Extra; 3] = [Extra::Venv, Extra::Bundle, Extra::Composer];
+
+/// Where [`scrub_crawler_inputs`] points `BUNDLE_USER_CONFIG`.
+pub const NO_BUNDLE_USER_CONFIG: &str = "/nonexistent/bundle-user-config";
+
+/// Apply [`CRAWLER_EXTRAS`] to a `socket-patch` child, and pin
+/// `BUNDLE_USER_CONFIG` to a missing file. Without the pin the ruby
+/// crawler falls back to `$HOME/.bundle/config`, the developer's global
+/// bundler config (a `path` or `gemfile` there moves the gem crawl), the
+/// same way `Extra::Composer` pins `COMPOSER_HOME`. The pin lives here,
+/// not in `Extra::Bundle`, because `bundle` children get their own
+/// `BUNDLE_USER_HOME` from `cache_env::isolate`, which the pin would
+/// shadow. A test that sets `BUNDLE_USER_CONFIG` afterwards still wins.
+pub fn scrub_crawler_inputs(cmd: &mut Command) {
+    scrub_extra(cmd, &CRAWLER_EXTRAS);
+    cmd.env("BUNDLE_USER_CONFIG", NO_BUNDLE_USER_CONFIG);
 }
 
 /// Apply each of `extras` to `cmd` (see [`Extra`]). Run it before
@@ -234,6 +352,31 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                     }
                 }
                 cmd.env_remove("BUNDLE_APP_CONFIG");
+                cmd.env_remove("RUBYOPT");
+                cmd.env_remove("RUBYLIB");
+            }
+            Extra::Pdm => {
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().starts_with("PDM_") {
+                        cmd.env_remove(&key);
+                    }
+                }
+                cmd.env_remove("UV_PROJECT_ENVIRONMENT");
+            }
+            Extra::Poetry => {
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().starts_with("POETRY_") {
+                        cmd.env_remove(&key);
+                    }
+                }
+            }
+            Extra::Composer => {
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().starts_with("COMPOSER_") {
+                        cmd.env_remove(&key);
+                    }
+                }
+                cmd.env("COMPOSER_HOME", "/nonexistent/composer-home");
             }
         }
     }

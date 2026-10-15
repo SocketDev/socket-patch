@@ -1909,7 +1909,7 @@ mod tests {
         );
     }
 
-    /// #1101 (Bun), #1134 (vlt): a workspace member's own `bun.lock`,
+    /// #1101 (Bun), #1134 / #1542 (vlt): a workspace member's own `bun.lock`,
     /// `bun.lockb` or `vlt-lock.json` is a lock its manager never reads
     /// (members install from the workspace root's lock), so vendoring into
     /// it would wire nothing. The engine and the hosted→vendored takeover
@@ -1936,6 +1936,23 @@ mod tests {
                 VLT_TEXT,
                 vec![
                     ("vlt.json", r#"{"workspaces":"packages/*"}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            // #1542: vlt lists members through extglobs too.
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("vlt.json", r#"{"workspaces":["packages/+(a|b)"]}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("vlt.json", r#"{"workspaces":["packages/@(a|b)"]}"#),
                     ("vlt-lock.json", VLT_TEXT),
                 ],
             ),

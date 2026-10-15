@@ -700,6 +700,48 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, &path).await;
     }
 
+    // Beside a uv project or script lock, the project's `uv.toml` may set
+    // `no-sources`, under which uv ignores the `[tool.uv.sources]` entry the
+    // rewrite would add (#564). Advisory: never rewritten, so a link or an
+    // unreadable in-memory entry is left out rather than refused.
+    if out
+        .files
+        .keys()
+        .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path))
+    {
+        let rel = crate::utils::python_script::UV_TOML;
+        if let Some(text) = read_advisory(view, unreadable, rel).await {
+            out.files.insert(rel.to_string(), text);
+        }
+    }
+    // A PEP 723 script also takes uv's settings from above the root when
+    // the root holds none (#1501); only a disk view has an above.
+    if out
+        .files
+        .keys()
+        .any(|path| crate::utils::python_lock::is_script_lock_name(path))
+        && !crate::utils::python_script::root_governs_script(
+            out.files.get("pyproject.toml").map(String::as_str),
+            out.files
+                .get(crate::utils::python_script::UV_TOML)
+                .map(String::as_str),
+        )
+    {
+        let files = view
+            .disk_root_reading(std::iter::empty::<&std::path::Path>())
+            .map(crate::utils::python_script::ancestor_uv_config_files)
+            .unwrap_or_default();
+        if let Some(config) = view
+            .disk_root_reading(files.iter().map(|(_, path)| path))
+            .and_then(crate::utils::python_script::find_ancestor_uv_config)
+        {
+            out.files.insert(
+                crate::patch::redirect::UV_ANCESTOR_CONFIG_KEY.to_string(),
+                format!("{}\n{}", config.rel, config.text),
+            );
+        }
+    }
+
     // Rush monorepos have no root package.json/lock pair: the single pnpm
     // source-of-truth lock lives at common/config/rush/pnpm-lock.yaml, and
     // (when subspaces are enabled) one lock per subspace under
@@ -1245,10 +1287,12 @@ pub fn yarn_berry_manifest_targets<'a>(
 
 /// The npm deps whose yarn classic pin reads the served tarball, one per
 /// distinct artifact URL: the project's `yarn.lock` is a classic lock that
-/// names the package, the grant carries a sha512, and either the grant has
-/// no sha1 for the `resolved` fragment yarn 1 keys its cache slot on
-/// (#558), or the lock doesn't pin this artifact yet, so the tarball's own
-/// dependencies must be checked against the lock (#591).
+/// pins the artifact already or locks the package as a registry copy, and
+/// the grant carries a sha512. The tarball gives the sha1 for the
+/// `resolved` fragment yarn 1 keys its cache slot on when the grant has
+/// none (#558), and its own dependencies are checked against the lock
+/// (#591) on every run: a pin an earlier release wrote was never checked
+/// (#1462).
 /// A lock the project's offline mirror refuses outright (`yarn_outer`: the
 /// mirror settings outside the project files) needs none.
 pub fn yarn_classic_artifact_targets<'a>(
@@ -1270,11 +1314,10 @@ pub fn yarn_classic_artifact_targets<'a>(
 
 /// [`yarn_classic_artifact_targets`] over a classic `lock`, reading its
 /// registry copies through `read_copies`. The lock is read in one pass for
-/// the artifacts it pins already, once a dep with a sha1 asks; the
-/// registry-copy test reads every block, so it runs after that, at most
-/// once per lock, and only when some dep still needs it (#1423): a rescan
-/// whose grants all carry a sha1 and are pinned already never reads the
-/// blocks.
+/// the artifacts it pins already; the registry-copy test reads every
+/// block, so it runs after that, at most once per lock, and only when some
+/// dep is not pinned yet (#1423): a rescan whose deps are all pinned
+/// already never reads the blocks.
 fn select_classic_artifacts<'a>(
     candidates: &'a [Candidate],
     lock: &str,
@@ -1289,15 +1332,14 @@ fn select_classic_artifacts<'a>(
         .map(|c| &c.dep)
         .filter(|dep| dep.ecosystem == "npm" && dep.integrity.sha512.is_some())
         .filter(|dep| {
-            dep.integrity.sha1.is_none()
-                || !pinned
-                    .get_or_insert_with(|| quoted_fragment_urls(lock))
-                    .contains(dep.artifact_url.as_str())
-        })
-        .filter(|dep| {
-            registry_copies
-                .get_or_insert_with(|| read_copies.take().map_or_else(HashSet::new, |r| r(lock)))
-                .contains(&(crate::patch::redirect::full_name(dep), dep.version.clone()))
+            pinned
+                .get_or_insert_with(|| quoted_fragment_urls(lock))
+                .contains(dep.artifact_url.as_str())
+                || registry_copies
+                    .get_or_insert_with(|| {
+                        read_copies.take().map_or_else(HashSet::new, |r| r(lock))
+                    })
+                    .contains(&(crate::patch::redirect::full_name(dep), dep.version.clone()))
         })
         .filter(|dep| seen.insert(dep.artifact_url.clone()))
         .collect()
@@ -1439,6 +1481,10 @@ pub struct RewriteOptions<'a> {
     /// resolved only when a cargo dep is rewritten (the cargo rewriter's
     /// offline-source refusal).
     pub cargo_outer: &'a (dyn Fn() -> CratesIoSource + Send + Sync),
+    /// A variable of the environment pnpm installs the project in, by
+    /// name: a `pnpm_config_trust_lockfile` there beats the
+    /// pnpm-workspace.yaml key the trust auto-config writes (#1514).
+    pub pnpm_env: &'a (dyn Fn(&str) -> Option<String> + Send + Sync),
     /// Run the rewriters on the blocking pool (the disk flow: pure CPU over
     /// every lock text).
     pub blocking: bool,
@@ -1701,6 +1747,8 @@ pub async fn rewrite(
         let Gated {
             vetoed,
             lockless,
+            copy_left,
+            copy_shadowed,
             discovery,
         } = unattributed_pins(
             view,
@@ -1714,6 +1762,8 @@ pub async fn rewrite(
         if vetoed.is_empty() {
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
+            done.rewrite.warnings.extend(copy_left);
+            done.rewrite.bundled_skipped_uuids.extend(copy_shadowed);
             done.final_discovery = discovery;
             return done;
         }
@@ -1724,8 +1774,10 @@ pub async fn rewrite(
 
 /// Lockfile discovery over the project as `done` would leave it, read as
 /// the management commands read it ([`HostedInventory`]): the skips for
-/// the confirmed candidates whose pin would be contested wiring, and a
-/// [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin. A lockless NuGet /
+/// the confirmed candidates whose pin would be contested wiring, a
+/// [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin, and a
+/// [`REDIRECT_COPY_UNPATCHED`] warning per pnpm or yarn copy a pin's own
+/// lock installs beside it. A lockless NuGet /
 /// Cargo pin ([`UnlockedPin`]) is written as before — whether such a pin
 /// may be written at all is the open hosted-rollback decision (E45) — but
 /// the run says that nothing can manage it until a lockfile exists.
@@ -1858,6 +1910,58 @@ async fn unattributed_pins(
             )
         })
         .collect();
+    // A pin whose own pnpm or yarn lock also installs an unpatched copy of
+    // the same `name@version` is written: the registry copy is patched, and
+    // discovery withholds the pin from attestation but still manages it
+    // ([`Discovery::shadowed`], #828). The rewriters cannot see every such
+    // copy: a pnpm `file:` directory's version lives in its own package.json
+    // (#935), and yarn keys a `file:` / url / `portal:` copy by the
+    // DEPENDENCY name (`lp2@file:…`), so which package it holds is read from
+    // the copy itself (#939, #1236). The run names each one here, and keeps
+    // the in-run VEX from assuming the uuid applied. A copy a rewriter
+    // already named (the yarn classic `file:` directory skip) is not named
+    // twice.
+    //
+    // [`Discovery::shadowed`]: crate::vex::discover::Discovery::shadowed
+    let mut copy_left: Vec<RewriteWarning> = Vec::new();
+    let mut copy_shadowed: BTreeSet<String> = BTreeSet::new();
+    let mut named: BTreeSet<(&std::path::Path, &str)> = BTreeSet::new();
+    for r in &discovery.shadowed {
+        if r.mode != crate::vex::discover::WiringMode::Hosted
+            || !done.confirmed.iter().any(|(_, uuid)| *uuid == r.uuid)
+        {
+            continue;
+        }
+        for c in discovery.unpatched_copies.iter().filter(|c| {
+            c.purl == r.purl
+                && c.file == r.source_file
+                && matches!(
+                    c.file.file_name().and_then(|n| n.to_str()),
+                    Some("pnpm-lock.yaml" | "shrinkwrap.yaml" | "yarn.lock")
+                )
+        }) {
+            copy_shadowed.insert(r.uuid.clone());
+            if yarn_rewriter_named(&done.rewrite.warnings, &c.file, &c.key)
+                || !named.insert((c.file.as_path(), c.key.as_str()))
+            {
+                continue;
+            }
+            copy_left.push(warning(
+                REDIRECT_COPY_UNPATCHED,
+                format!(
+                    "{}: {} is pinned to patch {}, but lock entry `{}` {}; that copy stays \
+                     UNPATCHED, so `vex` attests nothing for {}. Depend on the registry \
+                     release instead of that copy to patch it",
+                    c.file.display(),
+                    r.purl,
+                    r.uuid,
+                    c.key,
+                    c.how,
+                    r.purl
+                ),
+            ));
+        }
+    }
     // Contested wiring (not a lockless pin, see above) is what the run must
     // never leave behind. A pin discovery does not see at all (a file it
     // does not read, such as a pre-2.6 bundler Gemfile the next `bundle
@@ -1926,8 +2030,24 @@ async fn unattributed_pins(
     Gated {
         vetoed,
         lockless,
+        copy_left,
+        copy_shadowed,
         discovery,
     }
+}
+
+/// Whether a yarn rewriter's own warning already names lock entry `key` of
+/// the root `yarn.lock` (the only yarn lock the rewriters read): the yarn
+/// classic `file:` directory / url / alias skips name the entry by its raw
+/// key, exactly as discovery records it.
+fn yarn_rewriter_named(warnings: &[RewriteWarning], file: &std::path::Path, key: &str) -> bool {
+    if file != std::path::Path::new("yarn.lock") {
+        return false;
+    }
+    let entry = format!("`{key}`");
+    warnings
+        .iter()
+        .any(|w| w.code.starts_with("redirect_yarn_") && w.detail.contains(&entry))
 }
 
 /// What [`unattributed_pins`] decided for one pass.
@@ -1937,6 +2057,12 @@ struct Gated {
     vetoed: Vec<SkippedPatch>,
     /// A [`REDIRECT_PIN_LOCKLESS`] warning per lockless pin.
     lockless: Vec<RewriteWarning>,
+    /// A [`REDIRECT_COPY_UNPATCHED`] warning per pnpm or yarn copy a pin's
+    /// own lock installs beside it.
+    copy_left: Vec<RewriteWarning>,
+    /// The uuids of those pins, which the in-run VEX must not assume
+    /// applied (joined into [`RewriteResult::bundled_skipped_uuids`]).
+    copy_shadowed: BTreeSet<String>,
     /// The discovery the verdict read, for [`Rewritten::final_discovery`].
     discovery: Option<FinalDiscovery>,
 }
@@ -1960,6 +2086,13 @@ fn reusable_prior(
 /// Warning: a confirmed pin no lockfile records a version for (a lockless
 /// NuGet / Cargo redirect), which no later command can attribute.
 pub const REDIRECT_PIN_LOCKLESS: &str = "redirect_pin_lockless";
+
+/// Warning: a confirmed pin's own pnpm or yarn lock also installs an
+/// unpatched copy of the same `name@version` from a `file:` directory or
+/// tarball dependency (#935), or, in a yarn lock, from a `file:` / url /
+/// berry `portal:` / `link:` dependency declared under another name (#939,
+/// #1236), which no rewrite reaches.
+pub const REDIRECT_COPY_UNPATCHED: &str = "redirect_copy_unpatched";
 
 /// `skipped[].reason` of a candidate whose pin lockfile discovery would not
 /// attribute (see [`rewrite`]).
@@ -2380,19 +2513,23 @@ fn pnpm_trust(
         // ignored (#880). The governing-root pre-check refused every root
         // file but these two, so nothing is written here.
         let root_file = root_file.display().to_string();
-        match read_workspace_for_trust(std::path::Path::new(&root_file))
-            .ok()
-            .flatten()
-            .map(|text| plan_workspace_trust(Some(&text)))
-        {
-            Some(TrustPlan::AlreadyTrue) => {
-                pnpm_rerun_only = spliced_pnpm_locks == 0;
-                pnpm_trust_already_true_detail(&server, &root_file)
+        if let Some(found) = pnpm_trust_env_override(view, files, options.pnpm_env) {
+            pnpm_trust_env_set_detail(&server, &found.source)
+        } else {
+            match read_workspace_for_trust(std::path::Path::new(&root_file))
+                .ok()
+                .flatten()
+                .map(|text| plan_workspace_trust(Some(&text)))
+            {
+                Some(TrustPlan::AlreadyTrue) => {
+                    pnpm_rerun_only = spliced_pnpm_locks == 0;
+                    pnpm_trust_already_true_detail(&server, &root_file)
+                }
+                Some(TrustPlan::UserSet(value)) => {
+                    pnpm_trust_user_set_detail(&server, &root_file, &value)
+                }
+                _ => pnpm_trust_manual_guidance(&server),
             }
-            Some(TrustPlan::UserSet(value)) => {
-                pnpm_trust_user_set_detail(&server, &root_file, &value)
-            }
-            _ => pnpm_trust_manual_guidance(&server),
         }
     } else {
         let (workspace, symlinked) = read_workspace(view);
@@ -2423,6 +2560,7 @@ fn pnpm_trust(
         // A keyless file the lock was installed from as a multi-package
         // workspace: only pnpm <= 10.4 reads one that way (every nested
         // package), and the root-only scaffold would drop those members.
+        let env_override = pnpm_trust_env_override(view, files, options.pnpm_env);
         let keyless_members = pinned_pre_10_5.is_none()
             && !symlinked
             && matches!(&workspace, Ok(Some(text)) if crate::formats::pnpm::workspace::is_keyless(text))
@@ -2433,6 +2571,16 @@ fn pnpm_trust(
                 &server,
                 pinned_pre_10_5.as_deref().unwrap_or_default(),
                 options.dry_run,
+            ),
+            // pnpm 11+ read the environment's `trustLockfile` ahead of
+            // the file (#1514): an explicit setting nothing written there
+            // could override.
+            Ok(_) if env_override.is_some() => pnpm_trust_env_set_detail(
+                &server,
+                &env_override
+                    .as_ref()
+                    .map(|found| found.source.clone())
+                    .unwrap_or_default(),
             ),
             // Present but UNREADABLE: never plan a Create (it would
             // overwrite the user's workspace file) — fall back to
@@ -2558,6 +2706,39 @@ fn pnpm_trust_user_set_detail(server: &str, file: &str, value: &str) -> String {
          and left untouched — install with `pnpm install --trust-lockfile`, or set \
          `trustLockfile: true` yourself so every install accepts the patched \
          artifacts. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+        pnpm_trust_policy_preamble(server),
+    )
+}
+
+/// A `pnpm_config_trust_lockfile` variable of the install's environment
+/// (`env`) that the project's pnpm reads and that is not true (#1514). pnpm
+/// 11+ read it ahead of pnpm-workspace.yaml, so it is an explicit user
+/// setting a written key could not override: respected like a
+/// `trustLockfile: false` in the file. The project's files are read for
+/// its pnpm major only when such a variable is set.
+fn pnpm_trust_env_override(
+    view: &ProjectView<'_>,
+    files: &BTreeMap<String, String>,
+    env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+) -> Option<crate::utils::pnpm_workspace::PnpmSetting> {
+    use crate::utils::pnpm_workspace::{pnpm_major_from, trust_lockfile_env};
+    let off = |major| trust_lockfile_env(major, env).filter(|found| found.as_bool() != Some(true));
+    off(None)?;
+    off(pnpm_major_from(|rel| match files.get(rel) {
+        Some(text) => Some(text.clone()),
+        None => read_advisory_text(view, rel),
+    }))
+}
+
+/// The trust detail for a `pnpm_config_trust_lockfile` override in the
+/// environment (`source`, as [`pnpm_trust_env_override`] names it).
+fn pnpm_trust_env_set_detail(server: &str, source: &str) -> String {
+    format!(
+        "{}. {source} sets pnpm's `trustLockfile`, which was respected: pnpm >=11 \
+         reads it ahead of {PNPM_WORKSPACE_REL}, so a `trustLockfile: true` there \
+         would not take effect in this environment, and nothing was written — unset \
+         the variable or set it to `true` wherever the project installs, or re-run \
+         the scan with `--mode vendored`. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
         pnpm_trust_policy_preamble(server),
     )
 }
@@ -3121,6 +3302,10 @@ mod tests {
         CratesIoSource::Registry
     }
 
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
     const GRANT: &str = "GRANTTOKEN0123";
     const PATCH_UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
 
@@ -3235,10 +3420,10 @@ mod tests {
         );
     }
 
-    /// #1423: the served tarball is read only for a dep the lock locks as
-    /// a registry copy and doesn't pin to the artifact yet. The lock's
-    /// blocks are read at most once however many deps there are, and not
-    /// at all on a rescan whose deps are all pinned already.
+    /// #1423: the served tarball is read only for a dep the lock pins to
+    /// the artifact or locks as a registry copy. The lock's blocks are
+    /// read at most once however many deps there are, and not at all on a
+    /// rescan whose deps are all pinned already.
     #[test]
     fn classic_artifact_targets_read_the_lock_blocks_at_most_once() {
         let mut lock = String::from("# yarn lockfile v1\n\n");
@@ -3262,13 +3447,17 @@ mod tests {
             classic_registry_copies(lock)
         };
 
-        // Every dep pinned to its artifact already: nothing to fetch, and
-        // the blocks are never read.
+        // Every dep pinned to its artifact already: each tarball is still
+        // read, since an earlier release pinned it without checking its
+        // dependencies (#1462), but the blocks are never read.
         let mut pinned = lock.clone();
         for c in &candidates {
             pinned.push_str(&format!("# \"{}#s1\"\n", c.dep.artifact_url));
         }
-        assert!(select_classic_artifacts(&candidates, &pinned, counted).is_empty());
+        assert_eq!(
+            select_classic_artifacts(&candidates, &pinned, counted).len(),
+            n
+        );
         assert_eq!(reads.get(), 0);
 
         // Unpinned: every registry copy is selected once per artifact; a
@@ -3405,6 +3594,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3477,6 +3667,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3771,6 +3962,15 @@ mod tests {
         view: &ProjectView<'_>,
         unreadable: &BTreeSet<String>,
     ) -> (CandidateFiles, Rewritten) {
+        npm_rewrite_in(view, unreadable, &no_env).await
+    }
+
+    /// [`npm_rewrite`] with pnpm's environment looked up through `env`.
+    async fn npm_rewrite_in(
+        view: &ProjectView<'_>,
+        unreadable: &BTreeSet<String>,
+        env: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    ) -> (CandidateFiles, Rewritten) {
         let outer = OuterAllowRemote::default;
         let options = RewriteOptions {
             dry_run: false,
@@ -3782,6 +3982,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -3959,6 +4160,101 @@ snapshots:
         );
     }
 
+    /// #1514: pnpm 11+ read a `pnpm_config_trust_lockfile` (or
+    /// `PNPM_CONFIG_TRUST_LOCKFILE`) variable ahead of pnpm-workspace.yaml.
+    /// One set to anything but true in the scan's environment is an
+    /// explicit user setting: nothing is written (a key the variable
+    /// overrides would not take effect) and the warning names the variable
+    /// and its remedies instead of claiming installs need no extra flags.
+    /// The member-lock branch respects it too; a true one, an npm-family
+    /// one, and a project on pnpm 10 keep the auto-config.
+    #[tokio::test]
+    async fn issue_1514_a_trust_lockfile_env_override_is_respected() {
+        fn off(var: &str) -> Option<String> {
+            (var == "pnpm_config_trust_lockfile").then(|| "false".to_string())
+        }
+        fn upper_off(var: &str) -> Option<String> {
+            (var == "PNPM_CONFIG_TRUST_LOCKFILE").then(|| "false".to_string())
+        }
+        fn on(var: &str) -> Option<String> {
+            (var == "pnpm_config_trust_lockfile").then(|| "true".to_string())
+        }
+        fn npm_off(var: &str) -> Option<String> {
+            (var == "npm_config_trust_lockfile").then(|| "false".to_string())
+        }
+        let mut root = MemoryProject::new();
+        root.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        for (env, var) in [
+            (
+                off as fn(&str) -> Option<String>,
+                "pnpm_config_trust_lockfile",
+            ),
+            (upper_off, "PNPM_CONFIG_TRUST_LOCKFILE"),
+        ] {
+            let (_, done) =
+                npm_rewrite_in(&ProjectView::Memory(&root), &BTreeSet::new(), &env).await;
+            assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+            assert!(
+                !done.rewrite.files.contains_key(PNPM_WORKSPACE_REL),
+                "{:?}",
+                done.rewrite.files.keys()
+            );
+            let detail = pnpm_trust_detail(&done);
+            assert!(detail.contains(&format!("`{var}=false`")), "{detail}");
+            assert!(!detail.contains("no extra flags"), "{detail}");
+            assert!(detail.contains("--mode vendored"), "{detail}");
+        }
+        // An existing `trustLockfile: true` is overridden all the same.
+        let mut trusted = root.clone();
+        trusted.insert_text(
+            PNPM_WORKSPACE_REL,
+            "packages:\n  - '.'\ntrustLockfile: true\n",
+        );
+        let (_, done) =
+            npm_rewrite_in(&ProjectView::Memory(&trusted), &BTreeSet::new(), &off).await;
+        assert!(!done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("`pnpm_config_trust_lockfile=false`"),
+            "{detail}"
+        );
+
+        // A true override, the npm spelling (no pnpm reads it) and a
+        // project installed by pnpm 10 (which never verifies) keep the write.
+        for env in [on as fn(&str) -> Option<String>, npm_off] {
+            let (_, done) =
+                npm_rewrite_in(&ProjectView::Memory(&root), &BTreeSet::new(), &env).await;
+            assert!(done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+            assert!(pnpm_trust_detail(&done).contains("no extra flags"));
+        }
+        let mut pnpm10 = root.clone();
+        pnpm10.insert_text(
+            "package.json",
+            r#"{"name":"app","packageManager":"pnpm@10.34.6"}"#,
+        );
+        let (_, done) = npm_rewrite_in(&ProjectView::Memory(&pnpm10), &BTreeSet::new(), &off).await;
+        assert!(done.rewrite.files.contains_key(PNPM_WORKSPACE_REL));
+
+        // A workspace member's own lock (#880): the root file is not
+        // written either way, and the env override is what is reported.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(PNPM_WORKSPACE_REL),
+            "packages:\n  - 'app'\nsharedWorkspaceLockfile: false\ntrustLockfile: true\n",
+        )
+        .unwrap();
+        let member = tmp.path().join("app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("pnpm-lock.yaml"), LEFT_PAD_V9_LOCK).unwrap();
+        let (_, done) = npm_rewrite_in(&ProjectView::Disk(&member), &BTreeSet::new(), &off).await;
+        assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+        let detail = pnpm_trust_detail(&done);
+        assert!(
+            detail.contains("`pnpm_config_trust_lockfile=false`"),
+            "{detail}"
+        );
+    }
+
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
     /// manifest is read for its `patchedDependencies`, and a package the
     /// project patches itself with `bun patch` keeps its registry record,
@@ -4017,6 +4313,7 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
+                pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
@@ -4121,6 +4418,7 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
+                pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
                 patch_server_origins: Vec::new(),
@@ -4296,6 +4594,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -4636,6 +4935,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: configured.iter().map(|o| o.to_string()).collect(),
@@ -4851,6 +5151,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -4905,6 +5206,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),
@@ -5401,6 +5703,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
             patch_server_origins: Vec::new(),

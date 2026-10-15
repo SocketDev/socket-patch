@@ -1,4 +1,6 @@
-//! `apply`: invariants, network behavior, silent/exit modes and the gem and npm multi-copy apply paths.
+//! `apply`: invariants, network behavior, silent/exit modes, the `--json`
+//! failure paths and their human render checks, and the gem and npm
+//! multi-copy apply paths.
 //!
 //! One test binary per command: each module was its own binary.
 
@@ -11,12 +13,15 @@ mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
 
+mod apply_failure_paths;
+mod apply_fixture;
 mod apply_invariants;
 mod apply_network;
+mod apply_render;
+mod apply_silent_staging_errors;
 mod bun_global_store;
 mod check_verifies_installed_tree;
 mod cli_gem_variant_mismatch_policy;
-mod covgap_commands_apply;
 mod e2e_safety_advisories;
 mod gem_stale_bundler_plugin;
 mod in_process_gem_config_warning;

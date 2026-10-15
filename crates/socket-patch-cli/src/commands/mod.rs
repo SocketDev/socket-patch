@@ -58,7 +58,13 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
 /// * a manifest (`.socket/manifest.json`) holding patches → agent;
 /// * neither → hosted (hosted mode keeps no ledger of its own);
 /// * both → `Err(usage message)`: the run cannot tell which mode to keep,
-///   so it asks for an explicit `--mode` rather than guess.
+///   so it asks for an explicit `--mode` rather than guess;
+/// * a vendor ledger beside hosted pins in the lockfiles (a partial
+///   `--mode hosted` takeover, or per-package `get --mode`) →
+///   `Err(usage message)` too: hosted mode keeps no ledger, so its pins
+///   are its state, and keeping vendored mode would take every one of
+///   them over (#1437). The lockfiles are only walked beside a non-empty
+///   ledger, the one case where a pin changes the answer.
 ///
 /// Both stores are read from [`GlobalArgs::project_root`], so a
 /// `--manifest-path` into another project consults that project's ledger,
@@ -108,7 +114,45 @@ pub(crate) async fn mode_from_project_state(
             project_root.display(),
             manifest_path.display(),
         )),
-        (true, false) => Ok(scan::ScanMode::Vendored),
+        (true, false) => {
+            // Lockless cargo/nuget pins and Gemfile-only gem pins (a
+            // CHECKSUMS-less lock, #1224) are never refs, so
+            // `HostedPin::recorded` drops them; they are hosted state too.
+            let discovery = discover_wiring(common, &project_root).await;
+            let gemfile_pins = socket_patch_core::vex::discover::gem_manifest_source_pins(
+                &socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&project_root),
+            )
+            .await;
+            let mut purls: Vec<String> =
+                socket_patch_core::patch::redirect::upstream::HostedPin::recorded(&discovery)
+                    .into_iter()
+                    .map(|pin| pin.purl)
+                    .chain(
+                        discovery
+                            .unlocked_pins
+                            .iter()
+                            .map(|pin| format!("pkg:{}/{}", pin.ecosystem, pin.name)),
+                    )
+                    .chain(gemfile_pins.into_iter().map(|(purl, _)| purl))
+                    .collect();
+            if purls.is_empty() {
+                return Ok(scan::ScanMode::Vendored);
+            }
+            purls.sort_unstable();
+            purls.dedup();
+            let more = purls.len().saturating_sub(3);
+            purls.truncate(3);
+            let mut named = purls.join(", ");
+            if more > 0 {
+                named.push_str(&format!(" and {more} more"));
+            }
+            Err(format!(
+                "{} holds both hosted pins in its dependency files ({named}) and vendored \
+                 patches (.socket/vendor/state.json): pass --mode hosted, --mode vendored \
+                 or --mode agent to choose the mode this run uses",
+                project_root.display(),
+            ))
+        }
         (false, true) => Ok(scan::ScanMode::Agent),
         (false, false) => Ok(scan::ScanMode::Hosted),
     }
@@ -452,6 +496,117 @@ mod tests {
         // Beside a vendor ledger it is ambiguous, not silently vendored.
         write_ledger(tmp.path()).await;
         assert!(mode_from_project_state(&common).await.is_err());
+    }
+
+    /// A `package-lock.json` at `root` pinning `name@version` to Socket's
+    /// hosted patch server: hosted state, which keeps no ledger.
+    fn write_hosted_lock(root: &Path, name: &str, version: &str) {
+        let lock = serde_json::json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0" },
+                format!("node_modules/{name}"): {
+                    "version": version,
+                    "resolved": format!(
+                        "https://patch.socket.dev/patch/npm/{name}/{version}/tok/{UUID}/\
+                         {name}-{version}.tgz"
+                    ),
+                    "integrity": format!("sha512-{}", "a".repeat(86)),
+                },
+            },
+        });
+        std::fs::write(
+            root.join("package-lock.json"),
+            serde_json::to_vec_pretty(&lock).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Vendored packages beside hosted pins (a partial `--mode hosted`
+    /// takeover, or per-package `get --mode`): a bare run cannot keep both
+    /// modes, and picking vendored would take every hosted pin over
+    /// (#1437), so it asks for `--mode`.
+    #[tokio::test]
+    async fn hosted_pins_beside_a_ledger_are_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ledger(tmp.path()).await;
+        write_hosted_lock(tmp.path(), "minimist", "1.2.2");
+        let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
+        let err = mode.expect_err("vendored and hosted state together");
+        assert!(err.contains("hosted"), "{err}");
+        assert!(err.contains("--mode"), "{err}");
+    }
+
+    /// A hosted pin over the very package the ledger holds is still a
+    /// hosted pin: a bare vendored run would convert it back.
+    #[tokio::test]
+    async fn a_hosted_pin_over_a_ledger_entry_is_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ledger(tmp.path()).await;
+        write_hosted_lock(tmp.path(), "left-pad", "1.3.0");
+        let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
+        assert!(mode.is_err(), "{mode:?}");
+    }
+
+    /// A lockless hosted pin (a nuget source no lock records yet) is
+    /// hosted state too, though `HostedPin::recorded` never lists it.
+    #[tokio::test]
+    async fn a_lockless_hosted_pin_beside_a_ledger_is_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ledger(tmp.path()).await;
+        let key = format!("socket-patch-{UUID}");
+        std::fs::write(
+            tmp.path().join("nuget.config"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  \
+                 <packageSources>\n    <add key=\"{key}\" value=\"https://patch.socket.dev/\
+                 patch-registry/nuget/tok/{UUID}/index.json\" />\n  </packageSources>\n  \
+                 <packageSourceMapping>\n    <packageSource key=\"{key}\">\n      \
+                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+                 </packageSourceMapping>\n</configuration>\n"
+            ),
+        )
+        .unwrap();
+        let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
+        let err = mode.expect_err("vendored and lockless hosted state together");
+        assert!(err.contains("pkg:nuget/Newtonsoft.Json"), "{err}");
+    }
+
+    /// A gem pinned only in the Gemfile (the hosted rewriter's wiring over
+    /// a CHECKSUMS-less lock, #1224) has no lock ref yet, but it is hosted
+    /// state all the same.
+    #[tokio::test]
+    async fn a_gemfile_only_hosted_pin_beside_a_ledger_is_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ledger(tmp.path()).await;
+        std::fs::write(
+            tmp.path().join("Gemfile"),
+            format!(
+                "source \"https://rubygems.org\"\n\nsource \"https://patch.socket.dev/\
+                 patch-registry/gem/tok/{UUID}/\" do\n  gem \"rails\", \"7.0.0\"\nend\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n",
+        )
+        .unwrap();
+        let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
+        let err = mode.expect_err("vendored and Gemfile-only hosted state together");
+        assert!(err.contains("pkg:gem/rails@7.0.0"), "{err}");
+    }
+
+    /// Hosted pins alone are a hosted project, and need no ledger.
+    #[tokio::test]
+    async fn hosted_pins_alone_are_hosted() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_hosted_lock(tmp.path(), "minimist", "1.2.2");
+        let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
+        assert_eq!(mode, Ok(scan::ScanMode::Hosted));
     }
 
     /// With `--manifest-path` into another project, the ledger is read

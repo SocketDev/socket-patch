@@ -18,12 +18,12 @@ mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
 
-mod coverage_fix_repair_vendor_predelete;
-mod covgap_commands_repair;
-mod covgap_commands_repair_vendor;
 mod repair_invariants;
+mod repair_render;
 mod repair_vendor_e2e;
+mod repair_vendor_failure_paths;
 mod repair_vendor_flavors_e2e;
+mod repair_vendor_predelete;
 
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;

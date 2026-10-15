@@ -20,6 +20,9 @@ use clap::Parser;
 use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::Cli;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
+
 /// Subcommands under test. `rollback` is omitted because its only positional
 /// is optional — covered by the no-positional variant. Setup is exercised
 /// even though most globals are no-ops there; the point is to lock in that
@@ -718,12 +721,10 @@ use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS as GLOBAL_ENV_VARS;
 #[serial_test::serial]
 fn empty_nonbool_env_vars_do_not_crash_the_binary() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    // Start from the hermetic env (no ambient SOCKET_* bleed into the
+    // child, telemetry off)…
+    let mut cmd = hermetic::binary_command();
     cmd.current_dir(tmp.path());
-    // Start from a clean slate (no ambient SOCKET_* bleed into the child)…
-    for var in GLOBAL_ENV_VARS {
-        cmd.env_remove(var);
-    }
     // …then export every non-bool global blank, the way `VAR=` does.
     for var in [
         "SOCKET_CWD",
@@ -739,8 +740,6 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
     ] {
         cmd.env(var, "");
     }
-    // Keep the spawned process from attempting telemetry network calls.
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
 
     let out = cmd
         .args(["list", "--json"])

@@ -187,7 +187,10 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   which pnpm applies through `overrides` without a lock.
   For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
   the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
-  explicitly disabled by the project. pnpm >=11 needs this for hosted URLs.
+  explicitly disabled by the project or, for pnpm >=11, by a
+  `pnpm_config_trust_lockfile` environment variable the scan runs with (pnpm
+  reads it ahead of the file, so nothing is written and the warning names the
+  variable). pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
   remains enforced. pnpm <=10 does not need the setting. An existing
   `pnpm-workspace.yaml` with no keys (empty or only comments) gets the
@@ -278,6 +281,29 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   unpatched artifact. The reverse shape — an alias of the patched NAME pointing at a
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
+- **yarn copies under another dependency name (classic & berry)** — yarn keys a `file:`
+  tarball or directory, a URL tarball and a berry `portal:` / `link:` dependency by the
+  name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as `lp2@file:…`,
+  while `node_modules/lp2` is left-pad@1.3.0. No pin or vendored wiring of `left-pad`
+  reaches that copy, so it stays unpatched. Which package such a copy is comes from the
+  copy itself (the tarball's or directory's `package.json`, or the registry package a
+  URL's path names; a berry `portal:` / `link:` target's `package.json` also gives the
+  version, since the lock records `0.0.0-use.local`). The copy is read wherever yarn
+  installs it from, including a `file:` path outside the project (`file:../shared/lp`),
+  and a tarball's `package.json` is found under whatever top-level directory it has, as
+  yarn strips the first path segment. A copy whose package can't be read (a non-registry
+  URL, a missing directory) is treated as possibly any package at its lock version: it
+  is named as a copy it may be, and `vex` attests nothing that lock wires at that
+  version. An absolute path (`portal:/home/me/lp`, `file:/abs/lp.tgz`) is never read, as
+  the lock is untrusted input; a `portal:` / `link:` copy whose `package.json` isn't
+  read has no version either, so it may be any version of any package and `vex` attests
+  nothing that lock wires. Use a relative path to let the copy be read. Hosted mode still pins the
+  registry entry and names the copy (`redirect_copy_unpatched`, unless a yarn classic
+  skip warning already names it); vendored mode still wires the registry entry and names
+  it (`vendor_copy_unpatched` for berry; the yarn classic codes below for classic); and
+  `vex` never attests the package from that lock while the copy is there. When the
+  package is installed only through such copies, vendoring refuses with
+  `vendor_lock_entry_not_rewritable` naming them, since `yarn install` can't help.
 - **yarn classic and yarn 2+** — installing with yarn 2+ (berry) migrates a classic (v1)
   `yarn.lock` and re-resolves every entry from the registry, dropping hosted pins and
   vendored wiring alike, so the packages install unpatched. A run that leaves such a pin
@@ -325,9 +351,10 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   that copy stays unpatched; `vex` never attests the package from that lock while the
   copy is there. This holds whatever dependency name the project gives the copy: yarn 1
   locks `"lp2": "file:./lpdir"` as `lp2@file:./lpdir`, so which package it is comes from
-  the directory's `package.json` (and, for `vex`, a `file:` tarball's manifest or a
-  registry tarball URL's path; hosted and vendored scans name a URL copy with
-  `redirect_yarn_classic_non_registry_entry_skipped` /
+  the directory's `package.json` (or a `file:` tarball's manifest, or a registry tarball
+  URL's path; hosted scans name a URL copy with
+  `redirect_yarn_classic_non_registry_entry_skipped` and a `file:` tarball copy with
+  `redirect_copy_unpatched`, and vendored scans name either with
   `vendor_yarn_classic_non_registry_entry_skipped`). A git copy under another name
   records no package name in the lock and is not detected. When every entry of the package is such a copy (git, `file:` directory,
   non-registry tarball or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,
@@ -400,6 +427,15 @@ other tools that follow the convention: neither that directory's own
 `node_modules` nor anything below it is crawled. The scan root is always
 crawled, even when it is tagged itself. A `CACHEDIR.TAG` that lacks the
 signature, is a directory or is a symlink prunes nothing.
+
+Agent and report-only scans patch every crawled copy in place. Hosted and
+vendored scans rewire only the scan root's lockfiles, so a patched package
+that only a nested, independent npm project installs (a directory below
+the root with its own lockfile, such as `tools/x/` holding
+`package-lock.json`, that is not a workspace member installed from the
+root's lock) is left alone with a `nested_project_skipped` warning. The
+warning names the project directory; pass it as a PATH
+(`socket-patch scan --mode vendored tools/x`) to patch that project.
 
 Inside each `node_modules`, the package stores of isolated layouts are
 walked too, since they are the only home of transitive dependencies:
@@ -619,8 +655,11 @@ package that `require()`s its own name resolve itself. The payload's `devDepende
 are dropped from its `package.json` (vlt would otherwise try to install them). The uuid
 directory carries a `.gitignore` that re-includes the payload (`!*`) against the project's
 own ignores (`node_modules`, `dist/`, `*.map`, …) while ignoring the links vlt creates
-inside it, and a `.gitattributes` that turns EOL conversion off so an `autocrlf` checkout
-stays byte-exact. The lock's node becomes a `file` node, the importer edges and the
+inside it, and a `.gitattributes` (`* -text -filter -ident -working-tree-encoding`) that
+turns off EOL conversion and overrides the project's clean/smudge filters, such as a Git
+LFS `*.tgz` rule, so an `autocrlf` or LFS-less checkout stays byte-exact (#1541). A tarball
+an older release already committed as an LFS pointer stays one until it is re-added:
+after the next vendored run, `git add --renormalize .socket/vendor/npm` and commit. The lock's node becomes a `file` node, the importer edges and the
 importers' `package.json` specs move to the `file:` path, and every moved entry is placed
 where vlt's own serializer puts it, so `vlt ci` keeps the lock byte-identical. Transitive
 targets are refused (`vendor_vlt_transitive_unsupported`: vlt silently reverts

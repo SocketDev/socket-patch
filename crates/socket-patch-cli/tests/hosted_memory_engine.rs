@@ -808,7 +808,7 @@ async fn hosted_bundle_command_prints_the_engine_result() {
         .map(|(k, v)| (k, String::from_utf8(v).unwrap()))
         .collect();
     let bundle = serde_json::json!({ "files": files, "presentOnly": [".pnp.loader.mjs"] });
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let mut child = hermetic::binary_command()
         .args([
             "hosted-bundle",
             "--org",
@@ -818,8 +818,6 @@ async fn hosted_bundle_command_prints_the_engine_result() {
             "--api-url",
             &server.uri(),
         ])
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_TELEMETRY_DISABLED", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -852,11 +850,8 @@ async fn hosted_bundle_command_prints_the_engine_result() {
         .unwrap()
         .starts_with(env!("CARGO_PKG_VERSION")));
 
-    let missing = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let missing = hermetic::binary_command()
         .args(["hosted-bundle"])
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_ORG_SLUG")
-        .env("SOCKET_NO_CONFIG", "1")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
@@ -1089,6 +1084,29 @@ async fn a_bundler4_custom_lockfile_is_refused() {
         ".bundle/config".to_string(),
         b"---\nBUNDLE_LOCKFILE: \"custom.lock\"\n".to_vec(),
     );
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(project.error.is_none(), "{:?}", project.error);
+    assert!(project.redirected.is_empty(), "{:?}", project.redirected);
+    assert!(
+        changed_paths(&output).is_empty(),
+        "{:?}",
+        changed_paths(&output)
+    );
+    assert_gem_lock_unsupported(&output);
+}
+
+/// #1477: bundler 4's Gemfile `lockfile "custom.lock"` call names the
+/// lock bundler reads just like the setting, so the project is refused the
+/// same way, with nothing written.
+#[tokio::test]
+async fn a_bundler4_gemfile_lockfile_call_is_refused() {
+    let (server, input) = gem_server_and_input().await;
+    let mut files = input.clone();
+    files.insert("custom.lock".to_string(), input["Gemfile.lock"].clone());
+    let mut gemfile = b"lockfile \"custom.lock\"\n".to_vec();
+    gemfile.extend_from_slice(&input["Gemfile"]);
+    files.insert("Gemfile".to_string(), gemfile);
     let output = run_engine(&server, build_input(&files, &[], options(false))).await;
     let project = &output.projects[0];
     assert!(project.error.is_none(), "{:?}", project.error);
@@ -1628,6 +1646,298 @@ async fn a_leftover_root_only_scaffold_on_pnpm_9_is_flagged() {
                 .iter()
                 .any(|f| f.path == "pnpm-workspace.yaml"),
             "the file is never rewritten or removed"
+        );
+    }
+}
+
+/// An npm tarball holding only `package/package.json` for `name@version`.
+fn npm_manifest_tgz(name: &str, version: &str) -> Vec<u8> {
+    let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "package/package.json", manifest.as_bytes())
+        .unwrap();
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+/// A granted hosted left-pad@1.3.0 patch on `server` (tarball and yarn
+/// berry zip artifacts), its served tarball mounted.
+async fn mount_left_pad_grant(server: &MockServer, uuid: &str) {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let tarball = npm_manifest_tgz("left-pad", "1.3.0");
+    let sha512 = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tarball))
+    );
+    let artifact = format!("/patch/npm/left-pad/1.3.0/tok/{uuid}/left-pad-1.3.0.tgz");
+    let url = format!("{}{artifact}", server.uri());
+    let patch = common::Patch {
+        purl: "pkg:npm/left-pad@1.3.0".into(),
+        uuid: uuid.into(),
+        reference: serde_json::json!({
+            "status": "granted",
+            "url": url,
+            "purl": null,
+            "artifacts": [
+                { "kind": "tarball", "url": url, "integrity": { "sha512": sha512 } },
+                { "kind": "yarn-berry-zip", "url": url,
+                  "integrity": { "yarnBerry10c0": format!("10c0/{}", "7".repeat(128)) } }
+            ],
+            "registryOverride": null,
+        }),
+    };
+    mount_api(server, &[patch]).await;
+    Mock::given(method("GET"))
+        .and(path(artifact))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(server)
+        .await;
+}
+
+/// The `redirect_copy_unpatched` warnings a project's redirect reports.
+fn copy_unpatched_details(project: &socket_patch_cli::hosted_memory::ProjectResult) -> Vec<String> {
+    project.redirect["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "redirect_copy_unpatched")
+        .map(|w| w["detail"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// #1236 follow-up: yarn 1 locks a `file:` TARBALL declared under another
+/// dependency name (`"lp2": "file:./forks/left-pad-1.3.0.tgz"`) as
+/// `lp2@file:…` and installs it as `node_modules/lp2`, which is
+/// left-pad@1.3.0 and stays unpatched whatever the pin does. The hosted
+/// scan still pins the registry block, and now names that copy (the
+/// tarball's own `package.json` says which package it is). Control: a
+/// tarball holding another package is not named.
+#[tokio::test]
+async fn issue_1236_classic_renamed_file_tarball_copy_is_named() {
+    const UUID: &str = "12361236-1236-4236-8236-123612361236";
+    let key = "\"lp2@file:./forks/left-pad-1.3.0.tgz\"";
+    for (fork, named) in [("left-pad", true), ("other-pkg", false)] {
+        let server = MockServer::start().await;
+        mount_left_pad_grant(&server, UUID).await;
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package.json".to_string(),
+            br#"{"name":"app","version":"1.0.0","packageManager":"yarn@1.22.22","dependencies":{"left-pad":"1.3.0","lp2":"file:./forks/left-pad-1.3.0.tgz"}}"#.to_vec(),
+        );
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# yarn lockfile v1\n\n\nleft-pad@1.3.0:\n  version \"1.3.0\"\n  \
+                 resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#{}\"\n  \
+                 integrity sha512-UP==\n\n{key}:\n  version \"1.3.0\"\n  \
+                 resolved \"file:./forks/left-pad-1.3.0.tgz#{}\"\n",
+                "a".repeat(40),
+                "b".repeat(40),
+            )
+            .into_bytes(),
+        );
+        files.insert(
+            "forks/left-pad-1.3.0.tgz".to_string(),
+            npm_manifest_tgz(fork, "1.3.0"),
+        );
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{:?}", project.error);
+        assert_eq!(project.redirected.len(), 1, "{fork}: {:?}", project.skipped);
+        let details = copy_unpatched_details(project);
+        if named {
+            assert_eq!(details.len(), 1, "{:#}", project.redirect);
+            assert!(
+                details[0].contains(&format!("`{key}`")) && details[0].contains("UNPATCHED"),
+                "{}",
+                details[0]
+            );
+        } else {
+            assert!(details.is_empty(), "{details:?}");
+        }
+    }
+}
+
+/// #939: yarn berry keys a `file:` tarball / directory, a url tarball and
+/// a `portal:` / `link:` dependency by the DEPENDENCY name (`lp2@…`), so a
+/// copy of left-pad@1.3.0 under another name escapes the `resolutions` pin
+/// and installs unpatched. The hosted scan still pins the registry entry,
+/// and now names that copy instead of reporting a clean success. Control:
+/// a `file:` / `portal:` copy holding another package is not named.
+#[tokio::test]
+async fn issue_939_berry_renamed_copy_is_named() {
+    const UUID: &str = "93939393-9393-4393-8393-939393939393";
+    let ws = "app%40workspace%3A.";
+    let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+    // (case, manifest spec, lock key, lock version, resolution)
+    let cases = [
+        (
+            "file: tarball",
+            "file:./forks/left-pad-1.3.0.tgz".to_string(),
+            format!("lp2@file:./forks/left-pad-1.3.0.tgz::locator={ws}"),
+            "1.3.0",
+            format!(
+                "lp2@file:./forks/left-pad-1.3.0.tgz#./forks/left-pad-1.3.0.tgz::hash=5c8e4c&locator={ws}"
+            ),
+        ),
+        (
+            "file: directory",
+            "file:./forks/left-pad".to_string(),
+            format!("lp2@file:./forks/left-pad::locator={ws}"),
+            "1.3.0",
+            format!("lp2@file:./forks/left-pad#./forks/left-pad::hash=1a2b3c&locator={ws}"),
+        ),
+        (
+            "registry tarball url",
+            url.to_string(),
+            format!("lp2@{url}"),
+            "1.3.0",
+            format!("lp2@{url}"),
+        ),
+        (
+            "portal:",
+            "portal:./forks/left-pad".to_string(),
+            format!("lp2@portal:./forks/left-pad::locator={ws}"),
+            "0.0.0-use.local",
+            format!("lp2@portal:./forks/left-pad::locator={ws}"),
+        ),
+        (
+            "link:",
+            "link:./forks/left-pad".to_string(),
+            format!("lp2@link:./forks/left-pad::locator={ws}"),
+            "0.0.0-use.local",
+            format!("lp2@link:./forks/left-pad::locator={ws}"),
+        ),
+    ];
+    for (case, spec, key, version, resolution) in &cases {
+        for fork in ["left-pad", "other-pkg"] {
+            let named = fork == "left-pad" || case.contains("url");
+            let server = MockServer::start().await;
+            mount_left_pad_grant(&server, UUID).await;
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package.json".to_string(),
+                format!(
+                    r#"{{"name":"app","version":"1.0.0","dependencies":{{"left-pad":"^1.3.0","lp2":"{spec}"}}}}"#
+                )
+                .into_bytes(),
+            );
+            files.insert(
+                "yarn.lock".to_string(),
+                format!(
+                    "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                     \"app@workspace:.\":\n  version: 0.0.0-use.local\n  \
+                     resolution: \"app@workspace:.\"\n  dependencies:\n    \
+                     left-pad: \"npm:^1.3.0\"\n    lp2: \"{spec}\"\n  \
+                     languageName: unknown\n  linkType: soft\n\n\
+                     \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+                     resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
+                     languageName: node\n  linkType: hard\n\n\
+                     \"{key}\":\n  version: {version}\n  resolution: \"{resolution}\"\n  \
+                     languageName: node\n  linkType: hard\n",
+                    "1".repeat(128)
+                )
+                .into_bytes(),
+            );
+            files.insert(
+                "forks/left-pad-1.3.0.tgz".to_string(),
+                npm_manifest_tgz(fork, "1.3.0"),
+            );
+            files.insert(
+                "forks/left-pad/package.json".to_string(),
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#).into_bytes(),
+            );
+            let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+            let project = &output.projects[0];
+            assert!(project.error.is_none(), "{case}: {:?}", project.error);
+            assert_eq!(
+                project.redirected.len(),
+                1,
+                "{case}/{fork}: {:?} {:#}",
+                project.skipped,
+                project.redirect
+            );
+            let details = copy_unpatched_details(project);
+            if named {
+                assert_eq!(details.len(), 1, "{case}/{fork}: {:#}", project.redirect);
+                assert!(
+                    details[0].contains(key.as_str()) && details[0].contains("UNPATCHED"),
+                    "{case}: {}",
+                    details[0]
+                );
+            } else {
+                assert!(details.is_empty(), "{case}/{fork}: {details:?}");
+            }
+        }
+    }
+}
+
+/// #1540: a berry `portal:` / `link:` copy with an ABSOLUTE path is never
+/// read (#1516), and its lock version is the placeholder
+/// `0.0.0-use.local`, so it may be any version of any package. The hosted
+/// scan still pins the registry entry, and names that copy as possibly
+/// unpatched (`redirect_copy_unpatched`) whatever it links to; it used to
+/// report a clean success while `node_modules/lp2` held unpatched bytes.
+#[tokio::test]
+async fn issue_1540_berry_absolute_portal_and_link_copies_are_named() {
+    const UUID: &str = "15401540-1540-4540-8540-154015401540";
+    let ws = "app%40workspace%3A.";
+    for protocol in ["portal", "link"] {
+        let spec = format!("{protocol}:/home/me/shared/left-pad");
+        let key = format!("lp2@{spec}::locator={ws}");
+        let server = MockServer::start().await;
+        mount_left_pad_grant(&server, UUID).await;
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package.json".to_string(),
+            format!(
+                r#"{{"name":"app","version":"1.0.0","dependencies":{{"left-pad":"^1.3.0","lp2":"{spec}"}}}}"#
+            )
+            .into_bytes(),
+        );
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"app@workspace:.\":\n  version: 0.0.0-use.local\n  \
+                 resolution: \"app@workspace:.\"\n  dependencies:\n    \
+                 left-pad: \"npm:^1.3.0\"\n    lp2: \"{spec}\"\n  \
+                 languageName: unknown\n  linkType: soft\n\n\
+                 \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+                 resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
+                 languageName: node\n  linkType: hard\n\n\
+                 \"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
+                 languageName: node\n  linkType: soft\n",
+                "1".repeat(128)
+            )
+            .into_bytes(),
+        );
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{protocol}: {:?}", project.error);
+        assert_eq!(
+            project.redirected.len(),
+            1,
+            "{protocol}: {:?} {:#}",
+            project.skipped,
+            project.redirect
+        );
+        let details = copy_unpatched_details(project);
+        assert_eq!(details.len(), 1, "{protocol}: {:#}", project.redirect);
+        assert!(
+            details[0].contains(key.as_str())
+                && details[0].contains("can't be read")
+                && details[0].contains("UNPATCHED"),
+            "{protocol}: {}",
+            details[0]
         );
     }
 }

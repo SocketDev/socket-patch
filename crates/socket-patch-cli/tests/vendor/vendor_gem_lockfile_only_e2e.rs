@@ -1,9 +1,9 @@
 //! Service vendoring of portable gems without a local install or registry fetch.
 
-use crate::common::{binary, git_sha256};
+use crate::common::{binary, git_sha256, hermetic};
+use crate::npm_fixture::dead_endpoint;
 
 use std::path::Path;
-use std::process::Command;
 
 use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -126,11 +126,17 @@ async fn mount_gem_download(mock: &MockServer, gem: Vec<u8>) {
 }
 
 /// `vendor --json --vendor-source <source>` through the built binary, with
-/// every ambient `SOCKET_*` var scrubbed and the API pointed at a
+/// the hermetic `SOCKET_*` environment, every ambient `BUNDLE_*` var and
+/// both gem-home vars scrubbed and `HOME` on a stand-in (an ambient
+/// `BUNDLE_PATH`, app config, `~/.bundle/config` or gem home moves the gem
+/// store the crawler reads) and the API pointed at a
 /// guaranteed-dead endpoint (patch staging is satisfied from
 /// `.socket/blobs`, so nothing should reach it).
 fn run_vendor(root: &Path, source: &str, api_url: &str) -> (i32, serde_json::Value, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle]);
+    cmd.env_remove("GEM_HOME").env_remove("GEM_PATH");
+    crate::common::jvm_env::isolate_cli(&mut cmd);
     cmd.args([
         "vendor",
         "--json",
@@ -146,12 +152,6 @@ fn run_vendor(root: &Path, source: &str, api_url: &str) -> (i32, serde_json::Val
         "test-org",
     ])
     .current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let fixture = crate::prebuilt_common::Server::project(root);
     fixture.command(&mut cmd);
     let out = cmd.output().expect("run socket-patch vendor");
@@ -160,17 +160,6 @@ fn run_vendor(root: &Path, source: &str, api_url: &str) -> (i32, serde_json::Val
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("vendor --json must emit JSON: {e}\n{stdout}\n{stderr}"));
     (out.status.code().unwrap_or(-1), v, stderr)
-}
-
-/// A guaranteed-unreachable local endpoint: bind an ephemeral port, then
-/// release it, so every request fails fast with connection-refused.
-fn dead_endpoint() -> String {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    format!("http://127.0.0.1:{port}")
 }
 
 fn failed_event(v: &serde_json::Value) -> &serde_json::Value {

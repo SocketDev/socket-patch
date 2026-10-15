@@ -11,6 +11,8 @@
 
 use std::path::Path;
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -384,26 +386,19 @@ fn install_package(root: &Path, venv: &str, bytes: &[u8]) -> std::path::PathBuf 
 }
 
 async fn scan_output(root: &Path, server: &MockServer, extra: &[&str]) -> std::process::Output {
-    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") || name.starts_with("POETRY_") || name == "VIRTUAL_ENV" {
-            cmd.env_remove(key);
-        }
-    }
-    // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the scan
-    // above and the spawn would be inherited, so remove them
-    // unconditionally (see in_process_vendor.rs `run_cli`).
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
-    ] {
-        cmd.env_remove(key);
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
+    let mut std_cmd = hermetic::binary_command();
+    hermetic::scrub_extra(
+        &mut std_cmd,
+        &[hermetic::Extra::Venv, hermetic::Extra::Poetry],
+    );
+    // The #[serial] in-process tests here `set_var` this for their own
+    // mock; a non-serial scan building its command meanwhile would inherit
+    // it, so remove it by name rather than only via the builder's sweep.
+    std_cmd.env_remove("SOCKET_PYPI_JSON_API");
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    // Hermetic against the runner's own Python user site, which a
+    // `--system-site-packages` venv reaches (#409).
+    cmd.env("PYTHONNOUSERSITE", "1")
         .args(["scan", "--mode", "hosted", "--yes", "--cwd"])
         .arg(root)
         .args([
@@ -488,6 +483,84 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
         );
         assert_eq!(read(&tmp.path().join("poetry.lock")), redirected);
     }
+}
+
+/// A `.venv` created with `--system-site-packages` whose base interpreter
+/// lives at `root/base`; `bytes` is installed in the BASE interpreter only,
+/// which is where pip leaves a release it finds already satisfied there.
+/// Returns the base copy's file.
+fn install_behind_system_site_venv(root: &Path, bytes: &[u8]) -> std::path::PathBuf {
+    let base = root.join("base");
+    let (home, stdlib) = if cfg!(windows) {
+        (base.clone(), base.join("Lib"))
+    } else {
+        (base.join("bin"), base.join("lib").join("python3.12"))
+    };
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&stdlib).unwrap();
+    std::fs::write(stdlib.join("os.py"), "").unwrap();
+    let file = install_package(root, "base", bytes);
+    // The project venv (`write_project` made its empty site-packages)
+    // reaches the base interpreter.
+    std::fs::write(
+        root.join(".venv").join("pyvenv.cfg"),
+        format!(
+            "home = {}\ninclude-system-site-packages = true\nversion = 3.12.4\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+    file
+}
+
+/// #409: pip leaves a release the base interpreter already has where it
+/// is, so behind a `--system-site-packages` venv the unpatched base copy is
+/// the one the build imports. It must get the stale-install warning, and
+/// `--vex` must not attest from the lock pin as if nothing were installed.
+#[tokio::test]
+async fn stale_base_copy_behind_system_site_venv_warns_and_cannot_attest() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let installed = install_behind_system_site_venv(tmp.path(), UPSTREAM);
+    let vex = tmp.path().join("out.vex.json");
+    let out = scan_output(
+        tmp.path(),
+        &server,
+        &["--json", "--vex", vex.to_str().unwrap()],
+    )
+    .await;
+    let json = envelope(&out);
+    assert_eq!(out.status.code(), Some(1), "{json}");
+    assert!(stale_warning(&json), "{json}");
+    assert_eq!(json["error"]["code"], "no_applicable_patches", "{json}");
+    assert!(!vex.exists(), "stale base bytes cannot produce a VEX file");
+    assert_eq!(std::fs::read(installed).unwrap(), UPSTREAM);
+}
+
+/// #409: once the venv holds its own patched copy (`pip install
+/// --force-reinstall` leaves the base copy in place), the base copy is
+/// shadowed: no stale warning, and the venv's verified bytes attest.
+#[tokio::test]
+async fn venv_copy_shadows_stale_base_copy_behind_system_site_venv() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    install_behind_system_site_venv(tmp.path(), UPSTREAM);
+    install_package(tmp.path(), ".venv", PATCHED);
+    let vex = tmp.path().join("out.vex.json");
+    let out = scan_output(
+        tmp.path(),
+        &server,
+        &["--json", "--vex", vex.to_str().unwrap()],
+    )
+    .await;
+    let json = envelope(&out);
+    assert!(out.status.success(), "{json}");
+    assert!(!stale_warning(&json), "{json}");
+    assert_eq!(json["vex"]["statements"], 1, "{json}");
 }
 
 #[tokio::test]

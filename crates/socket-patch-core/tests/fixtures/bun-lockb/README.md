@@ -14,6 +14,14 @@ and an empty `BUN_INSTALL_CACHE_DIR` to regenerate. Bun 1.2+ fixtures include
 - 1.3.14 / 1.4.2: current optional configuration extensions.
 - `*-extensions`: root and workspace scripts, a GitHub resolution, and
   catalogs on 1.2.23 and 1.4.2.
+- `1.4.2-scoped-overrides`: a nested `overrides` entry (unused by the
+  installed packages), whose `sCoPdOvR`
+  extension Bun writes after `cNfGvRsN`, and a `!` workspace pattern
+  (#1492); written on Linux x64.
+- `negated-workspace/<version>.lockb`: the root lock Bun 1.2.23, 1.3.0
+  and 1.3.1 write for a `["packages/*","!packages/b"]` workspace, on Linux
+  x64. 1.2.23 lists `packages/b`, while 1.3.0 and 1.3.1 (identical bytes)
+  leave it out, and neither carries the `cNfGvRsN` tag (#1521).
 - `0.8.1-production` / `1.0.0-production`: a production dependency and a
   different version aliased in dev dependencies, pinning production-filter
   string-pool reconstruction on early binary readers.

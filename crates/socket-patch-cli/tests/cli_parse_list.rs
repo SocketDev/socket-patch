@@ -12,13 +12,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use clap::Parser;
 use socket_patch_cli::commands::list::{run, ListArgs};
 
 #[path = "common/mod.rs"]
 mod common;
+use common::hermetic::binary_command;
 use socket_patch_cli::{Cli, Commands};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
@@ -273,7 +273,7 @@ fn missing_manifest_json_is_an_empty_success_via_binary() {
     // No manifest and no ledger is an empty project (normal for hosted
     // mode): `list --json` emits the success envelope with no events.
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    let out = binary_command()
         .args(["list", "--cwd", tmp.path().to_str().unwrap(), "--json"])
         .output()
         .expect("failed to execute socket-patch binary");
@@ -424,9 +424,12 @@ fn write_manifest_in(dir: &Path, manifest: &PatchManifest) {
     .unwrap();
 }
 
-/// Run `list` against the compiled binary with `--cwd <cwd>` plus extra args.
+/// Run `list` against the compiled binary with `--cwd <cwd>` plus extra
+/// args, in the hermetic env: ambient developer/CI configuration
+/// (SOCKET_SILENT, SOCKET_JSON, tokens…) can't change the branch under
+/// test, and telemetry stays off so the test stays offline.
 fn run_list_binary(cwd: &Path, extra: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+    binary_command()
         .arg("list")
         .arg("--cwd")
         .arg(cwd)
@@ -852,26 +855,12 @@ fn absolute_manifest_path_content_wins_over_cwd_via_binary() {
 // found in manifest." line for an empty manifest.
 // ---------------------------------------------------------------------------
 
-/// Like [`run_list_binary`] but with every `GlobalArgs` env var scrubbed,
-/// so ambient developer/CI configuration (SOCKET_SILENT, SOCKET_JSON,
-/// tokens…) can't change the branch under test, and telemetry disabled so
-/// the test stays offline.
-fn run_list_binary_scrubbed(cwd: &Path, extra: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.arg("list").arg("--cwd").arg(cwd).args(extra);
-    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
-        cmd.env_remove(var);
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
-    cmd.output().expect("failed to execute socket-patch binary")
-}
-
 #[test]
 fn silent_suppresses_human_listing_via_binary() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest_in(tmp.path(), &populated_manifest());
 
-    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    let out = run_list_binary(tmp.path(), &["--silent"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
@@ -885,7 +874,7 @@ fn silent_suppresses_human_listing_via_binary() {
 
     // Control run: the same manifest WITHOUT --silent must print the table —
     // otherwise the assertion above passes vacuously.
-    let loud = run_list_binary_scrubbed(tmp.path(), &[]);
+    let loud = run_list_binary(tmp.path(), &[]);
     assert_eq!(loud.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&loud.stdout).contains("Package: pkg:npm/test-pkg@1.0.0"),
@@ -898,7 +887,7 @@ fn silent_suppresses_no_patches_message_via_binary() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest_in(tmp.path(), &PatchManifest::new());
 
-    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    let out = run_list_binary(tmp.path(), &["--silent"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         out.status.code(),
@@ -918,7 +907,7 @@ fn silent_does_not_mute_json_envelope_via_binary() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest_in(tmp.path(), &populated_manifest());
 
-    let out = run_list_binary_scrubbed(tmp.path(), &["--silent", "--json"]);
+    let out = run_list_binary(tmp.path(), &["--silent", "--json"]);
     assert_eq!(out.status.code(), Some(0));
     let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
         .expect("--silent --json must still print the JSON envelope");
@@ -932,7 +921,7 @@ fn silent_empty_project_prints_nothing_via_binary() {
     // nothing and exits 0.
     let tmp = tempfile::tempdir().unwrap();
 
-    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    let out = run_list_binary(tmp.path(), &["--silent"]);
     assert_eq!(out.status.code(), Some(0), "an empty project exits 0");
     assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
 }
@@ -1385,7 +1374,7 @@ fn silent_suppresses_hosted_listing_via_binary() {
     let tmp = tempfile::tempdir().unwrap();
     write_hosted_lock(tmp.path(), &[(HOSTED_PURL, HOSTED_UUID)]);
 
-    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    let out = run_list_binary(tmp.path(), &["--silent"]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -1398,7 +1387,7 @@ fn silent_suppresses_hosted_listing_via_binary() {
         "--silent must suppress the hosted listing; got {stdout:?}"
     );
     // Control: the same project without --silent prints the pin.
-    let loud = run_list_binary_scrubbed(tmp.path(), &[]);
+    let loud = run_list_binary(tmp.path(), &[]);
     assert!(
         String::from_utf8_lossy(&loud.stdout).contains(&format!("Package: {HOSTED_PURL}")),
         "non-silent run must print the listing"
@@ -1418,7 +1407,7 @@ fn silent_gates_the_malformed_ledger_warning_via_binary() {
     std::fs::write(vendor_dir.join("redirect-state.json"), "{ torn ledger").unwrap();
 
     // Control: without --silent the corruption is surfaced.
-    let loud = run_list_binary_scrubbed(tmp.path(), &[]);
+    let loud = run_list_binary(tmp.path(), &[]);
     assert_eq!(loud.status.code(), Some(0), "manifest still lists");
     assert!(
         String::from_utf8_lossy(&loud.stderr).contains("malformed"),
@@ -1428,7 +1417,7 @@ fn silent_gates_the_malformed_ledger_warning_via_binary() {
     );
 
     // --silent: the warning is muted, the exit code unchanged.
-    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    let out = run_list_binary(tmp.path(), &["--silent"]);
     assert_eq!(out.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&out.stderr).trim().is_empty(),
@@ -1693,7 +1682,7 @@ fn silent_gates_the_malformed_vendor_ledger_warning_via_binary() {
     std::fs::create_dir_all(&vendor_dir).unwrap();
     std::fs::write(vendor_dir.join("state.json"), "{ torn ledger").unwrap();
 
-    let loud = run_list_binary_scrubbed(tmp.path(), &[]);
+    let loud = run_list_binary(tmp.path(), &[]);
     assert_eq!(loud.status.code(), Some(0), "manifest still lists");
     assert!(
         String::from_utf8_lossy(&loud.stderr).contains("unreadable vendor ledger"),
@@ -1702,7 +1691,7 @@ fn silent_gates_the_malformed_vendor_ledger_warning_via_binary() {
         String::from_utf8_lossy(&loud.stderr)
     );
 
-    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    let out = run_list_binary(tmp.path(), &["--silent"]);
     assert_eq!(out.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&out.stderr).trim().is_empty(),
@@ -1785,7 +1774,7 @@ async fn list_telemetry_counts_manifest_patches_only_via_binary() {
         ],
     );
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = binary_command();
     cmd.arg("list")
         .arg("--cwd")
         .arg(tmp.path())
@@ -1794,12 +1783,8 @@ async fn list_telemetry_counts_manifest_patches_only_via_binary() {
         .arg("sktsec_telemetry_test")
         .arg("--org")
         .arg("test-org");
-    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
-        cmd.env_remove(var);
-    }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "0");
     cmd.env("SOCKET_API_URL", server.uri());
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
     let out = cmd.output().expect("run socket-patch binary");
     assert_eq!(
         out.status.code(),

@@ -13,22 +13,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // these tests pin, and `SOCKET_MANIFEST_PATH` makes a *passing* test write
 // its manifest and blobs into whatever real project the variable points at.
 use crate::common;
+use crate::get_fixture::received_paths;
 
 const ORG_SLUG: &str = "test-org";
 const UUID_A: &str = "11111111-1111-4111-8111-111111111111";
 const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
-
-/// Collect the paths of every request the mock actually received. Used to
-/// prove which code path the binary really took (vs. fabricating the right
-/// envelope without touching the network it claims to touch).
-async fn received_paths(mock: &MockServer) -> Vec<String> {
-    mock.received_requests()
-        .await
-        .expect("wiremock must record received requests")
-        .iter()
-        .map(|r| r.url.path().to_string())
-        .collect()
-}
 
 /// A single-file patch-view `files` map that survives the "patch has no
 /// applicable files" guardrail (a fetched view whose `files_for_manifest`

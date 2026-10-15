@@ -86,18 +86,17 @@ use serde_json::Value;
 
 use super::{
     npm_purl, npm_vendored_tarball_names, parse_json, root_anchored_spelling, vendor_ref_decorated,
-    DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired, DIAG_LOCKFILE_UNPARSEABLE,
-    DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    ClassicPinnedBlock, DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired,
+    DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::yarn::blocks::{berry_field, classic_field};
+use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref, CopyRef};
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
     classic_key_real_name, classic_pattern_real_name, resolution_selector_target,
-    split_classic_pattern, split_resolved_sha1, BerryLocator,
+    split_resolved_sha1, BerryLocator,
 };
-use crate::formats::yarn::source::{
-    classic_copy_source, manifest_name, registry_tarball_name, CopySource,
-};
+use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
     berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,
@@ -143,9 +142,15 @@ fn stray_top_level_line(text: &str) -> Option<&str> {
 
 async fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &mut Discovery) {
     let mut copies: Vec<LockCopy> = Vec::new();
-    for entry in entries {
+    // Every pattern a live block's key holds: what the lock resolves.
+    let locked: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.live)
+        .flat_map(|e| e.patterns.iter().map(String::as_str))
+        .collect();
+    for entry in &entries {
         if entry.live && !entry.patterns.is_empty() {
-            classic_block(ctx, &entry, &mut copies, out);
+            classic_block(ctx, entry, &locked, &mut copies, out);
         }
     }
     record_copies(ctx, copies, out).await;
@@ -154,31 +159,15 @@ async fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &m
 /// The copy a classic `file:` / url block installs, to be read for the
 /// package it really holds ([`record_copies`], #1236): yarn 1 keys it by the
 /// DEPENDENCY name (`"lp2@file:./lpdir"`), like berry. The `file:` path is
-/// the key pattern's, relative to the root (a path yarn resolved against a
-/// workspace member reads nothing there, and is left alone).
+/// the key pattern's: yarn 1 writes it relative to the root and normalized,
+/// whichever `package.json` declared it (a member's `file:./lpdir` locks as
+/// `file:./packages/a/lpdir`), so one that leaves the root is read there too
+/// (#1516).
 fn classic_copy(entry: &YarnEntry, resolved: Option<&str>) -> Option<LockCopy> {
-    let version = classic_field(&entry.block.lines, "version")?;
-    let file = entry.patterns.iter().find_map(|p| {
-        let (_, range) = split_classic_pattern(p)?;
-        range.strip_prefix("file:")
-    });
-    let source = match file {
-        Some(path) => {
-            let path = path.split('#').next().unwrap_or_default();
-            CopyRef::File(crate::utils::cargo_workspace::normalize_rel("", path)?)
-        }
-        None => {
-            let url = resolved?.split('#').next().unwrap_or_default();
-            if !url.starts_with("http") {
-                return None;
-            }
-            CopyRef::Url(url.to_string())
-        }
-    };
     Some(LockCopy {
         key: entry.block.key.clone(),
-        source,
-        version: version.to_string(),
+        source: classic_copy_ref(&entry.patterns, resolved)?,
+        version: classic_field(&entry.block.lines, "version")?.to_string(),
     })
 }
 
@@ -203,6 +192,7 @@ fn classic_block_purl(entry: &YarnEntry) -> Option<String> {
 fn classic_block(
     ctx: &DiscoverCtx<'_>,
     entry: &YarnEntry,
+    locked: &std::collections::HashSet<&str>,
     copies: &mut Vec<LockCopy>,
     out: &mut Discovery,
 ) {
@@ -322,7 +312,12 @@ fn classic_block(
         .filter(|sri| is_sri_pin(sri))
         .map(|sri| LockIntegrity::Sri(sri.to_string()))
         .or_else(|| split_resolved_sha1(resolved).1.map(LockIntegrity::Sha1Hex));
-    emit(name, version, resolved, wiring, integrity, &block.key, out);
+    // A hosted pin's sub-maps decide what installs beside it (#1538).
+    let pinned =
+        matches!(wiring, Wired::Hosted(_)).then(|| ClassicPinnedBlock::new(&block.lines, locked));
+    emit(
+        name, version, resolved, wiring, integrity, &block.key, pinned, out,
+    );
 }
 
 // ── berry ────────────────────────────────────────────────────────────────
@@ -484,6 +479,7 @@ async fn confirm_berry_hosted_keyed(
                 entry.wiring,
                 entry.integrity,
                 &entry.key,
+                None,
                 out,
             );
         } else {
@@ -539,6 +535,21 @@ fn berry_block(
     } else if reference.starts_with("file:") || reference.starts_with("http") {
         (reference, None)
     } else {
+        // A `portal:` / `link:` directory under another dependency name
+        // links `node_modules/<dep>` to the package its `package.json`
+        // names, which no `resolutions` pin of that package reaches (#939).
+        if reference.starts_with("portal:") || reference.starts_with("link:") {
+            if let (Some(source), Some(version)) = (
+                berry_copy_ref(reference),
+                berry_field(&block.lines, "version"),
+            ) {
+                copies.push(LockCopy {
+                    key: block.key.clone(),
+                    source,
+                    version: version.to_string(),
+                });
+            }
+        }
         return; // workspace: / patch: / portal: / link: / exec: / git
     };
     let Some(wiring) = classify(ctx, spec, YARN_LOCK, &block.key, out) else {
@@ -555,16 +566,10 @@ fn berry_block(
             // A user's `file:` / url copy: yarn keys it by the DEPENDENCY
             // name (`lp2@file:…`), so which package it installs is read
             // from the copy itself ([`record_copies`], #939).
-            let source = match reference.strip_prefix("file:") {
-                Some(path) => {
-                    let path = path.split(['#', ':']).next().unwrap_or_default();
-                    berry_file_copy_path(reference, path).map(CopyRef::File)
-                }
-                None => Some(CopyRef::Url(
-                    reference.split('#').next().unwrap_or_default().to_string(),
-                )),
-            };
-            if let (Some(version), Some(source)) = (berry_field(&block.lines, "version"), source) {
+            if let (Some(version), Some(source)) = (
+                berry_field(&block.lines, "version"),
+                berry_copy_ref(reference),
+            ) {
                 copies.push(LockCopy {
                     key: block.key.clone(),
                     source,
@@ -639,7 +644,9 @@ fn berry_block(
                 key: block.key.clone(),
             });
         }
-        hosted => emit(name, version, spec, hosted, integrity, &block.key, out),
+        hosted => emit(
+            name, version, spec, hosted, integrity, &block.key, None, out,
+        ),
     }
 }
 
@@ -812,7 +819,9 @@ fn checked_purl(name: &str, version: &str, key: &str, out: &mut Discovery) -> Op
     purl
 }
 
-/// Push the ref for a classic block or a berry hosted entry.
+/// Push the ref for a classic block or a berry hosted entry; `classic_block`
+/// is a hosted classic pin's block ([`ClassicPinnedBlock`]).
+#[allow(clippy::too_many_arguments)]
 fn emit(
     name: &str,
     version: &str,
@@ -820,6 +829,7 @@ fn emit(
     wiring: Wired,
     integrity: Option<LockIntegrity>,
     key: &str,
+    classic_block: Option<ClassicPinnedBlock>,
     out: &mut Discovery,
 ) {
     match wiring {
@@ -835,14 +845,10 @@ fn emit(
             } else {
                 std::borrow::Cow::Borrowed(spec)
             };
-            out.push(PatchedRef::hosted(
-                purl,
-                uuid,
-                YARN_LOCK,
-                Some(&url),
-                integrity,
-                true,
-            ));
+            out.push(PatchedRef {
+                yarn_classic_block: classic_block,
+                ..PatchedRef::hosted(purl, uuid, YARN_LOCK, Some(&url), integrity, true)
+            });
         }
         Wired::Vendored(vref) => {
             let Some(purl) = vendored_purl(name, version, spec, &vref, key, out) else {
@@ -854,112 +860,69 @@ fn emit(
 }
 
 /// A yarn lock entry (berry or classic) that installs a user's `file:`
-/// tarball / directory or url tarball (not a Socket wiring), awaiting
-/// [`record_copies`].
+/// tarball / directory, url tarball or berry `portal:` / `link:` directory
+/// (not a Socket wiring), awaiting [`record_copies`].
 struct LockCopy {
     key: String,
     source: CopyRef,
     version: String,
 }
 
-/// Where a [`LockCopy`]'s bytes come from.
-enum CopyRef {
-    /// A root-relative `file:` tarball or directory.
-    File(String),
-    /// A url tarball, `#` fragment dropped.
-    Url(String),
-}
-
 /// Record each [`LockCopy`] as an unpatched copy of the package it really
-/// installs (#939 berry, #1236 classic). yarn keys a `file:` / url
-/// dependency by the name the depender gave it, so
-/// `"lp2": "file:left-pad-1.3.0.tgz"` locks as `lp2@…` while
-/// `node_modules/lp2` IS left-pad@1.3.0, and no pin of `left-pad` reaches
-/// it. The real name comes from the copy itself: the registry tarball path
-/// of a url (`…/<name>/-/<name>-<version>.tgz`), the `package.json` inside
-/// a `file:` tarball, or a `file:` directory's `package.json`. A copy whose
-/// name cannot be read is left alone.
+/// installs (#939 berry, #1236 classic). yarn keys such a dependency by
+/// the name the depender gave it, so `"lp2": "file:left-pad-1.3.0.tgz"`
+/// locks as `lp2@…` while `node_modules/lp2` IS left-pad@1.3.0, and no pin
+/// of `left-pad` reaches it. The real package comes from the copy itself
+/// ([`CopyRef::identity`]). A copy whose package cannot be read (a
+/// missing directory, a tarball with no readable `package.json`, a
+/// non-registry url) may be any package at its lock version, so it is
+/// recorded as a copy of every package this lock wires at that version:
+/// vouching for those would rest on a copy nobody read (#1516). A
+/// `portal:` / `link:` copy has no lock version: one never read (an
+/// absolute path) may be any version of any package, and contests every
+/// package this lock wires (#1540); one read and found to hold no
+/// versioned package (a `link:` to a plain directory) is left alone.
 async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut Discovery) {
     for copy in copies {
-        let (name, how) = match &copy.source {
-            CopyRef::File(rel) => {
-                let name = if is_tarball_leaf(rel) {
-                    match ctx.read_advisory_bytes(rel).await {
-                        Some(bytes) => {
-                            tokio::task::spawn_blocking(move || tarball_package_name(&bytes))
-                                .await
-                                .ok()
-                                .flatten()
-                        }
-                        None => None,
-                    }
-                } else {
-                    let manifest = if rel.is_empty() {
-                        PACKAGE_JSON.to_string()
-                    } else {
-                        format!("{rel}/{PACKAGE_JSON}")
-                    };
-                    match ctx.read_advisory_text(&manifest).await {
-                        Some(text) => manifest_name(text.as_bytes()),
-                        None => None,
-                    }
-                };
-                (name, format!("installs it from the user's file:{rel}"))
-            }
-            CopyRef::Url(url) => (
-                registry_tarball_name(url, &copy.version),
-                // Published in the VEX document: never a credential.
-                format!(
-                    "installs it from {:?}",
-                    crate::utils::redact::redact_url(url)
-                ),
-            ),
+        let bytes = match copy.source.read_path() {
+            Some(rel) => ctx.read_advisory_bytes(&rel).await,
+            None => None,
         };
-        let Some(name) = name else {
+        let Some((name, version)) =
+            crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
+        else {
+            let unread_linked = copy.source.is_unread_linked();
+            if matches!(copy.source, CopyRef::Linked(_)) && !unread_linked {
+                continue;
+            }
+            out.unidentified_copy(
+                YARN_LOCK,
+                (!unread_linked).then_some(copy.version.as_str()),
+                &copy.key,
+                &format!(
+                    "{}, whose package can't be read, so it may be {} of any package \
+                     (yarn keys it by the dependency name)",
+                    copy.source.how(),
+                    if unread_linked {
+                        "any version"
+                    } else {
+                        "this version"
+                    }
+                ),
+            );
             continue;
         };
         out.unpatched_copy(
             YARN_LOCK,
-            npm_purl(&name, &copy.version),
+            npm_purl(&name, &version),
             &copy.key,
             &format!(
-                "{how}, which no Socket wiring of {name} reaches (yarn keys it by the \
-                 dependency name)"
+                "{}, which no Socket wiring of {name} reaches (yarn keys it by the \
+                 dependency name)",
+                copy.source.how()
             ),
         );
     }
-}
-
-/// The root-relative path a berry `file:` reference names: relative to the
-/// workspace in its `locator=` binding (`b@workspace:packages/b`), or to
-/// the root when it has none. `None` when it leaves the root.
-fn berry_file_copy_path(reference: &str, path: &str) -> Option<String> {
-    let workspace = reference
-        .split_once("::")
-        .and_then(|(_, bindings)| bindings.split('&').find_map(|b| b.strip_prefix("locator=")))
-        .map(crate::utils::purl::percent_decode_purl_component)
-        .and_then(|locator| {
-            locator
-                .split_once("@workspace:")
-                .map(|(_, ws)| ws.to_string())
-        })
-        .unwrap_or_default();
-    let workspace = if workspace == "." {
-        String::new()
-    } else {
-        workspace
-    };
-    crate::utils::cargo_workspace::normalize_rel(&workspace, path)
-}
-
-fn is_tarball_leaf(path: &str) -> bool {
-    path.ends_with(".tgz") || path.ends_with(".tar.gz")
-}
-
-/// `name` of the `package.json` inside an npm tarball.
-fn tarball_package_name(bytes: &[u8]) -> Option<String> {
-    let map = crate::patch::package::read_archive_bytes_to_map(bytes).ok()?;
-    manifest_name(map.get(PACKAGE_JSON)?)
 }
 
 #[cfg(test)]
@@ -1475,6 +1438,184 @@ mod tests {
         }
     }
 
+    /// #1516: renamed classic copies #1236's reader could not read, so
+    /// each was taken for "not left-pad" and the wiring was attested while
+    /// `node_modules/lpN` installed left-pad@1.3.0 unpatched: a root
+    /// `file:` directory or tarball outside the root (yarn installs it all
+    /// the same), a tarball whose root directory is not `package/` (yarn
+    /// strips the first segment whatever it is), a non-registry url, and an
+    /// absolute path (never read: an untrusted lock could name any file or
+    /// share). Each now contests the ref. Controls: an outside-root copy
+    /// holding another package; an unreadable url copy of another version.
+    /// A key the root `package.json` doesn't declare (a workspace member's,
+    /// which yarn 1 also locks root-relative) contests the same way.
+    #[tokio::test]
+    async fn issue_1516_unread_classic_copies_contest_the_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wirings = [
+            (
+                "hosted",
+                classic_block("left-pad@1.3.0", "1.3.0", &hosted, Some(SRI)),
+            ),
+            (
+                "vendored",
+                classic_block(
+                    "left-pad@1.3.0",
+                    "1.3.0",
+                    &format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz#{SHA1}"),
+                    Some(SRI),
+                ),
+            ),
+        ];
+        let url_copy = |version: &str| {
+            classic_block(
+                "\"lp4@http://127.0.0.1:8799/lp.tgz\"",
+                version,
+                &format!("http://127.0.0.1:8799/lp.tgz#{SHA1}"),
+                None,
+            )
+        };
+        let copies = [
+            (
+                "outside-root file: directory",
+                "lp1@",
+                "\"lp1@file:../ext/lpdir\":\n  version \"1.3.0\"\n\n".to_string(),
+            ),
+            (
+                "outside-root file: tarball",
+                "lp2@",
+                classic_block(
+                    "\"lp2@file:../ext/left-pad-1.3.0.tgz\"",
+                    "1.3.0",
+                    &format!("file:../ext/left-pad-1.3.0.tgz#{SHA1}"),
+                    None,
+                ),
+            ),
+            (
+                "tarball rooted at left-pad-1.3.0/",
+                "lp3@",
+                classic_block(
+                    "\"lp3@file:./lp.tgz\"",
+                    "1.3.0",
+                    &format!("file:./lp.tgz#{SHA1}"),
+                    None,
+                ),
+            ),
+            ("non-registry url", "lp4@", url_copy("1.3.0")),
+            (
+                "absolute file: directory",
+                "lp5@",
+                "\"lp5@file:/srv/ext/lpdir\":\n  version \"1.3.0\"\n\n".to_string(),
+            ),
+        ];
+        let project = |blocks: &[String], fork: &str| {
+            let p = Project::nested("p");
+            p.write("yarn.lock", classic(blocks));
+            p.write(
+                "package.json",
+                serde_json::json!({
+                    "name": "p",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "left-pad": "1.3.0",
+                        "lp1": "file:../ext/lpdir",
+                        "lp3": "file:./lp.tgz",
+                        "lp4": "http://127.0.0.1:8799/lp.tgz",
+                        "lp5": "file:/srv/ext/lpdir",
+                    },
+                    "devDependencies": { "lp2": "file:../ext/left-pad-1.3.0.tgz" },
+                })
+                .to_string(),
+            );
+            p.write(
+                "../ext/lpdir/package.json",
+                format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+            );
+            p.write("../ext/left-pad-1.3.0.tgz", npm_tgz(fork, "1.3.0"));
+            p.write("lp.tgz", npm_tgz_rooted("left-pad-1.3.0", fork, "1.3.0"));
+            p
+        };
+        for (mode, wired) in &wirings {
+            for (case, dep, copy) in &copies {
+                let out = run(&project(&[wired.clone(), copy.clone()], "left-pad")).await;
+                assert!(out.refs.is_empty(), "{mode} {case}: {:#?}", out.refs);
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains(*dep)
+                            && d.detail.contains("UNPATCHED")),
+                    "{mode} {case}: {:#?}",
+                    out.diagnostics
+                );
+            }
+            // The readable copies hold another package: not left-pad.
+            for (case, _, copy) in &copies[..3] {
+                let out = run(&project(&[wired.clone(), copy.clone()], "other-pkg")).await;
+                assert_eq!(out.refs.len(), 1, "{mode} {case}: {:#?}", out.diagnostics);
+            }
+            // An unreadable copy of another version can't be left-pad@1.3.0.
+            let out = run(&project(&[wired.clone(), url_copy("2.0.0")], "left-pad")).await;
+            assert_eq!(
+                out.refs.len(),
+                1,
+                "{mode} url 2.0.0: {:#?}",
+                out.diagnostics
+            );
+            // yarn 1 locks a `file:` key relative to the root and normalized,
+            // whoever declared it (a member's `file:../../../ext/lpdir`, the
+            // root's `file:../ext/lpdir/`): a key the root `package.json`
+            // doesn't spell is read all the same.
+            let p = project(&[wired.clone(), copies[0].2.clone()], "left-pad");
+            p.write(
+                "package.json",
+                r#"{"name":"p","version":"1.0.0","workspaces":["packages/*"],"dependencies":{"left-pad":"1.3.0"}}"#,
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{mode} undeclared: {:#?}", out.refs);
+        }
+    }
+
+    /// #1516: an unidentified berry copy contests a ref the berry extractor
+    /// confirms only after reading the copies (a vendored entry, confirmed
+    /// by `resolutions`): the contest is matched once every ref is in.
+    #[tokio::test]
+    async fn issue_1516_unread_berry_copy_contests_a_vendored_ref() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        let url = |version: &str| {
+            berry_block(
+                "lp2@http://127.0.0.1:8799/lp.tgz",
+                version,
+                "lp2@http://127.0.0.1:8799/lp.tgz",
+                None,
+            )
+        };
+        let project = |blocks: &[String]| {
+            let p = Project::new();
+            p.write("yarn.lock", berry(blocks));
+            p.write(
+                "package.json",
+                package_json_with_resolutions(serde_json::json!({
+                    "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                })),
+            );
+            p
+        };
+        let out = run(&project(&[wired.clone(), url("1.3.0")])).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("lp2@")),
+            "{:#?}",
+            out.diagnostics
+        );
+        assert_refs(
+            &run(&project(&[wired, url("2.0.0")])).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+        );
+    }
+
     /// Socket-shaped blocks that fail validation are DIAGNOSED, never refs:
     /// no version, mixed-package key, unsafe name, a leaf naming another
     /// package, a traversal leaf, a non-canonical vendored uuid.
@@ -1700,6 +1841,143 @@ mod tests {
             );
             assert!(out.refs.len() == 1, "{case}");
         }
+    }
+
+    /// #939 (bug-hunt run 25): a berry `portal:` / `link:` dependency under
+    /// another name links `node_modules/lp2` to a directory holding the
+    /// wired left-pad@1.3.0, which no `resolutions` pin reaches. The lock
+    /// records the placeholder version `0.0.0-use.local`, so the package's
+    /// name and version come from the target's `package.json`; it contests
+    /// the wiring like a `file:` copy does. Controls: a target holding
+    /// another package or another version is no copy of left-pad@1.3.0.
+    #[tokio::test]
+    async fn issue_939_berry_portal_and_link_copies_contest_the_ref() {
+        let ws = "a%40workspace%3Apackages%2Fa";
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        let project = |protocol: &str, manifest: &str| {
+            let descriptor = format!("lp2@{protocol}:../../vend/lp::locator={ws}");
+            let p = Project::new();
+            p.write(
+                "yarn.lock",
+                berry(&[
+                    wired.clone(),
+                    berry_block(&descriptor, "0.0.0-use.local", &descriptor, None),
+                ]),
+            );
+            p.write(
+                "package.json",
+                package_json_with_resolutions(serde_json::json!({
+                    "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                })),
+            );
+            p.write("vend/lp/package.json", manifest);
+            p
+        };
+        for protocol in ["portal", "link"] {
+            let out = run(&project(
+                protocol,
+                r#"{"name":"left-pad","version":"1.3.0"}"#,
+            ))
+            .await;
+            assert!(out.refs.is_empty(), "{protocol}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains(&format!("lp2@{protocol}:"))
+                        && d.detail.contains("UNPATCHED")),
+                "{protocol}: {:#?}",
+                out.diagnostics
+            );
+            for other in [
+                r#"{"name":"other-pkg","version":"1.3.0"}"#,
+                r#"{"name":"left-pad","version":"1.2.0"}"#,
+            ] {
+                assert_refs(
+                    &run(&project(protocol, other)).await,
+                    &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+                );
+            }
+        }
+    }
+
+    /// #1540: a berry `portal:` / `link:` copy with an ABSOLUTE path is never
+    /// read (a lock is untrusted input, #1516), and its lock version is the
+    /// placeholder `0.0.0-use.local`, so it may be any version of any
+    /// package. It contests every ref its lock wires, whatever the target
+    /// holds, like an unread `file:` copy does at its lock version; it was
+    /// dropped, so `vex` attested `not_affected` while `node_modules/lp2`
+    /// held unpatched left-pad@1.3.0.
+    #[tokio::test]
+    async fn issue_1540_absolute_portal_and_link_copies_contest_every_ref() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        for protocol in ["portal", "link"] {
+            for manifest in [
+                r#"{"name":"left-pad","version":"1.3.0"}"#,
+                r#"{"name":"other-pkg","version":"9.9.9"}"#,
+            ] {
+                let p = Project::new();
+                p.write("ext/lp/package.json", manifest);
+                let abs = p.root().join("ext/lp").to_string_lossy().replace('\\', "/");
+                let descriptor = format!("lp2@{protocol}:{abs}::locator=app%40workspace%3A.");
+                p.write(
+                    "yarn.lock",
+                    berry(&[
+                        wired.clone(),
+                        berry_block(&descriptor, "0.0.0-use.local", &descriptor, None),
+                    ]),
+                );
+                p.write(
+                    "package.json",
+                    package_json_with_resolutions(serde_json::json!({
+                        "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                    })),
+                );
+                let out = run(&p).await;
+                assert!(
+                    out.refs.is_empty(),
+                    "{protocol} {manifest}: {:#?}",
+                    out.refs
+                );
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains(&format!("lp2@{protocol}:"))
+                            && d.detail.contains("can't be read")),
+                    "{protocol} {manifest}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
+    /// #1540 control: a RELATIVE `link:` to a plain directory (no
+    /// `package.json`, which `link:` allows) is read and holds no package,
+    /// so it contests nothing.
+    #[tokio::test]
+    async fn issue_1540_relative_link_to_a_plain_directory_contests_nothing() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        let descriptor = "assets@link:./assets::locator=app%40workspace%3A.";
+        let p = Project::new();
+        p.write("assets/logo.svg", "<svg/>");
+        p.write(
+            "yarn.lock",
+            berry(&[
+                wired,
+                berry_block(descriptor, "0.0.0-use.local", descriptor, None),
+            ]),
+        );
+        p.write(
+            "package.json",
+            package_json_with_resolutions(serde_json::json!({
+                "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+            })),
+        );
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+        );
     }
 
     /// A berry registry locator beside a hosted one of the same

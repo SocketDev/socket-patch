@@ -281,6 +281,45 @@ pub struct PatchedRef {
     /// Hosted only: the Socket URL (artifact, registry index, or source url)
     /// the reference was recovered from, for diagnostics.
     pub url: Option<String>,
+    /// Hosted yarn classic only: the pinned block yarn 1 installs the
+    /// package from, whose dependency sub-maps decide which dependencies
+    /// install beside it (#1538).
+    pub yarn_classic_block: Option<ClassicPinnedBlock>,
+}
+
+/// A hosted yarn classic pin's lock block, as lock-only VEX reads it
+/// (#1538). Yarn 1 installs the dependencies the block's `dependencies:` /
+/// `optionalDependencies:` sub-maps name, each through a block of its own,
+/// not the ones the patched tarball's `package.json` declares: a pin an
+/// earlier release wrote without rewriting the sub-maps (#1462) installs
+/// the patched package beside the old dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassicPinnedBlock {
+    lines: Vec<String>,
+    /// Every descriptor the sub-maps name keys a block of the lock.
+    sub_maps_locked: bool,
+}
+
+impl ClassicPinnedBlock {
+    /// The block of `lines`, in a lock whose keys hold the patterns
+    /// `locked`.
+    pub(crate) fn new(lines: &[String], locked: &std::collections::HashSet<&str>) -> Self {
+        use crate::formats::yarn::classic_deps::block_dep_descriptors;
+        ClassicPinnedBlock {
+            lines: lines.to_vec(),
+            sub_maps_locked: block_dep_descriptors(lines)
+                .iter()
+                .all(|d| locked.contains(d.as_str())),
+        }
+    }
+
+    /// Whether yarn 1 installs, from this block, exactly the dependency
+    /// maps the patched package's `package.json` (`pkg`) declares, each
+    /// one locked.
+    pub fn installs_dependencies_of(&self, pkg: &serde_json::Value) -> bool {
+        self.sub_maps_locked
+            && crate::formats::yarn::classic_deps::dep_maps_declare(&self.lines, pkg)
+    }
 }
 
 impl PatchedRef {
@@ -303,6 +342,7 @@ impl PatchedRef {
             locked_integrity,
             integrity_required,
             url: url.map(str::to_string),
+            yarn_classic_block: None,
         }
     }
 
@@ -322,6 +362,7 @@ impl PatchedRef {
             locked_integrity,
             integrity_required: false,
             url: None,
+            yarn_classic_block: None,
         }
     }
 
@@ -429,6 +470,23 @@ pub struct UnpatchedCopy {
     pub purl: String,
     /// Root-relative lock file.
     pub file: PathBuf,
+    /// The lock entry's key, as the lock spells it.
+    pub key: String,
+    /// How that entry installs, completing "lock entry `<key>` …".
+    pub how: String,
+}
+
+/// A lock entry that installs SOME package (at `version`, when known) under
+/// another dependency name, from a copy whose package can't be read
+/// ([`Discovery::unidentified_copy`], #1516, #1540).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnidentifiedCopy {
+    /// Root-relative lock file.
+    pub file: PathBuf,
+    /// The lock entry's version; `None` when the lock does not say (a yarn
+    /// berry `portal:` / `link:` copy, whose version is its unread
+    /// manifest's), so it may be any version (#1540).
+    pub version: Option<String>,
     /// The lock entry's key, as the lock spells it.
     pub key: String,
     /// How that entry installs, completing "lock entry `<key>` …".
@@ -563,6 +621,10 @@ pub struct Discovery {
     /// Same-lock copies that contest that lock's own refs
     /// ([`Discovery::unpatched_copy`]).
     pub unpatched_copies: Vec<UnpatchedCopy>,
+    /// Same-lock copies whose package can't be read, pending
+    /// [`Discovery::contest_within_locks`] ([`Discovery::unidentified_copy`]);
+    /// always empty once discovery returns (folded into `unpatched_copies`).
+    pub unidentified_copies: Vec<UnidentifiedCopy>,
     /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
     pub unattested: Vec<Unattested>,
     /// Copies no wiring reaches, pending [`Discovery::unattest_unwired_copies`];
@@ -622,8 +684,10 @@ pub struct Discovery {
     pub withheld: Vec<Recognized>,
     /// Hosted `resolutions` selectors a yarn berry project's root
     /// `package.json` still carries although its lock no longer installs
-    /// them ([`StaleSelector`], #1203). Not refs and not contested wiring:
-    /// the management commands retire them. Sorted, deduped.
+    /// them (#1203), and hosted uv `override-dependencies` pins a lock's
+    /// paired metadata still carries for a package the lock no longer holds
+    /// (#1445) ([`StaleSelector`]). Not refs and not contested wiring: the
+    /// management commands retire them. Sorted, deduped.
     pub stale_selectors: Vec<StaleSelector>,
 }
 
@@ -633,13 +697,21 @@ pub struct Discovery {
 /// `resolutions`, so the selector is left routing a descriptor nothing
 /// depends on (see
 /// [`crate::vendor::lock_inventory::yarn::berry_selector_routes_nothing`]).
+///
+/// The uv twin (#1445): a hosted `override-dependencies` pin (under the
+/// rewrite's ownership comment) plus its `[tool.uv.sources]` URL, for a
+/// transitive package `uv remove <parent>` / `uv lock --upgrade-package
+/// <parent>` dropped from the lock; uv never edits either line. `file` is
+/// then the lock (the restore retires the pair from its paired metadata
+/// and the lock's `[manifest]` record), `selector` the canonical package
+/// name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StaleSelector {
-    /// Root-relative manifest carrying the selector.
+    /// Root-relative manifest carrying the selector (uv: the lock).
     pub file: PathBuf,
-    /// The `resolutions` key.
+    /// The `resolutions` key (uv: the canonical package name).
     pub selector: String,
-    /// The hosted tarball URL it routes to.
+    /// The hosted artifact URL it routes to.
     pub url: String,
     /// The package version the URL's artifact is (canonical base purl).
     pub purl: String,
@@ -858,12 +930,65 @@ impl Discovery {
         });
     }
 
+    /// A lock entry of `file` that installs a copy of some package at
+    /// `version` whose package can't be read (a non-registry url, a missing
+    /// directory, a tarball with no readable `package.json`). It may be any
+    /// package at that version, so [`Discovery::contest_within_locks`]
+    /// takes it as an unpatched copy of every package `file` wires at
+    /// `version` (at any version when `version` is `None`, #1540): vouching
+    /// for one would rest on a copy nobody read (#1516). Matched there,
+    /// once every extractor has pushed its refs.
+    pub(crate) fn unidentified_copy(
+        &mut self,
+        file: &str,
+        version: Option<&str>,
+        key: &str,
+        how: &str,
+    ) {
+        self.unidentified_copies.push(UnidentifiedCopy {
+            file: PathBuf::from(file),
+            version: version.map(str::to_string),
+            key: key.to_string(),
+            how: how.to_string(),
+        });
+    }
+
+    /// Fold [`Discovery::unidentified_copies`] into `unpatched_copies`: one
+    /// copy per ref of the same file at the same version (at any version
+    /// for a copy with none).
+    fn expand_unidentified_copies(&mut self) {
+        let mut expanded = Vec::new();
+        for u in &self.unidentified_copies {
+            let purls: BTreeSet<&str> = self
+                .refs
+                .iter()
+                .filter(|r| r.source_file == u.file)
+                .filter(|r| match &u.version {
+                    Some(v) => r.purl.rsplit_once('@').is_some_and(|(_, rv)| rv == v),
+                    None => true,
+                })
+                .map(|r| r.purl.as_str())
+                .collect();
+            for purl in purls {
+                expanded.push(UnpatchedCopy {
+                    purl: purl.to_string(),
+                    file: u.file.clone(),
+                    key: u.key.clone(),
+                    how: u.how.clone(),
+                });
+            }
+        }
+        self.unidentified_copies.clear();
+        self.unpatched_copies.extend(expanded);
+    }
+
     /// Drop every ref whose OWN lock also installs an unpatched copy of the
     /// same `name@version` ([`Discovery::unpatched_copy`]): the build ships
     /// that copy whatever the wiring does, so the ref is diagnosed
     /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted, but
     /// [`Discovery::shadowed`]. Its uuid stays recognized (rule 11).
     fn contest_within_locks(&mut self) {
+        self.expand_unidentified_copies();
         if self.unpatched_copies.is_empty() {
             return;
         }
@@ -1036,6 +1161,26 @@ impl Discovery {
         self.contested.iter().find(|c| {
             c.uuid == uuid && c.mode == WiringMode::Vendored && PurlKey::same(&c.purl, &key)
         })
+    }
+
+    /// The withholding that killed a VENDORED ledger claim because the
+    /// build also installs an unpatched copy of the same version that no
+    /// rewire reaches (a bundled copy, or one npm installs from a git /
+    /// url / `file:` spec): the wiring ref moved to [`Discovery::shadowed`],
+    /// with the [`DIAG_REF_UNATTRIBUTABLE`] diagnostic naming that copy
+    /// when one does. Lets a reader of a dead claim name the copy instead
+    /// of saying nothing wires the artifact (#1511).
+    pub fn vendored_shadow(&self, purl: &str, uuid: &str) -> Option<(&PatchedRef, Option<&Diag>)> {
+        let key = canonical_base_purl(purl);
+        let shadowed = self.shadowed.iter().find(|r| {
+            r.uuid == uuid && r.mode == WiringMode::Vendored && PurlKey::same(&r.purl, &key)
+        })?;
+        let diag = self.diagnostics.iter().find(|d| {
+            d.code == DIAG_REF_UNATTRIBUTABLE
+                && d.file == shadowed.source_file
+                && d.detail.contains(shadowed.purl.as_str())
+        });
+        Some((shadowed, diag))
     }
 
     /// Whether any lock discovery read resolves `purl` (any spelling) at
@@ -2235,13 +2380,24 @@ pub(crate) enum TomlDiag {
 
 /// Parse `text` as TOML, recording [`DIAG_LOCKFILE_UNPARSEABLE`] for
 /// root-relative `file` (in `style`) on failure.
-pub(crate) fn toml_or_diag(
+///
+/// Discovery only reads, so this is toml_edit's read-only parse: the
+/// document keeps byte spans into `text` instead of copying every key,
+/// value and comment out of it the way a [`toml_edit::DocumentMut`] does.
+/// On a large `poetry.lock` that copy, and freeing it, cost more than the
+/// parse itself (#1473). Values read the same either way (`as_str` and
+/// friends return the decoded value); only an item's layout (its raw
+/// decor, as `poetry_lock::is_multiline_array` reads) needs the source.
+/// The PyPI lock extractors read this document directly; the cargo and
+/// pyproject/hatch readers still convert it with `into_mut`, as their
+/// helpers take a `DocumentMut`.
+pub(crate) fn toml_or_diag<S: AsRef<str>>(
     file: &str,
-    text: &str,
+    text: S,
     style: TomlDiag,
     out: &mut Discovery,
-) -> Option<toml_edit::DocumentMut> {
-    match text.parse::<toml_edit::DocumentMut>() {
+) -> Option<toml_edit::Document<S>> {
+    match toml_edit::Document::parse(text) {
         Ok(doc) => Some(doc),
         Err(e) => {
             let reason = match style {
@@ -2935,6 +3091,12 @@ pub(crate) mod testing {
     /// A minimal npm tarball (`package/package.json` naming
     /// `name@version`) — a user's `file:` tarball copy.
     pub(crate) fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+        npm_tgz_rooted("package", name, version)
+    }
+
+    /// [`npm_tgz`] with the manifest under `root/` instead of `package/`
+    /// (a `git archive --prefix` or GitHub release tarball, #1516).
+    pub(crate) fn npm_tgz_rooted(root: &str, name: &str, version: &str) -> Vec<u8> {
         let manifest = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
@@ -2944,8 +3106,12 @@ pub(crate) mod testing {
         header.set_size(manifest.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar.append_data(&mut header, "package/package.json", manifest.as_bytes())
-            .unwrap();
+        tar.append_data(
+            &mut header,
+            format!("{root}/package.json"),
+            manifest.as_bytes(),
+        )
+        .unwrap();
         tar.into_inner().unwrap().finish().unwrap()
     }
 
@@ -2977,14 +3143,26 @@ pub(crate) mod testing {
 
     /// A throwaway project root.
     pub(crate) struct Project {
-        dir: tempfile::TempDir,
+        _dir: tempfile::TempDir,
+        root: PathBuf,
         origins: Vec<String>,
     }
 
     impl Project {
         pub(crate) fn new() -> Self {
+            Self::nested("")
+        }
+
+        /// A project rooted at `sub/` inside the throwaway directory, so a
+        /// fixture can write files beside it (`../ext/…`) without leaving
+        /// the tempdir (#1516).
+        pub(crate) fn nested(sub: &str) -> Self {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let root = dir.path().join(sub);
+            std::fs::create_dir_all(&root).expect("create project root");
             Project {
-                dir: tempfile::tempdir().expect("create tempdir"),
+                _dir: dir,
+                root,
                 origins: Vec::new(),
             }
         }
@@ -2997,7 +3175,7 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn root(&self) -> &Path {
-            self.dir.path()
+            &self.root
         }
 
         /// Write `content` at root-relative `rel`, creating parents.
@@ -3147,6 +3325,63 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    /// The read-only parse [`toml_or_diag`] hands extractors reads every
+    /// value the way the `DocumentMut` it replaced did (#1473): escaped,
+    /// literal and multi-line strings decode, quoted and dotted keys
+    /// resolve, CRLF and a comment between entries change nothing.
+    #[test]
+    fn read_only_toml_reads_values_like_a_mutable_parse() {
+        let text = "# lock\r\n\
+            [[package]]\r\n\
+            name = \"a\\u0062c\"  # escaped\r\n\
+            version = '1.0'\r\n\
+            \"quoted key\" = \"\"\"\r\nmulti\r\nline\"\"\"\r\n\
+            source.url = 'https://h/x\\y.whl'\r\n\
+            files = [\r\n  {file = \"x.whl\", hash = \"sha256:ab\"}, # one\r\n]\r\n\
+            \r\n\
+            [metadata.files]\r\n\
+            abc = [{file = \"x.whl\", hash = \"sha256:ab\"}]\r\n";
+        let mutable: toml_edit::DocumentMut = text.parse().unwrap();
+        let mut out = Discovery::default();
+        let read_only = toml_or_diag("poetry.lock", text, TomlDiag::Raw, &mut out).unwrap();
+        assert!(out.diagnostics.is_empty());
+        let package = |t: &toml_edit::Table| {
+            t["package"]
+                .as_array_of_tables()
+                .unwrap()
+                .get(0)
+                .cloned()
+                .unwrap()
+        };
+        let (a, b) = (package(&mutable), package(&read_only));
+        for key in ["name", "version", "quoted key"] {
+            assert_eq!(a[key].as_str(), b[key].as_str(), "{key}");
+        }
+        assert_eq!(b["name"].as_str(), Some("abc"));
+        assert_eq!(b["quoted key"].as_str(), Some("multi\r\nline"));
+        assert_eq!(b["source"]["url"].as_str(), Some("https://h/x\\y.whl"));
+        let hash = |p: &toml_edit::Table| {
+            p["files"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_inline_table()
+                .unwrap()["hash"]
+                .as_str()
+                .map(str::to_string)
+        };
+        assert_eq!(hash(&a), hash(&b));
+        assert_eq!(
+            crate::utils::poetry_lock::metadata_files(&read_only, "ABC").len(),
+            crate::utils::poetry_lock::metadata_files(&mutable, "ABC").len(),
+        );
+        assert_eq!(
+            crate::utils::poetry_lock::metadata_files(&read_only, "ABC").len(),
+            1
+        );
+    }
 
     /// A pyproject-only pypi project (hatch, or any flavor before its first
     /// lock) has no install-deciding file: `pyproject.toml` / `hatch.toml`

@@ -41,8 +41,6 @@
 //! alive by a ledger under `--no-verify`, and agent-mode (`apply`) patches,
 //! which have no lockfile wiring to discover.
 
-use crate::common::binary;
-
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -81,17 +79,10 @@ const CVE: &str = "CVE-2026-7100";
 /// ecosystem stores the crawlers read pinned to `store` — an ambient
 /// `~/.m2` must never become installed evidence.
 fn cli(store: &Path) -> Command {
-    let mut cmd = Command::new(binary());
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("MAVEN_REPO_LOCAL", store.join("m2"))
-        .env_remove("M2_HOME")
-        .env_remove("VIRTUAL_ENV");
+    let mut cmd = crate::hermetic::binary_command();
+    crate::hermetic::scrub_extra(&mut cmd, &[crate::hermetic::Extra::Venv]);
+    cmd.env("MAVEN_REPO_LOCAL", store.join("m2"))
+        .env_remove("M2_HOME");
     cmd
 }
 

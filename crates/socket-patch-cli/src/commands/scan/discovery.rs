@@ -577,9 +577,168 @@ pub(super) fn severity_order(s: &str) -> u8 {
     socket_patch_core::api::ranking::severity_order(Some(s))
 }
 
+/// Warning code: a hosted or vendored scan left patched npm packages that
+/// only a nested, independent npm project installs (#1534).
+pub(crate) const NESTED_PROJECT_SKIPPED: &str = "nested_project_skipped";
+
+/// #1534: the patched npm packages a hosted or vendored scan of `cwd`
+/// must leave to a nested project. The crawl reads every `node_modules`
+/// below the root, including those of a nested project with its own lock
+/// (`tools/x/` holding `package-lock.json`), but such a run rewires only
+/// the root's locks. A package is left out when the root's lock inventory
+/// (`locked`) does not list it, its crawled copy sits in a nested
+/// project ([`nested_npm_project`]), and no `node_modules` of the root's
+/// own install holds another copy. Returns the purls to drop and one
+/// `(code, detail)` warning per nested project, naming the PATH to pass.
+///
+/// [`nested_npm_project`]: socket_patch_core::hosted::governing_root::nested_npm_project
+pub(crate) async fn nested_project_skips(
+    cwd: &std::path::Path,
+    mode: &str,
+    options: &socket_patch_core::crawlers::types::CrawlerOptions,
+    crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    locked: &[LockfileEntry],
+    with_patches: &[BatchPackagePatches],
+) -> (HashSet<PurlKey>, Vec<(String, String)>) {
+    use socket_patch_core::hosted::governing_root::nested_npm_project;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    let locked: HashSet<PurlKey> = locked
+        .iter()
+        .filter(|e| e.ecosystem == "npm")
+        .map(|e| PurlKey::new(&e.purl))
+        .collect();
+    let npm = |purl: &str| {
+        matches!(
+            socket_patch_core::crawlers::Ecosystem::from_purl(purl),
+            Some(socket_patch_core::crawlers::Ecosystem::Npm)
+        )
+    };
+    let paths: HashMap<PurlKey, &std::path::Path> = crawled
+        .iter()
+        .filter(|p| npm(&p.purl))
+        .map(|p| (PurlKey::new(&p.purl), p.path.as_path()))
+        .collect();
+    // Candidate purl -> the nested project holding its crawled copy.
+    let mut candidates: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for pkg in with_patches {
+        let key = PurlKey::new(&pkg.purl);
+        if !npm(&pkg.purl) || locked.contains(&key) {
+            continue;
+        }
+        let Some(path) = paths.get(&key) else {
+            continue;
+        };
+        if let Some(project) = nested_npm_project(cwd, path).await {
+            candidates.insert(pkg.purl.clone(), project);
+        }
+    }
+    if candidates.is_empty() {
+        return Default::default();
+    }
+    // The crawl keeps one copy per purl: a copy in the root's own install
+    // keeps the package the root's, whatever copy the crawl kept.
+    // An unreadable tree keeps every candidate the root's (the backend
+    // then reports it), rather than dropping a package the root installs.
+    let crawler = socket_patch_core::crawlers::NpmCrawler::new();
+    let wanted: Vec<String> = candidates.keys().cloned().collect();
+    let Ok(nm_roots) = crawler.get_node_modules_paths(options).await else {
+        return Default::default();
+    };
+    for nm_root in nm_roots {
+        if nested_npm_project(cwd, &nm_root).await.is_some() {
+            continue;
+        }
+        let Ok(found) = crawler.find_by_purls(&nm_root, &wanted).await else {
+            return Default::default();
+        };
+        let rooted: HashSet<PurlKey> = found
+            .into_iter()
+            .filter(|(_, copies)| !copies.is_empty())
+            .map(|(purl, _)| PurlKey::new(&purl))
+            .collect();
+        candidates.retain(|purl, _| !rooted.contains(&PurlKey::new(purl)));
+    }
+    // The PATH as the user's shell sees it: relative to the directory the
+    // command runs in (a PATH-list leg or `--cwd` scans elsewhere), else
+    // absolute.
+    let shell_dir = std::env::current_dir()
+        .ok()
+        .map(|d| std::fs::canonicalize(&d).unwrap_or(d));
+    let mut by_project: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut skipped = HashSet::new();
+    for (purl, project) in candidates {
+        let project = std::fs::canonicalize(&project).unwrap_or(project);
+        let shown = shell_dir
+            .as_deref()
+            .and_then(|base| project.strip_prefix(base).ok())
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .unwrap_or(&project)
+            .to_string_lossy()
+            .replace('\\', "/");
+        skipped.insert(PurlKey::new(&purl));
+        by_project.entry(shown).or_default().push(purl);
+    }
+    // Spelled out per mode so the remedy-command check can parse each.
+    let rerun = |dir: &str| {
+        if mode == "hosted" {
+            format!("`socket-patch scan --mode hosted {dir}`")
+        } else {
+            format!("`socket-patch scan --mode vendored {dir}`")
+        }
+    };
+    let warnings = by_project
+        .into_iter()
+        .map(|(dir, purls)| {
+            let (verb, left) = if purls.len() == 1 {
+                ("is", "it is")
+            } else {
+                ("are", "they are")
+            };
+            (
+                NESTED_PROJECT_SKIPPED.to_string(),
+                format!(
+                    "{} {verb} installed only by {dir}, a separate npm project with its own \
+                     lockfile; this run rewires only this directory's lockfile, so {left} left \
+                     alone; run {} to patch that project",
+                    purls.join(", "),
+                    rerun(&shell_word(&dir)),
+                ),
+            )
+        })
+        .collect();
+    (skipped, warnings)
+}
+
+/// `word` as one POSIX shell word: single-quoted unless it is plain.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./-:@%+=,".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1534: the PATH in the `nested_project_skipped` remedy survives a
+    /// copy-paste into a POSIX shell.
+    #[test]
+    fn shell_word_quotes_only_what_the_shell_would_split() {
+        assert_eq!(shell_word("tools/x"), "tools/x");
+        assert_eq!(shell_word("/repo/@scope/x-1.0"), "/repo/@scope/x-1.0");
+        assert_eq!(shell_word("tools/my x"), "'tools/my x'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("$HOME"), "'$HOME'");
+        assert_eq!(shell_word(""), "''");
+    }
     use socket_patch_core::api::types::BatchPatchInfo;
     use std::borrow::Cow;
 

@@ -43,7 +43,6 @@
 //! go-patches redirect (no uuid — a documented limitation, asserted below).
 //! Embedded: `scan --vex` and `apply --vex` on a manifest-less project.
 
-use crate::common::binary;
 use crate::common::envelope::codes_in;
 
 use crate::vex_e2e_common;
@@ -132,19 +131,12 @@ impl Fx {
     /// Hermetic child: ambient `SOCKET_*` scrubbed, no token / config /
     /// telemetry, the fixture's private caches.
     fn command(&self) -> Command {
-        let mut cmd = Command::new(binary());
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-                cmd.env_remove(key);
-            }
-        }
-        cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-            .env("SOCKET_NO_CONFIG", "1")
-            .env("SOCKET_NO_API_TOKEN", "1")
+        let mut cmd = crate::hermetic::binary_command();
+        crate::hermetic::scrub_extra(&mut cmd, &[crate::hermetic::Extra::Venv]);
+        cmd.env("SOCKET_NO_API_TOKEN", "1")
             .env("GOMODCACHE", &self.gomodcache)
             .env("GOPATH", &self.gopath)
-            .env_remove("GOFLAGS")
-            .env_remove("VIRTUAL_ENV");
+            .env_remove("GOFLAGS");
         cmd
     }
 

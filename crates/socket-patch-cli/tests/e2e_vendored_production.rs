@@ -102,7 +102,7 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::binary;
+use common::{binary, hermetic};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -295,7 +295,7 @@ fn has_command(cmd: &str) -> bool {
     } else {
         &["--version"]
     };
-    let mut probe_cmd = Command::new(cmd);
+    let mut probe_cmd = pm_command(cmd);
     probe_cmd
         .args(probe)
         .stdout(std::process::Stdio::null())
@@ -307,7 +307,7 @@ fn has_command(cmd: &str) -> bool {
 /// `corepack <pm> --version` succeeds — the liveness probe for a specific yarn
 /// flavor (also the call that downloads it the first time, kept in the sandbox).
 fn has_corepack_pm(pm: &str) -> bool {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = pm_command("corepack");
     cmd.args([pm, "--version"])
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     cache_env::isolate(&mut cmd);
@@ -323,30 +323,18 @@ fn has_corepack_pm(pm: &str) -> bool {
 /// The scrub is load-bearing. An ambient `SOCKET_PROXY_URL`/`SOCKET_API_URL`
 /// would silently point the run at staging; an ambient `SOCKET_API_TOKEN` (or a
 /// socket-cli login on disk) would move it off the free public proxy this suite
-/// exists to cover. Every ambient `SOCKET_*` is removed (except the config
-/// kill-switch), hostile seeds are planted and then removed on the adjacent
-/// line so a dropped scrub reddens the suite instead of leaking a developer's
-/// shell, and `SOCKET_NO_CONFIG=true` blocks the socket-cli config.json.
+/// exists to cover. The shared builder (`hermetic::binary_command`) removes
+/// every ambient `SOCKET_*`, seeds those three with hostile values and removes
+/// them (so a dropped scrub reddens the suite instead of leaking a developer's
+/// shell), and forces `SOCKET_NO_CONFIG=1` to block the socket-cli
+/// config.json. The crawler's own ambient inputs are scrubbed too
+/// (`hermetic::CRAWLER_EXTRAS`: an activated venv, `BUNDLE_*`, `COMPOSER_*`),
+/// so an ambient BUNDLE_PATH can't move the gem leg's crawl off
+/// `vendor/bundle`.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = Command::new(binary());
-    cmd.args(args)
-        .current_dir(cwd)
-        // Seed hostile values, then remove them (adjacent, so deleting a remove
-        // line leaves the seed and breaks the suite rather than passing vacuously).
-        .env("SOCKET_API_TOKEN", "hostile-seed-must-be-scrubbed")
-        .env("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile")
-        .env("SOCKET_API_URL", "http://127.0.0.1:1/hostile")
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_PROXY_URL")
-        .env_remove("SOCKET_API_URL");
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env("SOCKET_NO_CONFIG", "true");
+    let mut cmd = hermetic::binary_command();
+    hermetic::scrub_crawler_inputs(&mut cmd);
+    cmd.args(args).current_dir(cwd);
     let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -512,21 +500,36 @@ fn vendor_revert(cwd: &Path, leg: &str) -> u64 {
 // Toolchain invocation
 // ---------------------------------------------------------------------------
 
-/// Run `bundle <args>` with the ambient `BUNDLE_*`/`GEM_*`/`RUBYOPT` state
-/// scrubbed first (a developer's global bundler config — frozen mode, a
-/// custom BUNDLE_PATH or gem home, a RUBYOPT require — must not leak into a
-/// leg that hard-asserts bundler outcomes; mirrors e2e_vendor_gem_build.rs).
-/// The cache sandbox re-pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after
-/// the scrub, and the per-leg `env` is applied last so the leg's pins win.
+/// A package-manager child (and its liveness probe) with the shared
+/// hermetic scrubs, applied before `cache_env::isolate` and the leg's own
+/// env so a leg's pins (the uv legs' `VIRTUAL_ENV`) survive: every ambient
+/// `SOCKET_*` ([`hermetic::scrub_socket_vars`]), an activated venv (uv/pip
+/// would install into the wrong interpreter), bundler's `BUNDLE_*` and
+/// `RUBYOPT` ([`hermetic::Extra::Bundle`]; an ambient BUNDLE_PATH or frozen
+/// mode changes what `bundle` installs and where) and the yarn/pnpm
+/// node-linker overrides. Deliberately not the full `Extra::Yarn` / `Extra::Pnpm`
+/// sweeps: those remove every `YARN_*` / `npm_config_*`, including the
+/// proxy and CA settings these live-registry suites need behind a proxy.
+fn pm_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    hermetic::scrub_socket_vars(&mut cmd);
+    hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
+    cmd.env_remove("YARN_NODE_LINKER");
+    cmd.env_remove("npm_config_node_linker");
+    cmd
+}
+
+/// Run `bundle <args>` with the ambient bundler config scrubbed first
+/// ([`hermetic::Extra::Bundle`]: every `BUNDLE_*` and `RUBYOPT`). A
+/// developer's global bundler config (frozen mode, a custom BUNDLE_PATH, a
+/// RUBYOPT require) must not leak into a leg that hard-asserts bundler
+/// outcomes. `GEM_HOME`/`GEM_PATH` stay, since `bundle` resolves through
+/// them under rvm/chruby; every install here pins BUNDLE_PATH. The cache
+/// sandbox pins its own BUNDLE_USER_HOME/GEM_SPEC_CACHE after the scrub,
+/// and the per-leg `env` is applied last so the leg's pins win.
 fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("bundle");
+    let mut cmd = pm_command("bundle");
     cmd.args(args).current_dir(cwd);
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy().into_owned();
-        if key.starts_with("BUNDLE_") || key.starts_with("GEM_") || key == "RUBYOPT" {
-            cmd.env_remove(&k);
-        }
-    }
     cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
@@ -540,17 +543,12 @@ fn bundle(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
 /// during fixture setup) from "the install of the vendored lock failed" (always
 /// a hard failure — that is the thing under test).
 fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(program);
+    let mut cmd = pm_command(program);
     cmd.args(args).current_dir(cwd);
     cache_env::isolate(&mut cmd);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // A `VIRTUAL_ENV` inherited from the developer's shell makes uv/pip install
-    // into the wrong interpreter; a node-linker override breaks yarn/pnpm.
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
-    cmd.env_remove("npm_config_node_linker");
     cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"))
 }
@@ -558,12 +556,10 @@ fn tool(cwd: &Path, program: &str, args: &[&str], env: &[(&str, &str)]) -> Outpu
 /// Run `corepack <pm> <args>` in `cwd` with the download prompt disabled and
 /// the shared cache sandbox applied (per-leg `env` wins, applied last).
 fn corepack(cwd: &Path, pm: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = pm_command("corepack");
     cmd.arg(pm).args(args).current_dir(cwd);
     cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("YARN_NODE_LINKER");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -1688,15 +1684,7 @@ fn bun_manifestless_vex_production(
     let vex = |extra: &[&str]| -> (Option<i32>, serde_json::Value, Option<serde_json::Value>) {
         let out_path = checkout.join("out.vex.json");
         let _ = std::fs::remove_file(&out_path);
-        let mut cmd = Command::new(binary());
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("SOCKET_") {
-                cmd.env_remove(key);
-            }
-        }
-        let out = cmd
-            .env("SOCKET_TELEMETRY_DISABLED", "1")
-            .env("SOCKET_NO_CONFIG", "1")
+        let out = hermetic::binary_command()
             .env("SOCKET_NO_API_TOKEN", "1")
             .current_dir(checkout)
             .args(["vex", "--json", "--output"])
@@ -1877,7 +1865,8 @@ fn pypi_requirements_txt_vendored_install_proof() {
     );
     let reqs_before = std::fs::read(proj.join("requirements.txt")).unwrap();
 
-    // Discovery reads the venv via VIRTUAL_ENV.
+    // Discovery finds the `.venv` under the cwd (`run_socket` scrubs
+    // VIRTUAL_ENV).
     let env_json = scan_vendored(&proj, &["--ecosystems", "pypi"]);
     assert_vendor_applied(&env_json, "urllib3@1.26.18", LEG);
     assert_download_uuid(&env_json, PYPI_UUIDS, LEG);

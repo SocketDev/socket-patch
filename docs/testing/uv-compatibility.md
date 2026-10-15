@@ -175,6 +175,23 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   `redirect_uv_lock_unsupported` (#767). Before, vendored left a lock that
   `uv sync --locked` rejects, and hosted replaced the user's URL with one its
   own rollback then refused to restore.
+- `no-sources = true` makes uv ignore every `[tool.uv.sources]` entry, and
+  `no-sources-package = [...]` ignores the entries of the packages it names
+  (uv 0.10+), so a wired source fails `uv sync --locked` and a plain
+  `uv sync` installs the unpatched registry wheel. Both modes refuse it
+  before any file is written: vendored with `pypi_uv_no_sources`, hosted
+  with `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported`
+  (#564). The settings are read where uv reads them (checked against uv
+  0.11): a project `uv.toml` replaces pyproject's `[tool.uv]` outright; a
+  PEP 723 script's own `no-sources` wins over the project's, while the two
+  `no-sources-package` lists combine; and an explicit `no-sources = false`
+  disables the list. A script's project settings come from the nearest
+  directory at or above it holding a `uv.toml` or a `pyproject.toml` with
+  `[tool.uv]` (`uv.toml` first), so a script scanned from `scripts/` under
+  a project that sets `no-sources` is refused too, with the parent file
+  named (#1501); a project stops that lookup at itself. `UV_NO_SOURCES`, `UV_NO_SOURCES_PACKAGE`, the matching
+  flags and a user-level `uv.toml` belong to the machine that installs,
+  which the scan cannot see.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751
@@ -230,7 +247,9 @@ restores the `requires-dist`, `requires-dev` and `[manifest] constraints`
 entries with the specifier pyproject.toml declares at revert time, not the one
 recorded when vendoring. When uv's spelling can't be derived, as with a
 multi-clause range (uv orders clauses differently across releases), the edit is
-treated as drift and both files are kept. Tests also cover restoring one package while
+treated as drift and both files are kept. A PEP 723 script lock follows the
+same rule: its `[manifest]` entries are restored with the specifier the
+script's `# /// script` block declares at revert time. Tests also cover restoring one package while
 preserving another package's vendored entries.
 
 ## Reproduce the release-family matrix

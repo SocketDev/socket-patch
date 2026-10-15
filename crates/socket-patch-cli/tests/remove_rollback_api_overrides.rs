@@ -18,59 +18,11 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 #[path = "common/mod.rs"]
 mod common;
 use common::{binary, git_sha256};
-
-/// Every `SOCKET_*` env var `GlobalArgs` reads as a flag fallback — scrubbed
-/// so behavior is driven only by the explicit flags under test (an ambient
-/// `SOCKET_API_TOKEN` would let the buggy env-fallback path pass).
-const SOCKET_ENV_VARS: &[&str] = &[
-    "SOCKET_API_TOKEN",
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_VENDOR_SOURCE",
-    "SOCKET_VENDOR_URL",
-    "SOCKET_PATCH_SERVER_URL",
-    "SOCKET_OFFLINE",
-    "SOCKET_STRICT",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_SKIP_ROLLBACK",
-    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
-    "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
-    "SOCKET_NO_VLT_INSTALL_CLEANUP",
-];
-
-/// Drift guard: the scrub must cover every env var `GlobalArgs` binds — the
-/// production `GLOBAL_ARG_ENV_VARS` list is the source of truth. A var
-/// missing here escapes the scrub, so an ambient value in the developer's
-/// shell or CI (e.g. `SOCKET_STRICT=garbage`) aborts every invocation in
-/// this file. Mirrors `cli_parse_vendor.rs`.
-#[test]
-fn env_scrub_covers_every_global_arg_env_var() {
-    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
-        assert!(
-            SOCKET_ENV_VARS.contains(var),
-            "{var} is bound by GlobalArgs but missing from SOCKET_ENV_VARS — the scrub won't strip it",
-        );
-    }
-}
 
 /// Minimal HTTP stub playing the authenticated API: serves `blob` bytes at
 /// any path ending in `/patches/blob/<hash>`, 404 otherwise, and records
@@ -189,7 +141,11 @@ fn remove_rollback_downloads_missing_blob_via_flag_overrides() {
     );
     std::fs::write(socket.join("manifest.json"), manifest).unwrap();
 
-    let mut cmd = Command::new(binary());
+    // The hermetic builder removes every `SOCKET_*` var `GlobalArgs` reads
+    // as a flag fallback, so behavior is driven only by the explicit flags
+    // under test (an ambient `SOCKET_API_TOKEN` would let the buggy
+    // env-fallback path pass).
+    let mut cmd = common::hermetic_command(&binary());
     cmd.args([
         "remove",
         "pkg:npm/__ovr_test__@1.0.0",
@@ -202,11 +158,7 @@ fn remove_rollback_downloads_missing_blob_via_flag_overrides() {
         "testorg",
     ])
     .current_dir(tmp.path());
-    for var in SOCKET_ENV_VARS {
-        cmd.env_remove(var);
-    }
     cmd.env("SOCKET_PROXY_URL", format!("http://127.0.0.1:{dead}"));
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
 
     let out = cmd.output().expect("run socket-patch remove");
     let stdout = String::from_utf8_lossy(&out.stdout);

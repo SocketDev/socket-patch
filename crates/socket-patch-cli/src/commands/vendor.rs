@@ -464,6 +464,23 @@ async fn unwired_check_failure(
             c.other.display(),
         );
     }
+    if let Some((r, diag)) = discovery.vendored_shadow(&entry.base_purl, &entry.uuid) {
+        // Re-vendoring cannot reach that copy: name it instead (#1511).
+        let copy = diag.map_or_else(
+            || {
+                format!(
+                    "{} wires {dir}, but the build also installs an unpatched copy of the \
+                     same version",
+                    r.source_file.display()
+                )
+            },
+            |d| d.detail.clone(),
+        );
+        return format!(
+            "copy unpatched: {copy}; re-vendoring cannot reach that copy, so depend on the \
+             registry release there (or remove that copy) to have it patched"
+        );
+    }
     // Only the npm-family and Python extractors record every lock entry
     // (`resolved_elsewhere`), so only there does "no lock resolves it"
     // prove the dependency is gone rather than unreadable.
@@ -1254,10 +1271,10 @@ async fn run_check(args: &VendorArgs) -> i32 {
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
-            Some(record) => match vendor::check_vendored_artifact(root, entry, record).await {
-                vendor::ArtifactHealth::Healthy => None,
-                health => Some(format!("artifact verification failed: {health:?}")),
-            },
+            Some(record) => {
+                let health = vendor::check_vendored_artifact(root, entry, record).await;
+                vendor::describe_artifact_failure(root, entry, &health).await
+            }
             None => Some("patch record missing; restore the manifest or vendor ledger".to_string()),
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {

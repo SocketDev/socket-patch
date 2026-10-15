@@ -82,8 +82,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::vex_e2e_common::{
-    assert_attested, assert_not_attested, binary, git_sha256, patch_view, run_vex, statements_for,
-    strip_ledgers, strip_manifest, Marker, PatchApi, VexOutcome, VexRun, VexVia,
+    assert_attested, assert_not_attested, binary, git_sha256, hermetic, patch_view, run_vex,
+    statements_for, strip_ledgers, strip_manifest, Marker, PatchApi, VexOutcome, VexRun, VexVia,
 };
 
 /// Appended to the installed module by the synthetic patch.
@@ -196,7 +196,7 @@ impl Uv {
     /// oracle), the cache sandbox applied, then `cache` as `UV_CACHE_DIR`.
     fn command(&self, cwd: &Path, args: &[OsString], cache: &Path) -> Command {
         let mut cmd = Command::new(&self.exe);
-        scrub_python_env(&mut cmd);
+        scrub_tool_env(&mut cmd);
         cmd.args(args).current_dir(cwd);
         crate::cache_env::isolate(&mut cmd);
         cmd.env("UV_CACHE_DIR", cache);
@@ -231,14 +231,21 @@ impl Uv {
     }
 }
 
+/// [`scrub_python_env`] plus the ambient `SOCKET_*` sweep, for the uv /
+/// python / pip children.
+fn scrub_tool_env(cmd: &mut Command) {
+    hermetic::scrub_socket_vars(cmd);
+    scrub_python_env(cmd);
+}
+
+/// Remove the ambient python / uv / pip config and `VIRTUAL_ENV`. `SOCKET_*`
+/// is left to the caller: `hermetic::command` for the binary (sweeping it
+/// here would drop the opt-outs that builder forces on) and
+/// [`scrub_tool_env`] for everything else.
 fn scrub_python_env(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        if name.starts_with("PYTHON")
-            || name.starts_with("UV_")
-            || name.starts_with("PIP_")
-            || name.starts_with("SOCKET_")
-        {
+        if name.starts_with("PYTHON") || name.starts_with("UV_") || name.starts_with("PIP_") {
             cmd.env_remove(&key);
         }
     }
@@ -690,17 +697,13 @@ impl ScanApi {
     }
 }
 
-/// Run `socket-patch <args>` with the ambient `SOCKET_*` / python env
-/// scrubbed.
+/// Run `socket-patch <args>` with the hermetic `SOCKET_*` environment and
+/// the ambient python env scrubbed.
 fn socket_patch(cwd: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic::command(&binary());
     scrub_python_env(&mut cmd);
     let _fixture = prebuilt_common::prepare_command(&mut cmd, cwd, args, &[]);
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .current_dir(cwd)
-        .output()
-        .expect("spawn socket-patch")
+    cmd.current_dir(cwd).output().expect("spawn socket-patch")
 }
 
 fn envelope(out: &Output, what: &str) -> Value {
@@ -865,7 +868,7 @@ fn build(uv: &Uv, lane: Lane, mode: Mode, tmp: &Path) -> Result<Built, String> {
                 Mode::Vendored => &["six==1.16.0"],
             };
             let mut cmd = Command::new(host_python());
-            scrub_python_env(&mut cmd);
+            scrub_tool_env(&mut cmd);
             crate::cache_env::isolate(&mut cmd);
             let out = cmd
                 .args(["-m", "pip", "lock"])
@@ -1063,7 +1066,7 @@ fn install(uv: &Uv, lane: Lane, dir: &Path, cache: &Path, offline: bool, frozen:
 
 fn oracle(_uv: &Uv, dir: &Path, _cache: &Path) -> String {
     let mut cmd = Command::new(venv_python(dir));
-    scrub_python_env(&mut cmd);
+    scrub_tool_env(&mut cmd);
     let out = cmd
         .args(["-c", ORACLE])
         .current_dir(dir)
@@ -1649,6 +1652,17 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         script_sibling_revert(uv, &report, &proj, tmp.path());
     }
 
+    // ── 5c. the parent dropped after the hosted run (#1445) ───────────
+    if mode == Mode::Hosted && lane == Lane::Transitive {
+        transitive_orphan_unwind(
+            uv,
+            &report,
+            &proj,
+            tmp.path(),
+            patch_server.as_deref().unwrap(),
+        );
+    }
+
     // ── 6. the real revert ────────────────────────────────────────────
     // Vendored: `vendor --revert` restores every wiring file byte for
     // byte. Hosted (v5): `rollback` rewrites each pin back to the DEFAULT
@@ -1893,6 +1907,98 @@ fn script_sibling_revert(uv: &Uv, report: &Report<'_>, proj: &Path, tmp: &Path) 
     report.row("sibling-revert", "restored, user addition kept");
 }
 
+/// #1445: once the parent that pulled `six` in is removed (what `uv remove
+/// python-dateutil` does to the metadata, then a relock), uv drops `six`
+/// from uv.lock but keeps the hosted `override-dependencies` entry, its
+/// `[tool.uv.sources]` URL and the lock's `[manifest] overrides` record.
+/// That leftover is Socket's own pin: `list` lists around it and `rollback`
+/// retires all three, leaving a lock uv accepts as is. Runs on a copy so
+/// the real revert below is unaffected.
+fn transitive_orphan_unwind(uv: &Uv, report: &Report<'_>, proj: &Path, tmp: &Path, uri: &str) {
+    let what = report.what("orphan-unwind");
+    let dir = tmp.join("orphan");
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["pyproject.toml", "uv.lock"] {
+        std::fs::copy(proj.join(f), dir.join(f)).unwrap();
+    }
+    let path = dir.join("pyproject.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let dropped = text.replace(
+        "dependencies = [\"python-dateutil==2.9.0.post0\"]",
+        "dependencies = []",
+    );
+    assert_ne!(dropped, text, "{what}: no python-dateutil to drop:\n{text}");
+    std::fs::write(&path, dropped).unwrap();
+    let cache = tmp.join("orphan-cache");
+    let out = uv.run_py(&dir, &["lock"], &cache);
+    if !ok(&out) {
+        report.row("orphan-unwind", "n/a (`uv lock` without the parent failed)");
+        println!("{}", dump(&out));
+        return;
+    }
+    let uuid = Mode::Hosted.uuid();
+    let lock = std::fs::read_to_string(dir.join("uv.lock")).unwrap();
+    let pyproject = std::fs::read_to_string(&path).unwrap();
+    if lock.contains("name = \"six\"\nversion") || !pyproject.contains(uuid) {
+        report.row("orphan-unwind", "n/a (uv dropped the override itself)");
+        return;
+    }
+    let server = |args: &[&str]| -> Output {
+        let mut all = args.to_vec();
+        all.extend_from_slice(&[
+            "--json",
+            "--cwd",
+            dir.to_str().unwrap(),
+            "--api-url",
+            uri,
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG,
+            "--patch-server-url",
+            uri,
+        ]);
+        socket_patch(&dir, &all)
+    };
+    let warned = |env: &Value| {
+        env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|w| w["code"] == "hosted_resolution_orphaned")
+    };
+    let out = server(&["list"]);
+    let env = envelope(&out, &what);
+    assert!(
+        out.status.code() == Some(0) && warned(&env),
+        "{what}: list must list around the leftover pin:\n{}",
+        dump(&out)
+    );
+    let out = server(&["rollback", "--yes"]);
+    let env = envelope(&out, &what);
+    assert!(
+        out.status.code() == Some(0) && warned(&env),
+        "{what}: rollback must retire the leftover pin:\n{}",
+        dump(&out)
+    );
+    for f in ["pyproject.toml", "uv.lock"] {
+        let body = std::fs::read_to_string(dir.join(f)).unwrap();
+        assert!(
+            !body.contains(uuid) && !body.contains("six"),
+            "{what}: {f} still wires six:\n{body}"
+        );
+    }
+    let retired = std::fs::read(dir.join("uv.lock")).unwrap();
+    let out = uv.run_py(&dir, &["lock"], &cache);
+    assert!(ok(&out), "{what}: uv lock:\n{}", dump(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(dir.join("uv.lock")).unwrap()),
+        String::from_utf8_lossy(&retired),
+        "{what}: uv rewrote the retired lock"
+    );
+    report.row("orphan-unwind", "retired; uv keeps the lock as is");
+}
+
 // ── production legs ────────────────────────────────────────────────────
 
 /// The uv program a production leg drives: `SOCKET_PATCH_UV_E2E_BIN`, else
@@ -2104,7 +2210,7 @@ pub fn production_manifestless(p: &Production<'_>) {
     strip_manifest(&fresh);
     let sync = |dir: &Path, cache: &Path, offline: bool| {
         let mut cmd = Command::new(p.uv);
-        scrub_python_env(&mut cmd);
+        scrub_tool_env(&mut cmd);
         crate::cache_env::isolate(&mut cmd);
         if let Some(py) = std::env::var_os("SOCKET_PATCH_UV_E2E_PYTHON").filter(|p| !p.is_empty()) {
             cmd.env("UV_PYTHON", py);

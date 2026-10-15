@@ -119,7 +119,7 @@ What socket-patch does with those files:
 | uniformly LF or CRLF | rewritten in the file's own ending; no hosted ledger | lock entry spliced in the file's ending; `package.json` re-serialized in its own layout (BOM, indent, ending, trailing newline) |
 | leading BOM | kept | kept, both files |
 | mixed CRLF / LF, or a bare CR | refused untouched: `redirect_yarn_berry_mixed_line_endings` | refused before any write: `vendor_yarn_berry_mixed_line_endings` |
-| revert (`rollback`, `remove`, takeovers) | upstream entries reconstructed from registry metadata; mixed endings refuse as drift | byte-exact; a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
+| revert (`rollback`, `remove`, takeovers) | upstream entries reconstructed from registry metadata; mixed endings refuse as drift | byte-exact while the lock is unchanged since vendoring; a lock changed since gets the restored entry keyed by the descriptors it declares now and with its checksum in the lock's current spelling (#759); a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
 | mode takeover into this mode | the vendored revert is staged and the hosted rewrite planned against it; a purl the berry rewriter refuses (line endings, `cacheKey`, `compressionLevel`, no berry checksum) is retracted and stays vendored, byte-identical | the backend's project gates (both files' line endings, `cacheKey`, `compressionLevel`) run BEFORE the hosted redirect is reverted; a refused purl stays hosted, byte-identical |
 
 Every reader — manifest-less `vex`, the lockfile inventory, the npm flavor

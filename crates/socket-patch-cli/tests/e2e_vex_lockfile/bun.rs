@@ -497,19 +497,11 @@ impl Api {
 
 // ── running the CLI ──────────────────────────────────────────────────────
 
-/// The CLI with the ambient `SOCKET_*` environment scrubbed, telemetry and
-/// socket-cli config off, and no ambient API token.
+/// The CLI with the hermetic `SOCKET_*` environment: ambient vars scrubbed,
+/// telemetry, socket-cli config and the update check off, and no ambient
+/// API token.
 fn cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("SOCKET_NO_CONFIG", "1")
-        .env("SOCKET_NO_UPDATE_CHECK", "1");
-    cmd
+    crate::hermetic::binary_command()
 }
 
 /// Parsed stdout envelope of a `--json` run.

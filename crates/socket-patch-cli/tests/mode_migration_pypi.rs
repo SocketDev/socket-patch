@@ -11,12 +11,13 @@
 //! from the staged manifest by the prebuilt fixture server, and the hosted
 //! API + hosted wheel are a wiremock.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::io::Write as _;
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -145,15 +146,9 @@ fn run_raw(root: &Path, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, 
         "lib/python3.11/site-packages"
     }))
     .unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    let mut cmd = hermetic::binary_command();
     cmd.args(args).arg("--cwd").arg(root).current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
-        .env("VIRTUAL_ENV", &venv)
+    cmd.env("VIRTUAL_ENV", &venv)
         .env("PIPENV_IGNORE_VIRTUALENVS", "0")
         .envs(extra.iter().copied());
     let fixture = (args.first() == Some(&"vendor")).then(|| {
@@ -822,6 +817,150 @@ async fn uv_vendored_to_hosted() {
     let (_tmp, root) = project();
     let files = stage_uv(&root);
     assert_vendored_to_hosted(&root, files).await;
+}
+
+/// #564: under `no-sources = true` (pyproject's `[tool.uv]` or a project
+/// `uv.toml`) uv ignores `[tool.uv.sources]`, so a wired source fails
+/// `uv sync --locked` and a plain `uv sync` installs the unpatched wheel.
+/// Both modes used to wire it and exit 0; they must refuse and write
+/// nothing.
+#[tokio::test]
+async fn uv_no_sources_is_refused_in_both_modes() {
+    for (file, setting) in [
+        ("pyproject.toml", "\n[tool.uv]\nno-sources = true\n"),
+        ("uv.toml", "no-sources = true\n"),
+    ] {
+        let (_tmp, root) = project();
+        stage_uv(&root);
+        let path = root.join(file);
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(setting);
+        std::fs::write(&path, text).unwrap();
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        // Skipped with the refusal as its warning, like the other uv
+        // project shapes hosted mode cannot wire.
+        assert_eq!(code, 0, "hosted {file}: {env:#}");
+        assert_eq!(hosted_pinned(&env), 0, "hosted {file}: {env:#}");
+        assert!(
+            env.to_string().contains("redirect_uv_project_unsupported")
+                && env.to_string().contains("no-sources"),
+            "hosted {file}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "hosted {file} wrote nothing");
+
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored {file}: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_no_sources"),
+            "vendored {file}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "vendored {file} wrote nothing");
+    }
+}
+
+/// #1501: a PEP 723 script takes uv's settings from the nearest directory
+/// at or above it that holds a `uv.toml` or a `pyproject.toml` with
+/// `[tool.uv]`. A parent project's `no-sources = true` therefore drops the
+/// script's source too, so both modes must refuse a script scanned from a
+/// subdirectory just as they do beside the setting. A parent pyproject
+/// without `[tool.uv]` sets nothing, and the script is still wired.
+#[tokio::test]
+async fn uv_script_no_sources_in_a_parent_is_refused_in_both_modes() {
+    let parent_pyproject = "[project]\nname = \"root\"\nversion = \"0.1.0\"\n";
+    for (file, setting, refused) in [
+        ("uv.toml", "no-sources = true\n".to_string(), true),
+        (
+            "pyproject.toml",
+            format!("{parent_pyproject}\n[tool.uv]\nno-sources = true\n"),
+            true,
+        ),
+        (
+            "pyproject.toml",
+            format!("{parent_pyproject}\n[tool.uv]\nno-sources-package = [\"Six\"]\n"),
+            true,
+        ),
+        ("pyproject.toml", parent_pyproject.to_string(), false),
+    ] {
+        let (_tmp, root) = project();
+        stage_script_lock(&root);
+        std::fs::write(root.parent().unwrap().join(file), &setting).unwrap();
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted {file}: {env:#}");
+        if refused {
+            assert_eq!(hosted_pinned(&env), 0, "hosted {file}: {env:#}");
+            assert!(
+                env.to_string().contains("redirect_uv_script_unsupported")
+                    && env.to_string().contains(&format!("../{file}")),
+                "hosted {file}: {env:#}"
+            );
+            assert_eq!(tree(&root), before, "hosted {file} wrote nothing");
+        } else {
+            assert_eq!(hosted_pinned(&env), 1, "hosted {file}: {env:#}");
+            continue;
+        }
+
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored {file}: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_no_sources")
+                && env.to_string().contains(&format!("../{file}")),
+            "vendored {file}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "vendored {file} wrote nothing");
+    }
+}
+
+/// In a uv workspace, uv takes a member's script settings from the
+/// workspace root, so a member's own `[tool.uv]` does not shield the script
+/// from the root's `no-sources`. The #1138 workspace-member guard refuses
+/// the run before the script lane's own lookup, in both modes.
+#[tokio::test]
+async fn uv_script_in_a_workspace_member_is_not_wired() {
+    let (_tmp, root) = project();
+    stage_script_lock(&root);
+    std::fs::write(
+        root.join("pyproject.toml"),
+        "[project]\nname = \"s\"\nversion = \"0.1.0\"\n\n[tool.uv]\npackage = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.parent().unwrap().join("pyproject.toml"),
+        "[project]\nname = \"b\"\nversion = \"0.1.0\"\n\n[tool.uv.workspace]\nmembers = [\"proj\"]\n\n[tool.uv]\nno-sources = true\n",
+    )
+    .unwrap();
+    let before = tree(&root);
+
+    let server = MockServer::start().await;
+    mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 1, "hosted: {env:#}");
+    assert_eq!(
+        env["error"]["code"], "redirect_workspace_lockfile_elsewhere",
+        "hosted: {env:#}"
+    );
+    assert_eq!(tree(&root), before, "hosted wrote nothing");
+
+    stage_manifest(&root);
+    let before = tree(&root);
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_ne!(code, 0, "vendored: {env:#}");
+    assert!(
+        env.to_string().contains("pypi_uv_workspace_unsupported"),
+        "vendored: {env:#}"
+    );
+    assert_eq!(tree(&root), before, "vendored wrote nothing");
 }
 
 /// A Hatch project; returns its wiring files.

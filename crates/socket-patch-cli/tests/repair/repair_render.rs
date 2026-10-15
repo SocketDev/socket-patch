@@ -1,8 +1,9 @@
-//! Coverage-gap tests for `commands/repair.rs`: the human-mode (non-`--json`)
-//! output arms that every existing suite drove through `--json`, plus the
-//! warn-and-continue housekeeping contracts.
+//! `repair`'s render suite (#1089): the human-mode (non-`--json`) output
+//! of `commands/repair.rs`, plus the warn-and-continue housekeeping
+//! contracts. Behavior is asserted through `--json` codes elsewhere; the
+//! sentence checks here are the render checks, one per message family.
 //!
-//! Ranges pinned:
+//! Lines pinned:
 //!   * the loud `manifest_not_found` / `repair_failed` stderr prints,
 //!   * the loud "All {artifacts} are present locally." summary,
 //!   * the `... and N more` truncation of the offline warning (>5 missing)
@@ -23,6 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::common::envelope::{find_event, json_string, parse_json_envelope};
 use crate::common::{binary, git_sha256, hermetic_command};
 
 use wiremock::matchers::{method, path};
@@ -371,7 +373,9 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
         !stdout.contains("unused blob"),
         "no archive line may use the blob wording; stdout=\n{stdout}"
     );
-    // The download phase checks blobs only: the referenced one is present.
+    // The download phase checks blobs only: the referenced one stays, and
+    // its summary keeps the blob noun.
+    assert!(socket.join("blobs").join(REFERENCED_HASH).exists());
     assert!(
         stdout.contains("All blobs are present locally."),
         "the referenced blob is present; stdout=\n{stdout}"
@@ -464,21 +468,12 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
         Some(0),
         "json: archive-cleanup failure stays non-fatal; stdout=\n{json_stdout}"
     );
-    let v: serde_json::Value = serde_json::from_str(json_stdout.trim()).expect("envelope JSON");
-    assert_eq!(v["status"], "success");
-    let events = v["events"].as_array().expect("events array");
-    let skip = events
-        .iter()
-        .find(|e| e["action"] == "skipped" && e["errorCode"] == "cleanup_failed")
-        .unwrap_or_else(|| {
-            panic!("json: envelope must record the failed archive cleanup; got events={events:?}")
-        });
+    let v = parse_json_envelope(&json_stdout);
+    assert_eq!(json_string(&v, "status"), Some("success"), "envelope={v}");
+    let skip = find_event(&v, "skipped", Some("cleanup_failed"));
     assert!(
-        skip["reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("diff cleanup failed"),
-        "the skip reason must name the failing archive pass; got {skip}"
+        skip["reason"].as_str().unwrap_or("").starts_with("diff "),
+        "the skip must be labeled with the failing archive pass; got {skip}"
     );
     // The packages pass still swept its orphan: `gc` reports it (the
     // failed diffs pass counts as empty).

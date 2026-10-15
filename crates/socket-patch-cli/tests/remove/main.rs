@@ -13,8 +13,8 @@ mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
 
-mod covgap_commands_remove;
 mod pypi_name_spellings;
 mod remove_duality_invariants;
+mod remove_failure_paths;
 mod remove_invariants;
 mod remove_network;

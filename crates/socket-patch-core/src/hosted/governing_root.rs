@@ -21,16 +21,23 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::constants::npm_family::VLT_LOCK;
+use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, VLT_LOCK};
 use crate::formats::governing_locks::{npm_lock_files, NpmLockFamily};
 use crate::formats::text::strip_bom;
+use crate::formats::yarn::berry_gates::YARN_LOCK;
+use crate::formats::yarn::is_berry_lock;
 use crate::patch::redirect::npmrc::npmrc_top_level_value;
-use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
+use crate::utils::fs::{
+    open_regular_file, open_regular_file_sync, read_regular_to_bytes, read_regular_to_string,
+    read_regular_to_string_sync,
+};
 use crate::utils::pnpm_workspace::governing_workspace_file;
-use crate::utils::workspace_globs::workspaces_include;
+use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
 use crate::vendor::lock_inventory::ProjectView;
+use crate::vendor::vlt_lock_text::{self, DepIdKind, LockSniff};
+use crate::vendor::{bun_lock_text, bun_lockb};
 
 use super::engine::{Candidate, Refusal};
 use super::guidance::{
@@ -450,6 +457,41 @@ async fn vlt_lock_root(
     Some((ancestor, vec![VLT_LOCK]))
 }
 
+/// The independent npm-family project below `scan_root` whose
+/// `node_modules` holds the crawled copy at `copy` (#1534): the deepest
+/// directory between `scan_root` (exclusive) and the copy's first
+/// `node_modules` that holds an npm-family lock of its own and is not a
+/// workspace member whose package manager ignores that lock
+/// ([`member_stray_lock`]). `None` when the copy belongs to `scan_root`'s
+/// own install (its `node_modules`, or a workspace member without a lock
+/// of its own). `copy` is matched against `scan_root` as given and
+/// canonicalized.
+///
+/// A hosted or vendored run rewires only `scan_root`'s locks, so such a
+/// copy is reached by passing the nested project as a PATH instead.
+pub async fn nested_npm_project(scan_root: &Path, copy: &Path) -> Option<PathBuf> {
+    let canonical = tokio::fs::canonicalize(scan_root).await.ok();
+    let (base, rel) = std::iter::once(scan_root)
+        .chain(canonical.as_deref())
+        .find_map(|dir| copy.strip_prefix(dir).ok().map(|rel| (dir, rel)))?;
+    let parts: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map_while(|c| match c {
+            std::path::Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    let depth = parts.iter().position(|p| *p == "node_modules")?;
+    for k in (1..=depth).rev() {
+        let mut dir = base.to_path_buf();
+        dir.extend(&parts[..k]);
+        if has_own_npm_family_lock(&dir) && member_stray_lock(&dir).await.is_none() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
 /// The hosted refusal for [`member_stray_lock`].
 async fn member_stray_lock_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
     let stray = member_stray_lock(root).await?;
@@ -494,7 +536,13 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        if !workspaces_include(&patterns, &rel) {
+        // #1097: each package manager reads `workspaces` its own way. The
+        // widest reading goes first, so a root that cannot list the member
+        // costs no lock reads.
+        if !WorkspacesDialect::ALL
+            .iter()
+            .any(|&dialect| workspaces_include_as(&patterns, &rel, dialect))
+        {
             continue;
         }
         let mut locks: Vec<&'static str> = WORKSPACE_ROOT_FAMILIES
@@ -508,6 +556,19 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         if ancestor.join(VLT_LOCK).is_file() && !vlt_json_declares_workspaces(ancestor).await {
             locks.push(VLT_LOCK);
         }
+        // Only the locks whose package manager lists the member govern it;
+        // a root none of them lists the member under is not its root.
+        let found = !locks.is_empty();
+        let mut governing = Vec::new();
+        for lock in locks {
+            if lock_lists_member(ancestor, lock, &patterns, &rel).await {
+                governing.push(lock);
+            }
+        }
+        if found && governing.is_empty() {
+            continue;
+        }
+        let locks = governing;
         if locks.is_empty() {
             // Rush keeps its locks under common/config: the rewriters own
             // a run from the Rush root.
@@ -520,6 +581,145 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         return Some((ancestor.to_path_buf(), locks));
     }
     None
+}
+
+/// Whether the package manager that reads `lock` at `root` lists the
+/// member `rel` under the root's `workspaces` `patterns`. An untagged Bun
+/// lock (see [`lock_dialect`]) is ambiguous: Bun 1.3.0 and 1.3.1 already
+/// honour `!` but write no config version (#1521). Only a directory that
+/// a `!` pattern excludes reads differently, and for it the lock's own
+/// workspace list decides: Bun before 1.3 lists every member it matched,
+/// so a lock that lists the member, or any other `!`-excluded directory,
+/// is older Bun's; 1.3.0/1.3.1 never list an excluded one. A list that
+/// cannot be read keeps the wider pre-1.3 reading.
+async fn lock_lists_member(root: &Path, lock: &str, patterns: &[String], rel: &[String]) -> bool {
+    if lock == VLT_LOCK {
+        return vlt_lists_member(root, &[patterns.to_vec()], rel).await;
+    }
+    let dialect = lock_dialect(root, lock).await;
+    if !workspaces_include_as(patterns, rel, dialect) {
+        return false;
+    }
+    if dialect != WorkspacesDialect::BUN_PRE_1_3
+        || workspaces_include_as(patterns, rel, WorkspacesDialect::BUN)
+    {
+        return true;
+    }
+    let Some(listed) = bun_workspace_dirs(root, lock).await else {
+        return true;
+    };
+    listed.iter().any(|dir| {
+        let dir: Vec<String> = dir.split('/').map(str::to_string).collect();
+        dir == rel
+            || (workspaces_include_as(patterns, &dir, WorkspacesDialect::BUN_PRE_1_3)
+                && !workspaces_include_as(patterns, &dir, WorkspacesDialect::BUN))
+    })
+}
+
+/// The member directories the Bun lock `lock` at `root` lists, relative to
+/// `root` as `/`-separated plain components (a `./` prefix or `\`
+/// separators normalized, the root `""` left out); the text lock when both exist, as
+/// Bun reads it. `None` when the lock is unreadable or not in Bun's shape.
+async fn bun_workspace_dirs(root: &Path, lock: &str) -> Option<Vec<String>> {
+    let listed = if lock == BUN_LOCK || root.join(BUN_LOCK).is_file() {
+        let text = read_regular_to_string(&root.join(BUN_LOCK)).await.ok()?;
+        let lines: Vec<String> = strip_bom(&text).split('\n').map(str::to_string).collect();
+        bun_lock_text::listed_workspace_dirs(&lines)?
+    } else {
+        let bytes = read_regular_to_bytes(&root.join(BUN_LOCKB)).await.ok()?;
+        bun_lockb::BunLockb::parse(&bytes)
+            .and_then(|lock| lock.workspace_paths())
+            .ok()?
+    };
+    Some(
+        listed
+            .iter()
+            .map(|dir| {
+                dir.split(['/', '\\'])
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .filter(|dir| !dir.is_empty())
+            .collect(),
+    )
+}
+
+/// The `package.json` `workspaces` dialect of the package manager that
+/// reads `lock` at `root` (#1097). yarn classic and berry tell apart by
+/// berry's `__metadata` key ([`is_berry_lock`]; an empty or unreadable
+/// `yarn.lock` reads as classic, the wider set), and Bun 1.3+ by the
+/// top-level `configVersion` it writes into `bun.lock`, or the trailing
+/// `cNfGvRsN` extension that carries it in a binary `bun.lockb` (#1492;
+/// a lock without it, as Bun 1.3.1 and earlier write, reads as older Bun,
+/// the wider set, which [`lock_lists_member`] narrows). Only the head of
+/// a text lock is read: both keys come first.
+async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
+    match lock {
+        YARN_LOCK => {
+            if is_berry_lock(&read_head(&root.join(lock)).await) {
+                WorkspacesDialect::YARN_BERRY
+            } else {
+                WorkspacesDialect::YARN_CLASSIC
+            }
+        }
+        BUN_LOCK => {
+            let head = read_head(&root.join(lock)).await;
+            if strip_bom(&head)
+                .lines()
+                .any(|line| line.starts_with("  \"configVersion\""))
+            {
+                WorkspacesDialect::BUN
+            } else {
+                WorkspacesDialect::BUN_PRE_1_3
+            }
+        }
+        // Bun reads the text lock when both exist.
+        BUN_LOCKB if root.join(BUN_LOCK).is_file() => Box::pin(lock_dialect(root, BUN_LOCK)).await,
+        // Bun marks a binary lock with its config version too (#1492).
+        BUN_LOCKB => {
+            if bun_lockb_config_version(&root.join(lock)).await.is_some() {
+                WorkspacesDialect::BUN
+            } else {
+                WorkspacesDialect::BUN_PRE_1_3
+            }
+        }
+        // [`lock_lists_member`] reads a vlt lock through
+        // [`vlt_lists_member`], which also weighs vlt before 1.3.
+        VLT_LOCK => WorkspacesDialect::VLT,
+        _ => WorkspacesDialect::NPM,
+    }
+}
+
+/// The `configVersion` a binary `bun.lockb` carries in its `cNfGvRsN`
+/// extension (#1492), read through the FIFO-safe opener on the blocking
+/// pool. `None` when the lock is unreadable, not a binary lock, or
+/// untagged (written before Bun wrote `configVersion`).
+async fn bun_lockb_config_version(path: &Path) -> Option<u64> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let (mut file, _) = open_regular_file_sync(&path).ok()?;
+        bun_lockb::read_config_version(&mut file)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// How much of a lock [`lock_dialect`] reads: the yarn berry and Bun keys
+/// it looks for sit in the first lines.
+const LOCK_HEAD_BYTES: u64 = 4096;
+
+/// The first [`LOCK_HEAD_BYTES`] of a regular file, lossily decoded; empty
+/// when it cannot be read or is not a regular file (a FIFO fails fast
+/// instead of blocking in open(2), Bugbot on #1480).
+async fn read_head(path: &Path) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::new();
+    if let Ok((file, _)) = open_regular_file(path).await {
+        let _ = file.take(LOCK_HEAD_BYTES).read_to_end(&mut head).await;
+    }
+    String::from_utf8_lossy(&head).into_owned()
 }
 
 /// #942: the project directory is a member of a vlt workspace, whose
@@ -560,7 +760,7 @@ async fn vlt_workspace_root(root: &Path) -> Option<PathBuf> {
         let Ok(text) = read_regular_to_string(&ancestor.join(VLT_JSON)).await else {
             continue;
         };
-        let Some(patterns) = vlt_workspace_patterns(&text) else {
+        let Some(groups) = vlt_workspace_patterns(&text) else {
             continue;
         };
         let Ok(rel) = canonical.strip_prefix(ancestor) else {
@@ -570,15 +770,85 @@ async fn vlt_workspace_root(root: &Path) -> Option<PathBuf> {
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        if !workspaces_include(&patterns, &rel) {
+        if !ancestor.join(VLT_LOCK).is_file() {
+            // Never installed, so no lock tells the vlt versions apart: a
+            // root the current one lists the member under governs it and
+            // refuses nothing; otherwise an outer root may (#1542).
+            if groups
+                .iter()
+                .any(|group| workspaces_include_as(group, &rel, WorkspacesDialect::VLT))
+            {
+                return None;
+            }
             continue;
         }
-        if !ancestor.join(VLT_LOCK).is_file() {
-            return None;
+        if !vlt_lists_member(ancestor, &groups, &rel).await {
+            continue;
         }
         return Some(ancestor.to_path_buf());
     }
     None
+}
+
+/// Whether vlt lists the member `rel` under the `workspaces` `groups` of
+/// the root `root`, which holds `vlt-lock.json` (#1542). vlt globs each
+/// group on its own. vlt 1.3 and older vlt read a `!` pattern differently
+/// ([`WorkspacesDialect::VLT`], [`WorkspacesDialect::VLT_PRE_1_3`]) but
+/// write the same lock, so for a directory only one of them lists, the
+/// lock decides: vlt records an edge from every member it installed that
+/// has a dependency, so a lock with an edge from the member, or from any
+/// other directory only older vlt lists, is older vlt's. A lock that
+/// cannot be read keeps the wider reading.
+async fn vlt_lists_member(root: &Path, groups: &[Vec<String>], rel: &[String]) -> bool {
+    let lists = |dir: &[String], dialect| {
+        groups
+            .iter()
+            .any(|group| workspaces_include_as(group, dir, dialect))
+    };
+    let current = lists(rel, WorkspacesDialect::VLT);
+    let older = lists(rel, WorkspacesDialect::VLT_PRE_1_3);
+    if current == older {
+        return current;
+    }
+    let Some(importers) = vlt_lock_workspace_dirs(root).await else {
+        return true;
+    };
+    let older_lock = importers.iter().any(|dir| {
+        lists(dir, WorkspacesDialect::VLT_PRE_1_3) && !lists(dir, WorkspacesDialect::VLT)
+    });
+    // A directory only vlt 1.3 lists (`!!x`) is a member unless the lock
+    // shows older vlt; one only older vlt lists is a member only then.
+    if current {
+        !older_lock || importers.iter().any(|dir| dir == rel)
+    } else {
+        older_lock
+    }
+}
+
+/// The workspace directories `root`'s `vlt-lock.json` holds edges from, as
+/// `/`-separated components. `None` when the lock cannot be read.
+async fn vlt_lock_workspace_dirs(root: &Path) -> Option<Vec<Vec<String>>> {
+    let text = read_regular_to_string(&root.join(VLT_LOCK)).await.ok()?;
+    let LockSniff::Readable(lock) = vlt_lock_text::sniff_lock(&text) else {
+        return None;
+    };
+    let Some(edges) = lock.edges() else {
+        return Some(Vec::new());
+    };
+    Some(
+        edges
+            .keys()
+            .filter_map(|key| vlt_lock_text::split_dep_id(key.split_once(' ')?.0))
+            .filter(|id| id.kind == DepIdKind::Workspace)
+            .map(|id| {
+                id.first
+                    .split(['/', '\\'])
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 /// Whether `<dir>/vlt.json` has a `workspaces` field. vlt keys its
@@ -608,10 +878,10 @@ fn nearer_root(
     }
 }
 
-/// The `workspaces` patterns of a `vlt.json`: a string, an array, or an
-/// object of named groups whose values are a string or an array. `None`
-/// when the field is absent or the file does not parse.
-fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<String>> {
+/// The `workspaces` pattern groups of a `vlt.json`: a string or an array
+/// (one group), or an object of named groups whose values are a string or
+/// an array. `None` when the field is absent or the file does not parse.
+fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<Vec<String>>> {
     fn strings(value: &serde_json::Value, out: &mut Vec<String>) {
         match value {
             serde_json::Value::String(s) => out.push(s.clone()),
@@ -624,12 +894,15 @@ fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<String>> {
     let text = strip_bom(vlt_json);
     let doc: serde_json::Value = serde_json::from_str(text).ok()?;
     let field = doc.get("workspaces")?;
-    let mut out = Vec::new();
-    match field {
-        serde_json::Value::Object(groups) => groups.values().for_each(|v| strings(v, &mut out)),
-        other => strings(other, &mut out),
-    }
-    Some(out)
+    let group = |value| {
+        let mut out = Vec::new();
+        strings(value, &mut out);
+        out
+    };
+    Some(match field {
+        serde_json::Value::Object(groups) => groups.values().map(group).collect(),
+        other => vec![group(other)],
+    })
 }
 
 /// The `workspaces` patterns of a `package.json`: the array form (npm,
@@ -724,6 +997,66 @@ mod tests {
         refusal(&ProjectView::Disk(dir), &[candidate(ecosystem)], true)
             .await
             .map(|r| r.code)
+    }
+
+    /// #1534: a crawled copy belongs to the deepest directory below the
+    /// scan root that is an independent npm-family lock root; the root's
+    /// own `node_modules`, a lockless workspace member and a member whose
+    /// lock npm ignores all stay the root's.
+    #[tokio::test]
+    async fn nested_npm_project_finds_the_independent_lock_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "package.json",
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        );
+        write(root, "package-lock.json", "{}");
+        // An independent project, with a lockless sub-package of its own.
+        write(root, "tools/x/package.json", r#"{"name":"x"}"#);
+        write(root, "tools/x/package-lock.json", "{}");
+        write(root, "tools/x/sub/package.json", r#"{"name":"sub"}"#);
+        // A yarn project is independent too.
+        write(root, "examples/y/yarn.lock", "");
+        // Workspace members: one lockless, one with a stray npm lock.
+        write(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        write(root, "packages/b/package.json", r#"{"name":"b"}"#);
+        write(root, "packages/b/package-lock.json", "{}");
+
+        let owner = |rel: &str| {
+            let copy = root.join(rel);
+            async move { nested_npm_project(root, &copy).await }
+        };
+        assert_eq!(owner("node_modules/left-pad").await, None);
+        assert_eq!(
+            owner("node_modules/a/node_modules/left-pad").await,
+            None,
+            "inside a node_modules is a package, not a project"
+        );
+        assert_eq!(
+            owner("tools/x/node_modules/left-pad").await,
+            Some(root.join("tools/x"))
+        );
+        assert_eq!(
+            owner("tools/x/node_modules/.pnpm/left-pad@1.3.0/node_modules/left-pad").await,
+            Some(root.join("tools/x"))
+        );
+        assert_eq!(
+            owner("tools/x/sub/node_modules/left-pad").await,
+            Some(root.join("tools/x")),
+            "a lockless directory belongs to the nearest lock root"
+        );
+        assert_eq!(
+            owner("examples/y/node_modules/left-pad").await,
+            Some(root.join("examples/y"))
+        );
+        assert_eq!(owner("packages/a/node_modules/left-pad").await, None);
+        assert_eq!(owner("packages/b/node_modules/left-pad").await, None);
+        assert_eq!(
+            nested_npm_project(root, Path::new("/elsewhere/node_modules/x")).await,
+            None
+        );
     }
 
     /// #590: a pnpm workspace member has no lock; the root's lock governs it.
@@ -1075,7 +1408,9 @@ mod tests {
         let member = tmp.path().join("packages/a");
         // Lockless root.
         assert_eq!(code(&member, "npm").await, None);
-        write(tmp.path(), "yarn.lock", "");
+        // A yarn berry lock: berry drops `!`-negated directories (yarn
+        // classic does not, #1097).
+        write(tmp.path(), "yarn.lock", "__metadata:\n  version: 8\n");
         assert_eq!(
             code(&member, "npm").await.as_deref(),
             Some(WORKSPACE_LOCKFILE_ELSEWHERE)
@@ -1099,6 +1434,397 @@ mod tests {
         write(tmp.path(), "package-lock.json", "{}");
         write(tmp.path(), "sub/package.json", "{}");
         assert_eq!(code(&tmp.path().join("sub"), "npm").await, None);
+    }
+
+    /// #1097: the root's lock decides how its `workspaces` read. yarn
+    /// classic, and Bun before 1.3 (a `bun.lock` without `configVersion`,
+    /// or a binary `bun.lockb`), ignore `!` patterns; npm, yarn berry and
+    /// Bun 1.3+ honour them. npm and yarn match extglobs; Bun refuses to
+    /// install with one, so its lock never lists such a member.
+    #[tokio::test]
+    async fn package_json_workspaces_read_in_the_root_locks_dialect() {
+        const CLASSIC: &str = "# yarn lockfile v1\n\n";
+        const BERRY: &str = "__metadata:\n  version: 8\n";
+        const BUN_13: &str = "{\n  \"lockfileVersion\": 1,\n  \"configVersion\": 0,\n}\n";
+        const BUN_12: &str = "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {},\n}\n";
+        let negated = r#"["packages/*","!packages/b"]"#;
+        let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
+        for (workspaces, locks, expected) in [
+            (negated, &[("yarn.lock", CLASSIC)][..], refused),
+            // An empty yarn.lock (never installed) reads as classic: the
+            // wider member set fails closed.
+            (negated, &[("yarn.lock", "")][..], refused),
+            (negated, &[("yarn.lock", BERRY)][..], None),
+            (negated, &[("package-lock.json", "{}")][..], None),
+            (negated, &[("npm-shrinkwrap.json", "{}")][..], None),
+            (negated, &[("bun.lock", BUN_12)][..], refused),
+            (negated, &[("bun.lock", BUN_13)][..], None),
+            (negated, &[("bun.lockb", "\0")][..], refused),
+            // Bun reads the text lock when both exist.
+            (
+                negated,
+                &[("bun.lock", BUN_13), ("bun.lockb", "\0")][..],
+                None,
+            ),
+            // Any lock whose manager installs the member refuses.
+            (
+                negated,
+                &[("package-lock.json", "{}"), ("yarn.lock", CLASSIC)][..],
+                refused,
+            ),
+            (
+                r#"["packages/@(a|b)"]"#,
+                &[("package-lock.json", "{}")][..],
+                refused,
+            ),
+            (
+                r#"["packages/+(b|c)"]"#,
+                &[("yarn.lock", CLASSIC)][..],
+                refused,
+            ),
+            (r#"["packages/!(z)"]"#, &[("yarn.lock", BERRY)][..], refused),
+            (
+                r#"["packages/!(b)"]"#,
+                &[("package-lock.json", "{}")][..],
+                None,
+            ),
+            (r#"["packages/@(a|b)"]"#, &[("bun.lock", BUN_13)][..], None),
+            // #1490: yarn berry's picomatch also reads regex groups, POSIX
+            // classes and `..` segments.
+            (
+                r#"["packages/(a|b)"]"#,
+                &[("yarn.lock", BERRY)][..],
+                refused,
+            ),
+            (
+                r#"["packages/[[:alpha:]]"]"#,
+                &[("yarn.lock", BERRY)][..],
+                refused,
+            ),
+            (
+                r#"["packages/a/../b"]"#,
+                &[("yarn.lock", BERRY)][..],
+                refused,
+            ),
+            (
+                r#"["packages/*","!packages/(b|c)"]"#,
+                &[("yarn.lock", BERRY)][..],
+                None,
+            ),
+            (r#"["packages/(b)"]"#, &[("yarn.lock", BERRY)][..], None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                &format!(r#"{{"private":true,"workspaces":{workspaces}}}"#),
+            );
+            for (name, text) in locks {
+                write(tmp.path(), name, text);
+            }
+            write(tmp.path(), "packages/b/package.json", "{}");
+            assert_eq!(
+                code(&tmp.path().join("packages/b"), "npm").await.as_deref(),
+                expected,
+                "{workspaces} with {locks:?}"
+            );
+        }
+    }
+
+    /// #1097 (review on #1480): only the locks whose package manager lists
+    /// the member govern it. The refusal names those alone, and a member's
+    /// own lock is stray only when its own manager lists the member.
+    #[tokio::test]
+    async fn only_the_locks_whose_manager_lists_the_member_govern_it() {
+        const CLASSIC: &str = "# yarn lockfile v1\n";
+        const BUN_13: &str = "{\n  \"lockfileVersion\": 1,\n  \"configVersion\": 1,\n}\n";
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
+        );
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "yarn.lock", CLASSIC);
+        write(tmp.path(), "packages/b/package.json", "{}");
+        let member = tmp.path().join("packages/b");
+        let refusal = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("yarn classic installs packages/b from the root");
+        assert_eq!(refusal.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        assert!(refusal.message.contains("yarn.lock"), "{}", refusal.message);
+        assert!(
+            !refusal.message.contains("package-lock.json"),
+            "npm excludes packages/b: {}",
+            refusal.message
+        );
+
+        // npm excludes packages/b, so its own npm lock is the one npm
+        // reads, not a stray.
+        write(tmp.path(), "packages/b/package-lock.json", "{}");
+        assert_eq!(member_stray_lock(&member).await, None);
+        // Likewise Bun 1.3 and vlt (no `vlt.json` workspaces).
+        std::fs::remove_file(member.join("package-lock.json")).unwrap();
+        std::fs::remove_file(tmp.path().join("package-lock.json")).unwrap();
+        write(tmp.path(), "bun.lock", BUN_13);
+        write(tmp.path(), "packages/b/bun.lock", BUN_13);
+        assert_eq!(member_stray_lock(&member).await, None);
+        std::fs::remove_file(member.join("bun.lock")).unwrap();
+        std::fs::remove_file(tmp.path().join("bun.lock")).unwrap();
+        write(tmp.path(), "vlt-lock.json", "{}");
+        write(tmp.path(), "packages/b/vlt-lock.json", "{}");
+        assert_eq!(member_stray_lock(&member).await, None);
+        // Under a classic yarn.lock alone the member is listed, and its own
+        // npm lock is not npm's to ignore.
+        std::fs::remove_file(tmp.path().join("vlt-lock.json")).unwrap();
+        std::fs::remove_file(member.join("vlt-lock.json")).unwrap();
+        write(tmp.path(), "package-lock.json", "{}");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(tmp.path(), "packages/a/package-lock.json", "{}");
+        assert!(member_stray_lock(&tmp.path().join("packages/a"))
+            .await
+            .is_some());
+    }
+
+    /// Bugbot on #1480: the lock head is read through the FIFO-safe
+    /// opener, so a FIFO reads as empty instead of hanging the run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_head_read_does_not_block_on_a_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("yarn.lock");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let head = tokio::time::timeout(std::time::Duration::from_secs(10), read_head(&fifo))
+            .await
+            .expect("read_head must not block on a FIFO");
+        assert_eq!(head, "");
+        write(tmp.path(), "bun.lock", "{\n  \"configVersion\": 1,\n}\n");
+        assert!(read_head(&tmp.path().join("bun.lock"))
+            .await
+            .contains("configVersion"));
+    }
+
+    /// #1097 (review on #1480): only a top-level `configVersion` marks Bun
+    /// 1.3+; the same key deeper in a pre-1.3 lock does not.
+    #[tokio::test]
+    async fn bun_config_version_is_read_at_the_top_level_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
+        );
+        write(
+            tmp.path(),
+            "bun.lock",
+            "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"configVersion\": \"1\",\n    },\n    \"packages/b\": {\n      \"name\": \"b\",\n    },\n  },\n}\n",
+        );
+        write(tmp.path(), "packages/b/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("packages/b"), "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
+    }
+
+    /// #1521: Bun 1.3.0 and 1.3.1 honour `!` but tag neither lock with a
+    /// config version, so an untagged lock is either theirs or older
+    /// Bun's. The lock's own workspace list tells them apart: Bun 1.2
+    /// lists the `!`-excluded member, 1.3.0/1.3.1 leave it out, and then
+    /// the member's own lock is the one Bun reads. These are the locks
+    /// each release writes for the same `["packages/*","!packages/b"]`
+    /// root (`tests/fixtures/bun-lockb/negated-workspace`).
+    #[tokio::test]
+    async fn untagged_bun_lock_reads_its_workspace_list() {
+        const TEXT_1_2_23: &str = "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"root\",\n    },\n    \"packages/a\": {\n      \"name\": \"a\",\n      \"version\": \"1.0.0\",\n    },\n    \"packages/b\": {\n      \"name\": \"b\",\n      \"version\": \"1.0.0\",\n    },\n  },\n  \"packages\": {\n    \"a\": [\"a@workspace:packages/a\"],\n\n    \"b\": [\"b@workspace:packages/b\"],\n  }\n}\n";
+        // Bun 1.3.1 writes the same bytes.
+        const TEXT_1_3_0: &str = "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"root\",\n    },\n    \"packages/a\": {\n      \"name\": \"a\",\n      \"version\": \"1.0.0\",\n    },\n  },\n  \"packages\": {\n    \"a\": [\"a@workspace:packages/a\"],\n  }\n}\n";
+        const BINARY_1_2_23: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/negated-workspace/1.2.23.lockb");
+        const BINARY_1_3_0: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/negated-workspace/1.3.0.lockb");
+        const BINARY_1_3_1: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/negated-workspace/1.3.1.lockb");
+        let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
+        for (name, lock, expected) in [
+            ("bun.lock", TEXT_1_2_23.as_bytes(), refused),
+            ("bun.lock", TEXT_1_3_0.as_bytes(), None),
+            ("bun.lockb", BINARY_1_2_23, refused),
+            ("bun.lockb", BINARY_1_3_0, None),
+            ("bun.lockb", BINARY_1_3_1, None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
+            );
+            std::fs::write(tmp.path().join(name), lock).unwrap();
+            // The verdict comes from the list each lock holds, not from a
+            // lock that failed to read.
+            let listed = bun_workspace_dirs(tmp.path(), name).await;
+            assert_eq!(
+                listed.map(|dirs| dirs.contains(&"packages/b".to_string())),
+                Some(expected.is_some()),
+                "{name} of {} bytes",
+                lock.len()
+            );
+            write(tmp.path(), "packages/a/package.json", "{}");
+            write(tmp.path(), "packages/b/package.json", "{}");
+            let member = tmp.path().join("packages/b");
+            assert_eq!(
+                code(&member, "npm").await.as_deref(),
+                expected,
+                "{name} of {} bytes",
+                lock.len()
+            );
+            // The member's own lock is a stray only when the root's Bun
+            // lists the member.
+            std::fs::write(member.join(name), lock).unwrap();
+            assert_eq!(
+                member_stray_lock(&member).await.is_some(),
+                expected.is_some(),
+                "{name} of {} bytes",
+                lock.len()
+            );
+            // A member no `!` pattern excludes is governed either way.
+            assert_eq!(
+                code(&tmp.path().join("packages/a"), "npm").await.as_deref(),
+                refused,
+                "{name} of {} bytes",
+                lock.len()
+            );
+        }
+    }
+
+    /// #1521 (review): the version is read once per lock. An untagged lock
+    /// that lists one `!`-excluded directory is older Bun's, so another
+    /// excluded directory added since its last install is a member too;
+    /// and a member key spelled `./packages/b` is the same directory.
+    #[tokio::test]
+    async fn untagged_bun_lock_listing_any_excluded_dir_is_pre_1_3() {
+        let lock = |members: &[&str]| {
+            let mut text = String::from(
+                "{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"root\",\n    },\n",
+            );
+            for member in members {
+                text.push_str(&format!(
+                    "    \"{member}\": {{\n      \"name\": \"m\",\n    }},\n"
+                ));
+            }
+            text.push_str("  },\n  \"packages\": {\n  }\n}\n");
+            text
+        };
+        let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
+        for (members, member, expected) in [
+            (&["packages/a", "packages/b"][..], "packages/c", refused),
+            (&["packages/a", "./packages/b"][..], "packages/b", refused),
+            (&["packages/a", "./packages/b"][..], "packages/c", refused),
+            (&["packages/a"][..], "packages/c", None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/*","!packages/b","!packages/c"]}"#,
+            );
+            write(tmp.path(), "bun.lock", &lock(members));
+            for dir in ["a", "b", "c"] {
+                write(tmp.path(), &format!("packages/{dir}/package.json"), "{}");
+            }
+            assert_eq!(
+                code(&tmp.path().join(member), "npm").await.as_deref(),
+                expected,
+                "{member} under a lock listing {members:?}"
+            );
+        }
+    }
+
+    /// #1492: Bun 1.2+ still writes a binary `bun.lockb` under
+    /// `saveTextLockfile = false`, and Bun 1.3.x+ marks it with a
+    /// `cNfGvRsN` config-version tag (the twin of the text lock's
+    /// `configVersion`). A tagged lone `bun.lockb` honours `!`, so the
+    /// excluded member's own lock is the one Bun reads; an untagged one
+    /// (Bun 1.2.23 here) or one that is not a binary lock keeps the wider
+    /// pre-1.3 reading.
+    #[tokio::test]
+    async fn bun_lockb_with_a_config_version_tag_honours_negated_workspaces() {
+        const BUN_1_3_14: &[u8] = include_bytes!("../../tests/fixtures/bun-lockb/1.3.14/bun.lockb");
+        // The lock Bun 1.2.23 writes for this root: it lists `packages/b`.
+        const BUN_1_2_23: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/negated-workspace/1.2.23.lockb");
+        // A workspace root's lock: the tag follows its workspace and
+        // catalog extensions.
+        const BUN_1_4_2_WORKSPACE: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/1.4.2-extensions/bun.lockb");
+        // Scoped overrides: Bun writes their extension after the tag.
+        const BUN_1_4_2_SCOPED: &[u8] =
+            include_bytes!("../../tests/fixtures/bun-lockb/1.4.2-scoped-overrides/bun.lockb");
+        let refused = Some(WORKSPACE_LOCKFILE_ELSEWHERE);
+        for (lock, expected) in [
+            (BUN_1_3_14, None),
+            (BUN_1_4_2_WORKSPACE, None),
+            (BUN_1_4_2_SCOPED, None),
+            (BUN_1_2_23, refused),
+            (&b"\0"[..], refused),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/*","!packages/b"]}"#,
+            );
+            std::fs::write(tmp.path().join("bun.lockb"), lock).unwrap();
+            write(tmp.path(), "packages/b/package.json", "{}");
+            let member = tmp.path().join("packages/b");
+            assert_eq!(
+                code(&member, "npm").await.as_deref(),
+                expected,
+                "bun.lockb of {} bytes",
+                lock.len()
+            );
+            // The member's own binary lock is a stray only when the
+            // root's Bun lists the member.
+            std::fs::write(member.join("bun.lockb"), lock).unwrap();
+            assert_eq!(
+                member_stray_lock(&member).await.is_some(),
+                expected.is_some(),
+                "bun.lockb of {} bytes",
+                lock.len()
+            );
+        }
+    }
+
+    /// #1097: a lockless intermediate root reads its `workspaces` in the
+    /// widest dialect, so a member it lists only through an extglob, or
+    /// excludes only with `!`, still reaches the outer root's lock.
+    #[tokio::test]
+    async fn lockless_intermediate_root_reads_the_widest_dialect() {
+        for inner in [r#"["@(a|b)"]"#, r#"["*","!b"]"#] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{"private":true,"workspaces":["packages/*"]}"#,
+            );
+            write(tmp.path(), "yarn.lock", "# yarn lockfile v1\n");
+            write(
+                tmp.path(),
+                "packages/inner/package.json",
+                &format!(r#"{{"private":true,"workspaces":{inner}}}"#),
+            );
+            write(tmp.path(), "packages/inner/b/package.json", "{}");
+            assert_eq!(
+                code(&tmp.path().join("packages/inner/b"), "npm")
+                    .await
+                    .as_deref(),
+                Some(WORKSPACE_LOCKFILE_ELSEWHERE),
+                "{inner}"
+            );
+        }
     }
 
     /// #1094: npm installs every workspace member from the root's lock and
@@ -1365,7 +2091,10 @@ mod tests {
         let json = r#"{"workspaces":["a/*"]}"#;
         for bom in ["", "\u{feff}"] {
             let text = format!("{bom}{json}");
-            assert_eq!(vlt_workspace_patterns(&text), Some(vec!["a/*".to_string()]));
+            assert_eq!(
+                vlt_workspace_patterns(&text),
+                Some(vec![vec!["a/*".to_string()]])
+            );
             assert_eq!(workspace_patterns(&text), Some(vec!["a/*".to_string()]));
         }
         let text = format!("\u{feff}\u{feff}{json}");
@@ -1379,18 +2108,17 @@ mod tests {
     fn vlt_workspace_patterns_read_every_shape() {
         assert_eq!(
             vlt_workspace_patterns(r#"{"workspaces":"packages/*"}"#),
-            Some(vec!["packages/*".to_string()])
+            Some(vec![vec!["packages/*".to_string()]])
         );
         assert_eq!(
             vlt_workspace_patterns("\u{feff}{\"workspaces\":[\"a/*\",\"b\"]}"),
-            Some(vec!["a/*".to_string(), "b".to_string()])
+            Some(vec![vec!["a/*".to_string(), "b".to_string()]])
         );
         assert_eq!(
             vlt_workspace_patterns(r#"{"workspaces":{"apps":"apps/*","libs":["libs/*","x"]}}"#),
             Some(vec![
-                "apps/*".to_string(),
-                "libs/*".to_string(),
-                "x".to_string()
+                vec!["apps/*".to_string()],
+                vec!["libs/*".to_string(), "x".to_string()]
             ])
         );
         assert_eq!(vlt_workspace_patterns(r#"{"registries":{}}"#), None);
@@ -1494,6 +2222,181 @@ mod tests {
             std::fs::remove_file(tmp.path().join(VLT_LOCK)).unwrap();
             assert_eq!(code(&member, "npm").await, None, "{case}");
         }
+    }
+
+    /// #1542: vlt expands extglobs in `workspaces` (vlt 1.2.0 and 1.3.8
+    /// install `packages/a` as a member of `packages/+(a|b)` and
+    /// `packages/@(a|b)`), so a member listed through one is refused, with
+    /// or without a stray lock of its own, whether the patterns sit in
+    /// `vlt.json` or in the `package.json` fallback.
+    #[tokio::test]
+    async fn vlt_extglob_member_is_refused() {
+        for pattern in ["packages/+(a|b)", "packages/@(a|b)"] {
+            for package_json_fallback in [false, true] {
+                for stray in [false, true] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let list = serde_json::json!([pattern]).to_string();
+                    if package_json_fallback {
+                        write(
+                            tmp.path(),
+                            "package.json",
+                            &format!(r#"{{"private":true,"workspaces":{list}}}"#),
+                        );
+                        write(tmp.path(), "vlt.json", r#"{"registries":{}}"#);
+                    } else {
+                        write(tmp.path(), "package.json", r#"{"private":true}"#);
+                        write(
+                            tmp.path(),
+                            "vlt.json",
+                            &format!(r#"{{"workspaces":{list}}}"#),
+                        );
+                    }
+                    write(tmp.path(), VLT_LOCK, "{}");
+                    write(tmp.path(), "packages/a/package.json", "{}");
+                    write(tmp.path(), "packages/c/package.json", "{}");
+                    if stray {
+                        write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+                        write(tmp.path(), "packages/c/vlt-lock.json", "{}");
+                    }
+                    let case = format!(
+                        "{pattern}, package.json fallback: {package_json_fallback}, stray: {stray}"
+                    );
+                    let member = tmp.path().join("packages/a");
+                    assert_eq!(
+                        code(&member, "npm").await.as_deref(),
+                        Some(WORKSPACE_LOCKFILE_ELSEWHERE),
+                        "{case}"
+                    );
+                    assert_eq!(member_stray_lock(&member).await.is_some(), stray, "{case}");
+                    // `packages/c` is not listed: its own lock governs it.
+                    let other = tmp.path().join("packages/c");
+                    assert_eq!(code(&other, "npm").await, None, "{case}");
+                    assert!(member_stray_lock(&other).await.is_none(), "{case}");
+                }
+            }
+        }
+    }
+
+    /// #1542: vlt 1.3 drops a `!`-excluded directory wherever the `!`
+    /// pattern sits, while vlt before 1.3 ignores `!` patterns and lists
+    /// it. Both write the same lock, so the root's `vlt-lock.json` decides:
+    /// vlt records an edge from every member it installed that has a
+    /// dependency, so a lock with edges from the excluded member, or from
+    /// any other directory only older vlt lists, is older vlt's and the
+    /// member is refused. A lock that cannot be read keeps the wider
+    /// reading.
+    #[tokio::test]
+    async fn vlt_negated_member_reads_the_root_lock() {
+        let lock = |from: &[&str]| {
+            let edges: Vec<String> = from
+                .iter()
+                .map(|id| format!(r#""{id} left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#))
+                .collect();
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{}},\n  \"edges\": {{\n    {}\n  }}\n}}\n",
+                edges.join(",\n    ")
+            )
+        };
+        for (workspaces, root_lock, refused) in [
+            // vlt 1.3: `packages/a` is excluded wherever the `!` sits.
+            (r#"["!packages/a","packages/*"]"#, lock(&[]), false),
+            (r#"["packages/*","!packages/a"]"#, lock(&[]), false),
+            (
+                r#"["packages/*","!packages/a"]"#,
+                lock(&["workspace~packages+b"]),
+                false,
+            ),
+            // A later pattern whose text the `!` matches lists it again.
+            (
+                r#"["packages/*","!packages/a","packages/a"]"#,
+                lock(&[]),
+                true,
+            ),
+            (r#"["!packages/*","packages/a"]"#, lock(&[]), true),
+            // vlt 1.2 installed the excluded member (or another one).
+            (
+                r#"["!packages/a","packages/*"]"#,
+                lock(&["workspace~packages+a"]),
+                true,
+            ),
+            (
+                r#"["packages/*","!packages/a","!packages/z"]"#,
+                lock(&["workspace~packages+z"]),
+                true,
+            ),
+            // An unreadable lock keeps the wider reading.
+            (
+                r#"["!packages/a","packages/*"]"#,
+                "not json".to_string(),
+                true,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), "package.json", r#"{"private":true}"#);
+            write(
+                tmp.path(),
+                "vlt.json",
+                &format!(r#"{{"workspaces":{workspaces}}}"#),
+            );
+            write(tmp.path(), VLT_LOCK, &root_lock);
+            write(tmp.path(), "packages/a/package.json", "{}");
+            write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+            let member = tmp.path().join("packages/a");
+            let case = format!("{workspaces} with {root_lock:?}");
+            assert_eq!(code(&member, "npm").await.is_some(), refused, "{case}");
+            assert_eq!(
+                member_stray_lock(&member).await.is_some(),
+                refused,
+                "{case}"
+            );
+        }
+    }
+
+    /// #1542: a nearer, never-installed `vlt.json` that excludes the member
+    /// with a `!` pattern is not its root, so an outer root that lists it
+    /// still refuses it.
+    #[tokio::test]
+    async fn vlt_excluded_by_an_uninstalled_inner_root_walks_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            "vlt.json",
+            r#"{"workspaces":["inner/packages/*"]}"#,
+        );
+        write(tmp.path(), VLT_LOCK, "{}");
+        write(tmp.path(), "inner/package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            "inner/vlt.json",
+            r#"{"workspaces":["packages/*","!packages/a"]}"#,
+        );
+        write(tmp.path(), "inner/packages/a/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("inner/packages/a"), "npm")
+                .await
+                .as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
+    }
+
+    /// #1542: vlt globs each named `workspaces` group on its own, so a `!`
+    /// pattern in one group does not exclude what another group lists.
+    #[tokio::test]
+    async fn vlt_negation_stays_in_its_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            "vlt.json",
+            r#"{"workspaces":{"libs":["!packages/a"],"apps":["packages/*"]}}"#,
+        );
+        write(tmp.path(), VLT_LOCK, "{}");
+        write(tmp.path(), "packages/a/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("packages/a"), "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
     }
 
     /// #1101: Bun installs every `package.json` workspace member from the

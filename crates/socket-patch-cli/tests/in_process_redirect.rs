@@ -8,6 +8,8 @@
 //! This is the CLI counterpart of the depscan-side install-verify e2e; the
 //! rewriter bytes themselves are pinned by the shared golden fixtures.
 
+#[path = "common/hermetic.rs"]
+mod hermetic;
 #[path = "common/rollback_json.rs"]
 mod rollback_json;
 
@@ -1613,6 +1615,87 @@ async fn scan_redirect_npm_bundled_copy_is_not_attested_in_run() {
     }
 }
 
+/// REGRESSION (#1481): npm's half of #935. A workspace member depends on a
+/// `file:` copy of the patched `name@version` (a packed tarball, or a
+/// source directory npm links), beside the registry entry the run pins.
+/// npm installs that copy from its spec, so it stays unpatched: the run
+/// keeps pinning the registry copy (the warnings are pinned by the core
+/// rewriter tests), and its in-run `--vex` must not attest the purl.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_npm_file_copy_is_not_attested_in_run() {
+    let registry = format!(
+        r#""node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "resolved": "https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}"#
+    );
+    // npm 10's lock for `"{NAME}": "file:../../vendor/{NAME}-{VERSION}.tgz"`.
+    let tarball = format!(
+        r#""packages/b": {{ "version": "1.0.0", "dependencies": {{ "{NAME}": "file:../../vendor/{NAME}-{VERSION}.tgz" }} }},
+    "packages/b/node_modules/{NAME}": {{
+      "version": "{VERSION}",
+      "resolved": "file:vendor/{NAME}-{VERSION}.tgz",
+      "integrity": "sha512-UPSTREAMupstream=="
+    }}"#
+    );
+    // npm 10's lock for `"{NAME}": "file:../../lpdir"`: a link entry and
+    // the directory's own entry, which alone carries the version.
+    let directory = format!(
+        r#""lpdir": {{ "name": "{NAME}", "version": "{VERSION}" }},
+    "packages/b": {{ "version": "1.0.0", "dependencies": {{ "{NAME}": "file:../../lpdir" }} }},
+    "packages/b/node_modules/{NAME}": {{ "resolved": "lpdir", "link": true }}"#
+    );
+    for (shape, copy) in [("tarball", tarball), ("directory", directory)] {
+        let lock = format!(
+            r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "workspaces": ["packages/*"], "dependencies": {{ "{NAME}": "{VERSION}" }} }},
+    "node_modules/b": {{ "resolved": "packages/b", "link": true }},
+    {registry},
+    {copy}
+  }}
+}}
+"#
+        );
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        mock_reference(&server).await;
+        mock_view(&server).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        std::fs::write(tmp.path().join("package-lock.json"), &lock).unwrap();
+
+        let out = tmp.path().join("out.vex.json");
+        let mut args = redirect_args(tmp.path(), server.uri());
+        args.vex.vex = Some(out.clone());
+        args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+        let _ = run(args).await;
+
+        let rewritten = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+        assert!(
+            rewritten.contains(HOSTED_URL),
+            "{shape}: the registry entry is redirected:\n{rewritten}"
+        );
+        // No document is written when no statement survives, so a missing
+        // file is the expected "attests nothing" outcome here.
+        let attested = std::fs::read_to_string(&out)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|doc| doc.to_string().contains(PURL));
+        assert!(
+            !attested,
+            "{shape}: in-run VEX must not attest a purl whose file: copy stays unpatched"
+        );
+    }
+}
+
 /// npm 7+ installs from the v2 `packages` map. An ignored legacy bundled
 /// flag must not block the hosted in-run attestation before that install.
 #[tokio::test]
@@ -2273,52 +2356,18 @@ async fn native_binary_no_matching_version_preserves_exact_bytes() {
         .exists());
 }
 
-/// A `socket-patch` Command with the ambient `SOCKET_*` env surface scrubbed,
-/// for the subprocess tests below: the binary binds a wide clap env surface
-/// (SOCKET_DRY_RUN, SOCKET_OFFLINE, SOCKET_ECOSYSTEMS, SOCKET_PROXY_URL, ...),
-/// and an ambient value silently changes what these tests exercise — ambient
-/// `SOCKET_DRY_RUN=true` turns the rewrite into a no-op and every on-disk
-/// oracle red. Seed-then-scrub (the `common/mod.rs` pattern): the hostile
-/// seeds never reach the child because `env_remove` clears them too, but if a
-/// scrub line is ever dropped the seed turns the suite red immediately.
-/// Telemetry opt-outs are deliberately kept so an opted-out dev stays opted
-/// out. The in-process tests above don't need this — their literal `ScanArgs`
-/// bypass clap's env bindings entirely.
+/// A `socket-patch` Command in the hermetic environment
+/// (`tests/common/hermetic.rs`), for the subprocess tests below. The
+/// in-process tests above don't need it: their literal `ScanArgs` bypass
+/// clap's env bindings entirely.
 fn scrubbed_cli() -> std::process::Command {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
-    cmd.env("SOCKET_DRY_RUN", "true")
-        .env("SOCKET_OFFLINE", "true")
-        .env("SOCKET_ECOSYSTEMS", "cargo")
-        .env("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json")
-        .env_remove("SOCKET_DRY_RUN")
-        .env_remove("SOCKET_OFFLINE")
-        .env_remove("SOCKET_ECOSYSTEMS")
-        .env_remove("SOCKET_MANIFEST_PATH");
+    let mut cmd = hermetic::binary_command();
     // A registry exported by npm (`npm_config_registry`) or Bun would
     // steer the Bun restores off the fixtures' registry.
     for key in [
         "BUN_CONFIG_REGISTRY",
         "NPM_CONFIG_REGISTRY",
         "npm_config_registry",
-    ] {
-        cmd.env_remove(key);
-    }
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("SOCKET_") && !name.contains("TELEMETRY") && name != "SOCKET_NO_CONFIG"
-        {
-            cmd.env_remove(&key);
-        }
-    }
-    // In-process tests in this binary `std::env::set_var` these via
-    // `apply_env_toggles`; one set by a parallel test between the scan
-    // above and the spawn would be inherited, so remove them
-    // unconditionally (see in_process_vendor.rs `run_cli`).
-    for key in [
-        "SOCKET_OFFLINE",
-        "SOCKET_DEBUG",
-        "SOCKET_API_URL",
-        "SOCKET_PROXY_URL",
     ] {
         cmd.env_remove(key);
     }
@@ -5580,6 +5629,86 @@ async fn yarn_berry_rollback_reads_the_tarball_from_the_project_registry() {
     );
 }
 
+/// #1465: a metadata mirror that passes the default registry's documents
+/// through unchanged hands out tarball URLs conventional under the default
+/// registry (npmjs normally, `SOCKET_NPM_REGISTRY` here), not under itself.
+/// Yarn compares only against the package's own registry, so it binds them
+/// with `::__archiveUrl=`; rollback and remove must keep that binding, or
+/// yarn fetches the conventional path under the mirror, which 404s.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_unwind_keeps_a_default_registry_url_behind_a_mirror() {
+    for command in ["rollback", "remove"] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+        mock_reference_with_berry_url(&server, &hosted_url).await;
+        mock_view(&server).await;
+        let integrity = vlt_hosted_common::sha512_sri(&upstream_tarball());
+        let advertised = format!(
+            "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+            server.uri()
+        );
+        mock_npm_registry_advertising(&server, &integrity, &advertised).await;
+        // The project's mirror passes the default registry's document
+        // through, tarball URL and all.
+        let mirror = format!("{}/mirror", server.uri());
+        Mock::given(method("GET"))
+            .and(path(format!("/mirror/{NAME}/{VERSION}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": NAME,
+                "version": VERSION,
+                "dist": { "tarball": advertised, "integrity": integrity },
+            })))
+            .mount(&server)
+            .await;
+        let binding = |t: &str| {
+            t.replace(
+                &format!("resolution: \"{NAME}@npm:{VERSION}\""),
+                &format!(
+                    "resolution: \"{NAME}@npm:{VERSION}::__archiveUrl={}\"",
+                    socket_patch_core::utils::uri::encode_uri_component(&advertised)
+                ),
+            )
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_berry_project_spelled(tmp.path(), binding);
+        std::fs::write(
+            tmp.path().join(".yarnrc.yml"),
+            format!("nodeLinker: node-modules\nnpmRegistryServer: \"{mirror}\"\n"),
+        )
+        .unwrap();
+        let lock_path = tmp.path().join("yarn.lock");
+        let pristine = std::fs::read_to_string(&lock_path).unwrap();
+
+        let env = run_redirect_subprocess_with(
+            tmp.path(),
+            &server.uri(),
+            &["--patch-server-url", &server.uri()],
+        );
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
+
+        let args: &[&str] = if command == "rollback" {
+            &["rollback"]
+        } else {
+            &["remove", PURL]
+        };
+        let (code, env) = hosted_unwind_json(tmp.path(), &server, &server.uri(), args);
+        assert_eq!(code, Some(0), "{command}: {env:#}");
+        let restored = std::fs::read_to_string(&lock_path).unwrap();
+        let checksum = berry_checksum_of(&restored);
+        assert_eq!(
+            restored,
+            pristine.replace(
+                &format!("10c0/{}", "3".repeat(128)),
+                &format!("10c0/{checksum}")
+            ),
+            "{command} keeps the mirror's __archiveUrl binding"
+        );
+    }
+}
+
 /// A pnpm project whose lock records the patched entry as
 /// `{integrity, tarball: <tarball>}` — what pnpm writes under
 /// `lockfile-include-tarball-url`, or for a tarball URL the registry
@@ -5718,6 +5847,30 @@ async fn pnpm_rollback_reads_the_npmrc_mirror_document_for_an_offpath_tarball() 
     mock_view(&server).await;
     mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
     let advertised = format!("{}/cdn/files/{NAME}-{VERSION}.tgz", server.uri());
+    let mirror = mock_pnpm_mirror(&server, &advertised).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pristine = write_pnpm_tarball_project(tmp.path(), &advertised);
+    std::fs::write(tmp.path().join(".npmrc"), format!("registry={mirror}\n")).unwrap();
+    assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// #1465 for pnpm: a mirror that passes the default registry's documents
+/// through hands out URLs conventional under the default registry, not
+/// under the mirror. pnpm compares only against the package's own
+/// registry, so it records them as `tarball:`; rollback must keep it.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_a_default_registry_tarball_behind_a_mirror() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let advertised = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
     let mirror = mock_pnpm_mirror(&server, &advertised).await;
 
     let tmp = tempfile::tempdir().unwrap();

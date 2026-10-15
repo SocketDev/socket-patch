@@ -8,11 +8,11 @@
 //!   `SOCKET_NO_CONFIG` survived, whether `SOCKET_NO_UPDATE_CHECK` was
 //!   forced, which package-manager vars were swept, case of `npm_config_*`);
 //! * a ratchet over the test tree: no private `scrub_socket_env` copy, and
-//!   no new file that spawns the binary with a bare `Command::new`. The
-//!   `PENDING_RAW_SPAWNS` list below only shrinks — move a file onto
-//!   `hermetic::command` / `common::run*` and delete its entry. (The copy
-//!   check matches that one name; files that still sweep `SOCKET_*` by hand
-//!   under another name are the bare spawns that list tracks.)
+//!   no file that spawns the binary with a bare `Command::new`; spawns go
+//!   through `hermetic::command` / `common::run*`. The detector matches the
+//!   spellings in `has_raw_spawn` (for `Command::new` and the PTY suites'
+//!   `portable_pty::CommandBuilder::new`), not a path bound to a local
+//!   first.
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
@@ -24,124 +24,6 @@ use std::process::Command;
 
 use hermetic::Extra;
 use serial_test::serial;
-
-/// Files that still spawn the binary with a bare `Command::new`, so their
-/// children see whatever `SOCKET_*` the ambient shell exports unless the file
-/// scrubs by hand.
-const PENDING_RAW_SPAWNS: &[&str] = &[
-    "apply/apply_network.rs",
-    "cli/covgap_api_client.rs",
-    "cli/covgap_commands_list.rs",
-    "cli/telemetry_e2e.rs",
-    "cli_apply_silent.rs",
-    "cli_argv_non_utf8.rs",
-    "cli_config_fallback.rs",
-    "cli_get_silent.rs",
-    "cli_global_args.rs",
-    "cli_parse_list.rs",
-    "cli_remove_silent.rs",
-    "cli_scan_silent.rs",
-    "cli_sigpipe.rs",
-    "coverage_fix_apply_silent_mute_exit.rs",
-    "coverage_fix_scan_hosted_dryrun_vendored.rs",
-    "coverage_fix_vendor_silent_mute_exit.rs",
-    "covgap_commands_rollback.rs",
-    "covgap_commands_scan_mod.rs",
-    "covgap_commands_vendor.rs",
-    "covgap_commands_vex.rs",
-    "covgap_utils_socket_cli_config.rs",
-    "e2e_cargo.rs",
-    "e2e_composer.rs",
-    "e2e_composer_version_identity.rs",
-    "e2e_embedded_vex.rs",
-    "e2e_gem.rs",
-    "e2e_golang.rs",
-    "e2e_golang_build.rs",
-    "e2e_golang_workspace_build.rs",
-    "e2e_hosted_production.rs",
-    "e2e_maven.rs",
-    "e2e_npm.rs",
-    "e2e_nuget.rs",
-    "e2e_nuget_dotnet_build.rs",
-    "e2e_pypi.rs",
-    "e2e_pypi_multi_copy.rs",
-    "e2e_redirect_bun_build.rs",
-    "e2e_redirect_cargo_build.rs",
-    "e2e_redirect_cargo_shapes.rs",
-    "e2e_redirect_composer_build.rs",
-    "e2e_redirect_gem_build.rs",
-    "e2e_redirect_maven_build.rs",
-    "e2e_redirect_npm_build.rs",
-    "e2e_scan.rs",
-    "e2e_socket_yml_policy.rs",
-    "e2e_vendor_bun_build.rs",
-    "e2e_vendor_cargo_build.rs",
-    "e2e_vendor_composer_build.rs",
-    "e2e_vendor_composer_crlf.rs",
-    "e2e_vendor_gem_build.rs",
-    "e2e_vendor_golang_build.rs",
-    "e2e_vendor_jvm_build.rs",
-    "e2e_vendor_maven_build.rs",
-    "e2e_vendor_npm_build.rs",
-    "e2e_vendor_pypi_build.rs",
-    "e2e_vendored_production.rs",
-    "e2e_vex.rs",
-    "e2e_vex_build/deno.rs",
-    "e2e_vex_build/hatch.rs",
-    "e2e_vex_build/poetry.rs",
-    "e2e_vex_lockfile/bun.rs",
-    "e2e_vex_lockfile/cargo.rs",
-    "e2e_vex_lockfile/golang.rs",
-    "e2e_vex_lockfile/maven.rs",
-    "e2e_vex_lockfile/npm.rs",
-    "e2e_vex_lockfile/nuget.rs",
-    "e2e_vex_lockfile/pnpm.rs",
-    "e2e_vex_lockfile/poetry.rs",
-    "e2e_vex_lockfile/uv.rs",
-    "e2e_vex_lockfile/yarn.rs",
-    "e2e_vex_redirect.rs",
-    "e2e_vex_vendor.rs",
-    "hosted_memory_common/mod.rs",
-    "hosted_memory_engine.rs",
-    "hosted_superseding_pypi.rs",
-    "in_process_redirect.rs",
-    "in_process_redirect_pdm.rs",
-    "in_process_redirect_pnpm.rs",
-    "in_process_redirect_poetry.rs",
-    "in_process_rollback_hosted.rs",
-    "in_process_rollback_vendored.rs",
-    "in_process_vendor.rs",
-    "in_process_vendor_bun_takeover.rs",
-    "in_process_vendor_npm_v1_takeover.rs",
-    "mode_migration_bun.rs",
-    "mode_migration_cargo.rs",
-    "mode_migration_pypi.rs",
-    "remove_rollback_api_overrides.rs",
-    "rollback/rollback_multicopy_blob_gate.rs",
-    "scan_api_retry_e2e.rs",
-    "scan_pnpm_relocated_store_cwd_e2e.rs",
-    "scan_requirements_lock_only.rs",
-    "scan_rollout_e2e.rs",
-    "scan_vendor_e2e.rs",
-    "scan_vendor_requirements_unwired.rs",
-    "vendor/e2e_golang_redirect.rs",
-    "vendor/in_process_vendor_bun.rs",
-    "vendor/vendor_gem_lockfile_only_e2e.rs",
-    "vendor/vendor_rerun_no_network_e2e.rs",
-    "vendor_crash_safety_e2e.rs",
-    "vendor_eject.rs",
-    "vendor_eject_bun_lockb.rs",
-    "vendor_eject_fresh_checkout.rs",
-    "vendor_jvm_cli.rs",
-    "vendor_partial_staging_e2e.rs",
-    "vex_e2e_common/uv.rs",
-    "vex_pdm_hatch_common/mod.rs",
-    "vex_pipenv_pip_common/mod.rs",
-    "vex_terminal_output.rs",
-    "vlt_e2e_common/mod.rs",
-    "vlt_hosted_common/mod.rs",
-    "vlt_vendor_common/mod.rs",
-];
 
 /// The environment `cmd`'s child would see: the parent environment with
 /// `cmd`'s explicit sets and removals applied.
@@ -361,20 +243,105 @@ fn workflow_env_copies_carry_every_opt_out() {
 #[serial]
 fn command_never_leaks_its_hostile_seeds() {
     let env = effective_env(&hermetic::command(Path::new("socket-patch")));
-    for key in [
-        "SOCKET_GLOBAL",
-        "SOCKET_GLOBAL_PREFIX",
-        "SOCKET_DRY_RUN",
-        "SOCKET_ECOSYSTEMS",
-        "SOCKET_MANIFEST_PATH",
-        "SOCKET_JSON",
-        "SOCKET_SILENT",
-        "SOCKET_VERBOSE",
-        "SOCKET_UPDATE_BASE_URL",
-        "SOCKET_UPDATE_STATE_DIR",
-    ] {
+    for (key, _) in hermetic::HOSTILE_SEEDS {
         assert_eq!(get(&env, key), None, "{key} seed must be scrubbed");
     }
+}
+
+/// In-process tests set flag-bound vars in the test binary's own
+/// environment (`apply_env_toggles`, save/restore helpers). One set after
+/// the builder's sweep but before the spawn must still not reach the child.
+#[test]
+#[serial]
+fn command_drops_flag_bound_vars_set_after_it_is_built() {
+    let cmd = hermetic::command(Path::new("socket-patch"));
+    with_ambient(
+        &[
+            ("SOCKET_OFFLINE", "true"),
+            ("SOCKET_DEBUG", "1"),
+            ("SOCKET_PROXY_URL", "http://ambient.invalid"),
+            ("SOCKET_SKIP_ROLLBACK", "true"),
+            // Peer aliases the binary promotes onto `SOCKET_API_TOKEN` & co.
+            ("SOCKET_CLI_API_TOKEN", "late-token"),
+            ("SOCKET_CLI_ORG_SLUG", "late-org"),
+            ("SOCKET_CLI_API_BASE_URL", "http://ambient.invalid"),
+            ("SOCKET_CLI_NO_API_TOKEN", "1"),
+        ],
+        || {
+            let env = effective_env(&cmd);
+            for key in [
+                "SOCKET_OFFLINE",
+                "SOCKET_DEBUG",
+                "SOCKET_PROXY_URL",
+                "SOCKET_SKIP_ROLLBACK",
+                "SOCKET_CLI_API_TOKEN",
+                "SOCKET_CLI_ORG_SLUG",
+                "SOCKET_CLI_API_BASE_URL",
+                "SOCKET_CLI_NO_API_TOKEN",
+            ] {
+                assert_eq!(get(&env, key), None, "{key} set after build leaked");
+            }
+        },
+    );
+}
+
+/// The environment a PTY child would see.
+fn pty_env(cmd: &portable_pty::CommandBuilder) -> BTreeMap<String, String> {
+    cmd.iter_full_env_as_str()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
+
+/// The PTY suites used to hand-roll their scrubs, and the copies drifted.
+/// `pty_command` must give a PTY child exactly the environment `command`
+/// gives a piped one, whatever the ambient shell holds.
+#[test]
+#[serial]
+fn pty_command_carries_the_same_env_as_command() {
+    with_ambient(
+        &[
+            ("SOCKET_YES", "true"),
+            ("SOCKET_JSON", "true"),
+            ("SOCKET_DRY_RUN", "true"),
+            ("SOCKET_API_TOKEN", "ambient-token"),
+            ("SOCKET_CLI_API_TOKEN", "ambient-peer-token"),
+            ("SOCKET_SOME_FUTURE_FLAG", "1"),
+            ("SOCKET_NO_CONFIG", "0"),
+            ("SOCKET_NO_UPDATE_CHECK", "0"),
+            ("SOCKET_TELEMETRY_DISABLED", "0"),
+        ],
+        || {
+            let piped: BTreeMap<String, String> =
+                effective_env(&hermetic::command(Path::new("socket-patch")))
+                    .into_iter()
+                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                    .collect();
+            let pty = pty_env(&hermetic::pty_command("socket-patch"));
+            assert_eq!(pty, piped);
+            assert_eq!(pty.get("SOCKET_YES"), None);
+            assert_eq!(pty.get("SOCKET_SOME_FUTURE_FLAG"), None);
+            assert_eq!(
+                pty.get("SOCKET_NO_UPDATE_CHECK").map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                pty.get("SOCKET_TELEMETRY_DISABLED").map(String::as_str),
+                Some("1")
+            );
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn pty_command_never_leaks_its_hostile_seeds_and_keeps_caller_env() {
+    let mut cmd = hermetic::pty_binary_command();
+    let env = pty_env(&cmd);
+    for (key, _) in hermetic::HOSTILE_SEEDS {
+        assert_eq!(env.get(*key), None, "{key} seed must be scrubbed");
+    }
+    cmd.env("SOCKET_NO_UPDATE_CHECK", "0");
+    assert_eq!(cmd.get_env("SOCKET_NO_UPDATE_CHECK"), Some("0".as_ref()));
 }
 
 #[test]
@@ -492,6 +459,9 @@ fn bundle_extra_sweeps_every_bundler_override() {
             ("BUNDLE_APP_CONFIG", "/ambient/.bundle"),
             ("BUNDLE_GEMFILE", "/ambient/Gemfile"),
             ("GEM_HOME", "/ambient/gems"),
+            ("GEM_PATH", "/ambient/gems"),
+            ("RUBYOPT", "-rbundler/setup"),
+            ("RUBYLIB", "/ambient/bundler/lib"),
         ],
         || {
             let mut cmd = Command::new("bundle");
@@ -500,11 +470,48 @@ fn bundle_extra_sweeps_every_bundler_override() {
             assert_eq!(get(&env, "BUNDLE_PATH"), None);
             assert_eq!(get(&env, "BUNDLE_APP_CONFIG"), None);
             assert_eq!(get(&env, "BUNDLE_GEMFILE"), None);
+            assert_eq!(get(&env, "RUBYOPT"), None);
+            assert_eq!(get(&env, "RUBYLIB"), None);
+            // rvm/chruby homes stay: `bundle` resolves through them.
             assert_eq!(get(&env, "GEM_HOME"), Some("/ambient/gems"));
+            assert_eq!(get(&env, "GEM_PATH"), Some("/ambient/gems"));
 
             // A suite's own BUNDLE_PATH, set after the scrub, survives.
             cmd.env("BUNDLE_PATH", "/store");
             assert_eq!(get(&effective_env(&cmd), "BUNDLE_PATH"), Some("/store"));
+        },
+    );
+}
+
+#[test]
+#[serial]
+fn composer_extra_sweeps_overrides_and_pins_an_empty_home() {
+    with_ambient(
+        &[
+            ("COMPOSER_VENDOR_DIR", "third"),
+            ("COMPOSER_HOME", "/ambient/composer"),
+            ("COMPOSER_CACHE_DIR", "/ambient/composer-cache"),
+            ("XDG_CONFIG_HOME", "/ambient/config"),
+        ],
+        || {
+            let mut cmd = Command::new("socket-patch");
+            hermetic::scrub_extra(&mut cmd, &[Extra::Composer]);
+            let env = effective_env(&cmd);
+            assert_eq!(get(&env, "COMPOSER_VENDOR_DIR"), None);
+            assert_eq!(get(&env, "COMPOSER_CACHE_DIR"), None);
+            // The pin outranks XDG_CONFIG_HOME in the Composer home lookup.
+            assert_eq!(
+                get(&env, "COMPOSER_HOME"),
+                Some("/nonexistent/composer-home")
+            );
+            assert_eq!(get(&env, "XDG_CONFIG_HOME"), Some("/ambient/config"));
+
+            // A suite's own COMPOSER_HOME, set after the scrub, survives.
+            cmd.env("COMPOSER_HOME", "/fixture/home");
+            assert_eq!(
+                get(&effective_env(&cmd), "COMPOSER_HOME"),
+                Some("/fixture/home")
+            );
         },
     );
 }
@@ -552,10 +559,14 @@ fn test_sources() -> Vec<(String, String)> {
 }
 
 /// Whether `text` spawns the `socket-patch` binary with a bare
-/// `Command::new`: `binary()` (any path prefix), the `CARGO_BIN_EXE_*`
-/// literal, `socket_bin()` or a `BINARY` const.
+/// `Command::new` or `CommandBuilder::new`: `binary()` (any path prefix),
+/// the `CARGO_BIN_EXE_*` literal, `socket_bin()` or a `BINARY` const.
 fn has_raw_spawn(text: &str) -> bool {
-    text.split("Command::new(").skip(1).any(|rest| {
+    let mut spawns = text
+        .split("Command::new(")
+        .skip(1)
+        .chain(text.split("CommandBuilder::new(").skip(1));
+    spawns.any(|rest| {
         let arg = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':');
         let head = &rest[..rest.len() - arg.len()];
         let name = head.rsplit("::").next().unwrap_or(head);
@@ -574,6 +585,9 @@ fn raw_spawn_detector_matches_the_spellings_in_the_tree() {
         "Command::new(env!(\"CARGO_BIN_EXE_socket-patch\"))",
         "Command::new(socket_bin())",
         "Command::new(BINARY)",
+        "CommandBuilder::new(binary())",
+        "portable_pty::CommandBuilder::new(common::binary())",
+        "CommandBuilder::new(env!(\"CARGO_BIN_EXE_socket-patch\"))",
     ] {
         assert!(has_raw_spawn(spawn), "{spawn}");
     }
@@ -583,6 +597,8 @@ fn raw_spawn_detector_matches_the_spellings_in_the_tree() {
         "Command::new(bin)",
         "Command::new(binary_path)",
         "Command::new(BINARY_DIR)",
+        "hermetic::pty_binary_command()",
+        "CommandBuilder::new(\"/bin/sh\")",
     ] {
         assert!(!has_raw_spawn(ok), "{ok}");
     }
@@ -607,33 +623,84 @@ fn no_scrub_socket_env_copies() {
 }
 
 #[test]
+#[serial]
+fn crawler_inputs_sweep_bundler_and_composer_overrides() {
+    with_ambient(
+        &[
+            ("VIRTUAL_ENV", "/ambient/venv"),
+            ("BUNDLE_PATH", "/ambient/bundle"),
+            ("BUNDLE_GEMFILE", "/ambient/Gemfile"),
+            ("BUNDLE_USER_CONFIG", "/ambient/bundle-config"),
+            ("RUBYOPT", "-rbundler/setup"),
+            ("RUBYLIB", "/ambient/bundler/lib"),
+            ("COMPOSER_VENDOR_DIR", "/ambient/vendor"),
+            ("COMPOSER_HOME", "/ambient/composer"),
+        ],
+        || {
+            let mut cmd = hermetic::binary_command();
+            hermetic::scrub_crawler_inputs(&mut cmd);
+            let env = effective_env(&cmd);
+            assert_eq!(get(&env, "VIRTUAL_ENV"), None);
+            assert_eq!(get(&env, "BUNDLE_PATH"), None);
+            assert_eq!(get(&env, "BUNDLE_GEMFILE"), None);
+            assert_eq!(get(&env, "RUBYOPT"), None);
+            assert_eq!(get(&env, "RUBYLIB"), None);
+            assert_eq!(get(&env, "COMPOSER_VENDOR_DIR"), None);
+            // Global configs are pinned to missing files, not left to fall
+            // back to the developer's `~/.bundle/config` / composer home.
+            assert_eq!(
+                get(&env, "BUNDLE_USER_CONFIG"),
+                Some(hermetic::NO_BUNDLE_USER_CONFIG)
+            );
+            assert_eq!(
+                get(&env, "COMPOSER_HOME"),
+                Some("/nonexistent/composer-home")
+            );
+
+            // A test's own pin, set after the scrub, survives.
+            cmd.env("BUNDLE_USER_CONFIG", "/fixture/bundle-config");
+            let env = effective_env(&cmd);
+            assert_eq!(
+                get(&env, "BUNDLE_USER_CONFIG"),
+                Some("/fixture/bundle-config")
+            );
+        },
+    );
+}
+
+#[test]
+fn no_private_bundler_sweeps() {
+    let found: Vec<String> = test_sources()
+        .into_iter()
+        .filter(|(rel, text)| {
+            rel != "spawn_env_hygiene.rs"
+                && rel != "common/hermetic.rs"
+                && text.contains("starts_with(\"BUNDLE_\")")
+        })
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(
+        found.is_empty(),
+        "these test files sweep `BUNDLE_*` by hand: {found:?}. Use \
+         `hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Bundle])`, \
+         which also keeps rvm/chruby's GEM_HOME/GEM_PATH (see cache_env.rs)."
+    );
+}
+
+#[test]
 fn no_new_bare_binary_spawns() {
     let found: Vec<String> = test_sources()
         .into_iter()
         .filter(|(rel, text)| rel != "spawn_env_hygiene.rs" && has_raw_spawn(text))
         .map(|(rel, _)| rel)
         .collect();
-    let unexpected: Vec<&String> = found
-        .iter()
-        .filter(|f| !PENDING_RAW_SPAWNS.contains(&f.as_str()))
-        .collect();
     assert!(
-        unexpected.is_empty(),
-        "these test files spawn the binary with a bare Command::new: \
-         {unexpected:?}. Use `hermetic::command(&bin)` / \
-         `hermetic::binary_command()` or `common::run*` (tests/common/) so the \
-         child gets the hermetic SOCKET_* environment. Do not add them to \
-         PENDING_RAW_SPAWNS."
-    );
-    let stale: Vec<&&str> = PENDING_RAW_SPAWNS
-        .iter()
-        .filter(|f| !found.iter().any(|g| g == *f))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "these files no longer spawn the binary bare: {stale:?}. Delete them \
-         from PENDING_RAW_SPAWNS in \
-         crates/socket-patch-cli/tests/spawn_env_hygiene.rs (another PR may \
-         have migrated them; rebase and drop the entries)."
+        found.is_empty(),
+        "these test files spawn the binary with a bare Command::new or \
+         CommandBuilder::new: \
+         {found:?}. Use `hermetic::command(&bin)` / \
+         `hermetic::binary_command()` or `common::run*` (tests/common/), or \
+         `hermetic::pty_command` / `hermetic::pty_binary_command()` for a PTY \
+         child, so the child gets the hermetic SOCKET_* environment."
     );
 }

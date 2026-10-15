@@ -163,6 +163,7 @@ impl NpmLockBackend for BunBinaryBackend {
             bundled,
             user_tarballs,
         } = preflight_package(&project, root, coords, &leaf)?;
+        refuse_ignored_mirrors(root, &mirrors).await?;
         warnings.extend(super::bun_lock::default_trust_warning(
             project.manifest.as_deref(),
             None,
@@ -280,18 +281,27 @@ impl NpmLockBackend for BunBinaryBackend {
                 original: None,
                 new: Some(serde_json::Value::String(staged.packed.sha256_hex.clone())),
             });
-            if before.as_deref() == Some(artifact.as_slice()) {
-                continue;
+            if before.as_deref() != Some(artifact.as_slice()) {
+                if let Err(e) =
+                    tokio::fs::create_dir_all(path.parent().expect("mirror parent")).await
+                {
+                    undo_mirrors(&mirror_backups).await;
+                    return Err(format!("cannot create workspace vendor directory: {e}"));
+                }
+                if let Err(e) = atomic_write_bytes_preserving_mode(&path, &artifact).await {
+                    undo_mirrors(&mirror_backups).await;
+                    return Err(format!("cannot write workspace tarball {rel}: {e}"));
+                }
+                mirror_backups.push((path, before));
             }
-            if let Err(e) = tokio::fs::create_dir_all(path.parent().expect("mirror parent")).await {
+            if let Err(e) = restore_mirror_metadata(root, rel).await {
                 undo_mirrors(&mirror_backups).await;
-                return Err(format!("cannot create workspace vendor directory: {e}"));
+                return Err(e);
             }
-            if let Err(e) = atomic_write_bytes_preserving_mode(&path, &artifact).await {
-                undo_mirrors(&mirror_backups).await;
-                return Err(format!("cannot write workspace tarball {rel}: {e}"));
-            }
-            mirror_backups.push((path, before));
+        }
+        if let Err(e) = probe_mirrors(root, &mirrors, warnings).await {
+            undo_mirrors(&mirror_backups).await;
+            return Err(e);
         }
         if !lock_changed && mirror_backups.is_empty() {
             return Ok(None);
@@ -620,7 +630,8 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                         Ok(Some(path))
                     }
                     Ok(_) => Err("workspace tarball has changed; left alone".into()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    // Gone already: its `<uuid>/.gitignore` still goes.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(path)),
                     Err(e) => Err(format!("cannot read workspace tarball: {e}")),
                 }
             })();
@@ -921,9 +932,175 @@ pub(super) fn validate_mirror_path(root: &Path, rel: &str) -> Result<PathBuf, St
     Ok(path)
 }
 
-/// Remove a reverted workspace tarball and prune its emptied parents
-/// through the workspace's `.socket/`, or queue both for after the commit
-/// of a staged hosted takeover (see `group_commit::defer_removal`).
+/// `<member>/.socket/vendor/npm/<uuid>`, the directory a workspace mirror
+/// path (as [`validate_mirror_path`] accepts it) lives in.
+fn mirror_uuid_dir_rel(rel: &str) -> Option<String> {
+    let (workspace, artifact) = rel.rsplit_once("/.socket/vendor/npm/")?;
+    let (uuid, _) = artifact.split_once('/')?;
+    Some(format!("{workspace}/.socket/vendor/npm/{uuid}"))
+}
+
+/// The member uuid dirs (`<member>/.socket/vendor/npm/<uuid>`) a
+/// `bun.lockb` workspace mirrors `uuid`'s tarball into, as the backend's
+/// pre-flight lists them; empty when no readable binary lock drives the
+/// installs.
+pub(crate) fn workspace_mirror_dirs(root: &Path, uuid: &str) -> Vec<String> {
+    if super::lock_inventory::bun_text_lock_drives(&super::lock_inventory::ProjectView::Disk(root))
+    {
+        return Vec::new();
+    }
+    read_regular_to_bytes_sync(&root.join(LOCK))
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| BunLockb::parse(&bytes))
+        .and_then(|lock| lock.workspace_paths())
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|ws| format!("{}/.socket/vendor/npm/{uuid}", ws.trim_start_matches("./")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Refuse `vendor_artifact_gitignored` before anything is written when git
+/// ignores a workspace mirror's uuid dir as a directory (a member's
+/// `.socket/` rule, a root `packages/*/.socket/`): no `.gitignore` inside
+/// it can re-include the mirror, so it would never reach the commit and a
+/// fresh checkout's older Bun cannot install from it (#1116). File rules
+/// such as `*.tgz` are left to the mirror's own `<uuid>/.gitignore`.
+async fn refuse_ignored_mirrors(
+    root: &Path,
+    mirrors: &[(String, String)],
+) -> Result<(), Box<VendorOutcome>> {
+    let dirs: Vec<String> = mirrors
+        .iter()
+        .filter_map(|(_, rel)| mirror_uuid_dir_rel(rel))
+        .map(|dir| format!("{dir}/"))
+        .collect();
+    if dirs.is_empty() {
+        return Ok(());
+    }
+    match super::npm_dir::gitignored(root, &dirs).await {
+        Some(rules) => Err(Box::new(refused(
+            super::npm_dir::GITIGNORED,
+            super::npm_dir::gitignored_detail(&first_ignored(&rules, &dirs[0]), &rules),
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Write the root artifact's `<uuid>/.gitignore` and `<uuid>/.gitattributes`
+/// (#837) beside the workspace mirror `rel`; returns that uuid dir.
+pub(super) async fn restore_mirror_metadata(root: &Path, rel: &str) -> Result<String, String> {
+    let dir_rel = mirror_uuid_dir_rel(rel).ok_or("invalid workspace tarball path")?;
+    super::npm_dir::restore_uuid_metadata(&root.join(&dir_rel))
+        .await
+        .map_err(|e| format!("cannot write {dir_rel}/.gitignore: {e}"))?;
+    Ok(dir_rel)
+}
+
+/// Ask git, in one probe, whether it would commit every written workspace
+/// mirror and the `<uuid>/.gitignore` and `<uuid>/.gitattributes` beside
+/// it ([`restore_mirror_metadata`], which overrides file rules such as
+/// Node.gitignore's `*.tgz`, #1116). Still ignored is an error (the caller
+/// unwinds); git failing to answer is only a warning.
+async fn probe_mirrors(
+    root: &Path,
+    mirrors: &[(String, String)],
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(), String> {
+    let mut probe = Vec::new();
+    for (_, rel) in mirrors {
+        let dir_rel = mirror_uuid_dir_rel(rel).ok_or("invalid workspace tarball path")?;
+        probe.push(rel.clone());
+        probe.push(format!("{dir_rel}/.gitignore"));
+        probe.push(format!("{dir_rel}/.gitattributes"));
+    }
+    if probe.is_empty() {
+        return Ok(());
+    }
+    match super::npm_dir::gitignore_probe(root, &probe).await {
+        Ok(Some(rules)) => Err(format!(
+            "{}: {}",
+            super::npm_dir::GITIGNORED,
+            super::npm_dir::gitignored_detail(&first_ignored(&rules, &probe[0]), &rules)
+        )),
+        Ok(None) => Ok(()),
+        Err(why) => {
+            warnings.push(VendorWarning::new(
+                super::npm_dir::GITIGNORE_UNCHECKED,
+                super::npm_dir::gitignore_unchecked_detail(&probe[0], &why),
+            ));
+            Ok(())
+        }
+    }
+}
+
+/// The first path [`super::npm_dir::gitignored`]'s rules name
+/// (`<source>:<line>:<pattern>\t<path>; ...`), without a trailing `/`;
+/// `fallback` when they name none.
+pub(super) fn first_ignored(rules: &str, fallback: &str) -> String {
+    rules
+        .split("; ")
+        .next()
+        .and_then(|rule| rule.rsplit_once('\t'))
+        .map(|(_, path)| path.trim_end_matches('/').to_string())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| fallback.trim_end_matches('/').to_string())
+}
+
+/// The `<uuid>/.gitignore` and `<uuid>/.gitattributes` beside a workspace
+/// mirror that go with it on removal: only ours, byte for byte, and only
+/// when nothing but the mirror itself (and the scope directory holding it)
+/// is left in that uuid dir, so the member's `.socket/` can still be pruned.
+fn mirror_metadata(path: &Path) -> Vec<PathBuf> {
+    // `<member>/.socket/vendor/npm/<uuid>`: the ancestor under `vendor/npm`.
+    let Some(dir) = path.ancestors().skip(1).find(|dir| {
+        let npm = dir.parent();
+        npm.and_then(Path::file_name).is_some_and(|n| n == "npm")
+            && npm
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "vendor")
+    }) else {
+        return Vec::new();
+    };
+    let mut metadata = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if path.starts_with(&child) {
+            // The mirror, or the `@scope/` directory holding only it.
+            if child != path
+                && std::fs::read_dir(&child).map_or(true, |mut it| {
+                    it.any(|e| e.map_or(true, |e| e.path() != path))
+                })
+            {
+                return Vec::new();
+            }
+            continue;
+        }
+        let ours: fn(&[u8]) -> bool = match entry.file_name().to_str() {
+            Some(".gitignore") => |b| b == super::npm_dir::UUID_GITIGNORE.as_bytes(),
+            // Current or pre-#1541 bytes.
+            Some(".gitattributes") => super::npm_dir::is_uuid_gitattributes,
+            _ => return Vec::new(),
+        };
+        if !read_regular_to_bytes_sync(&child).is_ok_and(|b| ours(&b)) {
+            return Vec::new();
+        }
+        metadata.push(child);
+    }
+    metadata
+}
+
+/// Remove a reverted workspace tarball, if still there (with its `<uuid>/.gitignore` and
+/// `.gitattributes`, see [`mirror_metadata`]) and prune its emptied
+/// parents through the workspace's `.socket/`, or queue all of them for
+/// after the commit of a staged hosted takeover (see
+/// `group_commit::defer_removal`).
 pub(super) async fn remove_mirror(path: &Path) -> std::io::Result<()> {
     let bound = path
         .ancestors()
@@ -931,10 +1108,28 @@ pub(super) async fn remove_mirror(path: &Path) -> std::io::Result<()> {
         .take(5)
         .find(|dir| dir.file_name().is_some_and(|name| name == ".socket"))
         .unwrap_or(path);
-    if crate::utils::group_commit::defer_removal(path, bound) {
-        return Ok(());
+    let metadata = mirror_metadata(path);
+    // A tarball already gone (deleted by hand) still takes its metadata.
+    let present = tokio::fs::symlink_metadata(path).await.is_ok();
+    let queue: Vec<&Path> = present
+        .then_some(path)
+        .into_iter()
+        .chain(metadata.iter().map(PathBuf::as_path))
+        .collect();
+    if let Some((first, rest)) = queue.split_first() {
+        if crate::utils::group_commit::defer_removal(first, bound) {
+            for file in rest {
+                crate::utils::group_commit::defer_removal(file, bound);
+            }
+            return Ok(());
+        }
     }
-    tokio::fs::remove_file(path).await?;
+    if present {
+        tokio::fs::remove_file(path).await?;
+    }
+    for file in &metadata {
+        let _ = tokio::fs::remove_file(file).await;
+    }
     prune_mirror_parents(path).await;
     Ok(())
 }
@@ -959,7 +1154,11 @@ pub(super) async fn undo_mirrors(backups: &[(PathBuf, Option<Vec<u8>>)]) {
         if let Some(bytes) = before {
             let _ = atomic_write_bytes_preserving_mode(path, bytes).await;
         } else {
+            let metadata = mirror_metadata(path);
             let _ = tokio::fs::remove_file(path).await;
+            for file in &metadata {
+                let _ = tokio::fs::remove_file(file).await;
+            }
             prune_mirror_parents(path).await;
         }
     }
@@ -1443,6 +1642,177 @@ mod rebuild_tests {
         for mirror in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
             assert!(!root.join(&mirror.file).exists());
         }
+    }
+
+    // ── git-ignored workspace mirrors (#1116) ─────────────────────────────
+
+    fn mirror_rels(entry: &VendorEntry) -> Vec<String> {
+        entry
+            .wiring
+            .iter()
+            .filter(|r| r.kind == MIRROR_KIND)
+            .map(|r| r.file.clone())
+            .collect()
+    }
+
+    /// Node.gitignore's `*.tgz` ignores every tarball, the member mirrors
+    /// included: each mirror's uuid dir gets the root artifact's `!*`
+    /// `.gitignore`, so git commits it (and `repair` puts it back). A
+    /// revert takes that metadata with the mirror, pruning the member's
+    /// `.socket/`.
+    #[tokio::test]
+    async fn a_tgz_rule_still_commits_every_workspace_mirror() {
+        let fx = flip_fixture().await;
+        let root = fx.root();
+        if ts::git_project(root, "node_modules\n*.tgz\n").is_none() {
+            return;
+        }
+        assert_eq!(
+            super::super::npm_common::npm_tarball_gitignore_preflight(root, UUID).await,
+            None,
+            "a file rule does not stop a takeover"
+        );
+        let (result, entry, warnings) = ts::expect_done(flip_run(&fx, None).await);
+        assert!(result.success, "{result:?}");
+        assert!(
+            !ts::has_warning(&warnings, super::super::npm_dir::GITIGNORE_UNCHECKED),
+            "{warnings:?}"
+        );
+        let entry = entry.expect("vendoring wires the lock");
+        let mirrors = mirror_rels(&entry);
+        assert!(!mirrors.is_empty(), "fixture wires workspace mirrors");
+        assert_eq!(
+            super::super::npm_dir::gitignored(root, &mirrors).await,
+            None,
+            "git commits every mirror"
+        );
+        let gitignore = |rel: &str| Path::new(rel).parent().unwrap().join(".gitignore");
+        for rel in &mirrors {
+            assert_eq!(
+                std::fs::read_to_string(root.join(gitignore(rel))).unwrap(),
+                super::super::npm_dir::UUID_GITIGNORE,
+                "{rel}"
+            );
+        }
+
+        for rel in &mirrors {
+            std::fs::remove_file(root.join(gitignore(rel))).unwrap();
+        }
+        super::super::bun_workspace::repair(root, &entry, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::npm_dir::gitignored(root, &mirrors).await,
+            None,
+            "repair restores the mirrors' .gitignore"
+        );
+
+        // A mirror deleted by hand still takes its metadata on revert, and
+        // so does a `.gitattributes` an older release wrote (#1541).
+        std::fs::remove_file(root.join(&mirrors[0])).unwrap();
+        for rel in &mirrors {
+            let attributes = Path::new(rel).parent().unwrap().join(".gitattributes");
+            std::fs::write(
+                root.join(attributes),
+                super::super::npm_dir::LEGACY_UUID_GITATTRIBUTES,
+            )
+            .unwrap();
+        }
+        ts::persist(root, PURL, entry.clone()).await;
+        let outcome = revert(&entry, root, RevertOpts::new(false)).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert_eq!(std::fs::read(root.join(LOCK)).unwrap(), ORIGINAL);
+        for rel in &mirrors {
+            let member = rel.split("/.socket/").next().unwrap();
+            assert!(
+                !root.join(member).join(".socket").exists(),
+                "{member}/.socket is pruned with its mirror"
+            );
+        }
+    }
+
+    /// A rule that ignores a member's `.socket/` as a directory cannot be
+    /// overridden from inside it, so vendoring refuses
+    /// `vendor_artifact_gitignored` before writing anything, dry run
+    /// included, rather than commit a lock whose member tarball never
+    /// reaches the repository.
+    #[tokio::test]
+    async fn an_ignored_member_vendor_dir_refuses_before_any_write() {
+        let workspaces = BunLockb::parse(ORIGINAL)
+            .unwrap()
+            .workspace_paths()
+            .unwrap();
+        let member = workspaces[0].trim_start_matches("./").to_string();
+        let shapes = [
+            (
+                "member .socket/",
+                format!("{member}/.gitignore"),
+                ".socket/\n",
+            ),
+            (
+                "root member glob",
+                ".gitignore".into(),
+                "node_modules\n*/**/.socket/\n",
+            ),
+        ];
+        for (label, file, rules) in &shapes {
+            for dry_run in [true, false] {
+                let fx = flip_fixture().await;
+                let root = fx.root();
+                if ts::git_project(root, "node_modules\n").is_none() {
+                    return;
+                }
+                std::fs::create_dir_all(root.join(&file).parent().unwrap()).unwrap();
+                std::fs::write(root.join(file), rules).unwrap();
+                // The hosted takeover's pre-flight (run before it restores
+                // the registry entry) refuses the same project.
+                let takeover =
+                    super::super::npm_common::npm_tarball_gitignore_preflight(root, UUID).await;
+                assert_eq!(
+                    takeover.map(|(code, _)| code),
+                    Some("vendor_artifact_gitignored"),
+                    "{label}: takeover pre-flight"
+                );
+                let blobs = root.join(".socket/blobs");
+                let outcome = crate::vendor::test_support::vendor_bun(
+                    PURL,
+                    &fx.installed(),
+                    root,
+                    &fx.record,
+                    &PatchSources::blobs_only(&blobs),
+                    "",
+                    dry_run,
+                    false,
+                    None,
+                )
+                .await;
+                match outcome {
+                    VendorOutcome::Refused { code, detail } => {
+                        assert_eq!(code, "vendor_artifact_gitignored", "{label}: {detail}");
+                        assert!(detail.contains(&member), "{label}: {detail}");
+                    }
+                    other => {
+                        panic!("{label} (dry run {dry_run}): expected a refusal, got {other:?}")
+                    }
+                }
+                assert_eq!(std::fs::read(root.join(LOCK)).unwrap(), ORIGINAL, "{label}");
+                assert!(!root.join(".socket/vendor").exists(), "{label}");
+                assert!(!root.join(&member).join(".socket").exists(), "{label}");
+            }
+        }
+    }
+
+    /// A refusal names the path git reports as ignored, not the first one
+    /// probed: with members `a` and `b`, only `b` may be ignored.
+    #[test]
+    fn first_ignored_names_the_path_git_reports() {
+        let rules = "packages/b/.gitignore:1:.socket/\tpackages/b/.socket/vendor/npm/u/; \
+                     .gitignore:2:x\tpackages/c/.socket/vendor/npm/u/";
+        assert_eq!(
+            first_ignored(rules, "packages/a/.socket/vendor/npm/u/"),
+            "packages/b/.socket/vendor/npm/u"
+        );
+        assert_eq!(first_ignored("", "packages/a/x/"), "packages/a/x");
     }
 
     // ── bun.lockb migrated to bun.lock (#784) ─────────────────────────────

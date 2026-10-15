@@ -13,13 +13,12 @@
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{binary, git_sha256};
+use common::{binary, git_sha256, hermetic_command};
 
 #[path = "prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
 use std::path::Path;
-use std::process::Command;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -91,14 +90,8 @@ fn npm_project() -> tempfile::TempDir {
 /// `vendor --json --offline` through the built binary, optionally crashing
 /// at `failpoint`. Returns the exit code and stdout.
 fn vendor(root: &Path, failpoint: Option<&str>) -> (i32, String) {
-    let mut cmd = Command::new(binary());
+    let mut cmd = hermetic_command(&binary());
     cmd.args(["vendor", "--json"]).current_dir(root);
-    for (key, _) in std::env::vars() {
-        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     if let Some(point) = failpoint {
         cmd.env("SOCKET_PATCH_FAILPOINT", point);
     }
@@ -291,16 +284,10 @@ fn crash_before_the_barrier_repairs_a_copy_dir_artifact() {
     .unwrap();
 
     let run = |failpoint: Option<&str>| {
-        let mut cmd = Command::new(binary());
+        let mut cmd = hermetic_command(&binary());
         cmd.args(["vendor", "--json"])
             .current_dir(&root)
-            .env("CARGO_HOME", &cargo_home)
-            .env("SOCKET_TELEMETRY_DISABLED", "1");
-        for (key, _) in std::env::vars() {
-            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
-                cmd.env_remove(key);
-            }
-        }
+            .env("CARGO_HOME", &cargo_home);
         if let Some(point) = failpoint {
             cmd.env("SOCKET_PATCH_FAILPOINT", point);
         }

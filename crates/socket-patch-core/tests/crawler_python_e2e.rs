@@ -1090,7 +1090,7 @@ async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
 
     let prev_home = std::env::var("HOME").ok();
     std::env::set_var("HOME", home.path());
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: project.path().to_path_buf(),
         global: false,
@@ -1169,7 +1169,7 @@ async fn get_site_packages_paths_uv_without_env_never_falls_back_to_global() {
         }
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", home.path());
-        let crawler = PythonCrawler;
+        let crawler = PythonCrawler::new();
         let opts = CrawlerOptions {
             cwd: project.path().to_path_buf(),
             global: false,
@@ -1222,7 +1222,7 @@ async fn get_site_packages_paths_uv_lock_beside_poetry_keeps_fallback() {
     std::env::remove_var("VIRTUAL_ENV");
     let prev_home = std::env::var("HOME").ok();
     std::env::set_var("HOME", home.path());
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: project.path().to_path_buf(),
         global: false,
@@ -1296,7 +1296,7 @@ async fn get_site_packages_paths_pipenv_without_venv_never_falls_back_to_global(
         std::env::set_var("WORKON_HOME", workon.path());
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", home.path());
-        let crawler = PythonCrawler;
+        let crawler = PythonCrawler::new();
         let opts = CrawlerOptions {
             cwd: project.path().to_path_buf(),
             global: false,
@@ -1329,7 +1329,7 @@ async fn get_site_packages_paths_pipenv_without_venv_never_falls_back_to_global(
 #[serial]
 async fn get_site_packages_paths_no_marker_no_venv_returns_empty() {
     let project = tempfile::tempdir().unwrap();
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: project.path().to_path_buf(),
         global: false,
@@ -1449,7 +1449,7 @@ async fn read_python_metadata_rejects_fifo_metadata_without_hanging() {
     };
     assert_eq!(direct, Some(("evil".to_string(), "1.0.0".to_string())));
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: true,
@@ -1482,7 +1482,7 @@ async fn find_by_purls_handles_unreadable_site_packages() {
     tokio::fs::create_dir(&site_packages).await.unwrap();
     common::chmod_unreadable(&site_packages);
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let result = crawler
         .find_by_purls(&site_packages, &["pkg:pypi/requests@2.28.0".to_string()])
         .await
@@ -1507,7 +1507,7 @@ async fn crawl_all_handles_unreadable_site_packages() {
     tokio::fs::create_dir(&site_packages).await.unwrap();
     common::chmod_unreadable(&site_packages);
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: true,
@@ -1523,7 +1523,7 @@ async fn crawl_all_handles_unreadable_site_packages() {
 #[test]
 #[serial_test::parallel]
 fn python_crawler_default_and_new_construct_cleanly() {
-    let _a = PythonCrawler;
+    let _a = PythonCrawler::default();
     let _b = PythonCrawler::new();
 }
 
@@ -1547,7 +1547,7 @@ async fn find_by_purls_matches_canonicalized_name() {
     // PEP 503 canonicalization: "Requests" -> "requests"
     stage_dist_info(tmp.path(), "Requests", "2.28.0").await;
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let result = crawler
         .find_by_purls(tmp.path(), &["pkg:pypi/requests@2.28.0".to_string()])
         .await
@@ -1575,7 +1575,7 @@ async fn find_by_purls_strips_qualifiers() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let result = crawler
         .find_by_purls(
             tmp.path(),
@@ -1606,7 +1606,7 @@ async fn find_by_purls_strips_subpath() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let result = crawler
         .find_by_purls(
             tmp.path(),
@@ -1636,7 +1636,7 @@ async fn find_by_purls_percent_decodes_encoded_version() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "torch", "2.1.0+cpu").await;
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let result = crawler
         .find_by_purls(tmp.path(), &["pkg:pypi/torch@2.1.0%2Bcpu".to_string()])
         .await
@@ -1661,7 +1661,7 @@ async fn find_by_purls_empty_purls_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let result = crawler.find_by_purls(tmp.path(), &[]).await.unwrap();
     assert!(result.is_empty());
 }
@@ -1670,7 +1670,7 @@ async fn find_by_purls_empty_purls_returns_empty() {
 #[serial_test::parallel]
 async fn find_by_purls_missing_site_packages_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     // site_packages_path doesn't exist — read_dir Err arm must yield empty.
     let result = crawler
         .find_by_purls(
@@ -1688,7 +1688,7 @@ async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let result = crawler
         .find_by_purls(tmp.path(), &["pkg:not-pypi/foo@1.0".to_string()])
         .await
@@ -1702,7 +1702,7 @@ async fn find_by_purls_version_mismatch_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     stage_dist_info(tmp.path(), "requests", "2.28.0").await;
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let result = crawler
         .find_by_purls(tmp.path(), &["pkg:pypi/requests@99.99.99".to_string()])
         .await
@@ -1721,7 +1721,7 @@ async fn crawl_all_via_site_packages_finds_dist_info_packages() {
         .await
         .unwrap();
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: true,
@@ -1765,7 +1765,7 @@ async fn crawl_all_with_unparseable_dist_info_skips() {
     tokio::fs::create_dir_all(&dist).await.unwrap();
     tokio::fs::write(dist.join("METADATA"), b"").await.unwrap();
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: true,
@@ -1787,7 +1787,7 @@ async fn get_site_packages_paths_with_global_prefix_passthrough() {
     let custom = tmp.path().join("custom-sp");
     tokio::fs::create_dir_all(&custom).await.unwrap();
 
-    let crawler = PythonCrawler;
+    let crawler = PythonCrawler::new();
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: false,

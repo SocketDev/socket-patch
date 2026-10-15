@@ -64,6 +64,22 @@ pub fn event_triples(envelope: &Value) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// Whether some `action` event for `purl` has `errorCode == code`.
+pub fn has_event(envelope: &Value, action: &str, code: &str, purl: &str) -> bool {
+    events(envelope)
+        .iter()
+        .any(|e| e["action"] == action && e["errorCode"] == code && e["purl"] == purl)
+}
+
+/// The string `purl` of every `action` event, in order.
+pub fn event_purls(envelope: &Value, action: &str) -> Vec<String> {
+    events(envelope)
+        .iter()
+        .filter(|e| e["action"] == action)
+        .filter_map(|e| e["purl"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// The `errorCode` of every event that has one; empty when `events` is
 /// missing.
 pub fn event_codes(envelope: &Value) -> Vec<String> {
