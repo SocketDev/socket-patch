@@ -1,4 +1,4 @@
-//! Coverage-gap integration test for `update::state`: the degenerate
+//! Integration test for `update::state`: the degenerate
 //! "no resolvable state dir" environment — `SOCKET_UPDATE_STATE_DIR`,
 //! the platform cache vars, and the home vars all unset/empty (a
 //! stripped container). The documented contract is that callers
