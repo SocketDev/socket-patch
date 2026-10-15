@@ -368,21 +368,26 @@ fn xml_element_texts<const N: usize>(xml: &str, paths: [&[&str]; N]) -> [Option<
 /// `<name>.gemspec` → `pkg:gem/<name>[@<version>]` from literal
 /// `<spec>.name = "…"` / `<spec>.version = "…"` assignments; a version
 /// computed from a constant (`Foo::VERSION`) is dropped, and the name falls
-/// back to the file stem. As in Ruby, comments, `=begin`/`=end` blocks and
-/// heredoc bodies are not code, and the last assignment wins (#1573).
+/// back to the file stem. As in Ruby, comments, `=begin`/`=end` blocks,
+/// heredoc bodies and anything after `__END__` are not code, and the last
+/// assignment wins (#1573).
 fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
-    let code = ruby_code_lines(strip_bom(content));
-    // The value of the last `<x>.<attr> = …` assignment: `Some(literal)`
+    let mut code: Vec<&str> = Vec::new();
+    crate::formats::gem::manifest::for_each_code_line(content, |_, c| code.push(c));
+    // The `spec` of `Gem::Specification.new do |spec|`, when the file names
+    // it, so a helper's `ext.name = …` elsewhere can't pass for the spec's.
+    let receiver = code.iter().find_map(|c| spec_block_param(c));
+    // The value of the last `<spec>.<attr> = …` assignment: `Some(literal)`
     // for a quoted literal, `None` for anything computed.
     let literal = |attr: &str| -> Option<String> {
-        let suffix = format!(".{attr}");
         code.iter()
             .filter_map(|line| {
                 let (lhs, rhs) = line.split_once('=')?;
-                if !lhs.trim().ends_with(&suffix) || rhs.starts_with(['=', '~']) {
-                    return None;
-                }
-                Some(quoted_literal(rhs.trim()))
+                let (recv, method) = lhs.trim().rsplit_once('.')?;
+                let assigns = method == attr
+                    && receiver.is_none_or(|r| recv == r)
+                    && !rhs.starts_with(['=', '~']);
+                assigns.then(|| quoted_literal(rhs.trim()))
             })
             .next_back()
             .flatten()
@@ -397,114 +402,23 @@ fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
     })
 }
 
+/// The block parameter of `Gem::Specification.new … do |spec|` (or
+/// `{ |spec|`) on this line of code.
+fn spec_block_param(code: &str) -> Option<&str> {
+    let after = &code[code.find("Gem::Specification.new")?..];
+    let (_, param) = after.split_once('|')?;
+    let param = param.split('|').next()?.trim();
+    let ident = !param.is_empty()
+        && param.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !param.starts_with(|c: char| c.is_ascii_digit());
+    ident.then_some(param)
+}
+
 /// The non-empty, non-interpolated text of a leading `"…"` / `'…'` literal.
 fn quoted_literal(rhs: &str) -> Option<String> {
-    let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-    let inner = &rhs[1..];
-    let value = inner[..inner.find(quote)?].trim();
+    let (value, _) = crate::formats::gem::gemfile::leading_quoted(rhs)?;
+    let value = value.trim();
     (!value.is_empty() && !value.contains("#{")).then(|| value.to_string())
-}
-
-/// The code of each line of a Ruby file: `#` comments (outside string
-/// literals) are cut off, and `=begin`/`=end` blocks and heredoc bodies are
-/// skipped. A line-level reader, not a Ruby parser — enough to keep text
-/// Ruby never executes from passing for an assignment.
-fn ruby_code_lines(content: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut heredocs: Vec<String> = Vec::new();
-    let mut in_block_comment = false;
-    for raw in content.lines() {
-        let raw = raw.strip_suffix('\r').unwrap_or(raw);
-        if in_block_comment {
-            in_block_comment = !is_ruby_doc_marker(raw, "=end");
-            continue;
-        }
-        if let Some(terminator) = heredocs.first() {
-            if raw.trim() == terminator {
-                heredocs.remove(0);
-            }
-            continue;
-        }
-        if is_ruby_doc_marker(raw, "=begin") {
-            in_block_comment = true;
-            continue;
-        }
-        let code = strip_ruby_comment(raw);
-        heredocs.extend(heredoc_terminators(code));
-        out.push(code);
-    }
-    out
-}
-
-/// `=begin` / `=end` only count at column 0, alone or followed by space.
-fn is_ruby_doc_marker(line: &str, marker: &str) -> bool {
-    line.strip_prefix(marker)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-}
-
-/// `line` up to its first `#` outside a `"…"` / `'…'` literal.
-fn strip_ruby_comment(line: &str) -> &str {
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (i, c) in line.char_indices() {
-        match quote {
-            Some(_) if escaped => escaped = false,
-            Some(_) if c == '\\' => escaped = true,
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c == '#' => return &line[..i],
-            None => {}
-        }
-    }
-    line
-}
-
-/// The terminators of the heredocs a code line opens (`<<~ID`, `<<-ID`,
-/// `<<ID` with an upper-case ID, or a quoted `<<~'id'` / `<<~"id"`), in
-/// order. A `<<` inside a string literal opens nothing.
-fn heredoc_terminators(code: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut i = 0;
-    while let Some(c) = code[i..].chars().next() {
-        let mut next = i + c.len_utf8();
-        match quote {
-            Some(_) if escaped => escaped = false,
-            Some(_) if c == '\\' => escaped = true,
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if code[i..].starts_with("<<") => {
-                let after = &code[i + 2..];
-                let after = after.strip_prefix(['~', '-']).unwrap_or(after);
-                let (ident, quoted) = match after.chars().next() {
-                    Some(q @ ('"' | '\'')) => (&after[1..], Some(q)),
-                    _ => (after, None),
-                };
-                let len = ident
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .unwrap_or(ident.len());
-                let id = &ident[..len];
-                let valid = !id.starts_with(|c: char| c.is_ascii_digit())
-                    && match quoted {
-                        Some(q) => !id.is_empty() && ident[len..].starts_with(q),
-                        None => id.starts_with(|c: char| c.is_ascii_uppercase()),
-                    };
-                if valid {
-                    found.push(id.to_string());
-                    // Resume after the identifier (and its closing quote).
-                    next = code.len() - ident.len() + len + usize::from(quoted.is_some());
-                } else {
-                    next = i + 2;
-                }
-            }
-            None => {}
-        }
-        i = next;
-    }
-    found
 }
 
 /// The one regular file directly under `cwd` named `*<ext>`, or `None` when
@@ -2918,6 +2832,18 @@ mod tests {
                 "  spec.name = \"acme\"\n  spec.description = <<-'TEXT'.strip\n  \
                  spec.version = \"0.0.1\"\n  TEXT\n  spec.version = \"3.0.0\"\n",
                 "pkg:gem/acme@3.0.0",
+            ),
+            (
+                "DATA section after __END__",
+                "  spec.name = \"acme\"\n  spec.version = Acme::VERSION\nend\n__END__\n\
+                 spec.version = \"0.0.1\"\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "another receiver's `.name` / `.version` is not the spec's",
+                "  spec.name = \"acme\"\n  spec.version = \"1.2.0\"\n  \
+                 ext.name = \"acme_ext\"\n  task.version = \"0.1\"\n",
+                "pkg:gem/acme@1.2.0",
             ),
             (
                 "trailing comment after a live literal",
