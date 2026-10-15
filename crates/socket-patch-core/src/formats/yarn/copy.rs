@@ -93,10 +93,13 @@ impl CopyRef {
     /// The package a [`CopyRef::Linked`] copy's manifest names when it
     /// names no version, so [`CopyRef::identity`] can't say: the copy may
     /// be any version of that package, and of no other (#1579). `None` for
-    /// any other copy, or a manifest that names no package.
+    /// any other copy, or a manifest that names no package (an empty or
+    /// invalid npm name names none, so the copy may be any package).
     pub(crate) fn linked_name(&self, bytes: Option<&[u8]>) -> Option<String> {
         match self {
-            CopyRef::Linked(..) => manifest_name(bytes?),
+            CopyRef::Linked(..) => {
+                manifest_name(bytes?).filter(|n| crate::vendor::is_safe_npm_name(n))
+            }
             _ => None,
         }
     }
@@ -400,5 +403,25 @@ mod tests {
             Some(("left-pad".into(), "1.3.0".into()))
         );
         assert_eq!(dir.identity("1.3.0", None), None);
+    }
+
+    /// #1579: a linked manifest naming a package but no version names that
+    /// package; an empty or invalid name names none.
+    #[test]
+    fn linked_name_reads_a_valid_name_only() {
+        let linked = CopyRef::Linked("vend/lp".into(), LinkKind::Portal);
+        assert_eq!(
+            linked
+                .linked_name(Some(br#"{"name":"left-pad"}"#))
+                .as_deref(),
+            Some("left-pad")
+        );
+        for manifest in [&br#"{"name":""}"#[..], br#"{"name":"../x"}"#, br#"{}"#] {
+            assert_eq!(linked.linked_name(Some(manifest)), None);
+        }
+        assert_eq!(
+            CopyRef::Directory("lp".into()).linked_name(Some(br#"{"name":"left-pad"}"#)),
+            None
+        );
     }
 }

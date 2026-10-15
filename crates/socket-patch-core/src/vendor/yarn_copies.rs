@@ -36,6 +36,9 @@ pub(crate) struct OtherNameCopy {
     /// `name`, so it is named, but never taken as proof that `name` is
     /// installed (#1516, #1540).
     pub(crate) identified: bool,
+    /// An unidentified `portal:` / `link:` copy whose `package.json` names
+    /// `name` but no version (#1579), as opposed to one that can't be read.
+    pub(crate) versionless: bool,
 }
 
 /// Every live entry of `lock_text` (either grammar) that installs
@@ -120,13 +123,14 @@ pub(crate) async fn other_name_copies(
             }
             // A manifest naming another package but no version is no copy
             // of this one.
-            None if linked_name.is_some_and(|n| n != name) => continue,
+            None if linked_name.as_deref().is_some_and(|n| n != name) => continue,
             None => false,
         };
         out.push(OtherNameCopy {
             key,
             source,
             identified,
+            versionless: !identified && linked_name.is_some(),
         });
     }
     out

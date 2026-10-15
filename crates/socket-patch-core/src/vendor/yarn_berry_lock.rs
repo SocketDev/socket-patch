@@ -275,6 +275,13 @@ impl NpmLockBackend for YarnBerryBackend {
                          dependency name, from {origin}; the name-keyed resolutions entry \
                          vendoring writes never reaches it, so that copy stays UNPATCHED"
                     )
+                } else if copy.versionless {
+                    format!(
+                        "{YARN_LOCK} entry `{key}` installs {name} under another dependency \
+                         name, from {origin}, whose package.json names no version, so it may \
+                         be {name}@{version}; the name-keyed resolutions entry vendoring \
+                         writes never reaches it, so if it is, that copy stays UNPATCHED"
+                    )
                 } else {
                     // An unidentified `portal:` / `link:` copy has no
                     // version to name (#1540, #1561).
@@ -2672,10 +2679,15 @@ __metadata:
                     continue;
                 }
                 assert_eq!(copies.len(), 1, "{protocol}/{target}: {warnings:?}");
+                let (what, why) = if target == "no-version-left-pad" {
+                    ("installs left-pad under", "names no version")
+                } else {
+                    ("installs a package under", "can't be read")
+                };
                 assert!(
                     copies[0].detail.contains(&format!("`\"{key}\"`"))
-                        && copies[0].detail.contains("installs a package under")
-                        && copies[0].detail.contains("can't be read"),
+                        && copies[0].detail.contains(what)
+                        && copies[0].detail.contains(why),
                     "{protocol}/{target}: {}",
                     copies[0].detail
                 );
