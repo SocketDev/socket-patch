@@ -1065,10 +1065,6 @@ fn mirror_metadata(path: &Path) -> Vec<PathBuf> {
     }) else {
         return Vec::new();
     };
-    let ours = [
-        (".gitignore", super::npm_dir::UUID_GITIGNORE),
-        (".gitattributes", super::npm_dir::UUID_GITATTRIBUTES),
-    ];
     let mut metadata = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -1086,15 +1082,16 @@ fn mirror_metadata(path: &Path) -> Vec<PathBuf> {
             }
             continue;
         }
-        let name = entry.file_name();
-        match ours.iter().find(|(n, _)| name == *n) {
-            Some((_, want))
-                if read_regular_to_bytes_sync(&child).is_ok_and(|b| b == want.as_bytes()) =>
-            {
-                metadata.push(child)
-            }
+        let ours: fn(&[u8]) -> bool = match entry.file_name().to_str() {
+            Some(".gitignore") => |b| b == super::npm_dir::UUID_GITIGNORE.as_bytes(),
+            // Current or pre-#1541 bytes.
+            Some(".gitattributes") => super::npm_dir::is_uuid_gitattributes,
             _ => return Vec::new(),
+        };
+        if !read_regular_to_bytes_sync(&child).is_ok_and(|b| ours(&b)) {
+            return Vec::new();
         }
+        metadata.push(child);
     }
     metadata
 }
@@ -1710,8 +1707,17 @@ mod rebuild_tests {
             "repair restores the mirrors' .gitignore"
         );
 
-        // A mirror deleted by hand still takes its metadata on revert.
+        // A mirror deleted by hand still takes its metadata on revert, and
+        // so does a `.gitattributes` an older release wrote (#1541).
         std::fs::remove_file(root.join(&mirrors[0])).unwrap();
+        for rel in &mirrors {
+            let attributes = Path::new(rel).parent().unwrap().join(".gitattributes");
+            std::fs::write(
+                root.join(attributes),
+                super::super::npm_dir::LEGACY_UUID_GITATTRIBUTES,
+            )
+            .unwrap();
+        }
         ts::persist(root, PURL, entry.clone()).await;
         let outcome = revert(&entry, root, RevertOpts::new(false)).await;
         assert!(outcome.success, "{outcome:?}");

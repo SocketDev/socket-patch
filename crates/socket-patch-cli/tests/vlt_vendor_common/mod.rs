@@ -457,7 +457,7 @@ pub fn ledger_entry(root: &Path, purl: &str) -> Value {
 /// The exact `<uuid>/.gitignore` and `.gitattributes` bytes (DESIGN §4.2).
 pub const UUID_GITIGNORE: &str =
     "!*\n**/node_modules/*/node_modules/\n**/node_modules/@*/*/node_modules/\n";
-pub const UUID_GITATTRIBUTES: &str = "* -text\n";
+pub const UUID_GITATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding\n";
 
 pub fn git() -> Option<PathBuf> {
     socket_patch_core::utils::process::resolve_tool("git")

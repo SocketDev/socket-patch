@@ -281,7 +281,7 @@ async fn vlt_repair_restores_the_uuid_gitignore() {
         assert_eq!(std::fs::read(uuid.join(".gitignore")).unwrap(), ignore);
         assert_eq!(
             std::fs::read_to_string(uuid.join(".gitattributes")).unwrap(),
-            "* -text\n"
+            "* -text -filter -ident -working-tree-encoding\n"
         );
     }
 }
