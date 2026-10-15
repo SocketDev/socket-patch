@@ -1095,7 +1095,7 @@ impl Discovery {
                         let other = self.tree_of(&e.file);
                         e.covers(&r.purl)
                             && other != tree
-                            && !wiring.contains(&(e.purl.clone(), other.to_path_buf()))
+                            && !wiring.contains(&(r.purl.clone(), other.to_path_buf()))
                     })
                 })
                 .flatten();
@@ -1236,10 +1236,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs.iter().any(|r| PurlKey::same(&r.purl, &key))
             || self.contested.iter().any(|c| PurlKey::same(&c.purl, &key))
-            || self
-                .elsewhere
-                .iter()
-                .any(|e| PurlKey::same(&e.purl, &key) || e.covers(&key))
+            || self.elsewhere.iter().any(|e| PurlKey::same(&e.purl, &key))
     }
 
     fn recognize(&mut self, uuid: &str, mode: WiringMode, file: &str) {

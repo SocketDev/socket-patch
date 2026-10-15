@@ -261,7 +261,19 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Discovery) {
     let (code, comment) = split_comment(line);
     let code = code.trim();
-    // Blank lines, comments, and option lines (`-r`, `--index-url`, `-e`).
+    if let Some(location) = editable_location(code) {
+        // pip installs an editable source checkout of whatever package it
+        // holds, never a Socket artifact: evidence for the package its
+        // `#egg=` names, at any version (#1549).
+        if !mentions_vendor_dir(location) {
+            if let Some(name) = egg_name(location) {
+                out.resolved_elsewhere_any_version(file, pypi_name_purl(name));
+            }
+        }
+        return;
+    }
+    // Blank lines, comments, and the other option lines (`-r`,
+    // `--index-url`).
     if code.is_empty() || code.starts_with('-') {
         return;
     }
@@ -286,6 +298,30 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
         integrity_of(location, hash_options(code)),
         out,
     );
+}
+
+/// The location of an editable requirement (`-e <loc>`, `--editable <loc>`,
+/// `--editable=<loc>`).
+fn editable_location(code: &str) -> Option<&str> {
+    let rest = code
+        .strip_prefix("--editable")
+        .or_else(|| code.strip_prefix("-e"))?;
+    let rest = match rest.strip_prefix('=') {
+        Some(rest) => rest,
+        None if rest.starts_with(char::is_whitespace) => rest,
+        None => return None,
+    };
+    rest.split_whitespace().next()
+}
+
+/// The package a VCS / url requirement names in its `#egg=<name>` fragment.
+fn egg_name(location: &str) -> Option<&str> {
+    let (_, fragment) = location.split_once('#')?;
+    let egg = fragment.split('&').find_map(|p| p.strip_prefix("egg="))?;
+    let end = egg
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .unwrap_or(egg.len());
+    Some(&egg[..end]).filter(|name| !name.is_empty())
 }
 
 /// The `pypi_purl` of an exact `name[extras]==X` registry requirement
@@ -510,24 +546,32 @@ fn emit(
 /// Record a user's own (non-Socket) reference `location` as evidence that
 /// `entry`'s file installs its package from elsewhere (#1549): pip and
 /// Pipenv install that artifact, unpatched, whichever lock wires the same
-/// release to a Socket patch. The release is an exact `version` pin beside
-/// the reference, else the artifact's wheel / sdist filename (when it names
-/// the declared package). With neither, it may be any version. A bare
-/// requirements line names its package only through its filename, so one
-/// whose filename isn't an artifact's (a source directory) is left out.
+/// release to a Socket patch. The release is the artifact's wheel / sdist
+/// filename (when it names the declared package), else an exact `version`
+/// pin beside the reference. With neither, it may be any version. A bare
+/// requirements line names its package only through its filename or an
+/// `#egg=` fragment, so one with neither (a source directory) is left out.
 fn foreign_reference(entry: &Entry<'_>, location: &str, out: &mut Discovery) {
     let leaf = artifact_leaf(location).and_then(|leaf| vendored_leaf_purl("pypi", &leaf));
     let leaf = leaf
         .as_deref()
         .and_then(|purl| purl.strip_prefix("pkg:pypi/"))
         .and_then(|nv| nv.rsplit_once('@'));
-    let Some(name) = entry.name.or(leaf.map(|(name, _)| name)) else {
+    let Some(name) = entry
+        .name
+        .or(leaf.map(|(name, _)| name))
+        .or_else(|| egg_name(location))
+    else {
         return;
     };
-    let version = entry.pinned_version.filter(|v| !v.is_empty()).or_else(|| {
-        leaf.filter(|(leaf_name, _)| *leaf_name == canonicalize_pypi_name(name))
-            .map(|(_, version)| version)
-    });
+    let version = leaf
+        .filter(|(leaf_name, _)| *leaf_name == canonicalize_pypi_name(name))
+        .map(|(_, version)| version)
+        .or_else(|| {
+            entry
+                .pinned_version
+                .filter(|v| !v.is_empty() && !v.contains('*'))
+        });
     match version {
         Some(version) => out.resolved_elsewhere(entry.file, pypi_purl(name, version)),
         None => out.resolved_elsewhere_any_version(entry.file, pypi_name_purl(name)),
@@ -546,8 +590,8 @@ fn artifact_leaf(location: &str) -> Option<String> {
 /// [`Discovery::resolved_elsewhere_any_version`]; `None` for a name a purl
 /// can't safely carry.
 fn pypi_name_purl(name: &str) -> Option<String> {
-    let purl = pypi_purl(name, "0")?;
-    Some(purl.strip_suffix("@0")?.to_string())
+    let name = canonicalize_pypi_name(name);
+    crate::patch::path_safety::is_safe_single_segment(&name).then(|| format!("pkg:pypi/{name}"))
 }
 
 fn hosted_ref(
@@ -1645,6 +1689,14 @@ mod tests {
                 ),
             ),
             (
+                "Pipfile.lock wheel beside a wildcard version",
+                ("requirements.txt", vendored_requirements.clone()),
+                (
+                    "Pipfile.lock",
+                    pipfile(serde_json::json!({ "file": upstream, "version": "==1.16.*" })),
+                ),
+            ),
+            (
                 "Pipfile.lock path with an exact version",
                 ("requirements.txt", vendored_requirements.clone()),
                 (
@@ -1746,6 +1798,16 @@ mod tests {
                 "six @ git+https://github.com/benjaminp/six.git@abc123\n",
             ),
             ("directory requirement", "six @ file:///srv/src/six\n"),
+            (
+                "bare vcs line named by #egg",
+                "git+https://github.com/benjaminp/six.git@1.16.0#egg=six\n",
+            ),
+            (
+                "editable vcs",
+                "-e git+https://github.com/benjaminp/six.git#egg=six\n",
+            ),
+            ("editable dir", "--editable=./src/six#egg=Six\n"),
+            ("editable dir, long flag", "--editable ./src/six#egg=six\n"),
         ] {
             let p = Project::new();
             p.write(

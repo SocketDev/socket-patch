@@ -1381,7 +1381,8 @@ pub fn contested_by_a_non_socket_direct_reference(
                 assert_no_statement(&out, &what);
                 let text = out.stdout.clone() + &out.stderr;
                 assert!(
-                    text.contains("patched_ref_unattributable") && text.contains(other_rel),
+                    text.contains("patched_ref_unattributable")
+                        && text.contains(&format!("but {other_rel} resolves the same version")),
                     "{what}: the contested wiring must be explained: {out}"
                 );
             }
