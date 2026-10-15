@@ -1,9 +1,13 @@
-//! `scan`: batching, ecosystem scope, ordering, paths, sync, hosted refusals and the vendor flow.
+//! `scan`: batching, ecosystem scope, ordering, paths, sync, hosted refusals,
+//! the hosted `--json` failure paths and their human render checks, and the
+//! vendor flow.
 //!
 //! One test binary per command: each module was its own binary.
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/rollback_json.rs"]
+mod rollback_json;
 #[path = "../vlt_hosted_common/mod.rs"]
 mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]
@@ -13,7 +17,10 @@ mod coverage_fix_scan_discovery_corrupt_ledger;
 mod covgap_commands_fetch_stage;
 mod covgap_commands_scan_vendor_flow;
 mod covgap_ecosystem_dispatch;
+mod hosted_failure_paths;
+mod hosted_fixture;
 mod hosted_management_refusals;
+mod hosted_render;
 mod hosted_symlinked_files;
 mod hosted_wheel_metadata_order;
 mod hosted_yarn_berry_manifest;
