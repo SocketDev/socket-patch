@@ -42,8 +42,21 @@ use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
 /// `<uuid>/.gitignore`, exactly.
 pub(crate) const UUID_GITIGNORE: &str =
     "!*\n**/node_modules/*/node_modules/\n**/node_modules/@*/*/node_modules/\n";
-/// `<uuid>/.gitattributes`, exactly.
-pub(crate) const UUID_GITATTRIBUTES: &str = "* -text\n";
+/// `<uuid>/.gitattributes`, exactly. It unsets every attribute that lets
+/// git store or check out other bytes than the artifact's: EOL conversion
+/// (`text`), clean/smudge filters such as a repository's `*.tgz
+/// filter=lfs` rule (#1541), `ident` expansion and re-encoding. A nested
+/// file beats every `.gitattributes` above it; only `.git/info/attributes`
+/// outranks it.
+pub(crate) const UUID_GITATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding\n";
+/// The `<uuid>/.gitattributes` releases before #1541 wrote: still ours,
+/// and rewritten to [`UUID_GITATTRIBUTES`] by the next vendored run.
+pub(crate) const LEGACY_UUID_GITATTRIBUTES: &str = "* -text\n";
+
+/// `bytes` is a `<uuid>/.gitattributes` socket-patch wrote, current or legacy.
+pub(crate) fn is_uuid_gitattributes(bytes: &[u8]) -> bool {
+    bytes == UUID_GITATTRIBUTES.as_bytes() || bytes == LEGACY_UUID_GITATTRIBUTES.as_bytes()
+}
 
 const GITIGNORE: &str = ".gitignore";
 const GITATTRIBUTES: &str = ".gitattributes";
@@ -1015,8 +1028,86 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(tmp.path().join(GITATTRIBUTES)).unwrap(),
-            "* -text\n"
+            "* -text -filter -ident -working-tree-encoding\n"
         );
+    }
+
+    /// #1541: a vendored tree written by an older release holds the
+    /// legacy `* -text` file; the next run rewrites it in place.
+    #[tokio::test]
+    async fn legacy_uuid_gitattributes_is_upgraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join(GITATTRIBUTES), LEGACY_UUID_GITATTRIBUTES)
+            .await
+            .unwrap();
+        restore_uuid_metadata(tmp.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(GITATTRIBUTES)).unwrap(),
+            UUID_GITATTRIBUTES
+        );
+        assert!(is_uuid_gitattributes(LEGACY_UUID_GITATTRIBUTES.as_bytes()));
+        assert!(is_uuid_gitattributes(UUID_GITATTRIBUTES.as_bytes()));
+        assert!(!is_uuid_gitattributes(b"* -text filter=lfs\n"));
+    }
+
+    /// #1541: a repository rule that hands `*.tgz` (or every file) to Git
+    /// LFS, or re-encodes or expands it on checkout, does not reach the
+    /// vendored artifacts once the uuid `.gitattributes` is in place, so
+    /// the commit stores their exact bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_uuid_gitattributes_overrides_repository_lfs_rules() {
+        let Some(git) = crate::utils::process::resolve_tool("git") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let status = std::process::Command::new(&git)
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(
+            root.join(".gitattributes"),
+            "*.tgz filter=lfs diff=lfs merge=lfs -text\n\
+             *.js filter=lfs working-tree-encoding=UTF-16 ident text eol=crlf\n",
+        )
+        .unwrap();
+        let uuid = root.join(".socket/vendor/npm/u");
+        std::fs::create_dir_all(&uuid).unwrap();
+        let paths = [
+            ".socket/vendor/npm/u/left-pad-1.3.0.tgz",
+            ".socket/vendor/npm/u/a-1.0.0/node_modules/a/index.js",
+        ];
+        let attr = |path: &str| {
+            let out = std::process::Command::new(&git)
+                .args([
+                    "check-attr",
+                    "filter",
+                    "text",
+                    "ident",
+                    "working-tree-encoding",
+                    "--",
+                ])
+                .arg(path)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert!(
+            attr(paths[0]).contains("filter: lfs"),
+            "the repo rule applies"
+        );
+        restore_uuid_metadata(&uuid).await.unwrap();
+        for path in paths {
+            let out = attr(path);
+            for name in ["filter", "text", "ident", "working-tree-encoding"] {
+                assert!(out.contains(&format!("{path}: {name}: unset")), "{out}");
+            }
+        }
     }
 
     fn tgz(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {

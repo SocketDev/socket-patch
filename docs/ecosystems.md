@@ -655,8 +655,9 @@ package that `require()`s its own name resolve itself. The payload's `devDepende
 are dropped from its `package.json` (vlt would otherwise try to install them). The uuid
 directory carries a `.gitignore` that re-includes the payload (`!*`) against the project's
 own ignores (`node_modules`, `dist/`, `*.map`, …) while ignoring the links vlt creates
-inside it, and a `.gitattributes` that turns EOL conversion off so an `autocrlf` checkout
-stays byte-exact. The lock's node becomes a `file` node, the importer edges and the
+inside it, and a `.gitattributes` (`* -text -filter -ident -working-tree-encoding`) that
+turns off EOL conversion and overrides the project's clean/smudge filters, such as a Git
+LFS `*.tgz` rule, so an `autocrlf` or LFS-less checkout stays byte-exact (#1541). The lock's node becomes a `file` node, the importer edges and the
 importers' `package.json` specs move to the `file:` path, and every moved entry is placed
 where vlt's own serializer puts it, so `vlt ci` keeps the lock byte-identical. Transitive
 targets are refused (`vendor_vlt_transitive_unsupported`: vlt silently reverts
