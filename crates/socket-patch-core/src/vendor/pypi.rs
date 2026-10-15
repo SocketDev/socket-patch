@@ -1900,24 +1900,6 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         result.error = Some("wheel build reported success without an artifact".to_string());
         return done(result, None, warnings);
     };
-    if let Err((code, detail)) =
-        keep_wheel_committable(project_root, &uuid_dir_rel, &rel_wheel, &mut warnings).await
-    {
-        // A REUSED wheel is the committed artifact the live ledger entry
-        // still names: never sweep it.
-        if !reused {
-            let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
-            prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
-        }
-        if let Some(code) = code {
-            return refused(code, detail);
-        }
-        let mut result = result;
-        result.success = false;
-        result.error = Some(detail);
-        return done(result, None, warnings);
-    }
-
     // A compiled-extension wheel (cp311/manylinux tags) only installs on this
     // platform, where the registry offered wheels for many — surface it.
     if platform_locked {
@@ -1966,6 +1948,31 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                 return done(result, None, warnings);
             }
         }
+    }
+
+    // The wheel this run put in place (its in-sync pin checked) must
+    // survive the commit (#1572).
+    if let Err((code, detail)) =
+        keep_wheel_committable(project_root, &uuid_dir_rel, &rel_wheel, &mut warnings).await
+    {
+        // A REUSED wheel is the committed artifact the live ledger entry
+        // still names, and an in-sync rebuild (its pin checked above) is the
+        // wheel the wiring already names: keep both, so the local tree still
+        // installs. Only a fresh wheel nothing names yet is swept.
+        if !reused && !in_sync {
+            let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+            prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
+        }
+        if let Some(code) = code {
+            return refused(code, detail);
+        }
+        let mut result = result;
+        result.success = false;
+        result.error = Some(detail);
+        return done(result, None, warnings);
+    }
+
+    if in_sync {
         // Artifact rebuilt; wiring untouched, ledger entry stays with the
         // first run (the only copy of the pre-vendor originals).
         warnings.push(VendorWarning::new(
@@ -5626,6 +5633,31 @@ wheels = [
             panic!("an in-sync re-run is not refused: {outcome:?}");
         };
         assert!(result.success, "{:?}", result.error);
+    }
+
+    /// #1572 review: an in-sync rebuild whose uuid dotfiles can't be written
+    /// fails, but keeps the rebuilt wheel the wiring already names, so the
+    /// local tree still installs.
+    #[tokio::test]
+    async fn an_in_sync_rebuild_keeps_its_wheel_when_the_dotfiles_fail() {
+        let fx = e2e_fixture_hashed().await;
+        let VendorOutcome::Done { result, .. } = vendor_served(&fx, false).await else {
+            panic!("expected Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+        let wheel = uuid_dir.join(WHEEL_NAME);
+        std::fs::remove_file(&wheel).unwrap();
+        // A directory where the `.gitattributes` goes fails its write.
+        std::fs::remove_file(uuid_dir.join(".gitattributes")).unwrap();
+        std::fs::create_dir(uuid_dir.join(".gitattributes")).unwrap();
+        let outcome = vendor_served(&fx, false).await;
+        let VendorOutcome::Done { result, entry, .. } = outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(!result.success, "the failed write fails the run");
+        assert!(entry.is_none());
+        assert!(wheel.is_file(), "the rebuilt, wired wheel stays");
     }
 
     /// #1572: a repository LFS rule for `*.whl` would commit a pointer in
