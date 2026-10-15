@@ -29,8 +29,14 @@
 //!
 //! Anything else Socket-SHAPED (a `.socket/vendor/` path that escapes the
 //! root or is not a pypi wheel, a patch-server url with no patch uuid) is a
-//! [`DIAG_REF_INVALID`]; registry pins and users' own urls/paths are
-//! skipped silently.
+//! [`DIAG_REF_INVALID`]. Registry pins and, in `Pipfile.lock` and the
+//! requirements files, users' own urls / paths / VCS checkouts wire
+//! nothing: they are evidence that the lock installs the package from
+//! elsewhere ([`Discovery::resolved_elsewhere`]), which contests another
+//! lock's wiring of the same release (#1549). Such a reference's version
+//! is an exact `version` pin beside it or its artifact's own wheel / sdist
+//! filename; one with neither may install any version
+//! ([`Discovery::resolved_elsewhere_any_version`]).
 //!
 //! ## Pipfile.lock
 //!
@@ -168,9 +174,12 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         let references = pkg.references();
         let location = match references.as_slice() {
             [] => {
-                // A registry pin (`version: "==X"`, no VCS / editable
-                // source): evidence against another lock's wiring.
-                if let (false, Some(version)) = (pkg.is_vcs(), pkg.exact_pin()) {
+                // A registry pin (`version: "==X"`): evidence against
+                // another lock's wiring. A VCS / editable source names no
+                // release, so it may be any version (#1549).
+                if pkg.is_vcs() {
+                    out.resolved_elsewhere_any_version(PIPFILE_LOCK, pypi_name_purl(name));
+                } else if let Some(version) = pkg.exact_pin() {
                     out.resolved_elsewhere(PIPFILE_LOCK, pypi_purl(name, version));
                 }
                 continue;
@@ -208,6 +217,7 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 pinned_version: pkg.exact_pin(),
                 tag: None,
                 root_uri: false,
+                foreign_is_evidence: true,
             },
             location,
             integrity_of(location, hashes),
@@ -270,6 +280,7 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
             pinned_version: None,
             tag,
             root_uri: false,
+            foreign_is_evidence: true,
         },
         location,
         integrity_of(location, hash_options(code)),
@@ -384,6 +395,7 @@ fn hatch_spec(
             pinned_version: None,
             tag: None,
             root_uri: expanded,
+            foreign_is_evidence: false,
         },
         location,
         integrity_of(location, Vec::new()),
@@ -408,6 +420,12 @@ struct Entry<'a> {
     /// URI, so a `#sha256=…` after the path is a fragment, not part of the
     /// file name.
     root_uri: bool,
+    /// A non-Socket reference here installs the package from elsewhere,
+    /// evidence against another lock's wiring ([`foreign_reference`]):
+    /// `Pipfile.lock` and requirements files, which install exactly what
+    /// they reference. Hatch's dependency tables are declarations a
+    /// resolver reads, not an install source of their own.
+    foreign_is_evidence: bool,
 }
 
 impl Entry<'_> {
@@ -469,7 +487,12 @@ fn emit(
 ) {
     let uri = entry.root_uri || url_form(location);
     let result = match classify(ctx, location, uri) {
-        Ok(None) => return,
+        Ok(None) => {
+            if entry.foreign_is_evidence {
+                foreign_reference(entry, location, out);
+            }
+            return;
+        }
         Ok(Some(Wired::Hosted(uuid))) => hosted_ref(entry, location, uuid, integrity),
         Ok(Some(Wired::Vendored(vref))) => vendored_ref(entry, &vref, integrity),
         Err(detail) => Err(detail),
@@ -482,6 +505,49 @@ fn emit(
             format!("{}: {}: {detail}", entry.file, entry.subject(location)),
         ),
     }
+}
+
+/// Record a user's own (non-Socket) reference `location` as evidence that
+/// `entry`'s file installs its package from elsewhere (#1549): pip and
+/// Pipenv install that artifact, unpatched, whichever lock wires the same
+/// release to a Socket patch. The release is an exact `version` pin beside
+/// the reference, else the artifact's wheel / sdist filename (when it names
+/// the declared package). With neither, it may be any version. A bare
+/// requirements line names its package only through its filename, so one
+/// whose filename isn't an artifact's (a source directory) is left out.
+fn foreign_reference(entry: &Entry<'_>, location: &str, out: &mut Discovery) {
+    let leaf = artifact_leaf(location).and_then(|leaf| vendored_leaf_purl("pypi", &leaf));
+    let leaf = leaf
+        .as_deref()
+        .and_then(|purl| purl.strip_prefix("pkg:pypi/"))
+        .and_then(|nv| nv.rsplit_once('@'));
+    let Some(name) = entry.name.or(leaf.map(|(name, _)| name)) else {
+        return;
+    };
+    let version = entry.pinned_version.filter(|v| !v.is_empty()).or_else(|| {
+        leaf.filter(|(leaf_name, _)| *leaf_name == canonicalize_pypi_name(name))
+            .map(|(_, version)| version)
+    });
+    match version {
+        Some(version) => out.resolved_elsewhere(entry.file, pypi_purl(name, version)),
+        None => out.resolved_elsewhere_any_version(entry.file, pypi_name_purl(name)),
+    }
+}
+
+/// The percent-decoded last path segment of a url or path, its `#`
+/// fragment and `?` query cut: the artifact's filename.
+fn artifact_leaf(location: &str) -> Option<String> {
+    let path = location.split(['#', '?']).next()?;
+    let leaf = path.rsplit(['/', '\\']).next()?;
+    (!leaf.is_empty()).then(|| crate::utils::purl::percent_decode_purl_component(leaf).into_owned())
+}
+
+/// `pkg:pypi/<name>` (PEP 503-canonical, no version) for
+/// [`Discovery::resolved_elsewhere_any_version`]; `None` for a name a purl
+/// can't safely carry.
+fn pypi_name_purl(name: &str) -> Option<String> {
+    let purl = pypi_purl(name, "0")?;
+    Some(purl.strip_suffix("@0")?.to_string())
 }
 
 fn hosted_ref(
@@ -1526,5 +1592,199 @@ mod tests {
             .iter()
             .all(|r| r.purl == "pkg:pypi/urllib3@1.26.18" && r.uuid == UUID_A));
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    /// REGRESSION (#1549): a Pipfile.lock `file` url or `path` wheel, or a
+    /// requirements `name @ <url>` line, that installs the same release
+    /// from a non-Socket artifact contests another lock's wiring exactly
+    /// like a registry `==` pin does: Pipenv / pip install the upstream
+    /// artifact, so the ref is withheld (`patched_ref_unattributable`,
+    /// naming both files) instead of attested. The version comes from an
+    /// exact `version` pin or the artifact's own wheel / sdist filename.
+    #[tokio::test]
+    async fn issue_1549_non_socket_direct_references_contest_wiring() {
+        const WHL: &str = "six-1.16.0-py2.py3-none-any.whl";
+        let upstream = format!("https://files.pythonhosted.org/packages/d9/5a/{WHL}");
+        let vendored = vendored_wheel(UUID_A, WHL);
+        let vendored_requirements =
+            format!("./{vendored} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0\n");
+        let vendored_pipfile = pipfile_lock(serde_json::json!({ "default": {
+            "six": { "file": format!("./{vendored}"), "hashes": [format!("sha256:{SHA}")] },
+        }}));
+        let pipfile = |entry: serde_json::Value| {
+            pipfile_lock(serde_json::json!({ "default": { "six": entry } }))
+        };
+        type Case = (&'static str, (&'static str, String), (&'static str, String));
+        let cases: Vec<Case> = vec![
+            (
+                "Pipfile.lock file url",
+                ("requirements.txt", vendored_requirements.clone()),
+                (
+                    "Pipfile.lock",
+                    pipfile(serde_json::json!({
+                        "file": upstream, "hashes": [format!("sha256:{SHA_B}")],
+                    })),
+                ),
+            ),
+            (
+                "Pipfile.lock path wheel",
+                ("requirements.txt", vendored_requirements.clone()),
+                (
+                    "Pipfile.lock",
+                    pipfile(serde_json::json!({
+                        "path": format!("./wheels/{WHL}"), "hashes": [format!("sha256:{SHA_B}")],
+                    })),
+                ),
+            ),
+            (
+                "Pipfile.lock file:// url",
+                ("requirements.txt", vendored_requirements.clone()),
+                (
+                    "Pipfile.lock",
+                    pipfile(serde_json::json!({ "file": format!("file:///srv/wheels/{WHL}") })),
+                ),
+            ),
+            (
+                "Pipfile.lock path with an exact version",
+                ("requirements.txt", vendored_requirements.clone()),
+                (
+                    "Pipfile.lock",
+                    pipfile(serde_json::json!({ "path": "./src/six", "version": "==1.16.0" })),
+                ),
+            ),
+            (
+                "requirements name @ url (mirror)",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                (
+                    "requirements.txt",
+                    format!("six @ {upstream} --hash=sha256:{SHA_B}\n"),
+                ),
+            ),
+            (
+                "requirements bare url line",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", format!("{upstream}#sha256={SHA_B}\n")),
+            ),
+            (
+                "requirements bare path line",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", format!("./wheels/{WHL}\n")),
+            ),
+        ];
+        for (name, wired, other) in cases {
+            let p = Project::new();
+            p.write(wired.0, &wired.1).write(other.0, &other.1);
+            let out = p.discover().await;
+            assert!(out.refs.is_empty(), "{name}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.file == std::path::Path::new(wired.0)
+                        && d.detail.contains(UUID_A)
+                        && d.detail.contains(other.0)),
+                "{name}: {:#?}",
+                out.diagnostics
+            );
+            let c = out
+                .vendored_contest("pkg:pypi/six@1.16.0", UUID_A)
+                .expect(name);
+            assert_eq!(c.other, std::path::Path::new(other.0), "{name}");
+
+            // Without the contesting file the same wiring is a ref.
+            let alone = Project::new();
+            alone.write(wired.0, &wired.1);
+            assert_eq!(alone.discover().await.refs.len(), 1, "{name} alone");
+        }
+    }
+
+    /// REGRESSION (#1549): a non-Socket direct reference whose version
+    /// can't be read (a source directory, a VCS url, an artifact named
+    /// for no release) may install any version of its package, so it
+    /// contests another lock's wiring of that package at every version;
+    /// one of ANOTHER package, or of another release, contests nothing.
+    #[tokio::test]
+    async fn issue_1549_unversioned_direct_references_contest_every_version() {
+        const WHL: &str = "six-1.16.0-py2.py3-none-any.whl";
+        let vendored = vendored_wheel(UUID_A, WHL);
+        let vendored_requirements =
+            format!("./{vendored} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0\n");
+        let pipfile = |entry: serde_json::Value| {
+            pipfile_lock(serde_json::json!({ "default": { "six": entry } }))
+        };
+        for (name, other) in [
+            (
+                "path dir",
+                pipfile(serde_json::json!({ "path": "./src/six" })),
+            ),
+            (
+                "file sdist url with no version",
+                pipfile(serde_json::json!({ "file": "https://example.com/dl/six.zip" })),
+            ),
+            (
+                "vcs entry",
+                pipfile(serde_json::json!({
+                    "git": "https://github.com/benjaminp/six.git", "ref": "abc123",
+                })),
+            ),
+        ] {
+            let p = Project::new();
+            p.write("requirements.txt", &vendored_requirements)
+                .write("Pipfile.lock", &other);
+            let out = p.discover().await;
+            assert!(out.refs.is_empty(), "{name}: {:#?}", out.refs);
+            assert!(
+                out.vendored_contest("pkg:pypi/six@1.16.0", UUID_A)
+                    .is_some(),
+                "{name}: {:#?}",
+                out.diagnostics
+            );
+        }
+        for (name, line) in [
+            (
+                "vcs requirement",
+                "six @ git+https://github.com/benjaminp/six.git@abc123\n",
+            ),
+            ("directory requirement", "six @ file:///srv/src/six\n"),
+        ] {
+            let p = Project::new();
+            p.write(
+                "Pipfile.lock",
+                pipfile(serde_json::json!({
+                    "file": format!("./{vendored}"), "hashes": [format!("sha256:{SHA}")],
+                })),
+            )
+            .write("requirements.txt", line);
+            let out = p.discover().await;
+            assert!(out.refs.is_empty(), "{name}: {:#?}", out.refs);
+            assert!(
+                out.vendored_contest("pkg:pypi/six@1.16.0", UUID_A)
+                    .is_some(),
+                "{name}"
+            );
+        }
+
+        // Another package, or another release of this one, leaves the
+        // wiring alone.
+        for (name, other) in [
+            (
+                "other package dir",
+                pipfile_lock(serde_json::json!({ "default": {
+                    "idna": { "path": "./src/idna" },
+                }})),
+            ),
+            (
+                "other release wheel",
+                pipfile(serde_json::json!({
+                    "file": "https://files.pythonhosted.org/packages/six-1.15.0-py2.py3-none-any.whl",
+                })),
+            ),
+        ] {
+            let p = Project::new();
+            p.write("requirements.txt", &vendored_requirements)
+                .write("Pipfile.lock", &other);
+            let out = p.discover().await;
+            assert_eq!(out.refs.len(), 1, "{name}: {:#?}", out.diagnostics);
+        }
     }
 }

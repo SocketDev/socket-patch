@@ -453,10 +453,34 @@ impl UnlockedPin {
 /// [`Discovery::resolved_elsewhere`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ResolvedElsewhere {
-    /// Canonical base purl ([`canonical_base_purl`]).
+    /// Canonical base purl ([`canonical_base_purl`]). Versionless
+    /// (`pkg:pypi/six`) for an entry whose version can't be read: it may
+    /// resolve any version of that package
+    /// ([`Discovery::resolved_elsewhere_any_version`]).
     pub purl: String,
     /// Root-relative lock file.
     pub file: PathBuf,
+}
+
+impl ResolvedElsewhere {
+    /// Whether this entry resolves the canonical base `purl`: the same
+    /// `name@version`, or any version of `name` for a versionless entry.
+    fn covers(&self, purl: &str) -> bool {
+        self.purl == purl || purl_without_version(purl) == Some(self.purl.as_str())
+    }
+
+    /// Whether the entry names no version, so may resolve any.
+    fn any_version(&self) -> bool {
+        purl_without_version(&self.purl).is_none()
+    }
+}
+
+/// `pkg:<type>/<name>` of a versioned `pkg:<type>/<name>@<version>`;
+/// `None` for a purl with no version (an npm scope's `@` is part of the
+/// name).
+fn purl_without_version(purl: &str) -> Option<&str> {
+    let (head, _) = purl.rsplit_once('@')?;
+    (head.contains('/') && !head.ends_with('/')).then_some(head)
 }
 
 /// A lock entry that installs its OWN copy of a package — a `file:`
@@ -901,6 +925,24 @@ impl Discovery {
         });
     }
 
+    /// Record that lock `file` resolves the package `name_purl`
+    /// (`pkg:<type>/<name>`, no version; `None` is ignored) from a
+    /// non-Socket source whose version can't be read: a source directory, a
+    /// VCS checkout, an artifact named for no release. It may install any
+    /// version, so it is [`Discovery::resolved_elsewhere`] evidence against
+    /// every version of that package (#1549).
+    pub(crate) fn resolved_elsewhere_any_version(&mut self, file: &str, name_purl: Option<String>) {
+        let Some(name_purl) = name_purl else { return };
+        let purl = canonical_base_purl(&name_purl);
+        if purl_without_version(&purl).is_some() {
+            return;
+        }
+        self.elsewhere.push(ResolvedElsewhere {
+            purl,
+            file: PathBuf::from(file),
+        });
+    }
+
     /// Record that lock `file`'s entry `key` installs its own copy of `purl`
     /// (`None` is ignored), `how` saying from where. The cross-lock contest
     /// only weighs OTHER locks (a lock that wires a package is never its
@@ -1051,14 +1093,14 @@ impl Discovery {
                     let tree = self.tree_of(&r.source_file);
                     self.elsewhere.iter().find(|e| {
                         let other = self.tree_of(&e.file);
-                        e.purl == r.purl
+                        e.covers(&r.purl)
                             && other != tree
                             && !wiring.contains(&(e.purl.clone(), other.to_path_buf()))
                     })
                 })
                 .flatten();
             match other {
-                Some(e) => contested.push((r, e.file.clone())),
+                Some(e) => contested.push((r, e.clone())),
                 None => self.refs.push(r),
             }
         }
@@ -1068,21 +1110,25 @@ impl Discovery {
                 uuid: r.uuid.clone(),
                 mode: r.mode,
                 file: r.source_file.clone(),
-                other: other.clone(),
+                other: other.file.clone(),
             });
             let file = r.source_file.to_string_lossy().into_owned();
+            let resolves = if other.any_version() {
+                "resolves the package, at a version it doesn't name, from elsewhere"
+            } else {
+                "resolves the same version from elsewhere"
+            };
             self.diag(
                 DIAG_REF_UNATTRIBUTABLE,
                 &file,
                 format!(
-                    "{file}: {} is wired to Socket patch {}, but {} resolves the same version \
-                     from elsewhere (not a Socket patch) — which lock the build installs from \
-                     depends on the package manager that runs, so the patch is not attested; \
-                     rewire both locks (re-run `socket-patch scan` / `vendor`) or delete the \
-                     stale one",
+                    "{file}: {} is wired to Socket patch {}, but {} {resolves} (not a Socket \
+                     patch) — which lock the build installs from depends on the package \
+                     manager that runs, so the patch is not attested; rewire both locks \
+                     (re-run `socket-patch scan` / `vendor`) or delete the stale one",
                     r.purl,
                     r.uuid,
-                    other.display()
+                    other.file.display()
                 ),
             );
             self.withhold_rewirable(r);
@@ -1190,7 +1236,10 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs.iter().any(|r| PurlKey::same(&r.purl, &key))
             || self.contested.iter().any(|c| PurlKey::same(&c.purl, &key))
-            || self.elsewhere.iter().any(|e| PurlKey::same(&e.purl, &key))
+            || self
+                .elsewhere
+                .iter()
+                .any(|e| PurlKey::same(&e.purl, &key) || e.covers(&key))
     }
 
     fn recognize(&mut self, uuid: &str, mode: WiringMode, file: &str) {
