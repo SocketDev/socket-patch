@@ -9,9 +9,8 @@ mod pty_io;
 #[path = "../common/update_fixture.rs"]
 mod update_fixture;
 
-mod covgap_commands_update;
-mod covgap_update_download;
-mod covgap_update_swap;
 mod self_update_channels_e2e;
 mod self_update_telemetry_e2e;
+mod update_json_contracts;
 mod update_notifier_e2e;
+mod update_render;

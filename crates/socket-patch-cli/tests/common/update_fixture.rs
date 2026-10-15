@@ -22,6 +22,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use socket_patch_cli::commands::update::UPDATE_TARGET;
 use socket_patch_core::update::asset_name_for_target;
 
+/// A TCP endpoint nothing listens on (port 9 = discard, never bound on a
+/// dev host): any request the child makes fails fast and loudly, so a
+/// "zero network" contract regressing into a fetch flips the exit code.
+pub const DEAD_ENDPOINT: &str = "http://127.0.0.1:9";
+
 /// Release asset filename for the target this test binary was built for.
 pub fn asset_name_for_current_target() -> String {
     asset_name_for_target(UPDATE_TARGET)
