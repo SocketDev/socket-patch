@@ -4228,6 +4228,48 @@ snapshots:
         );
     }
 
+    /// #1557: pnpm 11+ ignore a `pnpm_config_trust_lockfile` (or
+    /// `PNPM_CONFIG_TRUST_LOCKFILE`) that is empty, `null` or `undefined`
+    /// and read pnpm-workspace.yaml instead, so the scan writes
+    /// `trustLockfile: true` as if the variable were unset, and the warning
+    /// does not claim the variable was respected.
+    #[tokio::test]
+    async fn issue_1557_an_empty_trust_lockfile_variable_keeps_the_write() {
+        fn empty(var: &str) -> Option<String> {
+            (var == "pnpm_config_trust_lockfile").then(String::new)
+        }
+        fn upper_empty(var: &str) -> Option<String> {
+            (var == "PNPM_CONFIG_TRUST_LOCKFILE").then(String::new)
+        }
+        fn null(var: &str) -> Option<String> {
+            (var == "pnpm_config_trust_lockfile").then(|| "null".to_string())
+        }
+        fn undefined(var: &str) -> Option<String> {
+            (var == "PNPM_CONFIG_TRUST_LOCKFILE").then(|| "undefined".to_string())
+        }
+        let mut root = MemoryProject::new();
+        root.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        for env in [
+            empty as fn(&str) -> Option<String>,
+            upper_empty,
+            null,
+            undefined,
+        ] {
+            let (_, done) =
+                npm_rewrite_in(&ProjectView::Memory(&root), &BTreeSet::new(), &env).await;
+            assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+            let workspace = done
+                .rewrite
+                .files
+                .get(PNPM_WORKSPACE_REL)
+                .unwrap_or_else(|| panic!("{:?}", done.rewrite.files.keys()));
+            assert!(workspace.contains("trustLockfile: true"), "{workspace}");
+            let detail = pnpm_trust_detail(&done);
+            assert!(detail.contains("no extra flags"), "{detail}");
+            assert!(!detail.contains("in the environment"), "{detail}");
+        }
+    }
+
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
     /// manifest is read for its `patchedDependencies`, and a package the
     /// project patches itself with `bun patch` keeps its registry record,

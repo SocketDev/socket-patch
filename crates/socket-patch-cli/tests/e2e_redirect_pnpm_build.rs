@@ -172,6 +172,14 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
 /// registry.npmjs.org, where a clamp turned a single `read ECONNRESET`
 /// into a failed required leg.
 fn corepack_with_retries(cwd: &Path, pm: &str, args: &[&str], registry_retries: bool) -> Output {
+    corepack_command(cwd, pm, args, registry_retries)
+        .output()
+        .expect("failed to run corepack")
+}
+
+/// The command [`corepack_with_retries`] runs, for a caller that adds
+/// environment after the hermetic scrub.
+fn corepack_command(cwd: &Path, pm: &str, args: &[&str], registry_retries: bool) -> Command {
     let mut cmd = pnpm_command(pm);
     let legacy = pm
         .strip_prefix("pnpm@")
@@ -211,7 +219,7 @@ fn corepack_with_retries(cwd: &Path, pm: &str, args: &[&str], registry_retries: 
     // would otherwise take the sandbox values back out again.
     cache_env::isolate(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    cmd.output().expect("failed to run corepack")
+    cmd
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
@@ -819,6 +827,19 @@ fn fresh_checkout_install(
     extra_args: &[&str],
     with_workspace_yaml: bool,
 ) -> (PathBuf, Output) {
+    fresh_checkout_install_env(fx, pm, label, extra_args, with_workspace_yaml, &[])
+}
+
+/// [`fresh_checkout_install`] with `env` set on the install, after the
+/// hermetic scrub.
+fn fresh_checkout_install_env(
+    fx: &PnpmRedirectFixture,
+    pm: &str,
+    label: &str,
+    extra_args: &[&str],
+    with_workspace_yaml: bool,
+    env: &[(&str, &str)],
+) -> (PathBuf, Output) {
     let fresh = fx.tmp.path().join(format!("fresh-{label}"));
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join("package.json"), fresh.join("package.json")).unwrap();
@@ -851,7 +872,9 @@ fn fresh_checkout_install(
     let store_flag = format!("--store-dir={}", fresh_store.display());
     let mut args = vec!["install", "--frozen-lockfile", &store_flag];
     args.extend_from_slice(extra_args);
-    let out = corepack(&fresh, pm, &args);
+    let mut cmd = corepack_command(&fresh, pm, &args, false);
+    cmd.envs(env.iter().copied());
+    let out = cmd.output().expect("failed to run corepack");
     (fresh, out)
 }
 
@@ -1426,6 +1449,75 @@ async fn pnpm11_trust_lockfile_env_override_is_respected() {
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     let workspace = std::fs::read_to_string(&ws_path).unwrap_or_default();
     assert!(workspace.contains("trustLockfile: true"), "{workspace}");
+}
+
+/// #1557: pnpm 11+ ignore a `pnpm_config_trust_lockfile` that is empty
+/// (what `${{ vars.X }}` exports when the repo variable is unset), `null`
+/// or `undefined`, and read pnpm-workspace.yaml instead. A scan whose
+/// environment sets it so must heal the trust config as if it were unset,
+/// and a fresh frozen install in that same environment then lands the
+/// patched bytes from the written key.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "wall-bound real-pnpm install (~60s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn pnpm11_empty_trust_lockfile_env_is_ignored() {
+    let Some(fx) = redirect_scanned_pnpm_project(
+        PNPM_TERTIARY,
+        "pnpm11-trust-env-empty",
+        false,
+        true,
+        HostedDriver::Scan,
+    )
+    .await
+    else {
+        return;
+    };
+    let ws_path = fx.proj.join("pnpm-workspace.yaml");
+    assert!(
+        !ws_path.exists(),
+        "the opted-out fixture scan wrote no workspace file"
+    );
+
+    let api_url = fx._server.uri();
+    let args = [
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        fx.proj.to_str().unwrap(),
+        "--api-url",
+        &api_url,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let env = [("pnpm_config_trust_lockfile".to_string(), String::new())];
+    let (code, stdout, stderr) = run_socket_env(&fx.proj, &args, &env);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let envelope = parse_envelope(&stdout);
+    let workspace = std::fs::read_to_string(&ws_path).unwrap_or_default();
+    assert!(
+        workspace.contains("trustLockfile: true"),
+        "an empty variable pnpm ignores must not stop the write:\n{envelope}"
+    );
+    assert!(
+        !stdout.contains("in the environment sets pnpm"),
+        "the warning must not claim the empty variable was respected:\n{envelope}"
+    );
+
+    // pnpm itself, run with the same empty variable, honours the key.
+    let (fresh, ci) = fresh_checkout_install_env(
+        &fx,
+        PNPM_TERTIARY,
+        "pnpm11-trust-env-empty",
+        &[],
+        true,
+        &[("pnpm_config_trust_lockfile", "")],
+    );
+    assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm11 empty trust env");
 }
 
 /// Legacy pnpm@7 leg: the fixture install emits a lockfileVersion 5.4 lock

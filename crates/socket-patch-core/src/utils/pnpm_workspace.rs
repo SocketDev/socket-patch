@@ -162,6 +162,11 @@ fn env_setting(
 /// spelling, which pnpm 11 and newer read ahead of pnpm-workspace.yaml.
 /// `None` on pnpm 10 and older, which never verify lock URLs, and for
 /// `npm_config_trust_lockfile`, which no pnpm reads.
+///
+/// pnpm ignores a variable that is empty, `null` or `undefined` and reads
+/// pnpm-workspace.yaml instead (#1557), so such a value sets nothing here
+/// either: only a literal `false` turns the setting off, and any other
+/// string is read as true ([`PnpmSetting::as_bool`]).
 pub fn trust_lockfile_env(
     major: Option<u32>,
     env: impl Fn(&str) -> Option<String>,
@@ -169,8 +174,10 @@ pub fn trust_lockfile_env(
     if major.is_some_and(|major| major < 11) {
         return None;
     }
+    let env =
+        |var: &str| env(var).filter(|value| !matches!(value.trim(), "" | "null" | "undefined"));
     // pnpm 11's spelling, then the uppercase one pnpm 12 reads too.
-    env_setting("trust-lockfile", Some(major.unwrap_or(11)), &env).or_else(|| {
+    env_setting("trust-lockfile", Some(major.unwrap_or(11)), env).or_else(|| {
         let var = "PNPM_CONFIG_TRUST_LOCKFILE";
         let value = env(var)?.trim().to_string();
         Some(PnpmSetting {
@@ -970,6 +977,43 @@ mod tests {
             trust_lockfile_env(Some(11), env(on)).and_then(|s| s.as_bool()),
             Some(true)
         );
+    }
+
+    /// #1557: pnpm 11 and newer ignore a `pnpm_config_trust_lockfile` (or
+    /// `PNPM_CONFIG_TRUST_LOCKFILE`) that is empty, `null` or `undefined`
+    /// and read `trustLockfile` from pnpm-workspace.yaml instead, so such a
+    /// value sets nothing. Only a literal `false` turns it off; any other
+    /// string (`0`, `no`, `FALSE`) is read as true.
+    #[test]
+    fn an_empty_or_null_trust_lockfile_variable_sets_nothing() {
+        let one = |var: &'static str, value: &'static str| {
+            move |name: &str| (name == var).then(|| value.to_string())
+        };
+        for var in ["pnpm_config_trust_lockfile", "PNPM_CONFIG_TRUST_LOCKFILE"] {
+            for value in ["", "  ", "null", "undefined"] {
+                for major in [Some(11), Some(12), None] {
+                    assert_eq!(
+                        trust_lockfile_env(major, one(var, value)),
+                        None,
+                        "{var}={value:?} on pnpm {major:?}"
+                    );
+                }
+            }
+            for value in ["0", "no", "FALSE", "TRUE"] {
+                let found = trust_lockfile_env(Some(11), one(var, value)).unwrap();
+                assert_eq!(found.as_bool(), Some(true), "{var}={value}");
+            }
+        }
+        // An ignored lowercase spelling does not hide the uppercase one.
+        let found = trust_lockfile_env(
+            Some(12),
+            env(&[
+                ("pnpm_config_trust_lockfile", ""),
+                ("PNPM_CONFIG_TRUST_LOCKFILE", "false"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(found.as_bool(), Some(false));
     }
 
     /// #1460: pnpm 11 and newer read only `pnpm_config_*`, pnpm 10 and
