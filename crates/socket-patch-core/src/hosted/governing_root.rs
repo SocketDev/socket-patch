@@ -262,7 +262,7 @@ async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
 /// Whether the project directory is its own npm-family lock root: it holds
 /// a lock the rewriters read, or is a Rush repo (Rush keeps its locks under
 /// common/config, read by the rewriter).
-fn has_own_npm_family_lock(root: &Path) -> bool {
+pub fn has_own_npm_family_lock(root: &Path) -> bool {
     npm_lock_files()
         .chain(EXTRA_OWN_LOCKS)
         .any(|name| root.join(name).exists())
@@ -502,40 +502,41 @@ pub async fn nested_npm_project(scan_root: &Path, copy: &Path) -> Option<PathBuf
 
 /// #1554: the project a lockless install (`package-lock=false`, `npm
 /// install --no-package-lock`) of `dir`'s `node_modules` belongs to, when
-/// it lies strictly below `base`: `dir`, or, while a workspace lists it,
-/// that workspace's root (which installs its members, locked or not).
-/// `None` when that project is `base`'s own (or above it), has no
-/// `package.json` (npm installs into no such directory), or reads a pnpm
-/// lock kept elsewhere.
+/// it lies strictly below `base`: `dir`, or, while a workspace at or below
+/// `base` lists it, that workspace's root (which installs its members,
+/// locked or not). `None` when that project is `base`'s own, or has no
+/// `package.json` (npm installs into no such directory).
 async fn lockless_npm_project(base: &Path, mut dir: PathBuf) -> Option<PathBuf> {
-    while let Some(workspace) = listing_workspace(&dir).await {
-        dir = workspace;
+    while dir != base && dir.starts_with(base) {
+        match listing_workspace(base, &dir).await {
+            Some(workspace) => dir = workspace,
+            None => {
+                let manifest = tokio::fs::metadata(dir.join("package.json")).await;
+                return manifest.is_ok_and(|m| m.is_file()).then_some(dir);
+            }
+        }
     }
-    if dir == base || !dir.starts_with(base) {
-        return None;
-    }
-    if !tokio::fs::metadata(dir.join("package.json"))
-        .await
-        .is_ok_and(|m| m.is_file())
-        || pnpm_lock_elsewhere(&dir).await.is_some()
-    {
-        return None;
-    }
-    Some(dir)
+    None
 }
 
-/// The nearest ancestor of `dir` whose `package.json` or `vlt.json`
-/// `workspaces` (in any package manager's reading) or `pnpm-workspace.yaml`
-/// `packages:` lists it, whether or not that workspace holds a lock. A
-/// `pnpm-workspace.yaml` that cannot be read, or whose globs cannot be
-/// matched, lists it: the copy then stays the scan root's, as before.
-async fn listing_workspace(dir: &Path) -> Option<PathBuf> {
+/// The nearest ancestor of `dir`, up to `base`, that installs it as a
+/// workspace member, whether or not it holds a lock: its `package.json` or
+/// `vlt.json` `workspaces` (in any package manager's reading) or its
+/// `pnpm-workspace.yaml` `packages:` ([`lists_as_member`], which errs
+/// toward "member") lists `dir`, or it is a Rush root (`rush.json` lists
+/// projects that keep no lock of their own).
+///
+/// [`lists_as_member`]: crate::utils::pnpm_workspace::lists_as_member
+async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
     let lists = |patterns: &[String], rel: &[String]| {
         WorkspacesDialect::ALL
             .iter()
             .any(|&dialect| workspaces_include_as(patterns, rel, dialect))
     };
     for ancestor in dir.ancestors().skip(1) {
+        if !ancestor.starts_with(base) {
+            break;
+        }
         let Ok(rel) = dir.strip_prefix(ancestor) else {
             continue;
         };
@@ -543,29 +544,22 @@ async fn listing_workspace(dir: &Path) -> Option<PathBuf> {
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        if let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await {
-            if workspace_patterns(&text).is_some_and(|patterns| lists(&patterns, &rel)) {
-                return Some(ancestor.to_path_buf());
-            }
-        }
-        if let Ok(text) = read_regular_to_string(&ancestor.join(VLT_JSON)).await {
-            if vlt_workspace_patterns(&text)
+        let package_json = read_regular_to_string(&ancestor.join("package.json")).await;
+        let listed = ancestor.join("rush.json").exists()
+            || package_json
+                .ok()
+                .and_then(|text| workspace_patterns(&text))
+                .is_some_and(|patterns| lists(&patterns, &rel))
+            || read_regular_to_string(&ancestor.join(VLT_JSON))
+                .await
+                .ok()
+                .and_then(|text| vlt_workspace_patterns(&text))
                 .is_some_and(|groups| groups.iter().any(|group| lists(group, &rel)))
-            {
-                return Some(ancestor.to_path_buf());
-            }
-        }
-        if let Ok(yaml) = read_regular_to_string(&ancestor.join(PNPM_WORKSPACE)).await {
-            let listed = match read_package_globs(&yaml) {
-                Ok(Some(globs)) => {
-                    crate::utils::pnpm_workspace::lists_member(&globs, &rel).unwrap_or(true)
-                }
-                Ok(None) => false,
-                Err(_) => true,
-            };
-            if listed {
-                return Some(ancestor.to_path_buf());
-            }
+            || read_regular_to_string(&ancestor.join(PNPM_WORKSPACE))
+                .await
+                .is_ok_and(|yaml| crate::utils::pnpm_workspace::lists_as_member(&yaml, &rel));
+        if listed {
+            return Some(ancestor.to_path_buf());
         }
     }
     None
@@ -1307,6 +1301,51 @@ mod tests {
             Some(root.join("s/x"))
         );
         assert_eq!(owner("bare/node_modules/left-pad").await, None);
+    }
+
+    /// #1554 under a pnpm workspace root, a Rush root, and a scan of a
+    /// member below a workspace file whose globs cannot be read.
+    #[tokio::test]
+    async fn lockless_project_under_other_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A pnpm workspace root: only a directory it lists is its member.
+        let pnpm = tmp.path().join("pnpm");
+        write(&pnpm, "package.json", r#"{"name":"root"}"#);
+        write(&pnpm, "pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+        write(&pnpm, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+        write(&pnpm, "packages/a/package.json", r#"{"name":"a"}"#);
+        write(&pnpm, "tools/x/package.json", r#"{"name":"x"}"#);
+        assert_eq!(
+            nested_npm_project(&pnpm, &pnpm.join("tools/x/node_modules/left-pad")).await,
+            Some(pnpm.join("tools/x"))
+        );
+        assert_eq!(
+            nested_npm_project(&pnpm, &pnpm.join("packages/a/node_modules/left-pad")).await,
+            None
+        );
+        // Rush projects keep no lock of their own: the Rush root installs them.
+        let rush = tmp.path().join("rush");
+        write(&rush, "rush.json", "{}");
+        write(&rush, "apps/web/package.json", r#"{"name":"web"}"#);
+        assert_eq!(
+            nested_npm_project(&rush, &rush.join("apps/web/node_modules/left-pad")).await,
+            None
+        );
+        // Scanning a member: a workspace file above the scan root does not
+        // decide what is independent below it.
+        let mono = tmp.path().join("mono");
+        write(
+            &mono,
+            "pnpm-workspace.yaml",
+            "packages:\n  - '{apps,libs}/**'\n",
+        );
+        let web = mono.join("apps/web");
+        write(&web, "package.json", r#"{"name":"web"}"#);
+        write(&web, "tools/x/package.json", r#"{"name":"x"}"#);
+        assert_eq!(
+            nested_npm_project(&web, &web.join("tools/x/node_modules/left-pad")).await,
+            Some(web.join("tools/x"))
+        );
     }
 
     /// #590: a pnpm workspace member has no lock; the root's lock governs it.

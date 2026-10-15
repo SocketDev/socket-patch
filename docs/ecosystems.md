@@ -448,7 +448,10 @@ root's lock; or one with a `package.json` and `node_modules` installed
 without a lockfile, such as under `package-lock=false`, that no workspace
 lists) is left alone with a `nested_project_skipped` warning. The
 warning names the project directory; pass it as a PATH
-(`socket-patch scan --mode vendored tools/x`) to patch that project.
+(`socket-patch scan --mode vendored tools/x`) to patch that project. A
+project without a lockfile needs one first (`npm install
+--package-lock` there), or can be patched in place with
+`socket-patch scan --mode agent tools/x`.
 
 Inside each `node_modules`, the package stores of isolated layouts are
 walked too, since they are the only home of transitive dependencies:

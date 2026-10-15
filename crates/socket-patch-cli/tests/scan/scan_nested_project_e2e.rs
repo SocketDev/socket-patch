@@ -458,6 +458,13 @@ async fn root_vendored_scan_skips_a_lockless_nested_project() {
             );
             assert_eq!(v["status"], "success", "npmrc={npmrc} run {run}: {v:#}");
             assert_nested_skipped(&v);
+            let detail = warning(&v, WARNING).unwrap()["detail"].as_str().unwrap();
+            assert!(detail.contains("without a lockfile"), "{detail}");
+            assert!(
+                detail.contains("npm install --package-lock")
+                    && detail.contains("scan --mode agent tools/x"),
+                "names a remedy that works without a lockfile: {detail}"
+            );
         }
         let root_lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
         assert!(root_lock.contains(".socket/vendor"), "{root_lock}");

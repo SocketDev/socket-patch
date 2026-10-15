@@ -666,7 +666,8 @@ pub(crate) async fn nested_project_skips(
     let shell_dir = std::env::current_dir()
         .ok()
         .map(|d| std::fs::canonicalize(&d).unwrap_or(d));
-    let mut by_project: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Project -> (whether it has a lockfile of its own, its purls).
+    let mut by_project: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
     let mut skipped = HashSet::new();
     for (purl, project) in candidates {
         let project = std::fs::canonicalize(&project).unwrap_or(project);
@@ -678,7 +679,12 @@ pub(crate) async fn nested_project_skips(
             .to_string_lossy()
             .replace('\\', "/");
         skipped.insert(PurlKey::new(&purl));
-        by_project.entry(shown).or_default().push(purl);
+        let locked = socket_patch_core::hosted::governing_root::has_own_npm_family_lock(&project);
+        by_project
+            .entry(shown)
+            .or_insert_with(|| (locked, Vec::new()))
+            .1
+            .push(purl);
     }
     // Spelled out per mode so the remedy-command check can parse each.
     let rerun = |dir: &str| {
@@ -690,22 +696,35 @@ pub(crate) async fn nested_project_skips(
     };
     let warnings = by_project
         .into_iter()
-        .map(|(dir, purls)| {
+        .map(|(dir, (locked, purls))| {
             let (verb, left) = if purls.len() == 1 {
                 ("is", "it is")
             } else {
                 ("are", "they are")
             };
-            (
-                NESTED_PROJECT_SKIPPED.to_string(),
+            let word = shell_word(&dir);
+            // #1554: a project installed without a lockfile has none for a
+            // hosted or vendored run of its own to rewire either.
+            let detail = if locked {
                 format!(
                     "{} {verb} installed only by {dir}, a separate npm project with its own \
                      lockfile; this run rewires only this directory's lockfile, so {left} left \
                      alone; run {} to patch that project",
                     purls.join(", "),
-                    rerun(&shell_word(&dir)),
-                ),
-            )
+                    rerun(&word),
+                )
+            } else {
+                format!(
+                    "{} {verb} installed only by {dir}, a separate npm project installed \
+                     without a lockfile; this run rewires only this directory's lockfile, so \
+                     {left} left alone; to patch that project, create its lockfile \
+                     (`npm install --package-lock` in {dir}) and run {}, or patch its \
+                     node_modules in place with `socket-patch scan --mode agent {word}`",
+                    purls.join(", "),
+                    rerun(&word),
+                )
+            };
+            (NESTED_PROJECT_SKIPPED.to_string(), detail)
         })
         .collect();
     (skipped, warnings)
