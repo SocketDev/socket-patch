@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-14 (run 22), main `fc1b4f9` (includes #1529, the #1527 fix), latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–22 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503 and #1527 are closed. Open: #450, #1547. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-15 (run 23), main `e76cb9b`, latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–23 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503 and #1527 are closed. Open: #450, #1547. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -9,14 +9,14 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | OS | Poetry | Agent (in-project `.venv`) | Agent (default out-of-tree venv) | Agent: nameless `package-mode=false` / `[project].name` override / `in-project=false` + stray `.venv` | Agent + hosted VEX: `in-project=true`, no `.venv`, existing out-of-tree env | Hosted (scan, install, rollback) | Hosted VEX with undiscovered venv | Vendored | Mode switch hosted ⇄ vendored | Vendored `repair` (lock-only, wheel deleted) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 0.12.17 | untested | untested | n/a | untested | pass v5 (refused, `redirect_poetry_lock_unsupported`) | n/a | pass v5 (`[metadata.hashes]`); r14 pass | vendored→hosted fail #945 | untested |
-| Linux | 1.0.10 | untested | pass r8 (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.0 native-empty + populated; pip ≥ 23.1) | untested | pass v5 (populated lock 1.0); r19 supersede A → B | r19 pass (two-package partial takeovers, LF + CRLF) | untested |
+| Linux | 1.0.10 | untested | pass r8 (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.0 native-empty + populated; pip ≥ 23.1) | untested | pass v5 (populated lock 1.0); r19 supersede A → B | r19 pass (two-package partial takeovers, LF + CRLF) | r23 pass (lock-only, wheel deleted, fresh install patched) |
 | Linux | 1.1.15 | pass v5 | pass r8 (scan, re-run, vex, rollback); r9 `envs.toml` (3.10/3.11) pass | n/a | fixed by #527 (not re-run) | pass v5 (lock 1.1, extras + dev); r5 dotted name `jaraco.context` rewrite/install/vex/rollback | untested | pass v5 (LF + CRLF, unicode/space path); r19 supersede A → B (lock 1.1) | pass r14 (both ways, LF + CRLF); r19 two-package partial takeovers | pass r19 (after supersede) |
-| Linux | 1.2.2 | untested | untested | n/a | untested | pass v5 (lock 1.1, extras + dev, warm-venv stale check) | untested | pass (lock 1.1) | untested | untested |
+| Linux | 1.2.2 | r23 pass (scan, re-run, vex, rollback) | r23 pass (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.1, extras + dev, warm-venv stale check) | untested | pass (lock 1.1) | untested | untested |
 | Linux | 1.8.5 | untested | pass; r9 `envs.toml` + custom path pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path) | pass r9 (#527) | pass v5 (LF + CRLF) | pass r5 (#330) | pass v5 (LF + CRLF, unicode/space path) | pass r14 (both ways, LF + CRLF) | pass v5 (#380 fixed) |
 | Linux | 2.0.1 | pass r17 | pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path, both names) | fixed by #527 (not re-run) | pass v5 (LF + CRLF); r17 `re-resolve=false` pass; `source = "pypi"` fixed by #1413 (r18 on 1.5–2.5; 2.0.1 not re-run) | pass r5 (#330) | pass r17 (LF + CRLF, `re-resolve=false`); `source = "pypi"` fixed by #1413 (r18 on 1.5–2.5; 2.0.1 not re-run) | pass r21 (both ways, LF + CRLF) | untested |
 | Linux | 2.1.1 / 2.1.4 | r22 pass (2.1.4: scan, re-run, vex) | r22 pass (2.1.4) | untested | untested | pass v5 (repo e2e, up to rollback); r22 2.1.4 pass (install, `sync`, rollback byte-identical) | untested | pass v5 (repo e2e); r22 2.1.4 pass (`vendor --check`) | r22 pass (2.1.4, both ways, fresh install after each, rollback) | r22 pass (2.1.4) |
 | Linux | 2.3.3 | pass | pass | pass r11 (all 3 layouts) | untested | pass (groups, markers, path/url deps, supersede, dry-run, get) | untested | pass (path/url deps) | fixed by #503 (not re-run) | fixed (#380) |
-| Linux | 2.4.3 | untested | pass | pass r11 (all 3 layouts) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF, CI) | untested | fixed (#380) |
+| Linux | 2.4.3 | r23 pass (scan, re-run, vex, rollback) | pass; r23 pass | pass r11 (all 3 layouts) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF, CI) | r23 pass (both ways, fresh install after each, `sync`, rollback byte-identical) | fixed (#380) |
 | Linux | 2.5.1 | pass v5 | pass r5 (full agent cycle incl. rollback + vex) | pass r5 (all 3 cases, plus long names, symlinked dir, relative / `{cache-dir}` / `~` virtualenvs.path, XDG_CACHE_HOME, `.venv` symlink) | pass r9 (#527) | pass v5 (LF + CRLF, PEP 621 extras/groups/markers, `sync`, `remove`, dry-run, `get`, relock/`add`, directory targets) | pass r5 (#330: stale check fires) | pass v5 (LF + CRLF, unicode/space path) | hosted→vendored pass r5; vendored→hosted pass r10 (#328 fixed by #503); r14 both ways LF + CRLF pass, mixed EOL → whole-file LF (#814) | pass v5 (#380 fixed) |
 | macOS | 1.8.5 | untested | pass | fail #327 (closed; not re-run) | untested | pass (LF + CRLF) | untested | pass (LF + CRLF) | untested | untested |
 | macOS | 2.0.1 | untested | pass | fail #327 (closed; not re-run) | untested | untested | untested | untested | untested | untested |
@@ -271,15 +271,34 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 | 2.5.1 | #450 | still fails |
 | macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
 
+### Run 23 cells (Linux, main `e76cb9b`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 2.4.3 | Hosted → vendored → hosted, fresh install after each, `poetry sync`, rollback byte-identical | pass |
+| 2.4.3, 1.2.2 | Agent, in-project and default out-of-tree venv: scan, re-run, vex, rollback | pass |
+| 1.0.10 | Vendored `repair` (lock-only, wheel deleted), fresh install (pip 22.2.2) | pass |
+| 2.5.1, 1.8.5, 1.1.15 | Project path with spaces and non-ASCII (`/tmp/sp ü ç/proj é`): vendored, vendored → hosted, agent, vex, fresh installs | pass |
+| 2.5.1 | Agent → hosted takeover, then a bare scan (keeps agent, warns hosted wiring live), vex, rollback | pass (lock byte-identical after rollback) |
+| 2.5.1 | Agent-patched venv reinstalled upstream (`pip --force-reinstall`), then `vex` | pass (refuses, `no_applicable_patches`) |
+| 2.5.1 | 16 hand-edited lock 2.1 shapes (no EOL, comments in block / `files`, no trailing comma, sdist first, inline / tab-indented / blank-line `files`, single quotes, `key=val`, `develop = false`, string `markers`, `files` after `[package.dependencies]`, `name = "Six"`): hosted (install, rollback) and vendored (install, `--revert` byte-identical) | pass |
+| writer 1.1.15 → installers 1.1.15 / 1.8.5 | Lock 1.1 `[metadata.files]` shapes (populated, comment, no EOL, entry after six, inline, CRLF): hosted + vendored, fresh install | pass (advisories present) |
+| 2.5.1 | `poetry install` racing an agent scan (8 iterations) | pass (outcome varies, `vex` always matches the bytes) |
+| 2.5.1, 1.8.5 | `installer.no-binary = six` / `:all:` with hosted and vendored rewrites | pass (wheel installed patched, vex ok) |
+| 2.5.1 | #1547 | still fails (`pkg:pypi/My_Service@1.2.0`) |
+| 2.5.1 | #450 (project apply, `rollback -g`) | still fails (manifest emptied, `.venv` still patched, exit 0) |
+| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
+
 ## Backlog
 
 1. Re-check #1547 once fixed (also the `[tool.poetry]` layout and a dotted name).
 2. Re-check #1105 (hosted A → vendored B, warm venv), #1184 (export residual keep) and #450 once fixed.
 3. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy. That follows from #538's "patch every copy" design and needs a maintainer call before anyone files it. Since #409 (#1419), a system-site venv that imports a base copy also patches that base copy, on purpose.
-4. Concurrent `poetry install` during a scan. Untested Linux cells: 1.2.2 agent, 1.0.10 vendored repair, 2.4.3 mode switch, 2.1.x nameless / `[project].name` layouts.
-5. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
-6. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 22 (runs 9–22). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
-7. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's error-code row for `mode_ambiguous` still names only agent + vendored state (the mode-resolution paragraph has the #1437 hosted-pin case).
+4. Untested Linux cells: 2.1.x nameless / `[project].name` layouts, hosted VEX with an undiscovered venv on 1.2.2 / 2.4.3, Poetry 1.2.2 mode switch. Hand-edited lock shapes on lock 1.0 / 2.0 (Poetry 1.0 / 1.3–1.8 writers).
+5. Hosted / vendored with `pylock.toml` exported by poetry-plugin-export beside `poetry.lock`.
+6. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
+7. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 23 (runs 9–23). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+8. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's error-code row for `mode_ambiguous` still names only agent + vendored state (the mode-resolution paragraph has the #1437 hosted-pin case).
 
 ## Known non-bugs
 
@@ -356,3 +375,5 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 - `[project].name` + `dynamic = ["version"]` + a different `[tool.poetry].name`: product detection returns `product_undetected` on purpose (`product.rs` `pyproject_name_version`), because Poetry 2 builds `[project].name` ("[tool.poetry.name] … will be ignored") and Poetry 1.x builds `[tool.poetry].name`. Use `--product`. Not filed.
 - `explicit` / `supplemental` `[[tool.poetry.source]]` entries that six doesn't resolve from are not refused by hosted or vendored (r22). The refusal only covers a source six actually uses.
 - Hosted → vendored takeover against a mock origin fails with "already declares a [package.source] for six; refusing to overwrite a user-authored source" unless `SOCKET_PATCH_SERVER_URL` names the mock (the hosted-origin rule). Harness artifact.
+- A scan racing a concurrent `poetry install` may report `package_not_installed` and leave six unpatched (exit 0). `vex` then refuses, so nothing is misattested. Expected race outcome.
+- `scan --mode hosted` over agent state keeps `.socket/manifest.json`; a later bare `scan` resolves to agent mode and warns that the hosted wiring is still live. Documented mode resolution.
