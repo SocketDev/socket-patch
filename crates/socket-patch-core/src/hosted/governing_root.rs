@@ -2530,6 +2530,197 @@ mod tests {
         assert_eq!(code(&tmp.path().join("packages/a"), "npm").await, None);
     }
 
+    /// A `vlt-lock.json` whose edges leave from the given dep ids.
+    fn vlt_lock_with_edges(from: &[&str]) -> String {
+        let edges: Vec<String> = from
+            .iter()
+            .map(|id| format!(r#""{id} left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#))
+            .collect();
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{}},\n  \"edges\": {{\n    {}\n  }}\n}}\n",
+            edges.join(",\n    ")
+        )
+    }
+
+    /// #1564: vlt 1.4 reads a root `pnpm-workspace.yaml`'s `packages:` when
+    /// neither `vlt.json` nor `package.json` has a `workspaces` field, and
+    /// installs a member it lists from the root's `vlt-lock.json`. A member
+    /// is refused with or without a stray lock of its own, whether or not
+    /// the root has a `vlt.json` at all.
+    #[tokio::test]
+    async fn vlt_pnpm_workspace_yaml_member_is_refused() {
+        for vlt_json in [None, Some(r#"{"registries":{}}"#)] {
+            for stray in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                write(tmp.path(), "package.json", r#"{"private":true}"#);
+                if let Some(text) = vlt_json {
+                    write(tmp.path(), VLT_JSON, text);
+                }
+                write(
+                    tmp.path(),
+                    PNPM_WORKSPACE,
+                    "packages:\n  - \"packages/*\"\n",
+                );
+                write(
+                    tmp.path(),
+                    VLT_LOCK,
+                    &vlt_lock_with_edges(&["file~_d", "workspace~packages+a"]),
+                );
+                write(tmp.path(), "packages/a/package.json", "{}");
+                if stray {
+                    write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+                }
+                let member = tmp.path().join("packages/a");
+                let case = format!("vlt.json: {vlt_json:?}, stray: {stray}");
+                let refused = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+                    .await
+                    .unwrap_or_else(|| panic!("{case}: member must be refused"));
+                assert_eq!(refused.code, WORKSPACE_LOCKFILE_ELSEWHERE, "{case}");
+                assert!(
+                    refused.message.contains(VLT_LOCK)
+                        && refused.message.contains("nothing was written"),
+                    "{case}: {}",
+                    refused.message
+                );
+                if !stray {
+                    assert!(
+                        refused.message.contains(PNPM_WORKSPACE),
+                        "{case}: {}",
+                        refused.message
+                    );
+                }
+                assert_eq!(member_stray_lock(&member).await.is_some(), stray, "{case}");
+                assert_eq!(code(tmp.path(), "npm").await, None, "{case}");
+
+                // A member with its own vlt.json is its own vlt project.
+                write(tmp.path(), "packages/a/vlt.json", "{}");
+                assert!(member_stray_lock(&member).await.is_none(), "{case}");
+                if stray {
+                    assert_eq!(code(&member, "npm").await, None, "{case}");
+                }
+            }
+        }
+    }
+
+    /// #1564: vlt 1.3.8 and older ignore `pnpm-workspace.yaml`, so a lock
+    /// with no edge from any directory its `packages:` list is theirs and
+    /// the directory is its own project. vlt 1.4 records an edge from every
+    /// member it installed that has a dependency. `vlt.json` and
+    /// `package.json` `workspaces` fields win over the file, as does a `!`
+    /// pattern in it; a root that was never installed governs nothing; a
+    /// lock that cannot be read keeps the refusing side.
+    #[tokio::test]
+    async fn vlt_pnpm_workspace_yaml_reads_the_root_lock() {
+        let listed = "packages:\n  - \"packages/*\"\n";
+        for (case, vlt_json, package_json, yaml, root_lock, refused) in [
+            (
+                "vlt 1.4 lock",
+                None,
+                r#"{"private":true}"#,
+                listed,
+                Some(vlt_lock_with_edges(&["workspace~packages+b"])),
+                true,
+            ),
+            (
+                "vlt 1.3.8 lock",
+                None,
+                r#"{"private":true}"#,
+                listed,
+                Some(vlt_lock_with_edges(&["file~_d"])),
+                false,
+            ),
+            (
+                "empty lock",
+                None,
+                r#"{"private":true}"#,
+                listed,
+                Some(vlt_lock_with_edges(&[])),
+                false,
+            ),
+            (
+                "unreadable lock",
+                None,
+                r#"{"private":true}"#,
+                listed,
+                Some("not json".to_string()),
+                true,
+            ),
+            (
+                "never installed",
+                None,
+                r#"{"private":true}"#,
+                listed,
+                None,
+                false,
+            ),
+            (
+                "package.json workspaces win",
+                None,
+                r#"{"private":true,"workspaces":["tools/*"]}"#,
+                listed,
+                Some(vlt_lock_with_edges(&["workspace~packages+a"])),
+                false,
+            ),
+            (
+                "empty package.json workspaces win",
+                None,
+                r#"{"private":true,"workspaces":[]}"#,
+                listed,
+                Some(vlt_lock_with_edges(&["workspace~packages+a"])),
+                false,
+            ),
+            (
+                "vlt.json workspaces win",
+                Some(r#"{"workspaces":"tools/*"}"#),
+                r#"{"private":true}"#,
+                listed,
+                Some(vlt_lock_with_edges(&["workspace~packages+a"])),
+                false,
+            ),
+            (
+                "negated in the yaml",
+                None,
+                r#"{"private":true}"#,
+                "packages:\n  - \"packages/*\"\n  - \"!packages/a\"\n",
+                Some(vlt_lock_with_edges(&["workspace~packages+b"])),
+                false,
+            ),
+            (
+                "not listed",
+                None,
+                r#"{"private":true}"#,
+                "packages:\n  - \"tools/*\"\n",
+                Some(vlt_lock_with_edges(&["workspace~tools+x"])),
+                false,
+            ),
+        ] {
+            for stray in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                write(tmp.path(), "package.json", package_json);
+                if let Some(text) = vlt_json {
+                    write(tmp.path(), VLT_JSON, text);
+                }
+                write(tmp.path(), PNPM_WORKSPACE, yaml);
+                if let Some(text) = &root_lock {
+                    write(tmp.path(), VLT_LOCK, text);
+                }
+                write(tmp.path(), "packages/a/package.json", "{}");
+                write(tmp.path(), "packages/b/package.json", "{}");
+                if stray {
+                    write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+                }
+                let member = tmp.path().join("packages/a");
+                let case = format!("{case}, stray: {stray}");
+                assert_eq!(code(&member, "npm").await.is_some(), refused, "{case}");
+                assert_eq!(
+                    member_stray_lock(&member).await.is_some(),
+                    refused && stray,
+                    "{case}"
+                );
+            }
+        }
+    }
+
     /// The nearer of a `vlt.json` root and a `package.json` root governs.
     #[tokio::test]
     async fn nearer_of_vlt_and_package_json_roots_is_named() {

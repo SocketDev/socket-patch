@@ -5416,6 +5416,20 @@ mod member_stray_lock_tests {
                     ("vlt-lock.json", "{}"),
                 ][..],
             ),
+            // #1564: vlt 1.4's `pnpm-workspace.yaml` `packages:` source,
+            // shown by the root lock's edge from the member.
+            (
+                "redirect/npm/vlt/basic/expected",
+                "vlt-lock.json",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &[
+                    ("pnpm-workspace.yaml", "packages:\n  - packages/*\n"),
+                    (
+                        "vlt-lock.json",
+                        r#"{"lockfileVersion":1,"options":{},"nodes":{},"edges":{"workspace~packages+a left-pad":"prod 1.3.0 ~npm~left-pad@1.3.0"}}"#,
+                    ),
+                ][..],
+            ),
             (
                 "redirect/npm/package-lock-v3/basic/expected",
                 "package-lock.json",

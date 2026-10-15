@@ -1919,6 +1919,7 @@ mod tests {
     async fn bun_and_vlt_members_with_stray_lock_are_refused() {
         const BUN_TEXT: &str = "{\n  \"lockfileVersion\": 1\n}\n";
         const VLT_TEXT: &str = r#"{"lockfileVersion":1,"options":{},"nodes":{},"edges":{}}"#;
+        const VLT_PNPM_WORKSPACE_TEXT: &str = r#"{"lockfileVersion":1,"options":{},"nodes":{},"edges":{"workspace~packages+a left-pad":"prod 1.3.0 ~npm~left-pad@1.3.0"}}"#;
         let pj_workspace = r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#;
         for (member_lock, member_text, root_files) in [
             (
@@ -1954,6 +1955,19 @@ mod tests {
                 vec![
                     ("vlt.json", r#"{"workspaces":["packages/@(a|b)"]}"#),
                     ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            // #1564: vlt 1.4 reads `pnpm-workspace.yaml` `packages:` when
+            // neither `vlt.json` nor `package.json` declares `workspaces`;
+            // the root lock's member edge shows vlt 1.4 installed it.
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("package.json", r#"{"name":"root","private":true}"#),
+                    ("vlt.json", r#"{"registries":{}}"#),
+                    ("pnpm-workspace.yaml", "packages:\n  - \"packages/*\"\n"),
+                    ("vlt-lock.json", VLT_PNPM_WORKSPACE_TEXT),
                 ],
             ),
         ] {
