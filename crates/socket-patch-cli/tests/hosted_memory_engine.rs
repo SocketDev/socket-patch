@@ -1880,6 +1880,56 @@ async fn issue_939_berry_renamed_copy_is_named() {
     }
 }
 
+/// Run the hosted engine over a berry project that depends on left-pad
+/// from the registry and on `lp2` through the `portal:` / `link:` `spec`,
+/// plus `extra` files, and return its `redirect_copy_unpatched` details
+/// (after checking the registry entry is still pinned).
+async fn berry_linked_copy_details(uuid: &str, spec: &str, extra: &[(&str, &str)]) -> Vec<String> {
+    let ws = "app%40workspace%3A.";
+    let key = format!("lp2@{spec}::locator={ws}");
+    let server = MockServer::start().await;
+    mount_left_pad_grant(&server, uuid).await;
+    let mut files = BTreeMap::new();
+    files.insert(
+        "package.json".to_string(),
+        format!(
+            r#"{{"name":"app","version":"1.0.0","dependencies":{{"left-pad":"^1.3.0","lp2":"{spec}"}}}}"#
+        )
+        .into_bytes(),
+    );
+    files.insert(
+        "yarn.lock".to_string(),
+        format!(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"app@workspace:.\":\n  version: 0.0.0-use.local\n  \
+             resolution: \"app@workspace:.\"\n  dependencies:\n    \
+             left-pad: \"npm:^1.3.0\"\n    lp2: \"{spec}\"\n  \
+             languageName: unknown\n  linkType: soft\n\n\
+             \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
+             languageName: node\n  linkType: hard\n\n\
+             \"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
+             languageName: node\n  linkType: soft\n",
+            "1".repeat(128)
+        )
+        .into_bytes(),
+    );
+    for (rel, text) in extra {
+        files.insert(rel.to_string(), text.as_bytes().to_vec());
+    }
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(project.error.is_none(), "{spec}: {:?}", project.error);
+    assert_eq!(
+        project.redirected.len(),
+        1,
+        "{spec}: {:?} {:#}",
+        project.skipped,
+        project.redirect
+    );
+    copy_unpatched_details(project)
+}
+
 /// #1540: a berry `portal:` / `link:` copy with an ABSOLUTE path is never
 /// read (#1516), and its lock version is the placeholder
 /// `0.0.0-use.local`, so it may be any version of any package. The hosted
@@ -1888,52 +1938,13 @@ async fn issue_939_berry_renamed_copy_is_named() {
 /// report a clean success while `node_modules/lp2` held unpatched bytes.
 #[tokio::test]
 async fn issue_1540_berry_absolute_portal_and_link_copies_are_named() {
-    const UUID: &str = "15401540-1540-4540-8540-154015401540";
-    let ws = "app%40workspace%3A.";
     for protocol in ["portal", "link"] {
         let spec = format!("{protocol}:/home/me/shared/left-pad");
-        let key = format!("lp2@{spec}::locator={ws}");
-        let server = MockServer::start().await;
-        mount_left_pad_grant(&server, UUID).await;
-        let mut files = BTreeMap::new();
-        files.insert(
-            "package.json".to_string(),
-            format!(
-                r#"{{"name":"app","version":"1.0.0","dependencies":{{"left-pad":"^1.3.0","lp2":"{spec}"}}}}"#
-            )
-            .into_bytes(),
-        );
-        files.insert(
-            "yarn.lock".to_string(),
-            format!(
-                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
-                 \"app@workspace:.\":\n  version: 0.0.0-use.local\n  \
-                 resolution: \"app@workspace:.\"\n  dependencies:\n    \
-                 left-pad: \"npm:^1.3.0\"\n    lp2: \"{spec}\"\n  \
-                 languageName: unknown\n  linkType: soft\n\n\
-                 \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
-                 resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
-                 languageName: node\n  linkType: hard\n\n\
-                 \"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
-                 languageName: node\n  linkType: soft\n",
-                "1".repeat(128)
-            )
-            .into_bytes(),
-        );
-        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
-        let project = &output.projects[0];
-        assert!(project.error.is_none(), "{protocol}: {:?}", project.error);
-        assert_eq!(
-            project.redirected.len(),
-            1,
-            "{protocol}: {:?} {:#}",
-            project.skipped,
-            project.redirect
-        );
-        let details = copy_unpatched_details(project);
-        assert_eq!(details.len(), 1, "{protocol}: {:#}", project.redirect);
+        let details =
+            berry_linked_copy_details("15401540-1540-4540-8540-154015401540", &spec, &[]).await;
+        assert_eq!(details.len(), 1, "{protocol}: {details:?}");
         assert!(
-            details[0].contains(key.as_str())
+            details[0].contains(&format!("lp2@{spec}::"))
                 && details[0].contains("can't be read")
                 && details[0].contains("UNPATCHED"),
             "{protocol}: {}",
@@ -1948,59 +1959,28 @@ async fn issue_1540_berry_absolute_portal_and_link_copies_are_named() {
 /// any package. The hosted scan still pins the registry entry, and names
 /// that copy as possibly unpatched (`redirect_copy_unpatched`); it used to
 /// report a clean success while the install with the submodule linked
-/// unpatched bytes as `node_modules/lp2`.
+/// unpatched bytes as `node_modules/lp2`. Control: a target whose
+/// `package.json` the snapshot holds is read, so one naming another
+/// package is no copy of left-pad.
 #[tokio::test]
 async fn issue_1561_berry_missing_relative_portal_and_link_copies_are_named() {
     const UUID: &str = "15611561-1561-4561-8561-156115611561";
-    let ws = "app%40workspace%3A.";
     for protocol in ["portal", "link"] {
         let spec = format!("{protocol}:./vend/lp");
-        let key = format!("lp2@{spec}::locator={ws}");
-        let server = MockServer::start().await;
-        mount_left_pad_grant(&server, UUID).await;
-        let mut files = BTreeMap::new();
-        files.insert(
-            "package.json".to_string(),
-            format!(
-                r#"{{"name":"app","version":"1.0.0","dependencies":{{"left-pad":"^1.3.0","lp2":"{spec}"}}}}"#
-            )
-            .into_bytes(),
-        );
-        files.insert(
-            "yarn.lock".to_string(),
-            format!(
-                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
-                 \"app@workspace:.\":\n  version: 0.0.0-use.local\n  \
-                 resolution: \"app@workspace:.\"\n  dependencies:\n    \
-                 left-pad: \"npm:^1.3.0\"\n    lp2: \"{spec}\"\n  \
-                 languageName: unknown\n  linkType: soft\n\n\
-                 \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
-                 resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
-                 languageName: node\n  linkType: hard\n\n\
-                 \"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
-                 languageName: node\n  linkType: soft\n",
-                "1".repeat(128)
-            )
-            .into_bytes(),
-        );
-        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
-        let project = &output.projects[0];
-        assert!(project.error.is_none(), "{protocol}: {:?}", project.error);
-        assert_eq!(
-            project.redirected.len(),
-            1,
-            "{protocol}: {:?} {:#}",
-            project.skipped,
-            project.redirect
-        );
-        let details = copy_unpatched_details(project);
-        assert_eq!(details.len(), 1, "{protocol}: {:#}", project.redirect);
+        let details = berry_linked_copy_details(UUID, &spec, &[]).await;
+        assert_eq!(details.len(), 1, "{protocol}: {details:?}");
         assert!(
-            details[0].contains(key.as_str())
+            details[0].contains(&format!("lp2@{spec}::"))
                 && details[0].contains("can't be read")
                 && details[0].contains("UNPATCHED"),
             "{protocol}: {}",
             details[0]
         );
+        let other = [(
+            "vend/lp/package.json",
+            r#"{"name":"other-pkg","version":"1.3.0"}"#,
+        )];
+        let details = berry_linked_copy_details(UUID, &spec, &other).await;
+        assert!(details.is_empty(), "{protocol}: {details:?}");
     }
 }

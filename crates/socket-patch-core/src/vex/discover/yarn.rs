@@ -890,13 +890,15 @@ async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut D
             Some(rel) => ctx.read_advisory_bytes(&rel).await,
             None => None,
         };
-        let read = bytes.is_some();
+        let parsed = bytes
+            .as_deref()
+            .is_some_and(crate::formats::yarn::copy::is_json_manifest);
         let Some((name, version)) =
             crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
         else {
             let linked = matches!(copy.source, CopyRef::Linked(_));
             if linked
-                && !crate::vendor::yarn_copies::linked_copy_unknown(ctx.view, &copy.source, read)
+                && !crate::vendor::yarn_copies::linked_copy_unknown(ctx.view, &copy.source, parsed)
                     .await
             {
                 continue;
@@ -1959,8 +1961,9 @@ mod tests {
     }
 
     /// #1561: a RELATIVE `portal:` / `link:` copy whose target can't be read
-    /// (a missing directory, e.g. a git submodule CI never checked out, or a
-    /// `package.json` that is no regular file) is as unknown as an absolute
+    /// (a missing directory, the empty one git leaves for a submodule CI
+    /// never checked out, a `package.json` that is no regular file or no
+    /// JSON, such as a Git LFS pointer) is as unknown as an absolute
     /// one (#1540): it may be any version of any package, so it contests
     /// every ref its lock wires. It was dropped like a `link:` to a plain
     /// directory, so `vex` attested `not_affected` while the install that
@@ -1969,10 +1972,20 @@ mod tests {
     async fn issue_1561_unreadable_relative_portal_and_link_targets_contest_every_ref() {
         let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
         for protocol in ["portal", "link"] {
-            for target in ["missing", "manifest-is-a-directory"] {
+            for target in ["missing", "empty", "manifest-is-a-directory", "lfs-pointer"] {
                 let p = Project::new();
-                if target == "manifest-is-a-directory" {
-                    p.write("vend/lp/package.json/index.js", "");
+                match target {
+                    "empty" => std::fs::create_dir_all(p.root().join("vend/lp")).unwrap(),
+                    "manifest-is-a-directory" => {
+                        p.write("vend/lp/package.json/index.js", "");
+                    }
+                    "lfs-pointer" => {
+                        p.write(
+                            "vend/lp/package.json",
+                            "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n",
+                        );
+                    }
+                    _ => {}
                 }
                 let descriptor = format!("lp2@{protocol}:./vend/lp::locator=app%40workspace%3A.");
                 p.write(

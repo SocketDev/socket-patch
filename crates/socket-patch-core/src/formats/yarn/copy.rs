@@ -58,13 +58,6 @@ impl CopyRef {
         }
     }
 
-    /// A `portal:` / `link:` copy that is never read ([`CopyRef::read_path`]
-    /// is `None`: an absolute path). Its lock version is the placeholder
-    /// `0.0.0-use.local`, so it may be any version of any package (#1540).
-    pub(crate) fn is_unread_linked(&self) -> bool {
-        matches!(self, CopyRef::Linked(_)) && self.read_path().is_none()
-    }
-
     /// The `(name, version)` this copy installs, given the lock entry's
     /// `version` and the bytes read at [`CopyRef::read_path`]. `None` when
     /// the copy does not say (an unreadable or nameless manifest, a
@@ -219,6 +212,13 @@ fn copy_path(base: &str, path: &str) -> Option<String> {
     ))
 }
 
+/// Whether `bytes` parse as a JSON `package.json` (any content): a copy
+/// whose manifest doesn't (a Git LFS pointer, an encrypted blob) can't be
+/// read for its package (#1561).
+pub(crate) fn is_json_manifest(bytes: &[u8]) -> bool {
+    parse_manifest(bytes).is_some()
+}
+
 fn parse_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
     let bytes = crate::formats::text::strip_bom_bytes(bytes);
     serde_json::from_slice::<serde_json::Value>(bytes).ok()
@@ -346,11 +346,11 @@ mod tests {
                 "{reference}"
             );
         }
-        let unix = CopyRef::Linked("/home/me/lp".into());
-        assert!(unix.read_path().is_none() && unix.is_unread_linked());
-        let relative = CopyRef::Linked("vend/lp".into());
-        assert!(!relative.is_unread_linked());
-        assert!(!CopyRef::Directory("/home/me/lp".into()).is_unread_linked());
+        assert!(CopyRef::Linked("/home/me/lp".into()).read_path().is_none());
+        assert_eq!(
+            CopyRef::Linked("vend/lp".into()).read_path().as_deref(),
+            Some("vend/lp/package.json")
+        );
     }
 
     #[test]

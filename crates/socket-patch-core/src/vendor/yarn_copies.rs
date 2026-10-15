@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use crate::formats::yarn::blocks::{berry_field, classic_field};
-use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref, CopyRef};
+use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref, is_json_manifest, CopyRef};
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::classic_key_real_name;
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
@@ -109,12 +109,12 @@ pub(crate) async fn other_name_copies(
             Some(rel) => read_regular_to_bytes(&project_root.join(rel)).await.ok(),
             None => None,
         };
-        let read = bytes.is_some();
+        let parsed = bytes.as_deref().is_some_and(is_json_manifest);
         let identified = match copy_identity(&source, &lock_version, bytes).await {
             Some((n, v)) if n == name && v == version => true,
             Some(_) => continue,
             None if matches!(source, CopyRef::Linked(_))
-                && !linked_copy_unknown(ProjectView::Disk(project_root), &source, read).await =>
+                && !linked_copy_unknown(ProjectView::Disk(project_root), &source, parsed).await =>
             {
                 continue
             }
@@ -130,34 +130,36 @@ pub(crate) async fn other_name_copies(
 }
 
 /// Whether a `portal:` / `link:` copy whose manifest named no versioned
-/// package may be any version of any package, given whether its
-/// `package.json` was `read`. Its lock version is the placeholder
-/// `0.0.0-use.local`, so only that manifest says what it is. One never
-/// read (an absolute path, #1540) is unknown, and so is one whose target
-/// can't be read: a missing directory (a git submodule CI never checked
-/// out, a generated or gitignored directory) or a `package.json` that is
-/// no readable regular file (#1561). Only a directory that exists with no
-/// `package.json` at all (a `link:` to plain assets), or a manifest read
+/// package may be any version of any package. Its lock version is the
+/// placeholder `0.0.0-use.local`, so only its `package.json` says what it
+/// is; `manifest_parsed` says that file was read and parsed as JSON. A copy
+/// is unknown when it is never read (an absolute path, #1540) or its
+/// target can't be read (#1561): a missing directory, an EMPTY one (the
+/// placeholder git leaves for a submodule CI never checked out), or a
+/// `package.json` that is no readable regular file or no JSON (a Git LFS
+/// pointer, an encrypted blob). Only a non-empty directory with no
+/// `package.json` at all (a `link:` to plain assets), or a manifest parsed
 /// and found to name no versioned package, is no package copy.
 pub(crate) async fn linked_copy_unknown(
     view: ProjectView<'_>,
     source: &CopyRef,
-    read: bool,
+    manifest_parsed: bool,
 ) -> bool {
     let CopyRef::Linked(dir) = source else {
         return false;
     };
-    if source.is_unread_linked() {
-        return true;
-    }
-    if read {
+    if manifest_parsed {
         return false;
     }
     let Some(manifest) = source.read_path() else {
         return true;
     };
-    let dir = if dir.is_empty() { "." } else { dir.as_str() };
-    !view.is_dir(dir) || view.exists_no_follow(&manifest).await
+    if !view.is_dir(dir) || view.exists_no_follow(&manifest).await {
+        return true;
+    }
+    view.list_dir(dir)
+        .await
+        .map_or(true, |entries| entries.is_empty())
 }
 
 /// [`CopyRef::identity`] off the async runtime when it unpacks a tarball (a
