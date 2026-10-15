@@ -368,23 +368,24 @@ fn xml_element_texts<const N: usize>(xml: &str, paths: [&[&str]; N]) -> [Option<
 /// `<name>.gemspec` → `pkg:gem/<name>[@<version>]` from literal
 /// `<spec>.name = "…"` / `<spec>.version = "…"` assignments; a version
 /// computed from a constant (`Foo::VERSION`) is dropped, and the name falls
-/// back to the file stem.
+/// back to the file stem. As in Ruby, comments, `=begin`/`=end` blocks and
+/// heredoc bodies are not code, and the last assignment wins (#1573).
 fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
+    let code = ruby_code_lines(strip_bom(content));
+    // The value of the last `<x>.<attr> = …` assignment: `Some(literal)`
+    // for a quoted literal, `None` for anything computed.
     let literal = |attr: &str| -> Option<String> {
-        strip_bom(content).lines().find_map(|raw| {
-            let line = raw.trim();
-            let (lhs, rhs) = line.split_once('=')?;
-            let lhs = lhs.trim();
-            if !lhs.ends_with(&format!(".{attr}")) || rhs.starts_with('=') {
-                return None;
-            }
-            let rhs = rhs.trim();
-            let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-            let inner = &rhs[1..];
-            let end = inner.find(quote)?;
-            let value = inner[..end].trim();
-            (!value.is_empty() && !value.contains("#{")).then(|| value.to_string())
-        })
+        let suffix = format!(".{attr}");
+        code.iter()
+            .filter_map(|line| {
+                let (lhs, rhs) = line.split_once('=')?;
+                if !lhs.trim().ends_with(&suffix) || rhs.starts_with(['=', '~']) {
+                    return None;
+                }
+                Some(quoted_literal(rhs.trim()))
+            })
+            .next_back()
+            .flatten()
     };
     let name = literal("name").unwrap_or_else(|| stem.to_string());
     if name.is_empty() || name.contains(['/', '\\', ' ']) {
@@ -394,6 +395,116 @@ fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
         Some(v) => format!("pkg:gem/{name}@{v}"),
         None => format!("pkg:gem/{name}"),
     })
+}
+
+/// The non-empty, non-interpolated text of a leading `"…"` / `'…'` literal.
+fn quoted_literal(rhs: &str) -> Option<String> {
+    let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let inner = &rhs[1..];
+    let value = inner[..inner.find(quote)?].trim();
+    (!value.is_empty() && !value.contains("#{")).then(|| value.to_string())
+}
+
+/// The code of each line of a Ruby file: `#` comments (outside string
+/// literals) are cut off, and `=begin`/`=end` blocks and heredoc bodies are
+/// skipped. A line-level reader, not a Ruby parser — enough to keep text
+/// Ruby never executes from passing for an assignment.
+fn ruby_code_lines(content: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut heredocs: Vec<String> = Vec::new();
+    let mut in_block_comment = false;
+    for raw in content.lines() {
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        if in_block_comment {
+            in_block_comment = !is_ruby_doc_marker(raw, "=end");
+            continue;
+        }
+        if let Some(terminator) = heredocs.first() {
+            if raw.trim() == terminator {
+                heredocs.remove(0);
+            }
+            continue;
+        }
+        if is_ruby_doc_marker(raw, "=begin") {
+            in_block_comment = true;
+            continue;
+        }
+        let code = strip_ruby_comment(raw);
+        heredocs.extend(heredoc_terminators(code));
+        out.push(code);
+    }
+    out
+}
+
+/// `=begin` / `=end` only count at column 0, alone or followed by space.
+fn is_ruby_doc_marker(line: &str, marker: &str) -> bool {
+    line.strip_prefix(marker)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// `line` up to its first `#` outside a `"…"` / `'…'` literal.
+fn strip_ruby_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => return &line[..i],
+            None => {}
+        }
+    }
+    line
+}
+
+/// The terminators of the heredocs a code line opens (`<<~ID`, `<<-ID`,
+/// `<<ID` with an upper-case ID, or a quoted `<<~'id'` / `<<~"id"`), in
+/// order. A `<<` inside a string literal opens nothing.
+fn heredoc_terminators(code: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut i = 0;
+    while let Some(c) = code[i..].chars().next() {
+        let mut next = i + c.len_utf8();
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if code[i..].starts_with("<<") => {
+                let after = &code[i + 2..];
+                let after = after.strip_prefix(['~', '-']).unwrap_or(after);
+                let (ident, quoted) = match after.chars().next() {
+                    Some(q @ ('"' | '\'')) => (&after[1..], Some(q)),
+                    _ => (after, None),
+                };
+                let len = ident
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(ident.len());
+                let id = &ident[..len];
+                let valid = !id.starts_with(|c: char| c.is_ascii_digit())
+                    && match quoted {
+                        Some(q) => !id.is_empty() && ident[len..].starts_with(q),
+                        None => id.starts_with(|c: char| c.is_ascii_uppercase()),
+                    };
+                if valid {
+                    found.push(id.to_string());
+                    // Resume after the identifier (and its closing quote).
+                    next = code.len() - ident.len() + len + usize::from(quoted.is_some());
+                } else {
+                    next = i + 2;
+                }
+            }
+            None => {}
+        }
+        i = next;
+    }
+    found
 }
 
 /// The one regular file directly under `cwd` named `*<ext>`, or `None` when
@@ -2750,6 +2861,81 @@ mod tests {
             Some("pkg:gem/acme"),
             "computed version dropped"
         );
+    }
+
+    /// #1573: a commented-out assignment is not an assignment. Ruby
+    /// (`Gem::Specification.load`) ignores `#` comments, `=begin`/`=end`
+    /// blocks and heredoc bodies, and the last live assignment wins.
+    #[tokio::test]
+    async fn detect_gemspec_ignores_commented_assignments() {
+        let gemspec = |body: &str| format!("Gem::Specification.new do |spec|\n{body}end\n");
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "commented literal version above a computed one",
+                "  spec.name = \"acme\"\n  # spec.version = \"0.0.1\" # pinned before VERSION\n  \
+                 spec.version = Acme::VERSION\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "commented name above the live one",
+                "  # spec.name = \"acme-legacy\"\n  spec.name = \"acme\"\n  \
+                 spec.version = \"2.3.4\"\n",
+                "pkg:gem/acme@2.3.4",
+            ),
+            (
+                "assignment after code in a trailing comment",
+                "  spec.name = \"acme\"\n  spec.files = [] # spec.version = \"0.0.1\"\n  \
+                 x = 1 # spec.name = \"other\"\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "=begin / =end block",
+                "=begin\n  spec.name = \"acme-legacy\"\n  spec.version = \"0.0.1\"\n=end\n  \
+                 spec.name = \"acme\"\n  spec.version = Acme::VERSION\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "heredoc body",
+                "  spec.name = \"acme\"\n  spec.description = <<~DESC\n    \
+                 spec.version = \"0.0.1\" was the old pin\n  DESC\n  \
+                 spec.version = Acme::VERSION\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "a later live assignment wins, as in Ruby",
+                "  spec.name = \"acme\"\n  spec.version = \"0.0.1\"\n  \
+                 spec.version = Acme::VERSION\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "`<<` inside a string opens no heredoc",
+                "  spec.summary = \"see <<EOF and 'quotes'\"\n  spec.name = \"acme\"\n  \
+                 spec.version = \"1.0.0\"\n",
+                "pkg:gem/acme@1.0.0",
+            ),
+            (
+                "quoted heredoc identifier",
+                "  spec.name = \"acme\"\n  spec.description = <<-'TEXT'.strip\n  \
+                 spec.version = \"0.0.1\"\n  TEXT\n  spec.version = \"3.0.0\"\n",
+                "pkg:gem/acme@3.0.0",
+            ),
+            (
+                "trailing comment after a live literal",
+                "  spec.name = \"acme\" # the gem\n  spec.version = \"1.2.0\" # bump\n",
+                "pkg:gem/acme@1.2.0",
+            ),
+        ];
+        for (what, body, want) in cases {
+            let r = detect_in(&[("acme.gemspec", &gemspec(body))]).await;
+            assert_eq!(r.purl.as_deref(), Some(*want), "{what}");
+        }
+        // Only a commented name: fall back to the file stem.
+        let r = detect_in(&[(
+            "acme.gemspec",
+            &gemspec("  # spec.name = \"acme-legacy\"\n  spec.name = Acme::NAME\n"),
+        )])
+        .await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:gem/acme"), "stem fallback");
     }
 
     /// The new probes never outrank the original three, and coexisting
