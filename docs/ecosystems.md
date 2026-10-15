@@ -296,8 +296,10 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   is named as a copy it may be, and `vex` attests nothing that lock wires at that
   version. An absolute path (`portal:/home/me/lp`, `file:/abs/lp.tgz`) is never read, as
   the lock is untrusted input; a `portal:` / `link:` copy whose `package.json` isn't
-  read has no version either, so it may be any version of any package and `vex` attests
-  nothing that lock wires. Use a relative path to let the copy be read. Hosted mode still pins the
+  read (an absolute path, or a relative target that is missing, such as a git submodule
+  CI didn't check out) has no version either, so it may be any version of any package
+  and `vex` attests nothing that lock wires. A `link:` to a directory that exists with no
+  `package.json` is not a package copy. Use a relative path to let the copy be read. Hosted mode still pins the
   registry entry and names the copy (`redirect_copy_unpatched`, unless a yarn classic
   skip warning already names it); vendored mode still wires the registry entry and names
   it (`vendor_copy_unpatched` for berry; the yarn classic codes below for classic); and
