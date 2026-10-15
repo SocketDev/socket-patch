@@ -17,6 +17,18 @@ pub fn parse_json_envelope(stdout: &str) -> Value {
         .unwrap_or_else(|e| panic!("failed to parse JSON envelope: {e}\nstdout:\n{stdout}"))
 }
 
+/// A finished run's stdout parsed as the envelope; panics with both streams
+/// when it isn't one, so a run that died before printing JSON shows why.
+pub fn output_envelope(out: &std::process::Output) -> Value {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "failed to parse JSON envelope: {e}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
 /// A top-level string field (`status`, …), or `None` when it is missing
 /// or not a string.
 pub fn json_string<'a>(env: &'a Value, key: &str) -> Option<&'a str> {

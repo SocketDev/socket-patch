@@ -1,4 +1,4 @@
-//! Coverage-gap tests for the interactive TTY branches of `src/ui/prompt.rs`:
+//! The interactive TTY branches of `src/ui/prompt.rs`, driven in a PTY:
 //!
 //! * `confirm()`'s bare-Enter -> `default_yes` return. Every production
 //!   caller passes `default_yes = true`, so this IS the "Enter proceeds
@@ -186,12 +186,12 @@ fn assert_cursor_restored(output: &str) {
 
 const REMOVE_MANIFEST: &str = r#"{
   "patches": {
-    "pkg:npm/__covgap_output_remove__@1.0.0": {
+    "pkg:npm/__prompts_tty_remove__@1.0.0": {
       "uuid": "33333333-3333-4333-8333-333333333333",
       "exportedAt": "2024-01-01T00:00:00Z",
       "files": {},
       "vulnerabilities": {},
-      "description": "covgap output bare-enter test",
+      "description": "prompts tty bare-enter test",
       "license": "MIT",
       "tier": "free"
     }
@@ -217,7 +217,7 @@ fn remove_interactive_bare_enter_proceeds_with_default_yes() {
     let (code, output) = run_in_pty(
         &[
             "remove",
-            "pkg:npm/__covgap_output_remove__@1.0.0",
+            "pkg:npm/__prompts_tty_remove__@1.0.0",
             "--skip-rollback",
         ],
         tmp.path(),
@@ -358,8 +358,8 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
     // The pty runs a sync child while wiremock needs a live async runtime,
     // so the runtime is built manually and kept alive across the pty run.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let purl = "pkg:npm/covgap-multi@1.0.0";
-    let encoded = "pkg%3Anpm%2Fcovgap-multi%401.0.0";
+    let purl = "pkg:npm/prompt-multi@1.0.0";
+    let encoded = "pkg%3Anpm%2Fprompt-multi%401.0.0";
     let mock = rt.block_on(async {
         let mock = MockServer::start().await;
         mount_two_free_patches(&mock, purl, encoded).await;
@@ -443,8 +443,8 @@ fn get_yes_answers_the_menu_with_its_default_without_showing_it() {
     // `--yes` skips interactive prompts, the patch menu included: it takes
     // the menu's default (the top-ranked patch) — even at a terminal.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let purl = "pkg:npm/covgap-multi-yes@1.0.0";
-    let encoded = "pkg%3Anpm%2Fcovgap-multi-yes%401.0.0";
+    let purl = "pkg:npm/prompt-multi-yes@1.0.0";
+    let encoded = "pkg%3Anpm%2Fprompt-multi-yes%401.0.0";
     let mock = rt.block_on(async {
         let mock = MockServer::start().await;
         mount_two_free_patches(&mock, purl, encoded).await;
@@ -482,7 +482,7 @@ fn get_yes_answers_the_menu_with_its_default_without_showing_it() {
     // The listing showed two patches; the pick is named before saving.
     let screen = crate::pty_io::render(output.as_bytes()).join("\n");
     assert!(
-        screen.contains("Selected:\n  pkg:npm/covgap-multi-yes@1.0.0 [FREE] 11111111"),
+        screen.contains("Selected:\n  pkg:npm/prompt-multi-yes@1.0.0 [FREE] 11111111"),
         "{screen}"
     );
 }
@@ -502,8 +502,8 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
     // child hung until the watchdog killed it). `q` is a plain character,
     // so it reaches the same cancel arm without the escape-parse race.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let purl = "pkg:npm/covgap-multi-esc@1.0.0";
-    let encoded = "pkg%3Anpm%2Fcovgap-multi-esc%401.0.0";
+    let purl = "pkg:npm/prompt-multi-esc@1.0.0";
+    let encoded = "pkg%3Anpm%2Fprompt-multi-esc%401.0.0";
     let mock = rt.block_on(async {
         let mock = MockServer::start().await;
         mount_two_free_patches(&mock, purl, encoded).await;
@@ -579,8 +579,8 @@ fn get_interactive_dialoguer_ctrl_c_restores_cursor_and_dies_by_sigint() {
     // `select_one`'s guard must show the cursor again before the default
     // SIGINT action kills the process — dialoguer leaves it hidden.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let purl = "pkg:npm/covgap-multi-ctrlc@1.0.0";
-    let encoded = "pkg%3Anpm%2Fcovgap-multi-ctrlc%401.0.0";
+    let purl = "pkg:npm/prompt-multi-ctrlc@1.0.0";
+    let encoded = "pkg%3Anpm%2Fprompt-multi-ctrlc%401.0.0";
     let mock = rt.block_on(async {
         let mock = MockServer::start().await;
         mount_two_free_patches(&mock, purl, encoded).await;
@@ -632,8 +632,8 @@ fn get_interactive_dialoguer_ctrl_c_with_sigint_ignored_cancels_cleanly() {
     // the cursor guard may not swap in a handler that re-raises into the
     // default (fatal) action. The menu then just returns Cancelled.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let purl = "pkg:npm/covgap-multi-sigign@1.0.0";
-    let encoded = "pkg%3Anpm%2Fcovgap-multi-sigign%401.0.0";
+    let purl = "pkg:npm/prompt-multi-sigign@1.0.0";
+    let encoded = "pkg%3Anpm%2Fprompt-multi-sigign%401.0.0";
     let mock = rt.block_on(async {
         let mock = MockServer::start().await;
         mount_two_free_patches(&mock, purl, encoded).await;

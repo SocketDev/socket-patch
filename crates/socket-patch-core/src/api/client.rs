@@ -3395,7 +3395,7 @@ mod tests {
     /// exercises the `Unauthorized` + `looks_like_token_hash` hint arm (the
     /// "you configured the sha512- storage hash, not the token" UX path).
     /// The run's route is the public proxy, anonymous. (The hint's stderr
-    /// text is pinned by the process-level twin in the CLI covgap suite.)
+    /// text is pinned by the CLI's `cli/api_client_org_fallback.rs`.)
     #[tokio::test]
     #[serial_test::serial]
     async fn org_auto_resolution_401_with_hash_shaped_token_hint_arm() {
