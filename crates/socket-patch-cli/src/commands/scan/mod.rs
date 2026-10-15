@@ -2576,8 +2576,85 @@ async fn run_scan(
     // longer serves, before the rewrite below re-pins any replacement.
     // Runs ahead of every "nothing found" exit: a package whose only patch
     // was withdrawn has no search results at all.
+    //
+    // Safety refusals run BEFORE the restore: a symlink or governing-root
+    // layout that hosted mode refuses must not be mutated.
     let withdrawn_sweep = if hosted && !args.common.is_global() && policy.writes_allowed() {
         let pins = withdrawn::pins_in_scope(&hosted_pin_list, &all_purls);
+
+        // Check layout refusals for the ecosystems involved in the sweep,
+        // before any restore (the sweep's `restore_upstream` would mutate
+        // lockfiles, including an ancestor lock or symlink the refusals
+        // prevent).
+        if !pins.is_empty() {
+            use socket_patch_core::vendor::lock_inventory::ProjectView;
+            let view = ProjectView::Disk(&args.common.cwd);
+
+            // Extract ecosystems from pins.
+            let mut has_npm = false;
+            let mut has_cargo = false;
+            let mut has_pypi = false;
+            for pin in &pins {
+                match Ecosystem::from_purl(&pin.purl) {
+                    Some(Ecosystem::Npm) => has_npm = true,
+                    Some(Ecosystem::Cargo) => has_cargo = true,
+                    Some(Ecosystem::Pypi) => has_pypi = true,
+                    _ => {}
+                }
+            }
+
+            // Check bun.lockb symlink refusal (npm ecosystem).
+            if has_npm {
+                use socket_patch_core::hosted::engine;
+                use socket_patch_core::vendor::lock_inventory::bun_text_lock_drives;
+                let bun_text_drives = bun_text_lock_drives(&view);
+                if !bun_text_drives && view.is_symlink("bun.lockb") {
+                    let refusal = engine::bun_lockb_symlink_refusal();
+                    if args.common.json {
+                        let mut env = scan_envelope(&args.common);
+                        env.mark_error(EnvelopeError::new(&refusal.code, &refusal.message));
+                        emit_scan(&env);
+                    } else {
+                        eprintln!("Error: {}", ui::sentence_case(&refusal.message));
+                    }
+                    return 1;
+                }
+            }
+
+            // Check governing-root refusals (cargo/pypi/npm ecosystems).
+            if has_cargo || has_pypi || has_npm {
+                use socket_patch_core::hosted::governing_root;
+                // Read trust_lockfile_config the way the main rewrite does.
+                let trust_env_off =
+                    socket_patch_core::utils::pnpm_workspace::trust_lockfile_env_for(
+                        &view,
+                        |var| std::env::var(var).ok(),
+                    )
+                    .await
+                    .is_some_and(|found| found.as_bool() != Some(true));
+                let trust_lockfile_config = !args.common.no_trust_lockfile_config && !trust_env_off;
+
+                if let Some(refusal) = governing_root::refusal_for_ecosystems(
+                    &view,
+                    has_cargo,
+                    has_pypi,
+                    has_npm,
+                    trust_lockfile_config,
+                )
+                .await
+                {
+                    if args.common.json {
+                        let mut env = scan_envelope(&args.common);
+                        env.mark_error(EnvelopeError::new(&refusal.code, &refusal.message));
+                        emit_scan(&env);
+                    } else {
+                        eprintln!("Error: {}", ui::sentence_case(&refusal.message));
+                    }
+                    return 1;
+                }
+            }
+        }
+
         Some(withdrawn::sweep(&args.common, &api_client, &pins).await)
     } else {
         None

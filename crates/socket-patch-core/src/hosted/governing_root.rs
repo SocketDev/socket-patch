@@ -92,12 +92,43 @@ pub async fn refusal(
         ProjectView::Snapshot(snap) => snap.root(),
         ProjectView::Memory(_) => return None,
     };
-    if candidates.iter().any(|c| c.dep.ecosystem == "cargo") {
+    let has_cargo = candidates.iter().any(|c| c.dep.ecosystem == "cargo");
+    let has_pypi = candidates.iter().any(|c| c.dep.ecosystem == "pypi");
+    let has_npm = candidates.iter().any(|c| c.dep.ecosystem == "npm");
+    refusal_for_ecosystems_impl(root, has_cargo, has_pypi, has_npm, trust_lockfile_config).await
+}
+
+/// Like [`refusal`], but takes ecosystem flags instead of candidates. Used by
+/// the withdrawn-pin sweep to check layout safety before any restore.
+pub async fn refusal_for_ecosystems(
+    view: &ProjectView<'_>,
+    has_cargo: bool,
+    has_pypi: bool,
+    has_npm: bool,
+    trust_lockfile_config: bool,
+) -> Option<Refusal> {
+    let root: &Path = match view {
+        ProjectView::Disk(root) => root,
+        ProjectView::Snapshot(snap) => snap.root(),
+        ProjectView::Memory(_) => return None,
+    };
+    refusal_for_ecosystems_impl(root, has_cargo, has_pypi, has_npm, trust_lockfile_config).await
+}
+
+/// Shared implementation for [`refusal`] and [`refusal_for_ecosystems`].
+async fn refusal_for_ecosystems_impl(
+    root: &Path,
+    has_cargo: bool,
+    has_pypi: bool,
+    has_npm: bool,
+    trust_lockfile_config: bool,
+) -> Option<Refusal> {
+    if has_cargo {
         if let Some(refusal) = cargo_member_refusal(root).await {
             return Some(refusal);
         }
     }
-    if candidates.iter().any(|c| c.dep.ecosystem == "pypi") {
+    if has_pypi {
         if let Some(workspace) = crate::utils::uv_workspace::governing_uv_workspace(root).await {
             return Some(Refusal {
                 code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
@@ -105,7 +136,7 @@ pub async fn refusal(
             });
         }
     }
-    if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+    if has_npm {
         let workspace = if has_own_npm_family_lock(root) {
             member_stray_lock_refusal(root).await
         } else {
