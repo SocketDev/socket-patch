@@ -469,7 +469,7 @@ fn plain_literal(s: &str) -> Option<(&str, &str)> {
 /// `code` is the line before any `#` comment. Skips `=begin`/`=end`
 /// blocks and heredoc bodies, and stops at `__END__`. A leading BOM is
 /// dropped, as Ruby does.
-fn for_each_code_line(contents: &str, mut f: impl FnMut(&str, &str)) {
+pub(crate) fn for_each_code_line<'a>(contents: &'a str, mut f: impl FnMut(&'a str, &'a str)) {
     use crate::formats::gem::gemfile::code_of;
     let contents = crate::formats::text::strip_bom(contents);
     let mut in_comment_block = false;

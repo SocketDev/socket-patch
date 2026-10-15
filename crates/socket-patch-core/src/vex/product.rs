@@ -368,23 +368,37 @@ fn xml_element_texts<const N: usize>(xml: &str, paths: [&[&str]; N]) -> [Option<
 /// `<name>.gemspec` → `pkg:gem/<name>[@<version>]` from literal
 /// `<spec>.name = "…"` / `<spec>.version = "…"` assignments; a version
 /// computed from a constant (`Foo::VERSION`) is dropped, and the name falls
-/// back to the file stem.
+/// back to the file stem. As in Ruby, comments, `=begin`/`=end` blocks,
+/// heredoc bodies and anything after `__END__` are not code, and the last
+/// assignment wins (#1573).
 fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
+    let mut lines: Vec<&str> = Vec::new();
+    crate::formats::gem::manifest::for_each_code_line(content, |_, c| lines.push(c));
+    // The `spec` of `Gem::Specification.new do |spec|`, when the file names
+    // it, so a helper's `ext.name = …` elsewhere can't pass for the spec's.
+    let receiver = lines
+        .iter()
+        .find_map(|c| spec_block_param(c).map(|(p, _)| p));
+    // One entry per statement: a line's code after any block opener, split
+    // on `;` (`Gem::Specification.new { |s| s.name = "a"; s.version = "1" }`).
+    let code: Vec<&str> = lines
+        .iter()
+        .flat_map(|c| ruby_statements(spec_block_param(c).map_or(c, |(_, rest)| rest)))
+        .collect();
+    // The value of the last `<spec>.<attr> = …` assignment: `Some(literal)`
+    // for a quoted literal, `None` for anything computed.
     let literal = |attr: &str| -> Option<String> {
-        strip_bom(content).lines().find_map(|raw| {
-            let line = raw.trim();
-            let (lhs, rhs) = line.split_once('=')?;
-            let lhs = lhs.trim();
-            if !lhs.ends_with(&format!(".{attr}")) || rhs.starts_with('=') {
-                return None;
-            }
-            let rhs = rhs.trim();
-            let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-            let inner = &rhs[1..];
-            let end = inner.find(quote)?;
-            let value = inner[..end].trim();
-            (!value.is_empty() && !value.contains("#{")).then(|| value.to_string())
-        })
+        code.iter()
+            .filter_map(|line| {
+                let (lhs, rhs) = line.split_once('=')?;
+                let (recv, method) = lhs.trim().rsplit_once('.')?;
+                let assigns = method == attr
+                    && receiver.is_none_or(|r| recv == r)
+                    && !rhs.starts_with(['=', '~']);
+                assigns.then(|| quoted_literal(rhs.trim()))
+            })
+            .next_back()
+            .flatten()
     };
     let name = literal("name").unwrap_or_else(|| stem.to_string());
     if name.is_empty() || name.contains(['/', '\\', ' ']) {
@@ -394,6 +408,48 @@ fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
         Some(v) => format!("pkg:gem/{name}@{v}"),
         None => format!("pkg:gem/{name}"),
     })
+}
+
+/// The block parameter of `Gem::Specification.new … do |spec|` (or
+/// `{ |spec|`) on this line of code, and the code after it.
+fn spec_block_param(code: &str) -> Option<(&str, &str)> {
+    let after = &code[code.find("Gem::Specification.new")?..];
+    let (_, param) = after.split_once('|')?;
+    let (param, rest) = param.split_once('|')?;
+    let param = param.trim();
+    let ident = !param.is_empty()
+        && param.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !param.starts_with(|c: char| c.is_ascii_digit());
+    ident.then_some((param, rest))
+}
+
+/// `code` split on each `;` outside a string literal.
+fn ruby_statements(code: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut quote, mut escaped, mut start) = (None, false, 0);
+    for (i, c) in code.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == ';' => {
+                out.push(&code[start..i]);
+                start = i + 1;
+            }
+            None => {}
+        }
+    }
+    out.push(&code[start..]);
+    out
+}
+
+/// The non-empty, non-interpolated text of a leading `"…"` / `'…'` literal.
+fn quoted_literal(rhs: &str) -> Option<String> {
+    let (value, _) = crate::formats::gem::gemfile::leading_quoted(rhs)?;
+    let value = value.trim();
+    (!value.is_empty() && !value.contains("#{")).then(|| value.to_string())
 }
 
 /// The one regular file directly under `cwd` named `*<ext>`, or `None` when
@@ -2750,6 +2806,101 @@ mod tests {
             Some("pkg:gem/acme"),
             "computed version dropped"
         );
+    }
+
+    /// #1573: a commented-out assignment is not an assignment. Ruby
+    /// (`Gem::Specification.load`) ignores `#` comments, `=begin`/`=end`
+    /// blocks and heredoc bodies, and the last live assignment wins.
+    #[tokio::test]
+    async fn detect_gemspec_ignores_commented_assignments() {
+        let gemspec = |body: &str| format!("Gem::Specification.new do |spec|\n{body}end\n");
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "commented literal version above a computed one",
+                "  spec.name = \"acme\"\n  # spec.version = \"0.0.1\" # pinned before VERSION\n  \
+                 spec.version = Acme::VERSION\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "commented name above the live one",
+                "  # spec.name = \"acme-legacy\"\n  spec.name = \"acme\"\n  \
+                 spec.version = \"2.3.4\"\n",
+                "pkg:gem/acme@2.3.4",
+            ),
+            (
+                "assignment after code in a trailing comment",
+                "  spec.name = \"acme\"\n  spec.files = [] # spec.version = \"0.0.1\"\n  \
+                 x = 1 # spec.name = \"other\"\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "=begin / =end block",
+                "=begin\n  spec.name = \"acme-legacy\"\n  spec.version = \"0.0.1\"\n=end\n  \
+                 spec.name = \"acme\"\n  spec.version = Acme::VERSION\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "heredoc body",
+                "  spec.name = \"acme\"\n  spec.description = <<~DESC\n    \
+                 spec.version = \"0.0.1\" was the old pin\n  DESC\n  \
+                 spec.version = Acme::VERSION\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "a later live assignment wins, as in Ruby",
+                "  spec.name = \"acme\"\n  spec.version = \"0.0.1\"\n  \
+                 spec.version = Acme::VERSION\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "`<<` inside a string opens no heredoc",
+                "  spec.summary = \"see <<EOF and 'quotes'\"\n  spec.name = \"acme\"\n  \
+                 spec.version = \"1.0.0\"\n",
+                "pkg:gem/acme@1.0.0",
+            ),
+            (
+                "quoted heredoc identifier",
+                "  spec.name = \"acme\"\n  spec.description = <<-'TEXT'.strip\n  \
+                 spec.version = \"0.0.1\"\n  TEXT\n  spec.version = \"3.0.0\"\n",
+                "pkg:gem/acme@3.0.0",
+            ),
+            (
+                "DATA section after __END__",
+                "  spec.name = \"acme\"\n  spec.version = Acme::VERSION\nend\n__END__\n\
+                 spec.version = \"0.0.1\"\n",
+                "pkg:gem/acme",
+            ),
+            (
+                "another receiver's `.name` / `.version` is not the spec's",
+                "  spec.name = \"acme\"\n  spec.version = \"1.2.0\"\n  \
+                 ext.name = \"acme_ext\"\n  task.version = \"0.1\"\n",
+                "pkg:gem/acme@1.2.0",
+            ),
+            (
+                "trailing comment after a live literal",
+                "  spec.name = \"acme\" # the gem\n  spec.version = \"1.2.0\" # bump\n",
+                "pkg:gem/acme@1.2.0",
+            ),
+        ];
+        for (what, body, want) in cases {
+            let r = detect_in(&[("acme.gemspec", &gemspec(body))]).await;
+            assert_eq!(r.purl.as_deref(), Some(*want), "{what}");
+        }
+        // Assignments on the block-opener line and after a `;`.
+        for one_line in [
+            "Gem::Specification.new do |s| s.name = \"acme\"; s.version = \"4.5.6\"\nend\n",
+            "Gem::Specification.new { |s| s.name = 'acme'; s.version = '4.5.6' }\n",
+        ] {
+            let r = detect_in(&[("other.gemspec", one_line)]).await;
+            assert_eq!(r.purl.as_deref(), Some("pkg:gem/acme@4.5.6"), "{one_line}");
+        }
+        // Only a commented name: fall back to the file stem.
+        let r = detect_in(&[(
+            "acme.gemspec",
+            &gemspec("  # spec.name = \"acme-legacy\"\n  spec.name = Acme::NAME\n"),
+        )])
+        .await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:gem/acme"), "stem fallback");
     }
 
     /// The new probes never outrank the original three, and coexisting
