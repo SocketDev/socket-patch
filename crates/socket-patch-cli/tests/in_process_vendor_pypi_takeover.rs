@@ -412,3 +412,36 @@ async fn scan_vendored_over_hosted_marker_split_requirements_never_unpatches() {
         assert_eq!(now, hosted, "the hosted pin stays byte-for-byte: {env:#}");
     }
 }
+
+/// #1572: a `.socket/` ignore rule would keep the vendored wheel out of the
+/// commit, and the uuid dir's own `.gitignore` can't re-include it. The
+/// vendoring refuses, and the takeover keeps the hosted pin, so six stays
+/// hosted instead of ending up neither hosted nor vendored.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_vendored_over_hosted_with_socket_dir_ignored_keeps_the_hosted_pin() {
+    let (_tmp, root) = project();
+    let Ok(status) = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status()
+    else {
+        return;
+    };
+    assert!(status.success());
+    std::fs::write(root.join("requirements.txt"), "six==1.16.0\n").unwrap();
+    let files: &[&str] = &["requirements.txt"];
+    std::fs::write(root.join(".gitignore"), ".socket/\n").unwrap();
+    let (hosted, exit, env) = host_then_vendor(&root, files).await;
+    assert_eq!(exit, 1, "the refusal fails the run: {env:#}");
+    assert!(has_code(&env, "vendor_artifact_gitignored"), "{env:#}");
+    assert!(
+        !has_code(&env, "vendor_takeover_reverted_redirect"),
+        "a refused purl must not be reported as restored: {env:#}"
+    );
+    assert_eq!(
+        snapshot(&root, files),
+        hosted,
+        "the hosted pin stays byte-for-byte: {env:#}"
+    );
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+}

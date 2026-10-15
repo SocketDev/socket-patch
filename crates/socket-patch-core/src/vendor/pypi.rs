@@ -1690,19 +1690,6 @@ fn pin_matches(pin_path: &str, pin_sha: &str, rel_wheel: &str, sha256_hex: &str)
 /// such as Python.gitignore-style `*.whl` (#1572).
 const UUID_GITIGNORE: &str = "!*\n";
 
-/// The uuid-dir half of the vendored gitignore check, for the hosted ->
-/// vendored takeover: it restores the hosted pin first, so a `.socket/`
-/// rule caught only by the vendoring would leave the package patched in
-/// neither mode. `None` when git would look inside the uuid dir, or the
-/// uuid is not canonical (the vendoring refuses that itself).
-pub async fn pypi_wheel_gitignore_preflight(
-    project_root: &Path,
-    uuid: &str,
-) -> Option<(&'static str, String)> {
-    let uuid_dir_rel = vendor_uuid_dir_rel("pypi", uuid)?;
-    super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
-}
-
 /// Write `<uuid>/.gitignore` and `<uuid>/.gitattributes` next to the
 /// wheel, then ask git whether it would commit them (#1572). The
 /// `.gitattributes` unsets the clean/smudge and EOL attributes a
@@ -5647,28 +5634,6 @@ wheels = [
                 );
             }
         }
-    }
-
-    /// #1572: the takeover's pre-flight answers the same refusal before the
-    /// hosted pin is restored, and nothing when git would commit the wheel.
-    #[tokio::test]
-    async fn wheel_gitignore_preflight_matches_the_vendored_refusal() {
-        use crate::vendor::test_support::git_project;
-        let tmp = tempfile::tempdir().unwrap();
-        if git_project(tmp.path(), "*.whl\n").is_none() {
-            return;
-        }
-        assert_eq!(pypi_wheel_gitignore_preflight(tmp.path(), UUID).await, None);
-        std::fs::write(tmp.path().join(".gitignore"), ".socket/\n").unwrap();
-        let (code, detail) = pypi_wheel_gitignore_preflight(tmp.path(), UUID)
-            .await
-            .expect("refused");
-        assert_eq!(code, "vendor_artifact_gitignored");
-        assert!(detail.contains(".socket/"), "{detail}");
-        assert_eq!(
-            pypi_wheel_gitignore_preflight(tmp.path(), "not-a-uuid").await,
-            None
-        );
     }
 
     /// A served wheel with an intact SRI whose `six.py` is still the ORIGINAL
