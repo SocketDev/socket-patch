@@ -2,16 +2,19 @@
 //! family: the pinned already-there wording, the two dry-run reports and
 //! the interactive reinstall confirm (PTY). The behavior behind each is
 //! asserted through `--json` in `update_json_contracts.rs`; these tests
-//! only pin what a person reads.
+//! only pin what a person reads. The unpinned already-latest and the
+//! `Updated socket-patch X → Y` lines are still checked by the happy-path
+//! tests in `self_update_e2e.rs`.
 //!
 //! Every run drives a COPY of the built binary staged into a tempdir
 //! (`update_fixture::staged_install`): `CARGO_BIN_EXE_socket-patch`
 //! itself must never be a swap target.
 
 use crate::update_fixture;
-use crate::update_json_contracts::DEAD_ENDPOINT;
 
-use update_fixture::{make_served_binary, run_installed, staged_install, FakeReleaseBuilder};
+use update_fixture::{
+    make_served_binary, run_installed, staged_install, FakeReleaseBuilder, DEAD_ENDPOINT,
+};
 
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 

@@ -198,7 +198,7 @@ async fn asset_server_error_is_download_failed() {
     assert_eq!(common::envelope_error_code(&env), Some("download_failed"));
     let message = common::envelope_error_message(&env).unwrap_or_default();
     assert!(
-        message.contains("500"),
+        message.contains("returned 500"),
         "download_failed must carry the HTTP status: {message}"
     );
 

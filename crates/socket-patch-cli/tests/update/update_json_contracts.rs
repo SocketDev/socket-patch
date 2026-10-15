@@ -17,14 +17,10 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use update_fixture::{
     make_served_binary, run_installed, sha256_file, staged_install, FakeReleaseBuilder,
+    DEAD_ENDPOINT,
 };
 
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
-
-/// A TCP endpoint nothing listens on (port 9 = discard, never bound on a
-/// dev host): any request the child makes fails fast and loudly, so a
-/// "zero network" contract regressing into a fetch flips the exit code.
-pub(crate) const DEAD_ENDPOINT: &str = "http://127.0.0.1:9";
 
 /// The already-latest envelope: exit 0, `status: success`, `dryRun:
 /// false`, exactly one skipped/already_latest event carrying
@@ -62,6 +58,12 @@ async fn update_already_latest_json_envelope_shape() {
     let event = find_event(&env, "skipped", Some("already_latest"));
     assert_eq!(event["details"]["current"], CURRENT);
     assert_eq!(event["details"]["latest"], CURRENT);
+    // The human explanation rides the event (its wording is checked in
+    // update_render.rs / self_update_e2e.rs, not here).
+    assert!(
+        event["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "the skip event must carry a reason: {stdout}"
+    );
     assert_eq!(env["summary"]["skipped"], 1);
 
     // No advisories were raised, so `warnings` must be omitted (the
@@ -77,8 +79,8 @@ async fn update_already_latest_json_envelope_shape() {
 
 /// `--update <CURRENT>`: an explicit pin equal to the compiled version is
 /// a no-op decided offline (no latest-resolution, no sums, no download;
-/// the dead endpoint fails any request). It reports the same
-/// skipped/already_latest event with the pin as `latest`, and it must NOT
+/// the dead endpoint fails any request). It reports one skipped event for
+/// the running version, and it must NOT
 /// refresh the passive notifier cache (the `if !pinned` state-write gate
 /// in `run()`: a pin says nothing about the latest release, so caching it
 /// as `latestSeen` would poison the nag).
@@ -99,10 +101,14 @@ fn update_pin_to_current_is_noop_zero_network() {
     let env = common::parse_json_envelope(&stdout);
     assert_envelope_invariants(&env, "update");
     assert_eq!(common::json_string(&env, "status"), Some("success"));
+    assert_eq!(
+        env["dryRun"], false,
+        "a wet pinned no-op must not read as a dry run: {stdout}"
+    );
     assert_eq!(events(&env).len(), 1, "exactly one skip event: {stdout}");
-    let event = find_event(&env, "skipped", Some("already_latest"));
+    let event = find_event(&env, "skipped", None);
     assert_eq!(event["details"]["current"], CURRENT);
-    assert_eq!(event["details"]["latest"], CURRENT);
+    assert_eq!(env["summary"]["skipped"], 1);
 
     install.assert_binary_intact();
     install.assert_only_binary_present();
