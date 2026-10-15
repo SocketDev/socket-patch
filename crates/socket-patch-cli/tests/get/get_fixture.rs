@@ -220,11 +220,14 @@ pub fn prestage_lock_file(socket: &Path) {
     std::fs::write(socket.join("apply.lock"), b"").unwrap();
 }
 
+/// The path of every request the mock received: which code path the binary
+/// really took. Panics when recording is off, so an empty list never passes
+/// a "no request" check vacuously.
 pub async fn received_paths(server: &MockServer) -> Vec<String> {
     server
         .received_requests()
         .await
-        .unwrap_or_default()
+        .expect("wiremock must record received requests")
         .iter()
         .map(|r| r.url.path().to_string())
         .collect()
@@ -680,7 +683,7 @@ pub fn traversal_files() -> serde_json::Value {
 
 /// Subprocess `get` with no `--api-token` / `--org`: the scrubbed child
 /// falls back to the public proxy, seeded at `uri` through
-/// `SOCKET_PROXY_URL` (get_invariants' recipe).
+/// `SOCKET_PROXY_URL`.
 pub fn run_get_via_proxy(cwd: &Path, uri: &str, extra: &[&str]) -> (i32, String, String) {
     let mut args = vec!["get"];
     args.extend_from_slice(extra);

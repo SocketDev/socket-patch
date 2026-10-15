@@ -406,6 +406,12 @@ async fn engine_view_404_is_download_failed() {
         json["events"][0]["errorCode"], "download_failed",
         "json={json}"
     );
+    // A fetch `Err` records `download_failed` too, with the error's own
+    // text: this fixed reason is the only mark of the `Ok(None)` arm.
+    assert_eq!(
+        json["events"][0]["error"], "could not fetch details",
+        "json={json}"
+    );
     assert_no_manifest(tmp.path());
 }
 
@@ -1202,9 +1208,9 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
 /// `get <uuid> --mode hosted` folds its result into the HOSTED error
 /// envelope, so a held apply lock surfaces as the top-level
 /// `error: {code: "lock_held", message}` object (v5.0: no top-level
-/// `errorCode`) — exit 1, nothing written. The human arm's lock error line
-/// and wait hint are pinned in `get_render.rs`. A `--dry-run` never contends: it previews the redirect under the held
-/// lock and exits 0.
+/// `errorCode`) — exit 1, nothing written. A `--dry-run` never contends:
+/// it previews the redirect under the held lock and exits 0. The human
+/// arm's lock error line and wait hint are pinned in `get_render.rs`.
 #[tokio::test]
 async fn hosted_lock_held_get_errors_with_top_level_error_code() {
     let (server, tmp, _lock) = hosted_project_with_held_lock().await;

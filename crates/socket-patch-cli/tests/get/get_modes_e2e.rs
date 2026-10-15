@@ -25,6 +25,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common;
+use crate::get_fixture::requests_containing;
 use crate::npm_e2e_common;
 use crate::vex_e2e_common;
 
@@ -204,17 +205,6 @@ fn parse_single_json_doc(stdout: &str) -> serde_json::Value {
     serde_json::from_str(trimmed).unwrap_or_else(|e| {
         panic!("stdout must be exactly one JSON document: {e}\nstdout:\n{stdout}")
     })
-}
-
-/// Requests the mock server saw for a given path fragment.
-async fn requests_containing(server: &MockServer, fragment: &str) -> usize {
-    server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter(|r| r.url.path().contains(fragment))
-        .count()
 }
 
 // ---------------------------------------------------------------------------
