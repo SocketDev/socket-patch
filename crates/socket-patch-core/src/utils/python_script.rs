@@ -385,7 +385,8 @@ fn contains_dependency(item: Option<&Item>, name: &str) -> bool {
 pub const UV_TOML: &str = "uv.toml";
 
 /// A uv settings file above the scanned root that uv applies to a PEP 723
-/// script there (#1501), found by [`find_ancestor_uv_config`].
+/// script (#1501) or a project (#1545) there, found by
+/// [`find_ancestor_uv_config`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UvConfig {
     /// The file relative to the scanned root, e.g. `../uv.toml`.
@@ -399,10 +400,21 @@ impl UvConfig {
     pub fn is_uv_toml(&self) -> bool {
         Path::new(&self.rel).file_name() == Some(UV_TOML.as_ref())
     }
+
+    /// The file as refusals name it, with the settings table it holds:
+    /// (label, path of the table within the file).
+    fn settings_location(&self) -> (String, &'static [&'static str]) {
+        if self.is_uv_toml() {
+            (self.rel.clone(), &[])
+        } else {
+            (format!("{} [tool.uv]", self.rel), &["tool", "uv"])
+        }
+    }
 }
 
-/// Whether a PEP 723 script in a root holding `pyproject` and `uv_toml`
-/// takes uv's settings from the root itself, so uv looks no further up.
+/// Whether a PEP 723 script or a project in a root holding `pyproject` and
+/// `uv_toml` takes uv's settings from the root itself, so uv looks no
+/// further up.
 pub fn root_governs_script(pyproject: Option<&str>, uv_toml: Option<&str>) -> bool {
     uv_toml.is_some() || pyproject.is_some_and(pyproject_has_uv_settings)
 }
@@ -421,12 +433,12 @@ fn pyproject_has_uv_settings(pyproject: &str) -> bool {
 }
 
 /// The uv settings file above `root` that uv applies to a PEP 723 script
-/// in `root`, when `root` itself holds none.
+/// or a project in `root`, when `root` itself holds none.
 ///
-/// uv reads a script's settings from the nearest directory at or above the
-/// script's that holds a `uv.toml`, or a `pyproject.toml` with a `[tool.uv]`
-/// table, with `uv.toml` first in each directory. A project stops that
-/// lookup at itself, so only the script lane asks. A user-level `uv.toml`
+/// uv reads a script's or a project's settings from the nearest directory
+/// at or above its own that holds a `uv.toml`, or a `pyproject.toml` with
+/// a `[tool.uv]` table, with `uv.toml` first in each directory. A
+/// user-level `uv.toml`
 /// (`~/.config/uv`) is the installing machine's and is not looked up.
 pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
     for (rel, path) in ancestor_uv_config_files(root) {
@@ -446,15 +458,21 @@ pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
 
 /// `[tool.uv]` keys that describe the project declaring them rather than
 /// settings another project inherits: uv documents them as project
-/// metadata only, and ignores them in a `uv.toml`.
+/// metadata, read from the project's (or its workspace root's) own
+/// pyproject. Checked against uv 0.11: a parent's `override-dependencies`
+/// or `constraint-dependencies` never reaches a child project's lock.
 const UV_PROJECT_ONLY_KEYS: &[&str] = &[
     "build-backend",
+    "build-constraint-dependencies",
     "conflicts",
+    "constraint-dependencies",
     "default-groups",
     "dependency-groups",
     "dev-dependencies",
     "environments",
+    "exclude-dependencies",
     "managed",
+    "override-dependencies",
     "package",
     "required-environments",
     "sources",
@@ -470,8 +488,10 @@ const UV_PROJECT_ONLY_KEYS: &[&str] = &[
 /// own `pyproject` and `uv_toml` set none, the `[tool.uv]` table a wired
 /// source adds makes the project's pyproject the settings file, so every
 /// setting of the parent (`exclude-newer`, `resolution`, indexes) is
-/// dropped: `uv sync --locked` fails and a plain `uv lock` re-resolves
-/// without them. A parent that sets only project metadata
+/// dropped: `uv sync --locked` fails on those the lock records, and a
+/// plain `uv lock` re-resolves without them. Every inherited setting is
+/// refused, not only the recorded ones, since socket-patch must not
+/// silently change how uv installs the project. A parent that sets only project metadata
 /// ([`UV_PROJECT_ONLY_KEYS`], e.g. a workspace root's `workspace`), or
 /// does not parse (uv reports it itself), loses nothing.
 pub fn refuse_uv_project_shadowing(
@@ -488,21 +508,13 @@ pub fn refuse_uv_project_shadowing(
     let Ok(document) = config.text.parse::<DocumentMut>() else {
         return Ok(());
     };
-    let (label, settings) = if config.is_uv_toml() {
-        (
-            config.rel.clone(),
-            Some(document.as_table() as &dyn TableLike),
-        )
-    } else {
-        (
-            format!("{} [tool.uv]", config.rel),
-            document
-                .get("tool")
-                .and_then(Item::as_table_like)
-                .and_then(|tool| tool.get("uv"))
-                .and_then(Item::as_table_like),
-        )
-    };
+    let (label, path) = config.settings_location();
+    let mut settings = Some(document.as_table() as &dyn TableLike);
+    for key in path {
+        settings = settings
+            .and_then(|table| table.get(key))
+            .and_then(Item::as_table_like);
+    }
     let keys: Vec<&str> = settings
         .into_iter()
         .flat_map(|table| table.iter().map(|(key, _)| key))
@@ -514,8 +526,8 @@ pub fn refuse_uv_project_shadowing(
     Err(format!(
         "{label} sets {} for this project, and the [tool.uv] table a wired source adds to \
          pyproject.toml would make uv read its settings from pyproject.toml instead and drop \
-         them, so `uv sync --locked` would fail; add a [tool.uv] table to pyproject.toml \
-         carrying the settings the project needs to wire a patch",
+         them (a lock written with them then fails `uv sync --locked`); add a [tool.uv] table \
+         to pyproject.toml carrying the settings the project needs to wire a patch",
         keys.join(", ")
     ))
 }
@@ -593,16 +605,12 @@ pub fn refuse_uv_script_no_sources(
 ) -> Result<(), String> {
     match ancestor {
         Some(config) if !root_governs_script(pyproject, uv_toml) => {
-            let project = if config.is_uv_toml() {
-                (config.rel.clone(), config.text.as_str(), &[][..])
-            } else {
-                (
-                    format!("{} [tool.uv]", config.rel),
-                    config.text.as_str(),
-                    &["tool", "uv"][..],
-                )
-            };
-            refuse_no_sources(name, Some(script), Some(project))
+            let (label, path) = config.settings_location();
+            refuse_no_sources(
+                name,
+                Some(script),
+                Some((label, config.text.as_str(), path)),
+            )
         }
         _ => refuse_uv_no_sources(name, Some(script), pyproject, uv_toml),
     }
@@ -1556,6 +1564,7 @@ mod ancestor_config_tests {
             "[tool.uv]\n",
             "[tool.uv.workspace]\nmembers = [\"libs/*\"]\n[tool.uv.sources]\nlib = { workspace = true }\n",
             "[tool.uv]\nmanaged = true\npackage = false\ndev-dependencies = []\n",
+            "[tool.uv]\noverride-dependencies = [\"six<2\"]\nconstraint-dependencies = []\n",
         ] {
             assert_eq!(
                 refuse_uv_project_shadowing(

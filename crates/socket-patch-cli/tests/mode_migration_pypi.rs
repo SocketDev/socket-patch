@@ -969,6 +969,17 @@ async fn uv_project_under_parent_settings_is_refused_in_both_modes() {
             assert_eq!(tree(&root), before, "hosted {file} wrote nothing");
         } else {
             assert_eq!(hosted_pinned(&env), 1, "hosted {file}: {env:#}");
+            // Vendored: a fresh project, so hosted's wiring is not taken over.
+            let (_tmp, root) = project();
+            stage_uv(&root);
+            std::fs::write(root.parent().unwrap().join(file), &setting).unwrap();
+            stage_manifest(&root);
+            let (code, env) = run_cli(&root, &["vendor"], &[]);
+            assert_eq!(code, 0, "vendored {file}: {env:#}");
+            assert!(
+                !env.to_string().contains("pypi_uv_ancestor_settings"),
+                "vendored {file}: {env:#}"
+            );
             continue;
         }
 

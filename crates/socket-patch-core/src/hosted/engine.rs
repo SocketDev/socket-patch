@@ -704,11 +704,11 @@ pub async fn read_candidate_files(
     // `no-sources`, under which uv ignores the `[tool.uv.sources]` entry the
     // rewrite would add (#564). Advisory: never rewritten, so a link or an
     // unreadable in-memory entry is left out rather than refused.
-    if out
+    let uv_lane = out
         .files
         .keys()
-        .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path))
-    {
+        .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path));
+    if uv_lane {
         let rel = crate::utils::python_script::UV_TOML;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
             out.files.insert(rel.to_string(), text);
@@ -717,10 +717,7 @@ pub async fn read_candidate_files(
     // A PEP 723 script (#1501) or a project (#1545) also takes uv's
     // settings from above the root when the root holds none; only a disk
     // view has an above.
-    if out
-        .files
-        .keys()
-        .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path))
+    if uv_lane
         && !crate::utils::python_script::root_governs_script(
             out.files.get("pyproject.toml").map(String::as_str),
             out.files
