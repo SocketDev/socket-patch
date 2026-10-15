@@ -878,32 +878,40 @@ struct LockCopy {
 /// non-registry url) may be any package at its lock version, so it is
 /// recorded as a copy of every package this lock wires at that version:
 /// vouching for those would rest on a copy nobody read (#1516). A
-/// `portal:` / `link:` copy has no lock version: one never read (an
-/// absolute path) may be any version of any package, and contests every
-/// package this lock wires (#1540); one read and found to hold no
-/// versioned package (a `link:` to a plain directory) is left alone.
+/// `portal:` / `link:` copy has no lock version: one whose package is
+/// unknown (never read, an absolute path, or a target that can't be read,
+/// [`crate::vendor::yarn_copies::linked_copy_unknown`]) may be any version
+/// of any package, and contests every package this lock wires (#1540,
+/// #1561); one that holds no versioned package (a `link:` to a plain
+/// directory) is left alone.
 async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut Discovery) {
     for copy in copies {
         let bytes = match copy.source.read_path() {
             Some(rel) => ctx.read_advisory_bytes(&rel).await,
             None => None,
         };
+        let parsed = bytes
+            .as_deref()
+            .is_some_and(crate::formats::yarn::copy::is_json_manifest);
         let Some((name, version)) =
             crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
         else {
-            let unread_linked = copy.source.is_unread_linked();
-            if matches!(copy.source, CopyRef::Linked(_)) && !unread_linked {
+            let linked = matches!(copy.source, CopyRef::Linked(_));
+            if linked
+                && !crate::vendor::yarn_copies::linked_copy_unknown(ctx.view, &copy.source, parsed)
+                    .await
+            {
                 continue;
             }
             out.unidentified_copy(
                 YARN_LOCK,
-                (!unread_linked).then_some(copy.version.as_str()),
+                (!linked).then_some(copy.version.as_str()),
                 &copy.key,
                 &format!(
                     "{}, whose package can't be read, so it may be {} of any package \
                      (yarn keys it by the dependency name)",
                     copy.source.how(),
-                    if unread_linked {
+                    if linked {
                         "any version"
                     } else {
                         "this version"
@@ -1946,6 +1954,62 @@ mod tests {
                             && d.detail.contains(&format!("lp2@{protocol}:"))
                             && d.detail.contains("can't be read")),
                     "{protocol} {manifest}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
+    /// #1561: a RELATIVE `portal:` / `link:` copy whose target can't be read
+    /// (a missing directory, the empty one git leaves for a submodule CI
+    /// never checked out, a `package.json` that is no regular file or no
+    /// JSON, such as a Git LFS pointer) is as unknown as an absolute
+    /// one (#1540): it may be any version of any package, so it contests
+    /// every ref its lock wires. It was dropped like a `link:` to a plain
+    /// directory, so `vex` attested `not_affected` while the install that
+    /// had the target linked unpatched left-pad@1.3.0 as `node_modules/lp2`.
+    #[tokio::test]
+    async fn issue_1561_unreadable_relative_portal_and_link_targets_contest_every_ref() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        for protocol in ["portal", "link"] {
+            for target in ["missing", "empty", "manifest-is-a-directory", "lfs-pointer"] {
+                let p = Project::new();
+                match target {
+                    "empty" => std::fs::create_dir_all(p.root().join("vend/lp")).unwrap(),
+                    "manifest-is-a-directory" => {
+                        p.write("vend/lp/package.json/index.js", "");
+                    }
+                    "lfs-pointer" => {
+                        p.write(
+                            "vend/lp/package.json",
+                            "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n",
+                        );
+                    }
+                    _ => {}
+                }
+                let descriptor = format!("lp2@{protocol}:./vend/lp::locator=app%40workspace%3A.");
+                p.write(
+                    "yarn.lock",
+                    berry(&[
+                        wired.clone(),
+                        berry_block(&descriptor, "0.0.0-use.local", &descriptor, None),
+                    ]),
+                );
+                p.write(
+                    "package.json",
+                    package_json_with_resolutions(serde_json::json!({
+                        "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                    })),
+                );
+                let out = run(&p).await;
+                assert!(out.refs.is_empty(), "{protocol} {target}: {:#?}", out.refs);
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains(&format!("lp2@{protocol}:"))
+                            && d.detail.contains("can't be read")),
+                    "{protocol} {target}: {:#?}",
                     out.diagnostics
                 );
             }

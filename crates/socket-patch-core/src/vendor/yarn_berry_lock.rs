@@ -276,13 +276,14 @@ impl NpmLockBackend for YarnBerryBackend {
                          vendoring writes never reaches it, so that copy stays UNPATCHED"
                     )
                 } else {
-                    // An unread `portal:` / `link:` copy has no version
-                    // to name (#1540).
-                    let what = if copy.source.is_unread_linked() {
-                        "a package".to_string()
-                    } else {
-                        format!("version {version}")
-                    };
+                    // An unidentified `portal:` / `link:` copy has no
+                    // version to name (#1540, #1561).
+                    let what =
+                        if matches!(copy.source, crate::formats::yarn::copy::CopyRef::Linked(_)) {
+                            "a package".to_string()
+                        } else {
+                            format!("version {version}")
+                        };
                     format!(
                         "{YARN_LOCK} entry `{key}` installs {what} under another \
                          dependency name, from {origin}, whose package can't be read, so it \
@@ -2555,6 +2556,70 @@ __metadata:
                         && copies[0].detail.contains("installs a package under")
                         && copies[0].detail.contains("can't be read"),
                     "{protocol}/{fork}: {}",
+                    copies[0].detail
+                );
+            }
+        }
+    }
+
+    /// #1561: a RELATIVE `portal:` / `link:` copy whose target is missing,
+    /// empty (the placeholder git leaves for a submodule CI never checked
+    /// out) or holds a `package.json` that is no JSON (a Git LFS pointer) is
+    /// as unknown as an
+    /// absolute one (#1540): named as a possible unpatched copy, while the
+    /// registry entry still vendors. It was dropped silently. Control: a
+    /// `link:` to an existing plain directory with no `package.json` is no
+    /// package copy and stays unnamed.
+    #[tokio::test]
+    async fn issue_1561_missing_relative_portal_and_link_targets_are_named() {
+        for protocol in ["portal", "link"] {
+            for target in ["missing", "empty", "lfs-pointer", "plain-dir"] {
+                let plain_dir = target == "plain-dir";
+                let key = format!("lp2@{protocol}:./vend/lp::locator=vendor-spike%40workspace%3A.");
+                let block = format!(
+                    "\n\"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
+                     languageName: node\n  linkType: soft\n"
+                );
+                let lock = format!("{B3_BEFORE_LOCK}{block}");
+                let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+                let dir = fx.tmp.path().join("vend/lp");
+                match target {
+                    "empty" => tokio::fs::create_dir_all(&dir).await.unwrap(),
+                    "lfs-pointer" => {
+                        tokio::fs::create_dir_all(&dir).await.unwrap();
+                        tokio::fs::write(
+                            dir.join("package.json"),
+                            "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    "plain-dir" => {
+                        tokio::fs::create_dir_all(&dir).await.unwrap();
+                        tokio::fs::write(dir.join("logo.svg"), "<svg/>")
+                            .await
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+
+                let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{protocol}/{target}: {:?}", result.error);
+                assert!(entry.is_some(), "{protocol}/{target}: registry vendors");
+                let copies: Vec<&VendorWarning> = warnings
+                    .iter()
+                    .filter(|w| w.code == "vendor_copy_unpatched")
+                    .collect();
+                if plain_dir {
+                    assert!(copies.is_empty(), "{protocol}: {warnings:?}");
+                    continue;
+                }
+                assert_eq!(copies.len(), 1, "{protocol}/{target}: {warnings:?}");
+                assert!(
+                    copies[0].detail.contains(&format!("`\"{key}\"`"))
+                        && copies[0].detail.contains("installs a package under")
+                        && copies[0].detail.contains("can't be read"),
+                    "{protocol}/{target}: {}",
                     copies[0].detail
                 );
             }
