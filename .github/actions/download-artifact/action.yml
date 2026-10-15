@@ -18,8 +18,9 @@ inputs:
 runs:
   using: composite
   steps:
-    # download-artifact v4 can finish "successfully" with a truncated file:
-    # run 38059192473 attempt 1 logged "Starting download" and nothing more,
+    # download-artifact can finish "successfully" with a truncated file.
+    # Seen on v4; keep the check on newer majors too: run
+    # 38059192473 attempt 1 logged "Starting download" and nothing more,
     # then `zstd -d` failed with "Read error (39) : premature end" in the
     # next step and the leg went red. A merge-queue leg that does that
     # evicts the entry, so check the files and fetch them once more.
