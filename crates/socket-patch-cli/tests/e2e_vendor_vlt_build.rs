@@ -245,7 +245,7 @@ async fn vlt_pinned_matrix_vendored_scan_fresh_ci() {
     );
     assert_eq!(
         read(&uuid_dir(&fx.proj, fx.t()).join(".gitattributes")),
-        "* -text\n"
+        "* -text -filter -ident -working-tree-encoding\n"
     );
     assert_fresh_vendored(&fx, fx.t(), "fresh-scan");
     fx.leg.ran();
