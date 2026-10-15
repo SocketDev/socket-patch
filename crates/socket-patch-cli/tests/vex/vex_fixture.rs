@@ -173,7 +173,7 @@ pub(crate) fn write_multi_manifest_project(cwd: &Path) {
 /// `vex --cwd <cwd>` (plus `--product` when given) in the hermetic env,
 /// run from `cwd`.
 pub(crate) fn vex_command(cwd: &Path, product: Option<&str>) -> Command {
-    let mut cmd = common::hermetic_command(&common::binary());
+    let mut cmd = common::hermetic::binary_command();
     cmd.current_dir(cwd)
         .args(["vex", "--cwd", cwd.to_str().unwrap()]);
     if let Some(product) = product {

@@ -263,7 +263,9 @@ fn corrupt_redirect_ledger_prints_a_warning_line() {
     assert!(
         err.lines().any(|l| l.starts_with("Warning:")
             && l.contains("pre-v5 redirect ledger")
-            && l.contains("redirect-state.json")),
+            && l.contains("redirect-state.json")
+            && l.contains("malformed")
+            && l.contains("not consulted")),
         "{err}"
     );
     assert!(err.contains("(package_not_found)"), "{err}");
@@ -294,7 +296,7 @@ fn corrupt_vendor_ledger_error_names_the_ledger() {
         );
         assert!(!err.contains("Manifest not found"), "{err}");
         assert!(
-            !err.contains("omitting"),
+            !err.contains("omitting") && !err.contains("package_not_found"),
             "the ledger error fires before verification: {err}"
         );
         assert_vendor_ledger_untouched(cwd);
@@ -311,6 +313,7 @@ fn multi_manifest_auto_detect_warning_and_silent() {
     let out_path = cwd.join("out.vex.json");
 
     for silent in [false, true] {
+        let _ = std::fs::remove_file(&out_path);
         let mut cmd = vex_command(cwd, None);
         cmd.args(["--no-verify", "--output", out_path.to_str().unwrap()]);
         if silent {

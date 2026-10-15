@@ -167,11 +167,12 @@ fn corrupt_vendor_ledger_fails_closed_before_verification() {
             "{env}"
         );
         assert!(
-            envelope_error_message(&env).is_some_and(|m| m.contains("state.json")),
-            "the error names the unreadable ledger: {env}"
+            envelope_error_message(&env)
+                .is_some_and(|m| m.contains("state.json") && m.contains("corrupt")),
+            "the error names the unreadable ledger and why: {env}"
         );
         assert!(
-            events(&env).is_empty(),
+            env["events"].as_array().is_none_or(|e| e.is_empty()),
             "no per-patch events on a pre-verification hard error: {env}"
         );
         assert_vendor_ledger_untouched(cwd);
@@ -293,7 +294,8 @@ fn omitted_patches_are_sorted_skipped_events() {
     assert!(
         events(&env)
             .iter()
-            .all(|e| e["errorCode"] == "package_not_found" && e["reason"].is_string()),
+            .all(|e| e["errorCode"] == "package_not_found"
+                && e["reason"].as_str().is_some_and(|r| !r.is_empty())),
         "{env}"
     );
 }
