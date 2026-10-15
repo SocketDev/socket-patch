@@ -276,13 +276,14 @@ impl NpmLockBackend for YarnBerryBackend {
                          vendoring writes never reaches it, so that copy stays UNPATCHED"
                     )
                 } else {
-                    // An unread `portal:` / `link:` copy has no version
-                    // to name (#1540).
-                    let what = if copy.source.is_unread_linked() {
-                        "a package".to_string()
-                    } else {
-                        format!("version {version}")
-                    };
+                    // An unidentified `portal:` / `link:` copy has no
+                    // version to name (#1540, #1561).
+                    let what =
+                        if matches!(copy.source, crate::formats::yarn::copy::CopyRef::Linked(_)) {
+                            "a package".to_string()
+                        } else {
+                            format!("version {version}")
+                        };
                     format!(
                         "{YARN_LOCK} entry `{key}` installs {what} under another \
                          dependency name, from {origin}, whose package can't be read, so it \

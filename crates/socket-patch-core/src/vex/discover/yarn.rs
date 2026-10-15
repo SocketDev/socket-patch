@@ -878,32 +878,38 @@ struct LockCopy {
 /// non-registry url) may be any package at its lock version, so it is
 /// recorded as a copy of every package this lock wires at that version:
 /// vouching for those would rest on a copy nobody read (#1516). A
-/// `portal:` / `link:` copy has no lock version: one never read (an
-/// absolute path) may be any version of any package, and contests every
-/// package this lock wires (#1540); one read and found to hold no
-/// versioned package (a `link:` to a plain directory) is left alone.
+/// `portal:` / `link:` copy has no lock version: one whose package is
+/// unknown (never read, an absolute path, or a target that can't be read,
+/// [`crate::vendor::yarn_copies::linked_copy_unknown`]) may be any version
+/// of any package, and contests every package this lock wires (#1540,
+/// #1561); one that holds no versioned package (a `link:` to a plain
+/// directory) is left alone.
 async fn record_copies(ctx: &DiscoverCtx<'_>, copies: Vec<LockCopy>, out: &mut Discovery) {
     for copy in copies {
         let bytes = match copy.source.read_path() {
             Some(rel) => ctx.read_advisory_bytes(&rel).await,
             None => None,
         };
+        let read = bytes.is_some();
         let Some((name, version)) =
             crate::vendor::yarn_copies::copy_identity(&copy.source, &copy.version, bytes).await
         else {
-            let unread_linked = copy.source.is_unread_linked();
-            if matches!(copy.source, CopyRef::Linked(_)) && !unread_linked {
+            let linked = matches!(copy.source, CopyRef::Linked(_));
+            if linked
+                && !crate::vendor::yarn_copies::linked_copy_unknown(ctx.view, &copy.source, read)
+                    .await
+            {
                 continue;
             }
             out.unidentified_copy(
                 YARN_LOCK,
-                (!unread_linked).then_some(copy.version.as_str()),
+                (!linked).then_some(copy.version.as_str()),
                 &copy.key,
                 &format!(
                     "{}, whose package can't be read, so it may be {} of any package \
                      (yarn keys it by the dependency name)",
                     copy.source.how(),
-                    if unread_linked {
+                    if linked {
                         "any version"
                     } else {
                         "this version"
