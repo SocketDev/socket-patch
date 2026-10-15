@@ -143,10 +143,11 @@ fn env_setting(
         Some(_) => &["npm_config_"],
         None => &["pnpm_config_", "npm_config_"],
     };
-    prefixes
-        .iter()
-        .map(|prefix| format!("{prefix}{key}"))
-        .find_map(|var| {
+    prefixes.iter().find_map(|prefix| {
+        let var = format!("{prefix}{key}");
+        if *prefix == "pnpm_config_" {
+            pnpm_env_setting(&var, major, &env)
+        } else {
             let value = env(&var)?.trim().to_string();
             let source = format!("`{var}={value}` in the environment");
             Some(PnpmSetting {
@@ -154,13 +155,45 @@ fn env_setting(
                 source,
                 yaml: false,
             })
-        })
+        }
+    })
+}
+
+/// A boolean setting from `var`, a variable of the `pnpm_config_*` family
+/// (either case) that pnpm 11 and newer read for a project on pnpm
+/// `major`. pnpm takes only `true` or `false` there and ignores any other
+/// value (empty, `null`, `undefined`, `0`, `FALSE`), reading the settings
+/// file instead (#1557), so such a value sets nothing. pnpm 12 trims the
+/// value first (` false` is false); pnpm 11 does not (` false` is
+/// ignored). With the major unknown the value is trimmed, so a padded
+/// `false` is respected: for the lock that withholds pins, the safe side.
+fn pnpm_env_setting(
+    var: &str,
+    major: Option<u32>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<PnpmSetting> {
+    let raw = env(var)?;
+    let value = if major == Some(11) {
+        raw.as_str()
+    } else {
+        raw.trim()
+    };
+    if !matches!(value, "true" | "false") {
+        return None;
+    }
+    let value = value.to_string();
+    Some(PnpmSetting {
+        source: format!("`{var}={value}` in the environment"),
+        value,
+        yaml: false,
+    })
 }
 
 /// pnpm's `trustLockfile` as the environment sets it, for a project on
 /// pnpm `major` (#1514): `pnpm_config_trust_lockfile`, or its uppercase
-/// spelling, which pnpm 11 and newer read ahead of pnpm-workspace.yaml.
-/// `None` on pnpm 10 and older, which never verify lock URLs, and for
+/// spelling, which pnpm 11 and newer read ahead of pnpm-workspace.yaml
+/// when it is `true` or `false` (see [`pnpm_env_setting`]). `None` on pnpm
+/// 10 and older, which never verify lock URLs, and for
 /// `npm_config_trust_lockfile`, which no pnpm reads.
 pub fn trust_lockfile_env(
     major: Option<u32>,
@@ -170,15 +203,20 @@ pub fn trust_lockfile_env(
         return None;
     }
     // pnpm 11's spelling, then the uppercase one pnpm 12 reads too.
-    env_setting("trust-lockfile", Some(major.unwrap_or(11)), &env).or_else(|| {
-        let var = "PNPM_CONFIG_TRUST_LOCKFILE";
-        let value = env(var)?.trim().to_string();
-        Some(PnpmSetting {
-            source: format!("`{var}={value}` in the environment"),
-            value,
-            yaml: false,
-        })
-    })
+    pnpm_env_setting("pnpm_config_trust_lockfile", major, &env)
+        .or_else(|| pnpm_env_setting("PNPM_CONFIG_TRUST_LOCKFILE", major, &env))
+}
+
+/// [`trust_lockfile_env`] for the project `view` shows, at the pnpm major
+/// that installs it: whether pnpm 11 ignores a padded value or pnpm 12
+/// trims it depends on the major. The project's files are read for it only
+/// when the environment sets the variable at all.
+pub async fn trust_lockfile_env_for(
+    view: &ProjectView<'_>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<PnpmSetting> {
+    trust_lockfile_env(None, &env)?;
+    trust_lockfile_env(pnpm_major(view).await, &env)
 }
 
 /// [`pnpm_setting`], falling back to the environment ([`env_setting`],
@@ -939,7 +977,7 @@ mod tests {
             None,
             env(&[
                 ("npm_config_git_branch_lockfile", "false"),
-                ("pnpm_config_git_branch_lockfile", "TRUE"),
+                ("pnpm_config_git_branch_lockfile", "true"),
             ]),
         )
         .unwrap();
@@ -953,7 +991,7 @@ mod tests {
     #[test]
     fn the_environment_sets_trust_lockfile_only_for_pnpm_11_and_newer() {
         const LOWER: &[(&str, &str)] = &[("pnpm_config_trust_lockfile", "false")];
-        const UPPER: &[(&str, &str)] = &[("PNPM_CONFIG_TRUST_LOCKFILE", " false ")];
+        const UPPER: &[(&str, &str)] = &[("PNPM_CONFIG_TRUST_LOCKFILE", "false")];
         const NPM: &[(&str, &str)] = &[("npm_config_trust_lockfile", "false")];
         for major in [Some(11), Some(12), None] {
             let found = trust_lockfile_env(major, env(LOWER)).expect("lowercase");
@@ -970,6 +1008,122 @@ mod tests {
             trust_lockfile_env(Some(11), env(on)).and_then(|s| s.as_bool()),
             Some(true)
         );
+    }
+
+    /// #1557: pnpm 11 and newer read a `pnpm_config_*` boolean only when it
+    /// is `true` or `false` and otherwise ignore it for the settings file
+    /// (measured with `pnpm config get` on pnpm 11.28.5 and 12.11.2), so any
+    /// other value (an unset CI variable's empty string, `null`,
+    /// `undefined`, `0`, `FALSE`) sets nothing, for `trustLockfile` and
+    /// every other key alike. pnpm 12 trims the value first and pnpm 11
+    /// does not, so a padded ` false` is ignored only on pnpm 11; with the
+    /// major unknown it is respected. npm's family keeps its own coercion
+    /// (pnpm 10 and older, see [`PnpmSetting::as_bool`]).
+    #[test]
+    fn a_pnpm_config_variable_counts_only_as_true_or_false() {
+        let one = |var: &'static str, value: &'static str| {
+            move |name: &str| (name == var).then(|| value.to_string())
+        };
+        const IGNORED: &[&str] = &["", "  ", "null", "undefined", "0", "FALSE", "yes"];
+        const PADDED: &[&str] = &[" false", "false ", " false "];
+        for var in ["pnpm_config_trust_lockfile", "PNPM_CONFIG_TRUST_LOCKFILE"] {
+            for value in IGNORED {
+                for major in [Some(11), Some(12), None] {
+                    assert_eq!(
+                        trust_lockfile_env(major, one(var, value)),
+                        None,
+                        "{var}={value:?} on pnpm {major:?}"
+                    );
+                }
+            }
+            for (value, on) in [("true", true), ("false", false)] {
+                let found = trust_lockfile_env(Some(11), one(var, value)).unwrap();
+                assert_eq!(found.as_bool(), Some(on), "{var}={value}");
+            }
+            for value in PADDED {
+                assert_eq!(trust_lockfile_env(Some(11), one(var, value)), None);
+                for major in [Some(12), None] {
+                    let found = trust_lockfile_env(major, one(var, value)).unwrap();
+                    assert_eq!(found.as_bool(), Some(false), "{var}={value:?}");
+                    assert!(found.source.contains(&format!("`{var}=false`")));
+                }
+            }
+        }
+        for key in [
+            "lockfile",
+            "shared-workspace-lockfile",
+            "git-branch-lockfile",
+        ] {
+            let var: &'static str =
+                Box::leak(format!("pnpm_config_{}", key.replace('-', "_")).into_boxed_str());
+            for value in IGNORED {
+                for major in [Some(11), None] {
+                    assert_eq!(
+                        env_setting(key, major, one(var, value)),
+                        None,
+                        "{var}={value:?}"
+                    );
+                }
+            }
+            let found = env_setting(key, Some(11), one(var, "false")).unwrap();
+            assert_eq!(found.as_bool(), Some(false), "{var}");
+            for value in PADDED {
+                assert_eq!(env_setting(key, Some(11), one(var, value)), None);
+                for major in [Some(12), None] {
+                    let found = env_setting(key, major, one(var, value)).unwrap();
+                    assert_eq!(found.as_bool(), Some(false), "{var}={value:?}");
+                }
+            }
+        }
+        // An ignored pnpm spelling does not hide the next one pnpm reads.
+        let found = trust_lockfile_env(
+            Some(12),
+            env(&[
+                ("pnpm_config_trust_lockfile", ""),
+                ("PNPM_CONFIG_TRUST_LOCKFILE", "false"),
+            ]),
+        )
+        .unwrap();
+        assert!(found.source.contains("PNPM_CONFIG_TRUST_LOCKFILE=false"));
+        // With no major known, an ignored pnpm spelling leaves npm's.
+        let found = env_setting(
+            "lockfile",
+            None,
+            env(&[
+                ("pnpm_config_lockfile", ""),
+                ("npm_config_lockfile", "false"),
+            ]),
+        )
+        .unwrap();
+        assert!(found.source.contains("`npm_config_lockfile=false`"));
+        // npm's family is unchanged: its empty value still reads as false.
+        let found = env_setting("lockfile", Some(10), env(&[("npm_config_lockfile", "")])).unwrap();
+        assert_eq!(found.as_bool(), Some(false));
+    }
+
+    /// #1557: the trust variable is read at the project's own pnpm major,
+    /// so the hosted member preflight and the rewrite agree on a padded
+    /// value: ignored on pnpm 11, `false` on pnpm 12.
+    #[tokio::test]
+    async fn the_trust_variable_follows_the_project_pnpm_major() {
+        const PADDED: &[(&str, &str)] = &[("pnpm_config_trust_lockfile", " false")];
+        for (pm, off) in [("pnpm@11.28.5", false), ("pnpm@12.11.2", true), ("", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let manifest = if pm.is_empty() {
+                r#"{"name":"app"}"#.to_string()
+            } else {
+                format!(r#"{{"name":"app","packageManager":"{pm}"}}"#)
+            };
+            write(tmp.path(), "package.json", &manifest);
+            let view = ProjectView::Disk(tmp.path());
+            let found = trust_lockfile_env_for(&view, env(PADDED)).await;
+            assert_eq!(
+                found.and_then(|found| found.as_bool()),
+                off.then_some(false),
+                "{pm}"
+            );
+            assert_eq!(trust_lockfile_env_for(&view, env(&[])).await, None);
+        }
     }
 
     /// #1460: pnpm 11 and newer read only `pnpm_config_*`, pnpm 10 and

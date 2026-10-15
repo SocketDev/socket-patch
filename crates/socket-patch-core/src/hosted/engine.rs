@@ -4226,6 +4226,35 @@ snapshots:
         );
     }
 
+    /// #1557: pnpm 11+ ignore a `pnpm_config_trust_lockfile` (or
+    /// `PNPM_CONFIG_TRUST_LOCKFILE`) that is not exactly `true` or `false`
+    /// (an unset CI variable's empty string, `null`, `undefined`) and read
+    /// pnpm-workspace.yaml instead, so the scan writes `trustLockfile:
+    /// true` as if the variable were unset, and the warning does not claim
+    /// the variable was respected.
+    #[tokio::test]
+    async fn issue_1557_an_empty_trust_lockfile_variable_keeps_the_write() {
+        let mut root = MemoryProject::new();
+        root.insert_text("pnpm-lock.yaml", LEFT_PAD_V9_LOCK);
+        for var in ["pnpm_config_trust_lockfile", "PNPM_CONFIG_TRUST_LOCKFILE"] {
+            for value in ["", "null", "undefined"] {
+                let env = move |name: &str| (name == var).then(|| value.to_string());
+                let (_, done) =
+                    npm_rewrite_in(&ProjectView::Memory(&root), &BTreeSet::new(), &env).await;
+                assert!(done.rewrite.files.contains_key("pnpm-lock.yaml"));
+                let workspace = done
+                    .rewrite
+                    .files
+                    .get(PNPM_WORKSPACE_REL)
+                    .unwrap_or_else(|| panic!("{:?}", done.rewrite.files.keys()));
+                assert!(workspace.contains("trustLockfile: true"), "{workspace}");
+                let detail = pnpm_trust_detail(&done);
+                assert!(detail.contains("no extra flags"), "{detail}");
+                assert!(!detail.contains("in the environment"), "{detail}");
+            }
+        }
+    }
+
     /// REGRESSION (#367), binary lock: a `bun.lockb`-only project's root
     /// manifest is read for its `patchedDependencies`, and a package the
     /// project patches itself with `bun patch` keeps its registry record,

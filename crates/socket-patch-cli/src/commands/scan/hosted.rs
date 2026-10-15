@@ -952,11 +952,14 @@ async fn run_redirect_selected_untracked(
     // the workspace root's pnpm-workspace.yaml, unless a
     // `pnpm_config_trust_lockfile` in this environment overrides that file
     // (#1514): adding the key there would not help, and the rewrite's
-    // trust warning names the variable instead.
-    let trust_env_off = socket_patch_core::utils::pnpm_workspace::trust_lockfile_env(None, |var| {
-        std::env::var(var).ok()
-    })
-    .is_some_and(|found| found.as_bool() != Some(true));
+    // trust warning names the variable instead. The variable is read at
+    // the project's pnpm major, as the rewrite reads it (#1557).
+    let trust_env_off =
+        socket_patch_core::utils::pnpm_workspace::trust_lockfile_env_for(&view, |var| {
+            std::env::var(var).ok()
+        })
+        .await
+        .is_some_and(|found| found.as_bool() != Some(true));
     if let Some(refusal) = socket_patch_core::hosted::governing_root::refusal(
         &view,
         &candidates,

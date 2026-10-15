@@ -188,9 +188,13 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
   the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project or, for pnpm >=11, by a
-  `pnpm_config_trust_lockfile` environment variable the scan runs with (pnpm
-  reads it ahead of the file, so nothing is written and the warning names the
-  variable). pnpm >=11 needs this for hosted URLs.
+  `pnpm_config_trust_lockfile=false` environment variable the scan runs with
+  (pnpm reads it ahead of the file, so nothing is written and the warning names
+  the variable). pnpm >=11 reads a `pnpm_config_*` variable only when it is
+  `true` or `false` (pnpm 12 trims surrounding spaces first, pnpm 11 does
+  not); any other value (empty, `null`, `undefined`, `0`) is ignored for the
+  file, so the CLI ignores it too and writes the key.
+  pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
   remains enforced. pnpm <=10 does not need the setting. An existing
   `pnpm-workspace.yaml` with no keys (empty or only comments) gets the
