@@ -9,7 +9,7 @@
 //! ignored. A leading `!` negates; each caller applies negations the way
 //! its package manager does. pnpm's globber also never lets a wildcard
 //! match a component that starts with `.` ([`glob_matches_no_dot`]).
-//! npm and yarn also match extglobs (`@(a|b)`, `?(..)`, `*(..)`, `+(..)`,
+//! npm, yarn and vlt also match extglobs (`@(a|b)`, `?(..)`, `*(..)`, `+(..)`,
 //! `!(..)`) within one component, and yarn classic ignores `!` patterns;
 //! [`WorkspacesDialect`] names what each package manager reads (#1097).
 //! yarn berry's picomatch further reads regex groups (`(a|b)`), POSIX
@@ -34,13 +34,16 @@ pub(crate) struct WorkspacesDialect {
     /// berry), which also take regex groups, POSIX classes and `..`
     /// segments ([`Picomatch`], #1490).
     pub(crate) picomatch: bool,
+    /// `*`, `?` and `**` match a component that starts with `.`. vlt's
+    /// node-glob does not (#1542).
+    pub(crate) dot: bool,
 }
 
 /// What a `workspaces` pattern with a leading `!` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Negation {
     /// It excludes what earlier patterns matched; a later pattern can
-    /// list the directory again (npm, Bun 1.3+, vlt).
+    /// list the directory again (npm, Bun 1.3+).
     LastMatchWins,
     /// It excludes the directory whatever the order (yarn berry's
     /// globby), and a leading `!(` is an extglob group, not a negation.
@@ -48,6 +51,14 @@ pub(crate) enum Negation {
     /// It is ignored: it neither excludes nor lists anything (yarn
     /// classic, Bun before 1.3).
     Ignored,
+    /// It excludes the directory whatever the order, until a later
+    /// pattern whose own text it matches lists it again; an even run of
+    /// leading `!` cancels out (vlt 1.3's `splitNegatedPatterns`, #1542).
+    Relisted,
+    /// A leading `!` is not special: `!x` lists only a directory literally
+    /// named so, and `!(..)` is an extglob group (vlt before 1.3, which
+    /// globs every pattern as given, #1542).
+    Literal,
 }
 
 impl WorkspacesDialect {
@@ -56,18 +67,21 @@ impl WorkspacesDialect {
         negation: Negation::LastMatchWins,
         extglob: true,
         picomatch: false,
+        dot: true,
     };
     /// yarn classic (a `yarn.lock` without berry's `__metadata`).
     pub(crate) const YARN_CLASSIC: Self = Self {
         negation: Negation::Ignored,
         extglob: true,
         picomatch: false,
+        dot: true,
     };
     /// yarn berry (a `yarn.lock` with `__metadata`).
     pub(crate) const YARN_BERRY: Self = Self {
         negation: Negation::Unordered,
         extglob: true,
         picomatch: true,
+        dot: true,
     };
     /// Bun 1.3 and later (a `bun.lock` with `configVersion`, or an
     /// untagged 1.3.0/1.3.1 lock that leaves an excluded member out,
@@ -76,6 +90,7 @@ impl WorkspacesDialect {
         negation: Negation::LastMatchWins,
         extglob: false,
         picomatch: false,
+        dot: true,
     };
     /// Bun before 1.3: it lists `!`-negated directories anyway. An
     /// untagged lock reads this way until its workspace list shows it
@@ -84,34 +99,48 @@ impl WorkspacesDialect {
         negation: Negation::Ignored,
         extglob: false,
         picomatch: false,
+        dot: true,
     };
-    /// vlt, as #942 read it.
+    /// vlt 1.3 and later, probed on 1.3.8 (#1542).
     pub(crate) const VLT: Self = Self {
-        negation: Negation::LastMatchWins,
-        extglob: false,
+        negation: Negation::Relisted,
+        extglob: true,
         picomatch: false,
+        dot: false,
+    };
+    /// vlt before 1.3, probed on 1.2.0 (#1542). Both write the same
+    /// `vlt-lock.json`, so `hosted::governing_root` tells them apart by the
+    /// members the lock records.
+    pub(crate) const VLT_PRE_1_3: Self = Self {
+        negation: Negation::Literal,
+        extglob: true,
+        picomatch: false,
+        dot: false,
     };
     /// Every dialect, for a root whose package manager is unknown: it lists
     /// a directory when any of them does.
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::NPM,
         Self::YARN_CLASSIC,
         Self::YARN_BERRY,
         Self::BUN,
         Self::BUN_PRE_1_3,
         Self::VLT,
+        Self::VLT_PRE_1_3,
     ];
 }
 
 /// Whether the member path (`rel`, relative to the workspace root, one
 /// entry per component) matches a `workspaces` pattern and no later
-/// `!`-negated one (npm and yarn: the last matching pattern wins), in vlt's
-/// dialect.
+/// `!`-negated one, in npm's dialect.
+#[cfg(test)]
 pub(crate) fn workspaces_include(patterns: &[String], rel: &[String]) -> bool {
-    workspaces_include_as(patterns, rel, WorkspacesDialect::VLT)
+    workspaces_include_as(patterns, rel, WorkspacesDialect::NPM)
 }
 
-/// [`workspaces_include`] in a given package manager's dialect.
+/// Whether the member path (`rel`, relative to the workspace root, one
+/// entry per component) is listed by the `workspaces` `patterns`, read in
+/// `dialect` (see [`Negation`] for what a `!` pattern does).
 pub(crate) fn workspaces_include_as(
     patterns: &[String],
     rel: &[String],
@@ -122,7 +151,7 @@ pub(crate) fn workspaces_include_as(
     }
     let matches = |pattern: &str, negated: bool| {
         let picomatch = dialect.picomatch.then_some(Picomatch { negated });
-        pattern_matches(pattern, rel, true, dialect.extglob, picomatch)
+        pattern_matches(pattern, rel, dialect.dot, dialect.extglob, picomatch)
     };
     match dialect.negation {
         Negation::LastMatchWins => {
@@ -150,6 +179,33 @@ pub(crate) fn workspaces_include_as(
         Negation::Ignored => patterns
             .iter()
             .any(|pattern| !pattern.starts_with('!') && matches(pattern, false)),
+        Negation::Relisted => {
+            let mut listed = false;
+            let mut ignore: Vec<&str> = Vec::new();
+            for pattern in patterns {
+                let bangs = pattern.len() - pattern.trim_start_matches('!').len();
+                let pattern = &pattern[bangs..];
+                if bangs % 2 == 1 {
+                    ignore.push(pattern);
+                    continue;
+                }
+                // minimatch(pattern, ignore): the pattern's own text, read
+                // as a path, against each earlier `!` glob.
+                let text: Vec<String> = pattern
+                    .split(['/', '\\'])
+                    .filter(|s| !s.is_empty() && *s != ".")
+                    .map(str::to_string)
+                    .collect();
+                ignore.retain(|ign| !pattern_matches(ign, &text, false, true, None));
+                listed |= matches(pattern, false);
+            }
+            // node-glob's ignore matches dot components.
+            listed
+                && !ignore
+                    .iter()
+                    .any(|ign| pattern_matches(ign, rel, true, dialect.extglob, None))
+        }
+        Negation::Literal => patterns.iter().any(|pattern| matches(pattern, false)),
     }
 }
 
@@ -996,11 +1052,7 @@ mod tests {
         // An unclosed group is literal; braces expand around a group.
         yes("packages/@(a", "packages/@(a");
         yes("{apps,packages}/@(a|b)", "apps/b");
-        // Without extglobs (Bun, vlt, uv, pnpm) the group is literal.
-        assert!(!workspaces_include(
-            &pats(&["packages/@(a|b)"]),
-            &rel("packages/a")
-        ));
+        // Without extglobs (Bun, uv, pnpm) the group is literal.
         assert!(!glob_matches("packages/@(a|b)", &rel("packages/a")));
         assert!(!workspaces_include_as(
             &pats(&["packages/@(a|b)"]),
@@ -1145,7 +1197,8 @@ mod tests {
         for (dialect, last, first, again) in [
             (D::NPM, false, true, true),
             (D::BUN, false, true, true),
-            (D::VLT, false, true, true),
+            (D::VLT, false, false, true),
+            (D::VLT_PRE_1_3, true, true, true),
             (D::YARN_BERRY, false, false, false),
             (D::YARN_CLASSIC, true, true, true),
             (D::BUN_PRE_1_3, true, true, true),
@@ -1228,6 +1281,85 @@ mod tests {
             &rel(&long),
             WorkspacesDialect::NPM
         ));
+    }
+
+    /// #1542: vlt reads `workspaces` with node-glob / minimatch, probed on
+    /// vlt 1.2.0 and 1.3.8 (`vlt install` then `vlt query ':workspace'`
+    /// over `packages/{a,b,ab,c,.h}`): extglobs match, and wildcards skip a
+    /// component that starts with `.`. vlt 1.3 drops a `!` pattern's
+    /// directories wherever the pattern sits, until a later pattern whose
+    /// own text it matches lists them again (`splitNegatedPatterns`); vlt
+    /// before 1.3 reads a leading `!` literally, so `!x` lists nothing and
+    /// `!(..)` is an extglob.
+    #[test]
+    fn vlt_dialects_list_what_vlt_lists() {
+        use WorkspacesDialect as D;
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // (patterns, directory, vlt 1.3 lists it, vlt 1.2 lists it)
+        for (patterns, dir, current, pre_1_3) in [
+            (&["packages/+(a|b)"][..], "packages/a", true, true),
+            (&["packages/+(a|b)"], "packages/ab", true, true),
+            (&["packages/+(a|b)"], "packages/c", false, false),
+            (&["packages/@(a|b)"], "packages/b", true, true),
+            (&["packages/@(a|b)"], "packages/ab", false, false),
+            (&["packages/?(a)b"], "packages/ab", true, true),
+            (&["packages/*(a)"], "packages/a", true, true),
+            (&["packages/*(a)"], "packages/b", false, false),
+            (&["packages/!(a)"], "packages/b", true, true),
+            (&["packages/!(a)"], "packages/a", false, false),
+            (&["packages/(a|b)"], "packages/a", false, false),
+            (&["packages/{a,b}"], "packages/a", true, true),
+            (&["packages/[ab]"], "packages/b", true, true),
+            (&["packages/*"], "packages/.h", false, false),
+            (&["**"], ".gh/x", false, false),
+            (&["packages/.h"], "packages/.h", true, true),
+            (&["!packages/a", "packages/*"], "packages/a", false, true),
+            (&["!packages/a", "packages/*"], "packages/b", true, true),
+            (&["packages/*", "!packages/a"], "packages/a", false, true),
+            (
+                &["packages/*", "!packages/a", "packages/a"],
+                "packages/a",
+                true,
+                true,
+            ),
+            (
+                &["packages/*", "!packages/a", "packages/[a]"],
+                "packages/a",
+                false,
+                true,
+            ),
+            (&["!packages/*", "packages/a"], "packages/a", true, true),
+            (&["packages/a", "!packages/*"], "packages/a", false, true),
+            (
+                &["!packages/a", "packages/@(a|b)"],
+                "packages/a",
+                false,
+                true,
+            ),
+            (
+                &["!packages/@(a|b)", "packages/a"],
+                "packages/a",
+                true,
+                true,
+            ),
+            (&["!!packages/a"], "packages/a", true, false),
+            (&["!(apps)/a"], "packages/a", false, true),
+            (&["packages/*", "!(apps)/a"], "packages/a", true, true),
+        ] {
+            let patterns = pats(patterns);
+            let dir = rel(dir);
+            assert_eq!(
+                workspaces_include_as(&patterns, &dir, D::VLT),
+                current,
+                "vlt 1.3: {patterns:?} ~ {dir:?}"
+            );
+            assert_eq!(
+                workspaces_include_as(&patterns, &dir, D::VLT_PRE_1_3),
+                pre_1_3,
+                "vlt 1.2: {patterns:?} ~ {dir:?}"
+            );
+        }
     }
 
     #[test]
