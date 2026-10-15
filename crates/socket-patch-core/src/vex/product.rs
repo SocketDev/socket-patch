@@ -372,11 +372,19 @@ fn xml_element_texts<const N: usize>(xml: &str, paths: [&[&str]; N]) -> [Option<
 /// heredoc bodies and anything after `__END__` are not code, and the last
 /// assignment wins (#1573).
 fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
-    let mut code: Vec<&str> = Vec::new();
-    crate::formats::gem::manifest::for_each_code_line(content, |_, c| code.push(c));
+    let mut lines: Vec<&str> = Vec::new();
+    crate::formats::gem::manifest::for_each_code_line(content, |_, c| lines.push(c));
     // The `spec` of `Gem::Specification.new do |spec|`, when the file names
     // it, so a helper's `ext.name = …` elsewhere can't pass for the spec's.
-    let receiver = code.iter().find_map(|c| spec_block_param(c));
+    let receiver = lines
+        .iter()
+        .find_map(|c| spec_block_param(c).map(|(p, _)| p));
+    // One entry per statement: a line's code after any block opener, split
+    // on `;` (`Gem::Specification.new { |s| s.name = "a"; s.version = "1" }`).
+    let code: Vec<&str> = lines
+        .iter()
+        .flat_map(|c| ruby_statements(spec_block_param(c).map_or(c, |(_, rest)| rest)))
+        .collect();
     // The value of the last `<spec>.<attr> = …` assignment: `Some(literal)`
     // for a quoted literal, `None` for anything computed.
     let literal = |attr: &str| -> Option<String> {
@@ -403,15 +411,38 @@ fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
 }
 
 /// The block parameter of `Gem::Specification.new … do |spec|` (or
-/// `{ |spec|`) on this line of code.
-fn spec_block_param(code: &str) -> Option<&str> {
+/// `{ |spec|`) on this line of code, and the code after it.
+fn spec_block_param(code: &str) -> Option<(&str, &str)> {
     let after = &code[code.find("Gem::Specification.new")?..];
     let (_, param) = after.split_once('|')?;
-    let param = param.split('|').next()?.trim();
+    let (param, rest) = param.split_once('|')?;
+    let param = param.trim();
     let ident = !param.is_empty()
         && param.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !param.starts_with(|c: char| c.is_ascii_digit());
-    ident.then_some(param)
+    ident.then_some((param, rest))
+}
+
+/// `code` split on each `;` outside a string literal.
+fn ruby_statements(code: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut quote, mut escaped, mut start) = (None, false, 0);
+    for (i, c) in code.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == ';' => {
+                out.push(&code[start..i]);
+                start = i + 1;
+            }
+            None => {}
+        }
+    }
+    out.push(&code[start..]);
+    out
 }
 
 /// The non-empty, non-interpolated text of a leading `"…"` / `'…'` literal.
@@ -2854,6 +2885,14 @@ mod tests {
         for (what, body, want) in cases {
             let r = detect_in(&[("acme.gemspec", &gemspec(body))]).await;
             assert_eq!(r.purl.as_deref(), Some(*want), "{what}");
+        }
+        // Assignments on the block-opener line and after a `;`.
+        for one_line in [
+            "Gem::Specification.new do |s| s.name = \"acme\"; s.version = \"4.5.6\"\nend\n",
+            "Gem::Specification.new { |s| s.name = 'acme'; s.version = '4.5.6' }\n",
+        ] {
+            let r = detect_in(&[("other.gemspec", one_line)]).await;
+            assert_eq!(r.purl.as_deref(), Some("pkg:gem/acme@4.5.6"), "{one_line}");
         }
         // Only a commented name: fall back to the file stem.
         let r = detect_in(&[(
