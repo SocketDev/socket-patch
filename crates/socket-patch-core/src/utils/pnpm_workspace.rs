@@ -207,6 +207,18 @@ pub fn trust_lockfile_env(
         .or_else(|| pnpm_env_setting("PNPM_CONFIG_TRUST_LOCKFILE", major, &env))
 }
 
+/// [`trust_lockfile_env`] for the project `view` shows, at the pnpm major
+/// that installs it: whether pnpm 11 ignores a padded value or pnpm 12
+/// trims it depends on the major. The project's files are read for it only
+/// when the environment sets the variable at all.
+pub async fn trust_lockfile_env_for(
+    view: &ProjectView<'_>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<PnpmSetting> {
+    trust_lockfile_env(None, &env)?;
+    trust_lockfile_env(pnpm_major(view).await, &env)
+}
+
 /// [`pnpm_setting`], falling back to the environment ([`env_setting`],
 /// for the project's pnpm major) on disk, where the CLI runs pnpm's
 /// environment.
@@ -1087,6 +1099,31 @@ mod tests {
         // npm's family is unchanged: its empty value still reads as false.
         let found = env_setting("lockfile", Some(10), env(&[("npm_config_lockfile", "")])).unwrap();
         assert_eq!(found.as_bool(), Some(false));
+    }
+
+    /// #1557: the trust variable is read at the project's own pnpm major,
+    /// so the hosted member preflight and the rewrite agree on a padded
+    /// value: ignored on pnpm 11, `false` on pnpm 12.
+    #[tokio::test]
+    async fn the_trust_variable_follows_the_project_pnpm_major() {
+        const PADDED: &[(&str, &str)] = &[("pnpm_config_trust_lockfile", " false")];
+        for (pm, off) in [("pnpm@11.28.5", false), ("pnpm@12.11.2", true), ("", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let manifest = if pm.is_empty() {
+                r#"{"name":"app"}"#.to_string()
+            } else {
+                format!(r#"{{"name":"app","packageManager":"{pm}"}}"#)
+            };
+            write(tmp.path(), "package.json", &manifest);
+            let view = ProjectView::Disk(tmp.path());
+            let found = trust_lockfile_env_for(&view, env(PADDED)).await;
+            assert_eq!(
+                found.and_then(|found| found.as_bool()),
+                off.then_some(false),
+                "{pm}"
+            );
+            assert_eq!(trust_lockfile_env_for(&view, env(&[])).await, None);
+        }
     }
 
     /// #1460: pnpm 11 and newer read only `pnpm_config_*`, pnpm 10 and
