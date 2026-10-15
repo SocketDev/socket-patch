@@ -68,16 +68,21 @@ pub fn run_scan(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// [`run_scan`] against a mock API (human output unless `extra` has
 /// `--json`).
 pub fn run_scan_api(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
-    let mut args = vec![
+    let mut args = api_args(api_url);
+    args.extend_from_slice(extra);
+    run_scan(cwd, &args)
+}
+
+/// The flags pointing a run at the mock API with a fake token and org.
+pub fn api_args(api_url: &str) -> Vec<&str> {
+    vec![
         "--api-url",
         api_url,
         "--api-token",
         "fake-token-for-test",
         "--org",
         ORG_SLUG,
-    ];
-    args.extend_from_slice(extra);
-    run_scan(cwd, &args)
+    ]
 }
 
 /// [`run_scan_api`] in agent mode: v5's bare scan is hosted, and these

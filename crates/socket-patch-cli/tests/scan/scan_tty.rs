@@ -16,17 +16,14 @@ use crate::scan_fixture::*;
 /// until exit (the `interactive_prompts_e2e.rs` harness pattern:
 /// reader thread + kill-after-timeout watchdog, no polling).
 fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
-    run_in_pty_with(args, cwd, &[], "", input, timeout)
+    run_in_pty_with(args, cwd, &[], input, timeout)
 }
 
-/// [`run_in_pty`] with extra child `env`, first writing `typeahead`
-/// straight after spawn — keystrokes a user types while the scan is
-/// still running, before any prompt is on screen.
+/// [`run_in_pty`] with extra child `env`.
 fn run_in_pty_with(
     args: &[&str],
     cwd: &Path,
     env: &[(&str, &str)],
-    typeahead: &str,
     input: &str,
     timeout: Duration,
 ) -> (i32, String) {
@@ -67,11 +64,6 @@ fn run_in_pty_with(
     });
 
     let mut writer = pair.master.take_writer().expect("take writer");
-    if !typeahead.is_empty() {
-        use std::io::Write as _;
-        let _ = writer.write_all(typeahead.as_bytes());
-        let _ = writer.flush();
-    }
     crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
     drop(writer);
 
@@ -102,17 +94,7 @@ async fn scan_on_a_tty_applies_without_prompting() {
     let cwd = tmp.path().to_path_buf();
     let (code, output) = tokio::task::spawn_blocking(move || {
         run_in_pty(
-            &[
-                "scan",
-                "--mode",
-                "agent",
-                "--api-url",
-                &uri,
-                "--api-token",
-                "fake-token-for-test",
-                "--org",
-                ORG_SLUG,
-            ],
+            &[&["scan", "--mode", "agent"][..], &api_args(&uri)].concat(),
             &cwd,
             "",
             Duration::from_secs(60),
@@ -171,18 +153,10 @@ async fn scan_json_on_a_tty_never_opens_the_select_menu() {
     let (code, output) = tokio::task::spawn_blocking(move || {
         run_in_pty(
             &[
-                "scan",
-                "--json",
-                "--mode",
-                "agent",
-                "--dry-run",
-                "--api-url",
-                &uri,
-                "--api-token",
-                "fake-token-for-test",
-                "--org",
-                ORG_SLUG,
-            ],
+                &["scan", "--json", "--mode", "agent", "--dry-run"][..],
+                &api_args(&uri),
+            ]
+            .concat(),
             &cwd,
             "",
             Duration::from_secs(30),
@@ -230,15 +204,7 @@ async fn scan_progress_on_a_tty_renders_without_stale_tail() {
     let cwd = tmp.path().to_path_buf();
     let (code, output) = tokio::task::spawn_blocking(move || {
         run_in_pty(
-            &[
-                "scan",
-                "--api-url",
-                &uri,
-                "--api-token",
-                "fake-token-for-test",
-                "--org",
-                ORG_SLUG,
-            ],
+            &[&["scan"][..], &api_args(&uri)].concat(),
             &cwd,
             "n\n",
             Duration::from_secs(60),
@@ -295,18 +261,9 @@ async fn scan_debug_mode_on_a_tty_keeps_debug_lines_off_the_status() {
     let cwd = tmp.path().to_path_buf();
     let (code, output) = tokio::task::spawn_blocking(move || {
         run_in_pty_with(
-            &[
-                "scan",
-                "--api-url",
-                &uri,
-                "--api-token",
-                "fake-token-for-test",
-                "--org",
-                ORG_SLUG,
-            ],
+            &[&["scan"][..], &api_args(&uri)].concat(),
             &cwd,
             &[("SOCKET_DEBUG", "1")],
-            "",
             "n\n",
             Duration::from_secs(60),
         )

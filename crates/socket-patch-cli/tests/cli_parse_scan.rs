@@ -622,7 +622,10 @@ fn mode_hosted_with_sync_errors() {
     for mode in ["hosted", "vendored"] {
         let mut args = parse_scan(&["--mode", mode, "--sync"]);
         let err = resolve_mode_flags(&mut args).expect_err("cross-mode --sync");
-        assert!(err.contains("cannot be used with --sync"), "{err}");
+        assert!(
+            err.contains(&format!("--mode {mode} cannot be used with --sync")),
+            "the error names the mode through cli_name(): {err}"
+        );
     }
 }
 

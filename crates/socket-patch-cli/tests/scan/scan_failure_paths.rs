@@ -5,7 +5,7 @@
 //! purl, a file). The human output of the same paths is pinned in
 //! `scan_render.rs`.
 //!
-//!   1. `resolve_mode_flags`' cross-mode conflicts and the early errors;
+//!   1. the early errors (`--offline`, usage errors);
 //!   2. hosted `--prune` and the paid-tier counters;
 //!   3. detail-fetch failures (total and partial) and empty detail answers;
 //!   4. vendor-owned purls, report-only runs and the `--sync` GC;
@@ -25,19 +25,6 @@ use crate::common::envelope::{
 use crate::scan_fixture::*;
 use crate::{vlt_hosted_common as hosted, vlt_vendored};
 
-/// The first `warnings[]` entry with `code`; panics with the envelope when
-/// there is none.
-fn warning<'a>(v: &'a serde_json::Value, code: &str) -> &'a serde_json::Value {
-    v["warnings"]
-        .as_array()
-        .and_then(|ws| ws.iter().find(|w| w["code"] == code))
-        .unwrap_or_else(|| panic!("warnings[] must carry {code}: {v:#}"))
-}
-
-fn warning_detail<'a>(v: &'a serde_json::Value, code: &str) -> &'a str {
-    warning(v, code)["detail"].as_str().unwrap_or_default()
-}
-
 /// `scan --json` against the mock API; returns the exit code and the parsed
 /// envelope (after checking the shared envelope invariants).
 fn run_json(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, serde_json::Value) {
@@ -51,67 +38,6 @@ fn run_json(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, serde_json::Valu
         "human warning lines must not leak into the JSON stream: {stdout}\nstderr={stderr}"
     );
     (code, v)
-}
-
-// ---------------------------------------------------------------------------
-// resolve_mode_flags: the `--sync` cross-mode conflict
-// ---------------------------------------------------------------------------
-// `--sync` means `--mode agent --prune`, so it contradicts any other
-// `--mode`. Clap parses each combination fine (no value-dependent conflict
-// is expressible); the fold is what rejects them, naming both flags.
-
-mod mode_fold {
-    use clap::Parser;
-    use socket_patch_cli::commands::scan::{resolve_mode_flags, ScanArgs};
-    use socket_patch_cli::{Cli, Commands};
-
-    /// Every env var that could reroute the parse or the fold (superset:
-    /// the shared scrub lists from `args.rs`).
-    fn with_clean_env<T>(f: impl FnOnce() -> T) -> T {
-        let vars: Vec<&str> = socket_patch_cli::args::GLOBAL_ARG_ENV_VARS
-            .iter()
-            .chain(socket_patch_cli::args::LOCAL_ARG_ENV_VARS.iter())
-            .copied()
-            .collect();
-        let saved: Vec<(&str, Option<String>)> =
-            vars.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &vars {
-            std::env::remove_var(k);
-        }
-        let result = f();
-        for (k, orig) in saved {
-            match orig {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-        result
-    }
-
-    fn fold_err(extra: &[&str]) -> String {
-        let mut argv = vec!["socket-patch", "scan"];
-        argv.extend_from_slice(extra);
-        let cli = with_clean_env(|| Cli::try_parse_from(&argv)).expect("parse");
-        let mut args: ScanArgs = match cli.command {
-            Commands::Scan(a) => a,
-            _ => panic!("expected Scan"),
-        };
-        resolve_mode_flags(&mut args).expect_err("cross-mode contradiction must error")
-    }
-
-    /// Each `--mode` against `--sync` errors, naming the mode through
-    /// `cli_name()` and the conflicting boolean.
-    #[test]
-    #[serial_test::serial]
-    fn mode_with_sync_boolean_errors_naming_both_flags() {
-        for mode in ["hosted", "vendored"] {
-            let err = fold_err(&["--mode", mode, "--sync"]);
-            assert!(
-                err.contains(&format!("--mode {mode}")) && err.contains("--sync"),
-                "the error must name --mode {mode} and --sync: {err}"
-            );
-        }
-    }
 }
 
 /// `--offline` and usage errors print the full envelope too.
@@ -145,6 +71,7 @@ fn scan_hosted_global_json_is_global_scope_unsupported() {
     let (code, stdout, _) = run_scan(tmp.path(), &["--mode", "hosted", "--global", "--json"]);
     assert_eq!(code, 2, "{stdout}");
     let v = parse_json_envelope(&stdout);
+    assert_envelope_invariants(&v, "scan");
     assert_eq!(v["status"], "error", "{v}");
     assert_eq!(
         envelope_error_code(&v),
@@ -179,7 +106,7 @@ async fn scan_hosted_prune_zero_package_json_carries_the_warning() {
     assert_eq!(v["redirect"]["mode"], "hosted");
     assert_eq!(v["summary"]["applied"], 0, "nothing pinned: {v}");
     assert!(
-        warning_detail(&v, "redirect_prune_ignored").contains("--prune"),
+        hosted::warning_detail(&v, "redirect_prune_ignored").contains("--prune"),
         "the warning must name the ignored flag: {v:#}"
     );
     assert!(
@@ -372,7 +299,7 @@ async fn scan_partial_failure_with_empty_results_exits_alike() {
     let tmp = project();
     let (json, v) = run_json(tmp.path(), &mock.uri(), &extra);
     assert!(
-        warning_detail(&v, "patch_details_failed").contains(bad),
+        hosted::warning_detail(&v, "patch_details_failed").contains(bad),
         "{v:#}"
     );
     assert_eq!(human, json, "human and --json exit alike: {stderr}\n{v:#}");
@@ -382,8 +309,8 @@ async fn scan_partial_failure_with_empty_results_exits_alike() {
 // Vendor-owned purls, report-only runs and the GC
 // ---------------------------------------------------------------------------
 
-/// A purl the vendored ledger owns is skipped by an agent-mode scan: no
-/// download, no manifest, and no apply event for it.
+/// A purl the vendored ledger owns is skipped by an agent-mode scan: one
+/// `skipped` event coded `vendored`, no download and no manifest.
 #[tokio::test]
 async fn scan_agent_json_skips_vendored_purls_without_downloading() {
     let mock = MockServer::start().await;
@@ -394,11 +321,14 @@ async fn scan_agent_json_skips_vendored_purls_without_downloading() {
 
     let (code, v) = run_json(tmp.path(), &mock.uri(), &["--mode", "agent", "--yes"]);
     assert_eq!(code, 0, "{v:#}");
-    assert!(
-        !event_triples(&v)
-            .iter()
-            .any(|(purl, action, _)| purl == MINIMIST && action != "skipped"),
-        "a vendor-owned purl is only ever skipped: {v:#}"
+    assert_eq!(
+        event_triples(&v)
+            .into_iter()
+            .filter(|(purl, _, _)| purl == MINIMIST)
+            .map(|(_, action, code)| (action, code))
+            .collect::<Vec<_>>(),
+        [("skipped".to_string(), "vendored".to_string())],
+        "a vendor-owned purl is only skipped, with the `vendored` code: {v:#}"
     );
     assert_eq!(v["summary"]["applied"], 0, "{v:#}");
     assert_eq!(view_gets(&recorded(&mock).await), 0, "{v:#}");
@@ -646,7 +576,7 @@ async fn scan_agent_json_mismatch_overwrite_reaches_the_apply_block() {
     let (code, v) = run_json(tmp.path(), &mock.uri(), &["--mode", "agent"]);
     assert_eq!(code, 0, "{v:#}");
     assert_eq!(v["summary"]["applied"], 1, "{v}");
-    let detail = warning_detail(&v, "content_mismatch_overwritten");
+    let detail = hosted::warning_detail(&v, "content_mismatch_overwritten");
     assert!(
         detail.contains(purl) && detail.contains("package/index.js"),
         "the overwrite must name the purl and the file: {v:#}"
@@ -674,7 +604,7 @@ async fn scan_agent_json_over_live_hosted_wiring_warns_retained() {
     let (code, v) = run_json(tmp.path(), &mock.uri(), &["--mode", "agent", "--yes"]);
     assert_eq!(code, 0, "{v:#}");
     assert!(
-        warning_detail(&v, "hosted_wiring_retained").contains(SILENT_TARGET),
+        hosted::warning_detail(&v, "hosted_wiring_retained").contains(SILENT_TARGET),
         "the warning names the package: {v:#}"
     );
     assert_eq!(event_purls(&v, "applied"), [SILENT_TARGET], "{v:#}");
@@ -756,7 +686,7 @@ fn scan_invalid_bun_lockb_warns_instead_of_silent_success() {
         assert_eq!(v["scannedPackages"], 0, "mode={mode:?}: {v}");
         assert_eq!(v["lockfileOnlyPackages"], 0, "mode={mode:?}: {v}");
         assert!(
-            warning_detail(&v, "bun_lockb_invalid").contains("bun.lockb"),
+            hosted::warning_detail(&v, "bun_lockb_invalid").contains("bun.lockb"),
             "mode={mode:?}: the format error must name its file: {v:#}"
         );
         assert!(
@@ -786,7 +716,7 @@ async fn scan_nonempty_keeps_the_bun_lockb_discovery_warning_in_every_mode() {
         assert_eq!(v["scannedPackages"], 1, "mode={mode:?}: {v}");
         assert_eq!(v["status"], "success", "mode={mode:?}: {v}");
         assert!(
-            warning_detail(&v, "bun_lockb_invalid").contains("bun.lockb"),
+            hosted::warning_detail(&v, "bun_lockb_invalid").contains("bun.lockb"),
             "mode={mode:?}: {v:#}"
         );
     }

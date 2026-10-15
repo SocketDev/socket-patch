@@ -985,8 +985,8 @@ async fn scan_human_apply_over_live_hosted_wiring_warns_retained() {
         .find(|l| l.starts_with("Warning: agent-mode scan left the hosted wiring live"))
         .unwrap_or_else(|| panic!("the retained-wiring warning must reach stderr; got {stderr:?}"));
     assert!(
-        stderr.contains(SILENT_TARGET),
-        "the warning must name the package; got {warning:?}\n{stderr:?}"
+        warning.contains(SILENT_TARGET),
+        "the warning must name the package; got {warning:?}"
     );
     assert_eq!(
         std::fs::read(tmp.path().join("node_modules/silent-target/index.js")).unwrap(),
