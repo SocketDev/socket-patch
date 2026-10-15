@@ -58,6 +58,7 @@ pub(crate) mod rollout;
 pub mod rollout_args;
 mod socket_yml_args;
 pub(crate) mod vendor_flow;
+mod withdrawn;
 
 use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
@@ -2571,6 +2572,17 @@ async fn run_scan(
         status.finish();
     }
 
+    // Hosted mode: restore the lockfile pins whose patch the server no
+    // longer serves, before the rewrite below re-pins any replacement.
+    // Runs ahead of every "nothing found" exit: a package whose only patch
+    // was withdrawn has no search results at all.
+    let withdrawn_sweep = if hosted && !args.common.is_global() && policy.writes_allowed() {
+        let pins = withdrawn::pins_in_scope(&hosted_pin_list, &all_purls);
+        Some(withdrawn::sweep(&args.common, &api_client, &pins).await)
+    } else {
+        None
+    };
+
     // Calculate patch counts
     let mut free_patches = 0usize;
     let mut paid_patches = 0usize;
@@ -2683,6 +2695,9 @@ async fn run_scan(
         // Hosted mode: the redirect engine records its events into this
         // envelope and prints it.
         if hosted {
+            if let Some(sweep) = withdrawn_sweep {
+                sweep.record_into(&mut env);
+            }
             return run_redirect(
                 &args,
                 &api_client,
