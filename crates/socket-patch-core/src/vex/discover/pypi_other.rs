@@ -323,12 +323,19 @@ fn editable_location(code: &str) -> Option<&str> {
 }
 
 /// The package a VCS / url requirement names in its `#egg=<name>` fragment.
+/// A legacy `#egg=<name>-<version>` fragment names the package before its
+/// first `-<digit>`, as setuptools and older pip read it.
 fn egg_name(location: &str) -> Option<&str> {
     let (_, fragment) = location.split_once('#')?;
     let egg = fragment.split('&').find_map(|p| p.strip_prefix("egg="))?;
     let end = egg
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
         .unwrap_or(egg.len());
+    let egg = &egg[..end];
+    let end = egg
+        .match_indices('-')
+        .find(|(i, _)| egg[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+        .map_or(egg.len(), |(i, _)| i);
     Some(&egg[..end]).filter(|name| !name.is_empty())
 }
 
@@ -1819,6 +1826,10 @@ mod tests {
             ),
             ("editable dir", "--editable=./src/six#egg=Six\n"),
             ("editable dir, long flag", "--editable ./src/six#egg=six\n"),
+            (
+                "legacy name-version egg",
+                "-e git+https://github.com/benjaminp/six.git#egg=six-1.16.0\n",
+            ),
         ] {
             let p = Project::new();
             p.write(
