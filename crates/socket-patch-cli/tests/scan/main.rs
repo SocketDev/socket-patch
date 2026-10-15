@@ -1,7 +1,8 @@
 //! `scan`: batching, ecosystem scope, ordering, paths, sync, hosted refusals,
 //! the scan and hosted `--json` failure paths and their human render checks,
 //! the hosted dry run over a vendored project,
-//! scan on a real terminal, and the vendor flow.
+//! `--prune` over a corrupt vendor ledger, scan on a real terminal, and
+//! the vendor flow (previews, lock failures, corrupt legacy manifests).
 //!
 //! One test binary per command: each module was its own binary.
 
@@ -18,10 +19,6 @@ mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
 
-mod coverage_fix_scan_discovery_corrupt_ledger;
-mod covgap_commands_fetch_stage;
-mod covgap_commands_scan_vendor_flow;
-mod covgap_ecosystem_dispatch;
 mod hosted_dryrun_vendored;
 mod hosted_failure_paths;
 mod hosted_fixture;
@@ -39,8 +36,10 @@ mod scan_invariants;
 mod scan_nested_project_e2e;
 mod scan_ordered_concurrency_e2e;
 mod scan_paths_e2e;
+mod scan_prune_corrupt_vendor_ledger;
 mod scan_render;
 mod scan_sync_e2e;
 #[cfg(unix)]
 mod scan_tty;
+mod scan_vendor_flow;
 mod scan_vendor_step_error_e2e;

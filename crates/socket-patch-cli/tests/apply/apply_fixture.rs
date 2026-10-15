@@ -206,3 +206,22 @@ pub fn write_gem_patch(root: &Path, uuid: &str, marker: &[u8]) -> PathBuf {
     stage_blob(root, &git_sha256(&patched), &patched);
     file
 }
+
+/// A root `package.json`, an empty `node_modules/` and a manifest of `n`
+/// npm patches (`pkg:npm/miss-<i>@1.0.0`) with no blob, diff or package
+/// artifact anywhere under `.socket/`, so staging has no usable source.
+pub fn write_sourceless_npm_patches(root: &Path, n: u32) {
+    write_root_package_json(root);
+    std::fs::create_dir_all(root.join("node_modules")).expect("create node_modules");
+    let patches: serde_json::Map<String, Value> = (0..n)
+        .map(|i| {
+            let uuid = format!("{i:08}-0000-4000-8000-{i:012}");
+            let body = format!("sourceless {i}\n");
+            (
+                format!("pkg:npm/miss-{i}@1.0.0"),
+                patch_record(&uuid, one_file("package/index.js", b"", body.as_bytes())),
+            )
+        })
+        .collect();
+    write_manifest(root, Value::Object(patches));
+}

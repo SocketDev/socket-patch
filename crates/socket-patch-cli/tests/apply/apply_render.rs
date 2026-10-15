@@ -7,12 +7,16 @@
 //! `Would remove` announcement, "No patches to apply.", the
 //! no-matching-package error block, the dry-run summary counts,
 //! `--verbose` per-file labels, the pnpm/bun/vlt layout notes, the
-//! yarn-PnP refusal, the gem fallback-home skip warning and the
-//! `--dry-run --vex` skip line.
+//! yarn-PnP refusal, the gem fallback-home skip warning, the
+//! `--dry-run --vex` skip line, and the staging layer's offline
+//! no-local-source report and download result line.
 
 use serde_json::json;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::apply_fixture::*;
+use crate::common::git_sha256;
 
 // ═══════════ go drift and reconcile reports ═══════════
 
@@ -426,6 +430,99 @@ fn dry_run_with_vex_announces_the_skip() {
     assert_eq!(code, 0, "stderr={stderr}");
     assert!(
         stdout.contains("Skipping VEX generation (--dry-run: nothing was applied)."),
+        "stdout={stdout}"
+    );
+}
+
+// ═══════════ staging: offline report and download result ═══════════
+
+/// The offline no-local-source report: the header carries the TOTAL count,
+/// at most five purls are listed, the rest is "... and N more", and the
+/// `repair` remedy closes it.
+#[test]
+fn offline_missing_report_caps_purls_and_names_repair() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_sourceless_npm_patches(tmp.path(), 7);
+
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("Error: 7 patches have no local source and --offline is set:"),
+        "stderr={stderr}"
+    );
+    // Five distinct fixture purls are listed (in no fixed order).
+    let fixture: Vec<String> = (0..7)
+        .map(|i| format!("  - pkg:npm/miss-{i}@1.0.0"))
+        .collect();
+    let listed: std::collections::BTreeSet<&str> =
+        stderr.lines().filter(|l| l.starts_with("  - ")).collect();
+    assert_eq!(
+        listed.len(),
+        5,
+        "the list is capped at five; stderr={stderr}"
+    );
+    assert!(
+        listed.iter().all(|l| fixture.iter().any(|f| f == l)),
+        "only the fixture purls are listed; stderr={stderr}"
+    );
+    assert!(stderr.contains("  ... and 2 more"), "stderr={stderr}");
+    assert!(
+        stderr.contains("Run `socket-patch repair` to download missing artifacts."),
+        "stderr={stderr}"
+    );
+}
+
+/// A human-mode online apply with a cold cache: the download progress is
+/// transient (nothing permanent on a non-terminal stderr) and only the
+/// "Downloaded 1 blob" result line stays, on stderr, never stdout. The
+/// fetch itself is pinned through `--json` in `apply_network.rs`.
+#[tokio::test]
+async fn online_staging_prints_result_line_not_progress() {
+    const ORG: &str = "test-org";
+    let before = b"before\n";
+    let after = b"after\n";
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG}/patches/blob/{}",
+            git_sha256(after)
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(after.to_vec()))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    let index = install_npm_pkg(tmp.path(), "fallback-test", "1.0.0", Some(before));
+    write_manifest(
+        tmp.path(),
+        json!({
+            "pkg:npm/fallback-test@1.0.0": patch_record(
+                "11111111-1111-4111-8111-111111111111",
+                one_file("package/index.js", before, after),
+            )
+        }),
+    );
+
+    let uri = mock.uri();
+    let (code, stdout, stderr) = run_apply(
+        tmp.path(),
+        &[],
+        &[
+            ("SOCKET_API_URL", uri.as_str()),
+            ("SOCKET_API_TOKEN", "fake-token-for-test"),
+            ("SOCKET_ORG_SLUG", ORG),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(std::fs::read(&index).unwrap(), after);
+    assert!(stderr.contains("Downloaded 1 blob"), "stderr={stderr}");
+    assert!(
+        !stderr.contains("Downloading missing patch artifacts"),
+        "progress is transient; stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("Downloading") && !stdout.contains("Downloaded"),
         "stdout={stdout}"
     );
 }

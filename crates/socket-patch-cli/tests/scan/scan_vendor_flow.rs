@@ -1,5 +1,8 @@
-//! Scan vendoring previews, lock failures and corrupt legacy manifests.
+//! `scan --vendor`: dry-run previews (already vendored, prune GC), the
+//! `--json` lock-held and lock-io errors, and a corrupt legacy manifest
+//! that is reported and stepped around.
 
+use crate::common::envelope::parse_json_envelope;
 use crate::common::{binary, git_sha256, hermetic_command};
 
 use crate::prebuilt_common;
@@ -27,17 +30,17 @@ const AFTER_B64: &str = "YWZ0ZXIK";
 fn write_fixture(root: &Path) {
     std::fs::write(
         root.join("package.json"),
-        r#"{ "name": "covgap-scan-vendor-flow", "version": "0.0.0" }"#,
+        r#"{ "name": "scan-vendor-flow", "version": "0.0.0" }"#,
     )
     .unwrap();
     let lock = serde_json::json!({
-        "name": "covgap-scan-vendor-flow",
+        "name": "scan-vendor-flow",
         "version": "0.0.0",
         "lockfileVersion": 3,
         "requires": true,
         "packages": {
             "": {
-                "name": "covgap-scan-vendor-flow",
+                "name": "scan-vendor-flow",
                 "version": "0.0.0",
                 "dependencies": { "left-pad": "^1.3.0" }
             },
@@ -267,8 +270,7 @@ fn assert_vendor_step_error(
     expect_code: &str,
 ) -> serde_json::Value {
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout must be one JSON object ({e}); stdout={stdout}"));
+    let v = parse_json_envelope(stdout.trim());
     assert_eq!(v["status"], "error", "envelope={v}");
     assert_eq!(v["error"]["code"], expect_code, "envelope={v}");
     assert!(
@@ -317,7 +319,7 @@ async fn scan_vendor_dry_run_reports_already_vendored() {
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let v = parse_json_envelope(stdout.trim());
     assert_eq!(v["dryRun"], true, "envelope={v}");
     let patches = v["events"].as_array().expect("vendor preview events");
     assert_eq!(patches.len(), 1, "envelope={v}");
@@ -364,7 +366,7 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
     let (code, stdout, stderr) =
         run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run", "--prune"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let v = parse_json_envelope(stdout.trim());
 
     // The vendor dry-run preview ran (empty discovery ⇒ no vendored
     // preview events).
@@ -419,7 +421,7 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
     let (code, stdout, stderr) =
         run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run", "--prune"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let v = parse_json_envelope(stdout.trim());
     assert_eq!(v["dryRun"], true, "envelope={v}");
     assert_eq!(
         v["events"][0]["purl"], STALE_PURL,
@@ -496,7 +498,7 @@ async fn scan_vendor_corrupt_manifest_is_reported_and_stepped_around() {
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let v = parse_json_envelope(stdout.trim());
     assert_eq!(v["status"], "success", "envelope={v}");
     assert_eq!(v["summary"]["applied"], 1, "envelope={v}");
     assert!(
