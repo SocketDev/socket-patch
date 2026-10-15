@@ -4,6 +4,8 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/pty_io.rs"]
+mod pty_io;
 #[path = "../vlt_hosted_common/mod.rs"]
 mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]
@@ -20,9 +22,14 @@ mod hosted_yarn_berry_manifest;
 mod hosted_yarn_classic_sha1;
 mod scan_batch_sizing_e2e;
 mod scan_ecosystems_scope_e2e;
+mod scan_failure_paths;
+mod scan_fixture;
 mod scan_invariants;
 mod scan_nested_project_e2e;
 mod scan_ordered_concurrency_e2e;
 mod scan_paths_e2e;
+mod scan_render;
 mod scan_sync_e2e;
+#[cfg(unix)]
+mod scan_tty;
 mod scan_vendor_step_error_e2e;
