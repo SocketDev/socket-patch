@@ -1,4 +1,4 @@
-//! `vendor`: lockfile-only gems, pristine fetch order, no-network re-runs, bun, the hosted redirects, the failure paths and the human render.
+//! `vendor`: lockfile-only gems, pristine fetch order, no-network re-runs, bun, the hosted redirects, the failure paths, the `--silent` error output and the human render.
 //!
 //! One test binary per command: each module was its own binary.
 
@@ -21,6 +21,7 @@ mod vendor_failure_paths;
 mod vendor_gem_lockfile_only_e2e;
 mod vendor_render;
 mod vendor_rerun_no_network_e2e;
+mod vendor_silent_errors;
 
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;

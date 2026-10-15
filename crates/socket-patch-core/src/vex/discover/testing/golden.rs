@@ -148,6 +148,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
             locked_integrity,
             integrity_required,
             url,
+            // The block's lines; the lock itself is the golden's input.
+            yarn_classic_block: _,
         } = r;
         json!({
             "purl": purl,

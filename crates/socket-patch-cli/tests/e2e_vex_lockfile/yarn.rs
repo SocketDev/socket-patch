@@ -705,8 +705,112 @@ fn hosted_patch_adding_an_uninstalled_dependency_is_omitted() {
         let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
         let cell = format!("{flavor:?} dependency installed");
         assert_attested(cwd, code, &env, UUID, "redirected", &cell);
+
+        // #1538: installed, but outside the range the patched package.json
+        // declares (the old dependency a pre-v5 pin's lock still installs).
+        put(
+            cwd,
+            "node_modules/is-odd/package.json",
+            br#"{"name":"is-odd","version":"2.0.0"}"#,
+        );
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        let cell = format!("{flavor:?} dependency out of range");
+        assert_omitted(cwd, code, &env, "dependency_not_installed", &cell);
     }
     drop(rt);
+}
+
+/// #1538: lock-only VEX of a yarn classic hosted pin whose patch changes
+/// `package.json`. yarn 1 installs the dependencies the pinned block's
+/// sub-maps name, so a pin an earlier release wrote without rewriting them
+/// (#1462) installs the patched package beside the old dependencies.
+///
+/// | lock | patched blob | verdict |
+/// |---|---|---|
+/// | no sub-map, patch adds `is-odd ^3.0.0` | patch API | dependency_not_installed |
+/// | sub-map `is-odd ^2.0.0`, patch says `^3.0.0` | patch API | dependency_not_installed |
+/// | sub-map rewritten, `is-odd@^3.0.0` locked | patch API | attests |
+/// | same | `.socket/blobs` only | attests |
+/// | same | nowhere | dependency_manifest_unverifiable |
+#[test]
+fn hosted_classic_lock_only_checks_the_pinned_dependency_maps() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    const MANIFEST: &str = "package/package.json";
+    let pristine = format!(
+        r#"{{"name":"{NAME}","version":"{VERSION}","dependencies":{{"is-odd":"^2.0.0"}}}}"#
+    );
+    let patched = format!(
+        r#"{{"name":"{NAME}","version":"{VERSION}","dependencies":{{"is-odd":"^3.0.0"}}}}"#
+    );
+    let after_hash = compute_git_sha256_from_bytes(patched.as_bytes());
+    let mut view = patch_view(UUID, PURL);
+    view["files"][MANIFEST] = serde_json::json!({
+        "beforeHash": compute_git_sha256_from_bytes(pristine.as_bytes()),
+        "afterHash": after_hash,
+    });
+    let (rt, server) = serve_patch_views(vec![(UUID, view.clone())]);
+    let (rt_no_blob, server_no_blob) = serve_patch_views(vec![(UUID, view.clone())]);
+    rt.block_on(
+        Mock::given(method("GET"))
+            .and(path(format!("/patch/blob/{after_hash}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(patched.clone().into_bytes()))
+            .mount(&server),
+    );
+
+    let base = hosted_lock(Flavor::Classic, "https://patch.socket.dev", UUID);
+    let is_odd = |range: &str, version: &str| {
+        format!(
+            "\nis-odd@{range}:\n  version \"{version}\"\n  resolved \
+             \"https://registry.yarnpkg.com/is-odd/-/is-odd-{version}.tgz#\
+             0123456789abcdef0123456789abcdef01234567\"\n  integrity \
+             sha512-aXNvZGRpc29kZGlzb2RkaXNvZGQ=\n"
+        )
+    };
+    let with_sub_map = |range: &str| format!("{base}  dependencies:\n    is-odd \"{range}\"\n");
+    let cells = [
+        (
+            "added dependency",
+            base.clone() + &is_odd("^2.0.0", "2.0.0"),
+        ),
+        (
+            "changed range",
+            with_sub_map("^2.0.0") + &is_odd("^2.0.0", "2.0.0"),
+        ),
+    ];
+    for (cell, lock) in cells {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        hosted_checkout(cwd, Flavor::Classic);
+        put(cwd, "yarn.lock", lock.as_bytes());
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        assert_omitted(cwd, code, &env, "dependency_not_installed", cell);
+    }
+
+    // The v5 pin: the sub-map rewritten and the new descriptor locked.
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    hosted_checkout(cwd, Flavor::Classic);
+    let lock = with_sub_map("^3.0.0") + &is_odd("^3.0.0", "3.0.1");
+    put(cwd, "yarn.lock", lock.as_bytes());
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+    assert_attested(cwd, code, &env, UUID, "redirected", "rewritten sub-map");
+
+    // The patched manifest from nowhere: never assumed.
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server_no_blob.uri()]);
+    let cell = "rewritten sub-map, no blob";
+    assert_omitted(cwd, code, &env, "dependency_manifest_unverifiable", cell);
+
+    // ...but read from the local blob store.
+    put(
+        cwd,
+        &format!(".socket/blobs/{after_hash}"),
+        patched.as_bytes(),
+    );
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server_no_blob.uri()]);
+    assert_attested(cwd, code, &env, UUID, "redirected", "local blob");
+    drop(rt);
+    drop(rt_no_blob);
 }
 
 // ──────────────────────────────────────────────────────────────────────

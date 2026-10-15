@@ -61,6 +61,7 @@ use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
 };
 use crate::utils::line_endings::LineEndings;
+use crate::utils::npm_range::npm_range_admits;
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::uri::encode_uri_component;
 
@@ -275,8 +276,15 @@ impl NpmLockBackend for YarnBerryBackend {
                          vendoring writes never reaches it, so that copy stays UNPATCHED"
                     )
                 } else {
+                    // An unread `portal:` / `link:` copy has no version
+                    // to name (#1540).
+                    let what = if copy.source.is_unread_linked() {
+                        "a package".to_string()
+                    } else {
+                        format!("version {version}")
+                    };
                     format!(
-                        "{YARN_LOCK} entry `{key}` installs version {version} under another \
+                        "{YARN_LOCK} entry `{key}` installs {what} under another \
                          dependency name, from {origin}, whose package can't be read, so it \
                          may be {name}@{version}; the name-keyed resolutions entry vendoring \
                          writes never reaches it, so if it is, that copy stays UNPATCHED"
@@ -1799,79 +1807,6 @@ fn plain_npm_range(range: &str) -> bool {
     !range.contains([':', '@', '/', '#'])
 }
 
-/// Whether the npm semver `range` admits `version`; `None` for a range
-/// this reader does not decide (a dist-tag, a partial hyphen bound).
-fn npm_range_admits(range: &str, version: &str) -> Option<bool> {
-    let version = semver::Version::parse(version).ok()?;
-    let mut admits = false;
-    for alternative in range.split("||") {
-        let comparators: Vec<String> = match alternative.split_once(" - ") {
-            // `a - b` with full versions is `>=a <=b`.
-            Some((low, high)) => {
-                let full = |v: &str| {
-                    let v = v.trim().trim_start_matches(['v', '=']);
-                    semver::Version::parse(v).ok().map(|_| v.to_string())
-                };
-                vec![format!(">={}", full(low)?), format!("<={}", full(high)?)]
-            }
-            None => glue_operators(alternative)
-                .iter()
-                .map(|c| npm_comparator(c))
-                .collect::<Option<_>>()?,
-        };
-        let req = match comparators.is_empty() {
-            true => "*".to_string(),
-            false => comparators.join(", "),
-        };
-        admits |= semver::VersionReq::parse(&req).ok()?.matches(&version);
-    }
-    Some(admits)
-}
-
-/// The comparators of one npm range alternative, an operator npm allows
-/// to stand apart (`>= 1.2.0`) joined to its version.
-fn glue_operators(alternative: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut pending = String::new();
-    for token in alternative.split_whitespace() {
-        if token
-            .chars()
-            .all(|c| matches!(c, '^' | '~' | '>' | '<' | '='))
-        {
-            pending.push_str(token);
-        } else {
-            out.push(format!("{}{token}", std::mem::take(&mut pending)));
-        }
-    }
-    out
-}
-
-/// One npm comparator in the `semver` crate's syntax, which differs for a
-/// bare version: npm's `1.3.0` is exact and `1.3` means `~1.3`, where the
-/// crate reads both as caret ranges.
-fn npm_comparator(comparator: &str) -> Option<String> {
-    let op_len = comparator
-        .find(|c: char| !matches!(c, '^' | '~' | '>' | '<' | '='))
-        .unwrap_or(comparator.len());
-    let (op, version) = comparator.split_at(op_len);
-    let version = version.strip_prefix('v').unwrap_or(version);
-    if !op.is_empty() {
-        return Some(format!("{op}{version}"));
-    }
-    // Prerelease and build tags ride on the patch part.
-    let core = version.split(['-', '+']).next().unwrap_or(version);
-    let parts: Vec<&str> = core.split('.').collect();
-    let wildcard = |p: &&str| matches!(*p, "*" | "x" | "X");
-    if parts.iter().any(wildcard) {
-        return Some(version.to_string());
-    }
-    match parts.len() {
-        3 => Some(format!("={version}")),
-        1 | 2 => Some(format!("~{version}")),
-        _ => None,
-    }
-}
-
 /// The root workspace's name: the lock's single-pattern `<name>@workspace:.`
 /// entry (the key + resolution of our file: entry embed it).
 fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
@@ -2577,6 +2512,51 @@ __metadata:
                 let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
                 assert!(text.contains("left-pad@file:./"), "{case}: rewired: {text}");
                 assert!(text.contains(&block), "{case}: copy byte-untouched: {text}");
+            }
+        }
+    }
+
+    /// #1540: a `portal:` / `link:` copy with an ABSOLUTE path is never read
+    /// (#1516), so its package and version are unknown. It is named as a
+    /// possible unpatched copy (`vendor_copy_unpatched`, unidentified
+    /// wording) whatever its target holds, never taken as proof the package
+    /// is installed, and the registry entry still vendors. It was dropped
+    /// silently.
+    #[tokio::test]
+    async fn issue_1540_absolute_portal_and_link_copies_are_named() {
+        for protocol in ["portal", "link"] {
+            for fork in ["left-pad", "other-pkg"] {
+                let ext = tempfile::tempdir().unwrap();
+                tokio::fs::write(
+                    ext.path().join("package.json"),
+                    format!(r#"{{"name":"{fork}","version":"1.3.0"}}"#),
+                )
+                .await
+                .unwrap();
+                let abs = ext.path().to_string_lossy().replace('\\', "/");
+                let key = format!("lp2@{protocol}:{abs}::locator=vendor-spike%40workspace%3A.");
+                let block = format!(
+                    "\n\"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
+                     languageName: node\n  linkType: soft\n"
+                );
+                let lock = format!("{B3_BEFORE_LOCK}{block}");
+                let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+
+                let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{protocol}/{fork}: {:?}", result.error);
+                assert!(entry.is_some(), "{protocol}/{fork}: registry entry vendors");
+                let copies: Vec<&VendorWarning> = warnings
+                    .iter()
+                    .filter(|w| w.code == "vendor_copy_unpatched")
+                    .collect();
+                assert_eq!(copies.len(), 1, "{protocol}/{fork}: {warnings:?}");
+                assert!(
+                    copies[0].detail.contains(&format!("`\"{key}\"`"))
+                        && copies[0].detail.contains("installs a package under")
+                        && copies[0].detail.contains("can't be read"),
+                    "{protocol}/{fork}: {}",
+                    copies[0].detail
+                );
             }
         }
     }
@@ -3462,42 +3442,6 @@ __metadata:
         assert_eq!(spell_checksum("abcd", true), "abcd");
     }
 
-    #[test]
-    fn npm_range_admits_reads_npm_semantics() {
-        for (range, version, want) in [
-            ("1.3.0", "1.3.0", Some(true)),
-            ("1.3.0", "1.3.1", Some(false)),
-            ("^1.3.0", "1.9.0", Some(true)),
-            ("^1.3.0", "2.0.0", Some(false)),
-            ("~1.3.0", "1.3.5", Some(true)),
-            ("~1.3.0", "1.4.0", Some(false)),
-            ("1.3", "1.3.9", Some(true)),
-            ("1.3", "1.4.0", Some(false)),
-            ("1", "1.9.0", Some(true)),
-            ("1.x", "1.9.0", Some(true)),
-            ("*", "4.0.0", Some(true)),
-            ("", "4.0.0", Some(true)),
-            (">=1.2.0 <1.4.0", "1.3.0", Some(true)),
-            (">=1.2.0 <1.3.0", "1.3.0", Some(false)),
-            ("^2.0.0 || ^1.3.0", "1.3.0", Some(true)),
-            ("1.0.0 - 2.0.0", "1.3.0", Some(true)),
-            ("1.0.0 - 1.2.0", "1.3.0", Some(false)),
-            ("1.0 - 2", "1.3.0", None),
-            (">= 1.2.0", "1.3.0", Some(true)),
-            ("< 1.3.0", "1.3.0", Some(false)),
-            ("v1.3.0", "1.3.0", Some(true)),
-            ("=1.3.0", "1.3.0", Some(true)),
-            ("1.3.0-beta.1", "1.3.0-beta.1", Some(true)),
-            ("1.3.0-beta.1", "1.3.0", Some(false)),
-            ("latest", "1.3.0", None),
-        ] {
-            assert_eq!(
-                npm_range_admits(range, version),
-                want,
-                "{range} vs {version}"
-            );
-        }
-    }
     #[tokio::test]
     async fn revert_leaves_drifted_fragments_alone_with_warnings() {
         // Lock drift: the user re-resolved our entry back to the registry.

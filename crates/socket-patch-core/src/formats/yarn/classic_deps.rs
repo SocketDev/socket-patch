@@ -160,6 +160,47 @@ pub(crate) fn dep_maps_match(lines: &[String], pkg: &Value) -> bool {
     with_manifest_dep_maps(lines, pkg) == lines
 }
 
+/// Whether the sub-maps `lines` carries declare exactly the dependencies
+/// `pkg` declares, read back however yarn 1 quoted them (`foo latest`
+/// and `foo "latest"` alike): what yarn installs from the block is what
+/// the manifest asks for.
+pub(crate) fn dep_maps_declare(lines: &[String], pkg: &Value) -> bool {
+    block_dep_maps(lines) == manifest_dep_maps(pkg)
+}
+
+/// A block's non-empty dependency sub-maps, each sorted by name, in
+/// [`DEP_FIELDS`] order (the shape of [`manifest_dep_maps`]).
+fn block_dep_maps(lines: &[String]) -> Vec<(&'static str, Vec<(String, String)>)> {
+    let mut maps: Vec<(&'static str, Vec<(String, String)>)> = Vec::new();
+    let mut field: Option<&'static str> = None;
+    for line in lines.iter().skip(1) {
+        if let Some(rest) = body_field_line(line) {
+            field = DEP_FIELDS
+                .iter()
+                .copied()
+                .find(|f| rest.strip_suffix(':') == Some(*f));
+            continue;
+        }
+        let Some(field) = field else {
+            continue;
+        };
+        let (name, rest) = yarn_token(line.trim_start());
+        let (range, _) = yarn_token(rest.trim_start());
+        if name.is_empty() || range.is_empty() {
+            continue;
+        }
+        match maps.iter_mut().find(|(f, _)| *f == field) {
+            Some((_, deps)) => deps.push((name, range)),
+            None => maps.push((field, vec![(name, range)])),
+        }
+    }
+    for (_, deps) in &mut maps {
+        deps.sort_unstable();
+    }
+    maps.sort_by_key(|(f, _)| DEP_FIELDS.iter().position(|d| d == f));
+    maps
+}
+
 fn is_dep_map_header(rest: &str) -> bool {
     DEP_FIELDS.iter().any(|f| rest.strip_suffix(':') == Some(f))
 }
@@ -213,6 +254,33 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn dep_maps_declare_reads_yarns_quoting() {
+        let block = lines(
+            "foo@1.0.0:\n  version \"1.0.0\"\n  dependencies:\n    bar latest\n    \
+             \"@s/baz\" \"^1.0.0\"\n  optionalDependencies:\n    opt \"^2.0.0\"\n",
+        );
+        let pkg = serde_json::json!({
+            "dependencies": {"@s/baz": "^1.0.0", "bar": "latest"},
+            "optionalDependencies": {"opt": "^2.0.0"},
+        });
+        assert!(dep_maps_declare(&block, &pkg));
+        let bumped = serde_json::json!({
+            "dependencies": {"@s/baz": "^2.0.0", "bar": "latest"},
+            "optionalDependencies": {"opt": "^2.0.0"},
+        });
+        assert!(!dep_maps_declare(&block, &bumped));
+        let added = serde_json::json!({
+            "dependencies": {"@s/baz": "^1.0.0", "bar": "latest", "qux": "1"},
+            "optionalDependencies": {"opt": "^2.0.0"},
+        });
+        assert!(!dep_maps_declare(&block, &added));
+        let moved = serde_json::json!({
+            "dependencies": {"@s/baz": "^1.0.0", "bar": "latest", "opt": "^2.0.0"},
+        });
+        assert!(!dep_maps_declare(&block, &moved));
     }
 
     #[test]
