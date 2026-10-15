@@ -30,9 +30,10 @@ pub(crate) struct OtherNameCopy {
     pub(crate) source: CopyRef,
     /// The copy itself says it is `name@version`. `false` for a copy of
     /// that version whose package cannot be read (a missing directory, a
-    /// tarball with no readable `package.json`, a non-registry url): it may
-    /// be `name`, so it is named, but never taken as proof that `name` is
-    /// installed (#1516).
+    /// tarball with no readable `package.json`, a non-registry url, or an
+    /// unread `portal:` / `link:` directory of any version): it may be
+    /// `name`, so it is named, but never taken as proof that `name` is
+    /// installed (#1516, #1540).
     pub(crate) identified: bool,
 }
 
@@ -40,9 +41,10 @@ pub(crate) struct OtherNameCopy {
 /// `name@version` under another dependency name, in lock order. A copy of
 /// that version whose package cannot be read is kept, unidentified: it
 /// may hold `name`, and leaving it out would let the scan and `vex` vouch
-/// for a lock that installs it unpatched (#1516). A `portal:` / `link:`
-/// copy whose manifest cannot be read is left out: its version is that
-/// manifest's, so nothing ties it to `version`.
+/// for a lock that installs it unpatched (#1516). So is a `portal:` /
+/// `link:` copy that is never read (an absolute path): its version is its
+/// manifest's, so it may be `version` too (#1540). One read and found to
+/// hold no versioned package (a `link:` to a plain directory) is left out.
 pub(crate) async fn other_name_copies(
     project_root: &Path,
     lock_text: &str,
@@ -108,7 +110,7 @@ pub(crate) async fn other_name_copies(
         let identified = match copy_identity(&source, &lock_version, bytes).await {
             Some((n, v)) if n == name && v == version => true,
             Some(_) => continue,
-            None if matches!(source, CopyRef::Linked(_)) => continue,
+            None if matches!(source, CopyRef::Linked(_)) && !source.is_unread_linked() => continue,
             None => false,
         };
         out.push(OtherNameCopy {

@@ -58,6 +58,13 @@ impl CopyRef {
         }
     }
 
+    /// A `portal:` / `link:` copy that is never read ([`CopyRef::read_path`]
+    /// is `None`: an absolute path). Its lock version is the placeholder
+    /// `0.0.0-use.local`, so it may be any version of any package (#1540).
+    pub(crate) fn is_unread_linked(&self) -> bool {
+        matches!(self, CopyRef::Linked(_)) && self.read_path().is_none()
+    }
+
     /// The `(name, version)` this copy installs, given the lock entry's
     /// `version` and the bytes read at [`CopyRef::read_path`]. `None` when
     /// the copy does not say (an unreadable or nameless manifest, a
@@ -151,7 +158,10 @@ pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
     } else {
         return None;
     };
-    let path = path.split(['#', ':']).next().unwrap_or_default();
+    // Cut the `::locator=…` bindings and any `#` selector; a single `:` is
+    // part of the path (a Windows drive, `portal:C:/Users/me/lp`).
+    let path = path.split("::").next().unwrap_or_default();
+    let path = path.split('#').next().unwrap_or_default();
     let rel = berry_copy_path(reference, path)?;
     Some(if linked {
         CopyRef::Linked(rel)
@@ -318,6 +328,29 @@ mod tests {
         );
         assert_eq!(berry_copy_ref("npm:1.3.0"), None);
         assert_eq!(berry_copy_ref("workspace:packages/b"), None);
+    }
+
+    /// #1540: an absolute `portal:` / `link:` path keeps its whole spelling,
+    /// a Windows drive's `:` included, and is never read.
+    #[test]
+    fn absolute_linked_refs_keep_the_path_and_are_unread() {
+        let ws = "::locator=app%40workspace%3A.";
+        for (reference, path) in [
+            (format!("portal:/home/me/lp{ws}"), "/home/me/lp"),
+            (format!("link:/home/me/lp{ws}"), "/home/me/lp"),
+            (format!("portal:C:/Users/me/lp{ws}"), "C:/Users/me/lp"),
+        ] {
+            assert_eq!(
+                berry_copy_ref(&reference),
+                Some(CopyRef::Linked(path.into())),
+                "{reference}"
+            );
+        }
+        let unix = CopyRef::Linked("/home/me/lp".into());
+        assert!(unix.read_path().is_none() && unix.is_unread_linked());
+        let relative = CopyRef::Linked("vend/lp".into());
+        assert!(!relative.is_unread_linked());
+        assert!(!CopyRef::Directory("/home/me/lp".into()).is_unread_linked());
     }
 
     #[test]

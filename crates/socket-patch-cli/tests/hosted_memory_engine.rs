@@ -1879,3 +1879,65 @@ async fn issue_939_berry_renamed_copy_is_named() {
         }
     }
 }
+
+/// #1540: a berry `portal:` / `link:` copy with an ABSOLUTE path is never
+/// read (#1516), and its lock version is the placeholder
+/// `0.0.0-use.local`, so it may be any version of any package. The hosted
+/// scan still pins the registry entry, and names that copy as possibly
+/// unpatched (`redirect_copy_unpatched`) whatever it links to; it used to
+/// report a clean success while `node_modules/lp2` held unpatched bytes.
+#[tokio::test]
+async fn issue_1540_berry_absolute_portal_and_link_copies_are_named() {
+    const UUID: &str = "15401540-1540-4540-8540-154015401540";
+    let ws = "app%40workspace%3A.";
+    for protocol in ["portal", "link"] {
+        let spec = format!("{protocol}:/home/me/shared/left-pad");
+        let key = format!("lp2@{spec}::locator={ws}");
+        let server = MockServer::start().await;
+        mount_left_pad_grant(&server, UUID).await;
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package.json".to_string(),
+            format!(
+                r#"{{"name":"app","version":"1.0.0","dependencies":{{"left-pad":"^1.3.0","lp2":"{spec}"}}}}"#
+            )
+            .into_bytes(),
+        );
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"app@workspace:.\":\n  version: 0.0.0-use.local\n  \
+                 resolution: \"app@workspace:.\"\n  dependencies:\n    \
+                 left-pad: \"npm:^1.3.0\"\n    lp2: \"{spec}\"\n  \
+                 languageName: unknown\n  linkType: soft\n\n\
+                 \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+                 resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  \
+                 languageName: node\n  linkType: hard\n\n\
+                 \"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
+                 languageName: node\n  linkType: soft\n",
+                "1".repeat(128)
+            )
+            .into_bytes(),
+        );
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{protocol}: {:?}", project.error);
+        assert_eq!(
+            project.redirected.len(),
+            1,
+            "{protocol}: {:?} {:#}",
+            project.skipped,
+            project.redirect
+        );
+        let details = copy_unpatched_details(project);
+        assert_eq!(details.len(), 1, "{protocol}: {:#}", project.redirect);
+        assert!(
+            details[0].contains(key.as_str())
+                && details[0].contains("can't be read")
+                && details[0].contains("UNPATCHED"),
+            "{protocol}: {}",
+            details[0]
+        );
+    }
+}
