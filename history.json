@@ -5393,5 +5393,540 @@
   "issues_commented": [
    1473
   ]
+ },
+ {
+  "date": "2026-10-15",
+  "main_sha": "e76cb9b37bbbf1bf2ddd7587d4cd883cc5a1d874",
+  "suite_source": "main",
+  "runner": "4 vCPU Intel(R) Xeon(R) Processor @ 2.80GHz (cloud sandbox)",
+  "last_sha": "313d53244d815cc87dafd3a6137461015d9be5b4",
+  "week_sha": "6fcc51b47c02441c7137c7eeb989a50a038327f7",
+  "median_ms_per_pkg_hosted": 0.1341,
+  "scenarios": {
+   "npm/hosted": {
+    "median_ms": 284.9,
+    "ms_per_pkg": 0.095,
+    "peak_rss_kb": 53712,
+    "requests": 127,
+    "day_ratio": 1.046,
+    "week_ratio": 1.035,
+    "status": "OK"
+   },
+   "npm/rescan": {
+    "median_ms": 232.9,
+    "ms_per_pkg": 0.0776,
+    "peak_rss_kb": 46176,
+    "requests": 127,
+    "day_ratio": 1.005,
+    "week_ratio": 0.789,
+    "status": "OK"
+   },
+   "pnpm/hosted": {
+    "median_ms": 185.4,
+    "ms_per_pkg": 0.0618,
+    "peak_rss_kb": 41456,
+    "requests": 127,
+    "day_ratio": 1.021,
+    "week_ratio": 1.025,
+    "status": "OK"
+   },
+   "pnpm/rescan": {
+    "median_ms": 180.1,
+    "ms_per_pkg": 0.06,
+    "peak_rss_kb": 38056,
+    "requests": 127,
+    "day_ratio": 0.934,
+    "week_ratio": 0.939,
+    "status": "OK"
+   },
+   "yarn-classic/hosted": {
+    "median_ms": 251.3,
+    "ms_per_pkg": 0.0838,
+    "peak_rss_kb": 48148,
+    "requests": 187,
+    "day_ratio": 0.987,
+    "week_ratio": 1.108,
+    "status": "week +14.3% / +60 req (#1328, intended)"
+   },
+   "yarn-classic/rescan": {
+    "median_ms": 185.6,
+    "ms_per_pkg": 0.0619,
+    "peak_rss_kb": 41360,
+    "requests": 187,
+    "day_ratio": 1.028,
+    "week_ratio": 0.909,
+    "status": "requests 127->187 (#1463, intended)"
+   },
+   "yarn-berry/hosted": {
+    "median_ms": 287.5,
+    "ms_per_pkg": 0.0958,
+    "peak_rss_kb": 47436,
+    "requests": 127,
+    "day_ratio": 1.048,
+    "week_ratio": 1.061,
+    "status": "OK"
+   },
+   "yarn-berry/rescan": {
+    "median_ms": 208.6,
+    "ms_per_pkg": 0.0695,
+    "peak_rss_kb": 41628,
+    "requests": 127,
+    "day_ratio": 1.025,
+    "week_ratio": 0.972,
+    "status": "OK"
+   },
+   "bun/hosted": {
+    "median_ms": 196.4,
+    "ms_per_pkg": 0.0655,
+    "peak_rss_kb": 40388,
+    "requests": 127,
+    "day_ratio": 1.004,
+    "week_ratio": 0.448,
+    "status": "OK"
+   },
+   "bun/rescan": {
+    "median_ms": 133.9,
+    "ms_per_pkg": 0.0446,
+    "peak_rss_kb": 36980,
+    "requests": 127,
+    "day_ratio": 1.017,
+    "week_ratio": 0.365,
+    "status": "OK"
+   },
+   "bun-isolated/hosted": {
+    "median_ms": 192.3,
+    "ms_per_pkg": 0.0641,
+    "peak_rss_kb": 42932,
+    "requests": 127,
+    "day_ratio": 1.013,
+    "week_ratio": 0.525,
+    "status": "OK"
+   },
+   "bun-isolated/rescan": {
+    "median_ms": 165.9,
+    "ms_per_pkg": 0.0553,
+    "peak_rss_kb": 40100,
+    "requests": 127,
+    "day_ratio": 0.965,
+    "week_ratio": 0.449,
+    "status": "OK"
+   },
+   "vlt/hosted": {
+    "median_ms": 514.9,
+    "ms_per_pkg": 0.3433,
+    "peak_rss_kb": 43164,
+    "requests": 94,
+    "day_ratio": 0.956,
+    "week_ratio": 0.496,
+    "status": "slow (2.56x, 515 ms; #1570)"
+   },
+   "vlt/rescan": {
+    "median_ms": 550.7,
+    "ms_per_pkg": 0.3671,
+    "peak_rss_kb": 42036,
+    "requests": 94,
+    "day_ratio": 1.005,
+    "week_ratio": 0.47,
+    "status": "slow (551 ms; #1570)"
+   },
+   "pip/hosted": {
+    "median_ms": 134.1,
+    "ms_per_pkg": 0.1341,
+    "peak_rss_kb": 34384,
+    "requests": 53,
+    "day_ratio": 1.015,
+    "week_ratio": 1.114,
+    "status": "OK"
+   },
+   "pip/rescan": {
+    "median_ms": 105.2,
+    "ms_per_pkg": 0.1052,
+    "peak_rss_kb": 34384,
+    "requests": 53,
+    "day_ratio": 1.036,
+    "week_ratio": 0.991,
+    "status": "OK"
+   },
+   "uv/hosted": {
+    "median_ms": 166.1,
+    "ms_per_pkg": 0.4152,
+    "peak_rss_kb": 40248,
+    "requests": 38,
+    "day_ratio": 1.025,
+    "week_ratio": 0.979,
+    "status": "slow (#836)"
+   },
+   "uv/rescan": {
+    "median_ms": 144.0,
+    "ms_per_pkg": 0.3601,
+    "peak_rss_kb": 39004,
+    "requests": 38,
+    "day_ratio": 1.002,
+    "week_ratio": 0.942,
+    "status": "OK"
+   },
+   "pylock/hosted": {
+    "median_ms": 176.0,
+    "ms_per_pkg": 0.44,
+    "peak_rss_kb": 39908,
+    "requests": 26,
+    "day_ratio": 0.984,
+    "week_ratio": 0.995,
+    "status": "slow (#836)"
+   },
+   "pylock/rescan": {
+    "median_ms": 121.3,
+    "ms_per_pkg": 0.3031,
+    "peak_rss_kb": 38264,
+    "requests": 26,
+    "day_ratio": 1.011,
+    "week_ratio": 0.859,
+    "status": "OK"
+   },
+   "poetry/hosted": {
+    "median_ms": 127.2,
+    "ms_per_pkg": 0.318,
+    "peak_rss_kb": 44820,
+    "requests": 26,
+    "day_ratio": 1.071,
+    "week_ratio": 0.949,
+    "status": "slow (2.37x; #1473)"
+   },
+   "poetry/rescan": {
+    "median_ms": 100.8,
+    "ms_per_pkg": 0.2519,
+    "peak_rss_kb": 43680,
+    "requests": 26,
+    "day_ratio": 1.022,
+    "week_ratio": 0.907,
+    "status": "OK"
+   },
+   "pipenv/hosted": {
+    "median_ms": 122.1,
+    "ms_per_pkg": 0.3052,
+    "peak_rss_kb": 34384,
+    "requests": 26,
+    "day_ratio": 0.958,
+    "week_ratio": 1.141,
+    "status": "slow (2.28x; #1246)"
+   },
+   "pipenv/rescan": {
+    "median_ms": 99.4,
+    "ms_per_pkg": 0.2485,
+    "peak_rss_kb": 34384,
+    "requests": 26,
+    "day_ratio": 0.957,
+    "week_ratio": 1.002,
+    "status": "OK"
+   },
+   "pdm/hosted": {
+    "median_ms": 108.5,
+    "ms_per_pkg": 0.2713,
+    "peak_rss_kb": 45852,
+    "requests": 26,
+    "day_ratio": 1.02,
+    "week_ratio": 0.961,
+    "status": "slow (2.02x)"
+   },
+   "pdm/rescan": {
+    "median_ms": 94.2,
+    "ms_per_pkg": 0.2354,
+    "peak_rss_kb": 43400,
+    "requests": 26,
+    "day_ratio": 0.95,
+    "week_ratio": 0.906,
+    "status": "OK"
+   },
+   "hatch/hosted": {
+    "median_ms": 72.3,
+    "ms_per_pkg": 0.0723,
+    "peak_rss_kb": 34384,
+    "requests": 53,
+    "day_ratio": 1.042,
+    "week_ratio": 0.948,
+    "status": "OK"
+   },
+   "hatch/rescan": {
+    "median_ms": 65.2,
+    "ms_per_pkg": 0.0652,
+    "peak_rss_kb": 34384,
+    "requests": 53,
+    "day_ratio": 0.989,
+    "week_ratio": 0.931,
+    "status": "OK"
+   },
+   "bundler/hosted": {
+    "median_ms": 211.9,
+    "ms_per_pkg": 0.2649,
+    "peak_rss_kb": 34384,
+    "requests": 43,
+    "day_ratio": 0.965,
+    "week_ratio": 1.097,
+    "status": "OK"
+   },
+   "bundler/rescan": {
+    "median_ms": 200.8,
+    "ms_per_pkg": 0.251,
+    "peak_rss_kb": 34384,
+    "requests": 43,
+    "day_ratio": 0.981,
+    "week_ratio": 1.02,
+    "status": "OK"
+   },
+   "composer/hosted": {
+    "median_ms": 186.2,
+    "ms_per_pkg": 0.2328,
+    "peak_rss_kb": 37568,
+    "requests": 43,
+    "day_ratio": 0.982,
+    "week_ratio": 1.045,
+    "status": "OK"
+   },
+   "composer/rescan": {
+    "median_ms": 128.1,
+    "ms_per_pkg": 0.1601,
+    "peak_rss_kb": 35024,
+    "requests": 43,
+    "day_ratio": 1.012,
+    "week_ratio": 0.89,
+    "status": "OK"
+   },
+   "cargo/hosted": {
+    "median_ms": 328.8,
+    "ms_per_pkg": 0.548,
+    "peak_rss_kb": 37620,
+    "requests": 33,
+    "day_ratio": 0.997,
+    "week_ratio": 1.072,
+    "status": "slow (#761)"
+   },
+   "cargo/rescan": {
+    "median_ms": 380.7,
+    "ms_per_pkg": 0.6344,
+    "peak_rss_kb": 35812,
+    "requests": 33,
+    "day_ratio": 0.992,
+    "week_ratio": 1.051,
+    "status": "slow (#761)"
+   },
+   "golang/hosted": {
+    "median_ms": 114.8,
+    "ms_per_pkg": 0.0957,
+    "peak_rss_kb": 35024,
+    "requests": 64,
+    "day_ratio": 1.049,
+    "week_ratio": 1.352,
+    "status": "regressed (#1424, week)"
+   },
+   "golang/rescan": {
+    "median_ms": 111.7,
+    "ms_per_pkg": 0.0931,
+    "peak_rss_kb": 35024,
+    "requests": 64,
+    "day_ratio": 1.026,
+    "week_ratio": 1.222,
+    "status": "regressed (#1424, week)"
+   },
+   "nuget/hosted": {
+    "median_ms": 92.4,
+    "ms_per_pkg": 0.1027,
+    "peak_rss_kb": 35152,
+    "requests": 53,
+    "day_ratio": 1.083,
+    "week_ratio": 1.36,
+    "status": "regressed (#1425, week)"
+   },
+   "nuget/rescan": {
+    "median_ms": 98.0,
+    "ms_per_pkg": 0.1089,
+    "peak_rss_kb": 35280,
+    "requests": 53,
+    "day_ratio": 0.947,
+    "week_ratio": 1.1,
+    "status": "regressed (#1425, week)"
+   },
+   "maven/hosted": {
+    "median_ms": 107.4,
+    "ms_per_pkg": 0.1074,
+    "peak_rss_kb": 35280,
+    "requests": 53,
+    "day_ratio": 1.042,
+    "week_ratio": 0.976,
+    "status": "CPU regressed (#1472)"
+   },
+   "maven/rescan": {
+    "median_ms": 95.3,
+    "ms_per_pkg": 0.0953,
+    "peak_rss_kb": 35280,
+    "requests": 53,
+    "day_ratio": 0.984,
+    "week_ratio": 0.798,
+    "status": "OK"
+   },
+   "gradle/hosted": {
+    "median_ms": 186.1,
+    "ms_per_pkg": 0.1861,
+    "peak_rss_kb": 35280,
+    "requests": 53,
+    "day_ratio": 1.032,
+    "week_ratio": 0.903,
+    "status": "OK"
+   },
+   "gradle/rescan": {
+    "median_ms": 181.0,
+    "ms_per_pkg": 0.181,
+    "peak_rss_kb": 35280,
+    "requests": 53,
+    "day_ratio": 1.005,
+    "week_ratio": 0.693,
+    "status": "OK"
+   },
+   "npm/dry-run": {
+    "median_ms": 247.7,
+    "ms_per_pkg": 0.0826,
+    "peak_rss_kb": 53112,
+    "requests": 67,
+    "day_ratio": 0.987,
+    "week_ratio": 1.038,
+    "status": "OK"
+   },
+   "npm/public-proxy": {
+    "median_ms": 247.7,
+    "ms_per_pkg": 0.0826,
+    "peak_rss_kb": 52600,
+    "requests": 151,
+    "day_ratio": 1.0,
+    "week_ratio": 1.037,
+    "status": "OK"
+   },
+   "npm/latency": {
+    "median_ms": 683.9,
+    "ms_per_pkg": 0.228,
+    "peak_rss_kb": 54104,
+    "requests": 127,
+    "day_ratio": 1.017,
+    "week_ratio": 1.019,
+    "status": "OK"
+   }
+  },
+  "regressions": [
+   {
+    "scenario": "golang/hosted",
+    "metric": "wall",
+    "ratio": 1.352,
+    "confirm_ratio": 1.32,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": true,
+    "issue": 1424,
+    "new": false,
+    "culprit": "1d523d30 (#1403)",
+    "note": "day ≈; no fix merged"
+   },
+   {
+    "scenario": "golang/rescan",
+    "metric": "wall",
+    "ratio": 1.222,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": true,
+    "issue": 1424,
+    "new": false,
+    "culprit": "1d523d30 (#1403)"
+   },
+   {
+    "scenario": "nuget/hosted",
+    "metric": "wall",
+    "ratio": 1.36,
+    "confirm_ratio": 1.202,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": true,
+    "issue": 1425,
+    "new": false,
+    "culprit": "#1340/#1341 candidates",
+    "note": "day +8.3% [+0.4,+14.8] ≈"
+   },
+   {
+    "scenario": "nuget/rescan",
+    "metric": "wall",
+    "ratio": 1.1,
+    "confirm_ratio": 1.11,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": true,
+    "issue": 1425,
+    "new": false
+   },
+   {
+    "scenario": "maven/hosted",
+    "metric": "cpu",
+    "ratio": 1.219,
+    "confirm_ratio": 1.172,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": true,
+    "issue": 1472,
+    "new": false,
+    "note": "wall -5.9%"
+   },
+   {
+    "scenario": "yarn-classic/hosted",
+    "metric": "wall",
+    "ratio": 1.108,
+    "confirm_ratio": 1.143,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": true,
+    "issue": null,
+    "new": false,
+    "culprit": "5096c41a (#1328), intended +60 artifact GETs; #1423 closed",
+    "note": "+27 ms; below 20% gate"
+   },
+   {
+    "scenario": "npm-family/hosted",
+    "metric": "rss",
+    "ratio": 1.166,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": true,
+    "issue": null,
+    "new": false,
+    "note": "npm/hosted +16.6%, yarn-classic/hosted +22.9%, npm/public-proxy +17.3%, npm/latency +17.2%, npm/dry-run +15.5%; below 30% gate"
+   },
+   {
+    "scenario": "pip/hosted",
+    "metric": "wall",
+    "ratio": 1.114,
+    "confirm_ratio": 1.089,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": false,
+    "note": "+8.9% [+7.0,+13.9] on 25+15 pairs, under the 10% gate; not 2 consecutive >=10%"
+   },
+   {
+    "scenario": "pipenv/hosted",
+    "metric": "wall",
+    "ratio": 1.141,
+    "confirm_ratio": 1.037,
+    "base": "6fcc51b4",
+    "window": "week",
+    "confirmed": false,
+    "note": "did not survive confirmation (+3.7%)"
+   }
+  ],
+  "slow": [
+   "cargo",
+   "pylock",
+   "uv",
+   "vlt",
+   "poetry",
+   "pipenv",
+   "pdm"
+  ],
+  "issues_opened": [
+   1570
+  ],
+  "issues_commented": []
  }
 ]
