@@ -1,11 +1,14 @@
 //! `scan`: batching, ecosystem scope, ordering, paths, sync, hosted refusals,
 //! the scan and hosted `--json` failure paths and their human render checks,
+//! the hosted dry run over a vendored project,
 //! scan on a real terminal, and the vendor flow.
 //!
 //! One test binary per command: each module was its own binary.
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../prebuilt_common/mod.rs"]
+mod prebuilt_common;
 #[path = "../common/pty_io.rs"]
 mod pty_io;
 #[path = "../common/rollback_json.rs"]
@@ -19,6 +22,7 @@ mod coverage_fix_scan_discovery_corrupt_ledger;
 mod covgap_commands_fetch_stage;
 mod covgap_commands_scan_vendor_flow;
 mod covgap_ecosystem_dispatch;
+mod hosted_dryrun_vendored;
 mod hosted_failure_paths;
 mod hosted_fixture;
 mod hosted_management_refusals;

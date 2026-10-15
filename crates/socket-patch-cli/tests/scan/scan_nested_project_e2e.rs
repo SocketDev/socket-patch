@@ -9,8 +9,7 @@
 use crate::common::envelope::{all_codes, parse_json_envelope};
 use crate::common::{binary, git_sha256, hermetic_command};
 
-#[path = "../prebuilt_common/mod.rs"]
-mod prebuilt_common;
+use crate::prebuilt_common;
 
 use std::path::Path;
 

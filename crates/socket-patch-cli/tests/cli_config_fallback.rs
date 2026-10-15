@@ -133,7 +133,9 @@ const PROXY_NOTICE: &str = "No SOCKET_API_TOKEN set";
 
 /// A config-supplied token + apiBaseUrl authenticate the client: with no
 /// org anywhere the binary must hit the fixture's `/v0/organizations` with
-/// the config token as bearer.
+/// the config token as bearer. The `SOCKET_DEBUG` provenance line for the
+/// config-sourced URL (the `inspect` closure in `resolve_api_base_url`)
+/// prints only under the debug flag, in human and `--json` runs alike.
 #[tokio::test]
 async fn config_token_and_api_base_url_authenticate() {
     let server = MockServer::start().await;
@@ -158,6 +160,34 @@ async fn config_token_and_api_base_url_authenticate() {
         Some(format!("Bearer {}", token('c')).as_str()),
         "org auto-resolve must hit the config apiBaseUrl with the config token"
     );
+
+    let provenance = format!("api base url: `{}` from socket-cli config", server.uri());
+    for (json, debug) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut cmd = scan_cmd(project.path(), data.path());
+        if debug {
+            cmd.env("SOCKET_DEBUG", "1");
+        }
+        if json {
+            cmd.arg("--json");
+        }
+        let out = run(cmd);
+        assert_eq!(out.code, Some(0), "json={json}; stderr:\n{}", out.stderr);
+        if debug {
+            assert!(
+                out.stderr.contains(&provenance),
+                "SOCKET_DEBUG=1 must name the config apiBaseUrl and its source \
+                 (json={json}); stderr:\n{}",
+                out.stderr
+            );
+        } else {
+            assert!(
+                !out.stderr.contains("api base url:"),
+                "without SOCKET_DEBUG the provenance diagnostic must stay silent \
+                 (json={json}); stderr:\n{}",
+                out.stderr
+            );
+        }
+    }
 }
 
 /// `defaultOrg` from the config skips the org auto-resolve round-trip —
