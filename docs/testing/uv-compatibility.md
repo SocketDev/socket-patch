@@ -189,7 +189,17 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   directory at or above it holding a `uv.toml` or a `pyproject.toml` with
   `[tool.uv]` (`uv.toml` first), so a script scanned from `scripts/` under
   a project that sets `no-sources` is refused too, with the parent file
-  named (#1501); a project stops that lookup at itself. `UV_NO_SOURCES`, `UV_NO_SOURCES_PACKAGE`, the matching
+  named (#1501). A project takes its settings from the same lookup, so one
+  whose own `pyproject.toml` has no `[tool.uv]` (and no `uv.toml` beside
+  it) inherits a parent's `uv.toml` / `[tool.uv]` (`exclude-newer`,
+  `resolution`, indexes). The `[tool.uv]` table a wired source adds would
+  make uv read the project's pyproject instead and drop every parent
+  setting, failing `uv sync --locked`, so both modes refuse it before any
+  file is written, naming the parent file: vendored with
+  `pypi_uv_ancestor_settings`, hosted with `redirect_uv_project_unsupported`
+  (#1545). A parent holding only another project's metadata (a workspace
+  root's `workspace` / `sources`, `managed`, `dev-dependencies` and so on)
+  sets nothing the project inherits and is not refused. `UV_NO_SOURCES`, `UV_NO_SOURCES_PACKAGE`, the matching
   flags and a user-level `uv.toml` belong to the machine that installs,
   which the scan cannot see.
 - Native projects and scripts resolving multiple versions of the same package
