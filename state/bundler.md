@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-15 (run 43), main `e76cb9b`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23.
+Last updated: 2026-10-15 (run 44), main `657fce2`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23.
 
 ## Coverage matrix
 
@@ -405,6 +405,16 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Gemspec product: commented `# spec.version = "…"` above `spec.version = Acme::VERSION` | **fail #1573** (`pkg:gem/acme@0.0.1`) |
 | Gemspec product: commented `# spec.name = "…"` above the real one | **fail #1573** |
 
+### Run 44 (main `657fce2`, v5.0.1; Linux Ruby 3.3.6; scratch copies of `e2e_redirect_gem_stale_install.rs` / `e2e_redirect_gem_build.rs`, real `bundle install` / `bundle cache`)
+
+| Cell | 4.0.18 | 2.5.22 |
+| --- | --- | --- |
+| #1573 fix (#1582): commented / `=begin` / heredoc `spec.name` / `spec.version`, last assignment wins | pass (closed) | — |
+| Docker layout hosted stale guard (`GEM_HOME` = `BUNDLE_APP_CONFIG`): project `.bundle/config` `BUNDLE_PATH` / `BUNDLE_DEPLOYMENT` ignored → shared-home warning + not attested; same keys in `$BUNDLE_APP_CONFIG/config` → quiet + attested (6 variants) | pass | — |
+| H→V takeover over a patched `vendor/cache` archive → takeover advisory `upstream_gem_stale_cache` | pass | pass |
+| Same → `vendor --revert` / `remove` / `rollback` of the vendored gem → no warning, fresh frozen install keeps patched bytes | **fail #1594** | **fail #1594** |
+| H→V takeover on a CHECKSUMS lock with a non-rubygems.org upstream | pass (refused `redirect_revert_failed`, documented) | — |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -427,14 +437,16 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. H→V takeover with the hosted patched archive in `vendor/cache`, end to end, then `vendor --revert` / `remove`. Both takeover paths forward `upstream_gem_stale_cache` (`vendor.rs:1958`, `:3270`), so this is lower priority.
-2. Re-run #985 / #1109 (`agent:needs-human`) and #1573 when fixes merge.
-3. Docker-style layout, hosted half: the stale-install guard with `GEM_HOME=BUNDLE_APP_CONFIG=/usr/local/bundle` and a committed project `.bundle/config` (the agent half passed in run 43).
-4. Gemspec product, remaining shapes: `Gem::Specification.new "name", "1.0"` constructor args with a stem that differs from the name, `=begin`/`=end` blocks.
-5. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
+1. Re-run #985 / #1109 (`agent:needs-human`) and #1594 when fixes merge.
+2. #1594 CHECKSUMS arm against real rubygems.org (needs an upstream the takeover can re-derive a checksum for; the mock upstream is refused).
+3. Gemspec product, `Gem::Specification.new "name", "1.0"` constructor args with a stem that differs from the name (rare).
+4. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
+5. V→H→V round trips with a committed `vendor/cache` (does a hosted re-pin leave the vendored-era cache consistent?).
 
 ## Known non-bugs
 
+- To drive a successful gem H→V takeover from `e2e_redirect_gem_build.rs`, mount a priority-1 `/patches/package` answer with a `sha512` tarball artifact and a `gem-stub-gemspec` artifact (`gem spec <archive> --ruby`); without them vendored mode fails `vendor_prebuilt_required` (run 44).
+- In the Docker layout, the stale-install remedy's `bundle config set --local path vendor/bundle` writes to `$BUNDLE_APP_CONFIG/config` (Bundler's own behaviour); it still takes effect (run 44).
 - `patches-api.socket.dev` / `api.socket.dev` are blocked from the sandbox. Use a local mock API (`--api-url`, `--api-token fake --org org`). A ~60-line Python mock serving `/v0/orgs/org/patches/{batch,view/<uuid>,by-package/…}` with `blobContent` is enough for agent and `-g` flows; for hosted, use a hold-open copy of `e2e_redirect_gem_build.rs`.
 - v5 vendoring downloads service artifacts only (`--vendor-source build` is gone). To drive vendored cells, copy `e2e_vendor_gem_build.rs` (its `prebuilt_common` fixture serves the artifact) rather than calling the CLI by hand: `vendor --offline` without a prestaged artifact fails with `vendor_service_offline_conflict`, which is expected.
 - `--global-prefix` takes the package-leaf dir (`<gem home>/gems`), like `node_modules` / `site-packages` for the other ecosystems. Pointing it at the gem home itself scans 0 packages; that's the convention, not a bug.
