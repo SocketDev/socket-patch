@@ -191,8 +191,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `pnpm_config_trust_lockfile=false` environment variable the scan runs with
   (pnpm reads it ahead of the file, so nothing is written and the warning names
   the variable). pnpm >=11 reads a `pnpm_config_*` variable only when it is
-  exactly `true` or `false`; any other value (empty, `null`, `undefined`, `0`)
-  is ignored for the file, so the CLI ignores it too and writes the key.
+  `true` or `false` (pnpm 12 trims surrounding spaces first, pnpm 11 does
+  not); any other value (empty, `null`, `undefined`, `0`) is ignored for the
+  file, so the CLI ignores it too and writes the key.
   pnpm >=11 needs this for hosted URLs.
   This skips registry re-verification for the whole lock; tarball integrity
   remains enforced. pnpm <=10 does not need the setting. An existing

@@ -146,7 +146,7 @@ fn env_setting(
     prefixes.iter().find_map(|prefix| {
         let var = format!("{prefix}{key}");
         if *prefix == "pnpm_config_" {
-            pnpm_env_setting(&var, &env)
+            pnpm_env_setting(&var, major, &env)
         } else {
             let value = env(&var)?.trim().to_string();
             let source = format!("`{var}={value}` in the environment");
@@ -160,12 +160,28 @@ fn env_setting(
 }
 
 /// A boolean setting from `var`, a variable of the `pnpm_config_*` family
-/// (either case) that pnpm 11 and newer read. pnpm takes only an exact
-/// `true` or `false` there and ignores any other value (empty, `null`,
-/// `undefined`, `0`, `FALSE`, ` false`), reading the settings file instead
-/// (#1557), so such a value sets nothing.
-fn pnpm_env_setting(var: &str, env: impl Fn(&str) -> Option<String>) -> Option<PnpmSetting> {
-    let value = env(var).filter(|value| matches!(value.as_str(), "true" | "false"))?;
+/// (either case) that pnpm 11 and newer read for a project on pnpm
+/// `major`. pnpm takes only `true` or `false` there and ignores any other
+/// value (empty, `null`, `undefined`, `0`, `FALSE`), reading the settings
+/// file instead (#1557), so such a value sets nothing. pnpm 12 trims the
+/// value first (` false` is false); pnpm 11 does not (` false` is
+/// ignored). With the major unknown the value is trimmed, so a padded
+/// `false` is respected: for the lock that withholds pins, the safe side.
+fn pnpm_env_setting(
+    var: &str,
+    major: Option<u32>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<PnpmSetting> {
+    let raw = env(var)?;
+    let value = if major == Some(11) {
+        raw.as_str()
+    } else {
+        raw.trim()
+    };
+    if !matches!(value, "true" | "false") {
+        return None;
+    }
+    let value = value.to_string();
     Some(PnpmSetting {
         source: format!("`{var}={value}` in the environment"),
         value,
@@ -187,8 +203,8 @@ pub fn trust_lockfile_env(
         return None;
     }
     // pnpm 11's spelling, then the uppercase one pnpm 12 reads too.
-    env_setting("trust-lockfile", Some(major.unwrap_or(11)), &env)
-        .or_else(|| pnpm_env_setting("PNPM_CONFIG_TRUST_LOCKFILE", &env))
+    pnpm_env_setting("pnpm_config_trust_lockfile", major, &env)
+        .or_else(|| pnpm_env_setting("PNPM_CONFIG_TRUST_LOCKFILE", major, &env))
 }
 
 /// [`pnpm_setting`], falling back to the environment ([`env_setting`],
@@ -983,18 +999,21 @@ mod tests {
     }
 
     /// #1557: pnpm 11 and newer read a `pnpm_config_*` boolean only when it
-    /// is exactly `true` or `false` and otherwise ignore it for the settings
-    /// file (measured with `pnpm config get` on pnpm 11.28.5), so any other
-    /// value (an unset CI variable's empty string, `null`, `undefined`,
-    /// `0`, `FALSE`, ` false`) sets nothing, for `trustLockfile` and every
-    /// other key alike. npm's family keeps its own coercion (pnpm 10 and
-    /// older, see [`PnpmSetting::as_bool`]).
+    /// is `true` or `false` and otherwise ignore it for the settings file
+    /// (measured with `pnpm config get` on pnpm 11.28.5 and 12.11.2), so any
+    /// other value (an unset CI variable's empty string, `null`,
+    /// `undefined`, `0`, `FALSE`) sets nothing, for `trustLockfile` and
+    /// every other key alike. pnpm 12 trims the value first and pnpm 11
+    /// does not, so a padded ` false` is ignored only on pnpm 11; with the
+    /// major unknown it is respected. npm's family keeps its own coercion
+    /// (pnpm 10 and older, see [`PnpmSetting::as_bool`]).
     #[test]
     fn a_pnpm_config_variable_counts_only_as_true_or_false() {
         let one = |var: &'static str, value: &'static str| {
             move |name: &str| (name == var).then(|| value.to_string())
         };
-        const IGNORED: &[&str] = &["", "  ", "null", "undefined", "0", "FALSE", " false", "yes"];
+        const IGNORED: &[&str] = &["", "  ", "null", "undefined", "0", "FALSE", "yes"];
+        const PADDED: &[&str] = &[" false", "false ", " false "];
         for var in ["pnpm_config_trust_lockfile", "PNPM_CONFIG_TRUST_LOCKFILE"] {
             for value in IGNORED {
                 for major in [Some(11), Some(12), None] {
@@ -1008,6 +1027,14 @@ mod tests {
             for (value, on) in [("true", true), ("false", false)] {
                 let found = trust_lockfile_env(Some(11), one(var, value)).unwrap();
                 assert_eq!(found.as_bool(), Some(on), "{var}={value}");
+            }
+            for value in PADDED {
+                assert_eq!(trust_lockfile_env(Some(11), one(var, value)), None);
+                for major in [Some(12), None] {
+                    let found = trust_lockfile_env(major, one(var, value)).unwrap();
+                    assert_eq!(found.as_bool(), Some(false), "{var}={value:?}");
+                    assert!(found.source.contains(&format!("`{var}=false`")));
+                }
             }
         }
         for key in [
@@ -1028,6 +1055,13 @@ mod tests {
             }
             let found = env_setting(key, Some(11), one(var, "false")).unwrap();
             assert_eq!(found.as_bool(), Some(false), "{var}");
+            for value in PADDED {
+                assert_eq!(env_setting(key, Some(11), one(var, value)), None);
+                for major in [Some(12), None] {
+                    let found = env_setting(key, major, one(var, value)).unwrap();
+                    assert_eq!(found.as_bool(), Some(false), "{var}={value:?}");
+                }
+            }
         }
         // An ignored pnpm spelling does not hide the next one pnpm reads.
         let found = trust_lockfile_env(
