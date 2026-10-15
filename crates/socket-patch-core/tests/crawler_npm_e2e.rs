@@ -3,17 +3,22 @@
 //! read_package_json, find_by_purls scoped vs unscoped, crawl_all
 //! over a synthetic node_modules tree).
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use socket_patch_core::crawlers::npm_crawler::{
-    build_npm_purl, bun_global_dir_from_env, get_bun_global_prefix, get_bun_global_prefix_with,
-    get_npm_global_prefix, get_npm_global_prefix_with, get_pnpm_global_prefix,
-    get_pnpm_global_prefix_with, get_yarn_global_prefix, get_yarn_global_prefix_with,
-    parse_bun_ls_global_output, parse_npm_root_output, parse_package_name, parse_pnpm_root_output,
-    parse_yarn_dir_output, read_package_json, resolve_bun_global_prefix_with,
+    build_npm_purl, bun_global_dir_from_env, find_store_peer_variant_copies, get_bun_global_prefix,
+    get_bun_global_prefix_with, get_npm_global_prefix, get_npm_global_prefix_with,
+    get_pnpm_global_prefix, get_pnpm_global_prefix_with, get_yarn_global_prefix,
+    get_yarn_global_prefix_with, parse_bun_ls_global_output, parse_npm_root_output,
+    parse_package_name, parse_pnpm_root_output, parse_yarn_dir_output, read_package_json,
+    resolve_bun_global_prefix_with,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::NpmCrawler;
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+use socket_patch_core::manifest::schema::PatchFileInfo;
+use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, PatchSources};
 
 fn options_at(root: &Path) -> CrawlerOptions {
     CrawlerOptions {
@@ -2201,9 +2206,6 @@ async fn crawl_all_inventories_pnpm3_legacy_registry_store_exactly_once() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
-    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-    use socket_patch_core::manifest::schema::PatchFileInfo;
-    use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, PatchSources};
     use socket_patch_core::patch::rollback::rollback_package_patch;
     use std::os::unix::fs::symlink;
 
@@ -2248,7 +2250,7 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
         .await
         .unwrap();
 
-    let mut files = std::collections::HashMap::new();
+    let mut files = HashMap::new();
     files.insert(
         "package/index.js".to_string(),
         PatchFileInfo {
@@ -2332,9 +2334,6 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn apply_heals_unpatched_pnpm_twin_when_primary_already_patched() {
-    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-    use socket_patch_core::manifest::schema::PatchFileInfo;
-    use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, PatchSources};
     use std::os::unix::fs::symlink;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2369,7 +2368,7 @@ async fn apply_heals_unpatched_pnpm_twin_when_primary_already_patched() {
         .await
         .unwrap();
 
-    let mut files = std::collections::HashMap::new();
+    let mut files = HashMap::new();
     files.insert(
         "package/index.js".to_string(),
         PatchFileInfo {
@@ -3104,8 +3103,6 @@ async fn find_by_purls_skips_vlt_dependency_links_and_importer_resolved_copies()
 #[tokio::test]
 #[serial_test::parallel]
 async fn find_by_purls_returns_same_version_git_copy_as_its_own_primary() {
-    use socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies;
-
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
     let store = nm.join(".vlt");
@@ -3298,51 +3295,44 @@ async fn crawl_all_inventories_vlt_workspace_root_store_once() {
     );
 }
 
-/// The apply fixture shared by the vlt fan-out tests: one patched file
-/// `package/index.js` and the blobs to apply and roll it back.
-#[cfg(unix)]
-struct VltPatch {
-    files: std::collections::HashMap<String, socket_patch_core::manifest::schema::PatchFileInfo>,
-    blobs: std::path::PathBuf,
+/// The apply fixture shared by the store fan-out tests: one patched file
+/// `package/index.js` (ORIGINAL -> PATCHED) and the blobs to apply and
+/// roll it back.
+struct IndexJsPatch {
+    files: HashMap<String, PatchFileInfo>,
+    blobs: PathBuf,
 }
 
-#[cfg(unix)]
-const VLT_ORIGINAL: &[u8] = b"module.exports = 'vulnerable';\n";
-#[cfg(unix)]
-const VLT_PATCHED: &[u8] = b"module.exports = 'fixed';\n";
+const ORIGINAL: &[u8] = b"module.exports = 'vulnerable';\n";
+const PATCHED: &[u8] = b"module.exports = 'fixed';\n";
 
-#[cfg(unix)]
-async fn vlt_patch(root: &Path) -> VltPatch {
-    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
-    use socket_patch_core::manifest::schema::PatchFileInfo;
-
-    let before_hash = compute_git_sha256_from_bytes(VLT_ORIGINAL);
-    let after_hash = compute_git_sha256_from_bytes(VLT_PATCHED);
+async fn index_js_patch(root: &Path) -> IndexJsPatch {
+    let before_hash = compute_git_sha256_from_bytes(ORIGINAL);
+    let after_hash = compute_git_sha256_from_bytes(PATCHED);
     let blobs = root.join("blobs");
     tokio::fs::create_dir_all(&blobs).await.unwrap();
-    tokio::fs::write(blobs.join(&after_hash), VLT_PATCHED)
+    tokio::fs::write(blobs.join(&after_hash), PATCHED)
         .await
         .unwrap();
-    tokio::fs::write(blobs.join(&before_hash), VLT_ORIGINAL)
+    tokio::fs::write(blobs.join(&before_hash), ORIGINAL)
         .await
         .unwrap();
-    let files = std::collections::HashMap::from([(
+    let files = HashMap::from([(
         "package/index.js".to_string(),
         PatchFileInfo {
             before_hash,
             after_hash,
         },
     )]);
-    VltPatch { files, blobs }
+    IndexJsPatch { files, blobs }
 }
 
-#[cfg(unix)]
-async fn vlt_apply(
+/// Apply `patch` to `primary` and its store twins under the Warn policy.
+async fn apply_index_js(
     purl: &str,
     primary: &Path,
-    patch: &VltPatch,
+    patch: &IndexJsPatch,
 ) -> socket_patch_core::patch::apply::ApplyResult {
-    use socket_patch_core::patch::apply::{apply_package_patch, MismatchPolicy, PatchSources};
     let sources = PatchSources {
         blobs_path: &patch.blobs,
         mem_blobs: None,
@@ -3430,26 +3420,26 @@ async fn apply_and_rollback_reach_every_vlt_variant_copy() {
         assert!(copies.len() >= 2, "{}: several copies", case.tree);
 
         let cas = tmp.path().join("cas-index.js");
-        tokio::fs::write(&cas, VLT_ORIGINAL).await.unwrap();
+        tokio::fs::write(&cas, ORIGINAL).await.unwrap();
         for copy in &copies {
             std::fs::hard_link(&cas, copy.join("index.js")).unwrap();
         }
-        let patch = vlt_patch(tmp.path()).await;
+        let patch = index_js_patch(tmp.path()).await;
         let primary = tmp.path().join(case.primary);
         assert!(primary.join("package.json").is_file(), "{}", case.tree);
 
-        let result = vlt_apply(case.purl, &primary, &patch).await;
+        let result = apply_index_js(case.purl, &primary, &patch).await;
         assert!(result.success, "{}: {:?}", case.tree, result.error);
         for copy in &copies {
             assert_eq!(
                 tokio::fs::read(copy.join("index.js")).await.unwrap(),
-                VLT_PATCHED,
+                PATCHED,
                 "{}: every store copy is patched ({})",
                 case.tree,
                 copy.display()
             );
         }
-        assert_eq!(tokio::fs::read(&cas).await.unwrap(), VLT_ORIGINAL);
+        assert_eq!(tokio::fs::read(&cas).await.unwrap(), ORIGINAL);
 
         let rb =
             rollback_package_patch(case.purl, &primary, &patch.files, &patch.blobs, false).await;
@@ -3457,13 +3447,13 @@ async fn apply_and_rollback_reach_every_vlt_variant_copy() {
         for copy in &copies {
             assert_eq!(
                 tokio::fs::read(copy.join("index.js")).await.unwrap(),
-                VLT_ORIGINAL,
+                ORIGINAL,
                 "{}: every store copy is restored ({})",
                 case.tree,
                 copy.display()
             );
         }
-        assert_eq!(tokio::fs::read(&cas).await.unwrap(), VLT_ORIGINAL);
+        assert_eq!(tokio::fs::read(&cas).await.unwrap(), ORIGINAL);
     }
 }
 
@@ -3482,15 +3472,15 @@ async fn apply_heals_unpatched_vlt_twin_when_primary_already_patched() {
         .join("~npm~use-sync-external-store@1.2.0~peer.2/node_modules/use-sync-external-store");
     let twin = store
         .join("~npm~use-sync-external-store@1.2.0~peer.3/node_modules/use-sync-external-store");
-    tokio::fs::write(primary_copy.join("index.js"), VLT_PATCHED)
+    tokio::fs::write(primary_copy.join("index.js"), PATCHED)
         .await
         .unwrap();
-    tokio::fs::write(twin.join("index.js"), VLT_ORIGINAL)
+    tokio::fs::write(twin.join("index.js"), ORIGINAL)
         .await
         .unwrap();
-    let patch = vlt_patch(tmp.path()).await;
+    let patch = index_js_patch(tmp.path()).await;
 
-    let result = vlt_apply(
+    let result = apply_index_js(
         "pkg:npm/use-sync-external-store@1.2.0",
         &tmp.path()
             .join("packages/a/node_modules/use-sync-external-store"),
@@ -3500,7 +3490,604 @@ async fn apply_heals_unpatched_vlt_twin_when_primary_already_patched() {
     assert!(result.success, "{:?}", result.error);
     assert_eq!(
         tokio::fs::read(twin.join("index.js")).await.unwrap(),
-        VLT_PATCHED,
+        PATCHED,
         "an AlreadyPatched primary must not mask a still-vulnerable twin"
     );
+}
+
+// ── store walkers: skip and fallback regions ─────────────────────────
+//
+// The skip/fallback regions of the store walkers
+// (`collect_nested_node_modules`, `collect_nested_store_entries`,
+// `gather_scoped_packages`) and every reject/fallback gate of
+// `find_store_peer_variant_copies` (pnpm and vlt stores). Each test stages
+// the on-disk shape that reaches its region and asserts resolver/scan
+// output.
+
+// ── plain-FILE store markers at a node_modules root ────────────
+
+/// A stray plain FILE named `.pnpm` or `.registry.npmjs.org` at a
+/// `node_modules` root (trivially stageable; real trees carry such junk)
+/// must be skipped by BOTH walks — the resolver's nested-nm BFS and the
+/// scan pass — without erroring out and without being mistaken for a
+/// virtual store.
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_and_crawl_all_skip_plain_file_store_markers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    stage_npm_pkg(&nm, "foo", "1.0.0").await;
+    // Plain files where the store DIRS would live.
+    tokio::fs::write(nm.join(".pnpm"), b"junk").await.unwrap();
+    tokio::fs::write(nm.join(".registry.npmjs.org"), b"junk")
+        .await
+        .unwrap();
+
+    // Resolver walk: foo resolves at the root, the marker files are
+    // skipped (no error, no phantom copies).
+    let crawler = NpmCrawler::new();
+    let purls = vec!["pkg:npm/foo@1.0.0".to_string()];
+    let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+    assert_eq!(result.len(), 1, "only foo resolves; got {result:?}");
+    let copies = result.get("pkg:npm/foo@1.0.0").unwrap();
+    assert_eq!(copies.len(), 1, "exactly one physical copy of foo");
+    assert_eq!(copies[0].path, nm.join("foo"));
+
+    // Scan walk: exactly one package inventoried.
+    let packages = crawler.crawl_all(&options_at(tmp.path())).await;
+    assert_eq!(
+        packages.len(),
+        1,
+        "marker files must not add or hide packages; got {:?}",
+        packages.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(packages[0].purl, "pkg:npm/foo@1.0.0");
+    assert_eq!(packages[0].path, nm.join("foo"));
+}
+
+// ── stray entries inside a `@scope` dir during the nested-nm BFS ─
+
+/// The resolver's nested-node_modules walk descends `@scope/<pkg>` dirs
+/// looking for deeper `node_modules`. Hidden entries (`.DS_Store`-style
+/// junk is ubiquitous inside scope dirs on macOS) and plain files inside
+/// the `@scope` dir must be skipped without breaking or polluting the
+/// walk — the target below the real scoped package must still resolve.
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_by_purls_ignores_stray_entries_in_scope_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    stage_npm_pkg(&nm, "@scope/pkg", "1.0.0").await;
+    // The target lives ONLY inside the scoped package's nested
+    // node_modules, so resolving it forces the walk through @scope.
+    stage_npm_pkg(&nm.join("@scope/pkg/node_modules"), "leaf", "2.0.0").await;
+    // Stray entries inside the @scope dir itself: a hidden dir and a
+    // plain file.
+    tokio::fs::create_dir_all(nm.join("@scope/.cache"))
+        .await
+        .unwrap();
+    tokio::fs::write(nm.join("@scope/notes.txt"), b"junk")
+        .await
+        .unwrap();
+
+    let crawler = NpmCrawler::new();
+    let purls = vec![
+        "pkg:npm/leaf@2.0.0".to_string(),
+        "pkg:npm/@scope/pkg@1.0.0".to_string(),
+    ];
+    let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+
+    assert_eq!(result.len(), 2, "both packages resolve; got {result:?}");
+    assert_eq!(
+        result.get("pkg:npm/leaf@2.0.0").unwrap()[0].path,
+        nm.join("@scope/pkg/node_modules/leaf"),
+        "leaf resolves only by descending @scope/pkg's nested node_modules"
+    );
+    assert_eq!(
+        result.get("pkg:npm/@scope/pkg@1.0.0").unwrap()[0].path,
+        nm.join("@scope/pkg")
+    );
+}
+
+// ── scoped root-linked pnpm direct dep: dedup + no symlink descend ─
+
+/// Scoped twin of the unscoped `identity_seen` dedup: a SCOPED pnpm
+/// direct dep is root-linked (`node_modules/@scope/leaf` → store copy),
+/// so the importer pass inventories it first and the store pass must
+/// skip the redundant re-read — while STILL descending the store copy,
+/// because a bundled dep is a real dir physically present only there.
+/// The importer pass must inventory the symlinked scoped package without
+/// descending through the symlink (descending would surface the bundled
+/// dep at its symlink-relative path instead of its physical store home).
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_dedups_scoped_root_linked_pnpm_direct_dep_and_skips_symlink_descend() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".pnpm");
+
+    // Store copy of the scoped package…
+    stage_npm_pkg(
+        &store.join("@scope+leaf@2.0.0").join("node_modules"),
+        "@scope/leaf",
+        "2.0.0",
+    )
+    .await;
+    let store_leaf = store.join("@scope+leaf@2.0.0/node_modules/@scope/leaf");
+    // …with a bundled dep as a REAL dir below it (its only physical home).
+    stage_npm_pkg(&store_leaf.join("node_modules"), "bundled", "1.0.0").await;
+
+    // Importer root: the scoped direct dep is a symlink into the store.
+    tokio::fs::create_dir_all(nm.join("@scope")).await.unwrap();
+    symlink(&store_leaf, nm.join("@scope/leaf")).unwrap();
+
+    let crawler = NpmCrawler::new();
+    let result = crawler.crawl_all(&options_at(tmp.path())).await;
+
+    let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+    assert_eq!(
+        result.len(),
+        2,
+        "exactly @scope/leaf (once) + bundled; got {purls:?}"
+    );
+    let leaf_copies: Vec<_> = result
+        .iter()
+        .filter(|p| p.purl == "pkg:npm/@scope/leaf@2.0.0")
+        .collect();
+    assert_eq!(
+        leaf_copies.len(),
+        1,
+        "the root-linked scoped dep must be inventoried exactly once"
+    );
+    assert_eq!(
+        leaf_copies[0].path,
+        nm.join("@scope/leaf"),
+        "the importer-root path wins over the store copy"
+    );
+    let bundled = result
+        .iter()
+        .find(|p| p.purl == "pkg:npm/bundled@1.0.0")
+        .unwrap_or_else(|| panic!("bundled dep must be inventoried; got {purls:?}"));
+    assert_eq!(
+        bundled.path,
+        store_leaf.join("node_modules/bundled"),
+        "bundled dep surfaces at its physical store home — reached by \
+         descending the store entry (dedup skip must not stop the \
+         descent), never through the importer symlink"
+    );
+}
+
+// ── find_store_peer_variant_copies: pnpm probe gates ────────────
+
+/// All four reject/fallback gates of the peer-variant store probe, in one
+/// staged store:
+/// - an UNDECODABLE entry name stays probeable and its real matching copy
+///   IS returned (a regression here silently skips a physical copy,
+///   leaving a live vulnerable file after apply reports success);
+/// - an entry whose candidate dir is absent is skipped;
+/// - a candidate that is a SYMLINK to another entry's copy is skipped
+///   (that copy is already yielded via its own entry — no double count);
+/// - an imposter whose package.json disagrees with the decoded name is
+///   rejected by the authority probe.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_store_peer_variant_copies_probe_gates() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".pnpm");
+
+    // (a) The primary peer-variant copy.
+    stage_npm_pkg(
+        &store.join("foo@1.0.0(react@17.0.2)").join("node_modules"),
+        "foo",
+        "1.0.0",
+    )
+    .await;
+    let primary = store.join("foo@1.0.0(react@17.0.2)/node_modules/foo");
+
+    // (b) A real twin under another peer combination — must be returned.
+    stage_npm_pkg(
+        &store.join("foo@1.0.0(react@18.2.0)").join("node_modules"),
+        "foo",
+        "1.0.0",
+    )
+    .await;
+    let twin = store.join("foo@1.0.0(react@18.2.0)/node_modules/foo");
+
+    // (c) An UNDECODABLE entry name (`_` reads as a legacy peer suffix,
+    // so decode yields None) holding a real matching copy — must be
+    // returned: undecodable stays probeable.
+    stage_npm_pkg(
+        &store.join("foo_bar@1.0.0").join("node_modules"),
+        "foo",
+        "1.0.0",
+    )
+    .await;
+    let undecodable_copy = store.join("foo_bar@1.0.0/node_modules/foo");
+
+    // (d) A matching-decoded entry whose node_modules holds no `foo` dir.
+    tokio::fs::create_dir_all(store.join("foo@1.0.0(vue@3.2.0)").join("node_modules"))
+        .await
+        .unwrap();
+
+    // (e) A matching-decoded entry whose `foo` is a SYMLINK to twin (b).
+    let sym_nm = store.join("foo@1.0.0(sym@1.0.0)").join("node_modules");
+    tokio::fs::create_dir_all(&sym_nm).await.unwrap();
+    symlink(&twin, sym_nm.join("foo")).unwrap();
+
+    // (f) An imposter: the entry NAME decodes to foo@1.0.0 (passes the
+    // advertisement filter) but the package.json inside says 1.0.1.
+    stage_npm_pkg(
+        &store.join("foo@1.0.0(baz@1.0.0)").join("node_modules"),
+        "foo",
+        "1.0.1",
+    )
+    .await;
+
+    let copies = find_store_peer_variant_copies(&primary).await;
+
+    let got: std::collections::HashSet<_> = copies.iter().cloned().collect();
+    let want: std::collections::HashSet<_> = [twin.clone(), undecodable_copy.clone()]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        got, want,
+        "exactly the real twin and the undecodable-entry copy — no \
+         primary, no symlink duplicate, no absent candidate, no imposter"
+    );
+}
+
+/// Fail-safe gate: when the PRIMARY's package.json is unreadable there is
+/// no safe way to identify twins, so NONE are reported — even though a
+/// perfectly probeable twin exists in the store (the primary itself is
+/// still handled by the caller).
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_store_peer_variant_copies_unreadable_primary_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".pnpm");
+
+    // Primary: a bare dir with NO package.json.
+    let primary = store.join("foo@1.0.0(react@17.0.2)/node_modules/foo");
+    tokio::fs::create_dir_all(&primary).await.unwrap();
+
+    // A fully-formed twin that WOULD match if the primary were readable.
+    stage_npm_pkg(
+        &store.join("foo@1.0.0(react@18.2.0)").join("node_modules"),
+        "foo",
+        "1.0.0",
+    )
+    .await;
+
+    let copies = find_store_peer_variant_copies(&primary).await;
+    assert!(
+        copies.is_empty(),
+        "unreadable primary identity ⇒ no twins reported; got {copies:?}"
+    );
+}
+
+// ── find_store_peer_variant_copies: vlt probe gates ─────────────
+
+/// vlt's fan-out from a workspace member's link: the store lives beside
+/// the ROOT `node_modules`, reachable only on the link's canonical chain.
+/// Real copies whose DepID decodes to the primary's `name@version` are
+/// returned (a `~peer.<n>` twin); a git dependency of the same
+/// `name@version` is never a variant (the resolver reports it as a primary
+/// of its own), and a store entry reached through a link is not a store
+/// entry.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_store_peer_variant_copies_vlt_member_link_and_git_copy() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".vlt");
+    let entry = |id: &str| store.join(id).join("node_modules");
+    stage_npm_pkg(&entry("~npm~foo@1.0.0~peer.2"), "foo", "1.0.0").await;
+    stage_npm_pkg(&entry("~npm~foo@1.0.0~peer.3"), "foo", "1.0.0").await;
+    stage_npm_pkg(&entry("git~github_cu+foo~v1.0.0"), "foo", "1.0.0").await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    stage_npm_pkg(&elsewhere.path().join("node_modules"), "foo", "1.0.0").await;
+    symlink(elsewhere.path(), store.join("~npm~foo@1.0.0~peer.4")).unwrap();
+
+    let member_nm = tmp.path().join("packages/a/node_modules");
+    tokio::fs::create_dir_all(&member_nm).await.unwrap();
+    symlink(
+        "../../../node_modules/.vlt/~npm~foo@1.0.0~peer.2/node_modules/foo",
+        member_nm.join("foo"),
+    )
+    .unwrap();
+
+    let copies = find_store_peer_variant_copies(&member_nm.join("foo")).await;
+    assert_eq!(
+        copies
+            .iter()
+            .map(|p| std::fs::canonicalize(p).unwrap())
+            .collect::<Vec<_>>(),
+        vec![std::fs::canonicalize(entry("~npm~foo@1.0.0~peer.3").join("foo")).unwrap()],
+        "exactly the peer twin; got {copies:?}"
+    );
+}
+
+/// Fail-safe gate on the vlt side too: an unreadable primary identity
+/// reports no twins.
+#[tokio::test]
+#[serial_test::parallel]
+async fn find_store_peer_variant_copies_vlt_unreadable_primary_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".vlt");
+    let primary = store.join("~npm~foo@1.0.0~peer.2/node_modules/foo");
+    tokio::fs::create_dir_all(&primary).await.unwrap();
+    stage_npm_pkg(
+        &store.join("~npm~foo@1.0.0~peer.3").join("node_modules"),
+        "foo",
+        "1.0.0",
+    )
+    .await;
+    assert!(find_store_peer_variant_copies(&primary).await.is_empty());
+}
+
+// ── pnpm<=3 legacy store: stray node_modules + depth-1 home ────
+
+/// Two edge shapes of the nested legacy-store walk:
+/// - a stray `node_modules` child inside the store host belongs to a
+///   parent entry, never a name/version coordinate — a decoy package
+///   staged below it must NOT be inventoried;
+/// - a depth-1 package home (`<host>/<pkg>/node_modules/<pkg>`) has no
+///   `/` in its host-relative path, so the raw component becomes an
+///   undecodable-but-probed entry name and the package IS inventoried.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_legacy_store_skips_stray_node_modules_and_probes_depth1_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let store = nm.join(".registry.npmjs.org");
+
+    // Normal legacy shape: <name>/<version>/node_modules/<name>.
+    stage_npm_pkg(&store.join("mkdirp/0.5.5/node_modules"), "mkdirp", "0.5.5").await;
+    // Depth-1 home: <name>/node_modules/<name> (no version dir).
+    stage_npm_pkg(&store.join("directpkg/node_modules"), "directpkg", "3.0.0").await;
+    // Stray node_modules child of the host, shaped like a package home so
+    // a skip regression would surface the decoy in the inventory.
+    stage_npm_pkg(
+        &store.join("node_modules/decoy/9.9.9/node_modules"),
+        "decoy",
+        "9.9.9",
+    )
+    .await;
+
+    let crawler = NpmCrawler::new();
+    let result = crawler.crawl_all(&options_at(tmp.path())).await;
+
+    let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+    assert_eq!(
+        result.len(),
+        2,
+        "exactly mkdirp + directpkg, decoy stays out; got {purls:?}"
+    );
+    let by_purl = |purl: &str| {
+        result
+            .iter()
+            .find(|p| p.purl == purl)
+            .unwrap_or_else(|| panic!("{purl} must be inventoried; got {purls:?}"))
+    };
+    assert_eq!(
+        by_purl("pkg:npm/mkdirp@0.5.5").path,
+        store.join("mkdirp/0.5.5/node_modules/mkdirp")
+    );
+    assert_eq!(
+        by_purl("pkg:npm/directpkg@3.0.0").path,
+        store.join("directpkg/node_modules/directpkg"),
+        "a depth-1 package home must be probed (undecodable entry name)"
+    );
+    assert!(
+        !purls.contains(&"pkg:npm/decoy@9.9.9"),
+        "a stray node_modules child of the store host must be skipped"
+    );
+}
+
+// ── peer-variant twin copy failures in apply_package_patch ───────────
+//
+// The fail-closed half of the twin-healing tests above: a store copy that
+// cannot be patched must flip the whole result to failure with a "store
+// copy ... failed to patch: ..." note, never report the CVE fixed while a
+// physical twin stays divergent. Also the copy-on-write guard for
+// hardlinked store files.
+
+/// Stage one store entry `<store>/<entry>/node_modules/foo` (foo@1.0.0)
+/// with, when `index_content` is `Some`, an `index.js`. Returns the
+/// staged package root.
+async fn stage_store_entry(store: &Path, entry: &str, index_content: Option<&[u8]>) -> PathBuf {
+    let nm = store.join(entry).join("node_modules");
+    stage_npm_pkg(&nm, "foo", "1.0.0").await;
+    let pkg = nm.join("foo");
+    if let Some(content) = index_content {
+        tokio::fs::write(pkg.join("index.js"), content)
+            .await
+            .unwrap();
+    }
+    pkg
+}
+
+/// Apply the shared `package/index.js` patch to foo@1.0.0 at `primary`.
+async fn apply_foo(root: &Path, primary: &Path) -> socket_patch_core::patch::apply::ApplyResult {
+    apply_index_js("pkg:npm/foo@1.0.0", primary, &index_js_patch(root).await).await
+}
+
+/// Fail-closed invariant: after the primary store copy patches cleanly, a
+/// peer-variant twin whose pre-existing file is MISSING (a hard error
+/// under Warn) must flip the whole result to failure and surface the
+/// aggregated "store copy ... failed to patch" note — never claim
+/// the CVE fixed with a divergent twin left behind.
+#[tokio::test]
+#[serial_test::parallel]
+async fn pnpm_twin_copy_failure_fails_whole_apply_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".pnpm");
+
+    let primary = stage_store_entry(&store, "foo@1.0.0(react@17.0.2)", Some(ORIGINAL)).await;
+    // Twin advertises the same foo@1.0.0 but is missing its pre-existing
+    // index.js — the copy apply fails with NotFound.
+    let twin = stage_store_entry(&store, "foo@1.0.0(react@18.2.0)", None).await;
+
+    let result = apply_foo(tmp.path(), &primary).await;
+
+    assert!(
+        !result.success,
+        "a failed twin copy must fail the whole apply (got success; error: {:?})",
+        result.error
+    );
+    let err = result.error.as_deref().expect("aggregated error present");
+    assert!(
+        err.contains("store copy"),
+        "error must carry the store-copy note: {err}"
+    );
+    assert!(
+        err.contains("react@18.2.0"),
+        "error must name the failing twin's path: {err}"
+    );
+    assert!(
+        err.contains("File not found"),
+        "error must carry the copy's underlying failure: {err}"
+    );
+
+    // Fail-closed does NOT roll back the primary: its bytes stay patched
+    // and its per-file records are what the envelope carries.
+    assert_eq!(
+        tokio::fs::read(primary.join("index.js")).await.unwrap(),
+        PATCHED,
+        "primary copy stays patched"
+    );
+    assert_eq!(
+        result.files_patched,
+        vec!["package/index.js".to_string()],
+        "the primary's per-file records are preserved"
+    );
+    // The twin is still missing its file — nothing was fabricated there.
+    assert!(!twin.join("index.js").exists());
+}
+
+/// Two failing twins: the second note must be CONCATENATED onto the first
+/// (`"...; store copy ..."`), naming both twin paths.
+#[tokio::test]
+#[serial_test::parallel]
+async fn pnpm_multiple_twin_copy_failures_aggregate_with_semicolon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".pnpm");
+
+    let primary = stage_store_entry(&store, "foo@1.0.0(react@17.0.2)", Some(ORIGINAL)).await;
+    stage_store_entry(&store, "foo@1.0.0(react@18.2.0)", None).await;
+    stage_store_entry(&store, "foo@1.0.0(react@19.0.0)", None).await;
+
+    let result = apply_foo(tmp.path(), &primary).await;
+
+    assert!(!result.success, "two failed twins must fail the apply");
+    let err = result.error.as_deref().expect("aggregated error present");
+    assert!(
+        err.contains("; store copy"),
+        "second failure must be joined onto the first with '; ': {err}"
+    );
+    assert!(
+        err.contains("react@18.2.0") && err.contains("react@19.0.0"),
+        "error must name BOTH failing twins: {err}"
+    );
+    // Primary still patched; fail-closed, not rolled back.
+    assert_eq!(
+        tokio::fs::read(primary.join("index.js")).await.unwrap(),
+        PATCHED
+    );
+}
+
+/// The vlt twin of the fail-closed invariant: a `~peer.3` copy that cannot
+/// be patched fails the whole apply, naming that copy.
+#[tokio::test]
+#[serial_test::parallel]
+async fn vlt_twin_copy_failure_fails_whole_apply_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".vlt");
+
+    let primary = stage_store_entry(&store, "~npm~foo@1.0.0~peer.2", Some(ORIGINAL)).await;
+    let twin = stage_store_entry(&store, "~npm~foo@1.0.0~peer.3", None).await;
+
+    let result = apply_foo(tmp.path(), &primary).await;
+
+    assert!(!result.success, "error: {:?}", result.error);
+    let err = result.error.as_deref().expect("aggregated error present");
+    assert!(
+        err.starts_with("store copy ") && err.contains("~peer.3"),
+        "the note names the failing vlt copy: {err}"
+    );
+    assert_eq!(
+        tokio::fs::read(primary.join("index.js")).await.unwrap(),
+        PATCHED
+    );
+    assert!(!twin.join("index.js").exists());
+}
+
+/// Copy-on-write security invariant (vlt 1.2.0 hardlinks store files from
+/// `<cache>/store/v1/<hex>/` on Linux): patching a target that shares its
+/// inode with the machine-wide cache must replace the target's directory
+/// entry and never write through the shared inode. The cache link keeps
+/// its bytes and its inode; the target ends up on a private inode. Any
+/// in-place write (open for write, truncate, append, chmod before the
+/// rename) fails this test.
+#[tokio::test]
+#[serial_test::parallel]
+async fn apply_breaks_hardlink_to_shared_store_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("node_modules").join(".vlt");
+    let primary = stage_store_entry(&store, "~npm~foo@1.0.0", None).await;
+    let cache = tmp.path().join("cache/store/v1/0a1b2c/index.js");
+    tokio::fs::create_dir_all(cache.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&cache, ORIGINAL).await.unwrap();
+    std::fs::hard_link(&cache, primary.join("index.js")).unwrap();
+    #[cfg(unix)]
+    let (cache_ino, cache_mode) = {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(&cache).unwrap();
+        assert_eq!(meta.nlink(), 2, "precondition: the target is a hardlink");
+        (meta.ino(), meta.mode())
+    };
+
+    let result = apply_foo(tmp.path(), &primary).await;
+    assert!(result.success, "{:?}", result.error);
+
+    assert_eq!(
+        tokio::fs::read(primary.join("index.js")).await.unwrap(),
+        PATCHED
+    );
+    assert_eq!(
+        tokio::fs::read(&cache).await.unwrap(),
+        ORIGINAL,
+        "the shared store file must never be written through"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let cache_meta = std::fs::metadata(&cache).unwrap();
+        let target_meta = std::fs::metadata(primary.join("index.js")).unwrap();
+        assert_eq!(cache_meta.ino(), cache_ino, "the cache keeps its inode");
+        assert_eq!(cache_meta.mode(), cache_mode, "the cache keeps its mode");
+        assert_eq!(
+            cache_meta.nlink(),
+            1,
+            "the target no longer links the cache"
+        );
+        assert_ne!(
+            target_meta.ino(),
+            cache_ino,
+            "the target is a private inode"
+        );
+        assert_eq!(target_meta.nlink(), 1);
+    }
 }

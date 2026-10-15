@@ -371,21 +371,12 @@ async fn get_vendor_paths_global_via_composer_home_env() {
     let vendor = composer_home.join("vendor");
     tokio::fs::create_dir_all(&vendor).await.unwrap();
 
-    let prev_composer = std::env::var("COMPOSER_HOME").ok();
-    std::env::set_var("COMPOSER_HOME", composer_home);
+    let _env = EnvVars::set(&[("COMPOSER_HOME", Some(composer_home.as_os_str()))]);
 
-    let crawler = ComposerCrawler;
-    let opts = CrawlerOptions {
-        cwd: tmp.path().to_path_buf(),
-        global: true,
-        global_prefix: None,
-    };
-    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
-
-    std::env::remove_var("COMPOSER_HOME");
-    if let Some(v) = prev_composer {
-        std::env::set_var("COMPOSER_HOME", v);
-    }
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(tmp.path()))
+        .await
+        .unwrap();
 
     assert_eq!(
         paths,
@@ -408,46 +399,20 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
     // where composer is installed.
     let empty_path = tempfile::tempdir().unwrap();
 
-    let prev_composer = std::env::var("COMPOSER_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
-    let prev_path = std::env::var("PATH").ok();
-    std::env::remove_var("COMPOSER_HOME");
-    std::env::set_var("HOME", tmp.path());
-    std::env::set_var("PATH", empty_path.path());
-    // Composer's other platform defaults (`%APPDATA%\Composer` on Windows,
-    // `$XDG_CONFIG_HOME/composer`) would outrank the HOME candidates here.
-    let prev_app_data = std::env::var_os("APPDATA");
-    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::remove_var("APPDATA");
-    std::env::remove_var("XDG_CONFIG_HOME");
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", None),
+        ("HOME", Some(tmp.path().as_os_str())),
+        ("PATH", Some(empty_path.path().as_os_str())),
+        // Composer's other platform defaults (`%APPDATA%\Composer` on Windows,
+        // `$XDG_CONFIG_HOME/composer`) would outrank the HOME candidates here.
+        ("APPDATA", None),
+        ("XDG_CONFIG_HOME", None),
+    ]);
 
-    let crawler = ComposerCrawler;
-    let opts = CrawlerOptions {
-        cwd: tmp.path().to_path_buf(),
-        global: true,
-        global_prefix: None,
-    };
-    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
-
-    if let Some(v) = prev_composer {
-        std::env::set_var("COMPOSER_HOME", v);
-    }
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
-    }
-    if let Some(v) = prev_path {
-        std::env::set_var("PATH", v);
-    } else {
-        std::env::remove_var("PATH");
-    }
-    if let Some(v) = prev_app_data {
-        std::env::set_var("APPDATA", v);
-    }
-    if let Some(v) = prev_xdg {
-        std::env::set_var("XDG_CONFIG_HOME", v);
-    }
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(tmp.path()))
+        .await
+        .unwrap();
 
     assert_eq!(
         paths,
@@ -472,46 +437,20 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
     tokio::fs::create_dir_all(&vendor).await.unwrap();
     let empty_path = tempfile::tempdir().unwrap();
 
-    let prev_composer = std::env::var("COMPOSER_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
-    let prev_path = std::env::var("PATH").ok();
-    std::env::remove_var("COMPOSER_HOME");
-    std::env::set_var("HOME", tmp.path());
-    std::env::set_var("PATH", empty_path.path());
-    // Composer's other platform defaults (`%APPDATA%\Composer` on Windows,
-    // `$XDG_CONFIG_HOME/composer`) would outrank the HOME candidates here.
-    let prev_app_data = std::env::var_os("APPDATA");
-    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::remove_var("APPDATA");
-    std::env::remove_var("XDG_CONFIG_HOME");
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", None),
+        ("HOME", Some(tmp.path().as_os_str())),
+        ("PATH", Some(empty_path.path().as_os_str())),
+        // Composer's other platform defaults (`%APPDATA%\Composer` on Windows,
+        // `$XDG_CONFIG_HOME/composer`) would outrank the HOME candidates here.
+        ("APPDATA", None),
+        ("XDG_CONFIG_HOME", None),
+    ]);
 
-    let crawler = ComposerCrawler;
-    let opts = CrawlerOptions {
-        cwd: tmp.path().to_path_buf(),
-        global: true,
-        global_prefix: None,
-    };
-    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
-
-    if let Some(v) = prev_composer {
-        std::env::set_var("COMPOSER_HOME", v);
-    }
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
-    }
-    if let Some(v) = prev_path {
-        std::env::set_var("PATH", v);
-    } else {
-        std::env::remove_var("PATH");
-    }
-    if let Some(v) = prev_app_data {
-        std::env::set_var("APPDATA", v);
-    }
-    if let Some(v) = prev_xdg {
-        std::env::set_var("XDG_CONFIG_HOME", v);
-    }
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(tmp.path()))
+        .await
+        .unwrap();
 
     assert_eq!(
         paths,
@@ -531,46 +470,20 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let empty_path = tempfile::tempdir().unwrap();
 
-    let prev_composer = std::env::var("COMPOSER_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
-    let prev_path = std::env::var("PATH").ok();
-    let prev_app_data = std::env::var_os("APPDATA");
-    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::remove_var("APPDATA");
-    std::env::remove_var("XDG_CONFIG_HOME");
-    std::env::remove_var("COMPOSER_HOME");
-    // HOME is set, but the temp HOME has no .composer / .config/composer.
-    std::env::set_var("HOME", tmp.path());
-    // PATH stubbed so the composer CLI cannot be spawned.
-    std::env::set_var("PATH", empty_path.path());
+    let _env = EnvVars::set(&[
+        ("APPDATA", None),
+        ("XDG_CONFIG_HOME", None),
+        ("COMPOSER_HOME", None),
+        // HOME is set, but the temp HOME has no .composer / .config/composer.
+        ("HOME", Some(tmp.path().as_os_str())),
+        // PATH stubbed so the composer CLI cannot be spawned.
+        ("PATH", Some(empty_path.path().as_os_str())),
+    ]);
 
-    let crawler = ComposerCrawler;
-    let opts = CrawlerOptions {
-        cwd: tmp.path().to_path_buf(),
-        global: true,
-        global_prefix: None,
-    };
-    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
-
-    if let Some(v) = prev_composer {
-        std::env::set_var("COMPOSER_HOME", v);
-    }
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
-    }
-    if let Some(v) = prev_path {
-        std::env::set_var("PATH", v);
-    } else {
-        std::env::remove_var("PATH");
-    }
-    if let Some(v) = prev_app_data {
-        std::env::set_var("APPDATA", v);
-    }
-    if let Some(v) = prev_xdg {
-        std::env::set_var("XDG_CONFIG_HOME", v);
-    }
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(tmp.path()))
+        .await
+        .unwrap();
 
     assert!(
         paths.is_empty(),
@@ -594,53 +507,20 @@ async fn get_vendor_paths_global_empty_home_not_cwd_relative() {
         .unwrap();
     let empty_path = tempfile::tempdir().unwrap();
 
-    let prev_composer = std::env::var("COMPOSER_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
-    let prev_profile = std::env::var("USERPROFILE").ok();
-    let prev_path = std::env::var("PATH").ok();
-    let prev_app_data = std::env::var_os("APPDATA");
-    let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    std::env::remove_var("APPDATA");
-    std::env::remove_var("XDG_CONFIG_HOME");
-    std::env::remove_var("COMPOSER_HOME");
-    std::env::set_var("HOME", "");
-    std::env::set_var("USERPROFILE", "");
-    std::env::set_var("PATH", empty_path.path());
-    let cwd_guard = CwdGuard::enter(tmp.path());
+    let _env = EnvVars::set(&[
+        ("APPDATA", None),
+        ("XDG_CONFIG_HOME", None),
+        ("COMPOSER_HOME", None),
+        ("HOME", Some(std::ffi::OsStr::new(""))),
+        ("USERPROFILE", Some(std::ffi::OsStr::new(""))),
+        ("PATH", Some(empty_path.path().as_os_str())),
+    ]);
+    let _cwd = CwdGuard::enter(tmp.path());
 
-    let crawler = ComposerCrawler;
-    let opts = CrawlerOptions {
-        cwd: tmp.path().to_path_buf(),
-        global: true,
-        global_prefix: None,
-    };
-    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
-
-    drop(cwd_guard);
-    if let Some(v) = prev_composer {
-        std::env::set_var("COMPOSER_HOME", v);
-    }
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
-    }
-    if let Some(v) = prev_profile {
-        std::env::set_var("USERPROFILE", v);
-    } else {
-        std::env::remove_var("USERPROFILE");
-    }
-    if let Some(v) = prev_path {
-        std::env::set_var("PATH", v);
-    } else {
-        std::env::remove_var("PATH");
-    }
-    if let Some(v) = prev_app_data {
-        std::env::set_var("APPDATA", v);
-    }
-    if let Some(v) = prev_xdg {
-        std::env::set_var("XDG_CONFIG_HOME", v);
-    }
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(tmp.path()))
+        .await
+        .unwrap();
 
     assert!(
         paths.is_empty(),
@@ -1573,4 +1453,219 @@ async fn user_level_vendor_dir_expands_home_and_env_placeholders() {
         .await
         .unwrap();
     assert_eq!(paths, vec![shared]);
+}
+
+// ── global home discovery chain: broken COMPOSER_HOME, composer CLI ──
+//
+// Fall-through ordering of `get_vendor_paths` in global mode when
+// COMPOSER_HOME names a missing directory, and the `composer global
+// config home` shell-out (a fake `composer` shim on PATH).
+
+/// A set-but-BROKEN `COMPOSER_HOME` (naming a nonexistent directory) must
+/// fall through the discovery chain — composer CLI, then platform defaults —
+/// rather than yield the bogus path or bail empty.
+/// `get_vendor_paths_global_via_composer_home_env` above
+/// pins the env var's success arm; this pins the failure arm's ordering.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_nonexistent_composer_home_falls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dot_composer_vendor = tmp.path().join(".composer").join("vendor");
+    tokio::fs::create_dir_all(&dot_composer_vendor)
+        .await
+        .unwrap();
+    // PATH stubbed to a binary-free tempdir so `composer global config
+    // home` on a machine with composer installed can't short-circuit the
+    // fallback chain.
+    let empty_path = tempfile::tempdir().unwrap();
+    let bogus_home = tmp.path().join("does-not-exist");
+
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", Some(bogus_home.as_os_str())),
+        ("HOME", Some(tmp.path().as_os_str())),
+        ("PATH", Some(empty_path.path().as_os_str())),
+        // Composer's other platform defaults (`%APPDATA%\Composer` on Windows,
+        // `$XDG_CONFIG_HOME/composer`) would outrank the HOME candidate here.
+        ("APPDATA", None),
+        ("XDG_CONFIG_HOME", None),
+    ]);
+
+    let crawler = ComposerCrawler;
+    let paths = crawler
+        .get_vendor_paths(&global_opts(tmp.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![dot_composer_vendor],
+        "a set-but-nonexistent COMPOSER_HOME must fall through to the \
+         HOME/.composer platform default, not yield the bogus path or empty"
+    );
+}
+
+/// Write an executable `composer` shim into `dir` that ignores its
+/// arguments and echoes `echo_path` — a stand-in for `composer global
+/// config home`. The shebang names /bin/sh by absolute path, so the script
+/// executes even with PATH stripped down to the shim dir alone.
+#[cfg(unix)]
+fn write_composer_shim(dir: &Path, echo_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let shim = dir.join("composer");
+    std::fs::write(
+        &shim,
+        format!("#!/bin/sh\necho '{}'\n", echo_path.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `composer global config home` answering an EXISTING directory is the
+/// production path on any machine with composer installed and
+/// COMPOSER_HOME unset: the CLI's answer must win over the HOME/.composer
+/// platform default.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_composer_cli_answer_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    // What the fake CLI reports as the composer home; its vendor/ exists.
+    let cli_home = tmp.path().join("cli-home");
+    let cli_vendor = cli_home.join("vendor");
+    tokio::fs::create_dir_all(&cli_vendor).await.unwrap();
+    // HOME tripwire: if the CLI branch were skipped, discovery would land
+    // here instead and the equality assert below would catch it.
+    let home = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir_all(home.path().join(".composer").join("vendor"))
+        .await
+        .unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    write_composer_shim(shim_dir.path(), &cli_home);
+
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", None),
+        ("HOME", Some(home.path().as_os_str())),
+        ("PATH", Some(shim_dir.path().as_os_str())),
+    ]);
+
+    let crawler = ComposerCrawler;
+    let paths = crawler
+        .get_vendor_paths(&global_opts(tmp.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![cli_vendor],
+        "the composer CLI's home answer must win over the HOME/.composer fallback"
+    );
+}
+
+/// The CLI answering a NONEXISTENT directory must fall through to the
+/// platform defaults rather than yield the bogus path or bail empty.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_composer_cli_nonexistent_home_falls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dot_composer_vendor = home.path().join(".composer").join("vendor");
+    tokio::fs::create_dir_all(&dot_composer_vendor)
+        .await
+        .unwrap();
+    // Each shim lives in its own tempdir; nothing rewrites a shim in place.
+    let shim_dir = tempfile::tempdir().unwrap();
+    write_composer_shim(shim_dir.path(), &tmp.path().join("cli-home-missing"));
+
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", None),
+        ("HOME", Some(home.path().as_os_str())),
+        ("PATH", Some(shim_dir.path().as_os_str())),
+        // `$XDG_CONFIG_HOME/composer` would outrank the HOME candidate here.
+        ("XDG_CONFIG_HOME", None),
+    ]);
+
+    let crawler = ComposerCrawler;
+    let paths = crawler
+        .get_vendor_paths(&global_opts(tmp.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![dot_composer_vendor],
+        "a CLI answer naming a nonexistent home must fall through to HOME/.composer"
+    );
+}
+
+/// #586: on an XDG system Composer 2 looks for its home in the XDG config
+/// dir first and only then in `~/.composer` (`Factory::getHomeDir`). A
+/// leftover `~/.composer` (Composer 1 era, even an empty one) must not
+/// hide the real global install under `~/.config/composer` when the
+/// `composer` CLI can't be asked.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_xdg_home_outranks_stale_dot_composer() {
+    let home = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir_all(home.path().join(".composer"))
+        .await
+        .unwrap();
+    let xdg_vendor = home.path().join(".config").join("composer").join("vendor");
+    tokio::fs::create_dir_all(&xdg_vendor).await.unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", None),
+        ("HOME", Some(home.path().as_os_str())),
+        ("PATH", Some(empty_path.path().as_os_str())),
+        ("XDG_CONFIG_HOME", None),
+        // Any `XDG_*` variable makes Composer treat the system as XDG.
+        ("XDG_SESSION_TYPE", Some(std::ffi::OsStr::new("tty"))),
+    ]);
+
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(home.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![xdg_vendor],
+        "Composer 2 picks ~/.config/composer over ~/.composer on an XDG system"
+    );
+}
+
+/// The same layout with `XDG_CONFIG_HOME` set: Composer 2 uses
+/// `$XDG_CONFIG_HOME/composer`, still ahead of a stale `~/.composer`.
+#[cfg(not(windows))]
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_xdg_config_home_outranks_stale_dot_composer() {
+    let home = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir_all(home.path().join(".composer").join("vendor"))
+        .await
+        .unwrap();
+    let xdg = tempfile::tempdir().unwrap();
+    let xdg_vendor = xdg.path().join("composer").join("vendor");
+    tokio::fs::create_dir_all(&xdg_vendor).await.unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let _env = EnvVars::set(&[
+        ("COMPOSER_HOME", None),
+        ("HOME", Some(home.path().as_os_str())),
+        ("PATH", Some(empty_path.path().as_os_str())),
+        ("XDG_CONFIG_HOME", Some(xdg.path().as_os_str())),
+    ]);
+
+    let paths = ComposerCrawler
+        .get_vendor_paths(&global_opts(home.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        paths,
+        vec![xdg_vendor],
+        "Composer 2 picks $XDG_CONFIG_HOME/composer over ~/.composer"
+    );
 }
