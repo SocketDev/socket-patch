@@ -52,9 +52,10 @@ use super::guidance::{
 pub const PNPM_LOCKFILE_ELSEWHERE: &str = "redirect_pnpm_lockfile_elsewhere";
 
 /// Refusal code for an npm, yarn, Bun or vlt workspace member: an ancestor
-/// `package.json` (or, for vlt, `vlt.json` or `pnpm-workspace.yaml`) lists
-/// the project directory in its `workspaces`, and the workspace's lock lives at that root. Also a uv
-/// workspace member (`[tool.uv.workspace] members`, #1138).
+/// `package.json` (or, for vlt, `vlt.json`) lists the project directory in
+/// its `workspaces` (or, for vlt 1.4, `pnpm-workspace.yaml` in its
+/// `packages:`, #1564), and the workspace's lock lives at that root. Also a
+/// uv workspace member (`[tool.uv.workspace] members`, #1138).
 pub const WORKSPACE_LOCKFILE_ELSEWHERE: &str = "redirect_workspace_lockfile_elsewhere";
 
 /// Refusal code for a pnpm workspace member with its own lock whose
@@ -800,11 +801,12 @@ async fn vlt_workspace_root(root: &Path) -> Option<(PathBuf, VltWorkspaceSource)
             .collect();
         if !ancestor.join(VLT_LOCK).is_file() {
             // Never installed, so no lock tells the vlt versions apart: a
-            // root the current one lists the member under governs it and
-            // refuses nothing; otherwise an outer root may (#1542).
-            if groups
-                .iter()
-                .any(|group| workspaces_include_as(group, &rel, WorkspacesDialect::VLT))
+            // `vlt.json` root the current one lists the member under
+            // governs it and refuses nothing; otherwise an outer root may
+            // (#1542). A `pnpm-workspace.yaml` without a vlt lock is not
+            // shown to be vlt's at all (#1564), so the walk goes on.
+            if source == VltWorkspaceSource::VltJson
+                && vlt_groups_list(&groups, &rel, WorkspacesDialect::VLT)
             {
                 return None;
             }
@@ -813,9 +815,7 @@ async fn vlt_workspace_root(root: &Path) -> Option<(PathBuf, VltWorkspaceSource)
         let listed = match source {
             VltWorkspaceSource::VltJson => vlt_lists_member(ancestor, &groups, &rel).await,
             VltWorkspaceSource::PnpmWorkspace => {
-                groups
-                    .iter()
-                    .any(|group| workspaces_include_as(group, &rel, WorkspacesDialect::VLT))
+                vlt_groups_list(&groups, &rel, WorkspacesDialect::VLT)
                     && vlt_lock_reads_pnpm_workspace(ancestor, &groups).await
             }
         };
@@ -878,11 +878,17 @@ async fn vlt_lock_reads_pnpm_workspace(root: &Path, groups: &[Vec<String>]) -> b
     let Some(importers) = vlt_lock_workspace_dirs(root).await else {
         return true;
     };
-    importers.iter().any(|dir| {
-        groups
-            .iter()
-            .any(|group| workspaces_include_as(group, dir, WorkspacesDialect::VLT))
-    })
+    importers
+        .iter()
+        .any(|dir| vlt_groups_list(groups, dir, WorkspacesDialect::VLT))
+}
+
+/// Whether vlt, reading patterns as `dialect`, lists the directory `rel`
+/// under any of the workspace `groups` (it globs each group on its own).
+fn vlt_groups_list(groups: &[Vec<String>], rel: &[String], dialect: WorkspacesDialect) -> bool {
+    groups
+        .iter()
+        .any(|group| workspaces_include_as(group, rel, dialect))
 }
 
 /// Whether vlt lists the member `rel` under the `workspaces` `groups` of
@@ -895,11 +901,7 @@ async fn vlt_lock_reads_pnpm_workspace(root: &Path, groups: &[Vec<String>]) -> b
 /// other directory only older vlt lists, is older vlt's. A lock that
 /// cannot be read keeps the wider reading.
 async fn vlt_lists_member(root: &Path, groups: &[Vec<String>], rel: &[String]) -> bool {
-    let lists = |dir: &[String], dialect| {
-        groups
-            .iter()
-            .any(|group| workspaces_include_as(group, dir, dialect))
-    };
+    let lists = |dir: &[String], dialect| vlt_groups_list(groups, dir, dialect);
     let current = lists(rel, WorkspacesDialect::VLT);
     let older = lists(rel, WorkspacesDialect::VLT_PRE_1_3);
     if current == older {
@@ -2814,6 +2816,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1564: a nearer `pnpm-workspace.yaml` with no `vlt-lock.json` beside
+    /// it (a vendored pnpm sub-monorepo) is not shown to be vlt's, so an
+    /// outer `vlt.json` root that lists the member still refuses it.
+    #[tokio::test]
+    async fn vlt_uninstalled_pnpm_workspace_yaml_walks_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            VLT_JSON,
+            r#"{"workspaces":"third_party/foo/packages/*"}"#,
+        );
+        write(tmp.path(), VLT_LOCK, "{}");
+        write(tmp.path(), "third_party/foo/package.json", "{}");
+        write(
+            tmp.path(),
+            &format!("third_party/foo/{PNPM_WORKSPACE}"),
+            "packages:\n  - packages/*\n",
+        );
+        write(tmp.path(), "third_party/foo/packages/a/package.json", "{}");
+        let member = tmp.path().join("third_party/foo/packages/a");
+        let refused = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("the outer vlt.json root governs the member");
+        assert_eq!(refused.code, WORKSPACE_LOCKFILE_ELSEWHERE);
+        assert!(refused.message.contains(VLT_JSON), "{}", refused.message);
     }
 
     /// The nearer of a `vlt.json` root and a `package.json` root governs.
