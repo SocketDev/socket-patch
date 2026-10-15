@@ -2561,6 +2561,54 @@ __metadata:
         }
     }
 
+    /// #1561: a RELATIVE `portal:` / `link:` copy whose target directory is
+    /// missing (a git submodule CI never checked out) is as unknown as an
+    /// absolute one (#1540): named as a possible unpatched copy, while the
+    /// registry entry still vendors. It was dropped silently. Control: a
+    /// `link:` to an existing plain directory with no `package.json` is no
+    /// package copy and stays unnamed.
+    #[tokio::test]
+    async fn issue_1561_missing_relative_portal_and_link_targets_are_named() {
+        for protocol in ["portal", "link"] {
+            for plain_dir in [false, true] {
+                let key = format!("lp2@{protocol}:./vend/lp::locator=vendor-spike%40workspace%3A.");
+                let block = format!(
+                    "\n\"{key}\":\n  version: 0.0.0-use.local\n  resolution: \"{key}\"\n  \
+                     languageName: node\n  linkType: soft\n"
+                );
+                let lock = format!("{B3_BEFORE_LOCK}{block}");
+                let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
+                if plain_dir {
+                    let dir = fx.tmp.path().join("vend/lp");
+                    tokio::fs::create_dir_all(&dir).await.unwrap();
+                    tokio::fs::write(dir.join("logo.svg"), "<svg/>")
+                        .await
+                        .unwrap();
+                }
+
+                let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{protocol}/{plain_dir}: {:?}", result.error);
+                assert!(entry.is_some(), "{protocol}/{plain_dir}: registry vendors");
+                let copies: Vec<&VendorWarning> = warnings
+                    .iter()
+                    .filter(|w| w.code == "vendor_copy_unpatched")
+                    .collect();
+                if plain_dir {
+                    assert!(copies.is_empty(), "{protocol}: {warnings:?}");
+                    continue;
+                }
+                assert_eq!(copies.len(), 1, "{protocol}: {warnings:?}");
+                assert!(
+                    copies[0].detail.contains(&format!("`\"{key}\"`"))
+                        && copies[0].detail.contains("installs a package under")
+                        && copies[0].detail.contains("can't be read"),
+                    "{protocol}: {}",
+                    copies[0].detail
+                );
+            }
+        }
+    }
+
     /// #939 (review): when left-pad@1.3.0 is locked ONLY under another
     /// dependency name, vendoring refuses `vendor_lock_entry_not_rewritable`
     /// naming that copy, in the loop and in the download plan alike, not

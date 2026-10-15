@@ -1952,6 +1952,51 @@ mod tests {
         }
     }
 
+    /// #1561: a RELATIVE `portal:` / `link:` copy whose target can't be read
+    /// (a missing directory, e.g. a git submodule CI never checked out, or a
+    /// `package.json` that is no regular file) is as unknown as an absolute
+    /// one (#1540): it may be any version of any package, so it contests
+    /// every ref its lock wires. It was dropped like a `link:` to a plain
+    /// directory, so `vex` attested `not_affected` while the install that
+    /// had the target linked unpatched left-pad@1.3.0 as `node_modules/lp2`.
+    #[tokio::test]
+    async fn issue_1561_unreadable_relative_portal_and_link_targets_contest_every_ref() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        for protocol in ["portal", "link"] {
+            for target in ["missing", "manifest-is-a-directory"] {
+                let p = Project::new();
+                if target == "manifest-is-a-directory" {
+                    p.write("vend/lp/package.json/index.js", "");
+                }
+                let descriptor = format!("lp2@{protocol}:./vend/lp::locator=app%40workspace%3A.");
+                p.write(
+                    "yarn.lock",
+                    berry(&[
+                        wired.clone(),
+                        berry_block(&descriptor, "0.0.0-use.local", &descriptor, None),
+                    ]),
+                );
+                p.write(
+                    "package.json",
+                    package_json_with_resolutions(serde_json::json!({
+                        "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                    })),
+                );
+                let out = run(&p).await;
+                assert!(out.refs.is_empty(), "{protocol} {target}: {:#?}", out.refs);
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains(&format!("lp2@{protocol}:"))
+                            && d.detail.contains("can't be read")),
+                    "{protocol} {target}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
     /// #1540 control: a RELATIVE `link:` to a plain directory (no
     /// `package.json`, which `link:` allows) is read and holds no package,
     /// so it contests nothing.
