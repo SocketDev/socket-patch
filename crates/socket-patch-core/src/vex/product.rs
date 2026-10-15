@@ -8,7 +8,7 @@
 //!      is returned as the URL with any credentials (userinfo), query
 //!      and fragment removed.
 //!   2. `package.json` (npm)        → `pkg:npm/<name>@<version>`
-//!   3. `pyproject.toml` (PyPI)     → `pkg:pypi/<name>@<version>`
+//!   3. `pyproject.toml` (PyPI)     → `pkg:pypi/<PEP 503 name>@<version>`
 //!   4. `Cargo.toml` (Cargo)        → `pkg:cargo/<name>@<version>`
 //!   5. `go.mod` (Go)               → `pkg:golang/<module>` (go.mod
 //!      records no version)
@@ -33,6 +33,8 @@
 //! a package manifest — the priority is documented and stable.
 
 use std::path::Path;
+
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 
 // npm/Node strip a BOM from package.json, cargo accepts one in Cargo.toml, and
 // git reads a BOM'd `.git/config`, but serde_json and the git config scanner
@@ -164,7 +166,10 @@ fn parse_pyproject(content: &str) -> Option<String> {
     }
     let doc = content.parse::<toml_edit::DocumentMut>().ok()?;
     let (name, version) = pyproject_name_version(&doc)?;
-    Some(format!("pkg:pypi/{name}@{version}"))
+    // The purl carries the PEP 503 name, like every pypi component purl:
+    // OpenVEX consumers match `My_Service` and `my-service` by exact purl
+    // (#1547).
+    crate::utils::purl::pypi_purl(&name, &version)
 }
 
 /// The project's name and version, read the way its build backend reads
@@ -190,7 +195,7 @@ fn pyproject_name_version(doc: &toml_edit::DocumentMut) -> Option<(String, Strin
         // and builds `[tool.poetry].name`: when they differ, the product
         // depends on the Poetry line, so name none rather than guess.
         if let (Some(a), Some(b)) = (project_name, poetry_name) {
-            if a != b {
+            if canonicalize_pypi_name(a) != canonicalize_pypi_name(b) {
                 return None;
             }
         }
@@ -1396,6 +1401,57 @@ mod tests {
         assert_eq!(
             parse_pyproject(content).as_deref(),
             Some("pkg:pypi/new@1.0.0")
+        );
+    }
+
+    // ── Regression #1547: the pypi product name is the canonical one ──
+    //
+    // OpenVEX consumers match `products[].@id` by exact purl, and SBOMs
+    // (and this document's own components) carry the PEP 503 name, so a
+    // raw `My_Service` product never matched anything.
+
+    #[tokio::test]
+    async fn detect_pyproject_canonicalizes_pep621_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "[project]\nname = \"My_Service\"\nversion = \"1.2.0\"\n\n[tool.poetry]\npackage-mode = false\n";
+        tokio::fs::write(dir.path().join("pyproject.toml"), content)
+            .await
+            .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/my-service@1.2.0"));
+    }
+
+    #[test]
+    fn pyproject_canonicalizes_tool_poetry_name() {
+        let legacy = "[tool.poetry]\nname = \"My_Service\"\nversion = \"0.1.0\"\n";
+        assert_eq!(
+            parse_pyproject(legacy).as_deref(),
+            Some("pkg:pypi/my-service@0.1.0")
+        );
+        let dotted = "[tool.poetry]\nname = \"Demo_Pkg.Core\"\nversion = \"0.1.0\"\n";
+        assert_eq!(
+            parse_pyproject(dotted).as_deref(),
+            Some("pkg:pypi/demo-pkg-core@0.1.0")
+        );
+    }
+
+    #[test]
+    fn pyproject_canonicalizes_tool_pdm_name() {
+        let content = "[tool.pdm]\nname = \"Legacy__PDM.App\"\nversion = \"0.0.1\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/legacy-pdm-app@0.0.1")
+        );
+    }
+
+    /// Poetry 1.x and 2 build the same distribution when the two names
+    /// differ only in spelling, so that is not a conflict.
+    #[test]
+    fn pyproject_poetry_names_equal_after_canonicalization() {
+        let content = "[project]\nname = \"My_Service\"\nversion = \"1.0\"\n\n[tool.poetry]\nname = \"my-service\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/my-service@1.0")
         );
     }
 

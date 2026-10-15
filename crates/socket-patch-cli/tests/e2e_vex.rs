@@ -601,6 +601,50 @@ fn auto_detect_uses_package_json() {
     );
 }
 
+/// #1547: a `pyproject.toml` product carries the PEP 503 name, as SBOMs
+/// and this document's own pypi components do; OpenVEX consumers match
+/// products by exact purl, so `pkg:pypi/My_Service@…` matched nothing.
+#[test]
+fn auto_detect_pyproject_uses_canonical_pypi_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    std::fs::write(
+        cwd.join("pyproject.toml"),
+        "[project]\nname = \"My_Service\"\nversion = \"1.2.0\"\n\n[tool.poetry]\npackage-mode = false\n",
+    )
+    .unwrap();
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:pypi/six@1.16.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "six.py",
+            "a".repeat(64).as_str(),
+            "b".repeat(64).as_str(),
+            "GHSA-z",
+            &["CVE-Z"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+
+    let out = cli()
+        .args(["vex", "--cwd", cwd.to_str().unwrap(), "--no-verify"])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc["statements"][0]["products"][0]["@id"],
+        "pkg:pypi/my-service@1.2.0"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // empty overrides mean "unset"
 //
