@@ -341,3 +341,40 @@ fn vendored_extras_pin_is_refused_and_nothing_is_attested() {
     assert_ne!(out.code, Some(0), "{out}");
     assert_no_statement(&out, "vendored extras");
 }
+
+/// #1549: a Pipfile.lock whose entry installs the same release from a
+/// non-Socket `file` url or `path` wheel contests the requirements wiring,
+/// as a registry `version: "==1.2.3"` entry there already does.
+#[test]
+fn pipfile_lock_direct_reference_contests_the_requirements_wiring() {
+    let lock = |entry: serde_json::Value| {
+        serde_json::json!({
+            "_meta": { "pipfile-spec": 6, "hash": { "sha256": "x" }, "requires": {}, "sources": [] },
+            "default": { NAME: entry },
+            "develop": {},
+        })
+        .to_string()
+    };
+    let hashes = serde_json::json!([format!("sha256:{}", "c".repeat(64))]);
+    contested_by_a_non_socket_direct_reference(
+        &flavors()[..1],
+        "Pipfile.lock",
+        &[
+            (
+                "file url",
+                lock(serde_json::json!({ "file": upstream_wheel_url(), "hashes": hashes })),
+            ),
+            (
+                "path wheel",
+                lock(serde_json::json!({
+                    "path": format!("./wheels/{NAME}-{VERSION}-py3-none-any.whl"),
+                    "hashes": hashes,
+                })),
+            ),
+            (
+                "registry pin (control)",
+                lock(serde_json::json!({ "version": format!("=={VERSION}"), "hashes": hashes })),
+            ),
+        ],
+    );
+}
