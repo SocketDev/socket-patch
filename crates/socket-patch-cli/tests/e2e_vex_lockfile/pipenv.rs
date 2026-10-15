@@ -346,3 +346,24 @@ fn vendored_legacy_installer_is_refused_and_nothing_is_attested() {
     assert_ne!(out.code, Some(0), "{out}");
     assert_no_statement(&out, "legacy vendored");
 }
+
+/// #1549 (mirror case): a requirements.txt line that installs the same
+/// release from a non-Socket url or wheel path contests the Pipfile.lock
+/// wiring, as a `vexdemo==1.2.3` registry pin there already does.
+#[test]
+fn requirements_direct_reference_contests_the_lock_wiring() {
+    let url = upstream_wheel_url();
+    contested_by_a_non_socket_direct_reference(
+        &flavors()[..1],
+        "requirements.txt",
+        &[
+            ("name @ url", format!("{NAME} @ {url}\n")),
+            ("bare url", format!("{url}\n")),
+            (
+                "bare wheel path",
+                format!("./wheels/{NAME}-{VERSION}-py3-none-any.whl\n"),
+            ),
+            ("registry pin (control)", format!("{NAME}=={VERSION}\n")),
+        ],
+    );
+}
