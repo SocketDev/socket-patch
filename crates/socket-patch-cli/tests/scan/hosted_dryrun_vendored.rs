@@ -10,18 +10,13 @@
 //! shapes) produces the vendored lock + `.socket/vendor/state.json` entry;
 //! the hosted API is wiremock (`in_process_redirect_pnpm.rs` shapes).
 
-#[path = "common/envelope.rs"]
-mod envelope;
-#[path = "common/hermetic.rs"]
-mod hermetic;
-#[path = "prebuilt_common/mod.rs"]
-mod prebuilt_common;
-use envelope::codes_in;
+use crate::prebuilt_common;
 
 use std::path::Path;
 
-#[path = "vlt_hosted_common/mod.rs"]
-mod vlt_hosted_common;
+use crate::common::envelope::codes_in;
+use crate::common::hermetic;
+use crate::vlt_hosted_common;
 
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -406,8 +401,8 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
         "the dry-run must preview the wet outcome: {doc:#}"
     );
     assert_eq!(
-        Some(&hosted_skipped(&doc)).map(Vec::len),
-        Some(0),
+        hosted_skipped(&doc).len(),
+        0,
         "a revertable vendored purl is not skipped: {doc:#}"
     );
     // Review finding: the pnpm trustLockfile auto-config the wet run
