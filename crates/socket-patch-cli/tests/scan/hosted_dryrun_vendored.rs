@@ -14,45 +14,19 @@ use crate::prebuilt_common;
 
 use std::path::Path;
 
-use crate::common::envelope::codes_in;
+use crate::common::envelope::{codes_in, hosted_pins};
 use crate::common::hermetic;
+use crate::hosted_fixture::{hosted_skipped, warning_detail};
 use crate::vlt_hosted_common;
 
 use serde_json::{json, Value};
-use serial_test::serial;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// The hosted `skipped` events as the pre-v5.0 `redirect.skipped[]` rows
-/// (`{purl, uuid, reason: <errorCode>, detail?: <reason>}`).
-fn hosted_skipped(doc: &Value) -> Vec<Value> {
-    doc["events"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|e| e["details"]["mode"] == "hosted" && e["action"] == "skipped")
-        .map(|e| {
-            let mut row = json!({"purl": e["purl"], "uuid": e["uuid"], "reason": e["errorCode"]});
-            if e["reason"].is_string() {
-                row["detail"] = e["reason"].clone();
-            }
-            row
-        })
-        .collect()
-}
-
 /// How many pins a hosted run wrote (`applied`) or would write (`verified`).
-fn hosted_pinned(doc: &Value) -> u64 {
-    doc["events"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|e| {
-            e["details"]["mode"] == "hosted"
-                && (e["action"] == "applied" || e["action"] == "verified")
-        })
-        .count() as u64
+fn hosted_pinned(doc: &Value) -> usize {
+    hosted_pins(doc).len()
 }
 
 const ORG: &str = "test-org";
@@ -338,14 +312,6 @@ fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     out
 }
 
-fn warning_detail<'a>(doc: &'a Value, code: &str) -> Option<&'a str> {
-    doc["warnings"]
-        .as_array()?
-        .iter()
-        .find(|w| w["code"] == code)
-        .and_then(|w| w["detail"].as_str())
-}
-
 fn rewritten_files(doc: &Value) -> Vec<&str> {
     doc["redirect"]["rewrittenFiles"]
         .as_array()
@@ -360,7 +326,6 @@ fn rewritten_files(doc: &Value) -> Vec<&str> {
 /// (`redirect_pnpm_entry_vendored`, "run `vendor --revert` first") never
 /// appears — the run itself performs that revert. Nothing lands on disk.
 #[tokio::test]
-#[serial]
 async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     let server = MockServer::start().await;
     mock_hosted_api(&server).await;
@@ -407,8 +372,7 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     );
     // Review finding: the pnpm trustLockfile auto-config the wet run
     // writes (the takeover splices the root v9 lock) must be previewed too.
-    let trust = warning_detail(&doc, "redirect_pnpm_trust_lockfile")
-        .unwrap_or_else(|| panic!("the trust config must be previewed: {doc:#}"));
+    let trust = warning_detail(&doc, "redirect_pnpm_trust_lockfile");
     // The vendor run created pnpm-workspace.yaml for its own wiring, and
     // the takeover's revert removes it again, so the wet run writes a new
     // one: the preview plans against the same reverted project.
@@ -465,8 +429,7 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
         workspace(root).is_some_and(|w| w.contains("trustLockfile: true")),
         "the wet run writes what the preview promised: {wet:#}"
     );
-    let wet_trust = warning_detail(&wet, "redirect_pnpm_trust_lockfile")
-        .unwrap_or_else(|| panic!("the wet run reports the trust config: {wet:#}"));
+    let wet_trust = warning_detail(&wet, "redirect_pnpm_trust_lockfile");
     assert!(
         wet_trust.contains("to a new pnpm-workspace.yaml"),
         "the preview named the wet run's file: {wet_trust}"
@@ -480,7 +443,6 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
 /// clean takeover, and never handed to the rewriters for a second,
 /// contradictory diagnosis.
 #[tokio::test]
-#[serial]
 async fn dry_run_refuses_unrevertable_vendored_state_like_the_wet_run() {
     let server = MockServer::start().await;
     mock_hosted_api(&server).await;
@@ -567,7 +529,6 @@ fn summary_line(stdout: &str) -> &str {
 /// package.json, so the deleted vendored ledger entry and artifact and the
 /// reverted wiring are committed too.
 #[tokio::test]
-#[serial]
 async fn human_takeover_prints_migration_lines_and_matching_file_counts() {
     let server = MockServer::start().await;
     mock_hosted_api(&server).await;
@@ -661,7 +622,6 @@ fn write_package_lock_project(root: &Path) {
 /// `allow-remote=all` write the wet run makes was neither warned about
 /// ("would be written to a new project .npmrc") nor listed in `rewrittenFiles`.
 #[tokio::test]
-#[serial]
 async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
     let server = MockServer::start().await;
     mock_hosted_api(&server).await;
@@ -686,8 +646,7 @@ async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
         "{doc:#}"
     );
     assert_eq!(hosted_pinned(&doc), 1, "{doc:#}");
-    let detail = warning_detail(&doc, "redirect_npm_allow_remote")
-        .unwrap_or_else(|| panic!("the .npmrc write must be previewed: {doc:#}"));
+    let detail = warning_detail(&doc, "redirect_npm_allow_remote");
     assert!(
         detail.contains("would be written to a new project .npmrc")
             && detail.contains("patch.test"),
@@ -715,48 +674,13 @@ async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
 /// `redirected: 1` (never `redirect_vlt_entry_vendored`) and writes
 /// nothing; the wet run lands the same outcome.
 #[tokio::test]
-#[serial]
 async fn vlt_dry_run_over_vendored_project_previews_the_wet_takeover() {
     use vlt_hosted_common as hosted;
     let server = MockServer::start().await;
     hosted::mock_all(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let registry_lock = format!(
-        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    {}\n  }},\n  \
-         \"edges\": {{\n    \"file~_d left-pad\": \"prod 1.3.0 {}\"\n  }}\n}}\n",
-        hosted::registry_node(hosted::TILDE_ID),
-        hosted::TILDE_ID
-    );
-    std::fs::write(root.join("vlt-lock.json"), &registry_lock).unwrap();
-    hosted::write_package_json(root);
-    hosted::install_importer(root, hosted::PRISTINE);
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(socket.join("blobs")).unwrap();
-    let mut record = hosted::view_body();
-    record.as_object_mut().unwrap().remove("purl");
-    record["exportedAt"] = json!("2026-01-01T00:00:00Z");
-    std::fs::write(
-        socket.join("manifest.json"),
-        json!({ "patches": { hosted::PURL: record } }).to_string(),
-    )
-    .unwrap();
-    std::fs::write(
-        socket
-            .join("blobs")
-            .join(hosted::git_sha256(hosted::PATCHED)),
-        hosted::PATCHED,
-    )
-    .unwrap();
-    let cwd = root.to_str().unwrap().to_string();
-    let fixture = prebuilt_common::Server::project(root);
-    let (code, env, stderr) = hosted::run_json(
-        root,
-        &["vendor", "--cwd", &cwd],
-        &[("SOCKET_VENDOR_URL", &fixture.uri)],
-    );
-    assert_eq!(code, 0, "{env:#}\n{stderr}");
-    std::fs::remove_file(socket.join("manifest.json")).unwrap();
+    crate::vlt_vendored::vendored_project(root, false);
     let vendored_lock = std::fs::read(root.join("vlt-lock.json")).unwrap();
     let vendored_state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
     let vendored_pkg = std::fs::read(root.join("package.json")).unwrap();

@@ -160,28 +160,33 @@ async fn config_token_and_api_base_url_authenticate() {
         Some(format!("Bearer {}", token('c')).as_str()),
         "org auto-resolve must hit the config apiBaseUrl with the config token"
     );
-    assert!(
-        !out.stderr.contains("api base url:"),
-        "without SOCKET_DEBUG the provenance diagnostic must stay silent; \
-         stderr:\n{}",
-        out.stderr
-    );
 
     let provenance = format!("api base url: `{}` from socket-cli config", server.uri());
-    for json in [false, true] {
+    for (json, debug) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut cmd = scan_cmd(project.path(), data.path());
-        cmd.env("SOCKET_DEBUG", "1");
+        if debug {
+            cmd.env("SOCKET_DEBUG", "1");
+        }
         if json {
             cmd.arg("--json");
         }
         let out = run(cmd);
         assert_eq!(out.code, Some(0), "json={json}; stderr:\n{}", out.stderr);
-        assert!(
-            out.stderr.contains(&provenance),
-            "SOCKET_DEBUG=1 must name the config apiBaseUrl and its source \
-             (json={json}); stderr:\n{}",
-            out.stderr
-        );
+        if debug {
+            assert!(
+                out.stderr.contains(&provenance),
+                "SOCKET_DEBUG=1 must name the config apiBaseUrl and its source \
+                 (json={json}); stderr:\n{}",
+                out.stderr
+            );
+        } else {
+            assert!(
+                !out.stderr.contains("api base url:"),
+                "without SOCKET_DEBUG the provenance diagnostic must stay silent \
+                 (json={json}); stderr:\n{}",
+                out.stderr
+            );
+        }
     }
 }
 
