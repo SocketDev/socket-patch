@@ -12,12 +12,12 @@ mod vlt_hosted_common;
 mod vlt_vendored;
 
 mod api_client_errors_e2e;
+mod api_client_org_fallback;
 mod cli_dry_run_paths_e2e;
-mod covgap_api_client;
-mod covgap_commands_list;
-mod covgap_output;
 mod envelope_helper_copies;
 mod interactive_prompts_e2e;
+mod list_render;
 mod output_modes_e2e;
+mod prompts_tty;
 mod shared_helper_copies;
 mod telemetry_e2e;

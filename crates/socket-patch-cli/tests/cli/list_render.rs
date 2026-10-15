@@ -1,4 +1,4 @@
-//! Coverage-gap tests for `commands/list.rs`: the `--debug` provenance
+//! `list` output: the `--debug` provenance
 //! echoes for config-sourced telemetry credentials (the two `inspect`
 //! closures in core api/client.rs's credential resolution, reached via
 //! `GlobalArgs::telemetry_credentials` -> `resolve_ambient_credentials`),
@@ -6,7 +6,9 @@
 //! human-readable listing's sparse-record branches — a vulnerability with
 //! no CVE ids (GHSA-only advisories are a real production shape), and a
 //! record with zero vulnerabilities / zero files, whose section headers
-//! must be omitted entirely.
+//! must be omitted entirely. These pin human output on purpose (one check
+//! per message family); `--json` behavior is read through
+//! `common::envelope`.
 //!
 //! Binary-driven. The debug-echo test mirrors
 //! cli_config_fallback.rs::list_telemetry_follows_socket_cli_login (its
@@ -21,6 +23,7 @@ use base64::Engine as _;
 use wiremock::MockServer;
 
 use crate::common;
+use crate::common::envelope::mode_events;
 use crate::vlt_hosted_common;
 use crate::vlt_vendored;
 
@@ -311,7 +314,9 @@ fn list_json_labels_a_vlt_vendored_entry() {
     let cwd = root.to_str().unwrap().to_string();
     let (code, env, stderr) = vlt_hosted_common::run_json(root, &["list", "--cwd", &cwd], &[]);
     assert_eq!(code, 0, "{env:#}\n{stderr}");
-    let text = env.to_string();
-    assert!(text.contains(vlt_hosted_common::PURL), "{env:#}");
-    assert!(text.contains("vendored"), "{env:#}");
+    let vendored: Vec<&str> = mode_events(&env, "vendored")
+        .iter()
+        .filter_map(|e| e["purl"].as_str())
+        .collect();
+    assert_eq!(vendored, [vlt_hosted_common::PURL], "{env:#}");
 }
