@@ -1,106 +1,16 @@
-//! Terminal-output contract for the standalone `vex` command: what a human
-//! (and a `--json` consumer) sees for dry runs, `-O -`, stale-document
-//! cleanup, omission reporting and flag typos. Fixtures are self-contained
-//! tempdir projects driven through the built binary with the hermetic
-//! `SOCKET_*` environment (the parent env is never mutated).
+//! What a human sees from the standalone `vex` command (#1089): dry runs,
+//! `-O -`, the written-document summary, stale-document cleanup, omission
+//! reporting, flag typos and the error and warning lines of the failure
+//! paths whose `--json` contracts live in `vex_failure_paths.rs`. One check
+//! per message family.
 
-#[path = "common/hermetic.rs"]
-mod hermetic;
-
-use std::collections::HashMap;
-use std::path::Path;
-use std::process::{Command, Output};
-
-use serde_json::Value;
-use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
-};
-
-const STALE_OPENVEX_DOC: &str = r#"{"@context":"https://openvex.dev/ns/v0.2.0","@id":"urn:uuid:stale","author":"Socket","timestamp":"2020-01-01T00:00:00Z","version":1,"statements":[]}"#;
-
-fn cli() -> Command {
-    hermetic::binary_command()
-}
-
-fn record(uuid: &str, ghsa: &str) -> PatchRecord {
-    let mut files = HashMap::new();
-    files.insert(
-        "package/index.js".to_string(),
-        PatchFileInfo {
-            before_hash: "a".repeat(64),
-            after_hash: "b".repeat(64),
-        },
-    );
-    let mut vulns = HashMap::new();
-    vulns.insert(
-        ghsa.to_string(),
-        VulnerabilityInfo {
-            cves: vec!["CVE-2026-0001".to_string()],
-            summary: "s".to_string(),
-            severity: "high".to_string(),
-            description: "d".to_string(),
-        },
-    );
-    PatchRecord {
-        uuid: uuid.to_string(),
-        exported_at: "2024-01-01T00:00:00Z".to_string(),
-        files,
-        vulnerabilities: vulns,
-        description: "p".to_string(),
-        license: "MIT".to_string(),
-        tier: "free".to_string(),
-    }
-}
-
-/// A manifest with `purls` (each with a distinct GHSA).
-fn write_manifest(cwd: &Path, purls: &[&str]) {
-    let mut m = PatchManifest::new();
-    for (i, purl) in purls.iter().enumerate() {
-        m.patches.insert(
-            purl.to_string(),
-            record(
-                &format!("{:08}-1111-4111-8111-111111111111", i + 1),
-                &format!("GHSA-test-{i}"),
-            ),
-        );
-    }
-    let dir = cwd.join(".socket");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
-    )
-    .unwrap();
-}
-
-fn vex(cwd: &Path, extra: &[&str]) -> Output {
-    cli()
-        .current_dir(cwd)
-        .args([
-            "vex",
-            "--cwd",
-            cwd.to_str().unwrap(),
-            "--product",
-            "pkg:npm/app@1.0.0",
-        ])
-        .args(extra)
-        .output()
-        .expect("invoke vex")
-}
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
-
-fn stdout(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
+use crate::vex_fixture::*;
 
 #[test]
 fn dry_run_with_output_writes_nothing_and_says_so() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
+    write_npm_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     let out_path = cwd.join("d.json");
 
     let o = vex(
@@ -116,21 +26,6 @@ fn dry_run_with_output_writes_nothing_and_says_so() {
             out_path.display()
         )
     );
-
-    let o = vex(
-        cwd,
-        &[
-            "--no-verify",
-            "--dry-run",
-            "--json",
-            "-O",
-            out_path.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    let env: Value = serde_json::from_slice(&o.stdout).expect("envelope");
-    assert_eq!(env["dryRun"], true, "{env}");
-    assert!(!out_path.exists());
 }
 
 #[test]
@@ -138,7 +33,7 @@ fn dry_run_failure_keeps_previous_document() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     // Verify mode with nothing installed: nothing attests.
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
+    write_npm_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     let out_path = cwd.join("keep.json");
     std::fs::write(&out_path, STALE_OPENVEX_DOC).unwrap();
 
@@ -152,7 +47,7 @@ fn dry_run_failure_keeps_previous_document() {
 fn output_dash_means_stdout() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
+    write_npm_manifest(cwd, &["pkg:npm/a@1.0.0"]);
 
     let o = vex(cwd, &["--no-verify", "-O", "-"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
@@ -160,19 +55,13 @@ fn output_dash_means_stdout() {
     assert_eq!(doc["statements"].as_array().unwrap().len(), 1);
     assert!(!cwd.join("-").exists(), "no file literally named `-`");
     assert_eq!(stderr(&o).trim_end(), "Emitted 1 VEX statement");
-
-    // --json still needs a real file: the envelope owns stdout.
-    let o = vex(cwd, &["--no-verify", "--json", "-O", "-"]);
-    assert_eq!(o.status.code(), Some(2));
-    let env: Value = serde_json::from_slice(&o.stdout).expect("envelope");
-    assert_eq!(env["error"]["code"], "json_requires_output", "{env}");
 }
 
 #[test]
 fn written_document_ends_with_newline_and_summary_is_singular() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
+    write_npm_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     let out_path = cwd.join("out.json");
 
     let o = vex(cwd, &["--no-verify", "-O", out_path.to_str().unwrap()]);
@@ -196,7 +85,7 @@ fn written_document_ends_with_newline_and_summary_is_singular() {
 fn failed_run_reports_stale_document_removal() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
+    write_npm_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     let out_path = cwd.join("keep.json");
     std::fs::write(&out_path, STALE_OPENVEX_DOC).unwrap();
 
@@ -217,32 +106,20 @@ fn failed_run_reports_stale_document_removal() {
             .ends_with("Error: No applied patches with vulnerability metadata to attest."),
         "{err}"
     );
-
-    std::fs::write(&out_path, STALE_OPENVEX_DOC).unwrap();
-    let o = vex(cwd, &["--json", "-O", out_path.to_str().unwrap()]);
-    let env: Value = serde_json::from_slice(&o.stdout).expect("envelope");
-    assert!(
-        env["warnings"]
-            .as_array()
-            .is_some_and(|w| w.iter().any(|w| w["code"] == "vex_stale_doc_removed")),
-        "{env}"
-    );
-    assert!(
-        !stderr(&o).contains("Removed the previous"),
-        "--json keeps stderr clean"
-    );
 }
 
 #[test]
 fn omissions_are_sorted_and_listed_once() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    let purls = [
-        "pkg:npm/zeta@1.0.0",
-        "pkg:npm/alpha@1.0.0",
-        "pkg:npm/mid@1.0.0",
-    ];
-    write_manifest(cwd, &purls);
+    write_npm_manifest(
+        cwd,
+        &[
+            "pkg:npm/zeta@1.0.0",
+            "pkg:npm/alpha@1.0.0",
+            "pkg:npm/mid@1.0.0",
+        ],
+    );
 
     let o = vex(cwd, &[]);
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
@@ -270,29 +147,6 @@ fn omissions_are_sorted_and_listed_once() {
             "  omitted: pkg:npm/zeta@1.0.0 (package_not_found)",
         ]
     );
-
-    // The JSON skipped events come out in the same order.
-    let out_path = cwd.join("o.json");
-    let o = vex(cwd, &["--json", "-O", out_path.to_str().unwrap()]);
-    let env: Value = serde_json::from_slice(&o.stdout).expect("envelope");
-    let order: Vec<&str> = env["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["purl"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        order,
-        vec![
-            "pkg:npm/alpha@1.0.0",
-            "pkg:npm/mid@1.0.0",
-            "pkg:npm/zeta@1.0.0"
-        ]
-    );
-    assert_eq!(
-        env["events"][0]["reason"],
-        "patch omitted from VEX: the package is not installed"
-    );
 }
 
 #[test]
@@ -301,7 +155,7 @@ fn trusted_patch_attests_without_setup_config() {
     let cwd = tmp.path();
     // No manifest `setup` section and no install hook: the trusted patch
     // still attests, with no omission warning.
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
+    write_npm_manifest(cwd, &["pkg:npm/a@1.0.0"]);
 
     let o = vex(cwd, &["--no-verify"]);
     let err = stderr(&o);
@@ -315,7 +169,7 @@ fn trusted_patch_attests_without_setup_config() {
 fn org_that_looks_like_a_file_warns() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
+    write_npm_manifest(cwd, &["pkg:npm/a@1.0.0"]);
 
     let o = vex(cwd, &["--no-verify", "-o", "out.json"]);
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
@@ -361,14 +215,16 @@ fn missing_custom_manifest_does_not_suggest_manifest_path() {
     assert_eq!(stderr(&o), expected);
 }
 
+/// A corrupt manifest is not a missing one: the error names the parse
+/// failure and the file, and no document reaches stdout.
 #[test]
 fn corrupt_manifest_error_names_the_file() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    std::fs::create_dir_all(cwd.join(".socket")).unwrap();
-    std::fs::write(cwd.join(".socket/manifest.json"), "{not json").unwrap();
+    write_corrupt_manifest(cwd);
     let o = vex(cwd, &[]);
     assert_eq!(o.status.code(), Some(2));
+    assert!(o.stdout.is_empty(), "{}", stdout(&o));
     let err = stderr(&o);
     assert!(
         err.starts_with("Error: Failed to parse manifest JSON: "),
@@ -381,16 +237,104 @@ fn corrupt_manifest_error_names_the_file() {
 fn product_undetected_names_the_unusable_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
-    write_manifest(cwd, &["pkg:npm/a@1.0.0"]);
+    write_npm_manifest(cwd, &["pkg:npm/a@1.0.0"]);
     std::fs::write(cwd.join("package.json"), r#"{"name":"app"}"#).unwrap();
-    let o = cli()
-        .args(["vex", "--no-verify", "--cwd", cwd.to_str().unwrap()])
-        .output()
-        .unwrap();
+    let o = vex_command(cwd, None).arg("--no-verify").output().unwrap();
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(
         stderr(&o).contains("(package.json was found but has no usable name and version)"),
         "{}",
         stderr(&o)
     );
+}
+
+/// The `redirect_ledger_corrupt` advisory is a stderr warning line, ahead
+/// of the run's own outcome.
+#[test]
+fn corrupt_redirect_ledger_prints_a_warning_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    write_npm_manifest(cwd, &["pkg:npm/leftpad@1.0.0"]);
+    write_corrupt_redirect_ledger(cwd);
+
+    let o = vex(cwd, &[]);
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.lines().any(|l| l.starts_with("Warning:")
+            && l.contains("pre-v5 redirect ledger")
+            && l.contains("redirect-state.json")
+            && l.contains("malformed")
+            && l.contains("not consulted")),
+        "{err}"
+    );
+    assert!(err.contains("(package_not_found)"), "{err}");
+    assert_redirect_ledger_untouched(cwd);
+}
+
+/// The `vendor_ledger_corrupt` error names the ledger, with or without a
+/// manifest (never "Manifest not found"), and `--silent` never mutes it.
+#[test]
+fn corrupt_vendor_ledger_error_names_the_ledger() {
+    for (with_manifest, silent) in [(true, false), (false, false), (false, true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        if with_manifest {
+            write_npm_manifest(cwd, &["pkg:npm/leftpad@1.0.0"]);
+        }
+        write_corrupt_vendor_ledger(cwd);
+
+        let o = vex(cwd, if silent { &["--silent"] } else { &[] });
+        let err = stderr(&o);
+        assert_eq!(o.status.code(), Some(2), "{err}");
+        assert!(o.stdout.is_empty(), "no document: {}", stdout(&o));
+        assert!(
+            err.lines().any(|l| l.starts_with("Error:")
+                && l.contains("vendor ledger")
+                && l.contains("state.json")),
+            "with_manifest={with_manifest} silent={silent}: {err}"
+        );
+        assert!(!err.contains("Manifest not found"), "{err}");
+        assert!(
+            !err.contains("omitting") && !err.contains("package_not_found"),
+            "the ledger error fires before verification: {err}"
+        );
+        assert_vendor_ledger_untouched(cwd);
+    }
+}
+
+/// The multi-manifest auto-detect warning names the manifest it used, and
+/// `--silent` suppresses it without changing the document.
+#[test]
+fn multi_manifest_auto_detect_warning_and_silent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    write_multi_manifest_project(cwd);
+    let out_path = cwd.join("out.vex.json");
+
+    for silent in [false, true] {
+        let _ = std::fs::remove_file(&out_path);
+        let mut cmd = vex_command(cwd, None);
+        cmd.args(["--no-verify", "--output", out_path.to_str().unwrap()]);
+        if silent {
+            cmd.arg("--silent");
+        }
+        let o = cmd.output().expect("invoke vex");
+        let err = stderr(&o);
+        assert_eq!(o.status.code(), Some(0), "{err}");
+        let warned = err
+            .lines()
+            .any(|l| l.contains("Multiple project manifests") && l.contains("using package.json"));
+        assert_eq!(warned, !silent, "silent={silent}: {err}");
+        if silent {
+            // Any wording of the warning must stay suppressed, not just the
+            // line `warned` matches.
+            assert!(!err.contains("Multiple project manifests"), "{err}");
+            assert!(o.stdout.is_empty(), "{}", stdout(&o));
+        }
+        assert_eq!(
+            read_doc(&out_path)["statements"][0]["products"][0]["@id"],
+            PRODUCT
+        );
+    }
 }
