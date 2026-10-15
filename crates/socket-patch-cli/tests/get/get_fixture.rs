@@ -615,7 +615,7 @@ pub async fn mount_ghsa_single(server: &MockServer) {
 }
 
 /// The hosted reference endpoint granting `uuid` for `purl` at `url` (the
-/// `covgap_commands_scan_hosted` fixture shape).
+/// `scan/hosted_fixture.rs` fixture shape).
 pub async fn mount_granted_reference(server: &MockServer, uuid: &str, purl: &str, url: &str) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))

@@ -1055,7 +1055,7 @@ const HOSTED_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/telemetry-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/telemetry-hosted-1.0.0.tgz";
 
 /// An npm project whose lockfile resolves [`HOSTED_NAME`] upstream (the
-/// `covgap_commands_scan_hosted.rs` `write_npm_project` shape).
+/// `scan/hosted_fixture.rs` `write_npm_project` shape).
 fn write_hosted_npm_project(root: &Path) {
     std::fs::write(
         root.join("package.json"),

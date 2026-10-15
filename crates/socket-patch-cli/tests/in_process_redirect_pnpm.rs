@@ -2770,7 +2770,7 @@ async fn hosted_scan_from_npm_member_with_stray_lock_refuses() {
     }
 }
 
-/// #1101 (Bun), #1134 (vlt): a workspace member holding a stray
+/// #1101 (Bun), #1134 / #1542 (vlt): a workspace member holding a stray
 /// `bun.lock` / `bun.lockb` / `vlt-lock.json` of its own (one its manager
 /// never reads; members install from the root lock) used to skip the
 /// #884 / #942 refusal. `scan` and `get` pinned the ignored member lock
@@ -2801,6 +2801,19 @@ async fn hosted_scan_from_bun_or_vlt_member_with_stray_lock_refuses() {
         (
             "vlt-lock.json",
             Some(r#"{"workspaces":"packages/*"}"#),
+            "vlt-lock.json",
+            vlt_text.as_str(),
+        ),
+        // #1542: vlt lists members through extglobs too.
+        (
+            "vlt-lock.json",
+            Some(r#"{"workspaces":["packages/+(a|b)"]}"#),
+            "vlt-lock.json",
+            vlt_text.as_str(),
+        ),
+        (
+            "vlt-lock.json",
+            Some(r#"{"workspaces":["packages/@(a|b)"]}"#),
             "vlt-lock.json",
             vlt_text.as_str(),
         ),

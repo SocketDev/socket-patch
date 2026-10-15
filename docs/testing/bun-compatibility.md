@@ -25,7 +25,7 @@ fixtures pin their warning code through `expected-warnings.json`) and by
 hermetic CLI suites that
 need no Bun binary (`tests/vendor/in_process_vendor_bun.rs`,
 `tests/in_process_vendor_bun_takeover.rs`, the bun cases of
-`tests/in_process_redirect.rs`, `tests/covgap_commands_scan_hosted.rs`,
+`tests/in_process_redirect.rs`, `tests/scan/hosted_failure_paths.rs`,
 `tests/scan/scan_failure_paths.rs`, `tests/scan/scan_render.rs`,
 `tests/rollback/rollback_failure_paths.rs`,
 `tests/rollback/rollback_render.rs`,

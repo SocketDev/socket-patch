@@ -1204,7 +1204,7 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
 }
 
 /// Hosted twin of `vendored_lock_held_vendor_step_errors_without_vendor_envelope`
-/// (and of `covgap_commands_scan_hosted::hosted_lock_held_refuses_before_any_write`):
+/// (and of `scan/hosted_failure_paths.rs`'s `hosted_lock_held_refuses_before_any_write`):
 /// `get <uuid> --mode hosted` folds its result into the HOSTED error
 /// envelope, so a held apply lock surfaces as the top-level
 /// `error: {code: "lock_held", message}` object (v5.0: no top-level
