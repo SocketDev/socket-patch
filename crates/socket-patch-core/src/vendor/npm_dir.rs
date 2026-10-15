@@ -45,9 +45,9 @@ pub(crate) const UUID_GITIGNORE: &str =
 /// `<uuid>/.gitattributes`, exactly. It unsets every attribute that lets
 /// git store or check out other bytes than the artifact's: EOL conversion
 /// (`text`), clean/smudge filters such as a repository's `*.tgz
-/// filter=lfs` rule (#1541), `ident` expansion and re-encoding. A nested
-/// file beats every `.gitattributes` above it; only `.git/info/attributes`
-/// outranks it.
+/// filter=lfs` rule (#1541), `ident` expansion and re-encoding. It beats
+/// every `.gitattributes` above the uuid dir, but not `.git/info/attributes`
+/// or a `.gitattributes` deeper in a vendored directory payload.
 pub(crate) const UUID_GITATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding\n";
 /// The `<uuid>/.gitattributes` releases before #1541 wrote: still ours,
 /// and rewritten to [`UUID_GITATTRIBUTES`] by the next vendored run.

@@ -1082,11 +1082,11 @@ fn mirror_metadata(path: &Path) -> Vec<PathBuf> {
             }
             continue;
         }
-        let ours = |bytes: &[u8]| match entry.file_name().to_str() {
-            Some(".gitignore") => bytes == super::npm_dir::UUID_GITIGNORE.as_bytes(),
+        let ours: fn(&[u8]) -> bool = match entry.file_name().to_str() {
+            Some(".gitignore") => |b| b == super::npm_dir::UUID_GITIGNORE.as_bytes(),
             // Current or pre-#1541 bytes.
-            Some(".gitattributes") => super::npm_dir::is_uuid_gitattributes(bytes),
-            _ => false,
+            Some(".gitattributes") => super::npm_dir::is_uuid_gitattributes,
+            _ => return Vec::new(),
         };
         if !read_regular_to_bytes_sync(&child).is_ok_and(|b| ours(&b)) {
             return Vec::new();
