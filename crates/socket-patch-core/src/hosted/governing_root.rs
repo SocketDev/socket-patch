@@ -32,10 +32,11 @@ use crate::utils::fs::{
     read_regular_to_string_sync,
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
-use crate::utils::workspace_globs::{workspaces_include, workspaces_include_as, WorkspacesDialect};
+use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
 use crate::vendor::lock_inventory::ProjectView;
+use crate::vendor::vlt_lock_text::{self, DepIdKind, LockSniff};
 use crate::vendor::{bun_lock_text, bun_lockb};
 
 use super::engine::{Candidate, Refusal};
@@ -592,6 +593,9 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
 /// is older Bun's; 1.3.0/1.3.1 never list an excluded one. A list that
 /// cannot be read keeps the wider pre-1.3 reading.
 async fn lock_lists_member(root: &Path, lock: &str, patterns: &[String], rel: &[String]) -> bool {
+    if lock == VLT_LOCK {
+        return vlt_lists_member(root, &[patterns.to_vec()], rel).await;
+    }
     let dialect = lock_dialect(root, lock).await;
     if !workspaces_include_as(patterns, rel, dialect) {
         return false;
@@ -754,7 +758,7 @@ async fn vlt_workspace_root(root: &Path) -> Option<PathBuf> {
         let Ok(text) = read_regular_to_string(&ancestor.join(VLT_JSON)).await else {
             continue;
         };
-        let Some(patterns) = vlt_workspace_patterns(&text) else {
+        let Some(groups) = vlt_workspace_patterns(&text) else {
             continue;
         };
         let Ok(rel) = canonical.strip_prefix(ancestor) else {
@@ -764,15 +768,86 @@ async fn vlt_workspace_root(root: &Path) -> Option<PathBuf> {
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        if !workspaces_include(&patterns, &rel) {
+        let any_vlt_lists = [WorkspacesDialect::VLT, WorkspacesDialect::VLT_PRE_1_3]
+            .iter()
+            .any(|&dialect| {
+                groups
+                    .iter()
+                    .any(|g| workspaces_include_as(g, &rel, dialect))
+            });
+        if !any_vlt_lists {
             continue;
         }
         if !ancestor.join(VLT_LOCK).is_file() {
             return None;
         }
+        if !vlt_lists_member(ancestor, &groups, &rel).await {
+            continue;
+        }
         return Some(ancestor.to_path_buf());
     }
     None
+}
+
+/// Whether vlt lists the member `rel` under the `workspaces` `groups` of
+/// the root `root`, which holds `vlt-lock.json` (#1542). vlt globs each
+/// group on its own. vlt 1.3 and older vlt read a `!` pattern differently
+/// ([`WorkspacesDialect::VLT`], [`WorkspacesDialect::VLT_PRE_1_3`]) but
+/// write the same lock, so for a directory only one of them lists, the
+/// lock decides: vlt records an edge from every member it installed that
+/// has a dependency, so a lock with an edge from the member, or from any
+/// other directory only older vlt lists, is older vlt's. A lock that
+/// cannot be read keeps the wider reading.
+async fn vlt_lists_member(root: &Path, groups: &[Vec<String>], rel: &[String]) -> bool {
+    let lists = |dir: &[String], dialect| {
+        groups
+            .iter()
+            .any(|group| workspaces_include_as(group, dir, dialect))
+    };
+    let current = lists(rel, WorkspacesDialect::VLT);
+    let older = lists(rel, WorkspacesDialect::VLT_PRE_1_3);
+    if current == older {
+        return current;
+    }
+    let Some(importers) = vlt_lock_workspace_dirs(root).await else {
+        return true;
+    };
+    let older_lock = importers.iter().any(|dir| {
+        lists(dir, WorkspacesDialect::VLT_PRE_1_3) && !lists(dir, WorkspacesDialect::VLT)
+    });
+    // A directory only vlt 1.3 lists (`!!x`) is a member unless the lock
+    // shows older vlt; one only older vlt lists is a member only then.
+    if current {
+        !older_lock || importers.iter().any(|dir| dir == rel)
+    } else {
+        older_lock
+    }
+}
+
+/// The workspace directories `root`'s `vlt-lock.json` holds edges from, as
+/// `/`-separated components. `None` when the lock cannot be read.
+async fn vlt_lock_workspace_dirs(root: &Path) -> Option<Vec<Vec<String>>> {
+    let text = read_regular_to_string(&root.join(VLT_LOCK)).await.ok()?;
+    let LockSniff::Readable(lock) = vlt_lock_text::sniff_lock(&text) else {
+        return None;
+    };
+    let Some(edges) = lock.edges() else {
+        return Some(Vec::new());
+    };
+    Some(
+        edges
+            .keys()
+            .filter_map(|key| vlt_lock_text::split_dep_id(key.split_once(' ')?.0))
+            .filter(|id| id.kind == DepIdKind::Workspace)
+            .map(|id| {
+                id.first
+                    .split(['/', '\\'])
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 /// Whether `<dir>/vlt.json` has a `workspaces` field. vlt keys its
@@ -802,10 +877,10 @@ fn nearer_root(
     }
 }
 
-/// The `workspaces` patterns of a `vlt.json`: a string, an array, or an
-/// object of named groups whose values are a string or an array. `None`
-/// when the field is absent or the file does not parse.
-fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<String>> {
+/// The `workspaces` pattern groups of a `vlt.json`: a string or an array
+/// (one group), or an object of named groups whose values are a string or
+/// an array. `None` when the field is absent or the file does not parse.
+fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<Vec<String>>> {
     fn strings(value: &serde_json::Value, out: &mut Vec<String>) {
         match value {
             serde_json::Value::String(s) => out.push(s.clone()),
@@ -818,12 +893,15 @@ fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<String>> {
     let text = strip_bom(vlt_json);
     let doc: serde_json::Value = serde_json::from_str(text).ok()?;
     let field = doc.get("workspaces")?;
-    let mut out = Vec::new();
-    match field {
-        serde_json::Value::Object(groups) => groups.values().for_each(|v| strings(v, &mut out)),
-        other => strings(other, &mut out),
-    }
-    Some(out)
+    let group = |value| {
+        let mut out = Vec::new();
+        strings(value, &mut out);
+        out
+    };
+    Some(match field {
+        serde_json::Value::Object(groups) => groups.values().map(group).collect(),
+        other => vec![group(other)],
+    })
 }
 
 /// The `workspaces` patterns of a `package.json`: the array form (npm,
@@ -2012,7 +2090,10 @@ mod tests {
         let json = r#"{"workspaces":["a/*"]}"#;
         for bom in ["", "\u{feff}"] {
             let text = format!("{bom}{json}");
-            assert_eq!(vlt_workspace_patterns(&text), Some(vec!["a/*".to_string()]));
+            assert_eq!(
+                vlt_workspace_patterns(&text),
+                Some(vec![vec!["a/*".to_string()]])
+            );
             assert_eq!(workspace_patterns(&text), Some(vec!["a/*".to_string()]));
         }
         let text = format!("\u{feff}\u{feff}{json}");
@@ -2026,18 +2107,17 @@ mod tests {
     fn vlt_workspace_patterns_read_every_shape() {
         assert_eq!(
             vlt_workspace_patterns(r#"{"workspaces":"packages/*"}"#),
-            Some(vec!["packages/*".to_string()])
+            Some(vec![vec!["packages/*".to_string()]])
         );
         assert_eq!(
             vlt_workspace_patterns("\u{feff}{\"workspaces\":[\"a/*\",\"b\"]}"),
-            Some(vec!["a/*".to_string(), "b".to_string()])
+            Some(vec![vec!["a/*".to_string(), "b".to_string()]])
         );
         assert_eq!(
             vlt_workspace_patterns(r#"{"workspaces":{"apps":"apps/*","libs":["libs/*","x"]}}"#),
             Some(vec![
-                "apps/*".to_string(),
-                "libs/*".to_string(),
-                "x".to_string()
+                vec!["apps/*".to_string()],
+                vec!["libs/*".to_string(), "x".to_string()]
             ])
         );
         assert_eq!(vlt_workspace_patterns(r#"{"registries":{}}"#), None);
@@ -2164,7 +2244,11 @@ mod tests {
                         write(tmp.path(), "vlt.json", r#"{"registries":{}}"#);
                     } else {
                         write(tmp.path(), "package.json", r#"{"private":true}"#);
-                        write(tmp.path(), "vlt.json", &format!(r#"{{"workspaces":{list}}}"#));
+                        write(
+                            tmp.path(),
+                            "vlt.json",
+                            &format!(r#"{{"workspaces":{list}}}"#),
+                        );
                     }
                     write(tmp.path(), VLT_LOCK, "{}");
                     write(tmp.path(), "packages/a/package.json", "{}");
@@ -2182,11 +2266,7 @@ mod tests {
                         Some(WORKSPACE_LOCKFILE_ELSEWHERE),
                         "{case}"
                     );
-                    assert_eq!(
-                        member_stray_lock(&member).await.is_some(),
-                        stray,
-                        "{case}"
-                    );
+                    assert_eq!(member_stray_lock(&member).await.is_some(), stray, "{case}");
                     // `packages/c` is not listed: its own lock governs it.
                     let other = tmp.path().join("packages/c");
                     assert_eq!(code(&other, "npm").await, None, "{case}");
@@ -2226,7 +2306,11 @@ mod tests {
                 false,
             ),
             // A later pattern whose text the `!` matches lists it again.
-            (r#"["packages/*","!packages/a","packages/a"]"#, lock(&[]), true),
+            (
+                r#"["packages/*","!packages/a","packages/a"]"#,
+                lock(&[]),
+                true,
+            ),
             (r#"["!packages/*","packages/a"]"#, lock(&[]), true),
             // vlt 1.2 installed the excluded member (or another one).
             (
@@ -2240,7 +2324,11 @@ mod tests {
                 true,
             ),
             // An unreadable lock keeps the wider reading.
-            (r#"["!packages/a","packages/*"]"#, "not json".to_string(), true),
+            (
+                r#"["!packages/a","packages/*"]"#,
+                "not json".to_string(),
+                true,
+            ),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             write(tmp.path(), "package.json", r#"{"private":true}"#);
@@ -2254,12 +2342,12 @@ mod tests {
             write(tmp.path(), "packages/a/vlt-lock.json", "{}");
             let member = tmp.path().join("packages/a");
             let case = format!("{workspaces} with {root_lock:?}");
+            assert_eq!(code(&member, "npm").await.is_some(), refused, "{case}");
             assert_eq!(
-                code(&member, "npm").await.is_some(),
+                member_stray_lock(&member).await.is_some(),
                 refused,
                 "{case}"
             );
-            assert_eq!(member_stray_lock(&member).await.is_some(), refused, "{case}");
         }
     }
 
