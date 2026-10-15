@@ -138,7 +138,9 @@ pub(crate) fn workspaces_include(patterns: &[String], rel: &[String]) -> bool {
     workspaces_include_as(patterns, rel, WorkspacesDialect::NPM)
 }
 
-/// [`workspaces_include`] in a given package manager's dialect.
+/// Whether the member path (`rel`, relative to the workspace root, one
+/// entry per component) is listed by the `workspaces` `patterns`, read in
+/// `dialect` (see [`Negation`] for what a `!` pattern does).
 pub(crate) fn workspaces_include_as(
     patterns: &[String],
     rel: &[String],
@@ -190,7 +192,7 @@ pub(crate) fn workspaces_include_as(
                 // minimatch(pattern, ignore): the pattern's own text, read
                 // as a path, against each earlier `!` glob.
                 let text: Vec<String> = pattern
-                    .split('/')
+                    .split(['/', '\\'])
                     .filter(|s| !s.is_empty() && *s != ".")
                     .map(str::to_string)
                     .collect();

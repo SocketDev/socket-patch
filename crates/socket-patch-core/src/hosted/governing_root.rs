@@ -684,6 +684,8 @@ async fn lock_dialect(root: &Path, lock: &str) -> WorkspacesDialect {
                 WorkspacesDialect::BUN_PRE_1_3
             }
         }
+        // [`lock_lists_member`] reads a vlt lock through
+        // [`vlt_lists_member`], which also weighs vlt before 1.3.
         VLT_LOCK => WorkspacesDialect::VLT,
         _ => WorkspacesDialect::NPM,
     }
@@ -768,18 +770,17 @@ async fn vlt_workspace_root(root: &Path) -> Option<PathBuf> {
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        let any_vlt_lists = [WorkspacesDialect::VLT, WorkspacesDialect::VLT_PRE_1_3]
-            .iter()
-            .any(|&dialect| {
-                groups
-                    .iter()
-                    .any(|g| workspaces_include_as(g, &rel, dialect))
-            });
-        if !any_vlt_lists {
-            continue;
-        }
         if !ancestor.join(VLT_LOCK).is_file() {
-            return None;
+            // Never installed, so no lock tells the vlt versions apart: a
+            // root the current one lists the member under governs it and
+            // refuses nothing; otherwise an outer root may (#1542).
+            if groups
+                .iter()
+                .any(|group| workspaces_include_as(group, &rel, WorkspacesDialect::VLT))
+            {
+                return None;
+            }
+            continue;
         }
         if !vlt_lists_member(ancestor, &groups, &rel).await {
             continue;
@@ -2349,6 +2350,34 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// #1542: a nearer, never-installed `vlt.json` that excludes the member
+    /// with a `!` pattern is not its root, so an outer root that lists it
+    /// still refuses it.
+    #[tokio::test]
+    async fn vlt_excluded_by_an_uninstalled_inner_root_walks_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            "vlt.json",
+            r#"{"workspaces":["inner/packages/*"]}"#,
+        );
+        write(tmp.path(), VLT_LOCK, "{}");
+        write(tmp.path(), "inner/package.json", r#"{"private":true}"#);
+        write(
+            tmp.path(),
+            "inner/vlt.json",
+            r#"{"workspaces":["packages/*","!packages/a"]}"#,
+        );
+        write(tmp.path(), "inner/packages/a/package.json", "{}");
+        assert_eq!(
+            code(&tmp.path().join("inner/packages/a"), "npm")
+                .await
+                .as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
     }
 
     /// #1542: vlt globs each named `workspaces` group on its own, so a `!`
