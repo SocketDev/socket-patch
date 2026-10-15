@@ -467,9 +467,10 @@ async fn vlt_lock_root(
 /// directory between `scan_root` (exclusive) and the copy's first
 /// `node_modules` that holds an npm-family lock of its own and is not a
 /// workspace member whose package manager ignores that lock
-/// ([`member_stray_lock`]). `None` when the copy belongs to `scan_root`'s
-/// own install (its `node_modules`, or a workspace member without a lock
-/// of its own). `copy` is matched against `scan_root` as given and
+/// ([`member_stray_lock`]); failing that, the project a lockless install
+/// of that `node_modules` belongs to ([`lockless_npm_project`], #1554).
+/// `None` when the copy belongs to `scan_root`'s own install (its
+/// `node_modules`, or a workspace member without a lock of its own). `copy` is matched against `scan_root` as given and
 /// canonicalized.
 ///
 /// A hosted or vendored run rewires only `scan_root`'s locks, so such a
@@ -492,6 +493,79 @@ pub async fn nested_npm_project(scan_root: &Path, copy: &Path) -> Option<PathBuf
         dir.extend(&parts[..k]);
         if has_own_npm_family_lock(&dir) && member_stray_lock(&dir).await.is_none() {
             return Some(dir);
+        }
+    }
+    let mut dir = base.to_path_buf();
+    dir.extend(&parts[..depth]);
+    lockless_npm_project(base, dir).await
+}
+
+/// #1554: the project a lockless install (`package-lock=false`, `npm
+/// install --no-package-lock`) of `dir`'s `node_modules` belongs to, when
+/// it lies strictly below `base`: `dir`, or, while a workspace lists it,
+/// that workspace's root (which installs its members, locked or not).
+/// `None` when that project is `base`'s own (or above it), has no
+/// `package.json` (npm installs into no such directory), or reads a pnpm
+/// lock kept elsewhere.
+async fn lockless_npm_project(base: &Path, mut dir: PathBuf) -> Option<PathBuf> {
+    while let Some(workspace) = listing_workspace(&dir).await {
+        dir = workspace;
+    }
+    if dir == base || !dir.starts_with(base) {
+        return None;
+    }
+    if !tokio::fs::metadata(dir.join("package.json"))
+        .await
+        .is_ok_and(|m| m.is_file())
+        || pnpm_lock_elsewhere(&dir).await.is_some()
+    {
+        return None;
+    }
+    Some(dir)
+}
+
+/// The nearest ancestor of `dir` whose `package.json` or `vlt.json`
+/// `workspaces` (in any package manager's reading) or `pnpm-workspace.yaml`
+/// `packages:` lists it, whether or not that workspace holds a lock. A
+/// `pnpm-workspace.yaml` that cannot be read, or whose globs cannot be
+/// matched, lists it: the copy then stays the scan root's, as before.
+async fn listing_workspace(dir: &Path) -> Option<PathBuf> {
+    let lists = |patterns: &[String], rel: &[String]| {
+        WorkspacesDialect::ALL
+            .iter()
+            .any(|&dialect| workspaces_include_as(patterns, rel, dialect))
+    };
+    for ancestor in dir.ancestors().skip(1) {
+        let Ok(rel) = dir.strip_prefix(ancestor) else {
+            continue;
+        };
+        let rel: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await {
+            if workspace_patterns(&text).is_some_and(|patterns| lists(&patterns, &rel)) {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+        if let Ok(text) = read_regular_to_string(&ancestor.join(VLT_JSON)).await {
+            if vlt_workspace_patterns(&text)
+                .is_some_and(|groups| groups.iter().any(|group| lists(group, &rel)))
+            {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+        if let Ok(yaml) = read_regular_to_string(&ancestor.join(PNPM_WORKSPACE)).await {
+            let listed = match read_package_globs(&yaml) {
+                Ok(Some(globs)) => {
+                    crate::utils::pnpm_workspace::lists_member(&globs, &rel).unwrap_or(true)
+                }
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            if listed {
+                return Some(ancestor.to_path_buf());
+            }
         }
     }
     None
@@ -1154,6 +1228,85 @@ mod tests {
             nested_npm_project(root, Path::new("/elsewhere/node_modules/x")).await,
             None
         );
+    }
+
+    /// #1554: a project installed without a lock (`package-lock=false`,
+    /// `npm install --no-package-lock`) is independent too, unless a
+    /// workspace lists it, whether or not that workspace was ever locked.
+    #[tokio::test]
+    async fn nested_npm_project_finds_a_lockless_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "package.json",
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        );
+        write(root, "package-lock.json", "{}");
+        write(root, "tools/x/package.json", r#"{"name":"x"}"#);
+        write(root, "tools/x/.npmrc", "package-lock=false\n");
+        write(root, "packages/a/package.json", r#"{"name":"a"}"#);
+        // A lockless inner workspace whose member has its own node_modules.
+        write(
+            root,
+            "apps/w/package.json",
+            r#"{"name":"w","workspaces":["m"]}"#,
+        );
+        write(root, "apps/w/m/package.json", r#"{"name":"m"}"#);
+        // vlt.json and pnpm-workspace.yaml members.
+        write(root, "v/package.json", r#"{"name":"v"}"#);
+        write(root, "v/vlt.json", r#"{"workspaces":["m"]}"#);
+        write(root, "v/m/package.json", r#"{"name":"vm"}"#);
+        write(root, "p/package.json", r#"{"name":"p"}"#);
+        write(root, "p/pnpm-workspace.yaml", "packages:\n  - m\n");
+        write(root, "p/m/package.json", r#"{"name":"pm"}"#);
+        // An unreadable pnpm-workspace.yaml keeps the copy the root's.
+        write(root, "q/pnpm-workspace.yaml", "packages: [\n");
+        write(root, "q/m/package.json", r#"{"name":"qm"}"#);
+        // A settings-only pnpm-workspace.yaml lists no member.
+        write(root, "s/pnpm-workspace.yaml", "onlyBuiltDependencies: []\n");
+        write(root, "s/x/package.json", r#"{"name":"sx"}"#);
+        // No package.json: npm never installs into such a directory.
+        std::fs::create_dir_all(root.join("bare")).unwrap();
+
+        let owner = |rel: &str| {
+            let copy = root.join(rel);
+            async move { nested_npm_project(root, &copy).await }
+        };
+        assert_eq!(
+            owner("tools/x/node_modules/left-pad").await,
+            Some(root.join("tools/x"))
+        );
+        assert_eq!(
+            owner("tools/x/node_modules/left-pad/node_modules/y").await,
+            Some(root.join("tools/x"))
+        );
+        assert_eq!(owner("node_modules/left-pad").await, None);
+        assert_eq!(owner("packages/a/node_modules/left-pad").await, None);
+        assert_eq!(
+            owner("apps/w/node_modules/left-pad").await,
+            Some(root.join("apps/w")),
+            "the lockless workspace root is itself independent"
+        );
+        assert_eq!(
+            owner("apps/w/m/node_modules/left-pad").await,
+            Some(root.join("apps/w")),
+            "a member belongs to its workspace root's install"
+        );
+        assert_eq!(
+            owner("v/m/node_modules/left-pad").await,
+            Some(root.join("v"))
+        );
+        assert_eq!(
+            owner("p/m/node_modules/left-pad").await,
+            Some(root.join("p"))
+        );
+        assert_eq!(owner("q/m/node_modules/left-pad").await, None);
+        assert_eq!(
+            owner("s/x/node_modules/left-pad").await,
+            Some(root.join("s/x"))
+        );
+        assert_eq!(owner("bare/node_modules/left-pad").await, None);
     }
 
     /// #590: a pnpm workspace member has no lock; the root's lock governs it.

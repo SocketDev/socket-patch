@@ -444,7 +444,9 @@ vendored scans rewire only the scan root's lockfiles, so a patched package
 that only a nested, independent npm project installs (a directory below
 the root with its own lockfile, such as `tools/x/` holding
 `package-lock.json`, that is not a workspace member installed from the
-root's lock) is left alone with a `nested_project_skipped` warning. The
+root's lock; or one with a `package.json` and `node_modules` installed
+without a lockfile, such as under `package-lock=false`, that no workspace
+lists) is left alone with a `nested_project_skipped` warning. The
 warning names the project directory; pass it as a PATH
 (`socket-patch scan --mode vendored tools/x`) to patch that project.
 

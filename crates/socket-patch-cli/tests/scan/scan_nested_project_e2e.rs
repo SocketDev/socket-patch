@@ -425,3 +425,58 @@ async fn warning_names_the_path_from_the_shells_directory() {
         "{detail}"
     );
 }
+
+/// #1554: [`write_repo`], but `tools/x` was installed without a lock
+/// (`package-lock=false` in its `.npmrc`, or `npm install
+/// --no-package-lock`).
+fn write_lockless_repo(root: &Path, npmrc: bool) {
+    write_repo(root);
+    std::fs::remove_file(root.join("tools/x/package-lock.json")).unwrap();
+    if npmrc {
+        std::fs::write(root.join("tools/x/.npmrc"), "package-lock=false\n").unwrap();
+    }
+}
+
+/// #1554: a lockless nested project is as independent as a locked one.
+/// Every run ended `partialFailure`, exit 1, with
+/// `vendor_lock_entry_not_found`, and the in-run VEX was dropped.
+#[tokio::test]
+async fn root_vendored_scan_skips_a_lockless_nested_project() {
+    for npmrc in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_lockless_repo(root, npmrc);
+        let mock = MockServer::start().await;
+        mount_api(&mock).await;
+
+        for run in 1..=2 {
+            let (code, stdout, stderr) = run_scan(root, &mock.uri(), "vendored", &[]);
+            let v = parse_json_envelope(&stdout);
+            assert_eq!(
+                code, 0,
+                "npmrc={npmrc} run {run}: exit 0\nstdout={stdout}\nstderr={stderr}"
+            );
+            assert_eq!(v["status"], "success", "npmrc={npmrc} run {run}: {v:#}");
+            assert_nested_skipped(&v);
+        }
+        let root_lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+        assert!(root_lock.contains(".socket/vendor"), "{root_lock}");
+        assert!(!root.join("tools/x/package-lock.json").exists());
+
+        let out = root.join("out.vex.json");
+        let (code, stdout, stderr) = run_scan(
+            root,
+            &mock.uri(),
+            "vendored",
+            &[
+                "--vex",
+                out.to_str().unwrap(),
+                "--vex-product",
+                "pkg:npm/root@1.0.0",
+            ],
+        );
+        assert_eq!(code, 0, "npmrc={npmrc}: stdout={stdout}\nstderr={stderr}");
+        let doc = std::fs::read_to_string(&out).expect("the in-run VEX is written");
+        assert!(!doc.contains("left-pad"), "{doc}");
+    }
+}
