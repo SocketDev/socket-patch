@@ -1016,6 +1016,15 @@ async fn pypi_prelude<'p>(
         ));
     };
 
+    // A rule ignoring the uuid dir itself (`.socket/`) can't be overridden
+    // from inside it, so the commit would drop the wheel the wiring names
+    // (#1572): refuse before anything is downloaded or written.
+    if let Some((code, detail)) =
+        super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
+    {
+        return Err(refused(code, detail));
+    }
+
     let (flavor, flavor_warnings) =
         match detect_pypi_flavor(project_root, Some((&canon_name, version))).await {
             Ok(f) => f,
@@ -1677,6 +1686,69 @@ fn pin_matches(pin_path: &str, pin_sha: &str, rel_wheel: &str, sha256_hex: &str)
     pin_path == rel_wheel && (pin_sha.is_empty() || pin_sha == sha256_hex)
 }
 
+/// `<uuid>/.gitignore`, exactly: re-includes the wheel against file rules
+/// such as Python.gitignore-style `*.whl` (#1572).
+const UUID_GITIGNORE: &str = "!*\n";
+
+/// The uuid-dir half of the vendored gitignore check, for the hosted ->
+/// vendored takeover: it restores the hosted pin first, so a `.socket/`
+/// rule caught only by the vendoring would leave the package patched in
+/// neither mode. `None` when git would look inside the uuid dir, or the
+/// uuid is not canonical (the vendoring refuses that itself).
+pub async fn pypi_wheel_gitignore_preflight(
+    project_root: &Path,
+    uuid: &str,
+) -> Option<(&'static str, String)> {
+    let uuid_dir_rel = vendor_uuid_dir_rel("pypi", uuid)?;
+    super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
+}
+
+/// Write `<uuid>/.gitignore` and `<uuid>/.gitattributes` next to the
+/// wheel, then ask git whether it would commit them (#1572). The
+/// `.gitattributes` unsets the clean/smudge and EOL attributes a
+/// repository rule such as `*.whl filter=lfs` would apply, so the commit
+/// stores the wheel's exact bytes. Still ignored (a rule the nested
+/// `.gitignore` cannot override) is `Err`; git failing to answer is only a
+/// warning. `Err((None, why))` is a failed write.
+async fn keep_wheel_committable(
+    project_root: &Path,
+    uuid_dir_rel: &str,
+    rel_wheel: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<(), (Option<&'static str>, String)> {
+    let uuid_dir = project_root.join(uuid_dir_rel);
+    for (name, want) in [
+        (".gitignore", UUID_GITIGNORE),
+        (".gitattributes", super::npm_dir::UUID_GITATTRIBUTES),
+    ] {
+        let path = uuid_dir.join(name);
+        if read_regular_to_bytes(&path).await.ok().as_deref() != Some(want.as_bytes()) {
+            crate::utils::fs::atomic_write_bytes(&path, want.as_bytes())
+                .await
+                .map_err(|e| (None, format!("cannot write {uuid_dir_rel}/{name}: {e}")))?;
+        }
+    }
+    let probe = [
+        rel_wheel.to_string(),
+        format!("{uuid_dir_rel}/.gitignore"),
+        format!("{uuid_dir_rel}/.gitattributes"),
+    ];
+    match super::npm_dir::gitignore_probe(project_root, &probe).await {
+        Ok(Some(rules)) => Err((
+            Some(super::npm_dir::GITIGNORED),
+            super::npm_dir::gitignored_detail(rel_wheel, &rules),
+        )),
+        Ok(None) => Ok(()),
+        Err(why) => {
+            warnings.push(VendorWarning::new(
+                super::npm_dir::GITIGNORE_UNCHECKED,
+                super::npm_dir::gitignore_unchecked_detail(rel_wheel, &why),
+            ));
+            Ok(())
+        }
+    }
+}
+
 /// Whether [`vendor_pypi_with_pipenv_version`] — a wet run with the service
 /// enabled — asks the patch service for `record`: past every refusal it
 /// raises first, and answered neither by the in-sync hot path nor by the
@@ -1827,6 +1899,23 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         result.error = Some("wheel build reported success without an artifact".to_string());
         return done(result, None, warnings);
     };
+    if let Err((code, detail)) =
+        keep_wheel_committable(project_root, &uuid_dir_rel, &rel_wheel, &mut warnings).await
+    {
+        // A REUSED wheel is the committed artifact the live ledger entry
+        // still names: never sweep it.
+        if !reused {
+            let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+            prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
+        }
+        if let Some(code) = code {
+            return refused(code, detail);
+        }
+        let mut result = result;
+        result.success = false;
+        result.error = Some(detail);
+        return done(result, None, warnings);
+    }
 
     // A compiled-extension wheel (cp311/manylinux tags) only installs on this
     // platform, where the registry offered wheels for many — surface it.
@@ -5430,6 +5519,155 @@ wheels = [
                 .await
                 .unwrap(),
             ORIG
+        );
+    }
+
+    /// Vendor `fx`'s six from a mock service serving a patched wheel.
+    async fn vendor_served(fx: &E2eFixture, dry_run: bool) -> VendorOutcome {
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let bytes: &[u8] = &served_wheel(b"gitignore probe");
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &sri_sha512(bytes), bytes).await;
+        crate::vendor::test_support::vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            dry_run,
+            false,
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await
+    }
+
+    /// #1572: Python.gitignore-style `*.whl` rules would keep the vendored
+    /// wheel out of the commit. The uuid dir gets a `.gitignore` that
+    /// re-includes it, so a fresh clone can install what the lock names.
+    #[tokio::test]
+    async fn a_whl_ignore_rule_is_overridden_by_the_uuid_gitignore() {
+        use crate::vendor::test_support::git_project;
+        let fx = e2e_fixture_hashed().await;
+        if git_project(&fx.root, "*.whl\n").is_none() {
+            return;
+        }
+        let wheel_rel = format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}");
+        assert!(
+            super::super::npm_dir::gitignored(&fx.root, &[wheel_rel.clone()])
+                .await
+                .is_some(),
+            "precondition: the rule ignores the wheel"
+        );
+        let VendorOutcome::Done { result, entry, .. } = vendor_served(&fx, false).await else {
+            panic!("expected Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+        assert_eq!(
+            std::fs::read_to_string(uuid_dir.join(".gitignore")).unwrap(),
+            UUID_GITIGNORE
+        );
+        assert_eq!(
+            std::fs::read_to_string(uuid_dir.join(".gitattributes")).unwrap(),
+            super::super::npm_dir::UUID_GITATTRIBUTES
+        );
+        assert_eq!(
+            super::super::npm_dir::gitignored(&fx.root, &[wheel_rel]).await,
+            None,
+            "git commits the vendored wheel"
+        );
+    }
+
+    /// #1572: a repository LFS rule for `*.whl` would commit a pointer in
+    /// place of the wheel. The uuid `.gitattributes` unsets the filter.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_uuid_gitattributes_unsets_a_repository_lfs_rule_for_wheels() {
+        use crate::vendor::test_support::git_project;
+        let fx = e2e_fixture_hashed().await;
+        let Some(git) = crate::utils::process::resolve_tool("git") else {
+            return;
+        };
+        if git_project(&fx.root, "").is_none() {
+            return;
+        }
+        std::fs::write(
+            fx.root.join(".gitattributes"),
+            "*.whl filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .unwrap();
+        let wheel_rel = format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}");
+        let filter = || {
+            let out = std::process::Command::new(&git)
+                .args(["check-attr", "filter", "--"])
+                .arg(&wheel_rel)
+                .current_dir(&fx.root)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert!(filter().contains("filter: lfs"), "the repo rule applies");
+        let VendorOutcome::Done { result, .. } = vendor_served(&fx, false).await else {
+            panic!("expected Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(filter().contains("filter: unset"), "{}", filter());
+    }
+
+    /// #1572: a rule ignoring the uuid dir itself can't be overridden from
+    /// inside it, so vendoring refuses before writing anything, dry run
+    /// included.
+    #[tokio::test]
+    async fn a_directory_ignore_rule_refuses_before_any_write() {
+        use crate::vendor::test_support::git_project;
+        for rule in [".socket/", ".socket/vendor/", "pypi/"] {
+            for dry_run in [false, true] {
+                let fx = e2e_fixture_hashed().await;
+                if git_project(&fx.root, &format!("{rule}\n")).is_none() {
+                    return;
+                }
+                let req_before = std::fs::read(fx.root.join("requirements.txt")).unwrap();
+                let outcome = vendor_served(&fx, dry_run).await;
+                let VendorOutcome::Refused { code, detail } = outcome else {
+                    panic!("{rule}: expected Refused, got {outcome:?}");
+                };
+                assert_eq!(code, "vendor_artifact_gitignored", "{rule}: {detail}");
+                assert!(detail.contains(rule), "{rule}: {detail}");
+                assert!(!fx.root.join(".socket").exists(), "{rule}: nothing written");
+                assert_eq!(
+                    std::fs::read(fx.root.join("requirements.txt")).unwrap(),
+                    req_before,
+                    "{rule}: requirements untouched"
+                );
+            }
+        }
+    }
+
+    /// #1572: the takeover's pre-flight answers the same refusal before the
+    /// hosted pin is restored, and nothing when git would commit the wheel.
+    #[tokio::test]
+    async fn wheel_gitignore_preflight_matches_the_vendored_refusal() {
+        use crate::vendor::test_support::git_project;
+        let tmp = tempfile::tempdir().unwrap();
+        if git_project(tmp.path(), "*.whl\n").is_none() {
+            return;
+        }
+        assert_eq!(pypi_wheel_gitignore_preflight(tmp.path(), UUID).await, None);
+        std::fs::write(tmp.path().join(".gitignore"), ".socket/\n").unwrap();
+        let (code, detail) = pypi_wheel_gitignore_preflight(tmp.path(), UUID)
+            .await
+            .expect("refused");
+        assert_eq!(code, "vendor_artifact_gitignored");
+        assert!(detail.contains(".socket/"), "{detail}");
+        assert_eq!(
+            pypi_wheel_gitignore_preflight(tmp.path(), "not-a-uuid").await,
+            None
         );
     }
 

@@ -3188,6 +3188,26 @@ pub(crate) async fn vendor_records_reusing(
                         continue;
                     }
                 }
+                // A `.socket/` ignore rule would drop the vendored wheel
+                // from the commit; refuse before the restore so the pin
+                // stays hosted (#1572), as npm's pre-flight does above.
+                if candidate.starts_with("pkg:pypi/") {
+                    if let Some((code, detail)) =
+                        socket_patch_core::vendor::pypi_wheel_gitignore_preflight(
+                            &common.cwd,
+                            &record.uuid,
+                        )
+                        .await
+                    {
+                        has_errors = true;
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, candidate.clone())
+                                .with_error(code, detail.clone()),
+                        );
+                        report_vendor_failure(common, candidate, &detail);
+                        continue;
+                    }
+                }
                 // The vendored sbt / scala-cli gate, before the restore: a
                 // pin it would stop stays hosted (never neither).
                 if let Err((code, detail)) =
