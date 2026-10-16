@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-15 (run 44), main `e76cb9b`, latest release 5.0.1. (main was force-pushed before runs 39, 43 and 44, so older SHAs in this ledger may not resolve any more.)
+Last updated: 2026-10-16 (run 45), main `657fce2`, latest release 5.0.1. (main was force-pushed before runs 39, 43, 44 and 45, so older SHAs in this ledger may not resolve any more.)
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -481,13 +481,25 @@ Run 44 additions (main `e76cb9b`, release 5.0.1, Linux; same mock contract plus 
 | 11.28.5 | vendored pass (root warns, `tools/x` vendored + patched) | pass | loud refusal | untested | fail #1557 (silent rewrite, `ERR_PNPM_TARBALL_URL_MISMATCH`); PR #1575 fixes |
 | 12.11.2 | hosted + vendored pass, with and without a root `pnpm-workspace.yaml` | pass (vex attests; rollback byte-exact) | loud refusal | pass; legacy `* -text` file rewritten by the next run | fail #1557; PR #1575 fixes |
 
+Run 45 additions (main `657fce2`, release 5.0.1, Linux, Node 22.22.0; mock registry package `sp-build@1.0.0` with `"postinstall": "node post.js"` writing `built.txt`, plus a one-line `index.js` patch; the oracle is the marker plus `built.txt` after a fresh `--frozen-lockfile` install):
+
+| pnpm | Build approval (`onlyBuiltDependencies` on 9/10, `allowBuilds` on 11/12), name-only / pinned `@1.0.0` key: hosted → fresh frozen | Same, vendored → fresh frozen | #1557 root path, env `""` / `undefined` (post-#1575) |
+| --- | --- | --- | --- |
+| 9.15.9 | pass | pass | n/a |
+| 10.0.0 – 10.34.1 (10.0.0, 10.10.0, 10.20.0, 10.28.0, 10.32.0, 10.33.2, 10.33.4, 10.34.0, 10.34.1) | pass (10.0.0) | pass | n/a |
+| 10.34.2 – 10.34.7 (10.34.2, .3, .6, .7) | pass | fail #1597 (script silently skipped; exit 1 with `strictDepBuilds: true`) | n/a |
+| 11.28.5 | pass | fail #1597 (`ERR_PNPM_IGNORED_BUILDS`, exit 1) | pass (trust key written, dead-registry frozen install patched) |
+| 12.11.2 | pass | fail #1597 (`ERR_PNPM_IGNORED_BUILDS`, exit 1); `rollback` recovers | pass |
+
 ## Backlog
+
+0ab. **#1597** (vendored pnpm ≥ 10.34.2 breaks build approvals for the `file:` tarball): re-verify once fixed on 10.34.7 / 11 / 12. Follow-ups: `neverBuiltDependencies`, `dangerouslyAllowAllBuilds`, a transitive build package, a supersede (the uuid in an approval key changes), pnpm 11 `allowBuilds` set to `false` for a vendored package, and the pnpm 10.34.2 changelog to cite the upstream change. Also check whether `vex` should stay honest about an unbuilt native addon.
 
 0w. #1460 is verified fixed (run 40, all 16 env × major cells). Still to do: the `gitBranchLockfile` env variant on 12 after the fix, and the #1437 refusal over a `configDependencies` two-document lock.
 0x. #935: hosted half fixed by #1469 (run 41, 8/9/10/12). Still open for the vendored scan warning; re-verify once fixed. Was: **#935 regression** (hosted silent pin over a `file:` copy, first bad f3c6313a): re-verify once fixed, also for `git+` copies. #1268 still reproduces on 12.11.2 (run 39).
 0y. #1266 / #1494: scoped alias, custom virtualStoreDir and member rollback done in run 41 (pass). Transitive alias done in run 42. A transitive alias in a workspace member, including a scoped alias name, was done in run 44 (hosted 9/10/11/12 pass). Still to do: a scoped alias *target* (`npm:@scope/x@…`, which needs a scoped patched package in the mock), and agent mode over the member fixture.
 0v. #1514 verified fixed on 11.28.3 (run 43). Still to do: the `--no-trust-lockfile-config` and Rush texts with the env set.
-0u. **#1557** (an empty / `null` / `undefined` `pnpm_config_trust_lockfile` is read as false; pnpm reads only `false`): the workspace-member path was proven end to end in run 44, and draft PR #1575 (`9b470d4`) fixes it on 11/12 (commented). Re-verify the root path and the member path on 11/12 once #1575 merges.
+0u. #1557 is verified fixed on `657fce2` (run 45): the root path on 11.28.5 / 12.11.2 with `""` and `undefined` writes the trust key, and the dead-registry frozen install lands the patch. Still to do: the member path (`sharedWorkspaceLockfile: false`) on 11/12 after the fix.
 0t. #1534 follow-up (`nested_project_skipped`, fc1b4f9): a `sharedWorkspaceLockfile: false` member passes (run 43). An independent nested project under a pnpm root passed in run 44 (hosted 9/12, vendored 11/12). Still to do: a nested project inside a Rush repo, and on pnpm 10.
 0z. Post-#1007 follow-ups: #734's gate when `.modules.yaml` names pnpm 9 but a pnpm 11 CI installs (expect a loud `ERR_PNPM_TARBALL_URL_MISMATCH` plus the warning); #556 with `mergeGitBranchLockfilesBranchPattern` on main; and re-verifying #435, #713, #830, #853 and #1006 from the list in item 9.
 00a. #1050 GC follow-ups: `scan --prune` over a peer-suffixed vendored snapshot and over Rush / subspace locks. (`sharedWorkspaceLockfile: false` member: vendored now refuses `vendor_pnpm_settings_elsewhere` on 10.34.6 too, by design. #1029 `modulesDir` / `virtualStoreDir` and `unpinned` rows: done in run 34.)
@@ -526,6 +538,8 @@ Run 44 additions (main `e76cb9b`, release 5.0.1, Linux; same mock contract plus 
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
+
+- Build approvals over a **hosted** pin keep working on pnpm 9–12, with both name-only and `name@version` keys (run 45): the lock keeps the `name@version` package key. Only vendored `file:` copies lose them (#1597).
 
 - pnpm 11/12 read `pnpm_config_trust_lockfile` (and `PNPM_CONFIG_TRUST_LOCKFILE`) as false only when it is exactly `false`. Every other value (`0`, `no`, `FALSE`, empty, `null`, `undefined`) falls back to the `pnpm-workspace.yaml` key, as `pnpm config get trustLockfile` shows (run 43). socket-patch matches this for `0` / `no` / `FALSE`, but not for empty / `null` / `undefined`, which is #1557.
 
