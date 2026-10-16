@@ -24,7 +24,7 @@
 use serde_json::Value;
 
 use super::blocks::{body_field_line, LockBlock};
-use super::patterns::split_key_patterns;
+use super::patterns::{split_classic_pattern, split_key_patterns};
 
 /// The block fields yarn 1 mirrors from a package's manifest, in the
 /// order it writes them.
@@ -67,14 +67,12 @@ pub(crate) fn unlocked_descriptors(
     pkg: &Value,
     carried: &[&[String]],
 ) -> Vec<String> {
-    let locked: std::collections::HashSet<String> = blocks
+    let patterns: Vec<String> = blocks
         .iter()
         .flat_map(|b| split_key_patterns(&b.key))
         .collect();
-    let carried = carried_descriptors(carried);
-    sorted_missing(manifest_descriptors(pkg), |d| {
-        locked.contains(d) || carried.contains(d)
-    })
+    let locked: std::collections::HashSet<&str> = patterns.iter().map(String::as_str).collect();
+    unlocked_descriptors_in(&locked, pkg, carried)
 }
 
 /// [`unlocked_descriptors`] against `locked`, every pattern the lock's
@@ -87,14 +85,14 @@ pub(crate) fn unlocked_descriptors_in(
 ) -> Vec<String> {
     let carried = carried_descriptors(carried);
     sorted_missing(manifest_descriptors(pkg), |d| {
-        locked.contains(d) || carried.contains(d)
+        locked.contains(d) || (carried.contains(d) && name_is_locked(locked, d))
     })
 }
 
 /// The descriptors every block of `carried` names in its sub-maps (none
 /// when `carried` is empty): yarn already resolves each of them for the
-/// package, through whatever block it keyed them by, and a pin that keeps
-/// them changes nothing about how (#1578).
+/// package, through the block it keyed by the packument's range, and a pin
+/// that keeps them changes nothing about how (#1578).
 fn carried_descriptors(carried: &[&[String]]) -> std::collections::HashSet<String> {
     let mut sets = carried
         .iter()
@@ -103,6 +101,20 @@ fn carried_descriptors(carried: &[&[String]]) -> std::collections::HashSet<Strin
     sets.fold(first, |acc, set: std::collections::HashSet<String>| {
         acc.intersection(&set).cloned().collect()
     })
+}
+
+/// Whether some key of the lock locks the package `descriptor` names,
+/// under any range. A carried descriptor is upstream's only while yarn
+/// has a block to resolve it through: a sub-map entry with none (one an
+/// older release wrote and never locked, #1379, or whose block was since
+/// dropped) still needs locking.
+fn name_is_locked(locked: &std::collections::HashSet<&str>, descriptor: &str) -> bool {
+    let Some((name, _)) = split_classic_pattern(descriptor) else {
+        return false;
+    };
+    locked
+        .iter()
+        .any(|p| split_classic_pattern(p).is_some_and(|(n, _)| n == name))
 }
 
 /// Every descriptor of `descriptors` no block of `blocks` is keyed by,
@@ -210,9 +222,12 @@ pub(crate) fn dep_maps_match(lines: &[String], pkg: &Value) -> bool {
 /// Whether the sub-maps `lines` carries declare exactly the dependencies
 /// `pkg` declares, read back however yarn 1 quoted them (`foo latest`
 /// and `foo "latest"` alike): what yarn installs from the block is what
-/// the manifest asks for.
+/// the manifest asks for. Either shape counts: the one yarn 1 writes
+/// after normalising the manifest (#1558), and the manifest's literal
+/// maps, which an earlier release wrote and yarn installs as well.
 pub(crate) fn dep_maps_declare(lines: &[String], pkg: &Value) -> bool {
-    block_dep_maps(lines) == manifest_dep_maps(pkg)
+    let block = block_dep_maps(lines);
+    block == manifest_dep_maps(pkg) || block == literal_dep_maps(pkg)
 }
 
 /// A block's non-empty dependency sub-maps, each sorted by name, in
@@ -248,6 +263,27 @@ fn block_dep_maps(lines: &[String]) -> Vec<(&'static str, Vec<(String, String)>)
 
 fn is_dep_map_header(rest: &str) -> bool {
     DEP_FIELDS.iter().any(|f| rest.strip_suffix(':') == Some(f))
+}
+
+/// `pkg`'s non-empty dependency maps exactly as the manifest spells them,
+/// each sorted by name, skipping non-string ranges: the shape the writer
+/// used before it followed yarn's normaliser.
+fn literal_dep_maps(pkg: &Value) -> Vec<(&'static str, Vec<(String, String)>)> {
+    DEP_FIELDS
+        .iter()
+        .filter_map(|&field| {
+            let map = pkg.get(field).and_then(Value::as_object)?;
+            let mut deps: Vec<(String, String)> = map
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect();
+            if deps.is_empty() {
+                return None;
+            }
+            deps.sort_unstable();
+            Some((field, deps))
+        })
+        .collect()
 }
 
 /// The manifest fields yarn 1's normaliser (`cleanDependencies`) reads,
@@ -466,8 +502,13 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
         let block =
             lines("is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"");
         assert!(dep_maps_declare(&block, &star));
-        assert!(!dep_maps_declare(
+        // The literal shape an earlier release wrote still declares it.
+        assert!(dep_maps_declare(
             &lines("is-odd@3.0.1:\n  dependencies:\n    is-number \"*\""),
+            &star
+        ));
+        assert!(!dep_maps_declare(
+            &lines("is-odd@3.0.1:\n  dependencies:\n    is-number \"^5.0.0\""),
             &star
         ));
         // The first non-trivial range wins, in yarn's field order.
@@ -518,6 +559,14 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
         assert_eq!(
             unlocked_descriptors(&blocks, &bumped, &carried),
             vec!["url@^0.12.0"]
+        );
+        // A carried descriptor with no block of its name at all (an older
+        // release's unlocked sub-map entry, #1379) still needs locking.
+        let dangling = lines("stubs@1.2.3:\n  dependencies:\n    wow \"^1.0.0\"");
+        let wow = serde_json::json!({"dependencies": {"wow": "^1.0.0"}});
+        assert_eq!(
+            unlocked_descriptors(&blocks, &wow, &[dangling.as_slice()]),
+            vec!["wow@^1.0.0"]
         );
         // Every pinned block must carry it: one that doesn't keeps it unlocked.
         let bare = lines("stubs@1.2.3:\n  version \"1.2.3\"");

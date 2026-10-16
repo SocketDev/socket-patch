@@ -4152,6 +4152,9 @@ fn rewrite_yarn_classic_with(
                         && classic_field(&b.lines, "version") == Some(dep.version.as_str())
                         && classic_copy_source(patterns, classic_field(&b.lines, "resolved"))
                             == CopySource::Registry
+                        && patterns
+                            .iter()
+                            .any(|p| split_classic_pattern(p).is_some_and(|(n, _)| n == fname))
                 })
                 .map(|(b, _)| b.lines.as_slice())
                 .collect();
