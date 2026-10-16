@@ -25,9 +25,9 @@
 //!   `no-binary`, `no-build`, an `exclude-newer-package` cutoff for the
 //!   package, #1604), and a `uv pip compile` pylock whose header command
 //!   line or uv settings filter the package's files (uv 0.9.16+ records
-//!   only the files they let through, #1613). PEP 751 allows both TOML spellings of the
-//!   artifacts: uv's inline `wheels = [{ … }]`, and the standard tables
-//!   `pip lock` writes (`[[packages.wheels]]` with a
+//!   only the files they let through, #1613). PEP 751 allows both TOML
+//!   spellings of the artifacts: uv's inline `wheels = [{ … }]`, and the
+//!   standard tables `pip lock` writes (`[[packages.wheels]]` with a
 //!   `[packages.wheels.hashes]` sub-table, `[packages.sdist]`); the entry
 //!   comes back in its siblings' spelling. `pip lock` records only the one
 //!   artifact pip selected — the wheel, or the sdist of a release with no
