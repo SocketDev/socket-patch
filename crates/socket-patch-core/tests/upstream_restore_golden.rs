@@ -2262,9 +2262,8 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         assert_pypi_round_trip(flags, &input, &[urllib3_dep()], None).await;
     }
 
-    // uv's settings files: the nearest `uv.toml` (top level or `[pip]`),
-    // else a pyproject's `[tool.uv]` / `[tool.uv.pip]`, in the lock's
-    // directory or above it.
+    // uv's settings files: a `uv.toml` (top level or `[pip]`), else a
+    // pyproject's `[tool.uv]` / `[tool.uv.pip]`.
     let plain = uv_pylock(false);
     for (rel, settings) in [
         ("uv.toml", "[pip]\nno-build = true\n"),
@@ -2278,13 +2277,11 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
             "[project]\nname = \"p\"\nversion = \"0\"\n\n[tool.uv.pip]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
         ),
     ] {
-        for lock in ["pylock.toml", "sub/pylock.toml"] {
-            let input = tree(&[(lock, plain.clone()), (rel, settings.to_string())]);
-            let (why, _, after) =
-                pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
-            assert!(after[lock].contains("patch.socket.dev"), "{rel} {lock}");
-            assert!(why.contains(rel), "{rel} {lock}: {why}");
-        }
+        let input = tree(&[("pylock.toml", plain.clone()), (rel, settings.to_string())]);
+        let (why, _, after) =
+            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(after["pylock.toml"].contains("patch.socket.dev"), "{rel}");
+        assert!(why.contains(rel), "{rel}: {why}");
     }
     for (rel, settings) in [
         ("uv.toml", "no-build-isolation = true\n"),

@@ -22,7 +22,10 @@
 //!   only the wheels its `requires-python` and environments can install, so
 //!   a release with any wheel that is not pure Python 3 is refused, as is a
 //!   lock whose `[options]` / `[tool.uv]` filter files (`exclude-newer`,
-//!   `no-binary`, `no-build`). PEP 751 allows both TOML spellings of the
+//!   `no-binary`, `no-build`, an `exclude-newer-package` cutoff for the
+//!   package, #1604), and a `uv pip compile` pylock whose header command
+//!   line or uv settings filter the package's files (uv 0.9.16+ records
+//!   only the files they let through, #1613). PEP 751 allows both TOML spellings of the
 //!   artifacts: uv's inline `wheels = [{ … }]`, and the standard tables
 //!   `pip lock` writes (`[[packages.wheels]]` with a
 //!   `[packages.wheels.hashes]` sub-table, `[packages.sdist]`); the entry
@@ -383,18 +386,30 @@ async fn restore_lock(
                 );
             }
         }
-        match pip_settings_filter(view, rel).await {
-            Ok(None) => {}
-            Ok(Some((settings, key))) => {
-                return refuse_hits(
-                    result,
-                    &format!(
-                        "{settings}'s uv `{key}` setting filters which release files \
-                         `uv pip compile` records, so they are not re-derivable"
-                    ),
-                )
-            }
+        let settings = match pip_settings(view, rel).await {
+            Ok(settings) => settings,
             Err(why) => return refuse_hits(result, &why),
+        };
+        let uv_table = settings.as_ref().and_then(|(path, doc)| {
+            if path.ends_with("uv.toml") {
+                Some(doc.as_table() as &dyn TableLike)
+            } else {
+                tool_uv(doc)
+            }
+        });
+        for hit in &hits {
+            let Some(key) = uv_table.and_then(|uv| settings_filter(uv, &hit.name)) else {
+                continue;
+            };
+            let path = settings.as_ref().map_or("", |(path, _)| path.as_str());
+            result.refuse(
+                &hit.uuid,
+                format!(
+                    "{rel}: {path}'s uv `{key}` setting filters which of {}'s release files \
+                     `uv pip compile` records, so they are not re-derivable",
+                    hit.name
+                ),
+            );
         }
     }
 
@@ -681,53 +696,29 @@ fn compile_filter(command: &[&str], name: &str) -> Option<String> {
     None
 }
 
-/// A uv setting `uv pip compile` reads beside a pylock that filters which
-/// files it records (`no-build`, `no-binary`, `only-binary`,
-/// `exclude-newer` and their per-package forms), as `(settings file,
-/// key)`: from the nearest `uv.toml` (top level or `[pip]`), else a
-/// pyproject's `[tool.uv]` / `[tool.uv.pip]`, in the lock's directory or
-/// above it. `no-build-isolation` changes only how an sdist is built.
-async fn pip_settings_filter(
+/// The uv settings `uv pip compile` reads beside a pylock, as `(settings
+/// file, document)`: the nearest `uv.toml`, else a pyproject with a
+/// `[tool.uv]` table, in the lock's directory or above it.
+async fn pip_settings(
     view: &mut View<'_>,
     rel: &str,
-) -> Result<Option<(String, String)>, String> {
-    let filters = |table: &dyn TableLike| -> Option<String> {
-        let scopes = std::iter::once(table).chain(table.get("pip").and_then(Item::as_table_like));
-        scopes.into_iter().find_map(|t| {
-            t.iter()
-                .map(|(k, _)| k)
-                .find(|k| {
-                    ["no-build", "no-binary", "only-binary", "exclude-newer"]
-                        .iter()
-                        .any(|f| k.starts_with(f))
-                        && !k.starts_with("no-build-isolation")
-                })
-                .map(str::to_string)
-        })
-    };
+) -> Result<Option<(String, DocumentMut)>, String> {
     let mut dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
     loop {
-        let join = |file: &str| {
-            if dir.is_empty() {
+        for file in ["uv.toml", "pyproject.toml"] {
+            let path = if dir.is_empty() {
                 file.to_string()
             } else {
                 format!("{dir}/{file}")
-            }
-        };
-        let uv_toml = join("uv.toml");
-        if let Some(text) = view.read(&uv_toml).await? {
+            };
+            let Some(text) = view.read(&path).await? else {
+                continue;
+            };
             let doc = text
                 .parse::<DocumentMut>()
-                .map_err(|e| format!("{uv_toml} is not valid TOML: {e}"))?;
-            return Ok(filters(doc.as_table()).map(|key| (uv_toml, key)));
-        }
-        let pyproject = join("pyproject.toml");
-        if let Some(text) = view.read(&pyproject).await? {
-            let doc = text
-                .parse::<DocumentMut>()
-                .map_err(|e| format!("{pyproject} is not valid TOML: {e}"))?;
-            if let Some(uv) = tool_uv(&doc) {
-                return Ok(filters(uv).map(|key| (pyproject, key)));
+                .map_err(|e| format!("{path} is not valid TOML: {e}"))?;
+            if file == "uv.toml" || tool_uv(&doc).is_some() {
+                return Ok(Some((path, doc)));
             }
         }
         if dir.is_empty() {
@@ -735,6 +726,43 @@ async fn pip_settings_filter(
         }
         dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
     }
+}
+
+/// The uv setting (top level or `[pip]`) that filters which of `name`'s
+/// files `uv pip compile` records: `no-build` / `no-binary` set to true or
+/// naming it (or `:all:`), `only-binary` naming it, their `-package`
+/// lists, `exclude-newer`, or an `exclude-newer-package` cutoff for it.
+/// `no-build-isolation` changes only how an sdist is built.
+fn settings_filter(uv: &dyn TableLike, name: &str) -> Option<String> {
+    let names = |item: &Item| {
+        if let Some(cutoffs) = item.as_table_like() {
+            return cutoffs.iter().any(|(package, cutoff)| {
+                canonicalize_pypi_name(package) == name && cutoff.as_bool() != Some(false)
+            });
+        }
+        match item.as_value() {
+            Some(Value::Boolean(on)) => *on.value(),
+            Some(Value::String(_)) | Some(Value::Datetime(_)) => true,
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name),
+            _ => false,
+        }
+    };
+    let scopes = std::iter::once(uv).chain(uv.get("pip").and_then(Item::as_table_like));
+    for table in scopes {
+        for (key, item) in table.iter() {
+            let filters = ["no-build", "no-binary", "only-binary", "exclude-newer"]
+                .iter()
+                .any(|f| key.starts_with(f))
+                && !key.starts_with("no-build-isolation");
+            if filters && names(item) {
+                return Some(key.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The registry and artifact shape the lock's other registry packages show.
