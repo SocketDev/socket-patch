@@ -1,6 +1,7 @@
 //! Where yarn 1 installs a classic lock block's copy from, decided once for
 //! every mode that reads or rewrites the block.
 
+use super::copy::manifest_name;
 use super::patterns::split_classic_pattern;
 use crate::vendor::npm_origin::npm_spec_is_registry;
 
@@ -125,12 +126,6 @@ pub(crate) fn classic_copy_real_name(
         }
         _ => None,
     }
-}
-
-/// `name` of a `package.json`, when it names a package
-/// ([`super::copy::package_name`]).
-pub(crate) fn manifest_name(bytes: &[u8]) -> Option<String> {
-    super::copy::package_name(&super::copy::parse_manifest(bytes)?)
 }
 
 /// The package an npm registry tarball url serves, from its

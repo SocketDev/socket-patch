@@ -11,7 +11,7 @@
 //! [`CopyRef`], and so cannot disagree on which package it is.
 
 use super::patterns::split_classic_pattern;
-use super::source::{is_tarball_path, manifest_name, registry_tarball_name};
+use super::source::{is_tarball_path, registry_tarball_name};
 
 /// Where a yarn lock entry's copy comes from, read for the package it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,15 +81,7 @@ impl CopyRef {
             CopyRef::Directory(_) => manifest_name(bytes?)?,
             CopyRef::Linked(..) => {
                 let manifest = parse_manifest(bytes?)?;
-                let name = package_name(&manifest)?;
-                // An empty or non-semver version names no version (#1598),
-                // as a missing one does (#1579).
-                let version = manifest
-                    .get("version")?
-                    .as_str()
-                    .filter(|v| semver::Version::parse(v).is_ok())?
-                    .to_string();
-                return Some((name, version));
+                return Some((package_name(&manifest)?, package_version(&manifest)?));
             }
             CopyRef::Url(url) => registry_tarball_name(url, lock_version)?,
         };
@@ -238,21 +230,35 @@ fn copy_path(base: &str, path: &str) -> Option<String> {
     ))
 }
 
-pub(super) fn parse_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
+fn parse_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
     let bytes = crate::formats::text::strip_bom_bytes(bytes);
     serde_json::from_slice::<serde_json::Value>(bytes).ok()
 }
 
+/// `name` of a `package.json`, when it names a package ([`package_name`]).
+pub(crate) fn manifest_name(bytes: &[u8]) -> Option<String> {
+    package_name(&parse_manifest(bytes)?)
+}
+
 /// A parsed manifest's `name`, when it names a package at all. An empty
-/// name, or one no package can carry (a path such as `../x`, whitespace),
-/// names none, so a copy holding it may be any package (#1579, #1598):
-/// reading it literally would call the copy "some other package" and let
-/// it escape every contest.
-pub(super) fn package_name(manifest: &serde_json::Value) -> Option<String> {
+/// name, or one npm could never have published (a path such as `../x`,
+/// whitespace, any character outside npm's url-safe set), names none, so a
+/// copy holding it may be any package (#1579, #1598): reading it literally
+/// would call the copy "some other package" and let it escape every
+/// contest.
+fn package_name(manifest: &serde_json::Value) -> Option<String> {
     let name = manifest.get("name")?.as_str()?;
-    (crate::vendor::is_safe_npm_name(name)
-        && !name.chars().any(|c| c.is_whitespace() || c.is_control()))
-    .then(|| name.to_string())
+    crate::vendor::vlt_lock_text::is_registry_package_name(name).then(|| name.to_string())
+}
+
+/// A parsed manifest's `version`, when it names one: npm's semver grammar,
+/// with build metadata dropped as npm drops it (`1.3.0+build.5` IS 1.3.0).
+/// An empty or non-semver version (`""`, `v1.3.0`, `latest`) names none,
+/// as a missing one does (#1579, #1598).
+fn package_version(manifest: &serde_json::Value) -> Option<String> {
+    let version = manifest.get("version")?.as_str()?;
+    crate::vendor::vlt_lock_text::is_npm_semver(version)
+        .then(|| version.split('+').next().unwrap_or(version).to_string())
 }
 
 /// `name` of the `package.json` inside an npm tarball.
@@ -429,7 +435,18 @@ mod tests {
         let linked = CopyRef::Linked("vend/lp".into(), LinkKind::Portal);
         let dir = CopyRef::Directory("lpdir".into());
         let tarball = CopyRef::Tarball("lp.tgz".into());
-        for name in ["", "../x", " left-pad", "left-pad ", "left pad", "a/b/c"] {
+        for name in [
+            "",
+            "../x",
+            " left-pad",
+            "left-pad ",
+            "left pad",
+            "a/b/c",
+            "left-pad\u{200b}",
+            "left-pad?",
+            "@/left-pad",
+            ".left-pad",
+        ] {
             let manifest = serde_json::json!({ "name": name, "version": "1.3.0" }).to_string();
             assert_eq!(
                 linked.identity("0.0.0-use.local", Some(manifest.as_bytes())),
@@ -449,7 +466,14 @@ mod tests {
                 "tarball {name:?}"
             );
         }
-        for version in ["", " 1.3.0", "v1.3.0", "latest", "1.3"] {
+        for version in [
+            "",
+            " 1.3.0",
+            "v1.3.0",
+            "latest",
+            "1.3",
+            "9007199254740993.0.0",
+        ] {
             let manifest =
                 serde_json::json!({ "name": "left-pad", "version": version }).to_string();
             assert_eq!(
@@ -467,7 +491,7 @@ mod tests {
         for (name, version) in [
             ("left-pad", "1.3.0"),
             ("@scope/left-pad", "1.3.0-beta.1"),
-            ("Left_Pad.js", "1.3.0+build.5"),
+            ("Left_Pad.js", "1.3.0"),
         ] {
             let manifest = serde_json::json!({ "name": name, "version": version }).to_string();
             assert_eq!(
@@ -475,6 +499,14 @@ mod tests {
                 Some((name.into(), version.into()))
             );
         }
+        // Build metadata is no part of npm's version: the copy IS 1.3.0.
+        assert_eq!(
+            linked.identity(
+                "0.0.0-use.local",
+                Some(br#"{"name":"left-pad","version":"1.3.0+build.5"}"#)
+            ),
+            Some(("left-pad".into(), "1.3.0".into()))
+        );
     }
 
     /// #1579: a linked manifest naming a package but no version names that
