@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-16 (run 25), main `657fce2`, latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–25 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503, #1527 and #1547 are closed. Open: #450. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-16 (run 26), main `657fce2`, latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–26 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503, #1527 and #1547 are closed. Open: #450, #1615 (and #1589, filed by the uv routine, with Poetry evidence). macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -9,7 +9,7 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | OS | Poetry | Agent (in-project `.venv`) | Agent (default out-of-tree venv) | Agent: nameless `package-mode=false` / `[project].name` override / `in-project=false` + stray `.venv` | Agent + hosted VEX: `in-project=true`, no `.venv`, existing out-of-tree env | Hosted (scan, install, rollback) | Hosted VEX with undiscovered venv | Vendored | Mode switch hosted ⇄ vendored | Vendored `repair` (lock-only, wheel deleted) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 0.12.17 | untested | untested | n/a | untested | pass v5 (refused, `redirect_poetry_lock_unsupported`) | n/a | pass v5 (`[metadata.hashes]`); r14 pass | vendored→hosted fail #945 | untested |
-| Linux | 1.0.10 | untested | pass r8 (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.0 native-empty + populated; pip ≥ 23.1) | untested | pass v5 (populated lock 1.0); r19 supersede A → B | r19 pass (two-package partial takeovers, LF + CRLF) | r23 pass (lock-only, wheel deleted, fresh install patched) |
+| Linux | 1.0.10 | untested | pass r8 (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.0 native-empty + populated; pip ≥ 23.1); r26 10 hand-edited lock 1.0 shapes pass | untested | pass v5 (populated lock 1.0); r19 supersede A → B | r19 pass (two-package partial takeovers, LF + CRLF) | r23 pass (lock-only, wheel deleted, fresh install patched) |
 | Linux | 1.1.15 | pass v5 | pass r8 (scan, re-run, vex, rollback); r9 `envs.toml` (3.10/3.11) pass | n/a | fixed by #527 (not re-run) | pass v5 (lock 1.1, extras + dev); r5 dotted name `jaraco.context` rewrite/install/vex/rollback | untested | pass v5 (LF + CRLF, unicode/space path); r19 supersede A → B (lock 1.1) | pass r14 (both ways, LF + CRLF); r19 two-package partial takeovers | pass r19 (after supersede) |
 | Linux | 1.2.2 | r23 pass (scan, re-run, vex, rollback) | r23 pass (scan, re-run, vex, rollback) | n/a | untested | pass v5 (lock 1.1, extras + dev, warm-venv stale check) | untested | pass (lock 1.1) | untested | untested |
 | Linux | 1.8.5 | untested | pass; r9 `envs.toml` + custom path pass | pass r5 (fixed by #330; nameless, in-project=false, unicode path) | pass r9 (#527) | pass v5 (LF + CRLF) | pass r5 (#330) | pass v5 (LF + CRLF, unicode/space path) | pass r14 (both ways, LF + CRLF) | pass v5 (#380 fixed) |
@@ -321,16 +321,33 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 | 2.5.1 | #450 | still fails |
 | macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
 
+### Run 26 cells (Linux, main `657fce2`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 2.5.1 + export plugin | `pylock.toml` (`--with dev`) + `pylock.test.toml` (`--with test`), 3 patched packages: hosted scan, `poetry install --with test`, `uv pip install -r`, vex | pass |
+| same | hosted rollback | `hosted_restore_refused` (no sibling registry package; Known non-bugs) |
+| same | vendored + `--revert` with ≥ 2 packages in one pylock | in-entry comments dropped (pylock lane only; handed over to pip) |
+| 1.0.10 | 10 hand-edited lock 1.0 `[metadata.files]` shapes × hosted / vendored, fresh install, revert | pass 20/20 |
+| 1.0.10, 2.5.1 | Vendored in a path with `#`, `%20`, `;` | pass (`;` on 1.0 is a pip limit, Known non-bugs) |
+| 2.5.1, 1.8.5 | VEX product with a non-canonical PEP 440 version (`[tool.poetry]` and PEP 621) | fail #1589 (commented) |
+| 2.5.1 | Two-package hosted `list` / `repair` / `remove` / `sync` / vex / rollback | pass |
+| 1.8.5 → 2.5.1 / 2.4.3, 2.5.1 → 1.8.5 | Vendored, then `poetry lock` with another Poetry major: `--revert`, `rollback`, `remove`, re-vendor, → hosted takeover | **fail #1615** (main + v5.0.1) |
+| same-version relocks (2.5.1, 1.8.5) | same | pass |
+| 1.8.5 → 2.5.1 | Hosted, cross-major relock, install, vex, rollback | pass |
+| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
+
 ## Backlog
 
-1. **Lead (run 24):** Poetry 2 `[tool.poetry.requires-plugins]` installs plugins (and their deps) into `<project>/.poetry/plugins`, which no mode crawls. That's code the Poetry CLI loads, not the project runtime, so it needs a maintainer call on scope before anyone files it.
-2. Re-check #1105 (hosted A → vendored B, warm venv), #1184 (export residual keep) and #450 once fixed.
-3. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy. That follows from #538's "patch every copy" design and needs a maintainer call before anyone files it. Since #409 (#1419), a system-site venv that imports a base copy also patches that base copy, on purpose.
-4. Untested Linux cells: hosted VEX with an undiscovered venv on 1.2.2 / 2.4.3; hand-edited lock 1.0 shapes (Poetry 1.0 writer). (Lock 2.0 from 1.3 / 1.5 / 1.7 writers: pass r25.)
-5. pylock export: `poetry export -f pylock.toml --with dev` / extras, and a named `pylock.<name>.toml`. (Vendored and both takeovers: r25, see Known non-bugs.) Maintainer call: for a Poetry project, vendored prefers an exported pylock over `poetry.lock`, so `poetry install` stays unpatched (warned); hosted rewrites both.
-6. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
-7. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 25 (runs 9–25). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
-8. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's error-code row for `mode_ambiguous` still names only agent + vendored state (the mode-resolution paragraph has the #1437 hosted-pin case).
+1. Re-check #1615, #1589, #450, #1105 and #1184 once fixed.
+2. #1615 on legacy formats: vendored with Poetry 1.1 (lock 1.1, coupled `[package.source]` + `[metadata.files]` fragments), then re-locked with 1.8 / 2.x; and 1.3 → 1.8 (lock 2.0 writers) re-render differences.
+3. **Lead (run 24):** Poetry 2 `[tool.poetry.requires-plugins]` installs plugins (and their deps) into `<project>/.poetry/plugins`, which no mode crawls. Needs a maintainer call on scope.
+4. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy (follows #538's "patch every copy"); a maintainer call before filing.
+5. Untested Linux cells: hosted VEX with an undiscovered venv on 1.2.2 / 2.4.3.
+6. pylock export: vendored prefers an exported pylock over `poetry.lock` for Poetry users (documented precedence; maintainer call).
+7. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
+8. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deleting them was denied (runs 9–26). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+9. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's `mode_ambiguous` row still names only agent + vendored state.
 
 ## Known non-bugs
 
@@ -413,3 +430,6 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 - Hosted rollback of a lock with no final newline adds one, and a restored pylock entry's `upload-time` keeps millisecond precision. Covered by "no guarantee of the original byte layout". Not filed.
 - A bare `--vex` flag is a usage error: `scan --vex` takes a path (`--vex vex.json`).
 - Vendored with an exported `pylock.toml` that pins the package beside `poetry.lock` wires only the pylock and leaves `poetry.lock` on its registry source (`pypi_multiple_lockfiles`; `vendor --check` says "wiring contested"). Documented precedence: standalone PEP 751 locks rank between uv and Poetry when they pin the package (`formats/governing_locks.rs` `PYPI_TOOL_LOCKS`). So a hosted → vendored takeover returns `poetry.lock` to upstream. Not filed (r25).
+- A project path containing `;` breaks vendored installs on Poetry 1.0 (pip parses the absolute wheel path as `requirement; marker`, "Invalid marker"). Any path dependency there fails the same way; `#` and `%20` are fine, and Poetry 2.5.1 is fine with all three. Not filed (r26).
+- With several exported pylocks (`--with dev` → `pylock.toml`, `--with test` → `pylock.test.toml`), hosted warns `redirect_uv_entry_not_found` for each package a pylock deliberately doesn't list, and vendored repeats one generic "wiring pylock.test.toml, pylock.toml" warning per package. Cosmetic, handed to pip (r26).
+- `list --json` reports patches as `events[]` with `action: discovered`, not a `patches` array. Not a bug.
