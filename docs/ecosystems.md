@@ -225,9 +225,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   names, so when the patch adds a dependency (or changes a range) that no
   `yarn.lock` block locks, the pin is refused with
   `redirect_yarn_classic_dep_manifest_unlocked` (lock the new descriptor first,
-  for example with `yarn add`, then re-run). When every descriptor is already
-  locked, the entry's dependency sub-maps are rewritten to match
-  (`redirect_yarn_classic_dep_manifest_rewritten`). Vendored mode refuses the
+  for example with `yarn add`, then re-run). A dependency the entry's sub-map
+  already names is left alone even when no block is keyed by it: yarn keys
+  those blocks by the registry metadata's ranges, which can differ from the
+  tarball's `package.json`. When every descriptor is already locked, the
+  entry's dependency sub-maps are rewritten to match, normalised the way yarn
+  1 writes them (`redirect_yarn_classic_dep_manifest_rewritten`). Vendored mode refuses the
   same case with `vendor_dep_manifest_unlocked`. If the download, the check or
   the `package.json` read fails, the patch is skipped as
   `npm_tarball_unavailable`. A project that sets `yarn-offline-mirror`
