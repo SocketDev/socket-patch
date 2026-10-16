@@ -1885,10 +1885,29 @@ async fn issue_939_berry_renamed_copy_is_named() {
 /// plus `extra` files, and return its `redirect_copy_unpatched` details
 /// (after checking the registry entry is still pinned).
 async fn berry_linked_copy_details(uuid: &str, spec: &str, extra: &[(&str, &str)]) -> Vec<String> {
-    let ws = "app%40workspace%3A.";
-    let key = format!("lp2@{spec}::locator={ws}");
     let server = MockServer::start().await;
     mount_left_pad_grant(&server, uuid).await;
+    let mut files = berry_linked_copy_files(spec);
+    for (rel, text) in extra {
+        files.insert(rel.to_string(), text.as_bytes().to_vec());
+    }
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(project.error.is_none(), "{spec}: {:?}", project.error);
+    assert_eq!(
+        project.redirected.len(),
+        1,
+        "{spec}: {:?} {:#}",
+        project.skipped,
+        project.redirect
+    );
+    copy_unpatched_details(project)
+}
+
+/// A berry project depending on registry left-pad and on `lp2` at `spec`.
+fn berry_linked_copy_files(spec: &str) -> BTreeMap<String, Vec<u8>> {
+    let ws = "app%40workspace%3A.";
+    let key = format!("lp2@{spec}::locator={ws}");
     let mut files = BTreeMap::new();
     files.insert(
         "package.json".to_string(),
@@ -1914,20 +1933,7 @@ async fn berry_linked_copy_details(uuid: &str, spec: &str, extra: &[(&str, &str)
         )
         .into_bytes(),
     );
-    for (rel, text) in extra {
-        files.insert(rel.to_string(), text.as_bytes().to_vec());
-    }
-    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
-    let project = &output.projects[0];
-    assert!(project.error.is_none(), "{spec}: {:?}", project.error);
-    assert_eq!(
-        project.redirected.len(),
-        1,
-        "{spec}: {:?} {:#}",
-        project.skipped,
-        project.redirect
-    );
-    copy_unpatched_details(project)
+    files
 }
 
 /// #1540: a berry `portal:` / `link:` copy with an ABSOLUTE path is never
@@ -2045,5 +2051,37 @@ async fn issue_1598_berry_invalid_manifest_name_or_version_is_named() {
                 details[0]
             );
         }
+    }
+}
+
+/// #1598 on disk: the real binary's `scan --mode hosted` over the same
+/// project names the copy too, not only the in-memory engine.
+#[tokio::test]
+async fn issue_1598_berry_invalid_manifest_name_or_version_is_named_on_disk() {
+    const UUID: &str = "15981598-1598-4598-8598-159815981598";
+    for text in [
+        r#"{"name":"","version":"1.3.0"}"#,
+        r#"{"name":"../x","version":"1.3.0"}"#,
+        r#"{"name":"left-pad","version":""}"#,
+    ] {
+        let server = MockServer::start().await;
+        mount_left_pad_grant(&server, UUID).await;
+        let mut files = berry_linked_copy_files("portal:./vend/lp");
+        files.insert("vend/lp/package.json".to_string(), text.as_bytes().to_vec());
+        let disk = run_disk(&server, &files, false);
+        let warnings = disk.redirect["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w["code"] == "redirect_copy_unpatched"
+                    && w["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("UNPATCHED"))),
+            "{text}: {:#}",
+            disk.envelope
+        );
     }
 }
