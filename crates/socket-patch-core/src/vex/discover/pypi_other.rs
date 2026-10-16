@@ -359,7 +359,7 @@ fn requirement_location(code: &str) -> Option<(Option<&str>, &str)> {
     if first.contains("://")
         || first.starts_with("file:")
         || mentions_vendor_dir(first)
-        || !first.starts_with(|c: char| c.is_ascii_alphanumeric())
+        || pip_reads_as_path(first)
     {
         // pip separates a marker from a URL with `; ` (whitespace-split
         // above leaves a trailing `;`) and from a path with a bare `;`.
@@ -372,6 +372,52 @@ fn requirement_location(code: &str) -> Option<(Option<&str>, &str)> {
     }
     let (name, location) = pep508_direct_reference(code)?;
     Some((Some(name), location))
+}
+
+/// Whether pip reads a requirement's first token (not a url) as a local
+/// path or archive (`pip._internal.req.constructors._get_url_from_path`),
+/// not a registry name: it starts with something other than a letter or
+/// digit, holds a path separator, or names an archive (#1587). As in
+/// pip, `name@<location>` stays a PEP 508 direct reference unless the part
+/// before the `@` itself looks like a path.
+fn pip_reads_as_path(first: &str) -> bool {
+    let path = first.split(';').next().unwrap_or(first);
+    if !path.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return true;
+    }
+    let looks_like_path = |s: &str| s.starts_with('.') || s.contains(['/', '\\']);
+    if let Some((prefix, _)) = path.split_once('@') {
+        if !looks_like_path(prefix) {
+            return false;
+        }
+    }
+    // pip strips `[extras]` before testing the archive suffix.
+    let bare = match path.strip_suffix(']').and_then(|p| p.rfind('[')) {
+        Some(open) => &path[..open],
+        None => path,
+    };
+    looks_like_path(path) || is_archive_file(bare)
+}
+
+/// pip's `is_archive_file`: a name ending in one of its archive suffixes,
+/// compared case-insensitively.
+fn is_archive_file(name: &str) -> bool {
+    const ARCHIVE_EXTENSIONS: &[&str] = &[
+        ".zip",
+        ".whl",
+        ".tar.bz2",
+        ".tbz",
+        ".tar.xz",
+        ".txz",
+        ".tlz",
+        ".tar.lz",
+        ".tar.lzma",
+        ".tar.gz",
+        ".tgz",
+        ".tar",
+    ];
+    let name = name.to_ascii_lowercase();
+    ARCHIVE_EXTENSIONS.iter().any(|ext| name.ends_with(ext))
 }
 
 /// `name[extras] @ <location>[ ; marker]` → `(name, location)`.
@@ -1740,6 +1786,35 @@ mod tests {
                 ("Pipfile.lock", vendored_pipfile.clone()),
                 ("requirements.txt", format!("./wheels/{WHL}\n")),
             ),
+            // #1587: pip installs a relative path without a leading `./`.
+            (
+                "requirements wheel path without ./",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", format!("wheels/{WHL}\n")),
+            ),
+            (
+                "requirements wheel filename only",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", format!("{WHL}\n")),
+            ),
+            (
+                "requirements sdist path without ./",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", "dist/six-1.16.0.tar.gz\n".to_string()),
+            ),
+            (
+                "requirements windows wheel path without .\\",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", format!("wheels\\{WHL}\n")),
+            ),
+            (
+                "requirements wheel path with a marker",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                (
+                    "requirements.txt",
+                    format!("wheels/{WHL}; python_version >= \"3\"\n"),
+                ),
+            ),
         ];
         for (name, wired, other) in cases {
             let p = Project::new();
@@ -1768,6 +1843,69 @@ mod tests {
             alone.write(wired.0, &wired.1);
             assert_eq!(alone.discover().await.refs.len(), 1, "{name} alone");
         }
+    }
+
+    /// REGRESSION (#1587): a requirements line is a local artifact the way
+    /// pip reads one (`_looks_like_path` / `is_archive_file`): a path
+    /// separator, a leading `.`, or an archive suffix. Registry specifiers
+    /// and PEP 508 `name @ url` lines keep their old reading.
+    #[test]
+    fn issue_1587_requirement_location_reads_paths_as_pip_does() {
+        for (line, location) in [
+            (
+                "./wheels/six-1.16.0-py3-none-any.whl",
+                "./wheels/six-1.16.0-py3-none-any.whl",
+            ),
+            (
+                "wheels/six-1.16.0-py3-none-any.whl",
+                "wheels/six-1.16.0-py3-none-any.whl",
+            ),
+            (
+                "wheels\\six-1.16.0-py3-none-any.whl",
+                "wheels\\six-1.16.0-py3-none-any.whl",
+            ),
+            ("six-1.16.0-py3-none-any.whl", "six-1.16.0-py3-none-any.whl"),
+            ("six-1.16.0-py3-none-any.WHL", "six-1.16.0-py3-none-any.WHL"),
+            ("dist/six-1.16.0.tar.gz", "dist/six-1.16.0.tar.gz"),
+            ("six-1.16.0.tar.gz --hash=sha256:ab", "six-1.16.0.tar.gz"),
+            ("six-1.16.0.zip", "six-1.16.0.zip"),
+            ("six-1.16.0.tar.bz2", "six-1.16.0.tar.bz2"),
+            ("six-1.16.0.tgz", "six-1.16.0.tgz"),
+            (
+                "wheels/six-1.16.0-py3-none-any.whl; python_version >= \"3\"",
+                "wheels/six-1.16.0-py3-none-any.whl",
+            ),
+            (
+                "wheels/six-1.16.0-py3-none-any.whl;python_version>=\"3\"",
+                "wheels/six-1.16.0-py3-none-any.whl",
+            ),
+            ("src/six", "src/six"),
+        ] {
+            assert_eq!(
+                super::requirement_location(line),
+                Some((None, location)),
+                "{line}"
+            );
+        }
+        for line in [
+            "six==1.16.0",
+            "six>=1",
+            "six",
+            "six[socks]==1.16.0",
+            "six; python_version < \"3\"",
+            "six==1.16.0 --hash=sha256:ab",
+        ] {
+            assert_eq!(super::requirement_location(line), None, "{line}");
+        }
+        assert_eq!(
+            super::requirement_location("six @ https://h/six-1.16.0-py3-none-any.whl"),
+            Some((Some("six"), "https://h/six-1.16.0-py3-none-any.whl")),
+        );
+        // pip reads `name@<archive>` as a PEP 508 reference, not a path.
+        assert_eq!(
+            super::requirement_location("six@six-1.16.0-py3-none-any.whl"),
+            Some((Some("six"), "six-1.16.0-py3-none-any.whl")),
+        );
     }
 
     /// REGRESSION (#1549): a non-Socket direct reference whose version
