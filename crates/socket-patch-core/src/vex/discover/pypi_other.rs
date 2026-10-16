@@ -117,6 +117,7 @@ use super::{
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::sha256_hex;
 use crate::utils::hatch::dependency_specs;
+use crate::utils::requirements;
 use crate::utils::requirements::{
     exact_pin, hash_options, logical_lines, split_comment, url_sha256_fragment, vendor_tag,
 };
@@ -356,68 +357,24 @@ fn registry_pin(code: &str) -> Option<String> {
 fn requirement_location(code: &str) -> Option<(Option<&str>, &str)> {
     let code = code.trim_start();
     let first = code.split_whitespace().next()?;
-    if first.contains("://")
-        || first.starts_with("file:")
-        || mentions_vendor_dir(first)
-        || pip_reads_as_path(first)
+    if !requirements::names_before_at(first)
+        && (first.contains("://")
+            || first.starts_with("file:")
+            || mentions_vendor_dir(first)
+            || requirements::pip_reads_as_path(first))
     {
         // pip separates a marker from a URL with `; ` (whitespace-split
-        // above leaves a trailing `;`) and from a path with a bare `;`.
+        // above leaves a trailing `;`) and from a path with a bare `;`,
+        // and strips a path's `[extras]` before reading it.
         let location = if first.contains("://") {
             first.trim_end_matches(';')
         } else {
-            first.split(';').next().unwrap_or(first)
+            requirements::strip_path_extras(first.split(';').next().unwrap_or(first))
         };
         return Some((None, location));
     }
     let (name, location) = pep508_direct_reference(code)?;
     Some((Some(name), location))
-}
-
-/// Whether pip reads a requirement's first token (not a url) as a local
-/// path or archive (`pip._internal.req.constructors._get_url_from_path`),
-/// not a registry name: it starts with something other than a letter or
-/// digit, holds a path separator, or names an archive (#1587). As in
-/// pip, `name@<location>` stays a PEP 508 direct reference unless the part
-/// before the `@` itself looks like a path.
-fn pip_reads_as_path(first: &str) -> bool {
-    let path = first.split(';').next().unwrap_or(first);
-    if !path.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-        return true;
-    }
-    let looks_like_path = |s: &str| s.starts_with('.') || s.contains(['/', '\\']);
-    if let Some((prefix, _)) = path.split_once('@') {
-        if !looks_like_path(prefix) {
-            return false;
-        }
-    }
-    // pip strips `[extras]` before testing the archive suffix.
-    let bare = match path.strip_suffix(']').and_then(|p| p.rfind('[')) {
-        Some(open) => &path[..open],
-        None => path,
-    };
-    looks_like_path(path) || is_archive_file(bare)
-}
-
-/// pip's `is_archive_file`: a name ending in one of its archive suffixes,
-/// compared case-insensitively.
-fn is_archive_file(name: &str) -> bool {
-    const ARCHIVE_EXTENSIONS: &[&str] = &[
-        ".zip",
-        ".whl",
-        ".tar.bz2",
-        ".tbz",
-        ".tar.xz",
-        ".txz",
-        ".tlz",
-        ".tar.lz",
-        ".tar.lzma",
-        ".tar.gz",
-        ".tgz",
-        ".tar",
-    ];
-    let name = name.to_ascii_lowercase();
-    ARCHIVE_EXTENSIONS.iter().any(|ext| name.ends_with(ext))
 }
 
 /// `name[extras] @ <location>[ ; marker]` → `(name, location)`.
@@ -1865,7 +1822,6 @@ mod tests {
                 "wheels\\six-1.16.0-py3-none-any.whl",
             ),
             ("six-1.16.0-py3-none-any.whl", "six-1.16.0-py3-none-any.whl"),
-            ("six-1.16.0-py3-none-any.WHL", "six-1.16.0-py3-none-any.WHL"),
             ("dist/six-1.16.0.tar.gz", "dist/six-1.16.0.tar.gz"),
             ("six-1.16.0.tar.gz --hash=sha256:ab", "six-1.16.0.tar.gz"),
             ("six-1.16.0.zip", "six-1.16.0.zip"),
@@ -1901,7 +1857,16 @@ mod tests {
             super::requirement_location("six @ https://h/six-1.16.0-py3-none-any.whl"),
             Some((Some("six"), "https://h/six-1.16.0-py3-none-any.whl")),
         );
-        // pip reads `name@<archive>` as a PEP 508 reference, not a path.
+        // pip reads `name@<location>` as a PEP 508 reference, not a path
+        // or url, and a path's `[extras]` are not part of it.
+        assert_eq!(
+            super::requirement_location("six@https://h/six-1.16.0-py3-none-any.whl"),
+            Some((Some("six"), "https://h/six-1.16.0-py3-none-any.whl")),
+        );
+        assert_eq!(
+            super::requirement_location("wheels/six-1.16.0-py3-none-any.whl[socks]"),
+            Some((None, "wheels/six-1.16.0-py3-none-any.whl")),
+        );
         assert_eq!(
             super::requirement_location("six@six-1.16.0-py3-none-any.whl"),
             Some((Some("six"), "six-1.16.0-py3-none-any.whl")),
