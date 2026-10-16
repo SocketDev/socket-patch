@@ -59,6 +59,7 @@ use toml_edit::{DocumentMut, InlineTable, Item, Value};
 
 use crate::formats::text::split_bom;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::split_lines;
 
 use super::cargo_config::{ensure_table_like, patch_entries, path_is_socket_owned};
 
@@ -285,22 +286,6 @@ pub fn reconcile_line_endings(original: &str, edited: &str) -> String {
         }
     }
     out
-}
-
-/// `(content, ending)` per line, ending ∈ {`"\r\n"`, `"\n"`, `""`}; an
-/// empty text has no lines.
-fn split_lines(text: &str) -> Vec<(&str, &str)> {
-    text.split_inclusive('\n')
-        .map(|seg| {
-            if let Some(content) = seg.strip_suffix("\r\n") {
-                (content, "\r\n")
-            } else if let Some(content) = seg.strip_suffix('\n') {
-                (content, "\n")
-            } else {
-                (seg, "")
-            }
-        })
-        .collect()
 }
 
 // ── pure transforms ──────────────────────────────────────────────────────────

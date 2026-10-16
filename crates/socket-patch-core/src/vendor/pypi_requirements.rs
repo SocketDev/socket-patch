@@ -25,7 +25,7 @@ use std::path::Path;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
-use crate::utils::line_endings::terminator;
+use crate::utils::line_endings::{self, terminator};
 use crate::utils::requirements::{
     expand_env_vars, hash_options, logical_lines, parse_requirement, requirement_name,
     requires_hashes, shlex_split, split_comment, strip_comment, vendor_tag,
@@ -535,24 +535,13 @@ pub(super) async fn revert_requirements(
                     lines.remove(idx);
                 }
                 WiringAction::Rewritten => {
-                    // The last original line gets the vendor line's own
-                    // terminator back. The record keeps no terminators, so
-                    // the lines before it in a continuation span take the
-                    // same one (the file's own, after an unterminated last
-                    // line).
-                    let eol = lines[idx].eol;
-                    let inner = if eol.is_empty() { nl } else { eol };
                     let originals: Vec<&str> = rec
                         .original
                         .as_ref()
                         .and_then(serde_json::Value::as_array)
                         .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
                         .unwrap_or_default();
-                    let count = originals.len();
-                    let restored = originals.into_iter().enumerate().map(|(i, text)| Line {
-                        text: text.to_string(),
-                        eol: if i + 1 == count { eol } else { inner },
-                    });
+                    let restored = restored_span(&originals, lines[idx].eol, nl);
                     lines.splice(idx..idx + 1, restored);
                 }
             }
@@ -610,9 +599,9 @@ fn drift_warning(file: &str, rec: &WiringRecord) -> VendorWarning {
 
 /// One physical line and the terminator it ends with: `"\r\n"`, `"\n"`, or
 /// `""` for an unterminated last line. The writers edit these so a file that
-/// mixes CRLF and LF keeps every line it leaves alone byte for byte, and a
-/// revert restores the original (#1567). Splitting with `str::lines()` and
-/// re-joining with one terminator re-terminated every minority-style line.
+/// mixes CRLF and LF keeps every line they leave alone byte for byte
+/// (#1567). Splitting with `str::lines()` and re-joining with one terminator
+/// re-terminated every minority-style line.
 #[derive(Debug, Clone)]
 struct Line {
     text: String,
@@ -622,22 +611,60 @@ struct Line {
 /// `content`'s physical lines, indexed like `str::lines()` (the indices
 /// [`scan_pins`] reports).
 fn split_lines(content: &str) -> Vec<Line> {
-    content
-        .split_inclusive('\n')
-        .map(|raw| {
-            let (text, eol) = if let Some(text) = raw.strip_suffix("\r\n") {
-                (text, "\r\n")
-            } else if let Some(text) = raw.strip_suffix('\n') {
-                (text, "\n")
-            } else {
-                (raw, "")
-            };
-            Line {
-                text: text.to_string(),
-                eol,
-            }
+    line_endings::split_lines(content)
+        .into_iter()
+        .map(|(text, eol)| Line {
+            text: text.to_string(),
+            eol,
         })
         .collect()
+}
+
+/// The recorded `original` of a replaced span: each physical line's text.
+/// The span's last line ends the way the vendor line does, so the revert
+/// takes its ending from there; an earlier line whose ending differs from
+/// it (a continuation that mixes CRLF and LF) keeps its ending in the
+/// record ([`restored_span`] reads it back).
+fn recorded_span(span: &[Line]) -> Vec<serde_json::Value> {
+    let last_eol = span.last().map_or("", |l| l.eol);
+    let count = span.len();
+    span.iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let text = if i + 1 < count && l.eol != last_eol {
+                format!("{}{}", l.text, l.eol)
+            } else {
+                l.text.clone()
+            };
+            serde_json::Value::String(text)
+        })
+        .collect()
+}
+
+/// The lines a [`recorded_span`] restores in place of a vendor line that
+/// ends with `eol`. A recorded line that keeps its own ending gets it back;
+/// the others end like the vendor line, or, before an unterminated vendor
+/// line, in the file's terminator `nl` (records written before #1567 keep
+/// no endings at all).
+fn restored_span(originals: &[&str], eol: &'static str, nl: &'static str) -> Vec<Line> {
+    let inner = if eol.is_empty() { nl } else { eol };
+    let mut lines: Vec<Line> = originals
+        .iter()
+        .map(|text| match line_endings::split_lines(text).as_slice() {
+            [(text, own)] if !own.is_empty() => Line {
+                text: text.to_string(),
+                eol: *own,
+            },
+            _ => Line {
+                text: text.to_string(),
+                eol: inner,
+            },
+        })
+        .collect();
+    if let Some(last) = lines.last_mut() {
+        last.eol = eol;
+    }
+    lines
 }
 
 /// The content [`split_lines`] read, with any edits made to it.
@@ -756,12 +783,7 @@ async fn plan_requirements(
                 kind: RECORD_KIND.to_string(),
                 action: WiringAction::Rewritten,
                 key: Some(format!("{}:{}", file.rel, start + 1)),
-                original: Some(serde_json::Value::Array(
-                    replaced
-                        .iter()
-                        .map(|l| serde_json::Value::String(l.text.clone()))
-                        .collect(),
-                )),
+                original: Some(serde_json::Value::Array(recorded_span(replaced))),
                 new: Some(serde_json::Value::String(line)),
             });
         }
@@ -1773,6 +1795,87 @@ mod tests {
         let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert_eq!(read_root(tmp.path()).await, original);
+    }
+
+    /// #1567: a continuation whose own physical lines end differently.
+    /// The record keeps the ending of each earlier line that differs from
+    /// the last one, so the revert restores the span byte for byte.
+    #[tokio::test]
+    async fn a_continuation_span_with_mixed_endings_reverts_byte_identically() {
+        for (original, wired) in [
+            (
+                "idna==3.7\nsix==1.16.0 \\\n    --hash=sha256:000111\r\nrequests==2.31.0\n",
+                format!("idna==3.7\n{}\r\nrequests==2.31.0\n", expected_line()),
+            ),
+            (
+                "idna==3.7\r\nsix==1.16.0 \\\r\n    --hash=sha256:000111 \\\n    --hash=sha256:222333\r\n",
+                format!("idna==3.7\r\n{}\r\n", expected_line()),
+            ),
+            // Unterminated last line: the earlier lines keep their own.
+            (
+                "idna==3.7\r\nsix==1.16.0 \\\n    --hash=sha256:000111",
+                format!("idna==3.7\r\n{}", expected_line()),
+            ),
+        ] {
+            let tmp = write_root(original).await;
+            let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap_or_else(|err| panic!("{original:?}: {err:?}"));
+            assert_eq!(read_root(tmp.path()).await, wired, "{original:?}");
+            let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+            assert!(outcome.success, "{original:?}: {:?}", outcome.error);
+            assert_eq!(read_root(tmp.path()).await, original, "{original:?}");
+        }
+    }
+
+    /// A uniform span records plain line texts, as before #1567, and a
+    /// ledger written before it (no endings recorded) still reverts: its
+    /// lines end like the vendor line.
+    #[tokio::test]
+    async fn a_uniform_span_records_plain_texts() {
+        let original = "six==1.16.0 \\\r\n    --hash=sha256:000111\r\nidna==3.7\n";
+        let tmp = write_root(original).await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(
+            wiring[0].original,
+            Some(serde_json::json!([
+                "six==1.16.0 \\",
+                "    --hash=sha256:000111"
+            ]))
+        );
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(read_root(tmp.path()).await, original);
+    }
+
+    /// #1567: the transitive append to a mixed file adds one line in the
+    /// file's majority terminator and touches no other line; the revert
+    /// restores the original.
+    #[tokio::test]
+    async fn mixed_line_endings_survive_a_transitive_append() {
+        let line = format!("./{REL_WHEEL}  # socket-patch vendor: six==1.16.0 (transitive)");
+        for (original, wired) in [
+            (
+                "idna==3.7\r\nrequests==2.31.0\n",
+                format!("idna==3.7\r\nrequests==2.31.0\n{line}\n"),
+            ),
+            (
+                "idna==3.7\r\n# a\r\nrequests==2.31.0\n",
+                format!("idna==3.7\r\n# a\r\nrequests==2.31.0\n{line}\r\n"),
+            ),
+        ] {
+            let tmp = write_root(original).await;
+            let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap_or_else(|err| panic!("{original:?}: {err:?}"));
+            assert_eq!(wiring[0].action, WiringAction::Added);
+            assert_eq!(read_root(tmp.path()).await, wired, "{original:?}");
+            let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+            assert!(outcome.success, "{original:?}: {:?}", outcome.error);
+            assert_eq!(read_root(tmp.path()).await, original, "{original:?}");
+        }
     }
 
     /// #1567: the superseding re-vendor (#765) rewrites only the vendor
