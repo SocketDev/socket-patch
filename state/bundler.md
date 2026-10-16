@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-15 (run 44), main `657fce2`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23.
+Last updated: 2026-10-16 (run 45), main `657fce2`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23 (full gem suites pass, run 45).
 
 ## Coverage matrix
 
@@ -415,6 +415,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Same → `vendor --revert` / `remove` / `rollback` of the vendored gem → no warning, fresh frozen install keeps patched bytes | **fail #1594** | **fail #1594** |
 | H→V takeover on a CHECKSUMS lock with a non-rubygems.org upstream | pass (refused `redirect_revert_failed`, documented) | — |
 
+### Run 45 (main `657fce2`, v5.0.1; Linux Ruby 3.3.6; the repo's real-Bundler suites with `SOCKET_PATCH_BUNDLER_E2E_REQUIRED=1`)
+
+| Suite | 4.0.23 | 2.7.2 |
+| --- | --- | --- |
+| `e2e_redirect_gem_build` (hosted, 51 tests) | pass | pass |
+| `e2e_redirect_gem_stale_install` (42 tests) | pass | pass |
+| `e2e_vendor_gem_build` (vendored, 43 tests) | pass | pass |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -439,9 +447,9 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 1. Re-run #985 / #1109 (`agent:needs-human`) and #1594 when fixes merge.
 2. #1594 CHECKSUMS arm against real rubygems.org (needs an upstream the takeover can re-derive a checksum for; the mock upstream is refused).
-3. Gemspec product, `Gem::Specification.new "name", "1.0"` constructor args with a stem that differs from the name (rare).
+3. V→H→V round trips with a committed `vendor/cache` (does a hosted re-pin leave the vendored-era cache consistent?).
 4. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
-5. V→H→V round trips with a committed `vendor/cache` (does a hosted re-pin leave the vendored-era cache consistent?).
+5. Re-run the three gem suites on 4.1.0 final when it ships.
 
 ## Known non-bugs
 
@@ -565,3 +573,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Wait loops like `while pgrep -f "cargo test …"` match their own shell and never exit. Wait on an output file instead (run 41 near-miss).
 - `zz = 1; self.source "…" do` isn't seen as a source block by the #1531 fix, which deliberately excludes receiver calls (`x.source`). An explicit `self.` on a Gemfile DSL call is contrived, so it's not filed (run 42).
 - `vex --json` needs `--output` (`json_requires_output`); grep the human output instead in probes (run 43).
+- `e2e_gem.rs` needs the real public patch API (`patches-api.socket.dev`), which the sandbox blocks, so its 3 lifecycle tests fail with "tunnel error". That's a sandbox artifact. Run the Bundler suites with `cargo test --no-fail-fast`, or cargo stops at that first failing binary (run 45).
+- Gemspec product: `Gem::Specification.new "name", "1.0" do |s|` constructor arguments aren't read, so the purl falls back to the file stem with no version. That's rare and only touches the VEX product id, so it's not filed (run 45, read-only).
