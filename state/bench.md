@@ -1,7 +1,7 @@
 [agent] Bench: progress log for the `socket-patch scan` benchmark suite (`crates/socket-patch-bench`, `.github/workflows/bench.yml`). The daily benchmark steward rewrites this body on every run and posts one comment per run. Machine-readable history is in `history.json` on the [`bench/ledger`](https://github.com/SocketDev/socket-patch/tree/bench/ledger) branch. The first run (2026-10-02) was logged in #580 and backfilled there.
 
 ## Last run
-- **When:** 2026-10-16, about 06:50–09:10 UTC.
+- **When:** 2026-10-16, about 06:50–08:45 UTC.
 - **main:** `657fce2b`, 14 commits since `e76cb9b3`. 9 of them touch scan code, all edge-case fixes: yarn portal copies read as no package (#1586), yarn berry missing `portal:`/`link:` copies (#1571), pnpm 11 env booleans (#1575), uv project shadowing parent uv settings (#1566), vlt 1.4 `pnpm-workspace.yaml` members (#1574), PyPI direct refs contesting wiring (#1562), VEX gemspec / pyproject (#1582, #1577) and a CLI test cleanup (#1565).
 - **Suite source:** `main`.
 - **Runner:** 4 vCPU, Intel(R) Xeon(R) Processor @ 2.80GHz, cloud sandbox. Absolute times are about 1.2x yesterday's, so this runner is slower.
