@@ -2017,3 +2017,33 @@ async fn issue_1579_berry_portal_placeholder_and_versionless_copies_are_named() 
         }
     }
 }
+
+/// #1598: a linked manifest whose `name` is empty or no valid npm name
+/// names no package, and one whose `version` is empty or no semver names
+/// no version, exactly like a missing key (#1579). The hosted scan read
+/// them literally ("a package called `""`", "another version"), reported a
+/// clean success, and its in-run VEX attested `not_affected` while yarn
+/// linked unpatched left-pad as `node_modules/lp2`. Now each is named.
+#[tokio::test]
+async fn issue_1598_berry_invalid_manifest_name_or_version_is_named() {
+    const UUID: &str = "15981598-1598-4598-8598-159815981598";
+    for protocol in ["portal", "link"] {
+        let spec = format!("{protocol}:./vend/lp");
+        for text in [
+            r#"{"name":"","version":"1.3.0"}"#,
+            r#"{"name":"../x","version":"1.3.0"}"#,
+            r#"{"name":" left-pad","version":"1.3.0"}"#,
+            r#"{"name":"left-pad","version":""}"#,
+            r#"{"name":"left-pad","version":"v1.3.0"}"#,
+        ] {
+            let details =
+                berry_linked_copy_details(UUID, &spec, &[("vend/lp/package.json", text)]).await;
+            assert_eq!(details.len(), 1, "{protocol} {text}: {details:?}");
+            assert!(
+                details[0].contains(&format!("lp2@{spec}::")) && details[0].contains("UNPATCHED"),
+                "{protocol} {text}: {}",
+                details[0]
+            );
+        }
+    }
+}

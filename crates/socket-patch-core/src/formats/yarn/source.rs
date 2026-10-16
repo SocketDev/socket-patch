@@ -127,14 +127,10 @@ pub(crate) fn classic_copy_real_name(
     }
 }
 
-/// `name` of a `package.json`.
+/// `name` of a `package.json`, when it names a package
+/// ([`super::copy::package_name`]).
 pub(crate) fn manifest_name(bytes: &[u8]) -> Option<String> {
-    let bytes = crate::formats::text::strip_bom_bytes(bytes);
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()?
-        .get("name")?
-        .as_str()
-        .map(str::to_string)
+    super::copy::package_name(&super::copy::parse_manifest(bytes)?)
 }
 
 /// The package an npm registry tarball url serves, from its
