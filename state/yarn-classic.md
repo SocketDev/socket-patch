@@ -1,8 +1,8 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-16 (run 43), main `657fce2`, release v5.0.1. No new issues. Verified PR #1596 (head `4d3698c1`) fixes #1578 (hosted 1.7.0 / 1.10.1 / 1.22.22; plus a new vendored shape, a meteor-node-stubs patch that lists package/package.json, which main refuses with exit 1 `vendor_dep_manifest_unlocked`) and #1558 (shapes 1-3 on 1.7.0 / 1.22.22). Negative controls still refuse, and main-written pins attest under the PR. Commented on both issues. New cells: hosted `yarn workspace b add` (exact / caret-merge / disjoint range) pass on 1.10.1 / 1.22.22; vendored is #691.
+Last updated: 2026-10-16 (run 44), main `657fce2` (unchanged since run 43), release v5.0.1. Filed #1610: vendored `rollback` / `remove` leave an unledgered `.socket/vendor/npm/<uuid>/` dir (e.g. the losing side of a merge where two branches vendored the same package at different uuids). `vendor --revert` sweeps it, but afterwards `vendor --check`, `list` and `repair` are silent. Repros on v5.0.1 too. Mixed-side merge resolutions (the lock from one branch, the ledger from the other) fail closed (exit 1, `vendor_check_failed` / `vendor_revert_kept` / `record_unavailable`). PR #1596 is still open, so #1558 / #1578 weren't re-run.
 
-Previous: 2026-10-15 (run 42), main `e76cb9b`, release v5.0.1. Run 42 filed #1578: hosted yarn classic refuses (`redirect_yarn_classic_dep_manifest_unlocked`, exit 0) a patch that changes no dependency whenever the packument's dependency ranges differ from the tarball's package.json. yarn 1 keys dependency blocks by the packument range (`url@*:`) but writes the sub-map from the tarball (`url "^0.11.0"`), and the #591 check compares tarball descriptors with lock keys. Real package meteor-node-stubs@1.2.3 (and 1.2.2) on 1.7.0 / 1.10.1 / 1.22.22. v5.0.1 is bad; v4.0.0 pins fine and main's VEX attests that pin. Git-dep packument normalisation (`user/repo` → `github:user/repo`) is the likely wider class (unproven: no codeload). Also verified: #1559 LFS fix (yarn classic vendored + `*.tgz filter=lfs`, legacy `* -text` upgrade + `git add --renormalize`), #1543 nested projects, SIGKILL at every point of hosted/vendored scans.
+Previous: 2026-10-16 (run 43), main `657fce2`, release v5.0.1. No new issues. Verified PR #1596 (head `4d3698c1`) fixes #1578 (hosted 1.7.0 / 1.10.1 / 1.22.22; plus a new vendored shape, a meteor-node-stubs patch that lists package/package.json, which main refuses with exit 1 `vendor_dep_manifest_unlocked`) and #1558 (shapes 1-3 on 1.7.0 / 1.22.22). Negative controls still refuse, and main-written pins attest under the PR. Commented on both issues. New cells: hosted `yarn workspace b add` (exact / caret-merge / disjoint range) pass on 1.10.1 / 1.22.22; vendored is #691.
 
 ## Coverage matrix
 
@@ -23,6 +23,11 @@ Cells are "pass", "fail #N", "n/a", "CI" or "untested". H = hosted, V = vendored
 | macOS | 1.7.0 | untested | untested | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
 | macOS | 1.10.1 / 1.22.22 | pass (probe) | refused: user / prefix / parent / env / BOM layers (probe, run 31) | fail #363 | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
 | Windows | 1.7.0 / 1.10.1 / 1.22.22 | pass (probe) | refused: user / prefix (node dir) / parent / env / PS 5.1 BOM / backslash path (probe on 1.10.1 / 1.22.22, run 31) | fail #363 (vendored: `Couldn't find the binary git`) | pass | pass | pass | pass | pass (run 18) | pass (run 18) |
+
+### Run 44 cells (Linux, `657fce2`, yarn 1.22.22)
+- V merge flow: branches a / b each vendor left-pad@1.3.0 at a different uuid, then merge with conflicts in yarn.lock, manifest.json and state.json.
+  - All "theirs": `vendor --check` ok, frozen install patched (B), vex attests B. `rollback` / `remove` leave a's uuid dir: fail #1610 (also on v5.0.1). `vendor --revert` sweeps it: pass.
+  - Lock from a, ledger from b (and the reverse): `vendor --check` exit 1 (`vendor_check_failed` + `vendor_ledger_missing`), vex `record_unavailable` (no false attestation), `rollback` exit 1 `vendor_revert_kept`, `repair --offline` `vendor_ledger_missing`. Fails closed, so pass. The stuck remedy loop is the #1072 / #991 class, not re-filed.
 
 ### Run 43 cells (Linux, `657fce2` + PR #1596 `4d3698c1`)
 - #1578 hosted meteor-node-stubs@1.2.3 (1.7.0 / 1.10.1 / 1.22.22): main fail #1578; PR pass (pinned, frozen install patched, installed and lock-only vex attest).
@@ -332,7 +337,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 2. #857 on PR #924 (vendored git-only dep; needs a git dep, which worked in run 20 via github.com).
 3. npm-workspace analogue of the #778 nested-copy scope miss (hand over to npm if it reproduces). Also `rollback <PATH>` / `--sync <PATH>` / `--prune <PATH>` on the same yarn layout.
 4. #921 on macOS / Windows (probe), plus `file:` copies in transitive deps and under `nohoist`.
-5. Merge flows: both branches vendor the same package at different uuids; hosted on one branch and vendored on the other.
+5. Merge flows: different uuids done in run 44 (#1610). Still open: hosted on one branch and vendored on the other, a re-vendor (superseding uuid) on one branch merged with a `yarn add` on the other, and an online `scan --prune` sweep of the #1610 orphan.
 10. `bitbucket:` / `gitlab:` shorthands (needs a package mirrored there).
 6. Cross-OS hosted checkout: embed one prebuilt patched tarball (base64) in the probe so every runner serves identical bytes. Add workspaces to the cross-OS vendored probe.
 7. #758 follow-ups: a real registry package with `bundledDependencies`.
@@ -340,6 +345,9 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 9. Packages whose upstream tarball root isn't `package/` (old `@types/*`, e.g. `@types/left-pad@1.2.0` uses `left-pad/`): the vendored prebuilt check requires `package/…` paths. Whether the real patch service normalizes the root can't be checked from the sandbox.
 
 ## Known non-bugs
+
+- Run-44 harness: a scratch cargo test under crates/socket-patch-cli/tests (copy the `e2e_vendor_yarn_classic_dev_flow.rs` helpers, `stage()` with a uuid parameter, `run_socket` through `prebuilt_common::prepare_command`), run with `cargo test --release --test <name> -- --nocapture`. Don't use `pgrep -f "cargo build"` in a wait loop: it matches its own shell.
+- A merge that takes yarn.lock from one branch and the vendor ledger from the other fails closed (`vendor --check` / `rollback` exit 1, vex omits it). That's the expected refusal; the remedy loop is #1072 / #991.
 
 - Run-41 harness: `h/mock.py` (generic: `MN` / `MV` / `MU` env, `PJ` = JSON of top-level package.json keys the patch replaces; serves the upstream registry tarball), `h/t.sh <name> <yarnver>` (PKG root package.json, POST hook after scan; prints scan codes, frozen-install patched state, installed and lock-only vex exits), `h/t4.sh` (same with `SCANBIN` = v4.0.0 from npm to write pre-v5 pins), `h/t1115.sh`.
 - yarn 1 `cleanDependencies` (normalize-manifest): a name in several of optionalDependencies / dependencies / devDependencies is kept only in the first, and a `""` / `"*"` range takes another field's non-trivial range. Lock blocks are written from that normalised manifest.
