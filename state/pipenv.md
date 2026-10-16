@@ -2,7 +2,7 @@
 
 The routine runs every 6 hours. Each run adds one comment here with the socket-patch commit it tested, the OS × Pipenv-version × mode cells it covered, the issues it filed, updated or closed, and what it plans to probe next. The routine treats this thread as its only memory.
 
-Last run: 2026-10-16 ~09:50Z, main `657fce2` (5.0.1, no new tag; unchanged since the previous run). Filed #1608 (vendored revert drift warnings print `Some("default:six")`). #1184 re-verified: `remove` / `rollback` fixed, and the `vendor --revert` human summary is still drift-worded (commented). All pass: 2026.9 `pipenv requirements --pypi-mirror` over hosted and vendored locks, `pipenv upgrade <other>` keeping hosted and vendored refs (2023.12.1 / 2026.9.1), `pipenv update` (relock drops the ref; vex has nothing to attest), and SIGKILL sweeps of `vendor --revert` / `rollback` / `remove` on a mixed requirements.txt + Pipfile.lock entry. Previous run: 2026-10-15 ~21:50Z.
+Last run: 2026-10-16 ~21:30Z, main `657fce2` (5.0.1, no new tag; unchanged). Filed #1616 (hosted + vendored refuse the patch when another non-default Pipfile.lock category pins a different release; 2023.12.1 / 2026.9.1). Pass: a git-ref entry beside a patched package (hosted rewrite + rollback byte-exact; vendored lock-only `install --deploy`, vex, byte-exact revert) on 2026.9.1. Previous run: 2026-10-16 ~09:50Z.
 
 ## Coverage matrix
 
@@ -109,6 +109,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 
 ## Backlog
 
+000000000000000000. #1616: re-verify once fixed (`[tests]` vs `[docs]` on 2026.9.1, `[dev-packages]` vs `[docs]` on 2023.12.1; hosted + vendored, rollback / revert byte-exact, the other-version entry left untouched; three categories; split + `use_pylock`). (A git-ref neighbour of a patched package: done 2026-10-16 21:30Z, pass.)
 00000000000000000. #1572: re-verify once fixed (`*.whl` / `.socket/` / `wheels/` ignore rules, LFS `*.whl`, the hosted → vendored takeover preflight, `pylock.toml` / requirements export lanes) on 2018 / 2022 / 2023 / 2026. If it's fixed with an owned `.gitignore`, check that `vendor --revert` / `remove` delete it and that `git status` is clean afterwards.
 0000000000000000. (#1549 verified fixed on `657fce2`, 2026-10-15 21:50Z: `file` / `path` / mirror / hosted-pin twin on 2023.12.1 and 2026.9.1.) (Mixed entry with a `use_pylock` pylock.toml as the third file: done 2026-10-15 21:50Z, pass.) New: 2026.9 `pipenv requirements --pypi-mirror` over hosted / vendored locks; hosted sdist under `resolver_backend = "pure-python"`. (#1524 / #1526 mixed requirements.txt + Pipfile.lock entry: done 2026-10-14 21:20Z, pass.) (Interrupted mixed revert / rollback / remove SIGKILL sweep: done 2026-10-16, pass.) (`pipenv requirements --pypi-mirror` on hosted / vendored: done 2026-10-16, pass.)
 000000000000000. (#1507 verified fixed on `4a29912`, 2026-10-14.) (Concurrent / interrupted scans and #1050 GC on `use_pylock`: done 2026-10-14, pass.) Still to do: hosted sdist artifact under 2026.9.x `resolver_backend = "pure-python"` (mock needs an sdist route); standalone `vendor` from an agent manifest on a `use_pylock` project (mock needs the blob route); interrupted `vendor --revert` / `rollback`; `pylock_name` GC.
@@ -189,7 +190,7 @@ macOS/Windows rows are from the 2026-09-30 probes on `f6b7fb9`. No probe ran on 
 - Mock-API note: the batch mock must filter by the requested purls, and `by-package` must carry `vulnerabilities[*].severity`, or `--package` / `--min-severity` cells give false failures.
 - A non-UTF-8 Pipfile makes hosted treat the lock as abandoned, but Pipenv itself refuses that Pipfile (`UnicodeDecodeError`). Not a real-world shape.
 - `PIPENV_PIPFILE` naming a Pipfile outside `--cwd` finds no venv: documented CLI scope.
-- Pipenv refuses different versions of one package across `[packages]` and a named category (categories are constrained by the default packages), so per-category version splits can't happen.
+- Pipenv refuses different versions of one package across `[packages]` and a named category (categories are constrained by the default packages). Two NON-default categories (named vs named, or `develop` vs named) can split, though, and socket-patch refuses that shape: #1616.
 - `vex` gives `product_undetected` on a bare Pipfile project (no name or version); `--product` is the documented remedy.
 - Pipenv 11.x / 2018.x with `virtualenv<20` can't create venvs from uv's standalone CPython (missing `libpython`): a sandbox tooling artifact, so use virtualenv 20.x. Pipenv 11.x also breaks on `(` in a project name (an unsanitized shebang): Pipenv's bug.
 - A hosted requirements.txt rewrite touches only the root file; an included pin gets `redirect_requirements_entry_not_found` (documented). The Pipenv-project consequence is #567.
