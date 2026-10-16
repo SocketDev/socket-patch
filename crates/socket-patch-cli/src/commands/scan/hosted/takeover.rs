@@ -437,7 +437,8 @@ const LANDED_PIN_ADVISORIES: &[&str] = &[
 /// wired outside the root file #699, a uv entry pinned down from another
 /// locked version #723, a Poetry 0.x lock #945); a rewriter warning naming
 /// the package; the rewrite's first warning (a lock-level refusal names no
-/// package), skipping [`LANDED_PIN_ADVISORIES`]; else [`NOT_PINNED`].
+/// package), skipping [`LANDED_PIN_ADVISORIES`] and the uv < 0.5.6
+/// advisories (#1569); else [`NOT_PINNED`].
 async fn explain(
     root: &std::path::Path,
     entry: &VendorEntry,
@@ -456,10 +457,11 @@ async fn explain(
     }
     // A pin that did land can carry a success advisory; it never explains
     // a pin that did not.
-    match warnings
-        .iter()
-        .find(|w| !LANDED_PIN_ADVISORIES.contains(&w.code.as_str()))
-    {
+    match warnings.iter().find(|w| {
+        !LANDED_PIN_ADVISORIES.contains(&w.code.as_str())
+            && !socket_patch_core::patch::redirect::UV_OLD_RELEASE_ADVISORIES
+                .contains(&w.code.as_str())
+    }) {
         Some(w) => (w.code.clone(), vec![w.clone()]),
         None => (NOT_PINNED.to_string(), Vec::new()),
     }

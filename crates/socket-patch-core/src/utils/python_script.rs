@@ -352,10 +352,13 @@ pub(crate) fn hosted_override_pins(doc: &DocumentMut, script: bool) -> Vec<Hoste
 }
 
 /// Whether `metadata` (a pyproject.toml, or a PEP 723 script when
-/// `script`) carries the hosted `override-dependencies` pin for `name`
-/// ([`hosted_override_pins`]): the transitive wiring uv before 0.5.5 does
-/// not honour (#1569). Unparseable metadata carries none.
-pub(crate) fn has_hosted_override(metadata: &str, script: bool, name: &str) -> bool {
+/// `script`) wires `name` as a transitive package: an `[tool.uv]
+/// override-dependencies` entry names it (the hosted rewrite's marked one or
+/// the user's own, which the rewrite reuses) and no dependency array
+/// declares it, so `[tool.uv.sources]` reaches it only through the
+/// override. uv before 0.5.5 ignores sources there (#1569). Unparseable
+/// metadata wires nothing.
+pub(crate) fn wires_through_override(metadata: &str, script: bool, name: &str) -> bool {
     let toml = if script {
         match script_metadata(metadata) {
             Ok((_, toml)) => toml,
@@ -368,9 +371,52 @@ pub(crate) fn has_hosted_override(metadata: &str, script: bool, name: &str) -> b
         return false;
     };
     let name = canonicalize_pypi_name(name);
-    hosted_override_pins(&doc, script)
-        .iter()
-        .any(|pin| pin.name == name)
+    let uv = doc
+        .get("tool")
+        .and_then(Item::as_table_like)
+        .and_then(|tool| tool.get("uv"))
+        .and_then(Item::as_table_like);
+    if !contains_dependency(uv.and_then(|uv| uv.get("override-dependencies")), &name) {
+        return false;
+    }
+    // The same "direct" reading the rewrites use to decide on an override.
+    let direct = if script {
+        contains_dependency(doc.get("dependencies"), &name)
+    } else {
+        pyproject_dependency_specs(&doc)
+            .into_iter()
+            .any(|(_, spec)| dependency_name(spec) == name)
+            || uv.is_some_and(|uv| contains_dependency(uv.get("dev-dependencies"), &name))
+    };
+    !direct
+}
+
+/// The advisory for [`wires_through_override`] wiring, shared by hosted
+/// (`redirect_uv_override_requires_uv_0_5_6`) and vendored
+/// (`pypi_uv_override_requires_uv_0_5_6`). Measured with the real binaries,
+/// 0.5.5 is the first uv that keeps the override's source; the advice and
+/// the codes keep the documented 0.5.6.
+pub(crate) fn uv_override_advisory(name: &str, version: &str) -> String {
+    format!(
+        "transitive wiring of {name}=={version} via [tool.uv] override-dependencies is \
+         not honored by uv before 0.5.5, which reinstalls the registry wheel on a plain \
+         `uv sync` — pin uv >= 0.5.6 or make the package a direct dependency"
+    )
+}
+
+/// The advisory for a repointed `[manifest]` `constraints` /
+/// `build-constraints` entry, shared by hosted
+/// (`redirect_uv_constraints_require_uv_0_5_6`) and vendored
+/// (`pypi_uv_constraints_require_uv_0_5_6`); `wheel` says whose wheel
+/// (`hosted` / `vendored`). uv 0.5.4 still rejects the entry, 0.5.5 accepts
+/// it.
+pub(crate) fn uv_constraints_advisory(name: &str, wheel: &str) -> String {
+    format!(
+        "[manifest] constraints for {name} were repointed at the {wheel} wheel, the shape \
+         uv 0.5.5+ writes; uv 0.2.37–0.5.4 reject it under `uv sync --locked` (`--frozen` \
+         and a plain `uv sync` still install the patch) — pin uv >= 0.5.6 or drop the \
+         constraint on the patched package"
+    )
 }
 
 /// Append `specifier` to `overrides` on its own line, under

@@ -1352,10 +1352,14 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                 Lane::Constraints => Some("redirect_uv_constraints_require_uv_0_5_6"),
                 _ => None,
             };
-            if let Some(code) = advisory {
-                assert!(
+            for code in [
+                "redirect_uv_override_requires_uv_0_5_6",
+                "redirect_uv_constraints_require_uv_0_5_6",
+            ] {
+                assert_eq!(
                     env.to_string().contains(code),
-                    "{}: no `{code}` advisory: {env:#}",
+                    advisory == Some(code),
+                    "{}: `{code}` advisory expected only on its own lane: {env:#}",
                     report.what("scan --mode hosted")
                 );
             }

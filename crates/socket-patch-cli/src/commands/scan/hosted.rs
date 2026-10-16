@@ -2343,14 +2343,11 @@ fn describe_skip_reason(reason: &str) -> String {
 fn lock_entry_warning_count(
     warnings: &[socket_patch_core::patch::redirect::RewriteWarning],
 ) -> usize {
-    const WRITTEN_PIN_ADVISORIES: [&str; 3] = [
-        "redirect_bun_default_trust_lost",
-        "redirect_uv_override_requires_uv_0_5_6",
-        "redirect_uv_constraints_require_uv_0_5_6",
-    ];
+    use socket_patch_core::patch::redirect::UV_OLD_RELEASE_ADVISORIES;
     warnings
         .iter()
-        .filter(|w| !WRITTEN_PIN_ADVISORIES.contains(&w.code.as_str()))
+        .filter(|w| w.code != "redirect_bun_default_trust_lost")
+        .filter(|w| !UV_OLD_RELEASE_ADVISORIES.contains(&w.code.as_str()))
         .count()
 }
 

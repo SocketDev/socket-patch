@@ -598,11 +598,7 @@ pub(super) async fn wire_uv(
         // 0.5.3 from 0.5.6, so this cannot be an offline refusal — advise.
         advisories.push(VendorWarning::new(
             "pypi_uv_override_requires_uv_0_5_6",
-            format!(
-                "transitive wiring of {canon_name} via [tool.uv] override-dependencies is \
-                 honored only by uv >= 0.5.6; older uv reinstalls the registry wheel on a \
-                 plain `uv sync` — pin uv or make the package a direct dependency"
-            ),
+            crate::utils::python_script::uv_override_advisory(canon_name, version),
         ));
         let spec = format!("{canon_name}=={version}");
         let uv_table = ensure_table(&mut doc, &["tool", "uv"])?;
@@ -790,12 +786,7 @@ pub(super) async fn wire_uv(
         // advise rather than refuse.
         advisories.push(VendorWarning::new(
             "pypi_uv_constraints_require_uv_0_5_6",
-            format!(
-                "[manifest] constraints for {canon_name} were repointed at the vendored wheel, \
-                 the shape uv >= 0.5.6 writes; uv 0.2.37–0.5.3 reject it under `uv sync \
-                 --locked` (`--frozen` and a plain `uv sync` still install the patch) — pin uv \
-                 >= 0.5.6 or drop the constraint on the patched package"
-            ),
+            crate::utils::python_script::uv_constraints_advisory(canon_name, "vendored"),
         ));
     }
     for edit in constraint_edits.iter().rev() {

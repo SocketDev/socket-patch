@@ -6033,43 +6033,46 @@ fn pipenv_pylock_refusal(path: &str, dep: &DepOverride) -> RewriteWarning {
     }
 }
 
-/// #1569: the advisories vendored mode gives as `pypi_uv_*_0_5_6` for the
-/// two wiring shapes uv before 0.5.5 does not honour, for a dep this run
-/// wired into `path`. `metadata` is the paired pyproject.toml / script as
-/// the run leaves it. The CLI cannot tell those uv binaries apart from the
-/// lock, so these advise rather than refuse; the redirect still counts.
+/// The hosted uv advisories for the two wiring shapes uv before 0.5.5 does
+/// not honour (#1569). They accompany a pin that landed, so a caller that
+/// counts or explains refusals skips them.
+pub const UV_OLD_RELEASE_ADVISORIES: [&str; 2] = [
+    "redirect_uv_override_requires_uv_0_5_6",
+    "redirect_uv_constraints_require_uv_0_5_6",
+];
+
+/// #1569: the advisories vendored mode gives as `pypi_uv_*_0_5_6`, for a dep
+/// this run wired into `path`. `metadata` is the paired pyproject.toml /
+/// script as the run leaves it, and `constrained` whether the lock's
+/// `[manifest]` constrains the dep. The CLI cannot tell those uv binaries
+/// apart from the lock, so these advise rather than refuse; the redirect
+/// still counts.
 fn uv_old_release_advisories(
     path: &str,
     metadata: Option<&str>,
-    lock: &str,
+    constrained: bool,
     dep: &DepOverride,
 ) -> Vec<RewriteWarning> {
-    use crate::utils::python_lock::{is_script_lock_name, manifest_constrains};
-    use crate::utils::python_script::has_hosted_override;
+    use crate::crawlers::python_crawler::canonicalize_pypi_name;
+    use crate::utils::python_lock::is_script_lock_name;
+    use crate::utils::python_script::{
+        uv_constraints_advisory, uv_override_advisory, wires_through_override,
+    };
 
-    let mut warnings = Vec::new();
+    let [override_code, constraints_code] = UV_OLD_RELEASE_ADVISORIES;
+    let name = canonicalize_pypi_name(&dep.name);
     let script = is_script_lock_name(path);
-    if metadata.is_some_and(|text| has_hosted_override(text, script, &dep.name)) {
+    let mut warnings = Vec::new();
+    if metadata.is_some_and(|text| wires_through_override(text, script, &name)) {
         warnings.push(RewriteWarning {
-            code: "redirect_uv_override_requires_uv_0_5_6".into(),
-            detail: format!(
-                "{path}: transitive wiring of {}=={} via [tool.uv] override-dependencies is \
-                 honored only by uv >= 0.5.6; older uv reinstalls the registry wheel on a \
-                 plain `uv sync` — pin uv or make the package a direct dependency",
-                dep.name, dep.version
-            ),
+            code: override_code.into(),
+            detail: format!("{path}: {}", uv_override_advisory(&name, &dep.version)),
         });
     }
-    if manifest_constrains(lock, &dep.name) {
+    if constrained {
         warnings.push(RewriteWarning {
-            code: "redirect_uv_constraints_require_uv_0_5_6".into(),
-            detail: format!(
-                "{path}: [manifest] constraints for {} were repointed at the hosted wheel, the \
-                 shape uv >= 0.5.6 writes; uv 0.2.37–0.5.3 reject it under `uv sync --locked` \
-                 (`--frozen` and a plain `uv sync` still install the patch) — pin uv >= 0.5.6 \
-                 or drop the constraint on the patched package",
-                dep.name
-            ),
+            code: constraints_code.into(),
+            detail: format!("{path}: {}", uv_constraints_advisory(&name, "hosted")),
         });
     }
     warnings
@@ -6196,7 +6199,8 @@ fn rewrite_uv_lock(
                             .and_then(|rel| result.files.get(rel).or_else(|| files.get(rel)))
                             .map(String::as_str)
                     });
-                let advisories = uv_old_release_advisories(path, metadata, &rewritten, dep);
+                let constrained = session.manifest_constrains(&dep.name);
+                let advisories = uv_old_release_advisories(path, metadata, constrained, dep);
                 result.warnings.extend(advisories);
             }
             if let Some(edit) = metadata_edit {
@@ -27061,6 +27065,7 @@ mod uv_old_release_advisories {
     use super::*;
 
     const URL: &str = "https://patch.test/six-1.16.0-py2.py3-none-any.whl";
+    const HOSTED_OVERRIDE_MARK_TEXT: &str = "# socket-patch hosted:";
     const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
     const ISODATE: &str = "[[package]]\nname = \"isodate\"\nversion = \"0.6.1\"\nsource = { registry = \"https://pypi.org/simple\" }\ndependencies = [{ name = \"six\" }]\nwheels = [{ url = \"https://files.pythonhosted.org/packages/isodate-0.6.1-py2.py3-none-any.whl\", hash = \"sha256:0751eece944162659049d35f4f549ed815792b38793f07cf73381c1c87cbed96\" }]\n";
 
@@ -27202,6 +27207,53 @@ mod uv_old_release_advisories {
         );
         let (_, again) = scan(&wired);
         assert!(again.files.is_empty() && again.warnings.is_empty());
+    }
+
+    /// The user's own unmarked `six==1.16.0` override is reused for the
+    /// hosted source, and uv before 0.5.5 ignores that source just the
+    /// same: advise, under the canonical name even for a `Six` grant.
+    #[test]
+    fn user_written_override_advises_uv_0_5_6() {
+        let input = files(&[
+            (
+                "pyproject.toml",
+                project(
+                    "\"isodate==0.6.1\"",
+                    "\n[tool.uv]\noverride-dependencies = [\"six==1.16.0\"]\n",
+                ),
+            ),
+            (
+                "uv.lock",
+                lock(
+                    "isodate",
+                    "{ name = \"isodate\", specifier = \"==0.6.1\" }",
+                    "",
+                    &[ISODATE, SIX],
+                ),
+            ),
+        ]);
+        let dep = DepOverride {
+            name: "Six".into(),
+            ..six()
+        };
+        let result = rewrite_registry_redirect(&input, std::slice::from_ref(&dep));
+        assert!(
+            result.confirmed_python_lock_uuids.contains(&dep.patch_uuid),
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.files["pyproject.toml"].contains(HOSTED_OVERRIDE_MARK_TEXT));
+        assert_eq!(
+            codes(&result),
+            vec!["redirect_uv_override_requires_uv_0_5_6"],
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            result.warnings[0].detail.contains("six==1.16.0"),
+            "{}",
+            result.warnings[0].detail
+        );
     }
 
     /// A direct dependency with no constraint needs neither shape: no

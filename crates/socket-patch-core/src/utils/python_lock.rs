@@ -413,11 +413,7 @@ fn rewrite_references(
 /// Whether the lock's `[manifest]` `constraints` / `build-constraints` name
 /// `name`: the entries [`rewrite_manifest`] repoints at the artifact, a
 /// shape uv before 0.5.5 rejects under `uv sync --locked` (#1569).
-/// Unparseable text names none.
-pub(crate) fn manifest_constrains(text: &str, name: &str) -> bool {
-    let Ok(document) = text.parse::<DocumentMut>() else {
-        return false;
-    };
+fn manifest_constrains(document: &DocumentMut, name: &str) -> bool {
     let name = canonicalize_pypi_name(name);
     let Some(manifest) = document.get("manifest").and_then(Item::as_table_like) else {
         return false;
@@ -1086,6 +1082,14 @@ impl PythonLockSession {
             finish_metadata_completion(document, completion, version, artifact);
         }
         Ok(preserve_line_endings(text, document.to_string()))
+    }
+
+    /// [`manifest_constrains`] over the session's document as the
+    /// rewrites so far left it, without re-parsing the lock.
+    pub(crate) fn manifest_constrains(&self, name: &str) -> bool {
+        self.document
+            .as_ref()
+            .is_ok_and(|document| manifest_constrains(document, name))
     }
 }
 
