@@ -351,6 +351,28 @@ pub(crate) fn hosted_override_pins(doc: &DocumentMut, script: bool) -> Vec<Hoste
         .collect()
 }
 
+/// Whether `metadata` (a pyproject.toml, or a PEP 723 script when
+/// `script`) carries the hosted `override-dependencies` pin for `name`
+/// ([`hosted_override_pins`]): the transitive wiring uv before 0.5.5 does
+/// not honour (#1569). Unparseable metadata carries none.
+pub(crate) fn has_hosted_override(metadata: &str, script: bool, name: &str) -> bool {
+    let toml = if script {
+        match script_metadata(metadata) {
+            Ok((_, toml)) => toml,
+            Err(_) => return false,
+        }
+    } else {
+        metadata.to_string()
+    };
+    let Ok(doc) = toml.parse::<DocumentMut>() else {
+        return false;
+    };
+    let name = canonicalize_pypi_name(name);
+    hosted_override_pins(&doc, script)
+        .iter()
+        .any(|pin| pin.name == name)
+}
+
 /// Append `specifier` to `overrides` on its own line, under
 /// [`HOSTED_OVERRIDE_MARK`]. An array the rewrite just created (empty) is
 /// laid out multi-line with a trailing comma; an existing array keeps its
