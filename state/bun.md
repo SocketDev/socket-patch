@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-15 (run 44), main `15ead12`, latest release 5.0.1, latest Bun 1.4.3.
+Last updated: 2026-10-16 (run 45), main `657fce2`, latest release 5.0.1, latest Bun 1.4.3.
 
 Method (run 36 note: the authenticated routes work too: `--api-url <mock> --org o --api-token fake` serves `/v0/orgs/o/patches/{batch,by-package,package,view}`; still set `SOCKET_PATCH_SERVER_URL` to the mock origin or hosted pins aren't recognized and `rollback` exits `manifest_not_found`. Run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` and `SOCKET_PROXY_URL` to the mock (run 32: without a token the CLI uses the public-proxy routes `/patch/batch`, `/patch/by-package/<purl>`, `/patch/view/<uuid>`, `/patch/blob/<hash>` and `POST /patch/package`, and `patch.socket.dev` returns 403 through the sandbox proxy). Test repos need `node_modules/` in `.gitignore`, or the fresh-clone oracle reads committed store entries. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -71,6 +71,8 @@ Run 41 (new main `bb73e2f`: #1496 for #1492): new **#1521**. Bun 1.3.0 / 1.3.1 h
 Run 42 (new main `a3f56f7`: #1523 for #1521): new **#1541**. When the repo's `.gitattributes` LFS-tracks `*.tgz`, vendored tarballs and `bun.lockb` member mirrors are committed as LFS objects (the uuid `.gitattributes` is only `* -text`). The scan exits 0, and a checkout without LFS smudge fails the frozen install (1.2.23 / 1.3.9 / 1.4.3, text + lockb, single + workspace). #1521 verified fixed (1.3.0 / 1.3.1 text + lockb, hosted + vendored). Also passing: `--cwd` / `SOCKET_CWD` / symlinked cwd, an env-only registry (`BUN_CONFIG_REGISTRY`) rollback across 1.3.6 / 1.3.7, a non-canonical CDN tarball registry through rollback / takeover / revert, and today's canary on hosted / vendored / agent workspaces.
 
 Run 43 (new main `7b6371c`: #1543 for #1534, the nested-project handover from run 41; no Bun-specific code change): no new bugs. #1534 verified fixed on Bun: a root hosted / vendored scan over an independent nested Bun project (own `bun.lock` / `bun.lockb`) warns `nested_project_skipped` with a correct shell-relative, quoted PATH, exits 0, and the suggested `scan --mode <m> <PATH>` patches the nested project (1.2.23 / 1.3.9 / 1.4.3 × text / lockb / isolated × hosted / vendored, fresh frozen clones patched). Root VEX leaves the skipped package out. Root locking the same / a different version, `!`-excluded members and `.gitattributes` `* text=auto eol=crlf` clones pass. #1541 / #1019: no fix yet, not re-run.
+
+Run 45 (new main `657fce2`: no Bun fix since run 44): new **#1600**. In a Bun project with a git, `file:` folder or URL/`file:` tarball copy of the vendored `name@version` beside the vendored registry entry, `vendor --check` fails with the generic `wiring missing … re-run socket-patch vendor` reason (the lock does reference the artifact) instead of `copy unpatched` (#1511 contract), and the remedy loops. Root cause: `vex/discover/bun.rs` `Unwired::contest` drops those refs without `out.shadow(r)`. First real-Bun `git+` tuple cells (local dumb-HTTP git server): hosted refuses `redirect_unattributable` (documented), vendored wires the registry copy silently (documented), `vex` fails closed, agent patches both copies, unwinds work.
 
 Run 44 (new main `15ead12`: #1559 for #1541, plus non-Bun fixes): new **#1581**. On a tree a pre-#1541 release vendored, in a repo that LFS-tracks `*.tgz`, `repair` (the remedy `vendor --check` prints in an LFS-less clone) leaves the root `<uuid>/.gitattributes` as legacy `* -text`. The repaired tarball goes back into LFS on commit, and fresh frozen installs still fail (1.2.23 / 1.3.9 / 1.4.3; lockb member mirrors are upgraded; plain npm is the same). #1541 verified fixed for new vendored runs (1.2.23 / 1.4.3 × text / lockb × single / workspace), and the 5.0.1 → main vendored re-run + `git add --renormalize` upgrade path passes. Passing: the #1534 leftovers (lockfile-only nested project, nested project inside a workspace member dir) and main `vendor --revert` of 5.0.1-vendored (legacy `.gitattributes`) workspaces.
 
@@ -348,7 +350,8 @@ Untested: a non-writable global dir, a symlinked `BUN_INSTALL`, and Bun 1.0.x.
 | 1.3.14 | text v1 | fail #497 | fail #497 | fail #497 | pass | untested | untested |
 | 1.4.2 | text v2 (URL and `file:` tgz) | fail #497 | fail #497 | fail #497 | pass | fail #497 | pass |
 | 1.1.45 (read by 1.1.45 / 1.2.23 / 1.4.2) | `bun.lockb` (URL tgz; run 6) | fail #497 | fail #497 | fail #497 | pass | fail #497 | untested |
-| any | `github:` tuples | untested | untested | untested | untested | untested | untested |
+| 1.2.23 / 1.3.9 / 1.4.3 | `git+http://` tuple (local git server, run 45), text + lockb | hosted refuses `redirect_unattributable` (documented); vendored: no warning (documented) | n/a (git copy stays unpatched by design) | pass (fails closed); `vendor --check` reason **fail #1600** | n/a (nothing pinned) | n/a | untested |
+| any | `github:` (codeload) tuples | untested | untested | untested | untested | untested | untested |
 | macOS, Windows | all | untested | untested | untested | untested | untested | untested |
 
 ### `socket.yml` policy and staged rollout (run 6, Linux)
@@ -613,6 +616,17 @@ Other passes (Linux, 1.4.2 unless noted):
 | #1534 leftover: lockfile-only nested project (no `node_modules`) under a root hosted / vendored scan | 1.4.3 text / lockb | pass (not crawled, nested lock untouched; contract scopes the warning to installed copies) |
 | #1534 leftover: nested project inside a workspace member dir (`packages/a/tools/x`), member doesn't lock it; suggested command; fresh frozen clones | 1.2.23 text / 1.3.9 lockb / 1.4.3 text + lockb × hosted / vendored | pass |
 
+### Run 45 (main `657fce2`, Linux)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| `git+http://` copy + nested registry copy: hosted scan | 1.4.3 text (5.0.1 and main) | pass (`redirect_unattributable`, nothing written; documented #497 design) |
+| Same, vendored scan → commit → fresh cold frozen install → `vex` | 1.2.23 / 1.3.9 / 1.4.3 × text / lockb | pass for wiring + `vex` (no_applicable_patches, fails closed); no scan warning (documented) |
+| Same + `file:` folder copy, and a `file:./left-pad-1.3.0.tgz` copy: `vendor --check` | 1.2.23 / 1.3.9 / 1.4.3 × text / lockb | **fail #1600** (`wiring missing … re-run vendor`; vendor / scan / repair no-op loop) |
+| Control: no extra copy, `vendor --check` + `vex` | 1.4.3 text | pass |
+| `git+` copy: vendored `rollback` / `remove <purl>` / `vendor --revert` | 1.4.3 text | pass |
+| `git+` copy: agent scan → `vex` | 1.4.3 text | pass (both copies patched, attests) |
+| `scan --mode vendored --vex` with a git / folder copy | 1.4.3 text | wires, then the envelope is `status: error` `no_applicable_patches` (exit 1) with no hint at the copy; folded into #1600 context |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
@@ -621,7 +635,7 @@ Other passes (Linux, 1.4.2 unless noted):
 3. #831: verified on Bun 1.4.2 text + `bun.lockb` (run 28). The workspace cell is now #1116; re-test it when fixed (also on the isolated linker). The `.gitattributes` / LFS rule is #1541 (run 42). `vendor --check` after `bun remove` (#970). #764 follow-up: macOS/Windows. Real Windows autocrlf checkouts.
 4. #861, #831, #784, #764, #635, #599 and #497: re-test when fixed. #626 on Bun once PR #634 merges. Also `globalStore` + workspaces and `globalStore` on macOS/Windows. (#605/#774 store copies on Bun peer-variant entries: pass, run 21.)
 5. macOS/Windows re-runs of the #366 / #405 / #469 / #803 fixes (Windows isolated uses junctions).
-6. #497 `github:` tuples (needs a probe).
+6. #497 `github:` (codeload) tuples (needs a probe); `git+` tuples covered in run 45 (#1600). #1600: re-test when fixed (also workspace members and `bun.lockb` tarball copies).
 7. Hosted rollback on real macOS and Windows checkouts.
 8. Bun 1.4.3 stable: core hosted / vendored / agent / workspace cells pass (run 38); `globalStore` and the #1084 isolated shape pass (run 39); still to do on 1.4.3: Windows/macOS. #992: re-test when fixed, including `[install.scopes]` and `NPM_CONFIG_REGISTRY` variants and the 1.1.45 `remove` / takeover cells. (Lifecycle scripts and scoped packages with scripts on `bun.lockb`: pass, run 27.) (Mixed modes, `globalStore` + vendored workspace lockb: pass, run 25. Superseding uuids in mixed modes, explicit `trustedDependencies`, `bun pm trust`, `--filter`: pass, run 26.)
 9. Digest boundary with a valid substitute tarball, 1.3.9 text lock vs 1.3.10 (low priority, documented limitation).
@@ -752,3 +766,4 @@ Other passes (Linux, 1.4.2 unless noted):
 - Bun ignores `NPM_CONFIG_USERCONFIG`, so a scope configured only there isn't a valid #1276 cell (run 39).
 - Vendoring on a `bun.lockb` workspace writes every patched tarball's mirror under every member, including members that don't depend on it. That's harmless (run 39).
 - A lockfile-only nested independent project (no `node_modules`) under a root hosted / vendored scan gets no `nested_project_skipped` warning: CLI_CONTRACT scopes the warning to packages the crawl finds installed (run 44).
+- A vendored Bun scan beside a git, folder or versionless-URL copy of the patched `name@version` wires the registry copy with no warning. That's documented (CLI_CONTRACT `vendor_non_registry_entry_skipped` row: the codes don't fire for copies without a version; `vex` attests nothing). Only `vendor --check`'s wrong reason is a bug (#1600) (run 45).
