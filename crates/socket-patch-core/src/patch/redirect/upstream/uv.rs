@@ -639,7 +639,14 @@ fn pip_compiled(doc: &DocumentMut, text: &str, shape: &Shape) -> bool {
         return false;
     }
     match uv_header_command(text) {
-        Some(command) => command.starts_with(&["pip", "compile"]),
+        Some(command) => {
+            // Skip leading global flags to find the subcommand
+            let subcommand_start = command
+                .iter()
+                .position(|arg| !arg.starts_with('-'))
+                .unwrap_or(command.len());
+            command[subcommand_start..].starts_with(&["pip", "compile"])
+        }
         None => !shape.index,
     }
 }
