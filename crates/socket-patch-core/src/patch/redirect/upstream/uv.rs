@@ -349,24 +349,19 @@ async fn restore_lock(
         );
     }
     // A per-package cutoff (#1604) filters only the packages it names.
-    let cutoffs = options
-        .and_then(|o| o.get("exclude-newer-package"))
-        .and_then(Item::as_table_like);
-    for hit in &hits {
-        if cutoffs.is_some_and(|c| {
-            c.iter().any(|(name, cutoff)| {
-                canonicalize_pypi_name(name) == hit.name && cutoff.as_bool() != Some(false)
-            })
-        }) {
-            result.refuse(
-                &hit.uuid,
-                format!(
-                    "{rel}: the lock's `exclude-newer-package` cutoff for {} filters its \
-                     release files by upload time",
-                    hit.name
-                ),
-            );
-        }
+    let cutoffs = options.and_then(|o| o.get("exclude-newer-package"));
+    for hit in hits
+        .iter()
+        .filter(|h| cutoffs.is_some_and(|c| names_package(c, &h.name)))
+    {
+        result.refuse(
+            &hit.uuid,
+            format!(
+                "{rel}: the lock's `exclude-newer-package` cutoff for {} filters its release \
+                 files by upload time",
+                hit.name
+            ),
+        );
     }
     let shape = match lock_shape(&doc, collection, pep751, &hits) {
         Ok(shape) => shape,
@@ -374,39 +369,41 @@ async fn restore_lock(
     };
     if pep751 && pip_compiled(&doc, &text, &shape) {
         let command = uv_header_command(&text).unwrap_or_default();
-        for hit in &hits {
-            if let Some(flag) = compile_filter(&command, &hit.name) {
-                result.refuse(
-                    &hit.uuid,
-                    format!(
-                        "{rel}: `uv pip compile {flag}` filters which of {}'s release files \
-                         the lock records, so they are not re-derivable",
-                        hit.name
-                    ),
-                );
+        // `--no-config` reads no settings file; `--config-file` names one
+        // relative to wherever uv ran, which the lock does not record.
+        let settings = if command.contains(&"--no-config") {
+            None
+        } else if command
+            .iter()
+            .any(|a| *a == "--config-file" || a.starts_with("--config-file="))
+        {
+            return refuse_hits(
+                result,
+                "`uv pip compile --config-file` read settings that may filter which release \
+                 files the lock records, and that file is not derivable from the lock",
+            );
+        } else {
+            match pip_settings(view, rel).await {
+                Ok(settings) => settings,
+                Err(why) => return refuse_hits(result, &why),
             }
-        }
-        let settings = match pip_settings(view, rel).await {
-            Ok(settings) => settings,
-            Err(why) => return refuse_hits(result, &why),
         };
-        let uv_table = settings.as_ref().and_then(|(path, doc)| {
-            if path.ends_with("uv.toml") {
-                Some(doc.as_table() as &dyn TableLike)
-            } else {
-                tool_uv(doc)
-            }
-        });
         for hit in &hits {
-            let Some(key) = uv_table.and_then(|uv| settings_filter(uv, &hit.name)) else {
+            let why = if let Some(flag) = compile_filter(&command, &hit.name) {
+                format!("`uv pip compile {flag}` filters")
+            } else if let Some((path, key)) = settings
+                .as_ref()
+                .and_then(|(path, uv)| Some((path, settings_filter(uv, &hit.name)?)))
+            {
+                format!("{path}'s uv `{key}` setting filters")
+            } else {
                 continue;
             };
-            let path = settings.as_ref().map_or("", |(path, _)| path.as_str());
             result.refuse(
                 &hit.uuid,
                 format!(
-                    "{rel}: {path}'s uv `{key}` setting filters which of {}'s release files \
-                     `uv pip compile` records, so they are not re-derivable",
+                    "{rel}: {why} which of {}'s release files `uv pip compile` records, so \
+                     they are not re-derivable",
                     hit.name
                 ),
             );
@@ -658,15 +655,30 @@ fn uv_header_command(text: &str) -> Option<Vec<&str>> {
         })
 }
 
+/// Whether a filter setting's value reaches `name`: `true`, a cutoff date,
+/// a list naming it (or `:all:`), or a per-package cutoff table naming it
+/// with anything but `false` (uv's "no cutoff").
+fn names_package(item: &Item, name: &str) -> bool {
+    if let Some(cutoffs) = item.as_table_like() {
+        return cutoffs.iter().any(|(package, cutoff)| {
+            canonicalize_pypi_name(package) == name && cutoff.as_bool() != Some(false)
+        });
+    }
+    match item.as_value() {
+        Some(Value::Boolean(on)) => *on.value(),
+        Some(Value::String(_)) | Some(Value::Datetime(_)) => true,
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name),
+        _ => false,
+    }
+}
+
 /// The `uv pip compile` flag in `command` that filters `name`'s files:
 /// `--no-build`, `--only-binary` / `--no-binary` naming it or `:all:`,
 /// `--exclude-newer`, or an `--exclude-newer-package` cutoff for it.
 fn compile_filter(command: &[&str], name: &str) -> Option<String> {
-    let names = |value: &str, sep: char| {
-        value
-            .split(sep)
-            .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name)
-    };
     let mut args = command.iter();
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -680,11 +692,13 @@ fn compile_filter(command: &[&str], name: &str) -> Option<String> {
                     continue;
                 };
                 if flag == "--exclude-newer-package" {
-                    value
-                        .split_once('=')
-                        .is_some_and(|(package, _)| canonicalize_pypi_name(package) == name)
+                    value.split_once('=').is_some_and(|(package, cutoff)| {
+                        canonicalize_pypi_name(package) == name && cutoff != "false"
+                    })
                 } else {
-                    names(value, ',')
+                    value
+                        .split(',')
+                        .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name)
                 }
             }
             _ => false,
@@ -697,28 +711,39 @@ fn compile_filter(command: &[&str], name: &str) -> Option<String> {
 }
 
 /// The uv settings `uv pip compile` reads beside a pylock, as `(settings
-/// file, document)`: the nearest `uv.toml`, else a pyproject with a
-/// `[tool.uv]` table, in the lock's directory or above it.
+/// file, its uv table)`: the nearest `uv.toml`, else a pyproject with a
+/// `[tool.uv]` table, in the lock's directory or above it. Like uv, a
+/// pyproject that does not parse is passed over.
 async fn pip_settings(
     view: &mut View<'_>,
     rel: &str,
-) -> Result<Option<(String, DocumentMut)>, String> {
+) -> Result<Option<(String, toml_edit::Table)>, String> {
     let mut dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
     loop {
-        for file in ["uv.toml", "pyproject.toml"] {
-            let path = if dir.is_empty() {
+        let path = |file: &str| {
+            if dir.is_empty() {
                 file.to_string()
             } else {
                 format!("{dir}/{file}")
-            };
-            let Some(text) = view.read(&path).await? else {
-                continue;
-            };
+            }
+        };
+        let uv_toml = path("uv.toml");
+        if let Some(text) = view.read(&uv_toml).await? {
             let doc = text
                 .parse::<DocumentMut>()
-                .map_err(|e| format!("{path} is not valid TOML: {e}"))?;
-            if file == "uv.toml" || tool_uv(&doc).is_some() {
-                return Ok(Some((path, doc)));
+                .map_err(|e| format!("{uv_toml} is not valid TOML: {e}"))?;
+            return Ok(Some((uv_toml, doc.as_table().clone())));
+        }
+        let pyproject = path("pyproject.toml");
+        if let Some(text) = view.read(&pyproject).await? {
+            let uv = text.parse::<DocumentMut>().ok().and_then(|doc| {
+                let uv = doc.get("tool")?.get("uv")?;
+                uv.as_table()
+                    .cloned()
+                    .or_else(|| uv.as_inline_table().map(|t| t.clone().into_table()))
+            });
+            if let Some(uv) = uv {
+                return Ok(Some((pyproject, uv)));
             }
         }
         if dir.is_empty() {
@@ -728,38 +753,25 @@ async fn pip_settings(
     }
 }
 
-/// The uv setting (top level or `[pip]`) that filters which of `name`'s
-/// files `uv pip compile` records: `no-build` / `no-binary` set to true or
-/// naming it (or `:all:`), `only-binary` naming it, their `-package`
-/// lists, `exclude-newer`, or an `exclude-newer-package` cutoff for it.
-/// `no-build-isolation` changes only how an sdist is built.
+/// The uv setting that filters which of `name`'s files `uv pip compile`
+/// records (`no-build`, `no-binary`, `only-binary`, `exclude-newer` and
+/// their per-package forms), where `[pip]`'s value of a key wins over the
+/// top level's. `no-build-isolation` changes only how an sdist is built.
 fn settings_filter(uv: &dyn TableLike, name: &str) -> Option<String> {
-    let names = |item: &Item| {
-        if let Some(cutoffs) = item.as_table_like() {
-            return cutoffs.iter().any(|(package, cutoff)| {
-                canonicalize_pypi_name(package) == name && cutoff.as_bool() != Some(false)
-            });
-        }
-        match item.as_value() {
-            Some(Value::Boolean(on)) => *on.value(),
-            Some(Value::String(_)) | Some(Value::Datetime(_)) => true,
-            Some(Value::Array(list)) => list
-                .iter()
-                .filter_map(Value::as_str)
-                .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name),
-            _ => false,
-        }
-    };
-    let scopes = std::iter::once(uv).chain(uv.get("pip").and_then(Item::as_table_like));
-    for table in scopes {
-        for (key, item) in table.iter() {
-            let filters = ["no-build", "no-binary", "only-binary", "exclude-newer"]
-                .iter()
-                .any(|f| key.starts_with(f))
-                && !key.starts_with("no-build-isolation");
-            if filters && names(item) {
-                return Some(key.to_string());
-            }
+    let pip = uv.get("pip").and_then(Item::as_table_like);
+    let keys = uv
+        .iter()
+        .map(|(k, _)| k)
+        .filter(|k| *k != "pip")
+        .chain(pip.into_iter().flat_map(|p| p.iter().map(|(k, _)| k)));
+    for key in keys {
+        let filters = ["no-build", "no-binary", "only-binary", "exclude-newer"]
+            .iter()
+            .any(|f| key.starts_with(f))
+            && !key.starts_with("no-build-isolation");
+        let value = pip.and_then(|p| p.get(key)).or_else(|| uv.get(key));
+        if filters && value.is_some_and(|v| names_package(v, name)) {
+            return Some(key.to_string());
         }
     }
     None

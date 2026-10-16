@@ -2257,6 +2257,7 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         " --only-binary :none:",
         " --no-build-isolation",
         " --exclude-newer-package idna=2023-01-01T00:00:00Z",
+        " --exclude-newer-package urllib3=false",
     ] {
         let input = tree(&[("pylock.toml", with_flags(flags))]);
         assert_pypi_round_trip(flags, &input, &[urllib3_dep()], None).await;
@@ -2286,7 +2287,11 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
     for (rel, settings) in [
         ("uv.toml", "no-build-isolation = true\n"),
         ("uv.toml", "[pip]\nno-binary = [\"idna\"]\n"),
-        // A nearer uv.toml replaces the pyproject's settings.
+        // `uv pip` reads `[pip]` over the top level.
+        ("uv.toml", "no-build = true\n\n[pip]\nno-build = false\n"),
+        // uv passes over a pyproject that does not parse.
+        ("pyproject.toml", "[project\n"),
+        // A pyproject without `[tool.uv]` sets nothing.
         (
             "pyproject.toml",
             "[project]\nname = \"p\"\nversion = \"0\"\n",
@@ -2304,6 +2309,14 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         ),
     ]);
     assert_pypi_round_trip("uv.toml over pyproject", &input, &[urllib3_dep()], None).await;
+    // `--no-config` read no settings file; `--config-file` read one the
+    // lock does not name.
+    let no_build = ("uv.toml", "no-build = true\n".to_string());
+    let input = tree(&[("pylock.toml", with_flags(" --no-config")), no_build]);
+    assert_pypi_round_trip("--no-config", &input, &[urllib3_dep()], None).await;
+    let input = tree(&[("pylock.toml", with_flags(" --config-file ci/uv.toml"))]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+    assert!(why.contains("--config-file"), "{why}");
 
     // `uv export --format pylock.toml` records every file whatever the
     // filters (it carries an `index`), so its restore is unaffected.
