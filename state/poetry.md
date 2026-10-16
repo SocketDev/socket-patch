@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-15 (run 24), main `657fce2`, latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–24 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503, #1527 and #1547 are closed. Open: #450. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-16 (run 25), main `657fce2`, latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–25 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503, #1527 and #1547 are closed. Open: #450. macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -309,15 +309,27 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 | 2.5.1 | six in `main` + `dev` with different markers: hosted, vendored, `install --only dev` | pass |
 | macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
 
+### Run 25 cells (Linux, main `657fce2`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| writers 1.3.2 / 1.5.1 / 1.7.1 (lock 2.0), 2.5.1 (lock 2.1) | Hosted: scan, fresh install, vex, rollback byte-identical; vendored: scan, fresh install, `--check`, vex, `--revert` byte-identical | pass |
+| 1.3.2, 1.5.1, 1.7.1 | Hosted advisories vs venv state (versionless 1.3 stamp → `redirect_poetry_stale_install_risk`) | pass |
+| 2.5.1 | Exported `pylock.toml` beside `poetry.lock`: vendored, `uv pip install -r pylock.toml`, `--check`, `--revert` | pylock wired, `poetry.lock` left upstream with `pypi_multiple_lockfiles` (documented precedence, see Known non-bugs) |
+| 2.5.1 | Same: hosted → vendored → hosted takeovers, fresh install, rollback | pass |
+| 1.7.1 (`install --sync`), 2.5.1 (`sync`) | Vendored → `--revert` → `vex` before reinstall → sync | pass |
+| 2.5.1 | #450 | still fails |
+| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
+
 ## Backlog
 
 1. **Lead (run 24):** Poetry 2 `[tool.poetry.requires-plugins]` installs plugins (and their deps) into `<project>/.poetry/plugins`, which no mode crawls. That's code the Poetry CLI loads, not the project runtime, so it needs a maintainer call on scope before anyone files it.
 2. Re-check #1105 (hosted A → vendored B, warm venv), #1184 (export residual keep) and #450 once fixed.
 3. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy. That follows from #538's "patch every copy" design and needs a maintainer call before anyone files it. Since #409 (#1419), a system-site venv that imports a base copy also patches that base copy, on purpose.
-4. Untested Linux cells: hosted VEX with an undiscovered venv on 1.2.2 / 2.4.3; hand-edited lock 1.0 shapes (Poetry 1.0 writer); lock 2.0 shapes from 1.3–1.7 writers.
-5. pylock export: vendored mode and the hosted → vendored takeover with the exported `pylock.toml`; `poetry export -f pylock.toml --with dev` / extras.
+4. Untested Linux cells: hosted VEX with an undiscovered venv on 1.2.2 / 2.4.3; hand-edited lock 1.0 shapes (Poetry 1.0 writer). (Lock 2.0 from 1.3 / 1.5 / 1.7 writers: pass r25.)
+5. pylock export: `poetry export -f pylock.toml --with dev` / extras, and a named `pylock.<name>.toml`. (Vendored and both takeovers: r25, see Known non-bugs.) Maintainer call: for a Poetry project, vendored prefers an exported pylock over `poetry.lock`, so `poetry install` stays unpatched (warned); hosted rewrites both.
 6. **macOS / Windows re-checks** for closed #327 / #329, the #640 default paths, #866 on macOS, macOS XDG and the Windows Poetry 1.0/1.1 env hash. All need probe branches.
-7. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 24 (runs 9–24). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
+7. Probe branches are still blocked: `bughunt/poetry/20260930-venv-discovery` and `bughunt/poetry/20260930-windows-modes` still exist, and deletion was denied again in run 25 (runs 9–25). A maintainer needs to delete them and allow deleting `bughunt/poetry/*`.
 8. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's error-code row for `mode_ambiguous` still names only agent + vendored state (the mode-resolution paragraph has the #1437 hosted-pin case).
 
 ## Known non-bugs
@@ -400,3 +412,4 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 - Hosted `rollback` of a poetry-plugin-export `pylock.toml` whose only registry package is the hosted one refuses (`hosted_restore_refused`, "no sibling registry package shows the registry and artifact fields", exit 1, nothing rolled back, `poetry.lock` kept hosted too). CLI_CONTRACT "Hosted unwind coverage" refuses a pylock whose other registry packages show no `index`. With none, the restore has no evidence, and the message names the `git checkout` remedy. With one sibling (idna) it restores fine (r24). Not filed.
 - Hosted rollback of a lock with no final newline adds one, and a restored pylock entry's `upload-time` keeps millisecond precision. Covered by "no guarantee of the original byte layout". Not filed.
 - A bare `--vex` flag is a usage error: `scan --vex` takes a path (`--vex vex.json`).
+- Vendored with an exported `pylock.toml` that pins the package beside `poetry.lock` wires only the pylock and leaves `poetry.lock` on its registry source (`pypi_multiple_lockfiles`; `vendor --check` says "wiring contested"). Documented precedence: standalone PEP 751 locks rank between uv and Poetry when they pin the package (`formats/governing_locks.rs` `PYPI_TOOL_LOCKS`). So a hosted → vendored takeover returns `poetry.lock` to upstream. Not filed (r25).
