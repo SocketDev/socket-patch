@@ -653,7 +653,7 @@ fn restored_span(originals: &[&str], eol: &'static str, nl: &'static str) -> Vec
         .map(|text| match line_endings::split_lines(text).as_slice() {
             [(text, own)] if !own.is_empty() => Line {
                 text: text.to_string(),
-                eol: *own,
+                eol: own,
             },
             _ => Line {
                 text: text.to_string(),
