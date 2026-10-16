@@ -2312,8 +2312,24 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
     // `--no-config` read no settings file; `--config-file` read one the
     // lock does not name.
     let no_build = ("uv.toml", "no-build = true\n".to_string());
-    let input = tree(&[("pylock.toml", with_flags(" --no-config")), no_build]);
+    let input = tree(&[
+        ("pylock.toml", with_flags(" --no-config")),
+        no_build.clone(),
+    ]);
     assert_pypi_round_trip("--no-config", &input, &[urllib3_dep()], None).await;
+    // uv records global options before `pip` or before `compile`.
+    for command in [
+        "uv --native-tls pip compile --format pylock.toml req.in --no-build",
+        "uv --offline pip --quiet compile --format pylock.toml req.in --no-build",
+    ] {
+        let lock = uv_pylock(false).replace(header, &format!("#    {command}\n"));
+        let input = tree(&[("pylock.toml", lock)]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("--no-build"), "{command}: {why}");
+    }
+    let lock = uv_pylock(false).replace(header, "#    uv --no-config pip compile req.in\n");
+    let input = tree(&[("pylock.toml", lock), no_build.clone()]);
+    assert_pypi_round_trip("global --no-config", &input, &[urllib3_dep()], None).await;
     let input = tree(&[("pylock.toml", with_flags(" --config-file ci/uv.toml"))]);
     let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
     assert!(why.contains("--config-file"), "{why}");

@@ -639,7 +639,12 @@ fn pip_compiled(doc: &DocumentMut, text: &str, shape: &Shape) -> bool {
         return false;
     }
     match uv_header_command(text) {
-        Some(command) => command.starts_with(&["pip", "compile"]),
+        // uv records global options where they were given, before `pip`
+        // or between it and `compile` (`uv --no-config pip compile …`).
+        Some(command) => command
+            .iter()
+            .position(|a| *a == "pip")
+            .is_some_and(|pip| command[pip + 1..].contains(&"compile")),
         None => !shape.index,
     }
 }
