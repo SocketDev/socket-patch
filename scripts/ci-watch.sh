@@ -65,25 +65,36 @@ rest_poll() {
   state=$(jq -r 'if .merged then "MERGED" elif .state == "closed" then "CLOSED" else "OPEN" end' <<<"$json")
   sha=$(jq -r '.head.sha' <<<"$json")
   base=$(jq -r '.base.ref' <<<"$json")
+  # Until the required checks are known the rollup stays pending, so an
+  # unreadable rule set never lets DONE through before ci-ok reports.
   if [ -z "$required" ]; then
     required=$(gh api "repos/$repo/rules/branches/$base" \
       -q '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context]' 2>/dev/null) \
-      || required=""
+      || { required=""; [ -n "$rules_warned" ] || echo "warn: can't read $base's required checks; retrying"; rules_warned=1; }
   fi
   entry=""
   [ "$merge" = 1 ] || return 0
   # A queue entry being built has unfinished merge_group runs on
-  # gh-readonly-queue/<base>/pr-<n>-<sha>; a rebuild starts new ones at
-  # once, so only two misses in a row count as having left the queue.
-  local active
-  active=$(gh api "repos/$repo/actions/runs?event=merge_group&per_page=30" \
-    -q "[.workflow_runs[] | select(.status != \"completed\" and (.head_branch | startswith(\"gh-readonly-queue/$base/pr-$pr-\")))] | length" 2>/dev/null) \
-    || active=""
-  if [ "${active:-0}" -gt 0 ]; then
-    entry="building" misses=0
-  elif [ "$was_in_queue" = 1 ] && { [ -z "$active" ] || [ "$((misses += 1))" -lt 2 ]; }; then
-    entry=$queued
-  fi
+  # gh-readonly-queue/<base>/pr-<n>-<sha>. Once they all pass the PR merges
+  # moments later, so that is not a dequeue unless it is still open 10
+  # minutes on; a rebuild starts new runs at once, so any other gap counts
+  # as leaving the queue only on the second miss in a row.
+  local group
+  group=$(gh api "repos/$repo/actions/runs?event=merge_group&per_page=30" -q "[.workflow_runs[]
+    | select(.head_branch | startswith(\"gh-readonly-queue/$base/pr-$pr-\"))]
+    | (.[0].head_branch // \"\") as \$latest | map(select(.head_branch == \$latest))
+    | if any(.status != \"completed\") then \"building\"
+      elif length > 0 and all(.conclusion | IN(\"success\", \"neutral\", \"skipped\")) then \"passed\"
+      else \"idle\" end" 2>/dev/null) || group=""
+  case "$group" in
+    building) entry="building" misses=0 passed_at="" ;;
+    passed) [ "$was_in_queue" = 1 ] || return 0
+      entry=$queued misses=0 passed_at=${passed_at:-$SECONDS}
+      [ $((SECONDS - passed_at)) -lt 600 ] || entry="" ;;
+    *) [ "$was_in_queue" = 1 ] && { [ -z "$group" ] || [ "$((misses += 1))" -lt 2 ]; } \
+      && entry=$queued ;;
+  esac
+  return 0
 }
 rest_checks() {
   local runs statuses
@@ -100,7 +111,7 @@ rest_checks() {
 errf=$(mktemp) || exit 2
 trap 'rm -f "$errf"' EXIT
 seen="" head="" queued="" was_in_queue=0 settled_before=-1 rollup_before="" polls=0
-total=0 pending=1 fail=0 rest=0 required="" misses=0 base=""
+total=0 pending=1 fail=0 rest=0 required="" misses=0 passed_at="" rules_warned="" base=""
 while true; do
   if [ "$rest" = 1 ]; then
     rest_poll
@@ -169,7 +180,7 @@ while true; do
     # Settled once every required check has reported; REST lists only
     # check runs that exist, like gh pr checks.
     rollup=PENDING
-    jq -e --argjson req "${required:-[]}" '($req - map(.name)) == []' <<<"$checks" >/dev/null 2>&1 \
+    [ -n "$required" ] && jq -e --argjson req "$required" '($req - map(.name)) == []' <<<"$checks" >/dev/null 2>&1 \
       && rollup=SUCCESS
   else
     entry=$(jq -r '.data.repository.pullRequest.mergeQueueEntry | if . then "\(.position) \(.state | ascii_downcase)" else "" end' <<<"$json")
