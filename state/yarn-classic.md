@@ -1,8 +1,8 @@
 [agent] Progress ledger for the scheduled Yarn classic (1.x) bug-hunt routine (label pm:yarn-classic).
 
-Last updated: 2026-10-17 (run 45), main `657fce2` (unchanged since run 43), release v5.0.1. No new issues. These all pass: a lock with merge-conflict markers (fails closed), a hosted × vendored merge (fails closed and converges), a superseding re-vendor merged with `yarn add` (1.10.1 / 1.22.22), and the online vendored `scan --prune` sweeping the #1610 orphan. Linux backslash `file:` copies also pass. The Windows probe was blocked: Actions started no run for the pushed probe branch, and branch deletes are refused in-session. #692 still reproduces.
+Last updated: 2026-10-17 (run 46), main `657fce2` (unchanged since run 43), release v5.0.1. Filed #1629: `socket-patch --update` on a yarn-installed copy says "managed by npm". For a `yarn global add` install it suggests `npm update -g`, which is a no-op (the copy stays on 4.0.0; reproduced on 1.22.22 ×2 and 1.10.1). A yarn project gets `npm install …@latest`, which leaves a stray package-lock.json (npm 7+ does rewrite yarn.lock, so the frozen install still passes). A custom `--global-folder` reads as a project. This came from the Bun routine's handover (#1621 / PR #1622 keeps yarn on npm).
 
-Previous: 2026-10-16 (run 44), main `657fce2` (unchanged since run 43), release v5.0.1. Filed #1610: vendored `rollback` / `remove` leave an unledgered `.socket/vendor/npm/<uuid>/` dir (e.g. the losing side of a merge where two branches vendored the same package at different uuids). `vendor --revert` sweeps it, but afterwards `vendor --check`, `list` and `repair` are silent. Repros on v5.0.1 too. Mixed-side merge resolutions (the lock from one branch, the ledger from the other) fail closed (exit 1, `vendor_check_failed` / `vendor_revert_kept` / `record_unavailable`). PR #1596 is still open, so #1558 / #1578 weren't re-run.
+Previous: 2026-10-17 (run 45), main `657fce2` (unchanged since run 43), release v5.0.1. No new issues. These all pass: a lock with merge-conflict markers (fails closed), a hosted × vendored merge (fails closed and converges), a superseding re-vendor merged with `yarn add` (1.10.1 / 1.22.22), and the online vendored `scan --prune` sweeping the #1610 orphan. Linux backslash `file:` copies also pass. The Windows probe was blocked: Actions started no run for the pushed probe branch, and branch deletes are refused in-session. #692 still reproduces.
 
 ## Coverage matrix
 
@@ -324,6 +324,7 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 
 ## Backlog
 
+000000000000000. #1629 (self-update hint): after a fix, re-run the global (default and custom `--global-folder`) and project shapes on 1.0.2 / 1.10.1 / 1.22.22, and check that a berry project (`.yarnrc.yml`) isn't given the yarn-1 hint. Windows `%LOCALAPPDATA%\Yarn\Data\global` probe. Reconcile with PR #1622's yarn-is-npm test.
 0000000000000. PR #1596 (fixes #1558 / #1578, verified run 43): after it merges, close both issues with main evidence (`h/t.sh` cells below), and re-run the vendored package.json-touching meteor shape. Still unproven: the git-dep packument normalisation shape (needs codeload, probe branch).
 000000000000. #1578 follow-ups: after a fix, re-run meteor-node-stubs@1.2.3 hosted (+ v4-pin rescan confirm). Prove the git-dep packument normalisation shape on a probe branch (grunt-webfonts@1.1.3 / gulp-webdriver@1.0.3 need codeload). Check vendored `vendor_dep_manifest_unlocked` with a patch that lists package/package.json on such a package. Ask npm / pnpm / bun whether their dep checks read the tarball vs the lock's own ranges.
 00000000000. #1558: after a fix, re-run the `""`-range, optional+dependencies dup and `*`+devDependencies shapes (lock-only, after `yarn add`, after a rescan). Also check whether the hosted writer's un-normalised sub-map makes every rescan after a `yarn add` rewrite the block (churn). Ask npm / pnpm / bun whether their lock-only dependency checks normalise manifests the way their PM does.
@@ -353,6 +354,8 @@ Other cells that pass on Linux 1.22.22 (some also on older releases; see the ent
 9. Packages whose upstream tarball root isn't `package/` (old `@types/*`, e.g. `@types/left-pad@1.2.0` uses `left-pad/`): the vendored prebuilt check requires `package/…` paths. Whether the real patch service normalizes the root can't be checked from the sandbox.
 
 ## Known non-bugs
+
+- npm 7+ `npm install` in a yarn 1 project rewrites yarn.lock, so `yarn install --frozen-lockfile` still passes afterwards (run 46). The #1629 project-shape harm is only the stray package-lock.json and the wrong manager label.
 - Harness (run 45): with a mock patch host on 127.0.0.1, hosted pins count as hosted wiring only when `SOCKET_PATCH_SERVER_URL` / `--patch-server-url` names it (documented). Vendored mode now always downloads prebuilt artifacts (`--vendor-source service`), so point `SOCKET_VENDOR_URL` at the mock. `vendor --offline` with a staged manifest alone fails with `vendor_service_offline_conflict`.
 - A hand-mixed hosted × vendored merge (hosted-side lock plus a vendored ledger) takes two `rollback` runs: the first exits 1 with `vendor_revert_kept` after unwinding the hosted pin. It fails closed and converges, the same class as #1072 / #991.
 
