@@ -141,6 +141,12 @@ pub fn upgrade_hint(channel: InstallChannel) -> &'static str {
 ///   upgrades through vlt, and vlx's cache dir (a project whose
 ///   `package.json` is named `vlx`, under `$XDG_DATA_HOME/vlt/vlx/`) is
 ///   refreshed by running vlx with `@latest`.
+/// - Bun: `bun add -g …@latest` for its global store (`bun update -g`
+///   keeps the exact version Bun's global manifest pins), `bun add
+///   …@latest` in a project, and bunx's cache dir (`bunx-<uid>-<spec>`) is
+///   refreshed by running bunx with `@latest`. npm's commands fail here the
+///   same way they do for pnpm, and `npm install` breaks the next
+///   `bun install --frozen-lockfile`.
 pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'static str {
     if channel != InstallChannel::Npm {
         return upgrade_hint(channel);
@@ -158,7 +164,10 @@ pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'stat
             "pnpm update --recursive --latest @socketsecurity/socket-patch"
         }
         NodeManager::Pnpm => "pnpm add @socketsecurity/socket-patch@latest",
+        NodeManager::Bun if global => "bun add -g @socketsecurity/socket-patch@latest",
+        NodeManager::Bun => "bun add @socketsecurity/socket-patch@latest",
         _ if global => upgrade_hint(channel),
+        NodeManager::Bunx => "bunx @socketsecurity/socket-patch@latest …",
         NodeManager::Vlx => "vlx -y -- @socketsecurity/socket-patch@latest …",
         NodeManager::Vlt => "vlt install @socketsecurity/socket-patch@latest",
         NodeManager::Npm => "npm install @socketsecurity/socket-patch@latest",
@@ -175,6 +184,7 @@ pub fn channel_label_for(channel: InstallChannel, canonical_exe: &Path) -> &'sta
     match node_manager(canonical_exe) {
         NodeManager::Npm => "npm",
         NodeManager::Pnpm => "pnpm",
+        NodeManager::Bun | NodeManager::Bunx => "bun",
         NodeManager::Vlt | NodeManager::Vlx => "vlt",
     }
 }
@@ -184,6 +194,8 @@ pub fn channel_label_for(channel: InstallChannel, canonical_exe: &Path) -> &'sta
 enum NodeManager {
     Npm,
     Pnpm,
+    Bun,
+    Bunx,
     Vlt,
     Vlx,
 }
@@ -193,13 +205,19 @@ enum NodeManager {
 /// `node_modules`, or vlx's cache project); pnpm by its `.pnpm` virtual
 /// store in the canonical path (every isolated-linker install, global or
 /// project), a `pnpm` home above a `global` store, or a `pnpm-lock.yaml`
-/// beside the outermost `node_modules` (`node-linker=hoisted`). Anything
-/// else is npm, which also covers yarn and Bun (no dedicated hint yet).
+/// beside the outermost `node_modules` (`node-linker=hoisted`). Bun by
+/// its `install/global` store, a `.bun` isolated-linker store inside
+/// `node_modules`, or a `bun.lock` / `bun.lockb` beside the outermost
+/// `node_modules`; bunx by its cache dir's name. Anything else is npm,
+/// which also covers yarn (no dedicated hint yet).
 fn node_manager(path: &Path) -> NodeManager {
     let holder = outermost_node_modules_holder(path);
     if !is_global_npm_install(path) {
         if holder.is_some_and(is_vlx_cache_dir) {
             return NodeManager::Vlx;
+        }
+        if holder.is_some_and(is_bunx_cache_dir) {
+            return NodeManager::Bunx;
         }
         if holder.is_some_and(|dir| dir.join(crate::constants::npm_family::VLT_LOCK).is_file()) {
             return NodeManager::Vlt;
@@ -211,19 +229,75 @@ fn node_manager(path: &Path) -> NodeManager {
     {
         return NodeManager::Pnpm;
     }
+    if is_bun_global_store(path)
+        || has_component_after_node_modules(path, ".bun")
+        || holder.is_some_and(|dir| {
+            [
+                crate::constants::npm_family::BUN_LOCK,
+                crate::constants::npm_family::BUN_LOCKB,
+            ]
+            .iter()
+            .any(|lock| dir.join(lock).is_file())
+        })
+    {
+        return NodeManager::Bun;
+    }
     NodeManager::Npm
+}
+
+/// Bun's global store, `$BUN_INSTALL/install/global/node_modules`
+/// (`~/.bun/install/global`, `%USERPROFILE%\.bun\install\global`).
+fn is_bun_global_store(path: &Path) -> bool {
+    let names = normal_components(path);
+    names
+        .iter()
+        .position(|n| *n == "node_modules")
+        .is_some_and(|nm| nm >= 2 && names[nm - 1] == "global" && names[nm - 2] == "install")
+}
+
+/// Whether `name` is a component inside the first `node_modules` of `path`
+/// (Bun's isolated linker keeps its store at `node_modules/.bun/`; a `.bun`
+/// above it is `$BUN_INSTALL`, which [`is_bun_global_store`] covers).
+fn has_component_after_node_modules(path: &Path, name: &str) -> bool {
+    let names = normal_components(path);
+    names
+        .iter()
+        .position(|n| *n == "node_modules")
+        .is_some_and(|nm| names[nm + 1..].iter().any(|n| *n == name))
+}
+
+/// bunx installs each spec into its own project dir,
+/// `$TMPDIR/bunx-<uid>-<spec>`; a scoped spec splits it in two
+/// (`bunx-<uid>-@scope/name@version`).
+fn is_bunx_cache_dir(dir: &Path) -> bool {
+    let is_bunx = |d: &Path| {
+        d.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("bunx-"))
+    };
+    is_bunx(dir)
+        || dir.parent().is_some_and(|parent| {
+            is_bunx(parent)
+                && parent
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("-@"))
+        })
+}
+
+fn normal_components(path: &Path) -> Vec<&std::ffi::OsStr> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(os) => Some(os),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A `global` store below a `pnpm` home (`~/Library/pnpm/global/5`,
 /// `~/.local/share/pnpm/global/v11/<hash>`, `%LOCALAPPDATA%\pnpm\global\5`).
 fn is_pnpm_global_store(path: &Path) -> bool {
-    let names: Vec<&std::ffi::OsStr> = path
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(os) => Some(os),
-            _ => None,
-        })
-        .collect();
+    let names = normal_components(path);
     let first_nm = names
         .iter()
         .position(|n| *n == "node_modules")
@@ -266,13 +340,7 @@ fn outermost_node_modules_holder(path: &Path) -> Option<&Path> {
 /// `npm install …` run from an arbitrary cwd would scaffold a stray
 /// `node_modules`/`package.json` there and leave the real copy stale.
 fn is_global_npm_install(path: &Path) -> bool {
-    let names: Vec<&std::ffi::OsStr> = path
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(os) => Some(os),
-            _ => None,
-        })
-        .collect();
+    let names = normal_components(path);
     let Some(first_nm) = names.iter().position(|n| *n == "node_modules") else {
         return false;
     };
@@ -811,6 +879,122 @@ mod tests {
         assert_eq!(
             upgrade_hint_for(InstallChannel::Npm, &p),
             "pnpm update --recursive --latest @socketsecurity/socket-patch"
+        );
+    }
+
+    /// #1621: a Bun install upgrades through Bun. `npm update -g` never
+    /// sees Bun's global store, and `npm install` in a Bun project writes a
+    /// stray package-lock.json and leaves bun.lock stale, so the next
+    /// `bun install --frozen-lockfile` fails.
+    #[test]
+    fn bun_global_installs_get_bun_add_g() {
+        let global = [
+            // The default `$BUN_INSTALL` (`~/.bun`).
+            "/home/u/.bun/install/global/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch",
+            "/Users/u/.bun/install/global/node_modules/@socketsecurity/socket-patch/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
+            // A custom `$BUN_INSTALL` without a `.bun` component.
+            "/opt/bunhome/install/global/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch",
+        ];
+        for p in global {
+            let p = Path::new(p);
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, p),
+                "bun add -g @socketsecurity/socket-patch@latest",
+                "{}",
+                p.display()
+            );
+            assert_eq!(channel_label_for(InstallChannel::Npm, p), "bun");
+        }
+        // Neither npm's `lib` prefix nor yarn's global store is Bun's.
+        for p in [
+            "/usr/local/lib/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+            "/home/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+        ] {
+            let p = Path::new(p);
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, p),
+                "npm update -g @socketsecurity/socket-patch"
+            );
+            assert_eq!(channel_label_for(InstallChannel::Npm, p), "npm");
+        }
+    }
+
+    #[test]
+    fn bun_project_installs_get_bun_add() {
+        let hoisted = "node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch";
+        let isolated = "node_modules/.bun/@socketsecurity+socket-patch-linux-x64-gnu@4.0.0/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch";
+
+        // Bun's isolated linker: the `.bun` store decides, lock or not.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        let p = project.path().join(isolated);
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p),
+            "bun add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(channel_label_for(InstallChannel::Npm, &p), "bun");
+        // The hoisted linker: the text or binary lockfile decides.
+        let p = project.path().join(hoisted);
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p),
+            "npm install @socketsecurity/socket-patch@latest"
+        );
+        for lock in ["bun.lock", "bun.lockb"] {
+            let project = tempfile::tempdir().unwrap();
+            std::fs::write(project.path().join("package.json"), "{}").unwrap();
+            std::fs::write(project.path().join(lock), "").unwrap();
+            let p = project.path().join(hoisted);
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, &p),
+                "bun add @socketsecurity/socket-patch@latest",
+                "{lock}"
+            );
+            assert_eq!(channel_label_for(InstallChannel::Npm, &p), "bun");
+        }
+        // A lock in a nested dir between the holder and the binary is not
+        // the holder's.
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::write(nested.path().join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(nested.path().join("node_modules/x")).unwrap();
+        std::fs::write(nested.path().join("node_modules/x/bun.lock"), "").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &nested.path().join(hoisted)),
+            "npm install @socketsecurity/socket-patch@latest"
+        );
+    }
+
+    /// bunx installs each spec into `$TMPDIR/bunx-<uid>-<spec>`, a project
+    /// dir with its own package.json and lock; a scoped spec nests one
+    /// level (`bunx-0-@scope/name@version`). Re-running bunx with `@latest`
+    /// is what refreshes it, while `bun add` there would edit the cache.
+    #[test]
+    fn bunx_cache_gets_bunx_latest() {
+        let bin = "node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch";
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in [
+            "bunx-0-@socketsecurity/socket-patch@4.0.0",
+            "bunx-1000-socket-patch-shim@1.0.0",
+        ] {
+            let holder = tmp.path().join(dir);
+            std::fs::create_dir_all(&holder).unwrap();
+            std::fs::write(holder.join("package.json"), "{}").unwrap();
+            std::fs::write(holder.join("bun.lock"), "").unwrap();
+            let p = holder.join(bin);
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, &p),
+                "bunx @socketsecurity/socket-patch@latest …",
+                "{dir}"
+            );
+            assert_eq!(channel_label_for(InstallChannel::Npm, &p), "bun");
+        }
+        // A project merely named like the cache but deeper is a Bun project.
+        let holder = tmp.path().join("bunx-0-x/apps/web");
+        std::fs::create_dir_all(&holder).unwrap();
+        std::fs::write(holder.join("package.json"), "{}").unwrap();
+        std::fs::write(holder.join("bun.lock"), "").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &holder.join(bin)),
+            "bun add @socketsecurity/socket-patch@latest"
         );
     }
 
