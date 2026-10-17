@@ -497,11 +497,8 @@ impl LegacyNpmCrawler {
         // The declared members the walk prunes by name (#1627) and the
         // package-manager-configured roots are shared with the parent
         // module (not part of the walk this oracle checks).
-        for root in skipped_workspace_member_roots(start_path) {
-            if !results.contains(&root) {
-                results.push(root);
-            }
-        }
+        let members = skipped_workspace_member_roots(start_path, &results);
+        results.extend(members);
         merge_configured_install_roots(results, configured_install_roots(start_path))
     }
 

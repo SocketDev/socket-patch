@@ -1006,7 +1006,7 @@ fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<Vec<String>>> {
 /// yarn, Bun) or the object form's `packages` array (yarn classic's
 /// `nohoist` shape, Bun's catalogs shape). `None` when the field is absent
 /// or the manifest does not parse.
-fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
+pub(crate) fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
     let text = strip_bom(package_json);
     let doc: serde_json::Value = serde_json::from_str(text).ok()?;
     let field = doc.get("workspaces")?;

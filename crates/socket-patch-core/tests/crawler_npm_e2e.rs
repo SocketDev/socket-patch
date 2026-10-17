@@ -887,6 +887,8 @@ async fn crawl_all_finds_declared_members_with_skip_dir_names() {
             r#"{"packages":["packages/**"]}"#,
             &["packages/temp/inner"][..],
         ),
+        // yarn berry reads a leading `!(` as an extglob group, not a negation.
+        (r#"["!(docs)/*"]"#, &["tools/build"][..]),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -908,6 +910,59 @@ async fn crawl_all_finds_declared_members_with_skip_dir_names() {
         expected.sort();
         assert_eq!(got, expected, "workspaces {workspaces}");
     }
+}
+
+/// #1627: the members of a workspace nested below the scan root (found by
+/// the walk through its own `node_modules`) count too.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_finds_skip_dir_members_of_a_nested_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let web = root.join("web");
+    tokio::fs::create_dir_all(&web).await.unwrap();
+    tokio::fs::write(
+        web.join("package.json"),
+        r#"{"name":"web","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .await
+    .unwrap();
+    stage_npm_pkg(&web.join("node_modules"), "ms", "2.1.3").await;
+    let member = stage_member(root, "web/packages/dist").await;
+
+    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let mut got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+    got.sort();
+    assert_eq!(got, vec![web.join("node_modules").join("ms"), member]);
+}
+
+/// #1627: the member walk keeps the walk's other rules. A member inside a
+/// tagged cache dir stays pruned, and a pattern that spells a member dir
+/// in another case than the disk (`packages/build` for `packages/Build`,
+/// which the walk does not prune) lists its copy once.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_member_walk_keeps_the_walk_rules() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    tokio::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["cache/*/*","packages/build"]}"#,
+    )
+    .await
+    .unwrap();
+    stage_member(root, "cache/build/pkg").await;
+    tokio::fs::write(
+        root.join("cache").join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .await
+    .unwrap();
+    let member = stage_member(root, "packages/Build").await;
+
+    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+    assert_eq!(got, vec![member]);
 }
 
 /// #1627 control: the name-based prune still holds for a `build` / `dist`

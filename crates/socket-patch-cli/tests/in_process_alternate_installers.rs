@@ -1170,6 +1170,15 @@ fn stage_skip_dir_member_workspace(
     let after_hash = git_sha256(&patched);
     let socket = root.join(".socket");
     write_manifest(&socket, "pkg:npm/ms@2.0.0", &before_hash, &after_hash);
+    // A vulnerability, so `vex` has a statement to make.
+    let manifest = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
+    let manifest = manifest.replacen(
+        r#""vulnerabilities": {}"#,
+        r#""vulnerabilities": { "GHSA-skip-dir-member": { "cves": ["CVE-2026-1627"],
+            "summary": "s", "severity": "high", "description": "d" } }"#,
+        1,
+    );
+    std::fs::write(socket.join("manifest.json"), manifest).unwrap();
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
     std::fs::write(socket.join("blobs").join(&after_hash), &patched).unwrap();
     let member_copy = copies.pop().unwrap();
@@ -1201,8 +1210,8 @@ async fn apply_patches_workspace_member_named_like_a_build_dir() {
 }
 
 /// #1627: with only the other member's copy patched, `apply --check`
-/// reports the `packages/build` copy as drift (exit 1) and its embedded
-/// VEX attests nothing as `not_affected`.
+/// reports the `packages/build` copy as drift (exit 1), and `vex` attests
+/// nothing as `not_affected` until that copy is patched too.
 #[tokio::test]
 #[serial]
 async fn apply_check_and_vex_see_unpatched_member_named_like_a_build_dir() {
@@ -1212,24 +1221,39 @@ async fn apply_check_and_vex_see_unpatched_member_named_like_a_build_dir() {
     std::fs::write(&app_copy, &patched).unwrap();
     assert_ne!(std::fs::read(&member_copy).unwrap(), patched);
 
-    let vex_path = tmp.path().join("vex.json");
     let mut args = default_apply(tmp.path());
     args.check = true;
-    args.vex = socket_patch_cli::commands::vex::VexEmbedArgs {
-        vex: Some(vex_path.clone()),
-        vex_product: Some("pkg:npm/root@1.0.0".to_string()),
-        ..Default::default()
-    };
     let code = apply_run(args).await;
     assert_eq!(
         code, 1,
         "apply --check must report the unpatched member copy"
     );
-    let vex = std::fs::read_to_string(&vex_path).unwrap_or_default();
+
+    let vex_path = tmp.path().join("vex.json");
+    let vex = || async {
+        let _ = std::fs::remove_file(&vex_path);
+        let code = socket_patch_cli::commands::vex::run(socket_patch_cli::commands::vex::VexArgs {
+            common: default_apply(tmp.path()).common,
+            output: Some(vex_path.clone()),
+            product: Some("pkg:npm/root@1.0.0".to_string()),
+            no_verify: false,
+            doc_id: None,
+            compact: false,
+        })
+        .await;
+        (code, std::fs::read_to_string(&vex_path).unwrap_or_default())
+    };
+    let (code, doc) = vex().await;
     assert!(
-        !vex.contains("not_affected"),
-        "VEX must not attest not_affected while packages/build's copy is unpatched:\n{vex}"
+        !doc.contains("not_affected"),
+        "VEX must not attest not_affected while packages/build's copy is unpatched \
+         (exit {code}):\n{doc}"
     );
+    // The control: with both copies patched, the same run attests it.
+    std::fs::write(&member_copy, &patched).unwrap();
+    let (code, doc) = vex().await;
+    assert_eq!(code, 0, "{doc}");
+    assert!(doc.contains("not_affected"), "{doc}");
 }
 
 // ---------------------------------------------------------------------------
