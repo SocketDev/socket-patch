@@ -9,6 +9,7 @@
 #   fail: <check name>                            -- one line per failed check
 #   progress: <settled>/<total> settled, <f> fail -- at most every 5th poll
 #   queue: entered at <n> | position <n> <state> | left the queue
+#                                                -- "building" for <n> over REST
 #   DONE checks pass|fail (<p> pass, <f> fail)   -- exits here without --merge
 #   DONE merged|closed|dequeued                  -- exits here with --merge
 #   warn: ...                                    -- a failed poll; keeps going
@@ -17,6 +18,13 @@
 # is one small GraphQL query; the full check list (several pages for a PR
 # here) is fetched only when the rollup state changes or every 5th poll.
 # A rate-limited poll pauses for 10 minutes instead of retrying.
+#
+# Claude Code cloud sessions can't reach GraphQL (gh pr view, gh pr checks
+# and gh api graphql all get a 403 there), so the first such 403 switches
+# the script to REST for good: each poll then reads the PR, its check runs
+# and commit statuses, and the base branch's required checks stand in for
+# the rollup. REST has no merge-queue entry, so with --merge the queue
+# lines track the PR's merge_group runs instead and carry no position.
 # Exit status: 0 on pass/merged, 1 on fail/closed/dequeued, 2 on bad usage.
 set -uo pipefail
 
@@ -25,48 +33,113 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --merge) merge=1 ;;
     --interval) interval="$2"; shift ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     [0-9]*) pr="$1" ;;
     *) echo "usage: $0 [PR] [--merge] [--interval SECONDS]" >&2; exit 2 ;;
   esac
   shift
 done
 
-if [ -z "$pr" ]; then
-  pr=$(gh pr view --json number -q .number 2>/dev/null) || { echo "no PR for the current branch" >&2; exit 2; }
+repo=${GH_REPO:-}
+if [ -z "$repo" ]; then
+  url=$(git remote get-url origin 2>/dev/null) || url=""
+  repo=$(sed -nE 's#^.*[:/]([^/:]+/[^/:]+)$#\1#p' <<<"${url%.git}")
 fi
-repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
+[ -n "$repo" ] || repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
 owner=${repo%/*} name=${repo#*/}
+if [ -z "$pr" ]; then
+  pr=$(gh pr view --json number -q .number 2>/dev/null) \
+    || pr=$(gh api "repos/$repo/pulls?head=$owner:$(git branch --show-current)&state=open" -q '.[0].number // empty' 2>/dev/null)
+  [ -n "$pr" ] || { echo "no PR for the current branch" >&2; exit 2; }
+fi
 
 # shellcheck disable=SC2016 # GraphQL variables, not shell
 query='query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){
   state headRefOid mergeQueueEntry{position state}
   commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}'
 
+# REST stand-ins for the GraphQL poll and for gh pr checks. Both leave
+# the gh error text in $json / $errf on failure, like the calls they replace.
+rest_poll() {
+  json=$(gh api "repos/$repo/pulls/$pr" 2>&1) || return 1
+  state=$(jq -r 'if .merged then "MERGED" elif .state == "closed" then "CLOSED" else "OPEN" end' <<<"$json")
+  sha=$(jq -r '.head.sha' <<<"$json")
+  base=$(jq -r '.base.ref' <<<"$json")
+  if [ -z "$required" ]; then
+    required=$(gh api "repos/$repo/rules/branches/$base" \
+      -q '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context]' 2>/dev/null) \
+      || required=""
+  fi
+  entry=""
+  [ "$merge" = 1 ] || return 0
+  # A queue entry being built has unfinished merge_group runs on
+  # gh-readonly-queue/<base>/pr-<n>-<sha>; a rebuild starts new ones at
+  # once, so only two misses in a row count as having left the queue.
+  local active
+  active=$(gh api "repos/$repo/actions/runs?event=merge_group&per_page=30" \
+    -q "[.workflow_runs[] | select(.status != \"completed\" and (.head_branch | startswith(\"gh-readonly-queue/$base/pr-$pr-\")))] | length" 2>/dev/null) \
+    || active=""
+  if [ "${active:-0}" -gt 0 ]; then
+    entry="building" misses=0
+  elif [ "$was_in_queue" = 1 ] && { [ -z "$active" ] || [ "$((misses += 1))" -lt 2 ]; }; then
+    entry=$queued
+  fi
+}
+rest_checks() {
+  local runs statuses
+  runs=$(gh api --paginate "repos/$repo/commits/$sha/check-runs?per_page=100" -q '.check_runs[]
+    | {name, bucket: (if .status != "completed" then "pending"
+        elif (.conclusion | IN("success", "neutral", "skipped")) then "pass"
+        elif .conclusion == "cancelled" then "cancel" else "fail" end)}' 2>"$errf") || return 0
+  statuses=$(gh api "repos/$repo/commits/$sha/status?per_page=100" -q '.statuses[]
+    | {name: .context, bucket: (if .state == "pending" then "pending"
+        elif .state == "success" then "pass" else "fail" end)}' 2>"$errf") || return 0
+  jq -s '.' <<<"$runs$statuses"
+}
+
 errf=$(mktemp) || exit 2
 trap 'rm -f "$errf"' EXIT
 seen="" head="" queued="" was_in_queue=0 settled_before=-1 rollup_before="" polls=0
-total=0 pending=1 fail=0
+total=0 pending=1 fail=0 rest=0 required="" misses=0 base=""
 while true; do
-  if ! json=$(gh api graphql -f query="$query" -F o="$owner" -F n="$name" -F p="$pr" 2>&1); then
+  if [ "$rest" = 1 ]; then
+    rest_poll
+  else
+    json=$(gh api graphql -f query="$query" -F o="$owner" -F n="$name" -F p="$pr" 2>&1)
+  fi
+  # shellcheck disable=SC2181 # both branches above set the status
+  if [ $? != 0 ]; then
+    if [ "$rest" = 0 ] && grep -q 'GraphQL is not available' <<<"$json"; then
+      echo "warn: GraphQL unavailable here; polling over REST"; rest=1; continue
+    fi
     if grep -qiE 'rate limit|HTTP 403|HTTP 429' <<<"$json"; then
       echo "warn: GitHub rate limit hit; pausing 10 minutes"; sleep 600; continue
     fi
     echo "warn: gh ${json%%$'\n'*}"; sleep "$interval"; continue
   fi
-  state=$(jq -r '.data.repository.pullRequest.state' <<<"$json")
-  sha=$(jq -r '.data.repository.pullRequest.headRefOid' <<<"$json")
+  if [ "$rest" = 0 ]; then
+    state=$(jq -r '.data.repository.pullRequest.state' <<<"$json")
+    sha=$(jq -r '.data.repository.pullRequest.headRefOid' <<<"$json")
+  fi
   if [ "$sha" != "$head" ]; then
     [ -n "$head" ] && echo "push: head now ${sha:0:9}, checks restart"
     head=$sha seen="" settled_before=-1
   fi
 
-  rollup=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.state // "NONE"' <<<"$json")
+  if [ "$rest" = 1 ]; then
+    rollup=REST # the check list is the only signal, so it is read every poll
+  else
+    rollup=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.state // "NONE"' <<<"$json")
+  fi
   polls=$((polls + 1))
-  if [ "$settled_before" = -1 ] || [ "$rollup" != "$rollup_before" ] || [ $((polls % 5)) = 0 ]; then
+  if [ "$rest" = 1 ] || [ "$settled_before" = -1 ] || [ "$rollup" != "$rollup_before" ] || [ $((polls % 5)) = 0 ]; then
     # gh pr checks pages through every check; its exit status is 8 while any
     # is pending and 1 when one failed, so only its output is trusted.
-    checks=$(gh pr checks "$pr" -R "$repo" --json name,bucket 2>"$errf")
+    if [ "$rest" = 1 ]; then
+      checks=$(rest_checks)
+    else
+      checks=$(gh pr checks "$pr" -R "$repo" --json name,bucket 2>"$errf")
+    fi
     if ! jq -e 'type == "array"' <<<"$checks" >/dev/null 2>&1; then
       # Keep the last counts and retry this fetch on the next poll; the
       # paginated call is the expensive one, so back off on a rate limit.
@@ -92,8 +165,15 @@ while true; do
     seen=$failed settled_before=$settled_now
   fi
   rollup_before=$rollup
-
-  entry=$(jq -r '.data.repository.pullRequest.mergeQueueEntry | if . then "\(.position) \(.state | ascii_downcase)" else "" end' <<<"$json")
+  if [ "$rest" = 1 ]; then
+    # Settled once every required check has reported; REST lists only
+    # check runs that exist, like gh pr checks.
+    rollup=PENDING
+    jq -e --argjson req "${required:-[]}" '($req - map(.name)) == []' <<<"$checks" >/dev/null 2>&1 \
+      && rollup=SUCCESS
+  else
+    entry=$(jq -r '.data.repository.pullRequest.mergeQueueEntry | if . then "\(.position) \(.state | ascii_downcase)" else "" end' <<<"$json")
+  fi
   if [ -n "$entry" ] && [ "$entry" != "$queued" ]; then
     [ "$was_in_queue" = 1 ] && echo "queue: position $entry" || echo "queue: entered at $entry"
     queued=$entry was_in_queue=1
