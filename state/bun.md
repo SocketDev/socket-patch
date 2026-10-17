@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-17 (run 47), main `657fce2`, latest release 5.0.1, latest Bun 1.4.3 (canary 1.4.4-canary.20261016 covered in run 46; no newer canary in run 47).
+Last updated: 2026-10-17 (run 48), main `7d3086f`, latest release 5.0.1, latest Bun 1.4.3 (canary 1.4.3-canary.20261017.1, reporting 1.4.4, covered in run 48).
 
 Method (run 36 note: the authenticated routes work too: `--api-url <mock> --org o --api-token fake` serves `/v0/orgs/o/patches/{batch,by-package,package,view}`; still set `SOCKET_PATCH_SERVER_URL` to the mock origin or hosted pins aren't recognized and `rollback` exits `manifest_not_found`. Run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` and `SOCKET_PROXY_URL` to the mock (run 32: without a token the CLI uses the public-proxy routes `/patch/batch`, `/patch/by-package/<purl>`, `/patch/view/<uuid>`, `/patch/blob/<hash>` and `POST /patch/package`, and `patch.socket.dev` returns 403 through the sandbox proxy). Test repos need `node_modules/` in `.gitignore`, or the fresh-clone oracle reads committed store entries. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -77,6 +77,8 @@ Run 45 (new main `657fce2`: no Bun fix since run 44): new **#1600**. In a Bun pr
 Run 46 (main unchanged at `657fce2`, so no re-triage): no new bugs. First canary coverage: Bun 1.4.4-canary.20261016 writes byte-identical text and binary locks to 1.4.3, and hosted / vendored / agent × single / workspace × text / lockb pass. A 79-pin isolated workspace (multi-version and scoped packages) passes hosted and vendored on text and lockb, and its hosted rollback is byte-exact. Under registry 429s, rollback and the hosted → vendored takeover refuse per pin, keep a frozen-installable lock, and finish on the re-run. See the run 46 section below.
 
 Run 47 (main unchanged at `657fce2`, so no re-triage): new **#1621**. `socket-patch --update` on a Bun-installed copy refuses `managed_install` as "managed by npm" and gives npm commands: `npm update -g …` for a `bun add -g` install (a no-op), and `npm install …@latest` for a Bun project (stray `package-lock.json`, stale `bun.lock`, and the next `bun install --frozen-lockfile` fails) and for the bunx cache. It's the Bun twin of #1111 (pnpm). Reproduced on 1.1.39 / 1.2.23 / 1.4.3. The yarn `global` store variant was handed to yarn-classic. See the run 47 section below.
+
+Run 48 (new main `7d3086f`: CI action pins only (#1590), no Rust change, so no re-triage): new **#1631**. Bun's workspace globs never match dot-directories with a wildcard (`packages/*` and `packages/**` skip `packages/.tools`; an explicit `packages/.tools` matches), but socket-patch's `WorkspacesDialect::BUN` / `BUN_PRE_1_3` set `dot: true`. An independent project in `packages/.tools` with its own lock is refused from inside (hosted `redirect_workspace_lockfile_elsewhere`, vendored `vendor_lockfile_missing`), and the root run skips it silently (the hidden-dir crawl skip), so hosted and vendored can't patch it at all (1.1.39 / 1.2.23 / 1.3.9 / 1.4.3 × text / lockb). Also passing: the canary's lock bytes, and the `bun.lockb` hosted → vendored takeover under registry 429s. See the run 48 section below.
 
 Run 44 (new main `15ead12`: #1559 for #1541, plus non-Bun fixes): new **#1581**. On a tree a pre-#1541 release vendored, in a repo that LFS-tracks `*.tgz`, `repair` (the remedy `vendor --check` prints in an LFS-less clone) leaves the root `<uuid>/.gitattributes` as legacy `* -text`. The repaired tarball goes back into LFS on commit, and fresh frozen installs still fail (1.2.23 / 1.3.9 / 1.4.3; lockb member mirrors are upgraded; plain npm is the same). #1541 verified fixed for new vendored runs (1.2.23 / 1.4.3 × text / lockb × single / workspace), and the 5.0.1 → main vendored re-run + `git add --renormalize` upgrade path passes. Passing: the #1534 leftovers (lockfile-only nested project, nested project inside a workspace member dir) and main `vendor --revert` of 5.0.1-vendored (legacy `.gitattributes`) workspaces.
 
@@ -649,6 +651,19 @@ Other passes (Linux, 1.4.2 unless noted):
 | 1.4.3 | bunx cache (`$TMPDIR/bunx-<uid>-<spec>`) | `npm install …@latest` | wrong target | **fail #1621** |
 | 1.4.3 / 1.2.23 / 1.1.39 | control: `bun add -g …@latest` / `bun add …@latest` | n/a | 4.0.0 → 5.0.1, frozen install passes | pass |
 
+### Run 48 (main `7d3086f`, Linux)
+| Cell | Bun | Result |
+| --- | --- | --- |
+| Lock bytes (single + workspace, text + lockb) | 1.4.3 vs 1.4.3-canary.20261017.1 | identical |
+| hosted / vendored, single + workspace, text + lockb → fresh cold frozen install | canary 20261017.1 | pass |
+| `bun.lockb` hosted → vendored takeover, one purl's registry document 429s | 1.2.23 / 1.3.9 / 1.4.3 × single / workspace | pass (`redirect_revert_failed` for that purl, the other vendored, frozen install patched, re-run heals, `vendor --check` 0) |
+| `[install.lockfile] print = "yarn"` + vendored → frozen → `vendor --check` → revert | 1.2.23 / 1.4.3 × text / lockb | pass (yarn.lock left to Bun) |
+| Workspace glob model vs real Bun: braces, `[ab]`, `?`, `**`, `./`, trailing `/`, nested patterns | 1.2.23 / 1.4.3 | pass (same lists) |
+| Same, dot-directories (`packages/*` → `packages/.hidden`, `packages/**` → `packages/.cache/x`) | 1.2.23 / 1.4.3 | **fail #1631** (Bun skips them, socket-patch matches them) |
+| Independent project in `packages/.tools`: hosted / vendored member run, `--cwd`, PATH, `get` | 1.1.39 / 1.2.23 / 1.3.9 / 1.4.3 × text / lockb | **fail #1631** (false refusal; root run silent) |
+| Same, agent scan + `vex --product` | 1.4.3 text | pass |
+| Control: `!packages/tools2` independent project | 1.4.3 text | pass (`nested_project_skipped` from root, member run pins its own lock) |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
@@ -676,8 +691,12 @@ Other passes (Linux, 1.4.2 unless noted):
 20. #1534 leftovers: macOS/Windows path quoting of the suggested PATH (lockfile-only and member-dir nesting pass, run 44).
 17. #1444: done in run 46 (79 pins, 429 mock: pass). Left: the same on `bun.lockb` (rollback refuses by design, so only the takeover) and on macOS/Windows.
 22. #1621: re-test when fixed (global, project, isolated-linker project, workspace root, bunx cache, the passive update notice, `bun.lockb` projects); macOS/Windows path shapes (`%USERPROFILE%\\.bun\\install\\global`).
-21. Each new Bun canary: compare its text and lockb bytes with the latest stable (run 46: 1.4.4-canary.20261016 identical).
+21. Each new Bun canary: compare its text and lockb bytes with the latest stable (run 46: 1.4.4-canary.20261016 identical; run 48: 1.4.3-canary.20261017.1 identical).
+23. #1631: re-test when fixed (member run in hosted / vendored mode, root-run reachability, `packages/**`, a lockless dot-directory under a lockless root, and `vex` on the stray lock). On macOS / Windows, check that Bun skips dot-directories the same way.
+24. The partial-takeover remedy text: on a shared `bun.lockb`, `redirect_revert_failed` advises `git checkout -- bun.lockb`, which would also discard the purls vendored in the same run (a re-run is the working remedy). Check whether the text lock and npm give the same hint before deciding whether it's worth a UX issue.
 ## Known non-bugs
+
+- A Bun `print = "yarn"` project: vendored / hosted runs leave the printed `yarn.lock` alone, and Bun regenerates it on its next install. Bun reads only `bun.lock(b)` (run 48).
 
 - A `429` from the upstream registry during a hosted rollback / remove / takeover restore isn't retried: CLI_CONTRACT "Throttling" retries only patch-API JSON calls ("Nothing else is retried"), and the pin is refused `hosted_restore_refused` / `redirect_revert_failed` with nothing written for it. The lock stays frozen-installable and a re-run finishes (run 46).
 - Mock fixture (run 46): key patches by `name@version`, not by name, or second versions of a name (`ms`, `debug`) look unpatched in a large tree.
