@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-16 (run 46), main `657fce2`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23 (full gem suites pass, run 45).
+Last updated: 2026-10-17 (run 47), main `657fce2`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23 (full gem suites pass, run 45).
 
 ## Coverage matrix
 
@@ -431,6 +431,13 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Same, CHECKSUMS lock | pass (fresh install fails closed, exit 37) | n/a |
 | Same, cache-only checkout (no `vendor/bundle`) | pass | pass |
 
+### Run 47 (main `657fce2`, v5.0.1; Linux Ruby 3.3.6; scratch copy of the superseding-patch test, then `rollback` / `remove`, real `bundle install` / `bundle cache`)
+
+| Cell | 4.0.18 | 2.6.9 | 2.4.22 |
+| --- | --- | --- | --- |
+| Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
+| Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
+
 ### Global mode (`-g`)
 
 | OS | Ruby / Bundler | `scan -g` report | `-g` vs project scoping | `scan -g --mode hosted` refused | `get -g` / `apply -g` | `rollback -g` byte-exact | `vex -g` | `--global-prefix <gems dir>` / `SOCKET_GLOBAL=1` | Non-writable gem dir |
@@ -453,9 +460,9 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #985 / #1109 (`agent:needs-human`) and #1594 when fixes merge.
+1. Re-run #985 / #1109 (`agent:needs-human`), #1594 and #1626 when fixes merge.
 2. #1594 CHECKSUMS arm against real rubygems.org (needs an upstream the takeover can re-derive a checksum for; the mock upstream is refused).
-3. V→H→V round trips with a committed `vendor/cache` (does a hosted re-pin leave the vendored-era cache consistent?). Also `rollback` after a superseding rescan with a gen-2 archive cached (`upstream_gem_stale_cache`?).
+3. #1626 siblings: a hosted→vendored takeover and `vendor --revert` in the unconverged-supersede window; V→H→V round trips with a committed `vendor/cache`.
 4. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
 5. Re-run the three gem suites on 4.1.0 final when it ships.
 
@@ -584,3 +591,4 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - `e2e_gem.rs` needs the real public patch API (`patches-api.socket.dev`), which the sandbox blocks, so its 3 lifecycle tests fail with "tunnel error". That's a sandbox artifact. Run the Bundler suites with `cargo test --no-fail-fast`, or cargo stops at that first failing binary (run 45).
 - Gemspec product: `Gem::Specification.new "name", "1.0" do |s|` constructor arguments aren't read, so the purl falls back to the file stem with no version. That's rare and only touches the VEX product id, so it's not filed (run 45, read-only).
 - When the stale cached archive is a superseded hosted patch (not upstream), the `redirect_gem_stale_install` detail still calls it "UNPATCHED" / "vulnerable upstream bytes". It's cosmetic: the warning fires and the remedy is right (run 46).
+- A superseded (gen-2) patched archive in `vendor/cache` after a superseding rescan is flagged by `upstream_gem_stale_cache` on unwind (it compares against upstream). Its scan-side wording ("UNPATCHED") is cosmetic (runs 46–47).
