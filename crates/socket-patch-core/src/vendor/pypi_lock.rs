@@ -672,12 +672,11 @@ fn restore_table_keys(
                     Some(current) if current.is_value() == before.is_value() => {
                         *current = before.clone();
                     }
-                    Some(_) => {
+                    current => {
+                        if current.is_none() {
+                            inserted.push(key.clone());
+                        }
                         live.insert(&key, before.clone());
-                    }
-                    None => {
-                        live.insert(&key, before.clone());
-                        inserted.push(key.clone());
                     }
                 }
             } else {
