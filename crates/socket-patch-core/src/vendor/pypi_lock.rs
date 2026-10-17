@@ -642,6 +642,17 @@ fn pair_changed(
 }
 
 fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn TableLike) -> bool {
+    restore_table_keys(live, original, new, &mut Vec::new())
+}
+
+/// [`restore_table`], noting in `inserted` each key it put back that the
+/// live table no longer had.
+fn restore_table_keys(
+    live: &mut dyn TableLike,
+    original: &dyn TableLike,
+    new: &dyn TableLike,
+    inserted: &mut Vec<String>,
+) -> bool {
     let keys: BTreeSet<String> = original
         .iter()
         .chain(new.iter())
@@ -658,9 +669,15 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
             if let Some(before) = before {
                 // In place, so the live key keeps its comments.
                 match live.get_mut(&key) {
-                    Some(current) => *current = before.clone(),
+                    Some(current) if current.is_value() == before.is_value() => {
+                        *current = before.clone();
+                    }
+                    Some(_) => {
+                        live.insert(&key, before.clone());
+                    }
                     None => {
                         live.insert(&key, before.clone());
+                        inserted.push(key.clone());
                     }
                 }
             } else {
@@ -690,11 +707,11 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
     drifted
 }
 
-/// [`restore_table`] on a header table, with the sub-tables of each key it
-/// put back printed where `original` had them: right after the key it
-/// followed. The copies carry their positions in the recorded text, which
-/// mean nothing among the live table's positions (#1623), so they drop
-/// them and print after the table before them in key order.
+/// [`restore_table`] on a header table, with each table-valued key it put
+/// back (vendoring had removed it) returned to its slot in `original`'s
+/// key order instead of the end. The copied sub-tables drop the positions
+/// they had in the recorded text, which mean nothing among the live
+/// table's (#1623), so they print right after the table before them.
 fn restore_header_table(live: &mut Table, original: &dyn TableLike, new: &dyn TableLike) -> bool {
     fn unplace(item: &mut Item) {
         let tables: Vec<&mut Table> = match item {
@@ -707,22 +724,16 @@ fn restore_header_table(live: &mut Table, original: &dyn TableLike, new: &dyn Ta
             table.iter_mut().for_each(|(_, child)| unplace(child));
         }
     }
-    let present: BTreeSet<String> = live.iter().map(|(key, _)| key.to_string()).collect();
-    let drifted = restore_table(live, original, new);
-    let original_keys: Vec<String> = original.iter().map(|(key, _)| key.to_string()).collect();
-    let added: BTreeSet<&String> = original_keys
-        .iter()
-        .filter(|key| {
-            !present.contains(*key)
-                && live
-                    .get(key)
-                    .is_some_and(|item| item.is_table() || item.is_array_of_tables())
-        })
-        .collect();
-    if added.is_empty() {
+    let mut inserted = Vec::new();
+    let drifted = restore_table_keys(live, original, new, &mut inserted);
+    inserted.retain(|key| {
+        live.get(key)
+            .is_some_and(|item| item.is_table() || item.is_array_of_tables())
+    });
+    if inserted.is_empty() {
         return drifted;
     }
-    for key in &added {
+    for key in &inserted {
         if let Some(item) = live.get_mut(key) {
             unplace(item);
         }
@@ -730,22 +741,69 @@ fn restore_header_table(live: &mut Table, original: &dyn TableLike, new: &dyn Ta
     let mut order: Vec<String> = live
         .iter()
         .map(|(key, _)| key.to_string())
-        .filter(|key| !added.contains(key))
+        .filter(|key| !inserted.contains(key))
         .collect();
+    let original_keys: Vec<String> = original.iter().map(|(key, _)| key.to_string()).collect();
     for (index, key) in original_keys.iter().enumerate() {
-        if !added.contains(key) {
+        if !inserted.contains(key) {
             continue;
         }
         let at = original_keys[..index]
             .iter()
             .rev()
-            .find_map(|previous| order.iter().position(|key| key == previous))
+            .find_map(|previous| order.iter().position(|known| known == previous))
             .map_or(0, |found| found + 1);
         order.insert(at, key.clone());
     }
-    let rank = |key: &toml_edit::Key| order.iter().position(|known| known == key.get());
-    live.sort_values_by(|left, _, right, _| rank(left).cmp(&rank(right)));
+    // Re-adding every entry in order keeps each key's own formatting.
+    let entries: Vec<_> = order
+        .iter()
+        .filter_map(|key| live.remove_entry(key))
+        .collect();
+    for (key, item) in entries {
+        live.insert_formatted(&key, item);
+    }
     drifted
+}
+
+/// Keeps every table under an array-of-tables element printed between
+/// that element's header and the next element's. A restored item is a
+/// copy from the recorded text, and its standard tables keep their
+/// positions there, while toml_edit prints tables in position order. Once
+/// the live document numbers its tables differently (another package was
+/// vendored, or the user added one), a restored sub-table could print
+/// after the next element's header and re-parse as part of that element
+/// (#1623). Tables the live text placed already sit in their range.
+fn keep_under_owner(table: &mut Table, low: isize, high: isize) {
+    let clamp = |position: isize| position.max(low).min(high);
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(child) => {
+                if let Some(position) = child.position() {
+                    child.set_position(Some(clamp(position)));
+                }
+                keep_under_owner(child, low, high);
+            }
+            Item::ArrayOfTables(array) => {
+                let mut starts = Vec::with_capacity(array.len());
+                let mut last = low;
+                for element in array.iter() {
+                    last = element
+                        .position()
+                        .map_or(last, |position| clamp(position).max(last));
+                    starts.push(last);
+                }
+                for (index, element) in array.iter_mut().enumerate() {
+                    if element.position().is_some() {
+                        element.set_position(Some(starts[index]));
+                    }
+                    let end = starts.get(index + 1).copied().unwrap_or(high);
+                    keep_under_owner(element, starts[index], end);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether `live` still holds at least one field exactly as the vendoring
@@ -931,6 +989,9 @@ pub(crate) fn restore_document(
         .parse()
         .map_err(|error| format!("invalid vendored TOML: {error}"))?;
     let drifted = restore_item(live.as_item_mut(), original.as_item(), new.as_item());
+    if !drifted {
+        keep_under_owner(live.as_table_mut(), isize::MIN, isize::MAX);
+    }
     Ok((
         if drifted {
             current_text
@@ -1776,6 +1837,42 @@ mod tests {
         let mut expected = six_only.clone();
         expected.insert_str(at(&six_only), added);
         assert_eq!(restored, expected);
+    }
+
+    /// #1623, replaced rather than re-added: a vendored `[[distribution.wheel]]`
+    /// array goes back with its recorded positions, which a package the user
+    /// added in front has shifted. It must still print under its own
+    /// `[[distribution]]`, not under the user's package.
+    #[test]
+    fn replaced_wheel_tables_stay_under_their_own_element() {
+        let original = "version = 1\n\n[[distribution]]\nname = \"idna\"\nversion = \"3.7\"\n\n[[distribution.wheel]]\nurl = \"https://example.test/idna.whl\"\nhash = \"sha256:i\"\n\n[[distribution]]\nname = \"six\"\nversion = \"1.16.0\"\n\n[[distribution.wheel]]\nurl = \"https://example.test/six.whl\"\nhash = \"sha256:s\"\n";
+        let new = original
+            .replace(
+                "https://example.test/idna.whl",
+                ".socket/vendor/pypi/a/idna.whl",
+            )
+            .replace("sha256:i", "sha256:vendored");
+        let added = "[[distribution]]\nname = \"certifi\"\nversion = \"1\"\n\n[[distribution.wheel]]\nurl = \"https://example.test/certifi-a.whl\"\n\n[[distribution.wheel]]\nurl = \"https://example.test/certifi-b.whl\"\n\n";
+        let at = |text: &str| text.find("[[distribution]]").unwrap();
+        let mut live = new.clone();
+        live.insert_str(at(&new), added);
+        let (restored, drifted) = restore_document(&live, original, &new).unwrap();
+        assert!(!drifted, "{restored}");
+        let mut expected = original.to_string();
+        expected.insert_str(at(original), added);
+        assert_eq!(restored, expected);
+    }
+
+    /// Putting a removed sub-table back at its key slot leaves the keys of a
+    /// dotted table in the same header alone.
+    #[test]
+    fn re_added_sub_table_keeps_dotted_key_order() {
+        let original = "[p]\nname = 1\nversion = 1\nd.version = 1\nd.name = 2\n\n[p.c]\nz = 1\n";
+        let new = "[p]\nname = 1\nversion = 1\nd.version = 1\nd.name = 2\n";
+        let live = new.replace("name = 1", "name = 3");
+        let (restored, drifted) = restore_document(&live, original, new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, original.replace("name = 1", "name = 3"));
     }
 
     /// A table restored whole keeps its sub-tables where the original
