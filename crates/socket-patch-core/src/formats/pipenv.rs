@@ -226,10 +226,64 @@ pub(crate) fn reserialized_around_reference(live: &Value, ours: &Value) -> bool 
         .all(|key| live.get(key) == ours.get(key))
 }
 
+/// Whether a Pipfile.lock entry is a plain registry pin of a release other
+/// than `version`: an exact `==<other>` and no `file`/`path`/VCS/editable
+/// source. Pipenv 2023+ resolves each category on its own, so one category
+/// can lock another release of a patched package (#1616); such an entry is
+/// not the patch's target and is left as Pipenv wrote it, while a wildcard,
+/// a range or a missing pin is still a conflict for the caller.
+pub(crate) fn pins_another_release(entry: &Value, version: &str) -> bool {
+    const SOURCES: [&str; 7] = ["file", "path", "git", "hg", "svn", "bzr", "editable"];
+    let Some(object) = entry.as_object() else {
+        return false;
+    };
+    if SOURCES.iter().any(|key| object.contains_key(*key)) {
+        return false;
+    }
+    object
+        .get("version")
+        .and_then(Value::as_str)
+        .and_then(|pin| pin.strip_prefix("=="))
+        .is_some_and(|pinned| {
+            !pinned.is_empty()
+                && pinned != version
+                && pinned
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".+-_!".contains(&byte))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pins_another_release_accepts_only_exact_registry_pins() {
+        for (entry, expected) in [
+            (json!({"version":"==1.15.0","hashes":[]}), true),
+            (
+                json!({"version":"==1.15.0","index":"pypi","markers":"x"}),
+                true,
+            ),
+            (json!({"version":"==1.16.0"}), false),
+            (json!({"version":"*"}), false),
+            (json!({"version":"==1.*"}), false),
+            (json!({"version":">=1.15"}), false),
+            (json!({"version":"===1.15.0"}), false),
+            (json!({"version":"=="}), false),
+            (json!({}), false),
+            (
+                json!({"version":"==1.15.0","file":"https://x/six.whl"}),
+                false,
+            ),
+            (json!({"version":"==1.15.0","git":"https://x/six"}), false),
+            (json!({"version":"==1.15.0","editable":true}), false),
+            (json!("==1.15.0"), false),
+        ] {
+            assert_eq!(pins_another_release(&entry, "1.16.0"), expected, "{entry}");
+        }
+    }
 
     /// #815: a re-rendered entry takes the lock's majority line ending.
     #[test]
