@@ -641,6 +641,42 @@ fn pair_changed(
     (!(already_original && unaccounted)).then_some(pairs)
 }
 
+/// A copy of `item`, a part of the recorded text, to put into the live
+/// document. Parsed standard tables keep their position in the text they
+/// came from, and toml_edit prints tables in position order, so a recorded
+/// `[[packages.wheels]]` / `[packages.wheels.hashes]` table could print
+/// under a later `[[packages]]` header of the live document and re-parse
+/// as part of that package (#1623). Without a position, each table prints
+/// right after the one before it, i.e. inside the table it now sits in.
+fn detached(item: &Item) -> Item {
+    fn clear(table: &mut Table) {
+        table.set_position(None);
+        for (_, child) in table.iter_mut() {
+            clear_positions(child);
+        }
+    }
+    fn clear_positions(item: &mut Item) {
+        match item {
+            Item::Table(table) => clear(table),
+            Item::ArrayOfTables(array) => array.iter_mut().for_each(clear),
+            _ => {}
+        }
+    }
+    let mut item = item.clone();
+    clear_positions(&mut item);
+    item
+}
+
+/// `original` in place of `live`, keeping the live table's own position
+/// (see [`detached`]) and, by replacing in place, the live key's comments.
+fn replace_item(live: &mut Item, original: &Item) {
+    let position = live.as_table().and_then(Table::position);
+    *live = detached(original);
+    if let Some(table) = live.as_table_mut() {
+        table.set_position(position);
+    }
+}
+
 fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn TableLike) -> bool {
     let keys: BTreeSet<String> = original
         .iter()
@@ -656,7 +692,12 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
         }
         if equal_item(live.get(&key), after) {
             if let Some(before) = before {
-                live.insert(&key, before.clone());
+                match live.get_mut(&key) {
+                    Some(current) => replace_item(current, before),
+                    None => {
+                        live.insert(&key, detached(before));
+                    }
+                }
             } else {
                 live.remove(&key);
             }
@@ -780,7 +821,7 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
         return false;
     }
     if item_text(live) == item_text(new) {
-        *live = original.clone();
+        replace_item(live, original);
         return false;
     }
     if let (Some(live), Some(original), Some(new)) = (
@@ -1602,6 +1643,68 @@ mod tests {
         let (restored, drifted) = restore_document(&second_only, &first, &both).unwrap();
         assert!(!drifted);
         assert_eq!(restored, LOCK);
+    }
+
+    /// #1623: `pip lock` writes each wheel as a `[[packages.wheels]]` table
+    /// with a `[packages.wheels.hashes]` sub-table. Restoring one package's
+    /// wheels while a later package is still vendored must print them under
+    /// their own package, not after the next `[[packages]]` header.
+    #[test]
+    fn pip_lock_wheel_tables_revert_under_their_own_package() {
+        const PIP_LOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"pip\"\n\n[[packages]]\nname = \"idna\"\nversion = \"3.7\"\n\n[[packages.wheels]]\nname = \"idna-3.7-py3-none-any.whl\"\nurl = \"https://example.test/idna-3.7-py3-none-any.whl\"\n\n[packages.wheels.hashes]\nsha256 = \"idna\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n\n[[packages.wheels]]\nname = \"six-1.16.0-py2.py3-none-any.whl\"\nurl = \"https://example.test/six-1.16.0-py2.py3-none-any.whl\"\n\n[packages.wheels.hashes]\nsha256 = \"six\"\n";
+        let first = rewrite_python_lock(
+            PIP_LOCK,
+            "idna",
+            "3.7",
+            ArtifactSource::Path(".socket/vendor/pypi/a/idna-3.7-py3-none-any.whl"),
+            "first",
+        )
+        .unwrap()
+        .unwrap();
+        let both = rewrite_python_lock(
+            &first,
+            "six",
+            "1.16.0",
+            ArtifactSource::Path(".socket/vendor/pypi/b/six-1.16.0-py2.py3-none-any.whl"),
+            "second",
+        )
+        .unwrap()
+        .unwrap();
+        let six_only = rewrite_python_lock(
+            PIP_LOCK,
+            "six",
+            "1.16.0",
+            ArtifactSource::Path(".socket/vendor/pypi/b/six-1.16.0-py2.py3-none-any.whl"),
+            "second",
+        )
+        .unwrap()
+        .unwrap();
+
+        // Revert the first-vendored package alone: idna's wheel tables come
+        // back exactly where `pip lock` wrote them.
+        let (second_only, drifted) = restore_document(&both, PIP_LOCK, &first).unwrap();
+        assert!(!drifted, "{second_only}");
+        assert_eq!(second_only, six_only);
+        let parsed: DocumentMut = second_only.parse().unwrap();
+        let packages = parsed["packages"].as_array_of_tables().unwrap();
+        assert_eq!(
+            packages.get(0).unwrap()["wheels"][0]["hashes"]["sha256"].as_str(),
+            Some("idna")
+        );
+        assert!(packages.get(1).unwrap().get("wheels").is_none());
+
+        // Then the second one: the original bytes.
+        let (restored, drifted) = restore_document(&second_only, &first, &both).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, PIP_LOCK);
+
+        // The other order (`vendor --revert` walks the ledger) ends the same.
+        let (first_only, drifted) = restore_document(&both, &first, &both).unwrap();
+        assert!(!drifted);
+        assert_eq!(first_only, first);
+        let (restored, drifted) = restore_document(&first_only, PIP_LOCK, &first).unwrap();
+        assert!(!drifted);
+        assert_eq!(restored, PIP_LOCK);
     }
 
     #[test]
