@@ -416,7 +416,10 @@ async fn restore_lock(
         for hit in &hits {
             let why = if let Some(flag) = compile_filter(&command, &hit.name) {
                 format!("`uv pip compile {flag}` filters")
-            } else if env_set("UV_EXCLUDE_NEWER") {
+            } else if std::env::var_os("UV_EXCLUDE_NEWER")
+                // Empty is unset, and `false` turns the cutoff off.
+                .is_some_and(|v| !v.is_empty() && v != "false")
+            {
                 "the `UV_EXCLUDE_NEWER` cutoff set in this environment filters".to_string()
             } else if let Some((path, key)) = settings_filter(&settings, &hit.name) {
                 format!("{path}'s uv `{key}` setting filters")
@@ -727,7 +730,9 @@ fn compile_filter(command: &[&str], name: &str) -> Option<String> {
             _ => (*arg, None),
         };
         let applies = match flag {
-            "--no-build" | "--exclude-newer" => true,
+            "--no-build" => true,
+            // `false` turns the cutoff off (uv 0.11.24+).
+            "--exclude-newer" => inline.or_else(|| args.next().copied()) != Some("false"),
             "--only-binary" | "--no-binary" | "--exclude-newer-package" => {
                 let Some(value) = inline.or_else(|| args.next().copied()) else {
                     continue;
