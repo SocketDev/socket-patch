@@ -489,7 +489,7 @@ impl ResolvedElsewhere {
 /// the names first: the contest asks this for every pair of a ref and a
 /// lock entry.
 fn same_pypi_release(a: &str, b: &str) -> bool {
-    a.starts_with("pkg:pypi/")
+    Ecosystem::from_purl(a) == Some(Ecosystem::Pypi)
         && purl_without_version(a).is_some_and(|name| purl_without_version(b) == Some(name))
         && crate::utils::purl_key::pypi_same_release(a, b)
 }
