@@ -1,6 +1,8 @@
 """Only a clean base-branch merge onto a head that passed CI may skip tests."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import tempfile
@@ -118,18 +120,24 @@ class PrHeadReuse(unittest.TestCase):
                 self.assertIsNone(reuse.reusable_run(dict(self.env, **change)))
                 call.assert_not_called()
 
+    def assert_falls_back(self, env):
+        # Capture the fallback notice: printed to the job log it becomes a
+        # real (misleading) annotation on every lint-ecosystems run.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(reuse.reusable_run(env))
+        self.assertTrue(out.getvalue().startswith("::notice::"), out.getvalue())
+
     def test_api_failure_timeout_and_bad_payload_run_everything(self):
         for error in (FileNotFoundError(), subprocess.CalledProcessError(1, "gh"),
                       subprocess.TimeoutExpired("gh", 15)):
             with self.subTest(error=error), patch.object(reuse.subprocess, "run", side_effect=error):
-                self.assertIsNone(reuse.reusable_run(self.env))
+                self.assert_falls_back(self.env)
         for text in ("not json", "{}", '{"parents": null}', '{"parents": [null, null]}'):
             with self.subTest(text=text), patch.object(reuse.subprocess, "run", return_value=
                     subprocess.CompletedProcess([], 0, stdout=text)):
-                self.assertIsNone(reuse.reusable_run(self.env))
+                self.assert_falls_back(self.env)
         with self.subTest("missing env"), patch.object(reuse.subprocess, "run") as call:
-            self.assertIsNone(reuse.reusable_run({"GITHUB_EVENT_NAME": "pull_request",
-                                                  "PR_BASE_REF": "main"}))
+            self.assert_falls_back({"GITHUB_EVENT_NAME": "pull_request", "PR_BASE_REF": "main"})
             call.assert_not_called()
 
     def test_main_writes_the_output(self):
