@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-16 (run 46), main `657fce2`, latest release 5.0.1. (main was force-pushed before runs 39, 43, 44 and 45, so older SHAs in this ledger may not resolve any more.)
+Last updated: 2026-10-17 (run 47), main `657fce2`, latest release 5.0.1. (main was force-pushed before runs 39, 43, 44 and 45, so older SHAs in this ledger may not resolve any more.)
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -500,9 +500,20 @@ Run 46 additions (main `657fce2`, release 5.0.1, Linux, Node 22.22.0; mock regis
 | 11.28.5 | pass ×3 (fresh frozen only) | untested | pass (root `trustLockfile: true` written; member frozen install patched) | untested | `allowBuilds: {"@sp/pad": false}`: pass (2/2) | pass |
 | 12.11.2 | pass ×3 | pass / pass | pass | hosted pass; vendored `fetch` fails loudly (`ERR_PNPM_TARBALL_READ_LOCAL_TARBALL`), the offline install then passes | `allowBuilds: {"@sp/pad": false}`: **fail, #1597 comment** (`ERR_PNPM_IGNORED_BUILDS` naming the `file:` spec, 2/2) | pass |
 
+Run 47 additions (main `657fce2`, release 5.0.1, Linux, Node 22.22.0; mock rebuilt from scratch: org patch API for `left-pad@1.3.0`, `sp-build@1.0.0` (postinstall writes `built.txt`) and scoped `@sp/pad@1.0.0`, plus a mock registry serving the last two, version documents included):
+
+| pnpm | Baseline hosted / vendored: pin → dead-registry fresh frozen → vex | Agent isolated / hoisted: apply, vex, rollback, store untouched | Vendored build approvals: `allowBuilds: true` / `false` / `false` + `dangerouslyAllowAllBuilds` | Hosted scoped-registry package (`@scope:registry`): rollback byte-exact | Hosted catalog (+ unused entry) → fresh frozen → plain install keeps pin |
+| --- | --- | --- | --- | --- | --- |
+| 9.15.9 / 10.34.7 / 11.28.6 | — / — / pass, pass | — / — / pass, pass | — | pass (pnpm doesn't record the URL) | — |
+| 12.0.0 / 12.11.2 / 12.12.1 | — | — | — | **fail #1619** (scoped `tarball:` dropped; 2/2 on 12.0.0 and 12.12.1; also workspace-file `registries`) | — |
+| 12.14.0 | pass, pass | pass, pass | fail #1597 / pass / pass (denial holds) | pass (12.13+ doesn't record the URL) | pass |
+
+#1619 isn't a regression: release 5.0.1 behaves the same. pnpm 12.0.0–12.12.1 record a scoped registry's `tarball:` unconditionally; 7–11 and 12.13+ don't; a non-scoped `registry=` mirror isn't recorded by 12.12.1.
+
 ## Backlog
 
-0ab. **#1597** (vendored pnpm ≥ 10.34.2 breaks build approvals for the `file:` tarball): re-verify once fixed on 10.34.7 / 11 / 12. Denials done in run 46 (12 breaks with `allowBuilds: false`, commented; 9/10/11 pass). Still to do: `dangerouslyAllowAllBuilds`, a transitive build package, a supersede (the uuid in an approval key changes), and the pnpm 10.34.2 changelog to cite the upstream change. Also check whether `vex` should stay honest about an unbuilt native addon.
+0ac. **#1619** (rollback drops scoped-registry `tarball:` on pnpm 12.0–12.12): re-verify once fixed on 12.0.0 / 12.12.1 and that 12.13+ stays bare; also `remove` and the hosted → vendored takeover restore over the same lock, and a Rush lock with `pnpmVersion` 12.12.
+0ab. **#1597** (vendored pnpm ≥ 10.34.2 breaks build approvals for the `file:` tarball): re-verify once fixed on 10.34.7 / 11 / 12. Denials done in run 46 (12.11.2 breaks with `allowBuilds: false`, commented; 9/10/11 pass). Run 47 on 12.14.0: `allowBuilds: true` still fails (`ERR_PNPM_IGNORED_BUILDS`), an unscoped `sp-build: false` denial holds, and `false` + `dangerouslyAllowAllBuilds: true` (12.12.0 semantics) holds. Still to do: a transitive build package, a supersede (the uuid in an approval key changes), and the pnpm 10.34.2 changelog to cite the upstream change. Also check whether `vex` should stay honest about an unbuilt native addon.
 
 0w. #1460 is verified fixed (run 40, all 16 env × major cells). Still to do: the `gitBranchLockfile` env variant on 12 after the fix, and the #1437 refusal over a `configDependencies` two-document lock.
 0x. #935: hosted half fixed by #1469 (run 41, 8/9/10/12). Still open for the vendored scan warning; re-verify once fixed. Was: **#935 regression** (hosted silent pin over a `file:` copy, first bad f3c6313a): re-verify once fixed, also for `git+` copies. #1268 still reproduces on 12.11.2 (run 39).
@@ -547,6 +558,8 @@ Run 46 additions (main `657fce2`, release 5.0.1, Linux, Node 22.22.0; mock regis
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
+
+- pnpm 12.0.0–12.12.1 record `tarball:` for every scoped-registry package, and 12.13.0 stopped doing that (pnpm#16866). A lock that differs between those pnpm versions only in that field is pnpm's own behaviour. Only socket-patch's rollback dropping the field is a bug (#1619).
 
 - Build approvals over a **hosted** pin keep working on pnpm 9–12, with both name-only and `name@version` keys (run 45): the lock keeps the `name@version` package key. Only vendored `file:` copies lose them (#1597).
 
