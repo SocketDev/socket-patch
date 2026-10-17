@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bun bug-hunt routine (label pm:bun).
 
-Last updated: 2026-10-16 (run 46), main `657fce2`, latest release 5.0.1, latest Bun 1.4.3 (canary 1.4.4-canary.20261016 covered in run 46).
+Last updated: 2026-10-17 (run 47), main `657fce2`, latest release 5.0.1, latest Bun 1.4.3 (canary 1.4.4-canary.20261016 covered in run 46; no newer canary in run 47).
 
 Method (run 36 note: the authenticated routes work too: `--api-url <mock> --org o --api-token fake` serves `/v0/orgs/o/patches/{batch,by-package,package,view}`; still set `SOCKET_PATCH_SERVER_URL` to the mock origin or hosted pins aren't recognized and `rollback` exits `manifest_not_found`. Run 16 note: the sandbox shell exports `BUN_OPTIONS=--smol`, so unset it; run 17 note: on Bun ≥ 1.2, `bunfig [install] saveTextLockfile = false` writes a binary `bun.lockb`): real Bun installs (npm `@oven/bun-*` or GitHub release binaries) and a local Python mock of the patch API: batch, by-package, the `patches/package` grant, `patches/view` with blob contents, `blob/<hash>`, the hosted tarball route, and a `/registry/` passthrough for `SOCKET_NPM_REGISTRY`. Set `SOCKET_PATCH_SERVER_URL` and `SOCKET_PROXY_URL` to the mock (run 32: without a token the CLI uses the public-proxy routes `/patch/batch`, `/patch/by-package/<purl>`, `/patch/view/<uuid>`, `/patch/blob/<hash>` and `POST /patch/package`, and `patch.socket.dev` returns 403 through the sandbox proxy). Test repos need `node_modules/` in `.gitignore`, or the fresh-clone oracle reads committed store entries. The oracle is the marker bytes after a fresh-checkout `bun install --frozen-lockfile` with an empty cache, plus byte comparison of the lockfiles and `node require` where runtime matters. The repo's own matrix (`scripts/backtest-bun.py`, `bun-compatibility.yml`) already covers plain hosted and vendored shapes across Bun 0.8.1–1.4.2. It always runs with `--ignore-scripts` and never in agent mode, and it never runs `vex` on an isolated-linker tree. This ledger tracks what it doesn't.
 
@@ -75,6 +75,8 @@ Run 43 (new main `7b6371c`: #1543 for #1534, the nested-project handover from ru
 Run 45 (new main `657fce2`: no Bun fix since run 44): new **#1600**. In a Bun project with a git, `file:` folder or URL/`file:` tarball copy of the vendored `name@version` beside the vendored registry entry, `vendor --check` fails with the generic `wiring missing … re-run socket-patch vendor` reason (the lock does reference the artifact) instead of `copy unpatched` (#1511 contract), and the remedy loops. Root cause: `vex/discover/bun.rs` `Unwired::contest` drops those refs without `out.shadow(r)`. First real-Bun `git+` tuple cells (local dumb-HTTP git server): hosted refuses `redirect_unattributable` (documented), vendored wires the registry copy silently (documented), `vex` fails closed, agent patches both copies, unwinds work.
 
 Run 46 (main unchanged at `657fce2`, so no re-triage): no new bugs. First canary coverage: Bun 1.4.4-canary.20261016 writes byte-identical text and binary locks to 1.4.3, and hosted / vendored / agent × single / workspace × text / lockb pass. A 79-pin isolated workspace (multi-version and scoped packages) passes hosted and vendored on text and lockb, and its hosted rollback is byte-exact. Under registry 429s, rollback and the hosted → vendored takeover refuse per pin, keep a frozen-installable lock, and finish on the re-run. See the run 46 section below.
+
+Run 47 (main unchanged at `657fce2`, so no re-triage): new **#1621**. `socket-patch --update` on a Bun-installed copy refuses `managed_install` as "managed by npm" and gives npm commands: `npm update -g …` for a `bun add -g` install (a no-op), and `npm install …@latest` for a Bun project (stray `package-lock.json`, stale `bun.lock`, and the next `bun install --frozen-lockfile` fails) and for the bunx cache. It's the Bun twin of #1111 (pnpm). Reproduced on 1.1.39 / 1.2.23 / 1.4.3. The yarn `global` store variant was handed to yarn-classic. See the run 47 section below.
 
 Run 44 (new main `15ead12`: #1559 for #1541, plus non-Bun fixes): new **#1581**. On a tree a pre-#1541 release vendored, in a repo that LFS-tracks `*.tgz`, `repair` (the remedy `vendor --check` prints in an LFS-less clone) leaves the root `<uuid>/.gitattributes` as legacy `* -text`. The repaired tarball goes back into LFS on commit, and fresh frozen installs still fail (1.2.23 / 1.3.9 / 1.4.3; lockb member mirrors are upgraded; plain npm is the same). #1541 verified fixed for new vendored runs (1.2.23 / 1.4.3 × text / lockb × single / workspace), and the 5.0.1 → main vendored re-run + `git add --renormalize` upgrade path passes. Passing: the #1534 leftovers (lockfile-only nested project, nested project inside a workspace member dir) and main `vendor --revert` of 5.0.1-vendored (legacy `.gitattributes`) workspaces.
 
@@ -639,6 +641,14 @@ Other passes (Linux, 1.4.2 unless noted):
 | `rollback` with all / alternate registry lookups 429 | 1.4.3 text, 2 + 79 pins | pass (per-pin `hosted_restore_refused`, consistent lock, re-run byte-exact) |
 | Hosted → vendored takeover with alternate 429s | 1.4.3 text, 79 pins | pass (40 vendored / 39 stay hosted, re-run heals, `vendor --check` 0) |
 
+### Self-update channel for Bun installs (run 47, Linux, main `657fce2`)
+| Bun | Shape | `--update` refusal hint | Following it | Result |
+| --- | --- | --- | --- | --- |
+| 1.4.3 / 1.2.23 / 1.1.39 | `bun add -g` (`$BUN_INSTALL/install/global/node_modules`) | `npm update -g …` ("managed by npm") | no-op, stays 4.0.0 | **fail #1621** |
+| 1.4.3 / 1.2.23 / 1.1.39 | project dependency (text lock) | `npm install …@latest` | stray `package-lock.json`, frozen install fails | **fail #1621** |
+| 1.4.3 | bunx cache (`$TMPDIR/bunx-<uid>-<spec>`) | `npm install …@latest` | wrong target | **fail #1621** |
+| 1.4.3 / 1.2.23 / 1.1.39 | control: `bun add -g …@latest` / `bun add …@latest` | n/a | 4.0.0 → 5.0.1, frozen install passes | pass |
+
 ## Backlog
 
 0. **Maintainer request (partly covered in runs 3 and 6):** global (`-g`) mode for hosted patches. Still to do: a non-writable global dir must fail loudly (needs a probe; the sandbox runs as root); Windows 1.1.45/1.2.23 with an ASCII temp path; Bun 1.0.x. #443 is still open; re-test #434 (`bun.cmd`) on Windows now that #442 has landed. Checklist: the 20261001T040000Z entry.
@@ -665,6 +675,7 @@ Other passes (Linux, 1.4.2 unless noted):
 19. #1541: verified fixed for new runs (run 44). #1581 (`repair` on a legacy tree): re-test when fixed. Still to do: hosted → vendored takeover in an LFS repo. Other `.gitattributes` rules on vendored artifacts: custom `filter=` smudge, `binary`/`-diff` on `bun.lockb`. (`* text=auto eol=crlf`: pass, run 43.) (#1097 extglobs on real Bun: Bun refuses them, pass, run 41.)
 20. #1534 leftovers: macOS/Windows path quoting of the suggested PATH (lockfile-only and member-dir nesting pass, run 44).
 17. #1444: done in run 46 (79 pins, 429 mock: pass). Left: the same on `bun.lockb` (rollback refuses by design, so only the takeover) and on macOS/Windows.
+22. #1621: re-test when fixed (global, project, isolated-linker project, workspace root, bunx cache, the passive update notice, `bun.lockb` projects); macOS/Windows path shapes (`%USERPROFILE%\\.bun\\install\\global`).
 21. Each new Bun canary: compare its text and lockb bytes with the latest stable (run 46: 1.4.4-canary.20261016 identical).
 ## Known non-bugs
 
@@ -783,3 +794,4 @@ Other passes (Linux, 1.4.2 unless noted):
 - Vendoring on a `bun.lockb` workspace writes every patched tarball's mirror under every member, including members that don't depend on it. That's harmless (run 39).
 - A lockfile-only nested independent project (no `node_modules`) under a root hosted / vendored scan gets no `nested_project_skipped` warning: CLI_CONTRACT scopes the warning to packages the crawl finds installed (run 44).
 - A vendored Bun scan beside a git, folder or versionless-URL copy of the patched `name@version` wires the registry copy with no warning. That's documented (CLI_CONTRACT `vendor_non_registry_entry_skipped` row: the codes don't fire for copies without a version; `vex` attests nothing). Only `vendor --check`'s wrong reason is a bug (#1600) (run 45).
+- `bun update -g @socketsecurity/socket-patch` doesn't upgrade a global install, because Bun's global `package.json` pins the exact version it was added at. That's Bun behaviour; `bun add -g …@latest` is the working command (run 47).
