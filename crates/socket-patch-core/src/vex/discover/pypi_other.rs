@@ -286,9 +286,9 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
         return;
     }
     let Some((name, location)) = requirement_location(code) else {
-        // A registry requirement; an exact `name[extras]==X` pin is evidence
-        // against another lock's wiring of the same package.
-        out.resolved_elsewhere(file, registry_pin(code));
+        // A registry requirement; a pin that can only install one release
+        // is evidence against another lock's wiring of that release.
+        registry_pin(file, code, out);
         return;
     };
     let tag = comment.and_then(vendor_tag);
@@ -342,20 +342,25 @@ fn egg_name(location: &str) -> Option<&str> {
     Some(&egg[..end]).filter(|name| !name.is_empty())
 }
 
-/// The `pypi_purl` of a registry requirement that can only install one
-/// release: an exact `name[extras]==X` pin in any PEP 440 spelling
-/// (`==1.16.0.0`, `==v1.16.0`), or an arbitrary-equality `name===X`. The
-/// version stays as spelled; the contest compares it under PEP 440 equality
-/// (`ResolvedElsewhere::covers`), the way pip resolves the pin (#1602).
-/// Ranges and wildcards (`~=1.16.0`, `==1.16.*`) are not read: what they
-/// install depends on the index.
-fn registry_pin(code: &str) -> Option<String> {
-    let requirement = parse_requirement(code)?;
-    let version = requirement
+/// Record a registry requirement that can only install one release as
+/// evidence against another lock's wiring of it: an exact
+/// `name[extras]==X` pin in any PEP 440 spelling (`==1.16.0.0`,
+/// `==v1.16.0`; the contest compares it under PEP 440 equality), or an
+/// arbitrary-equality `name===X` (compared as spelled, as pip does, #1602).
+/// Ranges and wildcards (`~=1.16.0`, `==1.16.*`) are not evidence: what
+/// they install depends on the index.
+fn registry_pin(file: &str, code: &str, out: &mut Discovery) {
+    let Some(requirement) = parse_requirement(code) else {
+        return;
+    };
+    if let Some(version) = requirement
         .exact_version()
         .filter(|version| crate::utils::pep440::is_valid(version))
-        .or_else(|| requirement.arbitrary_version())?;
-    pypi_purl(requirement.name, version)
+    {
+        out.resolved_elsewhere(file, pypi_purl(requirement.name, version));
+    } else if let Some(version) = requirement.arbitrary_version() {
+        out.resolved_elsewhere_as_spelled(file, pypi_purl(requirement.name, version));
+    }
 }
 
 /// The `(declared name, location)` of a requirement that names an artifact:
@@ -1827,11 +1832,50 @@ mod tests {
             "six~=1.16.0\n",
             "six==1.16.*\n",
             "six===1.16.1\n",
+            // pip compares `===` as a string: no release is spelled `1.16`.
+            "six===1.16\n",
             "other==1.16.0\n",
         ] {
             let out = discover(line).await;
             assert_eq!(out.refs.len(), 1, "{line:?}: {:#?}", out.diagnostics);
         }
+    }
+
+    /// #1602: a lock tree that wires the release itself, under another
+    /// PEP 440 spelling, is not a contester even when it also pins it:
+    /// pip resolves the include's `==1.16.0` to the tree's own vendored
+    /// wheel (#1086), and Pipenv's `==1.16` entry is the same release.
+    #[tokio::test]
+    async fn issue_1602_a_tree_wiring_another_spelling_contests_nothing() {
+        let vendored = vendored_wheel(UUID_A, "six-1.16.0-py2.py3-none-any.whl");
+        let short = vendored_wheel(UUID_A, "six-1.16-py2.py3-none-any.whl");
+        let p = Project::new();
+        p.write(
+            "Pipfile.lock",
+            &pipfile_lock(serde_json::json!({ "default": { "six": {
+                "file": format!("./{short}"),
+                "hashes": [format!("sha256:{SHA}")],
+            }}})),
+        )
+        .write("Pipfile", "[packages]\nsix = \"*\"\n")
+        .write(
+            "requirements.txt",
+            &format!(
+                "-r base.txt\n./{vendored} --hash=sha256:{SHA}  # socket-patch vendor: six==1.16.0\n"
+            ),
+        )
+        .write("base.txt", "six==1.16.0\n");
+        let out = p.discover().await;
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE),
+            "{:#?}",
+            out.diagnostics
+        );
+        let mut purls: Vec<&str> = out.refs.iter().map(|r| r.purl.as_str()).collect();
+        purls.sort();
+        assert_eq!(purls, ["pkg:pypi/six@1.16", "pkg:pypi/six@1.16.0"]);
     }
 
     /// REGRESSION (#1549): a non-Socket direct reference whose version

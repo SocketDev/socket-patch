@@ -381,7 +381,7 @@ fn requirements_pin_spellings_contest_the_lock_wiring() {
             ("v prefix", format!("{NAME}==v{VERSION}\n")),
             (
                 "padded, with a marker",
-                format!("{NAME}==1.2.3.0.0 ; python_version >= '3'\n"),
+                format!("{NAME}=={VERSION}.0.0 ; python_version >= '3'\n"),
             ),
         ],
     );

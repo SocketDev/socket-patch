@@ -460,17 +460,22 @@ pub struct ResolvedElsewhere {
     pub purl: String,
     /// Root-relative lock file.
     pub file: PathBuf,
+    /// The version matches only as spelled: a requirements `===X` pin,
+    /// which pip compares as a string
+    /// ([`Discovery::resolved_elsewhere_as_spelled`]).
+    pub as_spelled: bool,
 }
 
 impl ResolvedElsewhere {
     /// Whether this entry resolves the canonical base `purl`: the same
-    /// `name@version` (a PyPI version under PEP 440 equality, so a
-    /// hand-written `==1.2.3.0` or `==v1.2.3` resolves `1.2.3`, #1602), or
-    /// any version of `name` for a versionless entry.
+    /// `name@version` (a PyPI version under PEP 440 equality unless the
+    /// entry matches only [as spelled](Self::as_spelled), so a hand-written
+    /// `==1.2.3.0` or `==v1.2.3` resolves `1.2.3`, #1602), or any version of
+    /// `name` for a versionless entry.
     fn covers(&self, purl: &str) -> bool {
         self.purl == purl
             || purl_without_version(purl) == Some(self.purl.as_str())
-            || same_pypi_release(&self.purl, purl)
+            || (!self.as_spelled && same_pypi_release(&self.purl, purl))
     }
 
     /// Whether the entry names no version, so may resolve any.
@@ -480,19 +485,13 @@ impl ResolvedElsewhere {
 }
 
 /// Whether canonical bases `a` and `b` name one PyPI release under PEP 440
-/// equality (`@1.16`, `@1.16.0.0` and `@v1.16.0` are `@1.16.0`). An
-/// arbitrary-equality `===` pin is read the same way: pip compares it as a
-/// string, so this may contest a wiring it can't install, never miss one.
+/// equality (`@1.16`, `@1.16.0.0` and `@v1.16.0` are `@1.16.0`). Checks
+/// the names first: the contest asks this for every pair of a ref and a
+/// lock entry.
 fn same_pypi_release(a: &str, b: &str) -> bool {
-    if !a.starts_with("pkg:pypi/") {
-        return false;
-    }
-    match (a.rsplit_once('@'), b.rsplit_once('@')) {
-        (Some((name_a, version_a)), Some((name_b, version_b))) => {
-            name_a == name_b && crate::utils::pep440::versions_equal(version_a, version_b)
-        }
-        _ => false,
-    }
+    a.starts_with("pkg:pypi/")
+        && purl_without_version(a).is_some_and(|name| purl_without_version(b) == Some(name))
+        && crate::utils::purl_key::pypi_same_release(a, b)
 }
 
 /// `pkg:<type>/<name>` of a versioned `pkg:<type>/<name>@<version>`;
@@ -946,6 +945,19 @@ impl Discovery {
         self.elsewhere.push(ResolvedElsewhere {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
+            as_spelled: false,
+        });
+    }
+
+    /// [`Discovery::resolved_elsewhere`] for a version that matches only as
+    /// spelled: a requirements `===X` pin installs the release whose version
+    /// string is `X`, never a PEP 440-equal spelling of it (#1602).
+    pub(crate) fn resolved_elsewhere_as_spelled(&mut self, file: &str, purl: Option<String>) {
+        let Some(purl) = purl else { return };
+        self.elsewhere.push(ResolvedElsewhere {
+            purl: canonical_base_purl(&purl),
+            file: PathBuf::from(file),
+            as_spelled: true,
         });
     }
 
@@ -964,6 +976,7 @@ impl Discovery {
         self.elsewhere.push(ResolvedElsewhere {
             purl,
             file: PathBuf::from(file),
+            as_spelled: false,
         });
     }
 
@@ -1125,9 +1138,13 @@ impl Discovery {
                     let tree = self.tree_of(&r.source_file);
                     self.elsewhere.iter().find(|e| {
                         let other = self.tree_of(&e.file);
+                        // A tree that wires the release itself, in any
+                        // spelling, is no contester.
                         e.covers(&r.purl)
                             && other != tree
-                            && !wiring.contains(&(r.purl.clone(), other.to_path_buf()))
+                            && !wiring.iter().any(|(purl, t)| {
+                                t == other && (*purl == r.purl || same_pypi_release(purl, &r.purl))
+                            })
                     })
                 })
                 .flatten();
