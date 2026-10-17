@@ -65,6 +65,115 @@ pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// The `node_modules` dirs of the declared workspace members at
+/// `start_path` that the workspace walk prunes by name (#1627): members
+/// whose path crosses a [`SKIP_DIRS`] name (`packages/build`,
+/// `vendor/lib`). npm, yarn and Bun install a member's unhoistable deps
+/// into `<member>/node_modules` from the root lock, so such a copy is as
+/// live as any other member's. A member is a dir the root `package.json`
+/// `workspaces` patterns list in any package manager's reading
+/// ([`WorkspacesDialect::ALL`]: an extra root can only keep a copy, never
+/// drop one) that holds a `package.json`. Each positive pattern is walked
+/// from its literal prefix, through real dirs only (never a symlink,
+/// a hidden dir or a `node_modules`, as the walk itself), to the depth
+/// its segments allow (any depth for `**`, within
+/// [`WORKSPACE_GLOB_DIR_BUDGET`] dirs). Only existing directories are
+/// returned, sorted.
+pub(super) fn skipped_workspace_member_roots(start_path: &Path) -> Vec<PathBuf> {
+    use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
+
+    let Some(patterns) = root_workspace_patterns(start_path) else {
+        return Vec::new();
+    };
+    let mut budget = WORKSPACE_GLOB_DIR_BUDGET;
+    let mut roots = HashSet::new();
+    for pattern in patterns.iter().filter(|p| !p.starts_with('!')) {
+        let segments: Vec<&str> = pattern
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
+        let is_glob = |s: &str| s.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!', '+', '@']);
+        let literal = segments.iter().take_while(|s| !is_glob(s)).count();
+        // A literal prefix that climbs out (`..`), or crosses a link or a
+        // dir the walk never enters for another reason, names nothing here.
+        let mut rel: Vec<String> = Vec::new();
+        let mut dir = start_path.to_path_buf();
+        let mut reachable = true;
+        for segment in &segments[..literal] {
+            dir.push(segment);
+            rel.push(segment.to_string());
+            if segment.starts_with('.')
+                || *segment == "node_modules"
+                || !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir())
+            {
+                reachable = false;
+                break;
+            }
+        }
+        if !reachable {
+            continue;
+        }
+        let rest = &segments[literal..];
+        let max_depth = if rest.contains(&"**") {
+            usize::MAX
+        } else {
+            rest.len()
+        };
+        let mut stack = vec![(dir, rel, 0usize)];
+        while let Some((dir, rel, depth)) = stack.pop() {
+            if rel.iter().any(|seg| SKIP_DIRS.contains(&seg.as_str()))
+                && WorkspacesDialect::ALL
+                    .iter()
+                    .any(|&dialect| workspaces_include_as(&patterns, &rel, dialect))
+                && dir.join("package.json").is_file()
+                && is_dir_sync(&dir.join("node_modules"))
+            {
+                roots.insert(dir.join("node_modules"));
+            }
+            if depth >= max_depth {
+                continue;
+            }
+            for entry in list_dir_sync(&dir).entries {
+                if !entry.file_type.is_some_and(|ft| ft.is_dir())
+                    || entry.name_str == "node_modules"
+                    || entry.name_str.starts_with('.')
+                {
+                    continue;
+                }
+                let Some(left) = budget.checked_sub(1) else {
+                    break;
+                };
+                budget = left;
+                let mut child_rel = rel.clone();
+                child_rel.push(entry.name_str.clone());
+                stack.push((dir.join(&entry.name), child_rel, depth + 1));
+            }
+        }
+    }
+    let mut roots: Vec<PathBuf> = roots.into_iter().collect();
+    roots.sort();
+    roots
+}
+
+/// The root `package.json` `workspaces` patterns at `root` (the array or
+/// the `{"packages": [...]}` shape); `None` when there are none or the
+/// file cannot be read.
+fn root_workspace_patterns(root: &Path) -> Option<Vec<String>> {
+    let text = crate::utils::fs::read_regular_to_string_sync(&root.join("package.json")).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(strip_bom(&text)).ok()?;
+    let list = match doc.get("workspaces")? {
+        serde_json::Value::Array(list) => list,
+        serde_json::Value::Object(map) => map.get("packages")?.as_array()?,
+        _ => return None,
+    };
+    let patterns: Vec<String> = list
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect();
+    (!patterns.is_empty()).then_some(patterns)
+}
+
 /// Whether the installed pnpm tree of the project at `project` keeps its
 /// virtual store where the crawler does not look: a `.modules.yaml` in
 /// `node_modules` or a pnpm modules dir
@@ -2892,6 +3001,12 @@ impl NpmCrawler {
 
         // Recursively search for workspace node_modules
         results.extend(Self::find_workspace_node_modules(start_path, listing));
+        // Plus the declared members the walk prunes by name (#1627).
+        for root in skipped_workspace_member_roots(start_path) {
+            if !results.contains(&root) {
+                results.push(root);
+            }
+        }
 
         merge_configured_install_roots(results, configured_install_roots(start_path))
     }

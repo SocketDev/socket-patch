@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use super::{
     build_npm_purl, configured_install_roots, is_legacy_pnpm_store_dir_name, is_safe_npm_component,
-    merge_configured_install_roots, parse_package_name, read_package_json, NpmCrawler, StoreEntry,
-    Target, NESTED_STORE_MAX_DEPTH, NESTED_STORE_MAX_DIRS, SKIP_DIRS, VLT_STORE_NAME,
+    merge_configured_install_roots, parse_package_name, read_package_json,
+    skipped_workspace_member_roots, NpmCrawler, StoreEntry, Target, NESTED_STORE_MAX_DEPTH,
+    NESTED_STORE_MAX_DIRS, SKIP_DIRS, VLT_STORE_NAME,
 };
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
 use crate::utils::fs::is_dir;
@@ -493,9 +494,14 @@ impl LegacyNpmCrawler {
 
         // Recursively search for workspace node_modules
         Self::find_workspace_node_modules(start_path, &mut results).await;
-
-        // The package-manager-configured roots are shared with the parent
+        // The declared members the walk prunes by name (#1627) and the
+        // package-manager-configured roots are shared with the parent
         // module (not part of the walk this oracle checks).
+        for root in skipped_workspace_member_roots(start_path) {
+            if !results.contains(&root) {
+                results.push(root);
+            }
+        }
         merge_configured_install_roots(results, configured_install_roots(start_path))
     }
 
