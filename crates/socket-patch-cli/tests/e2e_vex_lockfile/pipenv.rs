@@ -367,3 +367,22 @@ fn requirements_direct_reference_contests_the_lock_wiring() {
         ],
     );
 }
+
+/// #1602: pip installs the same upstream release for every spelling of an
+/// exact pin, so each contests the Pipfile.lock wiring like `==1.2.3`.
+#[test]
+fn requirements_pin_spellings_contest_the_lock_wiring() {
+    contested_by_a_non_socket_direct_reference(
+        &flavors()[..1],
+        "requirements.txt",
+        &[
+            ("arbitrary equality", format!("{NAME}==={VERSION}\n")),
+            ("trailing zero", format!("{NAME}=={VERSION}.0\n")),
+            ("v prefix", format!("{NAME}==v{VERSION}\n")),
+            (
+                "padded, with a marker",
+                format!("{NAME}=={VERSION}.0.0 ; python_version >= '3'\n"),
+            ),
+        ],
+    );
+}
