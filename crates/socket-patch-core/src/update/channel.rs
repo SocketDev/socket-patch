@@ -166,8 +166,8 @@ pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'stat
         NodeManager::Pnpm => "pnpm add @socketsecurity/socket-patch@latest",
         NodeManager::Bun if global => "bun add -g @socketsecurity/socket-patch@latest",
         NodeManager::Bun => "bun add @socketsecurity/socket-patch@latest",
-        _ if global => upgrade_hint(channel),
         NodeManager::Bunx => "bunx @socketsecurity/socket-patch@latest …",
+        _ if global => upgrade_hint(channel),
         NodeManager::Vlx => "vlx -y -- @socketsecurity/socket-patch@latest …",
         NodeManager::Vlt => "vlt install @socketsecurity/socket-patch@latest",
         NodeManager::Npm => "npm install @socketsecurity/socket-patch@latest",
@@ -212,33 +212,33 @@ enum NodeManager {
 /// which also covers yarn (no dedicated hint yet).
 fn node_manager(path: &Path) -> NodeManager {
     let holder = outermost_node_modules_holder(path);
+    // bunx's cache is told by its dir name alone, whether or not the dir
+    // still holds a package.json.
+    if holder.is_some_and(is_bunx_cache_dir) {
+        return NodeManager::Bunx;
+    }
     if !is_global_npm_install(path) {
         if holder.is_some_and(is_vlx_cache_dir) {
             return NodeManager::Vlx;
-        }
-        if holder.is_some_and(is_bunx_cache_dir) {
-            return NodeManager::Bunx;
         }
         if holder.is_some_and(|dir| dir.join(crate::constants::npm_family::VLT_LOCK).is_file()) {
             return NodeManager::Vlt;
         }
     }
-    if has_component(path, ".pnpm")
-        || is_pnpm_global_store(path)
-        || holder.is_some_and(|dir| dir.join(crate::constants::npm_family::PNPM_LOCK).is_file())
-    {
+    // A store in the path names the manager that wrote it, ahead of any
+    // lockfile left beside the project (e.g. mid-migration).
+    if has_component(path, ".pnpm") || is_pnpm_global_store(path) {
         return NodeManager::Pnpm;
     }
-    if is_bun_global_store(path)
-        || has_component_after_node_modules(path, ".bun")
-        || holder.is_some_and(|dir| {
-            [
-                crate::constants::npm_family::BUN_LOCK,
-                crate::constants::npm_family::BUN_LOCKB,
-            ]
-            .iter()
-            .any(|lock| dir.join(lock).is_file())
-        })
+    if is_bun_global_store(path) || has_component_after_node_modules(path, ".bun") {
+        return NodeManager::Bun;
+    }
+    let holder_has = |lock: &str| holder.is_some_and(|dir| dir.join(lock).is_file());
+    if holder_has(crate::constants::npm_family::PNPM_LOCK) {
+        return NodeManager::Pnpm;
+    }
+    if holder_has(crate::constants::npm_family::BUN_LOCK)
+        || holder_has(crate::constants::npm_family::BUN_LOCKB)
     {
         return NodeManager::Bun;
     }
@@ -267,22 +267,20 @@ fn has_component_after_node_modules(path: &Path, name: &str) -> bool {
 }
 
 /// bunx installs each spec into its own project dir,
-/// `$TMPDIR/bunx-<uid>-<spec>`; a scoped spec splits it in two
-/// (`bunx-<uid>-@scope/name@version`).
+/// `$TMPDIR/bunx-<uid>-<spec>` with a numeric uid; a scoped spec splits it
+/// in two (`bunx-<uid>-@scope/name@version`).
 fn is_bunx_cache_dir(dir: &Path) -> bool {
-    let is_bunx = |d: &Path| {
-        d.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("bunx-"))
-    };
-    is_bunx(dir)
-        || dir.parent().is_some_and(|parent| {
-            is_bunx(parent)
-                && parent
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains("-@"))
-        })
+    // The `<spec>` part of `bunx-<uid>-<spec>`.
+    fn bunx_spec(dir: &Path) -> Option<&str> {
+        let rest = dir.file_name()?.to_str()?.strip_prefix("bunx-")?;
+        let (uid, spec) = rest.split_once('-')?;
+        (!uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit())).then_some(spec)
+    }
+    bunx_spec(dir).is_some_and(|spec| !spec.is_empty())
+        || dir
+            .parent()
+            .and_then(bunx_spec)
+            .is_some_and(|scope| scope.len() > 1 && scope.starts_with('@'))
 }
 
 fn normal_components(path: &Path) -> Vec<&std::ffi::OsStr> {
@@ -933,6 +931,14 @@ mod tests {
             "bun add @socketsecurity/socket-patch@latest"
         );
         assert_eq!(channel_label_for(InstallChannel::Npm, &p), "bun");
+        // The `.bun` store is Bun's even beside a pnpm lock left over from
+        // a migration.
+        std::fs::write(project.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p),
+            "bun add @socketsecurity/socket-patch@latest"
+        );
+        std::fs::remove_file(project.path().join("pnpm-lock.yaml")).unwrap();
         // The hoisted linker: the text or binary lockfile decides.
         let p = project.path().join(hoisted);
         assert_eq!(
@@ -987,15 +993,35 @@ mod tests {
             );
             assert_eq!(channel_label_for(InstallChannel::Npm, &p), "bun");
         }
-        // A project merely named like the cache but deeper is a Bun project.
-        let holder = tmp.path().join("bunx-0-x/apps/web");
+        // A cache dir without its package.json (which would otherwise read
+        // as a global prefix) is still bunx's.
+        let holder = tmp
+            .path()
+            .join("bunx-501-@socketsecurity/socket-patch@4.0.0");
         std::fs::create_dir_all(&holder).unwrap();
-        std::fs::write(holder.join("package.json"), "{}").unwrap();
-        std::fs::write(holder.join("bun.lock"), "").unwrap();
+        std::fs::write(holder.join("bun.lockb"), "").unwrap();
         assert_eq!(
             upgrade_hint_for(InstallChannel::Npm, &holder.join(bin)),
-            "bun add @socketsecurity/socket-patch@latest"
+            "bunx @socketsecurity/socket-patch@latest …"
         );
+        // A Bun project merely named like the cache, or nested below one
+        // without a scope level, is a Bun project.
+        for dir in [
+            "bunx-tools",
+            "bunx-x-y",
+            "bunx-0-x/apps",
+            "bunx-0-x/apps/web",
+        ] {
+            let holder = tmp.path().join(dir);
+            std::fs::create_dir_all(&holder).unwrap();
+            std::fs::write(holder.join("package.json"), "{}").unwrap();
+            std::fs::write(holder.join("bun.lock"), "").unwrap();
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, &holder.join(bin)),
+                "bun add @socketsecurity/socket-patch@latest",
+                "{dir}"
+            );
+        }
     }
 
     #[test]
