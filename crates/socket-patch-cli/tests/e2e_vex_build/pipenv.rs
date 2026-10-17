@@ -523,3 +523,123 @@ fn pipenv_pylock_projects_wire_what_pipenv_installs() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
+
+const SPLIT_PIPFILE: &str = "[[source]]\nurl = \"https://pypi.org/simple\"\nverify_ssl = true\nname = \"pypi\"\n\n[packages]\n\n[dev-packages]\n\n[docs]\nsix = \"==1.15.0\"\n\n[tests]\nsix = \"==1.16.0\"\n";
+
+/// #1616: Pipenv 2023+ resolves each category on its own, so `[docs]` can
+/// lock six 1.15.0 while `[tests]` locks the patched 1.16.0. Both modes
+/// rewire only `tests.six`, leave `docs.six` as Pipenv wrote it, and a
+/// fresh `pipenv sync --categories tests` installs the PATCHED six.
+fn split_categories_flow(pipenv: &Pipenv, mode: Mode, root: &Path) {
+    let v = pipenv.version.as_str();
+    let what = format!("pipenv {v} split categories {}", mode.label());
+    let proj = root.join("split").join(mode.label()).join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("Pipfile"), SPLIT_PIPFILE).unwrap();
+    let python = venv_bin(&pipenv.venv, "python");
+    pipenv.project_venv(&proj);
+    let out = pipenv.run(&proj, &["lock", "--python", python.to_str().unwrap()]);
+    assert_ok(&out, &format!("{what}: pipenv lock"));
+    let out = pipenv.run(&proj, &["sync", "--categories", "tests"]);
+    assert_ok(&out, &format!("{what}: pipenv sync --categories tests"));
+    let pristine_lock: Value = serde_json::from_slice(&read(&proj.join("Pipfile.lock"))).unwrap();
+    assert_eq!(pristine_lock["docs"]["six"]["version"], "==1.15.0");
+    assert_eq!(pristine_lock["tests"]["six"]["version"], "==1.16.0");
+    let py = venv_bin(&proj.join(".venv"), "python");
+    let (_, pristine, _) =
+        six_oracle(&py, &proj).unwrap_or_else(|| panic!("{what}: six not importable"));
+    let patched = [pristine.as_slice(), PATCH_SUFFIX].concat();
+    let api = RealApi::start(mode.uuid(), &pristine, &patched);
+    if mode == Mode::Hosted {
+        std::fs::remove_dir_all(proj.join(".venv")).unwrap();
+    }
+
+    let (code, env, stderr) = socket_scan(&proj, &api, mode.scan_flags(), &pipenv.envs);
+    assert_eq!(code, Some(0), "{what}: scan: {env}\n{stderr}");
+    let lock: Value = serde_json::from_slice(&read(&proj.join("Pipfile.lock"))).unwrap();
+    let wired = lock["tests"]["six"].to_string();
+    let ok = lock["docs"]["six"] == pristine_lock["docs"]["six"]
+        && match mode {
+            Mode::Hosted => wired.contains(&api.artifact_url()),
+            Mode::Vendored => wired.contains(&format!(".socket/vendor/pypi/{}/", mode.uuid())),
+        };
+    record(
+        "pipenv",
+        v,
+        &format!("split-categories/{}", mode.label()),
+        "wire",
+        if ok { "pass" } else { "FAIL" },
+    );
+    assert!(
+        ok,
+        "{what}: only tests.six is rewired: {lock}\n{env}\n{stderr}"
+    );
+
+    let fresh = root.join("split").join(mode.label()).join("fresh");
+    copy_tree(&proj, &fresh, &[".venv"]);
+    pipenv.project_venv(&fresh);
+    let out = pipenv.run(
+        &fresh,
+        &[
+            "sync",
+            "--categories",
+            "tests",
+            "--python",
+            python.to_str().unwrap(),
+        ],
+    );
+    assert_ok(
+        &out,
+        &format!("{what}: fresh `pipenv sync --categories tests`"),
+    );
+    let (_, bytes, is_patched) = six_oracle(&venv_bin(&fresh.join(".venv"), "python"), &fresh)
+        .unwrap_or_else(|| panic!("{what}: six not importable in the fresh checkout"));
+    let ok = is_patched && bytes == patched;
+    record(
+        "pipenv",
+        v,
+        &format!("split-categories/{}", mode.label()),
+        "install-patched",
+        if ok { "pass" } else { "FAIL" },
+    );
+    assert!(ok, "{what}: the fresh install must carry the PATCHED six");
+}
+
+#[test]
+#[ignore = "real Pipenv releases + PyPI (network). Run with --ignored."]
+fn pipenv_split_category_versions_wire_the_patched_category() {
+    let Some(uv) = find_uv() else {
+        return skip_or_fail(REQUIRED, "uv is not installed");
+    };
+    let mut failures = Vec::new();
+    // Per-category resolution (and so a version split) is Pipenv 2023+.
+    for version in versions(VERSIONS_VAR, VERSIONS)
+        .into_iter()
+        .filter(|v| year(v) >= 2023)
+    {
+        let scratch = tempfile::tempdir().unwrap();
+        let pipenv = match Pipenv::bootstrap(&uv, &version, scratch.path()) {
+            Ok(p) => p,
+            Err(e) => {
+                record("pipenv", &version, "split-categories", "bootstrap", "SKIP");
+                skip_or_fail(REQUIRED, &format!("pipenv {version} bootstrap: {e}"));
+                continue;
+            }
+        };
+        for mode in [Mode::Hosted, Mode::Vendored] {
+            let root = scratch.path().join("run");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                split_categories_flow(&pipenv, mode, &root)
+            }));
+            if let Err(e) = result {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                failures.push(format!("pipenv {version} split {}: {msg}", mode.label()));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}

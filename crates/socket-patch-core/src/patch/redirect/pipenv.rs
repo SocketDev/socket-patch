@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 pub(super) use crate::formats::pipenv::reserialized_around_reference;
-use crate::formats::pipenv::{entries, format_entry};
+use crate::formats::pipenv::{entries, format_entry, pins_another_release};
 use crate::vendor::lock_inventory::pypi::replaceable_hosted_pin;
 
 /// Whether any pypi override names a package this `Pipfile.lock` pins — the
@@ -157,7 +157,13 @@ fn plan(
         "file"
     };
     let mut changes = Vec::new();
+    let mut targeted = false;
     for (section, entry) in targets {
+        // Another category's own release (#1616): not this patch's target.
+        if pins_another_release(&entry.value, &dep.version) {
+            continue;
+        }
+        targeted = true;
         let object = entry
             .value
             .as_object()
@@ -235,6 +241,12 @@ fn plan(
         };
         changes.push((entry.range, replacement, edit));
     }
+    if !targeted {
+        return Err(PlanError::Conflict(format!(
+            "Pipenv version for {} does not match {}: no Pipfile.lock category pins it",
+            dep.name, dep.version
+        )));
+    }
     let mut rewritten = text.to_owned();
     let mut edits = Vec::new();
     for (range, replacement, edit) in changes.into_iter().rev() {
@@ -287,7 +299,6 @@ mod tests {
     fn refusal_is_atomic_across_categories() {
         let dep = dependency("urllib3", "1.26.18", "patch-one");
         for bad in [
-            json!({"version":"==2.0"}),
             json!({"version":"*"}),
             json!({"file":"https://example.org/fork.whl"}),
             json!({"version":"==1.26.18","git":"https://example.org/fork"}),
@@ -322,6 +333,55 @@ mod tests {
                 assert_eq!(result.warnings[0].code, "redirect_pipenv_refused");
                 assert!(result.refused_pipenv_uuids.contains("patch-one"));
             }
+        }
+    }
+
+    /// Pipenv 2023+ resolves each category on its own, so one category can
+    /// pin another release of the patched package (#1616): only the
+    /// categories pinning the patched release are redirected, the other one
+    /// stays as Pipenv wrote it, and the sibling rewriters are not vetoed.
+    #[test]
+    fn category_pinning_another_release_is_left_alone() {
+        let dep = dependency("urllib3", "1.26.18", "patch-one");
+        let mut value: Value = serde_json::from_str(&lock()).unwrap();
+        value["docs"] = json!({"urllib3":{"version":"==1.26.17","hashes":["older"]}});
+        value.sort_all_objects();
+        let original = format_entry(&value, "{", 0).unwrap() + "\n";
+        let files = BTreeMap::from([
+            (
+                "Pipfile".to_string(),
+                "[packages]\nurllib3 = \"*\"\n".to_string(),
+            ),
+            ("Pipfile.lock".to_string(), original.clone()),
+        ]);
+        let mut result = RewriteResult::default();
+        rewrite(&files, std::slice::from_ref(&dep), None, &mut result);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.refused_pipenv_uuids.is_empty());
+        assert!(result.confirmed_pipenv_uuids.contains("patch-one"));
+        let keys: Vec<_> = result.edits.iter().filter_map(|e| e.key.clone()).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|key| !key.contains("docs")), "{keys:?}");
+        let text = &result.files["Pipfile.lock"];
+        let after: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(after["docs"], value["docs"]);
+        for section in ["default", "tests"] {
+            assert!(after[section]["urllib3"]["file"]
+                .as_str()
+                .is_some_and(|url| url.contains("patch.socket.dev")));
+        }
+        // Re-planning the redirected lock is a no-op.
+        assert_eq!(plan(text, &dep, None).unwrap(), (text.clone(), Vec::new()));
+
+        // An unpinned or non-exact version is still not a release to skip.
+        for spec in ["*", ">=1.26", "==1.26.*"] {
+            let mut bad = value.clone();
+            bad["docs"]["urllib3"]["version"] = json!(spec);
+            let text = serde_json::to_string(&bad).unwrap();
+            assert!(
+                matches!(plan(&text, &dep, None), Err(PlanError::Conflict(_))),
+                "{spec}"
+            );
         }
     }
 
