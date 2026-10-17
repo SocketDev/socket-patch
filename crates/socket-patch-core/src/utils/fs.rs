@@ -772,14 +772,15 @@ fn stage_and_rename_blocking(
         // quota) surfaces here, before the truncated stage could be renamed
         // over the intact target.
         file.write_all(content)?;
-        if sync_file {
-            file.sync_all()?;
-        }
-        // Owner first, then the mode: `chown(2)` clears setuid/setgid, so
-        // the chmod must run last to restore the bits exactly.
+        // Owner before the fsync, so a durable write syncs it too, and
+        // before the mode: `chown(2)` clears setuid/setgid, so the chmod
+        // below must run last to restore the bits exactly.
         #[cfg(unix)]
         if let Some(dest) = &dest {
             keep_owner(&file, dest);
+        }
+        if sync_file {
+            file.sync_all()?;
         }
         // Set the preserved mode on the stage *before* the rename so the
         // file never appears at the destination with the wrong bits, even
