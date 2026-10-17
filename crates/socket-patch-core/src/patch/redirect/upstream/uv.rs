@@ -829,8 +829,12 @@ async fn global_uv_settings(
         .map(|p| (p, false))
         .chain(system.into_iter().map(|p| (p, true)));
     for (path, system) in candidates {
-        // uv passes over a candidate that is not a file; the regular-file
-        // opener also never blocks on a FIFO planted there.
+        // uv passes over a candidate that is not a file (opening a
+        // directory fails with `PermissionDenied` on Windows, so check
+        // first); the regular-file opener also never blocks on a FIFO.
+        if !tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
+            continue;
+        }
         let text = match crate::utils::fs::read_regular_to_string(&path).await {
             Ok(text) => text,
             Err(e)
