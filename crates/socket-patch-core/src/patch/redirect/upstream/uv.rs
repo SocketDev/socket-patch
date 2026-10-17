@@ -829,13 +829,20 @@ async fn global_uv_settings(
         .map(|p| (p, false))
         .chain(system.into_iter().map(|p| (p, true)));
     for (path, system) in candidates {
-        // uv passes over a candidate that is not a file.
-        if !tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
-            continue;
-        }
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        // uv passes over a candidate that is not a file; the regular-file
+        // opener also never blocks on a FIFO planted there.
+        let text = match crate::utils::fs::read_regular_to_string(&path).await {
+            Ok(text) => text,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        };
         let doc = text
             .parse::<DocumentMut>()
             .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
@@ -2347,6 +2354,17 @@ mod tests {
             ("UV_NO_CONFIG", "1".into()),
         ]);
         assert!(global_uv_settings(&var, false).await.unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            // A FIFO is passed over rather than read, which would block.
+            let fifo = root.join("fifo/uv/uv.toml");
+            std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+            let var = env(vec![("XDG_CONFIG_HOME", root.join("fifo"))]);
+            let found = paths(global_uv_settings(&var, false).await.unwrap());
+            assert!(found.iter().all(|p| !p.contains("fifo")), "{found:?}");
+        }
         write("bad/uv/uv.toml", "[pip\n");
         let var = env(vec![("XDG_CONFIG_HOME", root.join("bad"))]);
         assert!(global_uv_settings(&var, false).await.is_err());
