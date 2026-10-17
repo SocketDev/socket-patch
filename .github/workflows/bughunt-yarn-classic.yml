@@ -1,0 +1,39 @@
+name: bughunt yarn-classic windows backslash file copies probe
+on:
+  push:
+    branches: ['bughunt/yarn-classic/**']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: rustup show
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - name: build
+        run: cargo build --release -p socket-patch-cli
+      - name: probe
+        env:
+          KIT: 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
+        run: |
+          set +e -u
+          RT=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")
+          M="$RT/kit"; mkdir -p "$M"; echo "$KIT" | base64 -d | tar -xzf - -C "$M"
+          SP="$PWD/target/release/socket-patch"; [ -f "$SP.exe" ] && SP="$SP.exe"
+          for YV in 1.7.0 1.22.22; do
+            T="$RT/t$YV"; mkdir -p "$T"
+            SP="$SP" M="$M" T="$T" YV="$YV" bash "$M/probe.sh" 2>&1 | tee "$RT/out$YV.txt"
+          done
+          echo "=== SUMMARY"; grep -h RESULT "$RT"/out*.txt
