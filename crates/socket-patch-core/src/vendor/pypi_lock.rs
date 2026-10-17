@@ -641,216 +641,6 @@ fn pair_changed(
     (!(already_original && unaccounted)).then_some(pairs)
 }
 
-/// A copy of `item`, a part of the recorded text, to put into the live
-/// document. Parsed standard tables keep their position in the text they
-/// came from, and toml_edit prints tables in position order, so a recorded
-/// `[[packages.wheels]]` / `[packages.wheels.hashes]` table would print
-/// among the live document's tables by its recorded number: under a later
-/// `[[packages]]` header, re-parsed as part of that package (#1623). The
-/// copy's tables carry their recorded position as a negative mark instead,
-/// and [`place_restored`] puts them back after the table they followed.
-fn detached(item: &Item) -> Item {
-    let mut item = item.clone();
-    for_each_table(&mut item, &mut |table| {
-        if let Some(position) = table.position() {
-            table.set_position(Some(-position - 1));
-        }
-    });
-    item
-}
-
-/// `original` in place of `live`, keeping the live table's own position
-/// (see [`detached`]) and, by replacing in place, the live key's comments.
-fn replace_item(live: &mut Item, original: &Item) {
-    let position = live.as_table().and_then(Table::position);
-    *live = detached(original);
-    if let Some(table) = live.as_table_mut() {
-        table.set_position(position);
-    }
-}
-
-/// Every header table under `item`, depth first in toml_edit's print walk.
-fn for_each_table(item: &mut Item, visit: &mut dyn FnMut(&mut Table)) {
-    match item {
-        Item::Table(table) => {
-            if !table.is_dotted() {
-                visit(table);
-            }
-            for (_, child) in table.iter_mut() {
-                for_each_table(child, visit);
-            }
-        }
-        Item::ArrayOfTables(array) => {
-            for table in array.iter_mut() {
-                visit(table);
-                for (_, child) in table.iter_mut() {
-                    for_each_table(child, visit);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-#[derive(Clone, PartialEq)]
-enum Step {
-    Key(String),
-    Index(usize),
-}
-
-/// The path and position of every header table in `table`, in the order
-/// of [`for_each_table`].
-fn table_paths(table: &Table, path: &mut Vec<Step>, out: &mut Vec<(Vec<Step>, Option<isize>)>) {
-    if !table.is_dotted() {
-        out.push((path.clone(), table.position()));
-    }
-    for (key, item) in table.iter() {
-        match item {
-            Item::Table(child) => {
-                path.push(Step::Key(key.to_string()));
-                table_paths(child, path, out);
-                path.pop();
-            }
-            Item::ArrayOfTables(array) => {
-                for (index, child) in array.iter().enumerate() {
-                    path.push(Step::Key(key.to_string()));
-                    path.push(Step::Index(index));
-                    table_paths(child, path, out);
-                    path.truncate(path.len() - 2);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Renumbers `live`'s tables so each table restored from `original` (a
-/// negative mark, see [`detached`]) prints right after the live copy of
-/// the table it followed in `original`, keeping the original order among
-/// restored tables and the live order everywhere else.
-///
-/// The table a restored one followed is looked up by path, but only below
-/// the deepest array-of-tables element that holds the restored table and
-/// was not itself restored: element indices above it may differ between
-/// the two documents (a package the user added since vendoring), while
-/// the restore paired that element with its original.
-fn place_restored(live: &mut DocumentMut, original: &DocumentMut) {
-    let mut tables = Vec::new();
-    table_paths(live.as_table(), &mut Vec::new(), &mut tables);
-    if !tables
-        .iter()
-        .any(|(_, position)| position.is_some_and(|position| position < 0))
-    {
-        return;
-    }
-    let mut originals = Vec::new();
-    table_paths(original.as_table(), &mut Vec::new(), &mut originals);
-    let kept = |position: Option<isize>| position.is_none_or(|position| position >= 0);
-    // Where each kept table prints: its own position, or the one it
-    // inherits from the kept table before it.
-    let mut last = -1;
-    let effective: Vec<Option<isize>> = tables
-        .iter()
-        .map(|(_, position)| match position {
-            Some(position) if *position >= 0 => {
-                last = *position;
-                Some(last)
-            }
-            Some(_) => None,
-            None => Some(last),
-        })
-        .collect();
-    let printed_at = |prefix: &[Step], exact: bool| {
-        tables
-            .iter()
-            .zip(&effective)
-            .filter(|((path, position), _)| {
-                kept(*position)
-                    && if exact {
-                        path == prefix
-                    } else {
-                        path.starts_with(prefix)
-                    }
-            })
-            .filter_map(|(_, at)| *at)
-            .max()
-    };
-    let anchor = |live_path: &[Step], mark: isize| -> isize {
-        let recorded = -mark - 1;
-        let Some(original_path) = originals
-            .iter()
-            .find(|(_, position)| *position == Some(recorded))
-            .map(|(path, _)| path)
-        else {
-            return -1;
-        };
-        let scope = (1..=live_path.len())
-            .rev()
-            .filter(|&len| matches!(live_path[len - 1], Step::Index(_)))
-            .find(|&len| {
-                tables
-                    .iter()
-                    .any(|(path, position)| path == &live_path[..len] && kept(*position))
-            })
-            .unwrap_or(0);
-        let below = live_path.len() - scope;
-        if original_path.len() < below {
-            return -1;
-        }
-        let original_scope = &original_path[..original_path.len() - below];
-        let live_scope = &live_path[..scope];
-        let mut before: Vec<_> = originals
-            .iter()
-            .filter(|(path, position)| {
-                path.starts_with(original_scope)
-                    && position.is_some_and(|position| position < recorded)
-            })
-            .collect();
-        before.sort_by_key(|(_, position)| std::cmp::Reverse(*position));
-        for (path, _) in before {
-            let relative = &path[original_scope.len()..];
-            let ancestor = original_path.starts_with(path);
-            let unit = match relative
-                .iter()
-                .position(|step| matches!(step, Step::Index(_)))
-            {
-                Some(index) if !ancestor => &relative[..index],
-                _ => relative,
-            };
-            let target: Vec<Step> = live_scope.iter().chain(unit).cloned().collect();
-            if let Some(at) = printed_at(&target, ancestor) {
-                return at;
-            }
-        }
-        printed_at(live_scope, true).unwrap_or(-1)
-    };
-    let keys: Vec<Option<(isize, bool, isize)>> = tables
-        .iter()
-        .map(|(path, position)| {
-            position.map(|position| {
-                if position >= 0 {
-                    (position, false, 0)
-                } else {
-                    (anchor(path, position), true, -position - 1)
-                }
-            })
-        })
-        .collect();
-    let mut order: Vec<usize> = (0..tables.len()).filter(|&i| keys[i].is_some()).collect();
-    order.sort_by_key(|&i| keys[i]);
-    let mut renumbered = vec![None; tables.len()];
-    for (rank, index) in order.into_iter().enumerate() {
-        renumbered[index] = Some(rank as isize);
-    }
-    let mut index = 0;
-    for_each_table(live.as_item_mut(), &mut |table| {
-        if let Some(position) = renumbered[index] {
-            table.set_position(Some(position));
-        }
-        index += 1;
-    });
-}
-
 fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn TableLike) -> bool {
     let keys: BTreeSet<String> = original
         .iter()
@@ -866,10 +656,11 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
         }
         if equal_item(live.get(&key), after) {
             if let Some(before) = before {
+                // In place, so the live key keeps its comments.
                 match live.get_mut(&key) {
-                    Some(current) => replace_item(current, before),
+                    Some(current) => *current = before.clone(),
                     None => {
-                        live.insert(&key, detached(before));
+                        live.insert(&key, before.clone());
                     }
                 }
             } else {
@@ -896,6 +687,64 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
             _ => drifted = true,
         }
     }
+    drifted
+}
+
+/// [`restore_table`] on a header table, with the sub-tables of each key it
+/// put back printed where `original` had them: right after the key it
+/// followed. The copies carry their positions in the recorded text, which
+/// mean nothing among the live table's positions (#1623), so they drop
+/// them and print after the table before them in key order.
+fn restore_header_table(live: &mut Table, original: &dyn TableLike, new: &dyn TableLike) -> bool {
+    fn unplace(item: &mut Item) {
+        let tables: Vec<&mut Table> = match item {
+            Item::Table(table) => vec![table],
+            Item::ArrayOfTables(array) => array.iter_mut().collect(),
+            _ => return,
+        };
+        for table in tables {
+            table.set_position(None);
+            table.iter_mut().for_each(|(_, child)| unplace(child));
+        }
+    }
+    let present: BTreeSet<String> = live.iter().map(|(key, _)| key.to_string()).collect();
+    let drifted = restore_table(live, original, new);
+    let original_keys: Vec<String> = original.iter().map(|(key, _)| key.to_string()).collect();
+    let added: BTreeSet<&String> = original_keys
+        .iter()
+        .filter(|key| {
+            !present.contains(*key)
+                && live
+                    .get(key)
+                    .is_some_and(|item| item.is_table() || item.is_array_of_tables())
+        })
+        .collect();
+    if added.is_empty() {
+        return drifted;
+    }
+    for key in &added {
+        if let Some(item) = live.get_mut(key) {
+            unplace(item);
+        }
+    }
+    let mut order: Vec<String> = live
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .filter(|key| !added.contains(key))
+        .collect();
+    for (index, key) in original_keys.iter().enumerate() {
+        if !added.contains(key) {
+            continue;
+        }
+        let at = original_keys[..index]
+            .iter()
+            .rev()
+            .find_map(|previous| order.iter().position(|key| key == previous))
+            .map_or(0, |found| found + 1);
+        order.insert(at, key.clone());
+    }
+    let rank = |key: &toml_edit::Key| order.iter().position(|known| known == key.get());
+    live.sort_values_by(|left, _, right, _| rank(left).cmp(&rank(right)));
     drifted
 }
 
@@ -995,8 +844,15 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
         return false;
     }
     if item_text(live) == item_text(new) {
-        replace_item(live, original);
+        *live = original.clone();
         return false;
+    }
+    if let (Some(live), Some(original), Some(new)) = (
+        live.as_table_mut(),
+        original.as_table_like(),
+        new.as_table_like(),
+    ) {
+        return restore_header_table(live, original, new);
     }
     if let (Some(live), Some(original), Some(new)) = (
         live.as_table_like_mut(),
@@ -1044,7 +900,7 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
                 drifted = true;
                 continue;
             }
-            drifted |= restore_table(current, original[index], new[index]);
+            drifted |= restore_header_table(current, original[index], new[index]);
         }
         return drifted;
     }
@@ -1075,9 +931,6 @@ pub(crate) fn restore_document(
         .parse()
         .map_err(|error| format!("invalid vendored TOML: {error}"))?;
     let drifted = restore_item(live.as_item_mut(), original.as_item(), new.as_item());
-    if !drifted {
-        place_restored(&mut live, &original);
-    }
     Ok((
         if drifted {
             current_text
