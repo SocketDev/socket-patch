@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled pnpm bug-hunt routine (label pm:pnpm).
 
-Last updated: 2026-10-17 (run 47), main `657fce2`, latest release 5.0.1. (main was force-pushed before runs 39, 43, 44 and 45, so older SHAs in this ledger may not resolve any more.)
+Last updated: 2026-10-17 (run 48), main `657fce2`, latest release 5.0.1. (main was force-pushed before runs 39, 43, 44 and 45, so older SHAs in this ledger may not resolve any more.)
 
 Method: real pnpm installs. Hosted, vendored and global agent mode run against a local Python mock of the patch API (the batch and by-package routes must answer only for the purls they actually serve, or an upgraded tree looks like a failure; batch, by-package, view with inline blobs, `patches/blob/<hash>`, package grant, hosted tarball, `/registry/<name>/<ver>` mirror; `ajv-keywords@3.5.2` serves as the peer-dependency package). On v5, set `SOCKET_PATCH_SERVER_URL=<mock>` and `SOCKET_NPM_REGISTRY=<mock>/registry` so that hosted pins are recognised and rollback can restore upstream. The oracle is a marker prepended to `index.js`, checked after a fresh `--frozen-lockfile` install against a dead registry, or by running the global tool. The repo's pinned matrix (`.github/workflows/pnpm-compatibility.yml`) already covers plain hosted and vendored installs on pnpm 1–12. This ledger tracks what it doesn't.
 
@@ -510,9 +510,21 @@ Run 47 additions (main `657fce2`, release 5.0.1, Linux, Node 22.22.0; mock rebui
 
 #1619 isn't a regression: release 5.0.1 behaves the same. pnpm 12.0.0–12.12.1 record a scoped registry's `tarball:` unconditionally; 7–11 and 12.13+ don't; a non-scoped `registry=` mirror isn't recorded by 12.12.1.
 
+Run 48 additions (main `657fce2`, release 5.0.1, Linux, Node 22.22.0, Node 16.20.2 for pnpm 5/6; mock rebuilt: org patch API for `left-pad@1.3.0` and scoped `@sp/pad@1.0.0`, registry serving those plus unpatched `left-pad@1.2.0` and `sp-wrap@1.0.0` → `left-pad@1.3.0`):
+
+| pnpm | `install --fix-lockfile` / `--resolution-only` / `--lockfile-only` / `dedupe --check` after a hosted pin | Hosted scoped pin: `remove` (scoped / other) / takeover hosted → vendored → `rollback` / vendored-only rollback | Workspace, member a = left-pad 1.3.0, member b = 1.2.0: hosted / vendored fresh frozen + `--filter b` | Same workspace: vex + rollback (hosted / vendored / agent) | Concurrent scans: same cwd (hosted, vendored ×3) / root + member cwd | `resolution-mode=time-based` lock (`time:` block): hosted pin → dead-registry frozen → rollback | `npm:` alias + scoped package: hosted pin → frozen → rollback / agent apply → vex → rollback | Agent with hashed virtual store dirs (`virtual-store-dir-max-length=12`): direct / transitive (`sp-wrap`) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 5.18.10 (5.2) / 6.35.1 (5.3) / 7.33.7 (5.4) | — | — | — | — | — | — | pass / pass | — |
+| 8.15.9 (6.0) | — | — | — | — | — | pass | — / pass | — |
+| 9.15.9 | kept / dropped / kept / clean | — | pass / pass | pass (vex declines after plain install: documented) / pass / pass | — | pass | — | pass / pass |
+| 10.34.7 | kept / kept / kept / clean | — | pass / pass | — | — | pass | — | pass / pass |
+| 11.28.6 | dropped / dropped / kept / clean | — | pass / pass | — | — | n/a | — | pass / — |
+| 12.12.1 | — | **fail #1619** / as expected / **fail #1619** (2/2) / pass (2/2) | — | — | — | n/a | — | — |
+| 12.14.0 | dropped / n/a (flag removed) / kept / exit 1 (would dedupe) | pass / pass / pass / pass | pass / pass | pass / pass / pass | pass (`lock_held` for the loser) / documented refusals (`redirect_pnpm_lockfile_elsewhere`, `vendor_lockfile_missing`) | n/a | — | pass / pass |
+
 ## Backlog
 
-0ac. **#1619** (rollback drops scoped-registry `tarball:` on pnpm 12.0–12.12): re-verify once fixed on 12.0.0 / 12.12.1 and that 12.13+ stays bare; also `remove` and the hosted → vendored takeover restore over the same lock, and a Rush lock with `pnpmVersion` 12.12.
+0ac. **#1619** (rollback drops scoped-registry `tarball:` on pnpm 12.0–12.12): re-verify once fixed on 12.0.0 / 12.12.1 and that 12.13+ stays bare. Run 48 showed `remove` and the hosted → vendored takeover restore drop it too (commented). Still to do: a Rush lock with `pnpmVersion` 12.12.
 0ab. **#1597** (vendored pnpm ≥ 10.34.2 breaks build approvals for the `file:` tarball): re-verify once fixed on 10.34.7 / 11 / 12. Denials done in run 46 (12.11.2 breaks with `allowBuilds: false`, commented; 9/10/11 pass). Run 47 on 12.14.0: `allowBuilds: true` still fails (`ERR_PNPM_IGNORED_BUILDS`), an unscoped `sp-build: false` denial holds, and `false` + `dangerouslyAllowAllBuilds: true` (12.12.0 semantics) holds. Still to do: a transitive build package, a supersede (the uuid in an approval key changes), and the pnpm 10.34.2 changelog to cite the upstream change. Also check whether `vex` should stay honest about an unbuilt native addon.
 
 0w. #1460 is verified fixed (run 40, all 16 env × major cells). Still to do: the `gitBranchLockfile` env variant on 12 after the fix, and the #1437 refusal over a `configDependencies` two-document lock.
@@ -558,6 +570,7 @@ Run 47 additions (main `657fce2`, release 5.0.1, Linux, Node 22.22.0; mock rebui
 10. Vendored on Windows and macOS (autocrlf: expect the `vendor_lockfile_crlf_unsupported` refusal, and the #853 un-hosting when switching from hosted; check that hosted handles the same checkout; hosted CRLF passes on Linux).
 
 ## Known non-bugs
+- `pnpm install --fix-lockfile` re-resolves and drops hosted pins on pnpm 11 / 12 (9 / 10 keep them), like `pnpm dedupe` and `--resolution-only`. `pnpm 12 dedupe --check` then exits 1. That's upstream re-resolution (run 48).
 
 - pnpm 12.0.0–12.12.1 record `tarball:` for every scoped-registry package, and 12.13.0 stopped doing that (pnpm#16866). A lock that differs between those pnpm versions only in that field is pnpm's own behaviour. Only socket-patch's rollback dropping the field is a bug (#1619).
 
