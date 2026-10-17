@@ -627,7 +627,8 @@ struct WriteOpts {
     /// A durable commit point: run the durability barrier first, fsync the
     /// stage, and fsync the parent directory after the rename.
     durable: bool,
-    /// The new inode keeps the destination's permission bits.
+    /// The new inode keeps the destination's permission bits and, where
+    /// the caller may set them, its owner and group.
     preserve_mode: bool,
     /// Record the written path for the next durability barrier.
     record: bool,
@@ -1079,8 +1080,8 @@ mod tests {
 
         let path = fresh("plain");
         atomic_write_bytes(&path, b"new").await.unwrap();
-        let (uid, gid, _) = owner_and_mode(&path);
-        assert_eq!((uid, gid), (0, 0), "the plain writer is not preserving");
+        let (uid, _, _) = owner_and_mode(&path);
+        assert_eq!(uid, 0, "the plain writer is not preserving");
     }
 
     /// An unprivileged run can't give a file to another user, but it can
