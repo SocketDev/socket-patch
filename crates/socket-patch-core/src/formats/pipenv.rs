@@ -10,6 +10,8 @@ use std::ops::Range;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::utils::pep440;
+
 /// One `"name": value` member of a JSON object in the lock text.
 pub(crate) struct Property {
     pub(crate) name: String,
@@ -244,13 +246,9 @@ pub(crate) fn pins_another_release(entry: &Value, version: &str) -> bool {
         .get("version")
         .and_then(Value::as_str)
         .and_then(|pin| pin.strip_prefix("=="))
-        .is_some_and(|pinned| {
-            !pinned.is_empty()
-                && pinned != version
-                && pinned
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b".+-_!".contains(&byte))
-        })
+        // PEP 440-valid and unequal: `==1.16` is still the patched 1.16.0
+        // (a conflict for the caller), never a release to leave alone.
+        .is_some_and(|pinned| pep440::is_valid(pinned) && !pep440::versions_equal(pinned, version))
 }
 
 #[cfg(test)]
@@ -267,6 +265,8 @@ mod tests {
                 true,
             ),
             (json!({"version":"==1.16.0"}), false),
+            (json!({"version":"==1.16"}), false),
+            (json!({"version":"==v1.16.0"}), false),
             (json!({"version":"*"}), false),
             (json!({"version":"==1.*"}), false),
             (json!({"version":">=1.15"}), false),
