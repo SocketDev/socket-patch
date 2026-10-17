@@ -644,26 +644,18 @@ fn pair_changed(
 /// A copy of `item`, a part of the recorded text, to put into the live
 /// document. Parsed standard tables keep their position in the text they
 /// came from, and toml_edit prints tables in position order, so a recorded
-/// `[[packages.wheels]]` / `[packages.wheels.hashes]` table could print
-/// under a later `[[packages]]` header of the live document and re-parse
-/// as part of that package (#1623). Without a position, each table prints
-/// right after the one before it, i.e. inside the table it now sits in.
+/// `[[packages.wheels]]` / `[packages.wheels.hashes]` table would print
+/// among the live document's tables by its recorded number: under a later
+/// `[[packages]]` header, re-parsed as part of that package (#1623). The
+/// copy's tables carry their recorded position as a negative mark instead,
+/// and [`place_restored`] puts them back after the table they followed.
 fn detached(item: &Item) -> Item {
-    fn clear(table: &mut Table) {
-        table.set_position(None);
-        for (_, child) in table.iter_mut() {
-            clear_positions(child);
-        }
-    }
-    fn clear_positions(item: &mut Item) {
-        match item {
-            Item::Table(table) => clear(table),
-            Item::ArrayOfTables(array) => array.iter_mut().for_each(clear),
-            _ => {}
-        }
-    }
     let mut item = item.clone();
-    clear_positions(&mut item);
+    for_each_table(&mut item, &mut |table| {
+        if let Some(position) = table.position() {
+            table.set_position(Some(-position - 1));
+        }
+    });
     item
 }
 
@@ -675,6 +667,188 @@ fn replace_item(live: &mut Item, original: &Item) {
     if let Some(table) = live.as_table_mut() {
         table.set_position(position);
     }
+}
+
+/// Every header table under `item`, depth first in toml_edit's print walk.
+fn for_each_table(item: &mut Item, visit: &mut dyn FnMut(&mut Table)) {
+    match item {
+        Item::Table(table) => {
+            if !table.is_dotted() {
+                visit(table);
+            }
+            for (_, child) in table.iter_mut() {
+                for_each_table(child, visit);
+            }
+        }
+        Item::ArrayOfTables(array) => {
+            for table in array.iter_mut() {
+                visit(table);
+                for (_, child) in table.iter_mut() {
+                    for_each_table(child, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+/// The path and position of every header table in `table`, in the order
+/// of [`for_each_table`].
+fn table_paths(table: &Table, path: &mut Vec<Step>, out: &mut Vec<(Vec<Step>, Option<isize>)>) {
+    if !table.is_dotted() {
+        out.push((path.clone(), table.position()));
+    }
+    for (key, item) in table.iter() {
+        match item {
+            Item::Table(child) => {
+                path.push(Step::Key(key.to_string()));
+                table_paths(child, path, out);
+                path.pop();
+            }
+            Item::ArrayOfTables(array) => {
+                for (index, child) in array.iter().enumerate() {
+                    path.push(Step::Key(key.to_string()));
+                    path.push(Step::Index(index));
+                    table_paths(child, path, out);
+                    path.truncate(path.len() - 2);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Renumbers `live`'s tables so each table restored from `original` (a
+/// negative mark, see [`detached`]) prints right after the live copy of
+/// the table it followed in `original`, keeping the original order among
+/// restored tables and the live order everywhere else.
+///
+/// The table a restored one followed is looked up by path, but only below
+/// the deepest array-of-tables element that holds the restored table and
+/// was not itself restored: element indices above it may differ between
+/// the two documents (a package the user added since vendoring), while
+/// the restore paired that element with its original.
+fn place_restored(live: &mut DocumentMut, original: &DocumentMut) {
+    let mut tables = Vec::new();
+    table_paths(live.as_table(), &mut Vec::new(), &mut tables);
+    if !tables
+        .iter()
+        .any(|(_, position)| position.is_some_and(|position| position < 0))
+    {
+        return;
+    }
+    let mut originals = Vec::new();
+    table_paths(original.as_table(), &mut Vec::new(), &mut originals);
+    let kept = |position: Option<isize>| position.is_none_or(|position| position >= 0);
+    // Where each kept table prints: its own position, or the one it
+    // inherits from the kept table before it.
+    let mut last = -1;
+    let effective: Vec<Option<isize>> = tables
+        .iter()
+        .map(|(_, position)| match position {
+            Some(position) if *position >= 0 => {
+                last = *position;
+                Some(last)
+            }
+            Some(_) => None,
+            None => Some(last),
+        })
+        .collect();
+    let printed_at = |prefix: &[Step], exact: bool| {
+        tables
+            .iter()
+            .zip(&effective)
+            .filter(|((path, position), _)| {
+                kept(*position)
+                    && if exact {
+                        path == prefix
+                    } else {
+                        path.starts_with(prefix)
+                    }
+            })
+            .filter_map(|(_, at)| *at)
+            .max()
+    };
+    let anchor = |live_path: &[Step], mark: isize| -> isize {
+        let recorded = -mark - 1;
+        let Some(original_path) = originals
+            .iter()
+            .find(|(_, position)| *position == Some(recorded))
+            .map(|(path, _)| path)
+        else {
+            return -1;
+        };
+        let scope = (1..=live_path.len())
+            .rev()
+            .filter(|&len| matches!(live_path[len - 1], Step::Index(_)))
+            .find(|&len| {
+                tables
+                    .iter()
+                    .any(|(path, position)| path == &live_path[..len] && kept(*position))
+            })
+            .unwrap_or(0);
+        let below = live_path.len() - scope;
+        if original_path.len() < below {
+            return -1;
+        }
+        let original_scope = &original_path[..original_path.len() - below];
+        let live_scope = &live_path[..scope];
+        let mut before: Vec<_> = originals
+            .iter()
+            .filter(|(path, position)| {
+                path.starts_with(original_scope)
+                    && position.is_some_and(|position| position < recorded)
+            })
+            .collect();
+        before.sort_by_key(|(_, position)| std::cmp::Reverse(*position));
+        for (path, _) in before {
+            let relative = &path[original_scope.len()..];
+            let ancestor = original_path.starts_with(path);
+            let unit = match relative
+                .iter()
+                .position(|step| matches!(step, Step::Index(_)))
+            {
+                Some(index) if !ancestor => &relative[..index],
+                _ => relative,
+            };
+            let target: Vec<Step> = live_scope.iter().chain(unit).cloned().collect();
+            if let Some(at) = printed_at(&target, ancestor) {
+                return at;
+            }
+        }
+        printed_at(live_scope, true).unwrap_or(-1)
+    };
+    let keys: Vec<Option<(isize, bool, isize)>> = tables
+        .iter()
+        .map(|(path, position)| {
+            position.map(|position| {
+                if position >= 0 {
+                    (position, false, 0)
+                } else {
+                    (anchor(path, position), true, -position - 1)
+                }
+            })
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..tables.len()).filter(|&i| keys[i].is_some()).collect();
+    order.sort_by_key(|&i| keys[i]);
+    let mut renumbered = vec![None; tables.len()];
+    for (rank, index) in order.into_iter().enumerate() {
+        renumbered[index] = Some(rank as isize);
+    }
+    let mut index = 0;
+    for_each_table(live.as_item_mut(), &mut |table| {
+        if let Some(position) = renumbered[index] {
+            table.set_position(Some(position));
+        }
+        index += 1;
+    });
 }
 
 fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn TableLike) -> bool {
@@ -901,6 +1075,9 @@ pub(crate) fn restore_document(
         .parse()
         .map_err(|error| format!("invalid vendored TOML: {error}"))?;
     let drifted = restore_item(live.as_item_mut(), original.as_item(), new.as_item());
+    if !drifted {
+        place_restored(&mut live, &original);
+    }
     Ok((
         if drifted {
             current_text
@@ -1705,6 +1882,77 @@ mod tests {
         let (restored, drifted) = restore_document(&first_only, PIP_LOCK, &first).unwrap();
         assert!(!drifted);
         assert_eq!(restored, PIP_LOCK);
+    }
+
+    /// #1623: restored tables go back between the live tables they sat
+    /// between, not after every other sub-table of their package.
+    #[test]
+    fn pip_lock_wheel_tables_revert_before_later_sub_tables() {
+        const PIP_LOCK: &str = "lock-version = \"1.0\"\n\n[[packages]]\nname = \"idna\"\nversion = \"3.7\"\n\n[[packages.wheels]]\nname = \"idna-3.7-py3-none-any.whl\"\nurl = \"https://example.test/idna.whl\"\n\n[packages.wheels.hashes]\nsha256 = \"idna\"\n\n[[packages.attestation-identities]]\nkind = \"GitHub\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n\n[[packages.wheels]]\nname = \"six-1.16.0-py2.py3-none-any.whl\"\nurl = \"https://example.test/six.whl\"\n\n[packages.wheels.hashes]\nsha256 = \"six\"\n\n[packages.tool.pdm]\ngroups = [\"default\"]\n";
+        let first = rewrite_python_lock(
+            PIP_LOCK,
+            "idna",
+            "3.7",
+            ArtifactSource::Path(".socket/vendor/pypi/a/idna-3.7-py3-none-any.whl"),
+            "first",
+        )
+        .unwrap()
+        .unwrap();
+        let both = rewrite_python_lock(
+            &first,
+            "six",
+            "1.16.0",
+            ArtifactSource::Path(".socket/vendor/pypi/b/six-1.16.0-py2.py3-none-any.whl"),
+            "second",
+        )
+        .unwrap()
+        .unwrap();
+        let (six_only, drifted) = restore_document(&both, PIP_LOCK, &first).unwrap();
+        assert!(!drifted, "{six_only}");
+        let (restored, drifted) = restore_document(&six_only, &first, &both).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, PIP_LOCK);
+        // A package the user added in front since vendoring shifts every
+        // element index; the wheels still go back under their own package.
+        let added = "[[packages]]\nname = \"certifi\"\nversion = \"1\"\n\n[[packages.wheels]]\nname = \"certifi-1-py3-none-any.whl\"\n\n";
+        let at = |text: &str| text.find("[[packages]]").unwrap();
+        let mut live = both.clone();
+        live.insert_str(at(&both), added);
+        let (restored, drifted) = restore_document(&live, PIP_LOCK, &first).unwrap();
+        assert!(!drifted, "{restored}");
+        let mut expected = six_only.clone();
+        expected.insert_str(at(&six_only), added);
+        assert_eq!(restored, expected);
+    }
+
+    /// A table restored whole keeps its sub-tables where the original
+    /// printed them, even after a sibling table the user edited.
+    #[test]
+    fn whole_table_restore_keeps_original_sub_table_order() {
+        let original = "[project]\nname = \"app\"\n\n[tool.uv]\npackage = false\n\n[tool.ruff]\nline-length = 88\n\n[tool.uv.sources]\nsix = { index = \"internal\" }\n";
+        let new = original.replace(
+            "six = { index = \"internal\" }",
+            "six = { path = \".socket/vendor/pypi/u/six.whl\" }",
+        );
+        let live = new.replace("line-length = 88", "line-length = 100");
+        let (restored, drifted) = restore_document(&live, original, &new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(
+            restored,
+            original.replace("line-length = 88", "line-length = 100")
+        );
+    }
+
+    /// A live file that differs from the vendored text only in line endings
+    /// restores to the original layout, in the live line endings.
+    #[test]
+    fn crlf_checkout_restores_out_of_order_tables_in_place() {
+        let original = "[a]\nx = 1\n\n[b]\ny = 1\n\n[a.c]\nz = 1\n";
+        let new = original.replace("z = 1", "z = 2");
+        let live = new.replace('\n', "\r\n");
+        let (restored, drifted) = restore_document(&live, original, &new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, original.replace('\n', "\r\n"));
     }
 
     #[test]
