@@ -393,6 +393,14 @@ async fn restore_lock(
                 "`uv pip compile --config-file` read settings that may filter which release \
                  files the lock records, and that file is not derivable from the lock",
             );
+        } else if env_set("UV_CONFIG_FILE") {
+            // The header never records uv's environment; one set here is
+            // the best evidence of the one `uv pip compile` ran in.
+            return refuse_hits(
+                result,
+                "`UV_CONFIG_FILE` is set, and settings read from it may filter which release \
+                 files `uv pip compile` records",
+            );
         } else {
             let project = match pip_settings(view, rel).await {
                 Ok(settings) => settings,
@@ -408,6 +416,8 @@ async fn restore_lock(
         for hit in &hits {
             let why = if let Some(flag) = compile_filter(&command, &hit.name) {
                 format!("`uv pip compile {flag}` filters")
+            } else if env_set("UV_EXCLUDE_NEWER") {
+                "the `UV_EXCLUDE_NEWER` cutoff set in this environment filters".to_string()
             } else if let Some((path, key)) = settings_filter(&settings, &hit.name) {
                 format!("{path}'s uv `{key}` setting filters")
             } else {
@@ -658,6 +668,11 @@ fn pip_compiled(doc: &DocumentMut, text: &str, shape: &Shape) -> bool {
         // No header, or one `UV_CUSTOM_COMPILE_COMMAND` replaced.
         _ => !shape.index,
     }
+}
+
+/// Whether the uv environment variable `name` is set to a value.
+fn env_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
 }
 
 /// Whether a header command line is `uv pip compile`'s. uv records global
