@@ -99,6 +99,25 @@ pub(crate) fn terminator(text: &str) -> &'static str {
     }
 }
 
+/// `text`'s physical lines as `(content, ending)`, ending ∈ {`"\r\n"`,
+/// `"\n"`, `""`} (`""` only for an unterminated last line); an empty text
+/// has no lines. Indexed like `str::lines()`. For the writers that keep
+/// each line's own ending, so a file mixing CRLF and LF comes back with
+/// every line they leave alone byte for byte.
+pub(crate) fn split_lines(text: &str) -> Vec<(&str, &'static str)> {
+    text.split_inclusive('\n')
+        .map(|seg| {
+            if let Some(content) = seg.strip_suffix("\r\n") {
+                (content, "\r\n")
+            } else if let Some(content) = seg.strip_suffix('\n') {
+                (content, "\n")
+            } else {
+                (seg, "")
+            }
+        })
+        .collect()
+}
+
 /// `text` with every line break spelled `nl` (`"\r\n"` or `"\n"`):
 /// existing `\r\n` pairs are folded first, so the result never holds
 /// `\r\r\n`. How a writer spells a recorded fragment in the
