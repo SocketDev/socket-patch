@@ -1119,6 +1119,120 @@ async fn yarn_berry_node_modules_linker_apply_patches_file() {
 }
 
 // ---------------------------------------------------------------------------
+// npm workspace members named like build dirs (hand-built npm layout)
+// ---------------------------------------------------------------------------
+
+/// The layout `npm install` writes for the #1627 repro: the root pins
+/// `ms@2.1.3` and the members `packages/app` and `packages/build` (or
+/// `dist`, ...) each need `ms@2.0.0`, which npm can't hoist and installs
+/// into each member's own `node_modules`. Returns the two member copies'
+/// `index.js`, the patched bytes and the record hashes.
+fn stage_skip_dir_member_workspace(
+    root: &Path,
+    member: &str,
+) -> (PathBuf, PathBuf, Vec<u8>, String, String) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","version":"1.0.0","private":true,"workspaces":["packages/*"],"dependencies":{"ms":"2.1.3"}}"#,
+    )
+    .unwrap();
+    let stage_ms = |nm: PathBuf, version: &str| {
+        let dir = nm.join("ms");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"ms","version":"{version}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("index.js"),
+            format!("module.exports = '{version}';\n"),
+        )
+        .unwrap();
+        dir.join("index.js")
+    };
+    stage_ms(root.join("node_modules"), "2.1.3");
+    let mut copies = Vec::new();
+    for name in ["app", member] {
+        let dir = root.join("packages").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"1.0.0","dependencies":{{"ms":"2.0.0"}}}}"#),
+        )
+        .unwrap();
+        copies.push(stage_ms(dir.join("node_modules"), "2.0.0"));
+    }
+    let original = std::fs::read(&copies[0]).unwrap();
+    let before_hash = git_sha256(&original);
+    let mut patched = original;
+    patched.extend_from_slice(b"// socket-patched\n");
+    let after_hash = git_sha256(&patched);
+    let socket = root.join(".socket");
+    write_manifest(&socket, "pkg:npm/ms@2.0.0", &before_hash, &after_hash);
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(socket.join("blobs").join(&after_hash), &patched).unwrap();
+    let member_copy = copies.pop().unwrap();
+    (
+        copies.pop().unwrap(),
+        member_copy,
+        patched,
+        before_hash,
+        after_hash,
+    )
+}
+
+/// #1627: agent-mode apply patches the nested copy of a declared workspace
+/// member whose directory is named `build`, `dist`, `vendor`, `tmp`, `temp`
+/// or `coverage`, not just the other members' copies.
+#[tokio::test]
+#[serial]
+async fn apply_patches_workspace_member_named_like_a_build_dir() {
+    for member in ["build", "dist", "vendor", "tmp", "temp", "coverage"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app_copy, member_copy, patched, before_hash, after_hash) =
+            stage_skip_dir_member_workspace(tmp.path(), member);
+
+        let code = apply_run(default_apply(tmp.path())).await;
+        assert_eq!(code, 0, "apply (member packages/{member})");
+        assert_patched(&app_copy, &patched, &before_hash, &after_hash);
+        assert_patched(&member_copy, &patched, &before_hash, &after_hash);
+    }
+}
+
+/// #1627: with only the other member's copy patched, `apply --check`
+/// reports the `packages/build` copy as drift (exit 1) and its embedded
+/// VEX attests nothing as `not_affected`.
+#[tokio::test]
+#[serial]
+async fn apply_check_and_vex_see_unpatched_member_named_like_a_build_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app_copy, member_copy, patched, _, _) =
+        stage_skip_dir_member_workspace(tmp.path(), "build");
+    std::fs::write(&app_copy, &patched).unwrap();
+    assert_ne!(std::fs::read(&member_copy).unwrap(), patched);
+
+    let vex_path = tmp.path().join("vex.json");
+    let mut args = default_apply(tmp.path());
+    args.check = true;
+    args.vex = socket_patch_cli::commands::vex::VexEmbedArgs {
+        vex: Some(vex_path.clone()),
+        vex_product: Some("pkg:npm/root@1.0.0".to_string()),
+        ..Default::default()
+    };
+    let code = apply_run(args).await;
+    assert_eq!(
+        code, 1,
+        "apply --check must report the unpatched member copy"
+    );
+    let vex = std::fs::read_to_string(&vex_path).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "VEX must not attest not_affected while packages/build's copy is unpatched:\n{vex}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Rush pnpm symlink farm (hand-built, no real installer)
 // ---------------------------------------------------------------------------
 

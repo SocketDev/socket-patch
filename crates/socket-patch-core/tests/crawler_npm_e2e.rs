@@ -848,6 +848,104 @@ async fn crawl_all_recurses_into_workspace_packages() {
     );
 }
 
+/// Stage a workspace member at `rel` (its `package.json` plus a nested
+/// dependency npm could not hoist, named after the member so `crawl_all`,
+/// which reports each name@version once, lists every copy).
+async fn stage_member(root: &Path, rel: &str) -> PathBuf {
+    let dir = root.join(rel);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let name = rel.replace('/', "-");
+    tokio::fs::write(
+        dir.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"1.0.0","dependencies":{{"dep-{name}":"2.0.0"}}}}"#),
+    )
+    .await
+    .unwrap();
+    let dep = format!("dep-{name}");
+    stage_npm_pkg(&dir.join("node_modules"), &dep, "2.0.0").await;
+    dir.join("node_modules").join(dep)
+}
+
+/// #1627: a declared `workspaces` member whose directory carries a
+/// SKIP_DIRS name (`build`, `dist`, `vendor`, ...) is still crawled: npm,
+/// yarn and Bun install its unhoistable deps into `<member>/node_modules`
+/// from the root lock. Each member layout the report lists is covered,
+/// plus a literal pattern, a brace pattern and the `{packages: [...]}`
+/// field shape.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_finds_declared_members_with_skip_dir_names() {
+    for (workspaces, members) in [
+        (
+            r#"["packages/*"]"#,
+            &["packages/build", "packages/dist", "packages/lib"][..],
+        ),
+        (r#"["vendor/*"]"#, &["vendor/lib"][..]),
+        (r#"["tools/build"]"#, &["tools/build"][..]),
+        (r#"["{tools,apps}/*"]"#, &["tools/coverage", "apps/tmp"][..]),
+        (
+            r#"{"packages":["packages/**"]}"#,
+            &["packages/temp/inner"][..],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"root","private":true,"workspaces":{workspaces}}}"#),
+        )
+        .await
+        .unwrap();
+        stage_npm_pkg(&root.join("node_modules"), "ms", "2.1.3").await;
+        let mut expected = vec![root.join("node_modules").join("ms")];
+        for member in members {
+            expected.push(stage_member(root, member).await);
+        }
+
+        let result = NpmCrawler.crawl_all(&options_at(root)).await;
+        let mut got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "workspaces {workspaces}");
+    }
+}
+
+/// #1627 control: the name-based prune still holds for a `build` / `dist`
+/// dir no `workspaces` pattern declares, for a declared dir without a
+/// `package.json` (no package manager calls it a member).
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_still_skips_undeclared_skip_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    tokio::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*","build/*"]}"#,
+    )
+    .await
+    .unwrap();
+    // Undeclared: `dist` at the root and `packages/x/build` below a member.
+    stage_npm_pkg(
+        &root.join("dist").join("node_modules"),
+        "not-root-dist",
+        "1.0",
+    )
+    .await;
+    let member = stage_member(root, "packages/x").await;
+    stage_npm_pkg(
+        &root.join("packages/x/build/node_modules"),
+        "not-member-build",
+        "1.0",
+    )
+    .await;
+    // Declared by `build/*` but no package.json.
+    stage_npm_pkg(&root.join("build/out/node_modules"), "not-a-member", "1.0").await;
+
+    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+    assert_eq!(got, vec![member]);
+}
+
 #[tokio::test]
 #[serial_test::parallel]
 async fn crawl_all_skips_hidden_and_skip_dirs() {
