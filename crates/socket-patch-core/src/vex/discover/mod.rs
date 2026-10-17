@@ -464,14 +464,34 @@ pub struct ResolvedElsewhere {
 
 impl ResolvedElsewhere {
     /// Whether this entry resolves the canonical base `purl`: the same
-    /// `name@version`, or any version of `name` for a versionless entry.
+    /// `name@version` (a PyPI version under PEP 440 equality, so a
+    /// hand-written `==1.2.3.0` or `==v1.2.3` resolves `1.2.3`, #1602), or
+    /// any version of `name` for a versionless entry.
     fn covers(&self, purl: &str) -> bool {
-        self.purl == purl || purl_without_version(purl) == Some(self.purl.as_str())
+        self.purl == purl
+            || purl_without_version(purl) == Some(self.purl.as_str())
+            || same_pypi_release(&self.purl, purl)
     }
 
     /// Whether the entry names no version, so may resolve any.
     fn any_version(&self) -> bool {
         purl_without_version(&self.purl).is_none()
+    }
+}
+
+/// Whether canonical bases `a` and `b` name one PyPI release under PEP 440
+/// equality (`@1.16`, `@1.16.0.0` and `@v1.16.0` are `@1.16.0`). An
+/// arbitrary-equality `===` pin is read the same way: pip compares it as a
+/// string, so this may contest a wiring it can't install, never miss one.
+fn same_pypi_release(a: &str, b: &str) -> bool {
+    if !a.starts_with("pkg:pypi/") {
+        return false;
+    }
+    match (a.rsplit_once('@'), b.rsplit_once('@')) {
+        (Some((name_a, version_a)), Some((name_b, version_b))) => {
+            name_a == name_b && crate::utils::pep440::versions_equal(version_a, version_b)
+        }
+        _ => false,
     }
 }
 

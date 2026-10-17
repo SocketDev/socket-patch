@@ -118,7 +118,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::sha256_hex;
 use crate::utils::hatch::dependency_specs;
 use crate::utils::requirements::{
-    exact_pin, hash_options, logical_lines, split_comment, url_sha256_fragment, vendor_tag,
+    hash_options, logical_lines, parse_requirement, split_comment, url_sha256_fragment, vendor_tag,
 };
 use crate::vendor::common::DeclTable;
 use crate::vendor::lock_inventory::pypi::{hosted_artifact_url, parse_pipfile_lock};
@@ -342,11 +342,20 @@ fn egg_name(location: &str) -> Option<&str> {
     Some(&egg[..end]).filter(|name| !name.is_empty())
 }
 
-/// The `pypi_purl` of an exact `name[extras]==X` registry requirement
-/// ([`exact_pin`]).
+/// The `pypi_purl` of a registry requirement that can only install one
+/// release: an exact `name[extras]==X` pin in any PEP 440 spelling
+/// (`==1.16.0.0`, `==v1.16.0`), or an arbitrary-equality `name===X`. The
+/// version stays as spelled; the contest compares it under PEP 440 equality
+/// (`ResolvedElsewhere::covers`), the way pip resolves the pin (#1602).
+/// Ranges and wildcards (`~=1.16.0`, `==1.16.*`) are not read: what they
+/// install depends on the index.
 fn registry_pin(code: &str) -> Option<String> {
-    let (name, version) = exact_pin(code)?;
-    pypi_purl(name, version)
+    let requirement = parse_requirement(code)?;
+    let version = requirement
+        .exact_version()
+        .filter(|version| crate::utils::pep440::is_valid(version))
+        .or_else(|| requirement.arbitrary_version())?;
+    pypi_purl(requirement.name, version)
 }
 
 /// The `(declared name, location)` of a requirement that names an artifact:
@@ -1767,6 +1776,61 @@ mod tests {
             let alone = Project::new();
             alone.write(wired.0, &wired.1);
             assert_eq!(alone.discover().await.refs.len(), 1, "{name} alone");
+        }
+    }
+
+    /// REGRESSION (#1602): pip installs the upstream release for every
+    /// spelling of a pin that can only select it (`===X`, a PEP 440-equal
+    /// `==X.0` or `==vX`, a shorter `==1.16`), so each contests another
+    /// lock's wiring of that release like the canonical `==X` does. A pin
+    /// of another release, a range or a wildcard contests nothing.
+    #[tokio::test]
+    async fn issue_1602_requirements_pin_spellings_contest_wiring() {
+        const WHL: &str = "six-1.16.0-py2.py3-none-any.whl";
+        let vendored = vendored_wheel(UUID_A, WHL);
+        let wired = pipfile_lock(serde_json::json!({ "default": {
+            "six": { "file": format!("./{vendored}"), "hashes": [format!("sha256:{SHA}")] },
+        }}));
+        let discover = |requirements: &'static str| {
+            let wired = wired.clone();
+            async move {
+                let p = Project::new();
+                p.write("Pipfile.lock", &wired)
+                    .write("Pipfile", "[packages]\nsix = \"*\"\n")
+                    .write("requirements.txt", requirements);
+                p.discover().await
+            }
+        };
+        for line in [
+            "six==1.16.0\n",
+            "six===1.16.0\n",
+            "six==1.16.0.0\n",
+            "six==v1.16.0\n",
+            "six==1.16\n",
+            "Six == V1.16.0.0 ; python_version >= \"3\"\n",
+            "six[extra]===1.16.0 --hash=sha256:abc\n",
+        ] {
+            let out = discover(line).await;
+            assert!(out.refs.is_empty(), "{line:?}: {:#?}", out.refs);
+            let c = out
+                .vendored_contest("pkg:pypi/six@1.16.0", UUID_A)
+                .unwrap_or_else(|| panic!("{line:?}: not contested"));
+            assert_eq!(
+                c.other,
+                std::path::Path::new("requirements.txt"),
+                "{line:?}"
+            );
+        }
+        for line in [
+            "six==1.16.1\n",
+            "six==1.16.0.1\n",
+            "six~=1.16.0\n",
+            "six==1.16.*\n",
+            "six===1.16.1\n",
+            "other==1.16.0\n",
+        ] {
+            let out = discover(line).await;
+            assert_eq!(out.refs.len(), 1, "{line:?}: {:#?}", out.diagnostics);
         }
     }
 
