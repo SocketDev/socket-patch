@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Poetry bug-hunt routine (label pm:poetry).
 
-Last updated: 2026-10-17 (run 27), main `657fce2`, latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–27 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503, #1527 and #1547 are closed. Open: #450, #1615 (and #1589, filed by the uv routine, with Poetry evidence). macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
+Last updated: 2026-10-17 (run 28), main `7d3086f` (only a CI change since `657fce2`), latest release **v5.0.1**. Run 9 re-measured the cells marked "r9". Runs 10–28 have their own tables below. #327, #329, #671, #866, #945, #1023, #1024, #1136, #1282, #1447, #1503, #1527 and #1547 are closed. Open: #450, #1615, #1635 (and #1589, filed by the uv routine, with Poetry evidence). macOS / Windows cells that still show #327 / #329 haven't been re-run, because probe branches are blocked.
 
 ## Coverage matrix
 
@@ -353,10 +353,24 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 | 1.8.5, 2.5.1 | Hosted / vendored, then `poetry add --lock attrs`, fresh install, vex | pass (wiring and patched `files` hash kept) |
 | macOS / Windows | anything | blocked: deleting `bughunt/poetry/*` still denied (run 27 retried once), so no probes pushed |
 
+### Run 28 cells (Linux, main `7d3086f`)
+
+| Poetry | Cell | Result |
+| --- | --- | --- |
+| 1.8.5 `priority = "secondary"`, 1.1.15 `secondary = true`, 2.5.1 `PyPI` + mirror both primary | Hosted and vendored scan, fresh install, vex, rollback (six from PyPI) | pass 6/6 |
+| 1.8.5 `priority = "default"`, 1.1.15 `default = true` (PyPI mirror) | Hosted / vendored | refused before writing (documented user-authored source) |
+| 2.5.1 | Lock mode 0640 kept by hosted / vendored scan + rollback | pass |
+| 2.5.1, 1.8.5 | Root-run hosted / vendored scan + rollback on a uid-1000 project | **fail #1635** (lock becomes 0:0, owner's `poetry add --lock` gets EACCES; v5.0.1 too) |
+| 2.5.1 | Non-root hosted scan in a shared-group checkout | **fail #1635** (group lost) |
+| 2.5.1 | Agent scan as root over a uid-1000 venv | pass (owner kept) |
+| 1.3.2 → 1.8.5 | Vendored, relock (lock 2.0 → 2.0), `vendor --revert` | fail #1615 (commented) |
+| macOS / Windows | anything | blocked (deleting `bughunt/poetry/*` still denied) |
+
 ## Backlog
 
-1. Re-check #1615, #1589, #450, #1105 and #1184 once fixed.
-2. #1615: 1.3 → 1.8 (lock 2.0 writers) re-render differences (the 1.1 → 1.8 / 2.x path was confirmed in run 27).
+1. Re-check #1635, #1615, #1589, #450, #1105 and #1184 once fixed.
+1a. #1635 follow-up: a root vendored run leaves a root-owned `.socket/vendor` tree; check the owner's later `vendor --revert` / `rollback`.
+2. #1615: done for 1.1 → 1.8 / 2.x (r27) and 1.3 → 1.8 within lock 2.0 (r28). Remaining: 1.8 → 2.0–2.2.
 3. **Lead (run 24):** Poetry 2 `[tool.poetry.requires-plugins]` installs plugins (and their deps) into `<project>/.poetry/plugins`, which no mode crawls. Needs a maintainer call on scope.
 4. **Lead (run 14):** with `virtualenvs.create = false`, the project global fallback patches the system interpreter's dpkg-owned copy (follows #538's "patch every copy"); a maintainer call before filing.
 5. Untested Linux cells: hosted VEX with an undiscovered venv on 1.2.2 (needs `--prerelease=allow` + `cleo==1.0.0a5`).
@@ -366,6 +380,8 @@ Mock serves eight packages (six, toml, idna, attrs, packaging, certifi, urllib3,
 9. Docs: `installer.modern-installation = false` (Poetry 1.4–1.8) keeps a warm same-version install, but the "Installer boundaries" table says 1.4–1.8 replace it. Line 24 still says CRLF / legacy `files` get a single-line inline array (changed by #1185). CLI_CONTRACT's `mode_ambiguous` row still names only agent + vendored state.
 
 ## Known non-bugs
+
+- A PyPI mirror as the `default = true` (1.x) / `priority = "default"` (1.5–1.8) source gives six a `[package.source] legacy`, so hosted and vendored refuse it before writing. Documented user-authored-source refusal (r28). `secondary` sources that don't serve six work in both modes.
 
 - Hosted `vex` attests from the lock when Poetry's venv lives where socket-patch can't see it (for example a `POETRY_CACHE_DIR` exported only to Poetry); with the same env discoverable it refuses with `redirect_pypi_stale_install`. That's the documented lock-only behaviour (r27).
 - `poetry add --lock <other>` on Poetry 1.8.5 / 2.5.1 keeps the hosted / vendored six source and its `files` hash (r27); it's not one of the documented relock commands that drop it.
