@@ -937,7 +937,7 @@ async fn crawl_all_finds_skip_dir_members_of_a_nested_workspace() {
 }
 
 /// #1627: the member walk keeps the walk's other rules. A member inside a
-/// tagged cache dir stays pruned, and a pattern that spells a member dir
+/// tagged cache dir stays pruned (through a glob or a literal pattern), and a pattern that spells a member dir
 /// in another case than the disk (`packages/build` for `packages/Build`,
 /// which the walk does not prune) lists its copy once.
 #[tokio::test]
@@ -947,11 +947,12 @@ async fn crawl_all_member_walk_keeps_the_walk_rules() {
     let root = tmp.path();
     tokio::fs::write(
         root.join("package.json"),
-        r#"{"name":"root","private":true,"workspaces":["cache/*/*","packages/build"]}"#,
+        r#"{"name":"root","private":true,"workspaces":["cache/*/*","cache/build/lit","packages/build"]}"#,
     )
     .await
     .unwrap();
     stage_member(root, "cache/build/pkg").await;
+    stage_member(root, "cache/build/lit").await;
     tokio::fs::write(
         root.join("cache").join("CACHEDIR.TAG"),
         "Signature: 8a477f597d28d172789f06886806bc55\n",
@@ -959,6 +960,33 @@ async fn crawl_all_member_walk_keeps_the_walk_rules() {
     .await
     .unwrap();
     let member = stage_member(root, "packages/Build").await;
+
+    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+    assert_eq!(got, vec![member]);
+}
+
+/// #1627: a tagged scan root is still crawled (as the walk crawls it), so
+/// its skip-named members are found through a pattern that starts with a
+/// glob too.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_finds_members_of_a_tagged_scan_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    tokio::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["{apps,packages}/*"]}"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        root.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .await
+    .unwrap();
+    let member = stage_member(root, "apps/build").await;
 
     let result = NpmCrawler.crawl_all(&options_at(root)).await;
     let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();

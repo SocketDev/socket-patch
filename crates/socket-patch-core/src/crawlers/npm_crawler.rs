@@ -102,7 +102,8 @@ pub(super) fn skipped_workspace_member_roots(
 /// pattern is walked from its literal prefix to the depth its segments
 /// allow (any depth for `**`, within [`WORKSPACE_GLOB_DIR_BUDGET`] dirs per
 /// pattern), with the walk's own rules: real dirs only (never a symlink),
-/// never a hidden dir, a `node_modules` or a tagged cache dir. Names are
+/// never a hidden dir, a `node_modules` or a tagged cache dir below the
+/// root, literal prefix included. Names are
 /// read from the listings, so the [`SKIP_DIRS`] test sees each dir as the
 /// walk does even when a pattern spells it in another case.
 fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
@@ -155,6 +156,10 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
             };
             dir.push(&entry.name);
             rel.push(entry.name_str.clone());
+            if is_tagged_cache_dir(&dir, &list_dir_sync(&dir)) {
+                reachable = false;
+                break;
+            }
         }
         if !reachable {
             continue;
@@ -169,7 +174,10 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
         let mut stack = vec![(dir, rel, 0usize)];
         while let Some((dir, rel, depth)) = stack.pop() {
             let listing = list_dir_sync(&dir);
-            if is_tagged_cache_dir(&dir, &listing) {
+            // The workspace root itself is exempt, as the walk always
+            // crawls the scan root (and never reaches a nested project
+            // inside a tagged dir).
+            if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
                 continue;
             }
             if rel.iter().any(|seg| SKIP_DIRS.contains(&seg.as_str()))
