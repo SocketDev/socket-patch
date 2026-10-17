@@ -116,7 +116,8 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   releases the repointed entry makes `uv sync --locked` fail (`--frozen` and
   a plain `uv sync` still install the patch; the plain sync rewrites the
   entry back). The CLI cannot tell those binaries apart from the lock, so the
-  repoint emits the advisory `pypi_uv_constraints_require_uv_0_5_6`. The
+  repoint emits the advisory `pypi_uv_constraints_require_uv_0_5_6`
+  (hosted: `redirect_uv_constraints_require_uv_0_5_6`). The
   project-variant lane below exercises both shapes. Measured with the real
   0.5.4 and 0.5.5 binaries (`scripts/uv-vex-matrix.sh`): 0.5.4 still rejects
   the repointed entry under `--locked`, 0.5.5 accepts it — the effective
@@ -130,7 +131,8 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   but a plain `uv sync` re-resolves the override against the registry and
   reinstalls the pristine wheel (and rewrites the lock). The CLI cannot tell
   those binaries apart from the lock, so the override branch emits the
-  advisory warning `pypi_uv_override_requires_uv_0_5_6` instead of refusing.
+  advisory warning `pypi_uv_override_requires_uv_0_5_6` (hosted:
+  `redirect_uv_override_requires_uv_0_5_6`, #1569) instead of refusing.
   Measured with the real binaries: 0.5.4 still re-resolves the override,
   0.5.5 already keeps it (effective boundary 0.5.5). When the environment
   already holds the patched install (a `--frozen` sync ran first), 0.2.37 –

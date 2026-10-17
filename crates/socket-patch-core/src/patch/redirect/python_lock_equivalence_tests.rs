@@ -457,6 +457,8 @@ fn single_parse_uv_rewrite_matches_golden() {
         "redirect_uv_project_unsupported",
         "redirect_uv_script_unsupported",
         "redirect_uv_script_missing",
+        "redirect_uv_override_requires_uv_0_5_6",
+        "redirect_uv_constraints_require_uv_0_5_6",
     ] {
         assert!(codes.contains(code), "no case reached {code}: {codes:?}");
     }
