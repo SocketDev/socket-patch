@@ -751,21 +751,30 @@ pub(crate) const BUILD_STEPS_UNSUPPORTED: &str = "vendor_vlt_build_scripts_unsup
 pub(crate) const BINDING_GYP: &str = "binding.gyp";
 
 /// What `vlt build` runs in a package's own directory: its `preinstall`,
-/// `install`, `postinstall` and `prepare` scripts, and node-gyp for a
-/// `binding.gyp`. vlt builds a registry copy in the untracked store, but a
-/// vendored `file:` dependency in place, inside the committed artifact.
+/// `install` and `postinstall` scripts, its `preprepare`, `prepare` and
+/// `postprepare` scripts (each on its own, as vlt's `nodeNeedsBuild` checks
+/// them for a `file:` node), and node-gyp for a `binding.gyp`. vlt builds a
+/// registry copy in the untracked store, but a vendored `file:` dependency
+/// in place, inside the committed artifact.
 pub(crate) fn vlt_build_steps(pkg: &Value, has_binding_gyp: bool) -> Vec<String> {
     let scripts = pkg.get("scripts").and_then(Value::as_object);
-    let mut steps: Vec<String> = ["preinstall", "install", "postinstall", "prepare"]
-        .iter()
-        .filter(|k| {
-            scripts
-                .and_then(|s| s.get(**k))
-                .and_then(Value::as_str)
-                .is_some_and(|v| !v.trim().is_empty())
-        })
-        .map(|k| format!("a `{k}` script"))
-        .collect();
+    let mut steps: Vec<String> = [
+        "preinstall",
+        "install",
+        "postinstall",
+        "preprepare",
+        "prepare",
+        "postprepare",
+    ]
+    .iter()
+    .filter(|k| {
+        scripts
+            .and_then(|s| s.get(**k))
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.trim().is_empty())
+    })
+    .map(|k| format!("a `{k}` script"))
+    .collect();
     if has_binding_gyp {
         steps.push(format!("node-gyp for its {BINDING_GYP}"));
     }
@@ -1177,6 +1186,16 @@ mod tests {
             ]
         );
         assert!(vlt_build_steps(&serde_json::json!({"scripts": {"test": "x"}}), false).is_empty());
+        // vlt runs each prepare-family script for a `file:` directory even
+        // when it's the package's only one (#1633).
+        for script in ["preprepare", "postprepare"] {
+            let pkg = serde_json::json!({"scripts": {script: "node build.js"}});
+            assert_eq!(
+                vlt_build_steps(&pkg, false),
+                [format!("a `{script}` script")],
+                "{script}"
+            );
+        }
         assert!(vlt_build_steps(&serde_json::json!({}), false).is_empty());
         assert_eq!(
             build_steps_detail("esbuild", "0.20.2", &vlt_build_steps(&pkg, false)),

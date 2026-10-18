@@ -3456,6 +3456,19 @@ mod tests {
             .unwrap_err();
         assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
         assert!(detail.contains("a `postinstall` script"), "{detail}");
+        for script in ["preprepare", "postprepare"] {
+            tokio::fs::write(
+                store.join(PACKAGE_JSON),
+                format!("{{\"scripts\":{{\"{script}\":\"node build.js\"}}}}"),
+            )
+            .await
+            .unwrap();
+            let (code, detail) = vlt_vendor_preflight(&fx.root, PURL, UUID)
+                .await
+                .unwrap_err();
+            assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
+            assert!(detail.contains(&format!("a `{script}` script")), "{detail}");
+        }
         tokio::fs::write(store.join(PACKAGE_JSON), "{}")
             .await
             .unwrap();
@@ -4159,6 +4172,24 @@ mod tests {
         let (code, detail) = refusal(run(&fx, UUID, false).await);
         assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
         assert!(detail.ends_with("use --mode hosted"), "{detail}");
+        assert!(!fx.root.join(".socket").exists());
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+    }
+
+    #[tokio::test]
+    async fn a_postprepare_only_package_refuses_on_the_local_build() {
+        // vlt runs `postprepare` (and `preprepare`) for a `file:` directory
+        // even with no `prepare` beside it, rewriting the artifact (#1633).
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        tokio::fs::write(
+            fx.installed.join(PACKAGE_JSON),
+            "{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"scripts\":{\"postprepare\":\"node build.js\"}}",
+        )
+        .await
+        .unwrap();
+        let (code, detail) = refusal(run(&fx, UUID, false).await);
+        assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
+        assert!(detail.contains("a `postprepare` script"), "{detail}");
         assert!(!fx.root.join(".socket").exists());
         assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
     }
