@@ -42,7 +42,7 @@ runs:
     - name: Upload (attempt 1)
       id: first
       if: ${{ !cancelled() }}
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       continue-on-error: true
       with:
         name: ${{ inputs.name }}
@@ -61,7 +61,7 @@ runs:
     - name: Upload (attempt 2)
       id: second
       if: ${{ !cancelled() && steps.first.outcome == 'failure' }}
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       continue-on-error: true
       with:
         name: ${{ inputs.name }}-retry-${{ github.run_attempt }}-2
@@ -82,7 +82,7 @@ runs:
     - name: Upload (attempt 3)
       id: third
       if: ${{ !cancelled() && steps.second.outcome == 'failure' }}
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       with:
         name: ${{ inputs.name }}-retry-${{ github.run_attempt }}-3
         path: ${{ inputs.path }}
