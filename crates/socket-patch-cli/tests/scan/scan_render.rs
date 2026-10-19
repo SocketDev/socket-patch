@@ -1128,10 +1128,27 @@ async fn scan_hosted_human_prints_table_updates_and_redirects() {
         !stderr.contains("Non-interactive mode detected"),
         "scan never prompts; got {stderr:?}"
     );
+    // Two reference posts: the withdrawn-pin sweep checks the pinned
+    // OLD_UUID first (forbidden here, so the pin is kept), then the engine
+    // resolves the offered UUID.
+    let reqs = recorded(&mock).await;
     assert_eq!(
-        reference_posts(&recorded(&mock).await),
-        1,
-        "the engine resolved the reference"
+        reference_posts(&reqs),
+        2,
+        "the withdrawn sweep and the engine each resolved a reference"
+    );
+    let reference_bodies: Vec<String> = reqs
+        .iter()
+        .filter(|r| format!("{}", r.method) == "POST" && r.url.path().ends_with("/patches/package"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(
+        reference_bodies.iter().any(|b| b.contains(OLD_UUID)),
+        "the withdrawn sweep checked the pinned uuid; got {reference_bodies:?}"
+    );
+    assert!(
+        reference_bodies.iter().any(|b| b.contains(UUID)),
+        "the engine resolved the offered uuid; got {reference_bodies:?}"
     );
 
     // `--dry-run` previews without confirming (the engine honors it itself).
