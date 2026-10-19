@@ -1295,6 +1295,38 @@ async fn cargo_hosted_refuses_a_lockless_project_with_other_dependencies() {
     let _ = run_shape(shape).await;
 }
 
+/// #653: the hosted redirect is a `sparse+` registry, which cargo loads
+/// only from 1.68. A project whose `rust-version` declares cargo 1.67 is
+/// refused, with nothing written, instead of getting pins every build on
+/// its declared cargo then fails on (`usage of sparse registries requires
+/// -Z sparse-registry`). (A toolchain file would make rustup fetch that
+/// toolchain for the `cargo fetch` below; the planner unit tests cover it.)
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_refuses_a_project_declaring_cargo_below_1_68() {
+    let shape = Shape {
+        tag: "declared-cargo-1-67",
+        files: vec![
+            (
+                "Cargo.toml",
+                consumer_manifest("cfg-if = \"1.0.4\"\n").replace(
+                    "edition = \"2018\"\n",
+                    "edition = \"2018\"\nrust-version = \"1.67\"\n",
+                ),
+            ),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: Vec::new(),
+        crlf: false,
+        lockless: false,
+        refused: Some("redirect_cargo_old_cargo"),
+        prefetch: "",
+        contest: None,
+        restored: vec![],
+    };
+    let _ = run_shape(shape).await;
+}
+
 fn local_crate(name: &str, version: &str) -> String {
     format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2018\"\n")
 }

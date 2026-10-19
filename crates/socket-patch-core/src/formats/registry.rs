@@ -122,6 +122,11 @@ const REGISTRY: &[FormatFile] = &[
     // must see it (it wires the managed registry into whichever one is
     // present); vendored wiring before v5 lived there too.
     row(".cargo/config", "cargo", HOSTED | VENDORED | PROBE),
+    // Never edited: the toolchain the project pins is its declared cargo
+    // floor when `Cargo.toml` has no `rust-version`, which the hosted
+    // planner checks against the sparse-registry floor (cargo 1.68).
+    row("rust-toolchain.toml", "cargo", HOSTED | PRESENCE_ONLY),
+    row("rust-toolchain", "cargo", HOSTED | PRESENCE_ONLY),
     // ── composer ──
     row("composer.json", "composer", VENDORED),
     row(
