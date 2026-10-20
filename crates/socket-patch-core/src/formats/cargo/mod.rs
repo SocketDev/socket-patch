@@ -21,10 +21,13 @@
 //! * the vendored planner (`vendor::cargo_lock`) edits the same document
 //!   with `toml_edit`;
 //!
-//! [`manifest`] is the one reader of a `Cargo.toml`'s `[package]` identity.
+//! [`manifest`] is the one reader of a `Cargo.toml`'s `[package]` identity,
+//! and [`floor`] the one reader of the cargo the project declares it builds
+//! on (`rust-version`, `rust-toolchain[.toml]`).
 //!
 //! Everything here is pure; the callers own the reads.
 
+pub(crate) mod floor;
 pub(crate) mod hosted;
 pub mod manifest;
 pub mod source_replacement;
