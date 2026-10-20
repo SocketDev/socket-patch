@@ -28,132 +28,24 @@
 //!
 //! Behavior is asserted through the `--json` envelope (exit code,
 //! `status`, event actions and `errorCode`s) and the bytes on disk. The
-//! human wording of each case lives in `apply_render.rs` (#1089), which
-//! reuses this file's fixtures. In `--json` a no-matching-variant miss
+//! human wording of each case lives in `apply_render.rs` (#1089); both
+//! files share the fixtures in `apply_fixture.rs`. In `--json` a no-matching-variant miss
 //! shows as exit 1 with `status: partialFailure` and no `applied` or
 //! `failed` event for the base.
 
-use crate::common::envelope::{
-    assert_envelope_invariants, event_codes, event_purls, has_event, parse_json_envelope,
+use crate::apply_fixture::{
+    gem_multi_variant_fixture, gem_singleton_mismatch_fixture, gem_wrong_platform_fixture,
+    nokogiri_purl, run_gem_apply, GEM_BASE_PURL, GEM_LOCAL, NOKOGIRI_DARWIN_BEFORE,
+    NOKOGIRI_DARWIN_MARKER, NOKOGIRI_LINUX_PRISTINE,
 };
-use crate::common::hermetic::{self, Extra};
-use crate::common::{binary, git_sha256, hermetic_command};
+use crate::common::envelope::{
+    assert_envelope_invariants, event_codes, event_purls, find_event, has_event,
+    parse_json_envelope,
+};
+use crate::common::git_sha256;
 
-use std::path::{Path, PathBuf};
-
-pub(crate) const SINGLETON_PURL: &str = "pkg:gem/rack@3.1.0";
-const UUID_SINGLETON: &str = "31313131-3131-4131-8131-313131313131";
 /// The per-file warning code of a default-policy overwrite.
 const OVERWRITTEN: &str = "content_mismatch_overwritten";
-
-const PRISTINE: &[u8] = b"module Rack\n  VERSION = '3.1.0'\nend\n";
-pub(crate) const LOCAL: &[u8] = b"module Rack\n  VERSION = '3.1.0'\nend\n# local tweak\n";
-const PATCH_MARKER: &[u8] = b"\n# SOCKET-SINGLETON-PATCH\n";
-
-const MULTI_NAME: &str = "nokogiri";
-const MULTI_VERSION: &str = "1.16.5";
-const UUID_LINUX: &str = "41414141-4141-4141-8141-414141414141";
-const UUID_DARWIN: &str = "42424242-4242-4242-8242-424242424242";
-
-pub(crate) const LINUX_PRISTINE: &[u8] = b"module Nokogiri\n  VERSION = '1.16.5'\nend\n";
-const LINUX_MARKER: &[u8] = b"\n# SOCKET-LINUX-PATCH\n";
-pub(crate) const DARWIN_BEFORE: &[u8] = b"# nokogiri.rb from the arm64-darwin gem\n";
-const DARWIN_MARKER: &[u8] = b"\n# DARWIN-MARKER\n";
-
-pub(crate) fn with_marker(base: &[u8], marker: &[u8]) -> Vec<u8> {
-    let mut v = base.to_vec();
-    v.extend_from_slice(marker);
-    v
-}
-
-/// Run `socket-patch apply --offline --ecosystems gem <extra>` in `cwd`
-/// with the hermetic `SOCKET_*` environment (`hermetic_command`) and the
-/// ambient `BUNDLE_*` scrubbed, so only the argv decides behavior.
-pub(crate) fn run_apply(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic_command(&binary());
-    cmd.arg("apply")
-        .args(["--offline", "--ecosystems", "gem"])
-        .args(extra)
-        .current_dir(cwd);
-    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
-    let out = cmd.output().expect("run socket-patch apply");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
-}
-
-/// Synthesize an installed gem under the cwd's vendor/bundle tree (what
-/// the ruby crawler scans in local mode; a real `gem install` produces
-/// exactly this `gems/<name>-<version>[-<platform>]` leaf — verified
-/// against RubyGems on ruby 3.4). Returns the patchable file path.
-fn install_gem(cwd: &Path, leaf: &str, file_rel: &str, contents: &[u8]) -> PathBuf {
-    let gem_dir = cwd
-        .join("vendor")
-        .join("bundle")
-        .join("ruby")
-        .join("3.4.0")
-        .join("gems")
-        .join(leaf);
-    let file = gem_dir.join(file_rel);
-    std::fs::create_dir_all(file.parent().unwrap()).expect("create gem dir");
-    std::fs::write(&file, contents).expect("write gem file");
-    file
-}
-
-fn patch_record(uuid: &str, file: &str, before_hash: &str, after_hash: &str) -> serde_json::Value {
-    serde_json::json!({
-        "uuid": uuid,
-        "exportedAt": "2024-01-01T00:00:00Z",
-        "files": { file: { "beforeHash": before_hash, "afterHash": after_hash } },
-        "vulnerabilities": {},
-        "description": "gem variant mismatch fixture",
-        "license": "MIT",
-        "tier": "free"
-    })
-}
-
-fn write_socket_dir(cwd: &Path, patches: serde_json::Value, blobs: &[(&str, &[u8])]) {
-    let socket = cwd.join(".socket");
-    let blobs_dir = socket.join("blobs");
-    std::fs::create_dir_all(&blobs_dir).expect("create .socket/blobs");
-    std::fs::write(
-        socket.join("manifest.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
-    )
-    .expect("write manifest");
-    for (hash, content) in blobs {
-        std::fs::write(blobs_dir.join(hash), content).expect("write blob");
-    }
-}
-
-/// Singleton fixture: one bare-PURL gem record whose only file was
-/// locally modified on disk (matches NEITHER beforeHash nor afterHash);
-/// the afterHash blob is staged so the offline apply has the full
-/// patched bytes available. Returns the on-disk file path and the exact
-/// patched bytes a correct warn-overwrite must produce.
-pub(crate) fn singleton_fixture(cwd: &Path) -> (PathBuf, Vec<u8>) {
-    let patched = with_marker(PRISTINE, PATCH_MARKER);
-    let file = install_gem(cwd, "rack-3.1.0", "lib/rack.rb", LOCAL);
-    write_socket_dir(
-        cwd,
-        serde_json::json!({
-            SINGLETON_PURL: patch_record(
-                UUID_SINGLETON,
-                "lib/rack.rb",
-                &git_sha256(PRISTINE),
-                &git_sha256(&patched),
-            )
-        }),
-        &[(&git_sha256(&patched), patched.as_slice())],
-    );
-    // Fixture sanity: the on-disk bytes must match neither hash, or the
-    // mismatch path under test is never taken.
-    assert_ne!(git_sha256(LOCAL), git_sha256(PRISTINE));
-    assert_ne!(git_sha256(LOCAL), git_sha256(&patched));
-    (file, patched)
-}
 
 /// Default policy: the singleton's local modification is overwritten with
 /// the full verified patched content and surfaced as a warning — the same
@@ -161,9 +53,9 @@ pub(crate) fn singleton_fixture(cwd: &Path) -> (PathBuf, Vec<u8>) {
 #[test]
 fn singleton_mismatch_default_warns_and_applies() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (file, patched) = singleton_fixture(tmp.path());
+    let (file, patched) = gem_singleton_mismatch_fixture(tmp.path());
 
-    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--json"]);
+    let (code, stdout, _stderr) = run_gem_apply(tmp.path(), &["--json"]);
     assert_eq!(
         code, 0,
         "default mismatch on a singleton variant is a warning, not an error; stdout={stdout}"
@@ -178,13 +70,13 @@ fn singleton_mismatch_default_warns_and_applies() {
     assert_eq!(v["status"], "success", "{v:#}");
     assert_eq!(
         event_purls(&v, "applied"),
-        [SINGLETON_PURL],
+        [GEM_BASE_PURL],
         "singleton must be reported applied: {v:#}"
     );
     // The overwrite rides as the npm-family per-file warning event, the
     // same shape apply_network pins for npm, naming the package.
     assert!(
-        has_event(&v, "skipped", OVERWRITTEN, SINGLETON_PURL),
+        has_event(&v, "skipped", OVERWRITTEN, GEM_BASE_PURL),
         "the overwrite must ride as a warning event: {v:#}"
     );
 }
@@ -194,16 +86,16 @@ fn singleton_mismatch_default_warns_and_applies() {
 #[test]
 fn singleton_mismatch_strict_refuses() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (file, _patched) = singleton_fixture(tmp.path());
+    let (file, _patched) = gem_singleton_mismatch_fixture(tmp.path());
 
-    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--strict", "--json"]);
+    let (code, stdout, _stderr) = run_gem_apply(tmp.path(), &["--strict", "--json"]);
     assert_eq!(
         code, 1,
         "--strict must refuse the mismatch; stdout={stdout}"
     );
     assert_eq!(
         std::fs::read(&file).expect("read file"),
-        LOCAL,
+        GEM_LOCAL,
         "--strict must not modify the file"
     );
     let v = parse_json_envelope(&stdout);
@@ -211,9 +103,13 @@ fn singleton_mismatch_strict_refuses() {
     assert_eq!(v["status"], "partialFailure", "{v:#}");
     // The package fails on the per-file hash refusal (`apply_failed`),
     // not the no-matching-variant miss, which reports no `failed` event.
+    let failed = find_event(&v, "failed", Some("apply_failed"));
+    assert_eq!(failed["purl"], GEM_BASE_PURL, "{v:#}");
     assert!(
-        has_event(&v, "failed", "apply_failed", SINGLETON_PURL),
-        "--strict must fail the package on the hash mismatch: {v:#}"
+        failed["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("lib/rack.rb")),
+        "the refusal must name the mismatched file: {v:#}"
     );
     assert!(
         !event_codes(&v).iter().any(|c| c == OVERWRITTEN),
@@ -226,51 +122,23 @@ fn singleton_mismatch_strict_refuses() {
 #[test]
 fn singleton_mismatch_force_still_applies() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (file, patched) = singleton_fixture(tmp.path());
+    let (file, patched) = gem_singleton_mismatch_fixture(tmp.path());
 
-    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--force"]);
-    assert_eq!(code, 0, "--force must keep applying; stderr={stderr}");
+    let (code, stdout, _stderr) = run_gem_apply(tmp.path(), &["--force", "--json"]);
+    assert_eq!(code, 0, "--force must keep applying; stdout={stdout}");
     assert_eq!(
         std::fs::read(&file).expect("read patched file"),
         patched,
         "--force must overwrite with the verified patched bytes"
     );
-}
-
-fn multi_purl(platform: &str) -> String {
-    format!("pkg:gem/{MULTI_NAME}@{MULTI_VERSION}?platform={platform}")
-}
-
-/// Qualified-singleton fixture: a lone `?platform=x86_64-linux` record
-/// with the arm64-darwin gem installed, whose bytes match neither of the
-/// record's hashes. Returns the on-disk file path.
-pub(crate) fn qualified_wrong_platform_fixture(cwd: &Path) -> PathBuf {
-    let linux_patched = with_marker(LINUX_PRISTINE, LINUX_MARKER);
-    // On disk: the arm64-darwin gem, whose bytes match NEITHER of the
-    // linux record's hashes.
-    let file = install_gem(
-        cwd,
-        &format!("{MULTI_NAME}-{MULTI_VERSION}-arm64-darwin"),
-        &format!("lib/{MULTI_NAME}.rb"),
-        DARWIN_BEFORE,
+    let v = parse_json_envelope(&stdout);
+    assert_envelope_invariants(&v, "apply");
+    assert_eq!(v["status"], "success", "{v:#}");
+    assert_eq!(event_purls(&v, "applied"), [GEM_BASE_PURL], "{v:#}");
+    assert!(
+        has_event(&v, "skipped", OVERWRITTEN, GEM_BASE_PURL),
+        "{v:#}"
     );
-    write_socket_dir(
-        cwd,
-        serde_json::json!({
-            multi_purl("x86_64-linux"): patch_record(
-                UUID_LINUX,
-                "lib/nokogiri.rb",
-                &git_sha256(LINUX_PRISTINE),
-                &git_sha256(&linux_patched),
-            ),
-        }),
-        &[(&git_sha256(&linux_patched), linux_patched.as_slice())],
-    );
-    // Fixture sanity: the darwin bytes must match neither hash, or the
-    // wrong-platform path under test is never taken.
-    assert_ne!(git_sha256(DARWIN_BEFORE), git_sha256(LINUX_PRISTINE));
-    assert_ne!(git_sha256(DARWIN_BEFORE), git_sha256(&linux_patched));
-    file
 }
 
 /// A QUALIFIED singleton keeps the fail-closed gate: a lone
@@ -286,9 +154,9 @@ pub(crate) fn qualified_wrong_platform_fixture(cwd: &Path) -> PathBuf {
 #[test]
 fn qualified_singleton_wrong_platform_fails_closed() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let file = qualified_wrong_platform_fixture(tmp.path());
+    let file = gem_wrong_platform_fixture(tmp.path());
 
-    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--json"]);
+    let (code, stdout, _stderr) = run_gem_apply(tmp.path(), &["--json"]);
     assert_eq!(
         code, 1,
         "a qualified singleton whose distribution is not on disk must fail closed; stdout={stdout}"
@@ -297,6 +165,9 @@ fn qualified_singleton_wrong_platform_fails_closed() {
     assert_envelope_invariants(&v, "apply");
     assert_eq!(v["status"], "partialFailure", "{v:#}");
     assert!(event_purls(&v, "applied").is_empty(), "{v:#}");
+    // No variant was attempted, so no `failed` event either: that tells
+    // this miss apart from a variant that was tried and refused.
+    assert!(event_purls(&v, "failed").is_empty(), "{v:#}");
     assert!(
         !event_codes(&v).iter().any(|c| c == OVERWRITTEN),
         "a wrong-distribution record must never be surfaced as a \
@@ -304,46 +175,9 @@ fn qualified_singleton_wrong_platform_fails_closed() {
     );
     assert_eq!(
         std::fs::read(&file).expect("read file"),
-        DARWIN_BEFORE,
+        NOKOGIRI_DARWIN_BEFORE,
         "the installed distribution's bytes must be untouched"
     );
-}
-
-/// Multi-variant fixture: the x86_64-linux variant is installed (its
-/// beforeHash matches the on-disk bytes unless `local_bytes` overrides
-/// them); the arm64-darwin sibling describes a DIFFERENT distribution
-/// whose beforeHash can never match. Both afterHash blobs are staged.
-pub(crate) fn multi_variant_fixture(cwd: &Path, on_disk: &[u8]) -> (PathBuf, Vec<u8>, Vec<u8>) {
-    let linux_patched = with_marker(LINUX_PRISTINE, LINUX_MARKER);
-    let darwin_patched = with_marker(DARWIN_BEFORE, DARWIN_MARKER);
-    let file = install_gem(
-        cwd,
-        &format!("{MULTI_NAME}-{MULTI_VERSION}-x86_64-linux"),
-        &format!("lib/{MULTI_NAME}.rb"),
-        on_disk,
-    );
-    write_socket_dir(
-        cwd,
-        serde_json::json!({
-            multi_purl("x86_64-linux"): patch_record(
-                UUID_LINUX,
-                "lib/nokogiri.rb",
-                &git_sha256(LINUX_PRISTINE),
-                &git_sha256(&linux_patched),
-            ),
-            multi_purl("arm64-darwin"): patch_record(
-                UUID_DARWIN,
-                "lib/nokogiri.rb",
-                &git_sha256(DARWIN_BEFORE),
-                &git_sha256(&darwin_patched),
-            ),
-        }),
-        &[
-            (&git_sha256(&linux_patched), linux_patched.as_slice()),
-            (&git_sha256(&darwin_patched), darwin_patched.as_slice()),
-        ],
-    );
-    (file, linux_patched, darwin_patched)
 }
 
 /// Over-broadening guard: a MULTI-variant base keeps the current
@@ -354,9 +188,10 @@ pub(crate) fn multi_variant_fixture(cwd: &Path, on_disk: &[u8]) -> (PathBuf, Vec
 #[test]
 fn multi_variant_mismatched_sibling_is_skipped_not_overwritten() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (file, linux_patched, _darwin_patched) = multi_variant_fixture(tmp.path(), LINUX_PRISTINE);
+    let (file, linux_patched, _darwin_patched) =
+        gem_multi_variant_fixture(tmp.path(), NOKOGIRI_LINUX_PRISTINE);
 
-    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--json"]);
+    let (code, stdout, _stderr) = run_gem_apply(tmp.path(), &["--json"]);
     assert_eq!(
         code, 0,
         "the installed variant must apply cleanly; stdout={stdout}"
@@ -368,8 +203,8 @@ fn multi_variant_mismatched_sibling_is_skipped_not_overwritten() {
     );
     assert!(
         !after
-            .windows(DARWIN_MARKER.len())
-            .any(|w| w == DARWIN_MARKER),
+            .windows(NOKOGIRI_DARWIN_MARKER.len())
+            .any(|w| w == NOKOGIRI_DARWIN_MARKER),
         "the sibling distribution's bytes must never be written"
     );
     let v = parse_json_envelope(&stdout);
@@ -377,7 +212,7 @@ fn multi_variant_mismatched_sibling_is_skipped_not_overwritten() {
     assert_eq!(v["status"], "success", "{v:#}");
     assert_eq!(
         event_purls(&v, "applied"),
-        [multi_purl("x86_64-linux")],
+        [nokogiri_purl("x86_64-linux")],
         "{v:#}"
     );
     assert!(
@@ -392,13 +227,13 @@ fn multi_variant_mismatched_sibling_is_skipped_not_overwritten() {
 /// mismatch-policy fall-through is singleton-only.
 #[test]
 fn multi_variant_none_matching_still_fails_closed() {
-    let local = with_marker(LINUX_PRISTINE, b"# local tweak\n");
+    let local = [NOKOGIRI_LINUX_PRISTINE, b"# local tweak\n"].concat();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (file, linux_patched, darwin_patched) = multi_variant_fixture(tmp.path(), &local);
-    assert_ne!(git_sha256(&local), git_sha256(LINUX_PRISTINE));
-    assert_ne!(git_sha256(&local), git_sha256(DARWIN_BEFORE));
+    let (file, linux_patched, darwin_patched) = gem_multi_variant_fixture(tmp.path(), &local);
+    assert_ne!(git_sha256(&local), git_sha256(NOKOGIRI_LINUX_PRISTINE));
+    assert_ne!(git_sha256(&local), git_sha256(NOKOGIRI_DARWIN_BEFORE));
 
-    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--json"]);
+    let (code, stdout, _stderr) = run_gem_apply(tmp.path(), &["--json"]);
     assert_eq!(
         code, 1,
         "a multi-variant base with no matching variant must keep failing; stdout={stdout}"
@@ -407,6 +242,9 @@ fn multi_variant_none_matching_still_fails_closed() {
     assert_envelope_invariants(&v, "apply");
     assert_eq!(v["status"], "partialFailure", "{v:#}");
     assert!(event_purls(&v, "applied").is_empty(), "{v:#}");
+    // No variant was attempted, so no `failed` event either: that tells
+    // this miss apart from a variant that was tried and refused.
+    assert!(event_purls(&v, "failed").is_empty(), "{v:#}");
     assert!(!event_codes(&v).iter().any(|c| c == OVERWRITTEN), "{v:#}");
     let after = std::fs::read(&file).expect("read file");
     assert_eq!(
