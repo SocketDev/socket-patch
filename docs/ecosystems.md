@@ -304,7 +304,10 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   submodule CI didn't check out, or whose `package.json` is no JSON, such as a Git LFS
   pointer, or whose `package.json` names no package) has no version either, so it may
   be any version of any package and `vex` attests nothing that lock wires. One whose
-  `package.json` names a package but no version may be any version of that package. A
+  `package.json` names a package but no version may be any version of that package. An
+  empty `name`, or one no npm package can carry (`"../x"`, `" left-pad"`), names no
+  package, and an empty or non-semver `version` (`""`, `"v1.3.0"`) names no version, for
+  every copy whose `package.json` is read (#1598). A
   `portal:` to a directory with no `package.json` (a `.gitkeep` placeholder a fetch step
   fills) is unknown too, since yarn refuses to install a portal without one; only a
   `link:` to a non-empty directory with no `package.json` is not a package copy. Use a
