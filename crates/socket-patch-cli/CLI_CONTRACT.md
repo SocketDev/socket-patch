@@ -720,15 +720,15 @@ Not covered: the agent-mode blob cache and manifest are checked from `.socket` d
 
 ## Vendor command contract
 
-`vendor` is `apply`'s committable sibling: instead of patching installed packages in place
-(machine-local state), it ejects each patched package into `.socket/vendor/` and rewires the
+`vendor` converts the hosted patches pinned in the project's lockfiles into committable
+`.socket/vendor/` artifacts, without installing dependencies first. It rewires the
 ecosystem's lockfile/config so the project consumes the vendored copy. After committing
 `.socket/vendor/` + the lockfile edits, a fresh checkout builds with the patched dependency on
 machines with **no socket-patch installed and no Socket API access** (registry access for other,
 unvendored dependencies may still be needed). Every mechanism below was validated against the real
 package managers (`spikes/PHASE0-FINDINGS.txt`).
 
-**Eject a hosted project (v5.0)**: standalone `vendor` with NO manifest in a project whose lockfiles
+**Eject a hosted project (v5.0)**: standalone `vendor` in a project whose lockfiles
 pin hosted patches (not under `--global`; `--ecosystems` narrows the pins) takes its patch set from
 those pins — each pin's purl plus the patch uuid in its hosted URL — fetches each record from the
 patch API (`GET …/patches/view/<uuid>`, the same client and public-proxy fallback as `get`), vendors
@@ -736,15 +736,23 @@ into `.socket/vendor/` exactly like `scan --mode vendored`, and rewires each pac
 vendored (the upstream registry entry is restored first, so a later `vendor --revert` returns the
 project to upstream, never to hosted). The human output opens with
 `Ejecting N hosted package(s) into .socket/vendor/...` (`Would eject …` under `--dry-run`); the
-JSON is the vendor envelope. It needs no installed `node_modules` / site-packages: the sources are
-fetched from the upstream registry, so a fresh hosted checkout ejects.
+JSON is the vendor envelope. Hosted pins take precedence even when `.socket/manifest.json`
+exists: the manifest is neither used to select patches nor rewritten. The conversion skips
+installed-package discovery and variant probes, so an unrelated virtualenv or global cache
+cannot reject a lockfile-selected patch. It uses the shared lockfile readers, without VEX
+attestation or installed-byte verification; downloaded artifacts still pass integrity and
+patched-member verification. Upstream registry metadata is resolved for reversal, while the
+patched archives come from the artifact service. No installed `node_modules`, site-packages,
+or upstream source download is needed. When no hosted pins are in scope, legacy manifest-driven
+vendoring remains available.
 
 The eject is ONE planned transition, all-or-nothing: (1) every record is fetched first — a failed
 (or 404) view fetch is a `failed` event with `errorCode: "patch_fetch_failed"` and the run stops
 with `status: "error"`, `error.code: "eject_refused"`, exit 1, nothing touched; (2) the upstream
 restore of every pin is resolved against staged copies — a refused pin (offline registry, a
 non-derivable field; a binary `bun.lockb` record is rebuilt like the takeover's) is `eject_refused` with the `git checkout -- <lockfile>`
-remedy, nothing touched; (3) `--dry-run` stops here and reports each pin as an `applied` event with
+remedy, nothing touched. Backend refusals are also previewed against the restored text in memory
+(for example, unsupported pnpm catalog entries); (3) `--dry-run` stops here and reports each pin as an `applied` event with
 reason `eject_planned` — no file is written and no `.socket/` is created; (4) the wet run snapshots
 every file the eject may touch under one `apply.lock`, restores upstream, then vendors. If any
 package then fails, exactly the files the eject wrote are put back (the pins' files, the upstream

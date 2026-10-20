@@ -289,6 +289,22 @@ pub(crate) fn pin_hosted(fx: &NpmFixture) -> Vec<u8> {
 /// A wiremock npm registry answering left-pad@1.3.0's version document.
 pub(crate) async fn mock_npm_registry() -> MockServer {
     let server = MockServer::start().await;
+    let mut view = patch_record(
+        &compute_git_sha256_from_bytes(ORIG_INDEX),
+        &compute_git_sha256_from_bytes(PATCHED_INDEX),
+    );
+    view["purl"] = json!(PURL);
+    view["publishedAt"] = json!("2026-01-01T00:00:00Z");
+    view["files"]["package/index.js"]["blobContent"] = json!(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        PATCHED_INDEX
+    ));
+    prebuilt_common::mount_view(&server, &view, None).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/test-org/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view))
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/left-pad/1.3.0"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -306,15 +322,14 @@ pub(crate) async fn mock_npm_registry() -> MockServer {
 }
 
 /// `vendor --json --patch-server-url <mock origin>` through the binary,
-/// ONLINE against the mock registry (the upstream restore needs it) but
-/// anonymous, so no other network path opens.
+/// ONLINE against the mock registry and patch service.
 pub(crate) fn vendor_online(fx: &NpmFixture, registry: &str, extra: &[&str]) -> (i32, Value) {
     let root = fx.root().to_str().unwrap();
     let mut args = vec![
         "vendor",
         "--json",
         "--patch-server-url",
-        HOSTED_ORIGIN,
+        registry,
         "--cwd",
         root,
     ];
@@ -323,7 +338,10 @@ pub(crate) fn vendor_online(fx: &NpmFixture, registry: &str, extra: &[&str]) -> 
         fx.root(),
         &args,
         &[
-            ("SOCKET_NO_API_TOKEN", "1"),
+            ("SOCKET_API_URL", registry),
+            ("SOCKET_VENDOR_URL", registry),
+            ("SOCKET_API_TOKEN", "fake-token"),
+            ("SOCKET_ORG_SLUG", "test-org"),
             ("SOCKET_NPM_REGISTRY", registry),
         ],
     );

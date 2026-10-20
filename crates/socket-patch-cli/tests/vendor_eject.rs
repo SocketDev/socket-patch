@@ -10,8 +10,7 @@
 //! Every run goes through the built binary with a scrubbed environment: the
 //! API, the npm registry (`SOCKET_NPM_REGISTRY`) and the patch-server origin
 //! (`SOCKET_PATCH_SERVER_URL`, what makes the mock hosted URL count as
-//! hosted) all point at a wiremock; `SOCKET_VENDOR_SOURCE=build` keeps the
-//! vendoring service out of it.
+//! hosted) all point at a wiremock, including the prebuilt artifact service.
 
 #[path = "common/envelope.rs"]
 mod envelope;
@@ -269,6 +268,45 @@ async fn eject_vendors_hosted_pins_and_revert_returns_to_upstream() {
     assert_eq!(entry["integrity"], UPSTREAM_INTEGRITY, "{lock:#}");
     assert!(!p.artifact().exists(), "the artifact is removed");
     assert!(!p.redirect_state().exists());
+}
+
+/// Hosted pins remain the input when an agent manifest is present. The
+/// manifest does not list this patch and nothing is installed locally.
+#[tokio::test]
+async fn eject_reads_hosted_lockfiles_even_with_a_manifest() {
+    let p = hosted_project(true).await;
+    std::fs::remove_dir_all(p.root().join("node_modules")).unwrap();
+    std::fs::create_dir(p.root().join(".socket")).unwrap();
+    let manifest_path = p.root().join(".socket/manifest.json");
+    let manifest = b"{\"patches\": {}}\n";
+    std::fs::write(&manifest_path, manifest).unwrap();
+    mock_registry(&p).await;
+    mock_view(&p).await;
+
+    let original_lock = p.lock_bytes();
+    let (code, preview) = p.run_json(&["vendor", "--dry-run"]);
+    assert_eq!(code, 0, "{preview:#}");
+    assert_eq!(
+        find_event(&preview, "applied", Some("eject_planned"))["purl"],
+        PURL
+    );
+    assert_eq!(p.lock_bytes(), original_lock);
+    assert!(!p.artifact().exists());
+
+    let (code, env) = p.run_json(&["vendor"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(find_event(&env, "applied", None)["purl"], PURL);
+    assert!(p.artifact().is_file());
+    assert!(p.lock()["packages"]["node_modules/left-pad"]["resolved"]
+        .as_str()
+        .unwrap()
+        .contains(".socket/vendor/"));
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest);
+    assert!(!p.root().join("node_modules").exists());
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(p.root().join(".socket/vendor/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["entries"][PURL]["detached"], true);
 }
 
 /// Human eject: the first line announces the eject.
