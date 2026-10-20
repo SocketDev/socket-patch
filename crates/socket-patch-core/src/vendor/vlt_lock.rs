@@ -3456,6 +3456,19 @@ mod tests {
             .unwrap_err();
         assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
         assert!(detail.contains("a `postinstall` script"), "{detail}");
+        for script in ["preprepare", "postprepare"] {
+            tokio::fs::write(
+                store.join(PACKAGE_JSON),
+                format!("{{\"scripts\":{{\"{script}\":\"node build.js\"}}}}"),
+            )
+            .await
+            .unwrap();
+            let (code, detail) = vlt_vendor_preflight(&fx.root, PURL, UUID)
+                .await
+                .unwrap_err();
+            assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
+            assert!(detail.contains(&format!("a `{script}` script")), "{detail}");
+        }
         tokio::fs::write(store.join(PACKAGE_JSON), "{}")
             .await
             .unwrap();
@@ -4078,6 +4091,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dir_vendored_with_a_postprepare_script_refuses_on_reuse() {
+        // An earlier release vendored a postprepare-only package (#1633);
+        // the installed copy here has no script, so only the reuse check
+        // can refuse.
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (mut first, _) = entry_of(run(&fx, UUID, false).await);
+        let dir = fx.root.join(&first.artifact.path);
+        tokio::fs::write(
+            dir.join(PACKAGE_JSON),
+            "{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"scripts\":{\"postprepare\":\"node build.js\"}}",
+        )
+        .await
+        .unwrap();
+        first.artifact.file_inventory = Some(
+            crate::vendor::verify::compute_package_dir_inventory(&dir)
+                .await
+                .unwrap(),
+        );
+        persist(&fx, &first).await;
+        let lock = read(&fx, VLT_LOCK).await;
+        for dry_run in [true, false] {
+            let (code, detail) = refusal(run(&fx, UUID, dry_run).await);
+            assert_eq!(code, crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED);
+            assert!(detail.contains("a `postprepare` script"), "{detail}");
+            assert_eq!(read(&fx, VLT_LOCK).await, lock);
+            assert!(dir.join(PACKAGE_JSON).exists());
+        }
+    }
+
+    #[tokio::test]
     async fn an_in_sync_rerun_restores_the_uuid_metadata() {
         let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         let (first, _) = entry_of(run(&fx, UUID, false).await);
@@ -4161,6 +4204,32 @@ mod tests {
         assert!(detail.ends_with("use --mode hosted"), "{detail}");
         assert!(!fx.root.join(".socket").exists());
         assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+    }
+
+    #[tokio::test]
+    async fn a_prepare_family_only_package_refuses_on_the_local_build() {
+        // vlt runs `preprepare` and `postprepare` for a `file:` directory
+        // even with no `prepare` beside them, rewriting the artifact (#1633).
+        for script in ["preprepare", "postprepare"] {
+            let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+            tokio::fs::write(
+                fx.installed.join(PACKAGE_JSON),
+                format!(
+                    "{{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"scripts\":{{\"{script}\":\"node build.js\"}}}}"
+                ),
+            )
+            .await
+            .unwrap();
+            let (code, detail) = refusal(run(&fx, UUID, false).await);
+            assert_eq!(
+                code,
+                crate::vendor::npm_dir::BUILD_STEPS_UNSUPPORTED,
+                "{script}"
+            );
+            assert!(detail.contains(&format!("a `{script}` script")), "{detail}");
+            assert!(!fx.root.join(".socket").exists(), "{script}");
+            assert_eq!(read(&fx, VLT_LOCK).await, basic_lock(), "{script}");
+        }
     }
 
     #[tokio::test]

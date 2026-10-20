@@ -686,8 +686,9 @@ transitive lock surgery), as are several instances of one `name@version`, modifi
 variants, importer peer edges, foreign registries, a git, remote-tarball or local-directory
 node of the same package and a dependency declared in several fields
 (`vendor_lock_entry_unsupported`), and a package with a `preinstall`, `install`,
-`postinstall` or `prepare` script or a `binding.gyp`, which `vlt build` would build inside
-the committed directory (`vendor_vlt_build_scripts_unsupported`); use hosted mode for those. From vlt 1.0.8 a root
+`postinstall`, `preprepare`, `prepare` or `postprepare` script or a `binding.gyp`, which
+`vlt build` would build inside the committed directory (`vendor_vlt_build_scripts_unsupported`,
+also when an earlier release already vendored it); use hosted mode for those. From vlt 1.0.8 a root
 dependency with resolved peers carries a `~peer.<hex>` extra even with one peer context (a
 workspace member's a `~peer.N` one from rc.15): vendored mode writes its `file` node
 without the extra, exactly as vlt writes a `file:` dependency, keeps its peer edges, and
