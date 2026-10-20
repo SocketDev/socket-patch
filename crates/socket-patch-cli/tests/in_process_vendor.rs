@@ -4711,6 +4711,52 @@ snapshots:
         assert!(!root.join(".npmrc").exists());
     }
 
+    /// Hosted → vendored in a git project whose `.gitignore` matches the
+    /// vendor ledger (#1638): both the eject (no manifest) and the
+    /// manifest-driven takeover refuse `vendor_ledger_gitignored` before
+    /// restoring anything, so the project stays hosted.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_then_vendor_with_a_gitignored_ledger_keeps_the_hosted_wiring() {
+        if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+            return;
+        }
+        for with_manifest in [false, true] {
+            let server = MockServer::start().await;
+            mock_hosted_api(&server).await;
+            let registry = mock_registry(&server).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            write_package_lock_project(root);
+            assert!(super::git_project_ignoring(
+                root,
+                "node_modules/\nstate.json\n"
+            ));
+            assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+            let hosted_lock = std::fs::read(root.join("package-lock.json")).unwrap();
+            let hosted_npmrc = std::fs::read(root.join(".npmrc")).unwrap();
+            assert!(String::from_utf8_lossy(&hosted_lock).contains(HOSTED_URL));
+
+            if with_manifest {
+                seed_manifest_and_blob(root);
+            }
+            let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+            assert_eq!(code, 1, "with_manifest={with_manifest}: {env:#}");
+            assert_eq!(env["error"]["code"], "vendor_ledger_gitignored", "{env:#}");
+            assert_eq!(
+                std::fs::read(root.join("package-lock.json")).unwrap(),
+                hosted_lock,
+                "the hosted lock must be untouched"
+            );
+            assert_eq!(
+                std::fs::read(root.join(".npmrc")).unwrap(),
+                hosted_npmrc,
+                "the hosted .npmrc must be untouched"
+            );
+            assert!(!root.join(".socket/vendor").exists(), "{env:#}");
+        }
+    }
+
     /// Hosted → vendored in a git project that ignores `.socket/` (#831):
     /// hosted mode writes nothing there, so the rule is common. The
     /// gitignore refusal comes BEFORE the takeover restores the upstream

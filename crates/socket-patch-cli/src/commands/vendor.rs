@@ -1728,6 +1728,11 @@ impl EjectSnapshot {
 /// the project to upstream, not to hosted).
 async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
+    // A ledger git would not commit refuses before anything is fetched or
+    // restored, so the project stays hosted (#1638).
+    if let Some((code, detail)) = vendor::ledger_gitignore_refusal(&common.cwd).await {
+        return emit_eject_refusal(common, code, &detail);
+    }
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let telemetry = TelemetryAuth::for_client(&client);
