@@ -101,6 +101,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          # Pin uv: it is the PEP 751 oracle the pylock tests install with,
+          # and uv 0.13.2 started refusing Pipenv's `environments = []`
+          # pylock ("target environment is not supported by the lockfile").
+          # Bump deliberately, after checking the Pipenv pylock legs pass.
+          version: "0.13.1"
       - name: Install the Pythons the Pipenv releases run on
         run: uv python install 3.8 3.12
       - name: Build the CLI
