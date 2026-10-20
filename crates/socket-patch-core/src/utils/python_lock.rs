@@ -410,6 +410,30 @@ fn rewrite_references(
     }
 }
 
+/// Whether the lock's `[manifest]` `constraints` / `build-constraints` name
+/// `name`: the entries [`rewrite_manifest`] repoints at the artifact, a
+/// shape uv before 0.5.5 rejects under `uv sync --locked` (#1569).
+fn manifest_constrains(document: &DocumentMut, name: &str) -> bool {
+    let name = canonicalize_pypi_name(name);
+    let Some(manifest) = document.get("manifest").and_then(Item::as_table_like) else {
+        return false;
+    };
+    ["constraints", "build-constraints"].iter().any(|key| {
+        manifest
+            .get(key)
+            .and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_inline_table)
+            .any(|constraint| {
+                constraint
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| canonicalize_pypi_name(value) == name)
+            })
+    })
+}
+
 fn rewrite_manifest(document: &mut DocumentMut, name: &str, artifact: ArtifactSource<'_>) {
     let Some(manifest) = document
         .get_mut("manifest")
@@ -1058,6 +1082,14 @@ impl PythonLockSession {
             finish_metadata_completion(document, completion, version, artifact);
         }
         Ok(preserve_line_endings(text, document.to_string()))
+    }
+
+    /// [`manifest_constrains`] over the session's document as the
+    /// rewrites so far left it, without re-parsing the lock.
+    pub(crate) fn manifest_constrains(&self, name: &str) -> bool {
+        self.document
+            .as_ref()
+            .is_ok_and(|document| manifest_constrains(document, name))
     }
 }
 

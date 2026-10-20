@@ -6109,6 +6109,51 @@ fn pipenv_pylock_refusal(path: &str, dep: &DepOverride) -> RewriteWarning {
     }
 }
 
+/// The hosted uv advisories for the two wiring shapes uv before 0.5.5 does
+/// not honour (#1569). They accompany a pin that landed, so a caller that
+/// counts or explains refusals skips them.
+pub const UV_OLD_RELEASE_ADVISORIES: [&str; 2] = [
+    "redirect_uv_override_requires_uv_0_5_6",
+    "redirect_uv_constraints_require_uv_0_5_6",
+];
+
+/// #1569: the advisories vendored mode gives as `pypi_uv_*_0_5_6`, for a dep
+/// this run wired into `path`. `metadata` is the paired pyproject.toml /
+/// script as the run leaves it, and `constrained` whether the lock's
+/// `[manifest]` constrains the dep. The CLI cannot tell those uv binaries
+/// apart from the lock, so these advise rather than refuse; the redirect
+/// still counts.
+fn uv_old_release_advisories(
+    path: &str,
+    metadata: Option<&str>,
+    constrained: bool,
+    dep: &DepOverride,
+) -> Vec<RewriteWarning> {
+    use crate::crawlers::python_crawler::canonicalize_pypi_name;
+    use crate::utils::python_lock::is_script_lock_name;
+    use crate::utils::python_script::{
+        uv_constraints_advisory, uv_override_advisory, wires_through_override,
+    };
+
+    let [override_code, constraints_code] = UV_OLD_RELEASE_ADVISORIES;
+    let name = canonicalize_pypi_name(&dep.name);
+    let script = is_script_lock_name(path);
+    let mut warnings = Vec::new();
+    if metadata.is_some_and(|text| wires_through_override(text, script, &name)) {
+        warnings.push(RewriteWarning {
+            code: override_code.into(),
+            detail: format!("{path}: {}", uv_override_advisory(&name, &dep.version)),
+        });
+    }
+    if constrained {
+        warnings.push(RewriteWarning {
+            code: constraints_code.into(),
+            detail: format!("{path}: {}", uv_constraints_advisory(&name, "hosted")),
+        });
+    }
+    warnings
+}
+
 /// Each lock is parsed once ([`PythonLockSession`]) and every dep is
 /// planned, refused or applied against that one document. The lock is still
 /// rendered after every rewritten dep: each dep's FileEdit fragments are
@@ -6122,7 +6167,8 @@ fn rewrite_uv_lock(
     result: &mut RewriteResult,
 ) {
     use crate::utils::python_lock::{
-        is_python_lock_name, pipenv_reads_pylock, ArtifactSource, PythonLockSession,
+        is_python_lock_name, paired_metadata_rel, pipenv_reads_pylock, ArtifactSource,
+        PythonLockSession,
     };
 
     let locks: Vec<(&String, &String)> = files
@@ -6220,6 +6266,19 @@ fn rewrite_uv_lock(
             result
                 .confirmed_python_lock_uuids
                 .insert(dep.patch_uuid.clone());
+            if metadata_edit.is_some() || rewritten != content {
+                let metadata = metadata_edit
+                    .as_ref()
+                    .map(|edit| edit.rewritten.as_str())
+                    .or_else(|| {
+                        paired_metadata_rel(path)
+                            .and_then(|rel| result.files.get(rel).or_else(|| files.get(rel)))
+                            .map(String::as_str)
+                    });
+                let constrained = session.manifest_constrains(&dep.name);
+                let advisories = uv_old_release_advisories(path, metadata, constrained, dep);
+                result.warnings.extend(advisories);
+            }
             if let Some(edit) = metadata_edit {
                 record_python_metadata_edit(edit, dep, result);
             }
@@ -27290,5 +27349,260 @@ mod owned_pin_generation_matrix {
         );
         let (_, again) = plan(&rotated, &maven(A, new));
         assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+}
+
+/// #1569: the hosted uv rewrite wires a transitive package through a marked
+/// `[tool.uv] override-dependencies` entry and repoints `[manifest]
+/// constraints`, two shapes uv before 0.5.5 does not honour. Vendored mode
+/// advises on both (`pypi_uv_*_0_5_6`); hosted must too, on the run that
+/// wires them, without refusing the redirect.
+#[cfg(test)]
+mod uv_old_release_advisories {
+    use super::*;
+
+    const URL: &str = "https://patch.test/six-1.16.0-py2.py3-none-any.whl";
+    const HOSTED_OVERRIDE_MARK_TEXT: &str = "# socket-patch hosted:";
+    const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+    const ISODATE: &str = "[[package]]\nname = \"isodate\"\nversion = \"0.6.1\"\nsource = { registry = \"https://pypi.org/simple\" }\ndependencies = [{ name = \"six\" }]\nwheels = [{ url = \"https://files.pythonhosted.org/packages/isodate-0.6.1-py2.py3-none-any.whl\", hash = \"sha256:0751eece944162659049d35f4f549ed815792b38793f07cf73381c1c87cbed96\" }]\n";
+
+    fn six() -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: "six".into(),
+            namespace: None,
+            version: "1.16.0".into(),
+            token: String::new(),
+            patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact_url: URL.into(),
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some("c".repeat(64)),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn scan(files: &BTreeMap<String, String>) -> (BTreeMap<String, String>, RewriteResult) {
+        let result = rewrite_registry_redirect(files, &[six()]);
+        let mut out = files.clone();
+        out.extend(result.files.clone());
+        (out, result)
+    }
+
+    fn codes(result: &RewriteResult) -> Vec<&str> {
+        result.warnings.iter().map(|w| w.code.as_str()).collect()
+    }
+
+    fn project(dependencies: &str, uv: &str) -> String {
+        format!("[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [{dependencies}]\n{uv}")
+    }
+
+    fn lock(app_dep: &str, requires: &str, manifest: &str, packages: &[&str]) -> String {
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n{manifest}\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\nsource = {{ virtual = \".\" }}\ndependencies = [{{ name = \"{app_dep}\" }}]\n\n[package.metadata]\nrequires-dist = [{requires}]\n\n{}",
+            packages.join("\n")
+        )
+    }
+
+    fn files(pairs: &[(&str, String)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(path, text)| (path.to_string(), text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn transitive_override_wiring_advises_uv_0_5_6() {
+        for newline in ["\n", "\r\n"] {
+            let input = files(&[
+                (
+                    "pyproject.toml",
+                    project("\"isodate==0.6.1\"", "").replace('\n', newline),
+                ),
+                (
+                    "uv.lock",
+                    lock(
+                        "isodate",
+                        "{ name = \"isodate\", specifier = \"==0.6.1\" }",
+                        "",
+                        &[ISODATE, SIX],
+                    )
+                    .replace('\n', newline),
+                ),
+            ]);
+            let (wired, result) = scan(&input);
+            assert!(
+                result
+                    .confirmed_python_lock_uuids
+                    .contains(&six().patch_uuid),
+                "{:?}",
+                result.warnings
+            );
+            assert!(wired["pyproject.toml"].contains("override-dependencies"));
+            assert_eq!(
+                codes(&result),
+                vec!["redirect_uv_override_requires_uv_0_5_6"],
+                "{:?}",
+                result.warnings
+            );
+            let detail = &result.warnings[0].detail;
+            assert!(
+                detail.contains("six") && detail.contains("uv sync"),
+                "{detail}"
+            );
+            // A settled re-run wires nothing and repeats nothing.
+            let (_, again) = scan(&wired);
+            assert!(
+                again.files.is_empty() && again.warnings.is_empty(),
+                "{:?}",
+                again.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn repointed_manifest_constraint_advises_uv_0_5_6() {
+        let input = files(&[
+            (
+                "pyproject.toml",
+                project(
+                    "\"six==1.16.0\"",
+                    "\n[tool.uv]\nconstraint-dependencies = [\"six==1.16.0\"]\n",
+                ),
+            ),
+            (
+                "uv.lock",
+                lock(
+                    "six",
+                    "{ name = \"six\", specifier = \"==1.16.0\" }",
+                    "\n[manifest]\nconstraints = [{ name = \"six\", specifier = \"==1.16.0\" }]\n",
+                    &[SIX],
+                ),
+            ),
+        ]);
+        let (wired, result) = scan(&input);
+        assert!(
+            result
+                .confirmed_python_lock_uuids
+                .contains(&six().patch_uuid),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            wired["uv.lock"].contains(&format!(
+                "constraints = [{{ name = \"six\", url = \"{URL}\" }}]"
+            )),
+            "{}",
+            wired["uv.lock"]
+        );
+        assert_eq!(
+            codes(&result),
+            vec!["redirect_uv_constraints_require_uv_0_5_6"],
+            "{:?}",
+            result.warnings
+        );
+        let (_, again) = scan(&wired);
+        assert!(again.files.is_empty() && again.warnings.is_empty());
+    }
+
+    /// The user's own unmarked `six==1.16.0` override is reused for the
+    /// hosted source, and uv before 0.5.5 ignores that source just the
+    /// same: advise, under the canonical name even for a `Six` grant.
+    #[test]
+    fn user_written_override_advises_uv_0_5_6() {
+        let input = files(&[
+            (
+                "pyproject.toml",
+                project(
+                    "\"isodate==0.6.1\"",
+                    "\n[tool.uv]\noverride-dependencies = [\"six==1.16.0\"]\n",
+                ),
+            ),
+            (
+                "uv.lock",
+                lock(
+                    "isodate",
+                    "{ name = \"isodate\", specifier = \"==0.6.1\" }",
+                    "",
+                    &[ISODATE, SIX],
+                ),
+            ),
+        ]);
+        let dep = DepOverride {
+            name: "Six".into(),
+            ..six()
+        };
+        let result = rewrite_registry_redirect(&input, std::slice::from_ref(&dep));
+        assert!(
+            result.confirmed_python_lock_uuids.contains(&dep.patch_uuid),
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.files["pyproject.toml"].contains(HOSTED_OVERRIDE_MARK_TEXT));
+        assert_eq!(
+            codes(&result),
+            vec!["redirect_uv_override_requires_uv_0_5_6"],
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            result.warnings[0].detail.contains("six==1.16.0"),
+            "{}",
+            result.warnings[0].detail
+        );
+    }
+
+    /// A direct dependency with no constraint needs neither shape: no
+    /// advisory (the existing hosted lanes stay warning-free).
+    #[test]
+    fn direct_dependency_without_constraint_is_silent() {
+        let input = files(&[
+            ("pyproject.toml", project("\"six==1.16.0\"", "")),
+            (
+                "uv.lock",
+                lock(
+                    "six",
+                    "{ name = \"six\", specifier = \"==1.16.0\" }",
+                    "",
+                    &[SIX],
+                ),
+            ),
+        ]);
+        let (_, result) = scan(&input);
+        assert!(result
+            .confirmed_python_lock_uuids
+            .contains(&six().patch_uuid));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    /// A PEP 723 script lock wires a transitive package through the
+    /// script block's own `[tool.uv] override-dependencies`.
+    #[test]
+    fn transitive_script_override_advises_uv_0_5_6() {
+        let script = "# /// script\n# requires-python = \">=3.9\"\n# dependencies = [\"isodate==0.6.1\"]\n# ///\nimport isodate\n";
+        let lock = format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.9\"\n\n[manifest]\nrequirements = [{{ name = \"isodate\", specifier = \"==0.6.1\" }}]\n\n{ISODATE}\n{SIX}"
+        );
+        let input = files(&[("tool.py", script.to_string()), ("tool.py.lock", lock)]);
+        let (wired, result) = scan(&input);
+        assert!(
+            result
+                .confirmed_python_lock_uuids
+                .contains(&six().patch_uuid),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            wired["tool.py"].contains("override-dependencies"),
+            "{}",
+            wired["tool.py"]
+        );
+        assert_eq!(
+            codes(&result),
+            vec!["redirect_uv_override_requires_uv_0_5_6"],
+            "{:?}",
+            result.warnings
+        );
     }
 }
