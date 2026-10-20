@@ -102,7 +102,8 @@ Every subcommand accepts the same set of "global" flags via a single shared `Glo
 | `--vendor-url` | — | `SOCKET_VENDOR_URL` | (active API/proxy base) | string | Base host for the vendoring-service package-reference request |
 | `--patch-server-url` | — | `SOCKET_PATCH_SERVER_URL` | (server-returned) | string | Override the host of the prebuilt-archive download URL (local-dev / testing) |
 | `--offline` | — | `SOCKET_OFFLINE` | `false` | bool | **Strict airgap on every command** — never contact the network |
-| `--strict` | — | `SOCKET_STRICT` | `false` | bool | Treat a beforeHash mismatch as a hard error in the in-place apply paths (see the mismatch-policy note below) |
+| `--strict` | — | `SOCKET_STRICT` | `false` | bool | Keep rejecting file-content mismatches even with `--allow-user-patches`; mismatches already fail by default without consent. `apply --force` overrides this file check, but never grants consent for declared project patches. |
+| `--allow-user-patches` | — | — | `false` | bool | Explicit, invocation-only consent to attempt Socket patches alongside project patches/replacements, or overwrite modified installed files. No environment or repository-policy binding. Backend safety refusals still apply. See [Existing project patches](#existing-project-patches). |
 | `--global` | `-g` | `SOCKET_GLOBAL` | `false` | bool | Operate on globally-installed packages |
 | `--global-prefix` | — | `SOCKET_GLOBAL_PREFIX` | (auto) | path | Override global packages root |
 | `--json` | `-j` | `SOCKET_JSON` | `false` | bool | Machine-readable output |
@@ -121,7 +122,80 @@ Every subcommand accepts the same set of "global" flags via a single shared `Glo
 
 `--offline` means the same thing on every command (v3.0): never contact the network, fail loudly when a required local source is missing. On `repair`, `--offline` and `--download-only` are mutually exclusive (exit 2). `scan` and `get` need remote data for their core function (patch discovery / patch fetch), so `--offline` refuses them up front — exit 1 with an error naming the offline gate (JSON: `status: "error"`), before any crawl, client build, or network contact. This covers `scan --mode vendored` too: offline vendored staging is `vendor --offline`'s job.
 
-The `--strict` mismatch policy applies to the in-place apply paths (apply/get/scan --mode agent/hook/go redirect). DEFAULT (v3.4): a file whose on-disk content matches neither the patch's beforeHash nor its afterHash is overwritten with the FULL verified patched content (blob writes are hash-gated to exactly afterHash; the missing blob is downloaded on demand) and surfaced as a `content_mismatch_overwritten` stderr warning + Skipped event (agent-mode `get` / `scan --json`: a `warnings[]` entry, see "Agent-mode mismatch overwrites"). A file the patch adds (empty beforeHash) that already exists with other content is the same case. `--strict` turns that case into a hard error. Rollback of an added file deletes it; the content it replaced is not kept. `--force` overrides `--strict` and additionally skips missing files. Vendoring is unaffected: it commits the patch server's verified artifact and never reads the installed bytes.
+The in-place apply paths (`apply`, agent-mode `get` / `scan`, and their nested
+apply calls) reject files matching neither `beforeHash` nor `afterHash` by
+default. This also protects a pre-existing file where the Socket patch adds a
+new file (empty `beforeHash`). `--allow-user-patches` permits the old
+warn-and-overwrite behavior: only the full, hash-verified `afterHash` content
+can be written, with `content_mismatch_overwritten` diagnostics. `--strict`
+keeps rejecting file drift even with that consent. `apply --force` remains
+explicit consent for file drift and additionally skips missing files, but a
+**declared project patch still requires `--allow-user-patches`**. Overwriting
+is not a merge: the replaced local content is not kept for rollback.
+Vendoring commits the service artifact without merging installed changes.
+
+## Existing project patches
+
+**Release classification: MAJOR.** This intentionally tightens the default
+file-mismatch policy and package eligibility. Publish it with the next major
+release under the semver policy; version stamps and release notes belong to the
+release train.
+
+Project-owned patches are protected at package level, even if they touch a
+different file, are not installed yet, or all Socket `beforeHash` checks pass.
+A missing referenced diff does not remove that protection.
+
+- `scan` (every mode, including previews) excludes matching packages before patch
+  selection and emits `warnings[].code: user_patch_conflict`, naming the purl
+  and evidence path. Other packages remain eligible; skips alone exit 0. A nested
+  agent apply also checks existing in-scope manifest entries and refuses if any
+  conflict remains, even if the newly selected records have already been saved.
+  The full installed inventory still protects skipped packages from prune-as-missing.
+- Explicit `get` selection (including UUID, `--save-only`, and `--dry-run`),
+  mutating `apply`, and `vendor` refuse selected conflicts with exit 1,
+  `status: error`, `error.code: user_patch_conflict`, before their patch writes.
+  A hosted or vendored writer rechecks under its apply lock before rewiring.
+- `--allow-user-patches` approves the attempt for this invocation and emits
+  `user_patch_override` warnings. It is forwarded to nested apply. `--yes`,
+  `--force`, a UUID, policy settings, and `SOCKET_ALLOW_USER_PATCHES` do not grant
+  this consent. Automatic scans never introduce a confirmation prompt.
+- Consent does not turn an unsupported composition into a supported one. Native
+  Bun/npm refusals, Yarn layout restrictions, source ownership, integrity,
+  path-safety and other backend checks still apply. The CLI never edits, deletes,
+  rebases, or evaluates user patch files to make a Socket patch fit.
+- Read-only `apply --check`, `vendor --check`, `list` and `vex`, and explicit
+  reversal (`rollback`, `remove`, `vendor --revert`) keep their existing behavior.
+  `repair` may restore Socket-owned artifacts; any re-vendoring uses the same
+  consent gate. Existing Socket pins are not automatically unwound when a user
+  adds a patch: inspect them and explicitly roll back if necessary.
+
+Detection covers root and declared npm workspace manifests, ancestor workspace
+settings, and the following evidence:
+
+| Mechanism | Evidence |
+| --- | --- |
+| pnpm | `pnpm.patchedDependencies` in `package.json`; `patchedDependencies` in `pnpm-workspace.yaml` and `pnpm-lock.yaml`; registry lock keys carrying `patch_hash` or `patched` markers, including legacy and multi-document locks |
+| Yarn Berry | User `patch:` references in dependency/resolution fields or lock resolutions; builtin-only compatibility patches are exempt |
+| `patch-package` (npm / Yarn Classic / other npm layouts) | Default `patches/` filenames, including scoped, nested (`++`), sequenced and `.dev.patch` files; literal `--patch-dir` paths in package scripts |
+| Native npm / Bun | Root `patchedDependencies`; npm lock `patched` records; Bun text-lock declarations (binary Bun installs also have the root declaration) |
+| Composer Patches | Root `extra.patches`, external `patches.json` / configured `patches-file`, `patches.lock.json`, and dependency `extra.patches` in `composer.lock` |
+| Cargo | `[patch]` (including renamed `package` entries), `[replace]`, and `.cargo/config[.toml]` `paths` overrides; Socket-owned vendored paths are exempt |
+| Go | User-owned `replace` directives in `go.mod` / `go.work`; Socket-owned replacements are exempt |
+
+Exact npm versions and supported npm ranges are matched against the selected
+release; name-only and `*` declarations cover all releases, including prereleases.
+Unrecognized ranges protect
+the named package conservatively. Matching is conservative across copies and
+workspace members: one declaration protects every selected copy of that release.
+Unreadable/malformed metadata, dynamic patch directories, or a workspace glob the
+bounded reader cannot inspect protect the affected ecosystem with an explanatory
+conflict diagnostic. Filesystem inspection never executes hooks or fetches patch
+URLs. Arbitrary scripts, external build pipelines, unrecorded edits to files the
+Socket patch does not touch, and global-install patch declarations cannot be
+identified reliably; rejecting unknown file drift remains the fallback. This is
+not a proof that two patches compose, even after opt-in. See the
+[research and source references](../../docs/ecosystems.md#existing-project-patches).
+
 
 ## Per-subcommand arguments
 
@@ -1517,7 +1591,7 @@ command's integration tests check its output.
 | `vendor_artifact_redownload_failed` | `failed` | repair: download unavailable, integrity mismatch, or downloaded bytes/inventory differ from the ledger. Existing files are preserved. |
 | `vendor_artifact_unrepairable` | `failed` | repair: the ledger identity or patch record cannot be trusted or recovered. |
 | `vendor_uuid_mismatch` | `skipped` | repair: the manifest's patch uuid moved past the vendored artifact — a re-vendor (`vendor` / `scan --mode vendored`) is pending; repair does not cross patch generations. |
-| `content_mismatch_overwritten` | `skipped` (warning) | apply (default policy): a file matched NEITHER beforeHash nor afterHash and was overwritten with the full verified patched content. This includes a file the patch adds (empty beforeHash) that already exists with other content. `--strict` turns this case into a `failed` event instead. Agent-mode `get` / `scan --json` carry it as a `(content_mismatch_overwritten) …` `warnings[]` entry (#1004). |
+| `content_mismatch_overwritten` | `skipped` (warning) | apply (explicit `--allow-user-patches` / `--force`): a file matched NEITHER beforeHash nor afterHash and was overwritten with the full verified patched content. This includes a file the patch adds (empty beforeHash) that already exists with other content. `--strict` turns this case into a `failed` event instead. Agent-mode `get` / `scan --json` carry it as a `(content_mismatch_overwritten) …` `warnings[]` entry (#1004). |
 | `vendor_lock_checksums_unsupported` / `vendor_stale_lock_checksum` | `failed` | vendor (gem): an ambiguous/platform CHECKSUMS entry, or a v1-wired lock whose stale token blocks the hot path (run `vendor --revert` + re-vendor). |
 | `redirect_unattributable` | `skipped` (hosted event) | scan/get `--mode hosted`: the rewriters would pin the patch, but lockfile discovery over the result reads that pin as contested (another lock or requirements file resolves the same version elsewhere, or the pin is not one the package manager consumes), so `vex`, `rollback`, `remove` and `vendor` would refuse it. The candidate is left out of the rewrite, so nothing is written for it; the detail carries discovery's findings. Exit code unchanged. |
 | `redirect_copy_unpatched` | `warnings[]` (warning) | scan/get `--mode hosted` (pnpm, yarn): the pin was written, but its own lock also installs an unpatched copy of the same `name@version`, which no rewrite reaches: a pnpm `file:` directory or tarball dependency (#935), or a yarn `file:` tarball / directory, URL tarball or berry `portal:` / `link:` dependency declared under another name (`lp2@file:…`, #939, #1236; not repeated for a copy a yarn classic skip warning already names). The detail names the lock entry. Neither the run's own `--vex` nor a later `vex` attests the package (`vex` warns `patched_ref_unattributable`), but discovery still manages the pin, so `rollback` / `remove` undo it. |
@@ -1583,10 +1657,14 @@ command's integration tests check its output.
 | `vendor_prebuilt_stub_invalid` | `failed` | RubyGems: the server stub lacks required attributes or is otherwise invalid; no local stub fallback is permitted. |
 | `vendor_*` / `pypi_*` / `gemfile_*` / `lock_*` / `locked_version_mismatch` / `user_authored_*` / `native_extensions_unsupported` / `platform_gem_unsupported` | `failed`/`skipped` | vendor: per-ecosystem refusal + drift vocabulary; see the Vendor command contract section. New tags are additive (MINOR). |
 
+`user_patch_conflict` is also a scan run warning for packages excluded by the
+project-patch consent gate; `user_patch_override` records explicit consent.
+
 ### Top-level `EnvelopeError` codes
 
 | Code                  | Subcommands                      | Meaning |
 |-----------------------|----------------------------------|---------|
+| `user_patch_conflict` | get, apply, vendor; hosted/vendored write rechecks | A selected package has project-owned patch/replacement evidence and no `--allow-user-patches` consent. Evidence paths and a remedy are included; exit 1. |
 | `manifest_not_found`  | remove, repair, rollback, vex, apply (only when the manifest vanishes between apply's existence probe and its locked read) (not `list` since v5.0: a missing manifest is an empty list) | `.socket/manifest.json` doesn't exist. For `vex` (and `scan --vex`) it fires only when, in addition, NOTHING else names a patch — no vendor-ledger entry, no lockfile reference (hosted or vendored) — and the message says so (exit 2 standalone; `apply`/`vendor --vex` treat it as their calm no-op). v3.5: `repair` proceeds anyway (vendored phase only) when a vendor ledger or vendor-path lockfile references exist, and exits 0 with a `redirect_only_project` skip (not this error) when the project's only patch state is hosted pins in its lockfiles (v5.0; or a pre-v5 `redirect-state.json`). `list` likewise no longer fires this on a hosted-only project: v5.0 lists every hosted pin the lockfiles wire (exit 0, labeled `details.mode: "hosted"` + `details.lockfiles: [<files wiring it>]` — no `details.ledger`, since hosted mode keeps none; when the manifest exists too, both are shown, purl-sorted with the manifest entry first on a tie). A pin carries its uuid and empty details unless a pre-v5 redirect ledger records the same purl and uuid (read for migration only: its record supplies the vulnerabilities / tier / description); a pre-v5 ledger record whose pin is in no lockfile is not listed. v5.0: `list` reads the vendor ledger the same way — a vendored-only project (every `scan`/`get --mode vendored` project) lists its ledger entries' embedded records labeled `Mode: vendored (recorded in .socket/vendor/state.json)` in human mode — the twin of the hosted `Mode: hosted (wired in <lockfiles>)` line — (`details.mode: "vendored"` + `details.ledger: ".socket/vendor/state.json"` in JSON), exit 0. A standalone-`vendor` entry's fallback `record` lists the same way once no manifest entry covers it (by ledger key or base purl) — the copy manifest-less `vex` attests from, so `list` never reports `manifest_not_found` for a tree whose VEX document attests a patch; while the manifest covers it, only the manifest entry is listed. All sources always come from the SAME project (see the `--manifest-path` flag row), so `--manifest-path` into another project reads that project's state, never the local one. The error still fires when NONE of the three sources has a patch, and a present-but-broken manifest still reports `manifest_invalid`/`manifest_unreadable` regardless (corruption is never masked). A malformed pre-v5 redirect ledger degrades to "nothing to consult" with a stderr warning, muted by `--silent` (the pins still list); `list --json` carries it in the run-level `warnings[]` as `redirect_ledger_corrupt` instead of on stderr. v5.0: `rollback` likewise proceeds manifest-less when the vendor ledger or the lockfiles' hosted pins hold work (its error is the legacy `{status: "error", error: {code: "manifest_not_found", message: "Manifest not found"}, path}` shape); only the truly-empty project — no manifest, no vendor ledger, no hosted pin (a lone pre-v5 redirect ledger is deleted, exit 0) — keeps the exit-1 error, and a project whose lockfiles still reference `.socket/vendor/` artifacts with NO vendor ledger gets a distinct error naming `socket-patch repair`. `remove` (v5.0) proceeds manifest-less whenever a vendor ledger file exists or the lockfiles pin a hosted patch (an existence probe and the read-only hosted-pin discovery before the lock; the vendor ledger loads under it): ANY vendor-ledger entry matching the identifier — detached or not — is removed through the ledger path (`--preserve-state` and drift-keeps behave exactly as on the manifest path), a hosted-only match restores its upstream registry entry, and when that state exists but holds nothing for the identifier the error is `not_found` (exit 1), not this code — `manifest_not_found` fires from `remove` only when all three sources are empty. Manifest entries are removed in sorted purl order. |
 | `ambiguous_target`    | remove, get, rollback            | The identifier is a package name whose last-segment rule selects several packages across the manifest, the vendor ledger and the hosted pins (`core` → `@angular/core` and `@babel/core`). Nothing is changed (exit 1); the message names each package. Use the full name or a purl. See **Target grammar**. |
 | `manifest_invalid`    | list, remove, apply (incl. `--check`), repair, vendor (incl. `--check`), vex, rollback, get, scan (agent mode) | Manifest exists but is unparseable (malformed JSON or a schema violation). **v5.0, MAJOR (#931)**: one mapping on every command — `apply` used to say `apply_failed`, `repair` `repair_failed`, `vendor` the undocumented `invalid_manifest`, and `apply --check` / `vendor --check` / `vex` / `get` / `rollback` `manifest_unreadable`. Exit codes unchanged (`vex`: 2, every other command 1). Agent-mode `scan` fails with it (exit 1); the other scan modes, which don't read the manifest, add a warning with the same code and go on. |

@@ -347,6 +347,7 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
             // --force) deliberately downgrade a hash mismatch to "ready"
             // and the file WOULD be overwritten with verified content.
             strict: true,
+            allow_user_patches: false,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: Some(100),

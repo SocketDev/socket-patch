@@ -436,7 +436,7 @@ async fn apply_with_force_overrides_hash_mismatch() {
 }
 
 #[tokio::test]
-async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
+async fn apply_hash_mismatch_opt_in_warns_and_applies_strict_fails() {
     let after = b"after\n";
     let after_hash = git_sha256(after);
     let expected_before = b"expected-before\n";
@@ -461,11 +461,11 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
         tmp
     };
 
-    // DEFAULT: the mismatch is overwritten with the full verified patched
+    // OPT-IN: the mismatch is overwritten with the full verified patched
     // content (the blob is hash-gated to afterHash) and surfaced as a warning event — exit 0.
     let tmp = fixture();
     let out = hermetic::command(&binary())
-        .args(["apply", "--json", "--offline"])
+        .args(["apply", "--allow-user-patches", "--json", "--offline"])
         .current_dir(tmp.path())
         .output()
         .expect("run socket-patch");
@@ -474,7 +474,7 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
     assert_eq!(
         out.status.code().unwrap_or(-1),
         0,
-        "default mismatch is a warning, not an error: {v:#}"
+        "opted-in mismatch is a warning, not an error: {v:#}"
     );
     assert_eq!(v["status"], "success", "{v:#}");
     let events = v["events"].as_array().expect("events array");
@@ -497,7 +497,7 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
     // The human run logs the warning to stderr.
     let tmp = fixture();
     let out = hermetic::command(&binary())
-        .args(["apply", "--offline", "--yes"])
+        .args(["apply", "--allow-user-patches", "--offline", "--yes"])
         .current_dir(tmp.path())
         .output()
         .expect("run socket-patch");
@@ -511,7 +511,13 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
     // --strict: fail closed — exit 1, failed event, file untouched.
     let tmp = fixture();
     let out = hermetic::command(&binary())
-        .args(["apply", "--json", "--offline", "--strict"])
+        .args([
+            "apply",
+            "--allow-user-patches",
+            "--json",
+            "--offline",
+            "--strict",
+        ])
         .current_dir(tmp.path())
         .output()
         .expect("run socket-patch");
@@ -686,7 +692,7 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
 // Mismatch: the full blob is downloaded and applied.
 // ---------------------------------------------------------------------------
 
-/// The default mismatch policy applies the FULL afterHash blob to a
+/// The explicitly approved mismatch policy applies the FULL afterHash blob to a
 /// mismatched file. A leftover legacy package archive is not a source, so
 /// the stage step still downloads the blob.
 #[tokio::test]
@@ -749,7 +755,7 @@ async fn apply_mismatch_redownloads_full_blob_and_applies() {
             .unwrap();
     }
 
-    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--allow-user-patches"]);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(code, 0, "stdout={v:#}\nstderr={stderr}");
     let events = v["events"].as_array().expect("events array");
@@ -944,7 +950,7 @@ async fn apply_online_ignores_legacy_package_archive_when_downloads_fail() {
 /// Two physical copies of one PURL (a root copy plus a nested duplicate):
 /// the root copy already carries the afterHash bytes, the nested one was
 /// locally modified (matches NEITHER hash). The stage step fetches the full
-/// afterHash blob, and the default warn-and-overwrite policy must apply it
+/// afterHash blob, and the explicitly approved warn-and-overwrite policy must apply it
 /// to EVERY copy, not just the first (clean, root) one.
 #[tokio::test]
 async fn mismatch_overwrites_every_copy_of_a_duplicated_package() {
@@ -982,7 +988,7 @@ async fn mismatch_overwrites_every_copy_of_a_duplicated_package() {
 
     let socket = tmp.path().join(".socket");
     write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
-    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--allow-user-patches"]);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
         code, 0,

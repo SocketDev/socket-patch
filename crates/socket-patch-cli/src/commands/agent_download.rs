@@ -367,6 +367,7 @@ pub struct DownloadParams {
     /// `--strict` forwarded to the nested apply (a beforeHash mismatch
     /// fails instead of warn-and-overwrite).
     pub strict: bool,
+    pub allow_user_patches: bool,
     /// `--ecosystems` forwarded to the nested apply, so it never touches
     /// other ecosystems' packages the user filtered out.
     pub ecosystems: Option<Vec<String>>,
@@ -1401,6 +1402,7 @@ pub(crate) fn nested_apply_args_from_params(
         global: params.global,
         global_prefix: params.global_prefix.clone(),
         strict: params.strict,
+        allow_user_patches: params.allow_user_patches,
         // Scope the nested apply like the caller was scoped: `None` would
         // apply the WHOLE manifest, mutating other ecosystems' packages the
         // user filtered out.

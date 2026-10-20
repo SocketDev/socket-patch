@@ -45,13 +45,13 @@ pub struct VerifyResult {
 /// `Strict` exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MismatchPolicy {
-    /// DEFAULT: a beforeHash mismatch is overwritten with the verified
+    /// Explicitly permitted: a beforeHash mismatch is overwritten with the verified
     /// patched content and surfaced as a warning (the promoted
     /// [`VerifyResult`] keeps `expected_hash`/`current_hash`, which is
     /// how callers detect and report it). A MISSING pre-existing file is
     /// still a hard error.
     Warn,
-    /// A beforeHash mismatch is a hard error (`--strict`).
+    /// A beforeHash mismatch is a hard error (the CLI default, or `--strict`).
     Strict,
     /// [`MismatchPolicy::Warn`] PLUS missing pre-existing files are
     /// skipped instead of failing (`--force`).
@@ -840,7 +840,7 @@ pub const NEW_FILE_COLLISION_MESSAGE: &str =
 /// (CLI_CONTRACT "mismatch policy"). [`verify_file_patch`] reports it as
 /// `Ready` (its callers only ask "can this be written?"); the apply engine
 /// turns it into a `HashMismatch` with an empty `expected_hash`, so
-/// `--strict` refuses it and the default policy overwrites it with the
+/// `Strict` refuses it and explicit mismatch tolerance overwrites it with the
 /// `content_mismatch_overwritten` warning instead of silently.
 fn mark_new_file_collision(verify: &mut VerifyResult, file_info: &PatchFileInfo) {
     if file_info.before_hash.is_empty()
@@ -909,7 +909,7 @@ async fn apply_package_patch_at(
             && verify_result.status != VerifyStatus::AlreadyPatched
         {
             match (verify_result.status, policy) {
-                // Mismatch tolerated (default + force): promote to Ready.
+                // Mismatch explicitly tolerated (warn + force): promote to Ready.
                 // The promoted result KEEPS `expected_hash`/`current_hash`
                 // — the signature callers use to surface the warning. The
                 // blob source is hash-gated to afterHash.
@@ -3319,7 +3319,7 @@ mod tests {
     /// #626: agent apply must not write through a `node_modules` link to
     /// first-party source (a workspace member / `file:` dir, scoped or not,
     /// or an `npm link` target outside the project). The user's fork does
-    /// not match the patch's beforeHash, which the default policy would
+    /// not match the patch's beforeHash, which mismatch tolerance would
     /// otherwise overwrite. Refused for every policy, dry run included, and
     /// the fork keeps its bytes.
     #[cfg(unix)]

@@ -1728,6 +1728,11 @@ impl EjectSnapshot {
 /// the project to upstream, not to hosted).
 async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
+    let user_patch_warnings =
+        match super::user_patches::check(common, pins.iter().map(|p| &p.purl)).await {
+            Ok(warnings) => warnings,
+            Err(error) => return super::user_patches::refuse(common, Command::Vendor, error),
+        };
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let telemetry = TelemetryAuth::for_client(&client);
@@ -1783,6 +1788,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // before anything is touched, so every package stays hosted.
     if !fetch_failures.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
+        env.warnings.extend(
+            user_patch_warnings
+                .into_iter()
+                .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
+        );
         env.dry_run = common.dry_run;
         if common.json {
             env.warnings
@@ -1844,6 +1854,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     }
     if !refused.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
+        env.warnings.extend(
+            user_patch_warnings
+                .into_iter()
+                .map(|(code, detail)| RunWarning { code, detail }),
+        );
         env.dry_run = common.dry_run;
         if common.json {
             env.warnings
@@ -1873,6 +1888,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // preview the vendor step would be a write.
     if common.dry_run {
         let mut env = Envelope::new(Command::Vendor);
+        env.warnings.extend(
+            user_patch_warnings
+                .into_iter()
+                .map(|(code, detail)| RunWarning { code, detail }),
+        );
         env.dry_run = true;
         if common.json {
             env.warnings
@@ -1926,6 +1946,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             return emit_eject_refusal(common, code, &message);
         }
     };
+    if !common.allow_user_patches {
+        if let Err(error) = super::user_patches::check(common, pins.iter().map(|p| &p.purl)).await {
+            return super::user_patches::refuse(common, Command::Vendor, error);
+        }
+    }
     let touched: Vec<String> = pins
         .iter()
         .flat_map(|p| p.files.iter().cloned())
@@ -1943,6 +1968,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         }
     };
     let mut env = Envelope::new(Command::Vendor);
+    env.warnings.extend(
+        user_patch_warnings
+            .into_iter()
+            .map(|(code, detail)| RunWarning { code, detail }),
+    );
     if common.json {
         env.warnings
             .extend(crate::commands::vex_sources::api_auth_fallback_warning(
@@ -2197,6 +2227,20 @@ async fn run_vendor(
     // previous run whose patches were dropped from the manifest are reverted
     // even when zero in-scope patches remain. Its post-reconcile ledger
     // feeds the staging harvest below and then the engine.
+    match super::user_patches::check(common, manifest.patches.keys()).await {
+        Ok(warnings) => env.warnings.extend(
+            warnings
+                .into_iter()
+                .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
+        ),
+        Err(error) => {
+            if !common.json {
+                eprintln!("Error: {}", error.message);
+            }
+            env.mark_error(error);
+            return 1;
+        }
+    }
     let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);

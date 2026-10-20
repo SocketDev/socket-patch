@@ -573,7 +573,11 @@ async fn scan_agent_json_mismatch_overwrite_reaches_the_apply_block() {
         b"before\n// local edit\n",
     );
 
-    let (code, v) = run_json(tmp.path(), &mock.uri(), &["--mode", "agent"]);
+    let (code, v) = run_json(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "agent", "--allow-user-patches"],
+    );
     assert_eq!(code, 0, "{v:#}");
     assert_eq!(v["summary"]["applied"], 1, "{v}");
     let detail = hosted::warning_detail(&v, "content_mismatch_overwritten");
@@ -848,6 +852,82 @@ async fn scan_vendored_ignores_a_degraded_pre_v5_vlt_ledger_edit() {
             std::fs::read_to_string(hosted::ledger_path(root)).unwrap(),
             bytes,
             "{key}: the pre-v5 ledger is left byte-identical: {env:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn scan_skips_user_patches_in_every_mode_before_querying_or_writing() {
+    let mock = MockServer::start().await;
+    for mode in ["agent", "hosted", "vendored"] {
+        let tmp = minimist_project(b"before\n");
+        let declaration = r#"{"dependencies":{"minimist":"1.2.8"},"pnpm":{"patchedDependencies":{"minimist":"missing.patch"}}}"#;
+        std::fs::write(tmp.path().join("package.json"), declaration).unwrap();
+        let (code, json) = run_json(tmp.path(), &mock.uri(), &["--mode", mode, "--yes"]);
+        assert_eq!(code, 0, "{mode}: {json}");
+        assert!(
+            json["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "user_patch_conflict"),
+            "{json}"
+        );
+        assert!(!tmp.path().join(".socket").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+            declaration
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
+            b"before\n"
+        );
+    }
+    assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scan_still_patches_unrelated_packages_and_forwards_explicit_consent() {
+    for allowed in [false, true] {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/example@1.0.0";
+        mount_one_patch_api(&mock, purl, b"before\n").await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "example", "1.0.0", b"before\n");
+        std::fs::create_dir(tmp.path().join("patches")).unwrap();
+        if !allowed {
+            write_npm_package(tmp.path(), "unrelated", "1.0.0", b"before\n");
+        }
+        let patched_name = if allowed { "example" } else { "unrelated" };
+        std::fs::write(
+            tmp.path()
+                .join(format!("patches/{patched_name}+1.0.0.patch")),
+            "user diff",
+        )
+        .unwrap();
+        let mut args = vec!["--mode", "agent"];
+        if allowed {
+            args.push("--allow-user-patches");
+        }
+        let (code, json) = run_json(tmp.path(), &mock.uri(), &args);
+        assert_eq!(code, 0, "{json}");
+        if !allowed {
+            assert_eq!(
+                std::fs::read(tmp.path().join("node_modules/unrelated/index.js")).unwrap(),
+                b"before\n"
+            );
+            assert!(mock
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| !String::from_utf8_lossy(&request.body)
+                    .contains("pkg:npm/unrelated@")));
+        }
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/example/index.js")).unwrap(),
+            b"after\n"
         );
     }
 }

@@ -93,6 +93,17 @@ impl<'a> VendoredBackend<'a> {
     /// `scan_run_fits_windows_main_thread_stack`).
     pub(crate) async fn apply(&self, req: ApplyRequest<'_>, env: &mut Envelope) -> bool {
         let common: &GlobalArgs = &self.common;
+        if !common.allow_user_patches {
+            if let Err(error) =
+                super::user_patches::check(common, req.manifest.patches.keys()).await
+            {
+                if !common.json {
+                    eprintln!("Error: {}", error.message);
+                }
+                env.mark_error(error);
+                return true;
+            }
+        }
         let blobs = req.socket_dir.join("blobs");
         let sources = socket_patch_core::patch::apply::PatchSources {
             blobs_path: &blobs,

@@ -888,6 +888,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         silent,
         all_releases: args.all_releases,
         strict: args.common.strict,
+        allow_user_patches: args.common.allow_user_patches,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
@@ -2212,7 +2213,26 @@ async fn run_scan(
             .locate_nested_copies(&nm_roots, &filtered_crawled)
             .await;
     }
-    let filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
+    let mut filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
+    // Keep the full crawl above for GC: a protected package is still installed.
+    // Protect before querying/selecting, in every mode and in dry-run previews.
+    let user_patches = super::user_patches::inspect(&args.common).await;
+    filtered_crawled.retain(|package| {
+        let sources = user_patches.conflicts(&package.purl);
+        if sources.is_empty() {
+            return true;
+        }
+        layout_refusals.push((
+            if args.common.allow_user_patches {
+                super::user_patches::ALLOWED
+            } else {
+                super::user_patches::CONFLICT
+            }
+            .into(),
+            super::user_patches::detail(&package.purl, &sources, args.common.allow_user_patches),
+        ));
+        args.common.allow_user_patches
+    });
 
     // Gradle discovery notes (m2 gating, the user home) ride the run-level
     // warnings; the lock set only annotates `packages[]` below.

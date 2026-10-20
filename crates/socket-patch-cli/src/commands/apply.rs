@@ -120,12 +120,13 @@ fn mismatch_overwrite_warnings(results: &[ApplyResult], dry_run: bool) -> Vec<Ru
         .collect()
 }
 
-/// The mismatch policy this run applies with: `--force` ⊃ default
-/// (adds the missing-file skip), `--strict` restores fail-closed.
-fn mismatch_policy(force: bool, strict: bool) -> MismatchPolicy {
+/// Unknown local changes fail closed unless explicitly approved. --force is
+/// existing explicit consent for file drift; declared patches have a separate
+/// gate that requires --allow-user-patches even with --force.
+fn mismatch_policy(force: bool, strict: bool, allow_user_patches: bool) -> MismatchPolicy {
     if force {
         MismatchPolicy::Force
-    } else if strict {
+    } else if strict || !allow_user_patches {
         MismatchPolicy::Strict
     } else {
         MismatchPolicy::Warn
@@ -1039,7 +1040,7 @@ pub(crate) struct ApplyRunReport {
     /// when `code != 0`.
     pub applied: Vec<String>,
     /// Non-fatal per-file warnings the caller's envelope must carry: one
-    /// `content_mismatch_overwritten` per file the default mismatch policy
+    /// `content_mismatch_overwritten` per file the explicitly approved mismatch policy
     /// overwrote (#1004). A nested apply never prints JSON and is silent
     /// for a JSON caller, so this is their only channel. Filled whenever
     /// the apply loop ran, whatever the exit code.
@@ -1138,6 +1139,15 @@ pub(crate) async fn run_locked(
         }
     };
 
+    let user_patch_warnings =
+        match super::user_patches::check(&args.common, manifest.patches.keys()).await {
+            Ok(warnings) => warnings,
+            Err(error) => {
+                let code = report_apply_failure(&args, &error, &error.message, &telemetry).await;
+                return ApplyRunReport::run_failure(code, &error.code, error.message);
+            }
+        };
+
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
     // the npm crawler can't reach them and rewriting zips is a
@@ -1230,6 +1240,11 @@ pub(crate) async fn run_locked(
             // rightly ignores it). It rides the run-warning channel so it
             // is never silent.
             let mut run_warnings = run_warnings;
+            run_warnings.extend(
+                user_patch_warnings
+                    .into_iter()
+                    .map(|(code, detail)| RunWarning { code, detail }),
+            );
             run_warnings.extend(results.iter().filter_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success)?;
                 note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)
@@ -2146,7 +2161,11 @@ async fn apply_patches_inner(
 
     // Apply patches
     let sources = staged.as_patch_sources();
-    let policy = mismatch_policy(args.force, args.common.strict);
+    let policy = mismatch_policy(
+        args.force,
+        args.common.strict,
+        args.common.allow_user_patches,
+    );
     let mut has_errors = false;
 
     // Group release-variant PURLs by base. PyPI (`?artifact_id=`),
@@ -3502,7 +3521,7 @@ mod tests {
     /// `HashMap`-iteration-ordered pick let a variant describing a
     /// different, NOT-installed distribution randomly match and get
     /// attempted (nondeterministic spurious failures, or wrong-variant
-    /// content overwrites under the default mismatch policy). 64 rounds
+    /// content overwrites under the explicitly approved mismatch policy). 64 rounds
     /// with fresh maps so the randomized per-instance iteration order is
     /// actually exercised.
     #[tokio::test]

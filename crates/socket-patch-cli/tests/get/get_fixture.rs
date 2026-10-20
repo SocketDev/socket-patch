@@ -293,6 +293,7 @@ pub fn engine_params(root: &Path) -> DownloadParams {
         json: true,
         silent: true,
         strict: false,
+        allow_user_patches: false,
         ecosystems: None,
         persist_blobs: true,
         patch_server_url: None,

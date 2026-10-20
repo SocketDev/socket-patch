@@ -635,3 +635,4 @@ mod tests {
         assert_eq!(mode, Ok(scan::ScanMode::Vendored));
     }
 }
+pub(crate) mod user_patches;

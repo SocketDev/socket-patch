@@ -180,12 +180,10 @@ pub struct GlobalArgs {
     )]
     pub offline: bool,
 
-    /// Treat a beforeHash mismatch as a hard error. By DEFAULT a file whose
-    /// on-disk content matches neither the patch's beforeHash nor its
-    /// afterHash is overwritten with the full verified patched content and
-    /// surfaced as a stderr warning (`content_mismatch_overwritten`); this
-    /// flag restores the fail-closed behavior. On commands that have
-    /// `--force`, `--force` overrides it.
+    /// Reject modified file content even with --allow-user-patches. Without
+    /// explicit consent, mismatches already fail by default. On commands that
+    /// have --force, --force overrides this file-content check (but never the
+    /// separate check for declared project patches).
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long,
@@ -194,6 +192,13 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub strict: bool,
+
+    /// Explicitly permit attempting patches on packages with project patches or
+    /// local modifications. Review and test the combined result; backend safety
+    /// refusals still apply. --yes does not approve patch composition; --force
+    /// approves only file-content drift.
+    #[arg(help_heading = GLOBAL_OPTIONS, long)]
+    pub allow_user_patches: bool,
 
     /// Operate on globally-installed packages.
     #[arg(
@@ -780,6 +785,7 @@ impl Default for GlobalArgs {
             patch_server_url: None,
             offline: false,
             strict: false,
+            allow_user_patches: false,
             global: false,
             global_prefix: None,
             json: false,

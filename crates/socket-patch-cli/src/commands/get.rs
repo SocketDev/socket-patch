@@ -1300,6 +1300,17 @@ pub async fn run(args: GetArgs) -> i32 {
                 )
                 .await;
                 let selected = vec![search_result_from_response(&patch)];
+                let user_patch_warnings =
+                    match super::user_patches::check(&args.common, [&patch.purl]).await {
+                        Ok(warnings) => warnings,
+                        Err(error) => {
+                            return super::user_patches::refuse(
+                                &args.common,
+                                JsonCommand::Get,
+                                error,
+                            )
+                        }
+                    };
                 // Acting against the repo's socket.yml says so
                 // (`policy_bypassed`).
                 let mut uuid_warnings =
@@ -1312,6 +1323,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 // Already on stderr from the client: JSON only, after the
                 // print above.
                 uuid_warnings.extend(org_warnings.iter().cloned());
+                uuid_warnings.extend(user_patch_warnings);
                 // Mode dispatch. All three reuse THIS fetched patch and
                 // this possibly-proxy-fallback client rather than
                 // re-fetching with a fresh one, which would re-hit the
@@ -1728,6 +1740,10 @@ pub async fn run(args: GetArgs) -> i32 {
     } else {
         selected
     };
+    match super::user_patches::check(&args.common, selected.iter().map(|p| &p.purl)).await {
+        Ok(warnings) => narrow_warnings.extend(warnings),
+        Err(error) => return super::user_patches::refuse(&args.common, JsonCommand::Get, error),
+    }
     if agent_preview {
         return agent_dry_run(&args, &selected, &narrow_skips, &narrow_warnings).await;
     }
@@ -2165,6 +2181,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         silent: args.common.silent,
         all_releases: args.all_releases,
         strict: args.common.strict,
+        allow_user_patches: args.common.allow_user_patches,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
@@ -3845,6 +3862,7 @@ mod tests {
             silent: true,
             all_releases: false,
             strict: false,
+            allow_user_patches: false,
             ecosystems: None,
             persist_blobs: false,
             patch_server_url: None,
@@ -4542,6 +4560,7 @@ mod tests {
             silent: true,
             all_releases: false,
             strict: false,
+            allow_user_patches: false,
             ecosystems: None,
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
@@ -5619,6 +5638,7 @@ mod tests {
         let common = GlobalArgs {
             verbose: true,
             strict: true,
+            allow_user_patches: false,
             json: true,
             dry_run: true,
             ..GlobalArgs::default()

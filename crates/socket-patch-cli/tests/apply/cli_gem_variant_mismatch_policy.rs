@@ -1,17 +1,17 @@
 //! Mismatch-policy contract for release-variant (gem) packages.
 //!
-//! For npm, a locally-modified file is handled by the documented default
+//! For npm, a locally-modified file is handled by the explicitly approved
 //! mismatch policy: warn + apply the full verified patched content,
 //! `--strict` refuses, `--force` also skips missing files (see
-//! `apply_network.rs::apply_hash_mismatch_default_warns_and_applies_strict_fails`).
+//! `apply_network.rs::apply_hash_mismatch_opt_in_warns_and_applies_strict_fails`).
 //! Release-variant ecosystems (gem/pypi/maven) route through the variant
 //! loop instead, whose installed-distribution gate must still let the
-//! default policy reach an UNQUALIFIED SINGLETON base (one bare manifest
+//! opt-in policy reach an UNQUALIFIED SINGLETON base (one bare manifest
 //! record for the `package@version`, the common case) with a
 //! locally-modified file: warn-overwrite, not "no matching variant found".
 //!
 //! Behaviors pinned (all offline, real binary, synthetic gem trees):
-//!   * unqualified singleton + locally-modified file: default apply warns
+//!   * unqualified singleton + locally-modified file: opted-in apply warns
 //!     (`content_mismatch_overwritten`) AND applies the full afterHash
 //!     bytes; `--strict` refuses (file untouched, exit 1); `--force`
 //!     keeps applying as before.
@@ -147,14 +147,14 @@ fn singleton_fixture(cwd: &Path) -> (PathBuf, Vec<u8>) {
 /// the full verified patched content and surfaced as a warning — the same
 /// npm contract, not "no matching variant found" with the file untouched.
 #[test]
-fn singleton_mismatch_default_warns_and_applies() {
+fn singleton_mismatch_opt_in_warns_and_applies() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (file, patched) = singleton_fixture(tmp.path());
 
-    let (code, _stdout, stderr) = run_apply(tmp.path(), &[]);
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--allow-user-patches"]);
     assert_eq!(
         code, 0,
-        "default mismatch on a singleton variant is a warning, not an error; stderr={stderr}"
+        "opted-in mismatch on a singleton variant is a warning, not an error; stderr={stderr}"
     );
     assert_eq!(
         std::fs::read(&file).expect("read patched file"),
@@ -178,7 +178,7 @@ fn singleton_mismatch_default_warns_and_applies() {
     // warning event — the same shape apply_network pins for npm.
     let tmp = tempfile::tempdir().expect("tempdir");
     let (file, patched) = singleton_fixture(tmp.path());
-    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--json"]);
+    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--json", "--allow-user-patches"]);
     assert_eq!(code, 0, "json run must also succeed; stdout={stdout}");
     assert_eq!(std::fs::read(&file).expect("read patched file"), patched);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON envelope");

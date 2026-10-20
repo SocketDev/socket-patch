@@ -1628,7 +1628,7 @@ async fn get_uuid_json_nested_apply_failure_names_the_patch() {
 }
 
 /// The agent engine (`scan --mode agent --json`'s path) over an installed
-/// file a local edit changed: the default policy overwrites it, and the
+/// file a local edit changed: the opted-in policy overwrites it, and the
 /// envelope must say so — the warning `apply --json` reports as a
 /// `content_mismatch_overwritten` event — while the patch still counts as
 /// applied.
@@ -1644,6 +1644,7 @@ async fn engine_nested_apply_mismatch_overwrite_reaches_the_json_envelope() {
     std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
     let mut params = engine_params(tmp.path());
     params.save_only = false;
+    params.allow_user_patches = true;
     let selected = vec![search_result(UUID, PURL)];
     let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
@@ -1687,7 +1688,11 @@ async fn get_uuid_json_mismatch_overwrite_is_reported() {
     write_project(tmp.path());
     let installed = tmp.path().join("node_modules").join(NAME).join("index.js");
     std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
-    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--json"]);
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--json", "--allow-user-patches"],
+    );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let json = parse_json_envelope(&stdout);
     assert_eq!(json["status"], "success", "json={json}");
@@ -1698,4 +1703,63 @@ async fn get_uuid_json_mismatch_overwrite_is_reported() {
     );
     assert!(!stderr.contains("did not match"), "stderr={stderr}");
     assert_eq!(std::fs::read(&installed).unwrap(), AFTER_BYTES);
+}
+
+#[tokio::test]
+async fn get_uuid_requires_specific_consent_in_every_mode_before_persisting() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+    for extra in [
+        vec![UUID, "--json", "--mode", "agent"],
+        vec![UUID, "--json", "--mode", "hosted"],
+        vec![UUID, "--json", "--mode", "vendored"],
+        vec![UUID, "--json", "--save-only"],
+        vec![UUID, "--json", "--mode", "agent", "--dry-run"],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        std::fs::create_dir(tmp.path().join("patches")).unwrap();
+        std::fs::write(
+            tmp.path().join(format!("patches/{NAME}+1.0.0.patch")),
+            "user diff",
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &extra);
+        let json = parse_json_envelope(&stdout);
+        assert_eq!(code, 1, "{extra:?}: {stdout} {stderr}");
+        assert_eq!(json["error"]["code"], "user_patch_conflict", "{json}");
+        assert!(!tmp.path().join(".socket/manifest.json").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join(format!("node_modules/{NAME}/index.js"))).unwrap(),
+            BEFORE_BYTES
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_uuid_forwards_explicit_consent_to_nested_apply() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::create_dir(tmp.path().join("patches")).unwrap();
+    let patch = tmp.path().join(format!("patches/{NAME}+1.0.0.patch"));
+    std::fs::write(&patch, "user diff").unwrap();
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--json", "--mode", "agent", "--allow-user-patches"],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert_eq!(
+        std::fs::read(tmp.path().join(format!("node_modules/{NAME}/index.js"))).unwrap(),
+        AFTER_BYTES
+    );
+    assert_eq!(std::fs::read_to_string(patch).unwrap(), "user diff");
+    let json = parse_json_envelope(&stdout);
+    assert!(json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["code"] == "user_patch_override"));
 }

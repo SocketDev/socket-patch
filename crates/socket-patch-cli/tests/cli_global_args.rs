@@ -101,6 +101,9 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         }),
         ("--offline", None, |c| assert!(c.offline)),
         ("--strict", None, |c| assert!(c.strict)),
+        ("--allow-user-patches", None, |c| {
+            assert!(c.allow_user_patches)
+        }),
         ("--global", None, |c| assert!(c.global)),
         ("--global-prefix", Some("/opt/global"), |c| {
             assert_eq!(c.global_prefix, Some(PathBuf::from("/opt/global")))
@@ -236,17 +239,18 @@ fn global_flag_cases_cover_every_global_field() {
         no_npm_allow_remote_config: _,
         no_vlt_install_cleanup: _,
         strict: _,
+        allow_user_patches: _,
         vendor_source: _,
         vendor_url: _,
         patch_server_url: _,
         maven_config: _,
     } = common;
 
-    // 26 fields ↔ 26 long-flag cases. Bump both this count and add a case when
+    // 27 fields ↔ 27 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        26,
+        27,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 
