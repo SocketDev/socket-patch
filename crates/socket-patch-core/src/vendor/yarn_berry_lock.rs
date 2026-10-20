@@ -2431,7 +2431,8 @@ __metadata:
     /// (`lp2@…`), so a copy of left-pad@1.3.0 under another name escapes the
     /// name-keyed resolutions entry and installs unpatched. Vendoring still
     /// wires the registry entry, names that copy (`vendor_copy_unpatched`),
-    /// and leaves it byte-untouched. Control: a `file:` / `portal:` copy
+    /// and leaves it byte-untouched. So does an `exec:` script or a
+    /// non-http git remote (#1630). Control: a `file:` / `portal:` copy
     /// holding another package is not named.
     #[tokio::test]
     async fn issue_939_other_name_copies_are_named() {
@@ -2470,10 +2471,27 @@ __metadata:
                 "0.0.0-use.local",
                 format!("lp2@link:./forks/left-pad::locator={ws}"),
             ),
+            // #1630: the lock doesn't say which package these build or
+            // clone, so they are named whatever is on disk.
+            (
+                "exec: script",
+                format!("lp2@exec:./gen.js::locator={ws}"),
+                "1.3.0",
+                format!("lp2@exec:./gen.js#./gen.js::hash=db115a&locator={ws}"),
+            ),
+            (
+                "git+ssh: remote",
+                "lp2@git+ssh://git@github.com/stevemao/left-pad.git#v1.3.0".to_string(),
+                "1.3.0",
+                "lp2@git+ssh://git@github.com/stevemao/left-pad.git#commit=5d3c4f2".to_string(),
+            ),
         ];
         for (case, key, version, resolution) in &cases {
             for fork in ["left-pad", "other-pkg"] {
-                let named = fork == "left-pad" || case.contains("url");
+                let named = fork == "left-pad"
+                    || case.contains("url")
+                    || case.contains("exec")
+                    || case.contains("git");
                 let block = format!(
                     "\n\"{key}\":\n  version: {version}\n  resolution: \"{resolution}\"\n  \
                      languageName: node\n  linkType: hard\n"

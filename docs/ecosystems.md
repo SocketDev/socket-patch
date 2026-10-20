@@ -289,8 +289,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
 - **yarn copies under another dependency name (classic & berry)** — yarn keys a `file:`
-  tarball or directory, a URL tarball and a berry `portal:` / `link:` dependency by the
-  name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as `lp2@file:…`,
+  tarball or directory, a URL tarball and a berry `portal:` / `link:` / `exec:` / git
+  dependency by the name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as `lp2@file:…`,
   while `node_modules/lp2` is left-pad@1.3.0. No pin or vendored wiring of `left-pad`
   reaches that copy, so it stays unpatched. Which package such a copy is comes from the
   copy itself (the tarball's or directory's `package.json`, or the registry package a
@@ -299,7 +299,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   installs it from, including a `file:` path outside the project (`file:../shared/lp`),
   and a tarball's `package.json` is found under whatever top-level directory it has, as
   yarn strips the first path segment. A copy whose package can't be read (a non-registry
-  URL, a missing directory) is treated as possibly any package at its lock version: it
+  URL, a missing directory, a berry `exec:` script or a git remote such as
+  `git+ssh://…`, which hold no package until yarn builds or clones them) is treated as
+  possibly any package at its lock version: it
   is named as a copy it may be, and `vex` attests nothing that lock wires at that
   version. An absolute path (`portal:/home/me/lp`, `file:/abs/lp.tgz`) is never read, as
   the lock is untrusted input; a `portal:` / `link:` copy whose `package.json` isn't

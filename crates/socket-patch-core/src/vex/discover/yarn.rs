@@ -42,7 +42,10 @@
 //! names the package the entry installs (for an `npm:` alias key the
 //! resolution carries the REAL ident); the version is the block's unquoted
 //! `version:` line. `workspace:`, `patch:`, `portal:`, `link:`, `exec:`,
-//! `git` and plain registry locators are not ours and are skipped silently.
+//! `git` and plain registry locators are not ours. A plain registry locator
+//! and a copy under another dependency name (`file:`, url, `portal:`,
+//! `link:`, `exec:`, git; #939, #1630) contest a wiring of the package they
+//! install, or may install; the rest are skipped silently.
 //!
 //! * **Hosted** (`patch::redirect::rewrite_yarn_berry`): the direct
 //!   tarball-URL locator `resolution: "name@https://patch.socket.dev/…"`,
@@ -538,17 +541,17 @@ fn berry_block(
         // A `portal:` / `link:` directory under another dependency name
         // links `node_modules/<dep>` to the package its `package.json`
         // names, which no `resolutions` pin of that package reaches (#939).
-        if reference.starts_with("portal:") || reference.starts_with("link:") {
-            if let (Some(source), Some(version)) = (
-                berry_copy_ref(reference),
-                berry_field(&block.lines, "version"),
-            ) {
-                copies.push(LockCopy {
-                    key: block.key.clone(),
-                    source,
-                    version: version.to_string(),
-                });
-            }
+        // An `exec:` script or a non-http git remote installs a package
+        // the lock doesn't name at its `version:` (#1630).
+        if let (Some(source), Some(version)) = (
+            berry_copy_ref(reference),
+            berry_field(&block.lines, "version"),
+        ) {
+            copies.push(LockCopy {
+                key: block.key.clone(),
+                source,
+                version: version.to_string(),
+            });
         }
         return; // workspace: / patch: / portal: / link: / exec: / git
     };
@@ -1628,6 +1631,56 @@ mod tests {
             &run(&project(&[wired, url("2.0.0")])).await,
             &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
         );
+    }
+
+    /// #1630: an `exec:` generator or a non-http git remote under another
+    /// dependency name installs `node_modules/lp2` from a package the lock
+    /// doesn't name, at its lock version. It may be the wired
+    /// left-pad@1.3.0, so it contests the ref like an unread url copy.
+    /// Control: the same copy at another version is no copy of 1.3.0.
+    #[tokio::test]
+    async fn issue_1630_exec_and_git_copies_contest_a_vendored_ref() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        let ws = "app%40workspace%3A.";
+        let copies = [
+            (
+                "exec:",
+                format!("lp2@exec:./gen.js::locator={ws}"),
+                format!("lp2@exec:./gen.js#./gen.js::hash=db115a&locator={ws}"),
+            ),
+            (
+                "git+ssh:",
+                "lp2@git+ssh://git@github.com/stevemao/left-pad.git#v1.3.0".to_string(),
+                "lp2@git+ssh://git@github.com/stevemao/left-pad.git#commit=5d3c4f2".to_string(),
+            ),
+        ];
+        let project = |blocks: &[String]| {
+            let p = Project::new();
+            p.write("yarn.lock", berry(blocks));
+            p.write(
+                "package.json",
+                package_json_with_resolutions(serde_json::json!({
+                    "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                })),
+            );
+            p
+        };
+        for (case, key, resolution) in &copies {
+            let copy = |version: &str| berry_block(key, version, resolution, None);
+            let out = run(&project(&[wired.clone(), copy("1.3.0")])).await;
+            assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("lp2@")),
+                "{case}: {:#?}",
+                out.diagnostics
+            );
+            assert_refs(
+                &run(&project(&[wired.clone(), copy("2.0.0")])).await,
+                &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Vendored)],
+            );
+        }
     }
 
     /// Socket-shaped blocks that fail validation are DIAGNOSED, never refs:
