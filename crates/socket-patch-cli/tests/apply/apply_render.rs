@@ -7,7 +7,8 @@
 //! `Would remove` announcement, "No patches to apply.", the
 //! no-matching-package error block, the dry-run summary counts,
 //! `--verbose` per-file labels, the pnpm/bun/vlt layout notes, the
-//! yarn-PnP refusal, the gem fallback-home skip warning, the
+//! yarn-PnP refusal, the gem fallback-home skip warning, the gem
+//! variant mismatch warning and no-matching-variant error, the
 //! `--dry-run --vex` skip line, and the staging layer's offline
 //! no-local-source report and download result line.
 
@@ -398,6 +399,88 @@ mod gem_fallback_home_human {
         );
         assert_eq!(std::fs::read(&store_file).unwrap(), patched);
         assert_eq!(std::fs::read(&home_file).unwrap(), foreign);
+    }
+}
+
+// ═══════════ gem variant mismatch policy ═══════════
+
+/// The human legs of `cli_gem_variant_mismatch_policy.rs`, which asserts
+/// the same cases through `--json` codes. Run with that file's runner
+/// (`BUNDLE_*` scrubbed) and fixtures.
+mod gem_variant_mismatch_human {
+    use crate::cli_gem_variant_mismatch_policy::{
+        multi_variant_fixture, qualified_wrong_platform_fixture, run_apply, singleton_fixture,
+        with_marker, LINUX_PRISTINE, SINGLETON_PURL,
+    };
+
+    const OVERWRITE_LINE: &str = "did not match the patch's expected original content";
+
+    /// The default-policy overwrite prints the npm-family mismatch
+    /// warning: the package, and what happened to the file.
+    #[test]
+    fn singleton_overwrite_prints_mismatch_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        singleton_fixture(tmp.path());
+        let (code, _stdout, stderr) = run_apply(tmp.path(), &[]);
+        assert_eq!(code, 0, "stderr={stderr}");
+        assert!(stderr.contains(OVERWRITE_LINE), "stderr={stderr}");
+        assert!(stderr.contains(SINGLETON_PURL), "stderr={stderr}");
+        assert!(
+            stderr.contains("applied the full verified patched content"),
+            "stderr={stderr}"
+        );
+    }
+
+    /// `--strict` prints the per-package failure with the hash refusal,
+    /// not the overwrite warning.
+    #[test]
+    fn singleton_strict_prints_hash_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        singleton_fixture(tmp.path());
+        let (code, _stdout, stderr) = run_apply(tmp.path(), &["--strict"]);
+        assert_eq!(code, 1, "stderr={stderr}");
+        assert!(
+            stderr.contains(&format!("Failed to patch {SINGLETON_PURL}")),
+            "stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("File hash does not match expected value"),
+            "stderr={stderr}"
+        );
+        assert!(!stderr.contains(OVERWRITE_LINE), "stderr={stderr}");
+    }
+
+    /// A base with no matching variant (a wrong-platform qualified
+    /// singleton, or a multi-variant base whose variants all mismatch)
+    /// prints the no-matching-variant error, never the overwrite warning.
+    #[test]
+    fn no_matching_variant_prints_variant_error() {
+        let wrong_platform = tempfile::tempdir().unwrap();
+        qualified_wrong_platform_fixture(wrong_platform.path());
+        let none_matching = tempfile::tempdir().unwrap();
+        multi_variant_fixture(
+            none_matching.path(),
+            &with_marker(LINUX_PRISTINE, b"# local tweak\n"),
+        );
+        for root in [wrong_platform.path(), none_matching.path()] {
+            let (code, _stdout, stderr) = run_apply(root, &[]);
+            assert_eq!(code, 1, "stderr={stderr}");
+            assert!(
+                stderr.contains("no matching variant found"),
+                "stderr={stderr}"
+            );
+            assert!(!stderr.contains(OVERWRITE_LINE), "stderr={stderr}");
+        }
+    }
+
+    /// A skipped sibling variant prints no overwrite warning.
+    #[test]
+    fn mismatched_sibling_prints_no_overwrite_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        multi_variant_fixture(tmp.path(), LINUX_PRISTINE);
+        let (code, _stdout, stderr) = run_apply(tmp.path(), &[]);
+        assert_eq!(code, 0, "stderr={stderr}");
+        assert!(!stderr.contains(OVERWRITE_LINE), "stderr={stderr}");
     }
 }
 
