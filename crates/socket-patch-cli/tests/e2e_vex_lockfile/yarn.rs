@@ -813,6 +813,69 @@ fn hosted_classic_lock_only_checks_the_pinned_dependency_maps() {
     drop(rt_no_blob);
 }
 
+/// #1558: lock-only VEX reads the patched `package.json` the way yarn 1
+/// locks it. Each lock below is what yarn writes for the patched manifest,
+/// and a frozen install of it is patched, so each pin attests.
+///
+/// | patched dependencies | pinned block | verdict |
+/// |---|---|---|
+/// | `is-odd: ""` | `dependencies: is-odd ""`, `is-odd@:` locked | attests |
+/// | `is-odd` in both deps and optionalDeps | only `optionalDependencies` | attests |
+/// | deps `is-odd: "*"`, devDeps `is-odd: ^3.0.0` | `dependencies: is-odd "^3.0.0"` | attests |
+#[test]
+fn issue_1558_hosted_classic_lock_only_reads_the_manifest_as_yarn_does() {
+    const MANIFEST: &str = "package/package.json";
+    let pristine = format!(r#"{{"name":"{NAME}","version":"{VERSION}"}}"#);
+    let base = hosted_lock(Flavor::Classic, "https://patch.socket.dev", UUID);
+    let is_odd = |key: &str| {
+        format!(
+            "\nis-odd@{key}:\n  version \"3.0.1\"\n  resolved \
+             \"https://registry.yarnpkg.com/is-odd/-/is-odd-3.0.1.tgz#\
+             0123456789abcdef0123456789abcdef01234567\"\n  integrity \
+             sha512-aXNvZGRpc29kZGlzb2RkaXNvZGQ=\n"
+        )
+    };
+    let cells = [
+        (
+            "empty range",
+            r#""dependencies":{"is-odd":""}"#,
+            format!("{base}  dependencies:\n    is-odd \"\"\n") + &is_odd(""),
+        ),
+        (
+            "optional and regular",
+            r#""dependencies":{"is-odd":"^3.0.0"},"optionalDependencies":{"is-odd":"^3.0.0"}"#,
+            format!("{base}  optionalDependencies:\n    is-odd \"^3.0.0\"\n") + &is_odd("^3.0.0"),
+        ),
+        (
+            "star beside a dev range",
+            r#""dependencies":{"is-odd":"*"},"devDependencies":{"is-odd":"^3.0.0"}"#,
+            format!("{base}  dependencies:\n    is-odd \"^3.0.0\"\n") + &is_odd("^3.0.0"),
+        ),
+    ];
+    for (cell, deps, lock) in cells {
+        let patched = format!(r#"{{"name":"{NAME}","version":"{VERSION}",{deps}}}"#);
+        let after_hash = compute_git_sha256_from_bytes(patched.as_bytes());
+        let mut view = patch_view(UUID, PURL);
+        view["files"][MANIFEST] = serde_json::json!({
+            "beforeHash": compute_git_sha256_from_bytes(pristine.as_bytes()),
+            "afterHash": after_hash,
+        });
+        let (rt, server) = serve_patch_views(vec![(UUID, view)]);
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        hosted_checkout(cwd, Flavor::Classic);
+        put(cwd, "yarn.lock", lock.as_bytes());
+        put(
+            cwd,
+            &format!(".socket/blobs/{after_hash}"),
+            patched.as_bytes(),
+        );
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        assert_attested(cwd, code, &env, UUID, "redirected", cell);
+        drop(rt);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // VENDORED — lockfile only (cells a, b, e)
 // ──────────────────────────────────────────────────────────────────────

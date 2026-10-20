@@ -83,7 +83,15 @@ fn native_projects_keep_sources_and_metadata_in_sync() {
             std::slice::from_ref(&dep),
             &metadata,
         );
-        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        // A transitive pin goes through override-dependencies, which uv
+        // before 0.5.5 ignores: the run advises on it (#1569).
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        let expected: &[&str] = if direct {
+            &[]
+        } else {
+            &["redirect_uv_override_requires_uv_0_5_6"]
+        };
+        assert_eq!(codes, expected, "{:?}", result.warnings);
         let project: toml_edit::DocumentMut = result.files["pyproject.toml"].parse().unwrap();
         assert_eq!(
             project["tool"]["uv"]["sources"]["alpha"]["url"].as_str(),

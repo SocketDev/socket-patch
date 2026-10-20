@@ -579,6 +579,16 @@ pub(super) async fn stage_patch_dir(
 
     match super::reuse::reusable_committed_dir(project_root, record, &rel_dir).await {
         Ok(inventory) => {
+            // A dir committed before a build-step refusal existed (the
+            // prepare-family scripts, #1633) is refused on reuse too, or
+            // the next `vlt ci` keeps rewriting it.
+            if let Ok(pkg) = read_manifest(&rel_abs).await {
+                if let Some(refusal) =
+                    build_steps_refusal(&rel_abs, &pkg, &coords.name, &coords.version).await
+                {
+                    return Err(Box::new(refusal));
+                }
+            }
             if !dry_run {
                 if let Err(e) = restore_uuid_metadata(&uuid_dir).await {
                     return Err(Box::new(done_failure(
@@ -735,39 +745,61 @@ async fn prune_staged_node_modules(
                 ),
             )));
         }
-        let gyp = tokio::fs::symlink_metadata(stage.join(BINDING_GYP))
-            .await
-            .is_ok();
-        let steps = vlt_build_steps(&pkg, gyp);
-        if !steps.is_empty() {
-            return Err(Box::new(refused(
-                BUILD_STEPS_UNSUPPORTED,
-                build_steps_detail(name, version, &steps),
-            )));
+        if let Some(refusal) = build_steps_refusal(stage, &pkg, name, version).await {
+            return Err(Box::new(refusal));
         }
     }
     Ok(())
+}
+
+/// `vendor_vlt_build_scripts_unsupported` when `vlt build` would run
+/// something inside `dir`, the package directory whose manifest is `pkg`.
+async fn build_steps_refusal(
+    dir: &Path,
+    pkg: &Value,
+    name: &str,
+    version: &str,
+) -> Option<VendorOutcome> {
+    let gyp = tokio::fs::symlink_metadata(dir.join(BINDING_GYP))
+        .await
+        .is_ok();
+    let steps = vlt_build_steps(pkg, gyp);
+    (!steps.is_empty()).then(|| {
+        refused(
+            BUILD_STEPS_UNSUPPORTED,
+            build_steps_detail(name, version, &steps),
+        )
+    })
 }
 
 pub(crate) const BUILD_STEPS_UNSUPPORTED: &str = "vendor_vlt_build_scripts_unsupported";
 pub(crate) const BINDING_GYP: &str = "binding.gyp";
 
 /// What `vlt build` runs in a package's own directory: its `preinstall`,
-/// `install`, `postinstall` and `prepare` scripts, and node-gyp for a
-/// `binding.gyp`. vlt builds a registry copy in the untracked store, but a
-/// vendored `file:` dependency in place, inside the committed artifact.
+/// `install` and `postinstall` scripts, its `preprepare`, `prepare` and
+/// `postprepare` scripts (each on its own, as vlt's `nodeNeedsBuild` checks
+/// them for a `file:` node), and node-gyp for a `binding.gyp`. vlt builds a
+/// registry copy in the untracked store, but a vendored `file:` dependency
+/// in place, inside the committed artifact.
 pub(crate) fn vlt_build_steps(pkg: &Value, has_binding_gyp: bool) -> Vec<String> {
     let scripts = pkg.get("scripts").and_then(Value::as_object);
-    let mut steps: Vec<String> = ["preinstall", "install", "postinstall", "prepare"]
-        .iter()
-        .filter(|k| {
-            scripts
-                .and_then(|s| s.get(**k))
-                .and_then(Value::as_str)
-                .is_some_and(|v| !v.trim().is_empty())
-        })
-        .map(|k| format!("a `{k}` script"))
-        .collect();
+    let mut steps: Vec<String> = [
+        "preinstall",
+        "install",
+        "postinstall",
+        "preprepare",
+        "prepare",
+        "postprepare",
+    ]
+    .iter()
+    .filter(|k| {
+        scripts
+            .and_then(|s| s.get(**k))
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.trim().is_empty())
+    })
+    .map(|k| format!("a `{k}` script"))
+    .collect();
     if has_binding_gyp {
         steps.push(format!("node-gyp for its {BINDING_GYP}"));
     }
@@ -775,10 +807,14 @@ pub(crate) fn vlt_build_steps(pkg: &Value, has_binding_gyp: bool) -> Vec<String>
 }
 
 pub(crate) fn build_steps_detail(name: &str, version: &str, steps: &[String]) -> String {
+    let list = match steps {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    };
     format!(
-        "{name}@{version} has {}, which `vlt build` runs inside a vendored package's committed \
-         directory, rewriting the artifact; use --mode hosted",
-        steps.join(" and ")
+        "{name}@{version} has {list}, which `vlt build` runs inside a vendored package's \
+         committed directory, rewriting the artifact; use --mode hosted"
     )
 }
 
@@ -1179,7 +1215,23 @@ mod tests {
             ]
         );
         assert!(vlt_build_steps(&serde_json::json!({"scripts": {"test": "x"}}), false).is_empty());
+        // vlt runs each prepare-family script for a `file:` directory even
+        // when it's the package's only one (#1633).
+        for script in ["preprepare", "postprepare"] {
+            let pkg = serde_json::json!({"scripts": {script: "node build.js"}});
+            assert_eq!(
+                vlt_build_steps(&pkg, false),
+                [format!("a `{script}` script")],
+                "{script}"
+            );
+        }
         assert!(vlt_build_steps(&serde_json::json!({}), false).is_empty());
+        assert_eq!(
+            build_steps_detail("x", "1.0.0", &vlt_build_steps(&pkg, true)),
+            "x@1.0.0 has a `postinstall` script, a `prepare` script and node-gyp for its \
+             binding.gyp, which `vlt build` runs inside a vendored package's committed \
+             directory, rewriting the artifact; use --mode hosted"
+        );
         assert_eq!(
             build_steps_detail("esbuild", "0.20.2", &vlt_build_steps(&pkg, false)),
             "esbuild@0.20.2 has a `postinstall` script and a `prepare` script, which `vlt build` \

@@ -437,7 +437,8 @@ const LANDED_PIN_ADVISORIES: &[&str] = &[
 /// wired outside the root file #699, a uv entry pinned down from another
 /// locked version #723, a Poetry 0.x lock #945); a rewriter warning naming
 /// the package; the rewrite's first warning (a lock-level refusal names no
-/// package), skipping [`LANDED_PIN_ADVISORIES`]; else [`NOT_PINNED`].
+/// package), skipping [`LANDED_PIN_ADVISORIES`] and the uv < 0.5.6
+/// advisories (#1569); else [`NOT_PINNED`].
 async fn explain(
     root: &std::path::Path,
     entry: &VendorEntry,
@@ -447,19 +448,22 @@ async fn explain(
     if let Err(w) = socket_patch_core::patch::redirect::preflight_pypi_takeover(root, entry).await {
         return (w.code.clone(), vec![w]);
     }
-    if let Some(w) = dep.and_then(|dep| {
-        warnings
-            .iter()
-            .find(|w| names_package(&w.detail, &dep.name))
-    }) {
+    // The uv < 0.5.6 advisories ride on a pin that landed, and their
+    // wording ("wheel", "uv", "sync") can read as another package's name,
+    // so neither pass may pick one (#1569).
+    let candidates = || {
+        warnings.iter().filter(|w| {
+            !socket_patch_core::patch::redirect::UV_OLD_RELEASE_ADVISORIES
+                .contains(&w.code.as_str())
+        })
+    };
+    if let Some(w) = dep.and_then(|dep| candidates().find(|w| names_package(&w.detail, &dep.name)))
+    {
         return (w.code.clone(), vec![w.clone()]);
     }
     // A pin that did land can carry a success advisory; it never explains
     // a pin that did not.
-    match warnings
-        .iter()
-        .find(|w| !LANDED_PIN_ADVISORIES.contains(&w.code.as_str()))
-    {
+    match candidates().find(|w| !LANDED_PIN_ADVISORIES.contains(&w.code.as_str())) {
         Some(w) => (w.code.clone(), vec![w.clone()]),
         None => (NOT_PINNED.to_string(), Vec::new()),
     }
@@ -673,5 +677,44 @@ mod tests {
         let (code, explained) = explain(root, &entry, None, &with_refusal).await;
         assert_eq!(code, "redirect_lock_refused");
         assert_eq!(explained, vec![warn("redirect_lock_refused")]);
+    }
+
+    /// #1569: another pin's uv advisory says "wheel" and "uv sync", whole
+    /// words that are also package names; it never explains a staged
+    /// package that was not pinned, by name or as the lock-wide fallback.
+    #[tokio::test]
+    async fn uv_old_release_advisories_never_explain_a_skip() {
+        let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+            "ecosystem": "npm",
+            "basePurl": "pkg:npm/wheel@1.0.0",
+            "uuid": "u1",
+            "artifact": { "path": ".socket/vendor/npm/u1/wheel.tgz" },
+            "wiring": [],
+        }))
+        .expect("minimal vendor entry");
+        let dep = socket_patch_core::patch::redirect::DepOverride {
+            ecosystem: "npm".into(),
+            name: "wheel".into(),
+            namespace: None,
+            version: "1.0.0".into(),
+            token: String::new(),
+            patch_uuid: "u1".into(),
+            artifact_url: String::new(),
+            registry_override: None,
+            integrity: Default::default(),
+        };
+        let warnings: Vec<RewriteWarning> =
+            socket_patch_core::patch::redirect::UV_OLD_RELEASE_ADVISORIES
+                .iter()
+                .map(|code| RewriteWarning {
+                    code: code.to_string(),
+                    detail: "uv.lock: repointed at the hosted wheel; uv sync".into(),
+                })
+                .collect();
+        let root = std::path::Path::new(".");
+        assert_eq!(
+            explain(root, &entry, Some(&dep), &warnings).await.0,
+            NOT_PINNED
+        );
     }
 }

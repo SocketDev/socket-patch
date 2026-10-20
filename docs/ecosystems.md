@@ -225,9 +225,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   names, so when the patch adds a dependency (or changes a range) that no
   `yarn.lock` block locks, the pin is refused with
   `redirect_yarn_classic_dep_manifest_unlocked` (lock the new descriptor first,
-  for example with `yarn add`, then re-run). When every descriptor is already
-  locked, the entry's dependency sub-maps are rewritten to match
-  (`redirect_yarn_classic_dep_manifest_rewritten`). Vendored mode refuses the
+  for example with `yarn add`, then re-run). A dependency the entry's sub-map
+  already names is left alone even when no block is keyed by it: yarn keys
+  those blocks by the registry metadata's ranges, which can differ from the
+  tarball's `package.json`. When every descriptor is already locked, the
+  entry's dependency sub-maps are rewritten to match, normalised the way yarn
+  1 writes them (`redirect_yarn_classic_dep_manifest_rewritten`). Vendored mode refuses the
   same case with `vendor_dep_manifest_unlocked`. If the download, the check or
   the `package.json` read fails, the patch is skipped as
   `npm_tarball_unavailable`. A project that sets `yarn-offline-mirror`
@@ -304,7 +307,10 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   submodule CI didn't check out, or whose `package.json` is no JSON, such as a Git LFS
   pointer, or whose `package.json` names no package) has no version either, so it may
   be any version of any package and `vex` attests nothing that lock wires. One whose
-  `package.json` names a package but no version may be any version of that package. A
+  `package.json` names a package but no version may be any version of that package. An
+  empty `name`, or one no npm package can carry (`"../x"`, `" left-pad"`), names no
+  package, and an empty or non-semver `version` (`""`, `"v1.3.0"`) names no version, for
+  every copy whose `package.json` is read (#1598). A
   `portal:` to a directory with no `package.json` (a `.gitkeep` placeholder a fetch step
   fills) is unknown too, since yarn refuses to install a portal without one; only a
   `link:` to a non-empty directory with no `package.json` is not a package copy. Use a
@@ -431,7 +437,12 @@ projects), at any depth. The walk does not descend into symlinked
 directories, hidden directories (`.git`, `.cache`, ...), `node_modules`
 itself (packages are read from it, not searched for workspaces), or
 directories named `dist`, `build`, `coverage`, `tmp`, `temp`, `__pycache__`
-or `vendor`. It also prunes every directory that carries a
+or `vendor`, except that a workspace member the root `package.json`
+`workspaces` field declares (a directory holding a `package.json` that any
+of npm, yarn or Bun reads the patterns as listing, such as `packages/build`
+or `vendor/lib`) still has its own `node_modules` crawled. npm, yarn and
+Bun install a member's unhoistable dependencies there from the root lock.
+It also prunes every directory that carries a
 [Cache Directory Tagging](https://bford.info/cachedir/) `CACHEDIR.TAG` file
 beginning with the standard signature — a cargo `target/`, and caches of
 other tools that follow the convention: neither that directory's own
@@ -444,9 +455,14 @@ vendored scans rewire only the scan root's lockfiles, so a patched package
 that only a nested, independent npm project installs (a directory below
 the root with its own lockfile, such as `tools/x/` holding
 `package-lock.json`, that is not a workspace member installed from the
-root's lock) is left alone with a `nested_project_skipped` warning. The
+root's lock; or one with a `package.json` and `node_modules` installed
+without a lockfile, such as under `package-lock=false`, that no workspace
+lists) is left alone with a `nested_project_skipped` warning. The
 warning names the project directory; pass it as a PATH
-(`socket-patch scan --mode vendored tools/x`) to patch that project.
+(`socket-patch scan --mode vendored tools/x`) to patch that project. A
+project without a lockfile needs one first (`npm install
+--package-lock` there), or can be patched in place with
+`socket-patch scan --mode agent tools/x`.
 
 Inside each `node_modules`, the package stores of isolated layouts are
 walked too, since they are the only home of transitive dependencies:
@@ -678,8 +694,9 @@ transitive lock surgery), as are several instances of one `name@version`, modifi
 variants, importer peer edges, foreign registries, a git, remote-tarball or local-directory
 node of the same package and a dependency declared in several fields
 (`vendor_lock_entry_unsupported`), and a package with a `preinstall`, `install`,
-`postinstall` or `prepare` script or a `binding.gyp`, which `vlt build` would build inside
-the committed directory (`vendor_vlt_build_scripts_unsupported`); use hosted mode for those. From vlt 1.0.8 a root
+`postinstall`, `preprepare`, `prepare` or `postprepare` script or a `binding.gyp`, which
+`vlt build` would build inside the committed directory (`vendor_vlt_build_scripts_unsupported`,
+also when an earlier release already vendored it); use hosted mode for those. From vlt 1.0.8 a root
 dependency with resolved peers carries a `~peer.<hex>` extra even with one peer context (a
 workspace member's a `~peer.N` one from rc.15): vendored mode writes its `file` node
 without the extra, exactly as vlt writes a `file:` dependency, keeps its peer edges, and
