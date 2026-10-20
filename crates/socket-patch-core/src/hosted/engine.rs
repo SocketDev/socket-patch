@@ -3543,6 +3543,33 @@ mod tests {
         (vec![(purl.to_string(), uuid.to_string())], refs)
     }
 
+    /// #653: the toolchain files are the cargo planner's declared-floor
+    /// input when `Cargo.toml` has no `rust-version`, so they are read
+    /// (never edited, and naming no ecosystem to refuse).
+    #[tokio::test]
+    async fn the_cargo_toolchain_files_are_read_as_advisory_input() {
+        let (selected, refs) = cargo_reference("u-1");
+        let mut p = MemoryProject::new();
+        p.insert_text("Cargo.toml", "[dependencies]\nserde = \"1\"\n");
+        p.insert_text("rust-toolchain.toml", "[toolchain]\nchannel = \"1.67.1\"\n");
+        p.insert_text("rust-toolchain", "1.56.0\n");
+        let mut skipped = Vec::new();
+        let candidates = build_candidates(&selected, &refs, &mut skipped);
+        let view = ProjectView::Memory(&p);
+        let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+        assert_eq!(
+            read.files.get("rust-toolchain.toml").map(String::as_str),
+            Some("[toolchain]\nchannel = \"1.67.1\"\n")
+        );
+        assert_eq!(
+            read.files.get("rust-toolchain").map(String::as_str),
+            Some("1.56.0\n")
+        );
+        for rel in ["rust-toolchain.toml", "rust-toolchain"] {
+            assert_eq!(crate::formats::registry::hosted_file_ecosystem(rel), None);
+        }
+    }
+
     #[tokio::test]
     async fn an_unreadable_candidate_file_refuses_its_ecosystem() {
         let (selected, refs) = cargo_reference("u-1");
