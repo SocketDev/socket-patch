@@ -110,6 +110,54 @@ async fn pnpm_global_refuses_with_pnpm_hint() {
     install.assert_binary_intact();
 }
 
+/// #1621: a Bun project install refuses with Bun's own command. Running
+/// `npm install …` there writes a stray package-lock.json and leaves
+/// bun.lock stale, so the next `bun install --frozen-lockfile` fails.
+#[tokio::test]
+async fn bun_project_refuses_with_bun_hint() {
+    let install = staged_install_at("app/node_modules/@socketsecurity/socket-patch-x/bin");
+    std::fs::write(install.root.path().join("app/package.json"), "{}").unwrap();
+    std::fs::write(install.root.path().join("app/bun.lock"), "").unwrap();
+    let (code, _stdout, stderr) = run_installed(
+        &install,
+        &["--update", "--yes"],
+        &[("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL)],
+    );
+    assert_eq!(code, 1, "managed install must refuse.\nstderr:\n{stderr}");
+    assert!(stderr.contains("managed by bun"), "{stderr}");
+    assert!(
+        stderr.contains("`bun add @socketsecurity/socket-patch@latest`"),
+        "a Bun project must get Bun's upgrade command: {stderr}"
+    );
+    assert!(!stderr.contains("npm install"), "{stderr}");
+    install.assert_binary_intact();
+}
+
+/// #1621: Bun's global store (`$BUN_INSTALL/install/global`) is invisible
+/// to `npm update -g`, so a Bun global install must be told to use
+/// `bun add -g`.
+#[tokio::test]
+async fn bun_global_refuses_with_bun_hint() {
+    let install =
+        staged_install_at(".bun/install/global/node_modules/@socketsecurity/socket-patch-x/bin");
+    let (code, stdout, _stderr) = run_installed(
+        &install,
+        &["--update", "--yes", "--json"],
+        &[("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL)],
+    );
+    assert_eq!(code, 1, "managed install must refuse.\nstdout:\n{stdout}");
+    let env = common::parse_json_envelope(&stdout);
+    let message = env["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(env["error"]["code"], "managed_install", "{stdout}");
+    assert!(message.contains("managed by bun"), "{stdout}");
+    assert!(
+        message.contains("`bun add -g @socketsecurity/socket-patch@latest`"),
+        "{stdout}"
+    );
+    assert!(!message.contains("npm update -g"), "{stdout}");
+    install.assert_binary_intact();
+}
+
 /// An npm-bundled binary (any `node_modules` component) refuses with the
 /// npm upgrade command — and the refusal happens before ANY release
 /// traffic: a fully valid, newer release is mounted and its routes must
