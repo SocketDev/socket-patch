@@ -4199,7 +4199,25 @@ fn rewrite_yarn_classic_with(
                     .flat_map(|(patterns, _)| patterns.iter().map(String::as_str))
                     .collect()
             });
-            let missing = crate::formats::yarn::classic_deps::unlocked_descriptors_in(locked, pkg);
+            // The registry copies of this version the pin rewrites: a
+            // descriptor their sub-maps already carry is upstream's, keyed
+            // by the packument's range rather than the tarball's (#1578).
+            let carried: Vec<&[String]> = blocks
+                .iter()
+                .zip(&heads)
+                .filter(|(b, (patterns, real_name))| {
+                    real_name.as_deref() == Some(fname.as_str())
+                        && classic_field(&b.lines, "version") == Some(dep.version.as_str())
+                        && classic_copy_source(patterns, classic_field(&b.lines, "resolved"))
+                            == CopySource::Registry
+                        && patterns
+                            .iter()
+                            .any(|p| split_classic_pattern(p).is_some_and(|(n, _)| n == fname))
+                })
+                .map(|(b, _)| b.lines.as_slice())
+                .collect();
+            let missing =
+                crate::formats::yarn::classic_deps::unlocked_descriptors_in(locked, pkg, &carried);
             if !missing.is_empty() {
                 result
                     .refused_yarn_classic_uuids
@@ -22710,6 +22728,100 @@ packages:
             r.files
         );
         assert!(r.refused_yarn_classic_uuids.is_empty());
+    }
+
+    /// Run the hosted classic rewriter over `lock` for `ovr`, serving
+    /// `manifest` as its tarball's package.json.
+    fn classic_with_manifest(lock: &str, ovr: &DepOverride, manifest: &str) -> RewriteResult {
+        let files = BTreeMap::from([("yarn.lock".to_string(), lock.to_string())]);
+        let manifests = BTreeMap::from([(ovr.artifact_url.clone(), manifest.to_string())]);
+        let mut r = RewriteResult::default();
+        rewrite_yarn_classic_with(
+            &files,
+            std::slice::from_ref(ovr),
+            &manifests,
+            &yarnrc::OuterYarnMirror::default(),
+            &mut r,
+        );
+        r
+    }
+
+    /// #1578: yarn 1 keys a package's dependency blocks by the registry
+    /// packument's ranges (`url@*`) and fills the block's sub-map from the
+    /// tarball (`url "^0.11.0"`). A patch that leaves package.json alone
+    /// is pinned, sub-map untouched; one that adds an unlocked dependency
+    /// is still refused, naming only that one.
+    #[test]
+    fn issue_1578_hosted_classic_pins_over_packument_keyed_dependencies() {
+        let url = "http://p.test/meteor-node-stubs-1.2.3.tgz";
+        let ovr = npm_override("meteor-node-stubs", "1.2.3", url, "sha512-P==");
+        let lock = "# yarn lockfile v1\n\n\n\
+                    meteor-node-stubs@1.2.3:\n  version \"1.2.3\"\n  \
+                    resolved \"https://registry.yarnpkg.com/meteor-node-stubs/-/meteor-node-stubs-1.2.3.tgz#bbbb\"\n  \
+                    integrity sha512-UP==\n  dependencies:\n    assert \"^2.0.0\"\n    url \"^0.11.0\"\n\n\
+                    assert@*:\n  version \"2.1.0\"\n  \
+                    resolved \"https://registry.yarnpkg.com/assert/-/assert-2.1.0.tgz#cccc\"\n\n\
+                    url@*:\n  version \"0.11.4\"\n  \
+                    resolved \"https://registry.yarnpkg.com/url/-/url-0.11.4.tgz#dddd\"\n";
+        let served =
+            r#"{"name":"meteor-node-stubs","dependencies":{"url":"^0.11.0","assert":"^2.0.0"}}"#;
+        let r = classic_with_manifest(lock, &ovr, served);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.refused_yarn_classic_uuids.is_empty());
+        assert!(
+            r.files["yarn.lock"].contains(&format!(
+                "  resolved \"{url}#{NPM_SHA1}\"\n  integrity sha512-P==\n  \
+                 dependencies:\n    assert \"^2.0.0\"\n    url \"^0.11.0\"\n"
+            )),
+            "{:?}",
+            r.files
+        );
+
+        let added = r#"{"name":"meteor-node-stubs","dependencies":{"url":"^0.11.0","assert":"^2.0.0","wow":"^1.0.0"}}"#;
+        let r = classic_with_manifest(lock, &ovr, added);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_yarn_classic_dep_manifest_unlocked"]
+        );
+        assert!(
+            r.warnings[0]
+                .detail
+                .contains("depends on wow@^1.0.0, which"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// #1558 shape 2: a served manifest that declares a name in both
+    /// `optionalDependencies` and `dependencies` is written the way yarn 1
+    /// writes it, only under `optionalDependencies`, so yarn's next save
+    /// leaves the block as it is.
+    #[test]
+    fn issue_1558_hosted_classic_writes_yarns_normalised_sub_maps() {
+        let url = "http://p.test/is-odd-3.0.1.tgz";
+        let ovr = npm_override("is-odd", "3.0.1", url, "sha512-P==");
+        let lock = "# yarn lockfile v1\n\n\n\
+                    is-number@^6.0.0:\n  version \"6.0.0\"\n  \
+                    resolved \"https://registry.yarnpkg.com/is-number/-/is-number-6.0.0.tgz#aaaa\"\n\n\
+                    is-odd@3.0.1:\n  version \"3.0.1\"\n  \
+                    resolved \"https://registry.yarnpkg.com/is-odd/-/is-odd-3.0.1.tgz#bbbb\"\n  \
+                    integrity sha512-UP==\n";
+        let served = r#"{"name":"is-odd","dependencies":{"is-number":"^6.0.0"},"optionalDependencies":{"is-number":"^6.0.0"}}"#;
+        let r = classic_with_manifest(lock, &ovr, served);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_yarn_classic_dep_manifest_rewritten"]
+        );
+        let text = &r.files["yarn.lock"];
+        assert!(
+            text.contains(&format!(
+                "  resolved \"{url}#{NPM_SHA1}\"\n  integrity sha512-P==\n  \
+                 optionalDependencies:\n    is-number \"^6.0.0\"\n"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("  dependencies:"), "{text}");
     }
 
     /// #558: a yarn classic pin without a sha1 would have no `#<sha1>`
