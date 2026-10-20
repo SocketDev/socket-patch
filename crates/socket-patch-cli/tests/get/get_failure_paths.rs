@@ -1699,3 +1699,64 @@ async fn get_uuid_json_mismatch_overwrite_is_reported() {
     assert!(!stderr.contains("did not match"), "stderr={stderr}");
     assert_eq!(std::fs::read(&installed).unwrap(), AFTER_BYTES);
 }
+
+/// `git init` `root` with `gitignore`; `false` when git is not installed.
+fn git_project_ignoring(root: &std::path::Path, gitignore: &str) -> bool {
+    if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+        return false;
+    }
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(root.join(".gitignore"), gitignore).unwrap();
+    true
+}
+
+/// An agent-mode run that records a patch in a manifest git would not
+/// commit (`manifest.json`, or `*.json` + `!package.json`) warns
+/// `manifest_gitignored`, naming the rule: otherwise the blobs are
+/// committed without the manifest and a fresh checkout's `apply` silently
+/// applies nothing (#1638). A re-included manifest gets no warning.
+#[tokio::test]
+#[serial]
+async fn agent_record_warns_when_git_ignores_the_manifest() {
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, good_files()).await;
+    let selected = vec![search_result(UUID, PURL)];
+    for (gitignore, rule) in [
+        ("manifest.json\n", Some("manifest.json")),
+        ("*.json\n!package.json\n", Some("*.json")),
+        ("*.json\n!package.json\n!.socket/manifest.json\n", None),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        if !git_project_ignoring(tmp.path(), gitignore) {
+            return;
+        }
+        let (code, json) =
+            download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
+        assert_eq!(code, 0, "{gitignore:?}: json={json}");
+        assert!(tmp.path().join(".socket/manifest.json").is_file());
+        let warning = json["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|w| w["code"] == "manifest_gitignored");
+        match rule {
+            Some(rule) => {
+                let detail = warning.unwrap_or_else(|| panic!("{gitignore:?}: json={json}"))
+                    ["detail"]
+                    .as_str()
+                    .unwrap();
+                assert!(
+                    detail.contains(".socket/manifest.json") && detail.contains(rule),
+                    "{detail}"
+                );
+            }
+            None => assert!(warning.is_none(), "{gitignore:?}: json={json}"),
+        }
+    }
+}

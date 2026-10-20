@@ -1320,6 +1320,44 @@ pub(crate) async fn download_patch_records_preflighted(
     }
 }
 
+/// Warning code: git would not commit the manifest (see
+/// [`warn_if_manifest_gitignored`]).
+pub(crate) const MANIFEST_GITIGNORED: &str = "manifest_gitignored";
+
+/// Warn (stderr `[warn]` + `warnings[]`) when git's ignore rules keep the
+/// manifest this run recorded patches in out of the commit (#1638): the
+/// blobs are committed, but a fresh checkout's `socket-patch apply` finds
+/// no manifest, applies nothing and exits 0. Only a warning, because a
+/// pipeline that scans and applies in one job never commits `.socket/`.
+/// A manifest outside the project root is not checked.
+pub(crate) async fn warn_if_manifest_gitignored(
+    project_root: &Path,
+    manifest_path: &Path,
+    quiet: bool,
+    warnings: &mut Vec<RunWarning>,
+) {
+    let Ok(rel) = manifest_path.strip_prefix(project_root) else {
+        return;
+    };
+    let rel: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let rel = rel.join("/");
+    let Some(rules) = socket_patch_core::vendor::file_gitignored(project_root, &rel).await else {
+        return;
+    };
+    let w = format!(
+        "git would not commit {rel} ({rules}), so `socket-patch apply` in other checkouts \
+         (CI, a fresh clone) would find no manifest and apply nothing; remove that rule or \
+         add `!{rel}` to .gitignore"
+    );
+    if !quiet {
+        eprintln!("  [warn] {w}");
+    }
+    warnings.push(RunWarning::new(MANIFEST_GITIGNORED, w));
+}
+
 /// Warning code: the manifest now records a patch uuid the vendor ledger
 /// does not wire for that purl (see [`warn_on_vendored_uuid_drift`]).
 pub(crate) const VENDORED_UUID_DRIFT: &str = "vendored_uuid_drift";
@@ -1712,6 +1750,10 @@ pub async fn download_and_apply_patches_into(
     // download.) The nested apply below skips the vendored purl either way.
     let mut warnings = release_warnings(batch.warnings);
     warn_on_vendored_uuid_drift(&params.project_root(), quiet, &changed, &mut warnings).await;
+    if !recorded.is_empty() {
+        warn_if_manifest_gitignored(&params.project_root(), &manifest_path, quiet, &mut warnings)
+            .await;
+    }
     env.warnings.extend(warnings);
 
     if !quiet {
