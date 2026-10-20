@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::formats::pipenv::{reserialized_around_reference, splice_entry};
+use crate::formats::pipenv::{pins_another_release, reserialized_around_reference, splice_entry};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::vendor::lock_inventory::pypi::{hosted_pypi_reference, parse_pipfile_lock};
 
@@ -194,7 +194,14 @@ pub(super) fn check_target_guards_superseding(
         ));
     }
     let mut all_in_sync = true;
+    let mut targeted = false;
     for (section, key, entry) in &entries {
+        // Another category's own release (#1616): not this patch's target,
+        // left as Pipenv wrote it.
+        if pins_another_release(entry, version) {
+            continue;
+        }
+        targeted = true;
         let Some(obj) = entry.as_object() else {
             return Err((
                 "pypi_pipenv_lock_parse_failed",
@@ -296,6 +303,16 @@ pub(super) fn check_target_guards_superseding(
             ));
         }
         all_in_sync = false;
+    }
+    if !targeted {
+        let (section, key, _) = &entries[0];
+        return Err((
+            "pypi_pipenv_version_mismatch",
+            format!(
+                "{LOCK_FILE} {section}.{key} does not pin {version}, and no other category \
+                 does"
+            ),
+        ));
     }
     Ok(if all_in_sync {
         PipenvTarget::InSync
@@ -425,6 +442,10 @@ pub(super) async fn wire_pipenv_superseding(
             .collect();
         for key in keys {
             let old = map.get(&key).cloned().unwrap_or(Value::Null);
+            // Left alone by the guards: another category's own release.
+            if pins_another_release(&old, version) {
+                continue;
+            }
             // The file-ref entry shape: file + OUR hash; markers preserved
             // verbatim; index/version dropped (transitive entries never had
             // an index key).
@@ -2188,6 +2209,60 @@ mod tests {
         let reverted = revert_pipenv(&entry, tmp.path(), false).await;
         assert!(reverted.success);
         assert_eq!(read_lock(tmp.path()).await, before);
+    }
+
+    /// Pipenv 2023+ resolves each category on its own, so one category can
+    /// pin another release of the patched package (#1616). Only the
+    /// categories pinning the patched release are wired; the other-release
+    /// entry stays as Pipenv wrote it, and a lock where no category pins the
+    /// patched release is still refused.
+    #[tokio::test]
+    async fn category_pinning_another_release_is_left_alone() {
+        let mut lock: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        let six = lock["default"]["six"].take();
+        let mut older = six.clone();
+        older["version"] = Value::String("==1.15.0".into());
+        older["hashes"] = serde_json::json!(["sha256:older"]);
+        lock["default"] = serde_json::json!({});
+        lock["docs"] = serde_json::json!({ "six": older.clone() });
+        lock["tests"] = serde_json::json!({ "six": six });
+        let before = pipenv_dumps(&lock);
+        let tmp = write_lock(&before).await;
+        let project = load_pipenv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&project, "six", UUID, "1.16.0", &[]).unwrap(),
+            PipenvTarget::Fresh
+        );
+        let (wiring, meta) = wire_default(&project, tmp.path()).await;
+        let keys: Vec<&str> = wiring.iter().filter_map(|w| w.key.as_deref()).collect();
+        assert_eq!(keys, vec!["tests:six"]);
+        assert_eq!(meta.sections, vec!["tests"]);
+        let rewritten: Value = serde_json::from_str(&read_lock(tmp.path()).await).unwrap();
+        assert_eq!(rewritten["docs"]["six"], older);
+        assert!(rewritten["tests"]["six"]["file"]
+            .as_str()
+            .is_some_and(|file| file.ends_with(REL_WHEEL)));
+
+        // Wired: the other-release category does not break the in-sync
+        // re-run check.
+        let wired = load_pipenv_project(tmp.path()).await.unwrap();
+        assert_eq!(
+            check_target_guards(&wired, "six", UUID, "1.16.0", &[]).unwrap(),
+            PipenvTarget::InSync
+        );
+
+        let reverted = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(reverted.success, "{:?}", reverted.error);
+        assert!(reverted.warnings.is_empty(), "{:?}", reverted.warnings);
+        assert_eq!(read_lock(tmp.path()).await, before);
+
+        // No category pins the patched release: still refused.
+        let mut lock: Value = serde_json::from_str(&before).unwrap();
+        lock["tests"]["six"] = older;
+        let tmp = write_lock(&pipenv_dumps(&lock)).await;
+        let project = load_pipenv_project(tmp.path()).await.unwrap();
+        let err = check_target_guards(&project, "six", UUID, "1.16.0", &[]).unwrap_err();
+        assert_eq!(err.0, "pypi_pipenv_version_mismatch");
     }
 
     /// A symlinked Pipfile.lock is refused before any write by both wire and
