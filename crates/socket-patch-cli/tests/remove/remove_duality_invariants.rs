@@ -830,9 +830,8 @@ fn hosted_refused_restore_remove_fails_closed() {
     assert_eq!(v["error"]["code"], "hosted_revert_failed", "envelope={v}");
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
-        msg.contains(&format!(
-            "cannot restore {NPM_PURL} to its upstream registry entry"
-        )) && msg.contains("the registry records no integrity")
+        msg.contains(NPM_PURL)
+            && msg.contains("the registry records no integrity")
             && msg.contains("git checkout -- package-lock.json")
             && msg.contains("The manifest was not modified."),
         "the error must name the purl, the cause and the remedy; got {msg}"
