@@ -2244,6 +2244,8 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         " --no-binary Urllib3",
         " --exclude-newer 2024-01-01",
         " --exclude-newer-package urllib3=2023-10-17T17:46:22Z",
+        // Exempting another package leaves the global cutoff on urllib3.
+        " --exclude-newer 2024-01-01 --exclude-newer-package idna=false",
     ] {
         let input = tree(&[("pylock.toml", with_flags(flags))]);
         let (why, rewritten, after) =
@@ -2264,6 +2266,9 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         " --exclude-newer-package urllib3=false",
         " --exclude-newer false",
         " --exclude-newer=false",
+        // A `false` per-package cutoff exempts urllib3 from the global one.
+        " --exclude-newer 2024-01-01 --exclude-newer-package urllib3=false",
+        " --exclude-newer=2024-01-01 --exclude-newer-package=urllib3=false",
     ] {
         let input = tree(&[("pylock.toml", with_flags(flags))]);
         assert_pypi_round_trip(flags, &input, &[urllib3_dep()], None).await;
@@ -2295,6 +2300,11 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         ("uv.toml", "[pip]\nno-binary = [\"idna\"]\n"),
         // `uv pip` reads `[pip]` over the top level.
         ("uv.toml", "no-build = true\n\n[pip]\nno-build = false\n"),
+        // A `false` per-package cutoff exempts urllib3 from the global one.
+        (
+            "uv.toml",
+            "exclude-newer = \"2024-01-01T00:00:00Z\"\n\n[exclude-newer-package]\nurllib3 = false\n",
+        ),
         // uv passes over a pyproject that does not parse.
         ("pyproject.toml", "[project\n"),
         // A pyproject without `[tool.uv]` sets nothing.
@@ -2354,6 +2364,15 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
         assert!(why.contains(expect), "{why}");
     }
+    // A `false` per-package cutoff on the command line exempts urllib3
+    // from `UV_EXCLUDE_NEWER`.
+    let _env = EnvGuard::set(&[("UV_EXCLUDE_NEWER", "2023-01-01T00:00:00Z".to_string())]);
+    let input = tree(&[(
+        "pylock.toml",
+        with_flags(" --exclude-newer-package urllib3=false"),
+    )]);
+    assert_pypi_round_trip("UV_EXCLUDE_NEWER exempt", &input, &[urllib3_dep()], None).await;
+    drop(_env);
     // Empty is unset, and `false` turns the cutoff off.
     for value in ["", "false"] {
         let _env = EnvGuard::set(&[("UV_EXCLUDE_NEWER", value.to_string())]);
@@ -2636,6 +2655,8 @@ async fn uv_exclude_newer_package_refuses_only_its_package() {
             "[options.exclude-newer-package]\nurllib3 = \"2023-10-17T17:46:22Z\"\n",
             "[options.exclude-newer-package]\nidna = false\nurllib3 = \"2023-10-17T17:46:22Z\"\n",
             "exclude-newer-span = \"P7D\"\n",
+            // Exempting another package leaves the global cutoff on urllib3.
+            "exclude-newer = \"2024-01-01T00:00:00Z\"\n\n[options.exclude-newer-package]\nidna = false\n",
         ] {
             let input = input_with(options);
             let (why, rewritten, after) =
@@ -2646,6 +2667,8 @@ async fn uv_exclude_newer_package_refuses_only_its_package() {
         for options in [
             "[options.exclude-newer-package]\nidna = \"2022-01-01T00:00:00Z\"\n",
             "[options.exclude-newer-package]\nurllib3 = false\n",
+            // A `false` cutoff exempts urllib3 from the global one.
+            "exclude-newer = \"2024-01-01T00:00:00Z\"\n\n[options.exclude-newer-package]\nUrllib3 = false\n",
         ] {
             let input = input_with(options);
             assert_pypi_round_trip(&format!("{rel} {options}"), &input, &[urllib3_dep()], None)

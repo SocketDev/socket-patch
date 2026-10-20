@@ -339,27 +339,28 @@ async fn restore_lock(
         return refuse_hits(result, "unsupported lock version");
     }
     let options = doc.get("options").and_then(Item::as_table_like);
-    if let Some(key) = options.and_then(|o| {
+    let global_cutoff = options.and_then(|o| {
         o.iter()
             .map(|(k, _)| k)
             .find(|k| k.starts_with("exclude-newer") && *k != "exclude-newer-package")
-    }) {
-        return refuse_hits(
-            result,
-            &format!("the lock's `{key}` option filters release files by upload time"),
-        );
-    }
-    // A per-package cutoff (#1604) filters only the packages it names.
+    });
+    // A per-package cutoff (#1604) filters only the packages it names, and
+    // one of `false` exempts its package from the global cutoff.
     let cutoffs = options.and_then(|o| o.get("exclude-newer-package"));
-    for hit in hits
-        .iter()
-        .filter(|h| cutoffs.is_some_and(|c| names_package(c, &h.name)))
-    {
+    for hit in &hits {
+        let key = if cutoffs.is_some_and(|c| names_package(c, &hit.name)) {
+            "exclude-newer-package"
+        } else if let Some(key) =
+            global_cutoff.filter(|_| !cutoffs.is_some_and(|c| exempts(c, &hit.name)))
+        {
+            key
+        } else {
+            continue;
+        };
         result.refuse(
             &hit.uuid,
             format!(
-                "{rel}: the lock's `exclude-newer-package` cutoff for {} filters its release \
-                 files by upload time",
+                "{rel}: the lock's `{key}` option filters {}'s release files by upload time",
                 hit.name
             ),
         );
@@ -414,14 +415,20 @@ async fn restore_lock(
             project.into_iter().chain(global).collect()
         };
         for hit in &hits {
-            let why = if let Some(flag) = compile_filter(&command, &hit.name) {
+            // A per-package cutoff of `false`, on the command line or in
+            // the settings, exempts the package from the global cutoff.
+            let exempt = compile_exempts(&command, &hit.name)
+                || setting(&settings, "exclude-newer-package", &hit.name)
+                    .is_some_and(|(_, v)| exempts(v, &hit.name));
+            let why = if let Some(flag) = compile_filter(&command, &hit.name, exempt) {
                 format!("`uv pip compile {flag}` filters")
-            } else if std::env::var_os("UV_EXCLUDE_NEWER")
-                // Empty is unset, and `false` turns the cutoff off.
-                .is_some_and(|v| !v.is_empty() && v != "false")
+            } else if !exempt
+                && std::env::var_os("UV_EXCLUDE_NEWER")
+                    // Empty is unset, and `false` turns the cutoff off.
+                    .is_some_and(|v| !v.is_empty() && v != "false")
             {
                 "the `UV_EXCLUDE_NEWER` cutoff set in this environment filters".to_string()
-            } else if let Some((path, key)) = settings_filter(&settings, &hit.name) {
+            } else if let Some((path, key)) = settings_filter(&settings, &hit.name, exempt) {
                 format!("{path}'s uv `{key}` setting filters")
             } else {
                 continue;
@@ -719,10 +726,43 @@ fn names_package(item: &Item, name: &str) -> bool {
     }
 }
 
+/// Whether a per-package cutoff table exempts `name` from the global
+/// cutoff (an entry of `false`).
+fn exempts(cutoffs: &Item, name: &str) -> bool {
+    cutoffs.as_table_like().is_some_and(|cutoffs| {
+        cutoffs.iter().any(|(package, cutoff)| {
+            canonicalize_pypi_name(package) == name && cutoff.as_bool() == Some(false)
+        })
+    })
+}
+
+/// Whether `command` exempts `name` from the global cutoff with
+/// `--exclude-newer-package <name>=false`.
+fn compile_exempts(command: &[&str], name: &str) -> bool {
+    let mut args = command.iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.split_once('=') {
+            Some(("--exclude-newer-package", value)) => Some(value),
+            None if *arg == "--exclude-newer-package" => args.next().copied(),
+            _ => None,
+        };
+        if value
+            .and_then(|v| v.split_once('='))
+            .is_some_and(|(package, cutoff)| {
+                canonicalize_pypi_name(package) == name && cutoff == "false"
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// The `uv pip compile` flag in `command` that filters `name`'s files:
 /// `--no-build`, `--only-binary` / `--no-binary` naming it or `:all:`,
-/// `--exclude-newer`, or an `--exclude-newer-package` cutoff for it.
-fn compile_filter(command: &[&str], name: &str) -> Option<String> {
+/// `--exclude-newer` unless `name` is `exempt`, or an
+/// `--exclude-newer-package` cutoff for it.
+fn compile_filter(command: &[&str], name: &str, exempt: bool) -> Option<String> {
     let mut args = command.iter();
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -732,7 +772,9 @@ fn compile_filter(command: &[&str], name: &str) -> Option<String> {
         let applies = match flag {
             "--no-build" => true,
             // `false` turns the cutoff off (uv 0.11.24+).
-            "--exclude-newer" => inline.or_else(|| args.next().copied()) != Some("false"),
+            "--exclude-newer" => {
+                inline.or_else(|| args.next().copied()) != Some("false") && !exempt
+            }
             "--only-binary" | "--no-binary" | "--exclude-newer-package" => {
                 let Some(value) = inline.or_else(|| args.next().copied()) else {
                     continue;
@@ -880,58 +922,73 @@ async fn global_uv_settings(
 
 /// The uv setting that filters which of `name`'s files `uv pip compile`
 /// records (`no-build`, `no-binary`, `only-binary`, `exclude-newer` and
-/// their per-package forms), as `(file that sets it, key)`. Like uv, the
-/// files merge key by key: lists from every file add up, and otherwise the
-/// first file setting a key wins. Then `[pip]`'s value of a key wins over
-/// the top level's. `no-build-isolation` changes only how an sdist is
-/// built.
-fn settings_filter(files: &[(String, toml_edit::Table)], name: &str) -> Option<(String, String)> {
-    fn pip(uv: &toml_edit::Table) -> Option<&dyn TableLike> {
-        uv.get("pip").and_then(Item::as_table_like)
-    }
+/// their per-package forms), as `(file that sets it, key)`. A global
+/// `exclude-newer*` cutoff passes over an `exempt` package.
+/// `no-build-isolation` changes only how an sdist is built.
+fn settings_filter(
+    files: &[(String, toml_edit::Table)],
+    name: &str,
+    exempt: bool,
+) -> Option<(String, String)> {
     let keys = files.iter().flat_map(|(_, uv)| {
-        uv.iter()
-            .map(|(k, _)| k)
-            .filter(|k| *k != "pip")
-            .chain(pip(uv).into_iter().flat_map(|p| p.iter().map(|(k, _)| k)))
+        uv.iter().map(|(k, _)| k).filter(|k| *k != "pip").chain(
+            pip_table(uv)
+                .into_iter()
+                .flat_map(|p| p.iter().map(|(k, _)| k)),
+        )
     });
     for key in keys {
         let filters = ["no-build", "no-binary", "only-binary", "exclude-newer"]
             .iter()
             .any(|f| key.starts_with(f))
             && !key.starts_with("no-build-isolation");
-        if !filters {
+        let global_cutoff = key.starts_with("exclude-newer") && key != "exclude-newer-package";
+        if !filters || (exempt && global_cutoff) {
             continue;
         }
-        let in_pip: Vec<_> = files
-            .iter()
-            .filter_map(|(path, uv)| Some((path, pip(uv)?.get(key)?)))
-            .collect();
-        let set = if in_pip.is_empty() {
-            files
-                .iter()
-                .filter_map(|(path, uv)| Some((path, uv.get(key)?)))
-                .collect()
-        } else {
-            in_pip
-        };
-        let decides = if set.iter().all(|(_, v)| v.as_array().is_some()) {
-            set.iter().find(|(_, v)| names_package(v, name))
-        } else if set.iter().all(|(_, v)| v.is_table_like()) {
-            // Per-package tables merge entry by entry, the first one
-            // naming the package winning.
-            set.iter().find(|(_, v)| {
-                v.as_table_like()
-                    .is_some_and(|t| t.iter().any(|(k, _)| canonicalize_pypi_name(k) == name))
-            })
-        } else {
-            set.first()
-        };
-        if let Some((path, _)) = decides.filter(|(_, v)| names_package(v, name)) {
+        if let Some((path, _)) = setting(files, key, name).filter(|(_, v)| names_package(v, name)) {
             return Some((path.to_string(), key.to_string()));
         }
     }
     None
+}
+
+fn pip_table(uv: &toml_edit::Table) -> Option<&dyn TableLike> {
+    uv.get("pip").and_then(Item::as_table_like)
+}
+
+/// The value of uv setting `key` that decides for `name`, with the file
+/// setting it. Like uv, the files merge key by key: lists from every file
+/// add up, per-package tables merge entry by entry, and otherwise the
+/// first file setting a key wins. Then `[pip]`'s value of a key wins over
+/// the top level's.
+fn setting<'a>(
+    files: &'a [(String, toml_edit::Table)],
+    key: &str,
+    name: &str,
+) -> Option<(&'a String, &'a Item)> {
+    let in_pip: Vec<_> = files
+        .iter()
+        .filter_map(|(path, uv)| Some((path, pip_table(uv)?.get(key)?)))
+        .collect();
+    let set = if in_pip.is_empty() {
+        files
+            .iter()
+            .filter_map(|(path, uv)| Some((path, uv.get(key)?)))
+            .collect()
+    } else {
+        in_pip
+    };
+    if set.iter().all(|(_, v)| v.as_array().is_some()) {
+        set.into_iter().find(|(_, v)| names_package(v, name))
+    } else if set.iter().all(|(_, v)| v.is_table_like()) {
+        set.into_iter().find(|(_, v)| {
+            v.as_table_like()
+                .is_some_and(|t| t.iter().any(|(k, _)| canonicalize_pypi_name(k) == name))
+        })
+    } else {
+        set.into_iter().next()
+    }
 }
 
 /// The registry and artifact shape the lock's other registry packages show.
@@ -2252,18 +2309,18 @@ mod tests {
         // The project's `[pip] no-build = false` wins over the user's
         // top-level `no-build`; the user's `only-binary` still applies.
         assert_eq!(
-            settings_filter(&files, "six"),
+            settings_filter(&files, "six", false),
             Some(("user/uv.toml".into(), "only-binary".into()))
         );
-        assert_eq!(settings_filter(&files, "idna"), None);
+        assert_eq!(settings_filter(&files, "idna", false), None);
         // A system `[pip]` value wins over a user top-level one.
         let files = [uv_file("user/uv.toml", "no-binary = []\n"), system];
         assert_eq!(
-            settings_filter(&files, "six"),
+            settings_filter(&files, "six", false),
             Some(("/etc/uv/uv.toml".into(), "no-binary".into()))
         );
         assert_eq!(
-            settings_filter(&[user], "idna"),
+            settings_filter(&[user], "idna", false),
             Some(("user/uv.toml".into(), "no-build".into()))
         );
         // Lists from every file add up, as uv combines them.
@@ -2272,7 +2329,7 @@ mod tests {
             uv_file("user/uv.toml", "[pip]\nno-binary = [\"six\"]\n"),
         ];
         assert_eq!(
-            settings_filter(&files, "six"),
+            settings_filter(&files, "six", false),
             Some(("user/uv.toml".into(), "no-binary".into()))
         );
         // Per-package cutoffs merge entry by entry.
@@ -2291,10 +2348,10 @@ mod tests {
             ),
         ];
         assert_eq!(
-            settings_filter(&files, "six"),
+            settings_filter(&files, "six", false),
             Some(("user/uv.toml".into(), "exclude-newer-package".into()))
         );
-        assert_eq!(settings_filter(&files[2..], "six"), None);
+        assert_eq!(settings_filter(&files[2..], "six", false), None);
     }
 
     #[tokio::test]
