@@ -96,8 +96,8 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Corrupt vendor ledger fails the remove closed (the human branch also
-//    covers emit_error_envelope's stderr arm)
+// 2. Corrupt vendor ledger fails the remove closed (the human branch,
+//    emit_error_envelope's stderr arm, is in remove_render.rs)
 // ---------------------------------------------------------------------------
 
 /// Garbage `.socket/vendor/state.json` must abort the remove BEFORE any
@@ -426,8 +426,10 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
 #[test]
 fn remove_hosted_preserve_state_json_warns_no_preservable_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join("package-lock.json"), redirected_lock_text()).unwrap();
-    write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
+    let lock_path = tmp.path().join("package-lock.json");
+    std::fs::write(&lock_path, redirected_lock_text()).unwrap();
+    let socket = write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
+    let manifest_before = read_bytes(&socket.join("manifest.json"));
     let registry = NpmRegistry::start(true);
 
     let (code, stdout, stderr) = run_remove_online(
@@ -442,6 +444,18 @@ fn remove_hosted_preserve_state_json_warns_no_preservable_state() {
             .iter()
             .any(|c| c == "hosted_state_not_preservable"),
         "expected a hosted_state_not_preservable warning; envelope={v}"
+    );
+    // The restore really happened: the lock holds the upstream entry.
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        expected_reverted_lock_text(),
+        "the lock must hold exactly the upstream registry entry"
+    );
+    // The state half was preserved: manifest byte-identical.
+    assert_eq!(
+        read_bytes(&socket.join("manifest.json")),
+        manifest_before,
+        "--preserve-state must keep the manifest entry"
     );
 }
 
@@ -496,8 +510,43 @@ fn remove_hosted_only_preserve_state_json_warns_no_preservable_state() {
 // 7. Corrupt pre-v5 hosted ledger: ignored
 // ---------------------------------------------------------------------------
 
-/// A corrupt pre-v5 redirect ledger is inert: the removal still succeeds
-/// with no warning, and the ledger is left alone.
+/// A corrupt pre-v5 redirect ledger is inert: hosted state comes from the
+/// lockfiles, so a manifest removal neither reads nor warns about it, the
+/// removal succeeds, and the file is left alone.
+#[test]
+fn remove_corrupt_legacy_hosted_ledger_is_ignored() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let purl = "pkg:npm/__covgap_hcorrupt__@1.0.0";
+    let socket =
+        write_manifest_files_empty(tmp.path(), purl, "77777777-7777-4777-8777-777777777777");
+    let ledger_path = write_redirect_ledger_text(tmp.path(), "{nope");
+    let ledger_before = read_bytes(&ledger_path);
+
+    let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--offline"], &[]);
+    assert_eq!(
+        code, 0,
+        "a corrupt pre-v5 ledger must not block the removal; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("redirect") && !stderr.contains("ledger"),
+        "the pre-v5 ledger is never read, so nothing warns about it; got:\n{stderr}"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .unwrap();
+    assert!(
+        manifest["patches"].as_object().unwrap().is_empty(),
+        "the manifest entry must be removed"
+    );
+    assert_eq!(
+        read_bytes(&ledger_path),
+        ledger_before,
+        "the corrupt ledger must be left alone"
+    );
+}
+
+/// JSON twin: the removal still succeeds with no warning, and the corrupt
+/// ledger is left alone.
 #[test]
 fn remove_corrupt_legacy_hosted_ledger_is_ignored_json() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -525,7 +574,7 @@ fn remove_corrupt_legacy_hosted_ledger_is_ignored_json() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Hosted-only refusal + human listing
+// 8. Hosted-only --skip-rollback refusal
 // ---------------------------------------------------------------------------
 
 /// With no manifest entry to delete, removing a hosted patch can only mean
@@ -997,7 +1046,7 @@ fn remove_detached_skip_rollback_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// 15. Blob/archive cleanup failures warn, never fatal
+// 14. Blob/archive cleanup failures warn, never fatal
 // ---------------------------------------------------------------------------
 
 /// Plant `.socket/blobs`, `.socket/diffs`, `.socket/packages` as regular
@@ -1037,7 +1086,7 @@ fn remove_cleanup_failures_warn_not_fatal() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. rollback_patches_inner Err(String) plumbing (remove.rs's rollback match) — distinct
+// 15. rollback_patches_inner Err(String) plumbing (remove.rs's rollback match) — distinct
 //     from the covered Ok(success=false) gate abort.
 // ---------------------------------------------------------------------------
 
@@ -1120,7 +1169,7 @@ fn remove_rollback_infrastructure_error_surfaces_rollback_failed() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. Ledger-only path: --preserve-state, drift-keeps, and the missing
+// 16. Ledger-only path: --preserve-state, drift-keeps, and the missing
 //     `detached` flag — one revert loop shared with the manifest path.
 // ---------------------------------------------------------------------------
 

@@ -80,41 +80,6 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
     );
 }
 
-/// A corrupt pre-v5 redirect ledger is inert: hosted state comes from the
-/// lockfiles, so a manifest removal neither reads nor warns about it, the
-/// removal succeeds, and the file is left alone.
-#[test]
-fn remove_corrupt_legacy_hosted_ledger_is_ignored_human() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let purl = "pkg:npm/__covgap_hcorrupt__@1.0.0";
-    let socket =
-        write_manifest_files_empty(tmp.path(), purl, "77777777-7777-4777-8777-777777777777");
-    let ledger_path = write_redirect_ledger_text(tmp.path(), "{nope");
-    let ledger_before = read_bytes(&ledger_path);
-
-    let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--offline"], &[]);
-    assert_eq!(
-        code, 0,
-        "a corrupt pre-v5 ledger must not block the removal; stdout=\n{stdout}\nstderr=\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("redirect") && !stderr.contains("ledger"),
-        "the pre-v5 ledger is never read, so nothing warns about it; got:\n{stderr}"
-    );
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
-            .unwrap();
-    assert!(
-        manifest["patches"].as_object().unwrap().is_empty(),
-        "the manifest entry must be removed"
-    );
-    assert_eq!(
-        read_bytes(&ledger_path),
-        ledger_before,
-        "the corrupt ledger must be left alone"
-    );
-}
-
 /// Hosted-only human mode: the pre-confirm listing ("The following hosted
 /// redirect(s) will be unwound and removed:") must print to stderr, the
 /// wet run must restore the upstream entry, and a pre-v5 ledger left
