@@ -26,6 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::formats::cargo::floor;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
@@ -70,62 +71,25 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 const MULTI_VERSION_CARGO_MINOR: u32 = 45;
 
 /// The lowest cargo minor this project TELLS us it must build on, read
-/// offline from the project itself: the workspace root's `rust-version`
-/// (`[package]`, else `[workspace.package]`), else `rust-toolchain.toml`'s
-/// `[toolchain] channel`, else the legacy plain-text `rust-toolchain` file.
-///
-/// `None` when the project declares nothing, or pins a rolling channel
-/// (`stable`, `nightly`, …) — socket-patch never runs `cargo`, so there is
-/// no other signal, and "no declaration" is NOT evidence of a modern cargo.
+/// offline from the project root ([`floor::declared_cargo_minor`]); the
+/// toolchain files are read only when `Cargo.toml` declares nothing.
 async fn declared_cargo_minor(project_root: &Path) -> Option<u32> {
-    fn minor_of(spec: &str) -> Option<u32> {
-        let spec = spec.trim().trim_matches('"');
-        let rest = spec.strip_prefix("1.")?;
-        rest.split(['.', '-', '+']).next()?.parse().ok()
+    let read = |name: &str| project_root.join(name);
+    let manifest = read_regular_to_string(&read(cargo_manifest::CARGO_TOML)).await;
+    if let Some(minor) = manifest
+        .ok()
+        .as_deref()
+        .and_then(floor::root_manifest_minor)
+    {
+        return Some(minor);
     }
-    if let Ok(text) = read_regular_to_string(&project_root.join(cargo_manifest::CARGO_TOML)).await {
-        if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
-            let rust_version = doc
-                .get("package")
-                .and_then(|p| p.get("rust-version"))
-                .or_else(|| {
-                    doc.get("workspace")
-                        .and_then(|w| w.get("package"))
-                        .and_then(|p| p.get("rust-version"))
-                })
-                .and_then(|v| v.as_str())
-                .and_then(minor_of);
-            if rust_version.is_some() {
-                return rust_version;
-            }
-        }
-    }
-    if let Ok(text) = read_regular_to_string(&project_root.join("rust-toolchain.toml")).await {
-        if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
-            if let Some(channel) = doc
-                .get("toolchain")
-                .and_then(|t| t.get("channel"))
-                .and_then(|v| v.as_str())
-            {
-                return minor_of(channel);
-            }
-        }
-    }
-    // The legacy file is a bare channel name, but rustup also accepts the
-    // TOML form under this name.
-    if let Ok(text) = read_regular_to_string(&project_root.join("rust-toolchain")).await {
-        if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
-            if let Some(channel) = doc
-                .get("toolchain")
-                .and_then(|t| t.get("channel"))
-                .and_then(|v| v.as_str())
-            {
-                return minor_of(channel);
-            }
-        }
-        return minor_of(&text);
-    }
-    None
+    let toolchain_toml = read_regular_to_string(&read(floor::TOOLCHAIN_TOML))
+        .await
+        .ok();
+    let toolchain_legacy = read_regular_to_string(&read(floor::TOOLCHAIN_LEGACY))
+        .await
+        .ok();
+    floor::toolchain_minor(toolchain_toml.as_deref(), toolchain_legacy.as_deref())
 }
 
 /// A warning when THIS vendor puts a SECOND version of `name` behind
@@ -2147,6 +2111,25 @@ mod tests {
             .await
             .expect("an old pinned cargo warns");
         assert!(warning.detail.contains("pins cargo 1.41"), "{warning:?}");
+    }
+
+    /// #651: a root package that inherits its floor with
+    /// `rust-version.workspace = true` declares `[workspace.package]`'s
+    /// `rust-version`, not nothing — no multi-version warning for 1.70.
+    #[tokio::test]
+    async fn a_workspace_inherited_rust_version_is_the_declared_floor() {
+        let two = patch_table(&[("1.0.4", UUID), ("0.1.10", UUID2)]);
+        let inherited = two.replacen(
+            "[package]\n",
+            "[workspace]\n\n[workspace.package]\nrust-version = \"1.70\"\n\n\
+             [package]\nrust-version.workspace = true\n",
+            1,
+        );
+        let dir = toolchain_fixture(&[("Cargo.toml", &inherited)]).await;
+        assert_eq!(declared_cargo_minor(dir.path()).await, Some(70));
+        assert!(multi_version_warning(dir.path(), "cfg-if", "1.0.4")
+            .await
+            .is_none());
     }
 
     /// The path of the root manifest's Socket-owned `[patch.crates-io]`
