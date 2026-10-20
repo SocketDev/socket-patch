@@ -237,10 +237,11 @@ impl NpmLockBackend for YarnBerryBackend {
                 ),
             ));
         }
-        // A `file:` / url / `portal:` / `link:` copy of the package under
-        // ANOTHER dependency name (`lp2@file:…`, #939): the name-keyed
-        // resolutions entry never moves it, so it keeps installing the
-        // unpatched bytes. Named, like the alias entries above.
+        // A `file:` / url / `portal:` / `link:` / `exec:` / git copy of the
+        // package under ANOTHER dependency name (`lp2@file:…`, #939,
+        // #1630): the name-keyed resolutions entry never moves it, so it
+        // keeps installing the unpatched bytes. Named, like the alias
+        // entries above.
         let other_name =
             super::yarn_copies::other_name_copies(project_root, &lock_text, name, version).await;
         // The package IS installed, only under other names, and `yarn

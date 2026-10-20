@@ -863,8 +863,9 @@ fn emit(
 }
 
 /// A yarn lock entry (berry or classic) that installs a user's `file:`
-/// tarball / directory, url tarball or berry `portal:` / `link:` directory
-/// (not a Socket wiring), awaiting [`record_copies`].
+/// tarball / directory, url tarball, berry `portal:` / `link:` directory,
+/// berry `exec:` script or berry git remote (not a Socket wiring),
+/// awaiting [`record_copies`].
 struct LockCopy {
     key: String,
     source: CopyRef,
@@ -878,7 +879,8 @@ struct LockCopy {
 /// of `left-pad` reaches it. The real package comes from the copy itself
 /// ([`CopyRef::identity`]). A copy whose package cannot be read (a
 /// missing directory, a tarball with no readable `package.json`, a
-/// non-registry url) may be any package at its lock version, so it is
+/// non-registry url, an `exec:` script, a git remote; #1630) may be any
+/// package at its lock version, so it is
 /// recorded as a copy of every package this lock wires at that version:
 /// vouching for those would rest on a copy nobody read (#1516). A
 /// `portal:` / `link:` copy has no lock version: one whose package is

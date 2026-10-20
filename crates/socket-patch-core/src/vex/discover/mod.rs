@@ -978,7 +978,8 @@ impl Discovery {
 
     /// A lock entry of `file` that installs a copy of some package at
     /// `version` whose package can't be read (a non-registry url, a missing
-    /// directory, a tarball with no readable `package.json`). It may be any
+    /// directory, a tarball with no readable `package.json`, a berry
+    /// `exec:` script or git remote). It may be any
     /// package at that version, so [`Discovery::contest_within_locks`]
     /// takes it as an unpatched copy of every package `file` wires at
     /// `version` (at any version when `version` is `None`, #1540; of

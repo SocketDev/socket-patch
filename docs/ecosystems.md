@@ -299,7 +299,7 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   installs it from, including a `file:` path outside the project (`file:../shared/lp`),
   and a tarball's `package.json` is found under whatever top-level directory it has, as
   yarn strips the first path segment. A copy whose package can't be read (a non-registry
-  URL, a missing directory, a berry `exec:` script or a git remote such as
+  URL, a missing directory, a berry `exec:` script or a berry git remote such as
   `git+ssh://…`, which hold no package until yarn builds or clones them) is treated as
   possibly any package at its lock version: it
   is named as a copy it may be, and `vex` attests nothing that lock wires at that

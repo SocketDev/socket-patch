@@ -184,17 +184,16 @@ pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
     {
         return Some(CopyRef::Git(url()));
     }
-    if let Some(path) = reference.strip_prefix("exec:") {
-        let path = path.split("::").next().unwrap_or_default();
-        let path = path.split('#').next().unwrap_or_default();
-        return Some(CopyRef::Exec(berry_copy_path(reference, path)?));
-    }
-    let (path, linked) = if let Some(path) = reference.strip_prefix("file:") {
+    // `None` for `file:`, which is a tarball or a directory by its path.
+    type Kind = Option<fn(String) -> CopyRef>;
+    let (path, kind): (_, Kind) = if let Some(path) = reference.strip_prefix("file:") {
         (path, None)
     } else if let Some(path) = reference.strip_prefix("portal:") {
-        (path, Some(LinkKind::Portal))
+        (path, Some(|rel| CopyRef::Linked(rel, LinkKind::Portal)))
     } else if let Some(path) = reference.strip_prefix("link:") {
-        (path, Some(LinkKind::Link))
+        (path, Some(|rel| CopyRef::Linked(rel, LinkKind::Link)))
+    } else if let Some(path) = reference.strip_prefix("exec:") {
+        (path, Some(CopyRef::Exec))
     } else {
         return None;
     };
@@ -203,8 +202,8 @@ pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
     let path = path.split("::").next().unwrap_or_default();
     let path = path.split('#').next().unwrap_or_default();
     let rel = berry_copy_path(reference, path)?;
-    Some(if let Some(kind) = linked {
-        CopyRef::Linked(rel, kind)
+    Some(if let Some(kind) = kind {
+        kind(rel)
     } else if is_tarball_path(path) {
         CopyRef::Tarball(rel)
     } else {
