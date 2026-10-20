@@ -495,24 +495,65 @@ mod tests {
     #[test]
     #[serial(update_state_dir_env)]
     fn update_lock_released_on_drop_while_other_threads_spawn() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
+
+        /// Stops the spawners and restores the env var even when the test
+        /// panics, so a failure can't leave fork traffic or a dangling
+        /// state dir behind for the rest of the test binary.
+        struct Cleanup {
+            stop: Arc<AtomicBool>,
+            spawners: Vec<std::thread::JoinHandle<()>>,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                for spawner in self.spawners.drain(..) {
+                    let _ = spawner.join();
+                }
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
+                    None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
+                }
+            }
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("SOCKET_UPDATE_STATE_DIR");
         std::env::set_var("SOCKET_UPDATE_STATE_DIR", tmp.path());
 
         let stop = Arc::new(AtomicBool::new(false));
-        let spawners: Vec<_> = (0..2)
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let spawners = (0..2)
             .map(|_| {
                 let stop = Arc::clone(&stop);
+                let spawned = Arc::clone(&spawned);
                 std::thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        let _ = std::process::Command::new("true").status();
+                        if std::process::Command::new("true").status().is_ok() {
+                            spawned.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 })
             })
             .collect();
+        let cleanup = Cleanup {
+            stop,
+            spawners,
+            prev,
+        };
+
+        // Measure only once processes are really being spawned, or the test
+        // would pass without exercising anything.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while spawned.load(Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no process could be spawned"
+            );
+            std::thread::yield_now();
+        }
         let mut held = 0;
         for _ in 0..1000 {
             match acquire_update_lock() {
@@ -521,15 +562,7 @@ mod tests {
                 Err(e) => panic!("unexpected lock error: {e}"),
             }
         }
-        stop.store(true, Ordering::Relaxed);
-        for spawner in spawners {
-            spawner.join().unwrap();
-        }
-
-        match prev {
-            Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
-            None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
-        }
+        drop(cleanup);
         assert_eq!(
             held, 0,
             "a dropped guard left the lock held {held}/1000 times"
