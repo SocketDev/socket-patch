@@ -457,6 +457,74 @@ async fn dry_run_writes_nothing() {
     assert_eq!(std::fs::read(fx.installed_index()).unwrap(), ORIG_INDEX);
 }
 
+/// `git init` `root` and write its `.gitignore`. `false` when git is not
+/// installed (the probe has nothing to ask, so the test has nothing to
+/// check).
+fn git_project_ignoring(root: &Path, gitignore: &str) -> bool {
+    if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+        return false;
+    }
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(root.join(".gitignore"), gitignore).unwrap();
+    true
+}
+
+/// A `.gitignore` file rule that matches the vendor ledger (`state.json`,
+/// `*.json`) would leave it out of the commit the run asks for, so every
+/// other checkout has the lock wiring but no ledger and `rollback` fails
+/// with `vendor_ledger_missing` (#1638). The run refuses before writing
+/// anything, dry run included.
+#[tokio::test]
+async fn a_gitignored_ledger_refuses_before_any_write() {
+    for (gitignore, rule) in [
+        ("node_modules/\nstate.json\n", "state.json"),
+        ("node_modules/\n*.json\n!package*.json\n", "*.json"),
+        ("node_modules/\n**/state.json\n", "**/state.json"),
+    ] {
+        for dry_run in [false, true] {
+            let fx = npm_fixture();
+            if !git_project_ignoring(fx.root(), gitignore) {
+                return;
+            }
+            let extra: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
+            let (code, env) = vendor_cli(fx.root(), extra);
+            assert_eq!(code, 1, "{gitignore:?} dry_run={dry_run}: {env:#}");
+            assert_eq!(env["error"]["code"], "vendor_ledger_gitignored", "{env:#}");
+            let message = env["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(".socket/vendor/state.json") && message.contains(rule),
+                "the message names the ledger and the rule: {message}"
+            );
+            assert!(
+                !fx.vendor_dir().exists(),
+                "nothing is vendored for {gitignore:?}"
+            );
+            assert_eq!(fx.lock_bytes(), fx.original_lock, "lock byte-identical");
+        }
+    }
+}
+
+/// A rule that re-includes the ledger lets the run vendor as usual.
+#[tokio::test]
+async fn a_re_included_ledger_vendors() {
+    let fx = npm_fixture();
+    if !git_project_ignoring(
+        fx.root(),
+        "node_modules/\n*.json\n!package*.json\n!.socket/vendor/state.json\n",
+    ) {
+        return;
+    }
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert!(fx.state_path().is_file());
+    assert!(fx.tgz_path().is_file());
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 4. vendor → revert round-trip
 // ─────────────────────────────────────────────────────────────────────
@@ -3515,6 +3583,31 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) 
 /// halves and prunes the vendor tree. Manifest-agnostic on purpose: the
 /// vendored mode never writes `.socket/manifest.json` (its ledger owns the
 /// entries), so nothing here reads one.
+/// The ledger check sits in front of every vendored backend, not only the
+/// npm family the report used (#1638): a gem `scan --mode vendored` whose
+/// `.gitignore` matches `state.json` refuses before anything is written.
+#[tokio::test]
+async fn scan_vendor_gem_refuses_a_gitignored_ledger() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
+    let fx = gem_fixture();
+    if !git_project_ignoring(fx.root(), "vendor/bundle/\nstate.json\n") {
+        return;
+    }
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 1, "{env:#}");
+    assert_eq!(env["error"]["code"], "vendor_ledger_gitignored", "{env:#}");
+    assert!(!fx.root().join(".socket/vendor").exists(), "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(fx.root().join("Gemfile.lock")).unwrap(),
+        GEM_LOCK
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.root().join("Gemfile")).unwrap(),
+        GEM_GEMFILE
+    );
+}
+
 #[tokio::test]
 async fn scan_vendor_gem_end_to_end_and_reverts() {
     let mock = wiremock::MockServer::start().await;

@@ -534,6 +534,43 @@ pub(crate) async fn ignored_root_refusal(
 
 pub(crate) const GITIGNORED: &str = "vendor_artifact_gitignored";
 
+/// The vendor ledger is ignored by git, so the commit the vendored workflow
+/// ends with would leave it out (#1638).
+pub const LEDGER_GITIGNORED: &str = "vendor_ledger_gitignored";
+
+/// The `vendor_ledger_gitignored` refusal (code, detail) when git would not
+/// commit `.socket/vendor/state.json`: a file rule such as `state.json` or
+/// `*.json` that no file socket-patch writes overrides. Every other
+/// checkout would then get the lock wiring and the artifacts but no ledger,
+/// so `rollback`, `list` and `vendor --revert` there cannot see the patch.
+/// `None` when `.socket/vendor/` is ignored as a directory: the backends'
+/// own `vendor_artifact_gitignored` refusals report that rule per package.
+pub async fn ledger_gitignore_refusal(project_root: &Path) -> Option<(&'static str, String)> {
+    let ledger = super::state::VENDOR_STATE_REL;
+    let dir = ledger.rsplit_once('/').map_or(ledger, |(dir, _)| dir);
+    if gitignored(project_root, &[format!("{dir}/")])
+        .await
+        .is_some()
+    {
+        return None;
+    }
+    let rules = gitignored(project_root, &[ledger.to_string()]).await?;
+    Some((
+        LEDGER_GITIGNORED,
+        format!(
+            "git would not commit the vendor ledger {ledger} ({rules}), so other checkouts \
+             could not roll back or list the vendored patches; remove that rule or add \
+             `!{ledger}` to .gitignore, then vendor again"
+        ),
+    ))
+}
+
+/// The rules (as [`gitignored`] names them) that would keep git from
+/// committing the project-relative file `rel`, or `None`.
+pub async fn file_gitignored(project_root: &Path, rel: &str) -> Option<String> {
+    gitignored(project_root, &[rel.to_string()]).await
+}
+
 /// The vendored dir was written, but git could not say whether it would
 /// commit it.
 pub(crate) const GITIGNORE_UNCHECKED: &str = "vendor_artifact_gitignore_unchecked";

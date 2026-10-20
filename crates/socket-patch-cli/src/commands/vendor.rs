@@ -2761,6 +2761,16 @@ pub(crate) async fn vendor_records_reusing(
             return true;
         }
     };
+    // The ledger must survive the commit the run asks for, or no other
+    // checkout can roll the patches back (#1638): refuse before anything
+    // is written, dry run included.
+    if let Some((code, detail)) = vendor::ledger_gitignore_refusal(&common.cwd).await {
+        if !common.json {
+            eprintln!("Error: {detail}");
+        }
+        env.mark_error(EnvelopeError::new(code, detail));
+        return true;
+    }
     // Pre-stage trees a previous run left behind (it crashed or was
     // interrupted between staging an archive and settling): nothing of
     // this run is staged yet, and the caller holds the apply lock, so every

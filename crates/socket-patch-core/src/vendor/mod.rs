@@ -134,6 +134,9 @@ pub use verify::{
 // The hosted→vendored takeover refuses a berry project the backend would
 // refuse BEFORE it reverts the hosted redirect.
 pub use npm_common::npm_tarball_gitignore_preflight;
+// Git's ignore rules for the state files a vendored or agent-mode run asks
+// the user to commit (#1638).
+pub use npm_dir::{file_gitignored, ledger_gitignore_refusal, LEDGER_GITIGNORED};
 pub use npm_lock::npm_lock_vendor_preflight;
 pub use yarn_berry_lock::{yarn_berry_vendor_preflight, yarn_berry_vendor_target_preflight};
 
