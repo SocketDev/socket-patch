@@ -1397,8 +1397,6 @@ async fn run_check(args: &VendorArgs) -> i32 {
     i32::from(env.summary.failed != 0)
 }
 
-/// A refused eject: the JSON error envelope (`status: error`) or an
-/// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
 /// Whether every ecosystem in a vendored run has a backend that refuses a
 /// `.socket/vendor/` directory ignore rule per package
 /// (`vendor_artifact_gitignored`): the npm family (vlt included), NuGet
@@ -1407,6 +1405,8 @@ fn artifacts_gitignore_checked(mut ecosystems: impl Iterator<Item = Ecosystem>) 
     ecosystems.all(|eco| matches!(eco, Ecosystem::Npm | Ecosystem::Nuget | Ecosystem::Maven))
 }
 
+/// A refused eject: the JSON error envelope (`status: error`) or an
+/// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
 fn emit_eject_refusal(common: &GlobalArgs, code: &str, message: &str) -> i32 {
     if common.json {
         let mut env = Envelope::new(Command::Vendor);
