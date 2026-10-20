@@ -1,6 +1,8 @@
 """A reused CI verdict must belong to this workflow, repository and exact SHA."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import unittest
@@ -60,15 +62,22 @@ class Reuse(unittest.TestCase):
                 self.assertIsNone(reuse.reusable_run(dict(self.env, **change)))
                 call.assert_not_called()
 
+    def assert_falls_back(self, env):
+        # Capture the fallback notice: printed to the job log it becomes a
+        # real (misleading) annotation on every lint-ecosystems run.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertIsNone(reuse.reusable_run(env))
+        self.assertTrue(out.getvalue().startswith("::notice::"), out.getvalue())
+
     def test_api_failure_timeout_and_bad_payload_keep_all_checks(self):
         for error in (FileNotFoundError(), subprocess.CalledProcessError(1, "gh"),
                       subprocess.TimeoutExpired("gh", 15)):
             with self.subTest(error=error), patch.object(reuse.subprocess, "run", side_effect=error):
-                self.assertIsNone(reuse.reusable_run(self.env))
+                self.assert_falls_back(self.env)
         for text in ("not json", "{}", '{"workflow_runs": null}', '{"workflow_runs": [null]}'):
             with self.subTest(text=text), patch.object(reuse.subprocess, "run", return_value=
                     subprocess.CompletedProcess([], 0, stdout=text)):
-                self.assertIsNone(reuse.reusable_run(self.env))
+                self.assert_falls_back(self.env)
 
 
 if __name__ == "__main__":
