@@ -65,6 +65,147 @@ pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// The `node_modules` dirs of declared workspace members that the
+/// workspace walk prunes by name (#1627): members whose path crosses a
+/// [`SKIP_DIRS`] name (`packages/build`, `vendor/lib`). npm, yarn and Bun
+/// install a member's unhoistable deps into `<member>/node_modules` from
+/// the root lock, so such a copy is as live as any other member's. The
+/// workspace roots are `start_path` and the project of every `walked`
+/// root (`<project>/node_modules`), so a workspace nested below the scan
+/// root counts too. Sorted and deduplicated.
+pub(super) fn skipped_workspace_member_roots(
+    start_path: &Path,
+    walked: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut projects = vec![start_path];
+    projects.extend(
+        walked
+            .iter()
+            .filter(|nm| nm.file_name().is_some_and(|n| n == "node_modules"))
+            .filter_map(|nm| nm.parent()),
+    );
+    let mut roots: Vec<PathBuf> = projects
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .flat_map(skipped_members_of)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// [`skipped_workspace_member_roots`] for the one workspace root `root`. A
+/// member is a dir the root `package.json` `workspaces` patterns list in
+/// any package manager's reading ([`WorkspacesDialect::ALL`]: an extra root
+/// can only keep a copy, never drop one) that holds a `package.json`. Each
+/// pattern is walked from its literal prefix to the depth its segments
+/// allow (any depth for `**`, within [`WORKSPACE_GLOB_DIR_BUDGET`] dirs per
+/// pattern), with the walk's own rules: real dirs only (never a symlink),
+/// never a hidden dir, a `node_modules` or a tagged cache dir below the
+/// root, literal prefix included. Names are
+/// read from the listings, so the [`SKIP_DIRS`] test sees each dir as the
+/// walk does even when a pattern spells it in another case.
+fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
+    use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
+
+    let Some(patterns) = crate::utils::fs::read_regular_to_string_sync(&root.join("package.json"))
+        .ok()
+        .and_then(|text| crate::hosted::governing_root::workspace_patterns(&text))
+    else {
+        return Vec::new();
+    };
+    let walkable = |entry: &ListedEntry| {
+        entry.file_type.is_some_and(|ft| ft.is_dir())
+            && entry.name_str != "node_modules"
+            && !entry.name_str.starts_with('.')
+    };
+    let mut roots = Vec::new();
+    // A leading `!` is a negation in some readings and part of an extglob
+    // or a literal name in others; the dirs it can reach are walked either
+    // way, and `workspaces_include_as` decides.
+    for pattern in &patterns {
+        let segments: Vec<&str> = pattern
+            .trim_start_matches('!')
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
+        let is_glob = |s: &str| s.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!', '+', '@']);
+        let literal = segments.iter().take_while(|s| !is_glob(s)).count();
+        // The literal prefix, each component as its parent lists it (an
+        // exact name first, else the ASCII-case-insensitive match a
+        // case-insensitive filesystem resolves). A prefix that climbs out
+        // (`..`) or is not walkable names nothing here.
+        let mut dir = root.to_path_buf();
+        let mut rel: Vec<String> = Vec::new();
+        let mut reachable = true;
+        for segment in &segments[..literal] {
+            let entries: Vec<ListedEntry> = list_dir_sync(&dir)
+                .entries
+                .into_iter()
+                .filter(|e| walkable(e))
+                .collect();
+            let found = entries.iter().find(|e| e.name_str == *segment).or_else(|| {
+                entries
+                    .iter()
+                    .find(|e| e.name_str.eq_ignore_ascii_case(segment))
+            });
+            let Some(entry) = found else {
+                reachable = false;
+                break;
+            };
+            dir.push(&entry.name);
+            rel.push(entry.name_str.clone());
+            if is_tagged_cache_dir(&dir, &list_dir_sync(&dir)) {
+                reachable = false;
+                break;
+            }
+        }
+        if !reachable {
+            continue;
+        }
+        let rest = &segments[literal..];
+        let max_depth = if rest.contains(&"**") {
+            usize::MAX
+        } else {
+            rest.len()
+        };
+        let mut budget = WORKSPACE_GLOB_DIR_BUDGET;
+        let mut stack = vec![(dir, rel, 0usize)];
+        while let Some((dir, rel, depth)) = stack.pop() {
+            let listing = list_dir_sync(&dir);
+            // The workspace root itself is exempt, as the walk always
+            // crawls the scan root (and never reaches a nested project
+            // inside a tagged dir).
+            if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
+                continue;
+            }
+            if rel.iter().any(|seg| SKIP_DIRS.contains(&seg.as_str()))
+                && WorkspacesDialect::ALL
+                    .iter()
+                    .any(|&dialect| workspaces_include_as(&patterns, &rel, dialect))
+                && dir.join("package.json").is_file()
+                && has_node_modules_dir(&dir, &listing)
+            {
+                roots.push(dir.join("node_modules"));
+            }
+            if depth >= max_depth {
+                continue;
+            }
+            for entry in listing.entries.into_iter().filter(|e| walkable(e)) {
+                let Some(left) = budget.checked_sub(1) else {
+                    break;
+                };
+                budget = left;
+                let mut child_rel = rel.clone();
+                child_rel.push(entry.name_str.clone());
+                stack.push((dir.join(&entry.name), child_rel, depth + 1));
+            }
+        }
+    }
+    roots
+}
+
 /// Whether the installed pnpm tree of the project at `project` keeps its
 /// virtual store where the crawler does not look: a `.modules.yaml` in
 /// `node_modules` or a pnpm modules dir
@@ -2892,6 +3033,9 @@ impl NpmCrawler {
 
         // Recursively search for workspace node_modules
         results.extend(Self::find_workspace_node_modules(start_path, listing));
+        // Plus the declared members the walk prunes by name (#1627).
+        let members = skipped_workspace_member_roots(start_path, &results);
+        results.extend(members);
 
         merge_configured_install_roots(results, configured_install_roots(start_path))
     }

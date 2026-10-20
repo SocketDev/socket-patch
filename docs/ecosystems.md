@@ -434,7 +434,12 @@ projects), at any depth. The walk does not descend into symlinked
 directories, hidden directories (`.git`, `.cache`, ...), `node_modules`
 itself (packages are read from it, not searched for workspaces), or
 directories named `dist`, `build`, `coverage`, `tmp`, `temp`, `__pycache__`
-or `vendor`. It also prunes every directory that carries a
+or `vendor`, except that a workspace member the root `package.json`
+`workspaces` field declares (a directory holding a `package.json` that any
+of npm, yarn or Bun reads the patterns as listing, such as `packages/build`
+or `vendor/lib`) still has its own `node_modules` crawled. npm, yarn and
+Bun install a member's unhoistable dependencies there from the root lock.
+It also prunes every directory that carries a
 [Cache Directory Tagging](https://bford.info/cachedir/) `CACHEDIR.TAG` file
 beginning with the standard signature — a cargo `target/`, and caches of
 other tools that follow the convention: neither that directory's own
