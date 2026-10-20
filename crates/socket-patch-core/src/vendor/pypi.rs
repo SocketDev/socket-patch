@@ -1361,6 +1361,16 @@ async fn pypi_prelude<'p>(
                 ));
             }
         }
+        // A missing wheel means this run (or the wet run a dry run
+        // previews) rebuilds the uuid dir, so the `.socket/` refusal below
+        // applies here too, before the dry-run preview returns.
+        if !artifact_present {
+            if let Some((code, detail)) =
+                super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
+            {
+                return Err(refused(code, detail));
+            }
+        }
         if sibling_pending && (artifact_present || dry_run) {
             return Err(wire_in_sync_sibling(
                 already_patched_result(base, Path::new(""), &record.files),
@@ -1386,11 +1396,13 @@ async fn pypi_prelude<'p>(
     // From here on this run writes the uuid dir. A rule ignoring the dir
     // itself (`.socket/`) can't be overridden from inside it, so the commit
     // would drop the wheel the wiring names (#1572): refuse before anything
-    // is downloaded or written.
-    if let Some((code, detail)) =
-        super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
-    {
-        return Err(refused(code, detail));
+    // is downloaded or written. (An in-sync rebuild was checked above.)
+    if !in_sync {
+        if let Some((code, detail)) =
+            super::npm_dir::ignored_root_refusal(project_root, &uuid_dir_rel).await
+        {
+            return Err(refused(code, detail));
+        }
     }
 
     let prior: Option<VendorEntry> = reuse::prior_entry(project_root, "pypi", record, None)
@@ -5633,6 +5645,32 @@ wheels = [
             panic!("an in-sync re-run is not refused: {outcome:?}");
         };
         assert!(result.success, "{:?}", result.error);
+    }
+
+    /// #1572 review: a wired wheel missing under a `.socket/` rule (a fresh
+    /// clone of a repo that ignored it) refuses the rebuild, and the dry run
+    /// previews the same refusal instead of success.
+    #[tokio::test]
+    async fn an_in_sync_rebuild_under_a_socket_dir_rule_refuses_wet_and_dry() {
+        use crate::vendor::test_support::git_project;
+        let fx = e2e_fixture_hashed().await;
+        let VendorOutcome::Done { result, .. } = vendor_served(&fx, false).await else {
+            panic!("expected Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+        std::fs::remove_dir_all(&uuid_dir).unwrap();
+        if git_project(&fx.root, ".socket/\n").is_none() {
+            return;
+        }
+        for dry_run in [true, false] {
+            let outcome = vendor_served(&fx, dry_run).await;
+            let VendorOutcome::Refused { code, .. } = &outcome else {
+                panic!("dry_run={dry_run}: expected Refused, got {outcome:?}");
+            };
+            assert_eq!(*code, "vendor_artifact_gitignored", "dry_run={dry_run}");
+            assert!(!uuid_dir.exists(), "dry_run={dry_run}: nothing written");
+        }
     }
 
     /// #1572 review: an in-sync rebuild whose uuid dotfiles can't be written
