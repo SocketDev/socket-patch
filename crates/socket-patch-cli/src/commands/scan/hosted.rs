@@ -4237,6 +4237,8 @@ mod tests {
                 "Cargo.lock",
                 ".cargo/config.toml",
                 ".cargo/config",
+                "rust-toolchain.toml",
+                "rust-toolchain",
                 "composer.lock",
                 "nuget.config",
                 "NuGet.config",
