@@ -1399,6 +1399,14 @@ async fn run_check(args: &VendorArgs) -> i32 {
 
 /// A refused eject: the JSON error envelope (`status: error`) or an
 /// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
+/// Whether every ecosystem in a vendored run has a backend that refuses a
+/// `.socket/vendor/` directory ignore rule per package
+/// (`vendor_artifact_gitignored`): the npm family (vlt included), NuGet
+/// and the JVM trees. The others rely on the run-level ledger check.
+fn artifacts_gitignore_checked(mut ecosystems: impl Iterator<Item = Ecosystem>) -> bool {
+    ecosystems.all(|eco| matches!(eco, Ecosystem::Npm | Ecosystem::Nuget | Ecosystem::Maven))
+}
+
 fn emit_eject_refusal(common: &GlobalArgs, code: &str, message: &str) -> i32 {
     if common.json {
         let mut env = Envelope::new(Command::Vendor);
@@ -1730,7 +1738,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
     // A ledger git would not commit refuses before anything is fetched or
     // restored, so the project stays hosted (#1638).
-    if let Some((code, detail)) = vendor::ledger_gitignore_refusal(&common.cwd).await {
+    let purls: Vec<String> = pins.iter().map(|pin| pin.purl.clone()).collect();
+    let artifacts_checked = artifacts_gitignore_checked(partition_purls(&purls, None).into_keys());
+    if let Some((code, detail)) =
+        vendor::ledger_gitignore_refusal(&common.cwd, artifacts_checked).await
+    {
         return emit_eject_refusal(common, code, &detail);
     }
     let (client, use_public_proxy) =
@@ -2769,7 +2781,15 @@ pub(crate) async fn vendor_records_reusing(
     // The ledger must survive the commit the run asks for, or no other
     // checkout can roll the patches back (#1638): refuse before anything
     // is written, dry run included.
-    if let Some((code, detail)) = vendor::ledger_gitignore_refusal(&common.cwd).await {
+    let artifacts_checked = artifacts_gitignore_checked(
+        vendorable_partition
+            .iter()
+            .filter(|(_, purls)| !purls.is_empty())
+            .map(|(eco, _)| *eco),
+    );
+    if let Some((code, detail)) =
+        vendor::ledger_gitignore_refusal(&common.cwd, artifacts_checked).await
+    {
         if !common.json {
             eprintln!("Error: {detail}");
         }

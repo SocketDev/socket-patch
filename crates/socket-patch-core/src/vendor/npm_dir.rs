@@ -460,6 +460,23 @@ pub(crate) async fn gitignore_probe(
     project_root: &Path,
     paths: &[String],
 ) -> Result<Option<String>, String> {
+    Ok(ignoring_rule_lines(project_root, paths, true)
+        .await?
+        .map(|lines| summarize_rules(&lines)))
+}
+
+/// The ignoring rules `git check-ignore -v` reports for `paths`, one
+/// `<source>:<linenum>:<pattern>\t<pathname>` line each (see
+/// [`ignoring_rules`]), or `Ok(None)` when none matches, git is absent or
+/// the root is not a work tree. `no_index` asks about the paths as if
+/// nothing were tracked (the right question for files this run creates);
+/// without it a tracked file is never ignored, because git keeps
+/// committing changes to it whatever the ignore rules say.
+pub(crate) async fn ignoring_rule_lines(
+    project_root: &Path,
+    paths: &[String],
+    no_index: bool,
+) -> Result<Option<Vec<String>>, String> {
     let Some(git) = crate::utils::process::resolve_tool("git") else {
         return Ok(None);
     };
@@ -478,27 +495,29 @@ pub(crate) async fn gitignore_probe(
         };
     }
     let input: String = paths.iter().map(|p| format!("{p}\0")).collect();
-    let (code, out) = git_output(
-        &git,
-        project_root,
-        &["check-ignore", "-v", "-z", "--no-index", "--stdin"],
-        Some(input),
-    )
-    .await
-    .ok_or("`git check-ignore` did not run to completion")?;
+    let mut check = vec!["check-ignore", "-v", "-z", "--stdin"];
+    if no_index {
+        check.push("--no-index");
+    }
+    let (code, out) = git_output(&git, project_root, &check, Some(input))
+        .await
+        .ok_or("`git check-ignore` did not run to completion")?;
     if code != 0 && code != 1 {
         return Err(format!("`git check-ignore` exited {code}"));
     }
     let lines = ignoring_rules(&out);
-    Ok((code == 0 && !lines.is_empty()).then(|| {
-        let shown: Vec<&str> = lines.iter().take(3).map(String::as_str).collect();
-        let more = lines.len().saturating_sub(shown.len());
-        let mut detail = shown.join("; ");
-        if more > 0 {
-            detail.push_str(&format!("; and {more} more"));
-        }
-        detail
-    }))
+    Ok((code == 0 && !lines.is_empty()).then_some(lines))
+}
+
+/// Up to three of `lines` joined for a message, with a count of the rest.
+pub(crate) fn summarize_rules(lines: &[String]) -> String {
+    let shown: Vec<&str> = lines.iter().take(3).map(String::as_str).collect();
+    let more = lines.len().saturating_sub(shown.len());
+    let mut detail = shown.join("; ");
+    if more > 0 {
+        detail.push_str(&format!("; and {more} more"));
+    }
+    detail
 }
 
 /// The non-negated matches of `git check-ignore -v -z` output
@@ -533,43 +552,6 @@ pub(crate) async fn ignored_root_refusal(
 }
 
 pub(crate) const GITIGNORED: &str = "vendor_artifact_gitignored";
-
-/// The vendor ledger is ignored by git, so the commit the vendored workflow
-/// ends with would leave it out (#1638).
-pub const LEDGER_GITIGNORED: &str = "vendor_ledger_gitignored";
-
-/// The `vendor_ledger_gitignored` refusal (code, detail) when git would not
-/// commit `.socket/vendor/state.json`: a file rule such as `state.json` or
-/// `*.json` that no file socket-patch writes overrides. Every other
-/// checkout would then get the lock wiring and the artifacts but no ledger,
-/// so `rollback`, `list` and `vendor --revert` there cannot see the patch.
-/// `None` when `.socket/vendor/` is ignored as a directory: the backends'
-/// own `vendor_artifact_gitignored` refusals report that rule per package.
-pub async fn ledger_gitignore_refusal(project_root: &Path) -> Option<(&'static str, String)> {
-    let ledger = super::state::VENDOR_STATE_REL;
-    let dir = ledger.rsplit_once('/').map_or(ledger, |(dir, _)| dir);
-    if gitignored(project_root, &[format!("{dir}/")])
-        .await
-        .is_some()
-    {
-        return None;
-    }
-    let rules = gitignored(project_root, &[ledger.to_string()]).await?;
-    Some((
-        LEDGER_GITIGNORED,
-        format!(
-            "git would not commit the vendor ledger {ledger} ({rules}), so other checkouts \
-             could not roll back or list the vendored patches; remove that rule or add \
-             `!{ledger}` to .gitignore, then vendor again"
-        ),
-    ))
-}
-
-/// The rules (as [`gitignored`] names them) that would keep git from
-/// committing the project-relative file `rel`, or `None`.
-pub async fn file_gitignored(project_root: &Path, rel: &str) -> Option<String> {
-    gitignored(project_root, &[rel.to_string()]).await
-}
 
 /// The vendored dir was written, but git could not say whether it would
 /// commit it.

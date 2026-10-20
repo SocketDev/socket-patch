@@ -1349,8 +1349,9 @@ pub(crate) async fn warn_if_manifest_gitignored(
     };
     let w = format!(
         "git would not commit {rel} ({rules}), so `socket-patch apply` in other checkouts \
-         (CI, a fresh clone) would find no manifest and apply nothing; remove that rule or \
-         add `!{rel}` to .gitignore"
+         (CI, a fresh clone) would find no manifest and apply nothing; remove or narrow that \
+         rule (a `!{rel}` line re-includes the file only when no parent directory is \
+         ignored)"
     );
     if !quiet {
         eprintln!("  [warn] {w}");
