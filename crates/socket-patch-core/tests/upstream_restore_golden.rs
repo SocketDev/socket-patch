@@ -1202,7 +1202,11 @@ async fn pypi_mock(releases: &[Release<'_>]) -> (MockServer, EnvGuard) {
             .mount(&server)
             .await;
     }
-    let env = EnvGuard::set(&[("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()))]);
+    // The host's user- and system-level uv settings stay out of the tests.
+    let env = EnvGuard::set(&[
+        ("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri())),
+        ("UV_NO_CONFIG", "1".to_string()),
+    ]);
     (server, env)
 }
 
@@ -2212,6 +2216,197 @@ async fn pylock_whole_second_upload_times_round_trip() {
     assert_pypi_round_trip("uv export pylock", &input, &[urllib3_dep()], None).await;
 }
 
+/// #1613: since uv 0.9.16, `uv pip compile --format pylock.toml` applies
+/// `--no-build` / `--only-binary` / `--no-binary` (and the `exclude-newer`
+/// cutoffs) to the files it records, so a filter that reaches the patched
+/// package makes the entry's files not re-derivable from PyPI. The command
+/// line in uv's header and the uv settings `uv pip` reads beside the lock
+/// show the filter; one that names another package, or that only changes
+/// how sdists are built, restores byte for byte.
+#[tokio::test]
+#[serial]
+async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let header = "#    uv pip compile --format pylock.toml req.in -o pylock.toml\n";
+    let with_flags = |flags: &str| {
+        uv_pylock(false).replace(
+            header,
+            &format!("#    uv pip compile --format pylock.toml req.in{flags} -o pylock.toml\n"),
+        )
+    };
+    assert!(with_flags(" --no-build").contains("--no-build"));
+    for flags in [
+        " --no-build",
+        " --only-binary urllib3",
+        " --only-binary=:all:",
+        " --no-binary urllib3",
+        " --no-binary=idna,urllib3",
+        " --no-binary Urllib3",
+        " --exclude-newer 2024-01-01",
+        " --exclude-newer-package urllib3=2023-10-17T17:46:22Z",
+        // Exempting another package leaves the global cutoff on urllib3.
+        " --exclude-newer 2024-01-01 --exclude-newer-package idna=false",
+    ] {
+        let input = tree(&[("pylock.toml", with_flags(flags))]);
+        let (why, rewritten, after) =
+            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert_eq!(
+            after, rewritten,
+            "{flags}: a refused pin leaves the lock hosted"
+        );
+        assert!(why.contains("pylock.toml"), "{flags}: {why}");
+        let flag = flags.trim().split([' ', '=']).next().unwrap();
+        assert!(why.contains(flag), "{flags}: {why}");
+    }
+    for flags in [
+        " --no-binary idna",
+        " --only-binary :none:",
+        " --no-build-isolation",
+        " --exclude-newer-package idna=2023-01-01T00:00:00Z",
+        " --exclude-newer-package urllib3=false",
+        " --exclude-newer false",
+        " --exclude-newer=false",
+        // A `false` per-package cutoff exempts urllib3 from the global one.
+        " --exclude-newer 2024-01-01 --exclude-newer-package urllib3=false",
+        " --exclude-newer=2024-01-01 --exclude-newer-package=urllib3=false",
+    ] {
+        let input = tree(&[("pylock.toml", with_flags(flags))]);
+        assert_pypi_round_trip(flags, &input, &[urllib3_dep()], None).await;
+    }
+
+    // uv's settings files: a `uv.toml` (top level or `[pip]`), else a
+    // pyproject's `[tool.uv]` / `[tool.uv.pip]`.
+    let plain = uv_pylock(false);
+    for (rel, settings) in [
+        ("uv.toml", "[pip]\nno-build = true\n"),
+        ("uv.toml", "only-binary = [\"urllib3\"]\n"),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\n[tool.uv]\nno-binary-package = [\"urllib3\"]\n",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\n[tool.uv.pip]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
+        ),
+    ] {
+        let input = tree(&[("pylock.toml", plain.clone()), (rel, settings.to_string())]);
+        let (why, _, after) =
+            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(after["pylock.toml"].contains("patch.socket.dev"), "{rel}");
+        assert!(why.contains(rel), "{rel}: {why}");
+    }
+    for (rel, settings) in [
+        ("uv.toml", "no-build-isolation = true\n"),
+        ("uv.toml", "[pip]\nno-binary = [\"idna\"]\n"),
+        // `uv pip` reads `[pip]` over the top level.
+        ("uv.toml", "no-build = true\n\n[pip]\nno-build = false\n"),
+        // A `false` per-package cutoff exempts urllib3 from the global one.
+        (
+            "uv.toml",
+            "exclude-newer = \"2024-01-01T00:00:00Z\"\n\n[exclude-newer-package]\nurllib3 = false\n",
+        ),
+        // uv passes over a pyproject that does not parse.
+        ("pyproject.toml", "[project\n"),
+        // A pyproject without `[tool.uv]` sets nothing.
+        (
+            "pyproject.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n",
+        ),
+    ] {
+        let input = tree(&[("pylock.toml", plain.clone()), (rel, settings.to_string())]);
+        assert_pypi_round_trip(rel, &input, &[urllib3_dep()], None).await;
+    }
+    let input = tree(&[
+        ("pylock.toml", plain.clone()),
+        ("uv.toml", "offline = false\n".to_string()),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"p\"\nversion = \"0\"\n\n[tool.uv]\nno-build = true\n".to_string(),
+        ),
+    ]);
+    assert_pypi_round_trip("uv.toml over pyproject", &input, &[urllib3_dep()], None).await;
+    // `--no-config` read no settings file; `--config-file` read one the
+    // lock does not name.
+    let no_build = ("uv.toml", "no-build = true\n".to_string());
+    let input = tree(&[
+        ("pylock.toml", with_flags(" --no-config")),
+        no_build.clone(),
+    ]);
+    assert_pypi_round_trip("--no-config", &input, &[urllib3_dep()], None).await;
+    // uv records global options before `pip` or before `compile`.
+    for command in [
+        "uv --native-tls pip compile --format pylock.toml req.in --no-build",
+        "uv --offline pip --quiet compile --format pylock.toml req.in --no-build",
+    ] {
+        let lock = uv_pylock(false).replace(header, &format!("#    {command}\n"));
+        let input = tree(&[("pylock.toml", lock)]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("--no-build"), "{command}: {why}");
+    }
+    let lock = uv_pylock(false).replace(header, "#    uv --no-config pip compile req.in\n");
+    let input = tree(&[("pylock.toml", lock), no_build.clone()]);
+    assert_pypi_round_trip("global --no-config", &input, &[urllib3_dep()], None).await;
+    let input = tree(&[("pylock.toml", with_flags(" --config-file ci/uv.toml"))]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+    assert!(why.contains("--config-file"), "{why}");
+    // uv's environment is not in the header: a cutoff or settings file
+    // set in the restoring environment refuses.
+    for (var, value, expect) in [
+        (
+            "UV_EXCLUDE_NEWER",
+            "2023-01-01T00:00:00Z",
+            "UV_EXCLUDE_NEWER",
+        ),
+        ("UV_CONFIG_FILE", "ci/uv.toml", "UV_CONFIG_FILE"),
+    ] {
+        let _env = EnvGuard::set(&[(var, value.to_string())]);
+        let input = tree(&[("pylock.toml", uv_pylock(false))]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains(expect), "{why}");
+    }
+    // A `false` per-package cutoff on the command line exempts urllib3
+    // from `UV_EXCLUDE_NEWER`.
+    let _env = EnvGuard::set(&[("UV_EXCLUDE_NEWER", "2023-01-01T00:00:00Z".to_string())]);
+    let input = tree(&[(
+        "pylock.toml",
+        with_flags(" --exclude-newer-package urllib3=false"),
+    )]);
+    assert_pypi_round_trip("UV_EXCLUDE_NEWER exempt", &input, &[urllib3_dep()], None).await;
+    drop(_env);
+    // Empty is unset, and `false` turns the cutoff off.
+    for value in ["", "false"] {
+        let _env = EnvGuard::set(&[("UV_EXCLUDE_NEWER", value.to_string())]);
+        let input = tree(&[("pylock.toml", uv_pylock(false))]);
+        assert_pypi_round_trip("UV_EXCLUDE_NEWER off", &input, &[urllib3_dep()], None).await;
+    }
+    // With no uv command line recorded (`--no-header`, or a header that
+    // `UV_CUSTOM_COMPILE_COMMAND` replaced) the flags cannot be ruled out.
+    let comment = "# This file was autogenerated by uv via the following command:\n";
+    for lock in [
+        uv_pylock(false).replace(comment, "").replace(header, ""),
+        uv_pylock(false).replace(header, "#    make lock\n"),
+        uv_pylock(false).replace(header, "#    uv run poe lock\n"),
+    ] {
+        let input = tree(&[("pylock.toml", lock)]);
+        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        assert!(why.contains("does not record"), "{why}");
+    }
+
+    // `uv export --format pylock.toml` records every file whatever the
+    // filters (it carries an `index`), so its restore is unaffected.
+    let input = tree(&[
+        (
+            "pylock.toml",
+            uv_pylock(true).replace(
+                header,
+                "#    uv export --format pylock.toml --no-build -o pylock.toml\n",
+            ),
+        ),
+        ("uv.toml", "no-build = true\n".to_string()),
+    ]);
+    assert_pypi_round_trip("uv export", &input, &[urllib3_dep()], None).await;
+}
+
 /// A pylock as `pip lock` writes it (#804): PEP 751's array-of-tables
 /// spelling (`[[packages.wheels]]` with a `[packages.wheels.hashes]`
 /// sub-table), no `index`, and only the one artifact pip selected.
@@ -2416,6 +2611,70 @@ async fn uv_refusals() {
     let input = tree(&[("uv.lock", direct)]);
     let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
     assert!(why.contains("interpreter-specific wheels"), "{why}");
+}
+
+/// #1604: uv 0.12+ applies a per-package `exclude-newer-package` cutoff to
+/// each file, and records it as `[options.exclude-newer-package]`. A cutoff
+/// on the patched package makes its files not re-derivable, in project and
+/// script locks alike; one on another package, or `false` (no cutoff),
+/// restores byte for byte.
+#[tokio::test]
+#[serial]
+async fn uv_exclude_newer_package_refuses_only_its_package() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let with_options = |lock: String, options: &str| {
+        lock.replacen(
+            "requires-python = \">=3.8\"\n",
+            &format!("requires-python = \">=3.8\"\n\n[options]\n\n{options}"),
+            1,
+        )
+    };
+    let direct = uv_lock(
+        "    { name = \"idna\" },\n    { name = \"urllib3\" },\n",
+        "    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n",
+        "",
+    );
+    let pyproject = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"idna>=3\", \"urllib3==1.26.18\"]\n";
+    let script = "#!/usr/bin/env python3\n# /// script\n# dependencies = [\"idna>=3\", \"urllib3==1.26.18\"]\n# ///\nprint('hi')\n";
+    let script_lock = uv_lock("", "", "\n[manifest]\nrequirements = [\n    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n]\n")
+        .replace(
+            "[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [\n]\n\n[package.metadata]\nrequires-dist = [\n]\n\n",
+            "",
+        );
+    let lanes = [
+        ("uv.lock", direct, Some(("pyproject.toml", pyproject))),
+        ("tool.py.lock", script_lock, Some(("tool.py", script))),
+    ];
+    for (rel, lock, meta) in &lanes {
+        let input_with = |options: &str| {
+            let mut files = vec![(*rel, with_options(lock.clone(), options))];
+            files.extend(meta.map(|(m, text)| (m, text.to_string())));
+            tree(&files)
+        };
+        for options in [
+            "[options.exclude-newer-package]\nurllib3 = \"2023-10-17T17:46:22Z\"\n",
+            "[options.exclude-newer-package]\nidna = false\nurllib3 = \"2023-10-17T17:46:22Z\"\n",
+            "exclude-newer-span = \"P7D\"\n",
+            // Exempting another package leaves the global cutoff on urllib3.
+            "exclude-newer = \"2024-01-01T00:00:00Z\"\n\n[options.exclude-newer-package]\nidna = false\n",
+        ] {
+            let input = input_with(options);
+            let (why, rewritten, after) =
+                pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+            assert_eq!(after, rewritten, "{rel} {options}: the lock stays hosted");
+            assert!(why.contains("exclude-newer"), "{rel} {options}: {why}");
+        }
+        for options in [
+            "[options.exclude-newer-package]\nidna = \"2022-01-01T00:00:00Z\"\n",
+            "[options.exclude-newer-package]\nurllib3 = false\n",
+            // A `false` cutoff exempts urllib3 from the global one.
+            "exclude-newer = \"2024-01-01T00:00:00Z\"\n\n[options.exclude-newer-package]\nUrllib3 = false\n",
+        ] {
+            let input = input_with(options);
+            assert_pypi_round_trip(&format!("{rel} {options}"), &input, &[urllib3_dep()], None)
+                .await;
+        }
+    }
 }
 
 /// Serve each override's npm version document with the slot-[2] integrity
