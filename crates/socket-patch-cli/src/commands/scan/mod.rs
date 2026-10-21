@@ -1217,12 +1217,20 @@ fn is_info_note(code: &str) -> bool {
 }
 
 /// Print the run-level warnings to stderr: advisories as `Note:` (not
-/// under `--silent`), everything else as `Warning:`.
+/// under `--silent`), everything else as `Warning:`. User-patch skips are
+/// silenced too, matching `user_patches::check`; the envelope keeps them.
 fn print_layout_refusals(refusals: &[(String, String)], silent: bool) {
     for (code, detail) in refusals {
         if is_info_note(code) {
             if !silent {
                 eprintln!("Note: {detail}");
+            }
+        } else if matches!(
+            code.as_str(),
+            super::user_patches::CONFLICT | super::user_patches::ALLOWED
+        ) {
+            if !silent {
+                eprintln!("Warning: {detail}");
             }
         } else {
             eprintln!("Warning: {detail}");

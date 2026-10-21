@@ -1143,6 +1143,7 @@ pub(crate) async fn run_locked(
         match super::user_patches::check(&args.common, manifest.patches.keys()).await {
             Ok(warnings) => warnings,
             Err(error) => {
+                lock.release();
                 let code = report_apply_failure(&args, &error, &error.message, &telemetry).await;
                 return ApplyRunReport::run_failure(code, &error.code, error.message);
             }

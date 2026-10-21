@@ -180,6 +180,14 @@ impl UserPatchIndex {
                             index.add("golang", &entry.module, entry.version.as_deref(), &path);
                         }
                     }
+                    // Workspace members' go.mod replaces still apply under go.work.
+                    if file == "go.work" {
+                        pending.extend(
+                            crate::vendor::go_mod_edit::parse_use_dirs(&text)
+                                .into_iter()
+                                .map(|member| dir.join(member)),
+                        );
+                    }
                 }
             }
             for pattern in globs
@@ -294,6 +302,19 @@ impl UserPatchIndex {
                     && (e.name.is_empty()
                         || if ecosystem == "composer" {
                             e.name.eq_ignore_ascii_case(name)
+                        } else if ecosystem == "cargo" {
+                            // crates.io names are unique ignoring case and -/_.
+                            e.name.len() == name.len()
+                                && e.name.bytes().zip(name.bytes()).all(|(a, b)| {
+                                    let fold = |c: u8| {
+                                        if c == b'_' {
+                                            b'-'
+                                        } else {
+                                            c.to_ascii_lowercase()
+                                        }
+                                    };
+                                    fold(a) == fold(b)
+                                })
                         } else {
                             e.name == name
                         })
@@ -862,6 +883,7 @@ mod tests {
         let index = UserPatchIndex::discover(tmp.path()).await;
         for purl in [
             "pkg:cargo/real@1.0.0",
+            "pkg:cargo/Real@1.0.0",
             "pkg:cargo/old@1.0.0",
             "pkg:golang/example.com/user@v1.0.0",
         ] {
@@ -874,6 +896,26 @@ mod tests {
             "pkg:golang/example.com/owned@v1.0.0",
         ] {
             assert!(index.conflicts(purl).is_empty(), "{purl}: {index:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn go_work_members_replaces_are_consulted() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "go.work", "go 1.23\nuse (\n ./app\n)\n");
+        write(
+            tmp.path(),
+            "app/go.mod",
+            "module example.com/app\nreplace example.com/user => ../fork\n",
+        );
+        for root in [tmp.path().to_path_buf(), tmp.path().join("app")] {
+            let index = UserPatchIndex::discover(&root).await;
+            assert!(!index
+                .conflicts("pkg:golang/example.com/user@v1.0.0")
+                .is_empty());
+            assert!(index
+                .conflicts("pkg:golang/example.com/other@v1.0.0")
+                .is_empty());
         }
     }
 
