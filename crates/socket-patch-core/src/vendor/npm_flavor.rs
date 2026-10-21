@@ -416,9 +416,10 @@ pub(crate) async fn member_stray_lock_refusal(
     Some((
         "vendor_lockfile_missing",
         format!(
-            "{}; vendor from {} (the workspace root)",
+            "{}; vendor from {} (the {})",
             stray.detail,
-            stray.root.display()
+            stray.root.display(),
+            stray.root_kind
         ),
     ))
 }
@@ -2047,7 +2048,7 @@ mod tests {
             };
             assert_eq!(code, "vendor_lockfile_missing", "{member_lock}");
             assert!(
-                detail.contains("workspace")
+                (detail.contains("workspace") || detail.contains("vlt project"))
                     && detail.contains("ignores")
                     && detail.contains(member_lock),
                 "{member_lock}: {detail}"

@@ -317,6 +317,9 @@ async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal
 pub(crate) struct MemberStrayLock {
     /// The workspace root whose lock installs the member.
     pub(crate) root: PathBuf,
+    /// What [`Self::root`] is, for the "run from" hint: `workspace root`,
+    /// or `vlt project root` when no workspace lists the member (#1584).
+    pub(crate) root_kind: &'static str,
     /// The member's own lock files (root-relative names), every one of
     /// them ignored.
     pub(crate) ignored: Vec<&'static str>,
@@ -388,6 +391,7 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
     // Set when vlt governs through its project root rather than a
     // workspace listing (#1584).
     let mut vlt_project = false;
+    let mut root_kind = "workspace root";
     for (family, manager) in STRAY_LOCK_FAMILIES {
         let files = family.files();
         if !own.iter().any(|name| files.contains(name)) {
@@ -398,17 +402,29 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
                 if root.join(VLT_JSON).exists() {
                     return None;
                 }
+                // vlt installs its project root from here, whatever lists
+                // the directory (#1584). A `.git` here makes the directory
+                // that root; a project root nearer than the listing
+                // workspace root is the one vlt installs.
+                let own_dir = canonical_or_absolute(root);
+                let project = vlt_project_root(&own_dir, vlt_home().as_deref());
+                if project == own_dir {
+                    return None;
+                }
                 match vlt_lock_root(root, &mut package_json_root).await {
-                    Some(found) => Some(found),
-                    // Listed or not, a directory with no `vlt.json` is
-                    // installed from vlt's project root; as for a listed
-                    // member, a root never installed governs nothing.
-                    None => {
-                        let project = vlt_project_root(root, vlt_home().as_deref());
-                        let own_dir =
-                            std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-                        vlt_project = governing.is_none();
-                        (project != own_dir && project.join(VLT_LOCK).is_file())
+                    Some((ancestor, locks))
+                        if project == ancestor || !project.starts_with(&ancestor) =>
+                    {
+                        Some((ancestor, locks))
+                    }
+                    // As for a listed member, a root never installed
+                    // governs nothing.
+                    _ => {
+                        vlt_project = true;
+                        root_kind = "vlt project root";
+                        project
+                            .join(VLT_LOCK)
+                            .is_file()
                             .then(|| (project, vec![VLT_LOCK]))
                     }
                 }
@@ -436,7 +452,7 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
             root.display(),
             ancestor.display(),
             join_paths(&ancestor, &root_locks),
-            join_paths(root, &own),
+            join_paths(root, &[VLT_LOCK]),
             root.display()
         )
     } else {
@@ -451,6 +467,7 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
     };
     Some(MemberStrayLock {
         root: ancestor,
+        root_kind,
         ignored: own,
         detail,
     })
@@ -503,7 +520,7 @@ async fn vlt_lock_root(
 /// vlt keys none of this on a `workspaces` field, so a directory it does
 /// not list is installed from the root too (#1584).
 fn vlt_project_root(dir: &Path, home: Option<&Path>) -> PathBuf {
-    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir = canonical_or_absolute(dir);
     let mut last_known = dir.as_path();
     for ancestor in dir.ancestors() {
         if Some(ancestor) == home {
@@ -520,6 +537,14 @@ fn vlt_project_root(dir: &Path, home: Option<&Path>) -> PathBuf {
         }
     }
     last_known.to_path_buf()
+}
+
+/// `path` with symlinks and `..` resolved, as Node's `process.cwd()` is,
+/// like the sibling walks; the absolute path when it cannot be resolved.
+fn canonical_or_absolute(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The home directory vlt's project walk stops below: Node's
@@ -674,10 +699,10 @@ async fn member_stray_lock_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
     let refusal = Refusal {
         code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
         message: format!(
-            "{}; run socket-patch from {} (the workspace root); nothing was \
-             written",
+            "{}; run socket-patch from {} (the {}); nothing was written",
             stray.detail,
-            stray.root.display()
+            stray.root.display(),
+            stray.root_kind
         ),
     };
     Some((stray.root, refusal))
@@ -1958,7 +1983,9 @@ mod tests {
 
     /// #1097 (review on #1480): only the locks whose package manager lists
     /// the member govern it. The refusal names those alone, and a member's
-    /// own lock is stray only when its own manager lists the member.
+    /// own lock is stray only when its own manager lists the member (vlt
+    /// aside, which installs its project root from any directory without a
+    /// `vlt.json`, #1584).
     #[tokio::test]
     async fn only_the_locks_whose_manager_lists_the_member_govern_it() {
         const CLASSIC: &str = "# yarn lockfile v1\n";
@@ -1988,7 +2015,7 @@ mod tests {
         // reads, not a stray.
         write(tmp.path(), "packages/b/package-lock.json", "{}");
         assert_eq!(member_stray_lock(&member).await, None);
-        // Likewise Bun 1.3 and vlt (no `vlt.json` workspaces).
+        // Likewise Bun 1.3.
         std::fs::remove_file(member.join("package-lock.json")).unwrap();
         std::fs::remove_file(tmp.path().join("package-lock.json")).unwrap();
         write(tmp.path(), "bun.lock", BUN_13);
@@ -3229,7 +3256,12 @@ mod tests {
             let stray = member_stray_lock(&project)
                 .await
                 .unwrap_or_else(|| panic!("{case}: the lock is stray"));
-            assert_eq!(stray.root, tmp.path(), "{case}");
+            assert_eq!(
+                stray.root,
+                std::fs::canonicalize(tmp.path()).unwrap(),
+                "{case}"
+            );
+            assert_eq!(stray.root_kind, "vlt project root", "{case}");
             assert_eq!(stray.ignored, vec![VLT_LOCK], "{case}");
             let refused = refusal(&ProjectView::Disk(&project), &[candidate("npm")], true)
                 .await
@@ -3253,13 +3285,61 @@ mod tests {
         }
     }
 
+    /// #1584: vlt's project root decides over a workspace listing. A listed
+    /// member holding `.git` (a submodule) is its own vlt project, and a
+    /// `vlt.json` between the member and the listing root is the project
+    /// vlt installs, so that is the root named.
+    #[tokio::test]
+    async fn vlt_project_root_overrides_the_listing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        write(&base, "package.json", r#"{"private":true}"#);
+        write(&base, VLT_JSON, r#"{"workspaces":"packages/**"}"#);
+        write(&base, VLT_LOCK, "{}");
+        write(&base, "packages/a/package.json", "{}");
+        write(&base, "packages/a/vlt-lock.json", "{}");
+        let member = base.join("packages/a");
+        let listed = member_stray_lock(&member).await.expect("listed member");
+        assert_eq!(listed.root, base);
+        assert_eq!(listed.root_kind, "workspace root");
+
+        std::fs::create_dir_all(member.join(".git")).unwrap();
+        assert_eq!(member_stray_lock(&member).await, None);
+        assert_eq!(code(&member, "npm").await, None);
+        std::fs::remove_dir(member.join(".git")).unwrap();
+
+        // A config-only vlt.json nearer than the listing root.
+        write(&base, "packages/vlt.json", r#"{"config":{}}"#);
+        write(&base, "packages/package.json", "{}");
+        write(&base, &format!("packages/{VLT_LOCK}"), "{}");
+        let nearer = member_stray_lock(&member).await.expect("stray");
+        assert_eq!(nearer.root, base.join("packages"));
+        assert_eq!(nearer.root_kind, "vlt project root");
+        let refused = refusal(&ProjectView::Disk(&member), &[candidate("npm")], true)
+            .await
+            .expect("refused");
+        assert!(
+            refused.message.contains(&format!(
+                "run socket-patch from {} (the vlt project root)",
+                base.join("packages").display()
+            )),
+            "{}",
+            refused.message
+        );
+        // Never installed, the nearer root governs nothing.
+        std::fs::remove_file(base.join("packages").join(VLT_LOCK)).unwrap();
+        assert_eq!(member_stray_lock(&member).await, None);
+    }
+
     /// #1584: the walk for vlt's project root keeps the outermost
     /// `package.json` or `node_modules` directory, stops at a `.git`
     /// (after reading that directory) and before the home directory.
     #[test]
     fn vlt_project_root_walk_bounds() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path();
+        // A `.git` at the base keeps the walk inside the temp dir.
+        let base = &std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(base.join(".git")).unwrap();
         let dir = base.join("repo/tools/x");
         write(&dir, "package.json", "{}");
         assert_eq!(vlt_project_root(&dir, None), dir);

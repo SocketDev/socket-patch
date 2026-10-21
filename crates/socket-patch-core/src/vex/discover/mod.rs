@@ -1477,9 +1477,10 @@ async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discover
                 rel,
                 format!(
                     "{}, so the Socket references in {rel} are not attested; run socket-patch \
-                     from {} (the workspace root)",
+                     from {} (the {})",
                     stray.detail,
-                    stray.root.display()
+                    stray.root.display(),
+                    stray.root_kind
                 ),
             );
         }
@@ -5481,6 +5482,7 @@ mod member_stray_lock_tests {
                 "vlt-lock.json",
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                 &[
+                    ("package.json", r#"{"private":true}"#),
                     ("pnpm-workspace.yaml", "packages:\n  - packages/*\n"),
                     (
                         "vlt-lock.json",
