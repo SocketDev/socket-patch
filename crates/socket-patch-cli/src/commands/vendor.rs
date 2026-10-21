@@ -1982,6 +1982,20 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                 &client,
             ));
     }
+    // The vlt store entries the hosted pins installed, read before the
+    // restore unpins them: once the eject stands they hold hosted bytes the
+    // vendored lock no longer names, and are healed like a takeover's.
+    let pin_purls: Vec<String> = pins.iter().map(|p| p.purl.clone()).collect();
+    let vlt_targets = socket_patch_core::utils::fs::read_regular_to_string(
+        &common
+            .cwd
+            .join(socket_patch_core::constants::npm_family::VLT_LOCK),
+    )
+    .await
+    .map(|lock| {
+        socket_patch_core::patch::redirect::vlt_heal::lock_targets(&lock, &origins, &pin_purls)
+    })
+    .unwrap_or_default();
     let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
         &common.cwd,
         &pins,
@@ -2104,6 +2118,21 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             env.mark_partial_failure();
         }
     } else {
+        // The eject stands: invalidate the vlt store copies still holding
+        // the hosted bytes (as the per-purl takeover does), so a later
+        // `vendor --revert` cannot leave patched bytes under a registry pin.
+        if let Some(detail) = crate::commands::vlt_heal::takeover_heal(common, &vlt_targets).await {
+            let code = crate::commands::vlt_heal::REINSTALL_REQUIRED;
+            if !common.json && !common.silent {
+                if let Some(line) = format_advisory(code, &detail, common.verbose) {
+                    eprintln!("{line}");
+                }
+            }
+            env.warnings.push(RunWarning {
+                code: code.to_string(),
+                detail,
+            });
+        }
         // The vendored summary and its "Next steps:", deferred until the
         // eject is known to stand: a failed one is rolled back (or needs
         // the manual restore its error names), so neither applies.
