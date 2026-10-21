@@ -411,7 +411,11 @@ pub async fn npm_artifact_commit_check(
     entry: &VendorEntry,
     root: &Path,
 ) -> Result<Option<VendorWarning>, (&'static str, String)> {
-    if entry.ecosystem != "npm" {
+    // git cannot answer past a symlinked vendor dir, which `vendor`
+    // refuses anyway (`vendor_dir_symlink_unsupported`).
+    if entry.ecosystem != "npm"
+        || super::path::vendor_dir_symlink(root, "npm", Some(&entry.uuid)).is_some()
+    {
         return Ok(None);
     }
     let Some(uuid_dir) = super::path::vendor_uuid_dir_rel("npm", &entry.uuid) else {
@@ -896,6 +900,42 @@ mod tests {
             .unwrap_err();
         assert_eq!(code, "vendor_artifact_gitignored");
         assert!(detail.contains(&entry.artifact.path), "{detail}");
+    }
+
+    /// #664: through a linked eco dir repair neither writes the other
+    /// store's uuid metadata nor asks git, which cannot answer past a link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_vendor_dir_skips_uuid_metadata_and_commit_check() {
+        if crate::utils::process::resolve_tool("git").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let shared = tempfile::tempdir().unwrap();
+        let entry = entry(b"tgz");
+        tokio::fs::create_dir_all(root.path().join(".socket/vendor"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(shared.path(), root.path().join(".socket/vendor/npm")).unwrap();
+        tokio::fs::create_dir_all(shared.path().join(UUID))
+            .await
+            .unwrap();
+
+        assert!(!restore_npm_uuid_metadata(&entry, root.path())
+            .await
+            .unwrap());
+        assert!(!shared.path().join(UUID).join(".gitignore").exists());
+        assert!(matches!(
+            npm_artifact_commit_check(&entry, root.path()).await,
+            Ok(None)
+        ));
     }
 
     /// #664: repair never downloads into a linked eco dir, whose target
