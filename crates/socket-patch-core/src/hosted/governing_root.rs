@@ -521,9 +521,12 @@ async fn vlt_lock_root(
 /// not list is installed from the root too (#1584).
 fn vlt_project_root(dir: &Path, home: Option<&Path>) -> PathBuf {
     let dir = canonical_or_absolute(dir);
+    // Resolved like the ancestors, so the stop matches on Windows (`\\?\`)
+    // and through a symlinked home (Bugbot on #1658).
+    let home = home.map(canonical_or_absolute);
     let mut last_known = dir.as_path();
     for ancestor in dir.ancestors() {
-        if Some(ancestor) == home {
+        if Some(ancestor) == home.as_deref() {
             break;
         }
         if ancestor.join(VLT_JSON).exists() {
@@ -3363,11 +3366,22 @@ mod tests {
         }
         assert_eq!(vlt_project_root(&dir, None), base.to_path_buf());
 
-        // The home directory is never read: the walk stops below it.
+        // The home directory is never read: the walk stops below it, also
+        // when home is spelled through a symlink or `..`.
         assert_eq!(
             vlt_project_root(&dir, Some(&base.join("repo"))),
             base.join("repo/tools")
         );
+        assert_eq!(
+            vlt_project_root(&dir, Some(&base.join("repo/tools/../../repo"))),
+            base.join("repo/tools")
+        );
+        #[cfg(unix)]
+        {
+            let link = base.join("home-link");
+            std::os::unix::fs::symlink(base.join("repo"), &link).unwrap();
+            assert_eq!(vlt_project_root(&dir, Some(&link)), base.join("repo/tools"));
+        }
         write(base, "repo/vlt.json", "{}");
         assert_eq!(
             vlt_project_root(&dir, Some(&base.join("repo"))),
