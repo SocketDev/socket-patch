@@ -367,6 +367,15 @@ pub async fn restore(
     restore_npm_uuid_metadata(entry, root)
         .await
         .map_err(|e| format!("cannot restore the vendored dir's git metadata: {e}"))?;
+    // The restored uuid dir needs its `.gitignore` / `.gitattributes`
+    // again, or a `*.whl` / LFS rule catches the wheel (#1572).
+    if entry.ecosystem == "pypi" {
+        if let Some(rel) = super::path::vendor_uuid_dir_rel("pypi", &entry.uuid) {
+            super::pypi::restore_uuid_metadata(&root.join(rel))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
     Ok(warnings)
 }
 
