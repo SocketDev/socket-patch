@@ -445,15 +445,23 @@ fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<V
         // npm >= 12.1 writes lockfileVersion 4 for its native `npm patch`
         // (root `patchedDependencies` + a `patched` record on the entry),
         // and re-running `npm install` keeps it at 4: the npm >= 7 upgrade
-        // advice would be wrong (#711).
-        let detail = if lock_version == Some(4) {
+        // advice would be wrong (#711), and so would a plain `npm install`
+        // remedy, which loops (#1576).
+        let detail = if lock_version == Some(4) && has_native_patch(lock) {
             format!(
                 "{lock_name} has lockfileVersion 4, which npm >= 12.1 writes for its native \
                  `npm patch` (`patchedDependencies` in package.json); vendored mode supports \
                  only v2/v3 locks and would drop or break that patch. Fold the Socket fix into \
-                 your own patch, or remove the `patchedDependencies` entries and \
-                 regenerate the lock with `npm install`, or use hosted mode, which leaves the \
-                 patched package alone"
+                 your own patch, or remove the `patchedDependencies` entries and rewrite the \
+                 lock as v3 with `npm install --lockfile-version 3`, or use hosted mode, which \
+                 leaves the patched package alone"
+            )
+        } else if lock_version == Some(4) {
+            format!(
+                "{lock_name} has lockfileVersion 4, which npm >= 12.1 keeps once it has \
+                 written it, even after the last `npm patch` is removed; vendored mode \
+                 supports only v2/v3 locks. Rewrite the lock as v3 with \
+                 `npm install --lockfile-version 3` and re-run"
             )
         } else {
             format!(
@@ -468,6 +476,19 @@ fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<V
         )));
     }
     Ok(lock_version)
+}
+
+/// Whether a lock still carries an npm >= 12.1 native patch: a `patched`
+/// record on a `packages` entry, or `patchedDependencies` on the root one.
+fn has_native_patch(lock: &Value) -> bool {
+    lock.get("packages")
+        .and_then(Value::as_object)
+        .is_some_and(|packages| {
+            packages.iter().any(|(key, entry)| {
+                entry.get("patched").is_some()
+                    || (key.is_empty() && entry.get("patchedDependencies").is_some())
+            })
+        })
 }
 
 /// [`vendor_npm`]'s step 3: the rewritable `packages` instances of
@@ -2918,6 +2939,67 @@ mod tests {
                 && detail.contains("npm patch")
                 && detail.contains("patchedDependencies")
                 && !detail.contains("npm >= 7"),
+            "{detail}"
+        );
+    }
+
+    /// REGRESSION (#1576): `npm install` keeps a v4 lock at v4, so the
+    /// remedy must name the flag that writes v3, never a plain install.
+    #[tokio::test]
+    async fn lockfile_v4_refusal_remedy_downgrades_the_lock() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 4,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig==",
+                    "patched": { "integrity": "sha512-user==", "path": "patches/left-pad@1.3.0.patch" }
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
+        assert!(
+            detail.contains("npm install --lockfile-version 3")
+                && !detail.contains("regenerate the lock with `npm install`"),
+            "{detail}"
+        );
+    }
+
+    /// REGRESSION (#1576): a v4 lock whose native patches are all gone
+    /// is refused without claiming a patch it no longer has, and names
+    /// the downgrade that clears the refusal.
+    #[tokio::test]
+    async fn lockfile_v4_without_native_patch_names_only_the_downgrade() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 4,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
+        assert!(
+            detail.contains("lockfileVersion 4")
+                && detail.contains("npm install --lockfile-version 3")
+                && !detail.contains("would drop or break"),
             "{detail}"
         );
     }

@@ -29,7 +29,11 @@ npm 12 notes:
   mode therefore leaves such a package on its registry entry, in every npm
   lock, and warns `redirect_npm_patched_dependency_skipped`; other packages in
   the lock are still pinned. Vendored mode refuses the v4 lock
-  (`vendor_lockfile_version_unsupported`, naming `npm patch`) (#711).
+  (`vendor_lockfile_version_unsupported`, naming `npm patch`) (#711). npm
+  keeps a v4 lock at v4 on a plain `npm install`, even after `npm patch rm`,
+  so the refusal names `npm install --lockfile-version 3` as the step that
+  clears it; a v4 lock with no native patch left is refused without naming
+  one (#1576).
 - `allow-remote` defaults to `none`: any tarball whose `resolved` origin is not
   the configured registry is refused. `allow-remote=root` admits only direct
   dependencies. `allow-remote=all` is the setting a hosted redirect needs; it
