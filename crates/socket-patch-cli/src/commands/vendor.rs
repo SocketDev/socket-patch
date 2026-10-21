@@ -1845,7 +1845,13 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let pipenv_version = tokio::sync::OnceCell::new();
     let installed_sites = vendor::pypi::InstalledSiteListings::default();
     let vendored_at = now_rfc3339();
+    let restore_refused: HashSet<String> = refused.iter().map(|(p, _, _)| p.clone()).collect();
     for pin in &pins {
+        // A pin the restore already refused keeps its first, accurate
+        // reason; previewing it again would add a second failure event.
+        if restore_refused.contains(&pin.purl) {
+            continue;
+        }
         if let Some((code, detail)) = takeover_dry_refusal(
             &plan,
             &pin.purl,
