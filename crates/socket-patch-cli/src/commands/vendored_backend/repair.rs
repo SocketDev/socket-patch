@@ -504,15 +504,6 @@ impl VendoredBackend<'_> {
                                 if !npm_artifact_committable(common, env, purl, &entry).await {
                                     continue;
                                 }
-                                env.record(
-                                    PatchEvent::new(PatchAction::Rebuilt, purl.clone())
-                                        .with_details(serde_json::json!({
-                                            "path": entry.artifact.path,
-                                            "uuidMetadataRestored": true,
-                                            "artifactRebuilt": false,
-                                        })),
-                                );
-                                repaired += 1;
                             }
                             Err(e) => {
                                 fail(
