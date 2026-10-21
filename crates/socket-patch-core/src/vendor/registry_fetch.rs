@@ -6,6 +6,7 @@ use base64::Engine as _;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
+use crate::api::client::network_error_detail;
 use crate::api::retry::ApiTimeouts;
 use crate::constants::USER_AGENT;
 use crate::patch::apply::is_safe_relative_subpath;
@@ -957,7 +958,7 @@ async fn download_unredacted(client: &reqwest::Client, url: &str) -> Result<Vec<
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("GET {url}: {e}"))?;
+        .map_err(|e| format!("GET {url}: {}", network_error_detail(&e)))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("GET {url}: HTTP {status}"));

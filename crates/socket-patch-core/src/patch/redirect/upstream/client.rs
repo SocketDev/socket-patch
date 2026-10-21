@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
+use crate::api::client::network_error_detail;
 use crate::vendor::registry_fetch::{
     build_registry_client, npm_registry_base, pypi_json_api_base, RegistryClient,
 };
@@ -249,7 +250,7 @@ impl UpstreamClient {
         let resp = request
             .send()
             .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
+            .map_err(|e| format!("GET {url}: {}", network_error_detail(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("GET {url}: HTTP {status}"));
@@ -257,7 +258,7 @@ impl UpstreamClient {
         let text = resp
             .text()
             .await
-            .map_err(|e| format!("reading {url}: {e}"))?;
+            .map_err(|e| format!("reading {url}: {}", network_error_detail(&e)))?;
         serde_json::from_str(&text).map_err(|e| format!("{url} is not JSON: {e}"))
     }
 
@@ -902,6 +903,26 @@ mod tests {
         let h1 = go_mod_h1(b"module example.com/m\n");
         assert!(h1.starts_with("h1:") && h1.ends_with('='), "{h1}");
     }
+    /// #1650: a failed lookup names its transport cause, not just reqwest's
+    /// "error sending request for url (...)", so a refusal (and a CI flake)
+    /// says whether the registry was unreachable, reset or timed out.
+    #[tokio::test]
+    async fn a_failed_lookup_keeps_the_transport_cause() {
+        // A port that was just free: connecting is refused, deterministically.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/pypi/six/1.16.0/json");
+        let client = UpstreamClient::new(false);
+        let json = client.get_json(&url).await.expect_err("nothing listens");
+        let bytes = client.download(&url).await.expect_err("nothing listens");
+        for err in [json, bytes] {
+            assert!(err.starts_with(&format!("GET {url}: ")), "{err}");
+            assert!(err.to_lowercase().contains("refused"), "{err}");
+        }
+    }
+
     // The npm cache key reads `SOCKET_NPM_REGISTRY`, which serial tests set.
     #[tokio::test]
     #[serial_test::serial]
