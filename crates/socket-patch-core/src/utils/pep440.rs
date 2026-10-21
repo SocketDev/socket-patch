@@ -115,6 +115,49 @@ pub(crate) fn is_valid(text: &str) -> bool {
     parse(text).is_some()
 }
 
+/// `text` in PEP 440's normalized form, as `str(packaging.version.Version)`
+/// prints it and as uv.lock, wheel METADATA and PyPI record it: no leading
+/// `v` or surrounding whitespace, a zero epoch dropped, leading zeros
+/// dropped from every number (trailing `.0` release segments kept), the
+/// canonical `a`/`b`/`rc`/`.post`/`.dev` spellings and a lowercased,
+/// dot-separated local label (`1.0.0-RC1` → `1.0.0rc1`, `v01.02` → `1.2`,
+/// `1.0+Local-01` → `1.0+local.1`). `None` when `text` is not valid PEP 440.
+pub(crate) fn normalize(text: &str) -> Option<String> {
+    let captures = VERSION.captures(text)?;
+    let parsed = parse(text)?;
+    let mut out = String::new();
+    if parsed.epoch != "0" {
+        out.push_str(&parsed.epoch);
+        out.push('!');
+    }
+    let release: Vec<String> = captures["release"].split('.').map(number).collect();
+    out.push_str(&release.join("."));
+    if let Some((label, n)) = &parsed.pre {
+        out.push_str(label);
+        out.push_str(n);
+    }
+    if let Some(n) = &parsed.post {
+        out.push_str(".post");
+        out.push_str(n);
+    }
+    if let Some(n) = &parsed.dev {
+        out.push_str(".dev");
+        out.push_str(n);
+    }
+    if !parsed.local.is_empty() {
+        let local: Vec<&str> = parsed
+            .local
+            .iter()
+            .map(|part| match part {
+                LocalPart::Number(n) | LocalPart::Text(n) => n.as_str(),
+            })
+            .collect();
+        out.push('+');
+        out.push_str(&local.join("."));
+    }
+    Some(out)
+}
+
 /// Whether a whitespace-free specifier is an exact `==X` pin of `version`
 /// under PEP 440. Wildcards (`==1.*`), arbitrary equality (`===`) and every
 /// other operator are not.
@@ -231,6 +274,48 @@ mod tests {
             for spelling in equivalent_release_spellings(version) {
                 assert!(versions_equal(version, &spelling), "{version} {spelling}");
             }
+        }
+    }
+
+    /// What `str(packaging.version.Version(v))` prints, which is what
+    /// uv.lock, wheel METADATA and PyPI record (#1589).
+    #[test]
+    fn normalize_matches_packaging() {
+        for (raw, normalized) in [
+            ("1.0.0-RC1", "1.0.0rc1"),
+            ("1.0.0RC1", "1.0.0rc1"),
+            ("v1.2", "1.2"),
+            ("V1.2", "1.2"),
+            ("01.02.0", "1.2.0"),
+            ("2026.01.05", "2026.1.5"),
+            ("1.0.0+Local.1", "1.0.0+local.1"),
+            ("1.0.0+Local.Build", "1.0.0+local.build"),
+            ("1.0+Ubuntu-01", "1.0+ubuntu.1"),
+            ("1.0.post0", "1.0.post0"),
+            ("1.0-post.1", "1.0.post1"),
+            ("1.0-1", "1.0.post1"),
+            ("1.0rev", "1.0.post0"),
+            ("1.0_r2", "1.0.post2"),
+            ("1.0.0-beta.1", "1.0.0b1"),
+            ("1.0.0-rc.2", "1.0.0rc2"),
+            ("1.0.0-dev.3", "1.0.0.dev3"),
+            ("1.0DEV", "1.0.dev0"),
+            ("1.0alpha", "1.0a0"),
+            ("1.0-c1", "1.0rc1"),
+            ("1.0.preview2", "1.0rc2"),
+            ("1.0a1.post2.dev3", "1.0a1.post2.dev3"),
+            ("0!1.0", "1.0"),
+            ("00!1.0", "1.0"),
+            ("2!1.0", "2!1.0"),
+            ("1.16.0.0", "1.16.0.0"),
+            (" 1.2.0 ", "1.2.0"),
+            ("99999999999999999999999.0", "99999999999999999999999.0"),
+        ] {
+            assert_eq!(normalize(raw).as_deref(), Some(normalized), "{raw}");
+            assert!(versions_equal(raw, normalized), "{raw} == {normalized}");
+        }
+        for invalid in ["", "not-a-version", "1.0 extra", "1.*", "1..2"] {
+            assert_eq!(normalize(invalid), None, "{invalid}");
         }
     }
 

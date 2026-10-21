@@ -168,8 +168,13 @@ fn parse_pyproject(content: &str) -> Option<String> {
     let (name, version) = pyproject_name_version(&doc)?;
     // The purl carries the PEP 503 name, like every pypi component purl:
     // OpenVEX consumers match `My_Service` and `my-service` by exact purl
-    // (#1547). `packaging` strips a version's surrounding whitespace too.
-    crate::utils::purl::pypi_purl(&name, version.trim())
+    // (#1547). Its version is the PEP 440 normalized one uv.lock, the
+    // built wheel and SBOMs record (`1.0.0-RC1` → `1.0.0rc1`, #1589); one
+    // that isn't valid PEP 440 keeps its spelling, minus the surrounding
+    // whitespace `packaging` strips too.
+    let version =
+        crate::utils::pep440::normalize(&version).unwrap_or_else(|| version.trim().to_string());
+    crate::utils::purl::pypi_purl(&name, &version)
 }
 
 /// The project's name and version, read the way its build backend reads
@@ -1506,6 +1511,58 @@ mod tests {
         assert_eq!(
             parse_pyproject(content).as_deref(),
             Some("pkg:pypi/my-service@1.2.0")
+        );
+    }
+
+    /// The product carries the PEP 440 normalized version, the one
+    /// uv.lock, the built wheel and SBOMs record (#1589).
+    #[test]
+    fn pyproject_normalizes_pep621_version() {
+        for (raw, normalized) in [
+            ("1.0.0-RC1", "1.0.0rc1"),
+            ("v1.2", "1.2"),
+            ("01.02.0", "1.2.0"),
+            ("1.0.0+Local.1", "1.0.0+local.1"),
+            ("1.0.post0", "1.0.post0"),
+        ] {
+            let content = format!("[project]\nname = \"My_Service\"\nversion = \"{raw}\"\n");
+            assert_eq!(
+                parse_pyproject(&content),
+                Some(format!("pkg:pypi/my-service@{normalized}")),
+                "{raw}"
+            );
+        }
+    }
+
+    /// poetry-core builds the normalized version from `[tool.poetry]`
+    /// too, on Poetry 1.8 and 2 alike (#1589).
+    #[test]
+    fn pyproject_normalizes_tool_poetry_version() {
+        for (raw, normalized) in [
+            ("1.0.0-beta.1", "1.0.0b1"),
+            ("1.0.0-rc.2", "1.0.0rc2"),
+            ("1.0.0RC1", "1.0.0rc1"),
+            ("2026.01.05", "2026.1.5"),
+            ("1.0-post.1", "1.0.post1"),
+            ("1.0.0-dev.3", "1.0.0.dev3"),
+            ("1.0.0+Local.Build", "1.0.0+local.build"),
+        ] {
+            let content = format!("[tool.poetry]\nname = \"demo-ver\"\nversion = \"{raw}\"\n\n[build-system]\nbuild-backend = \"poetry.core.masonry.api\"\n");
+            assert_eq!(
+                parse_pyproject(&content),
+                Some(format!("pkg:pypi/demo-ver@{normalized}")),
+                "{raw}"
+            );
+        }
+    }
+
+    /// A version that isn't valid PEP 440 keeps its verbatim spelling.
+    #[test]
+    fn pyproject_keeps_non_pep440_version_verbatim() {
+        let content = "[project]\nname = \"demo\"\nversion = \"1.0-SNAPSHOT-x\"\n";
+        assert_eq!(
+            parse_pyproject(content).as_deref(),
+            Some("pkg:pypi/demo@1.0-SNAPSHOT-x")
         );
     }
 
