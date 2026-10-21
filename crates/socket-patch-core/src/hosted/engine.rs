@@ -2801,51 +2801,43 @@ fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
 /// `package.json#allowScripts` approves them, and it matches a pinned key
 /// (`"esbuild@0.19.12": true`) only against a registry-shaped `resolved`
 /// URL, which a hosted redirect replaces (#1595). Warn
-/// (`redirect_npm_allow_scripts`) for every package a root npm lock now
-/// pins to a hosted artifact whose install script is approved only by
-/// version. The policy is the user's, so it is never rewritten: the only
-/// key npm would still honor is a name-only one, which widens it.
+/// (`redirect_npm_allow_scripts`) for every package whose rewired
+/// package-lock.json entry runs an install script that loses its approval.
+/// The policy is the user's, so it is never rewritten: the only key npm
+/// would still honor is a name-only one, which widens it. npm >= 12 never
+/// reads npm-shrinkwrap.json, so a shrinkwrap pin cannot lose one.
 fn npm_allow_scripts(
     files: &BTreeMap<String, String>,
     rewrite: &RewriteResult,
     overrides: &[DepOverride],
 ) -> Vec<RewriteWarning> {
     use crate::patch::redirect::npm_allow_scripts::{
-        lock_has_install_script, lost_detail, pinned_approvals_lost, HOSTED_WARNING,
+        lost_detail, rewired_runs_install_script, AllowScripts, HOSTED_WARNING, NPM12_LOCK,
     };
-    let Some(package_json) = rewrite
-        .files
-        .get("package.json")
-        .or_else(|| files.get("package.json"))
+    let read = |rel: &str| rewrite.files.get(rel).or_else(|| files.get(rel));
+    let Some(policy) = read("package.json").and_then(|text| AllowScripts::parse(text)) else {
+        return Vec::new();
+    };
+    let Some(lock) =
+        read(NPM12_LOCK).and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
     else {
         return Vec::new();
     };
-    let npm_lock_texts: Vec<&String> = NPM_LOCKS
-        .iter()
-        .filter_map(|lock| rewrite.files.get(*lock).or_else(|| files.get(*lock)))
-        .collect();
-    let npm_overrides: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "npm").collect();
-    let groups: Vec<[String; 2]> = npm_overrides
-        .iter()
-        .map(|o| artifact_url_spellings(&o.artifact_url))
-        .collect();
-    let present = groups_present(&npm_lock_texts, &groups);
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     let mut warnings = Vec::new();
-    for (o, _) in npm_overrides.iter().zip(present).filter(|(_, p)| *p) {
+    for o in overrides.iter().filter(|o| o.ecosystem == "npm") {
         let name = crate::patch::redirect::full_name(o);
         if !seen.insert((name.clone(), o.version.clone())) {
             continue;
         }
-        if !npm_lock_texts
-            .iter()
-            .any(|lock| lock_has_install_script(lock, &name, &o.version))
-        {
+        let Some(lost) = policy.lost(&name, &o.version) else {
             continue;
-        }
-        let keys = pinned_approvals_lost(package_json, &name, &o.version);
-        if keys.is_empty() {
+        };
+        let rewired = |_: &str, entry: &serde_json::Value| {
+            entry.get("resolved").and_then(serde_json::Value::as_str)
+                == Some(o.artifact_url.as_str())
+        };
+        if !rewired_runs_install_script(&lock, &name, &o.version, rewired) {
             continue;
         }
         let target = match url_host(&o.artifact_url) {
@@ -2854,7 +2846,7 @@ fn npm_allow_scripts(
         };
         warnings.push(warning(
             HOSTED_WARNING,
-            lost_detail(&name, &o.version, &keys, &target),
+            lost_detail(&name, &o.version, &lost, &target),
         ));
     }
     warnings
