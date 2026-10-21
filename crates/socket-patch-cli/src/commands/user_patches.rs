@@ -9,6 +9,21 @@ use crate::json_envelope::{Command, Envelope, EnvelopeError};
 pub(crate) const CONFLICT: &str = "user_patch_conflict";
 pub(crate) const ALLOWED: &str = "user_patch_override";
 
+/// Ecosystems the detector reads evidence for; any other purl can't conflict.
+const DETECTED: &[&str] = &["pkg:npm/", "pkg:composer/", "pkg:cargo/", "pkg:golang/"];
+
+/// Whether any of `purls` could match project evidence, so a run with no
+/// such purl (an empty or pypi-only manifest) skips discovery entirely.
+fn any_detectable<'a>(common: &GlobalArgs, mut purls: impl Iterator<Item = &'a str>) -> bool {
+    purls.any(|purl| {
+        common.purl_ecosystem_selected(purl)
+            && DETECTED.iter().any(|prefix| {
+                purl.get(..prefix.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+            })
+    })
+}
+
 pub(crate) async fn inspect(common: &GlobalArgs) -> UserPatchIndex {
     if common.is_global() {
         // A local checkout does not govern a separately selected global tree.
@@ -35,11 +50,32 @@ pub(crate) async fn check(
     common: &GlobalArgs,
     purls: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<(String, String)>, EnvelopeError> {
+    let (warnings, conflicts) = partition(common, purls).await;
+    if conflicts.is_empty() {
+        Ok(warnings)
+    } else {
+        let mut messages: Vec<String> = conflicts.into_iter().map(|(_, m)| m).collect();
+        messages.sort();
+        messages.dedup();
+        Err(EnvelopeError::new(CONFLICT, messages.join("\n")))
+    }
+}
+
+/// [`check`]'s two outcomes kept apart: approved-override warnings, and the
+/// `(purl, message)` of each refused conflict.
+pub(crate) async fn partition(
+    common: &GlobalArgs,
+    purls: impl IntoIterator<Item = impl AsRef<str>>,
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let purls: Vec<String> = purls.into_iter().map(|p| p.as_ref().to_string()).collect();
+    if !any_detectable(common, purls.iter().map(String::as_str)) {
+        return (Vec::new(), Vec::new());
+    }
     let index = inspect(common).await;
     let mut warnings = Vec::new();
     let mut conflicts = Vec::new();
-    for purl in purls {
-        let purl = purl.as_ref();
+    for purl in &purls {
+        let purl = purl.as_str();
         if !common.purl_ecosystem_selected(purl) {
             continue;
         }
@@ -51,16 +87,10 @@ pub(crate) async fn check(
         if common.allow_user_patches {
             warnings.push((ALLOWED.into(), message));
         } else {
-            conflicts.push(message);
+            conflicts.push((purl.to_string(), message));
         }
     }
-    if conflicts.is_empty() {
-        Ok(warnings)
-    } else {
-        conflicts.sort();
-        conflicts.dedup();
-        Err(EnvelopeError::new(CONFLICT, conflicts.join("\n")))
-    }
+    (warnings, conflicts)
 }
 
 /// The human copy of [`check`]'s approved overrides; JSON carries them in
@@ -87,9 +117,12 @@ pub(crate) async fn skip_protected(
         socket_patch_core::manifest::schema::PatchRecord,
     >,
 ) -> (Vec<(String, String)>, std::collections::HashSet<String>) {
-    let index = inspect(common).await;
     let mut warnings = Vec::new();
     let mut skipped = std::collections::HashSet::new();
+    if !any_detectable(common, patches.keys().map(String::as_str)) {
+        return (warnings, skipped);
+    }
+    let index = inspect(common).await;
     patches.retain(|purl, _| {
         if !common.purl_ecosystem_selected(purl) {
             return true;

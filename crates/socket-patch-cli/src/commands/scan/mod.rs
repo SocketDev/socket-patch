@@ -889,6 +889,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         all_releases: args.all_releases,
         strict: args.common.strict,
         allow_user_patches: args.common.allow_user_patches,
+        user_patch_skips_reported: true,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
@@ -2356,7 +2357,7 @@ async fn run_scan(
             // and neither is one whose every package the consent gate held.
             if user_patch_withheld > 0 {
                 println!(
-                    "All {user_patch_withheld} installed package(s) are protected by project patches (see the warnings above); nothing was scanned. Pass --allow-user-patches to scan them anyway."
+                    "{user_patch_withheld} installed package(s) are protected by project patches (see the warnings above) and were not scanned. Pass --allow-user-patches to scan them anyway."
                 );
             } else if !policy.root_excluded() {
                 println!(

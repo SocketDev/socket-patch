@@ -368,6 +368,10 @@ pub struct DownloadParams {
     /// fails instead of warn-and-overwrite).
     pub strict: bool,
     pub allow_user_patches: bool,
+    /// The caller already reported every installed package the user-patch
+    /// gate holds (`scan`), so the nested apply need not repeat the
+    /// manifest entries it skips for them. `get` checks only its selection.
+    pub user_patch_skips_reported: bool,
     /// `--ecosystems` forwarded to the nested apply, so it never touches
     /// other ecosystems' packages the user filtered out.
     pub ecosystems: Option<Vec<String>>,
@@ -1429,6 +1433,7 @@ pub(crate) fn nested_apply_args_from_params(
 pub(crate) async fn run_nested_apply(
     common: GlobalArgs,
     json: bool,
+    report_user_patch_skips: bool,
     client: &ApiClient,
     lock: LockGuard,
 ) -> ApplyRunReport {
@@ -1438,7 +1443,10 @@ pub(crate) async fn run_nested_apply(
         force: false,
         check: false,
         vex: Default::default(),
-        nested: Some(super::apply::NestedApply { caller_json: json }),
+        nested: Some(super::apply::NestedApply {
+            caller_json: json,
+            report_user_patch_skips,
+        }),
     };
     let report = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
     // An error, so exempt from --silent ("errors only": a failing exit must
@@ -1735,6 +1743,7 @@ pub async fn download_and_apply_patches_into(
             run_nested_apply(
                 nested_apply_args_from_params(params, run, &manifest_path),
                 params.json,
+                !params.user_patch_skips_reported,
                 run.api_client,
                 lock,
             )

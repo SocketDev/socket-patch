@@ -128,7 +128,10 @@ default. This also protects a pre-existing file where the Socket patch adds a
 new file (empty `beforeHash`). The exception is content a Socket patch wrote:
 a file whose hash names a stored `.socket/blobs/` blob (as after an update to a
 newer patch for the same release) is overwritten with the
-`content_mismatch_overwritten` warning, except under `--strict`.
+`content_mismatch_overwritten` warning, except under `--strict`. Only a stored
+blob proves this: when it is gone (pruned by `gc` / `scan --prune`, or
+`.socket/blobs/` is not shared with the checkout), the earlier output reads as
+unknown drift and `apply --force` is the explicit way to replace it.
 `--allow-user-patches` permits the old
 warn-and-overwrite behavior: only the full, hash-verified `afterHash` content
 can be written, with `content_mismatch_overwritten` diagnostics. `--strict`

@@ -2107,6 +2107,7 @@ async fn save_and_apply_patch(
             run_nested_apply(
                 nested_apply_args(&args.common, &manifest_path, quiet),
                 args.common.json,
+                true,
                 client,
                 lock,
             )
@@ -2188,6 +2189,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         all_releases: args.all_releases,
         strict: args.common.strict,
         allow_user_patches: args.common.allow_user_patches,
+        user_patch_skips_reported: false,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
@@ -3869,6 +3871,7 @@ mod tests {
             all_releases: false,
             strict: false,
             allow_user_patches: false,
+            user_patch_skips_reported: false,
             ecosystems: None,
             persist_blobs: false,
             patch_server_url: None,
@@ -4567,6 +4570,7 @@ mod tests {
             all_releases: false,
             strict: false,
             allow_user_patches: false,
+            user_patch_skips_reported: false,
             ecosystems: None,
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,

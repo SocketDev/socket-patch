@@ -182,6 +182,10 @@ pub struct NestedApply {
     /// (one envelope per command), but the caller's stdout is, so the
     /// nested run's human error lines stay off stderr too.
     pub caller_json: bool,
+    /// Report the manifest entries the user-patch gate skips: the caller
+    /// (`get`) checked only its own selection. `scan` already reported
+    /// every protected installed package, so it passes `false`.
+    pub report_user_patch_skips: bool,
 }
 
 impl ApplyArgs {
@@ -1245,13 +1249,22 @@ pub(crate) async fn run_locked(
             let mut run_warnings = run_warnings;
             // A nested apply's caller (get, scan) already reported the
             // overrides it approved; repeating them would double each line.
-            if args.nested.is_none() {
-                run_warnings.extend(
-                    user_patch_warnings
-                        .into_iter()
-                        .map(|(code, detail)| RunWarning { code, detail }),
-                );
-            }
+            // Skips are new to `get`, which checked only its selection; a
+            // JSON caller gets them through the report.
+            let user_patch_warnings: Vec<RunWarning> = user_patch_warnings
+                .into_iter()
+                .filter(|(code, _)| match &args.nested {
+                    None => true,
+                    Some(n) => n.report_user_patch_skips && code == super::user_patches::CONFLICT,
+                })
+                .map(|(code, detail)| RunWarning { code, detail })
+                .collect();
+            run_warnings.extend(user_patch_warnings.iter().cloned());
+            let nested_skip_warnings = if args.nested.is_some() {
+                user_patch_warnings
+            } else {
+                Vec::new()
+            };
             run_warnings.extend(results.iter().filter_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success)?;
                 note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)
@@ -1519,6 +1532,7 @@ pub(crate) async fn run_locked(
             // JSON events above are the standalone apply's copy).
             let mut warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
             warnings.extend(cache_warnings);
+            warnings.extend(nested_skip_warnings);
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
             if success && !vex_failed {

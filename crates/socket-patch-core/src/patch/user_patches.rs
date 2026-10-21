@@ -37,10 +37,15 @@ impl UserPatchIndex {
         let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
         let mut pending = VecDeque::from([root.clone()]);
         // A member invocation still inherits the workspace's patch policy.
+        // The walk stops at the checkout's `.git`, and never reaches the home
+        // directory (whose `~/.cargo/config.toml` is user-wide, not a
+        // workspace) or above it, as in a container build with no `.git`.
+        let home = crate::utils::fs::home_dir();
         for parent in root
             .ancestors()
             .skip(1)
             .take_while(|_| !root.join(".git").exists())
+            .take_while(|parent| home.as_deref().is_none_or(|home| !home.starts_with(parent)))
         {
             if parent.join("pnpm-workspace.yaml").exists()
                 || parent.join("go.work").exists()
@@ -152,14 +157,14 @@ impl UserPatchIndex {
                 let path = dir.join(file);
                 // Like the pnpm lock: a lock that never says `patched` holds
                 // no patch evidence, so an unparseable one can't hide any.
-                if !index
+                let Some(text) = index
                     .read(&path, "npm")
                     .await
-                    .is_some_and(|text| text.contains("patched"))
-                {
+                    .filter(|text| text.contains("patched"))
+                else {
                     continue;
-                }
-                if let Some(value) = index.json(&path, "npm").await {
+                };
+                if let Some(value) = index.parse_json(&text, &path, "npm") {
                     index.native(&value, &path);
                     if let Some(packages) = value["packages"].as_object() {
                         for (key, entry) in packages {
@@ -416,7 +421,11 @@ impl UserPatchIndex {
 
     async fn json(&mut self, path: &Path, ecosystem: &'static str) -> Option<Value> {
         let text = self.read(path, ecosystem).await?;
-        match serde_json::from_str(&crate::vendor::bun_lock_text::strip_jsonc(&text)) {
+        self.parse_json(&text, path, ecosystem)
+    }
+
+    fn parse_json(&mut self, text: &str, path: &Path, ecosystem: &'static str) -> Option<Value> {
+        match serde_json::from_str(&crate::vendor::bun_lock_text::strip_jsonc(text)) {
             Ok(value) => Some(value),
             Err(e) => {
                 self.unknown(
@@ -507,6 +516,8 @@ impl UserPatchIndex {
         self.patch_directory(&dir.join("patches"), false).await;
         let flag = regex::Regex::new(r#"--patch-dir(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))"#)
             .unwrap();
+        // `cd` as a command, not the tail of a word like `abcd`.
+        let cd = regex::Regex::new(r"(?:^|[\s;&|(])cd\s").unwrap();
         if let Some(scripts) = value["scripts"].as_object() {
             for script in scripts
                 .values()
@@ -515,9 +526,9 @@ impl UserPatchIndex {
             {
                 // A `cd` after patch-package (`patch-package && cd ios && pod
                 // install`) can't move the directory it already read.
-                let moved = script
-                    .find("cd ")
-                    .is_some_and(|cd| cd < script.rfind("patch-package").unwrap_or(0));
+                let moved = cd
+                    .find(script)
+                    .is_some_and(|cd| cd.start() < script.rfind("patch-package").unwrap_or(0));
                 if moved || (script.contains("--patch-dir") && !flag.is_match(script)) {
                     self.unknown(
                         "npm",
@@ -994,6 +1005,21 @@ mod tests {
         );
         let index = UserPatchIndex::discover(tmp.path()).await;
         assert!(!index.conflicts("pkg:npm/other@1.0.0").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_word_ending_in_cd_is_not_a_directory_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"scripts":{"postinstall":"tsc -p ./src/abcd && patch-package"}}"#,
+        );
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(
+            index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
     }
 
     #[tokio::test]

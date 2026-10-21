@@ -2233,22 +2233,41 @@ async fn run_vendor(
     let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
     // After the reconcile: reverting entries dropped from the manifest
     // touches no project patch, so a protected record must not block it.
-    match super::user_patches::check(common, manifest.patches.keys()).await {
-        Ok(warnings) => {
-            super::user_patches::warn(common, &warnings);
-            env.warnings.extend(
-                warnings
-                    .into_iter()
-                    .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
-            );
-        }
-        Err(error) => {
+    let (warnings, conflicts) =
+        super::user_patches::partition(common, manifest.patches.keys()).await;
+    super::user_patches::warn(common, &warnings);
+    env.warnings.extend(
+        warnings
+            .into_iter()
+            .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
+    );
+    if !conflicts.is_empty() {
+        for (_, message) in &conflicts {
             if !common.json {
-                eprintln!("Error: {}", error.message);
+                eprintln!("Error: {message}");
             }
-            env.mark_error(error);
-            return 1;
         }
+        if env.events.is_empty() {
+            let mut messages: Vec<String> = conflicts.into_iter().map(|(_, m)| m).collect();
+            messages.dedup();
+            env.mark_error(crate::json_envelope::EnvelopeError::new(
+                super::user_patches::CONFLICT,
+                messages.join("\n"),
+            ));
+        } else {
+            // The reconcile already wrote: a top-level error would claim
+            // nothing happened, so the refusals are per-package failures.
+            for (purl, message) in conflicts {
+                env.record(
+                    crate::json_envelope::PatchEvent::new(
+                        crate::json_envelope::PatchAction::Failed,
+                        purl.as_str(),
+                    )
+                    .with_error(super::user_patches::CONFLICT, message),
+                );
+            }
+        }
+        return 1;
     }
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
