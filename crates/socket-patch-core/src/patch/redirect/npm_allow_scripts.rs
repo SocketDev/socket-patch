@@ -93,7 +93,7 @@ impl AllowScripts {
     /// file is unreadable): nothing can be lost.
     pub fn parse(package_json: &str) -> Option<Self> {
         let manifest: Value =
-            serde_json::from_str(package_json.trim_start_matches('\u{feff}')).ok()?;
+            serde_json::from_str(crate::formats::text::strip_bom(package_json)).ok()?;
         let policy = manifest.get("allowScripts")?.as_object()?;
         let entries: Vec<_> = policy
             .iter()
