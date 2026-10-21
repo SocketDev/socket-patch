@@ -159,7 +159,15 @@ pub(crate) fn workspaces_include_as(
             let mut included = false;
             for pattern in patterns {
                 let (negated, pattern) = split_negation(pattern);
-                if matches(pattern, negated) {
+                // Bun's walker skips dot components, but it filters the
+                // walked directories through its `!` patterns with a plain
+                // match that has no dot rule (as node-glob's ignore below).
+                let hit = if negated {
+                    pattern_matches(pattern, rel, true, dialect.extglob, None)
+                } else {
+                    matches(pattern, false)
+                };
+                if hit {
                     included = !negated;
                 }
             }
@@ -1305,6 +1313,18 @@ mod tests {
                 (&["packages/.hidden"], "packages/.hidden", true),
                 (&["packages/.*"], "packages/.hidden", true),
                 (&["packages/.cache/*"], "packages/.cache/x", true),
+                // A `!` pattern still excludes a dot directory an explicit
+                // pattern listed.
+                (
+                    &["packages/.hidden", "!packages/*"],
+                    "packages/.hidden",
+                    dialect == D::BUN_PRE_1_3,
+                ),
+                (
+                    &["packages/.*", "!packages/**"],
+                    "packages/.hidden",
+                    dialect == D::BUN_PRE_1_3,
+                ),
             ] {
                 assert_eq!(
                     workspaces_include_as(&pats(patterns), &rel(dir), dialect),
