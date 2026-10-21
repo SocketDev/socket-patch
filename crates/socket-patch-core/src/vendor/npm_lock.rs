@@ -182,7 +182,7 @@ impl NpmLockBackend for PackageLockBackend {
                 )));
             }
         };
-        let lock_version = lock_version_gate(&lock, &lock_name)?;
+        let lock_version = lock_version_gate(&lock, &lock_name, project_root)?;
 
         // The root manifest's `overrides` (#490): which git / url / `file:`
         // dependent specs npm really installs from.
@@ -423,7 +423,7 @@ pub async fn npm_lock_vendor_preflight(project_root: &Path) -> Option<(&'static 
     }
     let (lock_name, lock_bytes, _) = select_lockfile(project_root).await.ok()??;
     let gate = match LOCK_MEMO.parse(&lock_bytes, || parse_json_manifest(&lock_bytes)) {
-        Ok(lock) => lock_version_gate(&lock, &lock_name).err(),
+        Ok(lock) => lock_version_gate(&lock, &lock_name, project_root).err(),
         Err(e) => Some(Box::new(refused(
             "vendor_lockfile_version_unsupported",
             format!("{lock_name} is not parseable JSON: {e}"),
@@ -437,7 +437,11 @@ pub async fn npm_lock_vendor_preflight(project_root: &Path) -> Option<(&'static 
 
 /// The lock version gate of [`vendor_npm`]'s step 2: only v2/v3 locks with
 /// a `packages` object are rewritten. `Ok` is the parsed `lockfileVersion`.
-fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<VendorOutcome>> {
+fn lock_version_gate(
+    lock: &Value,
+    lock_name: &str,
+    project_root: &Path,
+) -> Result<Option<u64>, Box<VendorOutcome>> {
     let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
     if !matches!(lock_version, Some(2) | Some(3))
         || !lock.get("packages").is_some_and(Value::is_object)
@@ -447,7 +451,7 @@ fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<V
         // and re-running `npm install` keeps it at 4: the npm >= 7 upgrade
         // advice would be wrong (#711), and so would a plain `npm install`
         // remedy, which loops (#1576).
-        let detail = if lock_version == Some(4) && has_native_patch(lock) {
+        let detail = if lock_version == Some(4) && has_native_patch(lock, project_root) {
             format!(
                 "{lock_name} has lockfileVersion 4, which npm >= 12.1 writes for its native \
                  `npm patch` (`patchedDependencies` in package.json); vendored mode supports \
@@ -478,16 +482,21 @@ fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<V
     Ok(lock_version)
 }
 
-/// Whether a lock still carries an npm >= 12.1 native patch: a `patched`
-/// record on a `packages` entry, or `patchedDependencies` on the root one.
-fn has_native_patch(lock: &Value) -> bool {
+/// Whether the project still carries an npm >= 12.1 native patch, read as
+/// hosted mode's #711 gate reads it: a root `package.json`
+/// `patchedDependencies` key, or a non-null `patched` record on a lock
+/// entry. Only the refusal path calls it, so the blocking read is rare.
+fn has_native_patch(lock: &Value, project_root: &Path) -> bool {
+    let manifest = std::fs::read_to_string(project_root.join("package.json")).ok();
+    if !super::bun_lock_text::patched_dependency_keys(manifest.as_deref(), None).is_empty() {
+        return true;
+    }
     lock.get("packages")
         .and_then(Value::as_object)
         .is_some_and(|packages| {
-            packages.iter().any(|(key, entry)| {
-                entry.get("patched").is_some()
-                    || (key.is_empty() && entry.get("patchedDependencies").is_some())
-            })
+            packages
+                .values()
+                .any(|entry| entry.get("patched").is_some_and(|p| !p.is_null()))
         })
 }
 
@@ -585,7 +594,8 @@ pub(super) async fn read_project(project_root: &Path) -> Result<NpmLockProject, 
     let lock = LOCK_MEMO
         .parse(&lock_bytes, || parse_json_manifest(&lock_bytes))
         .map_err(|_| "vendor_lockfile_version_unsupported")?;
-    lock_version_gate(&lock, &lock_name).map_err(|o| super::npm_common::refusal_code(&o))?;
+    lock_version_gate(&lock, &lock_name, project_root)
+        .map_err(|o| super::npm_common::refusal_code(&o))?;
     let overrides = NpmOverrides::read(project_root).await;
     Ok(NpmLockProject {
         lock_name,
@@ -2938,15 +2948,17 @@ mod tests {
             detail.contains("lockfileVersion 4")
                 && detail.contains("npm patch")
                 && detail.contains("patchedDependencies")
+                && detail.contains("npm install --lockfile-version 3")
                 && !detail.contains("npm >= 7"),
             "{detail}"
         );
     }
 
-    /// REGRESSION (#1576): `npm install` keeps a v4 lock at v4, so the
-    /// remedy must name the flag that writes v3, never a plain install.
+    /// REGRESSION (#1576): a `patchedDependencies` key in package.json
+    /// still counts as a native patch when no lock entry records it, and
+    /// the remedy names the flag that writes v3, never a plain install.
     #[tokio::test]
-    async fn lockfile_v4_refusal_remedy_downgrades_the_lock() {
+    async fn lockfile_v4_manifest_patch_remedy_downgrades_the_lock() {
         let lock = json!({
             "name": "fixture",
             "version": "1.0.0",
@@ -2957,17 +2969,23 @@ mod tests {
                     "version": "1.3.0",
                     "resolved": REG_RESOLVED,
                     "integrity": "sha512-orig==",
-                    "patched": { "integrity": "sha512-user==", "path": "patches/left-pad@1.3.0.patch" }
+                    "patched": null
                 }
             }
         });
         let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        std::fs::write(
+            fx.root().join("package.json"),
+            r#"{"name":"fixture","patchedDependencies":{"left-pad@1.3.0":"patches/left-pad@1.3.0.patch"}}"#,
+        )
+        .unwrap();
         let detail = expect_refused(
             fx.vendor(false).await,
             "vendor_lockfile_version_unsupported",
         );
         assert!(
-            detail.contains("npm install --lockfile-version 3")
+            detail.contains("would drop or break")
+                && detail.contains("npm install --lockfile-version 3")
                 && !detail.contains("regenerate the lock with `npm install`"),
             "{detail}"
         );
