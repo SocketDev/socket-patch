@@ -920,6 +920,19 @@ async fn uv_no_binary_is_refused_in_both_modes() {
         assert_eq!(code, 0, "hosted {label}: {env:#}");
         if !refused {
             assert_eq!(hosted_pinned(&env), 1, "hosted {label}: {env:#}");
+            let (_tmp, root) = project();
+            stage_uv(&root);
+            let path = root.join(file);
+            let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+            text.push_str(setting);
+            std::fs::write(&path, text).unwrap();
+            stage_manifest(&root);
+            let (code, env) = run_cli(&root, &["vendor"], &[]);
+            assert_eq!(code, 0, "vendored {label}: {env:#}");
+            assert!(
+                !env.to_string().contains("pypi_uv_no_binary"),
+                "vendored {label}: {env:#}"
+            );
             continue;
         }
         assert_eq!(hosted_pinned(&env), 0, "hosted {label}: {env:#}");

@@ -26385,6 +26385,12 @@ mod python_metadata_pairing_tests {
         let refused = |path: &str, files: &[(&str, &str)]| match plan(path, files, &[]) {
             Err(warning) => {
                 assert!(warning.detail.contains("no-binary"), "{}", warning.detail);
+                // The refusal names the package, also under the bool.
+                assert!(
+                    warning.detail.contains("installs click only from an sdist"),
+                    "{}",
+                    warning.detail
+                );
                 warning.code
             }
             Ok(_) => panic!("{path} with {files:?} must refuse"),

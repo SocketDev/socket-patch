@@ -214,7 +214,9 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   (project `uv.toml` over `[tool.uv]`, a script's own `no-binary` over the
   project's, lists combined, `no-binary = false` disabling the list, a
   parent's settings for a script whose root sets none). `no-build*` allows
-  wheels and is not refused. A `uv pip compile --no-binary` pylock.toml
+  wheels and is not refused. `UV_NO_BINARY`, `UV_NO_BINARY_PACKAGE`, the
+  matching flags and a user-level `uv.toml` belong to the machine that
+  installs, which the scan cannot see. A `uv pip compile --no-binary` pylock.toml
   records nothing of the setting in its own data; its hosted lane is
   tracked in #1603.
 - Native projects and scripts resolving multiple versions of the same package

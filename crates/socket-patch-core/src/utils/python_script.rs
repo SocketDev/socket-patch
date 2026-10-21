@@ -634,7 +634,9 @@ struct PackageSetting {
     all: &'static str,
     packages: &'static str,
     /// Why the setting makes a wired patch fail, after "{file} sets {key}, ".
+    /// `{name}` stands for the package.
     consequence: &'static str,
+    /// How to wire the patch; `{name}` stands for the package.
     remedy: &'static str,
 }
 
@@ -649,11 +651,12 @@ const NO_SOURCES: PackageSetting = PackageSetting {
 const NO_BINARY: PackageSetting = PackageSetting {
     all: "no-binary",
     packages: "no-binary-package",
-    consequence: "so uv refuses to install it from a wheel and every `uv sync` would fail on \
+    consequence: "so uv installs {name} only from an sdist and every `uv sync` would fail on \
                   the patched wheel (\"marked as `--no-binary` but is itself a binary \
                   distribution\")",
-    remedy: "patches are shipped as wheels; remove the package from the setting to wire a \
-             patch",
+    remedy: "patches ship as wheels, so to wire one let uv install {name} from a wheel \
+             (drop it from no-binary-package, or replace no-binary = true with a \
+             no-binary-package list of the other packages)",
 };
 
 /// The governing project settings file, as (label, text, path of its
@@ -824,10 +827,12 @@ fn refuse_package_setting(
     let project = project.and_then(|(file, text, path)| settings(file, text, path));
     let levels = [script, project];
     let levels = levels.iter().flatten();
+    let name = canonicalize_pypi_name(name);
     let refusal = |file: &str, key: &str| {
         Err(format!(
             "{file} sets {key}, {}; {}",
-            setting.consequence, setting.remedy
+            setting.consequence.replace("{name}", &name),
+            setting.remedy.replace("{name}", &name)
         ))
     };
     match levels
@@ -838,7 +843,6 @@ fn refuse_package_setting(
         Some((_, false)) => return Ok(()),
         None => {}
     }
-    let name = canonicalize_pypi_name(name);
     match levels
         .into_iter()
         .find(|level| level.packages.contains(&name))
