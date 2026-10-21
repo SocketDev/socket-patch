@@ -1970,6 +1970,46 @@ mod tests {
                     ("vlt-lock.json", VLT_PNPM_WORKSPACE_TEXT),
                 ],
             ),
+            // #1584: vlt's project root is the nearest ancestor `vlt.json`,
+            // so a directory below one that no `workspaces` field lists is
+            // installed from the root as well, as is a member a `..` glob
+            // lists, and the vlt 1.3.8 `pnpm-workspace.yaml` directory.
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("package.json", r#"{"name":"root","private":true}"#),
+                    ("vlt.json", r#"{"registries":{}}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("vlt.json", r#"{"workspaces":["other/../packages/*"]}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("package.json", r#"{"name":"root","private":true}"#),
+                    ("pnpm-workspace.yaml", "packages:\n  - \"packages/*\"\n"),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            // Without any `vlt.json`, vlt's root is the outermost directory
+            // holding a `package.json`.
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("package.json", r#"{"name":"root","private":true}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
         ] {
             let (tmp, record) = npm_project().await;
             tokio::fs::remove_file(tmp.path().join("package-lock.json"))

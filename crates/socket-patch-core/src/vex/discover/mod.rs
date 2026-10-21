@@ -5488,6 +5488,24 @@ mod member_stray_lock_tests {
                     ),
                 ][..],
             ),
+            // #1584: vlt installs its project root (the nearest ancestor
+            // `vlt.json`, else the outermost `package.json`) from a
+            // directory no `workspaces` field lists, too.
+            (
+                "redirect/npm/vlt/basic/expected",
+                "vlt-lock.json",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &[("vlt.json", r#"{"config":{}}"#), ("vlt-lock.json", "{}")][..],
+            ),
+            (
+                "redirect/npm/vlt/basic/expected",
+                "vlt-lock.json",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &[
+                    ("package.json", r#"{"private":true}"#),
+                    ("vlt-lock.json", "{}"),
+                ][..],
+            ),
             (
                 "redirect/npm/package-lock-v3/basic/expected",
                 "package-lock.json",

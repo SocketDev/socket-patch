@@ -338,7 +338,7 @@ const STRAY_LOCK_FAMILIES: [(NpmLockFamily, &str); 3] = [
 pub(crate) fn member_stray_lock_own_files() -> impl Iterator<Item = &'static str> {
     npm_lock_files()
         .chain(EXTRA_OWN_LOCKS)
-        .chain(["rush.json", VLT_JSON])
+        .chain(["rush.json", VLT_JSON, ".git"])
 }
 
 /// The project directory is a workspace member whose own locks are all
@@ -355,7 +355,10 @@ pub(crate) fn member_stray_lock_own_files() -> impl Iterator<Item = &'static str
 ///   workspace root (its `vlt.json` `workspaces`, or `package.json`
 ///   `workspaces` when `vlt.json` declares none, or on vlt 1.4 the
 ///   `pnpm-workspace.yaml` `packages:` when neither does, #1564) and
-///   installs it from the root's `vlt-lock.json`.
+///   installs it from the root's `vlt-lock.json`. Listed or not, any
+///   directory with no `vlt.json` of its own is installed from vlt's
+///   project root ([`vlt_project_root`], #1584), so its lock is stray
+///   whenever that root is another, installed directory.
 ///
 /// A member that also holds a lock its own manager does read (pnpm, yarn,
 /// or a family the root does not hold), or a Rush repo, keeps the
@@ -382,6 +385,9 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
     }
     let mut package_json_root = None;
     let mut governing: Option<(PathBuf, Vec<&'static str>, &str)> = None;
+    // Set when vlt governs through its project root rather than a
+    // workspace listing (#1584).
+    let mut vlt_project = false;
     for (family, manager) in STRAY_LOCK_FAMILIES {
         let files = family.files();
         if !own.iter().any(|name| files.contains(name)) {
@@ -392,7 +398,20 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
                 if root.join(VLT_JSON).exists() {
                     return None;
                 }
-                vlt_lock_root(root, &mut package_json_root).await
+                match vlt_lock_root(root, &mut package_json_root).await {
+                    Some(found) => Some(found),
+                    // Listed or not, a directory with no `vlt.json` is
+                    // installed from vlt's project root; as for a listed
+                    // member, a root never installed governs nothing.
+                    None => {
+                        let project = vlt_project_root(root, vlt_home().as_deref());
+                        let own_dir =
+                            std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+                        vlt_project = governing.is_none();
+                        (project != own_dir && project.join(VLT_LOCK).is_file())
+                            .then(|| (project, vec![VLT_LOCK]))
+                    }
+                }
             }
             _ => cached_package_json_root(root, &mut package_json_root)
                 .await
@@ -409,14 +428,27 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
         governing.get_or_insert((ancestor, root_locks, manager));
     }
     let (ancestor, root_locks, manager) = governing?;
-    let detail = format!(
-        "{} is a member of the {manager} workspace rooted at {}: {manager} installs it from {} \
-         and ignores its own {}, so a lock rewritten here would never be installed",
-        root.display(),
-        ancestor.display(),
-        join_paths(&ancestor, &root_locks),
-        join_paths(root, &own)
-    );
+    let detail = if vlt_project {
+        format!(
+            "{} has no {VLT_JSON} of its own, so it is inside the vlt project rooted at {}: \
+             vlt installs that project from {} and ignores {}, so a lock rewritten here would \
+             never be installed (a {VLT_JSON} in {} makes it a vlt project of its own)",
+            root.display(),
+            ancestor.display(),
+            join_paths(&ancestor, &root_locks),
+            join_paths(root, &own),
+            root.display()
+        )
+    } else {
+        format!(
+            "{} is a member of the {manager} workspace rooted at {}: {manager} installs it from {} \
+             and ignores its own {}, so a lock rewritten here would never be installed",
+            root.display(),
+            ancestor.display(),
+            join_paths(&ancestor, &root_locks),
+            join_paths(root, &own)
+        )
+    };
     Some(MemberStrayLock {
         root: ancestor,
         ignored: own,
@@ -460,6 +492,43 @@ async fn vlt_lock_root(
         (a, b) => a.or(b)?,
     };
     Some((ancestor, vec![VLT_LOCK]))
+}
+
+/// vlt's project root for a run from `dir`: `find("project")` in
+/// `@vltpkg/vlt-json` (the same in vlt 1.3.8 and 1.4), whose directory is
+/// the one vlt installs. The walk up from `dir` returns the nearest
+/// directory holding a `vlt.json`; failing that, the outermost one holding
+/// a `package.json` or `node_modules` (or `dir` itself). It ends after a
+/// directory holding `.git`, and before `home`, which it never reads.
+/// vlt keys none of this on a `workspaces` field, so a directory it does
+/// not list is installed from the root too (#1584).
+fn vlt_project_root(dir: &Path, home: Option<&Path>) -> PathBuf {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut last_known = dir.as_path();
+    for ancestor in dir.ancestors() {
+        if Some(ancestor) == home {
+            break;
+        }
+        if ancestor.join(VLT_JSON).exists() {
+            return ancestor.to_path_buf();
+        }
+        if ancestor.join("package.json").exists() || ancestor.join("node_modules").exists() {
+            last_known = ancestor;
+        }
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
+    last_known.to_path_buf()
+}
+
+/// The home directory vlt's project walk stops below: Node's
+/// `os.homedir()`, `HOME` on Unix and `USERPROFILE` on Windows.
+fn vlt_home() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The independent npm-family project below `scan_root` whose
@@ -971,8 +1040,9 @@ async fn package_json_declares_workspaces(dir: &Path) -> bool {
 
 /// Whether the vlt that wrote `root`'s `vlt-lock.json` read its
 /// `pnpm-workspace.yaml` `packages:` `groups` (#1564). Only vlt 1.4 and
-/// later do; older vlt installs each directory the file lists as its own
-/// project. vlt records an edge from every member it installed that has a
+/// later do; older vlt does not list those directories as members (it
+/// still installs the project root from them, which
+/// [`member_stray_lock`] reads through [`vlt_project_root`], #1584). vlt records an edge from every member it installed that has a
 /// dependency, so a lock with an edge from a listed directory is 1.4's,
 /// and one without is older vlt's (a member with no dependency has
 /// nothing to patch). A lock that cannot be read keeps the refusing side.
@@ -1926,9 +1996,12 @@ mod tests {
         assert_eq!(member_stray_lock(&member).await, None);
         std::fs::remove_file(member.join("bun.lock")).unwrap();
         std::fs::remove_file(tmp.path().join("bun.lock")).unwrap();
+        // vlt is different (#1584): with no `vlt.json` of its own the
+        // member is not its own vlt project, whatever `workspaces` lists,
+        // so vlt installs the root and its lock stays stray.
         write(tmp.path(), "vlt-lock.json", "{}");
         write(tmp.path(), "packages/b/vlt-lock.json", "{}");
-        assert_eq!(member_stray_lock(&member).await, None);
+        assert!(member_stray_lock(&member).await.is_some());
         // Under a classic yarn.lock alone the member is listed, and its own
         // npm lock is not npm's to ignore.
         std::fs::remove_file(tmp.path().join("vlt-lock.json")).unwrap();
@@ -2623,10 +2696,12 @@ mod tests {
                         "{case}"
                     );
                     assert_eq!(member_stray_lock(&member).await.is_some(), stray, "{case}");
-                    // `packages/c` is not listed: its own lock governs it.
+                    // `packages/c` is not listed, but with no `vlt.json` of
+                    // its own vlt still installs the root from there, so
+                    // its own lock is stray as well (#1584).
                     let other = tmp.path().join("packages/c");
-                    assert_eq!(code(&other, "npm").await, None, "{case}");
-                    assert!(member_stray_lock(&other).await.is_none(), "{case}");
+                    assert_eq!(code(&other, "npm").await.is_some(), stray, "{case}");
+                    assert_eq!(member_stray_lock(&other).await.is_some(), stray, "{case}");
                 }
             }
         }
@@ -2639,7 +2714,8 @@ mod tests {
     /// dependency, so a lock with edges from the excluded member, or from
     /// any other directory only older vlt lists, is older vlt's and the
     /// member is refused. A lock that cannot be read keeps the wider
-    /// reading.
+    /// reading. A stray lock of the member's own is refused either way
+    /// (#1584).
     #[tokio::test]
     async fn vlt_negated_member_reads_the_root_lock() {
         let lock = |from: &[&str]| {
@@ -2695,15 +2771,14 @@ mod tests {
             );
             write(tmp.path(), VLT_LOCK, &root_lock);
             write(tmp.path(), "packages/a/package.json", "{}");
-            write(tmp.path(), "packages/a/vlt-lock.json", "{}");
             let member = tmp.path().join("packages/a");
             let case = format!("{workspaces} with {root_lock:?}");
             assert_eq!(code(&member, "npm").await.is_some(), refused, "{case}");
-            assert_eq!(
-                member_stray_lock(&member).await.is_some(),
-                refused,
-                "{case}"
-            );
+            // Excluded or not, vlt installs the root from a directory with
+            // no `vlt.json` of its own, so a lock there is stray (#1584).
+            write(tmp.path(), "packages/a/vlt-lock.json", "{}");
+            assert!(code(&member, "npm").await.is_some(), "{case}");
+            assert!(member_stray_lock(&member).await.is_some(), "{case}");
         }
     }
 
@@ -3066,14 +3141,163 @@ mod tests {
                 }
                 let member = tmp.path().join("packages/a");
                 let case = format!("{case}, stray: {stray}");
-                assert_eq!(code(&member, "npm").await.is_some(), refused, "{case}");
+                // A stray lock is refused whether or not the root lists the
+                // member: vlt installs its project root, the root here, from
+                // every directory below it with no `vlt.json` (#1584). A
+                // root never installed governs nothing.
+                let stray_governed = stray && root_lock.is_some();
+                assert_eq!(
+                    code(&member, "npm").await.is_some(),
+                    refused || stray_governed,
+                    "{case}"
+                );
                 assert_eq!(
                     member_stray_lock(&member).await.is_some(),
-                    refused && stray,
+                    stray_governed,
                     "{case}"
                 );
             }
         }
+    }
+
+    /// #1584: vlt installs from its project root (`find("project")` in
+    /// `@vltpkg/vlt-json`): the nearest ancestor `vlt.json`, else the
+    /// outermost directory holding a `package.json` or `node_modules`,
+    /// stopping at a `.git` and before the home directory. A directory below
+    /// that root with no `vlt.json` of its own is never its own project,
+    /// listed by a `workspaces` field or not, so its `vlt-lock.json` is
+    /// stray.
+    #[tokio::test]
+    async fn vlt_project_root_governs_unlisted_directories() {
+        for (case, vlt_json, root_files, dir) in [
+            (
+                "unlisted, vlt.json config only",
+                Some(r#"{"config":{}}"#),
+                vec![],
+                "tools/x",
+            ),
+            (
+                "unlisted, vlt.json lists others",
+                Some(r#"{"workspaces":"apps/*"}"#),
+                vec![],
+                "tools/x",
+            ),
+            (
+                "`..` glob",
+                Some(r#"{"workspaces":["packages/../other/*"]}"#),
+                vec![],
+                "other/o",
+            ),
+            (
+                "`./` and `..` glob",
+                Some(r#"{"workspaces":["./packages/../other/*"]}"#),
+                vec![],
+                "other/o",
+            ),
+            (
+                "`*/..` glob",
+                Some(r#"{"workspaces":["packages/*/../a"]}"#),
+                vec!["packages/b/package.json"],
+                "packages/a",
+            ),
+            ("no vlt.json", None, vec![], "tools/x"),
+            (
+                "vlt 1.3.8 pnpm-workspace.yaml dir",
+                None,
+                vec![PNPM_WORKSPACE],
+                "packages/a",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), "package.json", r#"{"private":true}"#);
+            if let Some(text) = vlt_json {
+                write(tmp.path(), VLT_JSON, text);
+            }
+            for rel in root_files {
+                let text = if rel == PNPM_WORKSPACE {
+                    "packages:\n  - \"packages/*\"\n"
+                } else {
+                    "{}"
+                };
+                write(tmp.path(), rel, text);
+            }
+            write(tmp.path(), VLT_LOCK, &vlt_lock_with_edges(&["file~_d"]));
+            write(tmp.path(), &format!("{dir}/package.json"), "{}");
+            write(tmp.path(), &format!("{dir}/{VLT_LOCK}"), "{}");
+            let project = tmp.path().join(dir);
+
+            let stray = member_stray_lock(&project)
+                .await
+                .unwrap_or_else(|| panic!("{case}: the lock is stray"));
+            assert_eq!(stray.root, tmp.path(), "{case}");
+            assert_eq!(stray.ignored, vec![VLT_LOCK], "{case}");
+            let refused = refusal(&ProjectView::Disk(&project), &[candidate("npm")], true)
+                .await
+                .unwrap_or_else(|| panic!("{case}: refused"));
+            assert_eq!(refused.code, WORKSPACE_LOCKFILE_ELSEWHERE, "{case}");
+            assert!(
+                refused
+                    .message
+                    .contains(&tmp.path().join(VLT_LOCK).display().to_string())
+                    && refused.message.contains(VLT_JSON)
+                    && refused.message.contains("nothing was written"),
+                "{case}: {}",
+                refused.message
+            );
+            assert_eq!(code(tmp.path(), "npm").await, None, "{case}");
+
+            // Its own vlt.json makes it a project of its own.
+            write(tmp.path(), &format!("{dir}/{VLT_JSON}"), "{}");
+            assert_eq!(member_stray_lock(&project).await, None, "{case}");
+            assert_eq!(code(&project, "npm").await, None, "{case}");
+        }
+    }
+
+    /// #1584: the walk for vlt's project root keeps the outermost
+    /// `package.json` or `node_modules` directory, stops at a `.git`
+    /// (after reading that directory) and before the home directory.
+    #[test]
+    fn vlt_project_root_walk_bounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let dir = base.join("repo/tools/x");
+        write(&dir, "package.json", "{}");
+        assert_eq!(vlt_project_root(&dir, None), dir);
+
+        // A `node_modules` directory marks a candidate as well as a
+        // `package.json`, and the outermost candidate wins.
+        std::fs::create_dir_all(base.join("repo/tools/node_modules")).unwrap();
+        write(base, "repo/package.json", "{}");
+        assert_eq!(vlt_project_root(&dir, None), base.join("repo"));
+
+        // `.git` ends the walk after its own directory is read.
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        write(base, "package.json", "{}");
+        assert_eq!(vlt_project_root(&dir, None), base.join("repo"));
+        std::fs::create_dir_all(base.join("repo/tools/.git")).unwrap();
+        assert_eq!(vlt_project_root(&dir, None), base.join("repo/tools"));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        assert_eq!(vlt_project_root(&dir, None), dir);
+        for git in ["repo/.git", "repo/tools/.git", "repo/tools/x/.git"] {
+            std::fs::remove_dir(base.join(git)).unwrap();
+        }
+        assert_eq!(vlt_project_root(&dir, None), base.to_path_buf());
+
+        // The home directory is never read: the walk stops below it.
+        assert_eq!(
+            vlt_project_root(&dir, Some(&base.join("repo"))),
+            base.join("repo/tools")
+        );
+        write(base, "repo/vlt.json", "{}");
+        assert_eq!(
+            vlt_project_root(&dir, Some(&base.join("repo"))),
+            base.join("repo/tools")
+        );
+
+        // The nearest `vlt.json` wins over any candidate, at any depth.
+        assert_eq!(vlt_project_root(&dir, None), base.join("repo"));
+        write(base, "repo/tools/x/vlt.json", "{}");
+        assert_eq!(vlt_project_root(&dir, None), dir);
     }
 
     /// #1564: a nearer `pnpm-workspace.yaml` with no `vlt-lock.json` beside
