@@ -460,19 +460,38 @@ pub struct ResolvedElsewhere {
     pub purl: String,
     /// Root-relative lock file.
     pub file: PathBuf,
+    /// The version matches only as spelled: a requirements `===X` pin,
+    /// which pip compares as a string
+    /// ([`Discovery::resolved_elsewhere_as_spelled`]).
+    pub as_spelled: bool,
 }
 
 impl ResolvedElsewhere {
     /// Whether this entry resolves the canonical base `purl`: the same
-    /// `name@version`, or any version of `name` for a versionless entry.
+    /// `name@version` (a PyPI version under PEP 440 equality unless the
+    /// entry matches only [as spelled](Self::as_spelled), so a hand-written
+    /// `==1.2.3.0` or `==v1.2.3` resolves `1.2.3`, #1602), or any version of
+    /// `name` for a versionless entry.
     fn covers(&self, purl: &str) -> bool {
-        self.purl == purl || purl_without_version(purl) == Some(self.purl.as_str())
+        self.purl == purl
+            || purl_without_version(purl) == Some(self.purl.as_str())
+            || (!self.as_spelled && same_pypi_release(&self.purl, purl))
     }
 
     /// Whether the entry names no version, so may resolve any.
     fn any_version(&self) -> bool {
         purl_without_version(&self.purl).is_none()
     }
+}
+
+/// Whether canonical bases `a` and `b` name one PyPI release under PEP 440
+/// equality (`@1.16`, `@1.16.0.0` and `@v1.16.0` are `@1.16.0`). Checks
+/// the names first: the contest asks this for every pair of a ref and a
+/// lock entry.
+fn same_pypi_release(a: &str, b: &str) -> bool {
+    Ecosystem::from_purl(a) == Some(Ecosystem::Pypi)
+        && purl_without_version(a).is_some_and(|name| purl_without_version(b) == Some(name))
+        && crate::utils::purl_key::pypi_same_release(a, b)
 }
 
 /// `pkg:<type>/<name>` of a versioned `pkg:<type>/<name>@<version>`;
@@ -926,6 +945,19 @@ impl Discovery {
         self.elsewhere.push(ResolvedElsewhere {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
+            as_spelled: false,
+        });
+    }
+
+    /// [`Discovery::resolved_elsewhere`] for a version that matches only as
+    /// spelled: a requirements `===X` pin installs the release whose version
+    /// string is `X`, never a PEP 440-equal spelling of it (#1602).
+    pub(crate) fn resolved_elsewhere_as_spelled(&mut self, file: &str, purl: Option<String>) {
+        let Some(purl) = purl else { return };
+        self.elsewhere.push(ResolvedElsewhere {
+            purl: canonical_base_purl(&purl),
+            file: PathBuf::from(file),
+            as_spelled: true,
         });
     }
 
@@ -944,6 +976,7 @@ impl Discovery {
         self.elsewhere.push(ResolvedElsewhere {
             purl,
             file: PathBuf::from(file),
+            as_spelled: false,
         });
     }
 
@@ -1105,9 +1138,13 @@ impl Discovery {
                     let tree = self.tree_of(&r.source_file);
                     self.elsewhere.iter().find(|e| {
                         let other = self.tree_of(&e.file);
+                        // A tree that wires the release itself, in any
+                        // spelling, is no contester.
                         e.covers(&r.purl)
                             && other != tree
-                            && !wiring.contains(&(r.purl.clone(), other.to_path_buf()))
+                            && !wiring.iter().any(|(purl, t)| {
+                                t == other && (*purl == r.purl || same_pypi_release(purl, &r.purl))
+                            })
                     })
                 })
                 .flatten();
