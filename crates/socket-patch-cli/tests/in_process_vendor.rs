@@ -5130,3 +5130,151 @@ async fn in_process_vendor_state_attests_manifest_less() {
             .expect("manifest-less VEX tail panicked");
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 13. repair restores the npm `<uuid>/` metadata (#1581)
+// ─────────────────────────────────────────────────────────────────────
+
+const UUID_GITIGNORE: &str =
+    "!*\n**/node_modules/*/node_modules/\n**/node_modules/@*/*/node_modules/\n";
+const UUID_GITATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding\n";
+
+fn uuid_dir(fx: &NpmFixture) -> PathBuf {
+    fx.root().join(format!(".socket/vendor/npm/{UUID}"))
+}
+
+/// `git init` the fixture; `false` when git is not installed.
+fn git_init(root: &Path) -> bool {
+    if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+        return false;
+    }
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success());
+    true
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn repair_cli(cwd: &Path) -> (i32, Value) {
+    let (code, stdout, stderr) = run_cli(
+        cwd,
+        &["repair", "--json", "--cwd", cwd.to_str().unwrap()],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("repair --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (code, env)
+}
+
+/// #1581: a project vendored before #1541 keeps the legacy `* -text`
+/// `<uuid>/.gitattributes`, so a repository `*.tgz filter=lfs` rule still
+/// applies to the tarball. `repair` must upgrade it, both when the
+/// artifact is healthy and when it redownloads an LFS pointer, or the
+/// repaired tarball goes back into LFS on the next commit.
+#[tokio::test]
+async fn repair_upgrades_a_legacy_uuid_gitattributes() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let has_git = git_init(fx.root());
+    std::fs::write(
+        fx.root().join(".gitattributes"),
+        "*.tgz filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .unwrap();
+    let attrs = uuid_dir(&fx).join(".gitattributes");
+    let tarball = std::fs::read(fx.tgz_path()).unwrap();
+
+    // Healthy artifact.
+    std::fs::write(&attrs, "* -text\n").unwrap();
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(std::fs::read_to_string(&attrs).unwrap(), UUID_GITATTRIBUTES);
+
+    // The tarball checked out as an LFS pointer (no smudge).
+    std::fs::write(&attrs, "* -text\n").unwrap();
+    std::fs::write(
+        fx.tgz_path(),
+        "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n",
+    )
+    .unwrap();
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "rebuilt", None);
+    assert_eq!(std::fs::read(fx.tgz_path()).unwrap(), tarball);
+    assert_eq!(std::fs::read_to_string(&attrs).unwrap(), UUID_GITATTRIBUTES);
+    if has_git {
+        assert_eq!(
+            git_stdout(fx.root(), &["check-attr", "filter", "--", &rel_tgz()]),
+            format!("{}: filter: unset\n", rel_tgz()),
+            "the repository's LFS rule must not reach the vendored tarball"
+        );
+    }
+}
+
+/// #1581 (second symptom): when the whole `<uuid>/` dir is lost, `repair`
+/// redownloaded only the tarball. Without its `<uuid>/.gitignore` (`!*`) a
+/// stock Node.gitignore `*.tgz` rule ignores it, so "commit it" committed
+/// nothing and every fresh clone failed.
+#[tokio::test]
+async fn repair_of_a_lost_uuid_dir_restores_its_gitignore_and_gitattributes() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let has_git = git_init(fx.root());
+    std::fs::write(fx.root().join(".gitignore"), "node_modules/\n*.tgz\n").unwrap();
+    let tarball = std::fs::read(fx.tgz_path()).unwrap();
+    std::fs::remove_dir_all(uuid_dir(&fx)).unwrap();
+
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "rebuilt", None);
+    assert_eq!(std::fs::read(fx.tgz_path()).unwrap(), tarball);
+    assert_eq!(
+        std::fs::read_to_string(uuid_dir(&fx).join(".gitignore")).unwrap(),
+        UUID_GITIGNORE
+    );
+    assert_eq!(
+        std::fs::read_to_string(uuid_dir(&fx).join(".gitattributes")).unwrap(),
+        UUID_GITATTRIBUTES
+    );
+    if has_git {
+        assert_eq!(
+            git_stdout(fx.root(), &["check-ignore", "--no-index", &rel_tgz()]),
+            "",
+            "git must commit the redownloaded tarball"
+        );
+    }
+}
+
+/// #1581: a rule the `<uuid>/.gitignore` cannot override (`.socket/`) still
+/// ignores the redownloaded tarball. `repair` must say so with the same
+/// `vendor_artifact_gitignored` code `vendor` refuses with, not report a
+/// repair that the next commit drops.
+#[tokio::test]
+async fn repair_of_a_lost_uuid_dir_under_an_ignored_socket_dir_fails() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    if !git_init(fx.root()) {
+        return;
+    }
+    std::fs::write(fx.root().join(".gitignore"), "node_modules/\n.socket/\n").unwrap();
+    std::fs::remove_dir_all(uuid_dir(&fx)).unwrap();
+
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 1, "{env:#}");
+    let failed = find_event(&env, "failed", Some("vendor_artifact_gitignored"));
+    assert_eq!(failed["purl"], PURL, "{env:#}");
+}

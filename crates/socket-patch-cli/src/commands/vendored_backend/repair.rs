@@ -492,24 +492,38 @@ impl VendoredBackend<'_> {
                             continue;
                         }
                     }
-                    // vlt's `<uuid>/.gitignore` and `.gitattributes` are not
-                    // part of the artifact: a missing or edited one is
-                    // simply rewritten.
-                    if entry.ecosystem == "npm"
-                        && entry.flavor.as_deref() == Some(vendor::vlt_lock::FLAVOR)
-                        && !common.dry_run
-                    {
-                        if let Err(e) =
-                            vendor::vlt_lock::restore_vlt_uuid_metadata(&entry, &common.cwd).await
+                    // An npm-family `<uuid>/.gitignore` and `.gitattributes`
+                    // are not part of the artifact: a missing, edited or
+                    // pre-#1541 one is simply rewritten (#1581).
+                    if !common.dry_run {
+                        match vendor::redownload::restore_npm_uuid_metadata(&entry, &common.cwd)
+                            .await
                         {
-                            fail(
-                                env,
-                                common.json,
-                                purl,
-                                "vendor_artifact_unrepairable",
-                                format!("cannot restore the vendored dir's .gitignore: {e}"),
-                            );
-                            continue;
+                            Ok(false) => {}
+                            Ok(true) => {
+                                if !npm_artifact_committable(common, env, purl, &entry).await {
+                                    continue;
+                                }
+                                env.record(
+                                    PatchEvent::new(PatchAction::Rebuilt, purl.clone())
+                                        .with_details(serde_json::json!({
+                                            "path": entry.artifact.path,
+                                            "uuidMetadataRestored": true,
+                                            "artifactRebuilt": false,
+                                        })),
+                                );
+                                repaired += 1;
+                            }
+                            Err(e) => {
+                                fail(
+                                    env,
+                                    common.json,
+                                    purl,
+                                    "vendor_artifact_unrepairable",
+                                    format!("cannot restore the vendored dir's .gitignore: {e}"),
+                                );
+                                continue;
+                            }
                         }
                     }
                     // Likewise a JVM entry's derived metadata and owned
@@ -734,6 +748,11 @@ impl VendoredBackend<'_> {
                             continue;
                         }
                     }
+                    if !npm_artifact_committable(common, env, &candidate.purl, &candidate.entry)
+                        .await
+                    {
+                        continue;
+                    }
                     if !quiet {
                         println!(
                             "Redownloaded {} ({})",
@@ -756,6 +775,29 @@ impl VendoredBackend<'_> {
             }
         }
         repaired
+    }
+}
+
+/// After repair rewrote an npm-family uuid dir: `false` (and a
+/// `vendor_artifact_gitignored` failure) when git would still leave the
+/// artifact out of the next commit, which `vendor` refuses up front. A git
+/// that cannot answer is only a warning.
+async fn npm_artifact_committable(
+    common: &GlobalArgs,
+    env: &mut Envelope,
+    purl: &str,
+    entry: &VendorEntry,
+) -> bool {
+    match vendor::redownload::npm_artifact_commit_check(entry, &common.cwd).await {
+        Ok(None) => true,
+        Ok(Some(warning)) => {
+            record_warning(env, purl, &warning, common);
+            true
+        }
+        Err((code, detail)) => {
+            fail(env, common.json, purl, code, detail);
+            false
+        }
     }
 }
 
