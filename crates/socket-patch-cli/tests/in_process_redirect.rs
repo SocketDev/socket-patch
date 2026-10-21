@@ -4307,6 +4307,39 @@ async fn readonly_socket_vendor_does_not_block_a_hosted_run() {
     vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
+/// A hosted scan run as root over a user's checkout (a Docker bind mount,
+/// `sudo`) rewrites the lock but leaves it owned by that user, as the
+/// package manager's own writer does (#1635): a root-owned lock locks its
+/// owner out of the next in-place `poetry add` / `npm install`.
+///
+/// unix-only, and skipped unless root: only root can give a file away.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn root_hosted_scan_keeps_the_lock_owner() {
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: giving a file to another uid needs root");
+        return;
+    }
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let lock_path = tmp.path().join("package-lock.json");
+    std::os::unix::fs::chown(&lock_path, Some(1000), Some(1001)).unwrap();
+
+    let out = run_hosted_json_scan(tmp.path(), &server).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    let meta = std::fs::metadata(&lock_path).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (1000, 1001));
+}
+
 /// A MALFORMED pre-v5 redirect ledger (torn write, truncation, bad
 /// hand-edit) is IGNORED by v5 hosted scan: never read for planning, never
 /// quarantined, never an error. The run succeeds and redirects, the torn

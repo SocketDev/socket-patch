@@ -630,6 +630,81 @@ pub(crate) fn archive_filename_coords(filename: &str) -> Option<(&str, &str)> {
     (!dist.is_empty() && !version.is_empty()).then_some((dist, version))
 }
 
+/// pip's `_looks_like_path`: a path separator, or a leading `.`. `\\`
+/// counts on every OS, as it does on Windows.
+fn looks_like_path(s: &str) -> bool {
+    s.starts_with('.') || s.contains(['/', '\\'])
+}
+
+/// Whether a requirement token (not a url) is a no-space PEP 508 direct
+/// reference, `name@<location>`: it starts with a name and the part before
+/// its first `@` neither looks like a path nor has a url scheme. pip reads
+/// `six@https://…` and `six@wheels/six-….whl` this way, not as a path or
+/// url (`_get_url_from_path`, #1587).
+pub(crate) fn names_before_at(token: &str) -> bool {
+    token.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && token
+            .split_once('@')
+            .is_some_and(|(prefix, _)| !looks_like_path(prefix) && !prefix.contains(':'))
+}
+
+/// Whether pip installs a requirement token (not a url, marker after `;`
+/// allowed) as a local path or archive, not a registry name
+/// (`pip._internal.req.constructors._get_url_from_path`, #1587): it starts
+/// with something other than a letter or digit, holds a path separator, or
+/// names an archive ([`is_archive_file`], `[extras]` stripped). A
+/// [`names_before_at`] token is a PEP 508 reference instead.
+pub(crate) fn pip_reads_as_path(token: &str) -> bool {
+    let path = token.split(';').next().unwrap_or(token);
+    if !path.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return true;
+    }
+    !names_before_at(path) && (looks_like_path(path) || is_archive_file(strip_path_extras(path)))
+}
+
+/// A local path requirement without its trailing `[extras]`, as pip's
+/// `_strip_extras` reads it (`wheels/six-….whl[socks]`).
+pub(crate) fn strip_path_extras(path: &str) -> &str {
+    match path.strip_suffix(']').and_then(|p| p.rfind('[')) {
+        Some(open) if open > 0 && open + 2 < path.len() => &path[..open],
+        _ => path,
+    }
+}
+
+/// pip's `ARCHIVE_EXTENSIONS`: the suffixes `is_archive_file` reads as a
+/// local archive. [`archive_filename_coords`] reads a release from the
+/// wheel and common sdist ones only.
+const ARCHIVE_EXTENSIONS: &[&str] = &[
+    ".zip",
+    ".whl",
+    ".tar.bz2",
+    ".tbz",
+    ".tar.xz",
+    ".txz",
+    ".tlz",
+    ".tar.lz",
+    ".tar.lzma",
+    ".tar.gz",
+    ".tgz",
+    ".tar",
+];
+
+/// pip's `is_archive_file`: the name's extension, as pip's `splitext`
+/// splits it (`.tar` joins the extension after it), is an archive one,
+/// case-insensitively.
+pub(crate) fn is_archive_file(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let leaf = name.rsplit(['/', '\\']).next().unwrap_or(&name);
+    let Some(dot) = leaf.rfind('.') else {
+        return false;
+    };
+    let mut ext = &leaf[dot..];
+    if leaf[..dot].ends_with(".tar") {
+        ext = &leaf[dot - 4..];
+    }
+    ARCHIVE_EXTENSIONS.contains(&ext)
+}
+
 /// The pin in an artifact location's `#sha256=<hex>` fragment (pip's
 /// `<url>#sha256=…`, Poetry lock 1.0's `<url>#sha256=<hex>&`): the FIRST
 /// `sha256=` parameter after the first `#`, when it is 64 hex (lowercased).
@@ -917,6 +992,45 @@ mod tests {
             "physical stays raw"
         );
         assert_eq!(lines[1].text, "six==1.0");
+    }
+
+    /// #1587: pip's reading of a requirement token as a local artifact.
+    #[test]
+    fn pip_reads_as_path_follows_pip() {
+        for token in [
+            "./wheels/six-1.16.0-py3-none-any.whl",
+            "wheels/six-1.16.0-py3-none-any.whl",
+            "wheels\\six-1.16.0-py3-none-any.whl",
+            "six-1.16.0-py3-none-any.whl",
+            "six-1.16.0-py3-none-any.whl[socks]",
+            "dist/six-1.16.0.tar.gz",
+            "six-1.16.0.tar.gz;python_version>=\"3\"",
+            "six-1.16.0.tgz",
+            "six-1.16.0.tar",
+            "src/six",
+            "${WHEELS}/six.whl",
+        ] {
+            assert!(pip_reads_as_path(token), "{token}");
+        }
+        for token in [
+            "six",
+            "six==1.16.0",
+            "zope.interface",
+            "six[socks]==1.16.0",
+            "six;python_version<\"3\"",
+            "six@wheels/six-1.16.0-py3-none-any.whl",
+            "six@six-1.16.0-py3-none-any.whl",
+            "foo.tar.zip",
+        ] {
+            assert!(!pip_reads_as_path(token), "{token}");
+        }
+        assert!(names_before_at("six@https://h/six.whl"));
+        assert!(!names_before_at("https://u@h/six.whl"));
+        assert!(!names_before_at("wheels/x@1.whl"));
+        assert!(!names_before_at("six==1.0"));
+        assert_eq!(strip_path_extras("six.whl[socks]"), "six.whl");
+        assert_eq!(strip_path_extras("six.whl[]"), "six.whl[]");
+        assert_eq!(strip_path_extras("six.whl"), "six.whl");
     }
 
     #[test]

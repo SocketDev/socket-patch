@@ -2338,13 +2338,16 @@ fn describe_skip_reason(reason: &str) -> String {
 /// package has no lock entry: the count `format_unredirected` turns into its
 /// "(see the warning below)" hint. `redirect_bun_default_trust_lost` rides in
 /// the same vector but is about a pin that *was* written (Bun's default trust
-/// lost on the hosted URL, #371), so it never explains a missing entry.
+/// lost on the hosted URL, #371), so it never explains a missing entry. The
+/// uv < 0.5.6 advisories (#1569) likewise describe a written pin.
 fn lock_entry_warning_count(
     warnings: &[socket_patch_core::patch::redirect::RewriteWarning],
 ) -> usize {
+    use socket_patch_core::patch::redirect::UV_OLD_RELEASE_ADVISORIES;
     warnings
         .iter()
         .filter(|w| w.code != "redirect_bun_default_trust_lost")
+        .filter(|w| !UV_OLD_RELEASE_ADVISORIES.contains(&w.code.as_str()))
         .count()
 }
 
@@ -4396,6 +4399,14 @@ mod tests {
         // line point at it (#371 review).
         assert_eq!(
             lock_entry_warning_count(&[w("redirect_bun_default_trust_lost")]),
+            0
+        );
+        // Nor the uv < 0.5.6 advisories, which follow a written pin (#1569).
+        assert_eq!(
+            lock_entry_warning_count(&[
+                w("redirect_uv_override_requires_uv_0_5_6"),
+                w("redirect_uv_constraints_require_uv_0_5_6"),
+            ]),
             0
         );
         assert_eq!(

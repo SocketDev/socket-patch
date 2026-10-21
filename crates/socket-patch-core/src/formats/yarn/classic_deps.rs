@@ -12,11 +12,19 @@
 //! Neither writer can resolve a new descriptor itself, so they rewrite
 //! the sub-maps only when every descriptor is already locked, and refuse
 //! the patch otherwise.
+//!
+//! Both sides are read the way yarn 1 writes them: a manifest's maps go
+//! through yarn's own normaliser first (`cleanDependencies`), and a `""`
+//! range is an entry like any other (#1558). Yarn keys the blocks a
+//! package's dependencies resolve through by the registry packument's
+//! ranges, which can differ from the tarball's `package.json` that fills
+//! the sub-map, so a descriptor the block's sub-map already names is
+//! upstream's, not the patch's, and needs no block keyed by it (#1578).
 
 use serde_json::Value;
 
 use super::blocks::{body_field_line, LockBlock};
-use super::patterns::split_key_patterns;
+use super::patterns::{split_classic_pattern, split_key_patterns};
 
 /// The block fields yarn 1 mirrors from a package's manifest, in the
 /// order it writes them.
@@ -50,10 +58,21 @@ pub(crate) fn with_manifest_dep_maps(lines: &[String], pkg: &Value) -> Vec<Strin
 }
 
 /// Every descriptor (`name@range`) `pkg`'s dependency maps declare that no
-/// block of `blocks` is keyed by, sorted and deduplicated: the ones a lock
-/// rewritten to the patched manifest would leave unresolved.
-pub(crate) fn unlocked_descriptors(blocks: &[LockBlock], pkg: &Value) -> Vec<String> {
-    unlocked_among(blocks, manifest_descriptors(pkg))
+/// block of `blocks` is keyed by and that the sub-maps of `carried` (the
+/// lines of each block the patch is wired into) do not all name already,
+/// sorted and deduplicated: the ones a lock rewritten to the patched
+/// manifest would leave unresolved.
+pub(crate) fn unlocked_descriptors(
+    blocks: &[LockBlock],
+    pkg: &Value,
+    carried: &[&[String]],
+) -> Vec<String> {
+    let patterns: Vec<String> = blocks
+        .iter()
+        .flat_map(|b| split_key_patterns(&b.key))
+        .collect();
+    let locked: std::collections::HashSet<&str> = patterns.iter().map(String::as_str).collect();
+    unlocked_descriptors_in(&locked, pkg, carried)
 }
 
 /// [`unlocked_descriptors`] against `locked`, every pattern the lock's
@@ -62,8 +81,40 @@ pub(crate) fn unlocked_descriptors(blocks: &[LockBlock], pkg: &Value) -> Vec<Str
 pub(crate) fn unlocked_descriptors_in(
     locked: &std::collections::HashSet<&str>,
     pkg: &Value,
+    carried: &[&[String]],
 ) -> Vec<String> {
-    sorted_missing(manifest_descriptors(pkg), |d| locked.contains(d))
+    let carried = carried_descriptors(carried);
+    sorted_missing(manifest_descriptors(pkg), |d| {
+        locked.contains(d) || (carried.contains(d) && name_is_locked(locked, d))
+    })
+}
+
+/// The descriptors every block of `carried` names in its sub-maps (none
+/// when `carried` is empty): yarn already resolves each of them for the
+/// package, through the block it keyed by the packument's range, and a pin
+/// that keeps them changes nothing about how (#1578).
+fn carried_descriptors(carried: &[&[String]]) -> std::collections::HashSet<String> {
+    let mut sets = carried
+        .iter()
+        .map(|lines| block_dep_descriptors(lines).into_iter().collect());
+    let first: std::collections::HashSet<String> = sets.next().unwrap_or_default();
+    sets.fold(first, |acc, set: std::collections::HashSet<String>| {
+        acc.intersection(&set).cloned().collect()
+    })
+}
+
+/// Whether some key of the lock locks the package `descriptor` names,
+/// under any range. A carried descriptor is upstream's only while yarn
+/// has a block to resolve it through: a sub-map entry with none (one an
+/// older release wrote and never locked, #1379, or whose block was since
+/// dropped) still needs locking.
+fn name_is_locked(locked: &std::collections::HashSet<&str>, descriptor: &str) -> bool {
+    let Some((name, _)) = split_classic_pattern(descriptor) else {
+        return false;
+    };
+    locked
+        .iter()
+        .any(|p| split_classic_pattern(p).is_some_and(|(n, _)| n == name))
 }
 
 /// Every descriptor of `descriptors` no block of `blocks` is keyed by,
@@ -122,13 +173,21 @@ fn block_dep_entries(lines: &[String]) -> Vec<(String, String)> {
         if !in_map {
             continue;
         }
-        let (name, rest) = yarn_token(line.trim_start());
-        let (range, _) = yarn_token(rest.trim_start());
-        if !name.is_empty() && !range.is_empty() {
-            out.push((name, range));
-        }
+        out.extend(sub_map_entry(line));
     }
     out
+}
+
+/// One `name range` line of a block's sub-map. yarn 1 writes an empty
+/// range as `name ""` (#1558): that is an entry, only a line with no
+/// range token at all is not.
+fn sub_map_entry(line: &str) -> Option<(String, String)> {
+    let (name, rest) = yarn_token(line.trim_start());
+    let rest = rest.trim_start();
+    if name.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some((name, yarn_token(rest).0))
 }
 
 /// One classic-grammar token from the front of `s` — a `"`-quoted string
@@ -163,9 +222,12 @@ pub(crate) fn dep_maps_match(lines: &[String], pkg: &Value) -> bool {
 /// Whether the sub-maps `lines` carries declare exactly the dependencies
 /// `pkg` declares, read back however yarn 1 quoted them (`foo latest`
 /// and `foo "latest"` alike): what yarn installs from the block is what
-/// the manifest asks for.
+/// the manifest asks for. Either shape counts: the one yarn 1 writes
+/// after normalising the manifest (#1558), and the manifest's literal
+/// maps, which an earlier release wrote and yarn installs as well.
 pub(crate) fn dep_maps_declare(lines: &[String], pkg: &Value) -> bool {
-    block_dep_maps(lines) == manifest_dep_maps(pkg)
+    let block = block_dep_maps(lines);
+    block == manifest_dep_maps(pkg) || block == literal_dep_maps(pkg)
 }
 
 /// A block's non-empty dependency sub-maps, each sorted by name, in
@@ -184,11 +246,9 @@ fn block_dep_maps(lines: &[String]) -> Vec<(&'static str, Vec<(String, String)>)
         let Some(field) = field else {
             continue;
         };
-        let (name, rest) = yarn_token(line.trim_start());
-        let (range, _) = yarn_token(rest.trim_start());
-        if name.is_empty() || range.is_empty() {
+        let Some((name, range)) = sub_map_entry(line) else {
             continue;
-        }
+        };
         match maps.iter_mut().find(|(f, _)| *f == field) {
             Some((_, deps)) => deps.push((name, range)),
             None => maps.push((field, vec![(name, range)])),
@@ -205,9 +265,10 @@ fn is_dep_map_header(rest: &str) -> bool {
     DEP_FIELDS.iter().any(|f| rest.strip_suffix(':') == Some(f))
 }
 
-/// `pkg`'s non-empty dependency maps, each sorted by name. A non-string
-/// range is skipped, as yarn skips it.
-fn manifest_dep_maps(pkg: &Value) -> Vec<(&'static str, Vec<(String, String)>)> {
+/// `pkg`'s non-empty dependency maps exactly as the manifest spells them,
+/// each sorted by name, skipping non-string ranges: the shape the writer
+/// used before it followed yarn's normaliser.
+fn literal_dep_maps(pkg: &Value) -> Vec<(&'static str, Vec<(String, String)>)> {
     DEP_FIELDS
         .iter()
         .filter_map(|&field| {
@@ -223,6 +284,57 @@ fn manifest_dep_maps(pkg: &Value) -> Vec<(&'static str, Vec<(String, String)>)> 
             Some((field, deps))
         })
         .collect()
+}
+
+/// The manifest fields yarn 1's normaliser (`cleanDependencies`) reads,
+/// in its precedence order.
+const NORMALISED_FIELDS: [&str; 3] = ["optionalDependencies", "dependencies", "devDependencies"];
+
+/// `pkg`'s non-empty dependency maps as yarn 1 records them in the
+/// package's lock block, each sorted by name, in [`DEP_FIELDS`] order.
+///
+/// Yarn normalises a manifest before it locks it (`cleanDependencies` in
+/// its normalize-manifest `fix`, #1558): across [`NORMALISED_FIELDS`] in
+/// that order, a name stays only in the first field that declares it,
+/// and its range becomes the first non-trivial one (not `""` or `"*"`)
+/// any of those fields gives it. So a name in both `optionalDependencies`
+/// and `dependencies` is locked only as optional, and `"*"` beside a
+/// `devDependencies` range is locked as that range. A non-string range is
+/// skipped, as yarn skips it.
+fn manifest_dep_maps(pkg: &Value) -> Vec<(&'static str, Vec<(String, String)>)> {
+    let maps: Vec<(&'static str, &serde_json::Map<String, Value>)> = NORMALISED_FIELDS
+        .iter()
+        .filter_map(|&field| Some((field, pkg.get(field)?.as_object()?)))
+        .collect();
+    let mut non_trivial: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (_, map) in &maps {
+        for (name, range) in map.iter() {
+            if let Some(range) = range.as_str().filter(|r| !r.is_empty() && *r != "*") {
+                non_trivial.entry(name.as_str()).or_insert(range);
+            }
+        }
+    }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<(&'static str, Vec<(String, String)>)> = Vec::new();
+    for (field, map) in &maps {
+        let mut deps: Vec<(String, String)> = Vec::new();
+        for (name, range) in map.iter() {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            let Some(range) = range.as_str() else {
+                continue;
+            };
+            let range = non_trivial.get(name.as_str()).copied().unwrap_or(range);
+            deps.push((name.clone(), range.to_string()));
+        }
+        if DEP_FIELDS.contains(field) && !deps.is_empty() {
+            deps.sort_unstable();
+            out.push((field, deps));
+        }
+    }
+    out.sort_by_key(|(f, _)| DEP_FIELDS.iter().position(|d| d == f));
+    out
 }
 
 /// A sub-map key the way yarn 1's serializer writes it: quoted when it
@@ -291,12 +403,12 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
             "optionalDependencies": {"@scope/opt": "^2.0.0"},
         });
         assert_eq!(
-            unlocked_descriptors(&blocks, &pkg),
+            unlocked_descriptors(&blocks, &pkg, &[]),
             vec!["is-number@^7.0.0", "wow@^1.0.0"]
         );
         let unchanged = serde_json::json!({"dependencies": {"is-number": "^6.0.0"}});
-        assert!(unlocked_descriptors(&blocks, &unchanged).is_empty());
-        assert!(unlocked_descriptors(&blocks, &serde_json::json!({})).is_empty());
+        assert!(unlocked_descriptors(&blocks, &unchanged, &[]).is_empty());
+        assert!(unlocked_descriptors(&blocks, &serde_json::json!({}), &[]).is_empty());
     }
 
     /// #1423: the pre-split form agrees with [`unlocked_descriptors`].
@@ -317,8 +429,8 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
             serde_json::json!({}),
         ] {
             assert_eq!(
-                unlocked_descriptors_in(&locked, &pkg),
-                unlocked_descriptors(&blocks, &pkg),
+                unlocked_descriptors_in(&locked, &pkg, &[]),
+                unlocked_descriptors(&blocks, &pkg, &[]),
                 "{pkg}"
             );
         }
@@ -345,6 +457,123 @@ is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"\n"
         );
         let odd = blocks.iter().find(|b| b.key == "is-odd@3.0.1").unwrap();
         assert!(unlocked_among(&blocks, block_dep_descriptors(&odd.lines).into_iter()).is_empty());
+    }
+
+    /// #1558 shape 1: yarn writes an empty range as `name ""`. The block
+    /// declares exactly the manifest's `""` dependency, and its descriptor
+    /// is the `name@` key yarn locks it under.
+    #[test]
+    fn issue_1558_an_empty_range_is_a_sub_map_entry() {
+        let block =
+            lines("is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"\"\n");
+        let pkg = serde_json::json!({"dependencies": {"is-number": ""}});
+        assert!(dep_maps_declare(&block, &pkg));
+        assert!(dep_maps_match(&block, &pkg));
+        assert_eq!(block_dep_descriptors(&block), vec!["is-number@"]);
+        let blocks = scan_blocks("is-number@:\n  version \"7.0.0\"\n");
+        assert!(unlocked_descriptors(&blocks, &pkg, &[]).is_empty());
+        // A line with no range token at all is still not an entry.
+        assert!(block_dep_descriptors(&lines("a@1:\n  dependencies:\n    b\n")).is_empty());
+    }
+
+    /// #1558 shapes 2 and 3: the manifest is read through yarn 1's
+    /// `cleanDependencies` before it is compared or written. A name in
+    /// both `optionalDependencies` and `dependencies` is locked only as
+    /// optional; a `"*"` range takes a `devDependencies` range.
+    #[test]
+    fn issue_1558_manifest_maps_follow_yarns_normaliser() {
+        let both = serde_json::json!({
+            "dependencies": {"is-number": "^6.0.0", "ms": "2.1.3"},
+            "optionalDependencies": {"is-number": "^6.0.0"},
+        });
+        let yarn_shape = lines(
+            "is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    ms \"2.1.3\"\n  \
+             optionalDependencies:\n    is-number \"^6.0.0\"",
+        );
+        assert!(dep_maps_declare(&yarn_shape, &both));
+        assert!(dep_maps_match(&yarn_shape, &both));
+        let stale = lines("is-odd@3.0.1:\n  version \"3.0.1\"");
+        assert_eq!(with_manifest_dep_maps(&stale, &both), yarn_shape);
+
+        let star = serde_json::json!({
+            "dependencies": {"is-number": "*"},
+            "devDependencies": {"is-number": "^6.0.0", "dev-only": "1"},
+        });
+        let block =
+            lines("is-odd@3.0.1:\n  version \"3.0.1\"\n  dependencies:\n    is-number \"^6.0.0\"");
+        assert!(dep_maps_declare(&block, &star));
+        // The literal shape an earlier release wrote still declares it.
+        assert!(dep_maps_declare(
+            &lines("is-odd@3.0.1:\n  dependencies:\n    is-number \"*\""),
+            &star
+        ));
+        assert!(!dep_maps_declare(
+            &lines("is-odd@3.0.1:\n  dependencies:\n    is-number \"^5.0.0\""),
+            &star
+        ));
+        // The first non-trivial range wins, in yarn's field order.
+        let opt_first = serde_json::json!({
+            "dependencies": {"a": "^2.0.0"},
+            "optionalDependencies": {"a": "*"},
+        });
+        assert_eq!(
+            manifest_dep_maps(&opt_first),
+            vec![(
+                "optionalDependencies",
+                vec![("a".to_string(), "^2.0.0".to_string())]
+            )]
+        );
+    }
+
+    /// #1578: yarn keys a package's dependency blocks by the registry
+    /// packument's ranges (`url@*`), while the sub-map holds the tarball's
+    /// (`url "^0.11.0"`). A descriptor every pinned block already carries
+    /// is not the patch's to lock; one the patch adds still is.
+    #[test]
+    fn issue_1578_a_carried_descriptor_needs_no_key_of_its_own() {
+        let lock = "url@*:\n  version \"0.11.0\"\n\n\
+                    stubs@1.2.3:\n  version \"1.2.3\"\n  dependencies:\n    url \"^0.11.0\"\n";
+        let blocks = scan_blocks(lock);
+        let stubs = blocks.iter().find(|b| b.key == "stubs@1.2.3").unwrap();
+        let carried = [stubs.lines.as_slice()];
+        let pkg = serde_json::json!({"dependencies": {"url": "^0.11.0"}});
+        assert_eq!(
+            unlocked_descriptors(&blocks, &pkg, &[]),
+            vec!["url@^0.11.0"],
+            "without the carried block the key check alone refuses"
+        );
+        assert!(unlocked_descriptors(&blocks, &pkg, &carried).is_empty());
+        let patterns: Vec<String> = blocks
+            .iter()
+            .flat_map(|b| split_key_patterns(&b.key))
+            .collect();
+        let locked: std::collections::HashSet<&str> = patterns.iter().map(String::as_str).collect();
+        assert!(unlocked_descriptors_in(&locked, &pkg, &carried).is_empty());
+
+        let added = serde_json::json!({"dependencies": {"url": "^0.11.0", "wow": "^1.0.0"}});
+        assert_eq!(
+            unlocked_descriptors_in(&locked, &added, &carried),
+            vec!["wow@^1.0.0"]
+        );
+        let bumped = serde_json::json!({"dependencies": {"url": "^0.12.0"}});
+        assert_eq!(
+            unlocked_descriptors(&blocks, &bumped, &carried),
+            vec!["url@^0.12.0"]
+        );
+        // A carried descriptor with no block of its name at all (an older
+        // release's unlocked sub-map entry, #1379) still needs locking.
+        let dangling = lines("stubs@1.2.3:\n  dependencies:\n    wow \"^1.0.0\"");
+        let wow = serde_json::json!({"dependencies": {"wow": "^1.0.0"}});
+        assert_eq!(
+            unlocked_descriptors(&blocks, &wow, &[dangling.as_slice()]),
+            vec!["wow@^1.0.0"]
+        );
+        // Every pinned block must carry it: one that doesn't keeps it unlocked.
+        let bare = lines("stubs@1.2.3:\n  version \"1.2.3\"");
+        assert_eq!(
+            unlocked_descriptors(&blocks, &pkg, &[stubs.lines.as_slice(), bare.as_slice()]),
+            vec!["url@^0.11.0"]
+        );
     }
 
     #[test]

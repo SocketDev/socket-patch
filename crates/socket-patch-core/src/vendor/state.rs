@@ -1017,7 +1017,7 @@ pub const LEDGER_GITIGNORED: &str = "vendor_ledger_gitignored";
 /// - a rule that ignores `.socket/vendor/` as a directory (`.socket/`,
 ///   `vendor/`) is `vendor_artifact_gitignored`, unless
 ///   `artifacts_checked`: every backend in the run refuses that rule per
-///   package itself (the npm family, NuGet, the JVM trees), naming the
+///   package itself (the npm family, NuGet, PyPI, the JVM trees), naming the
 ///   package;
 /// - a file rule that matches only the ledger (`state.json`, `*.json`) is
 ///   `vendor_ledger_gitignored`.

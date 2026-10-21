@@ -430,7 +430,8 @@ pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::
 }
 
 /// [`atomic_write_bytes`], but the new inode keeps the destination's existing
-/// permission bits (when the destination exists).
+/// permission bits and, where the caller may set them, its owner and group
+/// (when the destination exists).
 ///
 /// The rename swaps in a fresh stage inode created with umask defaults, so the
 /// plain writer resets a user-owned file's mode — a 0600 private package.json
@@ -626,7 +627,8 @@ struct WriteOpts {
     /// A durable commit point: run the durability barrier first, fsync the
     /// stage, and fsync the parent directory after the rename.
     durable: bool,
-    /// The new inode keeps the destination's permission bits.
+    /// The new inode keeps the destination's permission bits and, where
+    /// the caller may set them, its owner and group.
     preserve_mode: bool,
     /// Record the written path for the next durability barrier.
     record: bool,
@@ -714,10 +716,34 @@ fn stage_open_options(perms: Option<&std::fs::Permissions>) -> std::fs::OpenOpti
     options
 }
 
+/// Give a mode-preserving stage the destination's owner and group before
+/// the rename, best-effort like npm's write-file-atomic: the fresh inode
+/// belongs to the euid/egid of this process, so a root run over a user's
+/// checkout (a Docker bind mount, `sudo`) would otherwise hand their
+/// `poetry.lock` to root, and a run in a shared group checkout would move it
+/// to the runner's primary group (#1635). An unprivileged caller can't give
+/// a file away (EPERM), but it may still keep the group when it belongs to
+/// it; failing that, the stage keeps the runner's ownership, as before.
+#[cfg(unix)]
+fn keep_owner(stage: &std::fs::File, dest: &std::fs::Metadata) {
+    use std::os::unix::fs::{fchown, MetadataExt};
+    let Ok(now) = stage.metadata() else {
+        return;
+    };
+    let (uid, gid) = (dest.uid(), dest.gid());
+    if (now.uid(), now.gid()) == (uid, gid) {
+        return;
+    }
+    if fchown(stage, Some(uid), Some(gid)).is_err() && now.gid() != gid {
+        let _ = fchown(stage, None::<u32>, Some(gid));
+    }
+}
+
 /// Stage `content` next to `path` and rename it over `path` — the one
 /// stage-and-rename core every writer above runs. `preserve_mode` keeps the
-/// destination's permission bits; `durable` fsyncs the stage before the
-/// rename and the parent directory after it.
+/// destination's permission bits and, where the caller may set them, its
+/// owner and group; `durable` fsyncs the stage before the rename and the
+/// parent directory after it.
 ///
 /// Off Unix every stage is fsynced here, through its own writable handle:
 /// Windows' `FlushFileBuffers` needs write access, so the barrier cannot
@@ -732,9 +758,10 @@ fn stage_and_rename_blocking(
 ) -> std::io::Result<()> {
     use std::io::Write as _;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let perms = preserve_mode
-        .then(|| std::fs::metadata(path).ok().map(|m| m.permissions()))
+    let dest = preserve_mode
+        .then(|| std::fs::metadata(path).ok())
         .flatten();
+    let perms = dest.as_ref().map(|m| m.permissions());
     let sync_file = durable || !super::durability::DEFERS_FILE_SYNC;
     let stage = stage_path(path, ".socket-stage-");
 
@@ -746,6 +773,13 @@ fn stage_and_rename_blocking(
         // quota) surfaces here, before the truncated stage could be renamed
         // over the intact target.
         file.write_all(content)?;
+        // Owner before the fsync, so a durable write syncs it too, and
+        // before the mode: `chown(2)` clears setuid/setgid, so the chmod
+        // below must run last to restore the bits exactly.
+        #[cfg(unix)]
+        if let Some(dest) = &dest {
+            keep_owner(&file, dest);
+        }
         if sync_file {
             file.sync_all()?;
         }
@@ -1000,6 +1034,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tokio::fs::read(&fresh).await.unwrap(), b"x");
+    }
+
+    /// A mode-preserving write keeps the destination's owner and group too
+    /// (#1635): a root run over a user's `poetry.lock` (a Docker bind mount,
+    /// `sudo`) must not hand the file to root, or Poetry can no longer
+    /// rewrite its own lock in place. Every preserving writer runs the one
+    /// stage core, so each is checked; the plain writer keeps umask/euid
+    /// defaults. The chown runs before the chmod, so a setuid bit survives.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserving_writes_keep_the_destination_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: giving a file to another uid needs root");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = |name: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, b"old").unwrap();
+            std::os::unix::fs::chown(&path, Some(1000), Some(1001)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4754)).unwrap();
+            path
+        };
+        let owner_and_mode = |path: &Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.uid(), meta.gid(), meta.mode() & 0o7777)
+        };
+
+        let path = fresh("poetry.lock");
+        atomic_write_bytes_preserving_mode(&path, b"new")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(owner_and_mode(&path), (1000, 1001, 0o4754));
+
+        let path = fresh("sync.lock");
+        atomic_write_sync(&path, b"new", true).unwrap();
+        assert_eq!(owner_and_mode(&path), (1000, 1001, 0o4754));
+
+        let path = fresh("unsynced.lock");
+        atomic_write_unsynced(&path, b"new", true).await.unwrap();
+        assert_eq!(owner_and_mode(&path), (1000, 1001, 0o4754));
+
+        let path = fresh("plain");
+        atomic_write_bytes(&path, b"new").await.unwrap();
+        let (uid, _, _) = owner_and_mode(&path);
+        assert_eq!(uid, 0, "the plain writer is not preserving");
+    }
+
+    /// An unprivileged run can't give a file to another user, but it can
+    /// keep the group of a shared checkout (`ubuntu:devs` must not become
+    /// `ubuntu:ubuntu`, locking the other `devs` out, #1635), since the
+    /// caller may chgrp its own file to any group it belongs to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserving_write_keeps_a_supplementary_group() {
+        use std::os::unix::fs::MetadataExt;
+        let egid = unsafe { libc::getegid() };
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0 as libc::gid_t; count.max(0) as usize];
+        let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        groups.truncate(count.max(0) as usize);
+        let Some(&group) = groups.iter().find(|g| **g != egid) else {
+            eprintln!("skipping: the caller has no supplementary group");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("poetry.lock");
+        std::fs::write(&path, b"old").unwrap();
+        std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
+
+        atomic_write_bytes_preserving_mode(&path, b"new")
+            .await
+            .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        assert_eq!(meta.gid(), group, "the shared group must survive");
     }
 
     /// The stage of a mode-preserving write is CREATED with the preserved

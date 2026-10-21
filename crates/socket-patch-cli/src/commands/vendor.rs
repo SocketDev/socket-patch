@@ -1399,10 +1399,15 @@ async fn run_check(args: &VendorArgs) -> i32 {
 
 /// Whether every ecosystem in a vendored run has a backend that refuses a
 /// `.socket/vendor/` directory ignore rule per package
-/// (`vendor_artifact_gitignored`): the npm family (vlt included), NuGet
-/// and the JVM trees. The others rely on the run-level ledger check.
+/// (`vendor_artifact_gitignored`): the npm family (vlt included), NuGet,
+/// PyPI and the JVM trees. The others rely on the run-level ledger check.
 fn artifacts_gitignore_checked(mut ecosystems: impl Iterator<Item = Ecosystem>) -> bool {
-    ecosystems.all(|eco| matches!(eco, Ecosystem::Npm | Ecosystem::Nuget | Ecosystem::Maven))
+    ecosystems.all(|eco| {
+        matches!(
+            eco,
+            Ecosystem::Npm | Ecosystem::Nuget | Ecosystem::Pypi | Ecosystem::Maven
+        )
+    })
 }
 
 /// A refused eject: the JSON error envelope (`status: error`) or an
