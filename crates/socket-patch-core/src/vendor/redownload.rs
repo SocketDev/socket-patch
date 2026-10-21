@@ -366,7 +366,7 @@ pub async fn restore(
     }
     restore_npm_uuid_metadata(entry, root)
         .await
-        .map_err(|e| format!("cannot restore the vendored dir's .gitignore: {e}"))?;
+        .map_err(|e| format!("cannot restore the vendored dir's git metadata: {e}"))?;
     Ok(warnings)
 }
 
@@ -376,9 +376,12 @@ pub async fn restore(
 /// yarn, bun, vlt) commits its artifact under that uuid dir, and only these
 /// two files keep a repository's `*.tgz` ignore or `filter=lfs` rule off it
 /// (#1581). `Ok(true)` when either was rewritten; a no-op for other
-/// ecosystems.
+/// ecosystems, and for a vendor dir reached through a symlink, which may
+/// be another project's store (see `path::vendor_dir_symlink`).
 pub async fn restore_npm_uuid_metadata(entry: &VendorEntry, root: &Path) -> std::io::Result<bool> {
-    if entry.ecosystem != "npm" {
+    if entry.ecosystem != "npm"
+        || super::path::vendor_dir_symlink(root, "npm", Some(&entry.uuid)).is_some()
+    {
         return Ok(false);
     }
     let Some(uuid_dir) = super::path::vendor_uuid_dir_rel("npm", &entry.uuid) else {
@@ -405,13 +408,20 @@ pub async fn npm_artifact_commit_check(
     let Some(uuid_dir) = super::path::vendor_uuid_dir_rel("npm", &entry.uuid) else {
         return Ok(None);
     };
-    let mut paths = vec![
+    // A directory artifact (vlt) is probed as a directory, so a rule that
+    // ignores it whole is seen.
+    let artifact = if super::verify::is_vlt_dir_entry(entry)
+        || !super::verify::artifact_is_file_shaped(&entry.artifact.path)
+    {
+        format!("{}/", entry.artifact.path.trim_end_matches('/'))
+    } else {
+        entry.artifact.path.clone()
+    };
+    let paths = [
+        artifact,
         format!("{uuid_dir}/.gitignore"),
         format!("{uuid_dir}/.gitattributes"),
     ];
-    if super::verify::artifact_is_file_shaped(&entry.artifact.path) {
-        paths.insert(0, entry.artifact.path.clone());
-    }
     match super::npm_dir::gitignore_probe(root, &paths).await {
         Ok(Some(rules)) => Err((
             super::npm_dir::GITIGNORED,

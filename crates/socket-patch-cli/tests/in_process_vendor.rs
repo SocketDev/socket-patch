@@ -5277,4 +5277,10 @@ async fn repair_of_a_lost_uuid_dir_under_an_ignored_socket_dir_fails() {
     assert_eq!(code, 1, "{env:#}");
     let failed = find_event(&env, "failed", Some("vendor_artifact_gitignored"));
     assert_eq!(failed["purl"], PURL, "{env:#}");
+
+    // The artifact is now healthy on disk, but git still drops it: the
+    // next run must not go green with nothing fixed.
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 1, "{env:#}");
+    find_event(&env, "failed", Some("vendor_artifact_gitignored"));
 }

@@ -419,6 +419,29 @@ impl VendoredBackend<'_> {
                 entry
             };
             let health = check_vendored_artifact(&common.cwd, &entry, &record).await;
+            // An npm-family `<uuid>/.gitignore` and `.gitattributes` are not
+            // part of the artifact: a missing, edited or pre-#1541 one is
+            // simply rewritten, and git must still commit the artifact with
+            // them (#1581). A broken artifact gets both after its redownload.
+            if !common.dry_run
+                && (health == ArtifactHealth::Healthy || workspace_copy_issue(&health))
+            {
+                if let Err(e) =
+                    vendor::redownload::restore_npm_uuid_metadata(&entry, &common.cwd).await
+                {
+                    fail(
+                        env,
+                        common.json,
+                        purl,
+                        "vendor_artifact_unrepairable",
+                        format!("cannot restore the vendored dir's git metadata: {e}"),
+                    );
+                    continue;
+                }
+                if !npm_artifact_committable(common, env, purl, &entry).await {
+                    continue;
+                }
+            }
             if health == ArtifactHealth::Healthy || workspace_copy_issue(&health) {
                 let mut healed = entry.clone();
                 match repair_workspace_copies(&common.cwd, &mut healed, common.dry_run).await {
@@ -490,31 +513,6 @@ impl VendoredBackend<'_> {
                                 detail,
                             );
                             continue;
-                        }
-                    }
-                    // An npm-family `<uuid>/.gitignore` and `.gitattributes`
-                    // are not part of the artifact: a missing, edited or
-                    // pre-#1541 one is simply rewritten (#1581).
-                    if !common.dry_run {
-                        match vendor::redownload::restore_npm_uuid_metadata(&entry, &common.cwd)
-                            .await
-                        {
-                            Ok(false) => {}
-                            Ok(true) => {
-                                if !npm_artifact_committable(common, env, purl, &entry).await {
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                fail(
-                                    env,
-                                    common.json,
-                                    purl,
-                                    "vendor_artifact_unrepairable",
-                                    format!("cannot restore the vendored dir's .gitignore: {e}"),
-                                );
-                                continue;
-                            }
                         }
                     }
                     // Likewise a JVM entry's derived metadata and owned
