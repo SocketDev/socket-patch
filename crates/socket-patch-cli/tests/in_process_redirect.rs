@@ -3935,6 +3935,20 @@ async fn hosted_npm_warns_when_pinned_allow_scripts_approval_is_lost() {
         "the user's allowScripts policy is never rewritten"
     );
 
+    // A BOM-prefixed lock (kept by the rewriter) is read the same way.
+    let tmp = tempfile::tempdir().unwrap();
+    write_project_with_allow_scripts(tmp.path(), serde_json::json!({ &pinned: true }));
+    let lock_path = tmp.path().join("package-lock.json");
+    let mut bom = b"\xEF\xBB\xBF".to_vec();
+    bom.extend(std::fs::read(&lock_path).unwrap());
+    std::fs::write(&lock_path, bom).unwrap();
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "anchor: {env}");
+    assert!(
+        warning_codes(&env).contains(&"redirect_npm_allow_scripts".to_string()),
+        "a BOM-prefixed lock still warns: {env}"
+    );
+
     // A name-only approval keeps matching the redirected entry: no warning.
     let tmp = tempfile::tempdir().unwrap();
     write_project_with_allow_scripts(tmp.path(), serde_json::json!({ &pinned: true, NAME: true }));

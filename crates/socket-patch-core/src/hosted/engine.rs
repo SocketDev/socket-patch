@@ -2819,7 +2819,7 @@ fn npm_allow_scripts(
         return Vec::new();
     };
     let Some(lock) =
-        read(NPM12_LOCK).and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        read(NPM12_LOCK).and_then(|text| crate::vendor::common::parse_json_text(text).ok())
     else {
         return Vec::new();
     };
