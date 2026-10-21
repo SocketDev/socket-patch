@@ -1776,6 +1776,37 @@ pub(super) async fn allow_file_refusal_with(
     ))
 }
 
+/// The `vendor_npm_allow_scripts` advisory for `name@version` (#1595), or
+/// `None`: npm >= 12 matches a version-pinned `package.json#allowScripts`
+/// approval only against a registry tarball URL, so once vendoring rewires
+/// the lock to the `file:` tarball the approved install script stops
+/// running. Only a package some npm lock records `hasInstallScript` for
+/// can lose one; the policy is the user's and is never rewritten.
+pub(super) async fn allow_scripts_lost(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+) -> Option<String> {
+    use crate::patch::redirect::npm_allow_scripts::{
+        lock_has_install_script, lost_detail, pinned_approvals_lost,
+    };
+    use crate::utils::fs::read_regular_to_string;
+    let package_json = read_regular_to_string(&project_root.join("package.json"))
+        .await
+        .ok()?;
+    let keys = pinned_approvals_lost(&package_json, name, version);
+    if keys.is_empty() {
+        return None;
+    }
+    let mut has_script = false;
+    for lock_name in NPM_LOCKS {
+        if let Ok(text) = read_regular_to_string(&project_root.join(lock_name)).await {
+            has_script |= lock_has_install_script(&text, name, version);
+        }
+    }
+    has_script.then(|| lost_detail(name, version, &keys, "the vendored `file:` tarball"))
+}
+
 /// [`allow_file_refusal_with`] against this process's npm config layers.
 /// Unit tests see only the project `.npmrc`: the developer's or runner's
 /// own layers (an `npm_config_allow_file` variable, a `~/.npmrc`) must not

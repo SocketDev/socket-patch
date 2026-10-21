@@ -2306,8 +2306,9 @@ async fn rewrite_once(
         &overrides,
         &options,
     );
-    let (npm_warnings, npmrc_config_write) =
+    let (mut npm_warnings, npmrc_config_write) =
         npm_allow_remote(view, &files, &rewrite, &overrides, &options);
+    npm_warnings.extend(npm_allow_scripts(&files, &rewrite, &overrides));
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last, after the lock edits it serves. v5 keeps no hosted
@@ -2794,6 +2795,69 @@ fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
         }
         ProjectView::Memory(_) => None,
     }
+}
+
+/// npm >= 12 blocks dependency install scripts unless the root
+/// `package.json#allowScripts` approves them, and it matches a pinned key
+/// (`"esbuild@0.19.12": true`) only against a registry-shaped `resolved`
+/// URL, which a hosted redirect replaces (#1595). Warn
+/// (`redirect_npm_allow_scripts`) for every package a root npm lock now
+/// pins to a hosted artifact whose install script is approved only by
+/// version. The policy is the user's, so it is never rewritten: the only
+/// key npm would still honor is a name-only one, which widens it.
+fn npm_allow_scripts(
+    files: &BTreeMap<String, String>,
+    rewrite: &RewriteResult,
+    overrides: &[DepOverride],
+) -> Vec<RewriteWarning> {
+    use crate::patch::redirect::npm_allow_scripts::{
+        lock_has_install_script, lost_detail, pinned_approvals_lost, HOSTED_WARNING,
+    };
+    let Some(package_json) = rewrite
+        .files
+        .get("package.json")
+        .or_else(|| files.get("package.json"))
+    else {
+        return Vec::new();
+    };
+    let npm_lock_texts: Vec<&String> = NPM_LOCKS
+        .iter()
+        .filter_map(|lock| rewrite.files.get(*lock).or_else(|| files.get(*lock)))
+        .collect();
+    let npm_overrides: Vec<&DepOverride> =
+        overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+    let groups: Vec<[String; 2]> = npm_overrides
+        .iter()
+        .map(|o| artifact_url_spellings(&o.artifact_url))
+        .collect();
+    let present = groups_present(&npm_lock_texts, &groups);
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut warnings = Vec::new();
+    for (o, _) in npm_overrides.iter().zip(present).filter(|(_, p)| *p) {
+        let name = crate::patch::redirect::full_name(o);
+        if !seen.insert((name.clone(), o.version.clone())) {
+            continue;
+        }
+        if !npm_lock_texts
+            .iter()
+            .any(|lock| lock_has_install_script(lock, &name, &o.version))
+        {
+            continue;
+        }
+        let keys = pinned_approvals_lost(package_json, &name, &o.version);
+        if keys.is_empty() {
+            continue;
+        }
+        let target = match url_host(&o.artifact_url) {
+            Some(host) => format!("the hosted patch tarball on {host}"),
+            None => "the hosted patch tarball".to_string(),
+        };
+        warnings.push(warning(
+            HOSTED_WARNING,
+            lost_detail(&name, &o.version, &keys, &target),
+        ));
+    }
+    warnings
 }
 
 /// npm >= 12 ships `allow-remote=none`: it refuses (EALLOWREMOTE) every

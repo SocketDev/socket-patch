@@ -4428,6 +4428,72 @@ snapshots:
         );
     }
 
+    /// #1595: npm 12 matches a version-pinned `allowScripts` approval only
+    /// against a registry tarball URL, so once vendoring rewires the lock
+    /// to the `file:` tarball the approved install script stops running.
+    /// The vendored run still vendors, leaves package.json untouched and
+    /// records `vendor_npm_allow_scripts`; a name-only approval (which npm
+    /// still honors) records nothing.
+    #[tokio::test]
+    #[serial]
+    async fn vendor_package_lock_warns_when_pinned_allow_scripts_approval_is_lost() {
+        let server = MockServer::start().await;
+        let registry = mock_registry(&server).await;
+        for (policy, expect_warning) in [
+            (json!({ format!("{CONV_NAME}@{CONV_VERSION}"): true }), true),
+            (
+                json!({ format!("{CONV_NAME}@{CONV_VERSION}"): true, CONV_NAME: true }),
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            write_package_lock_project(root);
+            let package_json = json!({
+                "name": "consumer",
+                "version": "0.0.0",
+                "dependencies": { CONV_NAME: CONV_VERSION },
+                "allowScripts": policy,
+            })
+            .to_string();
+            std::fs::write(root.join("package.json"), &package_json).unwrap();
+            let lock_path = root.join("package-lock.json");
+            let mut lock: Value =
+                serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+            lock["packages"][format!("node_modules/{CONV_NAME}")]["hasInstallScript"] = true.into();
+            std::fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+            seed_manifest_and_blob(root);
+            let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+            assert_eq!(code, 0, "vendoring still succeeds: {env:#}");
+            find_event(&env, "applied", None);
+            let warned = events(&env)
+                .iter()
+                .find(|e| e["errorCode"] == "vendor_npm_allow_scripts");
+            if expect_warning {
+                let warned =
+                    warned.unwrap_or_else(|| panic!("expected vendor_npm_allow_scripts: {env:#}"));
+                assert_eq!(warned["action"], "skipped", "{env:#}");
+                let text = warned.to_string();
+                assert!(
+                    text.contains(&format!("{CONV_NAME}@{CONV_VERSION}"))
+                        && text.contains("vendored `file:` tarball"),
+                    "{text}"
+                );
+            } else {
+                assert!(
+                    warned.is_none(),
+                    "a name-only approval still matches: {env:#}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("package.json")).unwrap(),
+                package_json,
+                "the user's allowScripts policy is never rewritten"
+            );
+        }
+    }
+
     /// [`write_package_lock_project`] plus a parent package `bund` that
     /// BUNDLES the same `name@version` (`inBundle: true`): the hosted run
     /// rewires only the hoisted entry (`redirect_npm_bundled_instance_skipped`).

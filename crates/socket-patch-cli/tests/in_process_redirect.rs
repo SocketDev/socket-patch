@@ -3861,6 +3861,92 @@ async fn pnpm_warning_strips_userinfo_and_names_only_spliced_hosts() {
     );
 }
 
+/// [`write_project`] whose lock records an install script for the patched
+/// package and whose root package.json approves it in npm 12's
+/// `allowScripts` with `policy`.
+fn write_project_with_allow_scripts(root: &Path, policy: serde_json::Value) {
+    write_project(root);
+    std::fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "name": "consumer",
+            "version": "0.0.0",
+            "dependencies": { NAME: VERSION },
+            "allowScripts": policy,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let path = root.join("package-lock.json");
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    lock["packages"][format!("node_modules/{NAME}")]["hasInstallScript"] = true.into();
+    std::fs::write(&path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+}
+
+/// #1595: npm 12 matches a version-pinned `allowScripts` approval
+/// (`"pkg@x.y.z": true`, what `npm approve-scripts` writes) only against a
+/// registry-shaped `resolved`, which the hosted redirect replaces, so the
+/// approved install script silently stops running. The run must say so
+/// (`redirect_npm_allow_scripts`, naming the pinned key and the name-only
+/// remedy) and leave package.json untouched; a name-only approval, which
+/// npm still honors, must not warn.
+#[tokio::test]
+#[serial]
+async fn hosted_npm_warns_when_pinned_allow_scripts_approval_is_lost() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pinned = format!("{NAME}@{VERSION}");
+    write_project_with_allow_scripts(tmp.path(), serde_json::json!({ &pinned: true }));
+    let package_json = std::fs::read(tmp.path().join("package.json")).unwrap();
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "anchor: {env}");
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(lock.contains("\"hasInstallScript\": true"), "{lock}");
+    assert_eq!(
+        warning_codes(&env),
+        vec![
+            "redirect_npm_allow_remote".to_string(),
+            "redirect_npm_allow_scripts".to_string()
+        ],
+        "{env}"
+    );
+    let detail = env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_npm_allow_scripts")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap()
+        .to_string();
+    assert!(
+        detail.contains(&format!("`\"{pinned}\": true`"))
+            && detail.contains(&format!("`\"{NAME}\": true`"))
+            && detail.contains("strict-allow-scripts"),
+        "the warning names the lost pin and the name-only remedy: {detail}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package.json")).unwrap(),
+        package_json,
+        "the user's allowScripts policy is never rewritten"
+    );
+
+    // A name-only approval keeps matching the redirected entry: no warning.
+    let tmp = tempfile::tempdir().unwrap();
+    write_project_with_allow_scripts(tmp.path(), serde_json::json!({ &pinned: true, NAME: true }));
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "anchor: {env}");
+    assert_eq!(
+        warning_codes(&env),
+        vec!["redirect_npm_allow_remote".to_string()],
+        "{env}"
+    );
+}
+
 /// A clean, fully-successful hosted run must carry an EXACT warning set — not
 /// merely "contains X". Presence-only assertions let spurious warnings ride
 /// along unnoticed: every pnpm/yarn/bun/Rush run shipped a bogus
