@@ -1721,13 +1721,16 @@ impl EjectSnapshot {
     }
 }
 
-/// Standalone `vendor` in a hosted project: EJECT. The patch set comes only
-/// from the lockfile pins (purl + the uuid in each hosted URL); each record
-/// is fetched from the API, vendored into
-/// `.socket/vendor/` exactly like `scan --mode vendored`, and the lock is
-/// rewired from hosted to vendored (the engine's takeover restores each
-/// pin's upstream registry entry first, so `vendor --revert` later returns
-/// the project to upstream, not to hosted).
+/// Standalone `vendor` with hosted pins in scope: EJECT. The patch set comes
+/// only from the lockfile pins (purl + the uuid in each hosted URL), even
+/// when `.socket/manifest.json` exists: manifest-only patches are not
+/// vendored and the manifest is not rewritten (vendoring those takes a full
+/// `scan --mode vendored`). Each record is fetched from the API, vendored
+/// into `.socket/vendor/` exactly like `scan --mode vendored`, and the lock
+/// is rewired from hosted to vendored in one planned transition: every
+/// pin's upstream registry entry is restored first (not per purl by the
+/// engine's takeover), so `vendor --revert` later returns the project to
+/// upstream, not to hosted.
 async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
     let (client, use_public_proxy) =
