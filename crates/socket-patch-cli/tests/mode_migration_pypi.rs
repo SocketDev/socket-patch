@@ -873,11 +873,26 @@ async fn uv_no_sources_is_refused_in_both_modes() {
 #[tokio::test]
 async fn uv_no_binary_is_refused_in_both_modes() {
     for (script, file, setting, refused) in [
-        (false, "pyproject.toml", "\n[tool.uv]\nno-binary-package = [\"Six\"]\n", true),
-        (false, "pyproject.toml", "\n[tool.uv]\nno-binary = true\n", true),
+        (
+            false,
+            "pyproject.toml",
+            "\n[tool.uv]\nno-binary-package = [\"Six\"]\n",
+            true,
+        ),
+        (
+            false,
+            "pyproject.toml",
+            "\n[tool.uv]\nno-binary = true\n",
+            true,
+        ),
         (false, "uv.toml", "no-binary-package = [\"six\"]\n", true),
         (true, "job.py", "", true),
-        (false, "pyproject.toml", "\n[tool.uv]\nno-build-package = [\"six\"]\n", false),
+        (
+            false,
+            "pyproject.toml",
+            "\n[tool.uv]\nno-build-package = [\"six\"]\n",
+            false,
+        ),
     ] {
         let (_tmp, root) = project();
         let label = if script { "script" } else { file };
