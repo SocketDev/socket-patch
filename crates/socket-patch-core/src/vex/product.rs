@@ -8,7 +8,8 @@
 //!      is returned as the URL with any credentials (userinfo), query
 //!      and fragment removed.
 //!   2. `package.json` (npm)        → `pkg:npm/<name>@<version>`
-//!   3. `pyproject.toml` (PyPI)     → `pkg:pypi/<PEP 503 name>@<version>`
+//!   3. `pyproject.toml` (PyPI)     → `pkg:pypi/<PEP 503 name>@<PEP 440
+//!      normalized version>`
 //!   4. `Cargo.toml` (Cargo)        → `pkg:cargo/<name>@<version>`
 //!   5. `go.mod` (Go)               → `pkg:golang/<module>` (go.mod
 //!      records no version)

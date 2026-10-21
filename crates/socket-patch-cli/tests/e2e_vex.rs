@@ -645,6 +645,53 @@ fn auto_detect_pyproject_uses_canonical_pypi_name() {
     );
 }
 
+/// #1589: the product version is the PEP 440 normalized one that uv.lock,
+/// the built wheel and SBOMs record, through `[project]` and
+/// `[tool.poetry]` alike.
+#[test]
+fn auto_detect_pyproject_normalizes_pep440_version() {
+    for (pyproject, product) in [
+        (
+            "[project]\nname = \"My_Service\"\nversion = \"1.0.0-RC1\"\n",
+            "pkg:pypi/my-service@1.0.0rc1",
+        ),
+        (
+            "[tool.poetry]\nname = \"demo-ver\"\nversion = \"1.0.0-beta.1\"\n\n[build-system]\nbuild-backend = \"poetry.core.masonry.api\"\n",
+            "pkg:pypi/demo-ver@1.0.0b1",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(cwd.join("pyproject.toml"), pyproject).unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:pypi/six@1.16.0".to_string(),
+            make_record(
+                "11111111-1111-4111-8111-111111111111",
+                "six.py",
+                "a".repeat(64).as_str(),
+                "b".repeat(64).as_str(),
+                "GHSA-z",
+                &["CVE-Z"],
+            ),
+        );
+        write_manifest(cwd, &manifest);
+
+        let out = cli()
+            .args(["vex", "--cwd", cwd.to_str().unwrap(), "--no-verify"])
+            .output()
+            .expect("invoke vex");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["statements"][0]["products"][0]["@id"], product);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // empty overrides mean "unset"
 //

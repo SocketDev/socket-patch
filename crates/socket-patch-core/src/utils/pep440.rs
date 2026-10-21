@@ -1,7 +1,8 @@
 //! PEP 440 version equality — the comparison pip, uv and Hatch apply to a
-//! hand-written `name==X` pin.
+//! hand-written `name==X` pin — and the normalized spelling
+//! (`normalize`) that uv.lock, wheel METADATA and PyPI record.
 //!
-//! Only equality is implemented: the writers that rewrite a pin need to know
+//! No ordering is implemented: the writers that rewrite a pin need to know
 //! whether `==X` selects exactly the release being patched, and under PEP 440
 //! that ignores case, leading zeros, trailing `.0` release segments and the
 //! alternate pre/post/dev spellings (`1.16` == `1.16.0` == `01.16.0.0`,
@@ -40,11 +41,11 @@ enum LocalPart {
     Text(String),
 }
 
-/// A parsed version in the form PEP 440 equality compares.
+/// A parsed version with every number's leading zeros stripped.
 #[derive(Debug, PartialEq, Eq)]
 struct Version {
     epoch: String,
-    /// Release segments with trailing zeros removed (`1.16.0` → `[1, 16]`).
+    /// Release segments as written (`01.16.0` → `[1, 16, 0]`).
     release: Vec<String>,
     pre: Option<(&'static str, String)>,
     post: Option<String>,
@@ -55,10 +56,7 @@ struct Version {
 fn parse(text: &str) -> Option<Version> {
     let captures = VERSION.captures(text)?;
     let digits = |name: &str| captures.name(name).map(|m| number(m.as_str()));
-    let mut release: Vec<String> = captures["release"].split('.').map(number).collect();
-    while release.len() > 1 && release.last().is_some_and(|segment| segment == "0") {
-        release.pop();
-    }
+    let release = captures["release"].split('.').map(number).collect();
     let pre = captures.name("pre_l").map(|label| {
         let label = match label.as_str().to_ascii_lowercase().as_str() {
             "a" | "alpha" => "a",
@@ -85,7 +83,9 @@ fn parse(text: &str) -> Option<Version> {
                 if part.bytes().all(|byte| byte.is_ascii_digit()) {
                     LocalPart::Number(number(part))
                 } else {
-                    LocalPart::Text(part.to_ascii_lowercase())
+                    // `str.lower()`, as `packaging` does: `(?i)` lets
+                    // `[a-z]` match U+212A KELVIN SIGN, which lowers to `k`.
+                    LocalPart::Text(part.to_lowercase())
                 }
             })
             .collect()
@@ -105,7 +105,17 @@ fn parse(text: &str) -> Option<Version> {
 /// version on either side is never equal to anything: callers fail closed.
 pub(crate) fn versions_equal(a: &str, b: &str) -> bool {
     match (parse(a), parse(b)) {
-        (Some(a), Some(b)) => a == b,
+        (Some(mut a), Some(mut b)) => {
+            // Equality ignores trailing `.0` release segments.
+            for version in [&mut a, &mut b] {
+                while version.release.len() > 1
+                    && version.release.last().is_some_and(|segment| segment == "0")
+                {
+                    version.release.pop();
+                }
+            }
+            a == b
+        }
         _ => false,
     }
 }
@@ -123,15 +133,13 @@ pub(crate) fn is_valid(text: &str) -> bool {
 /// dot-separated local label (`1.0.0-RC1` → `1.0.0rc1`, `v01.02` → `1.2`,
 /// `1.0+Local-01` → `1.0+local.1`). `None` when `text` is not valid PEP 440.
 pub(crate) fn normalize(text: &str) -> Option<String> {
-    let captures = VERSION.captures(text)?;
     let parsed = parse(text)?;
     let mut out = String::new();
     if parsed.epoch != "0" {
         out.push_str(&parsed.epoch);
         out.push('!');
     }
-    let release: Vec<String> = captures["release"].split('.').map(number).collect();
-    out.push_str(&release.join("."));
+    out.push_str(&parsed.release.join("."));
     if let Some((label, n)) = &parsed.pre {
         out.push_str(label);
         out.push_str(n);
@@ -291,6 +299,8 @@ mod tests {
             ("1.0.0+Local.1", "1.0.0+local.1"),
             ("1.0.0+Local.Build", "1.0.0+local.build"),
             ("1.0+Ubuntu-01", "1.0+ubuntu.1"),
+            ("1.0+abc.007", "1.0+abc.7"),
+            ("1.0+\u{212A}8s", "1.0+k8s"),
             ("1.0.post0", "1.0.post0"),
             ("1.0-post.1", "1.0.post1"),
             ("1.0-1", "1.0.post1"),
