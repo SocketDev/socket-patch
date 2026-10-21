@@ -908,18 +908,44 @@ mod tests {
     /// says whether the registry was unreachable, reset or timed out.
     #[tokio::test]
     async fn a_failed_lookup_keeps_the_transport_cause() {
-        // A port that was just free: connecting is refused, deterministically.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let url = format!("http://127.0.0.1:{port}/pypi/six/1.16.0/json");
+        use tokio::io::AsyncReadExt;
+
+        // A server that holds its port for the whole test (so nothing else
+        // can bind it) and hangs up on every request after reading its head:
+        // the client sees the connection close before any response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/pypi/six/1.16.0/json",
+            listener.local_addr().unwrap()
+        );
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            }
+        });
         let client = UpstreamClient::new(false);
-        let json = client.get_json(&url).await.expect_err("nothing listens");
-        let bytes = client.download(&url).await.expect_err("nothing listens");
+        let deadline = std::time::Duration::from_secs(30);
+        let json = tokio::time::timeout(deadline, client.get_json(&url))
+            .await
+            .expect("the lookup ends once the server hangs up")
+            .expect_err("the server never answers");
+        let bytes = tokio::time::timeout(deadline, client.download(&url))
+            .await
+            .expect("the download ends once the server hangs up")
+            .expect_err("the server never answers");
         for err in [json, bytes] {
             assert!(err.starts_with(&format!("GET {url}: ")), "{err}");
-            assert!(err.to_lowercase().contains("refused"), "{err}");
+            assert!(
+                err.contains("connection closed before message completed"),
+                "the cause chain must be kept: {err}"
+            );
         }
     }
 
