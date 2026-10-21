@@ -1302,7 +1302,10 @@ pub async fn run(args: GetArgs) -> i32 {
                 let selected = vec![search_result_from_response(&patch)];
                 let user_patch_warnings =
                     match super::user_patches::check(&args.common, [&patch.purl]).await {
-                        Ok(warnings) => warnings,
+                        Ok(warnings) => {
+                            super::user_patches::warn(&args.common, &warnings);
+                            warnings
+                        }
                         Err(error) => {
                             return super::user_patches::refuse(
                                 &args.common,
@@ -1741,7 +1744,10 @@ pub async fn run(args: GetArgs) -> i32 {
         selected
     };
     match super::user_patches::check(&args.common, selected.iter().map(|p| &p.purl)).await {
-        Ok(warnings) => narrow_warnings.extend(warnings),
+        Ok(warnings) => {
+            super::user_patches::warn(&args.common, &warnings);
+            narrow_warnings.extend(warnings);
+        }
         Err(error) => return super::user_patches::refuse(&args.common, JsonCommand::Get, error),
     }
     if agent_preview {

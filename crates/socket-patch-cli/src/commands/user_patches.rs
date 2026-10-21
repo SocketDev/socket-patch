@@ -28,8 +28,9 @@ pub(crate) fn detail(purl: &str, sources: &[String], allowed: bool) -> String {
 }
 
 /// Explicit-target commands fail before mutation rather than silently succeeding
-/// without the requested patch. The caller may attach approved warnings to its
-/// own envelope. Nothing here downloads or applies the user's patch.
+/// without the requested patch. Approved overrides come back as warnings for
+/// the caller to print once (see [`warn`]) and attach to its own envelope.
+/// Nothing here downloads or applies the user's patch.
 pub(crate) async fn check(
     common: &GlobalArgs,
     purls: impl IntoIterator<Item = impl AsRef<str>>,
@@ -48,9 +49,6 @@ pub(crate) async fn check(
         }
         let message = detail(purl, &sources, common.allow_user_patches);
         if common.allow_user_patches {
-            if !common.silent && !common.json {
-                eprintln!("Warning: {message}");
-            }
             warnings.push((ALLOWED.into(), message));
         } else {
             conflicts.push(message);
@@ -62,6 +60,16 @@ pub(crate) async fn check(
         conflicts.sort();
         conflicts.dedup();
         Err(EnvelopeError::new(CONFLICT, conflicts.join("\n")))
+    }
+}
+
+/// The human copy of [`check`]'s approved overrides; JSON carries them in
+/// the envelope and `--silent` mutes them.
+pub(crate) fn warn(common: &GlobalArgs, warnings: &[(String, String)]) {
+    if !common.silent && !common.json {
+        for (_, detail) in warnings {
+            eprintln!("Warning: {detail}");
+        }
     }
 }
 

@@ -98,13 +98,25 @@ impl UserPatchIndex {
             } else {
                 index.patch_directory(&dir.join("patches"), false).await;
             }
-            for file in ["pnpm-workspace.yaml", "pnpm-lock.yaml", "yarn.lock"] {
+            let yarn_lock = dir.join("yarn.lock");
+            if let Some(text) = index.read(&yarn_lock, "npm").await {
+                // Only Berry has patch: locators. Every Berry lock carries
+                // builtin compat patches, so scan the resolution lines rather
+                // than parse what can be a very large lockfile.
+                for line in text.lines() {
+                    let Some(value) = line.trim_start().strip_prefix("resolution:") else {
+                        continue;
+                    };
+                    let value = value.trim().trim_matches('"');
+                    // A locator has an ident before @patch:.
+                    if let Some((_, source)) = value.split_once("@patch:") {
+                        index.yarn(&format!("patch:{source}"), &yarn_lock);
+                    }
+                }
+            }
+            for file in ["pnpm-workspace.yaml", "pnpm-lock.yaml"] {
                 let path = dir.join(file);
                 if let Some(text) = index.read(&path, "npm").await {
-                    // Yarn classic isn't YAML; only Berry has patch: locators.
-                    if file == "yarn.lock" && !text.contains("patch:") {
-                        continue;
-                    }
                     if file == "pnpm-lock.yaml"
                         && !text.contains("patchedDependencies")
                         && !text.contains("patch_hash")
@@ -112,7 +124,7 @@ impl UserPatchIndex {
                     {
                         continue;
                     }
-                    match serde_saphyr::from_multiple::<Value>(&text) {
+                    match serde_saphyr::from_multiple_with_options::<Value>(&text, lock_options()) {
                         Ok(documents) => {
                             for value in documents {
                                 index.native(&value, &path);
@@ -124,20 +136,6 @@ impl UserPatchIndex {
                                                 .filter_map(Value::as_str)
                                                 .map(str::to_owned),
                                         );
-                                    }
-                                }
-                                if file == "yarn.lock" {
-                                    if let Some(map) = value.as_object() {
-                                        for entry in map.values() {
-                                            if let Some(spec) = entry["resolution"].as_str() {
-                                                // A locator has an ident before @patch:.
-                                                if let Some((_, source)) =
-                                                    spec.split_once("@patch:")
-                                                {
-                                                    index.yarn(&format!("patch:{source}"), &path);
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                             }
@@ -152,6 +150,15 @@ impl UserPatchIndex {
             }
             for file in ["package-lock.json", "npm-shrinkwrap.json", "bun.lock"] {
                 let path = dir.join(file);
+                // Like the pnpm lock: a lock that never says `patched` holds
+                // no patch evidence, so an unparseable one can't hide any.
+                if !index
+                    .read(&path, "npm")
+                    .await
+                    .is_some_and(|text| text.contains("patched"))
+                {
+                    continue;
+                }
                 if let Some(value) = index.json(&path, "npm").await {
                     index.native(&value, &path);
                     if let Some(packages) = value["packages"].as_object() {
@@ -204,10 +211,37 @@ impl UserPatchIndex {
     // Positive patterns are a conservative union: a patch in an excluded member
     // may still protect the same release elsewhere, never silently lose it.
     fn workspace_members(&mut self, root: &Path, pattern: &str) -> Vec<std::path::PathBuf> {
-        if Path::new(pattern).is_absolute() || pattern.split('/').any(|p| p == "..") {
+        if Path::new(pattern).is_absolute() {
             self.unknown("npm", root, "workspace outside the inspection root");
             return Vec::new();
         }
+        // Resolve `..` lexically: `packages/b/../a` is `packages/a`, and a
+        // leading `../shared/*` re-roots the walk at the parent.
+        let mut root = root.to_path_buf();
+        let mut segments: Vec<&str> = Vec::new();
+        for segment in pattern.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => match segments.last() {
+                    Some(last) if last.contains(['*', '?', '{', '[', '(']) => {
+                        self.unknown("npm", &root, "workspace glob traverses a wildcard");
+                        return Vec::new();
+                    }
+                    Some(_) => {
+                        segments.pop();
+                    }
+                    None => {
+                        if !root.pop() {
+                            self.unknown("npm", &root, "workspace outside the filesystem root");
+                            return Vec::new();
+                        }
+                    }
+                },
+                _ => segments.push(segment),
+            }
+        }
+        let pattern = segments.join("/");
+        let (root, pattern) = (root.as_path(), pattern.as_str());
         let prefix: std::path::PathBuf = pattern
             .split('/')
             .take_while(|p| !p.contains(['*', '?', '{', '[', '(']))
@@ -229,10 +263,11 @@ impl UserPatchIndex {
             .max_depth(max_depth)
             .into_iter()
             .filter_entry(|entry| {
-                !matches!(
-                    entry.file_name().to_str(),
-                    Some("node_modules" | ".git" | ".socket" | "target" | ".venv")
-                )
+                (entry.file_type().is_dir() || entry.path_is_symlink())
+                    && !matches!(
+                        entry.file_name().to_str(),
+                        Some("node_modules" | ".git" | ".socket" | "target" | ".venv")
+                    )
             });
         let mut out = Vec::new();
         let patterns = vec![pattern.to_string()];
@@ -258,24 +293,33 @@ impl UserPatchIndex {
             if entry.depth() == 32 && entry.file_type().is_dir() {
                 self.unknown("npm", entry.path(), "workspace inspection depth exceeded");
             }
-            if entry.file_type().is_symlink() && (entry.depth() == 0 || entry.path().is_dir()) {
-                self.unknown(
-                    "npm",
-                    entry.path(),
-                    "linked workspace cannot be inspected safely",
-                );
-                continue;
-            }
-            if workspaces_include_as(&patterns, &components, WorkspacesDialect::YARN_BERRY) {
-                if entry.file_type().is_symlink() {
+            // Package managers only treat a directory with a package.json as
+            // a workspace; anything else under a `**` glob is just source.
+            let member = entry.path().join("package.json").is_file();
+            if entry.file_type().is_symlink() {
+                // The walk doesn't follow links, so a link that is (or leads
+                // to) a member can't be inspected.
+                if entry.depth() == 0
+                    || (entry.path().is_dir()
+                        && (member
+                            || workspaces_include_as(
+                                &patterns,
+                                &components,
+                                WorkspacesDialect::YARN_BERRY,
+                            ) && !pattern.contains("**")))
+                {
                     self.unknown(
                         "npm",
                         entry.path(),
                         "linked workspace cannot be inspected safely",
                     );
-                } else if entry.file_type().is_dir() {
-                    out.push(entry.path().to_path_buf());
                 }
+                continue;
+            }
+            if member
+                && workspaces_include_as(&patterns, &components, WorkspacesDialect::YARN_BERRY)
+            {
+                out.push(entry.path().to_path_buf());
             }
         }
         out
@@ -447,13 +491,8 @@ impl UserPatchIndex {
                 continue;
             }
             if user_patch {
-                let (name, version) = split_selector(&source);
-                self.add(
-                    "npm",
-                    name,
-                    version.map(|v| v.strip_prefix("npm:").unwrap_or(v)),
-                    path,
-                );
+                let (name, version) = locator_target(&source);
+                self.add("npm", name, version, path);
             }
             return;
         }
@@ -474,9 +513,12 @@ impl UserPatchIndex {
                 .filter_map(Value::as_str)
                 .filter(|s| s.contains("patch-package"))
             {
-                if script.contains("cd ")
-                    || (script.contains("--patch-dir") && !flag.is_match(script))
-                {
+                // A `cd` after patch-package (`patch-package && cd ios && pod
+                // install`) can't move the directory it already read.
+                let moved = script
+                    .find("cd ")
+                    .is_some_and(|cd| cd < script.rfind("patch-package").unwrap_or(0));
+                if moved || (script.contains("--patch-dir") && !flag.is_match(script)) {
                     self.unknown(
                         "npm",
                         &dir.join("package.json"),
@@ -485,7 +527,7 @@ impl UserPatchIndex {
                 }
                 for captures in flag.captures_iter(script) {
                     let path = captures.iter().skip(1).flatten().next().unwrap().as_str();
-                    if path.contains(['$', '`']) || script.contains("cd ") {
+                    if path.contains(['$', '`']) || moved {
                         self.unknown(
                             "npm",
                             &dir.join("package.json"),
@@ -616,9 +658,8 @@ impl UserPatchIndex {
                         for (key, entry) in table.iter() {
                             // Socket's managed paths/registries must remain eligible for updates.
                             let target = entry.get("path").and_then(toml_edit::Item::as_str);
-                            if target.is_some_and(|p| {
-                                p.trim_start_matches("./").starts_with(".socket/vendor/")
-                            }) {
+                            if target.is_some_and(crate::vendor::cargo_config::path_is_socket_owned)
+                            {
                                 continue;
                             }
                             let name = entry
@@ -651,6 +692,37 @@ impl UserPatchIndex {
             }
         }
     }
+}
+
+/// The package a Yarn locator installs. An alias (`alias@npm:real@1.0.0`)
+/// installs `real`, which is the name the crawler reports.
+fn locator_target(locator: &str) -> (&str, Option<&str>) {
+    let at = locator
+        .char_indices()
+        .skip(1)
+        .find(|&(_, c)| c == '@')
+        .map(|(i, _)| i);
+    let Some(at) = at else {
+        return (locator, None);
+    };
+    let (name, range) = (&locator[..at], &locator[at + 1..]);
+    match range.strip_prefix("npm:") {
+        Some(target) if target.get(1..).is_some_and(|t| t.contains('@')) => split_selector(target),
+        Some(version) => (name, Some(version)),
+        None => (name, Some(range)),
+    }
+}
+
+fn lock_options() -> serde_saphyr::Options {
+    // Lockfiles of large monorepos exceed the default 250k-node budget, and a
+    // parse failure would protect every npm package.
+    let mut budget = serde_saphyr::Budget::default();
+    budget.max_events = 64_000_000;
+    budget.max_nodes = 32_000_000;
+    budget.max_total_scalar_bytes = 1 << 30;
+    let mut options = serde_saphyr::Options::default();
+    options.budget = Some(budget);
+    options
 }
 
 fn split_selector(key: &str) -> (&str, Option<&str>) {
@@ -897,6 +969,127 @@ mod tests {
         ] {
             assert!(index.conflicts(purl).is_empty(), "{purl}: {index:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn cd_after_patch_package_keeps_the_default_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"scripts":{"postinstall":"patch-package && cd ios && pod install"}}"#,
+        );
+        write(tmp.path(), "patches/plain+1.0.0.patch", "user diff");
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(!index.conflicts("pkg:npm/plain@1.0.0").is_empty());
+        assert!(
+            index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
+
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"scripts":{"postinstall":"cd app && patch-package"}}"#,
+        );
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(!index.conflicts("pkg:npm/other@1.0.0").is_empty());
+    }
+
+    #[tokio::test]
+    async fn yarn_alias_patch_protects_the_real_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"dependencies":{"alias":"patch:alias@npm%3Areal%401.0.0#./fix.patch"}}"#,
+        );
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(
+            !index.conflicts("pkg:npm/real@1.0.0").is_empty(),
+            "{index:?}"
+        );
+        assert!(
+            index.conflicts("pkg:npm/real@2.0.0").is_empty(),
+            "{index:?}"
+        );
+    }
+
+    #[test]
+    fn locator_target_reads_plain_scoped_and_aliased_locators() {
+        assert_eq!(locator_target("real@npm:1.0.0"), ("real", Some("1.0.0")));
+        assert_eq!(locator_target("@s/p@npm:1.0.0"), ("@s/p", Some("1.0.0")));
+        assert_eq!(locator_target("a@npm:real@1.0.0"), ("real", Some("1.0.0")));
+        assert_eq!(locator_target("a@npm:@s/p@1.0.0"), ("@s/p", Some("1.0.0")));
+        assert_eq!(locator_target("a@npm:"), ("a", Some("")));
+        assert_eq!(locator_target("bare"), ("bare", None));
+    }
+
+    #[tokio::test]
+    async fn cargo_path_merely_under_socket_vendor_is_still_a_user_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[patch.crates-io]\nserde = { path = '.socket/vendor/../../forks/serde' }\n",
+        );
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(!index.conflicts("pkg:cargo/serde@1.0.0").is_empty());
+    }
+
+    #[tokio::test]
+    async fn double_star_workspace_ignores_non_member_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            "packages: ['packages/**']\n",
+        );
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(
+            tmp.path(),
+            "packages/a/src/fixtures/bad/package.json",
+            "{broken",
+        );
+        write(tmp.path(), "packages/a/dist/x.js", "");
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        // pnpm itself reads that broken manifest as a project, so it still
+        // protects npm; directories without one are not inspected at all.
+        assert!(!index.conflicts("pkg:npm/x@1.0.0").is_empty());
+        std::fs::remove_file(tmp.path().join("packages/a/src/fixtures/bad/package.json")).unwrap();
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(index.conflicts("pkg:npm/x@1.0.0").is_empty(), "{index:?}");
+    }
+
+    #[tokio::test]
+    async fn dot_dot_workspace_globs_resolve_lexically() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "app/package.json",
+            r#"{"workspaces":["packages/b/../a", "../shared/*"]}"#,
+        );
+        write(tmp.path(), "app/packages/a/package.json", "{}");
+        write(
+            tmp.path(),
+            "app/packages/a/patches/one+1.0.0.patch",
+            "user diff",
+        );
+        write(tmp.path(), "shared/s/package.json", "{}");
+        write(tmp.path(), "shared/s/patches/two+2.0.0.patch", "user diff");
+        let index = UserPatchIndex::discover(&tmp.path().join("app")).await;
+        assert!(
+            !index.conflicts("pkg:npm/one@1.0.0").is_empty(),
+            "{index:?}"
+        );
+        assert!(
+            !index.conflicts("pkg:npm/two@2.0.0").is_empty(),
+            "{index:?}"
+        );
+        assert!(
+            index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
     }
 
     #[tokio::test]

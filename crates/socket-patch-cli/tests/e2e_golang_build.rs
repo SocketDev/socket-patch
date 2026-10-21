@@ -720,6 +720,24 @@ fn apply_json(dir: &Path, modcache: &Path) -> (i32, String, String) {
     )
 }
 
+/// [`apply_json`] with `--allow-user-patches`, for guards behind that gate.
+fn apply_json_consented(dir: &Path, modcache: &Path) -> (i32, String, String) {
+    run_socket(
+        dir,
+        &[
+            "apply",
+            "--offline",
+            "--allow-user-patches",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            dir.to_str().unwrap(),
+        ],
+        modcache,
+    )
+}
+
 fn check(dir: &Path, modcache: &Path) -> (i32, String, String) {
     run_socket(
         dir,
@@ -792,6 +810,8 @@ fn go_work_replace_overrides_the_socket_replace() {
     assert!(go_out(&consumer, &env).contains("OUT: FORK"));
 
     write_patch(&consumer);
+    // The go.work replace is also a user patch; consent past that gate so
+    // the run reaches the go.work guard this test is about.
     // The dry run predicts the refusal.
     let (code, so, se) = run_socket(
         &consumer,
@@ -799,6 +819,7 @@ fn go_work_replace_overrides_the_socket_replace() {
             "apply",
             "--offline",
             "--dry-run",
+            "--allow-user-patches",
             "--ecosystems",
             "golang",
             "--json",
@@ -812,7 +833,7 @@ fn go_work_replace_overrides_the_socket_replace() {
         "apply --dry-run must predict the refusal:\n{so}\n{se}"
     );
     assert!(so.contains("go.work replaces"), "{so}");
-    let (code, so, se) = apply_json(&consumer, &modcache);
+    let (code, so, se) = apply_json_consented(&consumer, &modcache);
     assert_ne!(
         code, 0,
         "apply must refuse an overridden replace:\n{so}\n{se}"
@@ -827,12 +848,12 @@ fn go_work_replace_overrides_the_socket_replace() {
 
     // Applied before the go.work replace existed: the replace is inert.
     std::fs::remove_file(consumer.join("go.work")).unwrap();
-    let (code, so, se) = apply_json(&consumer, &modcache);
+    let (code, so, se) = apply_json_consented(&consumer, &modcache);
     assert_eq!(code, 0, "apply without go.work:\n{so}\n{se}");
     std::fs::write(consumer.join("go.work"), &go_work).unwrap();
     assert!(go_out(&consumer, &env).contains("OUT: FORK"));
     // A re-run doesn't call the inert replace in sync.
-    let (code, so, se) = apply_json(&consumer, &modcache);
+    let (code, so, se) = apply_json_consented(&consumer, &modcache);
     assert_ne!(code, 0, "re-run apply must refuse:\n{so}\n{se}");
     let (code, so, se) = check(&consumer, &modcache);
     assert_eq!(

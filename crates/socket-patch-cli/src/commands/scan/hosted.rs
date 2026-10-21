@@ -1047,11 +1047,17 @@ async fn run_redirect_selected_untracked(
         if let Err(error) =
             crate::commands::user_patches::check(common, candidates.iter().map(&sel_purl)).await
         {
-            let command = scan_result
-                .as_ref()
-                .map(|env| env.command)
-                .unwrap_or(crate::json_envelope::Command::Scan);
-            return crate::commands::user_patches::refuse(common, command, error);
+            // The shared refusal path keeps this run's envelope and lets
+            // telemetry go out before the JSON error.
+            return refuse(
+                common,
+                scan_result.take(),
+                &engine::Refusal {
+                    code: error.code,
+                    message: error.message,
+                },
+                &mut telemetry.json_error,
+            );
         }
     }
 

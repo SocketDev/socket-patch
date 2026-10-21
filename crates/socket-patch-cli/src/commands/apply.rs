@@ -1241,11 +1241,15 @@ pub(crate) async fn run_locked(
             // rightly ignores it). It rides the run-warning channel so it
             // is never silent.
             let mut run_warnings = run_warnings;
-            run_warnings.extend(
-                user_patch_warnings
-                    .into_iter()
-                    .map(|(code, detail)| RunWarning { code, detail }),
-            );
+            // A nested apply's caller (get, scan) already reported the
+            // overrides it approved; repeating them would double each line.
+            if args.nested.is_none() {
+                run_warnings.extend(
+                    user_patch_warnings
+                        .into_iter()
+                        .map(|(code, detail)| RunWarning { code, detail }),
+                );
+            }
             run_warnings.extend(results.iter().filter_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success)?;
                 note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)

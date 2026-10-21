@@ -1730,7 +1730,10 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
     let user_patch_warnings =
         match super::user_patches::check(common, pins.iter().map(|p| &p.purl)).await {
-            Ok(warnings) => warnings,
+            Ok(warnings) => {
+                super::user_patches::warn(common, &warnings);
+                warnings
+            }
             Err(error) => return super::user_patches::refuse(common, Command::Vendor, error),
         };
     let (client, use_public_proxy) =
@@ -2228,11 +2231,14 @@ async fn run_vendor(
     // even when zero in-scope patches remain. Its post-reconcile ledger
     // feeds the staging harvest below and then the engine.
     match super::user_patches::check(common, manifest.patches.keys()).await {
-        Ok(warnings) => env.warnings.extend(
-            warnings
-                .into_iter()
-                .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
-        ),
+        Ok(warnings) => {
+            super::user_patches::warn(common, &warnings);
+            env.warnings.extend(
+                warnings
+                    .into_iter()
+                    .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
+            );
+        }
         Err(error) => {
             if !common.json {
                 eprintln!("Error: {}", error.message);

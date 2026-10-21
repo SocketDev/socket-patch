@@ -2225,10 +2225,14 @@ async fn run_scan(
     // Keep the full crawl above for GC: a protected package is still installed.
     // Protect before querying/selecting, in every mode and in dry-run previews.
     let user_patches = super::user_patches::inspect(&args.common).await;
+    let mut user_patch_withheld = 0usize;
     filtered_crawled.retain(|package| {
         let sources = user_patches.conflicts(&package.purl);
         if sources.is_empty() {
             return true;
+        }
+        if !args.common.allow_user_patches {
+            user_patch_withheld += 1;
         }
         layout_refusals.push((
             if args.common.allow_user_patches {
@@ -2348,8 +2352,13 @@ async fn run_scan(
             emit_scan(&env);
             return code;
         } else if !args.common.silent {
-            // A project the policy skipped as a whole is not an empty one.
-            if !policy.root_excluded() {
+            // A project the policy skipped as a whole is not an empty one,
+            // and neither is one whose every package the consent gate held.
+            if user_patch_withheld > 0 {
+                println!(
+                    "All {user_patch_withheld} installed package(s) are protected by project patches (see the warnings above); nothing was scanned. Pass --allow-user-patches to scan them anyway."
+                );
+            } else if !policy.root_excluded() {
                 println!(
                     "{}",
                     render::no_packages_message(
