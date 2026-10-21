@@ -2230,6 +2230,9 @@ async fn run_vendor(
     // previous run whose patches were dropped from the manifest are reverted
     // even when zero in-scope patches remain. Its post-reconcile ledger
     // feeds the staging harvest below and then the engine.
+    let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
+    // After the reconcile: reverting entries dropped from the manifest
+    // touches no project patch, so a protected record must not block it.
     match super::user_patches::check(common, manifest.patches.keys()).await {
         Ok(warnings) => {
             super::user_patches::warn(common, &warnings);
@@ -2247,7 +2250,6 @@ async fn run_vendor(
             return 1;
         }
     }
-    let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
     if manifest.patches.is_empty() && !common.json && !common.silent {

@@ -42,7 +42,8 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[test]
-fn apply_and_vendor_refuse_declared_patches_despite_matching_hashes_or_general_confirmation() {
+fn apply_skips_and_vendor_refuses_declared_patches_despite_matching_hashes_or_general_confirmation()
+{
     for (file, contents) in [
         (
             "package.json",
@@ -73,12 +74,24 @@ fn apply_and_vendor_refuse_declared_patches_despite_matching_hashes_or_general_c
             let original = std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap();
             let (code, stdout, stderr) = run_with_env(tmp.path(), &args, &[]);
             let value: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
-            assert_eq!(code, 1, "{args:?} {file}: {stdout} {stderr}");
-            assert_eq!(value["error"]["code"], "user_patch_conflict", "{value}");
-            assert!(value["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("--allow-user-patches"));
+            // apply leaves the package out with a warning and succeeds (a
+            // postinstall apply must not fail every install); vendor, an
+            // explicit vendoring of the whole manifest, refuses.
+            let message = if args[0] == "apply" {
+                assert_eq!(code, 0, "{args:?} {file}: {stdout} {stderr}");
+                let warning = value["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|w| w["code"] == "user_patch_conflict")
+                    .unwrap_or_else(|| panic!("{args:?} {file}: {value}"));
+                warning["detail"].as_str().unwrap().to_string()
+            } else {
+                assert_eq!(code, 1, "{args:?} {file}: {stdout} {stderr}");
+                assert_eq!(value["error"]["code"], "user_patch_conflict", "{value}");
+                value["error"]["message"].as_str().unwrap().to_string()
+            };
+            assert!(message.contains("--allow-user-patches"), "{message}");
             assert_eq!(
                 std::fs::read(tmp.path().join("node_modules/example/index.js")).unwrap(),
                 BEFORE
@@ -183,12 +196,87 @@ fn environment_and_read_only_checks_do_not_grant_or_require_consent() {
         &["apply", "--json", "--offline"],
         &[("SOCKET_ALLOW_USER_PATCHES", "1")],
     );
-    assert_eq!(code, 1, "{stdout}");
+    assert_eq!(code, 0, "{stdout}");
     assert!(stdout.contains("user_patch_conflict"));
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/example/index.js")).unwrap(),
+        BEFORE,
+        "the environment grants no consent"
+    );
     let (_, stdout, _) = run_with_env(
         tmp.path(),
         &["apply", "--json", "--offline", "--check"],
         &[],
     );
     assert!(!stdout.contains("user_patch_conflict"), "{stdout}");
+}
+
+#[test]
+fn apply_skips_only_the_protected_package() {
+    let tmp = fixture();
+    write(tmp.path(), "patches/example+1.0.0.patch", b"user diff\n");
+    write(
+        tmp.path(),
+        "node_modules/other/package.json",
+        r#"{"name":"other","version":"2.0.0"}"#,
+    );
+    write(tmp.path(), "node_modules/other/index.js", BEFORE);
+    let manifest_path = tmp.path().join(".socket/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let mut other = manifest["patches"][PURL].clone();
+    other["uuid"] = "22222222-2222-4222-8222-222222222222".into();
+    manifest["patches"]["pkg:npm/other@2.0.0"] = other;
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let original = std::fs::read(&manifest_path).unwrap();
+
+    let (code, stdout, stderr) = run_with_env(tmp.path(), &["apply", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let conflicts: Vec<_> = value["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "user_patch_conflict")
+        .collect();
+    assert_eq!(conflicts.len(), 1, "{value}");
+    assert!(conflicts[0]["detail"].as_str().unwrap().contains(PURL));
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/example/index.js")).unwrap(),
+        BEFORE
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/other/index.js")).unwrap(),
+        AFTER
+    );
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), original);
+}
+
+#[test]
+fn default_apply_replaces_an_earlier_socket_patch_but_not_a_local_edit() {
+    // After an update to a newer patch for the same release, the file holds
+    // the old patch's output, whose blob Socket stored: not a local change.
+    let previous: &[u8] = b"older Socket fix\n";
+    let tmp = fixture();
+    write_blob(&tmp.path().join(".socket"), &git_sha256(previous), previous);
+    write(tmp.path(), "node_modules/example/index.js", previous);
+    let (code, stdout, stderr) = run_with_env(tmp.path(), &["apply", "--json", "--offline"], &[]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/example/index.js")).unwrap(),
+        AFTER
+    );
+
+    // --strict still refuses it.
+    write(tmp.path(), "node_modules/example/index.js", previous);
+    let (code, stdout, stderr) = run_with_env(
+        tmp.path(),
+        &["apply", "--json", "--offline", "--strict"],
+        &[],
+    );
+    assert_eq!(code, 1, "{stdout} {stderr}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/example/index.js")).unwrap(),
+        previous
+    );
 }

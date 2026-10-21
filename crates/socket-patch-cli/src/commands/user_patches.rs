@@ -73,6 +73,45 @@ pub(crate) fn warn(common: &GlobalArgs, warnings: &[(String, String)]) {
     }
 }
 
+/// The manifest-wide gate for `apply`: rather than refuse a whole run over
+/// one protected entry (a postinstall apply would fail every install), drop
+/// the protected records from this run's in-memory copy and report each as
+/// a `user_patch_conflict` warning. Approved overrides stay in and come back
+/// as `user_patch_override` warnings. Only the caller's copy changes; the
+/// manifest on disk is never rewritten here. Also returns the skipped purls:
+/// they are still recorded, so nothing may reconcile them away as dropped.
+pub(crate) async fn skip_protected(
+    common: &GlobalArgs,
+    patches: &mut std::collections::HashMap<
+        String,
+        socket_patch_core::manifest::schema::PatchRecord,
+    >,
+) -> (Vec<(String, String)>, std::collections::HashSet<String>) {
+    let index = inspect(common).await;
+    let mut warnings = Vec::new();
+    let mut skipped = std::collections::HashSet::new();
+    patches.retain(|purl, _| {
+        if !common.purl_ecosystem_selected(purl) {
+            return true;
+        }
+        let sources = index.conflicts(purl);
+        if sources.is_empty() {
+            return true;
+        }
+        let message = detail(purl, &sources, common.allow_user_patches);
+        if common.allow_user_patches {
+            warnings.push((ALLOWED.into(), message));
+            true
+        } else {
+            warnings.push((CONFLICT.into(), message));
+            skipped.insert(purl.clone());
+            false
+        }
+    });
+    warnings.sort();
+    (warnings, skipped)
+}
+
 pub(crate) fn refuse(common: &GlobalArgs, command: Command, error: EnvelopeError) -> i32 {
     if common.json {
         let mut env = Envelope::new(command);

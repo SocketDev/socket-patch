@@ -125,7 +125,11 @@ Every subcommand accepts the same set of "global" flags via a single shared `Glo
 The in-place apply paths (`apply`, agent-mode `get` / `scan`, and their nested
 apply calls) reject files matching neither `beforeHash` nor `afterHash` by
 default. This also protects a pre-existing file where the Socket patch adds a
-new file (empty `beforeHash`). `--allow-user-patches` permits the old
+new file (empty `beforeHash`). The exception is content a Socket patch wrote:
+a file whose hash names a stored `.socket/blobs/` blob (as after an update to a
+newer patch for the same release) is overwritten with the
+`content_mismatch_overwritten` warning, except under `--strict`.
+`--allow-user-patches` permits the old
 warn-and-overwrite behavior: only the full, hash-verified `afterHash` content
 can be written, with `content_mismatch_overwritten` diagnostics. `--strict`
 keeps rejecting file drift even with that consent. `apply --force` remains
@@ -147,13 +151,17 @@ A missing referenced diff does not remove that protection.
 
 - `scan` (every mode, including previews) excludes matching packages before patch
   selection and emits `warnings[].code: user_patch_conflict`, naming the purl
-  and evidence path. Other packages remain eligible; skips alone exit 0. A nested
-  agent apply also checks existing in-scope manifest entries and refuses if any
-  conflict remains, even if the newly selected records have already been saved.
+  and evidence path. Other packages remain eligible; skips alone exit 0.
   The full installed inventory still protects skipped packages from prune-as-missing.
-- Explicit `get` selection (including UUID, `--save-only`, and `--dry-run`),
-  mutating `apply`, and `vendor` refuse selected conflicts with exit 1,
-  `status: error`, `error.code: user_patch_conflict`, before their patch writes.
+- Mutating `apply`, including the nested apply of agent-mode `get` / `scan`,
+  leaves each protected manifest entry out of the run with a
+  `user_patch_conflict` warning and applies every other entry; skips alone exit 0,
+  so a `postinstall` apply never fails an install over them. The manifest is not
+  changed, and a skipped entry is not reconciled away as dropped.
+- Explicit `get` selection (including UUID, `--save-only`, and `--dry-run`) and
+  `vendor` refuse selected conflicts with exit 1, `status: error`,
+  `error.code: user_patch_conflict`, before their patch writes. `vendor` still
+  reverts entries dropped from the manifest first.
   A hosted or vendored writer rechecks under its apply lock before rewiring.
 - `--allow-user-patches` approves the attempt for this invocation and emits
   `user_patch_override` warnings. It is forwarded to nested apply. `--yes`,
@@ -1657,14 +1665,14 @@ command's integration tests check its output.
 | `vendor_prebuilt_stub_invalid` | `failed` | RubyGems: the server stub lacks required attributes or is otherwise invalid; no local stub fallback is permitted. |
 | `vendor_*` / `pypi_*` / `gemfile_*` / `lock_*` / `locked_version_mismatch` / `user_authored_*` / `native_extensions_unsupported` / `platform_gem_unsupported` | `failed`/`skipped` | vendor: per-ecosystem refusal + drift vocabulary; see the Vendor command contract section. New tags are additive (MINOR). |
 
-`user_patch_conflict` is also a scan run warning for packages excluded by the
+`user_patch_conflict` is also a scan and apply run warning for packages excluded by the
 project-patch consent gate; `user_patch_override` records explicit consent.
 
 ### Top-level `EnvelopeError` codes
 
 | Code                  | Subcommands                      | Meaning |
 |-----------------------|----------------------------------|---------|
-| `user_patch_conflict` | get, apply, vendor; hosted/vendored write rechecks | A selected package has project-owned patch/replacement evidence and no `--allow-user-patches` consent. Evidence paths and a remedy are included; exit 1. |
+| `user_patch_conflict` | get, vendor; hosted/vendored write rechecks | A selected package has project-owned patch/replacement evidence and no `--allow-user-patches` consent. Evidence paths and a remedy are included; exit 1. (`scan` and `apply` report it as a warning and skip the package.) |
 | `manifest_not_found`  | remove, repair, rollback, vex, apply (only when the manifest vanishes between apply's existence probe and its locked read) (not `list` since v5.0: a missing manifest is an empty list) | `.socket/manifest.json` doesn't exist. For `vex` (and `scan --vex`) it fires only when, in addition, NOTHING else names a patch — no vendor-ledger entry, no lockfile reference (hosted or vendored) — and the message says so (exit 2 standalone; `apply`/`vendor --vex` treat it as their calm no-op). v3.5: `repair` proceeds anyway (vendored phase only) when a vendor ledger or vendor-path lockfile references exist, and exits 0 with a `redirect_only_project` skip (not this error) when the project's only patch state is hosted pins in its lockfiles (v5.0; or a pre-v5 `redirect-state.json`). `list` likewise no longer fires this on a hosted-only project: v5.0 lists every hosted pin the lockfiles wire (exit 0, labeled `details.mode: "hosted"` + `details.lockfiles: [<files wiring it>]` — no `details.ledger`, since hosted mode keeps none; when the manifest exists too, both are shown, purl-sorted with the manifest entry first on a tie). A pin carries its uuid and empty details unless a pre-v5 redirect ledger records the same purl and uuid (read for migration only: its record supplies the vulnerabilities / tier / description); a pre-v5 ledger record whose pin is in no lockfile is not listed. v5.0: `list` reads the vendor ledger the same way — a vendored-only project (every `scan`/`get --mode vendored` project) lists its ledger entries' embedded records labeled `Mode: vendored (recorded in .socket/vendor/state.json)` in human mode — the twin of the hosted `Mode: hosted (wired in <lockfiles>)` line — (`details.mode: "vendored"` + `details.ledger: ".socket/vendor/state.json"` in JSON), exit 0. A standalone-`vendor` entry's fallback `record` lists the same way once no manifest entry covers it (by ledger key or base purl) — the copy manifest-less `vex` attests from, so `list` never reports `manifest_not_found` for a tree whose VEX document attests a patch; while the manifest covers it, only the manifest entry is listed. All sources always come from the SAME project (see the `--manifest-path` flag row), so `--manifest-path` into another project reads that project's state, never the local one. The error still fires when NONE of the three sources has a patch, and a present-but-broken manifest still reports `manifest_invalid`/`manifest_unreadable` regardless (corruption is never masked). A malformed pre-v5 redirect ledger degrades to "nothing to consult" with a stderr warning, muted by `--silent` (the pins still list); `list --json` carries it in the run-level `warnings[]` as `redirect_ledger_corrupt` instead of on stderr. v5.0: `rollback` likewise proceeds manifest-less when the vendor ledger or the lockfiles' hosted pins hold work (its error is the legacy `{status: "error", error: {code: "manifest_not_found", message: "Manifest not found"}, path}` shape); only the truly-empty project — no manifest, no vendor ledger, no hosted pin (a lone pre-v5 redirect ledger is deleted, exit 0) — keeps the exit-1 error, and a project whose lockfiles still reference `.socket/vendor/` artifacts with NO vendor ledger gets a distinct error naming `socket-patch repair`. `remove` (v5.0) proceeds manifest-less whenever a vendor ledger file exists or the lockfiles pin a hosted patch (an existence probe and the read-only hosted-pin discovery before the lock; the vendor ledger loads under it): ANY vendor-ledger entry matching the identifier — detached or not — is removed through the ledger path (`--preserve-state` and drift-keeps behave exactly as on the manifest path), a hosted-only match restores its upstream registry entry, and when that state exists but holds nothing for the identifier the error is `not_found` (exit 1), not this code — `manifest_not_found` fires from `remove` only when all three sources are empty. Manifest entries are removed in sorted purl order. |
 | `ambiguous_target`    | remove, get, rollback            | The identifier is a package name whose last-segment rule selects several packages across the manifest, the vendor ledger and the hosted pins (`core` → `@angular/core` and `@babel/core`). Nothing is changed (exit 1); the message names each package. Use the full name or a purl. See **Target grammar**. |
 | `manifest_invalid`    | list, remove, apply (incl. `--check`), repair, vendor (incl. `--check`), vex, rollback, get, scan (agent mode) | Manifest exists but is unparseable (malformed JSON or a schema violation). **v5.0, MAJOR (#931)**: one mapping on every command — `apply` used to say `apply_failed`, `repair` `repair_failed`, `vendor` the undocumented `invalid_manifest`, and `apply --check` / `vendor --check` / `vex` / `get` / `rollback` `manifest_unreadable`. Exit codes unchanged (`vex`: 2, every other command 1). Agent-mode `scan` fails with it (exit 1); the other scan modes, which don't read the manifest, add a warning with the same code and go on. |

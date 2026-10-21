@@ -243,7 +243,8 @@ the [rollback contract](../crates/socket-patch-cli/CLI_CONTRACT.md#rollback-comm
 
 By default, `scan` skips packages with declared project patches (pnpm, Yarn,
 `patch-package`, native npm/Bun, Composer, Cargo or Go) and reports where the
-patch was found. Explicit `get`, `apply` and `vendor` refuse those conflicts.
+patch was found, and `apply` leaves them out while applying everything else.
+Explicit `get` and `vendor` refuse those conflicts.
 A user patch is protected even if it changes a different file than Socket's fix.
 
 After reviewing the interaction, you can explicitly approve an attempt:
@@ -255,7 +256,8 @@ socket-patch apply --allow-user-patches --strict
 
 The second form still refuses modified file content. Without `--strict`, explicit
 consent permits replacing a mismatched file with Socket's verified content; it
-does not merge your changes. Without consent, mismatched files fail by default.
+does not merge your changes. Without consent, mismatched files fail by default,
+unless they hold an earlier Socket patch's content (a patch update).
 `--yes` and `--force` do not approve combining declared project patches. Some
 package-manager combinations remain unsupported even with consent. See
 [existing project patches](ecosystems.md#existing-project-patches) for the

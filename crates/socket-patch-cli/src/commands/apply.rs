@@ -120,16 +120,19 @@ fn mismatch_overwrite_warnings(results: &[ApplyResult], dry_run: bool) -> Vec<Ru
         .collect()
 }
 
-/// Unknown local changes fail closed unless explicitly approved. --force is
-/// existing explicit consent for file drift; declared patches have a separate
-/// gate that requires --allow-user-patches even with --force.
+/// Unknown local changes fail closed unless explicitly approved; content an
+/// earlier Socket patch wrote is not a local change (patch updates). --force
+/// is existing explicit consent for file drift; declared patches have a
+/// separate gate that requires --allow-user-patches even with --force.
 fn mismatch_policy(force: bool, strict: bool, allow_user_patches: bool) -> MismatchPolicy {
     if force {
         MismatchPolicy::Force
-    } else if strict || !allow_user_patches {
+    } else if strict {
         MismatchPolicy::Strict
-    } else {
+    } else if allow_user_patches {
         MismatchPolicy::Warn
+    } else {
+        MismatchPolicy::SocketContent
     }
 }
 
@@ -1139,15 +1142,14 @@ pub(crate) async fn run_locked(
         }
     };
 
-    let user_patch_warnings =
-        match super::user_patches::check(&args.common, manifest.patches.keys()).await {
-            Ok(warnings) => warnings,
-            Err(error) => {
-                lock.release();
-                let code = report_apply_failure(&args, &error, &error.message, &telemetry).await;
-                return ApplyRunReport::run_failure(code, &error.code, error.message);
-            }
-        };
+    // Packages the project patched itself sit this run out (warned); every
+    // other record still applies. The read-only `--check` verifies them all.
+    let mut manifest = manifest;
+    let (user_patch_warnings, user_patched) = if args.check {
+        Default::default()
+    } else {
+        super::user_patches::skip_protected(&args.common, &mut manifest.patches).await
+    };
 
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
@@ -1219,7 +1221,7 @@ pub(crate) async fn run_locked(
         NpmPkgManager::Npm | NpmPkgManager::YarnClassic | NpmPkgManager::Unknown => {}
     }
 
-    match apply_patches_inner(&args, manifest, client).await {
+    match apply_patches_inner(&args, manifest, &user_patched, client).await {
         Ok(ApplyOutcome {
             success,
             results,
@@ -1967,6 +1969,7 @@ impl FallbackHomeSkip {
 async fn apply_patches_inner(
     args: &ApplyArgs,
     mut manifest: PatchManifest,
+    user_patched: &HashSet<String>,
     client: &ApiClient,
 ) -> Result<ApplyOutcome, String> {
     // Resolve patch sources (read `.socket/` directly, or stage an overlay
@@ -2016,7 +2019,13 @@ async fn apply_patches_inner(
     // found" early returns — so orphans are reconciled even when the manifest
     // now lists zero in-scope go patches (the all-removed case). No-op unless
     // local go is in scope.
-    reconcile_local_go(&args.common, &target_manifest_purls).await;
+    // Records skipped for project patches are still recorded, not orphans.
+    let recorded: HashSet<String> = target_manifest_purls
+        .iter()
+        .chain(user_patched)
+        .cloned()
+        .collect();
+    reconcile_local_go(&args.common, &recorded).await;
 
     if partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
