@@ -627,6 +627,71 @@ pub fn ancestor_uv_config_files(root: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
+/// A uv setting pair that applies to some packages: a bool that sets it
+/// for every package and a list naming packages (uv's `Combine` keeps the
+/// nearer bool and adds the lists up).
+struct PackageSetting {
+    all: &'static str,
+    packages: &'static str,
+    /// Why the setting makes a wired patch fail, after "{file} sets {key}, ".
+    consequence: &'static str,
+    remedy: &'static str,
+}
+
+const NO_SOURCES: PackageSetting = PackageSetting {
+    all: "no-sources",
+    packages: "no-sources-package",
+    consequence: "so uv ignores the [tool.uv.sources] entry and a plain `uv sync` would \
+                  install the unpatched registry wheel",
+    remedy: "remove the setting to wire a patch",
+};
+
+const NO_BINARY: PackageSetting = PackageSetting {
+    all: "no-binary",
+    packages: "no-binary-package",
+    consequence: "so uv refuses to install it from a wheel and every `uv sync` would fail on \
+                  the patched wheel (\"marked as `--no-binary` but is itself a binary \
+                  distribution\")",
+    remedy: "patches are shipped as wheels; remove the package from the setting to wire a \
+             patch",
+};
+
+/// The governing project settings file, as (label, text, path of its
+/// settings table): a `uv.toml` replaces pyproject's `[tool.uv]` outright.
+fn project_settings<'a>(
+    pyproject: Option<&'a str>,
+    uv_toml: Option<&'a str>,
+) -> Option<(String, &'a str, &'static [&'static str])> {
+    match uv_toml {
+        Some(text) => Some((UV_TOML.to_string(), text, &[][..])),
+        None => pyproject.map(|text| {
+            (
+                "pyproject.toml [tool.uv]".to_string(),
+                text,
+                &["tool", "uv"][..],
+            )
+        }),
+    }
+}
+
+/// The governing project settings for a PEP 723 script in a root whose own
+/// `pyproject` and `uv_toml` may not govern it: when neither sets uv's
+/// settings, `ancestor` (the [`find_ancestor_uv_config`] above the root)
+/// does (#1501).
+fn script_project_settings<'a>(
+    pyproject: Option<&'a str>,
+    uv_toml: Option<&'a str>,
+    ancestor: Option<&'a UvConfig>,
+) -> Option<(String, &'a str, &'static [&'static str])> {
+    match ancestor {
+        Some(config) if !root_governs_script(pyproject, uv_toml) => {
+            let (label, path) = config.settings_location();
+            Some((label, config.text.as_str(), path))
+        }
+        _ => project_settings(pyproject, uv_toml),
+    }
+}
+
 /// Refuse to wire a `[tool.uv.sources]` entry for `name` that uv would
 /// ignore (#564).
 ///
@@ -647,17 +712,12 @@ pub fn refuse_uv_no_sources(
     pyproject: Option<&str>,
     uv_toml: Option<&str>,
 ) -> Result<(), String> {
-    let project = match uv_toml {
-        Some(text) => Some((UV_TOML.to_string(), text, &[][..])),
-        None => pyproject.map(|text| {
-            (
-                "pyproject.toml [tool.uv]".to_string(),
-                text,
-                &["tool", "uv"][..],
-            )
-        }),
-    };
-    refuse_no_sources(name, script, project)
+    refuse_package_setting(
+        &NO_SOURCES,
+        name,
+        script,
+        project_settings(pyproject, uv_toml),
+    )
 }
 
 /// [`refuse_uv_no_sources`] for a PEP 723 script in a root whose own
@@ -671,32 +731,70 @@ pub fn refuse_uv_script_no_sources(
     uv_toml: Option<&str>,
     ancestor: Option<&UvConfig>,
 ) -> Result<(), String> {
-    match ancestor {
-        Some(config) if !root_governs_script(pyproject, uv_toml) => {
-            let (label, path) = config.settings_location();
-            refuse_no_sources(
-                name,
-                Some(script),
-                Some((label, config.text.as_str(), path)),
-            )
-        }
-        _ => refuse_uv_no_sources(name, Some(script), pyproject, uv_toml),
-    }
+    refuse_package_setting(
+        &NO_SOURCES,
+        name,
+        Some(script),
+        script_project_settings(pyproject, uv_toml, ancestor),
+    )
 }
 
-/// The check behind [`refuse_uv_no_sources`]: `project` is the governing
-/// settings file as (label, text, path of its settings table).
-fn refuse_no_sources(
+/// Refuse to wire a patched wheel for `name` that uv may not install
+/// (#1603).
+///
+/// Under `no-binary = true`, or a `no-binary-package` list naming the
+/// package, uv installs the package only from an sdist, and every Socket
+/// artifact is a wheel: once wired, `uv sync` (locked, frozen or plain)
+/// and `uv run --locked` fail. The settings combine as uv's
+/// ([`refuse_uv_no_sources`]): a `uv.toml` replaces pyproject's
+/// `[tool.uv]`, a script's own `no-binary` wins over the project's, the
+/// two lists add up, and `no-binary = false` disables the list.
+pub fn refuse_uv_no_binary(
+    name: &str,
+    script: Option<&str>,
+    pyproject: Option<&str>,
+    uv_toml: Option<&str>,
+) -> Result<(), String> {
+    refuse_package_setting(
+        &NO_BINARY,
+        name,
+        script,
+        project_settings(pyproject, uv_toml),
+    )
+}
+
+/// [`refuse_uv_no_binary`] for a PEP 723 script, with the project settings
+/// chosen as in [`refuse_uv_script_no_sources`].
+pub fn refuse_uv_script_no_binary(
+    name: &str,
+    script: &str,
+    pyproject: Option<&str>,
+    uv_toml: Option<&str>,
+    ancestor: Option<&UvConfig>,
+) -> Result<(), String> {
+    refuse_package_setting(
+        &NO_BINARY,
+        name,
+        Some(script),
+        script_project_settings(pyproject, uv_toml, ancestor),
+    )
+}
+
+/// The check behind [`refuse_uv_no_sources`] and [`refuse_uv_no_binary`]:
+/// `project` is the governing settings file as (label, text, path of its
+/// settings table).
+fn refuse_package_setting(
+    setting: &PackageSetting,
     name: &str,
     script: Option<&str>,
     project: Option<(String, &str, &[&str])>,
 ) -> Result<(), String> {
     struct Settings {
         file: String,
-        no_sources: Option<bool>,
+        all: Option<bool>,
         packages: Vec<String>,
     }
-    fn settings(file: String, toml: &str, path: &[&str]) -> Option<Settings> {
+    let settings = |file: String, toml: &str, path: &[&str]| -> Option<Settings> {
         let document: DocumentMut = toml.parse().ok()?;
         let mut table = document.as_table() as &dyn TableLike;
         for key in path {
@@ -704,9 +802,9 @@ fn refuse_no_sources(
         }
         Some(Settings {
             file,
-            no_sources: table.get("no-sources").and_then(Item::as_bool),
+            all: table.get(setting.all).and_then(Item::as_bool),
             packages: table
-                .get("no-sources-package")
+                .get(setting.packages)
                 .and_then(Item::as_array)
                 .into_iter()
                 .flatten()
@@ -714,7 +812,7 @@ fn refuse_no_sources(
                 .map(canonicalize_pypi_name)
                 .collect(),
         })
-    }
+    };
     let script = script.and_then(|text| {
         let (_, metadata) = script_metadata(text).ok()?;
         settings(
@@ -726,18 +824,17 @@ fn refuse_no_sources(
     let project = project.and_then(|(file, text, path)| settings(file, text, path));
     let levels = [script, project];
     let levels = levels.iter().flatten();
-    let refusal = |file: &str, setting: &str| {
+    let refusal = |file: &str, key: &str| {
         Err(format!(
-            "{file} sets {setting}, so uv ignores the [tool.uv.sources] entry and a plain \
-             `uv sync` would install the unpatched registry wheel; remove the setting to \
-             wire a patch"
+            "{file} sets {key}, {}; {}",
+            setting.consequence, setting.remedy
         ))
     };
     match levels
         .clone()
-        .find_map(|level| Some((level.file.as_str(), level.no_sources?)))
+        .find_map(|level| Some((level.file.as_str(), level.all?)))
     {
-        Some((file, true)) => return refusal(file, "no-sources = true"),
+        Some((file, true)) => return refusal(file, &format!("{} = true", setting.all)),
         Some((_, false)) => return Ok(()),
         None => {}
     }
@@ -746,7 +843,7 @@ fn refuse_no_sources(
         .into_iter()
         .find(|level| level.packages.contains(&name))
     {
-        Some(level) => refusal(&level.file, &format!("no-sources-package naming {name}")),
+        Some(level) => refusal(&level.file, &format!("{} naming {name}", setting.packages)),
         None => Ok(()),
     }
 }

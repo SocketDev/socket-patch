@@ -864,6 +864,73 @@ async fn uv_no_sources_is_refused_in_both_modes() {
     }
 }
 
+/// #1603: under `no-binary = true` or a `no-binary-package` list naming the
+/// package (pyproject's `[tool.uv]`, a project `uv.toml`, or a PEP 723
+/// script's own `[tool.uv]`), uv installs the package only from an sdist,
+/// so the patched wheel both modes wire fails every `uv sync`. Both used to
+/// wire it and exit 0; they must refuse and write nothing. `no-build-package`
+/// allows wheels, so it is still wired.
+#[tokio::test]
+async fn uv_no_binary_is_refused_in_both_modes() {
+    for (script, file, setting, refused) in [
+        (false, "pyproject.toml", "\n[tool.uv]\nno-binary-package = [\"Six\"]\n", true),
+        (false, "pyproject.toml", "\n[tool.uv]\nno-binary = true\n", true),
+        (false, "uv.toml", "no-binary-package = [\"six\"]\n", true),
+        (true, "job.py", "", true),
+        (false, "pyproject.toml", "\n[tool.uv]\nno-build-package = [\"six\"]\n", false),
+    ] {
+        let (_tmp, root) = project();
+        let label = if script { "script" } else { file };
+        if script {
+            stage_script_lock(&root);
+            let path = root.join(file);
+            let text = std::fs::read_to_string(&path).unwrap().replace(
+                "# ///\n",
+                "#\n# [tool.uv]\n# no-binary-package = [\"six\"]\n# ///\n",
+            );
+            assert!(text.contains("no-binary-package"), "{text}");
+            std::fs::write(&path, text).unwrap();
+        } else {
+            stage_uv(&root);
+            let path = root.join(file);
+            let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+            text.push_str(setting);
+            std::fs::write(&path, text).unwrap();
+        }
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted {label}: {env:#}");
+        if !refused {
+            assert_eq!(hosted_pinned(&env), 1, "hosted {label}: {env:#}");
+            continue;
+        }
+        assert_eq!(hosted_pinned(&env), 0, "hosted {label}: {env:#}");
+        let unsupported = if script {
+            "redirect_uv_script_unsupported"
+        } else {
+            "redirect_uv_project_unsupported"
+        };
+        assert!(
+            env.to_string().contains(unsupported) && env.to_string().contains("no-binary"),
+            "hosted {label}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "hosted {label} wrote nothing");
+
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored {label}: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_no_binary"),
+            "vendored {label}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "vendored {label} wrote nothing");
+    }
+}
+
 /// #1501: a PEP 723 script takes uv's settings from the nearest directory
 /// at or above it that holds a `uv.toml` or a `pyproject.toml` with
 /// `[tool.uv]`. A parent project's `no-sources = true` therefore drops the
