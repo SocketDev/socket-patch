@@ -18,6 +18,7 @@ use std::path::Path;
 #[path = "common/mod.rs"]
 mod common;
 
+use base64::Engine as _;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -468,7 +469,8 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
 /// to its upstream entry (drop the hosted replace and the socket go.sum
 /// lines, re-derive the pruned upstream pair from the checksum database),
 /// so the project is fully vendored — never a vendored go.mod beside a
-/// hosted pin. No ledger is involved at any point.
+/// hosted pin. No ledger is involved at any point. The vendored patch is
+/// the hosted pin's own: a manifest naming another patch is ignored.
 #[tokio::test(flavor = "multi_thread")]
 async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
     let tmp = tempfile::tempdir().unwrap();
@@ -516,11 +518,50 @@ async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
     .unwrap();
     std::fs::write(socket.join("blobs").join(&after), PATCHED_LIB).unwrap();
 
-    // Online: the takeover's upstream restore consults the (mocked)
-    // checksum database; the patch itself comes from the local manifest.
-    let (code, stdout, stderr) = run_with_prebuilt(
+    let manifest = std::fs::read(socket.join("manifest.json")).unwrap();
+
+    // The manifest above names a DIFFERENT patch (UUID_V), but a hosted pin
+    // is in scope: plain `vendor` ejects exactly the go.mod's hosted patch
+    // (UUID_H) and ignores the manifest (vendoring manifest patches takes a
+    // full `scan --mode vendored`). The eject fetches the record from the
+    // API and downloads the prebuilt module from the artifact service; the
+    // upstream restore consults the (mocked) checksum database.
+    let view = serde_json::json!({
+        "uuid": UUID_H,
+        "purl": UPURL,
+        "publishedAt": "2026-01-01T00:00:00Z",
+        "files": { "lib.go": {
+            "beforeHash": compute_git_sha256_from_bytes(PRISTINE_LIB.as_bytes()),
+            "afterHash": &after,
+            "blobContent": base64::engine::general_purpose::STANDARD.encode(PATCHED_LIB),
+        }},
+        "vulnerabilities": {},
+        "description": "golang hosted state fixture",
+        "license": "MIT",
+        "tier": "free",
+    });
+    prebuilt_common::mount_view_from_source(
+        &server,
+        &view,
+        None,
+        Some(&modcache.join(format!("{UMOD}@{UVER}"))),
+    )
+    .await;
+    let uri = server.uri();
+    let (code, stdout, stderr) = common::run_with_env(
         &consumer,
-        &["vendor", "--json", "--cwd", consumer.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--cwd",
+            consumer.to_str().unwrap(),
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
         &[
             ("GOMODCACHE", modcache.to_str().unwrap()),
             ("SOCKET_GOSUMDB_URL", sumdb.as_str()),
@@ -531,13 +572,24 @@ async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
         "vendor failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("vendor_takeover_reverted_redirect"),
-        "the takeover is reported: {stdout}"
+        !stdout.contains(UUID_V),
+        "the manifest-only patch is not part of the eject: {stdout}"
+    );
+    assert!(
+        !consumer
+            .join(format!(".socket/vendor/golang/{UUID_V}"))
+            .exists(),
+        "the manifest-only patch must not be vendored"
+    );
+    assert_eq!(
+        std::fs::read(socket.join("manifest.json")).unwrap(),
+        manifest,
+        "the eject never rewrites the manifest"
     );
     let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
     assert!(
         go_mod.contains(&format!(
-            "replace {UMOD} {UVER} => ./.socket/vendor/golang/{UUID_V}/{UMOD}@{UVER}"
+            "replace {UMOD} {UVER} => ./.socket/vendor/golang/{UUID_H}/{UMOD}@{UVER}"
         )),
         "{go_mod}"
     );
