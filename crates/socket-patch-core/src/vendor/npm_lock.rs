@@ -485,9 +485,11 @@ fn lock_version_gate(
 /// Whether the project still carries an npm >= 12.1 native patch, read as
 /// hosted mode's #711 gate reads it: a root `package.json`
 /// `patchedDependencies` key, or a non-null `patched` record on a lock
-/// entry. Only the refusal path calls it, so the blocking read is rare.
+/// entry. Only the refusal path calls it, so the blocking read is rare; it
+/// goes through the regular-file reader, so a FIFO there can't wedge it.
 fn has_native_patch(lock: &Value, project_root: &Path) -> bool {
-    let manifest = std::fs::read_to_string(project_root.join("package.json")).ok();
+    let manifest =
+        crate::utils::fs::read_regular_to_string_sync(&project_root.join("package.json")).ok();
     if !super::bun_lock_text::patched_dependency_keys(manifest.as_deref(), None).is_empty() {
         return true;
     }
@@ -3020,6 +3022,31 @@ mod tests {
                 && !detail.contains("would drop or break"),
             "{detail}"
         );
+    }
+
+    /// A FIFO at package.json is not a manifest: the native-patch probe
+    /// reads past it instead of blocking in open(2).
+    #[cfg(unix)]
+    #[test]
+    fn native_patch_probe_does_not_block_on_a_fifo_manifest() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("package.json");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = tmp.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(has_native_patch(&json!({ "packages": {} }), &root));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(found) => assert!(!found),
+            Err(_) => {
+                // Release the wedged opener so the suite can fail cleanly.
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                panic!("the native-patch probe wedged in open(2) on a FIFO");
+            }
+        }
     }
 
     /// The takeover preflight raises exactly the backend's own version
