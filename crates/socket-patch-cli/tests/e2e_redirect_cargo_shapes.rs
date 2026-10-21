@@ -550,6 +550,9 @@ async fn run_shape(shape: Shape) -> Option<()> {
             "--json",
             "--yes",
             "--no-telemetry",
+            // Consent past the user-patch gate so the shapes reach the
+            // redirect guards; tests/user_patches.rs covers the gate itself.
+            "--allow-user-patches",
             "--cwd",
             &proj_s,
             "--api-url",
@@ -574,6 +577,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
             .into_iter()
             .flatten()
             .filter_map(|w| w["code"].as_str())
+            .filter(|c| *c != "user_patch_override")
             .collect();
         assert_eq!(
             codes,
