@@ -80,19 +80,29 @@ pub fn skip(suite: &str, why: &str) -> bool {
     true
 }
 
-/// `net.retry` for the children of a [`required`] leg. Cargo retries only
-/// the transfers it classifies as spurious (connect failures, timeouts,
-/// 5xx) and backs off ~1s, 3.5s, 6.5s, 9.5s, then 10s per attempt, so 10
-/// rides out a ~80s crates.io / runner network blip where the default 3
-/// gave up after ~11s and failed the leg (a fresh-CARGO_HOME baseline build
-/// hit "Could not connect to static.crates.io" in the lock-v4 leg).
+/// `net.retry` for the children of a [`required`] leg or any CI run. Cargo
+/// retries only the transfers it classifies as spurious (connect failures,
+/// timeouts, 5xx) and backs off ~1s, 3.5s, 6.5s, 9.5s, then 10s per
+/// attempt, so 10 rides out a ~80s crates.io / runner network blip where
+/// the default 3 gave up after ~11s and failed the leg (a fresh-CARGO_HOME
+/// baseline build hit "Could not connect to static.crates.io" in the
+/// lock-v4 leg). CI
+/// counts too: the coverage job runs these suites optional, so its baseline
+/// fetch soft-skips, but a blip on a later fetch (the (4b) revert's `cargo
+/// fetch --locked`) is a hard assertion and failed `ci-ok`.
 const REQUIRED_NET_RETRY: &str = "10";
+
+/// Whether this is a CI runner (GitHub Actions sets `CI=true`), where
+/// crates.io is expected to be reachable and a blip must not fail the job.
+fn on_ci() -> bool {
+    env_nonempty("CI").is_some_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+}
 
 /// A `cargo` child with the fixture's private `CARGO_HOME`, the pinned
 /// toolchain, and no ambient `CARGO_TARGET_DIR` (shared-build-cache setups
 /// would redirect child builds out of the fixture). On a [`required`] leg
-/// it also widens cargo's own network retry (an explicit ambient
-/// `CARGO_NET_RETRY` wins); an optional run keeps the default so an
+/// or on CI it also widens cargo's own network retry (an explicit ambient
+/// `CARGO_NET_RETRY` wins); an optional local run keeps the default so an
 /// offline machine still skips quickly.
 pub fn cargo_command(cwd: &Path, cargo_home: &Path) -> Command {
     let mut cmd = Command::new("cargo");
@@ -102,7 +112,7 @@ pub fn cargo_command(cwd: &Path, cargo_home: &Path) -> Command {
     if let Some(tc) = toolchain() {
         cmd.env("RUSTUP_TOOLCHAIN", tc);
     }
-    if required() && env_nonempty("CARGO_NET_RETRY").is_none() {
+    if (required() || on_ci()) && env_nonempty("CARGO_NET_RETRY").is_none() {
         cmd.env("CARGO_NET_RETRY", REQUIRED_NET_RETRY);
     }
     cmd
