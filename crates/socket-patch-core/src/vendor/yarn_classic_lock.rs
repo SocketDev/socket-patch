@@ -234,7 +234,14 @@ impl NpmLockBackend for YarnClassicBackend {
         coords: &NpmCoords,
     ) -> Option<VendorOutcome> {
         let blocks = scan_blocks_shared(&plan.text);
-        let missing = unlocked_descriptors(&blocks, staged_pkg);
+        // The blocks this run wires: a descriptor their sub-maps already
+        // carry is upstream's, keyed by the packument's range (#1578).
+        let carried: Vec<&[String]> = blocks
+            .iter()
+            .filter(|b| plan.candidate_keys.contains(&b.key))
+            .map(|b| b.lines.as_slice())
+            .collect();
+        let missing = unlocked_descriptors(&blocks, staged_pkg, &carried);
         if missing.is_empty() {
             return None;
         }
@@ -1578,6 +1585,44 @@ wow@^1.0.0:
         let text = fx.lock_text().await;
         assert!(
             text.contains("  dependencies:\n    is-number \"^7.0.0\"\n"),
+            "{text}"
+        );
+    }
+
+    /// #1578: yarn 1 keys left-pad's dependency block by the packument's
+    /// range (`url@*`) while its sub-map holds the tarball's
+    /// (`url "^0.11.0"`). A patch whose package.json keeps that dependency
+    /// as it was vendors; one that adds an unlocked dependency is refused,
+    /// naming only the new one.
+    #[tokio::test]
+    async fn issue_1578_a_dependency_the_block_already_carries_is_not_refused() {
+        let lock = format!(
+            "{Y2_BEFORE}  dependencies:\n    url \"^0.11.0\"\n\n\
+             url@*:\n  version \"0.11.4\"\n"
+        );
+        let mut fx = fixture_with_lock(&lock).await;
+        patch_manifest(
+            &mut fx,
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"url":"^0.11.0","wow":"^1.0.0"}}"#,
+        )
+        .await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_dep_manifest_unlocked");
+        assert!(
+            detail.contains("wow@^1.0.0") && !detail.contains("url@"),
+            "{detail}"
+        );
+        assert_eq!(fx.lock_text().await, lock, "lock untouched");
+
+        patch_manifest(
+            &mut fx,
+            br#"{"name":"left-pad","version":"1.3.0","description":"patched","dependencies":{"url":"^0.11.0"}}"#,
+        )
+        .await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{:?}", result.error);
+        let text = fx.lock_text().await;
+        assert!(
+            text.contains("  dependencies:\n    url \"^0.11.0\"\n"),
             "{text}"
         );
     }

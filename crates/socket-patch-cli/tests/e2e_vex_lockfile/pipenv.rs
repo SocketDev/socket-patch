@@ -363,6 +363,19 @@ fn requirements_direct_reference_contests_the_lock_wiring() {
                 "bare wheel path",
                 format!("./wheels/{NAME}-{VERSION}-py3-none-any.whl\n"),
             ),
+            // #1587: pip installs these relative spellings too.
+            (
+                "wheel path without ./",
+                format!("wheels/{NAME}-{VERSION}-py3-none-any.whl\n"),
+            ),
+            (
+                "wheel filename only",
+                format!("{NAME}-{VERSION}-py3-none-any.whl\n"),
+            ),
+            (
+                "sdist path without ./",
+                format!("dist/{NAME}-{VERSION}.tar.gz\n"),
+            ),
             ("registry pin (control)", format!("{NAME}=={VERSION}\n")),
         ],
     );

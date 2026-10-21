@@ -117,6 +117,7 @@ use super::{
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::sha256_hex;
 use crate::utils::hatch::dependency_specs;
+use crate::utils::requirements;
 use crate::utils::requirements::{
     hash_options, logical_lines, parse_requirement, split_comment, url_sha256_fragment, vendor_tag,
 };
@@ -370,17 +371,19 @@ fn registry_pin(file: &str, code: &str, out: &mut Discovery) {
 fn requirement_location(code: &str) -> Option<(Option<&str>, &str)> {
     let code = code.trim_start();
     let first = code.split_whitespace().next()?;
-    if first.contains("://")
-        || first.starts_with("file:")
-        || mentions_vendor_dir(first)
-        || !first.starts_with(|c: char| c.is_ascii_alphanumeric())
+    if !requirements::names_before_at(first)
+        && (first.contains("://")
+            || first.starts_with("file:")
+            || mentions_vendor_dir(first)
+            || requirements::pip_reads_as_path(first))
     {
         // pip separates a marker from a URL with `; ` (whitespace-split
-        // above leaves a trailing `;`) and from a path with a bare `;`.
+        // above leaves a trailing `;`) and from a path with a bare `;`,
+        // and strips a path's `[extras]` before reading it.
         let location = if first.contains("://") {
             first.trim_end_matches(';')
         } else {
-            first.split(';').next().unwrap_or(first)
+            requirements::strip_path_extras(first.split(';').next().unwrap_or(first))
         };
         return Some((None, location));
     }
@@ -1754,6 +1757,35 @@ mod tests {
                 ("Pipfile.lock", vendored_pipfile.clone()),
                 ("requirements.txt", format!("./wheels/{WHL}\n")),
             ),
+            // #1587: pip installs a relative path without a leading `./`.
+            (
+                "requirements wheel path without ./",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", format!("wheels/{WHL}\n")),
+            ),
+            (
+                "requirements wheel filename only",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", format!("{WHL}\n")),
+            ),
+            (
+                "requirements sdist path without ./",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", "dist/six-1.16.0.tar.gz\n".to_string()),
+            ),
+            (
+                "requirements windows wheel path without .\\",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                ("requirements.txt", format!("wheels\\{WHL}\n")),
+            ),
+            (
+                "requirements wheel path with a marker",
+                ("Pipfile.lock", vendored_pipfile.clone()),
+                (
+                    "requirements.txt",
+                    format!("wheels/{WHL}; python_version >= \"3\"\n"),
+                ),
+            ),
         ];
         for (name, wired, other) in cases {
             let p = Project::new();
@@ -1876,6 +1908,77 @@ mod tests {
         let mut purls: Vec<&str> = out.refs.iter().map(|r| r.purl.as_str()).collect();
         purls.sort();
         assert_eq!(purls, ["pkg:pypi/six@1.16", "pkg:pypi/six@1.16.0"]);
+    }
+
+    /// REGRESSION (#1587): a requirements line is a local artifact the way
+    /// pip reads one (`_looks_like_path` / `is_archive_file`): a path
+    /// separator, a leading `.`, or an archive suffix. Registry specifiers
+    /// and PEP 508 `name @ url` lines keep their old reading.
+    #[test]
+    fn issue_1587_requirement_location_reads_paths_as_pip_does() {
+        for (line, location) in [
+            (
+                "./wheels/six-1.16.0-py3-none-any.whl",
+                "./wheels/six-1.16.0-py3-none-any.whl",
+            ),
+            (
+                "wheels/six-1.16.0-py3-none-any.whl",
+                "wheels/six-1.16.0-py3-none-any.whl",
+            ),
+            (
+                "wheels\\six-1.16.0-py3-none-any.whl",
+                "wheels\\six-1.16.0-py3-none-any.whl",
+            ),
+            ("six-1.16.0-py3-none-any.whl", "six-1.16.0-py3-none-any.whl"),
+            ("dist/six-1.16.0.tar.gz", "dist/six-1.16.0.tar.gz"),
+            ("six-1.16.0.tar.gz --hash=sha256:ab", "six-1.16.0.tar.gz"),
+            ("six-1.16.0.zip", "six-1.16.0.zip"),
+            ("six-1.16.0.tar.bz2", "six-1.16.0.tar.bz2"),
+            ("six-1.16.0.tgz", "six-1.16.0.tgz"),
+            (
+                "wheels/six-1.16.0-py3-none-any.whl; python_version >= \"3\"",
+                "wheels/six-1.16.0-py3-none-any.whl",
+            ),
+            (
+                "wheels/six-1.16.0-py3-none-any.whl;python_version>=\"3\"",
+                "wheels/six-1.16.0-py3-none-any.whl",
+            ),
+            ("src/six", "src/six"),
+        ] {
+            assert_eq!(
+                super::requirement_location(line),
+                Some((None, location)),
+                "{line}"
+            );
+        }
+        for line in [
+            "six==1.16.0",
+            "six>=1",
+            "six",
+            "six[socks]==1.16.0",
+            "six; python_version < \"3\"",
+            "six==1.16.0 --hash=sha256:ab",
+        ] {
+            assert_eq!(super::requirement_location(line), None, "{line}");
+        }
+        assert_eq!(
+            super::requirement_location("six @ https://h/six-1.16.0-py3-none-any.whl"),
+            Some((Some("six"), "https://h/six-1.16.0-py3-none-any.whl")),
+        );
+        // pip reads `name@<location>` as a PEP 508 reference, not a path
+        // or url, and a path's `[extras]` are not part of it.
+        assert_eq!(
+            super::requirement_location("six@https://h/six-1.16.0-py3-none-any.whl"),
+            Some((Some("six"), "https://h/six-1.16.0-py3-none-any.whl")),
+        );
+        assert_eq!(
+            super::requirement_location("wheels/six-1.16.0-py3-none-any.whl[socks]"),
+            Some((None, "wheels/six-1.16.0-py3-none-any.whl")),
+        );
+        assert_eq!(
+            super::requirement_location("six@six-1.16.0-py3-none-any.whl"),
+            Some((Some("six"), "six-1.16.0-py3-none-any.whl")),
+        );
     }
 
     /// REGRESSION (#1549): a non-Socket direct reference whose version

@@ -2119,6 +2119,144 @@ mod tests {
         );
     }
 
+    /// #1598: a copy's manifest whose `name` is empty or no valid npm name
+    /// (`""`, `"../x"`, `" left-pad"`) names no package, and one whose
+    /// `version` is empty or no valid semver names no version, exactly like
+    /// a manifest that lacks the key (#1579). Each was read as a copy of a
+    /// package literally called `""` (or of "another version"), so it was
+    /// dropped as unrelated and `vex` attested `not_affected` while yarn
+    /// installed unpatched left-pad@1.3.0 as `node_modules/lp2`. Berry
+    /// `portal:` / `link:` / `file:` directories and yarn 1 `file:`
+    /// directories and tarballs alike now contest the wiring.
+    #[tokio::test]
+    async fn issue_1598_invalid_manifest_name_or_version_contests() {
+        let wired = berry_vendored_block("left-pad", "1.3.0", UUID_A);
+        let resolutions = package_json_with_resolutions(serde_json::json!({
+            "left-pad": format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+        }));
+        let invalid_names = ["", "../x", " left-pad", "left pad"];
+        let mut cases: Vec<(String, String, String)> = Vec::new();
+        for protocol in ["portal", "link"] {
+            for name in invalid_names {
+                cases.push((
+                    protocol.into(),
+                    serde_json::json!({ "name": name, "version": "1.3.0" }).to_string(),
+                    "can't be read".into(),
+                ));
+            }
+            for version in ["", "v1.3.0", " 1.3.0", "latest"] {
+                cases.push((
+                    protocol.into(),
+                    serde_json::json!({ "name": "left-pad", "version": version }).to_string(),
+                    "names left-pad but no version".into(),
+                ));
+            }
+        }
+        for (protocol, manifest, why) in cases {
+            let p = Project::new();
+            p.write("vend/lp/package.json", &manifest);
+            let descriptor = format!("lp2@{protocol}:./vend/lp::locator=app%40workspace%3A.");
+            p.write(
+                "yarn.lock",
+                berry(&[
+                    wired.clone(),
+                    berry_block(&descriptor, "0.0.0-use.local", &descriptor, None),
+                ]),
+            );
+            p.write("package.json", resolutions.clone());
+            let out = run(&p).await;
+            assert!(
+                out.refs.is_empty(),
+                "{protocol} {manifest}: {:#?}",
+                out.refs
+            );
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                        && d.detail.contains(&format!("lp2@{protocol}:"))
+                        && d.detail.contains(&why)),
+                "{protocol} {manifest}: {:#?}",
+                out.diagnostics
+            );
+        }
+
+        // A berry `file:` directory holds its lock version; only its name
+        // is read.
+        for name in invalid_names {
+            let p = Project::new();
+            p.write(
+                "vend/lp/package.json",
+                serde_json::json!({ "name": name, "version": "1.3.0" }).to_string(),
+            );
+            let descriptor = "lp2@file:./vend/lp::locator=app%40workspace%3A.";
+            p.write(
+                "yarn.lock",
+                berry(&[
+                    wired.clone(),
+                    berry_block(descriptor, "1.3.0", descriptor, None),
+                ]),
+            );
+            p.write("package.json", resolutions.clone());
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "berry file: {name:?}: {:#?}", out.refs);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("lp2@file:")),
+                "berry file: {name:?}: {:#?}",
+                out.diagnostics
+            );
+        }
+
+        // yarn 1 `file:` directories and tarballs share the name reader.
+        let classic_wired = classic_block(
+            "left-pad@1.3.0",
+            "1.3.0",
+            &format!("file:./.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz#{SHA1}"),
+            Some(SRI),
+        );
+        let copies = [
+            (
+                "file: directory",
+                "\"lp2@file:./lpdir\":\n  version \"1.3.0\"\n\n".to_string(),
+            ),
+            (
+                "file: tarball",
+                classic_block(
+                    "\"lp2@file:./forks/left-pad-1.3.0.tgz\"",
+                    "1.3.0",
+                    &format!("file:./forks/left-pad-1.3.0.tgz#{SHA1}"),
+                    None,
+                ),
+            ),
+        ];
+        for name in invalid_names {
+            for (case, copy) in &copies {
+                let p = Project::new();
+                p.write("yarn.lock", classic(&[classic_wired.clone(), copy.clone()]));
+                p.write(
+                    "lpdir/package.json",
+                    serde_json::json!({ "name": name, "version": "1.3.0" }).to_string(),
+                );
+                p.write("forks/left-pad-1.3.0.tgz", npm_tgz(name, "1.3.0"));
+                let out = run(&p).await;
+                assert!(
+                    out.refs.is_empty(),
+                    "classic {case} {name:?}: {:#?}",
+                    out.refs
+                );
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("lp2@")),
+                    "classic {case} {name:?}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
     /// #1540 control: a RELATIVE `link:` to a plain directory (no
     /// `package.json`, which `link:` allows) is read and holds no package,
     /// so it contests nothing.
