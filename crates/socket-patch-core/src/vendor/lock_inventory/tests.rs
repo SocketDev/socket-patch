@@ -31,7 +31,7 @@ const PACKAGE_LOCK: &str = r#"{
       "resolved": "https://registry.npmjs.org/@scope/pkg/-/pkg-2.0.0.tgz",
       "integrity": "sha512-scoped=="
     },
-    "node_modules/bundled-dep": {
+    "node_modules/left-pad/node_modules/bundled-dep": {
       "version": "1.0.0",
       "inBundle": true
     },

@@ -19996,6 +19996,116 @@ mod tests {
         );
     }
 
+    /// #1618: an `inBundle` entry the ROOT project bundles (here `debug`,
+    /// and `ms` beneath it) has no parent tarball; `npm ci` installs it
+    /// from the lock, so both lock halves of a v2 lock are rewired and
+    /// nothing warns of a "bundling parent".
+    #[test]
+    fn npm_root_bundled_entries_are_rewired() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "app",
+      "dependencies": { "debug": "4.3.4", "left-pad": "1.3.0" },
+      "bundleDependencies": ["debug", "left-pad"]
+    },
+    "node_modules/debug": {
+      "version": "4.3.4",
+      "resolved": "https://registry.npmjs.org/debug/-/debug-4.3.4.tgz",
+      "integrity": "sha512-DEBUG==",
+      "inBundle": true
+    },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM==",
+      "inBundle": true
+    },
+    "node_modules/ms": {
+      "version": "2.1.3",
+      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+      "integrity": "sha512-MS==",
+      "inBundle": true
+    }
+  },
+  "dependencies": {
+    "debug": {
+      "version": "4.3.4",
+      "resolved": "https://registry.npmjs.org/debug/-/debug-4.3.4.tgz",
+      "integrity": "sha512-DEBUG==",
+      "requires": { "ms": "2.1.2" }
+    },
+    "left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    },
+    "ms": {
+      "version": "2.1.3",
+      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+      "integrity": "sha512-MS=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![
+            npm_override(
+                "left-pad",
+                "1.3.0",
+                "http://patch.test/lp.tgz",
+                "sha512-PATCHED==",
+            ),
+            npm_override(
+                "ms",
+                "2.1.3",
+                "http://patch.test/ms.tgz",
+                "sha512-MSPATCHED==",
+            ),
+        ];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_bundled_instance_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.bundled_skipped_uuids.is_empty(),
+            "{:?}",
+            r.bundled_skipped_uuids
+        );
+        let lock: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        for (key, legacy, url, sri) in [
+            (
+                "node_modules/left-pad",
+                "left-pad",
+                "http://patch.test/lp.tgz",
+                "sha512-PATCHED==",
+            ),
+            (
+                "node_modules/ms",
+                "ms",
+                "http://patch.test/ms.tgz",
+                "sha512-MSPATCHED==",
+            ),
+        ] {
+            assert_eq!(lock["packages"][key]["resolved"], url, "{key}");
+            assert_eq!(lock["packages"][key]["integrity"], sri, "{key}");
+            assert_eq!(lock["packages"][key]["inBundle"], true, "{key}: flag kept");
+            assert_eq!(
+                lock["dependencies"][legacy]["resolved"], url,
+                "{legacy} mirror"
+            );
+        }
+    }
+
     /// The v1/v2 legacy `dependencies` tree spells the bundled flag
     /// `bundled: true` — same guard as `inBundle` in `packages`.
     #[test]

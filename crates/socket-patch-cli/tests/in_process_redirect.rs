@@ -1696,6 +1696,52 @@ async fn scan_redirect_npm_file_copy_is_not_attested_in_run() {
     }
 }
 
+/// REGRESSION (#1618): npm 7+ marks a package the ROOT project bundles
+/// `inBundle: true`, and records the bundle list on the lock's `""` entry
+/// (as a list for every `package.json` spelling: a list, `true`, or the
+/// `bundledDependencies` alias). It has no parent tarball, so `npm ci`
+/// installs it from the lock: the scan rewires it and its in-run `--vex`
+/// attests it.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_npm_root_bundled_entry_is_rewired_and_attested() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }}, "bundleDependencies": true }}"#
+        ),
+    )
+    .unwrap();
+    // The lock npm 7+ writes for it.
+    let lock_path = tmp.path().join("package-lock.json");
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    lock["packages"][""]["bundleDependencies"] = serde_json::json!([NAME]);
+    lock["packages"][format!("node_modules/{NAME}")]["inBundle"] = serde_json::json!(true);
+    std::fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+    let out = tmp.path().join("out.vex.json");
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.vex.vex = Some(out.clone());
+    args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+    assert_eq!(run(args).await, 0);
+    let rewritten: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    let entry = &rewritten["packages"][format!("node_modules/{NAME}")];
+    assert_eq!(entry["resolved"], HOSTED_URL, "{rewritten:#}");
+    assert_eq!(entry["inBundle"], true, "flag kept");
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert!(document.to_string().contains(PURL), "{document:#}");
+    assert_eq!(document["statements"][0]["status"], "not_affected");
+}
+
 /// npm 7+ installs from the v2 `packages` map. An ignored legacy bundled
 /// flag must not block the hosted in-run attestation before that install.
 #[tokio::test]

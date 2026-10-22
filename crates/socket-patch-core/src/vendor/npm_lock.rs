@@ -2481,6 +2481,50 @@ mod tests {
         );
     }
 
+    /// #1618: a copy the ROOT project bundles (`inBundle: true` directly
+    /// under the root's `node_modules`) is installed from the lock, so it
+    /// is vendored like any entry instead of refused as unrewritable.
+    #[tokio::test]
+    async fn root_bundled_instance_is_vendored() {
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "version": "1.0.0",
+                    "dependencies": { "left-pad": "1.3.0" },
+                    "bundleDependencies": ["left-pad"]
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig==",
+                    "inBundle": true
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(entry.unwrap().wiring.len(), 1);
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code != "vendor_bundled_instance_skipped"),
+            "{warnings:?}"
+        );
+        let live = fx.read_lock().await;
+        let wired = &live["packages"]["node_modules/left-pad"];
+        assert_eq!(
+            wired["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+        assert_eq!(wired["inBundle"], json!(true), "flag kept");
+    }
+
     #[tokio::test]
     async fn link_and_in_bundle_instances_are_skipped_with_warnings() {
         let mut lock = default_lock();
