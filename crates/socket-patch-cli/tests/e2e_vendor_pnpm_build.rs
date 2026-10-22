@@ -2577,9 +2577,9 @@ fn pnpm_vendor_refuses_quoted_scoped_alias_references() {
 /// with ERR_PNPM_IGNORED_BUILDS. Vendoring now carries the approval to the
 /// vendored key: a fresh frozen offline install of the committed files
 /// lands the patched bytes AND runs the script, and `vendor --revert`
-/// byte-restores the workspace file. pnpm 10.30 (which refuses a `file:`
-/// key with ERR_PNPM_INVALID_VERSION_UNION and still matches the name)
-/// gets no key, and its script runs too.
+/// byte-restores the workspace file. pnpm 10.30 and 11.5.2 (which refuse
+/// a `file:` key with ERR_PNPM_INVALID_VERSION_UNION and still match the
+/// name) get no key, and their script runs too.
 #[tokio::test(flavor = "multi_thread")]
 async fn pnpm_vendor_keeps_approved_build_scripts_running() {
     for (pm, approval, carried) in [
@@ -2590,6 +2590,10 @@ async fn pnpm_vendor_keeps_approved_build_scripts_running() {
             "onlyBuiltDependencies:\n  - sp-build\n",
             false,
         ),
+        // 11.5.3 is where the id matching landed (10.34.2 is its backport);
+        // 11.5.2 still refuses a `file:` key.
+        ("pnpm@11.5.3", "allowBuilds:\n  sp-build: true\n", true),
+        ("pnpm@11.5.2", "allowBuilds:\n  sp-build: true\n", false),
     ] {
         if !has_corepack_pm(pm) {
             println!("SKIP: `corepack {pm}` unavailable");

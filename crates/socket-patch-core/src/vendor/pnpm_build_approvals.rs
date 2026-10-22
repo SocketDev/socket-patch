@@ -1,7 +1,7 @@
 //! pnpm build approvals for a vendored `file:` tarball (#1597).
 //!
 //! Vendoring wires a pnpm project to `name@file:.socket/vendor/npm/<uuid>/…`,
-//! and pnpm installs the package under that id. pnpm >= 10.34.2 matches a
+//! and pnpm installs the package under that id. pnpm 10.34.2+ / 11.5.3+ match a
 //! build decision (`allowBuilds`, `onlyBuiltDependencies`) against the id,
 //! so a key spelling the registry package (`name`, `name@1.2.3`,
 //! `name@1.2.3 || 1.2.4`) stops matching the vendored copy: pnpm 10 skips
@@ -21,8 +21,8 @@
 //! entries are never edited.
 //!
 //! The key is written only when the project's pnpm pins say it runs
-//! 10.34.2 or newer: older pnpm 10 still matches the name, and refuses a
-//! `file:` key outright (ERR_PNPM_INVALID_VERSION_UNION). Without a usable
+//! 10.34.2+ (11.5.3+ on pnpm 11): older releases still match the name, and
+//! refuse a `file:` key outright (ERR_PNPM_INVALID_VERSION_UNION). Without a usable
 //! pin, or for a decision the line surgery cannot extend (a flow-style
 //! value, a non-boolean one), nothing is written and the
 //! `vendor_pnpm_build_approval_lost` warning names the key to add.
@@ -51,7 +51,7 @@ pub(super) const KIND_PKG_ALLOW_BUILD: &str = "pnpm_pkg_allow_build";
 pub(super) const KIND_PKG_ONLY_BUILT: &str = "pnpm_pkg_only_built";
 
 /// Warning code: the project decides the package's build in a way this
-/// rewriter does not carry to the vendored key, so pnpm >= 10.34.2 stops
+/// rewriter does not carry to the vendored key, so pnpm 10.34.2+ / 11.5.3+ stop
 /// applying that decision.
 pub(crate) const VENDOR_PNPM_BUILD_APPROVAL_LOST: &str = "vendor_pnpm_build_approval_lost";
 
@@ -278,16 +278,17 @@ fn lost_warning(target: &Target<'_>, surface: &str, why: LostWhy) -> VendorWarni
         ),
         LostWhy::UnknownPnpm => format!(
             "no pnpm pin (package.json `packageManager`, `devEngines`, `engines.pnpm`, or \
-             node_modules/.modules.yaml) says which pnpm installs, and pnpm 10.20–10.34.1 \
-             refuse that key (ERR_PNPM_INVALID_VERSION_UNION); on pnpm >= 10.34.2 add \
+             node_modules/.modules.yaml) says which pnpm installs, and pnpm 10.20–10.34.1 and \
+             11.0–11.5.2 refuse that key (ERR_PNPM_INVALID_VERSION_UNION); on pnpm 10.34.2+ / \
+             11.5.3+ add \
              `{key}` there with the same decision, or pin pnpm and re-run to have it added"
         ),
     };
     VendorWarning::new(
         VENDOR_PNPM_BUILD_APPROVAL_LOST,
         format!(
-            "{surface} decides {name}@{version}'s install script by a key pnpm >= 10.34.2 \
-             no longer matches once the package is vendored, so pnpm 10 skips the script \
+            "{surface} decides {name}@{version}'s install script by a key pnpm 10.34.2+ / 11.5.3+ \
+             no longer match once the package is vendored, so pnpm 10 skips the script \
              and pnpm 11+ fail every install with ERR_PNPM_IGNORED_BUILDS; {reason}"
         ),
     )
@@ -749,7 +750,7 @@ mod tests {
     }
 
     /// pnpm 10.20–10.34.1 refuse a `file:` key, older pnpm still matches
-    /// the name: only a pin admitting nothing but 10.34.2+ gets the key.
+    /// the name: only a pin admitting nothing but 10.34.2+ / 11.5.3+ gets the key.
     #[test]
     fn the_key_is_written_only_for_a_pnpm_that_reads_it() {
         let text = "allowBuilds:\n  sp-build: true\n";

@@ -34,14 +34,22 @@ fn breaks_root_only_workspace((lo, hi): (MajorMinor, MajorMinor)) -> bool {
 /// `(major, minor, patch)`.
 type Release = (u64, u64, u64);
 
-/// The first pnpm that matches a build decision (`allowBuilds`,
+/// Whether pnpm `release` matches a build decision (`allowBuilds`,
 /// `onlyBuiltDependencies`) against a `file:` tarball's own id
-/// (`name@file:<spec>`), and the first that accepts such a key at all:
-/// 10.34.1 and older match the package name, and from at least 10.20 on
-/// refuse a `file:` key with ERR_PNPM_INVALID_VERSION_UNION (#1597;
+/// (`name@file:<spec>`), which is also the first release that accepts such
+/// a key at all. The change landed in 11.5.3 and was backported to
+/// 10.34.2: older releases match the package name, and from at least 10.20
+/// on refuse a `file:` key with ERR_PNPM_INVALID_VERSION_UNION (#1597;
 /// measured on 9.15.9, 10.0.0, 10.20.0, 10.30.0, 10.34.1, 10.34.2, 10.34.7,
-/// 11.28.7 and 12.15.0).
-const FILE_ID_BUILD_KEYS: Release = (10, 34, 2);
+/// 11.5.2, 11.5.3, 11.28.7 and 12.15.0).
+fn matches_file_ids(release: Release) -> bool {
+    match release.0 {
+        ..=9 => false,
+        10 => release >= (10, 34, 2),
+        11 => release >= (11, 5, 3),
+        _ => true,
+    }
+}
 
 /// The inclusive `(major, minor)` span a version spec admits: an exact
 /// version (`9.15.9`, `=9.15.9`, `v9.15.9`, a prerelease), `^X.Y.Z`,
@@ -171,7 +179,7 @@ pub fn root_only_workspace_breaks_add(
 }
 
 /// Whether the pnpm the project runs matches build decisions against a
-/// vendored `file:` id (see [`FILE_ID_BUILD_KEYS`]): `Some(true)` when every
+/// vendored `file:` id (see [`matches_file_ids`]): `Some(true)` when every
 /// pin that parses admits only such a release, `Some(false)` when every one
 /// admits only older ones, `None` without a parseable pin or when they
 /// disagree.
@@ -179,19 +187,19 @@ pub fn matches_file_id_build_keys(
     package_json: Option<&str>,
     modules_yaml: Option<&str>,
 ) -> Option<bool> {
-    let spans: Vec<(Release, Release)> = pnpm_pins(package_json, modules_yaml)
+    // A span decides when both ends agree within one major (the answer is
+    // monotonic inside a major, not across the 10 → 11 boundary).
+    let decided = |(lo, hi): (Release, Release)| {
+        (lo.0 == hi.0 && matches_file_ids(lo) == matches_file_ids(hi)).then(|| matches_file_ids(lo))
+    };
+    let mut answers = pnpm_pins(package_json, modules_yaml)
         .iter()
         .filter_map(|(_, spec)| version_bounds(spec))
-        .collect();
-    if spans.is_empty() {
-        None
-    } else if spans.iter().all(|(lo, _)| *lo >= FILE_ID_BUILD_KEYS) {
-        Some(true)
-    } else if spans.iter().all(|(_, hi)| *hi < FILE_ID_BUILD_KEYS) {
-        Some(false)
-    } else {
-        None
-    }
+        .map(decided)
+        .collect::<Vec<_>>()
+        .into_iter();
+    let first = answers.next()??;
+    answers.all(|a| a == Some(first)).then_some(first)
 }
 
 #[cfg(test)]
@@ -199,12 +207,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_id_build_keys_start_at_10_34_2() {
+    fn file_id_build_keys_start_at_10_34_2_and_11_5_3() {
         let pm = |spec: &str| format!("{{\"packageManager\":\"pnpm@{spec}\"}}");
         for (spec, want) in [
             ("10.34.2", Some(true)),
             ("10.34.7+sha512.abc", Some(true)),
             ("11.28.7", Some(true)),
+            ("11.5.3", Some(true)),
+            ("11.5.2", Some(false)),
+            ("11.2.0", Some(false)),
+            ("11.0.0", Some(false)),
             ("12.0.0-rc.1", Some(true)),
             ("10.34.1", Some(false)),
             ("10.20.0", Some(false)),
@@ -229,6 +241,19 @@ mod tests {
         assert_eq!(
             matches_file_id_build_keys(Some(&engines("~10.34.1")), None),
             None
+        );
+        // 11.0–11.5.2 predate the change despite sorting after 10.34.2.
+        assert_eq!(
+            matches_file_id_build_keys(Some(&engines("^11.0.0")), None),
+            None
+        );
+        assert_eq!(
+            matches_file_id_build_keys(Some(&engines("^11.5.3")), None),
+            Some(true)
+        );
+        assert_eq!(
+            matches_file_id_build_keys(Some(&engines("~11.4.0")), None),
+            Some(false)
         );
         assert_eq!(
             matches_file_id_build_keys(Some(&engines(">=10")), None),

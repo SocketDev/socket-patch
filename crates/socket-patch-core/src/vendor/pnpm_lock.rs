@@ -320,7 +320,7 @@ impl NpmLockBackend for PnpmBackend {
             WorkspaceEdit::default()
         };
 
-        // pnpm >= 10.34.2 matches build decisions against the vendored
+        // pnpm 10.34.2+ / 11.5.3+ match build decisions against the vendored
         // `name@file:` id, so carry the project's decision over to it
         // (#1597). Legacy locks are installed by pnpm <= 8, which matches
         // by name.
@@ -11074,7 +11074,7 @@ snapshots:
     /// pnpm 10.20–10.34.1 refuse a `file:` build key and older pnpm still
     /// matches the name: a project pinned there gets no key and no warning.
     /// Without any pin nothing is written either, and the warning says
-    /// which key a pnpm >= 10.34.2 needs.
+    /// which key a pnpm 10.34.2+ / 11.5.3+ needs.
     #[tokio::test]
     async fn build_approval_key_is_written_only_for_a_pnpm_that_reads_it() {
         let ws = "packages:\n  - '.'\nallowBuilds:\n  left-pad: true\n";
@@ -11107,7 +11107,7 @@ snapshots:
             .all(|w| w.code != build_approvals::VENDOR_PNPM_BUILD_APPROVAL_LOST)
     }
 
-    /// pnpm >= 10.34.2 matches `allowBuilds` / `onlyBuiltDependencies`
+    /// pnpm 10.34.2+ / 11.5.3+ match `allowBuilds` / `onlyBuiltDependencies`
     /// against the vendored `left-pad@file:<spec>` id, so a name-only or
     /// pinned decision stops applying (pnpm 11/12 fail every install with
     /// ERR_PNPM_IGNORED_BUILDS). Vendoring adds the same decision under the
