@@ -457,6 +457,95 @@ async fn dry_run_writes_nothing() {
     assert_eq!(std::fs::read(fx.installed_index()).unwrap(), ORIG_INDEX);
 }
 
+/// `git init` `root` and write its `.gitignore`. `false` when git is not
+/// installed (the probe has nothing to ask, so the test has nothing to
+/// check).
+fn git_project_ignoring(root: &Path, gitignore: &str) -> bool {
+    if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+        return false;
+    }
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(root.join(".gitignore"), gitignore).unwrap();
+    true
+}
+
+/// A `.gitignore` file rule that matches the vendor ledger (`state.json`,
+/// `*.json`) would leave it out of the commit the run asks for, so every
+/// other checkout has the lock wiring but no ledger and `rollback` fails
+/// with `vendor_ledger_missing` (#1638). The run refuses before writing
+/// anything, dry run included.
+#[tokio::test]
+async fn a_gitignored_ledger_refuses_before_any_write() {
+    for (gitignore, rule) in [
+        ("node_modules/\nstate.json\n", "state.json"),
+        ("node_modules/\n*.json\n!package*.json\n", "*.json"),
+        ("node_modules/\n**/state.json\n", "**/state.json"),
+    ] {
+        for dry_run in [false, true] {
+            let fx = npm_fixture();
+            if !git_project_ignoring(fx.root(), gitignore) {
+                return;
+            }
+            let extra: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
+            let (code, env) = vendor_cli(fx.root(), extra);
+            assert_eq!(code, 1, "{gitignore:?} dry_run={dry_run}: {env:#}");
+            assert_eq!(env["error"]["code"], "vendor_ledger_gitignored", "{env:#}");
+            let message = env["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(".socket/vendor/state.json") && message.contains(rule),
+                "the message names the ledger and the rule: {message}"
+            );
+            assert!(
+                !fx.vendor_dir().exists(),
+                "nothing is vendored for {gitignore:?}"
+            );
+            assert_eq!(fx.lock_bytes(), fx.original_lock, "lock byte-identical");
+        }
+    }
+}
+
+/// A rule that re-includes the ledger lets the run vendor as usual.
+#[tokio::test]
+async fn a_re_included_ledger_vendors() {
+    let fx = npm_fixture();
+    if !git_project_ignoring(
+        fx.root(),
+        "node_modules/\n*.json\n!package*.json\n!.socket/vendor/state.json\n",
+    ) {
+        return;
+    }
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert!(fx.state_path().is_file());
+    assert!(fx.tgz_path().is_file());
+}
+
+/// A ledger git already tracks keeps being committed whatever the ignore
+/// rules say, so a re-run after a `*.json` rule lands is not refused.
+#[tokio::test]
+async fn a_tracked_ledger_is_not_refused() {
+    let fx = npm_fixture();
+    if !git_project_ignoring(fx.root(), "node_modules/\n") {
+        return;
+    }
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(fx.root())
+        .args(["add", ".socket/vendor/state.json"])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(fx.root().join(".gitignore"), "node_modules/\n*.json\n").unwrap();
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 4. vendor → revert round-trip
 // ─────────────────────────────────────────────────────────────────────
@@ -3507,6 +3596,39 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) 
     (code, env)
 }
 
+/// The ledger check sits in front of every vendored backend, not only the
+/// npm family the report used (#1638): a gem `scan --mode vendored` whose
+/// `.gitignore` matches `state.json` refuses `vendor_ledger_gitignored`
+/// before anything is written. The gem backend has no per-package check of
+/// its own for a `.socket/` directory rule, so that refuses here too, as
+/// `vendor_artifact_gitignored`.
+#[tokio::test]
+async fn scan_vendor_gem_refuses_a_gitignored_ledger() {
+    for (gitignore, want) in [
+        ("vendor/bundle/\nstate.json\n", "vendor_ledger_gitignored"),
+        ("vendor/bundle/\n.socket/\n", "vendor_artifact_gitignored"),
+    ] {
+        let mock = wiremock::MockServer::start().await;
+        mount_gem_patch_api(&mock, GEM_PURL).await;
+        let fx = gem_fixture();
+        if !git_project_ignoring(fx.root(), gitignore) {
+            return;
+        }
+        let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+        assert_eq!(code, 1, "{gitignore:?}: {env:#}");
+        assert_eq!(env["error"]["code"], want, "{env:#}");
+        assert!(!fx.root().join(".socket/vendor").exists(), "{env:#}");
+        assert_eq!(
+            std::fs::read_to_string(fx.root().join("Gemfile.lock")).unwrap(),
+            GEM_LOCK
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.root().join("Gemfile")).unwrap(),
+            GEM_GEMFILE
+        );
+    }
+}
+
 /// `scan --mode vendored` end to end on a gem project: discover → download →
 /// vendor lands the gem pair edit (Gemfile pin + `path:`, lock PATH section
 /// + `(= …)!` DEPENDENCIES pin) and the patched artifact dir, keyed in the
@@ -4616,6 +4738,52 @@ snapshots:
             "vendor --revert lands on upstream: {lock}"
         );
         assert!(!root.join(".npmrc").exists());
+    }
+
+    /// Hosted → vendored in a git project whose `.gitignore` matches the
+    /// vendor ledger (#1638): both the eject (no manifest) and the
+    /// manifest-driven takeover refuse `vendor_ledger_gitignored` before
+    /// restoring anything, so the project stays hosted.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_then_vendor_with_a_gitignored_ledger_keeps_the_hosted_wiring() {
+        if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+            return;
+        }
+        for with_manifest in [false, true] {
+            let server = MockServer::start().await;
+            mock_hosted_api(&server).await;
+            let registry = mock_registry(&server).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            write_package_lock_project(root);
+            assert!(super::git_project_ignoring(
+                root,
+                "node_modules/\nstate.json\n"
+            ));
+            assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+            let hosted_lock = std::fs::read(root.join("package-lock.json")).unwrap();
+            let hosted_npmrc = std::fs::read(root.join(".npmrc")).unwrap();
+            assert!(String::from_utf8_lossy(&hosted_lock).contains(HOSTED_URL));
+
+            if with_manifest {
+                seed_manifest_and_blob(root);
+            }
+            let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+            assert_eq!(code, 1, "with_manifest={with_manifest}: {env:#}");
+            assert_eq!(env["error"]["code"], "vendor_ledger_gitignored", "{env:#}");
+            assert_eq!(
+                std::fs::read(root.join("package-lock.json")).unwrap(),
+                hosted_lock,
+                "the hosted lock must be untouched"
+            );
+            assert_eq!(
+                std::fs::read(root.join(".npmrc")).unwrap(),
+                hosted_npmrc,
+                "the hosted .npmrc must be untouched"
+            );
+            assert!(!root.join(".socket/vendor").exists(), "{env:#}");
+        }
     }
 
     /// Hosted → vendored in a git project that ignores `.socket/` (#831):

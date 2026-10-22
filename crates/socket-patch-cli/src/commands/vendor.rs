@@ -1397,6 +1397,19 @@ async fn run_check(args: &VendorArgs) -> i32 {
     i32::from(env.summary.failed != 0)
 }
 
+/// Whether every ecosystem in a vendored run has a backend that refuses a
+/// `.socket/vendor/` directory ignore rule per package
+/// (`vendor_artifact_gitignored`): the npm family (vlt included), NuGet,
+/// PyPI and the JVM trees. The others rely on the run-level ledger check.
+fn artifacts_gitignore_checked(mut ecosystems: impl Iterator<Item = Ecosystem>) -> bool {
+    ecosystems.all(|eco| {
+        matches!(
+            eco,
+            Ecosystem::Npm | Ecosystem::Nuget | Ecosystem::Pypi | Ecosystem::Maven
+        )
+    })
+}
+
 /// A refused eject: the JSON error envelope (`status: error`) or an
 /// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
 fn emit_eject_refusal(common: &GlobalArgs, code: &str, message: &str) -> i32 {
@@ -1728,6 +1741,15 @@ impl EjectSnapshot {
 /// the project to upstream, not to hosted).
 async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
+    // A ledger git would not commit refuses before anything is fetched or
+    // restored, so the project stays hosted (#1638).
+    let purls: Vec<String> = pins.iter().map(|pin| pin.purl.clone()).collect();
+    let artifacts_checked = artifacts_gitignore_checked(partition_purls(&purls, None).into_keys());
+    if let Some((code, detail)) =
+        vendor::ledger_gitignore_refusal(&common.cwd, artifacts_checked).await
+    {
+        return emit_eject_refusal(common, code, &detail);
+    }
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let telemetry = TelemetryAuth::for_client(&client);
@@ -2761,6 +2783,24 @@ pub(crate) async fn vendor_records_reusing(
             return true;
         }
     };
+    // The ledger must survive the commit the run asks for, or no other
+    // checkout can roll the patches back (#1638): refuse before anything
+    // is written, dry run included.
+    let artifacts_checked = artifacts_gitignore_checked(
+        vendorable_partition
+            .iter()
+            .filter(|(_, purls)| !purls.is_empty())
+            .map(|(eco, _)| *eco),
+    );
+    if let Some((code, detail)) =
+        vendor::ledger_gitignore_refusal(&common.cwd, artifacts_checked).await
+    {
+        if !common.json {
+            eprintln!("Error: {detail}");
+        }
+        env.mark_error(EnvelopeError::new(code, detail));
+        return true;
+    }
     // Pre-stage trees a previous run left behind (it crashed or was
     // interrupted between staging an archive and settling): nothing of
     // this run is staged yet, and the caller holds the apply lock, so every

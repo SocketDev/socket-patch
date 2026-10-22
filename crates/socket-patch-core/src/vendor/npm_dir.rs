@@ -465,6 +465,23 @@ pub(crate) async fn gitignore_probe(
     project_root: &Path,
     paths: &[String],
 ) -> Result<Option<String>, String> {
+    Ok(ignoring_rule_lines(project_root, paths, true)
+        .await?
+        .map(|lines| summarize_rules(&lines)))
+}
+
+/// The ignoring rules `git check-ignore -v` reports for `paths`, one
+/// `<source>:<linenum>:<pattern>\t<pathname>` line each (see
+/// [`ignoring_rules`]), or `Ok(None)` when none matches, git is absent or
+/// the root is not a work tree. `no_index` asks about the paths as if
+/// nothing were tracked (the right question for files this run creates);
+/// without it a tracked file is never ignored, because git keeps
+/// committing changes to it whatever the ignore rules say.
+pub(crate) async fn ignoring_rule_lines(
+    project_root: &Path,
+    paths: &[String],
+    no_index: bool,
+) -> Result<Option<Vec<String>>, String> {
     let Some(git) = crate::utils::process::resolve_tool("git") else {
         return Ok(None);
     };
@@ -483,27 +500,29 @@ pub(crate) async fn gitignore_probe(
         };
     }
     let input: String = paths.iter().map(|p| format!("{p}\0")).collect();
-    let (code, out) = git_output(
-        &git,
-        project_root,
-        &["check-ignore", "-v", "-z", "--no-index", "--stdin"],
-        Some(input),
-    )
-    .await
-    .ok_or("`git check-ignore` did not run to completion")?;
+    let mut check = vec!["check-ignore", "-v", "-z", "--stdin"];
+    if no_index {
+        check.push("--no-index");
+    }
+    let (code, out) = git_output(&git, project_root, &check, Some(input))
+        .await
+        .ok_or("`git check-ignore` did not run to completion")?;
     if code != 0 && code != 1 {
         return Err(format!("`git check-ignore` exited {code}"));
     }
     let lines = ignoring_rules(&out);
-    Ok((code == 0 && !lines.is_empty()).then(|| {
-        let shown: Vec<&str> = lines.iter().take(3).map(String::as_str).collect();
-        let more = lines.len().saturating_sub(shown.len());
-        let mut detail = shown.join("; ");
-        if more > 0 {
-            detail.push_str(&format!("; and {more} more"));
-        }
-        detail
-    }))
+    Ok((code == 0 && !lines.is_empty()).then_some(lines))
+}
+
+/// Up to three of `lines` joined for a message, with a count of the rest.
+pub(crate) fn summarize_rules(lines: &[String]) -> String {
+    let shown: Vec<&str> = lines.iter().take(3).map(String::as_str).collect();
+    let more = lines.len().saturating_sub(shown.len());
+    let mut detail = shown.join("; ");
+    if more > 0 {
+        detail.push_str(&format!("; and {more} more"));
+    }
+    detail
 }
 
 /// The non-negated matches of `git check-ignore -v -z` output
