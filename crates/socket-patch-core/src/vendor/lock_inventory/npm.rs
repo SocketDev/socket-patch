@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::constants::npm_family::NPM_LOCKS;
 use crate::utils::digest::is_sri_pin;
+use crate::vendor::npm_common::declares_bundled_deps;
 use crate::vendor::npm_origin::legacy_packages_key;
 use crate::vendor::path::parse_vendor_path;
 
@@ -73,8 +74,12 @@ pub(crate) struct NpmLockEntry<'a> {
     pub(crate) node: NpmLockNode<'a>,
     /// `link: true` (a `packages` entry npm links from a source dir).
     pub(crate) link: bool,
-    /// `inBundle: true` in `packages`, `bundled: true` in the legacy tree:
-    /// npm unpacks it from the parent package's own tarball.
+    /// `inBundle: true` in `packages`, `bundled: true` in the legacy tree,
+    /// when a DEPENDENCY bundles it: npm unpacks it from that package's
+    /// own tarball. A copy the root project or a workspace member bundles
+    /// (and every copy beneath it) has no parent tarball, so npm installs
+    /// it from the lock like any other entry and it is not flagged (#1618;
+    /// see [`npm_dependency_bundled`]).
     pub(crate) bundled: bool,
 }
 
@@ -143,25 +148,29 @@ fn walk_npm_packages<'a>(doc: &'a Value, out: &mut Vec<NpmLockEntry<'a>>) {
             value,
             node: NpmLockNode::of(name, value),
             link: npm_flag(value, "link"),
-            bundled: npm_flag(value, "inBundle"),
+            bundled: npm_dependency_bundled(packages, key, value),
         });
     }
 }
 
 fn walk_npm_legacy<'a>(doc: &'a Value, out: &mut Vec<NpmLockEntry<'a>>) {
     if let Some(deps) = doc.get("dependencies").and_then(Value::as_object) {
-        walk_npm_legacy_dependencies(deps, 0, "/dependencies", "", "", out);
+        walk_npm_legacy_dependencies(deps, 0, "/dependencies", "", "", false, out);
     }
 }
 
 /// The legacy tree: `{name: {version, resolved, integrity, dependencies:
 /// {…}}}`, `pointer` / `parent_key` / `chain` being the enclosing node's.
+/// `in_dep_bundle` says a `bundled: true` node here ships in a
+/// dependency's tarball, the [`npm_dependency_bundled`] rule: false at the
+/// root, whose bundles npm installs from the lock.
 fn walk_npm_legacy_dependencies<'a>(
     deps: &'a serde_json::Map<String, Value>,
     depth: usize,
     pointer_base: &str,
     parent_key: &str,
     chain: &str,
+    in_dep_bundle: bool,
     out: &mut Vec<NpmLockEntry<'a>>,
 ) {
     if depth > MAX_LEGACY_NPM_DEPTH {
@@ -170,6 +179,11 @@ fn walk_npm_legacy_dependencies<'a>(
     for (key, value) in deps {
         let pointer = format!("{pointer_base}/{}", escape_pointer_token(key));
         let packages_key = legacy_packages_key(parent_key, key);
+        let bundled = in_dep_bundle && npm_flag(value, "bundled");
+        // This node is the bundler of its nested `bundled` nodes unless it
+        // is itself a root-bundled copy that bundles nothing of its own.
+        let nested_in_dep_bundle =
+            bundled || !npm_flag(value, "bundled") || declares_bundled_deps(value);
         let location = match chain {
             "" => key.clone(),
             _ => format!("{chain} > {key}"),
@@ -197,7 +211,7 @@ fn walk_npm_legacy_dependencies<'a>(
             value,
             node: NpmLockNode::legacy(key, value),
             link: false,
-            bundled: npm_flag(value, "bundled"),
+            bundled,
         });
         if let Some((nested, nested_pointer, nested_key, nested_chain)) = nested {
             walk_npm_legacy_dependencies(
@@ -206,6 +220,7 @@ fn walk_npm_legacy_dependencies<'a>(
                 &nested_pointer,
                 &nested_key,
                 &nested_chain,
+                nested_in_dep_bundle,
                 out,
             );
         }
@@ -348,6 +363,49 @@ pub(crate) fn npm_legacy_identity<'a>(
 
 fn npm_flag(node: &Value, key: &str) -> bool {
     node.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Whether the `packages` entry at `key` ships inside a DEPENDENCY's
+/// tarball, where no rewire reaches it.
+///
+/// npm writes `inBundle: true` on every node a bundle covers, whoever the
+/// bundler is, and on each of that node's own dependencies. A bundled copy
+/// lives beneath its bundler, so the bundler is found by walking up the
+/// entry's owners (the key before its last `node_modules/`): the first
+/// owner that is a plain (not `inBundle`) dependency, or that declares
+/// `bundleDependencies` itself, is a dependency whose tarball carries the
+/// copy. An owner chain that reaches the root `""` or a workspace member
+/// (a key without `node_modules/`) is the project's own bundle: it has no
+/// parent tarball, and `npm install` / `npm ci` fetch it from `resolved` +
+/// `integrity` like any other entry (#1618). An owner missing from the
+/// lock keeps the entry bundled, the conservative reading.
+fn npm_dependency_bundled(
+    packages: &serde_json::Map<String, Value>,
+    key: &str,
+    value: &Value,
+) -> bool {
+    if !npm_flag(value, "inBundle") {
+        return false;
+    }
+    let mut key = key;
+    while let Some(owner) = npm_dependency_owner(key) {
+        let Some(owner_value) = packages.get(owner) else {
+            return true;
+        };
+        if !npm_flag(owner_value, "inBundle") || declares_bundled_deps(owner_value) {
+            return true;
+        }
+        key = owner;
+    }
+    false
+}
+
+/// The `packages` key of the dependency `key` is installed beneath (the
+/// key before its last `node_modules/`), or `None` when that is the root
+/// or a workspace member: the project's own source.
+fn npm_dependency_owner(key: &str) -> Option<&str> {
+    let owner = key[..key.rfind(NODE_MODULES_SEG)?].trim_end_matches('/');
+    owner.contains(NODE_MODULES_SEG).then_some(owner)
 }
 
 // ── registry view ──
@@ -727,6 +785,119 @@ mod tests {
             .collect();
         assert_eq!(bundled, [("host > inner".into(), "inner")]);
         assert!(npm_lock_legacy_mirror_nodes(&v1).is_empty());
+    }
+
+    /// #1618: npm writes `inBundle: true` on every copy a bundle covers,
+    /// including the root project's own `bundleDependencies` (any spelling:
+    /// a list, `true`, the `bundledDependencies` alias) and each of their
+    /// dependencies. Those have no parent tarball, so `npm ci` installs
+    /// them from the lock: only a copy a DEPENDENCY bundles is bundled.
+    #[test]
+    fn only_dependency_bundles_are_bundled() {
+        let entry = |extra: serde_json::Value| {
+            let mut e = serde_json::json!({ "version": "1.0.0" });
+            e.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            e
+        };
+        let bundle = || entry(serde_json::json!({ "inBundle": true }));
+        let doc = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "bundleDependencies": ["debug"], "workspaces": ["ws"] },
+                "ws": { "name": "ws", "bundleDependencies": true },
+                "node_modules/ws": { "resolved": "ws", "link": true },
+                // Root bundle, its hoisted and nested dependencies.
+                "node_modules/debug": bundle(),
+                "node_modules/ms": bundle(),
+                "node_modules/debug/node_modules/ms": bundle(),
+                // A workspace member's bundle, hoisted or not.
+                "ws/node_modules/wsdep": bundle(),
+                "node_modules/@s/hoisted": bundle(),
+                // A dependency's bundle, also beneath a root-bundled copy
+                // that bundles something of its own.
+                "node_modules/host": entry(serde_json::json!({})),
+                "node_modules/host/node_modules/inner": bundle(),
+                "node_modules/host/node_modules/inner/node_modules/deep": bundle(),
+                "node_modules/rb": entry(serde_json::json!({
+                    "inBundle": true, "bundleDependencies": ["own"]
+                })),
+                "node_modules/rb/node_modules/own": bundle(),
+                // Beneath an owner the lock lacks: kept bundled.
+                "node_modules/gone/node_modules/orphan": bundle()
+            }
+        });
+        let flags: Vec<(&str, bool)> = npm_lock_entries(&doc)
+            .iter()
+            .filter(|e| e.is_dependency() && !e.link)
+            .map(|e| (e.key, e.bundled))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("node_modules/debug", false),
+                ("node_modules/ms", false),
+                ("node_modules/debug/node_modules/ms", false),
+                ("ws/node_modules/wsdep", false),
+                ("node_modules/@s/hoisted", false),
+                ("node_modules/host", false),
+                ("node_modules/host/node_modules/inner", true),
+                (
+                    "node_modules/host/node_modules/inner/node_modules/deep",
+                    true
+                ),
+                ("node_modules/rb", false),
+                ("node_modules/rb/node_modules/own", true),
+                ("node_modules/gone/node_modules/orphan", true),
+            ]
+        );
+
+        // The legacy tree (a v1 lock, a v2 mirror) reads the same way: a
+        // top-level node is the root's, a nested one its parent's.
+        let v1 = serde_json::json!({
+            "lockfileVersion": 1,
+            "dependencies": {
+                "debug": {
+                    "version": "1.0.0",
+                    "bundled": true,
+                    "dependencies": { "ms": { "version": "1.0.0", "bundled": true } }
+                },
+                "rb": {
+                    "version": "1.0.0",
+                    "bundled": true,
+                    "bundleDependencies": ["own"],
+                    "dependencies": { "own": { "version": "1.0.0", "bundled": true } }
+                },
+                "host": {
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "inner": {
+                            "version": "1.0.0",
+                            "bundled": true,
+                            "dependencies": { "deep": { "version": "1.0.0", "bundled": true } }
+                        }
+                    }
+                }
+            }
+        });
+        let flags: Vec<(String, bool)> = npm_lock_entries(&v1)
+            .iter()
+            .map(|e| (e.location.to_string(), e.bundled))
+            .collect();
+        let flags: Vec<(&str, bool)> = flags.iter().map(|(l, b)| (l.as_str(), *b)).collect();
+        assert_eq!(
+            flags,
+            [
+                ("debug", false),
+                ("debug > ms", false),
+                ("rb", false),
+                ("rb > own", true),
+                ("host", false),
+                ("host > inner", true),
+                ("host > inner > deep", true),
+            ]
+        );
     }
 
     /// The legacy walk stops at the depth bound instead of recursing on a

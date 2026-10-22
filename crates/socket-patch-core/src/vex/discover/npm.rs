@@ -1925,6 +1925,27 @@ mod tests {
     /// either mode: the build ships unpatched bytes of that package. The
     /// uuid stays recognized, so the ledger record is dead too, and a
     /// bundled copy of a DIFFERENT version contests nothing.
+    /// #1618: a wired entry the ROOT project bundles is installed from the
+    /// lock, so it is a reference; nothing contests it.
+    #[tokio::test]
+    async fn root_bundled_wired_entry_is_a_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "bundleDependencies": ["left-pad"] },
+                "node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": hosted, "integrity": SRI, "inBundle": true
+                },
+            })),
+        );
+        let out = run(&p).await;
+        let refs: Vec<_> = out.refs.iter().map(|r| r.purl.as_str()).collect();
+        assert_eq!(refs, ["pkg:npm/left-pad@1.3.0"], "{:#?}", out.diagnostics);
+        assert!(bundled_contests(&out).is_empty(), "{:#?}", out.diagnostics);
+    }
+
     #[tokio::test]
     async fn bundled_copy_of_the_same_version_contests_the_wired_entry() {
         let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
