@@ -36,7 +36,47 @@ enum KeyKind {
     NameOnly,
     /// An exact version or `||`-joined exact versions: matches only when
     /// npm reads a covered version from a registry-shaped `resolved`.
-    Pinned(Vec<Version>),
+    Pinned(Pin),
+}
+
+/// The versions a pinned key covers, as arborist compares them.
+enum Pin {
+    /// One version (npa `type: 'version'`): the trimmed spec must equal
+    /// the registry version as a string, so `v1.2.3`, `=1.2.3` and
+    /// `1.2.3+build` never match `1.2.3`.
+    Exact(String),
+    /// A `||` disjunction (npa `type: 'range'`): every part must be a
+    /// strict `semver.valid` version, matched by `semver.satisfies` (loose,
+    /// so build metadata is ignored).
+    AnyOf(Vec<Version>),
+}
+
+impl Pin {
+    fn parse(spec: &str) -> Option<Self> {
+        if !spec.contains("||") {
+            // npa only calls a loose-valid version a version; anything
+            // else is a range or tag that matchRegistry rejects.
+            loose_version(spec)?;
+            return Some(Self::Exact(spec.to_string()));
+        }
+        spec.split("||")
+            .map(|part| {
+                let part = part.trim();
+                Version::parse(part.strip_prefix('v').unwrap_or(part)).ok()
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self::AnyOf)
+    }
+
+    fn covers(&self, version: &str) -> bool {
+        match self {
+            Self::Exact(spec) => spec == version,
+            Self::AnyOf(pins) => loose_version(version).is_some_and(|v| {
+                pins.iter()
+                    .any(|pin| pin.cmp_precedence(&v) == Ordering::Equal)
+            }),
+        }
+    }
 }
 
 /// The approval npm 12 gives one package under the policy.
@@ -75,8 +115,8 @@ fn split_key(key: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// `semver.valid(v, { loose: true })` for the exact-version spellings npm
-/// accepts in a pin: surrounding whitespace and a leading `=` / `v`.
+/// `semver.valid(v, { loose: true })`, which also accepts surrounding
+/// whitespace and a leading `=` / `v`: how npa decides a spec is a version.
 fn loose_version(text: &str) -> Option<Version> {
     let text = text.trim();
     let text = text.strip_prefix('=').unwrap_or(text).trim_start();
@@ -102,11 +142,7 @@ impl AllowScripts {
                 let (name, spec) = split_key(key);
                 let kind = match spec.map(str::trim) {
                     None | Some("") | Some("*") => KeyKind::NameOnly,
-                    Some(spec) => KeyKind::Pinned(
-                        spec.split("||")
-                            .map(loose_version)
-                            .collect::<Option<Vec<_>>>()?,
-                    ),
+                    Some(spec) => KeyKind::Pinned(Pin::parse(spec)?),
                 };
                 Some((key.clone(), name.to_string(), kind, allow))
             })
@@ -116,7 +152,7 @@ impl AllowScripts {
 
     /// npm's verdict for `name`, at `version` when npm can read one from a
     /// registry `resolved`, or `None` once it cannot (deny wins).
-    fn verdict(&self, name: &str, version: Option<&Version>) -> Verdict {
+    fn verdict(&self, name: &str, version: Option<&str>) -> Verdict {
         let mut allowed = false;
         for (_, key_name, kind, allow) in &self.entries {
             if key_name != name {
@@ -124,9 +160,7 @@ impl AllowScripts {
             }
             let matches = match (kind, version) {
                 (KeyKind::NameOnly, _) => true,
-                (KeyKind::Pinned(pins), Some(v)) => pins
-                    .iter()
-                    .any(|pin| pin.cmp_precedence(v) == Ordering::Equal),
+                (KeyKind::Pinned(pin), Some(v)) => pin.covers(v),
                 // Unverifiable version: a deny fails closed, an allow is
                 // refused.
                 (KeyKind::Pinned(_), None) => !allow,
@@ -147,8 +181,8 @@ impl AllowScripts {
     /// entries resolve outside the registry, or `None` when npm 12 runs
     /// them as before (or never did: denied or unreviewed already).
     pub fn lost(&self, name: &str, version: &str) -> Option<LostApproval> {
-        let version = loose_version(version)?;
-        if self.verdict(name, Some(&version)) != Verdict::Allowed
+        loose_version(version)?;
+        if self.verdict(name, Some(version)) != Verdict::Allowed
             || self.verdict(name, None) == Verdict::Allowed
         {
             return None;
@@ -162,12 +196,7 @@ impl AllowScripts {
                 .filter(|(_, _, kind, _)| match kind {
                     // Every pinned deny matches after the rewrite; only the
                     // allows that covered this version were lost.
-                    KeyKind::Pinned(pins) => {
-                        !allow
-                            || pins
-                                .iter()
-                                .any(|pin| pin.cmp_precedence(&version) == Ordering::Equal)
-                    }
+                    KeyKind::Pinned(pin) => !allow || pin.covers(version),
                     KeyKind::NameOnly => false,
                 })
                 .map(|(key, ..)| key.clone())
@@ -284,11 +313,43 @@ mod tests {
     }
 
     #[test]
-    fn scoped_pin_disjunction_loose_spellings_and_build_metadata_are_lost() {
-        let policy = r#"{"@img/sharp@0.33.0 || 0.33.5": true, "@img/sharp@v0.33.5": true,
-            "@img/sharp@=0.33.5": true, "@img/sharp@0.33.5+b": true}"#;
+    fn scoped_pin_and_disjunction_are_lost() {
+        let policy = r#"{"@img/sharp@0.33.0 || 0.33.5": true, "@img/sharp@ 0.33.5 ": true,
+            "@img/sharp@v0.33.0 || 0.33.5+b": true}"#;
         let lost = lost_for(policy, "@img/sharp", "0.33.5").unwrap();
-        assert_eq!(lost.allows.len(), 4);
+        assert_eq!(lost.allows.len(), 3);
+    }
+
+    /// npm compares a single-version pin as a string, so loose spellings
+    /// never approved the registry copy: nothing is lost, and the remedy
+    /// must not approve a script nobody approved.
+    #[test]
+    fn loose_single_version_spellings_never_matched() {
+        for spec in ["v0.19.12", "=0.19.12", "0.19.12+b"] {
+            let policy = format!(r#"{{"esbuild@{spec}": true}}"#);
+            assert!(lost_for(&policy, "esbuild", "0.19.12").is_none(), "{spec}");
+        }
+        // A disjunction part npm's strict semver.valid rejects voids the key.
+        assert!(lost_for(
+            r#"{"esbuild@=0.19.12 || 0.20.0": true}"#,
+            "esbuild",
+            "0.19.12"
+        )
+        .is_none());
+    }
+
+    /// A loosely spelled deny never matched the registry copy but fails
+    /// closed after the rewrite, overriding a name-only allow.
+    #[test]
+    fn loose_single_version_deny_starts_matching() {
+        let lost = lost_for(
+            r#"{"esbuild": true, "esbuild@v0.19.12": false}"#,
+            "esbuild",
+            "0.19.12",
+        )
+        .unwrap();
+        assert!(lost.allows.is_empty());
+        assert_eq!(lost.denies, vec!["esbuild@v0.19.12".to_string()]);
     }
 
     #[test]
