@@ -457,6 +457,95 @@ async fn dry_run_writes_nothing() {
     assert_eq!(std::fs::read(fx.installed_index()).unwrap(), ORIG_INDEX);
 }
 
+/// `git init` `root` and write its `.gitignore`. `false` when git is not
+/// installed (the probe has nothing to ask, so the test has nothing to
+/// check).
+fn git_project_ignoring(root: &Path, gitignore: &str) -> bool {
+    if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+        return false;
+    }
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(root.join(".gitignore"), gitignore).unwrap();
+    true
+}
+
+/// A `.gitignore` file rule that matches the vendor ledger (`state.json`,
+/// `*.json`) would leave it out of the commit the run asks for, so every
+/// other checkout has the lock wiring but no ledger and `rollback` fails
+/// with `vendor_ledger_missing` (#1638). The run refuses before writing
+/// anything, dry run included.
+#[tokio::test]
+async fn a_gitignored_ledger_refuses_before_any_write() {
+    for (gitignore, rule) in [
+        ("node_modules/\nstate.json\n", "state.json"),
+        ("node_modules/\n*.json\n!package*.json\n", "*.json"),
+        ("node_modules/\n**/state.json\n", "**/state.json"),
+    ] {
+        for dry_run in [false, true] {
+            let fx = npm_fixture();
+            if !git_project_ignoring(fx.root(), gitignore) {
+                return;
+            }
+            let extra: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
+            let (code, env) = vendor_cli(fx.root(), extra);
+            assert_eq!(code, 1, "{gitignore:?} dry_run={dry_run}: {env:#}");
+            assert_eq!(env["error"]["code"], "vendor_ledger_gitignored", "{env:#}");
+            let message = env["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(".socket/vendor/state.json") && message.contains(rule),
+                "the message names the ledger and the rule: {message}"
+            );
+            assert!(
+                !fx.vendor_dir().exists(),
+                "nothing is vendored for {gitignore:?}"
+            );
+            assert_eq!(fx.lock_bytes(), fx.original_lock, "lock byte-identical");
+        }
+    }
+}
+
+/// A rule that re-includes the ledger lets the run vendor as usual.
+#[tokio::test]
+async fn a_re_included_ledger_vendors() {
+    let fx = npm_fixture();
+    if !git_project_ignoring(
+        fx.root(),
+        "node_modules/\n*.json\n!package*.json\n!.socket/vendor/state.json\n",
+    ) {
+        return;
+    }
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert!(fx.state_path().is_file());
+    assert!(fx.tgz_path().is_file());
+}
+
+/// A ledger git already tracks keeps being committed whatever the ignore
+/// rules say, so a re-run after a `*.json` rule lands is not refused.
+#[tokio::test]
+async fn a_tracked_ledger_is_not_refused() {
+    let fx = npm_fixture();
+    if !git_project_ignoring(fx.root(), "node_modules/\n") {
+        return;
+    }
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(fx.root())
+        .args(["add", ".socket/vendor/state.json"])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(fx.root().join(".gitignore"), "node_modules/\n*.json\n").unwrap();
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 4. vendor → revert round-trip
 // ─────────────────────────────────────────────────────────────────────
@@ -3523,6 +3612,39 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) 
     (code, env)
 }
 
+/// The ledger check sits in front of every vendored backend, not only the
+/// npm family the report used (#1638): a gem `scan --mode vendored` whose
+/// `.gitignore` matches `state.json` refuses `vendor_ledger_gitignored`
+/// before anything is written. The gem backend has no per-package check of
+/// its own for a `.socket/` directory rule, so that refuses here too, as
+/// `vendor_artifact_gitignored`.
+#[tokio::test]
+async fn scan_vendor_gem_refuses_a_gitignored_ledger() {
+    for (gitignore, want) in [
+        ("vendor/bundle/\nstate.json\n", "vendor_ledger_gitignored"),
+        ("vendor/bundle/\n.socket/\n", "vendor_artifact_gitignored"),
+    ] {
+        let mock = wiremock::MockServer::start().await;
+        mount_gem_patch_api(&mock, GEM_PURL).await;
+        let fx = gem_fixture();
+        if !git_project_ignoring(fx.root(), gitignore) {
+            return;
+        }
+        let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+        assert_eq!(code, 1, "{gitignore:?}: {env:#}");
+        assert_eq!(env["error"]["code"], want, "{env:#}");
+        assert!(!fx.root().join(".socket/vendor").exists(), "{env:#}");
+        assert_eq!(
+            std::fs::read_to_string(fx.root().join("Gemfile.lock")).unwrap(),
+            GEM_LOCK
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.root().join("Gemfile")).unwrap(),
+            GEM_GEMFILE
+        );
+    }
+}
+
 /// `scan --mode vendored` end to end on a gem project: discover → download →
 /// vendor lands the gem pair edit (Gemfile pin + `path:`, lock PATH section
 /// + `(= …)!` DEPENDENCIES pin) and the patched artifact dir, keyed in the
@@ -4466,6 +4588,72 @@ snapshots:
         );
     }
 
+    /// #1595: npm 12 matches a version-pinned `allowScripts` approval only
+    /// against a registry tarball URL, so once vendoring rewires the lock
+    /// to the `file:` tarball the approved install script stops running.
+    /// The vendored run still vendors, leaves package.json untouched and
+    /// records `vendor_npm_allow_scripts`; a name-only approval (which npm
+    /// still honors) records nothing.
+    #[tokio::test]
+    #[serial]
+    async fn vendor_package_lock_warns_when_pinned_allow_scripts_approval_is_lost() {
+        let server = MockServer::start().await;
+        let registry = mock_registry(&server).await;
+        for (policy, expect_warning) in [
+            (json!({ format!("{CONV_NAME}@{CONV_VERSION}"): true }), true),
+            (
+                json!({ format!("{CONV_NAME}@{CONV_VERSION}"): true, CONV_NAME: true }),
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            write_package_lock_project(root);
+            let package_json = json!({
+                "name": "consumer",
+                "version": "0.0.0",
+                "dependencies": { CONV_NAME: CONV_VERSION },
+                "allowScripts": policy,
+            })
+            .to_string();
+            std::fs::write(root.join("package.json"), &package_json).unwrap();
+            let lock_path = root.join("package-lock.json");
+            let mut lock: Value =
+                serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+            lock["packages"][format!("node_modules/{CONV_NAME}")]["hasInstallScript"] = true.into();
+            std::fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+            seed_manifest_and_blob(root);
+            let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+            assert_eq!(code, 0, "vendoring still succeeds: {env:#}");
+            find_event(&env, "applied", None);
+            let warned = events(&env)
+                .iter()
+                .find(|e| e["errorCode"] == "vendor_npm_allow_scripts");
+            if expect_warning {
+                let warned =
+                    warned.unwrap_or_else(|| panic!("expected vendor_npm_allow_scripts: {env:#}"));
+                assert_eq!(warned["action"], "skipped", "{env:#}");
+                let text = warned.to_string();
+                assert!(
+                    text.contains(&format!("{CONV_NAME}@{CONV_VERSION}"))
+                        && text.contains("vendored `file:` tarball"),
+                    "{text}"
+                );
+            } else {
+                assert!(
+                    warned.is_none(),
+                    "a name-only approval still matches: {env:#}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("package.json")).unwrap(),
+                package_json,
+                "the user's allowScripts policy is never rewritten"
+            );
+        }
+    }
+
     /// [`write_package_lock_project`] plus a parent package `bund` that
     /// BUNDLES the same `name@version` (`inBundle: true`): the hosted run
     /// rewires only the hoisted entry (`redirect_npm_bundled_instance_skipped`).
@@ -4653,6 +4841,52 @@ snapshots:
             "vendor --revert lands on upstream: {lock}"
         );
         assert!(!root.join(".npmrc").exists());
+    }
+
+    /// Hosted → vendored in a git project whose `.gitignore` matches the
+    /// vendor ledger (#1638): both the eject (no manifest) and the
+    /// manifest-driven takeover refuse `vendor_ledger_gitignored` before
+    /// restoring anything, so the project stays hosted.
+    #[tokio::test]
+    #[serial]
+    async fn hosted_then_vendor_with_a_gitignored_ledger_keeps_the_hosted_wiring() {
+        if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+            return;
+        }
+        for with_manifest in [false, true] {
+            let server = MockServer::start().await;
+            mock_hosted_api(&server).await;
+            let registry = mock_registry(&server).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            write_package_lock_project(root);
+            assert!(super::git_project_ignoring(
+                root,
+                "node_modules/\nstate.json\n"
+            ));
+            assert_eq!(scan_run(hosted_args(root, server.uri())).await, 0);
+            let hosted_lock = std::fs::read(root.join("package-lock.json")).unwrap();
+            let hosted_npmrc = std::fs::read(root.join(".npmrc")).unwrap();
+            assert!(String::from_utf8_lossy(&hosted_lock).contains(HOSTED_URL));
+
+            if with_manifest {
+                seed_manifest_and_blob(root);
+            }
+            let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+            assert_eq!(code, 1, "with_manifest={with_manifest}: {env:#}");
+            assert_eq!(env["error"]["code"], "vendor_ledger_gitignored", "{env:#}");
+            assert_eq!(
+                std::fs::read(root.join("package-lock.json")).unwrap(),
+                hosted_lock,
+                "the hosted lock must be untouched"
+            );
+            assert_eq!(
+                std::fs::read(root.join(".npmrc")).unwrap(),
+                hosted_npmrc,
+                "the hosted .npmrc must be untouched"
+            );
+            assert!(!root.join(".socket/vendor").exists(), "{env:#}");
+        }
     }
 
     /// Hosted → vendored in a git project that ignores `.socket/` (#831):
@@ -5166,4 +5400,158 @@ async fn in_process_vendor_state_attests_manifest_less() {
             .join()
             .expect("manifest-less VEX tail panicked");
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 13. repair restores the npm `<uuid>/` metadata (#1581)
+// ─────────────────────────────────────────────────────────────────────
+
+const UUID_GITIGNORE: &str =
+    "!*\n**/node_modules/*/node_modules/\n**/node_modules/@*/*/node_modules/\n";
+const UUID_GITATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding\n";
+
+fn uuid_dir(fx: &NpmFixture) -> PathBuf {
+    fx.root().join(format!(".socket/vendor/npm/{UUID}"))
+}
+
+/// `git init` the fixture; `false` when git is not installed.
+fn git_init(root: &Path) -> bool {
+    if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+        return false;
+    }
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success());
+    true
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn repair_cli(cwd: &Path) -> (i32, Value) {
+    let (code, stdout, stderr) = run_cli(
+        cwd,
+        &["repair", "--json", "--cwd", cwd.to_str().unwrap()],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("repair --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (code, env)
+}
+
+/// #1581: a project vendored before #1541 keeps the legacy `* -text`
+/// `<uuid>/.gitattributes`, so a repository `*.tgz filter=lfs` rule still
+/// applies to the tarball. `repair` must upgrade it, both when the
+/// artifact is healthy and when it redownloads an LFS pointer, or the
+/// repaired tarball goes back into LFS on the next commit.
+#[tokio::test]
+async fn repair_upgrades_a_legacy_uuid_gitattributes() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let has_git = git_init(fx.root());
+    std::fs::write(
+        fx.root().join(".gitattributes"),
+        "*.tgz filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .unwrap();
+    let attrs = uuid_dir(&fx).join(".gitattributes");
+    let tarball = std::fs::read(fx.tgz_path()).unwrap();
+
+    // Healthy artifact.
+    std::fs::write(&attrs, "* -text\n").unwrap();
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(std::fs::read_to_string(&attrs).unwrap(), UUID_GITATTRIBUTES);
+
+    // The tarball checked out as an LFS pointer (no smudge).
+    std::fs::write(&attrs, "* -text\n").unwrap();
+    std::fs::write(
+        fx.tgz_path(),
+        "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n",
+    )
+    .unwrap();
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "rebuilt", None);
+    assert_eq!(std::fs::read(fx.tgz_path()).unwrap(), tarball);
+    assert_eq!(std::fs::read_to_string(&attrs).unwrap(), UUID_GITATTRIBUTES);
+    if has_git {
+        assert_eq!(
+            git_stdout(fx.root(), &["check-attr", "filter", "--", &rel_tgz()]),
+            format!("{}: filter: unset\n", rel_tgz()),
+            "the repository's LFS rule must not reach the vendored tarball"
+        );
+    }
+}
+
+/// #1581 (second symptom): when the whole `<uuid>/` dir is lost, `repair`
+/// redownloaded only the tarball. Without its `<uuid>/.gitignore` (`!*`) a
+/// stock Node.gitignore `*.tgz` rule ignores it, so "commit it" committed
+/// nothing and every fresh clone failed.
+#[tokio::test]
+async fn repair_of_a_lost_uuid_dir_restores_its_gitignore_and_gitattributes() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let has_git = git_init(fx.root());
+    std::fs::write(fx.root().join(".gitignore"), "node_modules/\n*.tgz\n").unwrap();
+    let tarball = std::fs::read(fx.tgz_path()).unwrap();
+    std::fs::remove_dir_all(uuid_dir(&fx)).unwrap();
+
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "rebuilt", None);
+    assert_eq!(std::fs::read(fx.tgz_path()).unwrap(), tarball);
+    assert_eq!(
+        std::fs::read_to_string(uuid_dir(&fx).join(".gitignore")).unwrap(),
+        UUID_GITIGNORE
+    );
+    assert_eq!(
+        std::fs::read_to_string(uuid_dir(&fx).join(".gitattributes")).unwrap(),
+        UUID_GITATTRIBUTES
+    );
+    if has_git {
+        assert_eq!(
+            git_stdout(fx.root(), &["check-ignore", "--no-index", &rel_tgz()]),
+            "",
+            "git must commit the redownloaded tarball"
+        );
+    }
+}
+
+/// #1581: a rule the `<uuid>/.gitignore` cannot override (`.socket/`) still
+/// ignores the redownloaded tarball. `repair` must say so with the same
+/// `vendor_artifact_gitignored` code `vendor` refuses with, not report a
+/// repair that the next commit drops.
+#[tokio::test]
+async fn repair_of_a_lost_uuid_dir_under_an_ignored_socket_dir_fails() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    if !git_init(fx.root()) {
+        return;
+    }
+    std::fs::write(fx.root().join(".gitignore"), "node_modules/\n.socket/\n").unwrap();
+    std::fs::remove_dir_all(uuid_dir(&fx)).unwrap();
+
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 1, "{env:#}");
+    let failed = find_event(&env, "failed", Some("vendor_artifact_gitignored"));
+    assert_eq!(failed["purl"], PURL, "{env:#}");
+
+    // The artifact is now healthy on disk, but git still drops it: the
+    // next run must not go green with nothing fixed.
+    let (code, env) = repair_cli(fx.root());
+    assert_eq!(code, 1, "{env:#}");
+    find_event(&env, "failed", Some("vendor_artifact_gitignored"));
 }

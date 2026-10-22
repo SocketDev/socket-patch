@@ -888,6 +888,8 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         silent,
         all_releases: args.all_releases,
         strict: args.common.strict,
+        allow_patch_conflicts: args.common.allow_patch_conflicts,
+        user_patch_skips_reported: true,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
         patch_server_url: args.common.patch_server_url.clone(),
@@ -1216,12 +1218,20 @@ fn is_info_note(code: &str) -> bool {
 }
 
 /// Print the run-level warnings to stderr: advisories as `Note:` (not
-/// under `--silent`), everything else as `Warning:`.
+/// under `--silent`), everything else as `Warning:`. User-patch skips are
+/// silenced too, matching `user_patches::check`; the envelope keeps them.
 fn print_layout_refusals(refusals: &[(String, String)], silent: bool) {
     for (code, detail) in refusals {
         if is_info_note(code) {
             if !silent {
                 eprintln!("Note: {detail}");
+            }
+        } else if matches!(
+            code.as_str(),
+            super::user_patches::CONFLICT | super::user_patches::ALLOWED
+        ) {
+            if !silent {
+                eprintln!("Warning: {detail}");
             }
         } else {
             eprintln!("Warning: {detail}");
@@ -2212,7 +2222,42 @@ async fn run_scan(
             .locate_nested_copies(&nm_roots, &filtered_crawled)
             .await;
     }
-    let filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
+    let mut filtered_crawled = policy.admit_crawled_copies(filtered_crawled, &supplement_purls);
+    // Keep the full crawl above for GC: a protected package is still installed.
+    // Protect before querying/selecting, in every mode and in dry-run previews.
+    let user_patches = super::user_patches::inspect(&args.common).await;
+    let mut user_patch_withheld = 0usize;
+    let mut user_patch_skips = Vec::new();
+    filtered_crawled.retain(|package| {
+        let sources = user_patches.conflicts(&package.purl);
+        if sources.is_empty() {
+            return true;
+        }
+        let detail =
+            super::user_patches::detail(&package.purl, &sources, args.common.allow_patch_conflicts);
+        if !args.common.allow_patch_conflicts {
+            user_patch_withheld += 1;
+            if !user_patch_skips
+                .iter()
+                .any(|event: &PatchEvent| event.purl.as_deref() == Some(package.purl.as_str()))
+            {
+                user_patch_skips.push(
+                    PatchEvent::new(PatchAction::Skipped, &package.purl)
+                        .with_reason(super::user_patches::CONFLICT, &detail),
+                );
+            }
+        }
+        layout_refusals.push((
+            if args.common.allow_patch_conflicts {
+                super::user_patches::ALLOWED
+            } else {
+                super::user_patches::CONFLICT
+            }
+            .into(),
+            detail,
+        ));
+        args.common.allow_patch_conflicts
+    });
 
     // Gradle discovery notes (m2 gating, the user home) ride the run-level
     // warnings; the lock set only annotates `packages[]` below.
@@ -2282,6 +2327,9 @@ async fn run_scan(
             // Layout refusals ride `warnings` so a consumer can tell an
             // unscannable project from an empty one.
             env.warnings.extend(layout_warnings(&layout_refusals));
+            for skip in &user_patch_skips {
+                env.record(skip.clone());
+            }
             if let Some(gc) = &unwired_gc {
                 gc.record_into(&mut env, args.common.dry_run);
             }
@@ -2320,8 +2368,13 @@ async fn run_scan(
             emit_scan(&env);
             return code;
         } else if !args.common.silent {
-            // A project the policy skipped as a whole is not an empty one.
-            if !policy.root_excluded() {
+            // A project the policy skipped as a whole is not an empty one,
+            // and neither is one whose every package the consent gate held.
+            if user_patch_withheld > 0 {
+                println!(
+                    "{user_patch_withheld} installed package(s) are protected by project patches (see the warnings above) and were not scanned. Pass --allow-patch-conflicts to scan them anyway."
+                );
+            } else if !policy.root_excluded() {
                 println!(
                     "{}",
                     render::no_packages_message(
@@ -2684,6 +2737,9 @@ async fn run_scan(
         env.set_extra("updates", serde_json::Value::Array(updates_json(&updates)));
         env.set_extra("rollout", stage.json());
         env.warnings.extend(layout_warnings(&layout_refusals));
+        for skip in &user_patch_skips {
+            env.record(skip.clone());
+        }
         // One warning per failed batch (status and exit unchanged).
         for (batch, err) in &failed_batches {
             let line = render::batch_failed_warning(*batch, total_batches, err);

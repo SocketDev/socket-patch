@@ -1003,6 +1003,74 @@ pub(crate) async fn write_marker_or_warn(
     }
 }
 
+/// The vendor ledger is ignored by git, so the commit the vendored workflow
+/// ends with would leave it out (#1638).
+pub const LEDGER_GITIGNORED: &str = "vendor_ledger_gitignored";
+
+/// Refuse a vendored run whose state git would not commit (#1638): every
+/// other checkout would get the lock wiring and the artifacts but no
+/// ledger, so `rollback`, `list` and `vendor --revert` there could not see
+/// the patches. One `git check-ignore` over `.socket/vendor/` and the
+/// ledger, honouring the index (a ledger already tracked keeps being
+/// committed):
+///
+/// - a rule that ignores `.socket/vendor/` as a directory (`.socket/`,
+///   `vendor/`) is `vendor_artifact_gitignored`, unless
+///   `artifacts_checked`: every backend in the run refuses that rule per
+///   package itself (the npm family, NuGet, PyPI, the JVM trees), naming the
+///   package;
+/// - a file rule that matches only the ledger (`state.json`, `*.json`) is
+///   `vendor_ledger_gitignored`.
+///
+/// `None` when git would commit both, git is absent, the root is not a work
+/// tree, or git cannot answer (the fail-open of
+/// [`super::npm_dir::gitignored`]).
+pub async fn ledger_gitignore_refusal(
+    project_root: &Path,
+    artifacts_checked: bool,
+) -> Option<(&'static str, String)> {
+    let dir = format!("{VENDOR_DIR}/");
+    let paths = [dir.clone(), VENDOR_STATE_REL.to_string()];
+    let lines = super::npm_dir::ignoring_rule_lines(project_root, &paths, false)
+        .await
+        .ok()??;
+    let dir_lines: Vec<String> = lines
+        .iter()
+        .filter(|line| line.ends_with(&format!("\t{dir}")))
+        .cloned()
+        .collect();
+    if !dir_lines.is_empty() {
+        return (!artifacts_checked).then(|| {
+            (
+                super::npm_dir::GITIGNORED,
+                super::npm_dir::gitignored_detail(
+                    VENDOR_DIR,
+                    &super::npm_dir::summarize_rules(&dir_lines),
+                ),
+            )
+        });
+    }
+    Some((
+        LEDGER_GITIGNORED,
+        format!(
+            "git would not commit the vendor ledger {VENDOR_STATE_REL} ({}), so other \
+             checkouts could not roll back or list the vendored patches; remove that rule \
+             or add `!{VENDOR_STATE_REL}` to .gitignore, then vendor again",
+            super::npm_dir::summarize_rules(&lines)
+        ),
+    ))
+}
+
+/// The rules (summarized for a message) that would keep git from
+/// committing the project-relative file `rel`. A tracked file is never
+/// ignored. `None` also when git is absent or cannot answer.
+pub async fn file_gitignored(project_root: &Path, rel: &str) -> Option<String> {
+    super::npm_dir::ignoring_rule_lines(project_root, &[rel.to_string()], false)
+        .await
+        .ok()?
+        .map(|lines| super::npm_dir::summarize_rules(&lines))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

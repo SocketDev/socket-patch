@@ -493,7 +493,8 @@ fn assert_refusal_left_tree_alone(root: &Path, lock_before: &[u8]) {
 
 /// Drive `scan --mode vendored --json` on `shape` and pin the refusal
 /// contract for `code`: exit 1, `partialFailure`, the download-phase
-/// record, zero downloads, zero view fetches, engine untouched.
+/// record, zero downloads, zero view fetches, engine untouched. Explicit
+/// user-patch consent still cannot bypass a malformed/unsupported lock.
 async fn assert_scan_refuses(shape: LockShape, code: &str) {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
@@ -505,7 +506,11 @@ async fn assert_scan_refuses(shape: LockShape, code: &str) {
         Vec::new()
     };
 
-    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
+    let (exit, stdout, stderr) = scan_vendored(
+        tmp.path(),
+        &mock.uri(),
+        &["--json", "--allow-patch-conflicts"],
+    );
     assert_eq!(exit, 1, "{shape:?}: stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "partialFailure", "{shape:?}: {v}");
@@ -1682,6 +1687,7 @@ async fn fifo_bun_lock_is_refused_without_blocking() {
             "--vendor-source",
             "service",
             "--json",
+            "--allow-patch-conflicts",
         ],
         &uri,
     );
@@ -1705,6 +1711,7 @@ async fn fifo_bun_lock_is_refused_without_blocking() {
             "--vendor-source",
             "service",
             "--json",
+            "--allow-patch-conflicts",
         ],
         &uri,
     );

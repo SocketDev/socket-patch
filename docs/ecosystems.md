@@ -133,6 +133,14 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   E404: the hosted run reads it from the same env / project / user / global /
   builtin layers and warns `redirect_npm_replace_registry_host` (set
   `replace-registry-host=npmjs` in the project `.npmrc`, or use vendored mode).
+  npm 12 runs a dependency's install script only when `package.json`
+  `allowScripts` approves it, and matches a version-pinned key
+  (`"esbuild@0.19.12": true`, what `npm approve-scripts` writes) only against a
+  registry tarball URL. Hosted and vendored lock entries are not one, so when a
+  patched package with an install script is approved only by version, the run
+  leaves the policy alone and warns `redirect_npm_allow_scripts` /
+  `vendor_npm_allow_scripts`: approve it by name (`"esbuild": true`) to keep
+  the script running (#1595).
   npm 6 ignores `resolved` for registry
   dependencies, so a redirected lockfileVersion 1 lock fails closed with
   EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm
@@ -289,8 +297,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
 - **yarn copies under another dependency name (classic & berry)** — yarn keys a `file:`
-  tarball or directory, a URL tarball and a berry `portal:` / `link:` dependency by the
-  name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as `lp2@file:…`,
+  tarball or directory, a URL tarball and a berry `portal:` / `link:` / `exec:` / git
+  dependency by the name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as `lp2@file:…`,
   while `node_modules/lp2` is left-pad@1.3.0. No pin or vendored wiring of `left-pad`
   reaches that copy, so it stays unpatched. Which package such a copy is comes from the
   copy itself (the tarball's or directory's `package.json`, or the registry package a
@@ -299,7 +307,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   installs it from, including a `file:` path outside the project (`file:../shared/lp`),
   and a tarball's `package.json` is found under whatever top-level directory it has, as
   yarn strips the first path segment. A copy whose package can't be read (a non-registry
-  URL, a missing directory) is treated as possibly any package at its lock version: it
+  URL, a missing directory, a berry `exec:` script or a berry git remote such as
+  `git+ssh://…`, which hold no package until yarn builds or clones them) is treated as
+  possibly any package at its lock version: it
   is named as a copy it may be, and `vex` attests nothing that lock wires at that
   version. An absolute path (`portal:/home/me/lp`, `file:/abs/lp.tgz`) is never read, as
   the lock is untrusted input; a `portal:` / `link:` copy whose `package.json` isn't
@@ -686,7 +696,8 @@ inside it, and a `.gitattributes` (`* -text -filter -ident -working-tree-encodin
 turns off EOL conversion and overrides the project's clean/smudge filters, such as a Git
 LFS `*.tgz` rule, so an `autocrlf` or LFS-less checkout stays byte-exact (#1541). A tarball
 an older release already committed as an LFS pointer stays one until it is re-added:
-after the next vendored run, `git add --renormalize .socket/vendor/npm` and commit. The lock's node becomes a `file` node, the importer edges and the
+after the next vendored run or `socket-patch repair`, `git add --renormalize
+.socket/vendor/npm` and commit. The lock's node becomes a `file` node, the importer edges and the
 importers' `package.json` specs move to the `file:` path, and every moved entry is placed
 where vlt's own serializer puts it, so `vlt ci` keeps the lock byte-identical. Transitive
 targets are refused (`vendor_vlt_transitive_unsupported`: vlt silently reverts
@@ -1459,3 +1470,40 @@ Prebuilt binaries are published for:
 | Linux | x86_64, ARM64, 32-bit ARM hard-float (`arm-unknown-linux-gnueabihf` / `-musleabihf`), i686 |
 | Windows | x86_64, ARM64, i686 |
 | Android | ARM64 |
+
+## Existing project patches
+
+Socket Patch treats declared project patches as a separate source of ownership.
+`scan` and `apply` skip their packages and report `user_patch_conflict`;
+explicit `get` and `vendor` refuse the conflict before patching. Use
+`--allow-patch-conflicts` only after reviewing how the fixes interact. This flag
+permits an attempt; it does not merge diffs or bypass unsupported backend cases.
+Installed file content that matches neither the original nor Socket-patched hash
+also fails by default. See the [CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#existing-project-patches)
+for exact matching rules, diagnostics and detection limits.
+
+The protection applies before any comparison of changed filenames. Two fixes can
+interact even when their diffs do not overlap, and a package manager may reapply
+its own diff after Socket changes the dependency source.
+
+| Mechanism | Research and interaction |
+| --- | --- |
+| pnpm | [`pnpm patch`](https://pnpm.io/cli/patch) records `patchedDependencies`; selectors can be exact versions, ranges, or bare names. Configuration moved into [`pnpm-workspace.yaml`](https://pnpm.io/settings). pnpm's [selector grouping](https://github.com/pnpm/pnpm/blob/v10.20.0/patching/config/src/groupPatchedDependencies.ts) treats `*` as all versions, including prereleases. Both declarations and lock markers matter, including before installation. |
+| Yarn | [`patch:`](https://yarnpkg.com/protocol/patch) changes package source at fetch time. [`yarn patch`](https://yarnpkg.com/features/patching) keeps the diff separately; replacing a locator is not a merge of that diff with Socket's artifact. Yarn builtin compatibility patches are distinguished from user patch paths. |
+| `patch-package` | Its [documented workflow](https://github.com/ds300/patch-package) applies diffs after installation, supports workspace-local setups and `--patch-dir`. Its [filename parser](https://github.com/ds300/patch-package/blob/master/src/PackageDetails.ts) identifies scoped/nested targets, patch sequences and dev-only patches. Looking only for a dependency on `patch-package` is insufficient. |
+| npm / Bun | [npm patch](https://docs.npmjs.com/cli/v12/commands/npm-patch/) and [Bun patch](https://bun.sh/docs/pm/cli/patch) persist project diffs. Socket's pre-existing native npm/Bun backend refusals remain in force after consent; a successful source rewrite alone does not establish that the user's diff was preserved. |
+| Composer | [Composer Patches](https://docs.cweagans.net/composer-patches/usage/defining-patches/) accepts inline and external definitions. [Configuration](https://docs.cweagans.net/composer-patches/usage/configuration/) can relocate that file, and dependencies can provide patches. [`patches.lock.json`](https://docs.cweagans.net/composer-patches/api/patches-lock-json/) is additional read-only evidence. |
+| Cargo / Go | Cargo's [`[patch]`, `[replace]`, and `paths`](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html) and Go's [`replace`](https://go.dev/ref/mod#go-mod-file-replace) can select a user fork or directory. These source choices must not be treated as pristine registry copies. Socket-owned wiring is distinguished from user replacements. |
+
+Python local/VCS sources, Ruby path/git dependencies, JVM dependency substitutions,
+NuGet source choices, and custom build hooks do not share a portable diff registry.
+Their existing source/layout restrictions still apply; the consent detector does
+not claim to interpret every possible plugin, script or external patch pipeline.
+Unknown edits in a file Socket would replace are protected by the default hash
+mismatch refusal. A separate, untouched file with an unrecorded local fix cannot
+be detected by that hash check.
+
+Patch declarations and diffs remain the user's files. Consent is not persisted in
+`socket.yml`, the manifest, or an environment variable; an automated hook must
+specify it deliberately on each invocation if the project intends to combine
+patches. Review the resulting installation and run the project's own tests.

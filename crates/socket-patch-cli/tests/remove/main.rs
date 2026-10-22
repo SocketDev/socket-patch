@@ -16,5 +16,7 @@ mod vlt_vendored;
 mod pypi_name_spellings;
 mod remove_duality_invariants;
 mod remove_failure_paths;
+mod remove_fixture;
 mod remove_invariants;
 mod remove_network;
+mod remove_render;

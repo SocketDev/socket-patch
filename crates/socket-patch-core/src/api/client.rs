@@ -38,7 +38,7 @@ static MULTI_ORG_SHOWN: AtomicBool = AtomicBool::new(false);
 /// at "error sending request for url (...)", dropping the part a user can
 /// act on ("Connection refused", a DNS or TLS failure). Causes already
 /// spelled out by an outer message are skipped.
-fn network_error_detail(e: &reqwest::Error) -> String {
+pub(crate) fn network_error_detail(e: &reqwest::Error) -> String {
     // reqwest's text names the request URL: a grant URL, or one with
     // userinfo from `--api-url` / a proxy, is quoted redacted.
     let mut msg = redact_urls_in(&e.to_string()).into_owned();

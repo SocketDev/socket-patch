@@ -556,6 +556,75 @@ async fn poetry_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, files).await;
 }
 
+/// What `poetry lock --no-update` by Poetry 1.8.5 makes of a lock 2.1
+/// written by Poetry 2.4.1: the same units without `groups`, as lock 2.0.
+fn relock_with_poetry_1_8(root: &Path) {
+    let lock = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    let relocked = relock_text(&lock);
+    assert_ne!(relocked, lock, "the re-lock re-renders the unit");
+    std::fs::write(root.join("poetry.lock"), relocked).unwrap();
+}
+
+fn relock_text(lock: &str) -> String {
+    lock.replace("Poetry 2.4.1", "Poetry 1.8.5")
+        .replace("groups = [\"main\"]\n", "")
+        .replace("lock-version = \"2.1\"", "lock-version = \"2.0\"")
+}
+
+/// #1615: after a re-lock by another Poetry version, every unwind restores
+/// the registry unit (in the re-lock's rendering) and reclaims the
+/// artifact, instead of drift-keeping it forever.
+#[tokio::test]
+async fn poetry_unwinds_after_a_relock_by_another_poetry_version() {
+    for unwind in [
+        vec!["vendor", "--revert"],
+        vec!["rollback", "--yes", "--offline"],
+        vec!["remove", PURL, "--yes", "--offline"],
+    ] {
+        let (_tmp, root) = project();
+        let files = stage_poetry(&root);
+        let pristine = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+        vendor_project(&root, files);
+        relock_with_poetry_1_8(&root);
+
+        let (code, env) = run_cli(&root, &unwind, &[]);
+        assert_eq!(code, 0, "{unwind:?}: {env:#}");
+        assert!(
+            !env.to_string().contains("vendor_lock_entry_drifted"),
+            "{unwind:?}: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("poetry.lock")).unwrap(),
+            relock_text(&pristine),
+            "{unwind:?}: the registry unit as Poetry 1.8.5 renders it"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+            "{unwind:?}: the vendored artifact is reclaimed"
+        );
+    }
+}
+
+/// #1615: the vendored -> hosted takeover reverts the re-locked unit too.
+#[tokio::test]
+async fn poetry_vendored_to_hosted_after_a_relock() {
+    let (_tmp, root) = project();
+    let files = stage_poetry(&root);
+    vendor_project(&root, files);
+    relock_with_poetry_1_8(&root);
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
+    let lock = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    assert!(
+        !lock.contains(".socket/vendor/") && lock.contains(&hosted_url),
+        "{lock}"
+    );
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+}
+
 const PIPFILE: &str = "[[source]]\nurl = \"https://pypi.org/simple\"\nverify_ssl = true\nname = \"pypi\"\n\n[packages]\nsix = \"==1.16.0\"\n\n[requires]\npython_version = \"3.11\"\n";
 
 /// A Pipenv project; returns its wiring files.
@@ -894,6 +963,101 @@ async fn uv_no_sources_is_refused_in_both_modes() {
             "vendored {file}: {env:#}"
         );
         assert_eq!(tree(&root), before, "vendored {file} wrote nothing");
+    }
+}
+
+/// #1603: under `no-binary = true` or a `no-binary-package` list naming the
+/// package (pyproject's `[tool.uv]`, a project `uv.toml`, or a PEP 723
+/// script's own `[tool.uv]`), uv installs the package only from an sdist,
+/// so the patched wheel both modes wire fails every `uv sync`. Both used to
+/// wire it and exit 0; they must refuse and write nothing. `no-build-package`
+/// allows wheels, so it is still wired.
+#[tokio::test]
+async fn uv_no_binary_is_refused_in_both_modes() {
+    for (script, file, setting, refused) in [
+        (
+            false,
+            "pyproject.toml",
+            "\n[tool.uv]\nno-binary-package = [\"Six\"]\n",
+            true,
+        ),
+        (
+            false,
+            "pyproject.toml",
+            "\n[tool.uv]\nno-binary = true\n",
+            true,
+        ),
+        (false, "uv.toml", "no-binary-package = [\"six\"]\n", true),
+        (true, "job.py", "", true),
+        (
+            false,
+            "pyproject.toml",
+            "\n[tool.uv]\nno-build-package = [\"six\"]\n",
+            false,
+        ),
+    ] {
+        let (_tmp, root) = project();
+        let label = if script { "script" } else { file };
+        if script {
+            stage_script_lock(&root);
+            let path = root.join(file);
+            let text = std::fs::read_to_string(&path).unwrap().replace(
+                "# ///\n",
+                "#\n# [tool.uv]\n# no-binary-package = [\"six\"]\n# ///\n",
+            );
+            assert!(text.contains("no-binary-package"), "{text}");
+            std::fs::write(&path, text).unwrap();
+        } else {
+            stage_uv(&root);
+            let path = root.join(file);
+            let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+            text.push_str(setting);
+            std::fs::write(&path, text).unwrap();
+        }
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted {label}: {env:#}");
+        if !refused {
+            assert_eq!(hosted_pinned(&env), 1, "hosted {label}: {env:#}");
+            let (_tmp, root) = project();
+            stage_uv(&root);
+            let path = root.join(file);
+            let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+            text.push_str(setting);
+            std::fs::write(&path, text).unwrap();
+            stage_manifest(&root);
+            let (code, env) = run_cli(&root, &["vendor"], &[]);
+            assert_eq!(code, 0, "vendored {label}: {env:#}");
+            assert!(
+                !env.to_string().contains("pypi_uv_no_binary"),
+                "vendored {label}: {env:#}"
+            );
+            continue;
+        }
+        assert_eq!(hosted_pinned(&env), 0, "hosted {label}: {env:#}");
+        let unsupported = if script {
+            "redirect_uv_script_unsupported"
+        } else {
+            "redirect_uv_project_unsupported"
+        };
+        assert!(
+            env.to_string().contains(unsupported) && env.to_string().contains("no-binary"),
+            "hosted {label}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "hosted {label} wrote nothing");
+
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_ne!(code, 0, "vendored {label}: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_uv_no_binary"),
+            "vendored {label}: {env:#}"
+        );
+        assert_eq!(tree(&root), before, "vendored {label} wrote nothing");
     }
 }
 

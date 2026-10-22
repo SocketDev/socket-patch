@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::common::{git_sha256, run_with_env};
+use crate::common::hermetic::{self, Extra};
+use crate::common::{binary, git_sha256, hermetic_command, run_with_env};
 
 pub const GO_PURL: &str = "pkg:golang/example.com/mod@v1.0.0";
 pub const GO_COPY_DIR: &str = ".socket/go-patches/example.com/mod@v1.0.0";
@@ -93,8 +94,10 @@ pub fn write_root_package_json(root: &Path) {
 }
 
 /// Synthesize an installed gem under the cwd's vendor/bundle tree (the
-/// layout the ruby crawler scans in local mode — same shape as
-/// `cli_gem_variant_mismatch_policy.rs`). Returns the patchable file path.
+/// layout the ruby crawler scans in local mode; a real `gem install`
+/// produces exactly this `gems/<name>-<version>[-<platform>]` leaf,
+/// verified against RubyGems on ruby 3.4). Returns the patchable file
+/// path.
 pub fn install_gem(root: &Path, leaf: &str, file_rel: &str, contents: &[u8]) -> PathBuf {
     let gem_dir = root
         .join("vendor")
@@ -224,4 +227,137 @@ pub fn write_sourceless_npm_patches(root: &Path, n: u32) {
         })
         .collect();
     write_manifest(root, Value::Object(patches));
+}
+
+// ═══════════ gem release-variant mismatch fixtures ═══════════
+//
+// Shared by `cli_gem_variant_mismatch_policy.rs` (the `--json`
+// contracts) and `apply_render.rs` (the human output).
+
+/// The rack singleton's on-disk bytes after a local edit: they match
+/// neither the record's beforeHash nor its afterHash.
+pub const GEM_LOCAL: &[u8] = b"module Rack\n  VERSION = '3.1.0'\nend\n# local tweak\n";
+pub const NOKOGIRI_LINUX_PRISTINE: &[u8] = b"module Nokogiri\n  VERSION = '1.16.5'\nend\n";
+pub const NOKOGIRI_DARWIN_BEFORE: &[u8] = b"# nokogiri.rb from the arm64-darwin gem\n";
+pub const NOKOGIRI_LINUX_MARKER: &[u8] = b"\n# SOCKET-LINUX-PATCH\n";
+pub const NOKOGIRI_DARWIN_MARKER: &[u8] = b"\n# DARWIN-MARKER\n";
+
+/// Run `socket-patch apply --offline --ecosystems gem <extra>` in `cwd`
+/// with the hermetic `SOCKET_*` environment (`hermetic_command`) and the
+/// ambient `BUNDLE_*` scrubbed, so only the argv decides behavior.
+pub fn run_gem_apply(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
+    let mut cmd = hermetic_command(&binary());
+    cmd.arg("apply")
+        .args(["--offline", "--ecosystems", "gem"])
+        .args(extra)
+        .current_dir(cwd);
+    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
+    let out = cmd.output().expect("run socket-patch apply");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// `pkg:gem/nokogiri@1.16.5?platform=<platform>`.
+pub fn nokogiri_purl(platform: &str) -> String {
+    format!("pkg:gem/nokogiri@1.16.5?platform={platform}")
+}
+
+/// Singleton fixture: one bare-PURL gem record (`GEM_BASE_PURL`) whose
+/// only file was locally modified on disk (`GEM_LOCAL`); the afterHash
+/// blob is staged so the offline apply has the full patched bytes.
+/// Returns the on-disk file path and the exact patched bytes a correct
+/// warn-overwrite must produce.
+pub fn gem_singleton_mismatch_fixture(root: &Path) -> (PathBuf, Vec<u8>) {
+    let patched = [GEM_PRISTINE, b"\n# SOCKET-SINGLETON-PATCH\n"].concat();
+    let file = install_gem(root, "rack-3.1.0", "lib/rack.rb", GEM_LOCAL);
+    write_manifest(
+        root,
+        json!({
+            GEM_BASE_PURL: patch_record(
+                "31313131-3131-4131-8131-313131313131",
+                one_file("lib/rack.rb", GEM_PRISTINE, &patched),
+            )
+        }),
+    );
+    stage_blob(root, &git_sha256(&patched), &patched);
+    // Fixture sanity: the on-disk bytes must match neither hash, or the
+    // mismatch path under test is never taken.
+    assert_ne!(git_sha256(GEM_LOCAL), git_sha256(GEM_PRISTINE));
+    assert_ne!(git_sha256(GEM_LOCAL), git_sha256(&patched));
+    (file, patched)
+}
+
+/// The x86_64-linux nokogiri record (`lib/nokogiri.rb`, pristine →
+/// pristine + `NOKOGIRI_LINUX_MARKER`), blob staged. Returns the
+/// patched bytes.
+fn write_nokogiri_linux_record(
+    root: &Path,
+    patches: &mut serde_json::Map<String, Value>,
+) -> Vec<u8> {
+    let patched = [NOKOGIRI_LINUX_PRISTINE, NOKOGIRI_LINUX_MARKER].concat();
+    patches.insert(
+        nokogiri_purl("x86_64-linux"),
+        patch_record(
+            "41414141-4141-4141-8141-414141414141",
+            one_file("lib/nokogiri.rb", NOKOGIRI_LINUX_PRISTINE, &patched),
+        ),
+    );
+    stage_blob(root, &git_sha256(&patched), &patched);
+    patched
+}
+
+/// Qualified-singleton fixture: a lone `?platform=x86_64-linux` record
+/// with the arm64-darwin gem installed, whose bytes match neither of the
+/// record's hashes. Returns the on-disk file path.
+pub fn gem_wrong_platform_fixture(root: &Path) -> PathBuf {
+    let file = install_gem(
+        root,
+        "nokogiri-1.16.5-arm64-darwin",
+        "lib/nokogiri.rb",
+        NOKOGIRI_DARWIN_BEFORE,
+    );
+    let mut patches = serde_json::Map::new();
+    let linux_patched = write_nokogiri_linux_record(root, &mut patches);
+    write_manifest(root, Value::Object(patches));
+    // Fixture sanity: the darwin bytes must match neither hash, or the
+    // wrong-platform path under test is never taken.
+    assert_ne!(
+        git_sha256(NOKOGIRI_DARWIN_BEFORE),
+        git_sha256(NOKOGIRI_LINUX_PRISTINE)
+    );
+    assert_ne!(
+        git_sha256(NOKOGIRI_DARWIN_BEFORE),
+        git_sha256(&linux_patched)
+    );
+    file
+}
+
+/// Multi-variant fixture: the x86_64-linux gem is installed with
+/// `on_disk` bytes; the manifest has its record plus an arm64-darwin
+/// sibling describing a DIFFERENT distribution whose beforeHash can never
+/// match. Both afterHash blobs are staged. Returns the on-disk file path
+/// and the linux and darwin patched bytes.
+pub fn gem_multi_variant_fixture(root: &Path, on_disk: &[u8]) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    let file = install_gem(
+        root,
+        "nokogiri-1.16.5-x86_64-linux",
+        "lib/nokogiri.rb",
+        on_disk,
+    );
+    let mut patches = serde_json::Map::new();
+    let linux_patched = write_nokogiri_linux_record(root, &mut patches);
+    let darwin_patched = [NOKOGIRI_DARWIN_BEFORE, NOKOGIRI_DARWIN_MARKER].concat();
+    patches.insert(
+        nokogiri_purl("arm64-darwin"),
+        patch_record(
+            "42424242-4242-4242-8242-424242424242",
+            one_file("lib/nokogiri.rb", NOKOGIRI_DARWIN_BEFORE, &darwin_patched),
+        ),
+    );
+    stage_blob(root, &git_sha256(&darwin_patched), &darwin_patched);
+    write_manifest(root, Value::Object(patches));
+    (file, linux_patched, darwin_patched)
 }

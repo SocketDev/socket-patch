@@ -120,15 +120,19 @@ fn mismatch_overwrite_warnings(results: &[ApplyResult], dry_run: bool) -> Vec<Ru
         .collect()
 }
 
-/// The mismatch policy this run applies with: `--force` ⊃ default
-/// (adds the missing-file skip), `--strict` restores fail-closed.
-fn mismatch_policy(force: bool, strict: bool) -> MismatchPolicy {
+/// Unknown local changes fail closed unless explicitly approved; content an
+/// earlier Socket patch wrote is not a local change (patch updates). --force
+/// is existing explicit consent for file drift; declared patches have a
+/// separate gate that requires --allow-patch-conflicts even with --force.
+fn mismatch_policy(force: bool, strict: bool, allow_patch_conflicts: bool) -> MismatchPolicy {
     if force {
         MismatchPolicy::Force
     } else if strict {
         MismatchPolicy::Strict
-    } else {
+    } else if allow_patch_conflicts {
         MismatchPolicy::Warn
+    } else {
+        MismatchPolicy::SocketContent
     }
 }
 
@@ -178,6 +182,10 @@ pub struct NestedApply {
     /// (one envelope per command), but the caller's stdout is, so the
     /// nested run's human error lines stay off stderr too.
     pub caller_json: bool,
+    /// Report the manifest entries the user-patch gate skips: the caller
+    /// (`get`) checked only its own selection. `scan` already reported
+    /// every protected installed package, so it passes `false`.
+    pub report_user_patch_skips: bool,
 }
 
 impl ApplyArgs {
@@ -430,6 +438,20 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     }
     drifts.sort();
 
+    // A drifting package the project patched itself is one a plain `apply`
+    // skips, so the generic remedy cannot clear it: its drift names the
+    // project patch and the consent the remedy needs.
+    let drift_ids: Vec<&str> = drifts.iter().map(|(id, _, _)| id.as_str()).collect();
+    let protected = super::user_patches::evidence(&args.common, &drift_ids).await;
+    for (id, _, detail) in &mut drifts {
+        if let Some(sources) = protected.get(id.as_str()) {
+            detail.push_str(&format!(
+                " (project patch/replacement metadata in {}; a plain `apply` leaves it untouched)",
+                sources.join(", ")
+            ));
+        }
+    }
+
     if drifts.is_empty() {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
@@ -464,7 +486,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 code != socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
                     && code != socket_patch_core::vendor::go_consumer_sync::REQUIREMENTS_CODE
             }) {
-                eprintln!("{}", check_remedy(&args.common));
+                eprintln!("{}", check_remedy(&args.common, !protected.is_empty()));
             }
         }
         1
@@ -637,9 +659,26 @@ fn record_check_skips(env: &mut Envelope, in_sync: &[String], not_installed: &[S
 /// it, with the check's own scope (`--cwd`, `--manifest-path`, `-g` /
 /// `--global-prefix`, `--ecosystems`). A bare `socket-patch apply` would
 /// act on another tree, exit 0 and leave the drift in place (#1219).
-fn check_remedy(common: &GlobalArgs) -> String {
-    let command = format!("socket-patch apply{}", crate::ui::scope_args(common));
-    format!("Run `{command}` to regenerate them.")
+/// `user_patched`: a drifting package has a project patch, which a plain
+/// `apply` skips, so the command carries the consent that applies it.
+fn check_remedy(common: &GlobalArgs, user_patched: bool) -> String {
+    let consent = if user_patched {
+        " --allow-patch-conflicts"
+    } else {
+        ""
+    };
+    let command = format!(
+        "socket-patch apply{}{consent}",
+        crate::ui::scope_args(common)
+    );
+    if user_patched {
+        format!(
+            "After reviewing how the project patches above interact with Socket's, \
+             run `{command}` to regenerate them."
+        )
+    } else {
+        format!("Run `{command}` to regenerate them.")
+    }
 }
 
 /// The `apply --check` success line: how many patches were checked, and how
@@ -830,9 +869,16 @@ fn manifest_targets_npm(manifest: &PatchManifest) -> bool {
 const YARN_PNP_UNSUPPORTED: &str = "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.";
 
 fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
+    refuse_yarn_pnp_with_skips(args, &[])
+}
+
+fn refuse_yarn_pnp_with_skips(args: &ApplyArgs, skipped: &[PatchEvent]) -> i32 {
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
+        for skip in skipped {
+            env.record(skip.clone());
+        }
         env.mark_error(EnvelopeError::new(
             "yarn_pnp_unsupported",
             YARN_PNP_UNSUPPORTED,
@@ -1034,12 +1080,15 @@ pub(crate) struct ApplyRunReport {
     /// `(errorCode, error)`. Set only when `code != 0` and `failures`
     /// alone would not explain it.
     pub run_error: Option<(String, String)>,
-    /// The package keys apply patched or found already patched, so a
-    /// failed run's caller can count exactly what applied. Filled only
-    /// when `code != 0`.
+    /// The package keys actually patched (or verified in a dry run).
+    /// Filled on successful and failed runs; exit 0 alone does not prove a write.
     pub applied: Vec<String>,
+    /// Whole-package skips, including project patches, vendored ownership,
+    /// already-patched files and absent installations, with their reasons.
+    /// These are outcomes even when their warning was already printed by scan.
+    pub skipped: Vec<PatchEvent>,
     /// Non-fatal per-file warnings the caller's envelope must carry: one
-    /// `content_mismatch_overwritten` per file the default mismatch policy
+    /// `content_mismatch_overwritten` per file the explicitly approved mismatch policy
     /// overwrote (#1004). A nested apply never prints JSON and is silent
     /// for a JSON caller, so this is their only channel. Filled whenever
     /// the apply loop ran, whatever the exit code.
@@ -1093,6 +1142,55 @@ fn collect_apply_failures(
     failures
 }
 
+/// Keep successful writes and whole-package skips separate for nested callers.
+/// One already-patched copy must not hide a write to another copy of the same
+/// package; per-copy advisories remain standalone apply events.
+fn collect_apply_outcomes(
+    results: &[ApplyResult],
+    unmatched: &[String],
+    lockfile_only: &HashSet<String>,
+    mut skipped: Vec<PatchEvent>,
+    dry_run: bool,
+) -> (Vec<String>, Vec<PatchEvent>) {
+    let mut applied = Vec::new();
+    for result in results {
+        let event = result_to_event(result, dry_run);
+        match event.action {
+            PatchAction::Applied | PatchAction::Verified => {
+                applied.push(result.package_key.clone());
+            }
+            PatchAction::Skipped => skipped.push(event),
+            _ => {}
+        }
+    }
+    for purl in unmatched {
+        let detail = if lockfile_only.contains(purl) {
+            LOCKFILE_ONLY_DETAIL
+        } else {
+            not_installed_detail(purl)
+        };
+        skipped.push(
+            PatchEvent::new(PatchAction::Skipped, purl)
+                .with_reason("package_not_installed", detail),
+        );
+    }
+    let applied_keys: HashSet<&str> = applied.iter().map(String::as_str).collect();
+    let failed_keys: HashSet<&str> = results
+        .iter()
+        .filter(|r| !r.success)
+        .map(|r| r.package_key.as_str())
+        .collect();
+    skipped.retain(|event| {
+        event
+            .purl
+            .as_deref()
+            .is_none_or(|purl| !applied_keys.contains(purl) && !failed_keys.contains(purl))
+    });
+    skipped.sort_by(|a, b| (&a.purl, &a.error_code).cmp(&(&b.purl, &b.error_code)));
+    skipped.dedup_by(|a, b| a.purl == b.purl && a.error_code == b.error_code);
+    (applied, skipped)
+}
+
 /// The locked half of `apply`: everything from the manifest read on — the
 /// package-manager layout gate, the apply loop, embedded VEX, output and
 /// telemetry — over a `lock` the caller already holds and the caller's
@@ -1125,7 +1223,7 @@ pub(crate) async fn run_locked(
                 "manifest_not_found",
                 format!("Manifest not found at {}", manifest_path.display()),
             );
-            let code = report_apply_failure(&args, &err, &err.message, &telemetry).await;
+            let code = report_apply_failure(&args, &err, &err.message, &[], &telemetry).await;
             return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
         Err(e) => {
@@ -1133,10 +1231,23 @@ pub(crate) async fn run_locked(
             // One manifest-load mapping for every command (#931):
             // `manifest_invalid` / `manifest_unreadable`, never `apply_failed`.
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
-            let code = report_apply_failure(&args, &err, &e.to_string(), &telemetry).await;
+            let code = report_apply_failure(&args, &err, &e.to_string(), &[], &telemetry).await;
             return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
     };
+
+    // Packages the project patched itself sit this run out (warned); every
+    // other record still applies. The read-only `--check` verifies them all.
+    let mut manifest = manifest;
+    let (user_patch_warnings, user_patch_skips) = if args.check {
+        Default::default()
+    } else {
+        super::user_patches::skip_protected(&args.common, &mut manifest.patches).await
+    };
+    let user_patched = user_patch_skips
+        .iter()
+        .filter_map(|e| e.purl.clone())
+        .collect();
 
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
@@ -1152,11 +1263,15 @@ pub(crate) async fn run_locked(
     match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
             if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest) {
-                return ApplyRunReport::run_failure(
-                    refuse_yarn_pnp(&args),
-                    "yarn_pnp_unsupported",
-                    YARN_PNP_UNSUPPORTED,
-                );
+                let code = refuse_yarn_pnp_with_skips(&args, &user_patch_skips);
+                return ApplyRunReport {
+                    skipped: user_patch_skips,
+                    ..ApplyRunReport::run_failure(
+                        code,
+                        "yarn_pnp_unsupported",
+                        YARN_PNP_UNSUPPORTED,
+                    )
+                };
             }
         }
         NpmPkgManager::Pnpm => {
@@ -1208,7 +1323,7 @@ pub(crate) async fn run_locked(
         NpmPkgManager::Npm | NpmPkgManager::YarnClassic | NpmPkgManager::Unknown => {}
     }
 
-    match apply_patches_inner(&args, manifest, client).await {
+    match apply_patches_inner(&args, manifest, &user_patched, client).await {
         Ok(ApplyOutcome {
             success,
             results,
@@ -1230,6 +1345,24 @@ pub(crate) async fn run_locked(
             // rightly ignores it). It rides the run-warning channel so it
             // is never silent.
             let mut run_warnings = run_warnings;
+            // A nested apply's caller (get, scan) already reported the
+            // overrides it approved; repeating them would double each line.
+            // Skips are new to `get`, which checked only its selection; a
+            // JSON caller gets them through the report.
+            let user_patch_warnings: Vec<RunWarning> = user_patch_warnings
+                .into_iter()
+                .filter(|(code, _)| match &args.nested {
+                    None => true,
+                    Some(n) => n.report_user_patch_skips && code == super::user_patches::CONFLICT,
+                })
+                .map(|(code, detail)| RunWarning { code, detail })
+                .collect();
+            run_warnings.extend(user_patch_warnings.iter().cloned());
+            let nested_skip_warnings = if args.nested.is_some() {
+                user_patch_warnings
+            } else {
+                Vec::new()
+            };
             run_warnings.extend(results.iter().filter_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success)?;
                 note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)
@@ -1343,6 +1476,9 @@ pub(crate) async fn run_locked(
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
+                for skip in &user_patch_skips {
+                    env.record(skip.clone());
+                }
                 for result in &results {
                     env.record(result_to_event(result, args.common.dry_run));
                     // Mismatch overwrites ride as Skipped warning events
@@ -1497,10 +1633,20 @@ pub(crate) async fn run_locked(
             // JSON events above are the standalone apply's copy).
             let mut warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
             warnings.extend(cache_warnings);
+            warnings.extend(nested_skip_warnings);
+            let (applied, skipped) = collect_apply_outcomes(
+                &results,
+                &unmatched,
+                &lockfile_only,
+                user_patch_skips,
+                args.common.dry_run,
+            );
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
             if success && !vex_failed {
                 return ApplyRunReport {
+                    applied,
+                    skipped,
                     warnings,
                     ..ApplyRunReport::default()
                 };
@@ -1530,25 +1676,23 @@ pub(crate) async fn run_locked(
             } else {
                 None
             };
-            // Vendor-owned results are skips, not applies.
-            let applied = results
-                .iter()
-                .filter(|r| r.success && r.package_path != VENDOR_OWNED_MARKER)
-                .map(|r| r.package_key.clone())
-                .collect();
             ApplyRunReport {
                 code: 1,
                 failures,
                 run_error,
                 applied,
+                skipped,
                 warnings,
             }
         }
         Err(e) => {
             lock.release();
             let err = EnvelopeError::new("apply_failed", e.clone());
-            let code = report_apply_failure(&args, &err, &e, &telemetry).await;
-            ApplyRunReport::run_failure(code, "apply_failed", e)
+            let code = report_apply_failure(&args, &err, &e, &user_patch_skips, &telemetry).await;
+            ApplyRunReport {
+                skipped: user_patch_skips,
+                ..ApplyRunReport::run_failure(code, "apply_failed", e)
+            }
         }
     }
 }
@@ -1564,12 +1708,16 @@ async fn report_apply_failure(
     args: &ApplyArgs,
     err: &EnvelopeError,
     error: &str,
+    skipped: &[PatchEvent],
     telemetry: &TelemetryAuth,
 ) -> i32 {
     track_patch_apply_failed(error, args.common.dry_run, telemetry).await;
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
+        for skip in skipped {
+            env.record(skip.clone());
+        }
         env.mark_error(err.clone());
         println!("{}", env.to_pretty_json());
     } else {
@@ -1947,6 +2095,7 @@ impl FallbackHomeSkip {
 async fn apply_patches_inner(
     args: &ApplyArgs,
     mut manifest: PatchManifest,
+    user_patched: &HashSet<String>,
     client: &ApiClient,
 ) -> Result<ApplyOutcome, String> {
     // Resolve patch sources (read `.socket/` directly, or stage an overlay
@@ -1996,7 +2145,13 @@ async fn apply_patches_inner(
     // found" early returns — so orphans are reconciled even when the manifest
     // now lists zero in-scope go patches (the all-removed case). No-op unless
     // local go is in scope.
-    reconcile_local_go(&args.common, &target_manifest_purls).await;
+    // Records skipped for project patches are still recorded, not orphans.
+    let recorded: HashSet<String> = target_manifest_purls
+        .iter()
+        .chain(user_patched)
+        .cloned()
+        .collect();
+    reconcile_local_go(&args.common, &recorded).await;
 
     if partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
@@ -2146,7 +2301,11 @@ async fn apply_patches_inner(
 
     // Apply patches
     let sources = staged.as_patch_sources();
-    let policy = mismatch_policy(args.force, args.common.strict);
+    let policy = mismatch_policy(
+        args.force,
+        args.common.strict,
+        args.common.allow_patch_conflicts,
+    );
     let mut has_errors = false;
 
     // Group release-variant PURLs by base. PyPI (`?artifact_id=`),
@@ -3321,6 +3480,42 @@ mod tests {
     }
 
     #[test]
+    fn nested_outcomes_keep_only_whole_package_skips() {
+        let mut unchanged_copy = sample_applied(VerifyStatus::AlreadyPatched);
+        let changed_copy = sample_applied(VerifyStatus::Ready);
+        let mut vendored = sample_applied(VerifyStatus::Ready);
+        vendored.package_key = "pkg:npm/vendor@1.0.0".into();
+        vendored.package_path = VENDOR_OWNED_MARKER.into();
+        let mut already_patched = unchanged_copy.clone();
+        already_patched.package_key = "pkg:npm/already@1.0.0".into();
+        unchanged_copy.package_path = "/another/node_modules/minimist".into();
+        let missing = "pkg:npm/missing@1.0.0".to_string();
+        let (applied, skipped) = collect_apply_outcomes(
+            &[unchanged_copy, changed_copy, vendored, already_patched],
+            std::slice::from_ref(&missing),
+            &HashSet::from([missing.clone()]),
+            Vec::new(),
+            false,
+        );
+        assert_eq!(applied, vec!["pkg:npm/minimist@1.2.2"]);
+        let reasons: Vec<_> = skipped
+            .iter()
+            .map(|s| (s.purl.as_deref().unwrap(), s.error_code.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                ("pkg:npm/already@1.0.0", "already_patched"),
+                ("pkg:npm/missing@1.0.0", "package_not_installed"),
+                ("pkg:npm/vendor@1.0.0", "vendored"),
+            ]
+        );
+        assert!(skipped
+            .iter()
+            .all(|s| s.reason.is_some() && s.files.is_empty()));
+    }
+
+    #[test]
     fn failed_result_maps_to_failed_action() {
         let mut result = sample_applied(VerifyStatus::Ready);
         result.success = false;
@@ -3502,7 +3697,7 @@ mod tests {
     /// `HashMap`-iteration-ordered pick let a variant describing a
     /// different, NOT-installed distribution randomly match and get
     /// attempted (nondeterministic spurious failures, or wrong-variant
-    /// content overwrites under the default mismatch policy). 64 rounds
+    /// content overwrites under the explicitly approved mismatch policy). 64 rounds
     /// with fresh maps so the randomized per-instance iteration order is
     /// actually exercised.
     #[tokio::test]
@@ -3818,7 +4013,7 @@ mod tests {
     /// it verbatim heals the tree that was checked.
     #[test]
     fn check_remedy_repeats_the_check_scope() {
-        let remedy = |common: GlobalArgs| check_remedy(&common);
+        let remedy = |common: GlobalArgs| check_remedy(&common, false);
         assert_eq!(
             remedy(GlobalArgs::default()),
             "Run `socket-patch apply` to regenerate them."
@@ -3859,6 +4054,19 @@ mod tests {
             }),
             "Run `socket-patch apply --cwd svc --manifest-path ../shared/manifest.json \
              --ecosystems npm,pypi` to regenerate them."
+        );
+        // A user-patched drift: the command itself carries the consent, so
+        // running it verbatim clears the drift a plain `apply` would skip.
+        assert_eq!(
+            check_remedy(
+                &GlobalArgs {
+                    cwd: PathBuf::from("app"),
+                    ..GlobalArgs::default()
+                },
+                true
+            ),
+            "After reviewing how the project patches above interact with Socket's, \
+             run `socket-patch apply --cwd app --allow-patch-conflicts` to regenerate them."
         );
     }
 

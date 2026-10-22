@@ -400,7 +400,7 @@ jobs:
         # SHA pin resolved from `gh api repos/actions/setup-go/git/refs/tags/v6.4.0`.
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: '1.24'
+          go-version: '1.24.13' # exact: bump deliberately (#1645)
           cache: false
 
       - name: Restore vexctl (macOS)
@@ -617,7 +617,7 @@ jobs:
         # This job is the Linux leg of `test` (see there): same Go pin.
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: '1.24'
+          go-version: '1.24.13' # exact: bump deliberately (#1645)
           cache: false
 
       - name: Install vexctl
@@ -1419,13 +1419,13 @@ jobs:
         if: matrix.suite == 'e2e_redirect_pnpm_build'
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '24.x'
+          node-version: '24.21.0' # exact: bump deliberately (#1645)
 
       - name: Setup Python
         if: matrix.suite == 'e2e_pypi' || matrix.uv != '' || matrix.poetry != '' || matrix.pdm != '' || matrix.hatch != ''
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: '3.12.x'
+          python-version: '3.12.10' # exact: last 3.12 with Windows+macOS builds; bump deliberately (#1645)
 
       - name: Setup uv (uv legs)
         if: matrix.uv != ''
@@ -1524,10 +1524,14 @@ jobs:
         if: matrix.composer != ''
         # The composer capstones shell out to a real composer; `composer:`
         # pins the release line (1, 2.2 LTS, 2) so the composer.lock grammar
-        # the edits assert stays stable across runners.
+        # the edits assert stays stable across runners. PHP defaults to 8.3,
+        # the ubuntu-24.04 image's own PHP, so setup-php only switches to it
+        # instead of fetching another PHP from the network (8.2 took ~56s per
+        # leg and failed outright when the download broke). `php:` overrides
+        # it for a composer line that wants an older PHP.
         uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
-          php-version: '8.2'
+          php-version: ${{ matrix.php || '8.3' }}
           tools: composer:${{ matrix.composer }}
 
       - name: Select the JVM toolchain (JVM legs)
@@ -1849,7 +1853,9 @@ jobs:
       matrix:
         include:
           - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2.2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1'}
+          # composer 1.10 keeps the PHP 8.2 it has always run on here
+          # (composer-compatibility.yml runs 1.10.28 on 8.1).
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1', php: '8.2'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
@@ -2238,7 +2244,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '24.x'
+          node-version: '24.21.0' # exact: bump deliberately (#1645)
       - name: Manifest-less VEX over every real yarn classic flow
         # The script exports SOCKET_PATCH_YARN_E2E_REQUIRED=1 and
         # SOCKET_PATCH_YARN_CLASSIC_E2E_VERSION itself.
@@ -2632,9 +2638,9 @@ jobs:
           # `node:sqlite` for its store index, which does not exist before
           # Node 22 (and is only stable in 24) — on 20 every `pnpm install`
           # dies with ERR_UNKNOWN_BUILTIN_MODULE. This suite drives real,
-          # current package managers against production, so it tracks what
-          # users actually run rather than the pin the offline suites need.
-          node-version: '24.x'
+          # current package managers against production, so it runs the Node
+          # line users run rather than the 20.x pin the offline suites need.
+          node-version: '24.21.0' # exact: bump deliberately (#1645)
 
       - name: Setup npm-family package managers
         if: steps.gate.outputs.run == 'true'
@@ -2679,7 +2685,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: '3.12.x'
+          python-version: '3.12.10' # exact: last 3.12 with Windows+macOS builds; bump deliberately (#1645)
 
       - name: Install uv
         if: steps.gate.outputs.run == 'true'
@@ -2699,7 +2705,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: '1.24'
+          go-version: '1.24.13' # exact: bump deliberately (#1645)
           cache: false
 
       - name: Run hosted-mode production e2e

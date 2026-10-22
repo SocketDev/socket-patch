@@ -48,6 +48,7 @@ mod group_equivalence_tests;
 #[cfg(test)]
 mod lock_index_equivalence_tests;
 mod maven_index;
+pub mod npm_allow_scripts;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
@@ -6019,6 +6020,17 @@ fn plan_python_metadata_with(
             project_file(crate::utils::python_script::UV_TOML),
             ancestor.as_ref(),
         )
+        .and_then(|()| {
+            // Every patched artifact is a wheel, which uv refuses to
+            // install under no-binary (#1603).
+            crate::utils::python_script::refuse_uv_script_no_binary(
+                &dep.name,
+                &original,
+                project_file("pyproject.toml"),
+                project_file(crate::utils::python_script::UV_TOML),
+                ancestor.as_ref(),
+            )
+        })
     } else {
         crate::utils::python_script::refuse_uv_no_sources(
             &dep.name,
@@ -6026,6 +6038,14 @@ fn plan_python_metadata_with(
             Some(&original),
             project_file(crate::utils::python_script::UV_TOML),
         )
+        .and_then(|()| {
+            crate::utils::python_script::refuse_uv_no_binary(
+                &dep.name,
+                None,
+                Some(&original),
+                project_file(crate::utils::python_script::UV_TOML),
+            )
+        })
         .and_then(|()| {
             crate::utils::python_script::refuse_uv_project_shadowing(
                 &original,
@@ -19977,6 +19997,116 @@ mod tests {
         );
     }
 
+    /// #1618: an `inBundle` entry the ROOT project bundles (here `debug`,
+    /// and `ms` beneath it) has no parent tarball; `npm ci` installs it
+    /// from the lock, so both lock halves of a v2 lock are rewired and
+    /// nothing warns of a "bundling parent".
+    #[test]
+    fn npm_root_bundled_entries_are_rewired() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "app",
+      "dependencies": { "debug": "4.3.4", "left-pad": "1.3.0" },
+      "bundleDependencies": ["debug", "left-pad"]
+    },
+    "node_modules/debug": {
+      "version": "4.3.4",
+      "resolved": "https://registry.npmjs.org/debug/-/debug-4.3.4.tgz",
+      "integrity": "sha512-DEBUG==",
+      "inBundle": true
+    },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM==",
+      "inBundle": true
+    },
+    "node_modules/ms": {
+      "version": "2.1.3",
+      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+      "integrity": "sha512-MS==",
+      "inBundle": true
+    }
+  },
+  "dependencies": {
+    "debug": {
+      "version": "4.3.4",
+      "resolved": "https://registry.npmjs.org/debug/-/debug-4.3.4.tgz",
+      "integrity": "sha512-DEBUG==",
+      "requires": { "ms": "2.1.2" }
+    },
+    "left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    },
+    "ms": {
+      "version": "2.1.3",
+      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+      "integrity": "sha512-MS=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        let overrides = vec![
+            npm_override(
+                "left-pad",
+                "1.3.0",
+                "http://patch.test/lp.tgz",
+                "sha512-PATCHED==",
+            ),
+            npm_override(
+                "ms",
+                "2.1.3",
+                "http://patch.test/ms.tgz",
+                "sha512-MSPATCHED==",
+            ),
+        ];
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_bundled_instance_skipped"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.bundled_skipped_uuids.is_empty(),
+            "{:?}",
+            r.bundled_skipped_uuids
+        );
+        let lock: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+        for (key, legacy, url, sri) in [
+            (
+                "node_modules/left-pad",
+                "left-pad",
+                "http://patch.test/lp.tgz",
+                "sha512-PATCHED==",
+            ),
+            (
+                "node_modules/ms",
+                "ms",
+                "http://patch.test/ms.tgz",
+                "sha512-MSPATCHED==",
+            ),
+        ] {
+            assert_eq!(lock["packages"][key]["resolved"], url, "{key}");
+            assert_eq!(lock["packages"][key]["integrity"], sri, "{key}");
+            assert_eq!(lock["packages"][key]["inBundle"], true, "{key}: flag kept");
+            assert_eq!(
+                lock["dependencies"][legacy]["resolved"], url,
+                "{legacy} mirror"
+            );
+        }
+    }
+
     /// The v1/v2 legacy `dependencies` tree spells the bundled flag
     /// `bundled: true` — same guard as `inBundle` in `packages`.
     #[test]
@@ -26354,6 +26484,110 @@ mod python_metadata_pairing_tests {
                 ("tool.py", &script_false),
                 ("uv.toml", "no-sources-package = [\"click\"]\n"),
             ],
+        );
+    }
+
+    /// #1603: under `no-binary = true`, or a `no-binary-package` list naming
+    /// the package, uv installs it only from an sdist, so the patched wheel
+    /// a source pins fails every `uv sync`. The planner refuses before
+    /// writing, with the same file precedence as `no-sources`.
+    #[test]
+    fn no_binary_refuses_a_wheel_uv_would_not_install() {
+        let refused = |path: &str, files: &[(&str, &str)]| match plan(path, files, &[]) {
+            Err(warning) => {
+                assert!(warning.detail.contains("no-binary"), "{}", warning.detail);
+                // The refusal names the package, also under the bool.
+                assert!(
+                    warning.detail.contains("installs click only from an sdist"),
+                    "{}",
+                    warning.detail
+                );
+                warning.code
+            }
+            Ok(_) => panic!("{path} with {files:?} must refuse"),
+        };
+        let wired = |path: &str, files: &[(&str, &str)]| {
+            let (edit, _) =
+                plan(path, files, &[]).unwrap_or_else(|w| panic!("{}: {}", w.code, w.detail));
+            assert!(edit.is_some(), "{path} with {files:?} must be wired");
+        };
+        let project = |setting: &str| format!("{PYPROJECT}\n[tool.uv]\n{setting}\n");
+        let script = |setting: &str| {
+            SCRIPT.replace("# ///\n", &format!("#\n# [tool.uv]\n# {setting}\n# ///\n"))
+        };
+        for setting in ["no-binary = true", "no-binary-package = [\"Click\"]"] {
+            assert_eq!(
+                refused("uv.lock", &[("pyproject.toml", &project(setting))]),
+                "redirect_uv_project_unsupported",
+                "{setting}"
+            );
+            assert_eq!(
+                refused(
+                    "uv.lock",
+                    &[
+                        ("pyproject.toml", PYPROJECT),
+                        ("uv.toml", &format!("{setting}\n"))
+                    ]
+                ),
+                "redirect_uv_project_unsupported",
+                "{setting}"
+            );
+            assert_eq!(
+                refused("tool.py.lock", &[("tool.py", &script(setting))]),
+                "redirect_uv_script_unsupported",
+                "{setting}"
+            );
+            assert_eq!(
+                refused(
+                    "tool.py.lock",
+                    &[("tool.py", SCRIPT), ("pyproject.toml", &project(setting))]
+                ),
+                "redirect_uv_script_unsupported",
+                "{setting}"
+            );
+            // uv.toml replaces pyproject's [tool.uv] entirely.
+            wired(
+                "uv.lock",
+                &[
+                    ("pyproject.toml", &project(setting)),
+                    ("uv.toml", "offline = false\n"),
+                ],
+            );
+        }
+        // Another package's entry, no-build, or a list disabled by
+        // no-binary = false leave the wheel installable.
+        for setting in [
+            "no-binary-package = [\"requests\"]",
+            "no-build-package = [\"click\"]",
+            "no-build = true",
+            "no-binary = false\nno-binary-package = [\"click\"]",
+        ] {
+            wired("uv.lock", &[("pyproject.toml", &project(setting))]);
+        }
+        // A script's own no-binary = false wins over the project's list.
+        wired(
+            "tool.py.lock",
+            &[
+                ("tool.py", &script("no-binary = false")),
+                ("uv.toml", "no-binary-package = [\"click\"]\n"),
+            ],
+        );
+        // A parent's setting reaches a script whose root sets none.
+        let Err(warning) = plan(
+            "tool.py.lock",
+            &[
+                ("tool.py", SCRIPT),
+                (UV_ANCESTOR_CONFIG_KEY, "../uv.toml\nno-binary = true\n"),
+            ],
+            &[],
+        ) else {
+            panic!("a parent uv.toml must refuse");
+        };
+        assert_eq!(warning.code, "redirect_uv_script_unsupported");
+        assert!(
+            warning.detail.contains("../uv.toml sets no-binary = true"),
+            "{}",
+            warning.detail
         );
     }
 

@@ -641,6 +641,23 @@ pub(crate) fn symlinked_wiring_warnings(cwd: &Path, purl: &str) -> Vec<VendorWar
     .collect()
 }
 
+/// A hosted-restore advisory as a takeover reports it. The gem stale-cache
+/// one describes a gem back on its upstream entry, but the takeover wires
+/// the gem to its vendored copy right after, which bundler installs
+/// instead: the archive only matters once that copy is unwired, and the
+/// unwind names it again then (#1594).
+fn takeover_detail(code: &str, detail: &str) -> String {
+    if code == socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE {
+        format!(
+            "{detail} (while the gem stays vendored, bundler installs the vendored copy \
+             instead; the command that unvendors it, such as `remove`, `rollback` or \
+             `vendor --revert`, names this archive again)"
+        )
+    } else {
+        detail.to_string()
+    }
+}
+
 pub(crate) fn record_warning(
     env: &mut Envelope,
     purl: &str,
@@ -1399,6 +1416,19 @@ async fn run_check(args: &VendorArgs) -> i32 {
     i32::from(env.summary.failed != 0)
 }
 
+/// Whether every ecosystem in a vendored run has a backend that refuses a
+/// `.socket/vendor/` directory ignore rule per package
+/// (`vendor_artifact_gitignored`): the npm family (vlt included), NuGet,
+/// PyPI and the JVM trees. The others rely on the run-level ledger check.
+fn artifacts_gitignore_checked(mut ecosystems: impl Iterator<Item = Ecosystem>) -> bool {
+    ecosystems.all(|eco| {
+        matches!(
+            eco,
+            Ecosystem::Npm | Ecosystem::Nuget | Ecosystem::Pypi | Ecosystem::Maven
+        )
+    })
+}
+
 /// A refused eject: the JSON error envelope (`status: error`) or an
 /// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
 fn emit_eject_refusal(common: &GlobalArgs, code: &str, message: &str) -> i32 {
@@ -1733,6 +1763,23 @@ impl EjectSnapshot {
 /// upstream, not to hosted.
 async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
+    // A ledger git would not commit refuses before anything is fetched or
+    // restored, so the project stays hosted (#1638).
+    let purls: Vec<String> = pins.iter().map(|pin| pin.purl.clone()).collect();
+    let artifacts_checked = artifacts_gitignore_checked(partition_purls(&purls, None).into_keys());
+    if let Some((code, detail)) =
+        vendor::ledger_gitignore_refusal(&common.cwd, artifacts_checked).await
+    {
+        return emit_eject_refusal(common, code, &detail);
+    }
+    let user_patch_warnings =
+        match super::user_patches::check(common, pins.iter().map(|p| &p.purl)).await {
+            Ok(warnings) => {
+                super::user_patches::warn(common, &warnings);
+                warnings
+            }
+            Err(error) => return super::user_patches::refuse(common, Command::Vendor, error),
+        };
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let telemetry = TelemetryAuth::for_client(&client);
@@ -1789,6 +1836,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // before anything is touched, so every package stays hosted.
     if !fetch_failures.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
+        env.warnings.extend(
+            user_patch_warnings
+                .into_iter()
+                .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
+        );
         env.dry_run = common.dry_run;
         if common.json {
             env.warnings
@@ -1884,6 +1936,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     }
     if !refused.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
+        env.warnings.extend(
+            user_patch_warnings
+                .into_iter()
+                .map(|(code, detail)| RunWarning { code, detail }),
+        );
         env.dry_run = common.dry_run;
         if common.json {
             env.warnings
@@ -1913,6 +1970,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // preview the vendor step would be a write.
     if common.dry_run {
         let mut env = Envelope::new(Command::Vendor);
+        env.warnings.extend(
+            user_patch_warnings
+                .into_iter()
+                .map(|(code, detail)| RunWarning { code, detail }),
+        );
         env.dry_run = true;
         if common.json {
             env.warnings
@@ -1965,6 +2027,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             return emit_eject_refusal(common, code, &message);
         }
     };
+    if !common.allow_patch_conflicts {
+        if let Err(error) = super::user_patches::check(common, pins.iter().map(|p| &p.purl)).await {
+            return super::user_patches::refuse(common, Command::Vendor, error);
+        }
+    }
     let touched: Vec<String> = pins
         .iter()
         .flat_map(|p| p.files.iter().cloned())
@@ -1982,6 +2049,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         }
     };
     let mut env = Envelope::new(Command::Vendor);
+    env.warnings.extend(
+        user_patch_warnings
+            .into_iter()
+            .map(|(code, detail)| RunWarning { code, detail }),
+    );
     if common.json {
         env.warnings
             .extend(crate::commands::vex_sources::api_auth_fallback_warning(
@@ -2265,6 +2337,44 @@ async fn run_vendor(
     // even when zero in-scope patches remain. Its post-reconcile ledger
     // feeds the staging harvest below and then the engine.
     let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
+    // After the reconcile: reverting entries dropped from the manifest
+    // touches no project patch, so a protected record must not block it.
+    let (warnings, conflicts) =
+        super::user_patches::partition(common, manifest.patches.keys()).await;
+    super::user_patches::warn(common, &warnings);
+    env.warnings.extend(
+        warnings
+            .into_iter()
+            .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
+    );
+    if !conflicts.is_empty() {
+        for (_, message) in &conflicts {
+            if !common.json {
+                eprintln!("Error: {message}");
+            }
+        }
+        if env.events.is_empty() {
+            let mut messages: Vec<String> = conflicts.into_iter().map(|(_, m)| m).collect();
+            messages.dedup();
+            env.mark_error(crate::json_envelope::EnvelopeError::new(
+                super::user_patches::CONFLICT,
+                messages.join("\n"),
+            ));
+        } else {
+            // The reconcile already wrote: a top-level error would claim
+            // nothing happened, so the refusals are per-package failures.
+            for (purl, message) in conflicts {
+                env.record(
+                    crate::json_envelope::PatchEvent::new(
+                        crate::json_envelope::PatchAction::Failed,
+                        purl.as_str(),
+                    )
+                    .with_error(super::user_patches::CONFLICT, message),
+                );
+            }
+        }
+        return 1;
+    }
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
     if manifest.patches.is_empty() && !common.json && !common.silent {
@@ -2828,6 +2938,24 @@ pub(crate) async fn vendor_records_reusing(
             return true;
         }
     };
+    // The ledger must survive the commit the run asks for, or no other
+    // checkout can roll the patches back (#1638): refuse before anything
+    // is written, dry run included.
+    let artifacts_checked = artifacts_gitignore_checked(
+        vendorable_partition
+            .iter()
+            .filter(|(_, purls)| !purls.is_empty())
+            .map(|(eco, _)| *eco),
+    );
+    if let Some((code, detail)) =
+        vendor::ledger_gitignore_refusal(&common.cwd, artifacts_checked).await
+    {
+        if !common.json {
+            eprintln!("Error: {detail}");
+        }
+        env.mark_error(EnvelopeError::new(code, detail));
+        return true;
+    }
     // Pre-stage trees a previous run left behind (it crashed or was
     // interrupted between staging an archive and settling): nothing of
     // this run is staged yet, and the caller holds the apply lock, so every
@@ -3346,7 +3474,7 @@ pub(crate) async fn vendor_records_reusing(
                 let mut advisories: Vec<VendorWarning> = restore
                     .warnings
                     .iter()
-                    .map(|(code, detail)| VendorWarning::new(code, detail.clone()))
+                    .map(|(code, detail)| VendorWarning::new(code, takeover_detail(code, detail)))
                     .collect();
                 if common.dry_run {
                     // The refusal the backend would raise over the restored
@@ -4584,7 +4712,8 @@ pub(crate) struct VendorGcSummary {
 }
 
 /// The revert warnings `scan --prune` forwards into `gc.warnings[]`: only
-/// the "the installed tree still holds the vendored copy" advisories. The
+/// the "the installed tree still holds the vendored copy" advisories, and
+/// the patched gem archive Bundler's cache would install again (#1594). The
 /// revert's other warnings are routine for a prune and stay out:
 /// `vendor_lock_entry_removed` is the normal leg-(b) case (the dependency
 /// was uninstalled), and a drift keep is already reported through
@@ -4593,6 +4722,7 @@ const GC_FORWARDED_ADVISORIES: &[&str] = &[
     socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
     socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
     crate::commands::pypi_reinstall::VENDOR_CODE,
+    socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE,
 ];
 
 impl VendorGcSummary {
@@ -4704,12 +4834,21 @@ pub(crate) async fn run_vendor_gc(
             let mut outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
             // The patch left the manifest while the package stays locked:
             // the restored lock pins the version the vendored build is
-            // installed as, which PDM, uv and Pipenv keep (#477).
+            // installed as, which PDM, uv and Pipenv keep (#477), and a
+            // patched gem archive in Bundler's cache installs again (#1594).
             if outcome.success && !outcome.kept_artifact {
                 crate::commands::pypi_reinstall::push_vendor_advisory(
                     &common.cwd,
                     &purl,
                     entry.flavor.as_deref(),
+                    &mut outcome.warnings,
+                )
+                .await;
+                crate::commands::vendored_backend::push_gem_stale_cache(
+                    &common.cwd,
+                    &entry.ecosystem,
+                    &entry.base_purl,
+                    common.offline,
                     &mut outcome.warnings,
                 )
                 .await;

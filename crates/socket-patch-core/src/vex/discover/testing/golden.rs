@@ -209,7 +209,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
     let elsewhere_rendered: Vec<Value> = elsewhere
         .iter()
         .map(|e| {
-            let ResolvedElsewhere { purl, file } = e;
+            let ResolvedElsewhere { purl, file, .. } = e;
             json!({ "purl": purl, "file": path_str(file) })
         })
         .collect();

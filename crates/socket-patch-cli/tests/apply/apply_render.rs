@@ -7,7 +7,8 @@
 //! `Would remove` announcement, "No patches to apply.", the
 //! no-matching-package error block, the dry-run summary counts,
 //! `--verbose` per-file labels, the pnpm/bun/vlt layout notes, the
-//! yarn-PnP refusal, the gem fallback-home skip warning, the
+//! yarn-PnP refusal, the gem fallback-home skip warning, the gem
+//! variant mismatch warning and no-matching-variant error, the
 //! `--dry-run --vex` skip line, and the staging layer's offline
 //! no-local-source report and download result line.
 
@@ -399,6 +400,88 @@ mod gem_fallback_home_human {
         assert_eq!(std::fs::read(&store_file).unwrap(), patched);
         assert_eq!(std::fs::read(&home_file).unwrap(), foreign);
     }
+}
+
+// ═══════════ gem variant mismatch policy ═══════════
+//
+// The human legs of `cli_gem_variant_mismatch_policy.rs`, which asserts
+// the same cases through `--json` codes.
+
+const GEM_OVERWRITE_LINE: &str = "did not match the patch's expected original content";
+
+/// The opted-in overwrite prints the npm-family mismatch warning, naming
+/// the package and what happened to the file.
+#[test]
+fn gem_singleton_overwrite_prints_mismatch_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    gem_singleton_mismatch_fixture(tmp.path());
+    let (code, _stdout, stderr) = run_gem_apply(tmp.path(), &["--allow-patch-conflicts"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let warning = stderr
+        .lines()
+        .find(|l| l.contains(GEM_OVERWRITE_LINE))
+        .unwrap_or_else(|| panic!("no mismatch warning; stderr={stderr}"));
+    assert!(warning.contains(GEM_BASE_PURL), "stderr={stderr}");
+    assert!(
+        warning.contains("applied the full verified patched content"),
+        "stderr={stderr}"
+    );
+}
+
+/// `--strict` prints the per-package failure with the hash refusal, not
+/// the overwrite warning.
+#[test]
+fn gem_singleton_strict_prints_hash_refusal() {
+    let tmp = tempfile::tempdir().unwrap();
+    gem_singleton_mismatch_fixture(tmp.path());
+    let (code, _stdout, stderr) = run_gem_apply(tmp.path(), &["--strict"]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains(&format!("Failed to patch {GEM_BASE_PURL}")),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("File hash does not match expected value"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains(GEM_OVERWRITE_LINE), "stderr={stderr}");
+}
+
+/// A base with no matching variant prints the no-matching-variant error,
+/// never the overwrite warning.
+fn assert_no_matching_variant_error(root: &std::path::Path) {
+    let (code, _stdout, stderr) = run_gem_apply(root, &[]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("no matching variant found"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains(GEM_OVERWRITE_LINE), "stderr={stderr}");
+}
+
+#[test]
+fn gem_wrong_platform_prints_no_matching_variant() {
+    let tmp = tempfile::tempdir().unwrap();
+    gem_wrong_platform_fixture(tmp.path());
+    assert_no_matching_variant_error(tmp.path());
+}
+
+#[test]
+fn gem_multi_variant_none_matching_prints_no_matching_variant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local = [NOKOGIRI_LINUX_PRISTINE, b"# local tweak\n"].concat();
+    gem_multi_variant_fixture(tmp.path(), &local);
+    assert_no_matching_variant_error(tmp.path());
+}
+
+/// A skipped sibling variant prints no overwrite warning.
+#[test]
+fn gem_mismatched_sibling_prints_no_overwrite_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    gem_multi_variant_fixture(tmp.path(), NOKOGIRI_LINUX_PRISTINE);
+    let (code, _stdout, stderr) = run_gem_apply(tmp.path(), &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(!stderr.contains(GEM_OVERWRITE_LINE), "stderr={stderr}");
 }
 
 // ═══════════ dry-run --vex ═══════════

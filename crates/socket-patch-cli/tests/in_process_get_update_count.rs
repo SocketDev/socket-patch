@@ -91,6 +91,8 @@ fn params(root: &Path) -> DownloadParams {
         json: true,
         silent: true,
         strict: false,
+        allow_patch_conflicts: false,
+        user_patch_skips_reported: false,
         ecosystems: None,
         persist_blobs: true,
         patch_server_url: None,

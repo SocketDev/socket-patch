@@ -31,8 +31,9 @@ use crate::commands::agent_download::{
     decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
     filter_to_installed_releases, max_vuln_severity, nested_apply_args, patch_event_metadata,
     record_apply_outcome, report_lock_failure, run_nested_apply, run_outcome, tag_mode,
-    unwind_new_blobs, warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload,
-    PatchAction, VendorRefusals, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING,
+    unwind_new_blobs, warn_if_manifest_gitignored, warn_on_vendored_uuid_drift,
+    write_all_patch_blobs, DetachedDownload, PatchAction, VendorRefusals, ALREADY_IN_MANIFEST,
+    BLOB_WRITE_FAILED, RELEASE_NARROWING,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
@@ -1300,6 +1301,20 @@ pub async fn run(args: GetArgs) -> i32 {
                 )
                 .await;
                 let selected = vec![search_result_from_response(&patch)];
+                let user_patch_warnings =
+                    match super::user_patches::check(&args.common, [&patch.purl]).await {
+                        Ok(warnings) => {
+                            super::user_patches::warn(&args.common, &warnings);
+                            warnings
+                        }
+                        Err(error) => {
+                            return super::user_patches::refuse(
+                                &args.common,
+                                JsonCommand::Get,
+                                error,
+                            )
+                        }
+                    };
                 // Acting against the repo's socket.yml says so
                 // (`policy_bypassed`).
                 let mut uuid_warnings =
@@ -1312,6 +1327,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 // Already on stderr from the client: JSON only, after the
                 // print above.
                 uuid_warnings.extend(org_warnings.iter().cloned());
+                uuid_warnings.extend(user_patch_warnings);
                 // Mode dispatch. All three reuse THIS fetched patch and
                 // this possibly-proxy-fallback client rather than
                 // re-fetching with a fresh one, which would re-hit the
@@ -1728,6 +1744,13 @@ pub async fn run(args: GetArgs) -> i32 {
     } else {
         selected
     };
+    match super::user_patches::check(&args.common, selected.iter().map(|p| &p.purl)).await {
+        Ok(warnings) => {
+            super::user_patches::warn(&args.common, &warnings);
+            narrow_warnings.extend(warnings);
+        }
+        Err(error) => return super::user_patches::refuse(&args.common, JsonCommand::Get, error),
+    }
     if agent_preview {
         return agent_dry_run(&args, &selected, &narrow_skips, &narrow_warnings).await;
     }
@@ -2059,6 +2082,13 @@ async fn save_and_apply_patch(
         warn_on_vendored_uuid_drift(&args.common.project_root(), quiet, &recorded, &mut warnings)
             .await;
     }
+    warn_if_manifest_gitignored(
+        &args.common.project_root(),
+        &manifest_path,
+        quiet,
+        &mut warnings,
+    )
+    .await;
 
     // Progress narration goes to stderr, like the search path's.
     if !quiet {
@@ -2085,6 +2115,8 @@ async fn save_and_apply_patch(
             run_nested_apply(
                 nested_apply_args(&args.common, &manifest_path, quiet),
                 args.common.json,
+                true,
+                &recorded,
                 client,
                 lock,
             )
@@ -2121,7 +2153,10 @@ async fn save_and_apply_patch(
         env.warnings.extend(warnings);
         // A failed apply names what failed (#424); the manifest names the
         // uuid of any other failing record.
-        let manifest = if apply_report.as_ref().is_some_and(|r| r.code != 0) {
+        let manifest = if apply_report
+            .as_ref()
+            .is_some_and(|r| r.code != 0 || !r.skipped.is_empty())
+        {
             Box::pin(read_manifest(&manifest_path)).await.ok().flatten()
         } else {
             None
@@ -2165,6 +2200,8 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         silent: args.common.silent,
         all_releases: args.all_releases,
         strict: args.common.strict,
+        allow_patch_conflicts: args.common.allow_patch_conflicts,
+        user_patch_skips_reported: false,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
         patch_server_url: args.common.patch_server_url.clone(),
@@ -3182,6 +3219,7 @@ mod tests {
             failures,
             run_error: None,
             applied: applied.iter().map(|p| p.to_string()).collect(),
+            skipped: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -3219,7 +3257,10 @@ mod tests {
     #[test]
     fn record_apply_outcome_clean_apply_records_every_patch_applied() {
         let mut env = Envelope::new(JsonCommand::Get);
-        let report = ApplyRunReport::default();
+        let report = ApplyRunReport {
+            applied: vec!["pkg:npm/a@1.0.0".into(), "pkg:npm/b@1.0.0".into()],
+            ..ApplyRunReport::default()
+        };
         let recs = recorded(&[("pkg:npm/a@1.0.0", "ua"), ("pkg:npm/b@1.0.0", "ub")]);
         record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
         assert_eq!(
@@ -3235,6 +3276,104 @@ mod tests {
         let mut env = Envelope::new(JsonCommand::Get);
         record_apply_outcome(&mut env, &recs, None, |_| None);
         assert!(env.events.is_empty());
+    }
+
+    #[test]
+    fn record_apply_outcome_preserves_skip_reasons_on_success_and_failure() {
+        for code in [0, 1] {
+            let mut env = Envelope::new(JsonCommand::Get);
+            let mut report = ApplyRunReport {
+                code,
+                applied: vec!["pkg:npm/clean@1.0.0".into()],
+                skipped: vec![
+                    PatchEvent::new(EventAction::Skipped, "pkg:npm/@scope/a@1.0.0")
+                        .with_reason("user_patch_conflict", "project patch in patches/a.patch"),
+                    PatchEvent::new(EventAction::Skipped, "pkg:npm/vendor@1.0.0")
+                        .with_reason("vendored", "managed by socket-patch vendor"),
+                ],
+                ..ApplyRunReport::default()
+            };
+            if code != 0 {
+                report
+                    .failures
+                    .push(failure("pkg:npm/failed@1.0.0", "apply_failed", "mismatch"));
+            }
+            let recs = recorded(&[
+                ("pkg:npm/%40scope/a@1.0.0?artifact_id=x", "ua"),
+                ("pkg:npm/vendor@1.0.0", "uv"),
+                ("pkg:npm/clean@1.0.0", "uc"),
+            ]);
+            record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
+            assert_eq!(env.summary.applied, 1);
+            assert_eq!(env.summary.skipped, 2);
+            assert_eq!(env.summary.failed, u32::from(code != 0));
+            let json = env.to_value();
+            assert_eq!(json["events"][0]["action"], "skipped");
+            assert_eq!(json["events"][0]["uuid"], "ua");
+            assert_eq!(json["events"][0]["errorCode"], "user_patch_conflict");
+            assert_eq!(
+                json["events"][0]["reason"],
+                "project patch in patches/a.patch"
+            );
+            assert!(json["events"][0].get("files").is_none());
+        }
+    }
+
+    #[test]
+    fn record_apply_outcome_deduplicates_a_previously_reported_manifest_skip() {
+        let mut env = Envelope::new(JsonCommand::Scan);
+        let skip = PatchEvent::new(EventAction::Skipped, "pkg:npm/@scope/a@1.0.0")
+            .with_reason("user_patch_conflict", "existing project patch");
+        env.record(skip.clone());
+        let report = ApplyRunReport {
+            skipped: vec![skip.clone(), skip],
+            ..ApplyRunReport::default()
+        };
+        record_apply_outcome(&mut env, &[], Some(&report), |_| Some("ua".into()));
+        assert_eq!(env.summary.skipped, 1);
+        assert_eq!(env.summary.applied, 0);
+        assert_eq!(env.events[0].uuid.as_deref(), Some("ua"));
+    }
+
+    #[test]
+    fn record_apply_outcome_ignores_unselected_non_conflict_skips() {
+        let mut env = Envelope::new(JsonCommand::Get);
+        let report = ApplyRunReport {
+            applied: vec!["pkg:npm/a@1.0.0".into()],
+            skipped: vec![
+                PatchEvent::new(EventAction::Skipped, "pkg:npm/other@1.0.0")
+                    .with_reason("already_patched", "already patched"),
+                PatchEvent::new(EventAction::Skipped, "pkg:npm/vendor@1.0.0")
+                    .with_reason("vendored", "managed by socket-patch vendor"),
+                PatchEvent::new(EventAction::Skipped, "pkg:npm/user@1.0.0")
+                    .with_reason("user_patch_conflict", "project patch in patches/user.patch"),
+            ],
+            ..ApplyRunReport::default()
+        };
+        let recs = recorded(&[("pkg:npm/a@1.0.0", "ua")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| Some("uu".into()));
+        assert_eq!(env.summary.applied, 1);
+        assert_eq!(env.summary.skipped, 1);
+        let json = env.to_value();
+        assert_eq!(json["events"][1]["purl"], "pkg:npm/user@1.0.0");
+        assert_eq!(json["events"][1]["errorCode"], "user_patch_conflict");
+    }
+
+    #[test]
+    fn record_apply_outcome_never_infers_a_write_from_exit_zero() {
+        let mut env = Envelope::new(JsonCommand::Get);
+        record_apply_outcome(
+            &mut env,
+            &recorded(&[("pkg:npm/a@1.0.0", "ua")]),
+            Some(&ApplyRunReport::default()),
+            |_| None,
+        );
+        assert_eq!(
+            outcomes(&env),
+            vec![o("skipped", "pkg:npm/a@1.0.0", "ua", "apply_not_attempted")]
+        );
+        assert!(env.events[0].reason.is_some());
+        assert_eq!(env.summary.applied, 0);
     }
 
     #[test]
@@ -3380,6 +3519,7 @@ mod tests {
             failures: Vec::new(),
             run_error: Some(("yarn_pnp_unsupported".to_string(), "pnp".to_string())),
             applied: Vec::new(),
+            skipped: Vec::new(),
             warnings: vec![RunWarning::new("content_mismatch_overwritten", "w")],
         };
         let recs = recorded(&[("pkg:npm/a@1.0.0", "ua")]);
@@ -3845,6 +3985,8 @@ mod tests {
             silent: true,
             all_releases: false,
             strict: false,
+            allow_patch_conflicts: false,
+            user_patch_skips_reported: false,
             ecosystems: None,
             persist_blobs: false,
             patch_server_url: None,
@@ -4542,6 +4684,8 @@ mod tests {
             silent: true,
             all_releases: false,
             strict: false,
+            allow_patch_conflicts: false,
+            user_patch_skips_reported: false,
             ecosystems: None,
             // The vendor-detached posture this fn exists for.
             persist_blobs: false,
@@ -5619,6 +5763,7 @@ mod tests {
         let common = GlobalArgs {
             verbose: true,
             strict: true,
+            allow_patch_conflicts: false,
             json: true,
             dry_run: true,
             ..GlobalArgs::default()

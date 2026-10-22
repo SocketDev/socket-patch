@@ -15,8 +15,9 @@
 //!   package is the entry's `name` field when present (npm writes it for
 //!   aliases — the key is then the ALIAS) else the key's trailing path, and
 //!   the version is the entry's `version`. `""` (the root) and bare keys
-//!   (workspace members — source dirs) are skipped, as are `link: true` and
-//!   `inBundle: true` entries: npm installs those from elsewhere, so a
+//!   (workspace members — source dirs) are skipped, as are `link: true`
+//!   entries and `inBundle: true` entries a dependency bundles (a root
+//!   bundle installs from the lock, #1618): npm installs those from elsewhere, so a
 //!   Socket URL written there wires nothing (the rewriters refuse them too).
 //!   A bundled entry is still an install of its `name@version`, unpacked
 //!   unpatched from the parent's tarball, so it CONTESTS a ref for the same
@@ -1917,6 +1918,27 @@ mod tests {
             .iter()
             .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("bundled"))
             .collect()
+    }
+
+    /// #1618: a wired entry the ROOT project bundles is installed from the
+    /// lock, so it is a reference; nothing contests it.
+    #[tokio::test]
+    async fn root_bundled_wired_entry_is_a_ref() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            lock_with_packages(serde_json::json!({
+                "": { "name": "app", "bundleDependencies": ["left-pad"] },
+                "node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": hosted, "integrity": SRI, "inBundle": true
+                },
+            })),
+        );
+        let out = run(&p).await;
+        let refs: Vec<_> = out.refs.iter().map(|r| r.purl.as_str()).collect();
+        assert_eq!(refs, ["pkg:npm/left-pad@1.3.0"], "{:#?}", out.diagnostics);
+        assert!(bundled_contests(&out).is_empty(), "{:#?}", out.diagnostics);
     }
 
     /// REGRESSION (#325): the rewired hoisted entry plus an `inBundle` copy

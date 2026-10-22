@@ -11,3 +11,4 @@ pub mod rollback;
 pub mod shared_store;
 pub mod sidecars;
 pub(crate) mod store_copies;
+pub mod user_patches;
