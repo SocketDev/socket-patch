@@ -1515,9 +1515,10 @@ async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discover
                 rel,
                 format!(
                     "{}, so the Socket references in {rel} are not attested; run socket-patch \
-                     from {} (the workspace root)",
+                     from {} (the {})",
                     stray.detail,
-                    stray.root.display()
+                    stray.root.display(),
+                    stray.root_kind
                 ),
             );
         }
@@ -5519,11 +5520,30 @@ mod member_stray_lock_tests {
                 "vlt-lock.json",
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                 &[
+                    ("package.json", r#"{"private":true}"#),
                     ("pnpm-workspace.yaml", "packages:\n  - packages/*\n"),
                     (
                         "vlt-lock.json",
                         r#"{"lockfileVersion":1,"options":{},"nodes":{},"edges":{"workspace~packages+a left-pad":"prod 1.3.0 ~npm~left-pad@1.3.0"}}"#,
                     ),
+                ][..],
+            ),
+            // #1584: vlt installs its project root (the nearest ancestor
+            // `vlt.json`, else the outermost `package.json`) from a
+            // directory no `workspaces` field lists, too.
+            (
+                "redirect/npm/vlt/basic/expected",
+                "vlt-lock.json",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &[("vlt.json", r#"{"config":{}}"#), ("vlt-lock.json", "{}")][..],
+            ),
+            (
+                "redirect/npm/vlt/basic/expected",
+                "vlt-lock.json",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                &[
+                    ("package.json", r#"{"private":true}"#),
+                    ("vlt-lock.json", "{}"),
                 ][..],
             ),
             (
