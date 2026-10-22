@@ -523,6 +523,75 @@ async fn poetry_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, files).await;
 }
 
+/// What `poetry lock --no-update` by Poetry 1.8.5 makes of a lock 2.1
+/// written by Poetry 2.4.1: the same units without `groups`, as lock 2.0.
+fn relock_with_poetry_1_8(root: &Path) {
+    let lock = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    let relocked = relock_text(&lock);
+    assert_ne!(relocked, lock, "the re-lock re-renders the unit");
+    std::fs::write(root.join("poetry.lock"), relocked).unwrap();
+}
+
+fn relock_text(lock: &str) -> String {
+    lock.replace("Poetry 2.4.1", "Poetry 1.8.5")
+        .replace("groups = [\"main\"]\n", "")
+        .replace("lock-version = \"2.1\"", "lock-version = \"2.0\"")
+}
+
+/// #1615: after a re-lock by another Poetry version, every unwind restores
+/// the registry unit (in the re-lock's rendering) and reclaims the
+/// artifact, instead of drift-keeping it forever.
+#[tokio::test]
+async fn poetry_unwinds_after_a_relock_by_another_poetry_version() {
+    for unwind in [
+        vec!["vendor", "--revert"],
+        vec!["rollback", "--yes", "--offline"],
+        vec!["remove", PURL, "--yes", "--offline"],
+    ] {
+        let (_tmp, root) = project();
+        let files = stage_poetry(&root);
+        let pristine = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+        vendor_project(&root, files);
+        relock_with_poetry_1_8(&root);
+
+        let (code, env) = run_cli(&root, &unwind, &[]);
+        assert_eq!(code, 0, "{unwind:?}: {env:#}");
+        assert!(
+            !env.to_string().contains("vendor_lock_entry_drifted"),
+            "{unwind:?}: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("poetry.lock")).unwrap(),
+            relock_text(&pristine),
+            "{unwind:?}: the registry unit as Poetry 1.8.5 renders it"
+        );
+        assert!(
+            !root.join(format!(".socket/vendor/pypi/{UUID}")).exists(),
+            "{unwind:?}: the vendored artifact is reclaimed"
+        );
+    }
+}
+
+/// #1615: the vendored -> hosted takeover reverts the re-locked unit too.
+#[tokio::test]
+async fn poetry_vendored_to_hosted_after_a_relock() {
+    let (_tmp, root) = project();
+    let files = stage_poetry(&root);
+    vendor_project(&root, files);
+    relock_with_poetry_1_8(&root);
+    let server = MockServer::start().await;
+    let hosted_url = mount_hosted_api(&server, true).await;
+    let (code, env) = hosted_scan(&root, &server);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(hosted_pinned(&env), 1, "{env:#}");
+    let lock = std::fs::read_to_string(root.join("poetry.lock")).unwrap();
+    assert!(
+        !lock.contains(".socket/vendor/") && lock.contains(&hosted_url),
+        "{lock}"
+    );
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+}
+
 const PIPFILE: &str = "[[source]]\nurl = \"https://pypi.org/simple\"\nverify_ssl = true\nname = \"pypi\"\n\n[packages]\nsix = \"==1.16.0\"\n\n[requires]\npython_version = \"3.11\"\n";
 
 /// A Pipenv project; returns its wiring files.
