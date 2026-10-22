@@ -1493,7 +1493,9 @@ pub(crate) fn apply_key_covers(key: &str, record: &str) -> bool {
 /// (`recorded`: `(purl, uuid)` of every selected patch now in the manifest)
 /// into `env`, so `--json` says what the human run prints (#424). Only a
 /// reported write counts as `applied`, even when apply exits 0. Skips retain
-/// their `reason` and `errorCode`, including new conflicts found after selection.
+/// their `reason` and `errorCode`, including new conflicts found after selection;
+/// of the manifest entries this run did not select, only user-patch conflicts
+/// are recorded.
 /// A failed run records a
 /// `failed` event (apply's `errorCode` / `error`) for each recorded patch a
 /// failure covers, `applied` for each one apply reports patched, a `failed`
@@ -1554,11 +1556,15 @@ pub(crate) fn record_apply_outcome(
             );
         }
     }
+    // An unselected manifest entry is reported only when the user-patch gate
+    // held it: its other skips (`already_patched`, `vendored`, ...) are not
+    // this run's outcome and would inflate `summary.skipped`.
     for skip in &report.skipped {
         let Some(key) = skip.purl.as_deref() else {
             continue;
         };
-        if recorded.iter().any(|(purl, _)| apply_key_covers(key, purl))
+        if skip.error_code.as_deref() != Some(super::user_patches::CONFLICT)
+            || recorded.iter().any(|(purl, _)| apply_key_covers(key, purl))
             || report
                 .failures
                 .iter()
