@@ -48,6 +48,7 @@ mod group_equivalence_tests;
 #[cfg(test)]
 mod lock_index_equivalence_tests;
 mod maven_index;
+pub mod npm_allow_scripts;
 pub mod npmrc;
 mod pdm;
 mod pipenv;

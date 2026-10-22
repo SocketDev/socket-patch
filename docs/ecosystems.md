@@ -133,6 +133,14 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   E404: the hosted run reads it from the same env / project / user / global /
   builtin layers and warns `redirect_npm_replace_registry_host` (set
   `replace-registry-host=npmjs` in the project `.npmrc`, or use vendored mode).
+  npm 12 runs a dependency's install script only when `package.json`
+  `allowScripts` approves it, and matches a version-pinned key
+  (`"esbuild@0.19.12": true`, what `npm approve-scripts` writes) only against a
+  registry tarball URL. Hosted and vendored lock entries are not one, so when a
+  patched package with an install script is approved only by version, the run
+  leaves the policy alone and warns `redirect_npm_allow_scripts` /
+  `vendor_npm_allow_scripts`: approve it by name (`"esbuild": true`) to keep
+  the script running (#1595).
   npm 6 ignores `resolved` for registry
   dependencies, so a redirected lockfileVersion 1 lock fails closed with
   EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm

@@ -498,14 +498,25 @@ pub async fn vendor_npm_any<'a>(
             entry.flavor = Some(flavor.as_str().to_string());
         }
         // npm >= 11.14's `allow-file` gates the `file:` specs the
-        // package-lock wiring writes (#969); the other flavors' package
-        // managers do not read it.
+        // package-lock wiring writes (#969), and npm 12's `allowScripts`
+        // pins stop matching them (#1595); the other flavors' package
+        // managers read neither.
         if flavor == NpmLockFlavor::PackageLock && result.success {
             if let Some((name, version)) = super::npm_common::parse_npm_purl(purl) {
                 if let Some(detail) =
                     npm_lock::allow_file_refusal(project_root, &name, &version).await
                 {
                     warnings.push(VendorWarning::new(npm_lock::ALLOW_FILE_WARNING, detail));
+                }
+                // npm 12 stops honoring a version-pinned allowScripts
+                // approval for the rewired `file:` tarball (#1595).
+                if let Some(detail) =
+                    npm_lock::allow_scripts_lost(project_root, &name, &version).await
+                {
+                    warnings.push(VendorWarning::new(
+                        crate::patch::redirect::npm_allow_scripts::VENDOR_WARNING,
+                        detail,
+                    ));
                 }
             }
         }

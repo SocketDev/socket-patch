@@ -1809,6 +1809,42 @@ pub(super) async fn allow_file_refusal_with(
     ))
 }
 
+/// The `vendor_npm_allow_scripts` advisory for `name@version` (#1595), or
+/// `None`: npm >= 12 matches a version-pinned `package.json#allowScripts`
+/// approval only against a registry tarball URL (and fails a pinned deny
+/// closed), so once vendoring rewires package-lock.json to the `file:`
+/// tarball an approved install script can stop running. Only the
+/// instances vendoring rewires count (the [`scan_lock_matches`] set), and
+/// only package-lock.json: npm >= 12 never reads npm-shrinkwrap.json. The
+/// policy is the user's and is never rewritten.
+pub(super) async fn allow_scripts_lost(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+) -> Option<String> {
+    use crate::patch::redirect::npm_allow_scripts::{
+        lost_detail, rewired_runs_install_script, AllowScripts, NPM12_LOCK,
+    };
+    use crate::utils::fs::read_regular_to_string;
+    let package_json = read_regular_to_string(&project_root.join("package.json"))
+        .await
+        .ok()?;
+    let lost = AllowScripts::parse(&package_json)?.lost(name, version)?;
+    let bytes = read_regular_to_bytes(&project_root.join(NPM12_LOCK))
+        .await
+        .ok()?;
+    let lock = parse_json_manifest(&bytes).ok()?;
+    let overrides = NpmOverrides::read(project_root).await;
+    let LockScan::Matches(matches) =
+        scan_lock_matches(&lock, &overrides, name, version, &mut Vec::new())
+    else {
+        return None;
+    };
+    let rewired = |key: &str, _: &Value| matches.iter().any(|m| m.key == key);
+    rewired_runs_install_script(&lock, name, version, rewired)
+        .then(|| lost_detail(name, version, &lost, "the vendored `file:` tarball"))
+}
+
 /// [`allow_file_refusal_with`] against this process's npm config layers.
 /// Unit tests see only the project `.npmrc`: the developer's or runner's
 /// own layers (an `npm_config_allow_file` variable, a `~/.npmrc`) must not

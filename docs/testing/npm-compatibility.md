@@ -76,6 +76,13 @@ npm 12 notes:
   install unchanged. An explicit `none` (or `root` with a transitive vendored
   copy) refuses them with EALLOWFILE; the vendored run warns
   `vendor_npm_allow_file` and `vendor --check` fails (#969).
+- `allowScripts` (npm 12): a version-pinned approval (`"pkg@x.y.z": true`)
+  matches only a registry-shaped `resolved`, so after a hosted or vendored
+  rewrite npm blocks the package's approved install script (every install
+  fails under `strict-allow-scripts=true`). A name-only approval keeps
+  working. The run leaves the policy untouched and warns
+  `redirect_npm_allow_scripts` / `vendor_npm_allow_scripts` when the patched
+  entry has `hasInstallScript` and no name-only approval covers it (#1595).
 
 Dependencies that ship their own `npm-shrinkwrap.json` (#753): the lock marks
 such a package `"hasShrinkwrap": true` (`firebase-tools`, `netlify-cli`), and
