@@ -3336,6 +3336,30 @@ mod tests {
     }
 
     #[test]
+    fn record_apply_outcome_ignores_unselected_non_conflict_skips() {
+        let mut env = Envelope::new(JsonCommand::Get);
+        let report = ApplyRunReport {
+            applied: vec!["pkg:npm/a@1.0.0".into()],
+            skipped: vec![
+                PatchEvent::new(EventAction::Skipped, "pkg:npm/other@1.0.0")
+                    .with_reason("already_patched", "already patched"),
+                PatchEvent::new(EventAction::Skipped, "pkg:npm/vendor@1.0.0")
+                    .with_reason("vendored", "managed by socket-patch vendor"),
+                PatchEvent::new(EventAction::Skipped, "pkg:npm/user@1.0.0")
+                    .with_reason("user_patch_conflict", "project patch in patches/user.patch"),
+            ],
+            ..ApplyRunReport::default()
+        };
+        let recs = recorded(&[("pkg:npm/a@1.0.0", "ua")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| Some("uu".into()));
+        assert_eq!(env.summary.applied, 1);
+        assert_eq!(env.summary.skipped, 1);
+        let json = env.to_value();
+        assert_eq!(json["events"][1]["purl"], "pkg:npm/user@1.0.0");
+        assert_eq!(json["events"][1]["errorCode"], "user_patch_conflict");
+    }
+
+    #[test]
     fn record_apply_outcome_never_infers_a_write_from_exit_zero() {
         let mut env = Envelope::new(JsonCommand::Get);
         record_apply_outcome(
