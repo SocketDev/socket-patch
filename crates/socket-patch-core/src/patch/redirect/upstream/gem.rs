@@ -1400,7 +1400,8 @@ pub(super) async fn unwound_stale_cache(
     let (_, name, version) = crate::utils::purl::purl_parts(purl)?;
     let mut lock = None;
     for file in BUNDLER_LOCKS {
-        if let Ok(text) = tokio::fs::read_to_string(root.join(file)).await {
+        // Guarded: a FIFO or device squatting the lock path must not block.
+        if let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(file)).await {
             lock = Some(text);
             break;
         }
@@ -2662,6 +2663,28 @@ mod tests {
             .expect("the unchecked archive is named");
         assert_eq!(code, STALE_CACHE);
         assert!(detail.contains("could not be checked"), "{detail}");
+    }
+
+    /// #1594: a FIFO at the lock path is skipped, never opened for reading
+    /// (which would block): the check goes on without a lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vendored_unwind_skips_a_fifo_lock() {
+        let tmp = unwound_project("https://rubygems.org/", None, Some(b"patched gem"));
+        let lock = tmp.path().join("Gemfile.lock");
+        std::fs::remove_file(&lock).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&lock)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let hit = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true),
+        )
+        .await
+        .expect("a FIFO lock must not block the check");
+        assert!(hit.is_some_and(|(_, d)| d.contains("could not be checked")));
     }
 
     /// #1594: a gem locked from a private remote with no `CHECKSUMS` sha
