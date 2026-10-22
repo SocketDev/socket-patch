@@ -438,6 +438,20 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     }
     drifts.sort();
 
+    // A drifting package the project patched itself is one a plain `apply`
+    // skips, so the generic remedy cannot clear it: its drift names the
+    // project patch and the consent the remedy needs.
+    let drift_ids: Vec<&str> = drifts.iter().map(|(id, _, _)| id.as_str()).collect();
+    let protected = super::user_patches::evidence(&args.common, &drift_ids).await;
+    for (id, _, detail) in &mut drifts {
+        if let Some(sources) = protected.get(id.as_str()) {
+            detail.push_str(&format!(
+                " ({})",
+                super::user_patches::detail(id, sources, false)
+            ));
+        }
+    }
+
     if drifts.is_empty() {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
@@ -472,7 +486,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 code != socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
                     && code != socket_patch_core::vendor::go_consumer_sync::REQUIREMENTS_CODE
             }) {
-                eprintln!("{}", check_remedy(&args.common));
+                eprintln!("{}", check_remedy(&args.common, !protected.is_empty()));
             }
         }
         1
@@ -645,9 +659,19 @@ fn record_check_skips(env: &mut Envelope, in_sync: &[String], not_installed: &[S
 /// it, with the check's own scope (`--cwd`, `--manifest-path`, `-g` /
 /// `--global-prefix`, `--ecosystems`). A bare `socket-patch apply` would
 /// act on another tree, exit 0 and leave the drift in place (#1219).
-fn check_remedy(common: &GlobalArgs) -> String {
+/// `user_patched`: a drifting package has a project patch, which a plain
+/// `apply` skips, so the remedy names the consent flag (or a manual merge).
+fn check_remedy(common: &GlobalArgs, user_patched: bool) -> String {
     let command = format!("socket-patch apply{}", crate::ui::scope_args(common));
-    format!("Run `{command}` to regenerate them.")
+    if user_patched {
+        format!(
+            "Run `{command}` to regenerate them; a package with a project patch is \
+             applied only with `--allow-patch-conflicts` after review, or merge \
+             the fixes manually."
+        )
+    } else {
+        format!("Run `{command}` to regenerate them.")
+    }
 }
 
 /// The `apply --check` success line: how many patches were checked, and how
@@ -3982,7 +4006,7 @@ mod tests {
     /// it verbatim heals the tree that was checked.
     #[test]
     fn check_remedy_repeats_the_check_scope() {
-        let remedy = |common: GlobalArgs| check_remedy(&common);
+        let remedy = |common: GlobalArgs| check_remedy(&common, false);
         assert_eq!(
             remedy(GlobalArgs::default()),
             "Run `socket-patch apply` to regenerate them."

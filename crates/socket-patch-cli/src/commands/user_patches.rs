@@ -93,6 +93,30 @@ pub(crate) async fn partition(
     (warnings, conflicts)
 }
 
+/// The project-patch evidence of each of `purls` that has any, with or
+/// without consent: `apply --check` names it on a drift a plain `apply`
+/// would leave in place.
+pub(crate) async fn evidence(
+    common: &GlobalArgs,
+    purls: &[&str],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut found = std::collections::HashMap::new();
+    if !any_detectable(common, purls.iter().copied()) {
+        return found;
+    }
+    let index = inspect(common).await;
+    for &purl in purls {
+        if !common.purl_ecosystem_selected(purl) {
+            continue;
+        }
+        let sources = index.conflicts(purl);
+        if !sources.is_empty() {
+            found.insert(purl.to_string(), sources);
+        }
+    }
+    found
+}
+
 /// The human copy of [`check`]'s approved overrides; JSON carries them in
 /// the envelope and `--silent` mutes them.
 pub(crate) fn warn(common: &GlobalArgs, warnings: &[(String, String)]) {

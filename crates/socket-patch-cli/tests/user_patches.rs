@@ -220,6 +220,12 @@ fn environment_and_read_only_checks_do_not_grant_or_require_consent() {
         &[],
     );
     assert!(!stdout.contains("user_patch_conflict"), "{stdout}");
+    // The drift names the project patch, and the remedy names the consent
+    // that clears it: a plain `apply` leaves the package untouched.
+    assert!(stdout.contains("patches/example+1.0.0.patch"), "{stdout}");
+    let (code, _, stderr) = run_with_env(tmp.path(), &["apply", "--offline", "--check"], &[]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("--allow-patch-conflicts"), "{stderr}");
 }
 
 #[test]
