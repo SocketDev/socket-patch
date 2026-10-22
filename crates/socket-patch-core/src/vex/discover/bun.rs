@@ -93,7 +93,7 @@
 
 use super::{
     canonical_base_purl, npm_purl, DiscoverCtx, Discovery, LocateOpts, Located, PatchedRef,
-    DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
 use crate::patch::redirect::hosted_url_version;
@@ -584,10 +584,7 @@ impl Unwired {
                             r.purl,
                         ),
                     );
-                    // No rewire reaches that copy: shadow the ref so
-                    // `vendor --check` names the copy (#1600) and rollback /
-                    // remove / the takeover still unwind it.
-                    out.shadow(r);
+                    shadow_vendored(out, r);
                 } else {
                     out.refs.push(r);
                 }
@@ -605,7 +602,7 @@ impl Unwired {
                         r.purl,
                     ),
                 );
-                out.shadow(r);
+                shadow_vendored(out, r);
                 continue;
             }
             out.diag(
@@ -621,6 +618,18 @@ impl Unwired {
             );
             out.withhold_rewirable(r);
         }
+    }
+}
+
+/// Keep a VENDORED ref an own-source copy contests as shadowed: no rewire
+/// reaches that copy, so `vendor --check` names it instead of claiming
+/// nothing wires the artifact (#1600), and rollback / remove / the
+/// takeover still unwind it. A hosted ref stays dropped: the hosted
+/// engine vetoes a pin only while its uuid is unattributed, and the bun
+/// rewriter does not skip an unversioned own-source copy itself.
+fn shadow_vendored(out: &mut Discovery, r: PatchedRef) {
+    if r.mode == WiringMode::Vendored {
+        out.shadow(r);
     }
 }
 
@@ -1232,31 +1241,36 @@ mod tests {
         }
     }
 
-    /// `out` withheld exactly one ref, `purl` wired to `UUID_A` in `mode`,
-    /// as a shadowed copy (never attested, still unwound by rollback /
-    /// remove / the takeover), and the diagnostic naming the copy is the
-    /// one [`Discovery::vendored_shadow`] hands `vendor --check`.
+    /// `out` attests nothing for `purl` wired to `UUID_A` in `mode`. A
+    /// vendored ref is withheld as shadowed (never attested, still unwound
+    /// by rollback / remove / the takeover), and the diagnostic naming the
+    /// copy is the one [`Discovery::vendored_shadow`] hands `vendor
+    /// --check`. A hosted ref stays dropped, so the hosted engine still
+    /// vetoes the pin as unattributed.
     fn assert_shadowed(out: &Discovery, purl: &str, mode: WiringMode, what: &str) {
         assert_refs(out, &[]);
+        if mode == WiringMode::Hosted {
+            assert!(out.shadowed.is_empty(), "{what}: {:#?}", out.shadowed);
+            return;
+        }
         assert_eq!(out.shadowed.len(), 1, "{what}: {:#?}", out.shadowed);
         assert_eq!(out.shadowed[0].purl, purl, "{what}");
         assert_eq!(out.shadowed[0].uuid, UUID_A, "{what}");
         assert_eq!(out.shadowed[0].mode, mode, "{what}");
-        if mode == WiringMode::Vendored {
-            let (_, diag) = out
-                .vendored_shadow(purl, UUID_A)
-                .unwrap_or_else(|| panic!("{what}: no vendored shadow: {out:#?}"));
-            let diag = diag.unwrap_or_else(|| panic!("{what}: no diagnostic names the copy"));
-            assert!(diag.detail.contains("UNPATCHED"), "{what}: {diag:#?}");
-        }
+        let (_, diag) = out
+            .vendored_shadow(purl, UUID_A)
+            .unwrap_or_else(|| panic!("{what}: no vendored shadow: {out:#?}"));
+        let diag = diag.unwrap_or_else(|| panic!("{what}: no diagnostic names the copy"));
+        assert!(diag.detail.contains("UNPATCHED"), "{what}: {diag:#?}");
     }
 
     /// REGRESSION (#1600): a user URL / `file:` tarball, git or folder copy
-    /// of the wired package beside a hosted or vendored registry entry is
-    /// one no rewire reaches. Its contest must keep the ref as shadowed,
+    /// of the wired package beside a vendored registry entry is one no
+    /// rewire reaches. Its contest must keep the vendored ref as shadowed,
     /// like a bundled copy (and npm's #1511), so `vendor --check` names
     /// that copy instead of claiming nothing wires the artifact and
-    /// prescribing a re-vendor that cannot help.
+    /// prescribing a re-vendor that cannot help. Hosted refs keep being
+    /// dropped.
     #[tokio::test]
     async fn issue_1600_non_registry_copy_shadows_the_ref() {
         let modes = |name: &str, version: &str, file: &str| {
@@ -1302,7 +1316,13 @@ mod tests {
         // binary.
         let root = fixture_path("bun-unversioned-copy");
         for (mode, wired) in modes("minimist", "1.2.2", "minimist-1.2.2.tgz") {
-            for dir in ["text-2/file", "text-2/url", "text-2/git"] {
+            for dir in [
+                "text-0/file",
+                "text-1/file",
+                "text-2/file",
+                "text-2/url",
+                "text-2/git",
+            ] {
                 let text = std::fs::read_to_string(root.join(dir).join("bun.lock")).unwrap();
                 let lock: String = text
                     .lines()
