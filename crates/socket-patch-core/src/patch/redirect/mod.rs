@@ -26365,6 +26365,9 @@ mod python_lock_warning_tests {
             ),
             // `:none:` clears only the values before it.
             (" --no-binary :none: --no-binary six", &[]),
+            // `uv pip sync` reads the settings `uv pip compile --no-config`
+            // passed over.
+            (" --no-config", &[("uv.toml", "no-binary = true\n")]),
         ];
         for (flags, extra) in refusals {
             let result = run(flags, extra);
@@ -26394,9 +26397,8 @@ mod python_lock_warning_tests {
             );
         }
         // Another package's flag or setting, no-build, a list turned off by
-        // no-binary = false, a uv.toml replacing pyproject's settings, and
-        // settings `uv pip compile --no-config` never read leave the wheel
-        // installable.
+        // no-binary = false, `:none:` after `:all:`, and a uv.toml replacing
+        // pyproject's settings leave the wheel installable.
         let wired: &[(&str, &[(&str, &str)])] = &[
             ("", &[]),
             (" --no-binary idna", &[]),
@@ -26419,7 +26421,6 @@ mod python_lock_warning_tests {
                     ),
                 ],
             ),
-            (" --no-config", &[("uv.toml", "no-binary = true\n")]),
             (" --no-binary :all: --no-binary :none:", &[]),
             // The root's own settings stop the lookup above it.
             (

@@ -1789,6 +1789,9 @@ mod tests {
                     pyproject("[tool.uv]\nno-binary-package = [\"two\"]\n"),
                 )),
             ),
+            // `uv pip sync` reads the settings `uv pip compile --no-config`
+            // passed over.
+            (" --no-config", Some(("uv.toml", "no-binary = true\n"))),
         ] {
             let Err(error) = load(pylock(flags), config).await else {
                 panic!("{flags:?} with {config:?} must refuse");
@@ -1798,9 +1801,8 @@ mod tests {
             assert!(error.1.contains("only from an sdist"), "{}", error.1);
         }
         // Another package's flag or setting, no-build, a list turned off by
-        // no-binary = false, a uv.toml that replaces pyproject's settings,
-        // and settings `uv pip compile --no-config` never read leave the
-        // wheel installable.
+        // no-binary = false and `:none:` after `:all:` leave the wheel
+        // installable.
         for (flags, config) in [
             ("", None),
             (" --no-binary six", None),
@@ -1813,7 +1815,6 @@ mod tests {
                     "no-binary = false\nno-binary-package = [\"two\"]\n",
                 )),
             ),
-            (" --no-config", Some(("uv.toml", "no-binary = true\n"))),
             (" --no-binary :all: --no-binary :none:", None),
         ] {
             if let Err(error) = load(pylock(flags), config).await {

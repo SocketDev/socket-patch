@@ -713,8 +713,9 @@ fn uv_header_command(text: &str) -> Option<Vec<&str>> {
 /// ("marked as `--no-binary` but is itself a binary distribution"). The
 /// signals are the `uv pip compile` command line the header records and
 /// the uv `settings` files (as [`settings_no_binary`] reads them), which
-/// `uv pip compile --no-config` did not read. Only a lock uv wrote is
-/// checked: another installer reads no uv setting.
+/// `uv pip sync` reads whether or not `uv pip compile` ran with
+/// `--no-config`. Only a lock uv wrote is checked: another installer reads
+/// no uv setting.
 pub(crate) fn pylock_no_binary(
     text: &str,
     name: &str,
@@ -731,15 +732,10 @@ pub(crate) fn pylock_no_binary(
          the patched wheel (\"marked as `--no-binary` but is itself a binary distribution\"); \
          patches ship as wheels, so to wire one let uv install {name} from a wheel"
     );
-    if let Some(command) = &command {
-        if binary_flag_covers(command, "--no-binary", &name) {
-            return Some(format!(
-                "the lock's `uv pip compile --no-binary` covers {name}, {consequence}"
-            ));
-        }
-        if command.contains(&"--no-config") {
-            return None;
-        }
+    if command.is_some_and(|command| binary_flag_covers(&command, "--no-binary", &name)) {
+        return Some(format!(
+            "the lock's `uv pip compile --no-binary` covers {name}, {consequence}"
+        ));
     }
     let (path, key) = settings_no_binary(settings, &name)?;
     Some(format!(

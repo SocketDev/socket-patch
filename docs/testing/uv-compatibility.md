@@ -223,8 +223,9 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   write when the `uv pip compile` command line in its header passes
   `--no-binary` naming the package or `:all:`, or the root's `uv.toml` /
   `[tool.uv]` covers it (vendored `pypi_uv_no_binary`, hosted
-  `redirect_uv_lock_unsupported`, #1603). A header with `--no-config`
-  read no settings file.
+  `redirect_uv_lock_unsupported`, #1603). The settings count even when
+  the header shows `--no-config`: that flag only kept them from the
+  compile, and `uv pip sync` reads them.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751
