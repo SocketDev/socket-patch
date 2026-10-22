@@ -17,7 +17,7 @@ use std::path::Path;
 
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::vendor::{
-    save_state, RevertOpts, VendorEntry, VendorServiceConfig, VendorState, VendorWarning,
+    save_state, RevertOpts, VendorServiceConfig, VendorState, VendorWarning,
 };
 
 use crate::args::GlobalArgs;
@@ -131,7 +131,10 @@ impl<'a> VendoredBackend<'a> {
         for key in keys {
             // Captured before a clean revert drops the entry.
             let flavor = state.entries.get(key).and_then(|e| e.flavor.clone());
-            let entry = state.entries.get(key).cloned();
+            let gem = state
+                .entries
+                .get(key)
+                .map(|e| (e.ecosystem.clone(), e.base_purl.clone()));
             let mut result = revert_vendor_entry(&self.common.cwd, key, state, opts).await;
             let hard_failure = matches!(
                 result.step,
@@ -155,10 +158,15 @@ impl<'a> VendoredBackend<'a> {
                     &mut result.warnings,
                 )
                 .await;
-                if let Some(entry) = &entry {
+                // A dry run reads the still-vendored lock, whose bare
+                // CHECKSUMS entry can't judge the archive: the wet run
+                // names it.
+                let dry = matches!(result.step, VendorRevertStep::WouldRevert);
+                if let Some((ecosystem, purl)) = gem.as_ref().filter(|_| !dry) {
                     push_gem_stale_cache(
                         &self.common.cwd,
-                        entry,
+                        ecosystem,
+                        purl,
                         self.common.offline,
                         &mut result.warnings,
                     )
@@ -180,24 +188,24 @@ impl<'a> VendoredBackend<'a> {
 }
 
 /// Name a patched `<name>-<version>.gem` left in Bundler's cache dir once
-/// the vendored gem `entry` is unwired (#1594): a `bundle cache` taken
-/// while a hosted pin was live keeps it there through the takeover, and
-/// bundler installs from it again once the lock is back on upstream. The
-/// hosted unwind raises the same warning (#1260).
+/// the vendored ledger entry of `ecosystem` for `base_purl` is unwired
+/// (#1594): a `bundle cache` taken while a hosted pin was live keeps it
+/// there through the takeover, and bundler installs from it again once the
+/// lock is back on upstream. The hosted unwind raises the same warning
+/// (#1260).
 pub(crate) async fn push_gem_stale_cache(
     root: &Path,
-    entry: &VendorEntry,
+    ecosystem: &str,
+    base_purl: &str,
     offline: bool,
     warnings: &mut Vec<VendorWarning>,
 ) {
-    if socket_patch_core::vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) != "gem" {
+    if socket_patch_core::vendor::jvm::layout::ledger_ecosystem(ecosystem) != "gem" {
         return;
     }
     if let Some((code, detail)) =
         socket_patch_core::patch::redirect::upstream::gem_stale_cache_after_unwind(
-            root,
-            &entry.base_purl,
-            offline,
+            root, base_purl, offline,
         )
         .await
     {

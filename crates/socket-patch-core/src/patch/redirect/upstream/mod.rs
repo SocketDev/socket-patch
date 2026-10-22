@@ -42,6 +42,7 @@ mod sbt;
 mod uv;
 mod vlt;
 
+use client::rubygems_base;
 pub(crate) use client::UpstreamClient;
 pub(crate) use uv::{declared_lock_specifier, respell_lock_specifier, LockRequirementArray};
 

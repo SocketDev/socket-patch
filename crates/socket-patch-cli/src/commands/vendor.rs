@@ -649,8 +649,8 @@ fn takeover_detail(code: &str, detail: &str) -> String {
     if code == socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE {
         format!(
             "{detail} (while the gem stays vendored, bundler installs the vendored copy \
-             instead; `remove`, `rollback` and `vendor --revert` name this archive again \
-             when they put it back on upstream)"
+             instead; the command that unvendors it, such as `remove`, `rollback` or \
+             `vendor --revert`, names this archive again)"
         )
     } else {
         detail.to_string()
@@ -4658,7 +4658,8 @@ pub(crate) async fn run_vendor_gc(
                 .await;
                 crate::commands::vendored_backend::push_gem_stale_cache(
                     &common.cwd,
-                    &entry,
+                    &entry.ecosystem,
+                    &entry.base_purl,
                     common.offline,
                     &mut outcome.warnings,
                 )

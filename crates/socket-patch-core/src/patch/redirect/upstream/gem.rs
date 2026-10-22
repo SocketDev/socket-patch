@@ -1383,12 +1383,15 @@ async fn stale_cache_warning(
 }
 
 /// [`STALE_CACHE`] for a gem a vendored unwind (`remove`, `rollback`,
-/// `vendor --revert`) put back on its upstream `GEM` entry at `root`
-/// (#1594). The archive a `bundle cache` took while a hosted pin was live
-/// survives a hosted → vendored takeover (the path source shadows it), so
-/// once the vendored copy is unwired bundler installs from it again. Judged
-/// like the hosted restore's check, against the lock's `CHECKSUMS` entry,
-/// else the rubygems.org compact index (unless `offline`).
+/// `vendor --revert`, `scan --prune`, `vendor`'s reconcile) put back on its
+/// upstream `GEM` entry at `root` (#1594). The archive a `bundle cache`
+/// took while a hosted pin was live survives a hosted → vendored takeover
+/// (the path source shadows it), so once the vendored copy is unwired
+/// bundler installs from it again. Judged like the hosted restore's check,
+/// against the lock's `CHECKSUMS` entry, else the rubygems.org compact
+/// index (unless `offline`). A gem locked from another remote with no
+/// `CHECKSUMS` sha can't be judged, and is most likely a private gem cached
+/// on purpose: no warning.
 pub(super) async fn unwound_stale_cache(
     root: &std::path::Path,
     purl: &str,
@@ -1396,14 +1399,36 @@ pub(super) async fn unwound_stale_cache(
 ) -> Option<(&'static str, String)> {
     let (_, name, version) = crate::utils::purl::purl_parts(purl)?;
     let mut lock = None;
-    for file in ["Gemfile.lock", "gems.locked"] {
+    for file in BUNDLER_LOCKS {
         if let Ok(text) = tokio::fs::read_to_string(root.join(file)).await {
             lock = Some(text);
             break;
         }
     }
+    if let Some(text) = &lock {
+        if lock_checksum(text, &name, &version).is_none() && !rubygems_locked(text, &name, &version)
+        {
+            return None;
+        }
+    }
     let client = UpstreamClient::new(offline);
     stale_cache_warning(root, purl, &name, &version, lock.as_deref(), &client).await
+}
+
+/// Whether `lock` resolves `name (version)` from a `GEM` section whose
+/// remote is rubygems.org (or the `SOCKET_RUBYGEMS_URL` stand-in).
+fn rubygems_locked(lock: &str, name: &str, version: &str) -> bool {
+    let lines: Vec<&str> = lock.split('\n').collect();
+    let base = super::rubygems_base();
+    gem_sections(&lines).iter().any(|sec| {
+        sec.entries
+            .iter()
+            .any(|e| e.name == name && e.version == version && !e.platform)
+            && sec
+                .remotes
+                .iter()
+                .any(|(_, r)| same_remote(r, RUBYGEMS_REMOTE) || same_remote(r, &base))
+    })
 }
 
 /// Restore one gem in a lock + manifest pair: `Ok(None)` when neither wires
@@ -2560,7 +2585,11 @@ mod tests {
     /// The project a vendored unwind leaves behind (#1594): the lock back on
     /// the upstream `GEM` entry, `checksum` its `CHECKSUMS` sha (none for a
     /// pre-2.6 lock), and `archive` in `vendor/cache`.
-    fn unwound_project(checksum: Option<&str>, archive: Option<&[u8]>) -> tempfile::TempDir {
+    fn unwound_project(
+        remote: &str,
+        checksum: Option<&str>,
+        archive: Option<&[u8]>,
+    ) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let checksums = checksum
             .map(|sha| format!("CHECKSUMS\n  rails (7.0.0) sha256={sha}\n\n"))
@@ -2568,7 +2597,7 @@ mod tests {
         std::fs::write(
             tmp.path().join("Gemfile.lock"),
             format!(
-                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+                "GEM\n  remote: {remote}\n  specs:\n    rails (7.0.0)\n\n\
                  PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\n{checksums}\
                  BUNDLED WITH\n   2.6.9\n"
             ),
@@ -2588,7 +2617,11 @@ mod tests {
     #[tokio::test]
     async fn vendored_unwind_names_a_patched_archive_in_vendor_cache() {
         let upstream_sha = sha_hex(b"upstream gem");
-        let tmp = unwound_project(Some(&upstream_sha), Some(b"patched gem"));
+        let tmp = unwound_project(
+            "https://rubygems.org/",
+            Some(&upstream_sha),
+            Some(b"patched gem"),
+        );
         let (code, detail) = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true)
             .await
             .expect("the patched archive is named");
@@ -2607,10 +2640,14 @@ mod tests {
     #[tokio::test]
     async fn vendored_unwind_keeps_quiet_about_an_upstream_or_missing_archive() {
         let upstream_sha = sha_hex(b"upstream gem");
-        let tmp = unwound_project(Some(&upstream_sha), Some(b"upstream gem"));
+        let tmp = unwound_project(
+            "https://rubygems.org/",
+            Some(&upstream_sha),
+            Some(b"upstream gem"),
+        );
         let hit = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true).await;
         assert_eq!(hit, None);
-        let tmp = unwound_project(Some(&upstream_sha), None);
+        let tmp = unwound_project("https://rubygems.org/", Some(&upstream_sha), None);
         let hit = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true).await;
         assert_eq!(hit, None);
     }
@@ -2619,12 +2656,31 @@ mod tests {
     /// be fetched, so the archive is named as unchecked rather than passed.
     #[tokio::test]
     async fn vendored_unwind_names_an_unchecked_archive_offline() {
-        let tmp = unwound_project(None, Some(b"patched gem"));
+        let tmp = unwound_project("https://rubygems.org/", None, Some(b"patched gem"));
         let (code, detail) = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true)
             .await
             .expect("the unchecked archive is named");
         assert_eq!(code, STALE_CACHE);
         assert!(detail.contains("could not be checked"), "{detail}");
+    }
+
+    /// #1594: a gem locked from a private remote with no `CHECKSUMS` sha
+    /// can't be checked against rubygems.org (it isn't from there), and a
+    /// committed cache of private gems is normal: no warning.
+    #[tokio::test]
+    async fn vendored_unwind_skips_an_unchecked_private_gem() {
+        let tmp = unwound_project("https://gems.example.com/", None, Some(b"private gem"));
+        let hit = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true).await;
+        assert_eq!(hit, None);
+        // A CHECKSUMS sha still judges it, whatever the remote.
+        let upstream_sha = sha_hex(b"upstream gem");
+        let tmp = unwound_project(
+            "https://gems.example.com/",
+            Some(&upstream_sha),
+            Some(b"patched gem"),
+        );
+        let hit = unwound_stale_cache(tmp.path(), "pkg:gem/rails@7.0.0", true).await;
+        assert!(hit.is_some_and(|(_, d)| d.contains("non-upstream")));
     }
 
     /// A gem restored in both a `Gemfile` and a `gems.rb` pair shares one
