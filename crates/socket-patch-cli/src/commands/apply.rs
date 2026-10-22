@@ -446,8 +446,8 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     for (id, _, detail) in &mut drifts {
         if let Some(sources) = protected.get(id.as_str()) {
             detail.push_str(&format!(
-                " ({})",
-                super::user_patches::detail(id, sources, false)
+                " (project patch/replacement metadata in {}; a plain `apply` leaves it untouched)",
+                sources.join(", ")
             ));
         }
     }
@@ -660,14 +660,21 @@ fn record_check_skips(env: &mut Envelope, in_sync: &[String], not_installed: &[S
 /// `--global-prefix`, `--ecosystems`). A bare `socket-patch apply` would
 /// act on another tree, exit 0 and leave the drift in place (#1219).
 /// `user_patched`: a drifting package has a project patch, which a plain
-/// `apply` skips, so the remedy names the consent flag (or a manual merge).
+/// `apply` skips, so the command carries the consent that applies it.
 fn check_remedy(common: &GlobalArgs, user_patched: bool) -> String {
-    let command = format!("socket-patch apply{}", crate::ui::scope_args(common));
+    let consent = if user_patched {
+        " --allow-patch-conflicts"
+    } else {
+        ""
+    };
+    let command = format!(
+        "socket-patch apply{}{consent}",
+        crate::ui::scope_args(common)
+    );
     if user_patched {
         format!(
-            "Run `{command}` to regenerate them; a package with a project patch is \
-             applied only with `--allow-patch-conflicts` after review, or merge \
-             the fixes manually."
+            "After reviewing how the project patches above interact with Socket's, \
+             run `{command}` to regenerate them."
         )
     } else {
         format!("Run `{command}` to regenerate them.")
@@ -4047,6 +4054,19 @@ mod tests {
             }),
             "Run `socket-patch apply --cwd svc --manifest-path ../shared/manifest.json \
              --ecosystems npm,pypi` to regenerate them."
+        );
+        // A user-patched drift: the command itself carries the consent, so
+        // running it verbatim clears the drift a plain `apply` would skip.
+        assert_eq!(
+            check_remedy(
+                &GlobalArgs {
+                    cwd: PathBuf::from("app"),
+                    ..GlobalArgs::default()
+                },
+                true
+            ),
+            "After reviewing how the project patches above interact with Socket's, \
+             run `socket-patch apply --cwd app --allow-patch-conflicts` to regenerate them."
         );
     }
 

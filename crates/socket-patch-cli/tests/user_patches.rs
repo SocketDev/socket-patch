@@ -225,7 +225,19 @@ fn environment_and_read_only_checks_do_not_grant_or_require_consent() {
     assert!(stdout.contains("patches/example+1.0.0.patch"), "{stdout}");
     let (code, _, stderr) = run_with_env(tmp.path(), &["apply", "--offline", "--check"], &[]);
     assert_eq!(code, 1, "{stderr}");
-    assert!(stderr.contains("--allow-patch-conflicts"), "{stderr}");
+    assert!(
+        stderr.contains("`socket-patch apply --allow-patch-conflicts`"),
+        "{stderr}"
+    );
+    // Running that remedy verbatim clears the drift.
+    let (code, stdout, stderr) = run_with_env(
+        tmp.path(),
+        &["apply", "--offline", "--allow-patch-conflicts"],
+        &[],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let (code, _, stderr) = run_with_env(tmp.path(), &["apply", "--offline", "--check"], &[]);
+    assert_eq!(code, 0, "{stderr}");
 }
 
 #[test]
