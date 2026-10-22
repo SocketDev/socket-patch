@@ -115,7 +115,7 @@ fn rollback_with_no_manifest_emits_error() {
     assert_eq!(v["summary"]["failed"], 0);
     // The `error.code` pins the specific failure, so an exit 1 for some
     // other reason (e.g. ambient env steering it elsewhere) can't pass.
-    // The human wording is rendered in `cli_rollback_silent.rs`.
+    // The human `Error:` line is rendered in `rollback_render.rs`.
 }
 
 #[test]
@@ -132,6 +132,7 @@ fn rollback_unknown_identifier_emits_error() {
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "patch_not_found");
     assert_eq!(v["events"], serde_json::json!([]), "a full error envelope");
+    // The human `Error:` line is rendered in `rollback_render.rs`.
 }
 
 /// The beforeHash pinned in `MANIFEST_JSON` (deliberately not staged on
@@ -198,8 +199,9 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         "nothing was restored on the bail"
     );
     // The per-file record names the blob. The remedy must not point at
-    // `repair`, which cannot fetch originals (#893); its wording is
-    // rendered in `rollback_render.rs`.
+    // `repair`, which cannot fetch originals (#893); the remedy itself is
+    // checked on the human `Failed to roll back:` line in
+    // `rollback_render.rs`, which renders this same `error` string.
     let err = entry["error"].as_str().expect("error message string");
     assert!(!err.contains("repair"), "got: {err}");
     let verified = entry["details"]["filesVerified"]
@@ -234,7 +236,7 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
 /// printed the core "No SOCKET_API_TOKEN set" notice twice in a single
 /// rollback invocation.
 #[test]
-fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
+fn rollback_undownloadable_blob_envelope_names_blob() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_socket_dir(tmp.path());
     install_manifest_package(tmp.path());
