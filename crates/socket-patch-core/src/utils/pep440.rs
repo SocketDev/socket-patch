@@ -1,7 +1,8 @@
 //! PEP 440 version equality — the comparison pip, uv and Hatch apply to a
-//! hand-written `name==X` pin.
+//! hand-written `name==X` pin — and the normalized spelling
+//! (`normalize`) that uv.lock, wheel METADATA and PyPI record.
 //!
-//! Only equality is implemented: the writers that rewrite a pin need to know
+//! No ordering is implemented: the writers that rewrite a pin need to know
 //! whether `==X` selects exactly the release being patched, and under PEP 440
 //! that ignores case, leading zeros, trailing `.0` release segments and the
 //! alternate pre/post/dev spellings (`1.16` == `1.16.0` == `01.16.0.0`,
@@ -40,11 +41,11 @@ enum LocalPart {
     Text(String),
 }
 
-/// A parsed version in the form PEP 440 equality compares.
+/// A parsed version with every number's leading zeros stripped.
 #[derive(Debug, PartialEq, Eq)]
 struct Version {
     epoch: String,
-    /// Release segments with trailing zeros removed (`1.16.0` → `[1, 16]`).
+    /// Release segments as written (`01.16.0` → `[1, 16, 0]`).
     release: Vec<String>,
     pre: Option<(&'static str, String)>,
     post: Option<String>,
@@ -55,10 +56,7 @@ struct Version {
 fn parse(text: &str) -> Option<Version> {
     let captures = VERSION.captures(text)?;
     let digits = |name: &str| captures.name(name).map(|m| number(m.as_str()));
-    let mut release: Vec<String> = captures["release"].split('.').map(number).collect();
-    while release.len() > 1 && release.last().is_some_and(|segment| segment == "0") {
-        release.pop();
-    }
+    let release = captures["release"].split('.').map(number).collect();
     let pre = captures.name("pre_l").map(|label| {
         let label = match label.as_str().to_ascii_lowercase().as_str() {
             "a" | "alpha" => "a",
@@ -85,7 +83,9 @@ fn parse(text: &str) -> Option<Version> {
                 if part.bytes().all(|byte| byte.is_ascii_digit()) {
                     LocalPart::Number(number(part))
                 } else {
-                    LocalPart::Text(part.to_ascii_lowercase())
+                    // `str.lower()`, as `packaging` does: `(?i)` lets
+                    // `[a-z]` match U+212A KELVIN SIGN, which lowers to `k`.
+                    LocalPart::Text(part.to_lowercase())
                 }
             })
             .collect()
@@ -105,7 +105,17 @@ fn parse(text: &str) -> Option<Version> {
 /// version on either side is never equal to anything: callers fail closed.
 pub(crate) fn versions_equal(a: &str, b: &str) -> bool {
     match (parse(a), parse(b)) {
-        (Some(a), Some(b)) => a == b,
+        (Some(mut a), Some(mut b)) => {
+            // Equality ignores trailing `.0` release segments.
+            for version in [&mut a, &mut b] {
+                while version.release.len() > 1
+                    && version.release.last().is_some_and(|segment| segment == "0")
+                {
+                    version.release.pop();
+                }
+            }
+            a == b
+        }
         _ => false,
     }
 }
@@ -113,6 +123,47 @@ pub(crate) fn versions_equal(a: &str, b: &str) -> bool {
 /// Whether `text` is a valid PEP 440 version.
 pub(crate) fn is_valid(text: &str) -> bool {
     parse(text).is_some()
+}
+
+/// `text` in PEP 440's normalized form, as `str(packaging.version.Version)`
+/// prints it and as uv.lock, wheel METADATA and PyPI record it: no leading
+/// `v` or surrounding whitespace, a zero epoch dropped, leading zeros
+/// dropped from every number (trailing `.0` release segments kept), the
+/// canonical `a`/`b`/`rc`/`.post`/`.dev` spellings and a lowercased,
+/// dot-separated local label (`1.0.0-RC1` → `1.0.0rc1`, `v01.02` → `1.2`,
+/// `1.0+Local-01` → `1.0+local.1`). `None` when `text` is not valid PEP 440.
+pub(crate) fn normalize(text: &str) -> Option<String> {
+    let parsed = parse(text)?;
+    let mut out = String::new();
+    if parsed.epoch != "0" {
+        out.push_str(&parsed.epoch);
+        out.push('!');
+    }
+    out.push_str(&parsed.release.join("."));
+    if let Some((label, n)) = &parsed.pre {
+        out.push_str(label);
+        out.push_str(n);
+    }
+    if let Some(n) = &parsed.post {
+        out.push_str(".post");
+        out.push_str(n);
+    }
+    if let Some(n) = &parsed.dev {
+        out.push_str(".dev");
+        out.push_str(n);
+    }
+    if !parsed.local.is_empty() {
+        let local: Vec<&str> = parsed
+            .local
+            .iter()
+            .map(|part| match part {
+                LocalPart::Number(n) | LocalPart::Text(n) => n.as_str(),
+            })
+            .collect();
+        out.push('+');
+        out.push_str(&local.join("."));
+    }
+    Some(out)
 }
 
 /// Whether a whitespace-free specifier is an exact `==X` pin of `version`
@@ -231,6 +282,50 @@ mod tests {
             for spelling in equivalent_release_spellings(version) {
                 assert!(versions_equal(version, &spelling), "{version} {spelling}");
             }
+        }
+    }
+
+    /// What `str(packaging.version.Version(v))` prints, which is what
+    /// uv.lock, wheel METADATA and PyPI record (#1589).
+    #[test]
+    fn normalize_matches_packaging() {
+        for (raw, normalized) in [
+            ("1.0.0-RC1", "1.0.0rc1"),
+            ("1.0.0RC1", "1.0.0rc1"),
+            ("v1.2", "1.2"),
+            ("V1.2", "1.2"),
+            ("01.02.0", "1.2.0"),
+            ("2026.01.05", "2026.1.5"),
+            ("1.0.0+Local.1", "1.0.0+local.1"),
+            ("1.0.0+Local.Build", "1.0.0+local.build"),
+            ("1.0+Ubuntu-01", "1.0+ubuntu.1"),
+            ("1.0+abc.007", "1.0+abc.7"),
+            ("1.0+\u{212A}8s", "1.0+k8s"),
+            ("1.0.post0", "1.0.post0"),
+            ("1.0-post.1", "1.0.post1"),
+            ("1.0-1", "1.0.post1"),
+            ("1.0rev", "1.0.post0"),
+            ("1.0_r2", "1.0.post2"),
+            ("1.0.0-beta.1", "1.0.0b1"),
+            ("1.0.0-rc.2", "1.0.0rc2"),
+            ("1.0.0-dev.3", "1.0.0.dev3"),
+            ("1.0DEV", "1.0.dev0"),
+            ("1.0alpha", "1.0a0"),
+            ("1.0-c1", "1.0rc1"),
+            ("1.0.preview2", "1.0rc2"),
+            ("1.0a1.post2.dev3", "1.0a1.post2.dev3"),
+            ("0!1.0", "1.0"),
+            ("00!1.0", "1.0"),
+            ("2!1.0", "2!1.0"),
+            ("1.16.0.0", "1.16.0.0"),
+            (" 1.2.0 ", "1.2.0"),
+            ("99999999999999999999999.0", "99999999999999999999999.0"),
+        ] {
+            assert_eq!(normalize(raw).as_deref(), Some(normalized), "{raw}");
+            assert!(versions_equal(raw, normalized), "{raw} == {normalized}");
+        }
+        for invalid in ["", "not-a-version", "1.0 extra", "1.*", "1..2"] {
+            assert_eq!(normalize(invalid), None, "{invalid}");
         }
     }
 
