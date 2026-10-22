@@ -2378,20 +2378,27 @@ mod tests {
         let paths = |files: Vec<(String, toml_edit::Table)>| -> Vec<String> {
             files.into_iter().map(|(path, _)| path).collect()
         };
-        let dirs =
-            std::env::join_paths([root.join("dirs1"), root.join("dirs2"), root.join("dirs3")])
-                .unwrap();
-        let var = env(vec![
+        let mut pairs = vec![
             ("XDG_CONFIG_HOME", root.join("xdg")),
             ("HOME", root.join("home")),
-            ("XDG_CONFIG_DIRS", dirs.into()),
-        ]);
+        ];
+        let mut expected = vec![root.join("xdg/uv/uv.toml").display().to_string()];
+        // `$XDG_CONFIG_DIRS` splits on `:` as on Unix, which would also
+        // split a Windows drive letter, so only Unix checks the system file.
+        if cfg!(unix) {
+            let dirs = format!(
+                "{}:{}:{}",
+                root.join("dirs1").display(),
+                root.join("dirs2").display(),
+                root.join("dirs3").display()
+            );
+            pairs.push(("XDG_CONFIG_DIRS", dirs.into()));
+            expected.push(root.join("dirs2/uv/uv.toml").display().to_string());
+        }
+        let var = env(pairs);
         assert_eq!(
             paths(global_uv_settings(&var, false).await.unwrap()),
-            [
-                root.join("xdg/uv/uv.toml").display().to_string(),
-                root.join("dirs2/uv/uv.toml").display().to_string(),
-            ]
+            expected
         );
         // A relative XDG_CONFIG_HOME counts as unset.
         let var = env(vec![
