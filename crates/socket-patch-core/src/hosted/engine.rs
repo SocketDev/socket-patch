@@ -709,7 +709,13 @@ pub async fn read_candidate_files(
         .files
         .keys()
         .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path));
-    if uv_lane {
+    // A PEP 751 lock is installed with `uv pip`, which refuses the patched
+    // wheel under the `no-binary` settings of the root's `uv.toml` (#1603).
+    let pylock_lane = out
+        .files
+        .keys()
+        .any(|path| crate::utils::python_lock::is_pep751_lock_name(path));
+    if uv_lane || pylock_lane {
         let rel = crate::utils::python_script::UV_TOML;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
             out.files.insert(rel.to_string(), text);

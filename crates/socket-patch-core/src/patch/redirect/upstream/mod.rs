@@ -44,7 +44,10 @@ mod vlt;
 
 use client::rubygems_base;
 pub(crate) use client::UpstreamClient;
-pub(crate) use uv::{declared_lock_specifier, respell_lock_specifier, LockRequirementArray};
+pub(crate) use uv::{
+    declared_lock_specifier, pylock_no_binary, respell_lock_specifier, root_uv_settings,
+    LockRequirementArray,
+};
 
 use super::staged::{flush_staged, read_rel, Staged, StagedBytes};
 

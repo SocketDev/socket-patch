@@ -216,9 +216,15 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   parent's settings for a script whose root sets none). `no-build*` allows
   wheels and is not refused. `UV_NO_BINARY`, `UV_NO_BINARY_PACKAGE`, the
   matching flags and a user-level `uv.toml` belong to the machine that
-  installs, which the scan cannot see. A `uv pip compile --no-binary` pylock.toml
-  records nothing of the setting in its own data; its hosted lane is
-  tracked in #1603.
+  installs, which the scan cannot see. A PEP 751 lock uv wrote is
+  installed with `uv pip`, which reads the same settings plus `[pip]
+  no-binary` (the two add up), and `uv pip compile --no-binary six`
+  records six with only its sdist: both modes refuse the lock before any
+  write when the `uv pip compile` command line in its header passes
+  `--no-binary` naming the package or `:all:`, or the root's `uv.toml` /
+  `[tool.uv]` covers it (vendored `pypi_uv_no_binary`, hosted
+  `redirect_uv_lock_unsupported`, #1603). A header with `--no-config`
+  read no settings file.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751
