@@ -1542,10 +1542,16 @@ async fn restore_one(
 /// the superseding patch whose block it undid.
 type RestoredPair = (Option<String>, Option<String>, Option<String>);
 
-/// Another Socket patch's uuid whose lock section locks `gem`'s name and
-/// version (the lock side of an unconverged superseding re-scan).
+/// Another Socket patch's uuid whose own lock section locks `gem`'s name
+/// and version (the lock side of an unconverged superseding re-scan). Only
+/// a single-remote section says which patch serves a spec: a merged
+/// section (bundler < 2.2) lists every remote's specs together, so another
+/// gem's Socket remote there says nothing about this gem.
 fn earlier_lock_pin(lines: &[&str], gem: &Gem<'_>, ctx: &Ctx<'_>) -> Option<String> {
     gem_sections(lines).iter().find_map(|s| {
+        let [(_, remote)] = s.remotes.as_slice() else {
+            return None;
+        };
         if !s
             .entries
             .iter()
@@ -1553,10 +1559,7 @@ fn earlier_lock_pin(lines: &[&str], gem: &Gem<'_>, ctx: &Ctx<'_>) -> Option<Stri
         {
             return None;
         }
-        s.remotes
-            .iter()
-            .filter_map(|(_, r)| ctx.hosted_uuid(r))
-            .find(|uuid| uuid != gem.uuid)
+        ctx.hosted_uuid(remote).filter(|uuid| uuid != gem.uuid)
     })
 }
 
@@ -2743,6 +2746,31 @@ mod tests {
         )
         .await;
         assert!(r.refused.contains_key(UUID), "{:?}", r.handled);
+    }
+
+    /// #1626: only a Socket section of its own pins the gem to an earlier
+    /// patch; another gem's Socket remote in a merged (bundler < 2.2)
+    /// section must not refuse this gem's restore.
+    #[test]
+    fn earlier_lock_pin_needs_a_section_of_its_own() {
+        const OTHER: &str = "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/99999999-9999-9999-9999-999999999999/";
+        let client = super::super::UpstreamClient::new(true);
+        let ctx = ctx_with(&client);
+        let own = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n\nGEM\n  remote: {OTHER}\n  \
+             specs:\n    rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n"
+        );
+        let lines: Vec<&str> = own.split('\n').collect();
+        assert_eq!(
+            earlier_lock_pin(&lines, &gem(), &ctx).as_deref(),
+            Some("99999999-9999-9999-9999-999999999999")
+        );
+        let merged = format!(
+            "GEM\n  remote: https://rubygems.org/\n  remote: {OTHER}\n  specs:\n    puma \
+             (6.0.0)\n    rails (7.0.0)\n\nDEPENDENCIES\n  puma!\n  rails (= 7.0.0)\n"
+        );
+        let lines: Vec<&str> = merged.split('\n').collect();
+        assert_eq!(earlier_lock_pin(&lines, &gem(), &ctx), None);
     }
 
     #[test]
