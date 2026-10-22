@@ -68,6 +68,7 @@ use super::npm_common::{
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
+use super::pnpm_build_approvals as build_approvals;
 use super::revert::{self, KeepPolicy};
 use super::source::PackageSource;
 use super::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
@@ -304,7 +305,7 @@ impl NpmLockBackend for PnpmBackend {
         // keys, which pnpm reads the same, #1096) pinned to pnpm 9.0–10.4: those read package.json `pnpm.overrides` (wired above)
         // and refuse `pnpm add` in the root-only workspace a created file
         // would make (#734). A later run on pnpm >= 10.5 adds the mirror.
-        let ws_edit = if dialect == PnpmDialect::V9
+        let mut ws_edit = if dialect == PnpmDialect::V9
             && !(ws_text.as_deref().is_none_or(workspace::is_keyless)
                 && (pinned_pre_10_5(project_root, &pkg_bytes).await
                     // A keyless file the lock was installed from as a
@@ -318,6 +319,25 @@ impl NpmLockBackend for PnpmBackend {
         } else {
             WorkspaceEdit::default()
         };
+
+        // pnpm >= 10.34.2 matches build decisions against the vendored
+        // `name@file:` id, so carry the project's decision over to it
+        // (#1597). Legacy locks are installed by pnpm <= 8, which matches
+        // by name.
+        let mut pkg_changed = pkg_changed;
+        if dialect == PnpmDialect::V9 {
+            let target = build_approvals::Target {
+                name: &cx.coords.name,
+                version: &cx.coords.version,
+                rel_tgz,
+            };
+            let base = ws_edit.new_text.as_deref().or(ws_text.as_deref());
+            let carried = build_approvals::carry(&target, base, &mut pkg, &mut wiring, warnings);
+            pkg_changed |= carried.pkg_changed;
+            if carried.ws_text.is_some() {
+                ws_edit.new_text = carried.ws_text;
+            }
+        }
 
         if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
             // Everything already carries this uuid + the packed integrity:
@@ -1095,9 +1115,19 @@ pub(super) async fn revert_pnpm_dialect(
 
     // pnpm-workspace.yaml override surface (pnpm >= 11): delete a file we
     // created, or splice our override back out of one we edited.
-    if let Some(rec) = entry.wiring.iter().find(|r| {
+    let ws_rec = entry.wiring.iter().find(|r| {
         dialect == PnpmDialect::V9 && r.file == PNPM_WORKSPACE && r.kind == KIND_WS_OVERRIDE
-    }) {
+    });
+    let ws_approvals: Vec<&WiringRecord> = entry
+        .wiring
+        .iter()
+        .filter(|r| {
+            dialect == PnpmDialect::V9
+                && r.file == PNPM_WORKSPACE
+                && build_approvals::is_ws_kind(&r.kind)
+        })
+        .collect();
+    if ws_rec.is_some() || !ws_approvals.is_empty() {
         let (created_file, created_overrides, created_packages) = match &entry.pnpm {
             Some(meta) => (
                 meta.created_workspace_file,
@@ -1108,7 +1138,8 @@ pub(super) async fn revert_pnpm_dialect(
         };
         if let Err(e) = revert_workspace(
             project_root,
-            rec,
+            ws_rec,
+            &ws_approvals,
             created_file,
             created_overrides,
             created_packages,
@@ -1140,7 +1171,8 @@ pub(super) async fn revert_pnpm_dialect(
 /// alone. `Err` is a genuine write failure.
 async fn revert_workspace(
     project_root: &Path,
-    rec: &WiringRecord,
+    rec: Option<&WiringRecord>,
+    approvals: &[&WiringRecord],
     created_file: bool,
     created_overrides: bool,
     created_packages: bool,
@@ -1154,8 +1186,9 @@ async fn revert_workspace(
             // ALREADY CONVERGED: for an Added override (no recorded
             // original) the reverted state is "no override" — a missing
             // file trivially satisfies it (an earlier partial revert may
-            // have deleted the scaffold we created). Not drift.
-            if rec.original.is_none() {
+            // have deleted the scaffold we created). Not drift. Build
+            // approvals we added are gone with the file.
+            if rec.is_none_or(|r| r.original.is_none()) {
                 return Ok(());
             }
             warnings.push(drifted(format!(
@@ -1180,7 +1213,7 @@ async fn revert_workspace(
 
     // Fast path: a file we created that is still byte-identical to the
     // scaffold we wrote → delete it (byte-restore to "no file").
-    if created_file {
+    if let Some(rec) = rec.filter(|_| created_file) {
         let scaffold = match (rec.key.as_deref(), rec.new.as_ref().and_then(Value::as_str)) {
             (Some(key), Some(spec)) => Some(ws_scaffold_text(key, spec)),
             _ => None,
@@ -1195,7 +1228,9 @@ async fn revert_workspace(
 
     let mut lines = split_lines(&text);
     let mut dirty = false;
-    revert_ws_record(&mut lines, rec, entry_uuid, &mut dirty, warnings);
+    if let Some(rec) = rec {
+        revert_ws_record(&mut lines, rec, entry_uuid, &mut dirty, warnings);
+    }
     if dirty && created_overrides {
         remove_empty_ws_overrides_section(&mut lines);
         // The `packages` scaffold added to a file with no keys (#1096)
@@ -1208,6 +1243,7 @@ async fn revert_workspace(
             }
         }
     }
+    dirty |= build_approvals::revert_ws(&mut lines, approvals);
     if dirty {
         atomic_write_bytes_preserving_mode(&path, lines.join("\n").as_bytes())
             .await
@@ -3137,6 +3173,10 @@ pub(super) fn revert_pkg_record(
     dirty: &mut bool,
     warnings: &mut Vec<VendorWarning>,
 ) {
+    if build_approvals::is_pkg_kind(&rec.kind) {
+        *dirty |= build_approvals::revert_pkg(doc, rec);
+        return;
+    }
     if rec.kind != KIND_PKG_OVERRIDE {
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
@@ -11010,5 +11050,167 @@ snapshots:
         ] {
             assert!(!same_package_key(&a, &b), "{a} !~ {b}");
         }
+    }
+
+    // ── build approvals carried to the vendored key (#1597) ───────────────
+
+    fn no_approval_warning(warnings: &[VendorWarning]) -> bool {
+        warnings
+            .iter()
+            .all(|w| w.code != build_approvals::VENDOR_PNPM_BUILD_APPROVAL_LOST)
+    }
+
+    /// pnpm >= 10.34.2 matches `allowBuilds` / `onlyBuiltDependencies`
+    /// against the vendored `left-pad@file:<spec>` id, so a name-only or
+    /// pinned decision stops applying (pnpm 11/12 fail every install with
+    /// ERR_PNPM_IGNORED_BUILDS). Vendoring adds the same decision under the
+    /// vendored key, and revert takes it out again byte-exactly. P1's
+    /// `consumer` depends on left-pad too: the key covers that copy.
+    #[tokio::test]
+    async fn ws_build_approval_is_carried_to_the_vendored_key_and_reverted() {
+        for decision in ["true", "false"] {
+            let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+            let ws = format!(
+                "packages:\n  - '.'\nallowBuilds:\n  left-pad: {decision}\n  \
+                 esbuild: true\nonlyBuiltDependencies:\n  - left-pad@1.3.0\n"
+            );
+            write_ws(&fx, &ws).await;
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(no_approval_warning(&warnings), "{warnings:?}");
+            let entry = entry.unwrap();
+            let key = format!("left-pad@file:{}", fx.rel_tgz());
+            let live = fx.read(PNPM_WORKSPACE).await;
+            assert!(
+                live.contains(&format!(
+                    "  left-pad: {decision}\n  {key}: {decision}\n  esbuild: true\n"
+                )),
+                "{live}"
+            );
+            assert!(
+                live.contains(&format!("  - left-pad@1.3.0\n  - '{key}'\n")),
+                "{live}"
+            );
+            let added: Vec<_> = entry
+                .wiring
+                .iter()
+                .filter(|r| build_approvals::is_ws_kind(&r.kind))
+                .collect();
+            assert_eq!(added.len(), 2, "{:?}", entry.wiring);
+            assert!(added.iter().all(|r| r.key.as_deref() == Some(key.as_str())));
+
+            // An in-sync re-run adds nothing.
+            let (_, again, _) = expect_done(fx.vendor(false).await);
+            assert!(again.is_none(), "re-run is in sync");
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, live);
+
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(fx.read(PNPM_WORKSPACE).await, ws, "workspace byte-restored");
+            assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+            assert!(!uuid_dir(&fx).exists());
+        }
+    }
+
+    /// pnpm 10 also reads `package.json#pnpm.onlyBuiltDependencies`: the
+    /// approval is carried there (next to the override) and reverted.
+    #[tokio::test]
+    async fn package_json_only_built_approval_is_carried_and_reverted() {
+        let pkg = P1_BEFORE_PKG.replace(
+            "  \"private\": true,\n",
+            "  \"private\": true,\n  \"pnpm\": {\n    \"onlyBuiltDependencies\": [\n      \"left-pad\"\n    ]\n  },\n",
+        );
+        let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(no_approval_warning(&warnings), "{warnings:?}");
+        let entry = entry.unwrap();
+        let live: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        let key = format!("left-pad@file:{}", fx.rel_tgz());
+        assert_eq!(
+            live["pnpm"]["onlyBuiltDependencies"],
+            serde_json::json!(["left-pad", key])
+        );
+        assert!(entry
+            .wiring
+            .iter()
+            .any(|r| build_approvals::is_pkg_kind(&r.kind)));
+
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            pkg,
+            "package.json byte-restored"
+        );
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
+    }
+
+    /// A superseding patch (new uuid) replaces the older patch's key with
+    /// its own, so no dead key piles up, and revert after the supersede
+    /// restores the user's file.
+    #[tokio::test]
+    async fn superseding_patch_replaces_the_older_vendored_approval_key() {
+        let mut fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let ws = "packages:\n  - '.'\nallowBuilds:\n  left-pad: true\n";
+        write_ws(&fx, ws).await;
+        let (_, prev, _) = expect_done(fx.vendor(false).await);
+        let prev = prev.unwrap();
+        let old_key = format!("left-pad@file:{}", fx.rel_tgz());
+
+        fx.record.uuid = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d".to_string();
+        let (_, next, _) = expect_done(fx.vendor(false).await);
+        let mut merged = next.unwrap();
+        let new_key = format!(
+            "left-pad@file:.socket/vendor/npm/{}/left-pad-1.3.0.tgz",
+            merged.uuid
+        );
+        let live = fx.read(PNPM_WORKSPACE).await;
+        assert!(!live.contains(&old_key), "{live}");
+        assert!(
+            live.contains(&format!(
+                "allowBuilds:\n  left-pad: true\n  {new_key}: true\n"
+            )),
+            "{live}"
+        );
+
+        super::super::state::carry_forward_wiring(&prev, &mut merged);
+        let outcome = revert_pnpm(&merged, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read(PNPM_WORKSPACE).await, ws);
+    }
+
+    /// A flow-style decision can't be extended by the line surgery: the
+    /// vendoring still succeeds, leaves the setting alone and says which
+    /// key to add.
+    #[tokio::test]
+    async fn inline_build_approval_warns_with_the_key_to_add() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        write_ws(
+            &fx,
+            "packages:\n  - '.'\nonlyBuiltDependencies: [left-pad]\n",
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let warning = warnings
+            .iter()
+            .find(|w| w.code == build_approvals::VENDOR_PNPM_BUILD_APPROVAL_LOST)
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(
+            warning
+                .detail
+                .contains(&format!("left-pad@file:{}", fx.rel_tgz())),
+            "{}",
+            warning.detail
+        );
+        assert!(fx
+            .read(PNPM_WORKSPACE)
+            .await
+            .contains("onlyBuiltDependencies: [left-pad]\n"));
     }
 }
