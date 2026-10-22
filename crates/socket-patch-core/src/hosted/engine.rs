@@ -702,7 +702,8 @@ pub async fn read_candidate_files(
 
     // Beside a uv project or script lock, the project's `uv.toml` may set
     // `no-sources`, under which uv ignores the `[tool.uv.sources]` entry the
-    // rewrite would add (#564). Advisory: never rewritten, so a link or an
+    // rewrite would add (#564), or `no-binary`, under which uv refuses the
+    // patched wheel (#1603). Advisory: never rewritten, so a link or an
     // unreadable in-memory entry is left out rather than refused.
     let uv_lane = out
         .files

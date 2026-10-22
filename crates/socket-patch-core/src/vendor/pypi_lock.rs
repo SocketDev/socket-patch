@@ -10,8 +10,9 @@ use crate::utils::python_lock::{
     is_python_lock_name, python_lock_paths, rewrite_python_lock, script_of_lock, ArtifactSource,
 };
 use crate::utils::python_script::{
-    find_ancestor_uv_config, refuse_uv_script_no_sources, replace_script_metadata,
-    rewrite_script_metadata, root_governs_script, script_metadata, UvConfig,
+    find_ancestor_uv_config, refuse_uv_script_no_binary, refuse_uv_script_no_sources,
+    replace_script_metadata, rewrite_script_metadata, root_governs_script, script_metadata,
+    UvConfig,
 };
 
 use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
@@ -270,6 +271,16 @@ async fn load_listed_locks(
                 ancestor.as_ref(),
             )
             .map_err(|detail| ("pypi_uv_no_sources", format!("{script_name}: {detail}")))?;
+            // The vendored artifact is a wheel, which uv refuses to
+            // install under no-binary (#1603).
+            refuse_uv_script_no_binary(
+                name,
+                &script,
+                pyproject.as_deref(),
+                uv_toml.as_deref(),
+                ancestor.as_ref(),
+            )
+            .map_err(|detail| ("pypi_uv_no_binary", format!("{script_name}: {detail}")))?;
             let script_wheel = source_path(package).unwrap_or(&placeholder);
             if rewrite_script_metadata(&script, name, version, ArtifactSource::Path(script_wheel))
                 .map_err(|error| {
@@ -1634,6 +1645,58 @@ mod tests {
             assert_eq!(error.0, "pypi_uv_no_sources", "{}", error.1);
             assert_eq!(
                 tokio::fs::read_to_string(temp.path().join("job.py"))
+                    .await
+                    .unwrap(),
+                script
+            );
+        }
+    }
+
+    /// #1603: uv refuses to install the vendored wheel for a script whose
+    /// settings (its own, the project's, or a parent's) forbid wheels for the
+    /// package, so the scan refuses before writing.
+    #[tokio::test]
+    async fn script_no_binary_refuses_before_writing() {
+        let lock = "version = 1\n[[package]]\nname = \"two\"\nversion = \"2\"\nsource = {registry = \"https://pypi.org/simple\"}\n";
+        let plain = "# /// script\n# dependencies = [\"two==2\"]\n# ///\n";
+        let no_binary =
+            "# /// script\n# dependencies = [\"two==2\"]\n#\n# [tool.uv]\n# no-binary-package = [\"Two\"]\n# ///\n";
+        for (script, dir, file, config) in [
+            (no_binary, "", None, ""),
+            (plain, "", Some("uv.toml"), "no-binary = true\n"),
+            (
+                plain,
+                "",
+                Some("pyproject.toml"),
+                "[project]\nname = \"p\"\nversion = \"0\"\n[tool.uv]\nno-binary = true\n",
+            ),
+            (
+                plain,
+                "scripts",
+                Some("uv.toml"),
+                "no-binary-package = [\"two\"]\n",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join(dir);
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            tokio::fs::write(root.join("job.py.lock"), lock)
+                .await
+                .unwrap();
+            tokio::fs::write(root.join("job.py"), script).await.unwrap();
+            if let Some(file) = file {
+                tokio::fs::write(temp.path().join(file), config)
+                    .await
+                    .unwrap();
+            }
+            let Err(error) =
+                load_python_locks(&root, "two", "2", "11111111-1111-4111-8111-111111111111").await
+            else {
+                panic!("{script:?} with {file:?} in {dir:?} must refuse");
+            };
+            assert_eq!(error.0, "pypi_uv_no_binary", "{}", error.1);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("job.py"))
                     .await
                     .unwrap(),
                 script
