@@ -1524,10 +1524,14 @@ jobs:
         if: matrix.composer != ''
         # The composer capstones shell out to a real composer; `composer:`
         # pins the release line (1, 2.2 LTS, 2) so the composer.lock grammar
-        # the edits assert stays stable across runners.
+        # the edits assert stays stable across runners. PHP defaults to 8.3,
+        # the ubuntu-24.04 image's own PHP, so setup-php only switches to it
+        # instead of fetching another PHP from the network (8.2 took ~56s per
+        # leg and failed outright when the download broke). `php:` overrides
+        # it for a composer line that wants an older PHP.
         uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
-          php-version: '8.2'
+          php-version: ${{ matrix.php || '8.3' }}
           tools: composer:${{ matrix.composer }}
 
       - name: Select the JVM toolchain (JVM legs)
@@ -1849,7 +1853,9 @@ jobs:
       matrix:
         include:
           - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2.2'}
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1'}
+          # composer 1.10 keeps the PHP 8.2 it has always run on here
+          # (composer-compatibility.yml runs 1.10.28 on 8.1).
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1', php: '8.2'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
