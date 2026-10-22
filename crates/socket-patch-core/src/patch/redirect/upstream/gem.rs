@@ -442,32 +442,12 @@ fn find_block(
     rel: &str,
     ctx: &Ctx<'_>,
 ) -> Result<Option<Block>, String> {
-    let re = Regex::new(&format!(
-        r#"(?m)^source "([^"\r\n]*)" do\r?\n  gem "{}", "{}"(?:, ([^\r\n]*))?\r?\nend(\r?\n|\z)"#,
-        regex::escape(&gem.name),
-        regex::escape(&gem.version)
-    ))
-    .expect("source-block regex from escaped coordinates is valid");
-    let hits: Vec<Block> = re
-        .captures_iter(text)
-        .filter(|c| ctx.hosted_uuid(&c[1]).as_deref() == Some(gem.uuid))
-        .map(|c| {
-            let m = c.get(0).expect("group 0 is the whole match");
-            Block {
-                start: m.start(),
-                end: m.end(),
-                opts: c.get(2).map(|o| o.as_str().to_string()),
-                eol: !c[3].is_empty(),
-            }
-        })
+    let hits: Vec<Block> = socket_blocks(text, gem, ctx)
+        .into_iter()
+        .filter(|(_, uuid)| uuid == gem.uuid)
+        .map(|(b, _)| b)
         .collect();
-    let rest_mentions = |b: Option<&Block>| {
-        let rest = match b {
-            Some(b) => format!("{}{}", &text[..b.start], &text[b.end..]),
-            None => text.to_string(),
-        };
-        rest.contains(gem.uuid)
-    };
+    let rest_mentions = |b: Option<&Block>| mentions_outside(text, b, gem.uuid);
     match hits.as_slice() {
         [] if rest_mentions(None) => Err(format!(
             "{rel} wires it in a shape other than the source block socket-patch writes"
@@ -478,6 +458,67 @@ fn find_block(
         )),
         [_] => Ok(hits.into_iter().next()),
         _ => Err(format!("{rel} declares it in several Socket source blocks")),
+    }
+}
+
+/// Every rewriter-shaped `source "<patch registry>" do` block for `gem`'s
+/// name and version, with the hosted patch uuid its index names.
+fn socket_blocks(text: &str, gem: &Gem<'_>, ctx: &Ctx<'_>) -> Vec<(Block, String)> {
+    let re = Regex::new(&format!(
+        r#"(?m)^source "([^"\r\n]*)" do\r?\n  gem "{}", "{}"(?:, ([^\r\n]*))?\r?\nend(\r?\n|\z)"#,
+        regex::escape(&gem.name),
+        regex::escape(&gem.version)
+    ))
+    .expect("source-block regex from escaped coordinates is valid");
+    re.captures_iter(text)
+        .filter_map(|c| {
+            let uuid = ctx.hosted_uuid(&c[1])?;
+            let m = c.get(0).expect("group 0 is the whole match");
+            let block = Block {
+                start: m.start(),
+                end: m.end(),
+                opts: c.get(2).map(|o| o.as_str().to_string()),
+                eol: !c[3].is_empty(),
+            };
+            Some((block, uuid))
+        })
+        .collect()
+}
+
+/// Whether `text` names `uuid` anywhere but inside `block`.
+fn mentions_outside(text: &str, block: Option<&Block>, uuid: &str) -> bool {
+    match block {
+        Some(b) => text[..b.start].contains(uuid) || text[b.end..].contains(uuid),
+        None => text.contains(uuid),
+    }
+}
+
+/// The block a superseding hosted re-scan left for `gem` (#1626): on a lock
+/// with no `CHECKSUMS` section that scan moves only the manifest's block to
+/// the new patch's uuid, so until a `bundle install` the lock pins `gem`'s
+/// uuid while the manifest's block names another patch of the same name
+/// and version. Restoring the lock alone would leave that block behind,
+/// and the next unfrozen install would re-patch. Returns the block and the
+/// superseding patch's uuid.
+fn superseded_block(
+    text: &str,
+    gem: &Gem<'_>,
+    rel: &str,
+    ctx: &Ctx<'_>,
+) -> Result<Option<(Block, String)>, String> {
+    let hits: Vec<(Block, String)> = socket_blocks(text, gem, ctx)
+        .into_iter()
+        .filter(|(_, uuid)| uuid != gem.uuid)
+        .collect();
+    match hits.as_slice() {
+        [] => Ok(None),
+        [(b, uuid)] if mentions_outside(text, Some(b), uuid) => Err(format!(
+            "{rel} names the superseding patch {uuid} outside the source block socket-patch writes"
+        )),
+        [_] => Ok(hits.into_iter().next()),
+        _ => Err(format!(
+            "{rel} declares it in several superseding Socket source blocks"
+        )),
     }
 }
 
@@ -1228,8 +1269,18 @@ pub(crate) async fn restore(
         let mut manifest = manifest_raw.clone();
         let globals = manifest.as_deref().map(global_sources).unwrap_or_default();
         let handled_before = result.handled.clone();
-        for pin in pins {
+        // Pins the lock wires go first, so one whose superseding patch's
+        // manifest block is also a pin here undoes that block itself
+        // (#1626), and the block's own pin then has nothing left to do.
+        let mut ordered: Vec<&&HostedPin> = pins.iter().collect();
+        ordered.sort_by_key(|p| !lock.as_deref().is_some_and(|l| l.contains(p.uuid.as_str())));
+        let mut undone: Vec<String> = Vec::new();
+        for pin in ordered {
             if result.refused.contains_key(&pin.uuid) {
+                continue;
+            }
+            if undone.contains(&pin.uuid) {
+                result.handled.insert(pin.uuid.clone());
                 continue;
             }
             let Some((name, version)) = pin.name_version() else {
@@ -1241,12 +1292,14 @@ pub(crate) async fn restore(
                 name,
                 version,
             };
+            let mut superseded = None;
             match restore_one(
                 &gem,
                 lock.as_deref(),
                 manifest.as_deref(),
                 manifest_rel,
                 &globals,
+                &mut superseded,
                 ctx,
             )
             .await
@@ -1263,16 +1316,19 @@ pub(crate) async fn restore(
                     lock = next_lock;
                     manifest = next_manifest;
                     result.handled.insert(pin.uuid.clone());
+                    undone.extend(superseded);
                 }
                 Err(why) => result.refuse(&pin.uuid, why),
             }
         }
         // The pins this pair restored, each judged once against its own
-        // restored lock.
+        // restored lock (a superseding pin shares its archive with the pin
+        // that undid it).
         for pin in pins {
             if !result.handled.contains(&pin.uuid)
                 || handled_before.contains(&pin.uuid)
                 || result.refused.contains_key(&pin.uuid)
+                || undone.contains(&pin.uuid)
             {
                 continue;
             }
@@ -1373,16 +1429,18 @@ async fn stale_cache_warning(
 }
 
 /// Restore one gem in a lock + manifest pair: `Ok(None)` when neither wires
-/// it, else the next `(lock, manifest)` texts.
+/// it, else the next `(lock, manifest)` texts. A superseding patch's block
+/// undone with it ([`superseded_block`]) leaves its uuid in `superseded`.
 async fn restore_one(
     gem: &Gem<'_>,
     lock: Option<&str>,
     manifest: Option<&str>,
     manifest_rel: &str,
     globals: &[String],
+    superseded: &mut Option<String>,
     ctx: &Ctx<'_>,
 ) -> Result<Option<(Option<String>, Option<String>)>, String> {
-    let block = match manifest {
+    let mut block = match manifest {
         Some(text) => find_block(text, gem, manifest_rel, ctx)?,
         None => None,
     };
@@ -1391,6 +1449,16 @@ async fn restore_one(
         Some(_) => wiring(&gem_sections(&lines), gem.uuid, ctx)?.is_some(),
         None => false,
     };
+    if wired && block.is_none() {
+        if let Some((b, uuid)) = manifest
+            .map(|text| superseded_block(text, gem, manifest_rel, ctx))
+            .transpose()?
+            .flatten()
+        {
+            block = Some(b);
+            *superseded = Some(uuid);
+        }
+    }
     if !wired && block.is_none() {
         return Ok(None);
     }
@@ -1876,6 +1944,7 @@ mod tests {
             Some(hosted_manifest),
             "Gemfile",
             &global_sources(hosted_manifest),
+            &mut None,
             &ctx,
         )
         .await
@@ -1978,6 +2047,7 @@ mod tests {
                 Some(hosted_manifest),
                 "Gemfile",
                 &global_sources(hosted_manifest),
+                &mut None,
                 &ctx,
             )
             .await
@@ -2556,6 +2626,76 @@ mod tests {
         let r = restore(&mut view, &[&pin], &pin.files, &ctx).await;
         assert!(r.refused.is_empty(), "{:?}", r.refused);
         assert_eq!(stale_cache(&r.warnings).len(), 1, "{:?}", r.warnings);
+    }
+
+    /// #1626: a superseding hosted re-scan on a lock with no CHECKSUMS
+    /// moves only the Gemfile block to the new uuid; the lock still pins
+    /// the old one until a `bundle install`. Restoring the lock's pin must
+    /// undo that block too, or the next unfrozen install re-patches.
+    #[tokio::test]
+    async fn restore_undoes_a_superseding_patch_block() {
+        const NEW: &str = "88888888-8888-8888-8888-888888888888";
+        let client = super::super::UpstreamClient::new(true);
+        let ctx = ctx_with(&client);
+        let upstream = hosted_pair(false, &"a".repeat(64));
+        let run = |pins: Vec<HostedPin>, gemfile: String| {
+            let lock = upstream["Gemfile.lock"].clone();
+            let ctx = &ctx;
+            async move {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(tmp.path().join("Gemfile"), &gemfile).unwrap();
+                std::fs::write(tmp.path().join("Gemfile.lock"), &lock).unwrap();
+                let mut view = View::new(tmp.path());
+                let refs: Vec<&HostedPin> = pins.iter().collect();
+                let files = vec!["Gemfile".to_string(), "Gemfile.lock".to_string()];
+                let r = restore(&mut view, &refs, &files, ctx).await;
+                let changed = view.changed();
+                (
+                    r,
+                    changed.get("Gemfile").cloned().flatten(),
+                    changed.get("Gemfile.lock").cloned().flatten(),
+                )
+            }
+        };
+        let pin = |uuid: &str, files: &[&str]| HostedPin {
+            purl: "pkg:gem/rails@7.0.0".into(),
+            uuid: uuid.into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+        };
+        let superseded = upstream["Gemfile"].replace(UUID, NEW);
+        assert!(superseded.contains(NEW), "{superseded}");
+        let want = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
+
+        // Only the lock's (old) pin is discovered.
+        let (r, gemfile, lock) = run(vec![pin(UUID, &["Gemfile.lock"])], superseded.clone()).await;
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
+        assert!(r.handled.contains(UUID));
+        assert_eq!(gemfile.as_deref(), Some(want));
+        let lock = lock.expect("the lock is restored");
+        assert!(
+            !lock.contains(IDX) && !lock.contains("patch-registry"),
+            "{lock}"
+        );
+
+        // Both pins in one run: each is handled, neither refused.
+        let (r, gemfile, _) = run(
+            vec![pin(UUID, &["Gemfile.lock"]), pin(NEW, &["Gemfile"])],
+            superseded.clone(),
+        )
+        .await;
+        assert!(r.refused.is_empty(), "{:?}", r.refused);
+        assert!(r.handled.contains(UUID) && r.handled.contains(NEW));
+        assert_eq!(gemfile.as_deref(), Some(want));
+
+        // Two superseding blocks for the same gem: not ours to pick.
+        let other = upstream["Gemfile"].replace(UUID, "99999999-9999-9999-9999-999999999999");
+        let block = &other[other.find("source \"https://patch").unwrap()..];
+        let (r, _, _) = run(
+            vec![pin(UUID, &["Gemfile.lock"])],
+            format!("{superseded}{block}"),
+        )
+        .await;
+        assert!(r.refused.contains_key(UUID), "{:?}", r.handled);
     }
 
     #[test]
