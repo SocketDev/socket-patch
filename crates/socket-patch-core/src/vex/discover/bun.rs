@@ -584,6 +584,10 @@ impl Unwired {
                             r.purl,
                         ),
                     );
+                    // No rewire reaches that copy: shadow the ref so
+                    // `vendor --check` names the copy (#1600) and rollback /
+                    // remove / the takeover still unwind it.
+                    out.shadow(r);
                 } else {
                     out.refs.push(r);
                 }
@@ -601,6 +605,7 @@ impl Unwired {
                         r.purl,
                     ),
                 );
+                out.shadow(r);
                 continue;
             }
             out.diag(

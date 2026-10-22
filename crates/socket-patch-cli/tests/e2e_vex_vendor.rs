@@ -2056,10 +2056,11 @@ fn vendored_bun_patch_beside_a_non_registry_copy() {
         let event = &check_env["events"][0];
         assert_eq!(event["errorCode"], "vendor_check_failed", "{check_env}");
         assert!(
-            event["reason"].as_str().is_some_and(|r| r
-                .starts_with("copy unpatched:")
-                && r.contains("\"minimist\"")
-                && !r.contains("re-run `socket-patch vendor`")),
+            event["reason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("copy unpatched:")
+                    && r.contains("\"minimist\"")
+                    && !r.contains("re-run `socket-patch vendor`")),
             "{label}: the check names the non-registry copy: {check_env}"
         );
     }
