@@ -3689,3 +3689,223 @@ async fn gem_hosted_unwind_names_a_patched_archive_in_vendor_cache() {
     unwind_names_the_patched_cached_archive(&fx, "rollback");
     unwind_names_the_patched_cached_archive(&fx, "remove");
 }
+
+/// The vendored half of the patch API for the fixture's patch: the
+/// patched `.gem` (the last `build_gem` of `DEP` left it in the stage dir)
+/// and the stub gemspec `gem spec --ruby` derives from it, beside the
+/// hosted registry override. Priority 1, so it answers every later
+/// `patches/package` call in place of the hosted-only grant.
+async fn mount_vendored_grant(fx: &RedirectFixture) {
+    use base64::Engine as _;
+    use sha2::Sha512;
+    let server = &fx._server;
+    let gem_path = fx
+        .tmp
+        .path()
+        .join("gem-stage")
+        .join(format!("{DEP}-src"))
+        .join(format!("{DEP}-{DEP_VERSION}.gem"));
+    let gem = std::fs::read(&gem_path).expect("the patched .gem from build_gem");
+    let mut spec = Command::new("gem");
+    spec.args(["spec", gem_path.to_str().unwrap(), "--ruby"]);
+    cache_env::isolate(&mut spec);
+    let stub = spec.output().expect("failed to run gem spec");
+    assert!(
+        stub.status.success(),
+        "gem spec --ruby:\n{}",
+        String::from_utf8_lossy(&stub.stderr)
+    );
+    let stub = stub.stdout;
+    let sri = |bytes: &[u8]| {
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+        )
+    };
+    let base = format!("/artifacts/{UUID}");
+    let gem_url = format!("{}{base}/{DEP}-{DEP_VERSION}.gem", server.uri());
+    let stub_url = format!("{}{base}/{DEP}-{DEP_VERSION}.gemspec", server.uri());
+    let patched_sha = sha256_hex(&gem);
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": gem_url,
+                    "purl": PURL,
+                    "artifacts": [
+                        { "kind": "tarball", "url": gem_url,
+                          "integrity": { "sha512": sri(&gem), "sha256": patched_sha } },
+                        { "kind": "gem-stub-gemspec", "url": stub_url,
+                          "integrity": { "sha512": sri(&stub) } }
+                    ],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": fx.index_url,
+                        "identifiers": {
+                            "name": DEP,
+                            "version": DEP_VERSION,
+                            "gemChecksumSha256": patched_sha,
+                        }
+                    }
+                }
+            }
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    for (leaf, bytes) in [
+        (format!("{DEP}-{DEP_VERSION}.gem"), gem),
+        (format!("{DEP}-{DEP_VERSION}.gemspec"), stub),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/{leaf}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(server)
+            .await;
+    }
+}
+
+/// #1594 through one vendored unwind `command`: the hosted pin was live
+/// when the project ran `bundle cache`, so `vendor/cache` holds the PATCHED
+/// archive. A hosted → vendored takeover wires the gem through its path
+/// source (the archive is unused while vendored), and the later unwind puts
+/// the pair back on the upstream `GEM` entry, where bundler installs from
+/// that archive first. The unwind must name the file, exactly as the hosted
+/// unwind does (#1260).
+fn vendored_unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str) {
+    let dir = stage_fresh_checkout(fx, &format!("vendored-cache-{command}"));
+    let install = bundle(&dir, &["install"]);
+    assert!(
+        install.status.success(),
+        "{command}: hosted install:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let cache_cmd = if fx.bundler.at_least(2, 0) {
+        "cache"
+    } else {
+        "package"
+    };
+    let cache = bundle(&dir, &[cache_cmd]);
+    assert!(
+        cache.status.success(),
+        "{command}: bundle {cache_cmd}:\n{}",
+        String::from_utf8_lossy(&cache.stderr)
+    );
+    let archive = dir
+        .join("vendor")
+        .join("cache")
+        .join(format!("{DEP}-{DEP_VERSION}.gem"));
+    assert!(
+        archive.is_file(),
+        "{command}: bundle {cache_cmd} wrote no archive"
+    );
+
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    let cwd = dir.to_str().expect("utf8 tmp path");
+    let common = [
+        "--json",
+        "--cwd",
+        cwd,
+        "--api-url",
+        &api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        &api,
+    ];
+    let envs = [("SOCKET_RUBYGEMS_URL", upstream.as_str())];
+
+    let mut takeover = vec!["get", UUID, "--mode", "vendored", "--yes"];
+    takeover.extend(common);
+    let (code, stdout, stderr) = run_socket_env(&dir, &takeover, &envs);
+    assert_eq!(
+        code, 0,
+        "{command}: takeover:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let gemfile = std::fs::read_to_string(dir.join(fx.gemfile_name)).unwrap();
+    assert!(
+        gemfile.contains(".socket/vendor/gem/"),
+        "{command}: the takeover vendored the gem:\n{gemfile}"
+    );
+    // The takeover's own notice says the vendored copy shadows the archive
+    // for now, not that installs already fail.
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let notice = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["errorCode"] == "upstream_gem_stale_cache")
+        .unwrap_or_else(|| panic!("{command}: the takeover names the archive: {env}"));
+    assert!(
+        notice["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("while the gem stays vendored")),
+        "{command}: {notice}"
+    );
+
+    let mut argv: Vec<&str> = match command {
+        "vendor --revert" => vec!["vendor", "--revert", "--yes"],
+        "remove" => vec!["remove", PURL, "--yes"],
+        _ => vec![command, PURL],
+    };
+    argv.extend(common);
+    let (code, stdout, stderr) = run_socket_env(&dir, &argv, &envs);
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("{command}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "{command}: {env}\nstderr:\n{stderr}");
+    let gemfile = std::fs::read_to_string(dir.join(fx.gemfile_name)).unwrap();
+    assert!(
+        !gemfile.contains(".socket/vendor/gem/"),
+        "{command}: the gem is no longer vendored:\n{gemfile}"
+    );
+    let hits: Vec<String> = env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["code"] == "upstream_gem_stale_cache")
+        // `remove` and `vendor --revert` report a vendored unwind's
+        // advisories as uncounted events, `rollback` in `warnings[]`.
+        .chain(
+            env["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["errorCode"] == "upstream_gem_stale_cache"),
+        )
+        .map(|w| w.to_string())
+        .collect();
+    assert_eq!(hits.len(), 1, "{command}: one stale-cache warning: {env}");
+    assert!(
+        hits[0].contains(&archive.display().to_string()),
+        "{command}: the warning names the cached archive: {}",
+        hits[0]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); the unpinned `test` \
+            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_vendored_unwind_names_a_patched_archive_in_vendor_cache() {
+    let Some(fx) = redirect_scanned_project(
+        "vendored-cache-unwind",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    mount_vendored_grant(&fx).await;
+    for command in ["remove", "rollback", "vendor --revert"] {
+        vendored_unwind_names_the_patched_cached_archive(&fx, command);
+    }
+}

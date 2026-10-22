@@ -640,6 +640,23 @@ pub(crate) fn symlinked_wiring_warnings(cwd: &Path, purl: &str) -> Vec<VendorWar
     .collect()
 }
 
+/// A hosted-restore advisory as a takeover reports it. The gem stale-cache
+/// one describes a gem back on its upstream entry, but the takeover wires
+/// the gem to its vendored copy right after, which bundler installs
+/// instead: the archive only matters once that copy is unwired, and the
+/// unwind names it again then (#1594).
+fn takeover_detail(code: &str, detail: &str) -> String {
+    if code == socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE {
+        format!(
+            "{detail} (while the gem stays vendored, bundler installs the vendored copy \
+             instead; the command that unvendors it, such as `remove`, `rollback` or \
+             `vendor --revert`, names this archive again)"
+        )
+    } else {
+        detail.to_string()
+    }
+}
+
 pub(crate) fn record_warning(
     env: &mut Envelope,
     purl: &str,
@@ -3309,7 +3326,7 @@ pub(crate) async fn vendor_records_reusing(
                 let mut advisories: Vec<VendorWarning> = restore
                     .warnings
                     .iter()
-                    .map(|(code, detail)| VendorWarning::new(code, detail.clone()))
+                    .map(|(code, detail)| VendorWarning::new(code, takeover_detail(code, detail)))
                     .collect();
                 if common.dry_run {
                     // The refusal the backend would raise over the restored
@@ -4547,7 +4564,8 @@ pub(crate) struct VendorGcSummary {
 }
 
 /// The revert warnings `scan --prune` forwards into `gc.warnings[]`: only
-/// the "the installed tree still holds the vendored copy" advisories. The
+/// the "the installed tree still holds the vendored copy" advisories, and
+/// the patched gem archive Bundler's cache would install again (#1594). The
 /// revert's other warnings are routine for a prune and stay out:
 /// `vendor_lock_entry_removed` is the normal leg-(b) case (the dependency
 /// was uninstalled), and a drift keep is already reported through
@@ -4556,6 +4574,7 @@ const GC_FORWARDED_ADVISORIES: &[&str] = &[
     socket_patch_core::vendor::bun_lock::REINSTALL_REQUIRED,
     socket_patch_core::vendor::vlt_lock::REINSTALL_REQUIRED,
     crate::commands::pypi_reinstall::VENDOR_CODE,
+    socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE,
 ];
 
 impl VendorGcSummary {
@@ -4667,12 +4686,21 @@ pub(crate) async fn run_vendor_gc(
             let mut outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
             // The patch left the manifest while the package stays locked:
             // the restored lock pins the version the vendored build is
-            // installed as, which PDM, uv and Pipenv keep (#477).
+            // installed as, which PDM, uv and Pipenv keep (#477), and a
+            // patched gem archive in Bundler's cache installs again (#1594).
             if outcome.success && !outcome.kept_artifact {
                 crate::commands::pypi_reinstall::push_vendor_advisory(
                     &common.cwd,
                     &purl,
                     entry.flavor.as_deref(),
+                    &mut outcome.warnings,
+                )
+                .await;
+                crate::commands::vendored_backend::push_gem_stale_cache(
+                    &common.cwd,
+                    &entry.ecosystem,
+                    &entry.base_purl,
+                    common.offline,
                     &mut outcome.warnings,
                 )
                 .await;
