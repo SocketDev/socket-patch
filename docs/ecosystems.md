@@ -133,6 +133,14 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   E404: the hosted run reads it from the same env / project / user / global /
   builtin layers and warns `redirect_npm_replace_registry_host` (set
   `replace-registry-host=npmjs` in the project `.npmrc`, or use vendored mode).
+  npm 12 runs a dependency's install script only when `package.json`
+  `allowScripts` approves it, and matches a version-pinned key
+  (`"esbuild@0.19.12": true`, what `npm approve-scripts` writes) only against a
+  registry tarball URL. Hosted and vendored lock entries are not one, so when a
+  patched package with an install script is approved only by version, the run
+  leaves the policy alone and warns `redirect_npm_allow_scripts` /
+  `vendor_npm_allow_scripts`: approve it by name (`"esbuild": true`) to keep
+  the script running (#1595).
   npm 6 ignores `resolved` for registry
   dependencies, so a redirected lockfileVersion 1 lock fails closed with
   EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm
@@ -289,8 +297,8 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
 - **yarn copies under another dependency name (classic & berry)** — yarn keys a `file:`
-  tarball or directory, a URL tarball and a berry `portal:` / `link:` dependency by the
-  name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as `lp2@file:…`,
+  tarball or directory, a URL tarball and a berry `portal:` / `link:` / `exec:` / git
+  dependency by the name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as `lp2@file:…`,
   while `node_modules/lp2` is left-pad@1.3.0. No pin or vendored wiring of `left-pad`
   reaches that copy, so it stays unpatched. Which package such a copy is comes from the
   copy itself (the tarball's or directory's `package.json`, or the registry package a
@@ -299,7 +307,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   installs it from, including a `file:` path outside the project (`file:../shared/lp`),
   and a tarball's `package.json` is found under whatever top-level directory it has, as
   yarn strips the first path segment. A copy whose package can't be read (a non-registry
-  URL, a missing directory) is treated as possibly any package at its lock version: it
+  URL, a missing directory, a berry `exec:` script or a berry git remote such as
+  `git+ssh://…`, which hold no package until yarn builds or clones them) is treated as
+  possibly any package at its lock version: it
   is named as a copy it may be, and `vex` attests nothing that lock wires at that
   version. An absolute path (`portal:/home/me/lp`, `file:/abs/lp.tgz`) is never read, as
   the lock is untrusted input; a `portal:` / `link:` copy whose `package.json` isn't
@@ -686,7 +696,8 @@ inside it, and a `.gitattributes` (`* -text -filter -ident -working-tree-encodin
 turns off EOL conversion and overrides the project's clean/smudge filters, such as a Git
 LFS `*.tgz` rule, so an `autocrlf` or LFS-less checkout stays byte-exact (#1541). A tarball
 an older release already committed as an LFS pointer stays one until it is re-added:
-after the next vendored run, `git add --renormalize .socket/vendor/npm` and commit. The lock's node becomes a `file` node, the importer edges and the
+after the next vendored run or `socket-patch repair`, `git add --renormalize
+.socket/vendor/npm` and commit. The lock's node becomes a `file` node, the importer edges and the
 importers' `package.json` specs move to the `file:` path, and every moved entry is placed
 where vlt's own serializer puts it, so `vlt ci` keeps the lock byte-identical. Transitive
 targets are refused (`vendor_vlt_transitive_unsupported`: vlt silently reverts

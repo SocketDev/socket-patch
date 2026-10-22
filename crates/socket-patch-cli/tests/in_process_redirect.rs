@@ -1696,6 +1696,52 @@ async fn scan_redirect_npm_file_copy_is_not_attested_in_run() {
     }
 }
 
+/// REGRESSION (#1618): npm 7+ marks a package the ROOT project bundles
+/// `inBundle: true`, and records the bundle list on the lock's `""` entry
+/// (as a list for every `package.json` spelling: a list, `true`, or the
+/// `bundledDependencies` alias). It has no parent tarball, so `npm ci`
+/// installs it from the lock: the scan rewires it and its in-run `--vex`
+/// attests it.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_npm_root_bundled_entry_is_rewired_and_attested() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::write(
+        tmp.path().join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }}, "bundleDependencies": true }}"#
+        ),
+    )
+    .unwrap();
+    // The lock npm 7+ writes for it.
+    let lock_path = tmp.path().join("package-lock.json");
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    lock["packages"][""]["bundleDependencies"] = serde_json::json!([NAME]);
+    lock["packages"][format!("node_modules/{NAME}")]["inBundle"] = serde_json::json!(true);
+    std::fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+    let out = tmp.path().join("out.vex.json");
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.vex.vex = Some(out.clone());
+    args.vex.vex_product = Some("pkg:npm/consumer@0.0.0".into());
+    assert_eq!(run(args).await, 0);
+    let rewritten: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    let entry = &rewritten["packages"][format!("node_modules/{NAME}")];
+    assert_eq!(entry["resolved"], HOSTED_URL, "{rewritten:#}");
+    assert_eq!(entry["inBundle"], true, "flag kept");
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert!(document.to_string().contains(PURL), "{document:#}");
+    assert_eq!(document["statements"][0]["status"], "not_affected");
+}
+
 /// npm 7+ installs from the v2 `packages` map. An ignored legacy bundled
 /// flag must not block the hosted in-run attestation before that install.
 #[tokio::test]
@@ -3861,6 +3907,106 @@ async fn pnpm_warning_strips_userinfo_and_names_only_spliced_hosts() {
     );
 }
 
+/// [`write_project`] whose lock records an install script for the patched
+/// package and whose root package.json approves it in npm 12's
+/// `allowScripts` with `policy`.
+fn write_project_with_allow_scripts(root: &Path, policy: serde_json::Value) {
+    write_project(root);
+    std::fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "name": "consumer",
+            "version": "0.0.0",
+            "dependencies": { NAME: VERSION },
+            "allowScripts": policy,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let path = root.join("package-lock.json");
+    let mut lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    lock["packages"][format!("node_modules/{NAME}")]["hasInstallScript"] = true.into();
+    std::fs::write(&path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+}
+
+/// #1595: npm 12 matches a version-pinned `allowScripts` approval
+/// (`"pkg@x.y.z": true`, what `npm approve-scripts` writes) only against a
+/// registry-shaped `resolved`, which the hosted redirect replaces, so the
+/// approved install script silently stops running. The run must say so
+/// (`redirect_npm_allow_scripts`, naming the pinned key and the name-only
+/// remedy) and leave package.json untouched; a name-only approval, which
+/// npm still honors, must not warn.
+#[tokio::test]
+#[serial]
+async fn hosted_npm_warns_when_pinned_allow_scripts_approval_is_lost() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pinned = format!("{NAME}@{VERSION}");
+    write_project_with_allow_scripts(tmp.path(), serde_json::json!({ &pinned: true }));
+    let package_json = std::fs::read(tmp.path().join("package.json")).unwrap();
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "anchor: {env}");
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(lock.contains("\"hasInstallScript\": true"), "{lock}");
+    assert_eq!(
+        warning_codes(&env),
+        vec![
+            "redirect_npm_allow_remote".to_string(),
+            "redirect_npm_allow_scripts".to_string()
+        ],
+        "{env}"
+    );
+    let detail = env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "redirect_npm_allow_scripts")
+        .and_then(|w| w["detail"].as_str())
+        .unwrap()
+        .to_string();
+    assert!(
+        detail.contains(&format!("`\"{pinned}\": true`"))
+            && detail.contains(&format!("`\"{NAME}\": true`"))
+            && detail.contains("strict-allow-scripts"),
+        "the warning names the lost pin and the name-only remedy: {detail}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("package.json")).unwrap(),
+        package_json,
+        "the user's allowScripts policy is never rewritten"
+    );
+
+    // A BOM-prefixed lock (kept by the rewriter) is read the same way.
+    let tmp = tempfile::tempdir().unwrap();
+    write_project_with_allow_scripts(tmp.path(), serde_json::json!({ &pinned: true }));
+    let lock_path = tmp.path().join("package-lock.json");
+    let mut bom = b"\xEF\xBB\xBF".to_vec();
+    bom.extend(std::fs::read(&lock_path).unwrap());
+    std::fs::write(&lock_path, bom).unwrap();
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "anchor: {env}");
+    assert!(
+        warning_codes(&env).contains(&"redirect_npm_allow_scripts".to_string()),
+        "a BOM-prefixed lock still warns: {env}"
+    );
+
+    // A name-only approval keeps matching the redirected entry: no warning.
+    let tmp = tempfile::tempdir().unwrap();
+    write_project_with_allow_scripts(tmp.path(), serde_json::json!({ &pinned: true, NAME: true }));
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "anchor: {env}");
+    assert_eq!(
+        warning_codes(&env),
+        vec!["redirect_npm_allow_remote".to_string()],
+        "{env}"
+    );
+}
+
 /// A clean, fully-successful hosted run must carry an EXACT warning set — not
 /// merely "contains X". Presence-only assertions let spurious warnings ride
 /// along unnoticed: every pnpm/yarn/bun/Rush run shipped a bogus
@@ -4305,6 +4451,39 @@ async fn readonly_socket_vendor_does_not_block_a_hosted_run() {
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(lock.contains(HOSTED_URL), "{lock}");
     vlt_hosted_common::assert_no_ledger(tmp.path());
+}
+
+/// A hosted scan run as root over a user's checkout (a Docker bind mount,
+/// `sudo`) rewrites the lock but leaves it owned by that user, as the
+/// package manager's own writer does (#1635): a root-owned lock locks its
+/// owner out of the next in-place `poetry add` / `npm install`.
+///
+/// unix-only, and skipped unless root: only root can give a file away.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn root_hosted_scan_keeps_the_lock_owner() {
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping: giving a file to another uid needs root");
+        return;
+    }
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let lock_path = tmp.path().join("package-lock.json");
+    std::os::unix::fs::chown(&lock_path, Some(1000), Some(1001)).unwrap();
+
+    let out = run_hosted_json_scan(tmp.path(), &server).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(lock.contains(HOSTED_URL), "{lock}");
+    let meta = std::fs::metadata(&lock_path).unwrap();
+    assert_eq!((meta.uid(), meta.gid()), (1000, 1001));
 }
 
 /// A MALFORMED pre-v5 redirect ledger (torn write, truncation, bad

@@ -29,7 +29,11 @@ npm 12 notes:
   mode therefore leaves such a package on its registry entry, in every npm
   lock, and warns `redirect_npm_patched_dependency_skipped`; other packages in
   the lock are still pinned. Vendored mode refuses the v4 lock
-  (`vendor_lockfile_version_unsupported`, naming `npm patch`) (#711).
+  (`vendor_lockfile_version_unsupported`, naming `npm patch`) (#711). npm
+  keeps a v4 lock at v4 on a plain `npm install`, even after `npm patch rm`,
+  so the refusal names `npm install --lockfile-version 3` as the step that
+  clears it; a v4 lock with no native patch left is refused without naming
+  one (#1576).
 - `allow-remote` defaults to `none`: any tarball whose `resolved` origin is not
   the configured registry is refused. `allow-remote=root` admits only direct
   dependencies. `allow-remote=all` is the setting a hosted redirect needs; it
@@ -72,6 +76,13 @@ npm 12 notes:
   install unchanged. An explicit `none` (or `root` with a transitive vendored
   copy) refuses them with EALLOWFILE; the vendored run warns
   `vendor_npm_allow_file` and `vendor --check` fails (#969).
+- `allowScripts` (npm 12): a version-pinned approval (`"pkg@x.y.z": true`)
+  matches only a registry-shaped `resolved`, so after a hosted or vendored
+  rewrite npm blocks the package's approved install script (every install
+  fails under `strict-allow-scripts=true`). A name-only approval keeps
+  working. The run leaves the policy untouched and warns
+  `redirect_npm_allow_scripts` / `vendor_npm_allow_scripts` when the patched
+  entry has `hasInstallScript` and no name-only approval covers it (#1595).
 
 Dependencies that ship their own `npm-shrinkwrap.json` (#753): the lock marks
 such a package `"hasShrinkwrap": true` (`firebase-tools`, `netlify-cli`), and

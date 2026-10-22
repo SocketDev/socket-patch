@@ -364,12 +364,88 @@ pub async fn restore(
             return Err(error.to_string());
         }
     }
-    if super::verify::is_vlt_dir_entry(entry) {
-        super::vlt_lock::restore_vlt_uuid_metadata(entry, root)
-            .await
-            .map_err(|e| e.to_string())?;
+    restore_npm_uuid_metadata(entry, root)
+        .await
+        .map_err(|e| format!("cannot restore the vendored dir's git metadata: {e}"))?;
+    // The restored uuid dir needs its `.gitignore` / `.gitattributes`
+    // again, or a `*.whl` / LFS rule catches the wheel (#1572).
+    if entry.ecosystem == "pypi" {
+        if let Some(rel) = super::path::vendor_uuid_dir_rel("pypi", &entry.uuid) {
+            super::pypi::restore_uuid_metadata(&root.join(rel))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
     Ok(warnings)
+}
+
+/// Rewrite an npm-family entry's `<uuid>/.gitignore` and
+/// `<uuid>/.gitattributes` when absent or changed: neither is part of the
+/// artifact, so repairing them is no rebuild. Every npm flavor (npm, pnpm,
+/// yarn, bun, vlt) commits its artifact under that uuid dir, and only these
+/// two files keep a repository's `*.tgz` ignore or `filter=lfs` rule off it
+/// (#1581). `Ok(true)` when either was rewritten; a no-op for other
+/// ecosystems, and for a vendor dir reached through a symlink, which may
+/// be another project's store (see `path::vendor_dir_symlink`).
+pub async fn restore_npm_uuid_metadata(entry: &VendorEntry, root: &Path) -> std::io::Result<bool> {
+    if entry.ecosystem != "npm"
+        || super::path::vendor_dir_symlink(root, "npm", Some(&entry.uuid)).is_some()
+    {
+        return Ok(false);
+    }
+    let Some(uuid_dir) = super::path::vendor_uuid_dir_rel("npm", &entry.uuid) else {
+        return Err(std::io::Error::other(format!(
+            "`{}` is not a canonical patch uuid",
+            entry.uuid
+        )));
+    };
+    super::npm_dir::restore_uuid_metadata(&root.join(uuid_dir)).await
+}
+
+/// Would git commit an npm-family entry's artifact and its uuid-dir
+/// metadata? Asked after repair rewrote them, since a rule the
+/// `<uuid>/.gitignore` cannot override (`.socket/`) still drops them from
+/// the next commit. `Err((code, detail))` is the `vendor_artifact_gitignored`
+/// refusal `vendor` gives; `Ok(Some(warning))` means git could not answer.
+pub async fn npm_artifact_commit_check(
+    entry: &VendorEntry,
+    root: &Path,
+) -> Result<Option<VendorWarning>, (&'static str, String)> {
+    // git cannot answer past a symlinked vendor dir, which `vendor`
+    // refuses anyway (`vendor_dir_symlink_unsupported`).
+    if entry.ecosystem != "npm"
+        || super::path::vendor_dir_symlink(root, "npm", Some(&entry.uuid)).is_some()
+    {
+        return Ok(None);
+    }
+    let Some(uuid_dir) = super::path::vendor_uuid_dir_rel("npm", &entry.uuid) else {
+        return Ok(None);
+    };
+    // A directory artifact (vlt) is probed as a directory, so a rule that
+    // ignores it whole is seen.
+    let artifact = if super::verify::is_vlt_dir_entry(entry)
+        || !super::verify::artifact_is_file_shaped(&entry.artifact.path)
+    {
+        format!("{}/", entry.artifact.path.trim_end_matches('/'))
+    } else {
+        entry.artifact.path.clone()
+    };
+    let paths = [
+        artifact,
+        format!("{uuid_dir}/.gitignore"),
+        format!("{uuid_dir}/.gitattributes"),
+    ];
+    match super::npm_dir::gitignore_probe(root, &paths).await {
+        Ok(Some(rules)) => Err((
+            super::npm_dir::GITIGNORED,
+            super::npm_dir::gitignored_detail(&paths[0], &rules),
+        )),
+        Ok(None) => Ok(None),
+        Err(why) => Ok(Some(VendorWarning::new(
+            super::npm_dir::GITIGNORE_UNCHECKED,
+            super::npm_dir::gitignore_unchecked_detail(&paths[0], &why),
+        ))),
+    }
 }
 
 /// Stage the entry's whole recorded JVM tree under `stage_root` from the
@@ -704,6 +780,162 @@ mod tests {
         tokio::fs::remove_file(&path).await.unwrap();
         restore(root.path(), &entry, &record(), &cfg).await.unwrap();
         assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+    }
+
+    /// #1581: a redownloaded npm tarball gets its `<uuid>/.gitignore` and
+    /// `.gitattributes` back, or a `*.tgz` ignore or `filter=lfs` rule
+    /// drops the repaired bytes from the next commit.
+    #[tokio::test]
+    async fn npm_redownload_restores_the_uuid_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = tgz("package", b"original unpatched member");
+        let entry = entry(&bytes);
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, UUID, "example-1.0.0.tgz", &bytes).await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
+        restore(root.path(), &entry, &record(), &cfg).await.unwrap();
+        let uuid_dir = root.path().join(format!(".socket/vendor/npm/{UUID}"));
+        assert_eq!(
+            tokio::fs::read_to_string(uuid_dir.join(".gitignore"))
+                .await
+                .unwrap(),
+            super::super::npm_dir::UUID_GITIGNORE
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(uuid_dir.join(".gitattributes"))
+                .await
+                .unwrap(),
+            super::super::npm_dir::UUID_GITATTRIBUTES
+        );
+    }
+
+    /// #1581: the pre-#1541 `* -text` file is upgraded, a current one is
+    /// left alone, and other ecosystems are not touched.
+    #[tokio::test]
+    async fn npm_uuid_metadata_upgrades_a_legacy_gitattributes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut entry = entry(b"tgz");
+        let uuid_dir = root.path().join(format!(".socket/vendor/npm/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(
+            uuid_dir.join(".gitignore"),
+            super::super::npm_dir::UUID_GITIGNORE,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            uuid_dir.join(".gitattributes"),
+            super::super::npm_dir::LEGACY_UUID_GITATTRIBUTES,
+        )
+        .await
+        .unwrap();
+        assert!(restore_npm_uuid_metadata(&entry, root.path())
+            .await
+            .unwrap());
+        assert_eq!(
+            tokio::fs::read_to_string(uuid_dir.join(".gitattributes"))
+                .await
+                .unwrap(),
+            super::super::npm_dir::UUID_GITATTRIBUTES
+        );
+        assert!(!restore_npm_uuid_metadata(&entry, root.path())
+            .await
+            .unwrap());
+
+        entry.ecosystem = "cargo".into();
+        tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
+        assert!(!restore_npm_uuid_metadata(&entry, root.path())
+            .await
+            .unwrap());
+        assert!(!uuid_dir.exists());
+    }
+
+    /// #1581: after repair, a `.socket/` rule the `<uuid>/.gitignore`
+    /// cannot override is the `vendor_artifact_gitignored` refusal, while a
+    /// file rule such as `*.tgz` is overridden.
+    #[tokio::test]
+    async fn npm_commit_check_refuses_only_an_unoverridable_rule() {
+        if crate::utils::process::resolve_tool("git").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let entry = entry(b"tgz");
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let uuid_dir = root.path().join(format!(".socket/vendor/npm/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(root.path().join(&entry.artifact.path), b"tgz")
+            .await
+            .unwrap();
+        restore_npm_uuid_metadata(&entry, root.path())
+            .await
+            .unwrap();
+
+        tokio::fs::write(
+            root.path().join(".gitignore"),
+            "*.tgz
+",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            npm_artifact_commit_check(&entry, root.path()).await,
+            Ok(None)
+        ));
+
+        tokio::fs::write(
+            root.path().join(".gitignore"),
+            ".socket/
+",
+        )
+        .await
+        .unwrap();
+        let (code, detail) = npm_artifact_commit_check(&entry, root.path())
+            .await
+            .unwrap_err();
+        assert_eq!(code, "vendor_artifact_gitignored");
+        assert!(detail.contains(&entry.artifact.path), "{detail}");
+    }
+
+    /// #664: through a linked eco dir repair neither writes the other
+    /// store's uuid metadata nor asks git, which cannot answer past a link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_vendor_dir_skips_uuid_metadata_and_commit_check() {
+        if crate::utils::process::resolve_tool("git").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let shared = tempfile::tempdir().unwrap();
+        let entry = entry(b"tgz");
+        tokio::fs::create_dir_all(root.path().join(".socket/vendor"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(shared.path(), root.path().join(".socket/vendor/npm")).unwrap();
+        tokio::fs::create_dir_all(shared.path().join(UUID))
+            .await
+            .unwrap();
+
+        assert!(!restore_npm_uuid_metadata(&entry, root.path())
+            .await
+            .unwrap());
+        assert!(!shared.path().join(UUID).join(".gitignore").exists());
+        assert!(matches!(
+            npm_artifact_commit_check(&entry, root.path()).await,
+            Ok(None)
+        ));
     }
 
     /// #664: repair never downloads into a linked eco dir, whose target

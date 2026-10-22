@@ -2,8 +2,8 @@
 //! dependency name the entry is keyed by (#939, #1236).
 //!
 //! Yarn (classic and berry alike) keys a `file:` tarball or directory, a
-//! url tarball and a berry `portal:` / `link:` dependency by the name the
-//! depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as
+//! url tarball and a berry `portal:` / `link:` / `exec:` / git dependency
+//! by the name the depender gave it: `"lp2": "file:./left-pad-1.3.0.tgz"` locks as
 //! `lp2@file:…`, while `node_modules/lp2` IS left-pad@1.3.0. No pin of
 //! `left-pad` reaches that copy, so every reader that asks "does this lock
 //! also install an unpatched copy of the patched `name@version`?" (lockfile
@@ -30,6 +30,15 @@ pub(crate) enum CopyRef {
     /// A url tarball (`#` fragment dropped): the package is the registry
     /// package its `/<name>/-/<leaf>-<version>.tgz` path names.
     Url(String),
+    /// A root-relative berry `exec:` script that builds the package at
+    /// install time: the lock names only its version, so the package is
+    /// never known (#1630).
+    Exec(String),
+    /// A berry git remote that isn't http(s) (`git+ssh:`, `ssh:`, `git:`;
+    /// `#` fragment dropped): the lock names only its version, so the
+    /// package is never known (#1630). An http(s) git remote is a
+    /// [`CopyRef::Url`], whose path names no registry package either.
+    Git(String),
 }
 
 /// Which berry protocol a [`CopyRef::Linked`] copy came from. yarn installs
@@ -44,7 +53,8 @@ pub(crate) enum LinkKind {
 impl CopyRef {
     /// The root-relative file to read for [`CopyRef::identity`]: the tarball
     /// itself, or the directory's `package.json`. `None` for a url, which
-    /// names its package in its path.
+    /// names its package in its path, and for an `exec:` script or a git
+    /// remote, which hold no package until yarn builds or clones them.
     ///
     /// `None` too for an absolute path: a lock is untrusted input, and an
     /// absolute spelling can name any file on the machine, or (a Windows
@@ -63,14 +73,14 @@ impl CopyRef {
             } else {
                 format!("{dir}/package.json")
             }),
-            CopyRef::Url(_) => None,
+            CopyRef::Url(_) | CopyRef::Exec(_) | CopyRef::Git(_) => None,
         }
     }
 
     /// The `(name, version)` this copy installs, given the lock entry's
     /// `version` and the bytes read at [`CopyRef::read_path`]. `None` when
     /// the copy does not say (an unreadable or nameless manifest, a
-    /// non-registry url).
+    /// non-registry url, an `exec:` script, a git remote).
     pub(crate) fn identity(
         &self,
         lock_version: &str,
@@ -84,6 +94,7 @@ impl CopyRef {
                 return Some((package_name(&manifest)?, package_version(&manifest)?));
             }
             CopyRef::Url(url) => registry_tarball_name(url, lock_version)?,
+            CopyRef::Exec(_) | CopyRef::Git(_) => return None,
         };
         Some((name, lock_version.to_string()))
     }
@@ -114,6 +125,11 @@ impl CopyRef {
             }
             CopyRef::Url(url) => format!(
                 "installs it from {:?}",
+                crate::utils::redact::redact_url(url)
+            ),
+            CopyRef::Exec(rel) => format!("builds it with the user's exec: script {rel}"),
+            CopyRef::Git(url) => format!(
+                "installs it from git {:?}",
                 crate::utils::redact::redact_url(url)
             ),
         }
@@ -150,22 +166,34 @@ pub(crate) fn classic_copy_ref(patterns: &[String], resolved: Option<&str>) -> O
 }
 
 /// The copy a berry locator `reference` installs from: a `file:` tarball or
-/// directory, a `portal:` / `link:` directory (each relative to the
-/// workspace its `locator=` binding names), or an http(s) url. `None` for
-/// any other protocol (`npm:`, `workspace:`, `patch:`, `exec:`, git). A
-/// path that leaves the root is still read there ([`copy_path`]).
+/// directory, a `portal:` / `link:` directory, an `exec:` script (each
+/// relative to the workspace its `locator=` binding names), an http(s)
+/// url, or another git remote. `None` for any other protocol (`npm:`,
+/// `workspace:`, `patch:`). A path that leaves the root is still read
+/// there ([`copy_path`]).
 pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
+    let url = || reference.split('#').next().unwrap_or_default().to_string();
     if reference.starts_with("http") {
-        return Some(CopyRef::Url(
-            reference.split('#').next().unwrap_or_default().to_string(),
-        ));
+        return Some(CopyRef::Url(url()));
     }
-    let (path, linked) = if let Some(path) = reference.strip_prefix("file:") {
+    // yarn's git resolver takes these besides http(s) (#1630); `git@host:`
+    // is the scp-like ssh spelling.
+    if ["git:", "git+", "ssh:", "git@"]
+        .iter()
+        .any(|p| reference.starts_with(p))
+    {
+        return Some(CopyRef::Git(url()));
+    }
+    // `None` for `file:`, which is a tarball or a directory by its path.
+    type Kind = Option<fn(String) -> CopyRef>;
+    let (path, kind): (_, Kind) = if let Some(path) = reference.strip_prefix("file:") {
         (path, None)
     } else if let Some(path) = reference.strip_prefix("portal:") {
-        (path, Some(LinkKind::Portal))
+        (path, Some(|rel| CopyRef::Linked(rel, LinkKind::Portal)))
     } else if let Some(path) = reference.strip_prefix("link:") {
-        (path, Some(LinkKind::Link))
+        (path, Some(|rel| CopyRef::Linked(rel, LinkKind::Link)))
+    } else if let Some(path) = reference.strip_prefix("exec:") {
+        (path, Some(CopyRef::Exec))
     } else {
         return None;
     };
@@ -174,8 +202,8 @@ pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
     let path = path.split("::").next().unwrap_or_default();
     let path = path.split('#').next().unwrap_or_default();
     let rel = berry_copy_path(reference, path)?;
-    Some(if let Some(kind) = linked {
-        CopyRef::Linked(rel, kind)
+    Some(if let Some(kind) = kind {
+        kind(rel)
     } else if is_tarball_path(path) {
         CopyRef::Tarball(rel)
     } else {
@@ -183,8 +211,8 @@ pub(crate) fn berry_copy_ref(reference: &str) -> Option<CopyRef> {
     })
 }
 
-/// The root-relative path a berry `file:` / `portal:` / `link:` reference
-/// names: relative to the workspace in its `locator=` binding
+/// The root-relative path a berry `file:` / `portal:` / `link:` / `exec:`
+/// reference names: relative to the workspace in its `locator=` binding
 /// (`b@workspace:packages/b`), or to the root when it has none
 /// ([`copy_path`]).
 fn berry_copy_path(reference: &str, path: &str) -> Option<String> {
@@ -365,6 +393,43 @@ mod tests {
         );
         assert_eq!(berry_copy_ref("npm:1.3.0"), None);
         assert_eq!(berry_copy_ref("workspace:packages/b"), None);
+    }
+
+    /// #1630: an `exec:` generator, or a git remote that isn't http(s),
+    /// installs a copy under the dependency name whose package the lock
+    /// doesn't say. It is a copy all the same, never read, so it may be
+    /// any package at its lock version.
+    #[test]
+    fn issue_1630_exec_and_git_refs_are_unread_copies() {
+        let ws = "::locator=b%40workspace%3Apackages%2Fb";
+        let exec = berry_copy_ref(&format!("exec:./gen.js#./gen.js::hash=db115a&{}", &ws[2..]));
+        assert_eq!(exec, Some(CopyRef::Exec("packages/b/gen.js".into())));
+        for git in [
+            "git+ssh://git@github.com/stevemao/left-pad.git#commit=5d3c4f2",
+            "ssh://git@github.com/stevemao/left-pad.git#commit=5d3c4f2",
+            "git://github.com/stevemao/left-pad.git#commit=5d3c4f2",
+            "git@github.com:stevemao/left-pad.git#commit=5d3c4f2",
+        ] {
+            let source = berry_copy_ref(git);
+            assert_eq!(
+                source,
+                Some(CopyRef::Git(git.split('#').next().unwrap().into())),
+                "{git}"
+            );
+        }
+        for source in [exec.unwrap(), CopyRef::Git("ssh://git@h/x.git".into())] {
+            assert_eq!(source.read_path(), None, "{source:?}");
+            assert_eq!(source.identity("1.3.0", None), None, "{source:?}");
+            assert_eq!(source.linked_name(None), None, "{source:?}");
+        }
+        assert_eq!(
+            CopyRef::Git("git+ssh://tok:secret@h/x.git".into()).how(),
+            "installs it from git \"git+ssh://<redacted>@h/x.git\""
+        );
+        assert_eq!(
+            CopyRef::Exec("gen.js".into()).how(),
+            "builds it with the user's exec: script gen.js"
+        );
     }
 
     /// #1540: an absolute `portal:` / `link:` path keeps its whole spelling,

@@ -204,6 +204,21 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   sets nothing the project inherits and is not refused. `UV_NO_SOURCES`, `UV_NO_SOURCES_PACKAGE`, the matching
   flags and a user-level `uv.toml` belong to the machine that installs,
   which the scan cannot see.
+- `no-binary = true` and `no-binary-package = [...]` make uv install the
+  package only from an sdist, and every Socket artifact is a wheel, so a
+  wired patch fails every `uv sync` ("marked as `--no-binary` but is itself
+  a binary distribution"). Both modes refuse it before any file is written:
+  vendored with `pypi_uv_no_binary`, hosted with
+  `redirect_uv_project_unsupported` / `redirect_uv_script_unsupported`
+  (#1603). The settings are read with the same precedence as `no-sources`
+  (project `uv.toml` over `[tool.uv]`, a script's own `no-binary` over the
+  project's, lists combined, `no-binary = false` disabling the list, a
+  parent's settings for a script whose root sets none). `no-build*` allows
+  wheels and is not refused. `UV_NO_BINARY`, `UV_NO_BINARY_PACKAGE`, the
+  matching flags and a user-level `uv.toml` belong to the machine that
+  installs, which the scan cannot see. A `uv pip compile --no-binary` pylock.toml
+  records nothing of the setting in its own data; its hosted lane is
+  tracked in #1603.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751

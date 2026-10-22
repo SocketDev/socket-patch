@@ -124,8 +124,9 @@ pub use source::PackageSource;
 pub(crate) use npm_common::is_safe_npm_name;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
-    carry_forward_wiring, load_state, lookup_entry, lookup_entry_kv, purl_keys_cover, save_state,
-    save_state_shared, VendorEntry, VendorState, VENDOR_STATE_REL,
+    carry_forward_wiring, file_gitignored, ledger_gitignore_refusal, load_state, lookup_entry,
+    lookup_entry_kv, purl_keys_cover, save_state, save_state_shared, VendorEntry, VendorState,
+    LEDGER_GITIGNORED, VENDOR_STATE_REL,
 };
 pub use verify::{
     artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory,

@@ -38,8 +38,8 @@ use crate::utils::line_endings::terminator;
 use crate::utils::purl::purl_name_version;
 use crate::utils::python_lock::preserve_line_endings;
 use crate::utils::python_script::{
-    find_ancestor_uv_config, refuse_uv_no_sources, refuse_uv_project_shadowing,
-    root_governs_script, UvConfig, UV_TOML,
+    find_ancestor_uv_config, refuse_uv_no_binary, refuse_uv_no_sources,
+    refuse_uv_project_shadowing, root_governs_script, UvConfig, UV_TOML,
 };
 
 use super::common::{
@@ -353,6 +353,15 @@ pub(super) fn check_target_guards(
         p.uv_toml.as_deref(),
     )
     .map_err(|detail| ("pypi_uv_no_sources", detail))?;
+    // The vendored artifact is a wheel, which uv refuses to install under
+    // no-binary (or a no-binary-package list naming the package) (#1603).
+    refuse_uv_no_binary(
+        canon_name,
+        None,
+        Some(&p.pyproject_text),
+        p.uv_toml.as_deref(),
+    )
+    .map_err(|detail| ("pypi_uv_no_binary", detail))?;
     // A parent uv.toml / [tool.uv] supplies the project's settings while
     // the project sets none; the [tool.uv] table wired below would make
     // uv drop them, failing `uv sync --locked` (#1545).
@@ -2986,6 +2995,37 @@ wheels = [
         for setting in [
             "no-sources-package = [\"requests\"]",
             "no-sources = false\nno-sources-package = [\"six\"]",
+        ] {
+            let tmp = write_pair(
+                &format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\n{setting}\n"),
+                DIRECT_REGISTRY_LOCK,
+            )
+            .await;
+            target(&load_uv_project(tmp.path()).await.unwrap()).unwrap();
+        }
+
+        // #1603: the vendored artifact is a wheel, which uv refuses to
+        // install under no-binary = true or a no-binary-package list naming
+        // the package, in pyproject's [tool.uv] or a project uv.toml.
+        for setting in ["no-binary = true", "no-binary-package = [\"Six\"]"] {
+            let tmp = write_pair(
+                &format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\n{setting}\n"),
+                DIRECT_REGISTRY_LOCK,
+            )
+            .await;
+            let err = target(&load_uv_project(tmp.path()).await.unwrap()).unwrap_err();
+            assert_eq!(err.0, "pypi_uv_no_binary", "{setting}: {}", err.1);
+            let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+            tokio::fs::write(tmp.path().join("uv.toml"), format!("{setting}\n"))
+                .await
+                .unwrap();
+            let err = target(&load_uv_project(tmp.path()).await.unwrap()).unwrap_err();
+            assert_eq!(err.0, "pypi_uv_no_binary", "{setting}: {}", err.1);
+        }
+        for setting in [
+            "no-binary-package = [\"requests\"]",
+            "no-build-package = [\"six\"]",
+            "no-binary = false\nno-binary-package = [\"six\"]",
         ] {
             let tmp = write_pair(
                 &format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv]\n{setting}\n"),

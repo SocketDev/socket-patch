@@ -1840,3 +1840,121 @@ async fn get_uuid_forwards_explicit_consent_to_nested_apply() {
         .iter()
         .any(|w| w["code"] == "user_patch_override"));
 }
+
+/// `git init` `root` with `gitignore`; `false` when git is not installed.
+fn git_project_ignoring(root: &std::path::Path, gitignore: &str) -> bool {
+    if socket_patch_core::utils::process::resolve_tool("git").is_none() {
+        return false;
+    }
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(root.join(".gitignore"), gitignore).unwrap();
+    true
+}
+
+/// Assert the envelope's `manifest_gitignored` warning names `rule`, or
+/// that there is none.
+fn assert_manifest_warning(json: &serde_json::Value, rule: Option<&str>, what: &str) {
+    let warning = json["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| w["code"] == "manifest_gitignored");
+    match rule {
+        Some(rule) => {
+            let detail = warning.unwrap_or_else(|| panic!("{what}: json={json}"))["detail"]
+                .as_str()
+                .unwrap();
+            assert!(
+                detail.contains(".socket/manifest.json") && detail.contains(rule),
+                "{detail}"
+            );
+        }
+        None => assert!(warning.is_none(), "{what}: json={json}"),
+    }
+}
+
+/// An agent-mode run that records a patch in a manifest git would not
+/// commit (`manifest.json`, `*.json` + `!package.json`, or a `.socket/`
+/// directory rule) warns `manifest_gitignored`, naming the rule: otherwise
+/// the blobs are committed without the manifest and a fresh checkout's
+/// `apply` silently applies nothing (#1638). A re-included manifest gets
+/// no warning.
+#[tokio::test]
+#[serial]
+async fn agent_record_warns_when_git_ignores_the_manifest() {
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, good_files()).await;
+    let selected = vec![search_result(UUID, PURL)];
+    for (gitignore, rule) in [
+        ("manifest.json\n", Some("manifest.json")),
+        ("*.json\n!package.json\n", Some("*.json")),
+        (".socket/\n", Some(".socket/")),
+        ("*.json\n!package.json\n!.socket/manifest.json\n", None),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        if !git_project_ignoring(tmp.path(), gitignore) {
+            return;
+        }
+        let (code, json) =
+            download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
+        assert_eq!(code, 0, "{gitignore:?}: json={json}");
+        assert!(tmp.path().join(".socket/manifest.json").is_file());
+        assert_manifest_warning(&json, rule, gitignore);
+    }
+}
+
+/// A manifest git already tracks keeps being committed whatever the ignore
+/// rules say, so a re-run after a `*.json` rule lands does not warn.
+#[tokio::test]
+#[serial]
+async fn agent_record_does_not_warn_for_a_tracked_manifest() {
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, good_files()).await;
+    let selected = vec![search_result(UUID, PURL)];
+    let tmp = tempfile::tempdir().unwrap();
+    if !git_project_ignoring(tmp.path(), "") {
+        return;
+    }
+    let (code, json) =
+        download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
+    assert_eq!(code, 0, "json={json}");
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(tmp.path())
+        .args(["add", ".socket/manifest.json"])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(tmp.path().join(".gitignore"), "*.json\n").unwrap();
+    let (code, json) =
+        download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
+    assert_eq!(code, 0, "json={json}");
+    assert_manifest_warning(&json, None, "tracked manifest");
+}
+
+/// `get <uuid>` records through its own save path, which warns the same
+/// way.
+#[tokio::test]
+async fn get_uuid_warns_when_git_ignores_the_manifest() {
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, good_files()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    if !git_project_ignoring(tmp.path(), "manifest.json\n") {
+        return;
+    }
+    let (code, stdout, stderr) =
+        run_get_bin(tmp.path(), &server.uri(), &[UUID, "--save-only", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(tmp.path().join(".socket/manifest.json").is_file());
+    assert_manifest_warning(
+        &parse_json_envelope(&stdout),
+        Some("manifest.json"),
+        "get <uuid>",
+    );
+}

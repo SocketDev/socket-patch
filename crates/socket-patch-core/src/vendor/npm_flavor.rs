@@ -416,9 +416,10 @@ pub(crate) async fn member_stray_lock_refusal(
     Some((
         "vendor_lockfile_missing",
         format!(
-            "{}; vendor from {} (the workspace root)",
+            "{}; vendor from {} (the {})",
             stray.detail,
-            stray.root.display()
+            stray.root.display(),
+            stray.root_kind
         ),
     ))
 }
@@ -497,14 +498,25 @@ pub async fn vendor_npm_any<'a>(
             entry.flavor = Some(flavor.as_str().to_string());
         }
         // npm >= 11.14's `allow-file` gates the `file:` specs the
-        // package-lock wiring writes (#969); the other flavors' package
-        // managers do not read it.
+        // package-lock wiring writes (#969), and npm 12's `allowScripts`
+        // pins stop matching them (#1595); the other flavors' package
+        // managers read neither.
         if flavor == NpmLockFlavor::PackageLock && result.success {
             if let Some((name, version)) = super::npm_common::parse_npm_purl(purl) {
                 if let Some(detail) =
                     npm_lock::allow_file_refusal(project_root, &name, &version).await
                 {
                     warnings.push(VendorWarning::new(npm_lock::ALLOW_FILE_WARNING, detail));
+                }
+                // npm 12 stops honoring a version-pinned allowScripts
+                // approval for the rewired `file:` tarball (#1595).
+                if let Some(detail) =
+                    npm_lock::allow_scripts_lost(project_root, &name, &version).await
+                {
+                    warnings.push(VendorWarning::new(
+                        crate::patch::redirect::npm_allow_scripts::VENDOR_WARNING,
+                        detail,
+                    ));
                 }
             }
         }
@@ -1970,6 +1982,46 @@ mod tests {
                     ("vlt-lock.json", VLT_PNPM_WORKSPACE_TEXT),
                 ],
             ),
+            // #1584: vlt's project root is the nearest ancestor `vlt.json`,
+            // so a directory below one that no `workspaces` field lists is
+            // installed from the root as well, as is a member a `..` glob
+            // lists, and the vlt 1.3.8 `pnpm-workspace.yaml` directory.
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("package.json", r#"{"name":"root","private":true}"#),
+                    ("vlt.json", r#"{"registries":{}}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("vlt.json", r#"{"workspaces":["other/../packages/*"]}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("package.json", r#"{"name":"root","private":true}"#),
+                    ("pnpm-workspace.yaml", "packages:\n  - \"packages/*\"\n"),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
+            // Without any `vlt.json`, vlt's root is the outermost directory
+            // holding a `package.json`.
+            (
+                "vlt-lock.json",
+                VLT_TEXT,
+                vec![
+                    ("package.json", r#"{"name":"root","private":true}"#),
+                    ("vlt-lock.json", VLT_TEXT),
+                ],
+            ),
         ] {
             let (tmp, record) = npm_project().await;
             tokio::fs::remove_file(tmp.path().join("package-lock.json"))
@@ -2007,7 +2059,7 @@ mod tests {
             };
             assert_eq!(code, "vendor_lockfile_missing", "{member_lock}");
             assert!(
-                detail.contains("workspace")
+                (detail.contains("workspace") || detail.contains("vlt project"))
                     && detail.contains("ignores")
                     && detail.contains(member_lock),
                 "{member_lock}: {detail}"

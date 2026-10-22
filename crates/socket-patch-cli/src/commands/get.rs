@@ -31,8 +31,9 @@ use crate::commands::agent_download::{
     decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
     filter_to_installed_releases, max_vuln_severity, nested_apply_args, patch_event_metadata,
     record_apply_outcome, report_lock_failure, run_nested_apply, run_outcome, tag_mode,
-    unwind_new_blobs, warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload,
-    PatchAction, VendorRefusals, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING,
+    unwind_new_blobs, warn_if_manifest_gitignored, warn_on_vendored_uuid_drift,
+    write_all_patch_blobs, DetachedDownload, PatchAction, VendorRefusals, ALREADY_IN_MANIFEST,
+    BLOB_WRITE_FAILED, RELEASE_NARROWING,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
@@ -2081,6 +2082,13 @@ async fn save_and_apply_patch(
         warn_on_vendored_uuid_drift(&args.common.project_root(), quiet, &recorded, &mut warnings)
             .await;
     }
+    warn_if_manifest_gitignored(
+        &args.common.project_root(),
+        &manifest_path,
+        quiet,
+        &mut warnings,
+    )
+    .await;
 
     // Progress narration goes to stderr, like the search path's.
     if !quiet {

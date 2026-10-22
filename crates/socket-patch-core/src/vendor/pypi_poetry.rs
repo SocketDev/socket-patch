@@ -8,6 +8,7 @@ use toml_edit::{DocumentMut, Item};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::poetry_lock;
+use crate::utils::python_lock::preserve_line_endings;
 
 use super::common::{
     ensure_unchanged, item_get, lock_units_named, pep621_declared_names, record, refuse_symlinked,
@@ -444,8 +445,195 @@ pub(super) async fn revert_poetry(
             error: Some(format!("{code}: {detail}")),
         };
     }
+    // A `poetry lock` by another Poetry version re-renders the unit we wrote
+    // (2.x adds `groups`, 1.4+ drop `category`, 1.8 drops `groups`, a lock-1.1
+    // relock moves `[metadata.files]` into the unit) while keeping its
+    // vendored source and patched hash. The verbatim splice reads that as
+    // drift forever, and re-vendoring can't normalize it (#1615).
+    if let Ok(text) = read_regular_to_string(&root.join(LOCK_FILE)).await {
+        if let Some(restored) = restore_re_rendered(entry, &text) {
+            if !dry_run && restored != text {
+                LOCK_MEMO.invalidate();
+                if let Err(e) =
+                    atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), restored.as_bytes())
+                        .await
+                {
+                    return RevertOutcome {
+                        kept_artifact: false,
+                        success: false,
+                        warnings: Vec::new(),
+                        error: Some(format!("cannot write {LOCK_FILE}: {e}")),
+                    };
+                }
+            }
+            return RevertOutcome {
+                kept_artifact: false,
+                success: true,
+                warnings: Vec::new(),
+                error: None,
+            };
+        }
+    }
     revert_lock_fragment_splice_atomic(entry, root, dry_run, LOCK_FILE, KIND_LOCK_PACKAGE, "poetry")
         .await
+}
+
+/// `lock_text` with `entry`'s vendored unit restored when the verbatim
+/// splice can't place it but the live lock still carries exactly the
+/// wiring we wrote: the same name and version, a `file` source at the
+/// recorded vendored wheel, and `files` listing only the patched wheel.
+/// The restore drops that source and puts back the recorded original's
+/// file list, keeping every other field as the re-lock rendered it. A lock
+/// that no longer names the vendored wheel at all is already restored.
+///
+/// `None` hands the revert to the verbatim splice: when every record still
+/// splices or is already restored, when a record isn't ours, when the live
+/// lock isn't lock 2.x (where `files` lives in the unit), or when the unit's
+/// wiring was edited, which stays drift.
+fn restore_re_rendered(entry: &VendorEntry, lock_text: &str) -> Option<String> {
+    let text_of = |value: &Option<serde_json::Value>| {
+        value
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let mut unit = None;
+    let mut integrity = None;
+    let mut splices = true;
+    for rec in &entry.wiring {
+        if rec.file != LOCK_FILE || rec.kind != KIND_LOCK_PACKAGE {
+            return None;
+        }
+        let (new, original) = (text_of(&rec.new)?, text_of(&rec.original)?);
+        if !lock_text.contains(&new) && !lock_text.contains(&original) {
+            splices = false;
+        }
+        let slot = if new.trim_start().starts_with("[[package]]") {
+            &mut unit
+        } else {
+            &mut integrity
+        };
+        if slot.replace((new, original)).is_some() {
+            return None;
+        }
+    }
+    if splices {
+        return None;
+    }
+    let (unit_new, unit_original) = unit?;
+    let first_package = |fragment: &str| -> Option<toml_edit::Table> {
+        let doc = fragment.parse::<DocumentMut>().ok()?;
+        let package = doc.get("package")?.as_array_of_tables()?.get(0)?.clone();
+        Some(package)
+    };
+    let wired = first_package(&unit_new)?;
+    let original = first_package(&unit_original)?;
+    let name = wired.get("name")?.as_str()?.to_owned();
+    let version = wired.get("version")?.as_str()?.to_owned();
+    let source = wired.get("source")?.as_table_like()?;
+    if source.get("type")?.as_str()? != "file" {
+        return None;
+    }
+    let url = source.get("url")?.as_str()?.to_owned();
+    // The patched and pre-vendor file lists: the legacy `[metadata.files]`
+    // entry when one was recorded, else the unit's own `files`. A lock-0
+    // `[metadata.hashes]` entry names no files, so it can't be re-rendered
+    // into lock 2.
+    let (patched_files, original_files) = match integrity {
+        Some((new_entry, original_entry)) => {
+            let entry_files = |text: &str| -> Option<toml_edit::Array> {
+                let doc = text.trim_start().parse::<DocumentMut>().ok()?;
+                let (_, item) = doc.iter().next()?;
+                item.as_array().cloned()
+            };
+            (entry_files(&new_entry)?, entry_files(&original_entry)?)
+        }
+        None => (
+            wired.get("files")?.as_array()?.clone(),
+            original.get("files")?.as_array()?.clone(),
+        ),
+    };
+    let patched_files = file_list(&patched_files)?;
+    file_list(&original_files)?;
+
+    // Already restored (by an earlier revert, or a re-lock that dropped the
+    // vendored source, possibly onto another version): nothing in the lock
+    // names the vendored wheel or its patched hash, so nothing is left to
+    // undo.
+    if !lock_text.contains(url.as_str())
+        && patched_files
+            .iter()
+            .all(|(_, hash)| !lock_text.contains(hash.as_str()))
+    {
+        return Some(lock_text.to_owned());
+    }
+    // The pre-vendor unit's source is never one we restore here: the target
+    // guards refuse to vendor a unit that has one.
+    if original.contains_key("source") {
+        return None;
+    }
+
+    let mut doc = lock_text.parse::<DocumentMut>().ok()?;
+    if !poetry_lock::lock_version(doc.as_table())
+        .ok()?
+        .starts_with('2')
+    {
+        return None;
+    }
+    // The restore re-renders the whole lock, so it may only change the
+    // target unit: refuse a lock toml_edit doesn't reproduce byte for byte.
+    if preserve_line_endings(lock_text, doc.to_string()) != lock_text {
+        return None;
+    }
+    let canon = canonicalize_pypi_name(&name);
+    let is_target = |package: &toml_edit::Table| {
+        package.get("version").and_then(Item::as_str) == Some(version.as_str())
+    };
+    let targets = lock_units_named(&doc, &canon);
+    if targets.iter().filter(|package| is_target(package)).count() != 1 {
+        return None;
+    }
+    let package = doc
+        .get_mut("package")?
+        .as_array_of_tables_mut()?
+        .iter_mut()
+        .find(|package| {
+            package
+                .get("name")
+                .and_then(Item::as_str)
+                .is_some_and(|n| canonicalize_pypi_name(n) == canon)
+                && is_target(package)
+        })?;
+    let live_source = package.get("source")?.as_table_like()?;
+    if live_source.get("type").and_then(Item::as_str) != Some("file")
+        || live_source.get("url").and_then(Item::as_str) != Some(url.as_str())
+        || file_list(package.get("files")?.as_array()?)? != patched_files
+    {
+        return None;
+    }
+    package.remove("source");
+    let files = if original_files.is_empty() {
+        toml_edit::value(toml_edit::Array::new())
+    } else {
+        poetry_lock::multiline_files(original_files)
+    };
+    package.insert("files", files);
+    Some(preserve_line_endings(lock_text, doc.to_string()))
+}
+
+/// The `(file, hash)` pairs of a Poetry `files` array, in order; `None`
+/// when an entry isn't a `{file = …, hash = …}` table.
+fn file_list(files: &toml_edit::Array) -> Option<Vec<(String, String)>> {
+    files
+        .iter()
+        .map(|entry| {
+            let entry = entry.as_inline_table()?;
+            Some((
+                entry.get("file")?.as_str()?.to_owned(),
+                entry.get("hash")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -1894,6 +2082,287 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             drifted,
             "drifted lock left alone"
         );
+    }
+
+    /// #1615: a `poetry lock` by another Poetry version re-renders the wired
+    /// unit (2.x adds `groups`, 1.4+ drops `category`, 1.8 drops `groups`)
+    /// but keeps its vendored source and patched hash. The revert must still
+    /// restore the registry entry, keeping whatever the re-lock rendered.
+    #[tokio::test]
+    async fn revert_restores_a_unit_another_poetry_version_re_rendered() {
+        let lock132 = include_str!("../../tests/fixtures/poetry/1.3.2/poetry.lock");
+        type Relock = fn(&str) -> String;
+        let cases: [(&str, &str, &str, Relock); 3] = [
+            // Vendored by Poetry 1.8.5, re-locked by 2.5.1.
+            ("1.8 -> 2.5", LOCK20_DIRECT_REGISTRY, "six", |lock| {
+                lock.replace("Poetry 1.8.5", "Poetry 2.5.1")
+                    .replace("files = [", "groups = [\"main\"]\nfiles = [")
+                    .replace("lock-version = \"2.0\"", "lock-version = \"2.1\"")
+            }),
+            // Vendored by Poetry 2.4.1, re-locked by 1.8.5 (`--no-update`).
+            ("2.4 -> 1.8", LOCK21_DIRECT_REGISTRY, "six", |lock| {
+                lock.replace("Poetry 2.4.1", "Poetry 1.8.5")
+                    .replace("groups = [\"main\"]\n", "")
+                    .replace("lock-version = \"2.1\"", "lock-version = \"2.0\"")
+            }),
+            // Lock 2.0 both sides: 1.3.2 wrote `category`, 1.8.5 drops it.
+            ("1.3 -> 1.8", lock132, "urllib3", |lock| {
+                lock.replace("Poetry and should", "Poetry 1.8.5 and should")
+                    .replace("category = \"main\"\n", "")
+            }),
+        ];
+        for (label, pristine, name, relock) in cases {
+            for crlf in [false, true] {
+                let pristine = pristine.replace("\r\n", "\n");
+                let eol = |text: String| {
+                    if crlf {
+                        text.replace('\n', "\r\n")
+                    } else {
+                        text
+                    }
+                };
+                let tmp = write_project(&eol(pristine.clone()), PYPROJECT_DIRECT).await;
+                let project = load_poetry_project(tmp.path()).await.unwrap();
+                let version = if name == "six" { "1.16.0" } else { "1.26.18" };
+                let wheel = format!("{name}-{version}-py2.py3-none-any.whl");
+                let path = format!(".socket/vendor/pypi/{UUID}/{wheel}");
+                let (wiring, meta) = wire_poetry(
+                    &project,
+                    tmp.path(),
+                    name,
+                    version,
+                    &path,
+                    &wheel,
+                    WHEEL_SHA,
+                    UUID,
+                )
+                .await
+                .unwrap();
+                let wired = read_lock(tmp.path()).await.replace("\r\n", "\n");
+                let relocked = eol(relock(&wired));
+                assert_ne!(relocked, eol(wired), "{label}: the re-lock must re-render");
+                tokio::fs::write(tmp.path().join("poetry.lock"), &relocked)
+                    .await
+                    .unwrap();
+                let entry = entry_for(wiring, meta);
+
+                let dry = revert_poetry(&entry, tmp.path(), true).await;
+                assert!(
+                    dry.success && dry.warnings.is_empty(),
+                    "{label}: {:?}",
+                    dry.warnings
+                );
+                assert_eq!(
+                    read_lock(tmp.path()).await,
+                    relocked,
+                    "{label}: dry run writes"
+                );
+
+                let outcome = revert_poetry(&entry, tmp.path(), false).await;
+                assert!(outcome.success, "{label}: {:?}", outcome.error);
+                assert!(
+                    outcome.warnings.is_empty(),
+                    "{label}: {:?}",
+                    outcome.warnings
+                );
+                assert_eq!(
+                    read_lock(tmp.path()).await,
+                    eol(relock(&pristine)),
+                    "{label} (crlf {crlf}): the registry unit in the re-lock's rendering"
+                );
+                // Converged: a second revert changes nothing and stays quiet.
+                let again = revert_poetry(&entry, tmp.path(), false).await;
+                assert!(
+                    again.success && again.warnings.is_empty(),
+                    "{label}: {:?}",
+                    again.warnings
+                );
+                assert_eq!(read_lock(tmp.path()).await, eol(relock(&pristine)));
+            }
+        }
+    }
+
+    /// #1615: a lock-1.1 project vendored by Poetry 1.1 and re-locked by 1.8
+    /// or 2.x moves the unit's integrity from `[metadata.files]` into the
+    /// unit's own `files`. The revert puts the recorded original file list
+    /// there: `[]` when Poetry 1.1 recorded none, else every file.
+    #[tokio::test]
+    async fn revert_restores_a_legacy_unit_re_locked_into_lock_2() {
+        let native =
+            include_str!("../../tests/fixtures/poetry/1.1.15/poetry.lock").replace("\r\n", "\n");
+        let listed = format!(
+            "urllib3 = [\n    {{file = \"urllib3-1.26.18-py2.py3-none-any.whl\", hash = \"sha256:{a}\"}},\n    {{file = \"urllib3-1.26.18.tar.gz\", hash = \"sha256:{b}\"}},\n]",
+            a = "a".repeat(64),
+            b = "b".repeat(64),
+        );
+        let wheel = "urllib3-1.26.18-py2.py3-none-any.whl";
+        let path = format!(".socket/vendor/pypi/{UUID}/{wheel}");
+        // What Poetry 2.5.1 writes for the vendored unit, given its `files`.
+        let relocked = |files: &str, source: bool| {
+            let source = if source {
+                format!("\n[package.source]\ntype = \"file\"\nurl = \"{path}\"\n")
+            } else {
+                String::new()
+            };
+            format!(
+                "# This file is automatically @generated by Poetry 2.5.1 and should not be changed by hand.\n\n\
+                 [[package]]\nname = \"urllib3\"\nversion = \"1.26.18\"\n\
+                 description = \"HTTP library with thread-safe connection pooling, file post, and more.\"\n\
+                 optional = false\n\
+                 python-versions = \">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*\"\n\
+                 groups = [\"main\"]\n{files}\n\n\
+                 [package.extras]\n\
+                 brotli = [\"brotli (==1.0.9)\", \"brotli (>=1.0.9)\", \"brotlicffi (>=0.8.0)\", \"brotlipy (>=0.6.0)\"]\n\
+                 secure = [\"certifi\", \"cryptography (>=1.3.4)\", \"idna (>=2.0.0)\", \"ipaddress\", \"pyOpenSSL (>=0.14)\", \"urllib3-secure-extra\"]\n\
+                 socks = [\"PySocks (>=1.5.6,!=1.5.7,<2.0)\"]\n{source}\n\
+                 [metadata]\nlock-version = \"2.1\"\npython-versions = \">=3.8\"\n\
+                 content-hash = \"4f9ffb08e662523420bf03909c6f496ad5f6d44d5107bda8fb5955ce0dfe3ab2\"\n"
+            )
+        };
+        let patched =
+            format!("files = [\n    {{file = \"{wheel}\", hash = \"sha256:{WHEEL_SHA}\"}},\n]");
+        for (pristine, restored_files) in [
+            (native.clone(), "files = []".to_string()),
+            (
+                native.replace("urllib3 = []", &listed),
+                listed.replacen("urllib3 = ", "files = ", 1),
+            ),
+        ] {
+            let tmp = write_project(&pristine, PYPROJECT_DIRECT).await;
+            let project = load_poetry_project(tmp.path()).await.unwrap();
+            let (wiring, meta) = wire_poetry(
+                &project,
+                tmp.path(),
+                "urllib3",
+                "1.26.18",
+                &path,
+                wheel,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap();
+            assert_eq!(wiring.len(), 2, "unit + [metadata.files] entry");
+            tokio::fs::write(tmp.path().join("poetry.lock"), relocked(&patched, true))
+                .await
+                .unwrap();
+
+            let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(
+                read_lock(tmp.path()).await,
+                relocked(&restored_files, false)
+            );
+        }
+    }
+
+    /// The re-render tolerance is not a drift bypass: once the unit no
+    /// longer carries exactly the wiring we wrote (another patched hash,
+    /// another vendored wheel, an extra file), it is still drift and the
+    /// lock is left alone.
+    #[tokio::test]
+    async fn re_rendered_unit_with_edited_wiring_is_still_drift() {
+        let relock = |lock: &str| {
+            lock.replace("Poetry 1.8.5", "Poetry 2.5.1")
+                .replace("files = [", "groups = [\"main\"]\nfiles = [")
+                .replace("lock-version = \"2.0\"", "lock-version = \"2.1\"")
+        };
+        let edits: [fn(&str) -> String; 5] = [
+            |lock| lock.replace(WHEEL_SHA, &"0".repeat(64)),
+            // The source dropped but the patched hash kept: PyPI's wheel
+            // would fail that hash, so the unit isn't restored either.
+            |lock| {
+                let start = lock.find("\n[package.source]").unwrap();
+                let end = lock.find("\n[metadata]").unwrap();
+                format!("{}{}", &lock[..start], &lock[end..])
+            },
+            |lock| lock.replace(UUID, "00000000-1d3a-4f6b-8c2d-7e5a9b1c3d5f"),
+            |lock| lock.replace("type = \"file\"", "type = \"url\""),
+            |lock| {
+                lock.replace(
+                    "\n]\n\n[package.source]",
+                    "\n    {file = \"six-1.16.0.tar.gz\", hash = \"sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926\"},\n]\n\n[package.source]",
+                )
+            },
+        ];
+        for edit in edits {
+            let tmp = write_project(LOCK20_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+            let p = load_poetry_project(tmp.path()).await.unwrap();
+            let (wiring, meta) = wire_default(&p, tmp.path()).await;
+            let drifted = edit(&relock(&read_lock(tmp.path()).await));
+            assert_ne!(drifted, relock(&read_lock(tmp.path()).await));
+            tokio::fs::write(tmp.path().join("poetry.lock"), &drifted)
+                .await
+                .unwrap();
+            let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+            assert!(outcome.success);
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
+                "{:?}",
+                outcome.warnings
+            );
+            assert_eq!(read_lock(tmp.path()).await, drifted);
+        }
+    }
+
+    /// A full `poetry lock` that re-resolved the package onto another
+    /// version from PyPI leaves nothing that names the vendored wheel: the
+    /// revert converges instead of drift-keeping the artifact forever.
+    #[tokio::test]
+    async fn revert_converges_after_a_relock_onto_another_version() {
+        let tmp = write_project(LOCK21_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_default(&p, tmp.path()).await;
+        let relocked = LOCK21_DIRECT_REGISTRY
+            .replace("1.16.0", "1.17.0")
+            .replace("8abb2f1d", "11111111")
+            .replace("1e61c374", "22222222");
+        tokio::fs::write(tmp.path().join("poetry.lock"), &relocked)
+            .await
+            .unwrap();
+        let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(
+            outcome.success && outcome.warnings.is_empty(),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(read_lock(tmp.path()).await, relocked, "nothing to write");
+    }
+
+    /// The re-render restore never invents a source: a recorded original
+    /// that had one (a tampered or foreign ledger; the guards refuse to
+    /// vendor such a unit) stays drift.
+    #[tokio::test]
+    async fn re_rendered_restore_refuses_an_original_with_a_source() {
+        let tmp = write_project(LOCK20_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        let (mut wiring, meta) = wire_default(&p, tmp.path()).await;
+        let original = wiring[0].original.as_ref().unwrap().as_str().unwrap();
+        let with_source = original.replace(
+            "\n\n[metadata]",
+            "\n\n[package.source]\ntype = \"legacy\"\nurl = \"https://example.test/simple\"\nreference = \"mirror\"\n\n[metadata]",
+        );
+        wiring[0].original = Some(serde_json::json!(with_source));
+        let relocked = read_lock(tmp.path())
+            .await
+            .replace("files = [", "groups = [\"main\"]\nfiles = [");
+        tokio::fs::write(tmp.path().join("poetry.lock"), &relocked)
+            .await
+            .unwrap();
+        let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(read_lock(tmp.path()).await, relocked);
     }
 
     #[test]

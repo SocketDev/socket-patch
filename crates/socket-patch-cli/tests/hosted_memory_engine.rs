@@ -2085,3 +2085,70 @@ async fn issue_1598_berry_invalid_manifest_name_or_version_is_named_on_disk() {
         );
     }
 }
+
+/// #1630: a berry `exec:` script, or a git remote that isn't http(s),
+/// under another dependency name installs `node_modules/lp2` from a
+/// package the lock doesn't name, at its lock version. It may be the
+/// pinned left-pad@1.3.0, so the hosted scan names it as possibly
+/// unpatched (`redirect_copy_unpatched`); it used to report a clean
+/// success while yarn installed unpatched left-pad as `node_modules/lp2`.
+/// Control: the same copy at another version is no copy of 1.3.0.
+#[tokio::test]
+async fn issue_1630_berry_exec_and_git_copies_are_named() {
+    const UUID: &str = "16301630-1630-4630-8630-163016301630";
+    let ws = "app%40workspace%3A.";
+    for (spec, key, resolution) in [
+        (
+            "exec:./gen.js",
+            format!("lp2@exec:./gen.js::locator={ws}"),
+            format!("lp2@exec:./gen.js#./gen.js::hash=db115a&locator={ws}"),
+        ),
+        (
+            "git+ssh://git@github.com/stevemao/left-pad.git#v1.3.0",
+            "lp2@git+ssh://git@github.com/stevemao/left-pad.git#v1.3.0".to_string(),
+            "lp2@git+ssh://git@github.com/stevemao/left-pad.git#commit=5d3c4f2".to_string(),
+        ),
+    ] {
+        for (version, named) in [("1.3.0", true), ("2.0.0", false)] {
+            let server = MockServer::start().await;
+            mount_left_pad_grant(&server, UUID).await;
+            let mut files = berry_linked_copy_files(spec);
+            let lock = String::from_utf8(files["yarn.lock"].clone()).unwrap();
+            let linked = format!(
+                "\"lp2@{spec}::locator={ws}\":\n  version: 0.0.0-use.local\n  \
+                 resolution: \"lp2@{spec}::locator={ws}\"\n  \
+                 languageName: node\n  linkType: soft\n"
+            );
+            assert!(lock.contains(&linked), "{lock}");
+            let lock = lock.replace(
+                &linked,
+                &format!(
+                    "\"{key}\":\n  version: {version}\n  resolution: \"{resolution}\"\n  \
+                     languageName: node\n  linkType: hard\n"
+                ),
+            );
+            files.insert("yarn.lock".to_string(), lock.into_bytes());
+            let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+            let project = &output.projects[0];
+            assert!(project.error.is_none(), "{spec}: {:?}", project.error);
+            assert_eq!(
+                project.redirected.len(),
+                1,
+                "{spec}: {:?} {:#}",
+                project.skipped,
+                project.redirect
+            );
+            let details = copy_unpatched_details(project);
+            if !named {
+                assert!(details.is_empty(), "{spec}@{version}: {details:?}");
+                continue;
+            }
+            assert_eq!(details.len(), 1, "{spec}@{version}: {details:?}");
+            assert!(
+                details[0].contains(&key) && details[0].contains("UNPATCHED"),
+                "{spec}: {}",
+                details[0]
+            );
+        }
+    }
+}

@@ -702,7 +702,8 @@ pub async fn read_candidate_files(
 
     // Beside a uv project or script lock, the project's `uv.toml` may set
     // `no-sources`, under which uv ignores the `[tool.uv.sources]` entry the
-    // rewrite would add (#564). Advisory: never rewritten, so a link or an
+    // rewrite would add (#564), or `no-binary`, under which uv refuses the
+    // patched wheel (#1603). Advisory: never rewritten, so a link or an
     // unreadable in-memory entry is left out rather than refused.
     let uv_lane = out
         .files
@@ -2306,8 +2307,9 @@ async fn rewrite_once(
         &overrides,
         &options,
     );
-    let (npm_warnings, npmrc_config_write) =
+    let (mut npm_warnings, npmrc_config_write) =
         npm_allow_remote(view, &files, &rewrite, &overrides, &options);
+    npm_warnings.extend(npm_allow_scripts(&files, &rewrite, &overrides));
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last, after the lock edits it serves. v5 keeps no hosted
@@ -2794,6 +2796,61 @@ fn governing_workspace(view: &ProjectView<'_>) -> Option<std::path::PathBuf> {
         }
         ProjectView::Memory(_) => None,
     }
+}
+
+/// npm >= 12 blocks dependency install scripts unless the root
+/// `package.json#allowScripts` approves them, and it matches a pinned key
+/// (`"esbuild@0.19.12": true`) only against a registry-shaped `resolved`
+/// URL, which a hosted redirect replaces (#1595). Warn
+/// (`redirect_npm_allow_scripts`) for every package whose rewired
+/// package-lock.json entry runs an install script that loses its approval.
+/// The policy is the user's, so it is never rewritten: the only key npm
+/// would still honor is a name-only one, which widens it. npm >= 12 never
+/// reads npm-shrinkwrap.json, so a shrinkwrap pin cannot lose one.
+fn npm_allow_scripts(
+    files: &BTreeMap<String, String>,
+    rewrite: &RewriteResult,
+    overrides: &[DepOverride],
+) -> Vec<RewriteWarning> {
+    use crate::patch::redirect::npm_allow_scripts::{
+        lost_detail, rewired_runs_install_script, AllowScripts, HOSTED_WARNING, NPM12_LOCK,
+    };
+    let read = |rel: &str| rewrite.files.get(rel).or_else(|| files.get(rel));
+    let Some(policy) = read("package.json").and_then(|text| AllowScripts::parse(text)) else {
+        return Vec::new();
+    };
+    let Some(lock) =
+        read(NPM12_LOCK).and_then(|text| crate::vendor::common::parse_json_text(text).ok())
+    else {
+        return Vec::new();
+    };
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut warnings = Vec::new();
+    for o in overrides.iter().filter(|o| o.ecosystem == "npm") {
+        let name = crate::patch::redirect::full_name(o);
+        if !seen.insert((name.clone(), o.version.clone())) {
+            continue;
+        }
+        let Some(lost) = policy.lost(&name, &o.version) else {
+            continue;
+        };
+        let rewired = |_: &str, entry: &serde_json::Value| {
+            entry.get("resolved").and_then(serde_json::Value::as_str)
+                == Some(o.artifact_url.as_str())
+        };
+        if !rewired_runs_install_script(&lock, &name, &o.version, rewired) {
+            continue;
+        }
+        let target = match url_host(&o.artifact_url) {
+            Some(host) => format!("the hosted patch tarball on {host}"),
+            None => "the hosted patch tarball".to_string(),
+        };
+        warnings.push(warning(
+            HOSTED_WARNING,
+            lost_detail(&name, &o.version, &lost, &target),
+        ));
+    }
+    warnings
 }
 
 /// npm >= 12 ships `allow-remote=none`: it refuses (EALLOWREMOTE) every

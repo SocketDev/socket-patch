@@ -22,9 +22,13 @@
 //!   only the wheels its `requires-python` and environments can install, so
 //!   a release with any wheel that is not pure Python 3 is refused, as is a
 //!   lock whose `[options]` / `[tool.uv]` filter files (`exclude-newer`,
-//!   `no-binary`, `no-build`). PEP 751 allows both TOML spellings of the
-//!   artifacts: uv's inline `wheels = [{ … }]`, and the standard tables
-//!   `pip lock` writes (`[[packages.wheels]]` with a
+//!   `no-binary`, `no-build`, an `exclude-newer-package` cutoff for the
+//!   package, #1604), and a `uv pip compile` pylock whose header command
+//!   line or uv settings (project, user and system) filter the package's
+//!   files, or whose header records no command line (uv 0.9.16+ records
+//!   only the files they let through, #1613). PEP 751 allows both TOML
+//!   spellings of the artifacts: uv's inline `wheels = [{ … }]`, and the
+//!   standard tables `pip lock` writes (`[[packages.wheels]]` with a
 //!   `[packages.wheels.hashes]` sub-table, `[packages.sdist]`); the entry
 //!   comes back in its siblings' spelling. `pip lock` records only the one
 //!   artifact pip selected — the wheel, or the sdist of a release with no
@@ -334,20 +338,111 @@ async fn restore_lock(
     if !version_ok {
         return refuse_hits(result, "unsupported lock version");
     }
-    if doc
-        .get("options")
-        .and_then(Item::as_table_like)
-        .is_some_and(|o| o.contains_key("exclude-newer"))
-    {
-        return refuse_hits(
-            result,
-            "the lock's `exclude-newer` option filters release files by upload time",
+    let options = doc.get("options").and_then(Item::as_table_like);
+    let global_cutoff = options.and_then(|o| {
+        o.iter()
+            .map(|(k, _)| k)
+            .find(|k| k.starts_with("exclude-newer") && *k != "exclude-newer-package")
+    });
+    // A per-package cutoff (#1604) filters only the packages it names, and
+    // one of `false` exempts its package from the global cutoff.
+    let cutoffs = options.and_then(|o| o.get("exclude-newer-package"));
+    for hit in &hits {
+        let key = if cutoffs.is_some_and(|c| names_package(c, &hit.name)) {
+            "exclude-newer-package"
+        } else if let Some(key) =
+            global_cutoff.filter(|_| !cutoffs.is_some_and(|c| exempts(c, &hit.name)))
+        {
+            key
+        } else {
+            continue;
+        };
+        result.refuse(
+            &hit.uuid,
+            format!(
+                "{rel}: the lock's `{key}` option filters {}'s release files by upload time",
+                hit.name
+            ),
         );
     }
     let shape = match lock_shape(&doc, collection, pep751, &hits) {
         Ok(shape) => shape,
         Err(why) => return refuse_hits(result, &why),
     };
+    if pep751 && pip_compiled(&doc, &text, &shape) {
+        // Without uv's command line (`--no-header`, or a header replaced by
+        // `UV_CUSTOM_COMPILE_COMMAND`) its filter flags are unknowable.
+        let Some(command) = uv_header_command(&text).filter(|c| is_pip_compile(c)) else {
+            return refuse_hits(
+                result,
+                &format!(
+                    "{rel}: the lock does not record the `uv pip compile` command line, whose \
+                     flags may filter which release files it records"
+                ),
+            );
+        };
+        // `--no-config` reads no settings file; `--config-file` names one
+        // relative to wherever uv ran, which the lock does not record.
+        let settings = if command.contains(&"--no-config") {
+            Vec::new()
+        } else if command
+            .iter()
+            .any(|a| *a == "--config-file" || a.starts_with("--config-file="))
+        {
+            return refuse_hits(
+                result,
+                "`uv pip compile --config-file` read settings that may filter which release \
+                 files the lock records, and that file is not derivable from the lock",
+            );
+        } else if env_set("UV_CONFIG_FILE") {
+            // The header never records uv's environment; one set here is
+            // the best evidence of the one `uv pip compile` ran in.
+            return refuse_hits(
+                result,
+                "`UV_CONFIG_FILE` is set, and settings read from it may filter which release \
+                 files `uv pip compile` records",
+            );
+        } else {
+            let project = match pip_settings(view, rel).await {
+                Ok(settings) => settings,
+                Err(why) => return refuse_hits(result, &why),
+            };
+            let global =
+                match global_uv_settings(&|name| std::env::var_os(name), cfg!(windows)).await {
+                    Ok(settings) => settings,
+                    Err(why) => return refuse_hits(result, &why),
+                };
+            project.into_iter().chain(global).collect()
+        };
+        for hit in &hits {
+            // A per-package cutoff of `false`, on the command line or in
+            // the settings, exempts the package from the global cutoff.
+            let exempt = compile_exempts(&command, &hit.name)
+                || setting(&settings, "exclude-newer-package", &hit.name)
+                    .is_some_and(|(_, v)| exempts(v, &hit.name));
+            let why = if let Some(flag) = compile_filter(&command, &hit.name, exempt) {
+                format!("`uv pip compile {flag}` filters")
+            } else if !exempt
+                && std::env::var_os("UV_EXCLUDE_NEWER")
+                    // Empty is unset, and `false` turns the cutoff off.
+                    .is_some_and(|v| !v.is_empty() && v != "false")
+            {
+                "the `UV_EXCLUDE_NEWER` cutoff set in this environment filters".to_string()
+            } else if let Some((path, key)) = settings_filter(&settings, &hit.name, exempt) {
+                format!("{path}'s uv `{key}` setting filters")
+            } else {
+                continue;
+            };
+            result.refuse(
+                &hit.uuid,
+                format!(
+                    "{rel}: {why} which of {}'s release files `uv pip compile` records, so \
+                     they are not re-derivable",
+                    hit.name
+                ),
+            );
+        }
+    }
 
     // The paired metadata (a project lock with no pyproject beside it was
     // edited alone).
@@ -565,6 +660,334 @@ fn pylock_unindexed_registry(package: &toml_edit::Table) -> Option<SiblingRegist
         (true, _) => None,
         (false, None) => Some(SiblingRegistry::PypiFiles),
         (false, Some(host)) => Some(SiblingRegistry::Files(host)),
+    }
+}
+
+/// Whether a PEP 751 lock was written by `uv pip compile`, which (since
+/// uv 0.9.16) records only the files its build filters and `exclude-newer`
+/// cutoffs let through (#1613). `uv export` records every file and an
+/// `index`; a lock whose header is gone (`--no-header`) is told apart by
+/// the `index` its siblings lack.
+fn pip_compiled(doc: &DocumentMut, text: &str, shape: &Shape) -> bool {
+    if shape.selected_only || doc.get("created-by").and_then(Item::as_str) != Some("uv") {
+        return false;
+    }
+    match uv_header_command(text) {
+        Some(command) if is_pip_compile(&command) => true,
+        Some(command) if command.first() == Some(&"export") => false,
+        // No header, or one `UV_CUSTOM_COMPILE_COMMAND` replaced.
+        _ => !shape.index,
+    }
+}
+
+/// Whether the uv environment variable `name` is set to a value.
+fn env_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
+/// Whether a header command line is `uv pip compile`'s. uv records global
+/// options where they were given, before `pip` or between it and
+/// `compile` (`uv --no-config pip compile …`).
+fn is_pip_compile(command: &[&str]) -> bool {
+    command
+        .iter()
+        .position(|a| *a == "pip")
+        .is_some_and(|pip| command[pip + 1..].contains(&"compile"))
+}
+
+/// The arguments of the `uv …` command line uv's autogenerated header
+/// records, after `uv`.
+fn uv_header_command(text: &str) -> Option<Vec<&str>> {
+    text.lines()
+        .take_while(|line| line.starts_with('#'))
+        .find_map(|line| {
+            let mut words = line.trim_start_matches('#').split_whitespace();
+            (words.next() == Some("uv")).then(|| words.collect())
+        })
+}
+
+/// Whether a filter setting's value reaches `name`: `true`, a cutoff date,
+/// a list naming it (or `:all:`), or a per-package cutoff table naming it
+/// with anything but `false` (uv's "no cutoff").
+fn names_package(item: &Item, name: &str) -> bool {
+    if let Some(cutoffs) = item.as_table_like() {
+        return cutoffs.iter().any(|(package, cutoff)| {
+            canonicalize_pypi_name(package) == name && cutoff.as_bool() != Some(false)
+        });
+    }
+    match item.as_value() {
+        Some(Value::Boolean(on)) => *on.value(),
+        Some(Value::String(_)) | Some(Value::Datetime(_)) => true,
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name),
+        _ => false,
+    }
+}
+
+/// Whether a per-package cutoff table exempts `name` from the global
+/// cutoff (an entry of `false`).
+fn exempts(cutoffs: &Item, name: &str) -> bool {
+    cutoffs.as_table_like().is_some_and(|cutoffs| {
+        cutoffs.iter().any(|(package, cutoff)| {
+            canonicalize_pypi_name(package) == name && cutoff.as_bool() == Some(false)
+        })
+    })
+}
+
+/// Whether `command` exempts `name` from the global cutoff with
+/// `--exclude-newer-package <name>=false`.
+fn compile_exempts(command: &[&str], name: &str) -> bool {
+    let mut args = command.iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.split_once('=') {
+            Some(("--exclude-newer-package", value)) => Some(value),
+            None if *arg == "--exclude-newer-package" => args.next().copied(),
+            _ => None,
+        };
+        if value
+            .and_then(|v| v.split_once('='))
+            .is_some_and(|(package, cutoff)| {
+                canonicalize_pypi_name(package) == name && cutoff == "false"
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The `uv pip compile` flag in `command` that filters `name`'s files:
+/// `--no-build`, `--only-binary` / `--no-binary` naming it or `:all:`,
+/// `--exclude-newer` unless `name` is `exempt`, or an
+/// `--exclude-newer-package` cutoff for it.
+fn compile_filter(command: &[&str], name: &str, exempt: bool) -> Option<String> {
+    let mut args = command.iter();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+            _ => (*arg, None),
+        };
+        let applies = match flag {
+            "--no-build" => true,
+            // `false` turns the cutoff off (uv 0.11.24+).
+            "--exclude-newer" => {
+                inline.or_else(|| args.next().copied()) != Some("false") && !exempt
+            }
+            "--only-binary" | "--no-binary" | "--exclude-newer-package" => {
+                let Some(value) = inline.or_else(|| args.next().copied()) else {
+                    continue;
+                };
+                if flag == "--exclude-newer-package" {
+                    value.split_once('=').is_some_and(|(package, cutoff)| {
+                        canonicalize_pypi_name(package) == name && cutoff != "false"
+                    })
+                } else {
+                    value
+                        .split(',')
+                        .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name)
+                }
+            }
+            _ => false,
+        };
+        if applies {
+            return Some(flag.to_string());
+        }
+    }
+    None
+}
+
+/// The uv settings `uv pip compile` reads beside a pylock, as `(settings
+/// file, its uv table)`: the nearest `uv.toml`, else a pyproject with a
+/// `[tool.uv]` table, in the lock's directory or above it. Like uv, a
+/// pyproject that does not parse is passed over.
+async fn pip_settings(
+    view: &mut View<'_>,
+    rel: &str,
+) -> Result<Option<(String, toml_edit::Table)>, String> {
+    let mut dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
+    loop {
+        let path = |file: &str| {
+            if dir.is_empty() {
+                file.to_string()
+            } else {
+                format!("{dir}/{file}")
+            }
+        };
+        let uv_toml = path("uv.toml");
+        if let Some(text) = view.read(&uv_toml).await? {
+            let doc = text
+                .parse::<DocumentMut>()
+                .map_err(|e| format!("{uv_toml} is not valid TOML: {e}"))?;
+            return Ok(Some((uv_toml, doc.as_table().clone())));
+        }
+        let pyproject = path("pyproject.toml");
+        if let Some(text) = view.read(&pyproject).await? {
+            let uv = text.parse::<DocumentMut>().ok().and_then(|doc| {
+                let uv = doc.get("tool")?.get("uv")?;
+                uv.as_table()
+                    .cloned()
+                    .or_else(|| uv.as_inline_table().map(|t| t.clone().into_table()))
+            });
+            if let Some(uv) = uv {
+                return Ok(Some((pyproject, uv)));
+            }
+        }
+        if dir.is_empty() {
+            return Ok(None);
+        }
+        dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
+    }
+}
+
+/// The user- and system-level `uv.toml` files uv reads after the project's
+/// settings, as `(path, table)` in that order: `$XDG_CONFIG_HOME/uv` (else
+/// `~/.config/uv`, or `%APPDATA%\uv` on Windows), then the first
+/// `$XDG_CONFIG_DIRS` entry holding one (default `/etc/xdg`), else
+/// `/etc/uv` (`%PROGRAMDATA%\uv` on Windows). A relative or empty variable
+/// counts as unset.
+async fn global_uv_settings(
+    var: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    windows: bool,
+) -> Result<Vec<(String, toml_edit::Table)>, String> {
+    use std::path::PathBuf;
+    // uv's boolish `UV_NO_CONFIG` reads no settings file.
+    let no_config = var("UV_NO_CONFIG")
+        .and_then(|v| v.into_string().ok())
+        .is_some_and(|v| ["1", "true", "yes", "y", "on"].contains(&v.to_lowercase().as_str()));
+    if no_config {
+        return Ok(Vec::new());
+    }
+    let absolute = |name: &str| {
+        var(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let file = |dir: PathBuf| dir.join("uv").join("uv.toml");
+    let (user, system) = if windows {
+        let system = absolute("PROGRAMDATA").map(file).into_iter().collect();
+        (absolute("APPDATA").map(file), system)
+    } else {
+        let user = absolute("XDG_CONFIG_HOME")
+            .or_else(|| absolute("HOME").map(|home| home.join(".config")))
+            .map(file);
+        // Like uv, the entries end at the first empty one.
+        let dirs = var("XDG_CONFIG_DIRS")
+            .and_then(|dirs| dirs.into_string().ok())
+            .unwrap_or_else(|| "/etc/xdg".into());
+        let mut system: Vec<_> = dirs
+            .split(':')
+            .take_while(|dir| !dir.is_empty())
+            .map(|dir| file(PathBuf::from(dir)))
+            .collect();
+        system.push(PathBuf::from("/etc/uv/uv.toml"));
+        (user, system)
+    };
+    let mut settings = Vec::new();
+    // uv reads the first system file that exists.
+    let candidates = user
+        .into_iter()
+        .map(|p| (p, false))
+        .chain(system.into_iter().map(|p| (p, true)));
+    for (path, system) in candidates {
+        // uv passes over a candidate that is not a file (opening a
+        // directory fails with `PermissionDenied` on Windows, so check
+        // first); the regular-file opener also never blocks on a FIFO.
+        if !tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let text = match crate::utils::fs::read_regular_to_string(&path).await {
+            Ok(text) => text,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        };
+        let doc = text
+            .parse::<DocumentMut>()
+            .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?;
+        settings.push((path.display().to_string(), doc.as_table().clone()));
+        if system {
+            break;
+        }
+    }
+    Ok(settings)
+}
+
+/// The uv setting that filters which of `name`'s files `uv pip compile`
+/// records (`no-build`, `no-binary`, `only-binary`, `exclude-newer` and
+/// their per-package forms), as `(file that sets it, key)`. A global
+/// `exclude-newer*` cutoff passes over an `exempt` package.
+/// `no-build-isolation` changes only how an sdist is built.
+fn settings_filter(
+    files: &[(String, toml_edit::Table)],
+    name: &str,
+    exempt: bool,
+) -> Option<(String, String)> {
+    let keys = files.iter().flat_map(|(_, uv)| {
+        uv.iter().map(|(k, _)| k).filter(|k| *k != "pip").chain(
+            pip_table(uv)
+                .into_iter()
+                .flat_map(|p| p.iter().map(|(k, _)| k)),
+        )
+    });
+    for key in keys {
+        let filters = ["no-build", "no-binary", "only-binary", "exclude-newer"]
+            .iter()
+            .any(|f| key.starts_with(f))
+            && !key.starts_with("no-build-isolation");
+        let global_cutoff = key.starts_with("exclude-newer") && key != "exclude-newer-package";
+        if !filters || (exempt && global_cutoff) {
+            continue;
+        }
+        if let Some((path, _)) = setting(files, key, name).filter(|(_, v)| names_package(v, name)) {
+            return Some((path.to_string(), key.to_string()));
+        }
+    }
+    None
+}
+
+fn pip_table(uv: &toml_edit::Table) -> Option<&dyn TableLike> {
+    uv.get("pip").and_then(Item::as_table_like)
+}
+
+/// The value of uv setting `key` that decides for `name`, with the file
+/// setting it. Like uv, the files merge key by key: lists from every file
+/// add up, per-package tables merge entry by entry, and otherwise the
+/// first file setting a key wins. Then `[pip]`'s value of a key wins over
+/// the top level's.
+fn setting<'a>(
+    files: &'a [(String, toml_edit::Table)],
+    key: &str,
+    name: &str,
+) -> Option<(&'a String, &'a Item)> {
+    let in_pip: Vec<_> = files
+        .iter()
+        .filter_map(|(path, uv)| Some((path, pip_table(uv)?.get(key)?)))
+        .collect();
+    let set = if in_pip.is_empty() {
+        files
+            .iter()
+            .filter_map(|(path, uv)| Some((path, uv.get(key)?)))
+            .collect()
+    } else {
+        in_pip
+    };
+    if set.iter().all(|(_, v)| v.as_array().is_some()) {
+        set.into_iter().find(|(_, v)| names_package(v, name))
+    } else if set.iter().all(|(_, v)| v.is_table_like()) {
+        set.into_iter().find(|(_, v)| {
+            v.as_table_like()
+                .is_some_and(|t| t.iter().any(|(k, _)| canonicalize_pypi_name(k) == name))
+        })
+    } else {
+        set.into_iter().next()
     }
 }
 
@@ -1871,6 +2294,173 @@ fn hide_header_over_sub_tables(table: &mut toml_edit::Table) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uv_file(path: &str, text: &str) -> (String, toml_edit::Table) {
+        let doc = text.parse::<DocumentMut>().unwrap();
+        (path.to_string(), doc.as_table().clone())
+    }
+
+    #[test]
+    fn settings_files_merge_key_by_key_with_pip_over_the_top_level() {
+        let project = uv_file("uv.toml", "[pip]\nno-build = false\n");
+        let user = uv_file("user/uv.toml", "no-build = true\nonly-binary = [\"six\"]\n");
+        let system = uv_file("/etc/uv/uv.toml", "[pip]\nno-binary = [\"six\"]\n");
+        let files = [project.clone(), user.clone(), system.clone()];
+        // The project's `[pip] no-build = false` wins over the user's
+        // top-level `no-build`; the user's `only-binary` still applies.
+        assert_eq!(
+            settings_filter(&files, "six", false),
+            Some(("user/uv.toml".into(), "only-binary".into()))
+        );
+        assert_eq!(settings_filter(&files, "idna", false), None);
+        // A system `[pip]` value wins over a user top-level one.
+        let files = [uv_file("user/uv.toml", "no-binary = []\n"), system];
+        assert_eq!(
+            settings_filter(&files, "six", false),
+            Some(("/etc/uv/uv.toml".into(), "no-binary".into()))
+        );
+        assert_eq!(
+            settings_filter(&[user], "idna", false),
+            Some(("user/uv.toml".into(), "no-build".into()))
+        );
+        // Lists from every file add up, as uv combines them.
+        let files = [
+            uv_file("uv.toml", "[pip]\nno-binary = []\n"),
+            uv_file("user/uv.toml", "[pip]\nno-binary = [\"six\"]\n"),
+        ];
+        assert_eq!(
+            settings_filter(&files, "six", false),
+            Some(("user/uv.toml".into(), "no-binary".into()))
+        );
+        // Per-package cutoffs merge entry by entry.
+        let files = [
+            uv_file(
+                "uv.toml",
+                "exclude-newer-package = { idna = \"2024-01-01\" }\n",
+            ),
+            uv_file(
+                "user/uv.toml",
+                "exclude-newer-package = { six = \"2024-01-01\" }\n",
+            ),
+            uv_file(
+                "/etc/uv/uv.toml",
+                "exclude-newer-package = { Six = false }\n",
+            ),
+        ];
+        assert_eq!(
+            settings_filter(&files, "six", false),
+            Some(("user/uv.toml".into(), "exclude-newer-package".into()))
+        );
+        assert_eq!(settings_filter(&files[2..], "six", false), None);
+    }
+
+    #[tokio::test]
+    async fn global_uv_settings_reads_the_user_then_first_system_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("xdg/uv/uv.toml", "[pip]\nno-build = true\n");
+        write("home/.config/uv/uv.toml", "no-binary = true\n");
+        write("dirs2/uv/uv.toml", "only-binary = [\"six\"]\n");
+        write("dirs3/uv/uv.toml", "no-build = true\n");
+        let env = |pairs: Vec<(&'static str, std::path::PathBuf)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.clone().into_os_string())
+            }
+        };
+        let paths = |files: Vec<(String, toml_edit::Table)>| -> Vec<String> {
+            files.into_iter().map(|(path, _)| path).collect()
+        };
+        // The display string of `<root>/<dir>/uv/uv.toml` as
+        // `global_uv_settings` builds it, with native separators.
+        let uv_toml = |dir: &str| {
+            dir.split('/')
+                .fold(root.to_path_buf(), |path, part| path.join(part))
+                .join("uv")
+                .join("uv.toml")
+                .display()
+                .to_string()
+        };
+        let mut pairs = vec![
+            ("XDG_CONFIG_HOME", root.join("xdg")),
+            ("HOME", root.join("home")),
+        ];
+        let mut expected = vec![uv_toml("xdg")];
+        // `$XDG_CONFIG_DIRS` splits on `:` as on Unix, which would also
+        // split a Windows drive letter, so only Unix checks the system file.
+        if cfg!(unix) {
+            let dirs = format!(
+                "{}:{}:{}",
+                root.join("dirs1").display(),
+                root.join("dirs2").display(),
+                root.join("dirs3").display()
+            );
+            pairs.push(("XDG_CONFIG_DIRS", dirs.into()));
+            expected.push(uv_toml("dirs2"));
+        }
+        let var = env(pairs);
+        assert_eq!(
+            paths(global_uv_settings(&var, false).await.unwrap()),
+            expected
+        );
+        // A relative XDG_CONFIG_HOME counts as unset.
+        let var = env(vec![
+            ("XDG_CONFIG_HOME", "rel".into()),
+            ("HOME", root.join("home")),
+            ("XDG_CONFIG_DIRS", root.join("none")),
+        ]);
+        let found = paths(global_uv_settings(&var, false).await.unwrap());
+        assert_eq!(found[0], uv_toml("home/.config"));
+        // Windows reads %APPDATA% and %PROGRAMDATA%.
+        write("appdata/uv/uv.toml", "no-build = true\n");
+        let var = env(vec![
+            ("APPDATA", root.join("appdata")),
+            ("PROGRAMDATA", root.join("dirs3")),
+        ]);
+        assert_eq!(
+            paths(global_uv_settings(&var, true).await.unwrap()),
+            [uv_toml("appdata"), uv_toml("dirs3")]
+        );
+        // Like uv, the system entries end at the first empty one, and a
+        // directory named `uv.toml` is passed over.
+        write("dirs4/uv/uv.toml/x", "");
+        let dirs = format!(
+            "{}:{}::{}",
+            root.join("dirs4").display(),
+            root.join("dirs1").display(),
+            root.join("dirs2").display()
+        );
+        let var = env(vec![("XDG_CONFIG_DIRS", dirs.into())]);
+        let found = paths(global_uv_settings(&var, false).await.unwrap());
+        assert!(found.iter().all(|p| !p.contains("dirs")), "{found:?}");
+        // `UV_NO_CONFIG` reads none.
+        let var = env(vec![
+            ("XDG_CONFIG_HOME", root.join("xdg")),
+            ("UV_NO_CONFIG", "1".into()),
+        ]);
+        assert!(global_uv_settings(&var, false).await.unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            // A FIFO is passed over rather than read, which would block.
+            let fifo = root.join("fifo/uv/uv.toml");
+            std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+            let var = env(vec![("XDG_CONFIG_HOME", root.join("fifo"))]);
+            let found = paths(global_uv_settings(&var, false).await.unwrap());
+            assert!(found.iter().all(|p| !p.contains("fifo")), "{found:?}");
+        }
+        write("bad/uv/uv.toml", "[pip\n");
+        let var = env(vec![("XDG_CONFIG_HOME", root.join("bad"))]);
+        assert!(global_uv_settings(&var, false).await.is_err());
+    }
 
     #[test]
     fn upload_times_are_milliseconds_without_trailing_zeros() {
