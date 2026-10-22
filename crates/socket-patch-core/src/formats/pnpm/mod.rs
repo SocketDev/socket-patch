@@ -30,7 +30,7 @@ pub(crate) mod lines;
 mod version;
 pub(crate) mod workspace;
 
-pub use version::root_only_workspace_breaks_add;
+pub use version::{matches_file_id_build_keys, root_only_workspace_breaks_add};
 
 pub(crate) use grammar::{
     entry_bundled, entry_field, is_pnpm_lock_text, Bundled, Entry, Resolution,

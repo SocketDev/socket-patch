@@ -326,13 +326,11 @@ impl NpmLockBackend for PnpmBackend {
         // by name.
         let mut pkg_changed = pkg_changed;
         if dialect == PnpmDialect::V9 {
-            let target = build_approvals::Target {
-                name: &cx.coords.name,
-                version: &cx.coords.version,
-                rel_tgz,
-            };
+            let target = build_approvals::Target::new(&cx.coords.name, &cx.coords.version, rel_tgz);
             let base = ws_edit.new_text.as_deref().or(ws_text.as_deref());
-            let carried = build_approvals::carry(&target, base, &mut pkg, &mut wiring, warnings);
+            let file_keys = matches_file_id_build_keys(project_root, &pkg_bytes).await;
+            let carried =
+                build_approvals::carry(&target, base, &mut pkg, file_keys, &mut wiring, warnings);
             pkg_changed |= carried.pkg_changed;
             if carried.ws_text.is_some() {
                 ws_edit.new_text = carried.ws_text;
@@ -2001,6 +1999,19 @@ async fn pinned_pre_10_5(project_root: &Path, pkg_bytes: &[u8]) -> bool {
         modules.as_deref(),
     )
     .is_some()
+}
+
+/// Whether the project's pnpm pins (package.json, the installed
+/// `node_modules/.modules.yaml`) say its pnpm matches build decisions
+/// against a vendored `file:` id (#1597); `None` when they don't tell.
+async fn matches_file_id_build_keys(project_root: &Path, pkg_bytes: &[u8]) -> Option<bool> {
+    let modules = read_regular_to_string(&project_root.join("node_modules/.modules.yaml"))
+        .await
+        .ok();
+    crate::formats::pnpm::matches_file_id_build_keys(
+        std::str::from_utf8(pkg_bytes).ok(),
+        modules.as_deref(),
+    )
 }
 
 /// The bytes of a freshly created pnpm-workspace.yaml: a root-only
@@ -11050,6 +11061,46 @@ snapshots:
 
     // ── build approvals carried to the vendored key (#1597) ───────────────
 
+    /// Record the pnpm that installed `node_modules`, as pnpm does.
+    async fn installed_by(fx: &Fixture, pm: &str) {
+        tokio::fs::write(
+            fx.root().join("node_modules/.modules.yaml"),
+            format!("{{\"packageManager\":\"{pm}\"}}"),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// pnpm 10.20–10.34.1 refuse a `file:` build key and older pnpm still
+    /// matches the name: a project pinned there gets no key and no warning.
+    /// Without any pin nothing is written either, and the warning says
+    /// which key a pnpm >= 10.34.2 needs.
+    #[tokio::test]
+    async fn build_approval_key_is_written_only_for_a_pnpm_that_reads_it() {
+        let ws = "packages:\n  - '.'\nallowBuilds:\n  left-pad: true\n";
+        for pm in [Some("pnpm@10.30.0"), None] {
+            let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+            if let Some(pm) = pm {
+                installed_by(&fx, pm).await;
+            }
+            write_ws(&fx, ws).await;
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            let entry = entry.unwrap();
+            assert!(
+                entry
+                    .wiring
+                    .iter()
+                    .all(|r| !build_approvals::is_ws_kind(&r.kind)),
+                "{:?}",
+                entry.wiring
+            );
+            let live = fx.read(PNPM_WORKSPACE).await;
+            assert!(!live.contains("left-pad@file:"), "{live}");
+            assert_eq!(no_approval_warning(&warnings), pm.is_some(), "{warnings:?}");
+        }
+    }
+
     fn no_approval_warning(warnings: &[VendorWarning]) -> bool {
         warnings
             .iter()
@@ -11066,6 +11117,7 @@ snapshots:
     async fn ws_build_approval_is_carried_to_the_vendored_key_and_reverted() {
         for decision in ["true", "false"] {
             let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+            installed_by(&fx, "pnpm@11.28.7").await;
             let ws = format!(
                 "packages:\n  - '.'\nallowBuilds:\n  left-pad: {decision}\n  \
                  esbuild: true\nonlyBuiltDependencies:\n  - left-pad@1.3.0\n"
@@ -11118,6 +11170,7 @@ snapshots:
             "  \"private\": true,\n  \"pnpm\": {\n    \"onlyBuiltDependencies\": [\n      \"left-pad\"\n    ]\n  },\n",
         );
         let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
+        installed_by(&fx, "pnpm@11.28.7").await;
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(no_approval_warning(&warnings), "{warnings:?}");
@@ -11150,6 +11203,7 @@ snapshots:
     #[tokio::test]
     async fn superseding_patch_replaces_the_older_vendored_approval_key() {
         let mut fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        installed_by(&fx, "pnpm@11.28.7").await;
         let ws = "packages:\n  - '.'\nallowBuilds:\n  left-pad: true\n";
         write_ws(&fx, ws).await;
         let (_, prev, _) = expect_done(fx.vendor(false).await);

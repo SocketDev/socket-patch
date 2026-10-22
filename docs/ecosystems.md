@@ -217,9 +217,15 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   install with `ERR_PNPM_IGNORED_BUILDS`. Vendoring adds the same decision
   under the vendored key next to the user's entry (`pnpm-workspace.yaml`, or
   `package.json#pnpm` for pnpm 10), replaces a key an older patch left, and
-  revert removes it. A flow-style value (`onlyBuiltDependencies: [pkg]`) is
-  left alone with the `vendor_pnpm_build_approval_lost` warning naming the
-  key to add.
+  revert removes it. The key is written only when the project's pnpm pins
+  (`packageManager`, `devEngines`, `engines.pnpm`, or the pnpm that last
+  installed `node_modules`) say 10.34.2 or newer: pnpm 10.20–10.34.1 refuse
+  such a key (`ERR_PNPM_INVALID_VERSION_UNION`) and still match the name, so
+  nothing is needed there. Without a usable pin, or for a decision the
+  rewriter can't extend (a flow-style value such as
+  `onlyBuiltDependencies: [pkg]`, a non-boolean `allowBuilds` value), the
+  setting is left alone with the `vendor_pnpm_build_approval_lost` warning
+  naming the key to add. Re-run the scan after upgrading pnpm past 10.34.1.
   **Reinstall after redirecting:** a successful warm-cache install can retain
   upstream bytes. Use a clean install tree and an empty store; `--force` is not
   a reliable substitute. Run `socket-patch vex` after installation to verify

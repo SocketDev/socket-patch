@@ -2577,22 +2577,29 @@ fn pnpm_vendor_refuses_quoted_scoped_alias_references() {
 /// with ERR_PNPM_IGNORED_BUILDS. Vendoring now carries the approval to the
 /// vendored key: a fresh frozen offline install of the committed files
 /// lands the patched bytes AND runs the script, and `vendor --revert`
-/// byte-restores the workspace file.
+/// byte-restores the workspace file. pnpm 10.30 (which refuses a `file:`
+/// key with ERR_PNPM_INVALID_VERSION_UNION and still matches the name)
+/// gets no key, and its script runs too.
 #[tokio::test(flavor = "multi_thread")]
 async fn pnpm_vendor_keeps_approved_build_scripts_running() {
-    for (pm, approval) in [
-        (PNPM_TERTIARY, "allowBuilds:\n  sp-build: true\n"),
-        (PNPM_PRIMARY, "onlyBuiltDependencies:\n  - sp-build\n"),
+    for (pm, approval, carried) in [
+        (PNPM_TERTIARY, "allowBuilds:\n  sp-build: true\n", true),
+        (PNPM_PRIMARY, "onlyBuiltDependencies:\n  - sp-build\n", true),
+        (
+            "pnpm@10.30.0",
+            "onlyBuiltDependencies:\n  - sp-build\n",
+            false,
+        ),
     ] {
         if !has_corepack_pm(pm) {
             println!("SKIP: `corepack {pm}` unavailable");
             continue;
         }
-        run_build_approval_capstone(pm, approval).await;
+        run_build_approval_capstone(pm, approval, carried).await;
     }
 }
 
-async fn run_build_approval_capstone(pm: &str, approval: &str) {
+async fn run_build_approval_capstone(pm: &str, approval: &str, carried: bool) {
     const NAME: &str = "sp-build";
     let original: &[u8] = b"module.exports = 'orig';\n";
     let patched: Vec<u8> = [MARKER.as_bytes(), original].concat();
@@ -2685,11 +2692,16 @@ async fn run_build_approval_capstone(pm: &str, approval: &str) {
     let env = parse_envelope(&stdout);
     assert_eq!(env["summary"]["applied"], 1, "{env}");
     let ws_after = std::fs::read_to_string(proj.join("pnpm-workspace.yaml")).unwrap();
-    assert!(
+    assert_eq!(
         ws_after.contains(&format!(
             "{NAME}@file:.socket/vendor/npm/{UUID}/{NAME}-1.0.0.tgz"
         )),
-        "{pm}: the approval is carried to the vendored key:\n{ws_after}"
+        carried,
+        "{pm}: the approval is carried to the vendored key iff pnpm reads it:\n{ws_after}"
+    );
+    assert!(
+        !stdout.contains("vendor_pnpm_build_approval_lost"),
+        "{pm}: the installed pnpm is known, so nothing is lost:\n{stdout}"
     );
 
     // Fresh checkout of the committable files: empty store, no registry.

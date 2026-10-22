@@ -31,11 +31,29 @@ fn breaks_root_only_workspace((lo, hi): (MajorMinor, MajorMinor)) -> bool {
     lo >= (9, 0) && hi < (10, 5)
 }
 
+/// `(major, minor, patch)`.
+type Release = (u64, u64, u64);
+
+/// The first pnpm that matches a build decision (`allowBuilds`,
+/// `onlyBuiltDependencies`) against a `file:` tarball's own id
+/// (`name@file:<spec>`), and the first that accepts such a key at all:
+/// 10.34.1 and older match the package name, and from at least 10.20 on
+/// refuse a `file:` key with ERR_PNPM_INVALID_VERSION_UNION (#1597;
+/// measured on 9.15.9, 10.0.0, 10.20.0, 10.30.0, 10.34.1, 10.34.2, 10.34.7,
+/// 11.28.7 and 12.15.0).
+const FILE_ID_BUILD_KEYS: Release = (10, 34, 2);
+
 /// The inclusive `(major, minor)` span a version spec admits: an exact
 /// version (`9.15.9`, `=9.15.9`, `v9.15.9`, a prerelease), `^X.Y.Z`,
 /// `~X.Y.Z`, or a wildcard (`9`, `9.x`, `10.4.x`, `9.*`). `None` for
 /// anything else (comparators, unions, hyphen ranges, junk).
 fn version_span(spec: &str) -> Option<(MajorMinor, MajorMinor)> {
+    version_bounds(spec).map(|(lo, hi)| ((lo.0, lo.1), (hi.0, hi.1)))
+}
+
+/// [`version_span`] at patch precision. A prerelease counts as its
+/// release.
+fn version_bounds(spec: &str) -> Option<(Release, Release)> {
     let spec = spec.trim();
     let (op, rest) = match spec.as_bytes().first()? {
         b'^' => ('^', &spec[1..]),
@@ -53,18 +71,22 @@ fn version_span(spec: &str) -> Option<(MajorMinor, MajorMinor)> {
         Some(part) if wild(part) => None,
         Some(part) => Some(part.parse::<u64>().ok()?),
     };
-    if let Some(patch) = parts.next() {
-        if !(wild(patch) || patch.parse::<u64>().is_ok()) {
-            return None;
-        }
-    }
+    let patch = match parts.next() {
+        None => None,
+        Some(part) if wild(part) => None,
+        Some(part) => Some(part.parse::<u64>().ok()?),
+    };
     if parts.next().is_some() {
         return None;
     }
-    Some(match (op, minor) {
-        (_, None) => ((major, 0), (major, u64::MAX)),
-        ('^', Some(minor)) if major > 0 => ((major, minor), (major, u64::MAX)),
-        (_, Some(minor)) => ((major, minor), (major, minor)),
+    const MAX: u64 = u64::MAX;
+    Some(match (op, minor, patch) {
+        (_, None, _) => ((major, 0, 0), (major, MAX, MAX)),
+        ('^', Some(minor), patch) if major > 0 => {
+            ((major, minor, patch.unwrap_or(0)), (major, MAX, MAX))
+        }
+        ('=', Some(minor), Some(patch)) => ((major, minor, patch), (major, minor, patch)),
+        (_, Some(minor), patch) => ((major, minor, patch.unwrap_or(0)), (major, minor, MAX)),
     })
 }
 
@@ -148,9 +170,79 @@ pub fn root_only_workspace_breaks_add(
     })
 }
 
+/// Whether the pnpm the project runs matches build decisions against a
+/// vendored `file:` id (see [`FILE_ID_BUILD_KEYS`]): `Some(true)` when every
+/// pin that parses admits only such a release, `Some(false)` when every one
+/// admits only older ones, `None` without a parseable pin or when they
+/// disagree.
+pub fn matches_file_id_build_keys(
+    package_json: Option<&str>,
+    modules_yaml: Option<&str>,
+) -> Option<bool> {
+    let spans: Vec<(Release, Release)> = pnpm_pins(package_json, modules_yaml)
+        .iter()
+        .filter_map(|(_, spec)| version_bounds(spec))
+        .collect();
+    if spans.is_empty() {
+        None
+    } else if spans.iter().all(|(lo, _)| *lo >= FILE_ID_BUILD_KEYS) {
+        Some(true)
+    } else if spans.iter().all(|(_, hi)| *hi < FILE_ID_BUILD_KEYS) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_id_build_keys_start_at_10_34_2() {
+        let pm = |spec: &str| format!("{{\"packageManager\":\"pnpm@{spec}\"}}");
+        for (spec, want) in [
+            ("10.34.2", Some(true)),
+            ("10.34.7+sha512.abc", Some(true)),
+            ("11.28.7", Some(true)),
+            ("12.0.0-rc.1", Some(true)),
+            ("10.34.1", Some(false)),
+            ("10.20.0", Some(false)),
+            ("9.15.9", Some(false)),
+        ] {
+            assert_eq!(
+                matches_file_id_build_keys(Some(&pm(spec)), None),
+                want,
+                "{spec}"
+            );
+        }
+        // Ranges admitting both sides, or no pin, decide nothing.
+        let engines = |range: &str| format!("{{\"engines\":{{\"pnpm\":\"{range}\"}}}}");
+        assert_eq!(
+            matches_file_id_build_keys(Some(&engines("^10.30.0")), None),
+            None
+        );
+        assert_eq!(
+            matches_file_id_build_keys(Some(&engines("^10.34.2")), None),
+            Some(true)
+        );
+        assert_eq!(
+            matches_file_id_build_keys(Some(&engines("~10.34.1")), None),
+            None
+        );
+        assert_eq!(
+            matches_file_id_build_keys(Some(&engines(">=10")), None),
+            None
+        );
+        assert_eq!(matches_file_id_build_keys(Some("{}"), None), None);
+        // The pnpm that last installed counts; a disagreeing pin undoes it.
+        let modules = r#"{"packageManager":"pnpm@11.28.7"}"#;
+        assert_eq!(matches_file_id_build_keys(None, Some(modules)), Some(true));
+        assert_eq!(
+            matches_file_id_build_keys(Some(&pm("10.20.0")), Some(modules)),
+            None
+        );
+    }
 
     #[test]
     fn version_span_reads_exact_caret_tilde_and_wildcards() {
