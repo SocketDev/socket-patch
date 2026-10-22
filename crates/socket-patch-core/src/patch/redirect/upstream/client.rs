@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
+use crate::api::client::network_error_detail;
 use crate::vendor::registry_fetch::{
     build_registry_client, npm_registry_base, pypi_json_api_base, RegistryClient,
 };
@@ -249,7 +250,7 @@ impl UpstreamClient {
         let resp = request
             .send()
             .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
+            .map_err(|e| format!("GET {url}: {}", network_error_detail(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("GET {url}: HTTP {status}"));
@@ -257,7 +258,7 @@ impl UpstreamClient {
         let text = resp
             .text()
             .await
-            .map_err(|e| format!("reading {url}: {e}"))?;
+            .map_err(|e| format!("reading {url}: {}", network_error_detail(&e)))?;
         serde_json::from_str(&text).map_err(|e| format!("{url} is not JSON: {e}"))
     }
 
@@ -902,6 +903,52 @@ mod tests {
         let h1 = go_mod_h1(b"module example.com/m\n");
         assert!(h1.starts_with("h1:") && h1.ends_with('='), "{h1}");
     }
+    /// #1650: a failed lookup names its transport cause, not just reqwest's
+    /// "error sending request for url (...)", so a refusal (and a CI flake)
+    /// says whether the registry was unreachable, reset or timed out.
+    #[tokio::test]
+    async fn a_failed_lookup_keeps_the_transport_cause() {
+        use tokio::io::AsyncReadExt;
+
+        // A server that holds its port for the whole test (so nothing else
+        // can bind it) and hangs up on every request after reading its head:
+        // the client sees the connection close before any response.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/pypi/six/1.16.0/json",
+            listener.local_addr().unwrap()
+        );
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            }
+        });
+        let client = UpstreamClient::new(false);
+        let deadline = std::time::Duration::from_secs(30);
+        let json = tokio::time::timeout(deadline, client.get_json(&url))
+            .await
+            .expect("the lookup ends once the server hangs up")
+            .expect_err("the server never answers");
+        let bytes = tokio::time::timeout(deadline, client.download(&url))
+            .await
+            .expect("the download ends once the server hangs up")
+            .expect_err("the server never answers");
+        for err in [json, bytes] {
+            assert!(err.starts_with(&format!("GET {url}: ")), "{err}");
+            assert!(
+                err.contains("connection closed before message completed"),
+                "the cause chain must be kept: {err}"
+            );
+        }
+    }
+
     // The npm cache key reads `SOCKET_NPM_REGISTRY`, which serial tests set.
     #[tokio::test]
     #[serial_test::serial]
