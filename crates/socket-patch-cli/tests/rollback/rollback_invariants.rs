@@ -113,15 +113,9 @@ fn rollback_with_no_manifest_emits_error() {
     assert_eq!(v["error"]["code"], "manifest_not_found");
     assert_eq!(v["events"], serde_json::json!([]), "a full error envelope");
     assert_eq!(v["summary"]["failed"], 0);
-    // Pin the *specific* error so a regression that exits 1 for some other
-    // reason (e.g. ambient env steering it elsewhere) can't pass.
-    let err = v["error"]["message"]
-        .as_str()
-        .expect("error message string");
-    assert!(
-        err.contains("Manifest not found"),
-        "unexpected error message: {err}"
-    );
+    // The `error.code` pins the specific failure, so an exit 1 for some
+    // other reason (e.g. ambient env steering it elsewhere) can't pass.
+    // The human wording is rendered in `cli_rollback_silent.rs`.
 }
 
 #[test]
@@ -138,13 +132,6 @@ fn rollback_unknown_identifier_emits_error() {
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "patch_not_found");
     assert_eq!(v["events"], serde_json::json!([]), "a full error envelope");
-    let err = v["error"]["message"]
-        .as_str()
-        .expect("error message string");
-    assert!(
-        err.contains("No patch found matching identifier"),
-        "unexpected error: {err}"
-    );
 }
 
 /// The beforeHash pinned in `MANIFEST_JSON` (deliberately not staged on
@@ -210,12 +197,11 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
         entry.get("files").is_none(),
         "nothing was restored on the bail"
     );
-    // The error names the remedy; the per-file record names the blob.
+    // The per-file record names the blob. The remedy must not point at
+    // `repair`, which cannot fetch originals (#893); its wording is
+    // rendered in `rollback_render.rs`.
     let err = entry["error"].as_str().expect("error message string");
-    assert!(
-        err.contains("Re-run without --offline") && !err.contains("repair"),
-        "error must carry the re-run remedy (repair cannot fetch originals, #893); got: {err}"
-    );
+    assert!(!err.contains("repair"), "got: {err}");
     let verified = entry["details"]["filesVerified"]
         .as_array()
         .expect("filesVerified array");
@@ -235,44 +221,6 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     assert!(
         msg.contains(MISSING_BEFORE_HASH),
         "message must name the missing hash; got: {msg}"
-    );
-    assert!(
-        msg.contains("--offline") && msg.contains("Re-run without --offline"),
-        "message must name the offline gate and the re-run remedy; got: {msg}"
-    );
-}
-
-/// Human-mode parity for the offline missing-blob bail: stderr explains
-/// the gate (count + repair hint) and the stdout summary names the failed
-/// package — the same information the JSON envelope now carries.
-#[test]
-fn rollback_offline_missing_blob_human_names_package_and_remedy() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    make_socket_dir(tmp.path());
-    install_manifest_package(tmp.path());
-    let out = rollback_cmd(tmp.path())
-        .args(["--offline"])
-        .output()
-        .expect("run socket-patch");
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "offline + missing blob must exit 1"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("missing and --offline is set"),
-        "stderr must explain the offline gate; stderr=\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Re-run without --offline") && !stderr.contains("socket-patch repair"),
-        "stderr must carry the re-run remedy; stderr=\n{stderr}"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Failed to roll back:")
-            && stdout.contains("pkg:npm/__rollback_test__@1.0.0"),
-        "the human summary must name the failed package; stdout=\n{stdout}"
     );
 }
 
@@ -316,12 +264,10 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
     assert_eq!(evs.len(), 1, "stdout=\n{stdout}");
     let entry = &evs[0];
     assert_eq!(entry["action"], "failed");
+    assert_eq!(entry["errorCode"], "missing_blob");
     assert_eq!(entry["purl"], "pkg:npm/__rollback_test__@1.0.0");
     let err = entry["error"].as_str().expect("error message string");
-    assert!(
-        err.contains("patch API is reachable") && !err.contains("repair"),
-        "error must carry the re-run remedy; got: {err}"
-    );
+    assert!(!err.contains("repair"), "got: {err}");
     let verified = entry["details"]["filesVerified"]
         .as_array()
         .expect("filesVerified array");
@@ -422,7 +368,7 @@ fn assert_only_not_installed_envelope(code: i32, stdout: &str) {
         "no installed tree to name; stdout=\n{stdout}"
     );
     assert!(
-        !stdout.contains("missingBlob") && !stdout.contains("Before blob not found"),
+        !stdout.contains("missingBlob") && !stdout.contains("missing_blob"),
         "a not-installed entry must never surface a blob problem; stdout=\n{stdout}"
     );
 }
@@ -577,12 +523,8 @@ fn rollback_mixed_installed_gated_and_not_installed_entries() {
         "the gated package is installed — path must be reported; stdout=\n{stdout}"
     );
     // The pinned missing-blob abort envelope survives for the installed
-    // package: engine vocabulary + re-run remedy.
-    let err = entry["error"].as_str().expect("error message string");
-    assert!(
-        err.contains("Cannot roll back: ") && err.contains("Re-run without --offline"),
-        "pinned abort error shape; got: {err}"
-    );
+    // package, in the engine's vocabulary.
+    assert_eq!(entry["errorCode"], "missing_blob", "stdout=\n{stdout}");
     let verified = entry["details"]["filesVerified"]
         .as_array()
         .expect("filesVerified array");

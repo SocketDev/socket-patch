@@ -8,7 +8,7 @@
 //! counts, the wet "Rolled back packages:" / "(already original)" report,
 //! the not-installed warning block, `--verbose` per-file details, the
 //! `--preserve-state` closing message, the empty-manifest announce, the
-//! boundary `Error:` lines, the vendored revert / unwire / preview lines,
+//! boundary `Error:` lines, the offline missing-blob gate, the vendored revert / unwire / preview lines,
 //! the drift-keep notice, the hosted restore / preview / refusal lines,
 //! the pre-v5 ledger retire lines, the Bun and vlt reinstall advisories,
 //! the manifest-write failure line (macOS) and the interactive confirm
@@ -406,6 +406,50 @@ fn blobs_path_as_file_prints_human_error() {
     assert!(
         stderr.contains("Error:"),
         "the human boundary error must print on stderr; stderr=\n{stderr}"
+    );
+}
+
+/// The offline missing-blob bail: an installed package whose before-blob
+/// is not on disk under `--offline`. Stderr explains the gate and the
+/// re-run remedy (never `repair`, which cannot fetch originals, #893), and
+/// the stdout summary names the failed package. The `--json` twin pins
+/// `missing_blob` in `rollback_invariants.rs`.
+#[test]
+fn offline_missing_blob_prints_gate_and_remedy() {
+    const PURL: &str = "pkg:npm/__rollback_test__@1.0.0";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_socket_manifest(
+        tmp.path(),
+        &[manifest_entry(
+            PURL,
+            "33333333-3333-4333-8333-333333333333",
+            &"0".repeat(64),
+            &"1".repeat(64),
+        )],
+    );
+    // Drifted bytes, so the before-blob is genuinely needed.
+    install_npm_pkg(
+        tmp.path(),
+        "node_modules",
+        "__rollback_test__",
+        "1.0.0",
+        b"installed-but-drifted\n",
+    );
+
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline"]);
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("missing and --offline is set"),
+        "stderr must explain the offline gate; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Re-run without --offline") && !stderr.contains("socket-patch repair"),
+        "stderr must carry the re-run remedy; stderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Failed to roll back:") && stdout.contains(PURL),
+        "the human summary must name the failed package; stdout=\n{stdout}"
     );
 }
 
