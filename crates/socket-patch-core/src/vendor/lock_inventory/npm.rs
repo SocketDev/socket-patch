@@ -76,11 +76,11 @@ pub(crate) struct NpmLockEntry<'a> {
     pub(crate) link: bool,
     /// `bundled: true` in the legacy tree, and `inBundle: true` in
     /// `packages` when a DEPENDENCY bundles it: npm unpacks it from that
-    /// package's own tarball. A copy the root project or a workspace member
-    /// bundles (and every copy beneath it) has no parent tarball, so npm
-    /// installs it from the lock like any other entry and it is not flagged
-    /// (#1618; see [`npm_dependency_bundled`]). npm writes no `bundled` flag
-    /// in the legacy tree for those.
+    /// package's own tarball. A copy the root project bundles (and the copies
+    /// beneath it) has no parent tarball, so npm installs it from the lock
+    /// like any other entry and it is not flagged (#1618; see
+    /// [`npm_dependency_bundled`]). npm writes no legacy `bundled` flag for
+    /// those.
     pub(crate) bundled: bool,
 }
 
@@ -228,7 +228,8 @@ fn escape_pointer_token(token: &str) -> String {
 ///
 /// * `packages` (lockfileVersion 2/3) whenever it exists — skipping the root
 ///   `""`, workspace members ([`NpmLockEntry::is_dependency`]) and
-///   `link: true` / `inBundle: true` entries, which npm installs from
+///   `link: true` entries and the `inBundle: true` entries a dependency
+///   bundles ([`NpmLockEntry::bundled`]), which npm installs from
 ///   elsewhere. A v2 lock's `dependencies` is a legacy mirror npm 7+ never
 ///   reads when `packages` exists, so it is ignored there;
 /// * otherwise the lockfileVersion 1 `dependencies` tree, recursive
@@ -252,8 +253,9 @@ pub(crate) fn npm_lock_located_nodes(doc: &Value) -> Vec<(String, NpmLockNode<'_
 }
 
 /// The BUNDLED entries of a parsed npm lock, each with where the lock puts
-/// it: `inBundle: true` in `packages` (lockfileVersion 2/3; the location is
-/// the `packages` key), `bundled: true` in the v1 `dependencies` tree (the
+/// it: `inBundle: true` in `packages` beneath a dependency that bundles it
+/// (lockfileVersion 2/3; the location is the `packages` key; a root
+/// bundle installs from the lock, [`NpmLockEntry::bundled`]), `bundled: true` in the v1 `dependencies` tree (the
 /// location is the `>`-joined chain of dependency names). These are exactly
 /// the entries [`npm_lock_nodes`] skips for being bundled, read from the
 /// same tree npm reads. npm unpacks them from the parent package's own
@@ -359,17 +361,20 @@ fn npm_flag(node: &Value, key: &str) -> bool {
 /// Whether the `packages` entry at `key` ships inside a DEPENDENCY's
 /// tarball, where no rewire reaches it.
 ///
-/// npm writes `inBundle: true` on every node a bundle covers, whoever the
-/// bundler is, and on each of that node's own dependencies. A bundled copy
-/// lives beneath its bundler, so the bundler is found by walking up the
-/// entry's owners (the key before its last `node_modules/`): the first
-/// owner that is a plain (not `inBundle`) dependency, or that declares
-/// `bundleDependencies` itself, is a dependency whose tarball carries the
-/// copy. An owner chain that reaches the root `""` or a workspace member
-/// (a key without `node_modules/`) is the project's own bundle: it has no
-/// parent tarball, and `npm install` / `npm ci` fetch it from `resolved` +
-/// `integrity` like any other entry (#1618). An owner missing from the
-/// lock keeps the entry bundled, the conservative reading.
+/// npm writes `inBundle: true` on every node a bundle covers, the root
+/// project's own `bundleDependencies` included, and on each of that node's
+/// own dependencies. A bundled copy lives beneath its bundler, so the
+/// bundler is found by walking up the entry's owners (the key before its
+/// last `node_modules/`): the first owner that is a plain (not `inBundle`)
+/// dependency, or that declares `bundleDependencies` itself, is a
+/// dependency whose tarball carries the copy. A chain that reaches the
+/// root `""`, when the root declares a bundle (npm records the list there,
+/// whatever spelling `package.json` used), is the project's own bundle: it
+/// has no parent tarball, and `npm install` / `npm ci` fetch it from
+/// `resolved` + `integrity` like any other entry (#1618). Every other end
+/// keeps the entry bundled, the conservative reading: an owner missing
+/// from the lock, a workspace member (npm writes no `inBundle` for a
+/// member's bundle), or a root that declares none.
 fn npm_dependency_bundled(
     packages: &serde_json::Map<String, Value>,
     key: &str,
@@ -379,24 +384,30 @@ fn npm_dependency_bundled(
         return false;
     }
     let mut key = key;
-    while let Some(owner) = npm_dependency_owner(key) {
+    loop {
+        let owner = npm_lock_owner(key);
         let Some(owner_value) = packages.get(owner) else {
             return true;
         };
-        if !npm_flag(owner_value, "inBundle") || declares_bundled_deps(owner_value) {
+        if owner.is_empty() {
+            return !declares_bundled_deps(owner_value);
+        }
+        if !owner.contains(NODE_MODULES_SEG)
+            || !npm_flag(owner_value, "inBundle")
+            || declares_bundled_deps(owner_value)
+        {
             return true;
         }
         key = owner;
     }
-    false
 }
 
-/// The `packages` key of the dependency `key` is installed beneath (the
-/// key before its last `node_modules/`), or `None` when that is the root
-/// or a workspace member: the project's own source.
-fn npm_dependency_owner(key: &str) -> Option<&str> {
-    let owner = key[..key.rfind(NODE_MODULES_SEG)?].trim_end_matches('/');
-    owner.contains(NODE_MODULES_SEG).then_some(owner)
+/// The `packages` key of the package `key` is installed beneath (the key
+/// before its last `node_modules/`): a dependency, a workspace member, or
+/// the root `""`.
+fn npm_lock_owner(key: &str) -> &str {
+    key.rfind(NODE_MODULES_SEG)
+        .map_or("", |idx| key[..idx].trim_end_matches('/'))
 }
 
 // ── registry view ──
@@ -779,10 +790,11 @@ mod tests {
     }
 
     /// #1618: npm writes `inBundle: true` on every copy a bundle covers,
-    /// including the root project's own `bundleDependencies` (any spelling:
-    /// a list, `true`, the `bundledDependencies` alias) and each of their
-    /// dependencies. Those have no parent tarball, so `npm ci` installs
-    /// them from the lock: only a copy a DEPENDENCY bundles is bundled.
+    /// including the root project's own `bundleDependencies` (recorded on
+    /// `""` as a list, whatever the `package.json` spelling) and each of
+    /// their dependencies. Those have no parent tarball, so `npm ci`
+    /// installs them from the lock: only a copy a DEPENDENCY bundles is
+    /// bundled, and any end the walk can't place stays bundled.
     #[test]
     fn only_dependency_bundles_are_bundled() {
         let entry = |extra: serde_json::Value| {
@@ -803,9 +815,10 @@ mod tests {
                 "node_modules/debug": bundle(),
                 "node_modules/ms": bundle(),
                 "node_modules/debug/node_modules/ms": bundle(),
-                // A workspace member's bundle, hoisted or not.
-                "ws/node_modules/wsdep": bundle(),
+                // A scoped root bundle; beneath a workspace member (npm
+                // flags none there) the owner is unknown, so kept.
                 "node_modules/@s/hoisted": bundle(),
+                "ws/node_modules/wsdep": bundle(),
                 // A dependency's bundle, also beneath a root-bundled copy
                 // that bundles something of its own.
                 "node_modules/host": entry(serde_json::json!({})),
@@ -830,8 +843,8 @@ mod tests {
                 ("node_modules/debug", false),
                 ("node_modules/ms", false),
                 ("node_modules/debug/node_modules/ms", false),
-                ("ws/node_modules/wsdep", false),
                 ("node_modules/@s/hoisted", false),
+                ("ws/node_modules/wsdep", true),
                 ("node_modules/host", false),
                 ("node_modules/host/node_modules/inner", true),
                 (
@@ -843,6 +856,16 @@ mod tests {
                 ("node_modules/gone/node_modules/orphan", true),
             ]
         );
+
+        // A root that declares no bundle can't be the bundler: kept.
+        let stale = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app" },
+                "node_modules/debug": bundle()
+            }
+        });
+        assert!(npm_lock_entries(&stale)[1].bundled);
     }
 
     /// The legacy walk stops at the depth bound instead of recursing on a

@@ -15,8 +15,9 @@
 //!   package is the entry's `name` field when present (npm writes it for
 //!   aliases — the key is then the ALIAS) else the key's trailing path, and
 //!   the version is the entry's `version`. `""` (the root) and bare keys
-//!   (workspace members — source dirs) are skipped, as are `link: true` and
-//!   `inBundle: true` entries: npm installs those from elsewhere, so a
+//!   (workspace members — source dirs) are skipped, as are `link: true`
+//!   entries and `inBundle: true` entries a dependency bundles (a root
+//!   bundle installs from the lock, #1618): npm installs those from elsewhere, so a
 //!   Socket URL written there wires nothing (the rewriters refuse them too).
 //!   A bundled entry is still an install of its `name@version`, unpacked
 //!   unpatched from the parent's tarball, so it CONTESTS a ref for the same
@@ -1919,12 +1920,6 @@ mod tests {
             .collect()
     }
 
-    /// REGRESSION (#325): the rewired hoisted entry plus an `inBundle` copy
-    /// of the SAME `name@version` (npm unpacks it from the parent's tarball,
-    /// so no rewire reaches it and it stays unpatched) is NOT attested, in
-    /// either mode: the build ships unpatched bytes of that package. The
-    /// uuid stays recognized, so the ledger record is dead too, and a
-    /// bundled copy of a DIFFERENT version contests nothing.
     /// #1618: a wired entry the ROOT project bundles is installed from the
     /// lock, so it is a reference; nothing contests it.
     #[tokio::test]
@@ -1946,6 +1941,12 @@ mod tests {
         assert!(bundled_contests(&out).is_empty(), "{:#?}", out.diagnostics);
     }
 
+    /// REGRESSION (#325): the rewired hoisted entry plus an `inBundle` copy
+    /// of the SAME `name@version` (npm unpacks it from the parent's tarball,
+    /// so no rewire reaches it and it stays unpatched) is NOT attested, in
+    /// either mode: the build ships unpatched bytes of that package. The
+    /// uuid stays recognized, so the ledger record is dead too, and a
+    /// bundled copy of a DIFFERENT version contests nothing.
     #[tokio::test]
     async fn bundled_copy_of_the_same_version_contests_the_wired_entry() {
         let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
