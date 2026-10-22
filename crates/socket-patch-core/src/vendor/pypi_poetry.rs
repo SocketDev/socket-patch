@@ -534,38 +534,61 @@ fn restore_re_rendered(entry: &VendorEntry, lock_text: &str) -> Option<String> {
         return None;
     }
     let url = source.get("url")?.as_str()?.to_owned();
-    let patched_files = file_list(wired.get("files")?.as_array()?)?;
-    // The pre-vendor file list: the legacy `[metadata.files]` entry when one
-    // was recorded, else the unit's own `files`. A lock-0 `[metadata.hashes]`
-    // entry names no files, so it can't be re-rendered into lock 2.
-    let original_files = match integrity {
-        Some((_, entry_text)) => {
-            let doc = entry_text.trim_start().parse::<DocumentMut>().ok()?;
-            let (_, item) = doc.iter().next()?;
-            item.as_array()?.clone()
+    // The patched and pre-vendor file lists: the legacy `[metadata.files]`
+    // entry when one was recorded, else the unit's own `files`. A lock-0
+    // `[metadata.hashes]` entry names no files, so it can't be re-rendered
+    // into lock 2.
+    let (patched_files, original_files) = match integrity {
+        Some((new_entry, original_entry)) => {
+            let entry_files = |text: &str| -> Option<toml_edit::Array> {
+                let doc = text.trim_start().parse::<DocumentMut>().ok()?;
+                let (_, item) = doc.iter().next()?;
+                item.as_array().cloned()
+            };
+            (entry_files(&new_entry)?, entry_files(&original_entry)?)
         }
-        None => original.get("files")?.as_array()?.clone(),
+        None => (
+            wired.get("files")?.as_array()?.clone(),
+            original.get("files")?.as_array()?.clone(),
+        ),
     };
+    let patched_files = file_list(&patched_files)?;
     file_list(&original_files)?;
 
     let mut doc = lock_text.parse::<DocumentMut>().ok()?;
-    if !poetry_lock::lock_version(doc.as_table()).ok()?.starts_with('2') {
+    if !poetry_lock::lock_version(doc.as_table())
+        .ok()?
+        .starts_with('2')
+    {
         return None;
     }
     let canon = canonicalize_pypi_name(&name);
     let packages = doc.get_mut("package")?.as_array_of_tables_mut()?;
-    let mut matches = packages.iter_mut().filter(|package| {
+    let is_target = |package: &toml_edit::Table| {
         package
             .get("name")
             .and_then(Item::as_str)
             .is_some_and(|n| canonicalize_pypi_name(n) == canon)
             && package.get("version").and_then(Item::as_str) == Some(version.as_str())
-    });
-    let package = matches.next()?;
-    if matches.next().is_some() {
+    };
+    if packages.iter().filter(|package| is_target(package)).count() != 1 {
         return None;
     }
-    let live_source = package.get("source")?.as_table_like()?;
+    let package = packages.iter_mut().find(|package| is_target(package))?;
+    // Already restored (by an earlier revert, possibly re-locked since): the
+    // unit carries its original source again and nothing in the lock names
+    // the vendored wheel, so there is nothing left to undo.
+    let original_source = original.get("source").and_then(Item::as_table_like);
+    let live_source = package.get("source").and_then(Item::as_table_like);
+    let restored = match (original_source, live_source) {
+        (None, None) => true,
+        (Some(o), Some(l)) => same_source(o, l),
+        _ => false,
+    };
+    if restored {
+        return (!lock_text.contains(url.as_str())).then(|| lock_text.to_owned());
+    }
+    let live_source = live_source?;
     if live_source.get("type").and_then(Item::as_str) != Some("file")
         || live_source.get("url").and_then(Item::as_str) != Some(url.as_str())
         || file_list(package.get("files")?.as_array()?)? != patched_files
@@ -590,6 +613,16 @@ fn restore_re_rendered(entry: &VendorEntry, lock_text: &str) -> Option<String> {
         lock_text,
         doc.to_string(),
     ))
+}
+
+/// Whether two `[package.source]` tables name the same source.
+fn same_source(a: &dyn toml_edit::TableLike, b: &dyn toml_edit::TableLike) -> bool {
+    let fields = |t: &dyn toml_edit::TableLike| {
+        t.iter()
+            .map(|(k, v)| (k.to_owned(), v.as_str().map(str::to_owned)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    fields(a) == fields(b)
 }
 
 /// The `(file, hash)` pairs of a Poetry `files` array, in order; `None`
@@ -2118,12 +2151,24 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
                 let entry = entry_for(wiring, meta);
 
                 let dry = revert_poetry(&entry, tmp.path(), true).await;
-                assert!(dry.success && dry.warnings.is_empty(), "{label}: {:?}", dry.warnings);
-                assert_eq!(read_lock(tmp.path()).await, relocked, "{label}: dry run writes");
+                assert!(
+                    dry.success && dry.warnings.is_empty(),
+                    "{label}: {:?}",
+                    dry.warnings
+                );
+                assert_eq!(
+                    read_lock(tmp.path()).await,
+                    relocked,
+                    "{label}: dry run writes"
+                );
 
                 let outcome = revert_poetry(&entry, tmp.path(), false).await;
                 assert!(outcome.success, "{label}: {:?}", outcome.error);
-                assert!(outcome.warnings.is_empty(), "{label}: {:?}", outcome.warnings);
+                assert!(
+                    outcome.warnings.is_empty(),
+                    "{label}: {:?}",
+                    outcome.warnings
+                );
                 assert_eq!(
                     read_lock(tmp.path()).await,
                     eol(relock(&pristine)),
@@ -2131,7 +2176,11 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
                 );
                 // Converged: a second revert changes nothing and stays quiet.
                 let again = revert_poetry(&entry, tmp.path(), false).await;
-                assert!(again.success && again.warnings.is_empty(), "{label}: {:?}", again.warnings);
+                assert!(
+                    again.success && again.warnings.is_empty(),
+                    "{label}: {:?}",
+                    again.warnings
+                );
                 assert_eq!(read_lock(tmp.path()).await, eol(relock(&pristine)));
             }
         }
@@ -2174,7 +2223,8 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
                  content-hash = \"4f9ffb08e662523420bf03909c6f496ad5f6d44d5107bda8fb5955ce0dfe3ab2\"\n"
             )
         };
-        let patched = format!("files = [\n    {{file = \"{wheel}\", hash = \"sha256:{WHEEL_SHA}\"}},\n]");
+        let patched =
+            format!("files = [\n    {{file = \"{wheel}\", hash = \"sha256:{WHEEL_SHA}\"}},\n]");
         for (pristine, restored_files) in [
             (native.clone(), "files = []".to_string()),
             (
