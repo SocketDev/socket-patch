@@ -29,7 +29,19 @@ use super::UpdateError;
 
 /// Guard holding the exclusive update lock; dropping releases it.
 pub struct UpdateLock {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        // Unlock explicitly instead of relying on the close. A `flock` belongs
+        // to the open file description, and a child that any thread of this
+        // process forks holds a copy of the descriptor until its exec closes
+        // it (`O_CLOEXEC`), so closing our copy alone can leave the lock held
+        // for that window. `LOCK_UN` on any copy releases it for all of them.
+        // Best effort: the close right after releases it in every other case.
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 /// Take the single-flight update lock, or fail with
@@ -71,7 +83,7 @@ pub fn acquire_update_lock() -> Result<Option<UpdateLock>, UpdateError> {
         )));
     }
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(UpdateLock { _file: file })),
+        Ok(()) => Ok(Some(UpdateLock { file })),
         // Only a genuine contention errno is "another update is running";
         // every other flock(2) failure (ENOLCK on an NFS-homed state dir,
         // ENOTSUP on a lockless filesystem, ...) must surface with its real
@@ -472,5 +484,88 @@ mod tests {
             Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
             None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
         }
+    }
+
+    /// Dropping the guard must release the lock even while other threads
+    /// spawn processes. Each fork holds a copy of the lock fd until its exec
+    /// closes it, so a guard that only closed its fd left the lock held for
+    /// that window and the re-acquire saw `InProgress` (it evicted a merge
+    /// queue entry via `update_lock_is_exclusive_and_released_on_drop`).
+    #[cfg(unix)]
+    #[test]
+    #[serial(update_state_dir_env)]
+    fn update_lock_released_on_drop_while_other_threads_spawn() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Stops the spawners and restores the env var even when the test
+        /// panics, so a failure can't leave fork traffic or a dangling
+        /// state dir behind for the rest of the test binary.
+        struct Cleanup {
+            stop: Arc<AtomicBool>,
+            spawners: Vec<std::thread::JoinHandle<()>>,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                for spawner in self.spawners.drain(..) {
+                    let _ = spawner.join();
+                }
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("SOCKET_UPDATE_STATE_DIR", v),
+                    None => std::env::remove_var("SOCKET_UPDATE_STATE_DIR"),
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("SOCKET_UPDATE_STATE_DIR");
+        std::env::set_var("SOCKET_UPDATE_STATE_DIR", tmp.path());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let spawners = (0..2)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                let spawned = Arc::clone(&spawned);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if std::process::Command::new("true").status().is_ok() {
+                            spawned.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        let cleanup = Cleanup {
+            stop,
+            spawners,
+            prev,
+        };
+
+        // Measure only once processes are really being spawned, or the test
+        // would pass without exercising anything.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while spawned.load(Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no process could be spawned"
+            );
+            std::thread::yield_now();
+        }
+        let mut held = 0;
+        for _ in 0..1000 {
+            match acquire_update_lock() {
+                Ok(guard) => drop(guard),
+                Err(UpdateError::InProgress) => held += 1,
+                Err(e) => panic!("unexpected lock error: {e}"),
+            }
+        }
+        drop(cleanup);
+        assert_eq!(
+            held, 0,
+            "a dropped guard left the lock held {held}/1000 times"
+        );
     }
 }

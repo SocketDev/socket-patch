@@ -565,6 +565,10 @@ async fn concurrent_update_lock_held() {
     install.assert_binary_intact();
 
     // Release the lock: the very next run must go all the way through.
+    // Unlock before the close: a child another test forks holds a copy of
+    // the locked fd until its exec, so closing ours alone can leave the
+    // lock held into the retry below.
+    FileExt::unlock(&lock_file).expect("release update.lock");
     drop(lock_file);
     let (code, stdout, stderr) = run_installed(
         &install,
