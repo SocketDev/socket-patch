@@ -104,7 +104,7 @@ fn legacy_files_entry(table: &dyn TableLike, name: &str, files: Array, rewritten
 ///     {file = "<wheel>", hash = "sha256:<hex>"},
 /// ]
 /// ```
-fn multiline_files(files: Array) -> Item {
+pub(crate) fn multiline_files(files: Array) -> Item {
     let entries: Vec<String> = files
         .iter()
         .filter_map(Value::as_inline_table)
