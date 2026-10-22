@@ -1051,31 +1051,45 @@ fn remove_detached_skip_rollback_refused() {
 
 /// Plant `.socket/blobs`, `.socket/diffs`, `.socket/packages` as regular
 /// FILES so every cleanup read_dir errors: the remove must still succeed
-/// (repair's posture: warn and continue, never fatal), with one stderr
-/// warning per store.
+/// (repair's posture: warn and continue, never fatal), with one
+/// `cleanup_failed` run warning per store. The human `Warning:` lines are
+/// checked in `remove_render.rs`.
 #[test]
 fn remove_cleanup_failures_warn_not_fatal() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_cleanup__@1.0.0";
-    let socket =
-        write_manifest_files_empty(tmp.path(), purl, "13131313-1313-4131-8131-131313131313");
-    for name in ["blobs", "diffs", "packages"] {
-        std::fs::write(socket.join(name), b"not a directory").unwrap();
-    }
+    let socket = plant_unsweepable_stores(tmp.path(), purl);
 
-    let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--skip-rollback"], &[]);
+    let (code, stdout, stderr) = run_remove(
+        tmp.path(),
+        &[purl, "--json", "--yes", "--skip-rollback"],
+        &[],
+    );
     assert_eq!(
         code, 0,
         "cleanup failures must never fail the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    for store in ["blob", "diffs", "packages"] {
-        assert!(
-            stderr
-                .lines()
-                .any(|l| l.starts_with("Warning:") && l.contains(&format!("{store} cleanup"))),
-            "the {store}-sweep failure must warn; got:\n{stderr}"
-        );
-    }
+    let v = parse_json_envelope(&stdout);
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(
+        warning_codes(&v),
+        ["cleanup_failed"; 3],
+        "one warning per failed sweep; envelope={v}"
+    );
+    // Each warning's detail opens with its pass's label.
+    let mut stores: Vec<&str> = v["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .filter_map(|w| w["detail"].as_str()?.split_once(" cleanup failed: "))
+        .map(|(store, _)| store)
+        .collect();
+    stores.sort_unstable();
+    assert_eq!(stores, ["blob", "diffs", "packages"], "envelope={v}");
+    assert!(
+        !stderr.contains("Warning:"),
+        "--json must not also print the warnings; stderr=\n{stderr}"
+    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
             .unwrap();

@@ -556,3 +556,26 @@ mod pty {
         );
     }
 }
+
+/// Human-mode twin of `remove_cleanup_failures_warn_not_fatal`: each
+/// failed sweep prints one `Warning:` line on stderr naming its store,
+/// and the remove still succeeds.
+#[test]
+fn remove_cleanup_failures_print_one_warning_per_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let purl = "pkg:npm/__covgap_cleanup__@1.0.0";
+    plant_unsweepable_stores(tmp.path(), purl);
+
+    let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--skip-rollback"], &[]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    for store in ["blob", "diffs", "packages"] {
+        let warnings = stderr
+            .lines()
+            .filter(|l| l.starts_with(&format!("Warning: {store} cleanup failed: ")))
+            .count();
+        assert_eq!(
+            warnings, 1,
+            "the {store} sweep must warn once; got:\n{stderr}"
+        );
+    }
+}

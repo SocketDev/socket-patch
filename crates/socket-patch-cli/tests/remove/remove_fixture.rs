@@ -45,6 +45,17 @@ pub(crate) fn write_manifest_files_empty(root: &Path, purl: &str, uuid: &str) ->
     socket
 }
 
+/// A one-entry manifest for `purl` whose `.socket/blobs`, `.socket/diffs`
+/// and `.socket/packages` are regular FILES, so every cleanup sweep fails.
+/// Returns the `.socket` dir.
+pub(crate) fn plant_unsweepable_stores(root: &Path, purl: &str) -> PathBuf {
+    let socket = write_manifest_files_empty(root, purl, "13131313-1313-4131-8131-131313131313");
+    for name in ["blobs", "diffs", "packages"] {
+        std::fs::write(socket.join(name), b"not a directory").unwrap();
+    }
+    socket
+}
+
 /// Two-entry `files: {}` manifest (purl1/uuid1, purl2/uuid2).
 pub(crate) fn write_two_entry_manifest(
     root: &Path,
