@@ -1942,6 +1942,129 @@ fn vendored_npm_patch_with_a_copy_under_a_has_shrinkwrap_dependency() {
     }
 }
 
+/// REGRESSION (#1600): a Bun project vendors `dep/minimist`'s registry
+/// copy while the root depends on minimist by a git, folder or URL /
+/// `file:` tarball spec, which bun installs from that spec, unpatched.
+/// `vex` attests nothing, and `vendor --check` must fail naming that
+/// copy. Before the fix it claimed no lockfile referenced the artifact
+/// (bun.lock still does) and prescribed a re-vendor that changes nothing.
+#[test]
+fn vendored_bun_patch_beside_a_non_registry_copy() {
+    let purl = "pkg:npm/minimist@1.2.2";
+    let uuid = "0a0a0a0a-1600-4600-8600-0a0a0a0a0a0a";
+    let patched = b"patched bun bytes\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    for (label, spec) in [
+        ("git", "minimist@github:minimistjs/minimist#c12a808"),
+        ("folder", "minimist@file:vend/minimist"),
+        ("tarball", "minimist@./minimist-1.2.2.tgz"),
+        (
+            "url",
+            "minimist@https://codeload.github.com/minimistjs/minimist/tar.gz/refs/tags/v1.2.2",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let cwd = tmp.path();
+        let rel = format!(".socket/vendor/npm/{uuid}/minimist-1.2.2.tgz");
+        let sha256 = sha256_hex(&write_member_tgz(
+            &cwd.join(&rel),
+            "package/index.js",
+            patched,
+        ));
+        let record = make_record(
+            uuid,
+            "package/index.js",
+            &after_hash,
+            "GHSA-bun-aaaa",
+            &["CVE-2026-1600"],
+        );
+        std::fs::write(
+            cwd.join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("bun.lock"),
+            format!(
+                "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \
+                 \"name\": \"app\",\n    }},\n  }},\n  \"packages\": {{\n    \
+                 \"dep\": [\"dep@file:dep\", {{ \"dependencies\": {{ \"minimist\": \"1.2.2\" }} }}],\n    \
+                 \"minimist\": [\"{spec}\", {{}}],\n    \
+                 \"dep/minimist\": [\"minimist@{rel}\", {{}}, \"sha512-cGF0Y2hlZA==\"],\n  \
+                 }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let wiring = WiringRecord {
+            file: "bun.lock".to_string(),
+            kind: "bun_lock_package".to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("dep/minimist".to_string()),
+            original: None,
+            new: None,
+        };
+        let mut state = VendorState::new();
+        state.entries.insert(
+            purl.to_string(),
+            detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
+        );
+        let dir = cwd.join(".socket/vendor");
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let vex_path = cwd.join("out.vex.json");
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+                "--output",
+                vex_path.to_str().unwrap(),
+                "--product",
+                "pkg:npm/app@1.0.0",
+            ])
+            .output()
+            .expect("invoke vex");
+        let env = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(out.status.code(), Some(1), "{label}: {env}");
+        assert!(
+            !vex_path.exists(),
+            "{label}: no VEX document may attest the purl: {env}"
+        );
+
+        let check = cli()
+            .args([
+                "vendor",
+                "--check",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .expect("invoke vendor --check");
+        let check_env: Value = serde_json::from_slice(&check.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{label}: vendor --check envelope JSON on stdout ({e}): {}",
+                String::from_utf8_lossy(&check.stdout)
+            )
+        });
+        assert_eq!(check.status.code(), Some(1), "{label}: {check_env}");
+        let event = &check_env["events"][0];
+        assert_eq!(event["errorCode"], "vendor_check_failed", "{check_env}");
+        assert!(
+            event["reason"].as_str().is_some_and(|r| r
+                .starts_with("copy unpatched:")
+                && r.contains("\"minimist\"")
+                && !r.contains("re-run `socket-patch vendor`")),
+            "{label}: the check names the non-registry copy: {check_env}"
+        );
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // 8. an applied, byte-verified agent-mode patch attests whether or not its
 // ecosystem has an install hook (there is no setup-state filter).

@@ -1227,6 +1227,138 @@ mod tests {
         }
     }
 
+    /// `out` withheld exactly one ref, `purl` wired to `UUID_A` in `mode`,
+    /// as a shadowed copy (never attested, still unwound by rollback /
+    /// remove / the takeover), and the diagnostic naming the copy is the
+    /// one [`Discovery::vendored_shadow`] hands `vendor --check`.
+    fn assert_shadowed(out: &Discovery, purl: &str, mode: WiringMode, what: &str) {
+        assert_refs(out, &[]);
+        assert_eq!(out.shadowed.len(), 1, "{what}: {:#?}", out.shadowed);
+        assert_eq!(out.shadowed[0].purl, purl, "{what}");
+        assert_eq!(out.shadowed[0].uuid, UUID_A, "{what}");
+        assert_eq!(out.shadowed[0].mode, mode, "{what}");
+        if mode == WiringMode::Vendored {
+            let (_, diag) = out
+                .vendored_shadow(purl, UUID_A)
+                .unwrap_or_else(|| panic!("{what}: no vendored shadow: {out:#?}"));
+            let diag = diag.unwrap_or_else(|| panic!("{what}: no diagnostic names the copy"));
+            assert!(diag.detail.contains("UNPATCHED"), "{what}: {diag:#?}");
+        }
+    }
+
+    /// REGRESSION (#1600): a user URL / `file:` tarball, git or folder copy
+    /// of the wired package beside a hosted or vendored registry entry is
+    /// one no rewire reaches. Its contest must keep the ref as shadowed,
+    /// like a bundled copy (and npm's #1511), so `vendor --check` names
+    /// that copy instead of claiming nothing wires the artifact and
+    /// prescribing a re-vendor that cannot help.
+    #[tokio::test]
+    async fn issue_1600_non_registry_copy_shadows_the_ref() {
+        let modes = |name: &str, version: &str, file: &str| {
+            [
+                (
+                    WiringMode::Hosted,
+                    hosted_url("npm", name, version, UUID_A, file),
+                ),
+                (
+                    WiringMode::Vendored,
+                    format!(".socket/vendor/npm/{UUID_A}/{file}"),
+                ),
+            ]
+        };
+        // Text lock: a versioned user tarball, and unversioned own-source
+        // copies (tarball, codeload URL, git, folder).
+        for (mode, wired) in modes("left-pad", "1.3.0", "left-pad-1.3.0.tgz") {
+            for user in [
+                "left-pad@https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "left-pad@./left-pad-1.3.0.tgz",
+                "left-pad@./pkg.tgz",
+                "left-pad@https://codeload.github.com/o/r/tar.gz/refs/tags/v1.3.0",
+                "left-pad@git+http://127.0.0.1:18766/left-pad.git#a8d9e0d",
+                "left-pad@github:o/r#c12a808",
+                "left-pad@file:vend/pad",
+            ] {
+                let p = Project::new();
+                p.write(
+                    "bun.lock",
+                    text_lock(
+                        2,
+                        &[
+                            tuple("left-pad", user, None),
+                            tuple("dep/left-pad", &format!("left-pad@{wired}"), Some(SRI)),
+                        ],
+                    ),
+                );
+                let out = run(&p).await;
+                assert_shadowed(&out, LEFT_PAD, mode, &format!("{mode:?} {user}"));
+            }
+        }
+        // Real Bun locks: git / folder / URL copies of minimist, text and
+        // binary.
+        let root = fixture_path("bun-unversioned-copy");
+        for (mode, wired) in modes("minimist", "1.2.2", "minimist-1.2.2.tgz") {
+            for dir in ["text-2/file", "text-2/url", "text-2/git"] {
+                let text = std::fs::read_to_string(root.join(dir).join("bun.lock")).unwrap();
+                let lock: String = text
+                    .lines()
+                    .map(
+                        |line| match line.trim_start().strip_prefix("\"dep/minimist\": ") {
+                            Some(_) => format!(
+                                "    \"dep/minimist\": [\"minimist@{wired}\", {{}}, \"{SRI}\"],\n"
+                            ),
+                            None => format!("{line}\n"),
+                        },
+                    )
+                    .collect();
+                let p = Project::new();
+                p.write("bun.lock", &lock);
+                let out = run(&p).await;
+                assert_shadowed(&out, "pkg:npm/minimist@1.2.2", mode, dir);
+            }
+            for shape in ["file", "url", "git"] {
+                let bytes =
+                    std::fs::read(root.join("lockb").join(shape).join("bun.lockb")).unwrap();
+                let mut lock = crate::vendor::bun_lockb::BunLockb::parse(&bytes).unwrap();
+                let id = lock
+                    .packages()
+                    .unwrap()
+                    .into_iter()
+                    .find(|p| p.name == "minimist" && p.version.as_deref() == Some("1.2.2"))
+                    .expect("nested registry record")
+                    .id;
+                lock.set_package(id, &wired, SRI).unwrap();
+                let p = Project::new();
+                p.write("bun.lockb", lock.bytes());
+                let out = run(&p).await;
+                assert_shadowed(&out, "pkg:npm/minimist@1.2.2", mode, shape);
+            }
+        }
+        // Binary user tarball records (Bun 1.1.45).
+        for (mode, wired) in modes("is-number", "6.0.0", "is-number-6.0.0.tgz") {
+            for shape in ["url", "file"] {
+                let bytes = std::fs::read(
+                    fixture_path("bun-lockb-user-tarball")
+                        .join(shape)
+                        .join("bun.lockb"),
+                )
+                .unwrap();
+                let mut lock = crate::vendor::bun_lockb::BunLockb::parse(&bytes).unwrap();
+                let id = lock
+                    .packages()
+                    .unwrap()
+                    .into_iter()
+                    .find(|p| p.name == "is-number" && p.version.as_deref() == Some("6.0.0"))
+                    .expect("nested registry record")
+                    .id;
+                lock.set_package(id, &wired, SRI).unwrap();
+                let p = Project::new();
+                p.write("bun.lockb", lock.bytes());
+                let out = run(&p).await;
+                assert_shadowed(&out, "pkg:npm/is-number@6.0.0", mode, shape);
+            }
+        }
+    }
+
     /// The `DIAG_REF_UNATTRIBUTABLE` diagnostics that name a bundled copy.
     fn bundled_contests(out: &Discovery) -> usize {
         out.diagnostics
