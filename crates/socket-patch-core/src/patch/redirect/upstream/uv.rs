@@ -732,7 +732,7 @@ pub(crate) fn pylock_no_binary(
          patches ship as wheels, so to wire one let uv install {name} from a wheel"
     );
     if let Some(command) = &command {
-        if compile_no_binary(command, &name) {
+        if binary_flag_covers(command, "--no-binary", &name) {
             return Some(format!(
                 "the lock's `uv pip compile --no-binary` covers {name}, {consequence}"
             ));
@@ -747,24 +747,29 @@ pub(crate) fn pylock_no_binary(
     ))
 }
 
-/// Whether the `uv pip compile` `command` passes `--no-binary` naming
-/// `name` (PEP 503 canonical) or `:all:`.
-fn compile_no_binary(command: &[&str], name: &str) -> bool {
+/// Whether the `uv pip compile` `command`'s `flag` (`--no-binary` or
+/// `--only-binary`) covers `name` (PEP 503 canonical): pip's
+/// comma-separated values naming it or `:all:`, where `:none:` clears the
+/// values before it.
+fn binary_flag_covers(command: &[&str], flag: &str, name: &str) -> bool {
+    let mut covered = false;
     let mut args = command.iter();
     while let Some(arg) = args.next() {
         let value = match arg.split_once('=') {
-            Some(("--no-binary", value)) => Some(value),
-            None if *arg == "--no-binary" => args.next().copied(),
+            Some((f, value)) if f == flag => Some(value),
+            None if *arg == flag => args.next().copied(),
             _ => None,
         };
-        if value.is_some_and(|v| {
-            v.split(',')
-                .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name)
-        }) {
-            return true;
+        for value in value.into_iter().flat_map(|v| v.split(',')) {
+            match value {
+                ":none:" => covered = false,
+                ":all:" => covered = true,
+                value if canonicalize_pypi_name(value) == name => covered = true,
+                _ => {}
+            }
         }
     }
-    false
+    covered
 }
 
 /// The uv setting in `files` under which `uv pip` installs `name` (PEP 503
@@ -803,22 +808,33 @@ fn settings_no_binary(
         .map(|(path, _)| (path.clone(), "no-binary-package".to_string()))
 }
 
-/// The uv settings table of a project's `uv.toml` text, else of its
-/// `pyproject` text's `[tool.uv]`, labelled with the file it came from:
-/// the settings uv reads in the project root. Like uv, a `uv.toml`
-/// replaces pyproject's settings, and a pyproject that does not parse, or
-/// has no `[tool.uv]`, sets nothing. An unparsable `uv.toml` also sets
-/// nothing here: uv reports it itself.
+/// The uv settings table `uv pip` reads for a lock in the project root,
+/// labelled with the file it came from: the root's `uv.toml` text, else
+/// its `pyproject` text's `[tool.uv]`, else (when the root sets none) the
+/// `ancestor` settings file above it ([`find_ancestor_uv_config`]). Like
+/// uv, a `uv.toml` replaces pyproject's settings. A file that does not
+/// parse sets nothing here: uv reports it itself.
+///
+/// [`find_ancestor_uv_config`]: crate::utils::python_script::find_ancestor_uv_config
 pub(crate) fn root_uv_settings(
     uv_toml: Option<&str>,
     pyproject: Option<&str>,
+    ancestor: Option<&crate::utils::python_script::UvConfig>,
 ) -> Option<(String, toml_edit::Table)> {
     if let Some(text) = uv_toml {
         let doc = text.parse::<DocumentMut>().ok()?;
         return Some(("uv.toml".to_string(), doc.as_table().clone()));
     }
-    let uv = pyproject_uv_table(pyproject?)?;
-    Some(("pyproject.toml".to_string(), uv))
+    if let Some(uv) = pyproject.and_then(pyproject_uv_table) {
+        return Some(("pyproject.toml".to_string(), uv));
+    }
+    let ancestor = ancestor?;
+    if ancestor.is_uv_toml() {
+        let doc = ancestor.text.parse::<DocumentMut>().ok()?;
+        Some((ancestor.rel.clone(), doc.as_table().clone()))
+    } else {
+        Some((ancestor.rel.clone(), pyproject_uv_table(&ancestor.text)?))
+    }
 }
 
 /// A pyproject text's `[tool.uv]` table (also spelled inline).
@@ -899,19 +915,19 @@ fn compile_filter(command: &[&str], name: &str, exempt: bool) -> Option<String> 
             "--exclude-newer" => {
                 inline.or_else(|| args.next().copied()) != Some("false") && !exempt
             }
-            "--only-binary" | "--no-binary" | "--exclude-newer-package" => {
+            "--only-binary" | "--no-binary" => {
+                if inline.is_none() {
+                    args.next();
+                }
+                binary_flag_covers(command, flag, name)
+            }
+            "--exclude-newer-package" => {
                 let Some(value) = inline.or_else(|| args.next().copied()) else {
                     continue;
                 };
-                if flag == "--exclude-newer-package" {
-                    value.split_once('=').is_some_and(|(package, cutoff)| {
-                        canonicalize_pypi_name(package) == name && cutoff != "false"
-                    })
-                } else {
-                    value
-                        .split(',')
-                        .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name)
-                }
+                value.split_once('=').is_some_and(|(package, cutoff)| {
+                    canonicalize_pypi_name(package) == name && cutoff != "false"
+                })
             }
             _ => false,
         };

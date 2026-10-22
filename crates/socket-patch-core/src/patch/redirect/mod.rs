@@ -6212,20 +6212,26 @@ fn rewrite_uv_lock(
             }),
         }
     }
+    // A PEP 751 lock is installed with `uv pip`, which reads uv's settings
+    // (#1603).
+    let pip_settings = locks
+        .iter()
+        .any(|(path, _)| is_pep751_lock_name(path))
+        .then(|| pylock_uv_settings(files));
     for (path, original) in locks {
         let mut content = original.clone();
         let mut session = PythonLockSession::new(original);
         let pipenv_reads = pipenv_reads_pylock(path, |rel| files.contains_key(rel));
-        // A PEP 751 lock is installed with `uv pip`, which reads its own
-        // settings (#1603).
-        let pip_settings = is_pep751_lock_name(path.rsplit('/').next().unwrap_or(path))
-            .then(|| pylock_uv_settings(files));
+        // Pipenv installs the pylocks it reads, and reads no uv setting.
+        let uv_pip_settings = pip_settings
+            .as_ref()
+            .filter(|_| is_pep751_lock_name(path) && !pipenv_reads);
         for &(dep, sha256) in &usable {
             let artifact = ArtifactSource::Url(&dep.artifact_url);
             let planned = session.plan(&content, &dep.name, &dep.version, artifact);
             // Every patched artifact is a wheel, which uv refuses to
             // install under no-binary (#1603).
-            let no_binary = match (&planned, &pip_settings) {
+            let no_binary = match (&planned, uv_pip_settings) {
                 (Ok(Some(_)), Some(settings)) => {
                     upstream::pylock_no_binary(original, &dep.name, settings)
                 }
@@ -6537,16 +6543,25 @@ const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<c
 /// [`find_ancestor_uv_config`]: crate::utils::python_script::find_ancestor_uv_config
 pub const UV_ANCESTOR_CONFIG_KEY: &str = "<socket-patch:uv-ancestor-config>";
 
-/// The uv settings `uv pip` reads for a PEP 751 lock in the root: the
-/// root's `uv.toml`, else pyproject's `[tool.uv]`. A user- or system-level
-/// `uv.toml` belongs to the machine that installs, which the scan cannot
-/// see.
+/// The uv settings `uv pip` reads for a PEP 751 lock in the root
+/// ([`upstream::root_uv_settings`]), with the settings file above the root
+/// the engine hands over under [`UV_ANCESTOR_CONFIG_KEY`]. A user- or
+/// system-level `uv.toml` belongs to the machine that installs, which the
+/// scan cannot see.
 fn pylock_uv_settings(files: &BTreeMap<String, String>) -> Vec<(String, toml_edit::Table)> {
+    let ancestor = files.get(UV_ANCESTOR_CONFIG_KEY).and_then(|value| {
+        let (rel, text) = value.split_once('\n')?;
+        Some(crate::utils::python_script::UvConfig {
+            rel: rel.to_string(),
+            text: text.to_string(),
+        })
+    });
     upstream::root_uv_settings(
         files
             .get(crate::utils::python_script::UV_TOML)
             .map(String::as_str),
         files.get("pyproject.toml").map(String::as_str),
+        ancestor.as_ref(),
     )
     .into_iter()
     .collect()
@@ -26336,6 +26351,20 @@ mod python_lock_warning_tests {
                     "[project]\nname = \"p\"\nversion = \"0\"\n[tool.uv.pip]\nno-binary = [\"six\"]\n",
                 )],
             ),
+            // uv takes the settings from above a root that sets none.
+            (
+                "",
+                &[(UV_ANCESTOR_CONFIG_KEY, "../uv.toml\n[pip]\nno-binary = [\"six\"]\n")],
+            ),
+            (
+                "",
+                &[(
+                    UV_ANCESTOR_CONFIG_KEY,
+                    "../pyproject.toml\n[tool.uv]\nno-binary-package = [\"six\"]\n",
+                )],
+            ),
+            // `:none:` clears only the values before it.
+            (" --no-binary :none: --no-binary six", &[]),
         ];
         for (flags, extra) in refusals {
             let result = run(flags, extra);
@@ -26391,6 +26420,15 @@ mod python_lock_warning_tests {
                 ],
             ),
             (" --no-config", &[("uv.toml", "no-binary = true\n")]),
+            (" --no-binary :all: --no-binary :none:", &[]),
+            // The root's own settings stop the lookup above it.
+            (
+                "",
+                &[
+                    ("uv.toml", "offline = false\n"),
+                    (UV_ANCESTOR_CONFIG_KEY, "../uv.toml\nno-binary = true\n"),
+                ],
+            ),
         ];
         for (flags, extra) in wired {
             let result = run(flags, extra);
@@ -26404,6 +26442,19 @@ mod python_lock_warning_tests {
                 "{flags:?} {extra:?}"
             );
         }
+        // Pipenv installs a pylock beside a Pipfile and reads no uv
+        // setting: its own refusal is the one that applies.
+        let result = run(
+            " --no-binary six",
+            &[("Pipfile", "[packages]\nsix = \"==1.16.0\"\n")],
+        );
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            ["redirect_pipenv_pylock_unsupported"],
+            "{:?}",
+            result.warnings
+        );
         // Another installer's lock reads no uv setting.
         let mut files = BTreeMap::from([(
             "pylock.toml".to_string(),

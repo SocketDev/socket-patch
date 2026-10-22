@@ -721,10 +721,10 @@ pub async fn read_candidate_files(
             out.files.insert(rel.to_string(), text);
         }
     }
-    // A PEP 723 script (#1501) or a project (#1545) also takes uv's
-    // settings from above the root when the root holds none; only a disk
-    // view has an above.
-    if uv_lane
+    // A PEP 723 script (#1501), a project (#1545) or `uv pip` installing a
+    // PEP 751 lock (#1603) also takes uv's settings from above the root
+    // when the root holds none; only a disk view has an above.
+    if (uv_lane || pylock_lane)
         && !crate::utils::python_script::root_governs_script(
             out.files.get("pyproject.toml").map(String::as_str),
             out.files
