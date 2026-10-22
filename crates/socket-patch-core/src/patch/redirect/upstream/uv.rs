@@ -2378,11 +2378,21 @@ mod tests {
         let paths = |files: Vec<(String, toml_edit::Table)>| -> Vec<String> {
             files.into_iter().map(|(path, _)| path).collect()
         };
+        // The display string of `<root>/<dir>/uv/uv.toml` as
+        // `global_uv_settings` builds it, with native separators.
+        let uv_toml = |dir: &str| {
+            dir.split('/')
+                .fold(root.to_path_buf(), |path, part| path.join(part))
+                .join("uv")
+                .join("uv.toml")
+                .display()
+                .to_string()
+        };
         let mut pairs = vec![
             ("XDG_CONFIG_HOME", root.join("xdg")),
             ("HOME", root.join("home")),
         ];
-        let mut expected = vec![root.join("xdg/uv/uv.toml").display().to_string()];
+        let mut expected = vec![uv_toml("xdg")];
         // `$XDG_CONFIG_DIRS` splits on `:` as on Unix, which would also
         // split a Windows drive letter, so only Unix checks the system file.
         if cfg!(unix) {
@@ -2393,7 +2403,7 @@ mod tests {
                 root.join("dirs3").display()
             );
             pairs.push(("XDG_CONFIG_DIRS", dirs.into()));
-            expected.push(root.join("dirs2/uv/uv.toml").display().to_string());
+            expected.push(uv_toml("dirs2"));
         }
         let var = env(pairs);
         assert_eq!(
@@ -2407,10 +2417,7 @@ mod tests {
             ("XDG_CONFIG_DIRS", root.join("none")),
         ]);
         let found = paths(global_uv_settings(&var, false).await.unwrap());
-        assert_eq!(
-            found[0],
-            root.join("home/.config/uv/uv.toml").display().to_string()
-        );
+        assert_eq!(found[0], uv_toml("home/.config"));
         // Windows reads %APPDATA% and %PROGRAMDATA%.
         write("appdata/uv/uv.toml", "no-build = true\n");
         let var = env(vec![
@@ -2419,10 +2426,7 @@ mod tests {
         ]);
         assert_eq!(
             paths(global_uv_settings(&var, true).await.unwrap()),
-            [
-                root.join("appdata/uv/uv.toml").display().to_string(),
-                root.join("dirs3/uv/uv.toml").display().to_string(),
-            ]
+            [uv_toml("appdata"), uv_toml("dirs3")]
         );
         // Like uv, the system entries end at the first empty one, and a
         // directory named `uv.toml` is passed over.
