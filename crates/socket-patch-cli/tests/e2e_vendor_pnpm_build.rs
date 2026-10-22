@@ -2568,3 +2568,175 @@ fn pnpm_vendor_refuses_quoted_scoped_alias_references() {
         );
     }
 }
+
+/// #1597: pnpm 10.34.2+ matches build approvals against the id it installs
+/// a package as, and the vendored copy installs as
+/// `sp-build@file:.socket/vendor/npm/<uuid>/…`. A name-keyed approval used
+/// to stop applying after vendoring: pnpm 10 skipped the approved
+/// `postinstall`, pnpm 11 (strictDepBuilds) failed every frozen install
+/// with ERR_PNPM_IGNORED_BUILDS. Vendoring now carries the approval to the
+/// vendored key: a fresh frozen offline install of the committed files
+/// lands the patched bytes AND runs the script, and `vendor --revert`
+/// byte-restores the workspace file.
+#[tokio::test(flavor = "multi_thread")]
+async fn pnpm_vendor_keeps_approved_build_scripts_running() {
+    for (pm, approval) in [
+        (PNPM_TERTIARY, "allowBuilds:\n  sp-build: true\n"),
+        (PNPM_PRIMARY, "onlyBuiltDependencies:\n  - sp-build\n"),
+    ] {
+        if !has_corepack_pm(pm) {
+            println!("SKIP: `corepack {pm}` unavailable");
+            continue;
+        }
+        run_build_approval_capstone(pm, approval).await;
+    }
+}
+
+async fn run_build_approval_capstone(pm: &str, approval: &str) {
+    const NAME: &str = "sp-build";
+    let original: &[u8] = b"module.exports = 'orig';\n";
+    let patched: Vec<u8> = [MARKER.as_bytes(), original].concat();
+    let manifest = serde_json::json!({
+        "name": NAME, "version": "1.0.0", "main": "index.js",
+        "scripts": {"postinstall": "node post.js"},
+    });
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for (file, bytes) in [
+        ("package.json", manifest.to_string().into_bytes()),
+        ("index.js", original.to_vec()),
+        (
+            "post.js",
+            b"require('fs').writeFileSync('built.txt', 'built');\n".to_vec(),
+        ),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("package/{file}"), bytes.as_slice())
+            .unwrap();
+    }
+    let tgz = builder.into_inner().unwrap().finish().unwrap();
+
+    let server = MockServer::start().await;
+    let route = format!("/{NAME}/-/{NAME}-1.0.0.tgz");
+    let mut record = manifest.clone();
+    record["dist"] = serde_json::json!({
+        "tarball": format!("{}{route}", server.uri()),
+        "integrity": format!("sha512-{}", b64(&sha2::Sha512::digest(&tgz))),
+    });
+    let packument = serde_json::json!({
+        "name": NAME, "dist-tags": {"latest": "1.0.0"}, "versions": {"1.0.0": record},
+    });
+    Mock::given(method("GET"))
+        .and(path(route.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{NAME}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(packument))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            "{{\"name\":\"approvals\",\"version\":\"0.0.0\",\"private\":true,\
+             \"dependencies\":{{\"{NAME}\":\"1.0.0\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join(".npmrc"),
+        format!("registry={}/\nfetch-retries=0\n", server.uri()),
+    )
+    .unwrap();
+    let ws_before = format!("packages:\n  - '.'\nminimumReleaseAge: 0\n{approval}");
+    std::fs::write(proj.join("pnpm-workspace.yaml"), &ws_before).unwrap();
+
+    let store = tmp.path().join("pnpm-store");
+    let install = corepack(
+        &proj,
+        pm,
+        &["install", "--store-dir", store.to_str().unwrap()],
+    );
+    assert!(
+        install.status.success(),
+        "{pm} fixture install: {install:?}"
+    );
+    let built = |root: &Path| root.join("node_modules").join(NAME).join("built.txt");
+    assert!(built(&proj).exists(), "{pm}: the approved script ran");
+    let lock_before = std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap();
+
+    let purl = format!("pkg:npm/{NAME}@1.0.0");
+    stage_patch(&proj, &purl, "package/index.js", original, &patched);
+    let cwd = proj.to_str().unwrap();
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, 0, "{pm} vendor failed.\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let ws_after = std::fs::read_to_string(proj.join("pnpm-workspace.yaml")).unwrap();
+    assert!(
+        ws_after.contains(&format!(
+            "{NAME}@file:.socket/vendor/npm/{UUID}/{NAME}-1.0.0.tgz"
+        )),
+        "{pm}: the approval is carried to the vendored key:\n{ws_after}"
+    );
+
+    // Fresh checkout of the committable files: empty store, no registry.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    std::fs::write(fresh.join(".npmrc"), "registry=http://127.0.0.1:1/\n").unwrap();
+    let fresh_store = tmp.path().join("fresh-pnpm-store");
+    let ci = corepack(
+        &fresh,
+        pm,
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--offline",
+            "--store-dir",
+            fresh_store.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ci.status.success(),
+        "{pm}: fresh frozen install must keep the approval.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(NAME).join("index.js")).unwrap(),
+        patched,
+        "{pm}: the patched bytes are installed"
+    );
+    assert!(
+        built(&fresh).exists(),
+        "{pm}: the approved postinstall still runs on the vendored copy"
+    );
+
+    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--revert", "--json", "--cwd", cwd]);
+    assert_eq!(code, 0, "{pm} revert failed.\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("pnpm-workspace.yaml")).unwrap(),
+        ws_before,
+        "{pm}: workspace file byte-restored"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap(),
+        lock_before
+    );
+}

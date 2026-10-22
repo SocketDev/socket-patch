@@ -1128,22 +1128,11 @@ pub(super) async fn revert_pnpm_dialect(
         })
         .collect();
     if ws_rec.is_some() || !ws_approvals.is_empty() {
-        let (created_file, created_overrides, created_packages) = match &entry.pnpm {
-            Some(meta) => (
-                meta.created_workspace_file,
-                meta.created_workspace_overrides,
-                meta.created_workspace_packages,
-            ),
-            None => (false, false, false),
-        };
         if let Err(e) = revert_workspace(
             project_root,
             ws_rec,
             &ws_approvals,
-            created_file,
-            created_overrides,
-            created_packages,
-            &entry.uuid,
+            entry,
             &mut outcome.warnings,
         )
         .await
@@ -1168,17 +1157,24 @@ pub(super) async fn revert_pnpm_dialect(
 /// still holds only the vendoring scaffold), or splice our override key back
 /// out of a file we edited (restoring the taken-over value, and dropping an
 /// `overrides:` section we created once it empties). Drift ⇒ warning, left
-/// alone. `Err` is a genuine write failure.
+/// alone. Build approvals vendoring added (`approvals`) are taken out too.
+/// `Err` is a genuine write failure.
 async fn revert_workspace(
     project_root: &Path,
     rec: Option<&WiringRecord>,
     approvals: &[&WiringRecord],
-    created_file: bool,
-    created_overrides: bool,
-    created_packages: bool,
-    entry_uuid: &str,
+    entry: &VendorEntry,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(), String> {
+    let (created_file, created_overrides, created_packages) = match &entry.pnpm {
+        Some(meta) => (
+            meta.created_workspace_file,
+            meta.created_workspace_overrides,
+            meta.created_workspace_packages,
+        ),
+        None => (false, false, false),
+    };
+    let entry_uuid = entry.uuid.as_str();
     let path = project_root.join(PNPM_WORKSPACE);
     let text = match read_regular_to_string(&path).await {
         Ok(t) => t,
