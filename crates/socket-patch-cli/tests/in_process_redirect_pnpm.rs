@@ -2879,6 +2879,62 @@ async fn hosted_scan_from_bun_or_vlt_member_with_stray_lock_refuses() {
     }
 }
 
+/// #1631: Bun's `packages/*` never lists a directory that starts with `.`,
+/// so a project in `packages/.tools` with its own `bun.lock` is not a
+/// member: Bun installs it from that lock. A hosted `scan` from it refused
+/// with `redirect_workspace_lockfile_elsewhere`; it now pins its own lock
+/// and leaves the root's untouched.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_bun_dot_directory_project_pins_its_own_lock() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let bun_text = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"workspaces\": {{ \"\": {{ \"name\": \"tools\", \
+         \"dependencies\": {{ \"{NAME}\": \"{VERSION}\" }} }} }},\n  \"packages\": {{\n    \
+         \"{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{}}, \"{UPSTREAM_SHA512}\"],\n  }}\n}}\n"
+    );
+    for root_lock in ["bun.lock", "bun.lockb"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_json_workspace(tmp.path(), root_lock, false);
+        let project = tmp.path().join("packages/.tools");
+        let pkg = project.join("node_modules").join(NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            format!(
+                r#"{{ "name": "tools", "private": true, "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+        let own = project.join("bun.lock");
+        std::fs::write(&own, &bun_text).unwrap();
+        let root = tmp.path().join(root_lock);
+        let root_before = std::fs::read(&root).unwrap();
+
+        let (code, doc) = run_hosted_json(&project, &server.uri());
+        assert_eq!(code, Some(0), "root {root_lock}: {doc:#}");
+        assert_eq!(hosted_pin_count(&doc), 1, "root {root_lock}: {doc:#}");
+        assert_ne!(
+            std::fs::read_to_string(&own).unwrap(),
+            bun_text,
+            "root {root_lock}: the project's own bun.lock is pinned"
+        );
+        assert_eq!(
+            std::fs::read(&root).unwrap(),
+            root_before,
+            "root {root_lock}: the root lock is untouched"
+        );
+    }
+}
+
 /// How many hosted pins the run wrote (would write, on a dry run): the
 /// envelope's `applied` / `verified` events tagged `details.mode: "hosted"`
 /// (v5.0: replaces `redirect.redirected`).

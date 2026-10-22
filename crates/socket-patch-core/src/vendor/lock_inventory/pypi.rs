@@ -670,7 +670,9 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
             continue;
         }
         // `name==version` (extras, env markers, hash options stripped) —
-        // the shared exact-pin rule discovery reads requirements with.
+        // the shared exact-pin rule. Discovery's cross-lock contest reads
+        // more spellings as evidence (`==v1.0`, `===1.0`, #1602): scan
+        // can't rewire those, so they only withhold an attestation.
         let mut integrity = LockIntegrity::None;
         let (name, version) = match crate::utils::requirements::exact_pin(t) {
             Some((raw_name, version)) => {

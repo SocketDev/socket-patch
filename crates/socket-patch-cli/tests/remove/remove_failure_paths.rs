@@ -1,235 +1,26 @@
 //! Failure paths of `commands/remove.rs`: the lock-contention return, the
 //! vendor-ledger hard-failure aborts, the hosted-redirect leg's dry-run /
 //! preserve-state / refusal / failure branches, the drift-keep exclusion
-//! arms, the mixed drift-keep partial failure, and the human-mode output
-//! surfaces.
+//! arms and the mixed drift-keep partial failure.
 //!
-//! `--json` tests assert behavior (exit, `error.code`, events, summary
-//! counts, bytes on disk) through `common::envelope`. They read the
-//! message only for what it must name: a purl, a flag, a path, a remedy
-//! command, the "manifest was not modified" promise, or the short phrase
-//! that tells two causes sharing one `error.code` apart. Human-mode tests
-//! are the render checks: one assertion per message family (#1089).
+//! These tests assert behavior (exit, `error.code`, events, summary
+//! counts, bytes on disk) through `--json` and `common::envelope`. They
+//! read the message only for what it must name: a purl, a flag, a path, a
+//! remedy command, the "manifest was not modified" promise, or the short
+//! phrase that tells two causes sharing one `error.code` apart. Human-mode
+//! wording lives in `remove_render.rs`, one check per message family
+//! (#1089); the shared fixtures live in `remove_fixture.rs`.
 //!
 //! Binary-driven (spawns `CARGO_BIN_EXE_socket-patch` through
 //! `common::run_with_env`, which scrubs the ambient `SOCKET_*` env): every
 //! fixture is hand-written camelCase JSON, and every wet run passes
-//! `--offline` — except the hosted leg's, whose upstream restore re-resolves
-//! the registry entry from a mock npm registry (`SOCKET_NPM_REGISTRY`). Fixture shapes are copied from
-//! remove_invariants.rs / remove_duality_invariants.rs /
-//! interactive_prompts_e2e.rs.
+//! `--offline`, except the hosted leg's, whose upstream restore re-resolves
+//! the registry entry from a mock npm registry (`SOCKET_NPM_REGISTRY`).
 
-use std::path::{Path, PathBuf};
-
-use crate::common;
 use crate::common::envelope::{event_purls, events, has_event, parse_json_envelope, warning_codes};
+use crate::remove_fixture::*;
 use crate::vlt_hosted_common;
 use crate::vlt_vendored;
-
-/// Spawn `socket-patch remove` with the scrubbed env plus telemetry
-/// disabled; `env` entries land last so per-test injections survive.
-fn run_remove(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
-    let mut full = vec!["remove"];
-    full.extend_from_slice(args);
-    let mut env_full = vec![("SOCKET_TELEMETRY_DISABLED", "1")];
-    env_full.extend_from_slice(env);
-    common::run_with_env(cwd, &full, &env_full)
-}
-
-fn read_bytes(path: &Path) -> Vec<u8> {
-    std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-/// One hand-written camelCase manifest with a single `files: {}` patch —
-/// the internal rollback needs no before-blobs, keeping wet runs offline.
-fn write_manifest_files_empty(root: &Path, purl: &str, uuid: &str) -> PathBuf {
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(&socket).expect("create .socket");
-    let manifest = format!(
-        r#"{{
-  "patches": {{
-    "{purl}": {{
-      "uuid": "{uuid}",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{}},
-      "vulnerabilities": {{}},
-      "description": "covgap remove test patch",
-      "license": "MIT",
-      "tier": "free"
-    }}
-  }}
-}}"#
-    );
-    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
-    socket
-}
-
-/// Two-entry `files: {}` manifest (purl1/uuid1, purl2/uuid2).
-fn write_two_entry_manifest(
-    root: &Path,
-    purl1: &str,
-    uuid1: &str,
-    purl2: &str,
-    uuid2: &str,
-) -> PathBuf {
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(&socket).expect("create .socket");
-    let manifest = format!(
-        r#"{{
-  "patches": {{
-    "{purl1}": {{
-      "uuid": "{uuid1}",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{}},
-      "vulnerabilities": {{}},
-      "description": "covgap remove test patch 1",
-      "license": "MIT",
-      "tier": "free"
-    }},
-    "{purl2}": {{
-      "uuid": "{uuid2}",
-      "exportedAt": "2024-01-02T00:00:00Z",
-      "files": {{}},
-      "vulnerabilities": {{}},
-      "description": "covgap remove test patch 2",
-      "license": "MIT",
-      "tier": "free"
-    }}
-  }}
-}}"#
-    );
-    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
-    socket
-}
-
-/// Vendor ledger with one npm entry keyed `key` (extra: raw JSON fields
-/// appended to the entry — e.g. `"flavor": "...",` or `"detached": true,`),
-/// plus the artifact dir it names. Fixture shape copied from
-/// remove_invariants.rs::write_vendored_ledger.
-fn write_vendor_ledger_entry(
-    root: &Path,
-    key: &str,
-    base_purl: &str,
-    uuid: &str,
-    wiring: &str,
-    extra: &str,
-) -> PathBuf {
-    let vendor = root.join(".socket/vendor");
-    let artifact_dir = vendor.join("npm").join(uuid);
-    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
-    std::fs::write(artifact_dir.join("package.tgz"), b"tgz").expect("write artifact");
-    let state = format!(
-        r#"{{
-  "version": 1,
-  "entries": {{
-    "{key}": {{
-      "ecosystem": "npm",
-      "basePurl": "{base_purl}",
-      "uuid": "{uuid}",
-      {extra}"artifact": {{ "path": ".socket/vendor/npm/{uuid}/package.tgz" }},
-      "wiring": {wiring}
-    }}
-  }}
-}}"#
-    );
-    std::fs::write(vendor.join("state.json"), state).expect("write vendor state");
-    artifact_dir
-}
-
-/// A wiring record naming a file the npm revert backend does not edit: the
-/// revert drift-keeps (`kept_artifact`) — fixture copied from
-/// remove_duality_invariants.rs.
-const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }]"#;
-
-// ---------------------------------------------------------------------------
-// Hosted-redirect fixtures (copied from remove_duality_invariants.rs). The
-// lockfile pin IS the hosted state; the ledger text is a pre-v5 leftover.
-// ---------------------------------------------------------------------------
-
-const NPM_PURL: &str = "pkg:npm/left-pad@1.3.0";
-const NPM_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
-const ORIG_RESOLVED: &str = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
-const ORIG_INTEGRITY: &str = "sha512-UPSTREAM==";
-const HOSTED_RESOLVED: &str = "https://patch.socket.dev/patch/npm/left-pad/1.3.0/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/left-pad-1.3.0.tgz";
-const HOSTED_INTEGRITY: &str = "sha512-PATCHED==";
-
-/// A lockfileVersion-3 package-lock.json whose left-pad entry currently
-/// holds the HOSTED (redirected) resolved/integrity pair.
-fn redirected_lock_text() -> String {
-    format!(
-        r#"{{
-  "name": "hosted-fixture",
-  "version": "0.0.0",
-  "lockfileVersion": 3,
-  "packages": {{
-    "": {{ "name": "hosted-fixture", "version": "0.0.0" }},
-    "node_modules/left-pad": {{
-      "name": "left-pad",
-      "version": "1.3.0",
-      "resolved": "{HOSTED_RESOLVED}",
-      "integrity": "{HOSTED_INTEGRITY}"
-    }}
-  }}
-}}
-"#
-    )
-}
-
-/// A PRE-V5 redirect ledger (v5 never writes one) with ONE npm record and
-/// its recorded `redirect_npm_lock_entry` edit matching
-/// [`redirected_lock_text`].
-fn npm_redirect_ledger_text() -> String {
-    format!(
-        r#"{{
-  "version": 1,
-  "mode": "hosted",
-  "edits": [
-    {{
-      "path": "package-lock.json",
-      "kind": "redirect_npm_lock_entry",
-      "action": "rewritten",
-      "key": "node_modules/left-pad",
-      "original": {{ "resolved": "{ORIG_RESOLVED}", "integrity": "{ORIG_INTEGRITY}" }},
-      "new": {{ "resolved": "{HOSTED_RESOLVED}", "integrity": "{HOSTED_INTEGRITY}" }}
-    }}
-  ],
-  "records": {{
-    "{NPM_PURL}": {{
-      "uuid": "{NPM_UUID}",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{}},
-      "vulnerabilities": {{}},
-      "description": "covgap hosted npm patch",
-      "license": "MIT",
-      "tier": "free"
-    }}
-  }}
-}}"#
-    )
-}
-
-fn write_redirect_ledger_text(root: &Path, text: &str) -> PathBuf {
-    let vendor = root.join(".socket/vendor");
-    std::fs::create_dir_all(&vendor).expect("create .socket/vendor");
-    let path = vendor.join("redirect-state.json");
-    std::fs::write(&path, text).expect("write redirect ledger");
-    path
-}
-
-/// The exact bytes the upstream restore writes when it puts
-/// [`redirected_lock_text`] back on the registry entry the mock registry
-/// serves (`ORIG_RESOLVED` / `ORIG_INTEGRITY`; same whole-file derivation
-/// the remove_duality_invariants.rs twins use).
-fn expected_reverted_lock_text() -> String {
-    let mut expected: serde_json::Value =
-        serde_json::from_str(&redirected_lock_text()).expect("parse fixture lock");
-    let entry = expected["packages"]["node_modules/left-pad"]
-        .as_object_mut()
-        .expect("lock entry object");
-    entry.insert("resolved".into(), serde_json::json!(ORIG_RESOLVED));
-    entry.insert("integrity".into(), serde_json::json!(ORIG_INTEGRITY));
-    format!("{}\n", serde_json::to_string_pretty(&expected).unwrap())
-}
 
 // ---------------------------------------------------------------------------
 // 1. Lock contention
@@ -305,8 +96,8 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Corrupt vendor ledger fails the remove closed (the human branch also
-//    covers emit_error_envelope's stderr arm)
+// 2. Corrupt vendor ledger fails the remove closed (the human branch,
+//    emit_error_envelope's stderr arm, is in remove_render.rs)
 // ---------------------------------------------------------------------------
 
 /// Garbage `.socket/vendor/state.json` must abort the remove BEFORE any
@@ -341,38 +132,6 @@ fn remove_corrupt_vendor_ledger_fails_closed_json() {
         "the error must name the unreadable ledger; got: {msg}"
     );
     assert_eq!(v["summary"]["removed"], 0);
-    assert_eq!(
-        read_bytes(&socket.join("manifest.json")),
-        manifest_before,
-        "the mutation must be aborted: manifest byte-identical"
-    );
-}
-
-/// Human-mode twin: the same failure must reach stderr as an `Error:` line
-/// (emit_error_envelope's non-JSON arm), with no JSON envelope on stdout.
-#[test]
-fn remove_corrupt_vendor_ledger_fails_closed_human() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let purl = "pkg:npm/__covgap_vsl__@1.0.0";
-    let socket =
-        write_manifest_files_empty(tmp.path(), purl, "22222222-2222-4222-8222-222222222222");
-    let manifest_before = read_bytes(&socket.join("manifest.json"));
-    let vendor = socket.join("vendor");
-    std::fs::create_dir_all(&vendor).unwrap();
-    std::fs::write(vendor.join("state.json"), "{{{").unwrap();
-
-    let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--offline"], &[]);
-    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr
-            .lines()
-            .any(|l| l.starts_with("Error:") && l.contains(".socket/vendor/state.json")),
-        "human mode must put the error line on stderr; got:\n{stderr}"
-    );
-    assert!(
-        !stdout.contains("\"command\""),
-        "human mode must not print a JSON envelope; got:\n{stdout}"
-    );
     assert_eq!(
         read_bytes(&socket.join("manifest.json")),
         manifest_before,
@@ -488,40 +247,6 @@ fn remove_detached_unknown_vendor_flavor_fails_closed() {
 //    writable, so the artifact delete succeeds but the ledger write fails.
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-fn chmod(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
-}
-
-/// Restore the dir's mode even on assertion panic (or a panic inside the
-/// binary runner), so the tempdir can clean up.
-#[cfg(unix)]
-struct ModeGuard(PathBuf);
-
-#[cfg(unix)]
-impl Drop for ModeGuard {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-    }
-}
-
-/// Probe whether permission bits are enforced for this process; root (or
-/// CAP_DAC_OVERRIDE containers) bypasses them, making read-only-dir tests
-/// fail spuriously. Returns false (and logs a skip) when they are not.
-#[cfg(unix)]
-fn readonly_dir_enforced(dir: &Path) -> bool {
-    let probe = dir.join(".covgap-write-probe");
-    if std::fs::write(&probe, b"x").is_ok() {
-        let _ = std::fs::remove_file(&probe);
-        eprintln!("skipping: permission bits not enforced (running as root?)");
-        return false;
-    }
-    true
-}
-
 /// A vendor revert that succeeds but whose ledger persist fails must abort
 /// with `vendor_state_write_failed` — and the manifest mutation (which
 /// runs after) must never have happened.
@@ -610,54 +335,8 @@ fn remove_detached_vendor_state_write_failure_fails_with_code() {
 //
 // v5 hosted state is the lockfile pin itself (no ledger): removing a hosted
 // patch restores the pin's DEFAULT UPSTREAM registry entry, re-resolved
-// from the mock npm registry below (`SOCKET_NPM_REGISTRY`).
+// from the mock npm registry in `remove_fixture.rs` (`SOCKET_NPM_REGISTRY`).
 // ---------------------------------------------------------------------------
-
-/// A mock npm registry serving left-pad@1.3.0's version document with the
-/// fixture's upstream tarball + integrity (or nothing: every lookup 404s).
-/// wiremock serves from its own thread; the runtime only owns the server.
-struct NpmRegistry {
-    server: wiremock::MockServer,
-    _rt: tokio::runtime::Runtime,
-}
-
-impl NpmRegistry {
-    fn start(serve_left_pad: bool) -> Self {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let server = rt.block_on(async {
-            let server = MockServer::start().await;
-            if serve_left_pad {
-                Mock::given(method("GET"))
-                    .and(path("/npm/left-pad/1.3.0"))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "name": "left-pad",
-                        "version": "1.3.0",
-                        "dist": { "tarball": ORIG_RESOLVED, "integrity": ORIG_INTEGRITY }
-                    })))
-                    .mount(&server)
-                    .await;
-            }
-            server
-        });
-        Self { server, _rt: rt }
-    }
-
-    fn base(&self) -> String {
-        format!("{}/npm", self.server.uri())
-    }
-}
-
-/// `run_remove` with the npm registry pointed at `registry`.
-fn run_remove_online(cwd: &Path, args: &[&str], registry: &NpmRegistry) -> (i32, String, String) {
-    let base = registry.base();
-    run_remove(cwd, args, &[("SOCKET_NPM_REGISTRY", base.as_str())])
-}
-
-fn legacy_ledger_path(root: &Path) -> PathBuf {
-    root.join(".socket/vendor/redirect-state.json")
-}
 
 /// A dry-run remove touching a hosted pin must leave the lockfile
 /// byte-identical (and write no ledger) while reporting the would-be
@@ -738,59 +417,19 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Hosted leg: --preserve-state note + preserve-state human summary
+// 6. Hosted leg: --preserve-state warning
 // ---------------------------------------------------------------------------
 
-/// `--preserve-state` still restores hosted pins (hosted has no
-/// preservable local state) and the human run must say so on stderr —
-/// while the manifest entry survives and the final preserve summary
-/// prints.
+/// Manifest-backed: the `--preserve-state` note rides the envelope's `warnings[]`
+/// as `hosted_state_not_preservable` (the code `rollback
+/// --preserve-state` reports). The human note is in `remove_render.rs`.
 #[test]
-fn remove_hosted_preserve_state_notes_no_preservable_state() {
+fn remove_hosted_preserve_state_json_warns_no_preservable_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
     let socket = write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
     let manifest_before = read_bytes(&socket.join("manifest.json"));
-    let registry = NpmRegistry::start(true);
-
-    let (code, stdout, stderr) = run_remove_online(
-        tmp.path(),
-        &[NPM_PURL, "--yes", "--preserve-state"],
-        &registry,
-    );
-    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains("hosted wiring has no preservable local state"),
-        "the preserve-state hosted note must reach stderr; got:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("Manifest entry preserved (--preserve-state)"),
-        "the preserve-state summary must print; got:\n{stdout}"
-    );
-
-    // The restore really happened: the lock holds the upstream entry.
-    assert_eq!(
-        std::fs::read_to_string(&lock_path).unwrap(),
-        expected_reverted_lock_text(),
-        "the lock must hold exactly the upstream registry entry"
-    );
-    // The state half was preserved: manifest byte-identical.
-    assert_eq!(
-        read_bytes(&socket.join("manifest.json")),
-        manifest_before,
-        "--preserve-state must keep the manifest entry"
-    );
-}
-
-/// Manifest-backed JSON twin: the note rides the envelope's `warnings[]`
-/// as `hosted_state_not_preservable` (the code `rollback
-/// --preserve-state` reports), not only human stderr.
-#[test]
-fn remove_hosted_preserve_state_json_warns_no_preservable_state() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join("package-lock.json"), redirected_lock_text()).unwrap();
-    write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
     let registry = NpmRegistry::start(true);
 
     let (code, stdout, stderr) = run_remove_online(
@@ -806,37 +445,30 @@ fn remove_hosted_preserve_state_json_warns_no_preservable_state() {
             .any(|c| c == "hosted_state_not_preservable"),
         "expected a hosted_state_not_preservable warning; envelope={v}"
     );
-}
-
-/// Hosted-only twin (#433): with no manifest — the default v5 shape after
-/// a bare `scan` — `remove --preserve-state` still restores the pin, and
-/// must say so: the `Note: …` line on stderr in human mode, the
-/// `hosted_state_not_preservable` warning in `--json`.
-#[test]
-fn remove_hosted_only_preserve_state_notes_no_preservable_state() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let lock_path = tmp.path().join("package-lock.json");
-    std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let registry = NpmRegistry::start(true);
-
-    let (code, stdout, stderr) = run_remove_online(
-        tmp.path(),
-        &[NPM_PURL, "--yes", "--preserve-state"],
-        &registry,
-    );
-    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains("Note: hosted wiring has no preservable local state"),
-        "the preserve-state hosted note must reach stderr; got:\n{stderr}"
-    );
+    // The restore really happened: the lock holds the upstream entry.
     assert_eq!(
         std::fs::read_to_string(&lock_path).unwrap(),
         expected_reverted_lock_text(),
         "the lock must hold exactly the upstream registry entry"
     );
+    // The state half was preserved: manifest byte-identical.
+    assert_eq!(
+        read_bytes(&socket.join("manifest.json")),
+        manifest_before,
+        "--preserve-state must keep the manifest entry"
+    );
+}
 
-    // JSON: re-pin, then the warning must ride the envelope.
+/// Hosted-only twin (#433): with no manifest — the default v5 shape after
+/// a bare `scan` — `remove --json --preserve-state` still restores the pin
+/// and carries a `hosted_state_not_preservable` warning, kept off stderr.
+/// The human `Note: …` line is checked in `remove_render.rs`.
+#[test]
+fn remove_hosted_only_preserve_state_json_warns_no_preservable_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let lock_path = tmp.path().join("package-lock.json");
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
+    let registry = NpmRegistry::start(true);
     let (code, stdout, stderr) = run_remove_online(
         tmp.path(),
         &[NPM_PURL, "--json", "--yes", "--preserve-state"],
@@ -882,7 +514,7 @@ fn remove_hosted_only_preserve_state_notes_no_preservable_state() {
 /// lockfiles, so a manifest removal neither reads nor warns about it, the
 /// removal succeeds, and the file is left alone.
 #[test]
-fn remove_corrupt_legacy_hosted_ledger_is_ignored_human() {
+fn remove_corrupt_legacy_hosted_ledger_is_ignored() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_hcorrupt__@1.0.0";
     let socket =
@@ -942,7 +574,7 @@ fn remove_corrupt_legacy_hosted_ledger_is_ignored_json() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Hosted-only refusal + human listing
+// 8. Hosted-only --skip-rollback refusal
 // ---------------------------------------------------------------------------
 
 /// With no manifest entry to delete, removing a hosted patch can only mean
@@ -971,50 +603,6 @@ fn remove_hosted_only_skip_rollback_refused() {
     );
     assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
     assert!(!tmp.path().join(".socket").exists(), "nothing written");
-}
-
-/// Hosted-only human mode: the pre-confirm listing ("The following hosted
-/// redirect(s) will be unwound and removed:") must print to stderr, the
-/// wet run must restore the upstream entry, and a pre-v5 ledger left
-/// beside the pin is retired once no hosted pin remains (it is never the
-/// revert source: its recorded original disagrees with the registry).
-#[test]
-fn remove_hosted_only_human_lists_redirects_and_unwinds() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let lock_path = tmp.path().join("package-lock.json");
-    std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-    let ledger_path = write_redirect_ledger_text(
-        tmp.path(),
-        &npm_redirect_ledger_text().replace(ORIG_INTEGRITY, "sha512-LEDGERledger=="),
-    );
-    let registry = NpmRegistry::start(true);
-
-    let (code, stdout, stderr) = run_remove_online(tmp.path(), &[NPM_PURL, "--yes"], &registry);
-    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains("The following hosted patch will be unwound and removed:"),
-        "the hosted-only listing must reach stderr; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("  - {NPM_PURL}")),
-        "the listing must name the purl; got:\n{stderr}"
-    );
-    assert!(
-        stdout.contains(&format!(
-            "Restored {NPM_PURL} to its upstream registry entry"
-        )),
-        "the restore line must print; got:\n{stdout}"
-    );
-    // The restore really ran: lock holds the registry's entry byte-exactly.
-    assert_eq!(
-        std::fs::read_to_string(&lock_path).unwrap(),
-        expected_reverted_lock_text(),
-        "the lock must hold exactly the upstream registry entry"
-    );
-    assert!(
-        !ledger_path.exists(),
-        "the pre-v5 ledger is retired once no hosted pin remains"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,40 +668,6 @@ fn remove_hosted_only_revert_failure_fails_closed() {
         "the error must name the purl and the offline cause; got: {msg}"
     );
     assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
-}
-
-/// B77: a human (non-JSON) hosted remove whose restore is refused prints
-/// the refusal ONCE. The hosted leg prints each refusal as it happens;
-/// remove used to print the same `Error:` line again on its way out.
-/// Covers the manifest-backed path (which adds that the manifest was not
-/// modified) and the hosted-only path.
-#[test]
-fn remove_hosted_revert_failure_prints_the_error_once() {
-    let needle = "annot restore pkg:npm/left-pad@1.3.0 to its upstream registry entry";
-    for manifest_backed in [true, false] {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let lock_path = tmp.path().join("package-lock.json");
-        std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-        if manifest_backed {
-            write_manifest_files_empty(tmp.path(), NPM_PURL, NPM_UUID);
-        }
-        let (code, stdout, stderr) = run_remove(tmp.path(), &[NPM_PURL, "--yes", "--offline"], &[]);
-        assert_eq!(
-            code, 1,
-            "manifest_backed={manifest_backed}: stdout=\n{stdout}\nstderr=\n{stderr}"
-        );
-        assert_eq!(
-            stderr.matches(needle).count(),
-            1,
-            "manifest_backed={manifest_backed}: the refusal must print exactly once; \
-             stderr=\n{stderr}"
-        );
-        assert_eq!(
-            stderr.contains("The manifest was not modified."),
-            manifest_backed,
-            "manifest_backed={manifest_backed}: stderr=\n{stderr}"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,32 +763,6 @@ fn remove_hosted_only_lockfile_write_failure_fails_closed() {
 // 11. Drift-keep exclusion arms + mixed partial failure
 // ---------------------------------------------------------------------------
 
-const MIXED_UUID: &str = "88888888-8888-4888-8888-888888888888";
-const MIXED_KEPT_PURL: &str = "pkg:npm/__covgap_dk_kept__@1.0.0";
-const MIXED_REMOVED_PURL: &str = "pkg:npm/__covgap_dk_removed__@2.0.0";
-
-/// Two manifest entries sharing one patch uuid — the only identifier shape
-/// that matches BOTH while the drift-keep exclusion set covers only one —
-/// plus a drift-keeping vendored ledger entry for the first.
-fn make_mixed_drift_fixture(root: &Path) -> PathBuf {
-    let socket = write_two_entry_manifest(
-        root,
-        MIXED_KEPT_PURL,
-        MIXED_UUID,
-        MIXED_REMOVED_PURL,
-        MIXED_UUID,
-    );
-    write_vendor_ledger_entry(
-        root,
-        MIXED_KEPT_PURL,
-        MIXED_KEPT_PURL,
-        MIXED_UUID,
-        DRIFTED_WIRING,
-        "",
-    );
-    socket
-}
-
 /// The MIXED drift-keep outcome — some entries kept, some removed — had
 /// never run in any mode. JSON contract: `status: partialFailure` with NO
 /// top-level error (the removal partially happened), `summary.removed`
@@ -1295,33 +823,6 @@ fn remove_mixed_drift_keep_is_partial_failure_json() {
         read_bytes(&ledger_path),
         ledger_before,
         "the drift-kept ledger entry must survive byte-for-byte"
-    );
-}
-
-/// Human twin: exit 1 plus the singular drift-keep error line on stderr
-/// (the count + pluralization surface).
-#[test]
-fn remove_mixed_drift_keep_is_partial_failure_human() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let socket = make_mixed_drift_fixture(tmp.path());
-
-    let (code, stdout, stderr) = run_remove(tmp.path(), &[MIXED_UUID, "--yes", "--offline"], &[]);
-    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains("1 matching entry was drift-kept"),
-        "the singular drift-keep error line must reach stderr; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("re-run `scan --mode vendored`"),
-        "the error must carry the normalize remedy; got:\n{stderr}"
-    );
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
-            .unwrap();
-    let patches = manifest["patches"].as_object().expect("patches object");
-    assert!(
-        patches.contains_key(MIXED_KEPT_PURL) && !patches.contains_key(MIXED_REMOVED_PURL),
-        "the kept entry must survive and the sibling must be removed; got: {patches:?}"
     );
 }
 
@@ -1545,178 +1046,7 @@ fn remove_detached_skip_rollback_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. Human-mode output surfaces
-// ---------------------------------------------------------------------------
-
-/// A base PURL expanding to multiple manifest entries must make the blast
-/// radius explicit on stderr before removing all of them.
-#[test]
-fn remove_multi_variant_blast_radius_prints_expansion() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let sdist = "pkg:pypi/__covgap_blast__@1.0.0?artifact_id=sdist";
-    let wheel = "pkg:pypi/__covgap_blast__@1.0.0?artifact_id=wheel";
-    let base = "pkg:pypi/__covgap_blast__@1.0.0";
-    let socket = write_two_entry_manifest(
-        tmp.path(),
-        sdist,
-        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        wheel,
-        "ffffffff-ffff-4fff-8fff-ffffffffffff",
-    );
-
-    let (code, stdout, stderr) = run_remove(tmp.path(), &[base, "--yes", "--offline"], &[]);
-    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains(&format!(
-            "{base} matches 2 release variants — all will be removed:"
-        )),
-        "the blast-radius line must reach stderr; got:\n{stderr}"
-    );
-    assert!(
-        stdout.contains("Removed 2 patches from manifest:"),
-        "both variants must be removed; got:\n{stdout}"
-    );
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
-            .unwrap();
-    assert!(
-        manifest["patches"].as_object().unwrap().is_empty(),
-        "both variants must be gone from the manifest"
-    );
-}
-
-/// The "already in original state" count line: an entry
-/// whose installed file is already at its original bytes rolls back as
-/// already-original, and the human run must say so. (JSON twin lives in
-/// remove_invariants.rs.)
-#[test]
-fn remove_already_original_human_prints_count_line() {
-    let original = b"covgap original bytes\n";
-    let before_hash = common::git_sha256(original);
-    let after_hash = "1111111111111111111111111111111111111111111111111111111111111111";
-    let purl = "pkg:npm/__covgap_already__@1.0.0";
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let socket = tmp.path().join(".socket");
-    std::fs::create_dir_all(&socket).unwrap();
-    let manifest = format!(
-        r#"{{
-  "patches": {{
-    "{purl}": {{
-      "uuid": "11111111-1111-4111-8111-111111111111",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{
-        "package/a.js": {{ "beforeHash": "{before_hash}", "afterHash": "{after_hash}" }}
-      }},
-      "vulnerabilities": {{}},
-      "description": "covgap already-original patch",
-      "license": "MIT",
-      "tier": "free"
-    }}
-  }}
-}}"#
-    );
-    std::fs::write(socket.join("manifest.json"), manifest).unwrap();
-    common::write_blob(&socket, &before_hash, original);
-
-    // Installed at the BEFORE bytes: rollback verifies already-original.
-    std::fs::write(
-        tmp.path().join("package.json"),
-        r#"{ "name": "covgap-already-root", "version": "0.0.0" }"#,
-    )
-    .unwrap();
-    let pkg_dir = tmp.path().join("node_modules/__covgap_already__");
-    std::fs::create_dir_all(&pkg_dir).unwrap();
-    std::fs::write(
-        pkg_dir.join("package.json"),
-        r#"{ "name": "__covgap_already__", "version": "1.0.0" }"#,
-    )
-    .unwrap();
-    std::fs::write(pkg_dir.join("a.js"), original).unwrap();
-
-    let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--offline"], &[]);
-    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stdout.contains("1 package already in original state"),
-        "the already-original count line must print; got:\n{stdout}"
-    );
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
-            .unwrap();
-    assert!(
-        manifest["patches"].as_object().unwrap().is_empty(),
-        "the entry must be removed"
-    );
-}
-
-/// Wet `--preserve-state` on a vendored entry, human mode: the per-key
-/// "Unwired vendoring … (artifact preserved)" line plus
-/// the final preserve summary, with all state kept.
-#[test]
-fn remove_preserve_state_vendored_human_wet_surfaces() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let purl = "pkg:npm/__covgap_pv__@1.0.0";
-    let uuid = "12121212-1212-4121-8121-121212121212";
-    let socket = write_manifest_files_empty(tmp.path(), purl, uuid);
-    let artifact_dir = write_vendor_ledger_entry(tmp.path(), purl, purl, uuid, "[]", "");
-    let manifest_before = read_bytes(&socket.join("manifest.json"));
-    let ledger_path = tmp.path().join(".socket/vendor/state.json");
-    let ledger_before = read_bytes(&ledger_path);
-
-    let (code, stdout, stderr) = run_remove(
-        tmp.path(),
-        &[purl, "--yes", "--offline", "--preserve-state"],
-        &[],
-    );
-    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stdout.contains(&format!(
-            "Unwired vendoring for {purl} (artifact preserved)"
-        )),
-        "the per-key preserve line must print; got:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("Manifest entry and vendored artifact preserved"),
-        "the preserve summary must print; got:\n{stdout}"
-    );
-    // All state kept: manifest, ledger, artifact.
-    assert_eq!(read_bytes(&socket.join("manifest.json")), manifest_before);
-    assert_eq!(read_bytes(&ledger_path), ledger_before);
-    assert!(artifact_dir.join("package.tgz").exists());
-}
-
-/// Dry-run `--preserve-state` twin: the "Would unwire vendoring …
-/// (artifact preserved)" preview line, nothing mutated.
-#[test]
-fn remove_preserve_state_vendored_human_dry_run_previews() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let purl = "pkg:npm/__covgap_pv__@1.0.0";
-    let uuid = "12121212-1212-4121-8121-121212121212";
-    let socket = write_manifest_files_empty(tmp.path(), purl, uuid);
-    let artifact_dir = write_vendor_ledger_entry(tmp.path(), purl, purl, uuid, "[]", "");
-    let manifest_before = read_bytes(&socket.join("manifest.json"));
-    let ledger_path = tmp.path().join(".socket/vendor/state.json");
-    let ledger_before = read_bytes(&ledger_path);
-
-    let (code, stdout, stderr) = run_remove(
-        tmp.path(),
-        &[purl, "--yes", "--offline", "--preserve-state", "--dry-run"],
-        &[],
-    );
-    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stdout.contains(&format!(
-            "Would unwire vendoring for {purl} (artifact preserved)"
-        )),
-        "the dry-run preserve preview must print; got:\n{stdout}"
-    );
-    assert_eq!(read_bytes(&socket.join("manifest.json")), manifest_before);
-    assert_eq!(read_bytes(&ledger_path), ledger_before);
-    assert!(artifact_dir.join("package.tgz").exists());
-}
-
-// ---------------------------------------------------------------------------
-// 15. Blob/archive cleanup failures warn, never fatal
+// 14. Blob/archive cleanup failures warn, never fatal
 // ---------------------------------------------------------------------------
 
 /// Plant `.socket/blobs`, `.socket/diffs`, `.socket/packages` as regular
@@ -1756,7 +1086,7 @@ fn remove_cleanup_failures_warn_not_fatal() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. rollback_patches_inner Err(String) plumbing (remove.rs's rollback match) — distinct
+// 15. rollback_patches_inner Err(String) plumbing (remove.rs's rollback match) — distinct
 //     from the covered Ok(success=false) gate abort.
 // ---------------------------------------------------------------------------
 
@@ -1839,107 +1169,7 @@ fn remove_rollback_infrastructure_error_surfaces_rollback_failed() {
 }
 
 // ---------------------------------------------------------------------------
-// 17. Hosted-only interactive decline — PTY-driven
-//     (the non-TTY confirm auto-proceeds, so only a real terminal reaches
-//     the cancel branch). Runner copied from interactive_prompts_e2e.rs.
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-mod pty {
-    use super::*;
-    use portable_pty::{native_pty_system, PtySize};
-    use std::time::Duration;
-
-    /// Spawn the binary inside a PTY, send `input`, collect all output
-    /// until exit (watchdog-killed after `timeout`).
-    fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-
-        // The hermetic environment: SOCKET_YES would skip the very prompt
-        // this test drives.
-        let mut cmd = common::hermetic::pty_binary_command();
-        for a in args {
-            cmd.arg(a);
-        }
-        cmd.cwd(cwd);
-
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
-        drop(pair.slave);
-
-        let reader_handle =
-            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
-
-        let mut killer = child.clone_killer();
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            let _ = killer.kill();
-        });
-
-        let mut writer = pair.master.take_writer().expect("take writer");
-        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
-        drop(writer);
-
-        let status = child.wait().expect("child.wait");
-        drop(pair.master);
-        let output = reader_handle.finish();
-        (
-            status.exit_code() as i32,
-            String::from_utf8_lossy(&output).to_string(),
-        )
-    }
-
-    /// Declining the hosted-only confirm prompt must cancel cleanly (exit
-    /// 0, "Cancelled; no changes made.") with the lock byte-identical and no
-    /// `.socket/` state written.
-    #[test]
-    fn remove_hosted_only_interactive_n_cancels() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let lock_path = tmp.path().join("package-lock.json");
-        std::fs::write(&lock_path, redirected_lock_text()).unwrap();
-        let lock_before = read_bytes(&lock_path);
-
-        let (code, output) = run_in_pty(
-            &["remove", NPM_PURL],
-            tmp.path(),
-            "n\n",
-            Duration::from_secs(15),
-        );
-        assert_eq!(
-            code, 0,
-            "declined hosted remove must exit cleanly; got: {output}"
-        );
-        // Vacuity guard: the hosted-only confirm prompt MUST have run.
-        assert!(
-            output.contains("Remove 1 hosted patch and unwind its lockfile wiring?"),
-            "the hosted-only confirm prompt must have shown; got: {output}"
-        );
-        assert!(
-            !output.contains("Non-interactive mode"),
-            "must NOT have taken the non-interactive branch in a PTY; got: {output}"
-        );
-        assert!(
-            output.contains("Cancelled; no changes made."),
-            "'n' must report cancellation; got: {output}"
-        );
-        // Declined: nothing moved.
-        assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
-        assert!(
-            !tmp.path().join(".socket").exists(),
-            "a declined remove leaves no .socket/ state"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 14. Ledger-only path: --preserve-state, drift-keeps, and the missing
+// 16. Ledger-only path: --preserve-state, drift-keeps, and the missing
 //     `detached` flag — one revert loop shared with the manifest path.
 // ---------------------------------------------------------------------------
 
@@ -1948,8 +1178,8 @@ mod pty {
 /// `--preserve-state` promise. The empty wiring
 /// makes the unwire an offline no-op, so the keep-everything half is what
 /// shows: exit 0, a `skipped`/`vendor_state_preserved` event, no `removed`
-/// event, ledger byte-identical, artifact on disk. Dry-run twin previews
-/// the unwire and mutates nothing.
+/// event, ledger byte-identical, artifact on disk. The dry-run preview's
+/// wording is checked in `remove_render.rs`.
 #[test]
 fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1991,45 +1221,6 @@ fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
     assert!(
         artifact_dir.join("package.tgz").exists(),
         "the artifact must be preserved"
-    );
-
-    // Dry-run twin: the listing and the preview line say what --preserve-state
-    // will do, and nothing moves.
-    let tmp2 = tempfile::tempdir().expect("tempdir");
-    let artifact_dir2 = write_vendor_ledger_entry(
-        tmp2.path(),
-        purl,
-        purl,
-        uuid,
-        "[]",
-        "\"detached\": true,\n      ",
-    );
-    let ledger_path2 = tmp2.path().join(".socket/vendor/state.json");
-    let ledger_before2 = read_bytes(&ledger_path2);
-    let (code, stdout, stderr) = run_remove(
-        tmp2.path(),
-        &[purl, "--offline", "--preserve-state", "--dry-run"],
-        &[],
-    );
-    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stdout.contains(&format!(
-            "Would unwire vendoring for {purl} (artifact preserved)"
-        )),
-        "the preserve preview line must print; stdout=\n{stdout}"
-    );
-    assert!(
-        stderr.contains("would be unwired (artifacts and ledger entries preserved)"),
-        "the listing must be honest about --preserve-state; stderr=\n{stderr}"
-    );
-    assert_eq!(
-        read_bytes(&ledger_path2),
-        ledger_before2,
-        "dry run: ledger untouched"
-    );
-    assert!(
-        artifact_dir2.join("package.tgz").exists(),
-        "dry run: artifact untouched"
     );
 }
 
@@ -2085,35 +1276,6 @@ fn remove_detached_drift_keep_holds_ledger_entry_and_exits_one() {
     assert!(
         artifact_dir.join("package.tgz").exists(),
         "the drift-kept artifact must survive"
-    );
-
-    // Human twin: the per-key keep line and the errors-only summary line.
-    let tmp2 = tempfile::tempdir().expect("tempdir");
-    write_vendor_ledger_entry(
-        tmp2.path(),
-        purl,
-        purl,
-        uuid,
-        DRIFTED_WIRING,
-        "\"detached\": true,\n      ",
-    );
-    let (code, stdout, stderr) = run_remove(tmp2.path(), &[purl, "--yes", "--offline"], &[]);
-    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains(&format!(
-            "Kept vendored state for {purl}: lockfile wiring drifted"
-        )),
-        "the per-key keep line must print; stderr=\n{stderr}"
-    );
-    assert!(
-        stderr.contains(
-            "1 matching entry was drift-kept (vendored state and ledger record retained)"
-        ),
-        "the summary error line must print; stderr=\n{stderr}"
-    );
-    assert!(
-        !stdout.contains("Reverted vendoring for"),
-        "nothing was reverted; stdout=\n{stdout}"
     );
 }
 

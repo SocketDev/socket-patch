@@ -8,7 +8,8 @@
 //! (#1071). A leading `./`, empty components and a trailing `/` are
 //! ignored. A leading `!` negates; each caller applies negations the way
 //! its package manager does. pnpm's globber also never lets a wildcard
-//! match a component that starts with `.` ([`glob_matches_no_dot`]).
+//! match a component that starts with `.` ([`glob_matches_no_dot`]), and
+//! neither do Bun's and vlt's (`WorkspacesDialect::dot`).
 //! npm, yarn and vlt also match extglobs (`@(a|b)`, `?(..)`, `*(..)`, `+(..)`,
 //! `!(..)`) within one component, and yarn classic ignores `!` patterns;
 //! [`WorkspacesDialect`] names what each package manager reads (#1097).
@@ -35,7 +36,7 @@ pub(crate) struct WorkspacesDialect {
     /// segments ([`Picomatch`], #1490).
     pub(crate) picomatch: bool,
     /// `*`, `?` and `**` match a component that starts with `.`. vlt's
-    /// node-glob does not (#1542).
+    /// node-glob (#1542) and Bun's glob (#1631) do not.
     pub(crate) dot: bool,
 }
 
@@ -90,7 +91,7 @@ impl WorkspacesDialect {
         negation: Negation::LastMatchWins,
         extglob: false,
         picomatch: false,
-        dot: true,
+        dot: false,
     };
     /// Bun before 1.3: it lists `!`-negated directories anyway. An
     /// untagged lock reads this way until its workspace list shows it
@@ -99,7 +100,7 @@ impl WorkspacesDialect {
         negation: Negation::Ignored,
         extglob: false,
         picomatch: false,
-        dot: true,
+        dot: false,
     };
     /// vlt 1.3 and later, probed on 1.3.8 (#1542).
     pub(crate) const VLT: Self = Self {
@@ -158,7 +159,15 @@ pub(crate) fn workspaces_include_as(
             let mut included = false;
             for pattern in patterns {
                 let (negated, pattern) = split_negation(pattern);
-                if matches(pattern, negated) {
+                // Bun's walker skips dot components, but it filters the
+                // walked directories through its `!` patterns with a plain
+                // match that has no dot rule (as node-glob's ignore below).
+                let hit = if negated {
+                    pattern_matches(pattern, rel, true, dialect.extglob, None)
+                } else {
+                    matches(pattern, false)
+                };
+                if hit {
                     included = !negated;
                 }
             }
@@ -1281,6 +1290,49 @@ mod tests {
             &rel(&long),
             WorkspacesDialect::NPM
         ));
+    }
+
+    /// #1631: Bun's workspace glob never lets `*`, `?` or `**` match a
+    /// component that starts with `.`, probed on Bun 1.1.39, 1.2.23, 1.3.9
+    /// and 1.4.3 (`packages/*` does not list `packages/.hidden`,
+    /// `packages/**` does not list `packages/.cache/x`); a pattern
+    /// component that spells the dot still matches it.
+    #[test]
+    fn bun_wildcards_skip_dot_components() {
+        use WorkspacesDialect as D;
+        let rel = |p: &str| p.split('/').map(str::to_string).collect::<Vec<_>>();
+        let pats = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for dialect in [D::BUN, D::BUN_PRE_1_3] {
+            for (patterns, dir, listed) in [
+                (&["packages/*"][..], "packages/.hidden", false),
+                (&["packages/*"], "packages/a", true),
+                (&["packages/**"], "packages/.cache/x", false),
+                (&["packages/**"], "packages/x/y", true),
+                (&["packages/?hidden"], "packages/.hidden", false),
+                (&["**"], ".github/x", false),
+                (&["packages/.hidden"], "packages/.hidden", true),
+                (&["packages/.*"], "packages/.hidden", true),
+                (&["packages/.cache/*"], "packages/.cache/x", true),
+                // A `!` pattern still excludes a dot directory an explicit
+                // pattern listed.
+                (
+                    &["packages/.hidden", "!packages/*"],
+                    "packages/.hidden",
+                    dialect == D::BUN_PRE_1_3,
+                ),
+                (
+                    &["packages/.*", "!packages/**"],
+                    "packages/.hidden",
+                    dialect == D::BUN_PRE_1_3,
+                ),
+            ] {
+                assert_eq!(
+                    workspaces_include_as(&pats(patterns), &rel(dir), dialect),
+                    listed,
+                    "{dialect:?}: {patterns:?} ~ {dir}"
+                );
+            }
+        }
     }
 
     /// #1542: vlt reads `workspaces` with node-glob / minimatch, probed on

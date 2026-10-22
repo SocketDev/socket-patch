@@ -2859,6 +2859,53 @@ mod tests {
         );
     }
 
+    /// #1631: Bun's workspace globs never let a wildcard match a directory
+    /// that starts with `.` (probed on Bun 1.1.39, 1.2.23, 1.3.9 and
+    /// 1.4.3), so a project in `packages/.tools` under `packages/*` is not
+    /// a member and its own Bun lock is the one Bun installs it from. A
+    /// pattern that spells the dot component still lists it.
+    #[tokio::test]
+    async fn bun_wildcards_skip_dot_directories() {
+        const TAGGED: &str = "{\n  \"lockfileVersion\": 1,\n  \"configVersion\": 1,\n}\n";
+        for root_lock in ["bun.lock", "bun.lockb"] {
+            for (lock_text, tag) in [("{}", "untagged"), (TAGGED, "tagged")] {
+                if root_lock == "bun.lockb" && tag == "tagged" {
+                    continue;
+                }
+                for (globs, member_dir, refused) in [
+                    (r#"["packages/*"]"#, "packages/.tools", false),
+                    (r#"["packages/**"]"#, "packages/.cache/x", false),
+                    (r#"["packages/?tools"]"#, "packages/.tools", false),
+                    (r#"["packages/.tools"]"#, "packages/.tools", true),
+                    (r#"["packages/.*"]"#, "packages/.tools", true),
+                    (r#"["packages/*"]"#, "packages/a", true),
+                ] {
+                    let case = format!("{root_lock} ({tag}), {globs} ~ {member_dir}");
+                    let tmp = tempfile::tempdir().unwrap();
+                    write(
+                        tmp.path(),
+                        "package.json",
+                        &format!(r#"{{"name":"root","private":true,"workspaces":{globs}}}"#),
+                    );
+                    write(tmp.path(), root_lock, lock_text);
+                    write(tmp.path(), &format!("{member_dir}/package.json"), "{}");
+                    write(tmp.path(), &format!("{member_dir}/bun.lock"), "{}");
+                    let member = tmp.path().join(member_dir);
+                    assert_eq!(
+                        code(&member, "npm").await.as_deref(),
+                        refused.then_some(WORKSPACE_LOCKFILE_ELSEWHERE),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        member_stray_lock(&member).await.is_some(),
+                        refused,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
     /// #1101: Bun installs every `package.json` workspace member from the
     /// root's `bun.lock` / `bun.lockb` and never reads a lock inside the
     /// member, so a stray member Bun lock does not make the member its own
