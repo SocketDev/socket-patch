@@ -569,10 +569,8 @@ fn remove_cleanup_failures_print_one_warning_per_store() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--skip-rollback"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     for store in ["blob", "diffs", "packages"] {
-        let warnings = stderr
-            .lines()
-            .filter(|l| l.starts_with(&format!("Warning: {store} cleanup failed: ")))
-            .count();
+        let prefix = format!("Warning: {store} cleanup failed: ");
+        let warnings = stderr.lines().filter(|l| l.starts_with(&prefix)).count();
         assert_eq!(
             warnings, 1,
             "the {store} sweep must warn once; got:\n{stderr}"

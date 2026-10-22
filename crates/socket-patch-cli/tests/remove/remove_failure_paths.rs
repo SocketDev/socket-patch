@@ -1076,16 +1076,19 @@ fn remove_cleanup_failures_warn_not_fatal() {
         ["cleanup_failed"; 3],
         "one warning per failed sweep; envelope={v}"
     );
-    // Each warning's detail opens with its pass's label.
-    let mut stores: Vec<&str> = v["warnings"]
+    // One warning per pass, not one pass warned three times. Which store
+    // each names is wording, checked in `remove_render.rs`.
+    let mut details: Vec<&str> = v["warnings"]
         .as_array()
         .expect("warnings array")
         .iter()
-        .filter_map(|w| w["detail"].as_str()?.split_once(" cleanup failed: "))
-        .map(|(store, _)| store)
+        .filter_map(|w| w["detail"].as_str())
         .collect();
-    stores.sort_unstable();
-    assert_eq!(stores, ["blob", "diffs", "packages"], "envelope={v}");
+    details.sort_unstable();
+    details.dedup();
+    assert_eq!(details.len(), 3, "envelope={v}");
+    assert_eq!(v["summary"]["removed"], 1, "envelope={v}");
+    assert_eq!(event_purls(&v, "removed"), [purl], "envelope={v}");
     assert!(
         !stderr.contains("Warning:"),
         "--json must not also print the warnings; stderr=\n{stderr}"
