@@ -3832,6 +3832,21 @@ fn vendored_unwind_names_the_patched_cached_archive(fx: &RedirectFixture, comman
         gemfile.contains(".socket/vendor/gem/"),
         "{command}: the takeover vendored the gem:\n{gemfile}"
     );
+    // The takeover's own notice says the vendored copy shadows the archive
+    // for now, not that installs already fail.
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let notice = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["errorCode"] == "upstream_gem_stale_cache")
+        .unwrap_or_else(|| panic!("{command}: the takeover names the archive: {env}"));
+    assert!(
+        notice["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("while the gem stays vendored")),
+        "{command}: {notice}"
+    );
 
     let mut argv: Vec<&str> = match command {
         "vendor --revert" => vec!["vendor", "--revert", "--yes"],
