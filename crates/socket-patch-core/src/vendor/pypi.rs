@@ -1722,7 +1722,9 @@ const UUID_GITIGNORE: &str = "!*\n";
 /// `<uuid>/.gitattributes` when absent or different; neither is part of
 /// the artifact.
 pub(crate) async fn restore_uuid_metadata(uuid_dir: &Path) -> std::io::Result<()> {
-    super::npm_dir::write_uuid_metadata(uuid_dir, UUID_GITIGNORE).await
+    super::npm_dir::write_uuid_metadata(uuid_dir, UUID_GITIGNORE)
+        .await
+        .map(|_| ())
 }
 
 /// Write `<uuid>/.gitignore` and `<uuid>/.gitattributes` next to the

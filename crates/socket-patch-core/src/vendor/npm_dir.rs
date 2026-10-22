@@ -381,21 +381,24 @@ pub(crate) async fn node_modules_holds_only_links(rel_abs: &Path) -> bool {
 }
 
 /// Rewrite `<uuid>/.gitignore` and `<uuid>/.gitattributes` when absent or
-/// different; neither is part of the artifact.
-pub(crate) async fn restore_uuid_metadata(uuid_dir: &Path) -> std::io::Result<()> {
+/// different; neither is part of the artifact. `true` when either was
+/// rewritten.
+pub(crate) async fn restore_uuid_metadata(uuid_dir: &Path) -> std::io::Result<bool> {
     write_uuid_metadata(uuid_dir, UUID_GITIGNORE).await
 }
 
 /// [`restore_uuid_metadata`] with the backend's own `.gitignore` text.
-pub(crate) async fn write_uuid_metadata(uuid_dir: &Path, gitignore: &str) -> std::io::Result<()> {
+pub(crate) async fn write_uuid_metadata(uuid_dir: &Path, gitignore: &str) -> std::io::Result<bool> {
+    let mut rewritten = false;
     for (name, want) in [(GITIGNORE, gitignore), (GITATTRIBUTES, UUID_GITATTRIBUTES)] {
         let path = uuid_dir.join(name);
         let current = crate::utils::fs::read_regular_to_bytes(&path).await.ok();
         if current.as_deref() != Some(want.as_bytes()) {
             atomic_write_bytes(&path, want.as_bytes()).await?;
+            rewritten = true;
         }
     }
-    Ok(())
+    Ok(rewritten)
 }
 
 // ── gitignore probe ──────────────────────────────────────────────────────

@@ -1443,22 +1443,6 @@ async fn preflight_package(
     Ok(())
 }
 
-/// Rewrite a vlt entry's `<uuid>/.gitignore` and `<uuid>/.gitattributes`
-/// when absent or changed (health: neither is part of the
-/// artifact, so repairing them is no rebuild).
-pub async fn restore_vlt_uuid_metadata(
-    entry: &VendorEntry,
-    project_root: &Path,
-) -> std::io::Result<()> {
-    let Some(uuid_dir) = super::path::vendor_uuid_dir_rel("npm", &entry.uuid) else {
-        return Err(std::io::Error::other(format!(
-            "`{}` is not a canonical patch uuid",
-            entry.uuid
-        )));
-    };
-    super::npm_dir::restore_uuid_metadata(&project_root.join(uuid_dir)).await
-}
-
 /// The importer package.json files of the project's canonical
 /// `vlt-lock.json`, project-relative: the root one plus every workspace
 /// importer its edges name. Just the root one when the lock is missing or
@@ -3167,7 +3151,9 @@ mod tests {
             .root
             .join(format!(".socket/vendor/npm/{UUID}/.gitignore"));
         tokio::fs::remove_file(&gitignore).await.unwrap();
-        restore_vlt_uuid_metadata(&entry, &fx.root).await.unwrap();
+        crate::vendor::redownload::restore_npm_uuid_metadata(&entry, &fx.root)
+            .await
+            .unwrap();
         assert_eq!(
             tokio::fs::read_to_string(&gitignore).await.unwrap(),
             super::super::npm_dir::UUID_GITIGNORE

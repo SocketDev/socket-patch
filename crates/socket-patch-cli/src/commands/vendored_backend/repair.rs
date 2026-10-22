@@ -419,6 +419,29 @@ impl VendoredBackend<'_> {
                 entry
             };
             let health = check_vendored_artifact(&common.cwd, &entry, &record).await;
+            // An npm-family `<uuid>/.gitignore` and `.gitattributes` are not
+            // part of the artifact: a missing, edited or pre-#1541 one is
+            // simply rewritten, and git must still commit the artifact with
+            // them (#1581). A broken artifact gets both after its redownload.
+            if !common.dry_run
+                && (health == ArtifactHealth::Healthy || workspace_copy_issue(&health))
+            {
+                if let Err(e) =
+                    vendor::redownload::restore_npm_uuid_metadata(&entry, &common.cwd).await
+                {
+                    fail(
+                        env,
+                        common.json,
+                        purl,
+                        "vendor_artifact_unrepairable",
+                        format!("cannot restore the vendored dir's git metadata: {e}"),
+                    );
+                    continue;
+                }
+                if !npm_artifact_committable(common, env, purl, &entry).await {
+                    continue;
+                }
+            }
             if health == ArtifactHealth::Healthy || workspace_copy_issue(&health) {
                 let mut healed = entry.clone();
                 match repair_workspace_copies(&common.cwd, &mut healed, common.dry_run).await {
@@ -488,26 +511,6 @@ impl VendoredBackend<'_> {
                                 purl,
                                 "vendor_dep_manifest_unlocked",
                                 detail,
-                            );
-                            continue;
-                        }
-                    }
-                    // vlt's `<uuid>/.gitignore` and `.gitattributes` are not
-                    // part of the artifact: a missing or edited one is
-                    // simply rewritten.
-                    if entry.ecosystem == "npm"
-                        && entry.flavor.as_deref() == Some(vendor::vlt_lock::FLAVOR)
-                        && !common.dry_run
-                    {
-                        if let Err(e) =
-                            vendor::vlt_lock::restore_vlt_uuid_metadata(&entry, &common.cwd).await
-                        {
-                            fail(
-                                env,
-                                common.json,
-                                purl,
-                                "vendor_artifact_unrepairable",
-                                format!("cannot restore the vendored dir's .gitignore: {e}"),
                             );
                             continue;
                         }
@@ -734,6 +737,11 @@ impl VendoredBackend<'_> {
                             continue;
                         }
                     }
+                    if !npm_artifact_committable(common, env, &candidate.purl, &candidate.entry)
+                        .await
+                    {
+                        continue;
+                    }
                     if !quiet {
                         println!(
                             "Redownloaded {} ({})",
@@ -756,6 +764,29 @@ impl VendoredBackend<'_> {
             }
         }
         repaired
+    }
+}
+
+/// After repair rewrote an npm-family uuid dir: `false` (and a
+/// `vendor_artifact_gitignored` failure) when git would still leave the
+/// artifact out of the next commit, which `vendor` refuses up front. A git
+/// that cannot answer is only a warning.
+async fn npm_artifact_committable(
+    common: &GlobalArgs,
+    env: &mut Envelope,
+    purl: &str,
+    entry: &VendorEntry,
+) -> bool {
+    match vendor::redownload::npm_artifact_commit_check(entry, &common.cwd).await {
+        Ok(None) => true,
+        Ok(Some(warning)) => {
+            record_warning(env, purl, &warning, common);
+            true
+        }
+        Err((code, detail)) => {
+            fail(env, common.json, purl, code, detail);
+            false
+        }
     }
 }
 
