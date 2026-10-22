@@ -289,8 +289,8 @@ async fn eject_requires_user_patch_consent_and_reports_it_in_previews_and_writes
     mock_registry(&p).await;
     mock_view(&p).await;
     for args in [
-        vec!["vendor", "--allow-user-patches", "--dry-run"],
-        vec!["vendor", "--allow-user-patches"],
+        vec!["vendor", "--allow-patch-conflicts", "--dry-run"],
+        vec!["vendor", "--allow-patch-conflicts"],
     ] {
         let (code, env) = p.run_json(&args);
         assert_eq!(code, 0, "{args:?}: {env:#}");

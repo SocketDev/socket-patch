@@ -211,7 +211,7 @@ async fn refused_go_rewrite_is_not_confirmed_by_another_lockfile() {
         &consumer,
         &server,
         &tmp.path().join("modcache"),
-        &["--allow-user-patches"],
+        &["--allow-patch-conflicts"],
     );
     assert_eq!(hosted_pinned(&env), 0, "envelope: {env}");
     assert!(

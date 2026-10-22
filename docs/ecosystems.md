@@ -1465,7 +1465,7 @@ Prebuilt binaries are published for:
 Socket Patch treats declared project patches as a separate source of ownership.
 `scan` and `apply` skip their packages and report `user_patch_conflict`;
 explicit `get` and `vendor` refuse the conflict before patching. Use
-`--allow-user-patches` only after reviewing how the fixes interact. This flag
+`--allow-patch-conflicts` only after reviewing how the fixes interact. This flag
 permits an attempt; it does not merge diffs or bypass unsupported backend cases.
 Installed file content that matches neither the original nor Socket-patched hash
 also fails by default. See the [CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#existing-project-patches)

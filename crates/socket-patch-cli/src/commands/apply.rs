@@ -123,13 +123,13 @@ fn mismatch_overwrite_warnings(results: &[ApplyResult], dry_run: bool) -> Vec<Ru
 /// Unknown local changes fail closed unless explicitly approved; content an
 /// earlier Socket patch wrote is not a local change (patch updates). --force
 /// is existing explicit consent for file drift; declared patches have a
-/// separate gate that requires --allow-user-patches even with --force.
-fn mismatch_policy(force: bool, strict: bool, allow_user_patches: bool) -> MismatchPolicy {
+/// separate gate that requires --allow-patch-conflicts even with --force.
+fn mismatch_policy(force: bool, strict: bool, allow_patch_conflicts: bool) -> MismatchPolicy {
     if force {
         MismatchPolicy::Force
     } else if strict {
         MismatchPolicy::Strict
-    } else if allow_user_patches {
+    } else if allow_patch_conflicts {
         MismatchPolicy::Warn
     } else {
         MismatchPolicy::SocketContent
@@ -2192,7 +2192,7 @@ async fn apply_patches_inner(
     let policy = mismatch_policy(
         args.force,
         args.common.strict,
-        args.common.allow_user_patches,
+        args.common.allow_patch_conflicts,
     );
     let mut has_errors = false;
 

@@ -93,7 +93,7 @@ impl<'a> VendoredBackend<'a> {
     /// `scan_run_fits_windows_main_thread_stack`).
     pub(crate) async fn apply(&self, req: ApplyRequest<'_>, env: &mut Envelope) -> bool {
         let common: &GlobalArgs = &self.common;
-        if !common.allow_user_patches {
+        if !common.allow_patch_conflicts {
             if let Err(error) =
                 super::user_patches::check(common, req.manifest.patches.keys()).await
             {

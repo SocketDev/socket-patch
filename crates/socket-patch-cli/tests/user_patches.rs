@@ -91,7 +91,7 @@ fn apply_skips_and_vendor_refuses_declared_patches_despite_matching_hashes_or_ge
                 assert_eq!(value["error"]["code"], "user_patch_conflict", "{value}");
                 value["error"]["message"].as_str().unwrap().to_string()
             };
-            assert!(message.contains("--allow-user-patches"), "{message}");
+            assert!(message.contains("--allow-patch-conflicts"), "{message}");
             assert_eq!(
                 std::fs::read(tmp.path().join("node_modules/example/index.js")).unwrap(),
                 BEFORE
@@ -116,7 +116,7 @@ fn consent_allows_agent_application_and_does_not_modify_the_user_patch() {
     write(tmp.path(), "patches/example+1.0.0.patch", b"user diff\n");
     let (code, stdout, stderr) = run_with_env(
         tmp.path(),
-        &["apply", "--json", "--offline", "--allow-user-patches"],
+        &["apply", "--json", "--offline", "--allow-patch-conflicts"],
         &[],
     );
     assert_eq!(code, 0, "{stdout} {stderr}");
@@ -147,7 +147,7 @@ fn unknown_local_edits_fail_closed_by_default_including_yes_silent_and_dry_run()
         vec!["--yes"],
         vec!["--silent"],
         vec!["--dry-run"],
-        vec!["--allow-user-patches", "--strict"],
+        vec!["--allow-patch-conflicts", "--strict"],
     ] {
         let tmp = fixture();
         write(tmp.path(), "node_modules/example/index.js", b"local edit\n");
@@ -194,7 +194,7 @@ fn environment_and_read_only_checks_do_not_grant_or_require_consent() {
     let (code, stdout, _) = run_with_env(
         tmp.path(),
         &["apply", "--json", "--offline"],
-        &[("SOCKET_ALLOW_USER_PATCHES", "1")],
+        &[("SOCKET_ALLOW_PATCH_CONFLICTS", "1")],
     );
     assert_eq!(code, 0, "{stdout}");
     assert!(stdout.contains("user_patch_conflict"));

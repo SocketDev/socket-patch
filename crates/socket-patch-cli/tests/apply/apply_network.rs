@@ -465,7 +465,7 @@ async fn apply_hash_mismatch_opt_in_warns_and_applies_strict_fails() {
     // content (the blob is hash-gated to afterHash) and surfaced as a warning event — exit 0.
     let tmp = fixture();
     let out = hermetic::command(&binary())
-        .args(["apply", "--allow-user-patches", "--json", "--offline"])
+        .args(["apply", "--allow-patch-conflicts", "--json", "--offline"])
         .current_dir(tmp.path())
         .output()
         .expect("run socket-patch");
@@ -497,7 +497,7 @@ async fn apply_hash_mismatch_opt_in_warns_and_applies_strict_fails() {
     // The human run logs the warning to stderr.
     let tmp = fixture();
     let out = hermetic::command(&binary())
-        .args(["apply", "--allow-user-patches", "--offline", "--yes"])
+        .args(["apply", "--allow-patch-conflicts", "--offline", "--yes"])
         .current_dir(tmp.path())
         .output()
         .expect("run socket-patch");
@@ -513,7 +513,7 @@ async fn apply_hash_mismatch_opt_in_warns_and_applies_strict_fails() {
     let out = hermetic::command(&binary())
         .args([
             "apply",
-            "--allow-user-patches",
+            "--allow-patch-conflicts",
             "--json",
             "--offline",
             "--strict",
@@ -755,7 +755,7 @@ async fn apply_mismatch_redownloads_full_blob_and_applies() {
             .unwrap();
     }
 
-    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--allow-user-patches"]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--allow-patch-conflicts"]);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(code, 0, "stdout={v:#}\nstderr={stderr}");
     let events = v["events"].as_array().expect("events array");
@@ -988,7 +988,7 @@ async fn mismatch_overwrites_every_copy_of_a_duplicated_package() {
 
     let socket = tmp.path().join(".socket");
     write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
-    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--allow-user-patches"]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--allow-patch-conflicts"]);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
         code, 0,

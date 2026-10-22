@@ -2188,7 +2188,7 @@ fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> 
         silent: args.common.silent,
         all_releases: args.all_releases,
         strict: args.common.strict,
-        allow_user_patches: args.common.allow_user_patches,
+        allow_patch_conflicts: args.common.allow_patch_conflicts,
         user_patch_skips_reported: false,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs,
@@ -3870,7 +3870,7 @@ mod tests {
             silent: true,
             all_releases: false,
             strict: false,
-            allow_user_patches: false,
+            allow_patch_conflicts: false,
             user_patch_skips_reported: false,
             ecosystems: None,
             persist_blobs: false,
@@ -4569,7 +4569,7 @@ mod tests {
             silent: true,
             all_releases: false,
             strict: false,
-            allow_user_patches: false,
+            allow_patch_conflicts: false,
             user_patch_skips_reported: false,
             ecosystems: None,
             // The vendor-detached posture this fn exists for.
@@ -5648,7 +5648,7 @@ mod tests {
         let common = GlobalArgs {
             verbose: true,
             strict: true,
-            allow_user_patches: false,
+            allow_patch_conflicts: false,
             json: true,
             dry_run: true,
             ..GlobalArgs::default()

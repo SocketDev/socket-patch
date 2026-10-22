@@ -552,7 +552,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
             "--no-telemetry",
             // Consent past the user-patch gate so the shapes reach the
             // redirect guards; tests/user_patches.rs covers the gate itself.
-            "--allow-user-patches",
+            "--allow-patch-conflicts",
             "--cwd",
             &proj_s,
             "--api-url",

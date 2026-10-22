@@ -1644,7 +1644,7 @@ async fn engine_nested_apply_mismatch_overwrite_reaches_the_json_envelope() {
     std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
     let mut params = engine_params(tmp.path());
     params.save_only = false;
-    params.allow_user_patches = true;
+    params.allow_patch_conflicts = true;
     let selected = vec![search_result(UUID, PURL)];
     let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
@@ -1691,7 +1691,7 @@ async fn get_uuid_json_mismatch_overwrite_is_reported() {
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--json", "--allow-user-patches"],
+        &[UUID, "--json", "--allow-patch-conflicts"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let json = parse_json_envelope(&stdout);
@@ -1748,7 +1748,7 @@ async fn get_uuid_forwards_explicit_consent_to_nested_apply() {
     let (code, stdout, stderr) = run_get_bin(
         tmp.path(),
         &server.uri(),
-        &[UUID, "--json", "--mode", "agent", "--allow-user-patches"],
+        &[UUID, "--json", "--mode", "agent", "--allow-patch-conflicts"],
     );
     assert_eq!(code, 0, "{stdout} {stderr}");
     assert_eq!(

@@ -506,8 +506,11 @@ async fn assert_scan_refuses(shape: LockShape, code: &str) {
         Vec::new()
     };
 
-    let (exit, stdout, stderr) =
-        scan_vendored(tmp.path(), &mock.uri(), &["--json", "--allow-user-patches"]);
+    let (exit, stdout, stderr) = scan_vendored(
+        tmp.path(),
+        &mock.uri(),
+        &["--json", "--allow-patch-conflicts"],
+    );
     assert_eq!(exit, 1, "{shape:?}: stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "partialFailure", "{shape:?}: {v}");
@@ -1684,7 +1687,7 @@ async fn fifo_bun_lock_is_refused_without_blocking() {
             "--vendor-source",
             "service",
             "--json",
-            "--allow-user-patches",
+            "--allow-patch-conflicts",
         ],
         &uri,
     );
@@ -1708,7 +1711,7 @@ async fn fifo_bun_lock_is_refused_without_blocking() {
             "--vendor-source",
             "service",
             "--json",
-            "--allow-user-patches",
+            "--allow-patch-conflicts",
         ],
         &uri,
     );

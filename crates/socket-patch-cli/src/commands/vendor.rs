@@ -1949,7 +1949,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             return emit_eject_refusal(common, code, &message);
         }
     };
-    if !common.allow_user_patches {
+    if !common.allow_patch_conflicts {
         if let Err(error) = super::user_patches::check(common, pins.iter().map(|p| &p.purl)).await {
             return super::user_patches::refuse(common, Command::Vendor, error);
         }

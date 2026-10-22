@@ -101,8 +101,8 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         }),
         ("--offline", None, |c| assert!(c.offline)),
         ("--strict", None, |c| assert!(c.strict)),
-        ("--allow-user-patches", None, |c| {
-            assert!(c.allow_user_patches)
+        ("--allow-patch-conflicts", None, |c| {
+            assert!(c.allow_patch_conflicts)
         }),
         ("--global", None, |c| assert!(c.global)),
         ("--global-prefix", Some("/opt/global"), |c| {
@@ -239,7 +239,7 @@ fn global_flag_cases_cover_every_global_field() {
         no_npm_allow_remote_config: _,
         no_vlt_install_cleanup: _,
         strict: _,
-        allow_user_patches: _,
+        allow_patch_conflicts: _,
         vendor_source: _,
         vendor_url: _,
         patch_server_url: _,

@@ -720,14 +720,14 @@ fn apply_json(dir: &Path, modcache: &Path) -> (i32, String, String) {
     )
 }
 
-/// [`apply_json`] with `--allow-user-patches`, for guards behind that gate.
+/// [`apply_json`] with `--allow-patch-conflicts`, for guards behind that gate.
 fn apply_json_consented(dir: &Path, modcache: &Path) -> (i32, String, String) {
     run_socket(
         dir,
         &[
             "apply",
             "--offline",
-            "--allow-user-patches",
+            "--allow-patch-conflicts",
             "--ecosystems",
             "golang",
             "--json",
@@ -819,7 +819,7 @@ fn go_work_replace_overrides_the_socket_replace() {
             "apply",
             "--offline",
             "--dry-run",
-            "--allow-user-patches",
+            "--allow-patch-conflicts",
             "--ecosystems",
             "golang",
             "--json",

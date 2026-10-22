@@ -151,7 +151,7 @@ fn singleton_mismatch_opt_in_warns_and_applies() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (file, patched) = singleton_fixture(tmp.path());
 
-    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--allow-user-patches"]);
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--allow-patch-conflicts"]);
     assert_eq!(
         code, 0,
         "opted-in mismatch on a singleton variant is a warning, not an error; stderr={stderr}"
@@ -178,7 +178,7 @@ fn singleton_mismatch_opt_in_warns_and_applies() {
     // warning event — the same shape apply_network pins for npm.
     let tmp = tempfile::tempdir().expect("tempdir");
     let (file, patched) = singleton_fixture(tmp.path());
-    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--json", "--allow-user-patches"]);
+    let (code, stdout, _stderr) = run_apply(tmp.path(), &["--json", "--allow-patch-conflicts"]);
     assert_eq!(code, 0, "json run must also succeed; stdout={stdout}");
     assert_eq!(std::fs::read(&file).expect("read patched file"), patched);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON envelope");

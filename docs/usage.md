@@ -250,8 +250,8 @@ A user patch is protected even if it changes a different file than Socket's fix.
 After reviewing the interaction, you can explicitly approve an attempt:
 
 ```sh
-socket-patch scan --package minimist --mode agent --allow-user-patches
-socket-patch apply --allow-user-patches --strict
+socket-patch scan --package minimist --mode agent --allow-patch-conflicts
+socket-patch apply --allow-patch-conflicts --strict
 ```
 
 The second form still refuses modified file content. Without `--strict`, explicit

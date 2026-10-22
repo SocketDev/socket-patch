@@ -576,7 +576,7 @@ async fn scan_agent_json_mismatch_overwrite_reaches_the_apply_block() {
     let (code, v) = run_json(
         tmp.path(),
         &mock.uri(),
-        &["--mode", "agent", "--allow-user-patches"],
+        &["--mode", "agent", "--allow-patch-conflicts"],
     );
     assert_eq!(code, 0, "{v:#}");
     assert_eq!(v["summary"]["applied"], 1, "{v}");
@@ -908,7 +908,7 @@ async fn scan_still_patches_unrelated_packages_and_forwards_explicit_consent() {
         .unwrap();
         let mut args = vec!["--mode", "agent"];
         if allowed {
-            args.push("--allow-user-patches");
+            args.push("--allow-patch-conflicts");
         }
         let (code, json) = run_json(tmp.path(), &mock.uri(), &args);
         assert_eq!(code, 0, "{json}");

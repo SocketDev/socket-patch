@@ -180,7 +180,7 @@ pub struct GlobalArgs {
     )]
     pub offline: bool,
 
-    /// Reject modified file content even with --allow-user-patches. Without
+    /// Reject modified file content even with --allow-patch-conflicts. Without
     /// explicit consent, mismatches already fail by default. On commands that
     /// have --force, --force overrides this file-content check (but never the
     /// separate check for declared project patches).
@@ -193,12 +193,13 @@ pub struct GlobalArgs {
     )]
     pub strict: bool,
 
-    /// Explicitly permit attempting patches on packages with project patches or
-    /// local modifications. Review and test the combined result; backend safety
+    /// Accept the risk of conflicts with existing project patches or local
+    /// modifications when applying Socket patches. Modified files may be
+    /// overwritten; patches are not merged automatically. Backend safety
     /// refusals still apply. --yes does not approve patch composition; --force
     /// approves only file-content drift.
     #[arg(help_heading = GLOBAL_OPTIONS, long)]
-    pub allow_user_patches: bool,
+    pub allow_patch_conflicts: bool,
 
     /// Operate on globally-installed packages.
     #[arg(
@@ -785,7 +786,7 @@ impl Default for GlobalArgs {
             patch_server_url: None,
             offline: false,
             strict: false,
-            allow_user_patches: false,
+            allow_patch_conflicts: false,
             global: false,
             global_prefix: None,
             json: false,

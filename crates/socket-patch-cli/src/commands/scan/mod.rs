@@ -888,7 +888,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         silent,
         all_releases: args.all_releases,
         strict: args.common.strict,
-        allow_user_patches: args.common.allow_user_patches,
+        allow_patch_conflicts: args.common.allow_patch_conflicts,
         user_patch_skips_reported: true,
         ecosystems: args.common.ecosystems.clone(),
         persist_blobs: args.mode != Some(ScanMode::Vendored),
@@ -2232,19 +2232,19 @@ async fn run_scan(
         if sources.is_empty() {
             return true;
         }
-        if !args.common.allow_user_patches {
+        if !args.common.allow_patch_conflicts {
             user_patch_withheld += 1;
         }
         layout_refusals.push((
-            if args.common.allow_user_patches {
+            if args.common.allow_patch_conflicts {
                 super::user_patches::ALLOWED
             } else {
                 super::user_patches::CONFLICT
             }
             .into(),
-            super::user_patches::detail(&package.purl, &sources, args.common.allow_user_patches),
+            super::user_patches::detail(&package.purl, &sources, args.common.allow_patch_conflicts),
         ));
-        args.common.allow_user_patches
+        args.common.allow_patch_conflicts
     });
 
     // Gradle discovery notes (m2 gating, the user home) ride the run-level
@@ -2357,7 +2357,7 @@ async fn run_scan(
             // and neither is one whose every package the consent gate held.
             if user_patch_withheld > 0 {
                 println!(
-                    "{user_patch_withheld} installed package(s) are protected by project patches (see the warnings above) and were not scanned. Pass --allow-user-patches to scan them anyway."
+                    "{user_patch_withheld} installed package(s) are protected by project patches (see the warnings above) and were not scanned. Pass --allow-patch-conflicts to scan them anyway."
                 );
             } else if !policy.root_excluded() {
                 println!(

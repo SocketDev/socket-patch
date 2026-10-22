@@ -36,9 +36,9 @@ pub(crate) async fn inspect(common: &GlobalArgs) -> UserPatchIndex {
 pub(crate) fn detail(purl: &str, sources: &[String], allowed: bool) -> String {
     let sources = sources.join(", ");
     if allowed {
-        format!("{purl}: --allow-user-patches permits attempting a Socket patch alongside project patches in {sources}; review and test the combined result. Backend safety checks still apply")
+        format!("{purl}: --allow-patch-conflicts permits attempting a Socket patch alongside project patches in {sources}; review and test the combined result. Backend safety checks still apply")
     } else {
-        format!("{purl}: protected by project patch/replacement metadata in {sources}; leaving this package untouched. Merge the fixes manually, or explicitly accept the conflict risk with --allow-user-patches (ordinary --yes/--force do not approve this)")
+        format!("{purl}: protected by project patch/replacement metadata in {sources}; leaving this package untouched. Merge the fixes manually, or explicitly accept the conflict risk with --allow-patch-conflicts (ordinary --yes/--force do not approve this)")
     }
 }
 
@@ -83,8 +83,8 @@ pub(crate) async fn partition(
         if sources.is_empty() {
             continue;
         }
-        let message = detail(purl, &sources, common.allow_user_patches);
-        if common.allow_user_patches {
+        let message = detail(purl, &sources, common.allow_patch_conflicts);
+        if common.allow_patch_conflicts {
             warnings.push((ALLOWED.into(), message));
         } else {
             conflicts.push((purl.to_string(), message));
@@ -131,8 +131,8 @@ pub(crate) async fn skip_protected(
         if sources.is_empty() {
             return true;
         }
-        let message = detail(purl, &sources, common.allow_user_patches);
-        if common.allow_user_patches {
+        let message = detail(purl, &sources, common.allow_patch_conflicts);
+        if common.allow_patch_conflicts {
             warnings.push((ALLOWED.into(), message));
             true
         } else {
