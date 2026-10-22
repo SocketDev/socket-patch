@@ -2088,7 +2088,7 @@ mod tests {
                 Some(hosted_manifest),
                 "Gemfile",
                 &global_sources(hosted_manifest),
-                                &ctx,
+                &ctx,
             )
             .await
             .unwrap()
