@@ -247,6 +247,11 @@ patch was found, and `apply` leaves them out while applying everything else.
 Explicit `get` and `vendor` refuse those conflicts.
 A user patch is protected even if it changes a different file than Socket's fix.
 
+With `--json`, a skipped package has an `action: "skipped"` event, a stable
+`errorCode` such as `user_patch_conflict`, and a `reason` explaining the conflict
+and where it was found. It is not counted in `summary.applied`, including when
+the conflict appears after selection while a patch is downloading.
+
 After reviewing the interaction, you can explicitly approve an attempt:
 
 ```sh

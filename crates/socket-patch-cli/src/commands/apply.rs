@@ -838,9 +838,16 @@ fn manifest_targets_npm(manifest: &PatchManifest) -> bool {
 const YARN_PNP_UNSUPPORTED: &str = "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.";
 
 fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
+    refuse_yarn_pnp_with_skips(args, &[])
+}
+
+fn refuse_yarn_pnp_with_skips(args: &ApplyArgs, skipped: &[PatchEvent]) -> i32 {
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
+        for skip in skipped {
+            env.record(skip.clone());
+        }
         env.mark_error(EnvelopeError::new(
             "yarn_pnp_unsupported",
             YARN_PNP_UNSUPPORTED,
@@ -1042,10 +1049,13 @@ pub(crate) struct ApplyRunReport {
     /// `(errorCode, error)`. Set only when `code != 0` and `failures`
     /// alone would not explain it.
     pub run_error: Option<(String, String)>,
-    /// The package keys apply patched or found already patched, so a
-    /// failed run's caller can count exactly what applied. Filled only
-    /// when `code != 0`.
+    /// The package keys actually patched (or verified in a dry run).
+    /// Filled on successful and failed runs; exit 0 alone does not prove a write.
     pub applied: Vec<String>,
+    /// Whole-package skips, including project patches, vendored ownership,
+    /// already-patched files and absent installations, with their reasons.
+    /// These are outcomes even when their warning was already printed by scan.
+    pub skipped: Vec<PatchEvent>,
     /// Non-fatal per-file warnings the caller's envelope must carry: one
     /// `content_mismatch_overwritten` per file the explicitly approved mismatch policy
     /// overwrote (#1004). A nested apply never prints JSON and is silent
@@ -1101,6 +1111,55 @@ fn collect_apply_failures(
     failures
 }
 
+/// Keep successful writes and whole-package skips separate for nested callers.
+/// One already-patched copy must not hide a write to another copy of the same
+/// package; per-copy advisories remain standalone apply events.
+fn collect_apply_outcomes(
+    results: &[ApplyResult],
+    unmatched: &[String],
+    lockfile_only: &HashSet<String>,
+    mut skipped: Vec<PatchEvent>,
+    dry_run: bool,
+) -> (Vec<String>, Vec<PatchEvent>) {
+    let mut applied = Vec::new();
+    for result in results {
+        let event = result_to_event(result, dry_run);
+        match event.action {
+            PatchAction::Applied | PatchAction::Verified => {
+                applied.push(result.package_key.clone());
+            }
+            PatchAction::Skipped => skipped.push(event),
+            _ => {}
+        }
+    }
+    for purl in unmatched {
+        let detail = if lockfile_only.contains(purl) {
+            LOCKFILE_ONLY_DETAIL
+        } else {
+            not_installed_detail(purl)
+        };
+        skipped.push(
+            PatchEvent::new(PatchAction::Skipped, purl)
+                .with_reason("package_not_installed", detail),
+        );
+    }
+    let applied_keys: HashSet<&str> = applied.iter().map(String::as_str).collect();
+    let failed_keys: HashSet<&str> = results
+        .iter()
+        .filter(|r| !r.success)
+        .map(|r| r.package_key.as_str())
+        .collect();
+    skipped.retain(|event| {
+        event
+            .purl
+            .as_deref()
+            .is_none_or(|purl| !applied_keys.contains(purl) && !failed_keys.contains(purl))
+    });
+    skipped.sort_by(|a, b| (&a.purl, &a.error_code).cmp(&(&b.purl, &b.error_code)));
+    skipped.dedup_by(|a, b| a.purl == b.purl && a.error_code == b.error_code);
+    (applied, skipped)
+}
+
 /// The locked half of `apply`: everything from the manifest read on — the
 /// package-manager layout gate, the apply loop, embedded VEX, output and
 /// telemetry — over a `lock` the caller already holds and the caller's
@@ -1133,7 +1192,7 @@ pub(crate) async fn run_locked(
                 "manifest_not_found",
                 format!("Manifest not found at {}", manifest_path.display()),
             );
-            let code = report_apply_failure(&args, &err, &err.message, &telemetry).await;
+            let code = report_apply_failure(&args, &err, &err.message, &[], &telemetry).await;
             return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
         Err(e) => {
@@ -1141,7 +1200,7 @@ pub(crate) async fn run_locked(
             // One manifest-load mapping for every command (#931):
             // `manifest_invalid` / `manifest_unreadable`, never `apply_failed`.
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
-            let code = report_apply_failure(&args, &err, &e.to_string(), &telemetry).await;
+            let code = report_apply_failure(&args, &err, &e.to_string(), &[], &telemetry).await;
             return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
     };
@@ -1149,11 +1208,15 @@ pub(crate) async fn run_locked(
     // Packages the project patched itself sit this run out (warned); every
     // other record still applies. The read-only `--check` verifies them all.
     let mut manifest = manifest;
-    let (user_patch_warnings, user_patched) = if args.check {
+    let (user_patch_warnings, user_patch_skips) = if args.check {
         Default::default()
     } else {
         super::user_patches::skip_protected(&args.common, &mut manifest.patches).await
     };
+    let user_patched = user_patch_skips
+        .iter()
+        .filter_map(|e| e.purl.clone())
+        .collect();
 
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
@@ -1169,11 +1232,15 @@ pub(crate) async fn run_locked(
     match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
             if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest) {
-                return ApplyRunReport::run_failure(
-                    refuse_yarn_pnp(&args),
-                    "yarn_pnp_unsupported",
-                    YARN_PNP_UNSUPPORTED,
-                );
+                let code = refuse_yarn_pnp_with_skips(&args, &user_patch_skips);
+                return ApplyRunReport {
+                    skipped: user_patch_skips,
+                    ..ApplyRunReport::run_failure(
+                        code,
+                        "yarn_pnp_unsupported",
+                        YARN_PNP_UNSUPPORTED,
+                    )
+                };
             }
         }
         NpmPkgManager::Pnpm => {
@@ -1378,6 +1445,9 @@ pub(crate) async fn run_locked(
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
+                for skip in &user_patch_skips {
+                    env.record(skip.clone());
+                }
                 for result in &results {
                     env.record(result_to_event(result, args.common.dry_run));
                     // Mismatch overwrites ride as Skipped warning events
@@ -1533,10 +1603,19 @@ pub(crate) async fn run_locked(
             let mut warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
             warnings.extend(cache_warnings);
             warnings.extend(nested_skip_warnings);
+            let (applied, skipped) = collect_apply_outcomes(
+                &results,
+                &unmatched,
+                &lockfile_only,
+                user_patch_skips,
+                args.common.dry_run,
+            );
             // A requested-but-failed VEX flips an otherwise-successful
             // apply to a non-zero exit (fail-the-command contract).
             if success && !vex_failed {
                 return ApplyRunReport {
+                    applied,
+                    skipped,
                     warnings,
                     ..ApplyRunReport::default()
                 };
@@ -1566,25 +1645,23 @@ pub(crate) async fn run_locked(
             } else {
                 None
             };
-            // Vendor-owned results are skips, not applies.
-            let applied = results
-                .iter()
-                .filter(|r| r.success && r.package_path != VENDOR_OWNED_MARKER)
-                .map(|r| r.package_key.clone())
-                .collect();
             ApplyRunReport {
                 code: 1,
                 failures,
                 run_error,
                 applied,
+                skipped,
                 warnings,
             }
         }
         Err(e) => {
             lock.release();
             let err = EnvelopeError::new("apply_failed", e.clone());
-            let code = report_apply_failure(&args, &err, &e, &telemetry).await;
-            ApplyRunReport::run_failure(code, "apply_failed", e)
+            let code = report_apply_failure(&args, &err, &e, &user_patch_skips, &telemetry).await;
+            ApplyRunReport {
+                skipped: user_patch_skips,
+                ..ApplyRunReport::run_failure(code, "apply_failed", e)
+            }
         }
     }
 }
@@ -1600,12 +1677,16 @@ async fn report_apply_failure(
     args: &ApplyArgs,
     err: &EnvelopeError,
     error: &str,
+    skipped: &[PatchEvent],
     telemetry: &TelemetryAuth,
 ) -> i32 {
     track_patch_apply_failed(error, args.common.dry_run, telemetry).await;
     if args.common.json {
         let mut env = Envelope::new(Command::Apply);
         env.dry_run = args.common.dry_run;
+        for skip in skipped {
+            env.record(skip.clone());
+        }
         env.mark_error(err.clone());
         println!("{}", env.to_pretty_json());
     } else {
@@ -3365,6 +3446,42 @@ mod tests {
             error: None,
             sidecar: None,
         }
+    }
+
+    #[test]
+    fn nested_outcomes_keep_only_whole_package_skips() {
+        let mut unchanged_copy = sample_applied(VerifyStatus::AlreadyPatched);
+        let changed_copy = sample_applied(VerifyStatus::Ready);
+        let mut vendored = sample_applied(VerifyStatus::Ready);
+        vendored.package_key = "pkg:npm/vendor@1.0.0".into();
+        vendored.package_path = VENDOR_OWNED_MARKER.into();
+        let mut already_patched = unchanged_copy.clone();
+        already_patched.package_key = "pkg:npm/already@1.0.0".into();
+        unchanged_copy.package_path = "/another/node_modules/minimist".into();
+        let missing = "pkg:npm/missing@1.0.0".to_string();
+        let (applied, skipped) = collect_apply_outcomes(
+            &[unchanged_copy, changed_copy, vendored, already_patched],
+            std::slice::from_ref(&missing),
+            &HashSet::from([missing.clone()]),
+            Vec::new(),
+            false,
+        );
+        assert_eq!(applied, vec!["pkg:npm/minimist@1.2.2"]);
+        let reasons: Vec<_> = skipped
+            .iter()
+            .map(|s| (s.purl.as_deref().unwrap(), s.error_code.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                ("pkg:npm/already@1.0.0", "already_patched"),
+                ("pkg:npm/missing@1.0.0", "package_not_installed"),
+                ("pkg:npm/vendor@1.0.0", "vendored"),
+            ]
+        );
+        assert!(skipped
+            .iter()
+            .all(|s| s.reason.is_some() && s.files.is_empty()));
     }
 
     #[test]

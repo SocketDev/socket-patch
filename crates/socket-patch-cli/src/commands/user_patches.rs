@@ -4,7 +4,7 @@
 use socket_patch_core::patch::user_patches::UserPatchIndex;
 
 use crate::args::GlobalArgs;
-use crate::json_envelope::{Command, Envelope, EnvelopeError};
+use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
 pub(crate) const CONFLICT: &str = "user_patch_conflict";
 pub(crate) const ALLOWED: &str = "user_patch_override";
@@ -108,22 +108,23 @@ pub(crate) fn warn(common: &GlobalArgs, warnings: &[(String, String)]) {
 /// the protected records from this run's in-memory copy and report each as
 /// a `user_patch_conflict` warning. Approved overrides stay in and come back
 /// as `user_patch_override` warnings. Only the caller's copy changes; the
-/// manifest on disk is never rewritten here. Also returns the skipped purls:
-/// they are still recorded, so nothing may reconcile them away as dropped.
+/// manifest on disk is never rewritten here. Also returns skipped events with
+/// the evidence and UUID: callers must preserve these outcomes, and nothing may
+/// reconcile their records away as dropped.
 pub(crate) async fn skip_protected(
     common: &GlobalArgs,
     patches: &mut std::collections::HashMap<
         String,
         socket_patch_core::manifest::schema::PatchRecord,
     >,
-) -> (Vec<(String, String)>, std::collections::HashSet<String>) {
+) -> (Vec<(String, String)>, Vec<PatchEvent>) {
     let mut warnings = Vec::new();
-    let mut skipped = std::collections::HashSet::new();
+    let mut skipped = Vec::new();
     if !any_detectable(common, patches.keys().map(String::as_str)) {
         return (warnings, skipped);
     }
     let index = inspect(common).await;
-    patches.retain(|purl, _| {
+    patches.retain(|purl, record| {
         if !common.purl_ecosystem_selected(purl) {
             return true;
         }
@@ -136,12 +137,17 @@ pub(crate) async fn skip_protected(
             warnings.push((ALLOWED.into(), message));
             true
         } else {
-            warnings.push((CONFLICT.into(), message));
-            skipped.insert(purl.clone());
+            warnings.push((CONFLICT.into(), message.clone()));
+            skipped.push(
+                PatchEvent::new(PatchAction::Skipped, purl)
+                    .with_uuid(&record.uuid)
+                    .with_reason(CONFLICT, message),
+            );
             false
         }
     });
     warnings.sort();
+    skipped.sort_by(|a, b| a.purl.cmp(&b.purl));
     (warnings, skipped)
 }
 

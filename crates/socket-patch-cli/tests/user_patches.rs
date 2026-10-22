@@ -79,6 +79,17 @@ fn apply_skips_and_vendor_refuses_declared_patches_despite_matching_hashes_or_ge
             // explicit vendoring of the whole manifest, refuses.
             let message = if args[0] == "apply" {
                 assert_eq!(code, 0, "{args:?} {file}: {stdout} {stderr}");
+                let skip = value["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|event| event["action"] == "skipped" && event["purl"] == PURL)
+                    .unwrap_or_else(|| panic!("missing skipped event: {value}"));
+                assert_eq!(skip["errorCode"], "user_patch_conflict");
+                assert_eq!(skip["uuid"], UUID);
+                assert!(skip["reason"].as_str().unwrap().contains(file));
+                assert_eq!(value["summary"]["applied"], 0);
+                assert_eq!(value["summary"]["skipped"], 1);
                 let warning = value["warnings"]
                     .as_array()
                     .unwrap()

@@ -2108,6 +2108,7 @@ async fn save_and_apply_patch(
                 nested_apply_args(&args.common, &manifest_path, quiet),
                 args.common.json,
                 true,
+                &recorded,
                 client,
                 lock,
             )
@@ -2144,7 +2145,10 @@ async fn save_and_apply_patch(
         env.warnings.extend(warnings);
         // A failed apply names what failed (#424); the manifest names the
         // uuid of any other failing record.
-        let manifest = if apply_report.as_ref().is_some_and(|r| r.code != 0) {
+        let manifest = if apply_report
+            .as_ref()
+            .is_some_and(|r| r.code != 0 || !r.skipped.is_empty())
+        {
             Box::pin(read_manifest(&manifest_path)).await.ok().flatten()
         } else {
             None
@@ -3207,6 +3211,7 @@ mod tests {
             failures,
             run_error: None,
             applied: applied.iter().map(|p| p.to_string()).collect(),
+            skipped: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -3244,7 +3249,10 @@ mod tests {
     #[test]
     fn record_apply_outcome_clean_apply_records_every_patch_applied() {
         let mut env = Envelope::new(JsonCommand::Get);
-        let report = ApplyRunReport::default();
+        let report = ApplyRunReport {
+            applied: vec!["pkg:npm/a@1.0.0".into(), "pkg:npm/b@1.0.0".into()],
+            ..ApplyRunReport::default()
+        };
         let recs = recorded(&[("pkg:npm/a@1.0.0", "ua"), ("pkg:npm/b@1.0.0", "ub")]);
         record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
         assert_eq!(
@@ -3260,6 +3268,80 @@ mod tests {
         let mut env = Envelope::new(JsonCommand::Get);
         record_apply_outcome(&mut env, &recs, None, |_| None);
         assert!(env.events.is_empty());
+    }
+
+    #[test]
+    fn record_apply_outcome_preserves_skip_reasons_on_success_and_failure() {
+        for code in [0, 1] {
+            let mut env = Envelope::new(JsonCommand::Get);
+            let mut report = ApplyRunReport {
+                code,
+                applied: vec!["pkg:npm/clean@1.0.0".into()],
+                skipped: vec![
+                    PatchEvent::new(EventAction::Skipped, "pkg:npm/@scope/a@1.0.0")
+                        .with_reason("user_patch_conflict", "project patch in patches/a.patch"),
+                    PatchEvent::new(EventAction::Skipped, "pkg:npm/vendor@1.0.0")
+                        .with_reason("vendored", "managed by socket-patch vendor"),
+                ],
+                ..ApplyRunReport::default()
+            };
+            if code != 0 {
+                report
+                    .failures
+                    .push(failure("pkg:npm/failed@1.0.0", "apply_failed", "mismatch"));
+            }
+            let recs = recorded(&[
+                ("pkg:npm/%40scope/a@1.0.0?artifact_id=x", "ua"),
+                ("pkg:npm/vendor@1.0.0", "uv"),
+                ("pkg:npm/clean@1.0.0", "uc"),
+            ]);
+            record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
+            assert_eq!(env.summary.applied, 1);
+            assert_eq!(env.summary.skipped, 2);
+            assert_eq!(env.summary.failed, u32::from(code != 0));
+            let json = env.to_value();
+            assert_eq!(json["events"][0]["action"], "skipped");
+            assert_eq!(json["events"][0]["uuid"], "ua");
+            assert_eq!(json["events"][0]["errorCode"], "user_patch_conflict");
+            assert_eq!(
+                json["events"][0]["reason"],
+                "project patch in patches/a.patch"
+            );
+            assert!(json["events"][0].get("files").is_none());
+        }
+    }
+
+    #[test]
+    fn record_apply_outcome_deduplicates_a_previously_reported_manifest_skip() {
+        let mut env = Envelope::new(JsonCommand::Scan);
+        let skip = PatchEvent::new(EventAction::Skipped, "pkg:npm/@scope/a@1.0.0")
+            .with_reason("user_patch_conflict", "existing project patch");
+        env.record(skip.clone());
+        let report = ApplyRunReport {
+            skipped: vec![skip.clone(), skip],
+            ..ApplyRunReport::default()
+        };
+        record_apply_outcome(&mut env, &[], Some(&report), |_| Some("ua".into()));
+        assert_eq!(env.summary.skipped, 1);
+        assert_eq!(env.summary.applied, 0);
+        assert_eq!(env.events[0].uuid.as_deref(), Some("ua"));
+    }
+
+    #[test]
+    fn record_apply_outcome_never_infers_a_write_from_exit_zero() {
+        let mut env = Envelope::new(JsonCommand::Get);
+        record_apply_outcome(
+            &mut env,
+            &recorded(&[("pkg:npm/a@1.0.0", "ua")]),
+            Some(&ApplyRunReport::default()),
+            |_| None,
+        );
+        assert_eq!(
+            outcomes(&env),
+            vec![o("skipped", "pkg:npm/a@1.0.0", "ua", "apply_not_attempted")]
+        );
+        assert!(env.events[0].reason.is_some());
+        assert_eq!(env.summary.applied, 0);
     }
 
     #[test]
@@ -3405,6 +3487,7 @@ mod tests {
             failures: Vec::new(),
             run_error: Some(("yarn_pnp_unsupported".to_string(), "pnp".to_string())),
             applied: Vec::new(),
+            skipped: Vec::new(),
             warnings: vec![RunWarning::new("content_mismatch_overwritten", "w")],
         };
         let recs = recorded(&[("pkg:npm/a@1.0.0", "ua")]);

@@ -2227,13 +2227,25 @@ async fn run_scan(
     // Protect before querying/selecting, in every mode and in dry-run previews.
     let user_patches = super::user_patches::inspect(&args.common).await;
     let mut user_patch_withheld = 0usize;
+    let mut user_patch_skips = Vec::new();
     filtered_crawled.retain(|package| {
         let sources = user_patches.conflicts(&package.purl);
         if sources.is_empty() {
             return true;
         }
+        let detail =
+            super::user_patches::detail(&package.purl, &sources, args.common.allow_patch_conflicts);
         if !args.common.allow_patch_conflicts {
             user_patch_withheld += 1;
+            if !user_patch_skips
+                .iter()
+                .any(|event: &PatchEvent| event.purl.as_deref() == Some(package.purl.as_str()))
+            {
+                user_patch_skips.push(
+                    PatchEvent::new(PatchAction::Skipped, &package.purl)
+                        .with_reason(super::user_patches::CONFLICT, &detail),
+                );
+            }
         }
         layout_refusals.push((
             if args.common.allow_patch_conflicts {
@@ -2242,7 +2254,7 @@ async fn run_scan(
                 super::user_patches::CONFLICT
             }
             .into(),
-            super::user_patches::detail(&package.purl, &sources, args.common.allow_patch_conflicts),
+            detail,
         ));
         args.common.allow_patch_conflicts
     });
@@ -2315,6 +2327,9 @@ async fn run_scan(
             // Layout refusals ride `warnings` so a consumer can tell an
             // unscannable project from an empty one.
             env.warnings.extend(layout_warnings(&layout_refusals));
+            for skip in &user_patch_skips {
+                env.record(skip.clone());
+            }
             if let Some(gc) = &unwired_gc {
                 gc.record_into(&mut env, args.common.dry_run);
             }
@@ -2722,6 +2737,9 @@ async fn run_scan(
         env.set_extra("updates", serde_json::Value::Array(updates_json(&updates)));
         env.set_extra("rollout", stage.json());
         env.warnings.extend(layout_warnings(&layout_refusals));
+        for skip in &user_patch_skips {
+            env.record(skip.clone());
+        }
         // One warning per failed batch (status and exit unchanged).
         for (batch, err) in &failed_batches {
             let line = render::batch_failed_warning(*batch, total_batches, err);

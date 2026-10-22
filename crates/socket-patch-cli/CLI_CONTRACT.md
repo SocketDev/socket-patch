@@ -153,14 +153,23 @@ different file, are not installed yet, or all Socket `beforeHash` checks pass.
 A missing referenced diff does not remove that protection.
 
 - `scan` (every mode, including previews) excludes matching packages before patch
-  selection and emits `warnings[].code: user_patch_conflict`, naming the purl
-  and evidence path. Other packages remain eligible; skips alone exit 0.
+  selection and emits a `skipped` event plus `warnings[].code: user_patch_conflict`,
+  naming the purl and evidence path. Other packages remain eligible; skips alone exit 0.
   The full installed inventory still protects skipped packages from prune-as-missing.
 - Mutating `apply`, including the nested apply of agent-mode `get` / `scan`,
   leaves each protected manifest entry out of the run with a
-  `user_patch_conflict` warning and applies every other entry; skips alone exit 0,
+  `skipped` event and `user_patch_conflict` warning and applies every other entry; skips alone exit 0,
   so a `postinstall` apply never fails an install over them. The manifest is not
   changed, and a skipped entry is not reconciled away as dropped.
+- Skipped events carry a stable `errorCode` and a human-readable `reason`.
+  `user_patch_conflict` identifies project patch/replacement metadata and names
+  its source; `vendored`, `already_patched`, and `package_not_installed` explain
+  other apply skips. A conflict introduced after selection is still `skipped`
+  by nested apply, with its selected purl and UUID, even on an otherwise
+  successful run. It never contributes to `summary.applied`. Known selection-time
+  skips are not emitted a second time by nested apply; newly discovered conflicts
+  are also shown in human output. Saving a manifest record remains a separate
+  `downloaded` / `updated` event and does not prove the package was patched.
 - Explicit `get` selection (including UUID, `--save-only`, and `--dry-run`) and
   `vendor` refuse selected conflicts with exit 1, `status: error`,
   `error.code: user_patch_conflict`, before their patch writes. `vendor` still
@@ -1668,8 +1677,11 @@ command's integration tests check its output.
 | `vendor_prebuilt_stub_invalid` | `failed` | RubyGems: the server stub lacks required attributes or is otherwise invalid; no local stub fallback is permitted. |
 | `vendor_*` / `pypi_*` / `gemfile_*` / `lock_*` / `locked_version_mismatch` / `user_authored_*` / `native_extensions_unsupported` / `platform_gem_unsupported` | `failed`/`skipped` | vendor: per-ecosystem refusal + drift vocabulary; see the Vendor command contract section. New tags are additive (MINOR). |
 
-`user_patch_conflict` is also a scan and apply run warning for packages excluded by the
-project-patch consent gate; `user_patch_override` records explicit consent.
+`user_patch_conflict` is a `skipped` event and a scan/apply run warning for packages
+excluded by the project-patch consent gate; `reason` includes the evidence and the
+opt-in remedy. `user_patch_override` records explicit consent. Agent get/scan
+use `skipped` / `apply_not_attempted` if a successful nested apply has no matching
+outcome for a selected record, rather than inferring a write from exit 0.
 
 ### Top-level `EnvelopeError` codes
 
@@ -1737,7 +1749,7 @@ project-patch consent gate; `user_patch_override` records explicit consent.
 | `vex`        | `Verified` (one per attested subcomponent) · `Skipped` (omissions) — only under `--json --output` |
 | `remove`     | `Removed` (per purl; `Verified` on dry-run) · `RolledBack` (one per installed copy the in-place rollback restored; `summary.rolledBack`) · vendored/hosted-leg `Removed`/`Skipped` events with `details.mode` · artifact-level `Removed`/`Verified` GC carrier (`details: {count, checked}`, `bytes`; only when the sweep removed something — v5.0, MAJOR: replaces `details.blobsRemoved` / `archivesRemoved` / `rolledBack`) · top-level `gc` (absent under `--preserve-state`) · `cleanup_failed` warnings |
 | `rollback`   | `RolledBack` (agent copies; vendored / hosted unwinds with `details.mode`) · `Verified` (dry-run previews, manifest removals included) · `Skipped` (already_original / no_files / package_not_installed) · `Failed` (per copy or leg; artifact-level `hosted_write_failed` / `hosted_wiring_contested`) · `Removed` (manifest entries, `details.manifest: true`) · top-level `gc` (absent under `--preserve-state`) |
-| `get`, `scan` | Agent mode: `Downloaded` / `Updated` (+`oldUuid`) / `Skipped` (`already_in_manifest`, `vendored`, `package_not_installed`, …) / `Failed` per patch, then `Applied` / `Failed` for the nested apply · Hosted: `Applied` (pin written) / `Skipped` (`details.mode: "hosted"`) · Vendored: `Downloaded` / `Failed`, then the vendor engine's events (`details.mode: "vendored"`) · dry runs: `Verified` / `Skipped` · `scan --prune`: `Removed` (`details.manifest: true`, or a vendored revert) / `Skipped` + top-level `gc` · `get` search outcomes: `Skipped` (`paid_required`, `package_not_installed`, …) — see [`scan` and `get` JSON](#scan-and-get-json-v50-major) |
+| `get`, `scan` | Agent mode: `Downloaded` / `Updated` (+`oldUuid`) / `Skipped` (`already_in_manifest`, `vendored`, `package_not_installed`, …) / `Failed` per patch, then `Applied` / `Skipped` / `Failed` for the nested apply · Hosted: `Applied` (pin written) / `Skipped` (`details.mode: "hosted"`) · Vendored: `Downloaded` / `Failed`, then the vendor engine's events (`details.mode: "vendored"`) · dry runs: `Verified` / `Skipped` · `scan --prune`: `Removed` (`details.manifest: true`, or a vendored revert) / `Skipped` + top-level `gc` · `get` search outcomes: `Skipped` (`paid_required`, `package_not_installed`, …) — see [`scan` and `get` JSON](#scan-and-get-json-v50-major) |
 | `--update`   | `Downloaded` → `Updated` (success) · `Skipped` (already_latest) · `Verified` (dry-run check, reason update_check) — see the Self-update contract section for details fields and top-level error codes |
 
 ### Migration status (v3.0)
@@ -1787,7 +1799,7 @@ One command is **intentionally not** plain-envelope and will stay that way (not 
 }
 ```
 
-**Events per mode.** Agent mode (`get`, `scan --mode agent` / `--sync`): a fetched patch is `downloaded` (new manifest record) or `updated` (+`oldUuid`: it replaced another uuid), one already recorded at the same uuid is `skipped` / `already_in_manifest` (it is still re-applied), a patch that could not be fetched or recorded is `failed` (`download_failed`, `patch_no_applicable_files`, `blob_write_failed`); then the nested apply adds `applied` for each recorded patch it patched (or found patched) and `failed` (apply's `apply_failed` / `package_not_installed` with its `error`, #424) for each it failed — a failing manifest patch the run did not select (the nested apply covers the whole `--ecosystems`-scoped manifest) gets its own `failed` event, and a failure no single patch explains (an unreadable manifest, the yarn PnP refusal, unavailable patch sources) is a purl-less `failed` event, so a failed apply is always `partialFailure` (exit 1). The apply's mismatch overwrites (#1004) are `content_mismatch_overwritten` warnings; a record whose purl the vendor ledger wires at another uuid adds a `vendored_uuid_drift` warning. Vendor-owned and lockfile-only selections are `skipped` / `vendored` and `skipped` / `package_not_installed` before any download. Hosted and vendored events are described under "Scan modes" above; every one carries `details.mode`. `get`'s narrowing adds `skipped` events (`package_not_installed`, `yarn_pnp_unsupported`, `pnpm_pnp_unsupported`) and `paidRequired` runs one `skipped` / `paid_required` event per patch found.
+**Events per mode.** Agent mode (`get`, `scan --mode agent` / `--sync`): a fetched patch is `downloaded` (new manifest record) or `updated` (+`oldUuid`: it replaced another uuid), one already recorded at the same uuid is `skipped` / `already_in_manifest` (it is still re-applied), a patch that could not be fetched or recorded is `failed` (`download_failed`, `patch_no_applicable_files`, `blob_write_failed`); then the nested apply adds `applied` only for each recorded patch it actually patched, `skipped` with `errorCode` / `reason` for each package it left untouched (including `already_patched`, `vendored`, `package_not_installed`, and `user_patch_conflict`), and `failed` (apply's `apply_failed` / `package_not_installed` with its `error`, #424) for each it failed — a failing manifest patch the run did not select (the nested apply covers the whole `--ecosystems`-scoped manifest) gets its own `failed` event, and a failure no single patch explains (an unreadable manifest, the yarn PnP refusal, unavailable patch sources) is a purl-less `failed` event, so a failed apply is always `partialFailure` (exit 1). The apply's mismatch overwrites (#1004) are `content_mismatch_overwritten` warnings; a record whose purl the vendor ledger wires at another uuid adds a `vendored_uuid_drift` warning. Vendor-owned and lockfile-only selections are `skipped` / `vendored` and `skipped` / `package_not_installed` before any download. Hosted and vendored events are described under "Scan modes" above; every one carries `details.mode`. `get`'s narrowing adds `skipped` events (`package_not_installed`, `yarn_pnp_unsupported`, `pnpm_pnp_unsupported`) and `paidRequired` runs one `skipped` / `paid_required` event per patch found.
 
 **Patch metadata.** `downloaded` / `updated` events (agent and vendored) carry the patch metadata in `details`, the same keys for every command:
 

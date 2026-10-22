@@ -865,6 +865,11 @@ async fn scan_skips_user_patches_in_every_mode_before_querying_or_writing() {
         std::fs::write(tmp.path().join("package.json"), declaration).unwrap();
         let (code, json) = run_json(tmp.path(), &mock.uri(), &["--mode", mode, "--yes"]);
         assert_eq!(code, 0, "{mode}: {json}");
+        let skip = find_event(&json, "skipped", Some("user_patch_conflict"));
+        assert_eq!(skip["purl"], MINIMIST);
+        assert!(skip["reason"].as_str().unwrap().contains("package.json"));
+        assert_eq!(json["summary"]["applied"], 0);
+        assert_eq!(json["summary"]["skipped"], 1);
         assert!(
             json["warnings"]
                 .as_array()
@@ -884,6 +889,73 @@ async fn scan_skips_user_patches_in_every_mode_before_querying_or_writing() {
         );
     }
     assert!(mock.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scan_reports_a_patch_added_after_selection_in_json_and_human_output() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    const PURL: &str = "pkg:npm/example@1.0.0";
+    for json in [true, false] {
+        let mock = MockServer::start().await;
+        mount_one_patch_api(&mock, PURL, b"before\n").await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "example", "1.0.0", b"before\n");
+        let patch = tmp.path().join("patches/example+1.0.0.patch");
+        let patch_at_fetch = patch.clone();
+        let response = serde_json::json!({
+            "uuid": UUID, "purl": PURL, "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {"package/index.js": {
+                "beforeHash": crate::common::git_sha256(b"before\n"),
+                "afterHash": crate::common::git_sha256(b"after\n"),
+                "blobContent": "YWZ0ZXIK"
+            }},
+            "vulnerabilities": {}, "description": "late conflict", "license": "MIT", "tier": "free"
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+            .respond_with(move |_: &wiremock::Request| {
+                std::fs::create_dir_all(patch_at_fetch.parent().unwrap()).unwrap();
+                std::fs::write(&patch_at_fetch, "user diff").unwrap();
+                ResponseTemplate::new(200).set_body_json(&response)
+            })
+            .with_priority(1)
+            .mount(&mock)
+            .await;
+        let mut args = vec!["--mode", "agent", "--yes"];
+        if json {
+            args.push("--json");
+        }
+        let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &args);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        if json {
+            let value = parse_json_envelope(&stdout);
+            let skip = find_event(&value, "skipped", Some("user_patch_conflict"));
+            assert_eq!(skip["purl"], PURL);
+            assert_eq!(skip["uuid"], UUID);
+            assert!(skip["reason"]
+                .as_str()
+                .unwrap()
+                .contains("example+1.0.0.patch"));
+            assert_eq!(value["summary"]["applied"], 0);
+            assert_eq!(value["summary"]["skipped"], 1);
+            assert!(value["warnings"].as_array().unwrap().iter().any(|warning| {
+                warning["code"] == "user_patch_conflict" && warning["detail"] == skip["reason"]
+            }));
+            assert!(!stderr.contains("example+1.0.0.patch"), "{stderr}");
+        } else {
+            assert!(stderr.contains("example+1.0.0.patch"), "{stdout}\n{stderr}");
+            assert!(stderr.contains("--allow-patch-conflicts"), "{stderr}");
+        }
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/example/index.js")).unwrap(),
+            b"before\n"
+        );
+        assert_eq!(std::fs::read_to_string(patch).unwrap(), "user diff");
+        assert_eq!(read_manifest(tmp.path())["patches"][PURL]["uuid"], UUID);
+    }
 }
 
 #[tokio::test]

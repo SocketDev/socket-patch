@@ -1601,6 +1601,83 @@ async fn engine_nested_apply_success_keeps_added_and_counts_applied() {
     );
 }
 
+/// The selection was eligible, then a user patch appeared while its view was
+/// being fetched. The locked apply must preserve the bytes and report a skip,
+/// including when scan suppressed warnings already seen during selection or a
+/// different selected package fails its apply.
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_preserves_conflicts_introduced_during_fetch() {
+    const OTHER: &str = "pkg:npm/other@1.0.0";
+    for sibling_fails in [false, true] {
+        for skips_reported in [false, true] {
+            let server = MockServer::start().await;
+            let tmp = tempfile::tempdir().unwrap();
+            write_project(tmp.path());
+            let patch = tmp.path().join(format!("patches/{NAME}+1.0.0.patch"));
+            let patch_at_fetch = patch.clone();
+            let response = view_json(
+                UUID,
+                PURL,
+                serde_json::json!({
+                    "package/index.js": {
+                        "beforeHash": git_hash(BEFORE_BYTES),
+                        "afterHash": git_hash(AFTER_BYTES),
+                        "blobContent": b64(AFTER_BYTES)
+                    }
+                }),
+            );
+            Mock::given(method("GET"))
+                .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+                .respond_with(move |_: &wiremock::Request| {
+                    std::fs::create_dir_all(patch_at_fetch.parent().unwrap()).unwrap();
+                    std::fs::write(&patch_at_fetch, "user diff").unwrap();
+                    ResponseTemplate::new(200).set_body_json(&response)
+                })
+                .mount(&server)
+                .await;
+            let mut selected = vec![search_result(UUID, PURL)];
+            if sibling_fails {
+                let pkg = tmp.path().join("node_modules/other");
+                std::fs::create_dir_all(&pkg).unwrap();
+                std::fs::write(
+                    pkg.join("package.json"),
+                    r#"{"name":"other","version":"1.0.0"}"#,
+                )
+                .unwrap();
+                std::fs::write(pkg.join("index.js"), "local edit").unwrap();
+                mount_real_view(&server, UUID_B, OTHER).await;
+                selected.push(search_result(UUID_B, OTHER));
+            }
+            let mut params = engine_params(tmp.path());
+            params.save_only = false;
+            params.user_patch_skips_reported = skips_reported;
+            let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+            assert_eq!(code, i32::from(sibling_fails), "{json}");
+            let skip = find_event(&json, "skipped", Some("user_patch_conflict"));
+            assert_eq!(skip["purl"], PURL);
+            assert_eq!(skip["uuid"], UUID);
+            assert!(skip["reason"]
+                .as_str()
+                .unwrap()
+                .contains(patch.to_str().unwrap()));
+            assert_eq!(json["summary"]["applied"], 0, "{json}");
+            assert_eq!(json["summary"]["skipped"], 1, "{json}");
+            assert_eq!(
+                json["summary"]["failed"],
+                usize::from(sibling_fails),
+                "{json}"
+            );
+            assert_eq!(
+                std::fs::read(tmp.path().join(format!("node_modules/{NAME}/index.js"))).unwrap(),
+                BEFORE_BYTES
+            );
+            assert_eq!(std::fs::read_to_string(patch).unwrap(), "user diff");
+            assert_eq!(manifest_json(tmp.path())["patches"][PURL]["uuid"], UUID);
+        }
+    }
+}
+
 /// `get <uuid> --json` (the single-patch path) with the nested apply ON
 /// over a first-party link: one JSON document whose patch record carries
 /// the apply failure, and `failed: 1`.
