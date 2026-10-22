@@ -205,7 +205,14 @@ async fn refused_go_rewrite_is_not_confirmed_by_another_lockfile() {
     let server = MockServer::start().await;
     mount_hosted_grant(&server).await;
 
-    let env = get_hosted(&consumer, &server, &tmp.path().join("modcache"));
+    // The user's replace is also a user patch; consent past that gate so
+    // the run reaches the hosted rewriter's own replace refusal.
+    let env = get_hosted_with(
+        &consumer,
+        &server,
+        &tmp.path().join("modcache"),
+        &["--allow-patch-conflicts"],
+    );
     assert_eq!(hosted_pinned(&env), 0, "envelope: {env}");
     assert!(
         env["warnings"]

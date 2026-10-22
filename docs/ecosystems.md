@@ -1470,3 +1470,40 @@ Prebuilt binaries are published for:
 | Linux | x86_64, ARM64, 32-bit ARM hard-float (`arm-unknown-linux-gnueabihf` / `-musleabihf`), i686 |
 | Windows | x86_64, ARM64, i686 |
 | Android | ARM64 |
+
+## Existing project patches
+
+Socket Patch treats declared project patches as a separate source of ownership.
+`scan` and `apply` skip their packages and report `user_patch_conflict`;
+explicit `get` and `vendor` refuse the conflict before patching. Use
+`--allow-patch-conflicts` only after reviewing how the fixes interact. This flag
+permits an attempt; it does not merge diffs or bypass unsupported backend cases.
+Installed file content that matches neither the original nor Socket-patched hash
+also fails by default. See the [CLI contract](../crates/socket-patch-cli/CLI_CONTRACT.md#existing-project-patches)
+for exact matching rules, diagnostics and detection limits.
+
+The protection applies before any comparison of changed filenames. Two fixes can
+interact even when their diffs do not overlap, and a package manager may reapply
+its own diff after Socket changes the dependency source.
+
+| Mechanism | Research and interaction |
+| --- | --- |
+| pnpm | [`pnpm patch`](https://pnpm.io/cli/patch) records `patchedDependencies`; selectors can be exact versions, ranges, or bare names. Configuration moved into [`pnpm-workspace.yaml`](https://pnpm.io/settings). pnpm's [selector grouping](https://github.com/pnpm/pnpm/blob/v10.20.0/patching/config/src/groupPatchedDependencies.ts) treats `*` as all versions, including prereleases. Both declarations and lock markers matter, including before installation. |
+| Yarn | [`patch:`](https://yarnpkg.com/protocol/patch) changes package source at fetch time. [`yarn patch`](https://yarnpkg.com/features/patching) keeps the diff separately; replacing a locator is not a merge of that diff with Socket's artifact. Yarn builtin compatibility patches are distinguished from user patch paths. |
+| `patch-package` | Its [documented workflow](https://github.com/ds300/patch-package) applies diffs after installation, supports workspace-local setups and `--patch-dir`. Its [filename parser](https://github.com/ds300/patch-package/blob/master/src/PackageDetails.ts) identifies scoped/nested targets, patch sequences and dev-only patches. Looking only for a dependency on `patch-package` is insufficient. |
+| npm / Bun | [npm patch](https://docs.npmjs.com/cli/v12/commands/npm-patch/) and [Bun patch](https://bun.sh/docs/pm/cli/patch) persist project diffs. Socket's pre-existing native npm/Bun backend refusals remain in force after consent; a successful source rewrite alone does not establish that the user's diff was preserved. |
+| Composer | [Composer Patches](https://docs.cweagans.net/composer-patches/usage/defining-patches/) accepts inline and external definitions. [Configuration](https://docs.cweagans.net/composer-patches/usage/configuration/) can relocate that file, and dependencies can provide patches. [`patches.lock.json`](https://docs.cweagans.net/composer-patches/api/patches-lock-json/) is additional read-only evidence. |
+| Cargo / Go | Cargo's [`[patch]`, `[replace]`, and `paths`](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html) and Go's [`replace`](https://go.dev/ref/mod#go-mod-file-replace) can select a user fork or directory. These source choices must not be treated as pristine registry copies. Socket-owned wiring is distinguished from user replacements. |
+
+Python local/VCS sources, Ruby path/git dependencies, JVM dependency substitutions,
+NuGet source choices, and custom build hooks do not share a portable diff registry.
+Their existing source/layout restrictions still apply; the consent detector does
+not claim to interpret every possible plugin, script or external patch pipeline.
+Unknown edits in a file Socket would replace are protected by the default hash
+mismatch refusal. A separate, untouched file with an unrecorded local fix cannot
+be detected by that hash check.
+
+Patch declarations and diffs remain the user's files. Consent is not persisted in
+`socket.yml`, the manifest, or an environment variable; an automated hook must
+specify it deliberately on each invocation if the project intends to combine
+patches. Review the resulting installation and run the project's own tests.

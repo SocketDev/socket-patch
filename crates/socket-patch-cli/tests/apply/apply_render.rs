@@ -409,13 +409,13 @@ mod gem_fallback_home_human {
 
 const GEM_OVERWRITE_LINE: &str = "did not match the patch's expected original content";
 
-/// The default-policy overwrite prints the npm-family mismatch warning,
-/// naming the package and what happened to the file.
+/// The opted-in overwrite prints the npm-family mismatch warning, naming
+/// the package and what happened to the file.
 #[test]
 fn gem_singleton_overwrite_prints_mismatch_warning() {
     let tmp = tempfile::tempdir().unwrap();
     gem_singleton_mismatch_fixture(tmp.path());
-    let (code, _stdout, stderr) = run_gem_apply(tmp.path(), &[]);
+    let (code, _stdout, stderr) = run_gem_apply(tmp.path(), &["--allow-patch-conflicts"]);
     assert_eq!(code, 0, "stderr={stderr}");
     let warning = stderr
         .lines()

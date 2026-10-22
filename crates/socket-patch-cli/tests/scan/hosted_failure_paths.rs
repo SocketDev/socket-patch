@@ -1208,7 +1208,8 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
         return;
     }
 
-    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &[]);
+    let (code, doc) =
+        scan_hosted_json(tmp.path(), &server.uri(), &["--allow-patch-conflicts"], &[]);
     // Restore before asserting so the tempdir cleans up and the bytes can
     // be read back.
     std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o644)).unwrap();

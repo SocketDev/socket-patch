@@ -238,3 +238,32 @@ A package converted from hosted to vendored returns to upstream on `vendor --rev
 Vendored reversal preserves unrelated edits and refuses unsafe drift. Keep its
 ledger with the artifacts. Full details and per-ecosystem restoration limits are in
 the [rollback contract](../crates/socket-patch-cli/CLI_CONTRACT.md#rollback-command-contract-v50).
+
+## Packages you already patch
+
+By default, `scan` skips packages with declared project patches (pnpm, Yarn,
+`patch-package`, native npm/Bun, Composer, Cargo or Go) and reports where the
+patch was found, and `apply` leaves them out while applying everything else.
+Explicit `get` and `vendor` refuse those conflicts.
+A user patch is protected even if it changes a different file than Socket's fix.
+
+With `--json`, a skipped package has an `action: "skipped"` event, a stable
+`errorCode` such as `user_patch_conflict`, and a `reason` explaining the conflict
+and where it was found. It is not counted in `summary.applied`, including when
+the conflict appears after selection while a patch is downloading.
+
+After reviewing the interaction, you can explicitly approve an attempt:
+
+```sh
+socket-patch scan --package minimist --mode agent --allow-patch-conflicts
+socket-patch apply --allow-patch-conflicts --strict
+```
+
+The second form still refuses modified file content. Without `--strict`, explicit
+consent permits replacing a mismatched file with Socket's verified content; it
+does not merge your changes. Without consent, mismatched files fail by default,
+unless they hold an earlier Socket patch's content (a patch update).
+`--yes` and `--force` do not approve combining declared project patches. Some
+package-manager combinations remain unsupported even with consent. See
+[existing project patches](ecosystems.md#existing-project-patches) for the
+mechanisms checked and the limitations.

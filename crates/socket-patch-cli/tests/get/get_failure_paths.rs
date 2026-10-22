@@ -1601,6 +1601,83 @@ async fn engine_nested_apply_success_keeps_added_and_counts_applied() {
     );
 }
 
+/// The selection was eligible, then a user patch appeared while its view was
+/// being fetched. The locked apply must preserve the bytes and report a skip,
+/// including when scan suppressed warnings already seen during selection or a
+/// different selected package fails its apply.
+#[tokio::test]
+#[serial]
+async fn engine_nested_apply_preserves_conflicts_introduced_during_fetch() {
+    const OTHER: &str = "pkg:npm/other@1.0.0";
+    for sibling_fails in [false, true] {
+        for skips_reported in [false, true] {
+            let server = MockServer::start().await;
+            let tmp = tempfile::tempdir().unwrap();
+            write_project(tmp.path());
+            let patch = tmp.path().join(format!("patches/{NAME}+1.0.0.patch"));
+            let patch_at_fetch = patch.clone();
+            let response = view_json(
+                UUID,
+                PURL,
+                serde_json::json!({
+                    "package/index.js": {
+                        "beforeHash": git_hash(BEFORE_BYTES),
+                        "afterHash": git_hash(AFTER_BYTES),
+                        "blobContent": b64(AFTER_BYTES)
+                    }
+                }),
+            );
+            Mock::given(method("GET"))
+                .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+                .respond_with(move |_: &wiremock::Request| {
+                    std::fs::create_dir_all(patch_at_fetch.parent().unwrap()).unwrap();
+                    std::fs::write(&patch_at_fetch, "user diff").unwrap();
+                    ResponseTemplate::new(200).set_body_json(&response)
+                })
+                .mount(&server)
+                .await;
+            let mut selected = vec![search_result(UUID, PURL)];
+            if sibling_fails {
+                let pkg = tmp.path().join("node_modules/other");
+                std::fs::create_dir_all(&pkg).unwrap();
+                std::fs::write(
+                    pkg.join("package.json"),
+                    r#"{"name":"other","version":"1.0.0"}"#,
+                )
+                .unwrap();
+                std::fs::write(pkg.join("index.js"), "local edit").unwrap();
+                mount_real_view(&server, UUID_B, OTHER).await;
+                selected.push(search_result(UUID_B, OTHER));
+            }
+            let mut params = engine_params(tmp.path());
+            params.save_only = false;
+            params.user_patch_skips_reported = skips_reported;
+            let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+            assert_eq!(code, i32::from(sibling_fails), "{json}");
+            let skip = find_event(&json, "skipped", Some("user_patch_conflict"));
+            assert_eq!(skip["purl"], PURL);
+            assert_eq!(skip["uuid"], UUID);
+            assert!(skip["reason"]
+                .as_str()
+                .unwrap()
+                .contains(patch.to_str().unwrap()));
+            assert_eq!(json["summary"]["applied"], 0, "{json}");
+            assert_eq!(json["summary"]["skipped"], 1, "{json}");
+            assert_eq!(
+                json["summary"]["failed"],
+                usize::from(sibling_fails),
+                "{json}"
+            );
+            assert_eq!(
+                std::fs::read(tmp.path().join(format!("node_modules/{NAME}/index.js"))).unwrap(),
+                BEFORE_BYTES
+            );
+            assert_eq!(std::fs::read_to_string(patch).unwrap(), "user diff");
+            assert_eq!(manifest_json(tmp.path())["patches"][PURL]["uuid"], UUID);
+        }
+    }
+}
+
 /// `get <uuid> --json` (the single-patch path) with the nested apply ON
 /// over a first-party link: one JSON document whose patch record carries
 /// the apply failure, and `failed: 1`.
@@ -1628,7 +1705,7 @@ async fn get_uuid_json_nested_apply_failure_names_the_patch() {
 }
 
 /// The agent engine (`scan --mode agent --json`'s path) over an installed
-/// file a local edit changed: the default policy overwrites it, and the
+/// file a local edit changed: the opted-in policy overwrites it, and the
 /// envelope must say so — the warning `apply --json` reports as a
 /// `content_mismatch_overwritten` event — while the patch still counts as
 /// applied.
@@ -1644,6 +1721,7 @@ async fn engine_nested_apply_mismatch_overwrite_reaches_the_json_envelope() {
     std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
     let mut params = engine_params(tmp.path());
     params.save_only = false;
+    params.allow_patch_conflicts = true;
     let selected = vec![search_result(UUID, PURL)];
     let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
@@ -1687,7 +1765,11 @@ async fn get_uuid_json_mismatch_overwrite_is_reported() {
     write_project(tmp.path());
     let installed = tmp.path().join("node_modules").join(NAME).join("index.js");
     std::fs::write(&installed, LOCAL_EDIT_BYTES).unwrap();
-    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--json"]);
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--json", "--allow-patch-conflicts"],
+    );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let json = parse_json_envelope(&stdout);
     assert_eq!(json["status"], "success", "json={json}");
@@ -1698,6 +1780,65 @@ async fn get_uuid_json_mismatch_overwrite_is_reported() {
     );
     assert!(!stderr.contains("did not match"), "stderr={stderr}");
     assert_eq!(std::fs::read(&installed).unwrap(), AFTER_BYTES);
+}
+
+#[tokio::test]
+async fn get_uuid_requires_specific_consent_in_every_mode_before_persisting() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+    for extra in [
+        vec![UUID, "--json", "--mode", "agent"],
+        vec![UUID, "--json", "--mode", "hosted"],
+        vec![UUID, "--json", "--mode", "vendored"],
+        vec![UUID, "--json", "--save-only"],
+        vec![UUID, "--json", "--mode", "agent", "--dry-run"],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        std::fs::create_dir(tmp.path().join("patches")).unwrap();
+        std::fs::write(
+            tmp.path().join(format!("patches/{NAME}+1.0.0.patch")),
+            "user diff",
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &extra);
+        let json = parse_json_envelope(&stdout);
+        assert_eq!(code, 1, "{extra:?}: {stdout} {stderr}");
+        assert_eq!(json["error"]["code"], "user_patch_conflict", "{json}");
+        assert!(!tmp.path().join(".socket/manifest.json").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join(format!("node_modules/{NAME}/index.js"))).unwrap(),
+            BEFORE_BYTES
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_uuid_forwards_explicit_consent_to_nested_apply() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    std::fs::create_dir(tmp.path().join("patches")).unwrap();
+    let patch = tmp.path().join(format!("patches/{NAME}+1.0.0.patch"));
+    std::fs::write(&patch, "user diff").unwrap();
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--json", "--mode", "agent", "--allow-patch-conflicts"],
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert_eq!(
+        std::fs::read(tmp.path().join(format!("node_modules/{NAME}/index.js"))).unwrap(),
+        AFTER_BYTES
+    );
+    assert_eq!(std::fs::read_to_string(patch).unwrap(), "user diff");
+    let json = parse_json_envelope(&stdout);
+    assert!(json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["code"] == "user_patch_override"));
 }
 
 /// `git init` `root` with `gitignore`; `false` when git is not installed.

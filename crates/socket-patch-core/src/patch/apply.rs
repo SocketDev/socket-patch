@@ -45,7 +45,7 @@ pub struct VerifyResult {
 /// `Strict` exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MismatchPolicy {
-    /// DEFAULT: a beforeHash mismatch is overwritten with the verified
+    /// Explicitly permitted: a beforeHash mismatch is overwritten with the verified
     /// patched content and surfaced as a warning (the promoted
     /// [`VerifyResult`] keeps `expected_hash`/`current_hash`, which is
     /// how callers detect and report it). A MISSING pre-existing file is
@@ -53,6 +53,12 @@ pub enum MismatchPolicy {
     Warn,
     /// A beforeHash mismatch is a hard error (`--strict`).
     Strict,
+    /// [`MismatchPolicy::Strict`], except content a Socket patch wrote
+    /// earlier is overwritten like [`MismatchPolicy::Warn`]: a file whose
+    /// hash names a stored blob (`.socket/blobs/<afterHash>`) holds another
+    /// Socket patch's output, as after an update from one patch to a newer
+    /// one for the same release, so no local change is lost (the CLI default).
+    SocketContent,
     /// [`MismatchPolicy::Warn`] PLUS missing pre-existing files are
     /// skipped instead of failing (`--force`).
     Force,
@@ -840,7 +846,7 @@ pub const NEW_FILE_COLLISION_MESSAGE: &str =
 /// (CLI_CONTRACT "mismatch policy"). [`verify_file_patch`] reports it as
 /// `Ready` (its callers only ask "can this be written?"); the apply engine
 /// turns it into a `HashMismatch` with an empty `expected_hash`, so
-/// `--strict` refuses it and the default policy overwrites it with the
+/// `Strict` refuses it and explicit mismatch tolerance overwrites it with the
 /// `content_mismatch_overwritten` warning instead of silently.
 fn mark_new_file_collision(verify: &mut VerifyResult, file_info: &PatchFileInfo) {
     if file_info.before_hash.is_empty()
@@ -908,8 +914,18 @@ async fn apply_package_patch_at(
         if verify_result.status != VerifyStatus::Ready
             && verify_result.status != VerifyStatus::AlreadyPatched
         {
+            let policy = match policy {
+                MismatchPolicy::SocketContent
+                    if verify_result.status == VerifyStatus::HashMismatch
+                        && is_socket_content(sources, verify_result.current_hash.as_deref())
+                            .await =>
+                {
+                    MismatchPolicy::Warn
+                }
+                policy => policy,
+            };
             match (verify_result.status, policy) {
-                // Mismatch tolerated (default + force): promote to Ready.
+                // Mismatch explicitly tolerated (warn + force): promote to Ready.
                 // The promoted result KEEPS `expected_hash`/`current_hash`
                 // — the signature callers use to surface the warning. The
                 // blob source is hash-gated to afterHash.
@@ -1129,6 +1145,19 @@ async fn apply_package_patch_at(
     }
     result.success = true;
     result
+}
+
+/// Whether `hash` (a file's current content hash) names a blob Socket
+/// stored: content some Socket patch wrote, not a local edit.
+async fn is_socket_content(sources: &PatchSources<'_>, hash: Option<&str>) -> bool {
+    let Some(hash) = hash.filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        return false;
+    };
+    sources.mem_blobs.is_some_and(|m| m.contains_key(hash))
+        || tokio::fs::symlink_metadata(sources.blobs_path.join(hash))
+            .await
+            .is_ok_and(|m| m.is_file())
 }
 
 /// The on-disk blob source — read `blobs_path/<hash>` fail-closed.
@@ -1952,6 +1981,65 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.is_some());
+    }
+
+    /// The CLI default (`SocketContent`) overwrites content an earlier
+    /// Socket patch wrote (its hash names a stored blob), as on a patch
+    /// update, and refuses any other mismatch like `Strict`.
+    #[tokio::test]
+    async fn socket_content_policy_overwrites_only_earlier_socket_output() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let patched = b"new socket patch";
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        let previous = b"old socket patch";
+        tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            blobs_dir
+                .path()
+                .join(compute_git_sha256_from_bytes(previous)),
+            previous,
+        )
+        .await
+        .unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: "aaaa".to_string(),
+                after_hash,
+            },
+        );
+        let target = pkg_dir.path().join("index.js");
+        let sources = PatchSources::blobs_only(blobs_dir.path());
+        let run = || {
+            apply_package_patch(
+                "pkg:npm/test@1.0.0",
+                pkg_dir.path(),
+                &files,
+                &sources,
+                false,
+                MismatchPolicy::SocketContent,
+            )
+        };
+
+        tokio::fs::write(&target, previous).await.unwrap();
+        let result = run().await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), patched);
+        let v = &result.files_verified[0];
+        assert!(
+            v.expected_hash.is_some() && v.current_hash != v.expected_hash,
+            "the overwrite keeps its warning signature"
+        );
+
+        let local = b"a local edit";
+        tokio::fs::write(&target, local).await.unwrap();
+        let result = run().await;
+        assert!(!result.success);
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), local);
     }
 
     /// beforeHash mismatch across the three policies: the DEFAULT (Warn)
@@ -3319,7 +3407,7 @@ mod tests {
     /// #626: agent apply must not write through a `node_modules` link to
     /// first-party source (a workspace member / `file:` dir, scoped or not,
     /// or an `npm link` target outside the project). The user's fork does
-    /// not match the patch's beforeHash, which the default policy would
+    /// not match the patch's beforeHash, which mismatch tolerance would
     /// otherwise overwrite. Refused for every policy, dry run included, and
     /// the fork keeps its bytes.
     #[cfg(unix)]

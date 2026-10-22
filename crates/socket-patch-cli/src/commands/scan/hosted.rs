@@ -1041,6 +1041,26 @@ async fn run_redirect_selected_untracked(
         None
     };
 
+    // Re-read project patch declarations under the write lock. A patch added
+    // during API selection must not be lost in a takeover or lock rewrite.
+    if !common.allow_patch_conflicts {
+        if let Err(error) =
+            crate::commands::user_patches::check(common, candidates.iter().map(&sel_purl)).await
+        {
+            // The shared refusal path keeps this run's envelope and lets
+            // telemetry go out before the JSON error.
+            return refuse(
+                common,
+                scan_result.take(),
+                &engine::Refusal {
+                    code: error.code,
+                    message: error.message,
+                },
+                &mut telemetry.json_error,
+            );
+        }
+    }
+
     // v5 hosted mode keeps no ledger: the lockfiles are the only record of
     // a redirect (vex, list, vendor and rollback read the hosted pins from
     // them). This run's patch records (fetched below) feed only the

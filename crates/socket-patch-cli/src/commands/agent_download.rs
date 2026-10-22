@@ -367,6 +367,11 @@ pub struct DownloadParams {
     /// `--strict` forwarded to the nested apply (a beforeHash mismatch
     /// fails instead of warn-and-overwrite).
     pub strict: bool,
+    pub allow_patch_conflicts: bool,
+    /// The caller already reported every installed package the user-patch
+    /// gate holds (`scan`), so the nested apply need not repeat the
+    /// manifest entries it skips for them. `get` checks only its selection.
+    pub user_patch_skips_reported: bool,
     /// `--ecosystems` forwarded to the nested apply, so it never touches
     /// other ecosystems' packages the user filtered out.
     pub ecosystems: Option<Vec<String>>,
@@ -1440,6 +1445,7 @@ pub(crate) fn nested_apply_args_from_params(
         global: params.global,
         global_prefix: params.global_prefix.clone(),
         strict: params.strict,
+        allow_patch_conflicts: params.allow_patch_conflicts,
         // Scope the nested apply like the caller was scoped: `None` would
         // apply the WHOLE manifest, mutating other ecosystems' packages the
         // user filtered out.
@@ -1466,18 +1472,45 @@ pub(crate) fn nested_apply_args_from_params(
 pub(crate) async fn run_nested_apply(
     common: GlobalArgs,
     json: bool,
+    report_user_patch_skips: bool,
+    recorded: &[(String, String)],
     client: &ApiClient,
     lock: LockGuard,
 ) -> ApplyRunReport {
+    let quiet = common.silent || json;
     let manifest_path = common.resolved_manifest_path();
     let apply_args = super::apply::ApplyArgs {
         common,
         force: false,
         check: false,
         vex: Default::default(),
-        nested: Some(super::apply::NestedApply { caller_json: json }),
+        nested: Some(super::apply::NestedApply {
+            caller_json: json,
+            report_user_patch_skips,
+        }),
     };
-    let report = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
+    let mut report = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
+    // Scan already printed its selection-time skips. A selected package that
+    // the locked recheck now skips is NEW evidence and must still be visible.
+    if !report_user_patch_skips {
+        for skip in &report.skipped {
+            if skip.error_code.as_deref() == Some(super::user_patches::CONFLICT)
+                && skip
+                    .purl
+                    .as_deref()
+                    .is_some_and(|key| recorded.iter().any(|(purl, _)| apply_key_covers(key, purl)))
+            {
+                if let Some(reason) = &skip.reason {
+                    report
+                        .warnings
+                        .push(RunWarning::new(super::user_patches::CONFLICT, reason));
+                    if !quiet {
+                        eprintln!("Warning: {reason}");
+                    }
+                }
+            }
+        }
+    }
     // An error, so exempt from --silent ("errors only": a failing exit must
     // say why); JSON runs carry the failure in the envelope instead.
     if report.code != 0 && !json {
@@ -1497,11 +1530,15 @@ pub(crate) fn apply_key_covers(key: &str, record: &str) -> bool {
 
 /// Record what the nested apply did to the run's recorded patches
 /// (`recorded`: `(purl, uuid)` of every selected patch now in the manifest)
-/// into `env`, so `--json` says what the human run prints (#424). A clean
-/// apply is one `applied` event per recorded patch. A failed one records a
+/// into `env`, so `--json` says what the human run prints (#424). Only a
+/// reported write counts as `applied`, even when apply exits 0. Skips retain
+/// their `reason` and `errorCode`; of the patches this run did not select,
+/// only a `user_patch_conflict` skip (a conflict found after selection) is
+/// recorded.
+/// A failed run records a
 /// `failed` event (apply's `errorCode` / `error`) for each recorded patch a
-/// failure covers, `applied` for each one apply reports patched (or already
-/// patched), a `failed` event for each other failing manifest patch (one
+/// failure covers, `applied` for each one apply reports patched, a `failed`
+/// event for each other failing manifest patch (one
 /// this run did not select — the nested apply covers the whole
 /// `--ecosystems`-scoped manifest; `uuid_of` looks up its uuid), and a
 /// purl-less `failed` event for a run-level reason (unreadable manifest,
@@ -1521,14 +1558,6 @@ pub(crate) fn record_apply_outcome(
         return;
     };
     env.warnings.extend(report.warnings.iter().cloned());
-    if report.code == 0 {
-        for (purl, uuid) in recorded {
-            env.record(
-                PatchEvent::new(EventAction::Applied, purl.as_str()).with_uuid(uuid.as_str()),
-            );
-        }
-        return;
-    }
     let mut failed_any = false;
     for (purl, uuid) in recorded {
         if let Some(failure) = report
@@ -1542,11 +1571,54 @@ pub(crate) fn record_apply_outcome(
                     .with_error(failure.code.as_str(), failure.error.as_str()),
             );
             failed_any = true;
+        } else if let Some(skip) = report.skipped.iter().find(|skip| {
+            skip.purl
+                .as_deref()
+                .is_some_and(|key| apply_key_covers(key, purl))
+        }) {
+            let mut event = skip.clone().with_uuid(uuid);
+            event.purl = Some(purl.clone());
+            record_apply_skip(env, event);
         } else if report.applied.iter().any(|k| apply_key_covers(k, purl)) {
             env.record(
                 PatchEvent::new(EventAction::Applied, purl.as_str()).with_uuid(uuid.as_str()),
             );
+        } else if report.code == 0 {
+            record_apply_skip(
+                env,
+                PatchEvent::new(EventAction::Skipped, purl)
+                    .with_uuid(uuid)
+                    .with_reason(
+                        "apply_not_attempted",
+                        "The nested apply did not report applying this package",
+                    ),
+            );
         }
+    }
+    // The nested apply covers the whole manifest, so its other skips
+    // (`already_patched`, `vendored`, ...) belong to packages this run did
+    // not select; only a user-patch conflict found after selection is news.
+    for skip in &report.skipped {
+        let Some(key) = skip.purl.as_deref() else {
+            continue;
+        };
+        if skip.error_code.as_deref() != Some(super::user_patches::CONFLICT)
+            || recorded.iter().any(|(purl, _)| apply_key_covers(key, purl))
+            || report
+                .failures
+                .iter()
+                .any(|failure| apply_key_covers(&failure.purl, key))
+        {
+            continue;
+        }
+        let mut event = skip.clone();
+        if event.uuid.is_none() {
+            event.uuid = uuid_of(key);
+        }
+        record_apply_skip(env, event);
+    }
+    if report.code == 0 {
+        return;
     }
     let mut appended: Vec<&str> = Vec::new();
     for failure in &report.failures {
@@ -1579,6 +1651,26 @@ pub(crate) fn record_apply_outcome(
             PatchEvent::artifact(EventAction::Failed)
                 .with_error("apply_failed", "the nested apply failed"),
         );
+    }
+}
+
+/// Scan can already carry the same selection-time skip. Keep one event, adding
+/// the manifest UUID when the locked apply knows it, without double-counting.
+fn record_apply_skip(env: &mut Envelope, event: PatchEvent) {
+    if let Some(existing) = env.events.iter_mut().find(|existing| {
+        existing.action == EventAction::Skipped
+            && existing.error_code == event.error_code
+            && existing
+                .purl
+                .as_deref()
+                .zip(event.purl.as_deref())
+                .is_some_and(|(a, b)| PurlKey::qualified(a) == PurlKey::qualified(b))
+    }) {
+        if existing.uuid.is_none() {
+            existing.uuid = event.uuid;
+        }
+    } else {
+        env.record(event);
     }
 }
 
@@ -1776,6 +1868,8 @@ pub async fn download_and_apply_patches_into(
             run_nested_apply(
                 nested_apply_args_from_params(params, run, &manifest_path),
                 params.json,
+                !params.user_patch_skips_reported,
+                &recorded,
                 run.api_client,
                 lock,
             )

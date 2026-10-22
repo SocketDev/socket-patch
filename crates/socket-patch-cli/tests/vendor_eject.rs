@@ -271,6 +271,47 @@ async fn eject_vendors_hosted_pins_and_revert_returns_to_upstream() {
     assert!(!p.redirect_state().exists());
 }
 
+/// The hosted-to-vendored transition also needs explicit patch consent.
+#[tokio::test]
+async fn eject_requires_user_patch_consent_and_reports_it_in_previews_and_writes() {
+    let p = hosted_project(true).await;
+    let patch = p.root().join("patches/left-pad+1.3.0.patch");
+    std::fs::create_dir_all(patch.parent().unwrap()).unwrap();
+    std::fs::write(&patch, b"user diff\n").unwrap();
+    let before = p.lock_bytes();
+
+    let (code, env) = p.run_json(&["vendor", "--yes"]);
+    assert_eq!(code, 1, "{env:#}");
+    assert_eq!(env["error"]["code"], "user_patch_conflict");
+    assert_eq!(p.lock_bytes(), before);
+    assert!(p.server.received_requests().await.unwrap().is_empty());
+
+    mock_registry(&p).await;
+    mock_view(&p).await;
+    for args in [
+        vec!["vendor", "--allow-patch-conflicts", "--dry-run"],
+        vec!["vendor", "--allow-patch-conflicts"],
+    ] {
+        let (code, env) = p.run_json(&args);
+        assert_eq!(code, 0, "{args:?}: {env:#}");
+        assert!(
+            env["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "user_patch_override"),
+            "{env:#}"
+        );
+        assert_eq!(std::fs::read(&patch).unwrap(), b"user diff\n");
+        if args.contains(&"--dry-run") {
+            assert_eq!(p.lock_bytes(), before);
+            assert!(!p.artifact().exists());
+        } else {
+            assert!(p.artifact().exists());
+        }
+    }
+}
+
 /// Human eject: the first line announces the eject.
 #[tokio::test]
 async fn eject_human_output_announces_the_eject() {
