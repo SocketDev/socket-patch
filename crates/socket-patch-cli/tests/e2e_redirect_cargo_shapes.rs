@@ -463,7 +463,10 @@ async fn run_shape(shape: Shape) -> Option<()> {
         );
         return None;
     }
-    pin_patched_versions(&proj, &home, &shape.patches);
+    if let Err(why) = pin_patched_versions(&proj, &home, &shape.patches) {
+        let _ = cargo_e2e_matrix::skip(&suite, &why);
+        return None;
+    }
     // A lockless shape deletes its lock before the scan, so the lock-format
     // matrix has nothing to exercise; re-encoding it would also misfire when
     // every package is sourceless (a `[patch]` path override): v1 then has
@@ -945,8 +948,11 @@ fn contest_after_scan(shape: &Shape, dep: &str, fresh: &Path, home: &Path, uri: 
 }
 
 /// Pin each patched version: a caret requirement locks the newest
-/// compatible release, which moves as crates.io publishes.
-fn pin_patched_versions(proj: &Path, home: &Path, patches: &[Patch]) {
+/// compatible release, which moves as crates.io publishes. `cargo update
+/// --precise` reads the index like `generate-lockfile` does, so a failure
+/// is reported (with cargo's stderr) for the caller to skip on, the same
+/// as a failed `generate-lockfile`; required legs still fail on it.
+fn pin_patched_versions(proj: &Path, home: &Path, patches: &[Patch]) -> Result<(), String> {
     for patch in patches {
         let lock = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
         let locked = cargo_e2e_matrix::parse_lock(&lock);
@@ -956,6 +962,7 @@ fn pin_patched_versions(proj: &Path, home: &Path, patches: &[Patch]) {
         {
             continue;
         }
+        let mut errors = String::new();
         let pinned = locked
             .iter()
             .filter(|p| p.name == patch.name)
@@ -966,20 +973,24 @@ fn pin_patched_versions(proj: &Path, home: &Path, patches: &[Patch]) {
             })
             .any(|p| {
                 let spec = format!("{}@{}", p.name, p.version);
-                cargo(
+                let update = cargo(
                     proj,
                     &["update", "-p", &spec, "--precise", patch.version],
                     home,
-                )
-                .status
-                .success()
+                );
+                if !update.status.success() {
+                    errors += &format!("`cargo update -p {spec}`: {}", stderr(&update));
+                }
+                update.status.success()
             });
-        assert!(
-            pinned,
-            "cannot lock {}@{}:\n{lock}",
-            patch.name, patch.version
-        );
+        if !pinned {
+            return Err(format!(
+                "cannot lock {}@{} (crates.io unreachable?):\n{errors}\n{lock}",
+                patch.name, patch.version
+            ));
+        }
     }
+    Ok(())
 }
 
 fn helper_manifest(deps: &str) -> String {
