@@ -1272,8 +1272,14 @@ pub(crate) async fn restore(
         // Pins the lock wires go first, so one whose superseding patch's
         // manifest block is also a pin here undoes that block itself
         // (#1626), and the block's own pin then has nothing left to do.
+        let lock_wires = |uuid: &str| {
+            lock.as_deref().is_some_and(|l| {
+                let lines: Vec<&str> = l.split('\n').collect();
+                matches!(wiring(&gem_sections(&lines), uuid, ctx), Ok(Some(_)))
+            })
+        };
         let mut ordered: Vec<&&HostedPin> = pins.iter().collect();
-        ordered.sort_by_key(|p| !lock.as_deref().is_some_and(|l| l.contains(p.uuid.as_str())));
+        ordered.sort_by_key(|p| !lock_wires(&p.uuid));
         let mut undone: Vec<String> = Vec::new();
         for pin in ordered {
             if result.refused.contains_key(&pin.uuid) {
@@ -1292,20 +1298,18 @@ pub(crate) async fn restore(
                 name,
                 version,
             };
-            let mut superseded = None;
             match restore_one(
                 &gem,
                 lock.as_deref(),
                 manifest.as_deref(),
                 manifest_rel,
                 &globals,
-                &mut superseded,
                 ctx,
             )
             .await
             {
                 Ok(None) => {}
-                Ok(Some((next_lock, next_manifest))) => {
+                Ok(Some((next_lock, next_manifest, superseded))) => {
                     if endings == Some(LineEndings::Mixed) && next_lock != lock {
                         result.refuse(
                             &pin.uuid,
@@ -1429,17 +1433,16 @@ async fn stale_cache_warning(
 }
 
 /// Restore one gem in a lock + manifest pair: `Ok(None)` when neither wires
-/// it, else the next `(lock, manifest)` texts. A superseding patch's block
-/// undone with it ([`superseded_block`]) leaves its uuid in `superseded`.
+/// it, else the next `(lock, manifest)` texts and the uuid of a superseding
+/// patch whose block was undone with it ([`superseded_block`]).
 async fn restore_one(
     gem: &Gem<'_>,
     lock: Option<&str>,
     manifest: Option<&str>,
     manifest_rel: &str,
     globals: &[String],
-    superseded: &mut Option<String>,
     ctx: &Ctx<'_>,
-) -> Result<Option<(Option<String>, Option<String>)>, String> {
+) -> Result<Option<RestoredPair>, String> {
     let mut block = match manifest {
         Some(text) => find_block(text, gem, manifest_rel, ctx)?,
         None => None,
@@ -1449,6 +1452,7 @@ async fn restore_one(
         Some(_) => wiring(&gem_sections(&lines), gem.uuid, ctx)?.is_some(),
         None => false,
     };
+    let mut superseded = None;
     if wired && block.is_none() {
         if let Some((b, uuid)) = manifest
             .map(|text| superseded_block(text, gem, manifest_rel, ctx))
@@ -1456,11 +1460,24 @@ async fn restore_one(
             .flatten()
         {
             block = Some(b);
-            *superseded = Some(uuid);
+            superseded = Some(uuid);
         }
     }
     if !wired && block.is_none() {
         return Ok(None);
+    }
+    // The other side of #1626: the manifest's block is this (superseding)
+    // patch's, but the lock still pins the gem to an earlier Socket patch.
+    // Undoing the block alone would leave the lock on that patch, so only
+    // the earlier patch's pin (which undoes both) can restore the pair.
+    if !wired {
+        if let Some(earlier) = earlier_lock_pin(&lines, gem, ctx) {
+            return Err(format!(
+                "the lock still pins it to the earlier Socket patch {earlier} (a superseding \
+                 re-scan moved only {manifest_rel}); restore that patch's pin, or run \
+                 `bundle install` first so the lock follows {manifest_rel}"
+            ));
+        }
     }
     let decl = if wired {
         let transitive = block.as_ref().is_some_and(|b| {
@@ -1518,7 +1535,29 @@ async fn restore_one(
         (Some(text), Some(b)) => Some(restore_manifest(text, b, gem, &decl)),
         _ => manifest.map(str::to_string),
     };
-    Ok(Some((next_lock, next_manifest)))
+    Ok(Some((next_lock, next_manifest, superseded)))
+}
+
+/// What [`restore_one`] gives back: the next lock and manifest texts, and
+/// the superseding patch whose block it undid.
+type RestoredPair = (Option<String>, Option<String>, Option<String>);
+
+/// Another Socket patch's uuid whose lock section locks `gem`'s name and
+/// version (the lock side of an unconverged superseding re-scan).
+fn earlier_lock_pin(lines: &[&str], gem: &Gem<'_>, ctx: &Ctx<'_>) -> Option<String> {
+    gem_sections(lines).iter().find_map(|s| {
+        if !s
+            .entries
+            .iter()
+            .any(|e| e.name == gem.name && e.version == gem.version)
+        {
+            return None;
+        }
+        s.remotes
+            .iter()
+            .filter_map(|(_, r)| ctx.hosted_uuid(r))
+            .find(|uuid| uuid != gem.uuid)
+    })
 }
 
 #[cfg(test)]
@@ -1938,13 +1977,12 @@ mod tests {
         );
         let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
         assert!(hosted_lock.contains("  rails (= 7.0.0)!"), "{hosted_lock}");
-        let (next_lock, next_manifest) = restore_one(
+        let (next_lock, next_manifest, _) = restore_one(
             &gem(),
             Some(hosted_lock),
             Some(hosted_manifest),
             "Gemfile",
             &global_sources(hosted_manifest),
-            &mut None,
             &ctx,
         )
         .await
@@ -2041,14 +2079,13 @@ mod tests {
             );
             let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
             assert!(hosted_lock.contains(IDX), "{hosted_lock}");
-            let (next_lock, next_manifest) = restore_one(
+            let (next_lock, next_manifest, _) = restore_one(
                 &gem(),
                 Some(hosted_lock),
                 Some(hosted_manifest),
                 "Gemfile",
                 &global_sources(hosted_manifest),
-                &mut None,
-                &ctx,
+                                &ctx,
             )
             .await
             .unwrap()
@@ -2677,15 +2714,25 @@ mod tests {
             "{lock}"
         );
 
-        // Both pins in one run: each is handled, neither refused.
-        let (r, gemfile, _) = run(
+        // Both pins in one run, in either order: the lock's pin undoes the
+        // block, and neither is refused.
+        for pins in [
             vec![pin(UUID, &["Gemfile.lock"]), pin(NEW, &["Gemfile"])],
-            superseded.clone(),
-        )
-        .await;
-        assert!(r.refused.is_empty(), "{:?}", r.refused);
-        assert!(r.handled.contains(UUID) && r.handled.contains(NEW));
-        assert_eq!(gemfile.as_deref(), Some(want));
+            vec![pin(NEW, &["Gemfile"]), pin(UUID, &["Gemfile.lock"])],
+        ] {
+            let (r, gemfile, lock) = run(pins, superseded.clone()).await;
+            assert!(r.refused.is_empty(), "{:?}", r.refused);
+            assert!(r.handled.contains(UUID) && r.handled.contains(NEW));
+            assert_eq!(gemfile.as_deref(), Some(want));
+            assert!(!lock.unwrap().contains("patch-registry"));
+        }
+
+        // The superseding pin alone can't restore the pair: undoing its
+        // block would leave the lock on the earlier patch.
+        let (r, gemfile, lock) = run(vec![pin(NEW, &["Gemfile"])], superseded.clone()).await;
+        let why = r.refused.get(NEW).expect("refused");
+        assert!(why.contains(UUID), "{why}");
+        assert_eq!((gemfile, lock), (None, None));
 
         // Two superseding blocks for the same gem: not ours to pick.
         let other = upstream["Gemfile"].replace(UUID, "99999999-9999-9999-9999-999999999999");
