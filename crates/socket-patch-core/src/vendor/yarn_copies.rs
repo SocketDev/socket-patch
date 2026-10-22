@@ -3,7 +3,8 @@
 //! #1236), shared by the classic and berry backends.
 //!
 //! Yarn keys a `file:` tarball or directory, a url tarball and a berry
-//! `portal:` / `link:` dependency by the name the depender gave it
+//! `portal:` / `link:` / `exec:` / git dependency by the name the depender
+//! gave it
 //! (`lp2@file:./left-pad-1.3.0.tgz`), so a re-lock or `resolutions` entry
 //! for `left-pad` never moves it, and `node_modules/lp2` keeps the
 //! unpatched left-pad bytes. Which package such a copy is comes from the
@@ -31,8 +32,9 @@ pub(crate) struct OtherNameCopy {
     pub(crate) source: CopyRef,
     /// The copy itself says it is `name@version`. `false` for a copy of
     /// that version whose package cannot be read (a missing directory, a
-    /// tarball with no readable `package.json`, a non-registry url, or an
-    /// unread `portal:` / `link:` directory of any version): it may be
+    /// tarball with no readable `package.json`, a non-registry url, an
+    /// `exec:` script, a git remote, or an unread `portal:` / `link:`
+    /// directory of any version): it may be
     /// `name`, so it is named, but never taken as proof that `name` is
     /// installed (#1516, #1540).
     pub(crate) identified: bool,
@@ -189,5 +191,7 @@ pub(crate) fn copy_origin(source: &CopyRef) -> &'static str {
         CopyRef::Directory(_) => "a file: directory, which yarn copies into node_modules",
         CopyRef::Linked(..) => "a portal:/link: directory, which yarn links into node_modules",
         CopyRef::Url(_) => "a URL tarball",
+        CopyRef::Exec(_) => "an exec: script, which yarn runs to build it",
+        CopyRef::Git(_) => "a git repository",
     }
 }
