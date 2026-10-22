@@ -835,6 +835,24 @@ fn format_of(rel: &str) -> Format {
     }
 }
 
+/// The warning code for a patched gem archive left in Bundler's cache dir
+/// once its gem is back on the upstream registry entry (#1260, #1594).
+pub const GEM_STALE_CACHE: &str = gem::STALE_CACHE;
+
+/// The [`GEM_STALE_CACHE`] advisory, as `(code, detail)`, for the gem
+/// `purl` a vendored unwind just put back on its upstream entry in the
+/// project at `root` (#1594). `None` when Bundler's cache dir holds no
+/// archive for it, or holds the upstream one. `offline` skips the
+/// rubygems.org lookup a lock without `CHECKSUMS` needs, so the archive is
+/// then named as unchecked.
+pub async fn gem_stale_cache_after_unwind(
+    root: &Path,
+    purl: &str,
+    offline: bool,
+) -> Option<(&'static str, String)> {
+    gem::unwound_stale_cache(root, purl, offline).await
+}
+
 /// Restore every pin in `pins` to its default upstream registry entry.
 /// See the module docs for the contract.
 pub async fn restore_upstream(

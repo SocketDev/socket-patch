@@ -17,7 +17,7 @@ use std::path::Path;
 
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::vendor::{
-    save_state, RevertOpts, VendorServiceConfig, VendorState, VendorWarning,
+    save_state, RevertOpts, VendorEntry, VendorServiceConfig, VendorState, VendorWarning,
 };
 
 use crate::args::GlobalArgs;
@@ -131,6 +131,7 @@ impl<'a> VendoredBackend<'a> {
         for key in keys {
             // Captured before a clean revert drops the entry.
             let flavor = state.entries.get(key).and_then(|e| e.flavor.clone());
+            let entry = state.entries.get(key).cloned();
             let mut result = revert_vendor_entry(&self.common.cwd, key, state, opts).await;
             let hard_failure = matches!(
                 result.step,
@@ -154,6 +155,15 @@ impl<'a> VendoredBackend<'a> {
                     &mut result.warnings,
                 )
                 .await;
+                if let Some(entry) = &entry {
+                    push_gem_stale_cache(
+                        &self.common.cwd,
+                        entry,
+                        self.common.offline,
+                        &mut result.warnings,
+                    )
+                    .await;
+                }
             }
             out.push(RevertedEntry {
                 key: key.clone(),
@@ -166,6 +176,32 @@ impl<'a> VendoredBackend<'a> {
             }
         }
         out
+    }
+}
+
+/// Name a patched `<name>-<version>.gem` left in Bundler's cache dir once
+/// the vendored gem `entry` is unwired (#1594): a `bundle cache` taken
+/// while a hosted pin was live keeps it there through the takeover, and
+/// bundler installs from it again once the lock is back on upstream. The
+/// hosted unwind raises the same warning (#1260).
+pub(crate) async fn push_gem_stale_cache(
+    root: &Path,
+    entry: &VendorEntry,
+    offline: bool,
+    warnings: &mut Vec<VendorWarning>,
+) {
+    if socket_patch_core::vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) != "gem" {
+        return;
+    }
+    if let Some((code, detail)) =
+        socket_patch_core::patch::redirect::upstream::gem_stale_cache_after_unwind(
+            root,
+            &entry.base_purl,
+            offline,
+        )
+        .await
+    {
+        warnings.push(VendorWarning::new(code, detail));
     }
 }
 
