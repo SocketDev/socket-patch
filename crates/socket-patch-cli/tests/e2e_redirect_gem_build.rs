@@ -2272,6 +2272,131 @@ async fn gem_hosted_superseding_patch_keeps_gem_sections_in_bundler_order() {
     );
 }
 
+/// #1626: on a lock with no CHECKSUMS section, a superseding hosted
+/// re-scan moves only the Gemfile's `source … do` block to the new patch;
+/// the lock keeps pinning the old one until a `bundle install`. A
+/// `rollback` / `remove` in that window must undo the new block along with
+/// the lock, or the pair stays inconsistent (frozen installs fail) and the
+/// next unfrozen install re-patches.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler; \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_unwind_after_unconverged_supersede_undoes_the_new_block() {
+    for command in ["rollback", "remove"] {
+        unwind_after_unconverged_supersede(command).await;
+    }
+}
+
+async fn unwind_after_unconverged_supersede(command: &str) {
+    let Some(fx) = redirect_scanned_project(
+        &format!("unconverged-supersede-{command}"),
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    const GEN2: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    const GEN3: &str = "9a9a9a9a-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln = |uuid: &'static str, lib: String| GenerationGem {
+        name: DEP,
+        uuid,
+        deps: vec![format!("{TRANSITIVE}:>= 0")],
+        lib_file: "vuln_gem.rb",
+        orig: orig_lib(),
+        gem: build_gem(
+            &stage.join(uuid),
+            DEP,
+            DEP_VERSION,
+            "vuln_gem.rb",
+            &lib,
+            &[TRANSITIVE],
+        ),
+        patched: lib,
+    };
+    let api = fx._server.uri();
+    mount_patch_generation(&fx._server, 2, &[vuln(GEN2, patched_lib())]).await;
+    let (code, out, err) = run_hosted_scan(&fx.proj, &api);
+    assert_eq!(code, 0, "{command}: gen 2 scan: {out}\n{err}");
+    let install = bundle(&fx.proj, &["install"]);
+    assert!(
+        install.status.success(),
+        "{command}: converge gen 2:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    mount_patch_generation(
+        &fx._server,
+        1,
+        &[vuln(GEN3, patched_lib().replace("PATCHED", "PATCHED-GEN3"))],
+    )
+    .await;
+    let (code, out, err) = run_hosted_scan(&fx.proj, &api);
+    assert_eq!(code, 0, "{command}: gen 3 scan: {out}\n{err}");
+    let gemfile_path = fx.proj.join(fx.gemfile_name);
+    let lock_path = fx.proj.join(fx.lock_name);
+    // The unconverged window this test is about: Gemfile on gen 3, lock on
+    // gen 2.
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(gemfile.contains(GEN3), "{command}: Gemfile:\n{gemfile}");
+    assert!(
+        lock.contains(GEN2) && !lock.contains(GEN3),
+        "{command}: lock:\n{lock}"
+    );
+
+    let upstream = format!("{api}/upstream");
+    let cwd = fx.proj.to_str().expect("utf8 tmp path");
+    let mut argv = vec![command, PURL, "--json", "--cwd", cwd];
+    if command == "remove" {
+        argv.push("--yes");
+    }
+    argv.extend([
+        "--api-url",
+        &api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        &api,
+    ]);
+    let (code, stdout, stderr) =
+        run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+    assert_eq!(code, 0, "{command}: {stdout}\nstderr:\n{stderr}");
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        !gemfile.contains("patch-registry"),
+        "{command}: the Gemfile is still wired to a Socket patch:\n{gemfile}"
+    );
+    assert!(
+        !lock.contains("patch-registry"),
+        "{command}: the lock is still wired to a Socket patch:\n{lock}"
+    );
+    assert!(
+        gemfile.contains(&format!("gem \"{DEP}\"")),
+        "{command}: the Gemfile declares the gem again:\n{gemfile}"
+    );
+    // The pair is consistent: a frozen install accepts it as is.
+    let frozen = bundle_env(&fx.proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        frozen.status.success(),
+        "{command}: frozen install after the unwind:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&frozen.stdout),
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        lock,
+        "{command}: the frozen install leaves the restored lock as is"
+    );
+}
+
 /// Bundler's modern `gems.rb`/`gems.locked` spelling, end to end: the
 /// candidate list must read the pair, the rewriter must key its edits to it,
 /// and the real bundler must install the patched gem from the redirected
