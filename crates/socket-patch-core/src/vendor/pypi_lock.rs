@@ -642,6 +642,17 @@ fn pair_changed(
 }
 
 fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn TableLike) -> bool {
+    restore_table_keys(live, original, new, &mut Vec::new())
+}
+
+/// [`restore_table`], noting in `inserted` each key it put back that the
+/// live table no longer had.
+fn restore_table_keys(
+    live: &mut dyn TableLike,
+    original: &dyn TableLike,
+    new: &dyn TableLike,
+    inserted: &mut Vec<String>,
+) -> bool {
     let keys: BTreeSet<String> = original
         .iter()
         .chain(new.iter())
@@ -656,7 +667,18 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
         }
         if equal_item(live.get(&key), after) {
             if let Some(before) = before {
-                live.insert(&key, before.clone());
+                // In place, so the live key keeps its comments.
+                match live.get_mut(&key) {
+                    Some(current) if current.is_value() == before.is_value() => {
+                        *current = before.clone();
+                    }
+                    current => {
+                        if current.is_none() {
+                            inserted.push(key.clone());
+                        }
+                        live.insert(&key, before.clone());
+                    }
+                }
             } else {
                 live.remove(&key);
             }
@@ -682,6 +704,105 @@ fn restore_table(live: &mut dyn TableLike, original: &dyn TableLike, new: &dyn T
         }
     }
     drifted
+}
+
+/// [`restore_table`] on a header table, with each table-valued key it put
+/// back (vendoring had removed it) returned to its slot in `original`'s
+/// key order instead of the end. The copied sub-tables drop the positions
+/// they had in the recorded text, which mean nothing among the live
+/// table's (#1623), so they print right after the table before them.
+fn restore_header_table(live: &mut Table, original: &dyn TableLike, new: &dyn TableLike) -> bool {
+    fn unplace(item: &mut Item) {
+        let tables: Vec<&mut Table> = match item {
+            Item::Table(table) => vec![table],
+            Item::ArrayOfTables(array) => array.iter_mut().collect(),
+            _ => return,
+        };
+        for table in tables {
+            table.set_position(None);
+            table.iter_mut().for_each(|(_, child)| unplace(child));
+        }
+    }
+    let mut inserted = Vec::new();
+    let drifted = restore_table_keys(live, original, new, &mut inserted);
+    inserted.retain(|key| {
+        live.get(key)
+            .is_some_and(|item| item.is_table() || item.is_array_of_tables())
+    });
+    if inserted.is_empty() {
+        return drifted;
+    }
+    for key in &inserted {
+        if let Some(item) = live.get_mut(key) {
+            unplace(item);
+        }
+    }
+    let mut order: Vec<String> = live
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .filter(|key| !inserted.contains(key))
+        .collect();
+    let original_keys: Vec<String> = original.iter().map(|(key, _)| key.to_string()).collect();
+    for (index, key) in original_keys.iter().enumerate() {
+        if !inserted.contains(key) {
+            continue;
+        }
+        let at = original_keys[..index]
+            .iter()
+            .rev()
+            .find_map(|previous| order.iter().position(|known| known == previous))
+            .map_or(0, |found| found + 1);
+        order.insert(at, key.clone());
+    }
+    // Re-adding every entry in order keeps each key's own formatting.
+    let entries: Vec<_> = order
+        .iter()
+        .filter_map(|key| live.remove_entry(key))
+        .collect();
+    for (key, item) in entries {
+        live.insert_formatted(&key, item);
+    }
+    drifted
+}
+
+/// Keeps every table under an array-of-tables element printed between
+/// that element's header and the next element's. A restored item is a
+/// copy from the recorded text, and its standard tables keep their
+/// positions there, while toml_edit prints tables in position order. Once
+/// the live document numbers its tables differently (another package was
+/// vendored, or the user added one), a restored sub-table could print
+/// after the next element's header and re-parse as part of that element
+/// (#1623). Tables the live text placed already sit in their range.
+fn keep_under_owner(table: &mut Table, low: isize, high: isize) {
+    let clamp = |position: isize| position.max(low).min(high);
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(child) => {
+                if let Some(position) = child.position() {
+                    child.set_position(Some(clamp(position)));
+                }
+                keep_under_owner(child, low, high);
+            }
+            Item::ArrayOfTables(array) => {
+                let mut starts = Vec::with_capacity(array.len());
+                let mut last = low;
+                for element in array.iter() {
+                    last = element
+                        .position()
+                        .map_or(last, |position| clamp(position).max(last));
+                    starts.push(last);
+                }
+                for (index, element) in array.iter_mut().enumerate() {
+                    if element.position().is_some() {
+                        element.set_position(Some(starts[index]));
+                    }
+                    let end = starts.get(index + 1).copied().unwrap_or(high);
+                    keep_under_owner(element, starts[index], end);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether `live` still holds at least one field exactly as the vendoring
@@ -784,6 +905,13 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
         return false;
     }
     if let (Some(live), Some(original), Some(new)) = (
+        live.as_table_mut(),
+        original.as_table_like(),
+        new.as_table_like(),
+    ) {
+        return restore_header_table(live, original, new);
+    }
+    if let (Some(live), Some(original), Some(new)) = (
         live.as_table_like_mut(),
         original.as_table_like(),
         new.as_table_like(),
@@ -829,7 +957,7 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
                 drifted = true;
                 continue;
             }
-            drifted |= restore_table(current, original[index], new[index]);
+            drifted |= restore_header_table(current, original[index], new[index]);
         }
         return drifted;
     }
@@ -860,6 +988,9 @@ pub(crate) fn restore_document(
         .parse()
         .map_err(|error| format!("invalid vendored TOML: {error}"))?;
     let drifted = restore_item(live.as_item_mut(), original.as_item(), new.as_item());
+    if !drifted {
+        keep_under_owner(live.as_table_mut(), isize::MIN, isize::MAX);
+    }
     Ok((
         if drifted {
             current_text
@@ -1602,6 +1733,175 @@ mod tests {
         let (restored, drifted) = restore_document(&second_only, &first, &both).unwrap();
         assert!(!drifted);
         assert_eq!(restored, LOCK);
+    }
+
+    /// #1623: `pip lock` writes each wheel as a `[[packages.wheels]]` table
+    /// with a `[packages.wheels.hashes]` sub-table. Restoring one package's
+    /// wheels while a later package is still vendored must print them under
+    /// their own package, not after the next `[[packages]]` header.
+    #[test]
+    fn pip_lock_wheel_tables_revert_under_their_own_package() {
+        const PIP_LOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"pip\"\n\n[[packages]]\nname = \"idna\"\nversion = \"3.7\"\n\n[[packages.wheels]]\nname = \"idna-3.7-py3-none-any.whl\"\nurl = \"https://example.test/idna-3.7-py3-none-any.whl\"\n\n[packages.wheels.hashes]\nsha256 = \"idna\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n\n[[packages.wheels]]\nname = \"six-1.16.0-py2.py3-none-any.whl\"\nurl = \"https://example.test/six-1.16.0-py2.py3-none-any.whl\"\n\n[packages.wheels.hashes]\nsha256 = \"six\"\n";
+        let first = rewrite_python_lock(
+            PIP_LOCK,
+            "idna",
+            "3.7",
+            ArtifactSource::Path(".socket/vendor/pypi/a/idna-3.7-py3-none-any.whl"),
+            "first",
+        )
+        .unwrap()
+        .unwrap();
+        let both = rewrite_python_lock(
+            &first,
+            "six",
+            "1.16.0",
+            ArtifactSource::Path(".socket/vendor/pypi/b/six-1.16.0-py2.py3-none-any.whl"),
+            "second",
+        )
+        .unwrap()
+        .unwrap();
+        let six_only = rewrite_python_lock(
+            PIP_LOCK,
+            "six",
+            "1.16.0",
+            ArtifactSource::Path(".socket/vendor/pypi/b/six-1.16.0-py2.py3-none-any.whl"),
+            "second",
+        )
+        .unwrap()
+        .unwrap();
+
+        // Revert the first-vendored package alone: idna's wheel tables come
+        // back exactly where `pip lock` wrote them.
+        let (second_only, drifted) = restore_document(&both, PIP_LOCK, &first).unwrap();
+        assert!(!drifted, "{second_only}");
+        assert_eq!(second_only, six_only);
+        let parsed: DocumentMut = second_only.parse().unwrap();
+        let packages = parsed["packages"].as_array_of_tables().unwrap();
+        assert_eq!(
+            packages.get(0).unwrap()["wheels"][0]["hashes"]["sha256"].as_str(),
+            Some("idna")
+        );
+        assert!(packages.get(1).unwrap().get("wheels").is_none());
+
+        // Then the second one: the original bytes.
+        let (restored, drifted) = restore_document(&second_only, &first, &both).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, PIP_LOCK);
+
+        // The other order (`vendor --revert` walks the ledger) ends the same.
+        let (first_only, drifted) = restore_document(&both, &first, &both).unwrap();
+        assert!(!drifted);
+        assert_eq!(first_only, first);
+        let (restored, drifted) = restore_document(&first_only, PIP_LOCK, &first).unwrap();
+        assert!(!drifted);
+        assert_eq!(restored, PIP_LOCK);
+    }
+
+    /// #1623: restored tables go back between the live tables they sat
+    /// between, not after every other sub-table of their package.
+    #[test]
+    fn pip_lock_wheel_tables_revert_before_later_sub_tables() {
+        const PIP_LOCK: &str = "lock-version = \"1.0\"\n\n[[packages]]\nname = \"idna\"\nversion = \"3.7\"\n\n[[packages.wheels]]\nname = \"idna-3.7-py3-none-any.whl\"\nurl = \"https://example.test/idna.whl\"\n\n[packages.wheels.hashes]\nsha256 = \"idna\"\n\n[[packages.attestation-identities]]\nkind = \"GitHub\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n\n[[packages.wheels]]\nname = \"six-1.16.0-py2.py3-none-any.whl\"\nurl = \"https://example.test/six.whl\"\n\n[packages.wheels.hashes]\nsha256 = \"six\"\n\n[packages.tool.pdm]\ngroups = [\"default\"]\n";
+        let first = rewrite_python_lock(
+            PIP_LOCK,
+            "idna",
+            "3.7",
+            ArtifactSource::Path(".socket/vendor/pypi/a/idna-3.7-py3-none-any.whl"),
+            "first",
+        )
+        .unwrap()
+        .unwrap();
+        let both = rewrite_python_lock(
+            &first,
+            "six",
+            "1.16.0",
+            ArtifactSource::Path(".socket/vendor/pypi/b/six-1.16.0-py2.py3-none-any.whl"),
+            "second",
+        )
+        .unwrap()
+        .unwrap();
+        let (six_only, drifted) = restore_document(&both, PIP_LOCK, &first).unwrap();
+        assert!(!drifted, "{six_only}");
+        let (restored, drifted) = restore_document(&six_only, &first, &both).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, PIP_LOCK);
+        // A package the user added in front since vendoring shifts every
+        // element index; the wheels still go back under their own package.
+        let added = "[[packages]]\nname = \"certifi\"\nversion = \"1\"\n\n[[packages.wheels]]\nname = \"certifi-1-py3-none-any.whl\"\n\n";
+        let at = |text: &str| text.find("[[packages]]").unwrap();
+        let mut live = both.clone();
+        live.insert_str(at(&both), added);
+        let (restored, drifted) = restore_document(&live, PIP_LOCK, &first).unwrap();
+        assert!(!drifted, "{restored}");
+        let mut expected = six_only.clone();
+        expected.insert_str(at(&six_only), added);
+        assert_eq!(restored, expected);
+    }
+
+    /// #1623, replaced rather than re-added: a vendored `[[distribution.wheel]]`
+    /// array goes back with its recorded positions, which a package the user
+    /// added in front has shifted. It must still print under its own
+    /// `[[distribution]]`, not under the user's package.
+    #[test]
+    fn replaced_wheel_tables_stay_under_their_own_element() {
+        let original = "version = 1\n\n[[distribution]]\nname = \"idna\"\nversion = \"3.7\"\n\n[[distribution.wheel]]\nurl = \"https://example.test/idna.whl\"\nhash = \"sha256:i\"\n\n[[distribution]]\nname = \"six\"\nversion = \"1.16.0\"\n\n[[distribution.wheel]]\nurl = \"https://example.test/six.whl\"\nhash = \"sha256:s\"\n";
+        let new = original
+            .replace(
+                "https://example.test/idna.whl",
+                ".socket/vendor/pypi/a/idna.whl",
+            )
+            .replace("sha256:i", "sha256:vendored");
+        let added = "[[distribution]]\nname = \"certifi\"\nversion = \"1\"\n\n[[distribution.wheel]]\nurl = \"https://example.test/certifi-a.whl\"\n\n[[distribution.wheel]]\nurl = \"https://example.test/certifi-b.whl\"\n\n";
+        let at = |text: &str| text.find("[[distribution]]").unwrap();
+        let mut live = new.clone();
+        live.insert_str(at(&new), added);
+        let (restored, drifted) = restore_document(&live, original, &new).unwrap();
+        assert!(!drifted, "{restored}");
+        let mut expected = original.to_string();
+        expected.insert_str(at(original), added);
+        assert_eq!(restored, expected);
+    }
+
+    /// Putting a removed sub-table back at its key slot leaves the keys of a
+    /// dotted table in the same header alone.
+    #[test]
+    fn re_added_sub_table_keeps_dotted_key_order() {
+        let original = "[p]\nname = 1\nversion = 1\nd.version = 1\nd.name = 2\n\n[p.c]\nz = 1\n";
+        let new = "[p]\nname = 1\nversion = 1\nd.version = 1\nd.name = 2\n";
+        let live = new.replace("name = 1", "name = 3");
+        let (restored, drifted) = restore_document(&live, original, new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, original.replace("name = 1", "name = 3"));
+    }
+
+    /// A table restored whole keeps its sub-tables where the original
+    /// printed them, even after a sibling table the user edited.
+    #[test]
+    fn whole_table_restore_keeps_original_sub_table_order() {
+        let original = "[project]\nname = \"app\"\n\n[tool.uv]\npackage = false\n\n[tool.ruff]\nline-length = 88\n\n[tool.uv.sources]\nsix = { index = \"internal\" }\n";
+        let new = original.replace(
+            "six = { index = \"internal\" }",
+            "six = { path = \".socket/vendor/pypi/u/six.whl\" }",
+        );
+        let live = new.replace("line-length = 88", "line-length = 100");
+        let (restored, drifted) = restore_document(&live, original, &new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(
+            restored,
+            original.replace("line-length = 88", "line-length = 100")
+        );
+    }
+
+    /// A live file that differs from the vendored text only in line endings
+    /// restores to the original layout, in the live line endings.
+    #[test]
+    fn crlf_checkout_restores_out_of_order_tables_in_place() {
+        let original = "[a]\nx = 1\n\n[b]\ny = 1\n\n[a.c]\nz = 1\n";
+        let new = original.replace("z = 1", "z = 2");
+        let live = new.replace('\n', "\r\n");
+        let (restored, drifted) = restore_document(&live, original, &new).unwrap();
+        assert!(!drifted, "{restored}");
+        assert_eq!(restored, original.replace('\n', "\r\n"));
     }
 
     #[test]
