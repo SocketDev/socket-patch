@@ -129,12 +129,6 @@ impl LockParse {
     pub(crate) fn restore(&mut self, doc: toml_edit::Document<String>) {
         self.doc = Some(Arc::new(doc));
     }
-
-    /// Hold the parse of a text this run just produced, and share it with
-    /// the next reader of those bytes.
-    fn produced(&mut self, doc: toml_edit::Document<String>) {
-        self.doc = Some(share_lock(doc));
-    }
 }
 
 /// A successful fragment-spliced lock rewrite.
@@ -328,7 +322,7 @@ pub(crate) fn finish<'a>(
     let known_edits = (result == rendered).then_some(edits);
     if known_edits.is_some() {
         // The output IS the rendered text just parsed: the next dep's input.
-        parse.produced(after_doc);
+        parse.restore(after_doc);
     }
     Ok(FragmentRewrite {
         text: result,
