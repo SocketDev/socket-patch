@@ -51,21 +51,27 @@ impl BunTextLock {
 
     /// [`Self::parse`], shared: a scan reads one `bun.lock` in the lock
     /// inventory, in VEX discovery and in the hosted redirect, and parsing
-    /// a large lock is most of a Bun rescan's CPU (#1606). The last text
-    /// parsed is kept with its result, and the same text (compared in
-    /// full, so a changed lock is always parsed again) gets that result
-    /// back. Readers only; a splice edits a copy of [`Self::lines`].
+    /// a large lock is most of a Bun rescan's CPU (#1606). The last lock
+    /// parsed is kept, and a text whose lines are exactly its
+    /// [`Self::lines`] gets it back; any other text (a changed lock) is
+    /// parsed again. A refused lock is not kept. Readers only; a splice
+    /// edits a copy of [`Self::lines`].
     pub(crate) fn parse_shared(text: &str) -> Result<Arc<Self>, BunTextError> {
         static LAST: ParseMemo = ParseMemo::new();
         LAST.parse(text)
     }
+
+    /// Whether `text` is the text this lock was parsed from.
+    fn is_parse_of(&self, text: &str) -> bool {
+        let mut lines = self.lines.iter();
+        text.split('\n')
+            .all(|line| lines.next().is_some_and(|parsed| parsed == line))
+            && lines.next().is_none()
+    }
 }
 
-/// The last text [`BunTextLock::parse_shared`] parsed, with its result.
-struct ParseMemo(Mutex<Option<ParsedText>>);
-
-/// A lock text and what [`BunTextLock::parse`] made of it.
-type ParsedText = (Arc<str>, Result<Arc<BunTextLock>, BunTextError>);
+/// The last lock [`BunTextLock::parse_shared`] parsed.
+struct ParseMemo(Mutex<Option<Arc<BunTextLock>>>);
 
 impl ParseMemo {
     const fn new() -> Self {
@@ -74,14 +80,12 @@ impl ParseMemo {
 
     fn parse(&self, text: &str) -> Result<Arc<BunTextLock>, BunTextError> {
         let last = || self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((cached, parsed)) = last().as_ref() {
-            if **cached == *text {
-                return parsed.clone();
-            }
+        if let Some(lock) = last().as_ref().filter(|lock| lock.is_parse_of(text)) {
+            return Ok(Arc::clone(lock));
         }
-        let parsed = BunTextLock::parse(text).map(Arc::new);
-        *last() = Some((Arc::from(text), parsed.clone()));
-        parsed
+        let lock = Arc::new(BunTextLock::parse(text)?);
+        *last() = Some(Arc::clone(&lock));
+        Ok(lock)
     }
 }
 
@@ -156,13 +160,34 @@ mod tests {
     }
 
     #[test]
-    fn refusals_are_shared_too() {
+    fn refusals_are_not_kept() {
         let memo = ParseMemo::new();
+        let first = memo.parse(LOCK).unwrap();
         let future = LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 99,");
         let refused = memo.parse(&future).err().unwrap();
         assert!(matches!(refused, BunTextError::Version(_)));
         assert_eq!(memo.parse(&future).err(), Some(refused));
-        assert!(memo.parse(LOCK).is_ok());
+        // The refusal left the last good parse in place.
+        assert!(Arc::ptr_eq(&first, &memo.parse(LOCK).unwrap()));
+    }
+
+    #[test]
+    fn a_prefix_or_extension_is_another_text() {
+        let memo = ParseMemo::new();
+        let first = memo.parse(LOCK).unwrap();
+        for other in [
+            format!("{LOCK}\n"),
+            LOCK.trim_end().to_string(),
+            LOCK.replace('\n', "\r\n"),
+        ] {
+            let parsed = memo.parse(&other).unwrap();
+            assert!(!Arc::ptr_eq(&first, &parsed), "{other:?}");
+            assert_eq!(
+                parsed.lines,
+                other.split('\n').map(str::to_string).collect::<Vec<_>>()
+            );
+            memo.parse(LOCK).unwrap();
+        }
     }
 
     #[test]
