@@ -123,12 +123,12 @@ jobs:
     steps:
       # Same workspace path as the build job, so the socket-patch path
       # compiled into the tests (CARGO_BIN_EXE_socket-patch) resolves.
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: npm-e2e*
           merge-multiple: true
           path: target/debug
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '24.11.1'
       - name: Install the pinned npm
@@ -137,7 +137,7 @@ jobs:
         run: |
           npm install --prefix "$RUNNER_TEMP/npm-tool" --no-audit --no-fund "npm@$NPM_TEST_VERSION"
           echo "SOCKET_PATCH_NPM_E2E_BIN=$RUNNER_TEMP/npm-tool/node_modules/.bin/npm" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: ${{ matrix.node }}
       - name: Hosted + vendored installs, manifest-less VEX
