@@ -65,6 +65,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod bun_vex;
 #[path = "in_process_vendor_bun_takeover/registry.rs"]
 mod registry;
+#[path = "in_process_vendor_bun_takeover/user_patch.rs"]
+mod user_patch;
 #[path = "in_process_vendor_bun_takeover/vlt.rs"]
 mod vlt;
 #[path = "vlt_hosted_common/mod.rs"]

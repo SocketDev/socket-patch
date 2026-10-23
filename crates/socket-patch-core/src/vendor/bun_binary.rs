@@ -397,7 +397,7 @@ pub(super) fn preflight_package(
     coords: &NpmCoords,
     leaf: &str,
 ) -> Result<BinaryTargets, Box<VendorOutcome>> {
-    super::bun_lock::refuse_user_patched(&project.user_patched, &coords.name, &coords.version)?;
+    super::bun_lock::refuse_user_patched(&project.user_patched, coords)?;
     let (bundled_only, matches): (Vec<_>, Vec<_>) = project
         .packages
         .iter()
