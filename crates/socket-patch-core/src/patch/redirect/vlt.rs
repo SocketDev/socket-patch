@@ -8,7 +8,7 @@
 //! commas and re-lays flags and trailing slots on later saves, so the
 //! revert ([`revert_vlt_slots`]) works slot by slot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value};
 
@@ -55,10 +55,82 @@ fn lock_unsupported(detail: &str) -> RewriteWarning {
     }
 }
 
-/// A lock that passed the lock-level parse, with its nodes section located.
+/// A lock that passed the lock-level parse, with its nodes section located
+/// and its node ids split once.
 pub(super) struct HostedLock {
     parsed: ParsedLock,
     nodes: Option<SectionSpan>,
+    index: NodeIndex,
+}
+
+/// A node whose id splits, with its slot [1].
+struct IndexedNode {
+    id: String,
+    dep_id: DepId,
+    slot1: Option<String>,
+}
+
+/// The lock's nodes with their ids split once per scan rather than once per
+/// override (#1570). Positions point into `nodes`, which keeps the lock's
+/// key order; a node whose id does not split is left out, as it matches no
+/// override.
+#[derive(Default)]
+struct NodeIndex {
+    nodes: Vec<IndexedNode>,
+    /// Registry nodes by `(name, version)`, from any registry segment.
+    registry: HashMap<(String, String), Vec<usize>>,
+    /// Git, file and remote nodes by slot [1].
+    non_registry: HashMap<String, Vec<usize>>,
+}
+
+impl NodeIndex {
+    fn new(nodes: Option<&Map<String, Value>>) -> Self {
+        let mut index = NodeIndex::default();
+        for (id, tuple) in nodes.into_iter().flatten() {
+            let Some(dep_id) = split_dep_id(id) else {
+                continue;
+            };
+            let at = index.nodes.len();
+            let slot1 = tuple.get(1).and_then(Value::as_str).map(str::to_string);
+            match dep_id.kind {
+                DepIdKind::Registry => {
+                    if let Some((name, version)) = dep_id.registry_identity() {
+                        let key = (name.to_string(), version.to_string());
+                        index.registry.entry(key).or_default().push(at);
+                    }
+                }
+                DepIdKind::Git | DepIdKind::File | DepIdKind::Remote => {
+                    if let Some(slot1) = &slot1 {
+                        index
+                            .non_registry
+                            .entry(slot1.clone())
+                            .or_default()
+                            .push(at);
+                    }
+                }
+                DepIdKind::Workspace => {}
+            }
+            index.nodes.push(IndexedNode {
+                id: id.clone(),
+                dep_id,
+                slot1,
+            });
+        }
+        index
+    }
+
+    fn at<'a>(&'a self, map: Option<&'a Vec<usize>>) -> impl Iterator<Item = &'a IndexedNode> {
+        map.into_iter().flatten().map(|&i| &self.nodes[i])
+    }
+
+    fn registry(&self, name: &str, version: &str) -> impl Iterator<Item = &IndexedNode> {
+        self.at(self.registry.get(&(name.to_string(), version.to_string())))
+    }
+
+    /// The git, file and remote nodes whose slot [1] is `name`.
+    fn non_registry(&self, name: &str) -> impl Iterator<Item = &IndexedNode> {
+        self.at(self.non_registry.get(name))
+    }
 }
 
 pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning> {
@@ -87,57 +159,57 @@ pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning
             "nodes section is not in vlt's canonical layout",
         ));
     }
-    Ok(HostedLock { parsed, nodes })
-}
-
-/// Is `id` a registry node of `name@version`, and is its segment the
-/// default registry? `None` for any other node.
-fn registry_instance(
-    id: &str,
-    name: &str,
-    version: &str,
-    options: Option<&Map<String, Value>>,
-) -> Option<bool> {
-    let dep_id = split_dep_id(id)?;
-    (dep_id.registry_identity()? == (name, version))
-        .then(|| is_default_registry(&dep_id.first, options))
+    let index = NodeIndex::new(parsed.nodes());
+    Ok(HostedLock {
+        parsed,
+        nodes,
+        index,
+    })
 }
 
 /// The default-registry and the foreign registry node ids of
 /// `name@version`, in the lock's key order.
 fn partition_instances<'a>(
-    nodes: &'a Map<String, Value>,
+    lock: &'a HostedLock,
     name: &str,
     version: &str,
-    options: Option<&Map<String, Value>>,
 ) -> (Vec<&'a str>, Vec<&'a str>) {
+    let options = lock.parsed.options();
     let mut defaults = Vec::new();
     let mut foreign = Vec::new();
-    for id in nodes.keys() {
-        match registry_instance(id, name, version, options) {
-            Some(true) => defaults.push(id.as_str()),
-            Some(false) => foreign.push(id.as_str()),
-            None => {}
+    for node in lock.index.registry(name, version) {
+        if is_default_registry(&node.dep_id.first, options) {
+            defaults.push(node.id.as_str());
+        } else {
+            foreign.push(node.id.as_str());
         }
     }
     (defaults, foreign)
 }
 
+/// The git, remote and local-directory node ids that also install
+/// `name@version`, in the lock's key order.
+fn outside_instances<'a>(lock: &'a HostedLock, name: &str, version: &str) -> Vec<&'a str> {
+    lock.index
+        .non_registry(name)
+        .filter(|node| {
+            let slot1 = node.slot1.as_deref().unwrap_or_default();
+            installs_outside_registry(&node.dep_id, slot1, name, version)
+        })
+        .map(|node| node.id.as_str())
+        .collect()
+}
+
 /// The default-registry node ids of `dep` in a lock that passed the
 /// lock-level parse.
 pub(super) fn default_instances<'a>(lock: &'a HostedLock, dep: &DepOverride) -> Vec<&'a str> {
-    let Some(nodes) = lock.parsed.nodes() else {
-        return Vec::new();
-    };
-    partition_instances(nodes, &full_name(dep), &dep.version, lock.parsed.options()).0
+    partition_instances(lock, &full_name(dep), &dep.version).0
 }
 
 /// Does `dep` have a node of socket-patch's vendored vlt shape in a
 /// lock that passed the lock-level parse?
 pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> bool {
-    lock.parsed
-        .nodes()
-        .is_some_and(|nodes| has_vendored_node(nodes, &full_name(dep), &dep.version))
+    has_vendored_node(lock, &full_name(dep), &dep.version)
 }
 
 /// The lock-level warnings that say vlt may discard the lock's pins:
@@ -231,15 +303,10 @@ fn lock_level_warnings(
     files: &BTreeMap<String, String>,
     bun_lockb_present: bool,
 ) -> Vec<RewriteWarning> {
-    let ids: Vec<DepId> = lock
-        .parsed
-        .nodes()
-        .map(|nodes| nodes.keys().filter_map(|id| split_dep_id(id)).collect())
-        .unwrap_or_default();
     let mut warnings: Vec<RewriteWarning> = discarding_lock_codes(
         lock.parsed.version,
         lock.parsed.options(),
-        ids.iter(),
+        lock.index.nodes.iter().map(|node| &node.dep_id),
         files.get(VLT_CONFIG).map(String::as_str),
     )
     .into_iter()
@@ -267,14 +334,10 @@ fn npm_purl(name: &str, version: &str) -> String {
 }
 
 /// A `file` node of socket-patch's vendored vlt shape for `name@version`.
-fn has_vendored_node(nodes: &Map<String, Value>, name: &str, version: &str) -> bool {
-    nodes.iter().any(|(id, tuple)| {
-        let slot1 = tuple.get(1).and_then(Value::as_str);
-        split_dep_id(id).is_some_and(|dep_id| {
-            dep_id.kind == DepIdKind::File
-                && slot1 == Some(name)
-                && parse_vendored_path(&dep_id.first, name).is_some_and(|p| p.version == version)
-        })
+fn has_vendored_node(lock: &HostedLock, name: &str, version: &str) -> bool {
+    lock.index.non_registry(name).any(|node| {
+        node.dep_id.kind == DepIdKind::File
+            && parse_vendored_path(&node.dep_id.first, name).is_some_and(|p| p.version == version)
     })
 }
 
@@ -318,15 +381,26 @@ pub(super) fn every_instance_pinned(
 ) -> Option<()> {
     let json: Value = serde_json::from_str(text).ok()?;
     let nodes = json.get("nodes")?.as_object()?;
-    ids.iter()
-        .all(|id| {
-            let tuple = nodes.get(*id).and_then(Value::as_array);
-            tuple.is_some_and(|t| {
-                t.get(2).and_then(Value::as_str) == Some(sha512)
-                    && t.get(3).and_then(Value::as_str) == Some(url)
-            })
+    instances_pinned(nodes, ids, sha512, url).then_some(())
+}
+
+/// Does every node of `ids` carry the patched sha512 and URL?
+fn instances_pinned(nodes: &Map<String, Value>, ids: &[&str], sha512: &str, url: &str) -> bool {
+    ids.iter().all(|id| {
+        let tuple = nodes.get(*id).and_then(Value::as_array);
+        tuple.is_some_and(|t| {
+            t.get(2).and_then(Value::as_str) == Some(sha512)
+                && t.get(3).and_then(Value::as_str) == Some(url)
         })
-        .then_some(())
+    })
+}
+
+/// Did an earlier run pin every one of `ids`? Reads the lock as parsed,
+/// not its text again.
+pub(super) fn already_pinned(lock: &HostedLock, ids: &[&str], sha512: &str, url: &str) -> bool {
+    lock.parsed
+        .nodes()
+        .is_some_and(|nodes| instances_pinned(nodes, ids, sha512, url))
 }
 
 struct Splice {
@@ -356,11 +430,8 @@ fn rewrite_dep(
 ) -> bool {
     let name = full_name(dep);
     let version = dep.version.as_str();
-    let options = lock.parsed.options();
-    let empty = Map::new();
-    let nodes = lock.parsed.nodes().unwrap_or(&empty);
 
-    let (defaults, foreign) = partition_instances(nodes, &name, version, options);
+    let (defaults, foreign) = partition_instances(lock, &name, version);
     if !foreign.is_empty() {
         result.vlt_foreign_uuids.insert(dep.patch_uuid.clone());
         result.warnings.push(RewriteWarning {
@@ -372,15 +443,7 @@ fn rewrite_dep(
             ),
         });
     }
-    let outside: Vec<&str> = nodes
-        .iter()
-        .filter(|(id, tuple)| {
-            let slot1 = tuple.get(1).and_then(Value::as_str).unwrap_or_default();
-            split_dep_id(id)
-                .is_some_and(|dep_id| installs_outside_registry(&dep_id, slot1, &name, version))
-        })
-        .map(|(id, _)| id.as_str())
-        .collect();
+    let outside = outside_instances(lock, &name, version);
     if !outside.is_empty() {
         result.vlt_foreign_uuids.insert(dep.patch_uuid.clone());
         result.warnings.push(RewriteWarning {
@@ -404,7 +467,7 @@ fn rewrite_dep(
         return false;
     };
     if defaults.is_empty() {
-        let warning = if has_vendored_node(nodes, &name, version) {
+        let warning = if has_vendored_node(lock, &name, version) {
             RewriteWarning {
                 code: "redirect_vlt_entry_vendored".into(),
                 detail: format!(
@@ -722,6 +785,96 @@ mod tests {
             ]
         );
         assert!(result.confirmed_vlt_uuids.contains("uuid-left-pad"));
+    }
+
+    /// The index answers every per-override question exactly as a scan
+    /// of every node does: same ids, same key order, same eras.
+    #[test]
+    fn the_node_index_matches_a_scan_of_every_node() {
+        let uuid = "123e4567-e89b-12d3-a456-426614174000";
+        let lock = format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"registries\": {{\"corp\": \"https://corp.example/\"}}}},\n  \"nodes\": {{\n{}\n  }}\n}}\n",
+            [
+                format!("\"~corp~left-pad@1.3.0\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                format!("\"{ID}~peer.1\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                format!("\"·npm·left-pad@1.3.0\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                format!("\"~npm~ms@2.1.3\": [0,\"ms\",\"{REG_SHA}\"]"),
+                format!("\"{ID}\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                format!("\"~npm~left-pad@1.2.0\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                "\"git~github:a+b~abc\": [0,\"left-pad\"]".into(),
+                "\"remote~https_c++x.example+left-pad-1.3.0.tgz\": [0,\"left-pad\"]".into(),
+                "\"remote~https_c++x.example+left-pad-1.2.0.tgz\": [0,\"left-pad\"]".into(),
+                "\"file~packages+lp\": [0,\"left-pad\"]".into(),
+                "\"file~packages+other\": [0,\"ms\"]".into(),
+                format!("\"file~.socket+vendor+npm+{uuid}+left-pad-1.3.0+node__modules+left-pad\": [0,\"left-pad\"]"),
+                format!("\"file~.socket+vendor+npm+{uuid}+ms-2.1.3+node__modules+ms\": [0,\"ms\"]"),
+                "\"workspace~left-pad\": [0,\"left-pad\"]".into(),
+                "\"not-a-dep-id\": [0,\"left-pad\"]".into(),
+            ]
+            .map(|line| format!("    {line}"))
+            .join(",\n")
+        );
+        let hosted = parse_hosted_lock(&lock).unwrap();
+        let nodes = hosted.parsed.nodes().unwrap();
+        let options = hosted.parsed.options();
+        let scan = |name: &str, version: &str| {
+            let mut defaults = Vec::new();
+            let mut foreign = Vec::new();
+            let mut outside = Vec::new();
+            let mut vendored = false;
+            for (id, tuple) in nodes {
+                let Some(dep_id) = split_dep_id(id) else {
+                    continue;
+                };
+                let slot1 = tuple.get(1).and_then(Value::as_str).unwrap_or_default();
+                if dep_id.registry_identity() == Some((name, version)) {
+                    if is_default_registry(&dep_id.first, options) {
+                        defaults.push(id.as_str());
+                    } else {
+                        foreign.push(id.as_str());
+                    }
+                }
+                if installs_outside_registry(&dep_id, slot1, name, version) {
+                    outside.push(id.as_str());
+                }
+                vendored |= dep_id.kind == DepIdKind::File
+                    && slot1 == name
+                    && parse_vendored_path(&dep_id.first, name)
+                        .is_some_and(|p| p.version == version);
+            }
+            (defaults, foreign, outside, vendored)
+        };
+        let indexed = |name: &str, version: &str| {
+            let (defaults, foreign) = partition_instances(&hosted, name, version);
+            let outside = outside_instances(&hosted, name, version);
+            (
+                defaults,
+                foreign,
+                outside,
+                has_vendored_node(&hosted, name, version),
+            )
+        };
+        for (name, version) in [
+            ("left-pad", "1.3.0"),
+            ("left-pad", "1.2.0"),
+            ("ms", "2.1.3"),
+            ("absent", "1.0.0"),
+        ] {
+            assert_eq!(
+                indexed(name, version),
+                scan(name, version),
+                "{name}@{version}"
+            );
+        }
+        let (defaults, foreign, outside, vendored) = indexed("left-pad", "1.3.0");
+        assert_eq!(
+            defaults,
+            [format!("{ID}~peer.1").as_str(), "·npm·left-pad@1.3.0", ID]
+        );
+        assert_eq!(foreign, ["~corp~left-pad@1.3.0"]);
+        assert_eq!(outside.len(), 3, "{outside:?}");
+        assert!(vendored);
+        assert_eq!(hosted.index.nodes.len(), nodes.len() - 1);
     }
 
     #[test]
