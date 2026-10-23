@@ -2339,6 +2339,31 @@ async fn unwind_after_unconverged_supersede(command: &str) {
     assert_eq!(code, 0, "{command}: gen 3 scan: {out}\n{err}");
     let gemfile_path = fx.proj.join(fx.gemfile_name);
     let lock_path = fx.proj.join(fx.lock_name);
+    // Bundler < 2.2 merges every rubygems source into one GEM section, so
+    // discovery can't attribute the new pin and the superseding scan
+    // refuses it, writing nothing. The unconverged window never opens.
+    if !fx.bundler.at_least(2, 2) {
+        assert!(
+            out.contains("\"errorCode\": \"redirect_unattributable\""),
+            "{command}: gen 3 scan on a merged GEM section must refuse:\n{out}"
+        );
+        let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+        let lock = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            gemfile.contains(GEN2) && !gemfile.contains(GEN3),
+            "{command}: the refused scan leaves the Gemfile on gen 2:\n{gemfile}"
+        );
+        assert!(
+            lock.contains(GEN2) && !lock.contains(GEN3),
+            "{command}: the refused scan leaves the lock on gen 2:\n{lock}"
+        );
+        println!(
+            "SKIP e2e_redirect_gem_build (unconverged-supersede {command}): bundler {} \
+             refuses the superseding scan on its merged GEM section",
+            fx.bundler.version
+        );
+        return;
+    }
     // The unconverged window this test is about: Gemfile on gen 3, lock on
     // gen 2.
     let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
