@@ -619,6 +619,9 @@ pub(super) async fn run_redirect(
     stage: &mut super::rollout::Stage,
     // Scan's pre-redirect lockfile discovery (see `rollout::Gate::prior`).
     prior: Option<super::rollout::Prior<'_>>,
+    // The withdrawn-pin sweep's reference answers (see
+    // `rollout::Gate::references`).
+    references: Option<super::withdrawn::KnownReferences>,
     // `--prune` / `--sync`, gated by the policy exactly as the human arm
     // gates it (`patches.enabled: false` writes nothing, the GC included):
     // only feeds the `redirect_prune_ignored` warning.
@@ -685,7 +688,11 @@ pub(super) async fn run_redirect(
         &pairs,
         scan_result,
         npm_prior,
-        Some(super::rollout::Gate::new(stage, rows).with_prior(prior)),
+        Some(
+            super::rollout::Gate::new(stage, rows)
+                .with_prior(prior)
+                .with_references(references),
+        ),
         "scan",
     )
     .await
@@ -869,12 +876,33 @@ async fn run_redirect_selected_untracked(
 
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|(_, uuid)| uuid.clone()).collect();
-        status.set(format!(
-            "Resolving hosted artifacts for {}...",
-            crate::ui::plural(uuids.len(), "patch", "patches")
-        ));
-        let fetched = api_client.fetch_registry_references(&uuids).await;
-        status.finish();
+        // A rescan selects the uuids its lockfiles pin, which the
+        // withdrawn-pin sweep just asked about: ask only about the uuids it
+        // has no settled answer for.
+        let known = rollout.as_mut().and_then(|gate| gate.references.take());
+        let to_fetch = match &known {
+            Some(known) => known.unknown(&uuids),
+            None => uuids.clone(),
+        };
+        let fetched = if to_fetch.is_empty() {
+            Ok(std::collections::HashMap::new())
+        } else {
+            status.set(format!(
+                "Resolving hosted artifacts for {}...",
+                crate::ui::plural(to_fetch.len(), "patch", "patches")
+            ));
+            let fetched = api_client.fetch_registry_references(&to_fetch).await;
+            status.finish();
+            fetched
+        };
+        // `build_candidates` looks up only the selected uuids, so the
+        // sweep's answers for pins outside the selection are inert.
+        let fetched = fetched.map(|mut fetched| {
+            if let Some(known) = known {
+                fetched.extend(known.into_answers());
+            }
+            fetched
+        });
         let references = match fetched {
             Ok(r) => r,
             // A capped run whose every row is NEW: the failure affects only
