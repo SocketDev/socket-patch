@@ -4550,6 +4550,8 @@ pub(crate) struct VendorGcSummary {
     /// Post-revert rewrites that failed: `("vendor_state_write_failed" |
     /// "manifest_write_failed", <detail>)`. The reverts themselves already
     /// happened on disk; the stale record is what the caller must report.
+    /// Also `("cleanup_failed", <detail>)` per orphan dir (c) could not
+    /// delete.
     pub write_failures: Vec<(&'static str, String)>,
     /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
     /// `vendor_bun_reinstall_required` (#764) and vlt's
@@ -4805,10 +4807,13 @@ pub(crate) async fn run_vendor_gc(
 
     // (c) orphan uuid dirs, against the post-removal ledger. Dirs a lockfile
     // still points at are kept, so they are not counted as reclaimed.
-    out.orphan_dirs = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run)
-        .await
-        .removed
-        .len();
+    // One that could not be deleted is a `cleanup_failed` warning.
+    let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run).await;
+    out.orphan_dirs = sweep.removed.len();
+    for (unit, e) in &sweep.failed {
+        let warning = orphan_removal_failed(unit, e);
+        out.write_failures.push((warning.code, warning.detail));
+    }
     out
 }
 
