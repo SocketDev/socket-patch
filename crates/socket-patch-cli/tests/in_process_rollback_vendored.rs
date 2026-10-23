@@ -1061,3 +1061,34 @@ async fn remove_sweeps_the_targets_orphans() {
         "another package's orphan is out of scope"
     );
 }
+
+/// A `remove --dry-run` previews the orphan sweep and deletes nothing; the
+/// orphan events never count toward `summary.removed` (the manifest
+/// entries dropped).
+#[tokio::test]
+async fn remove_dry_run_previews_orphans_without_counting_them() {
+    let fx = vendored_fixture_with_orphans().await;
+    let cwd = fx.root().to_str().unwrap().to_string();
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "remove",
+            PURL,
+            "--dry-run",
+            "--json",
+            "--offline",
+            "--cwd",
+            &cwd,
+        ],
+    );
+    let env: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("remove --json envelope: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(orphans_removed(&env), vec![PURL.to_string()], "{env:#}");
+    assert_eq!(env["summary"]["removed"], 0, "{env:#}");
+    assert!(fx.tgz_path().is_file(), "dry run reverts nothing");
+    assert!(
+        orphan_dir(&fx, ORPHAN_UUID).is_dir(),
+        "dry run deletes nothing"
+    );
+}

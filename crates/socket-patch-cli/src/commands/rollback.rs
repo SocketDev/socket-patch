@@ -110,7 +110,7 @@ pub(crate) fn as_question(text: &str) -> String {
 
 /// The default (destructive) rollback's confirmation prompt, naming only
 /// the legs that have work.
-fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize) -> String {
+fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize, orphans: usize) -> String {
     let mut clauses: Vec<String> = Vec::new();
     if manifest > 0 {
         clauses.push(format!(
@@ -137,6 +137,12 @@ fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize) -> String {
         clauses.push(format!(
             "restore {} to the upstream registry",
             plural(hosted, "hosted package", "hosted packages")
+        ));
+    }
+    if orphans > 0 {
+        clauses.push(format!(
+            "delete {} with no ledger record",
+            plural(orphans, "orphaned vendored dir", "orphaned vendored dirs")
         ));
     }
     as_question(&join_clauses(&clauses))
@@ -852,9 +858,9 @@ struct VendoredLegOutcome {
     /// could not be saved.
     failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
-    /// Orphan uuid dirs (no ledger entry) swept, by
-    /// [`crate::commands::vendor::orphan_label`] (previewed on dry-run).
-    orphans_removed: Vec<String>,
+    /// `removed` / `vendor_orphan_removed` events for the orphan uuid
+    /// dirs (no ledger entry) swept, also on dry-run.
+    orphans_removed: Vec<PatchEvent>,
 }
 
 /// Unwire the in-scope vendored entries. `preserve` keeps artifacts and
@@ -1068,12 +1074,8 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
     }
     // Swept orphan dirs are `removed` on a dry run too (as in
     // `vendor --revert`): `verified` would read as a vendored restore.
-    for label in &leg.orphans_removed {
-        env.record(
-            PatchEvent::new(PatchAction::Removed, label.clone())
-                .with_reason("vendor_orphan_removed", "vendored dir had no ledger entry")
-                .with_details(vendored(serde_json::json!({}))),
-        );
+    for event in &leg.orphans_removed {
+        env.record(event.clone().with_details(vendored(serde_json::json!({}))));
     }
 
     // ── hosted leg ──
@@ -1733,10 +1735,42 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .join(",")
         );
     }
+    // Uuid dirs under `.socket/vendor/` that no ledger entry owns (the
+    // losing side of a git merge of two vendor runs, an interrupted run)
+    // are local state too: a run with work sweeps the ones in its scope
+    // after the vendored leg, as `vendor --revert` does (#1610). Path-glob
+    // targets name installed copies, never an orphan.
+    let sweep_orphans = has_work && project_state && !args.preserve_state && !ledger_unreadable;
+    let orphan_in_scope = |unit: &socket_patch_core::vendor::path::SweptVendorDir| {
+        crate::commands::vendor::ecosystem_in_scope(&args.common, &unit.eco)
+            && (!scoped
+                || identifiers
+                    .iter()
+                    .any(|id| crate::commands::vendor::orphan_in_target(id, unit)))
+    };
     if has_work && !args.common.dry_run && !args.preserve_state {
+        // The orphans the sweep would delete, for the prompt: the reverts
+        // only shrink the ledger, so the pre-run ledger finds the same set.
+        let orphans = match &vendor_state_result {
+            Ok(state) if sweep_orphans => crate::commands::vendor::sweep_orphan_vendor_dirs_where(
+                &ledger_root,
+                state,
+                true,
+                &orphan_in_scope,
+            )
+            .await
+            .removed
+            .len(),
+            _ => 0,
+        };
         // Compose only the clauses that apply, so a hosted-only run never
         // claims manifest entries it does not have.
-        let prompt = rollback_prompt(manifest_scope.len(), vendor_scope.len(), hosted_scope.len());
+        let prompt = rollback_prompt(
+            manifest_scope.len(),
+            vendor_scope.len(),
+            hosted_scope.len(),
+            orphans,
+        );
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if !args.common.json && !args.common.silent {
                 println!("{}", crate::ui::CANCELLED);
@@ -1785,60 +1819,49 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // `--preserve-state` keeps artifacts and entries. Skipped
             // fail-closed when the ledger is unreadable.
             let mut vendored_leg = VendoredLegOutcome::default();
-            let mut vs = vendor_state_result
-                .as_ref()
-                .ok()
-                .cloned()
-                .unwrap_or_default();
+            let mut reverted_state: Option<VendorState> = None;
             if !vendor_corrupt && !vendor_scope.is_empty() {
+                let mut vs = vendor_state_result
+                    .as_ref()
+                    .ok()
+                    .cloned()
+                    .unwrap_or_default();
                 let mut keys: Vec<String> = vendor_scope.iter().cloned().collect();
                 keys.sort();
                 vendored_leg =
                     run_vendored_leg(&args.common, &keys, &mut vs, args.preserve_state).await;
+                reverted_state = Some(vs);
             }
 
-            // ── orphan vendored dirs ─────────────────────────────────────
-            // Uuid dirs no ledger entry owns (the losing side of a git
-            // merge of two vendor runs, an interrupted run) are local state
-            // too: swept like `vendor --revert` does, within the run's
-            // scope, keeping any a lockfile still points into (#1610).
-            if project_state && !args.preserve_state && !aborted && !ledger_unreadable {
+            // ── orphan vendored dirs (see `sweep_orphans`) ───────────────
+            // A wired orphan is kept with a warning: deleting it would
+            // break the next install.
+            let ledger_now = reverted_state
+                .as_ref()
+                .or(vendor_state_result.as_ref().ok());
+            if let Some(state) = ledger_now.filter(|_| sweep_orphans && !aborted) {
                 let sweep = crate::commands::vendor::sweep_orphan_vendor_dirs_where(
                     &ledger_root,
-                    &vs,
+                    state,
                     args.common.dry_run,
-                    |unit| {
-                        crate::commands::vendor::ecosystem_in_scope(&args.common, &unit.eco)
-                            && (!scoped
-                                || identifiers.iter().any(|id| {
-                                    unit.purls
-                                        .iter()
-                                        .any(|purl| id.matches_patch(purl, &unit.uuid))
-                                }))
-                    },
+                    &orphan_in_scope,
                 )
                 .await;
                 for unit in &sweep.still_wired {
                     let warning = crate::commands::vendor::orphan_still_wired(unit);
                     run_warnings.push((warning.code.to_string(), warning.detail));
                 }
+                for (unit, e) in &sweep.failed {
+                    let warning = crate::commands::vendor::orphan_removal_failed(unit, e);
+                    run_warnings.push((warning.code.to_string(), warning.detail));
+                }
                 if !args.common.json && !args.common.silent {
-                    let verb = if args.common.dry_run {
-                        "Would remove"
-                    } else {
-                        "Removed"
-                    };
-                    for unit in &sweep.removed {
-                        println!(
-                            "{verb} orphaned vendored dir .socket/vendor/{}/{} (no ledger entry)",
-                            unit.eco, unit.uuid
-                        );
-                    }
+                    crate::commands::vendor::print_orphan_sweep(args.common.dry_run, &sweep);
                 }
                 vendored_leg.orphans_removed = sweep
                     .removed
                     .iter()
-                    .map(crate::commands::vendor::orphan_label)
+                    .map(crate::commands::vendor::orphan_removed_event)
                     .collect();
             }
 
@@ -5603,30 +5626,35 @@ mod tests {
     #[test]
     fn rollback_prompt_singular_plural_and_clauses() {
         assert_eq!(
-            rollback_prompt(1, 0, 0),
+            rollback_prompt(1, 0, 0, 0),
             "Roll back 1 patch and remove it from the local manifest?"
         );
         assert_eq!(
-            rollback_prompt(2, 0, 0),
+            rollback_prompt(2, 0, 0, 0),
             "Roll back 2 patches and remove them from the local manifest?"
         );
         // Never "..., and restore" after an inner "and".
         assert_eq!(
-            rollback_prompt(1, 0, 1),
+            rollback_prompt(1, 0, 1, 0),
             "Roll back 1 patch, remove it from the local manifest, and restore 1 hosted \
              package to the upstream registry?"
         );
         assert_eq!(
-            rollback_prompt(0, 0, 3),
+            rollback_prompt(0, 0, 3, 0),
             "Restore 3 hosted packages to the upstream registry?"
         );
         assert_eq!(
-            rollback_prompt(0, 1, 0),
+            rollback_prompt(0, 1, 0, 0),
             "Delete 1 vendored artifact and its ledger record?"
         );
         assert_eq!(
-            rollback_prompt(0, 2, 0),
+            rollback_prompt(0, 2, 0, 0),
             "Delete 2 vendored artifacts and their ledger records?"
+        );
+        assert_eq!(
+            rollback_prompt(0, 1, 0, 1),
+            "Delete 1 vendored artifact and its ledger record and delete 1 orphaned \
+             vendored dir with no ledger record?"
         );
     }
 
