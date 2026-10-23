@@ -626,8 +626,8 @@ jobs:
       - name: Cache cargo
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
-        # The shards share one cache key; shard 1 alone writes it, from the
-        # warm step that builds every target.
+        # The shards share one cache key and shard 1 alone writes it.
+        # rust-cache keeps only dependencies, which every shard builds.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}

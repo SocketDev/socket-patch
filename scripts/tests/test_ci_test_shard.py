@@ -86,7 +86,8 @@ class Partition(unittest.TestCase):
     def test_coverage_mode_comes_from_the_environment(self):
         metadata = {"workspace_members": ["a"], "packages": [
             {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
-        with patch.dict(shard.os.environ, {"CI_TEST_COVERAGE": "1"}), \
+        env = {k: v for k, v in shard.os.environ.items() if k != "CI_TEST_TIMINGS"}
+        with patch.dict(shard.os.environ, {**env, "CI_TEST_COVERAGE": "1"}, clear=True), \
                 patch.object(shard.subprocess, "run", side_effect=[
                     subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata)),
                     subprocess.CompletedProcess([], 0),

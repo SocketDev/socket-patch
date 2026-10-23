@@ -19,7 +19,7 @@ CI_TEST_COVERAGE=1 runs the shard under cargo-llvm-cov for ci.yml's
 no doctests, which cargo-llvm-cov leaves out without `--doctests`. A later
 `cargo llvm-cov report` exports the shard's profiles.
 
-Extra arguments after `SHARD COUNT` go to every `cargo test` invocation.
+Extra arguments after `SHARD COUNT` go to every `cargo` invocation.
 Each invocation runs with `--no-fail-fast`; the exit status is non-zero if
 any of them failed.
 
