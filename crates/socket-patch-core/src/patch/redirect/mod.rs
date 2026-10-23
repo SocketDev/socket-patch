@@ -5501,15 +5501,18 @@ fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) ->
 // deviations). Byte-for-byte twin of the TS `rewriteBun`.
 fn parse_bun_hosted_lock(
     content: &str,
-) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {
+) -> Result<(Vec<String>, crate::formats::bun::BunEntries), RewriteWarning> {
     use crate::vendor::bun_lock_text::{has_workspace_packages, lock_version};
 
     // The shared gate's `Err` text IS the detail: hosted and vendored refuse
     // an unsupported head with one message (and one remedy per arm — a
     // future version means "update socket-patch", a missing integer means
     // "re-lock"), so the two modes cannot drift apart.
-    let (lines, entries) = match crate::formats::bun::BunTextLock::parse(content) {
-        Ok(lock) => (lock.lines, lock.entries),
+    let (lines, entries) = match crate::formats::bun::BunTextLock::parse_shared(content) {
+        Ok(lock) => (
+            lock.lines.clone(),
+            crate::formats::bun::BunEntries::new(lock),
+        ),
         Err(crate::formats::bun::BunTextError::Version(detail)) => {
             return Err(RewriteWarning {
                 code: "redirect_bun_lock_unsupported".into(),
