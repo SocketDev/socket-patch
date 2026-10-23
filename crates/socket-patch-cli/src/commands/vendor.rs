@@ -50,6 +50,10 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::lock_cli::acquire_or_emit;
+use crate::commands::vendor_orphans::{
+    orphan_label, orphan_removal_failed, orphan_removed_event, orphan_still_wired,
+    sweep_orphan_vendor_dirs,
+};
 use crate::commands::vendored_backend::{
     ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
@@ -513,75 +517,6 @@ async fn unwired_check_failure(
         "wiring missing: no lockfile or config references {dir} any more, so a fresh install \
          gets the unpatched package; re-run `socket-patch vendor` to rewire it"
     )
-}
-
-/// What the orphan sweep did with the uuid dirs no ledger entry owns.
-#[derive(Default)]
-struct OrphanSweep {
-    /// Un-ledgered AND unreferenced — deleted (unless `dry_run`).
-    removed: Vec<vendor::path::SweptVendorDir>,
-    /// Un-ledgered but a project lockfile still points into them — kept.
-    still_wired: Vec<vendor::path::SweptVendorDir>,
-}
-
-/// Uuid dirs under `.socket/vendor/<eco>/` with no owning `(eco, uuid)`
-/// ledger entry (a hand-edited state file, or artifacts left by an
-/// interrupted run). Unparseable dirs are never returned (and never
-/// deleted). Returns the orphans so callers can emit events / counts.
-///
-/// A missing ledger entry does NOT prove missing wiring: lockfiles can
-/// still point into `.socket/vendor/` after a deleted state.json or a
-/// partial commit. Deleting such a dir would break the next install, so
-/// every candidate is checked against the wiring-bearing files first — the
-/// same lockfile scan `repair` reports `vendor_ledger_missing` from — and a
-/// referenced dir is kept for the caller to warn about.
-async fn sweep_orphan_vendor_dirs(cwd: &Path, state: &VendorState, dry_run: bool) -> OrphanSweep {
-    let recorded_units: HashSet<(&str, &str)> = state
-        .entries
-        .values()
-        .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
-        .collect();
-    let candidates: Vec<vendor::path::SweptVendorDir> = vendor::path::sweep_vendor_dirs(cwd)
-        .await
-        .into_iter()
-        .filter(|unit| !recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())))
-        .collect();
-    let mut out = OrphanSweep::default();
-    if candidates.is_empty() {
-        return out;
-    }
-    let wired: HashSet<(String, String)> =
-        crate::commands::vendored_backend::repair::scan_vendor_references(cwd)
-            .await
-            .into_iter()
-            .map(|(eco, uuid, _path)| (eco, uuid))
-            .collect();
-    // Each removal also prunes the `<eco>/` and `vendor/` levels it
-    // emptied (never `.socket/` — the lock guard owns that level): the
-    // sweep runs AFTER the per-entry reverts and their ledger saves, so it
-    // is the last thing that can leave a fully reverted project with empty
-    // `.socket/vendor/<eco>/` husks.
-    let stop_dir = cwd.join(SOCKET_DIR);
-    for unit in candidates {
-        if wired.contains(&(unit.eco.clone(), unit.uuid.clone())) {
-            out.still_wired.push(unit);
-            continue;
-        }
-        if !dry_run {
-            let _ = remove_tree_and_prune(&unit.dir, &stop_dir).await;
-        }
-        out.removed.push(unit);
-    }
-    out
-}
-
-/// How an orphan uuid dir is named in events: the PURL recovered from its
-/// leaf when the layout is recognizable, else `<eco>/<uuid>`.
-fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
-    unit.purls
-        .first()
-        .cloned()
-        .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
 }
 
 /// Does `eco` fall inside this run's `--ecosystems` scope? A vendor-ledger
@@ -4530,27 +4465,18 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // points at (their wiring outlived the ledger).
     let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, common.dry_run).await;
     for unit in &sweep.still_wired {
-        let label = orphan_label(unit);
+        record_warning(env, &orphan_label(unit), &orphan_still_wired(unit), common);
+    }
+    for (unit, e) in &sweep.failed {
         record_warning(
             env,
-            &label,
-            &VendorWarning::new(
-                "vendor_orphan_still_wired",
-                format!(
-                    "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
-                     entry owns; the artifacts were kept (run `socket-patch repair` to re-adopt \
-                     them into the ledger, then revert again)",
-                    unit.eco, unit.uuid
-                ),
-            ),
+            &orphan_label(unit),
+            &orphan_removal_failed(unit, e),
             common,
         );
     }
     for unit in &sweep.removed {
-        env.record(
-            PatchEvent::new(PatchAction::Removed, orphan_label(unit))
-                .with_reason("vendor_orphan_removed", "vendored dir had no ledger entry"),
-        );
+        env.record(orphan_removed_event(unit));
     }
 
     if env.events.is_empty() {
@@ -4624,6 +4550,8 @@ pub(crate) struct VendorGcSummary {
     /// Post-revert rewrites that failed: `("vendor_state_write_failed" |
     /// "manifest_write_failed", <detail>)`. The reverts themselves already
     /// happened on disk; the stale record is what the caller must report.
+    /// Also `("cleanup_failed", <detail>)` per orphan dir (c) could not
+    /// delete.
     pub write_failures: Vec<(&'static str, String)>,
     /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
     /// `vendor_bun_reinstall_required` (#764) and vlt's
@@ -4879,10 +4807,13 @@ pub(crate) async fn run_vendor_gc(
 
     // (c) orphan uuid dirs, against the post-removal ledger. Dirs a lockfile
     // still points at are kept, so they are not counted as reclaimed.
-    out.orphan_dirs = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run)
-        .await
-        .removed
-        .len();
+    // One that could not be deleted is a `cleanup_failed` warning.
+    let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run).await;
+    out.orphan_dirs = sweep.removed.len();
+    for (unit, e) in &sweep.failed {
+        let warning = orphan_removal_failed(unit, e);
+        out.write_failures.push((warning.code, warning.detail));
+    }
     out
 }
 
