@@ -24,9 +24,10 @@
 //! answer keeps the pin too. If the reference lookup fails (the patch API
 //! is down, say), every pin is kept and the run warns.
 //!
-//! The answers are kept ([`WithdrawnSweep::take_references`]): on a rescan
-//! the redirect selects the same uuids the lockfiles pin, and asks the
-//! endpoint only about the ones the sweep did not (#1606, #1607).
+//! The settled answers are kept ([`WithdrawnSweep::take_references`]): on
+//! a rescan the redirect selects the same uuids the lockfiles pin, and asks
+//! the endpoint only about the ones the sweep has no answer for (#1606,
+//! #1607).
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
@@ -69,32 +70,40 @@ pub(super) struct WithdrawnSweep {
     references: Option<KnownReferences>,
 }
 
-/// Reference lookups a run already made: the uuids it asked about and the
-/// endpoint's answers. A uuid asked about but absent from `results` is one
-/// the endpoint does not know (`not_found`), the same answer a second
-/// request would give.
+/// Reference answers the sweep already has, for the redirect to reuse.
+/// Only settled answers are kept: a `pending_build` (or any status this
+/// build does not know) may have changed by the time the redirect runs, and
+/// a uuid the response left out (a 404 chunk answers nothing) is asked
+/// again rather than read as `not_found`.
 #[derive(Debug, Default)]
-pub(crate) struct KnownReferences {
-    asked: BTreeSet<String>,
-    results: HashMap<String, PackageVendorResult>,
-}
+pub(crate) struct KnownReferences(HashMap<String, PackageVendorResult>);
 
 impl KnownReferences {
-    /// The uuids in `uuids` this lookup did not ask about.
-    pub(crate) fn unasked(&self, uuids: &[String]) -> Vec<String> {
+    /// The settled answers in `results` for the uuids in `asked` (an
+    /// answer the request did not ask for is not trusted).
+    fn settled(asked: &[String], mut results: HashMap<String, PackageVendorResult>) -> Self {
+        results.retain(|uuid, r| {
+            asked.contains(uuid)
+                && matches!(
+                    r.status.as_str(),
+                    "granted" | "reused" | "withdrawn" | "not_found" | "forbidden"
+                )
+        });
+        KnownReferences(results)
+    }
+
+    /// The uuids in `uuids` with no known answer.
+    pub(crate) fn unknown(&self, uuids: &[String]) -> Vec<String> {
         uuids
             .iter()
-            .filter(|uuid| !self.asked.contains(*uuid))
+            .filter(|uuid| !self.0.contains_key(*uuid))
             .cloned()
             .collect()
     }
 
-    /// The known answers for `uuids`, as the reference fetch returns them.
-    pub(crate) fn answers_for(&self, uuids: &[String]) -> HashMap<String, PackageVendorResult> {
-        uuids
-            .iter()
-            .filter_map(|uuid| Some((uuid.clone(), self.results.get(uuid)?.clone())))
-            .collect()
+    /// The known answers, keyed by uuid as the reference fetch returns them.
+    pub(crate) fn into_answers(self) -> HashMap<String, PackageVendorResult> {
+        self.0
     }
 }
 
@@ -181,10 +190,7 @@ pub(super) async fn sweep(
             is_gone(status).then(|| (pin.clone(), status.clone()))
         })
         .collect();
-    out.references = Some(KnownReferences {
-        asked: uuids.into_iter().collect(),
-        results: references,
-    });
+    out.references = Some(KnownReferences::settled(&uuids, references));
     if gone.is_empty() {
         return out;
     }
@@ -318,18 +324,27 @@ mod tests {
     }
 
     #[test]
-    fn known_references_cover_only_the_uuids_asked_about() {
-        let granted: PackageVendorResult =
-            serde_json::from_value(serde_json::json!({ "status": "granted" })).unwrap();
-        let known = KnownReferences {
-            // `u2` was asked about but the endpoint left it out.
-            asked: ["u1", "u2"].map(String::from).into(),
-            results: HashMap::from([("u1".to_string(), granted)]),
+    fn only_settled_answers_are_known() {
+        let answer = |status: &str| -> PackageVendorResult {
+            serde_json::from_value(serde_json::json!({ "status": status })).unwrap()
         };
-        let uuids = ["u1", "u2", "u3"].map(String::from);
-        assert_eq!(known.unasked(&uuids), ["u3"]);
-        let answers = known.answers_for(&uuids);
-        assert_eq!(answers.len(), 1);
-        assert_eq!(answers["u1"].status, "granted");
+        // `left-out`: the response did not answer it (a 404 chunk, say).
+        let uuids = ["granted", "withdrawn", "building", "failed", "left-out"].map(String::from);
+        let known = KnownReferences::settled(
+            &uuids,
+            HashMap::from([
+                ("granted".to_string(), answer("granted")),
+                ("withdrawn".to_string(), answer("withdrawn")),
+                ("building".to_string(), answer("pending_build")),
+                ("failed".to_string(), answer("build_failed")),
+                // Not asked for: dropped.
+                ("unasked".to_string(), answer("granted")),
+            ]),
+        );
+        assert_eq!(known.unknown(&uuids), ["building", "failed", "left-out"]);
+        assert_eq!(known.unknown(&["unasked".to_string()]), ["unasked"]);
+        let mut answers: Vec<_> = known.into_answers().into_keys().collect();
+        answers.sort();
+        assert_eq!(answers, ["granted", "withdrawn"]);
     }
 }

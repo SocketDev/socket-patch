@@ -2650,6 +2650,10 @@ async fn run_scan(
     } else {
         None
     };
+    // The sweep's reference answers, reused by the hosted redirect.
+    let sweep_references = withdrawn_sweep
+        .as_mut()
+        .and_then(withdrawn::WithdrawnSweep::take_references);
 
     // Calculate patch counts
     let mut free_patches = 0usize;
@@ -2766,9 +2770,7 @@ async fn run_scan(
         // Hosted mode: the redirect engine records its events into this
         // envelope and prints it.
         if hosted {
-            let mut references = None;
-            if let Some(mut sweep) = withdrawn_sweep {
-                references = sweep.take_references();
+            if let Some(sweep) = withdrawn_sweep {
                 sweep.record_into(&mut env);
             }
             return run_redirect(
@@ -2784,7 +2786,7 @@ async fn run_scan(
                 batch_error_count > 0,
                 &mut stage,
                 prior_discovery,
-                references,
+                sweep_references,
                 prune,
             )
             .await;
@@ -3261,11 +3263,7 @@ async fn run_scan(
             Some(
                 rollout::Gate::new(&mut stage, rows)
                     .with_prior(prior_discovery)
-                    .with_references(
-                        withdrawn_sweep
-                            .as_mut()
-                            .and_then(withdrawn::WithdrawnSweep::take_references),
-                    ),
+                    .with_references(sweep_references),
             ),
             "scan",
         )

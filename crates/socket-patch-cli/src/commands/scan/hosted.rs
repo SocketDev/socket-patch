@@ -877,10 +877,11 @@ async fn run_redirect_selected_untracked(
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|(_, uuid)| uuid.clone()).collect();
         // A rescan selects the uuids its lockfiles pin, which the
-        // withdrawn-pin sweep just asked about: ask only about the rest.
+        // withdrawn-pin sweep just asked about: ask only about the uuids it
+        // has no settled answer for.
         let known = rollout.as_mut().and_then(|gate| gate.references.take());
         let to_fetch = match &known {
-            Some(known) => known.unasked(&uuids),
+            Some(known) => known.unknown(&uuids),
             None => uuids.clone(),
         };
         let fetched = if to_fetch.is_empty() {
@@ -894,9 +895,11 @@ async fn run_redirect_selected_untracked(
             status.finish();
             fetched
         };
+        // `build_candidates` looks up only the selected uuids, so the
+        // sweep's answers for pins outside the selection are inert.
         let fetched = fetched.map(|mut fetched| {
-            if let Some(known) = &known {
-                fetched.extend(known.answers_for(&uuids));
+            if let Some(known) = known {
+                fetched.extend(known.into_answers());
             }
             fetched
         });

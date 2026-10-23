@@ -68,11 +68,19 @@ fn scan_args(cwd: &Path, api_url: String, dry_run: bool) -> ScanArgs {
 /// Run an in-process hosted scan with the npm registry pointed at
 /// `server`, scrubbing the env toggles `run` mirrors into the process.
 async fn scan(cwd: &Path, server: &MockServer, dry_run: bool) -> i32 {
+    scan_with(cwd, server, dry_run, true).await
+}
+
+/// [`scan`], with `--json` on or off (off runs `--silent`).
+async fn scan_with(cwd: &Path, server: &MockServer, dry_run: bool, json: bool) -> i32 {
     std::env::set_var(
         "SOCKET_NPM_REGISTRY",
         format!("{}/npm-registry", server.uri()),
     );
-    let code = scan_run(scan_args(cwd, server.uri(), dry_run)).await;
+    let mut args = scan_args(cwd, server.uri(), dry_run);
+    args.common.json = json;
+    args.common.silent = !json;
+    let code = scan_run(args).await;
     for var in ["SOCKET_NPM_REGISTRY", "SOCKET_DRY_RUN"] {
         std::env::remove_var(var);
     }
@@ -563,18 +571,7 @@ async fn rescan_asks_once(json: bool) {
     )
     .await;
     mock_view(&server, UUID).await;
-    std::env::set_var(
-        "SOCKET_NPM_REGISTRY",
-        format!("{}/npm-registry", server.uri()),
-    );
-    let mut args = scan_args(tmp.path(), server.uri(), false);
-    args.common.json = json;
-    args.common.silent = !json;
-    let code = scan_run(args).await;
-    for var in ["SOCKET_NPM_REGISTRY", "SOCKET_DRY_RUN"] {
-        std::env::remove_var(var);
-    }
-    assert_eq!(code, 0);
+    assert_eq!(scan_with(tmp.path(), &server, false, json).await, 0);
 
     assert_eq!(lock(tmp.path()), wired, "the rescan keeps the pin");
     assert_eq!(
@@ -623,5 +620,30 @@ async fn the_redirect_asks_only_about_uuids_the_sweep_did_not() {
     assert_eq!(
         reference_uuids(&server).await,
         vec![vec![UUID.to_string()], vec![UUID2.to_string()]],
+    );
+}
+
+/// An answer that may change within the run (`pending_build`) is asked
+/// again by the redirect instead of reused.
+#[tokio::test]
+#[serial]
+async fn a_pending_build_answer_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, wired) = wired_project(tmp.path()).await;
+
+    let server = MockServer::start().await;
+    mock_search(&server, &[UUID]).await;
+    mock_references(
+        &server,
+        serde_json::json!({ UUID: { "status": "pending_build" } }),
+    )
+    .await;
+    mock_view(&server, UUID).await;
+    assert_eq!(scan(tmp.path(), &server, false).await, 0);
+
+    assert_eq!(lock(tmp.path()), wired, "a building patch keeps its pin");
+    assert_eq!(
+        reference_uuids(&server).await,
+        vec![vec![UUID.to_string()], vec![UUID.to_string()]],
     );
 }
