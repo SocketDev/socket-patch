@@ -175,15 +175,19 @@ pub(crate) fn strip_jsonc(text: &str) -> String {
 /// to `target` (a hosted URL or vendored tarball path) would orphan. Bun
 /// keys the patch on the package's resolution: the registry
 /// `name@version`, or, for a `bun patch` made after a hosted or vendored
-/// rewire, the tarball it resolves to (Bun 1.4, #1019; see
-/// [`resolution_patch_key`]). A bare `name` is matched too so that a key
-/// spelled without a version never slips past the gate.
+/// rewire, the tarball it resolves to (Bun 1.4, #1019). A bare `name` is
+/// matched too so that a key spelled without a version never slips past
+/// the gate.
 ///
 /// Bun applies such a patch only while the lock resolves the package to
 /// that resolution. Rewiring it elsewhere makes Bun drop the user's patch
 /// on every install, silently (#367), so both modes leave such a package
 /// alone and say why. A key for `target` itself is no conflict: the run
-/// leaves the package where the patch applies.
+/// leaves the package where the patch applies. Any other tarball key
+/// counts, even one the lock no longer resolves to: a takeover checks
+/// after reverting the wiring the key names, so the lock cannot tell a
+/// stale key from a live one, and the refusal's remedy (remove the entry)
+/// clears a stale one.
 pub(crate) fn patched_dependency_key<'k>(
     keys: &'k [String],
     name: &str,
@@ -202,30 +206,46 @@ pub(crate) fn patched_dependency_key<'k>(
         })
 }
 
-/// The `patchedDependencies` key a `bun patch` made after a hosted or
-/// vendored rewire writes for `name@version` (Bun 1.4, #1019): the package
-/// name and the URL or path of the tarball it resolves to, such as
-/// `left-pad@.socket/vendor/npm/<uuid>/left-pad-1.3.0.tgz`. Bun stops
-/// applying it once the lock resolves the package anywhere else, the
-/// registry included.
-pub(crate) fn resolution_patch_key<'k>(
-    keys: &'k [String],
-    name: &str,
-    version: &str,
-) -> Option<&'k str> {
-    keys.iter()
-        .map(String::as_str)
-        .find(|key| tarball_resolution(key, name, version).is_some())
-}
-
 /// The resolution `key` names when it is `name@<url or path>` of
-/// `name@version`'s own tarball: a hosted URL and a vendored path both end
-/// in npm's tarball name.
+/// `name@version`'s own tarball, the key a `bun patch` made after a hosted
+/// or vendored rewire writes (Bun 1.4, #1019), such as
+/// `left-pad@.socket/vendor/npm/<uuid>/left-pad-1.3.0.tgz`: a hosted URL
+/// and a vendored path both end in npm's tarball name.
 fn tarball_resolution<'k>(key: &'k str, name: &str, version: &str) -> Option<&'k str> {
     let (key_name, resolution) = split_name_spec(key)?;
     let leaf = name.rsplit('/').next().unwrap_or(name);
     (key_name == name && resolution.ends_with(&format!("/{leaf}-{version}.tgz")))
         .then_some(resolution)
+}
+
+/// Of `keys`, the ones naming a non-registry resolution that `specs` (the
+/// lock's `name@resolution` entry specs) still holds: the patches Bun
+/// applies to a hosted or vendored tarball right now (#1019). An unwind
+/// that takes one of these out of the lock drops that patch.
+pub(crate) fn live_resolution_keys<'s>(
+    keys: &[String],
+    specs: impl IntoIterator<Item = &'s str>,
+) -> std::collections::BTreeSet<String> {
+    let specs: std::collections::HashSet<&str> = specs.into_iter().collect();
+    keys.iter()
+        .filter(|key| {
+            split_name_spec(key).is_some_and(|(_, resolution)| resolution.contains('/'))
+                && specs.contains(key.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// The user-facing warning detail for a project-authored Bun patch keyed by
+/// a tarball the package no longer resolves to after an unwind (#1019).
+pub(crate) fn dropped_patch_detail(key: &str) -> String {
+    let name = split_name_spec(key).map_or(key, |(name, _)| name);
+    format!(
+        "package.json `patchedDependencies` has `{key}`, a patch the project applies with \
+         `bun patch` only while {name} resolves to that tarball; now that the lock resolves it \
+         elsewhere, `bun install` stops applying that patch without failing. Re-create it with \
+         `bun patch {name}` and `bun patch --commit`, or remove the entry"
+    )
 }
 
 /// The user-facing reason a package with a project-authored Bun patch is
@@ -917,21 +937,17 @@ mod tests {
         assert_eq!(patched_dependency_key(&keys, "p", "2.0.0", ""), None);
         assert_eq!(patched_dependency_key(&keys, "@s/p", "2.0.0-0", ""), None);
         // A run that keeps the package on the keyed resolution drops
-        // nothing; a rollback to the registry drops it.
+        // nothing.
         let target = "https://patch.socket.dev/patch/npm/plainpkg/1.0.0/tok/u1/plainpkg-1.0.0.tgz";
         assert_eq!(
             patched_dependency_key(&keys, "plainpkg", "1.0.0", target),
             None
         );
-        assert_eq!(
-            resolution_patch_key(&keys, "plainpkg", "1.0.0"),
-            Some(keys[0].as_str())
-        );
-        let registry_only = vec!["plainpkg@1.0.0".to_string(), "plainpkg".to_string()];
-        assert_eq!(
-            resolution_patch_key(&registry_only, "plainpkg", "1.0.0"),
-            None
-        );
+        // Only tarball keys the lock still holds are live.
+        let mut with_registry = keys.clone();
+        with_registry.push("left-pad@1.3.0".into());
+        let live = live_resolution_keys(&with_registry, [keys[1].as_str(), "left-pad@1.3.0"]);
+        assert_eq!(live.into_iter().collect::<Vec<_>>(), vec![keys[1].clone()]);
         // The refusal names the resolution Bun applies the patch to.
         let detail = patched_dependency_detail(&keys[1], "@s/p", "2.0.0");
         assert!(
