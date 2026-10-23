@@ -345,9 +345,16 @@ pub fn resolve_member_yarn_mirror(
         let yarnrc = read(&member.join(super::YARNRC_REL));
         let npmrc = read(&member.join(super::npmrc::NPMRC_REL));
         let mut setting = effective_mirror(yarnrc.as_deref(), npmrc.as_deref(), &outer)?;
-        if setting.origin == super::YARNRC_REL || setting.origin == super::npmrc::NPMRC_REL {
-            setting.origin = member.join(&setting.origin).display().to_string();
-        }
+        let origin =
+            if setting.origin == super::YARNRC_REL || setting.origin == super::npmrc::NPMRC_REL {
+                member.join(&setting.origin).display().to_string()
+            } else {
+                setting.origin
+            };
+        setting.origin = format!(
+            "{origin}, as read by yarn run in the workspace member {}",
+            member.display()
+        );
         Some(setting)
     })
 }
@@ -356,9 +363,11 @@ pub fn resolve_member_yarn_mirror(
 /// `root`: the directories below it that hold a `package.json` and match
 /// the root `package.json`'s `workspaces` in yarn classic's reading,
 /// sorted. Empty when the root has no classic `yarn.lock` or declares no
-/// workspaces. `node_modules` and `.git` are never searched, nor is a
-/// directory deeper than the deepest pattern (`**` searches down to
-/// [`MEMBER_SEARCH_DEPTH`]).
+/// workspaces. The search follows directory links like yarn's globber,
+/// never enters `node_modules` or `.git`, stops at the deepest pattern's
+/// depth ([`MEMBER_SEARCH_DEPTH`] for `**`, which also bounds a link
+/// cycle), and gives up after [`MEMBER_SEARCH_DIR_BUDGET`] directories,
+/// keeping the members found so far.
 pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
     use crate::utils::fs::read_regular_to_string_sync;
     use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
@@ -388,9 +397,9 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
             }
         })
         .max()
-        .unwrap_or(0)
-        .min(MEMBER_SEARCH_DEPTH);
+        .unwrap_or(0);
     let mut members = Vec::new();
+    let mut budget = MEMBER_SEARCH_DIR_BUDGET;
     let mut stack = vec![(root.to_path_buf(), Vec::<String>::new())];
     while let Some((dir, rel)) = stack.pop() {
         if !rel.is_empty()
@@ -402,22 +411,22 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
         if rel.len() >= depth {
             continue;
         }
+        let Some(left) = budget.checked_sub(1) else {
+            break;
+        };
+        budget = left;
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            // `file_type` does not follow symlinks, so a link cycle is
-            // never walked.
-            if name == "node_modules"
-                || name == ".git"
-                || !entry.file_type().is_ok_and(|t| t.is_dir())
-            {
+            let path = entry.path();
+            if name == "node_modules" || name == ".git" || !path.is_dir() {
                 continue;
             }
             let mut child = rel.clone();
             child.push(name);
-            stack.push((entry.path(), child));
+            stack.push((path, child));
         }
     }
     members.sort();
@@ -426,7 +435,11 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
 
 /// How deep [`yarn_classic_workspace_members`] searches for a `**`
 /// pattern's members.
-pub const MEMBER_SEARCH_DEPTH: usize = 8;
+pub const MEMBER_SEARCH_DEPTH: usize = 32;
+
+/// How many directories [`yarn_classic_workspace_members`] lists before it
+/// stops searching.
+pub const MEMBER_SEARCH_DIR_BUDGET: usize = 20_000;
 
 /// [`resolve_outer_yarn_mirror`] for this process, reading regular files
 /// only, with [`OuterYarnMirror::member`] from the project's yarn classic

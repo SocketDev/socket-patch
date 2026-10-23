@@ -307,7 +307,14 @@ impl Host {
             &members,
             |p| self.files.get(p).cloned(),
         ))
-        .map(|(p, origin)| (p, origin.replace('\\', "/")))
+        .map(|(p, origin)| {
+            let origin = origin.replace('\\', "/");
+            let (file, member) = origin
+                .split_once(", as read by yarn run in the workspace member ")
+                .expect("the origin names the member");
+            assert!(members.contains(&PathBuf::from(member)), "{origin}");
+            (p, file.to_string())
+        })
     }
 }
 
@@ -377,6 +384,32 @@ fn yarn_classic_workspace_members_follow_the_root_globs() {
         yarn_classic_workspace_members(root),
         vec![root.join("packages/a"), root.join("tools/x")]
     );
+    // A literal pattern is searched as deep as it goes.
+    write(
+        "package.json",
+        r#"{"private":true,"workspaces":["a/b/c/d/e/f/g/h/i"]}"#,
+    );
+    write("a/b/c/d/e/f/g/h/i/package.json", "{}");
+    assert_eq!(
+        yarn_classic_workspace_members(root),
+        vec![root.join("a/b/c/d/e/f/g/h/i")]
+    );
+    // A member reached through a directory link counts, as yarn's globber
+    // follows it.
+    #[cfg(unix)]
+    {
+        write(
+            "package.json",
+            r#"{"private":true,"workspaces":["linked/*"]}"#,
+        );
+        write("shared/s/package.json", "{}");
+        std::fs::create_dir_all(root.join("linked")).unwrap();
+        std::os::unix::fs::symlink(root.join("shared/s"), root.join("linked/s")).unwrap();
+        assert_eq!(
+            yarn_classic_workspace_members(root),
+            vec![root.join("linked/s")]
+        );
+    }
     // `**` searches deeper.
     write(
         "package.json",

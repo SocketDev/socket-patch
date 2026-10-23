@@ -266,8 +266,11 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `YARN_*` / `npm_config_*` environment variables. A file saved with a UTF-8
   BOM counts too, and `false` in a higher-precedence layer turns the mirror
   off. In a workspace, a mirror that yarn 1 run in a member directory
-  would use (from the member's own `.yarnrc` / `.npmrc`) is refused the
-  same way, since installs run there read the root's lock. Yarn looks mirror tarballs up by
+  would use is refused the same way, since installs run there read the
+  root's lock. Such a run reads the member's own `.yarnrc` / `.npmrc` as
+  the project files and the root's only as an ancestor's, below the user
+  and global ones, so a root `false` does not turn off a user mirror for
+  it; set `false` in the member too. Yarn looks mirror tarballs up by
   file name, and the hosted tarball has the same name as the upstream one
   already in the mirror, so installs would get the unpatched bytes and fail
   the integrity check. Use `--mode vendored` there; it works with a mirror.

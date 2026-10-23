@@ -1236,18 +1236,25 @@ async fn run_redirect_selected_untracked(
     // the lock block's sub-maps, every new descriptor locked (#591). The
     // tarball is checked against the grant's sha512; one that cannot be
     // fetched, verified or read drops its patch.
+    // The yarn 1 config layers outside the project (env, user, global and
+    // ancestor rc files), and the mirror a yarn run in a workspace member
+    // would use (#1115), located the way yarn 1 does: a mirror set in any
+    // of them refuses the classic rewrite like a project one. Resolved
+    // once: the member search walks the workspace tree.
+    let yarn_classic_outer_once = std::sync::OnceLock::new();
+    let yarn_classic_outer = || {
+        yarn_classic_outer_once
+            .get_or_init(|| resolve_outer_yarn_mirror_for_process(&common.cwd))
+            .clone()
+    };
     let classic_targets: Vec<(String, String, DepOverride)> =
-        engine::yarn_classic_artifact_targets(
-            &candidates,
-            &read.files,
-            &resolve_outer_yarn_mirror_for_process(&common.cwd),
-        )
-        .into_iter()
-        .filter_map(|dep| {
-            let sha512 = dep.integrity.sha512.clone()?;
-            Some((dep.artifact_url.clone(), sha512, dep.clone()))
-        })
-        .collect();
+        engine::yarn_classic_artifact_targets(&candidates, &read.files, &yarn_classic_outer())
+            .into_iter()
+            .filter_map(|dep| {
+                let sha512 = dep.integrity.sha512.clone()?;
+                Some((dep.artifact_url.clone(), sha512, dep.clone()))
+            })
+            .collect();
     for (url, sha512, dep) in classic_targets {
         status.set(format!("Fetching hosted tarball for {}...", dep.name));
         match socket_patch_core::hosted::npm_manifest::fetch_hosted_classic_artifact(
@@ -1319,10 +1326,6 @@ async fn run_redirect_selected_untracked(
         .and_then(|gate| gate.prior)
         .filter(|_| !takeover.is_staged())
         .and_then(|prior| prior.still_current());
-    // The yarn 1 config layers outside the project (env, user, global and
-    // ancestor rc files), located the way yarn 1 does: a mirror set in any
-    // of them refuses the classic rewrite like a project one.
-    let yarn_classic_outer = || resolve_outer_yarn_mirror_for_process(&common.cwd);
     // The cargo configs cargo reads for a build here (the project's, every
     // parent directory's and `$CARGO_HOME`'s): a directory source or local
     // registry in any of them refuses the cargo rewrite like a project one.
