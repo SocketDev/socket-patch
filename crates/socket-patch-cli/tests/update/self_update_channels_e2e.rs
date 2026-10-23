@@ -158,6 +158,59 @@ async fn bun_global_refuses_with_bun_hint() {
     install.assert_binary_intact();
 }
 
+/// #1629: a yarn project install refuses with yarn's own command. Running
+/// `npm install …` there writes a stray package-lock.json beside yarn.lock,
+/// and every later yarn run warns about mixing package managers.
+#[tokio::test]
+async fn yarn_project_refuses_with_yarn_hint() {
+    let install = staged_install_at("app/node_modules/@socketsecurity/socket-patch-x/bin");
+    std::fs::write(install.root.path().join("app/package.json"), "{}").unwrap();
+    std::fs::write(
+        install.root.path().join("app/yarn.lock"),
+        "# yarn lockfile v1\n",
+    )
+    .unwrap();
+    let (code, _stdout, stderr) = run_installed(
+        &install,
+        &["--update", "--yes"],
+        &[("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL)],
+    );
+    assert_eq!(code, 1, "managed install must refuse.\nstderr:\n{stderr}");
+    assert!(stderr.contains("managed by yarn"), "{stderr}");
+    assert!(
+        stderr.contains("`yarn add @socketsecurity/socket-patch@latest`"),
+        "a yarn project must get yarn's upgrade command: {stderr}"
+    );
+    assert!(!stderr.contains("npm install"), "{stderr}");
+    install.assert_binary_intact();
+}
+
+/// #1629: yarn's global folder (`yarn global dir`) is invisible to
+/// `npm update -g`, which prints "up to date" and leaves the yarn copy on
+/// the old version, so a `yarn global add` install must be told to use
+/// `yarn global add`.
+#[tokio::test]
+async fn yarn_global_refuses_with_yarn_hint() {
+    let install =
+        staged_install_at(".config/yarn/global/node_modules/@socketsecurity/socket-patch-x/bin");
+    let (code, stdout, _stderr) = run_installed(
+        &install,
+        &["--update", "--yes", "--json"],
+        &[("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL)],
+    );
+    assert_eq!(code, 1, "managed install must refuse.\nstdout:\n{stdout}");
+    let env = common::parse_json_envelope(&stdout);
+    let message = env["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(env["error"]["code"], "managed_install", "{stdout}");
+    assert!(message.contains("managed by yarn"), "{stdout}");
+    assert!(
+        message.contains("`yarn global add @socketsecurity/socket-patch@latest`"),
+        "{stdout}"
+    );
+    assert!(!message.contains("npm update -g"), "{stdout}");
+    install.assert_binary_intact();
+}
+
 /// An npm-bundled binary (any `node_modules` component) refuses with the
 /// npm upgrade command — and the refusal happens before ANY release
 /// traffic: a fully valid, newer release is mounted and its routes must
