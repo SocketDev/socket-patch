@@ -2278,6 +2278,9 @@ async fn gem_hosted_superseding_patch_keeps_gem_sections_in_bundler_order() {
 /// `rollback` / `remove` in that window must undo the new block along with
 /// the lock, or the pair stays inconsistent (frozen installs fail) and the
 /// next unfrozen install re-patches.
+/// On bundler < 2.2 (one merged GEM section) the re-scan moves the lock's
+/// Socket remote along with the block (#1688), so there is no such window;
+/// the test proves the superseding patch lands there and unwinds.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler; \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -2339,15 +2342,38 @@ async fn unwind_after_unconverged_supersede(command: &str) {
     assert_eq!(code, 0, "{command}: gen 3 scan: {out}\n{err}");
     let gemfile_path = fx.proj.join(fx.gemfile_name);
     let lock_path = fx.proj.join(fx.lock_name);
-    // The unconverged window this test is about: Gemfile on gen 3, lock on
-    // gen 2.
     let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
     let lock = std::fs::read_to_string(&lock_path).unwrap();
     assert!(gemfile.contains(GEN3), "{command}: Gemfile:\n{gemfile}");
-    assert!(
-        lock.contains(GEN2) && !lock.contains(GEN3),
-        "{command}: lock:\n{lock}"
-    );
+    if fx.bundler.at_least(2, 2) {
+        // The unconverged window this test is about: Gemfile on gen 3, lock
+        // on gen 2.
+        assert!(
+            lock.contains(GEN2) && !lock.contains(GEN3),
+            "{command}: lock:\n{lock}"
+        );
+    } else {
+        // #1688: bundler < 2.2 locks every remote in one merged GEM section,
+        // whose Socket remote moves to gen 3 with the Gemfile block (the
+        // pair stays converged, so a frozen install accepts it). The
+        // unwind below then undoes the converged gen 3 pair.
+        assert!(
+            lock.contains(GEN3) && !lock.contains(GEN2),
+            "{command}: lock:\n{lock}"
+        );
+        let frozen = bundle_env(&fx.proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
+        assert!(
+            frozen.status.success(),
+            "{command}: frozen install of the gen 3 pair:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&frozen.stdout),
+            String::from_utf8_lossy(&frozen.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            lock,
+            "{command}: the frozen install leaves the gen 3 lock as is"
+        );
+    }
 
     let upstream = format!("{api}/upstream");
     let cwd = fx.proj.to_str().expect("utf8 tmp path");
