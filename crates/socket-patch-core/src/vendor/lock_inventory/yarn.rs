@@ -1,7 +1,7 @@
 //! `yarn.lock`, classic and berry: the entry models lockfile discovery
 //! shares ([`classic_entries`], [`berry_entries`]) and the registry views.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::path::Path;
 use std::sync::OnceLock;
@@ -89,11 +89,9 @@ struct SelectorIndex {
     /// Every url a live entry resolves: its locator's reference, and an
     /// older pin's `__archiveUrl=` binding as written and percent-decoded.
     urls: HashSet<String>,
-    /// The package names live entries are keyed by.
-    names: HashSet<String>,
-    /// `(name, descriptor)` of every live entry pattern, plus the
-    /// descriptor without its `npm:` protocol.
-    descriptors: HashSet<(String, String)>,
+    /// The descriptors live entries are keyed by, per package name, each
+    /// also without its `npm:` protocol.
+    descriptors: HashMap<String, HashSet<String>>,
 }
 
 impl SelectorIndex {
@@ -113,14 +111,10 @@ impl SelectorIndex {
                 let Some((name, descriptor)) = split_pattern(pattern) else {
                     continue;
                 };
-                index.names.insert(name.to_string());
-                index
-                    .descriptors
-                    .insert((name.to_string(), descriptor.to_string()));
+                let descriptors = index.descriptors.entry(name.to_string()).or_default();
+                descriptors.insert(descriptor.to_string());
                 if let Some(bare) = descriptor.strip_prefix("npm:") {
-                    index
-                        .descriptors
-                        .insert((name.to_string(), bare.to_string()));
+                    descriptors.insert(bare.to_string());
                 }
             }
         }
@@ -170,11 +164,10 @@ pub(crate) fn berry_selector_routes_nothing(lock: &BerryLock, selector: &str, ur
     if index.urls.contains(url) {
         return false;
     }
-    match range {
-        None => !index.names.contains(target),
-        Some(want) => !index
-            .descriptors
-            .contains(&(target.to_string(), want.to_string())),
+    match (index.descriptors.get(target), range) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(descriptors), Some(want)) => !descriptors.contains(want),
     }
 }
 

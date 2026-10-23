@@ -179,7 +179,7 @@
 //!     `vlt-lock.json`), so discovery and the inventory see one entry walk
 //!     per format (an architecture test in this module enforces it).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -476,6 +476,21 @@ impl ResolvedElsewhere {
         self.purl == purl
             || purl_without_version(purl) == Some(self.purl.as_str())
             || (!self.as_spelled && same_pypi_release(&self.purl, purl))
+    }
+
+    /// The keys an index files this entry under. Every [`Self::covers`]
+    /// match shares the entry's purl or its versionless name, so the
+    /// entries covering a purl are all filed under its
+    /// [`Self::lookup_keys`].
+    fn index_keys(&self) -> impl Iterator<Item = &str> {
+        Self::lookup_keys(&self.purl)
+    }
+
+    /// `purl` itself and its versionless name (see [`Self::index_keys`]).
+    fn lookup_keys(purl: &str) -> impl Iterator<Item = &str> {
+        [Some(purl), purl_without_version(purl)]
+            .into_iter()
+            .flatten()
     }
 
     /// Whether the entry names no version, so may resolve any.
@@ -1136,16 +1151,13 @@ impl Discovery {
                 .or_default()
                 .insert(r.purl.clone());
         }
-        // Every entry a ref's purl can match ([`ResolvedElsewhere::covers`])
-        // is spelled either as that purl or as its versionless name, and a
-        // PyPI release match shares the name too. Index the entries under
-        // both spellings so each ref checks only its own package's entries
-        // instead of every entry of every lock (#1606, #1607).
-        let mut by_key: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        // Each ref checks only its own package's entries
+        // ([`ResolvedElsewhere::index_keys`]) instead of every entry of
+        // every lock (#1606, #1607).
+        let mut by_key: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, e) in self.elsewhere.iter().enumerate() {
-            by_key.entry(e.purl.as_str()).or_default().push(i);
-            if let Some(name) = purl_without_version(&e.purl) {
-                by_key.entry(name).or_default().push(i);
+            for key in e.index_keys() {
+                by_key.entry(key).or_default().push(i);
             }
         }
         let mut contested = Vec::new();
@@ -1154,14 +1166,14 @@ impl Discovery {
             let other = (!is_script_lock(&r.source_file))
                 .then(|| {
                     let tree = self.tree_of(&r.source_file);
-                    let mut candidates: Vec<usize> =
-                        [Some(r.purl.as_str()), purl_without_version(&r.purl)]
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|k| by_key.get(k))
-                            .flatten()
-                            .copied()
-                            .collect();
+                    // Only a PyPI ref can match another spelling of its
+                    // release.
+                    let pypi = Ecosystem::from_purl(&r.purl) == Some(Ecosystem::Pypi);
+                    let mut candidates: Vec<usize> = ResolvedElsewhere::lookup_keys(&r.purl)
+                        .filter_map(|k| by_key.get(k))
+                        .flatten()
+                        .copied()
+                        .collect();
                     candidates.sort_unstable();
                     candidates.dedup();
                     candidates
@@ -1175,7 +1187,10 @@ impl Discovery {
                                 && other != tree
                                 && !wiring.get(other).is_some_and(|purls| {
                                     purls.contains(&r.purl)
-                                        || purls.iter().any(|purl| same_pypi_release(purl, &r.purl))
+                                        || (pypi
+                                            && purls
+                                                .iter()
+                                                .any(|purl| same_pypi_release(purl, &r.purl)))
                                 })
                         })
                 })

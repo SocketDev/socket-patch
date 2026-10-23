@@ -125,8 +125,9 @@ fn with_pypi_equivalents(purls: &[String], lockfile_only: &HashSet<PurlKey>) -> 
 /// [`PurlKey`] folds together).
 fn is_pypi_purl(purl: &str) -> bool {
     purl.trim_start()
-        .get(..9)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pkg:pypi/"))
+        .strip_prefix("pkg:")
+        .and_then(|rest| rest.get(..5))
+        .is_some_and(|ty| ty.eq_ignore_ascii_case("pypi/"))
 }
 
 /// Mark each API purl that names a lockfile-only PyPI pin under another
@@ -141,7 +142,7 @@ fn adopt_pypi_equivalents(
 ) {
     let lock_only_pypi: Vec<&String> = scanned
         .iter()
-        .filter(|p| p.starts_with("pkg:pypi/") && lockfile_only_contains(lockfile_only, p))
+        .filter(|p| is_pypi_purl(p) && lockfile_only_contains(lockfile_only, p))
         .collect();
     if lock_only_pypi.is_empty() {
         return;
@@ -3615,6 +3616,7 @@ mod tests {
         let npm_only = vec!["pkg:npm/left-pad@1.3.0".to_string()];
         assert_eq!(with_pypi_equivalents(&npm_only, &lockfile_only), npm_only);
         assert!(is_pypi_purl(" pkg:PYPI/six@1.16") && !is_pypi_purl("pkg:pypi"));
+        assert!(!is_pypi_purl("PKG:pypi/six@1.16"));
     }
 
     #[test]

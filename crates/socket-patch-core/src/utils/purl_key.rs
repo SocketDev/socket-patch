@@ -70,7 +70,13 @@ fn is_canonical_base(purl: &str) -> bool {
     else {
         return true;
     };
-    !ty.bytes().any(|b| b.is_ascii_uppercase()) && !matches!(ty, "pypi" | "nuget" | "composer")
+    !ty.bytes().any(|b| b.is_ascii_uppercase()) && !folds_spelling(ty)
+}
+
+/// Whether [`canonical_base_purl`] folds the name or version spelling of
+/// a (lowercase) purl type; every other type keeps its spelling.
+fn folds_spelling(ty: &str) -> bool {
+    matches!(ty, "pypi" | "nuget" | "composer")
 }
 
 fn rebuild_canonical_base_purl(purl: &str) -> String {
@@ -90,7 +96,10 @@ fn rebuild_canonical_base_purl(purl: &str) -> String {
         "pypi" => (canonicalize_pypi_name(name), version.map(str::to_string)),
         "nuget" => (name.to_lowercase(), version.map(str::to_lowercase)),
         "composer" => (name.to_lowercase(), version.map(str::to_string)),
-        _ => (name.to_string(), version.map(str::to_string)),
+        _ => {
+            debug_assert!(!folds_spelling(&ty), "{ty} folds but has no arm");
+            (name.to_string(), version.map(str::to_string))
+        }
     };
     match version {
         Some(version) => format!("pkg:{ty}/{name}@{version}"),
