@@ -47,14 +47,14 @@ class Scheduling(unittest.TestCase):
         parallel = {"windows-compile-check"}
         # coverage and e2e-build head the two critical-path chains and wait
         # only for the ~10 s release-readiness job, not clippy (#1681).
+        # Everything downstream of them still waits for clippy.
         early = {"coverage", "e2e-build"}
         for job in early:
             self.assertEqual(dependencies(job), {"release-readiness"})
         for job in set(JOBS) - cheap:
             with self.subTest(job=job):
-                if job not in parallel:
-                    self.assertTrue(ancestors(job) & {"clippy", "release-readiness"})
-                    self.assertTrue(({job} | ancestors(job)) & ({"clippy"} | early))
+                if job not in parallel | early:
+                    self.assertIn("clippy", ancestors(job))
                 # Job-level always() would defeat failure/skip propagation.
                 self.assertFalse(any(line.startswith("    if:") and "always()" in line
                                      for line in JOBS[job]))
@@ -69,11 +69,13 @@ class Scheduling(unittest.TestCase):
                 job = family + suffix
                 builder = "e2e-build" + (suffix if suffix in ("-windows", "-macos") else "")
                 with self.subTest(job=job):
-                    self.assertEqual(dependencies(job), {builder})
+                    # The ubuntu build skips clippy (#1681), so its consumers
+                    # wait for clippy themselves.
+                    extra = {"clippy"} if builder == "e2e-build" else set()
+                    self.assertEqual(dependencies(job), {builder} | extra)
                     self.assertEqual({row["os"] for row in reader.matrix_include(JOBS[job])}, {os_name})
                     self.assertIn(f"        os: [{os_name}]", JOBS[builder])
-                    preflight = {"release-readiness"} if builder == "e2e-build" else {"release-readiness", "clippy"}
-                    self.assertEqual(ancestors(job), {builder} | preflight)
+                    self.assertEqual(ancestors(job), {builder, "release-readiness", "clippy"})
 
     def test_os_builds_use_the_same_artifact_contract(self):
         producer = "\n".join(JOBS["e2e-build"])

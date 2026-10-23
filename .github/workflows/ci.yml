@@ -68,9 +68,9 @@ concurrency:
 # bypass.
 # MERGE-QUEUE REUSE: a push to main whose exact SHA already passed this
 # workflow in the merge queue (scripts/ci-reuse-merge-group.py, run by
-# release-readiness) only compiles, to refresh the main-only caches, and skips the
-# test steps and test-only jobs the queue already ran. hosted-e2e still
-# runs. The full tier (e2e-full, yarn-berry-full, cargo-vex-matrix-full)
+# release-readiness) only compiles, to refresh the main-only caches, and
+# skips the test steps and test-only jobs the queue already ran. hosted-e2e
+# still runs. The full tier (e2e-full, yarn-berry-full, cargo-vex-matrix-full)
 # never runs on push unless CI_SCOPE is `full`; it is nightly and on
 # dispatch. API errors, missing evidence and direct pushes run everything
 # else.
@@ -82,8 +82,9 @@ concurrency:
 # branches and the release/v5-prerelease PR never reuse.
 jobs:
   # Required independently of ci-ok so the merge queue sees a compile/lint
-  # failure immediately. Most expensive jobs also depend on this preflight;
-  # coverage and e2e-build don't (#1681), see release-readiness.
+  # failure immediately. Every expensive job except coverage and e2e-build
+  # (#1681, see release-readiness) also waits for it, the e2e and cargo-vex
+  # legs through their own `needs`.
   clippy:
     if: github.event.pull_request.draft != true
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
@@ -123,6 +124,8 @@ jobs:
         # Clippy above checks the shipped targets. This catches errors in
         # cfg(test), integration tests and feature-gated targets without
         # linking hundreds of executables or waiting for the E2E fan-out.
+        # coverage and e2e-build start alongside it (#1681); the legs that
+        # consume e2e-build's binaries still wait for it.
         run: cargo check --locked --workspace --all-targets --all-features
 
   # The napi addon is only ever loaded by Node, so cargo's own tests never
@@ -293,7 +296,7 @@ jobs:
       # A PR push that only merged the base branch, with the PR's own diff
       # unchanged and the previous head green, skips the test jobs: the
       # merge queue re-tests every entry on the latest main anyway (#1373).
-      # This job and hosted-e2e still run. Only PRs into main (the only
+      # clippy, this job and hosted-e2e still run. Only PRs into main (the only
       # queue), and never the v5 integration PR, whose full tier the queue
       # does not run.
       - name: Check for an unchanged PR diff
@@ -1139,7 +1142,9 @@ jobs:
   e2e:
     if: needs.e2e-build.outputs.reuse != 'true'
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
-    needs: [e2e-build]
+    # e2e-build no longer waits for clippy (#1681), so wait for it here: a
+    # red clippy still skips the fan-out.
+    needs: [e2e-build, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -1859,7 +1864,7 @@ jobs:
   # LEAN SCOPE note at the top of `jobs:`.
   e2e-extended:
     if: needs.e2e-build.outputs.reuse != 'true' && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    needs: [e2e-build]
+    needs: [e2e-build, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -2079,7 +2084,7 @@ jobs:
     # Nightly, on dispatch (release-qa) and on v5 landings only, like
     # e2e-docker; CI_SCOPE=full also runs it on pushes to main.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease'
-    needs: [e2e-build]
+    needs: [e2e-build, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -2357,7 +2362,7 @@ jobs:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     # e2e-build only (its binaries; only the matching OS build is needed);
     # see yarn-classic-matrix on test/coverage.
-    needs: [e2e-build]
+    needs: [e2e-build, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -2473,7 +2478,7 @@ jobs:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     # Same gate as e2e-full.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease'
-    needs: [e2e-build]
+    needs: [e2e-build, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
