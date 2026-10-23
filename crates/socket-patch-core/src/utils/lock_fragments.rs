@@ -41,8 +41,11 @@ pub(crate) fn tick(counter: &'static std::thread::LocalKey<std::cell::Cell<usize
 /// lock from four places (the lock inventory, VEX discovery before and
 /// after the rewrite, the redirect's own probe) and the rewrite renders it
 /// once more; each whole-lock parse is ~10% of the scan on a 400-package
-/// lock (#1473, #1624), so all of them go through here and a run parses
-/// each distinct text once. Two slots: the lock as read and as rewritten.
+/// lock (#1473, #1624), so those readers go through here and a hosted scan
+/// parses each of the two texts once. Two slots: the lock as read and as
+/// rewritten; a miss (another lock read in between) costs only the parse
+/// it would have cost without the memo. Intermediate texts of the
+/// one-dep-at-a-time rewrite stay out of it, as nobody reads them again.
 #[cfg(not(test))]
 static LOCK_DOCS: ParseMemo<toml_edit::Document<String>, 2> = ParseMemo::new();
 
@@ -109,9 +112,11 @@ impl LockParse {
         Ok(self.doc.as_ref().expect("parsed just above").as_table())
     }
 
-    /// The held parse of `text` (taken out), or the shared one; `what` names
-    /// the lock in the parse error. A parse someone else still holds is
-    /// copied, which costs a fraction of parsing it again.
+    /// The held parse of `text` (taken out), a copy of the shared one, or a
+    /// fresh private parse; `what` names the lock in the parse error. A
+    /// parse someone else still holds is copied, which costs a fraction of
+    /// parsing it again; a text nobody parsed yet is parsed without sharing
+    /// it, as the caller is about to mutate it into the next text.
     pub(crate) fn take(
         &mut self,
         text: &str,
@@ -119,7 +124,15 @@ impl LockParse {
     ) -> Result<toml_edit::Document<String>, String> {
         let doc = match self.doc.take() {
             Some(doc) if doc.raw() == text => doc,
-            _ => parse_lock(text).map_err(|e| format!("invalid {what} lock: {e}"))?,
+            _ => match with_lock_docs(|memo| memo.get(text.as_bytes())) {
+                Some(shared) => shared,
+                None => {
+                    #[cfg(test)]
+                    tick(&PARSES);
+                    return toml_edit::Document::parse(text.to_owned())
+                        .map_err(|e| format!("invalid {what} lock: {e}"));
+                }
+            },
         };
         Ok(Arc::try_unwrap(doc).unwrap_or_else(|shared| (*shared).clone()))
     }

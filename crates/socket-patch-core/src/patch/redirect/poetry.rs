@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use toml_edit::DocumentMut;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
@@ -29,9 +28,8 @@ fn pre_1_4_writer(lock_text: &str, version: Option<&str>) -> Option<&'static str
     let version = match version {
         Some(version) => version,
         None => {
-            #[cfg(test)]
-            crate::utils::lock_fragments::tick(&crate::utils::lock_fragments::PARSES);
-            parsed = lock_text.parse::<DocumentMut>().ok()?;
+            // The batch already parsed (and shared) these bytes.
+            parsed = crate::utils::lock_fragments::parse_lock(lock_text).ok()?;
             lock_version(&parsed).ok()?
         }
     };
