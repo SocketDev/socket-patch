@@ -63,7 +63,10 @@ use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, C
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
-use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
+use crate::formats::gem::hosted::{
+    bundled_before_2_2, checksum_entry_span, converge_gem_lock_source,
+    refresh_merged_gem_lock_remote,
+};
 use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
@@ -7445,6 +7448,10 @@ fn rewrite_gem(
         // Whether THIS dep's Gemfile source redirect is in place (just
         // written or already present) — the lock pin below is gated on it.
         let mut source_placed = false;
+        // The URL of the Socket `source … do` block an earlier run left for
+        // THIS dep (before any in-place refresh below): the remote a merged
+        // lock section attributes to it (#1688).
+        let mut prior_block_url: Option<String> = None;
         if let Some(gf) = gemfile.as_mut() {
             // Looser "declared at all?" probe: matches every `gem` call that
             // names the gem anywhere in its arguments, in any form. It gates
@@ -7504,6 +7511,7 @@ fn rewrite_gem(
                 let url = m
                     .get(1)
                     .expect("block_re always captures group 1 (index URL)");
+                prior_block_url = Some(url.as_str().to_string());
                 if url.as_str() == ov.index_url {
                     source_placed = true;
                 } else {
@@ -7775,16 +7783,38 @@ fn rewrite_gem(
             // "mismatched checksums"; frozen: exit 16). A pre-CHECKSUMS lock
             // has no sha to converge around, so it keeps the
             // mixed-but-installable state + the frozen-install caveat.
-            if !checksums_era
-                || !converge_gem_lock_source(
+            //
+            // A lock an earlier redirect converged into a merged
+            // multi-remote section (bundler ≤ 2.1, or a lock that started
+            // there) instead has its Socket remote follow this dep's Gemfile
+            // block to the new URL, or discovery reads the pair as naming
+            // two patches and every scan skips the new one (#1688). Only a
+            // lock bundler < 2.2 wrote is proven frozen-installable after
+            // that refresh (e2e_redirect_gem_build); a later bundler keeping
+            // a merged lock keeps the caveat.
+            let converged = checksums_era
+                && converge_gem_lock_source(
                     lk,
                     dep,
                     &ov.index_url,
                     lock_name,
                     &mut lock_changed,
                     result,
-                )
-            {
+                );
+            let merged_refreshed = !converged
+                && prior_block_url.as_deref().is_some_and(|prior| {
+                    refresh_merged_gem_lock_remote(
+                        lk,
+                        dep,
+                        prior,
+                        &ov.index_url,
+                        lock_name,
+                        &mut lock_changed,
+                        result,
+                    )
+                });
+            let frozen_installable = converged || (merged_refreshed && bundled_before_2_2(lk));
+            if !frozen_installable {
                 mixed_state = true;
             }
         }
@@ -7794,7 +7824,8 @@ fn rewrite_gem(
     // section still records the upstream source, so `bundle install` with
     // `frozen`/`--deployment` set rejects the Gemfile's new source block.
     // Mirror of the CLI's pnpm trust-lockfile warning. A converged pair (the
-    // CHECKSUMS-era path) is frozen-installable as written — no caveat.
+    // CHECKSUMS-era path, or a bundler < 2.2 merged section refreshed in
+    // place) is frozen-installable as written — no caveat.
     if (gemfile_changed || lock_changed) && mixed_state {
         result.warnings.push(RewriteWarning {
             code: "redirect_gem_frozen_install".into(),
