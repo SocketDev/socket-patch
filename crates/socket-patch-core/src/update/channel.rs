@@ -176,7 +176,9 @@ pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'stat
         NodeManager::Bun if global => "bun add -g @socketsecurity/socket-patch@latest",
         NodeManager::Bun => "bun add @socketsecurity/socket-patch@latest",
         NodeManager::Bunx => "bunx @socketsecurity/socket-patch@latest …",
-        NodeManager::Yarn if is_yarn_global_store(canonical_exe) => {
+        NodeManager::Yarn
+            if is_yarn_global_store(canonical_exe) || is_prefix_global_install(canonical_exe) =>
+        {
             "yarn global add @socketsecurity/socket-patch@latest"
         }
         NodeManager::Yarn => match holder.map(read_package_json) {
@@ -439,24 +441,33 @@ fn outermost_node_modules_holder(path: &Path) -> Option<&Path> {
 }
 
 /// Whether the outermost `node_modules` of `path` belongs to a global
-/// install. The well-known global layouts (directly under `lib` on a Unix
-/// prefix or `npm` on Windows, or anywhere below a yarn/pnpm `global`
-/// store) decide without touching the disk. Otherwise the directory that
-/// holds the outermost `node_modules` decides: a project has a
-/// `package.json` there, while a global prefix without a `lib/` level
-/// (nvm-windows `…\nvm\v20.11.0`, fnm `…\installation`, Volta's image
-/// dirs) does not. Defaulting to global when unsure is the safer miss:
-/// `npm install …` run from an arbitrary cwd would scaffold a stray
-/// `node_modules`/`package.json` there and leave the real copy stale.
+/// install: a prefix layout ([`is_prefix_global_install`]) or anywhere
+/// below a `global` store (yarn's, pnpm's). Defaulting to global when
+/// unsure is the safer miss: `npm install …` run from an arbitrary cwd
+/// would scaffold a stray `node_modules`/`package.json` there and leave
+/// the real copy stale.
 fn is_global_npm_install(path: &Path) -> bool {
     let names = normal_components(path);
     let Some(first_nm) = names.iter().position(|n| *n == "node_modules") else {
         return false;
     };
+    names[..first_nm].iter().any(|n| *n == "global") || is_prefix_global_install(path)
+}
+
+/// A global prefix: the first `node_modules` sits directly under `lib` on
+/// a Unix prefix (including Volta's package images, whose `lib/` also
+/// holds yarn's package.json and yarn.lock after a `yarn global add`) or
+/// `npm` on Windows, which decides without touching the disk. Otherwise
+/// the directory that holds the outermost `node_modules` decides: a
+/// project has a `package.json` there, while a prefix without a `lib/`
+/// level (nvm-windows `…\nvm\v20.11.0`, fnm `…\installation`) does not.
+fn is_prefix_global_install(path: &Path) -> bool {
+    let names = normal_components(path);
+    let Some(first_nm) = names.iter().position(|n| *n == "node_modules") else {
+        return false;
+    };
     let parent = first_nm.checked_sub(1).map(|i| names[i]);
-    if matches!(parent, Some(p) if p == "lib" || p == "npm")
-        || names[..first_nm].iter().any(|n| *n == "global")
-    {
+    if matches!(parent, Some(p) if p == "lib" || p == "npm") {
         return true;
     }
     match outermost_node_modules_holder(path) {
@@ -1177,6 +1188,25 @@ mod tests {
             "no yarn.lock: not yarn's"
         );
         std::fs::write(store.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p),
+            "yarn global add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(channel_label_for(InstallChannel::Npm, &p), "yarn");
+        // Volta runs `yarn global add` with its global folder set to the
+        // package image's `lib/`, so yarn's package.json and yarn.lock sit
+        // beside a prefix-style `lib/node_modules`. That is still a global
+        // install: `yarn add` from the user's cwd would edit their project
+        // and leave the Volta copy stale.
+        let image = tmp
+            .path()
+            .join(".volta/tools/image/packages/@socketsecurity/socket-patch/lib");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        std::fs::write(image.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        let p = image.join(
+            "node_modules/@socketsecurity/socket-patch/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch",
+        );
         assert_eq!(
             upgrade_hint_for(InstallChannel::Npm, &p),
             "yarn global add @socketsecurity/socket-patch@latest"
