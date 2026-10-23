@@ -2274,7 +2274,46 @@ async fn apply_patches_inner(
     // the root store is the same copy the root walk found (#633).
     distinct_npm_copies(&mut all_packages).await;
 
+    let mut reused_go = false;
+    for (purl, record) in &manifest.patches {
+        if is_local_go(purl, &args.common) && !is_vendored(purl) && !all_packages.contains_key(purl)
+        {
+            if let Some(result) =
+                socket_patch_core::patch::redirect::golang_local::reuse_go_redirect(
+                    purl,
+                    &args.common.cwd,
+                    &record.files,
+                )
+                .await
+            {
+                if !result.success && args.prints_errors() {
+                    eprintln!(
+                        "{}",
+                        format_patch_failure(
+                            purl,
+                            result.error.as_deref().unwrap_or("invalid Go redirect")
+                        )
+                    );
+                }
+                matched_manifest_purls.insert(purl.clone());
+                results.push(result);
+                reused_go = true;
+            }
+        }
+    }
+
     if all_packages.is_empty() {
+        if reused_go && !args.common.dry_run {
+            run_warnings.extend(
+                socket_patch_core::vendor::go_consumer_sync::audit_warnings(
+                    &args.common.cwd,
+                    &go_pristine_mods,
+                )
+                .await
+                .into_iter()
+                .map(|(code, detail)| RunWarning { code, detail }),
+            );
+        }
         // Vendored purls are already accounted for (synthesized Skipped/
         // vendored results above); only the remainder is genuinely
         // unmatched. An all-vendored manifest with an absent installed
@@ -2300,7 +2339,7 @@ async fn apply_patches_inner(
         }
         print_lockfile_only_note(args, &unmatched, &lockfile_only);
         return Ok(ApplyOutcome {
-            success: unresolved.is_empty(),
+            success: unresolved.is_empty() && results.iter().all(|r| r.success),
             results,
             unmatched,
             lockfile_only,
@@ -2318,7 +2357,7 @@ async fn apply_patches_inner(
         args.common.strict,
         args.common.allow_patch_conflicts,
     );
-    let mut has_errors = false;
+    let mut has_errors = results.iter().any(|r| !r.success);
 
     // Group release-variant PURLs by base. PyPI (`?artifact_id=`),
     // RubyGems (`?platform=`), and Maven (`?classifier=&ext=`) carry

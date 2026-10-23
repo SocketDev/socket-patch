@@ -124,11 +124,18 @@ pub fn delivery(mode: &str) {
         let args = if entrypoint == "get" {
             vec!["get", UUID, "--mode", mode]
         } else {
-            vec!["scan", "--mode", mode]
+            vec!["scan", "--package", PURL, "--mode", mode]
         };
         let result = cli(&consumer, &cache, &args);
+        let events = result["events"].as_array().unwrap();
         assert!(
-            result["events"].as_array().unwrap().iter().any(|event| {
+            events
+                .iter()
+                .any(|event| event["purl"] == PURL && event["uuid"] == UUID),
+            "{mode}/{entrypoint} did not select {UUID}: {result:#}"
+        );
+        assert!(
+            events.iter().any(|event| {
                 event["purl"] == PURL
                     && (event["action"] == "applied" || event["action"] == "redirected")
             }),
@@ -142,6 +149,35 @@ pub fn delivery(mode: &str) {
         let run = go(&fresh, &tmp.path().join("empty-cache"), &["run", "."]);
         success(&run);
         assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "REJECTED");
+        // Ordinary dependency maintenance must preserve the replacement even
+        // after all installed modules and compiled objects are removed.
+        for args in [
+            vec!["clean", "-modcache", "-cache"],
+            vec!["mod", "download"],
+            vec!["mod", "tidy"],
+            vec!["mod", "verify"],
+            vec!["test", "-count=1", "./..."],
+        ] {
+            success(&go(&consumer, &cache, &args));
+        }
+        success(&go(
+            &consumer,
+            &cache,
+            &["get", &format!("{MODULE}@v5.7.0")],
+        ));
+        cli(&consumer, &cache, &args);
+        let reinstalled = go(&consumer, &cache, &["run", "."]);
+        success(&reinstalled);
+        assert_eq!(
+            String::from_utf8_lossy(&reinstalled.stdout).trim(),
+            "REJECTED"
+        );
+        for _ in 0..2 {
+            success(&go(&consumer, &cache, &["mod", "vendor"]));
+            let native = go(&consumer, &cache, &["run", "-mod=vendor", "."]);
+            success(&native);
+            assert_eq!(String::from_utf8_lossy(&native.stdout).trim(), "REJECTED");
+        }
         if mode != "hosted" {
             success(&go(&consumer, &cache, &["mod", "tidy"]));
             cli(&consumer, &cache, &["rollback", "--offline"]);

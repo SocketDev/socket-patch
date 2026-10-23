@@ -158,6 +158,57 @@ pub fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
     path_safety::is_safe_multi_segment(module) && path_safety::is_safe_single_segment(version)
 }
 
+/// Reuse an installed project-local redirect after Go's module cache was
+/// cleared. Never treat this copy as a pristine rebuild source: drift needs
+/// the original module, and copying the tree onto itself would delete it.
+pub async fn reuse_go_redirect(
+    purl: &str,
+    project_root: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Option<ApplyResult> {
+    let (module, version) = parse_golang_purl(purl)?;
+    if !are_safe_redirect_coords(&module, &version) || files.is_empty() {
+        return None;
+    }
+    let copy = copy_dir_for(project_root, GO_PATCHES_DIR, &module, &version);
+    if !copy.is_dir() {
+        return None;
+    }
+    let refusal = crate::vendor::go_consumer_sync::replace_refusal(
+        project_root,
+        &module,
+        &version,
+        GO_PATCHES_DIR,
+    )
+    .await
+    .or(selection_refusal(project_root, &module, &version).await);
+    if let Some(refusal) = refusal {
+        return Some(synthesized_result(
+            purl,
+            &copy,
+            Vec::new(),
+            false,
+            Some(refusal),
+        ));
+    }
+    if copy.join("go.mod").is_file()
+        && redirect_in_sync(
+            &copy,
+            files,
+            project_root,
+            &module,
+            &version,
+            GO_PATCHES_DIR,
+        )
+        .await
+    {
+        return Some(already_patched_result(purl, &copy, files));
+    }
+    Some(synthesized_result(purl, &copy, Vec::new(), false, Some(format!(
+        "the local Go patch copy or replace for {module} {version} is out of sync and the upstream module is not installed; restore the committed patch files or download the upstream module before reapplying"
+    ))))
+}
+
 /// Materialise a project-local patched copy and wire up the `replace` redirect.
 ///
 /// * `pristine_src` — the pristine module-cache source dir (the crawler's

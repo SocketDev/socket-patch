@@ -1270,6 +1270,11 @@ fn native_vendor_projection_and_workspace_selection() {
         "'--mod=readonly'",
         "\"-mod=mod\"",
     ] {
+        // Go 1.18 splits GOFLAGS on whitespace; quoted arguments were added
+        // later. The unquoted double-hyphen forms work throughout the matrix.
+        if golang_e2e_matrix::go_minor() < 21 && flags.starts_with(['\"', '\'']) {
+            continue;
+        }
         let mut bypass = env.clone();
         bypass.push(("GOFLAGS", flags));
         assert!(
@@ -1359,5 +1364,52 @@ fn checksum_conflict_preserves_orphan_redirect_and_reports_failure() {
     assert_eq!(code, 0, "{so} {se}");
     assert!(!consumer.join(".socket/go-patches").exists());
     assert!(go_out(&consumer, &env).contains("OUT: PRISTINE"));
+    chmod_writable(tmp.path());
+}
+
+#[test]
+fn agent_reapply_after_cache_clear_validates_the_saved_copy() {
+    if !golang_e2e_matrix::toolchain_ready("agent reuse after reinstall") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy) = stage(tmp.path());
+    write_patch(&consumer);
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 0, "{so} {se}");
+    let env = workspace_env(modcache.to_str().unwrap(), &proxy);
+    assert!(go(&consumer, &["clean", "-modcache"], &env)
+        .status
+        .success());
+    assert!(go_out(&consumer, &env).contains("OUT: PATCHED"));
+    let go_mod = std::fs::read(consumer.join("go.mod")).unwrap();
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(
+        code, 0,
+        "valid committed redirect needs no module cache: {so} {se}"
+    );
+    let (code, so, se) = run_socket(
+        &consumer,
+        &["apply", "--offline", "--dry-run", "--json"],
+        &modcache,
+    );
+    assert_eq!(
+        code, 0,
+        "preview must also recognize the installed patch: {so} {se}"
+    );
+    assert_eq!(std::fs::read(consumer.join("go.mod")).unwrap(), go_mod);
+    let lib = consumer
+        .join(".socket/go-patches")
+        .join(format!("{UMOD}@{UVER}/lib.go"));
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), PATCHED_LIB);
+    std::fs::write(&lib, PRISTINE_LIB).unwrap();
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(
+        code, 1,
+        "a corrupt saved copy must fail without an upstream source: {so} {se}"
+    );
+    assert!(so.contains("out of sync"), "{so}");
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), PRISTINE_LIB);
+    assert_eq!(std::fs::read(consumer.join("go.mod")).unwrap(), go_mod);
     chmod_writable(tmp.path());
 }
