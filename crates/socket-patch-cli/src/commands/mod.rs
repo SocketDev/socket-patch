@@ -16,6 +16,7 @@ pub mod rollback;
 pub mod scan;
 pub mod update;
 pub mod vendor;
+pub(crate) mod vendor_orphans;
 pub(crate) mod vendored_backend;
 pub mod vex;
 pub(crate) mod vex_consumed;

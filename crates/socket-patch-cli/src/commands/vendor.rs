@@ -50,6 +50,10 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::lock_cli::acquire_or_emit;
+use crate::commands::vendor_orphans::{
+    orphan_label, orphan_removal_failed, orphan_removed_event, orphan_still_wired,
+    sweep_orphan_vendor_dirs,
+};
 use crate::commands::vendored_backend::{
     ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
@@ -513,154 +517,6 @@ async fn unwired_check_failure(
         "wiring missing: no lockfile or config references {dir} any more, so a fresh install \
          gets the unpatched package; re-run `socket-patch vendor` to rewire it"
     )
-}
-
-/// What the orphan sweep did with the uuid dirs no ledger entry owns.
-#[derive(Default)]
-pub(crate) struct OrphanSweep {
-    /// Un-ledgered AND unreferenced — deleted (unless `dry_run`).
-    pub(crate) removed: Vec<vendor::path::SweptVendorDir>,
-    /// Un-ledgered but a project lockfile still points into them — kept.
-    pub(crate) still_wired: Vec<vendor::path::SweptVendorDir>,
-    /// Un-ledgered and unreferenced, but the delete failed (the error).
-    pub(crate) failed: Vec<(vendor::path::SweptVendorDir, String)>,
-}
-
-/// Uuid dirs under `.socket/vendor/<eco>/` with no owning `(eco, uuid)`
-/// ledger entry (a hand-edited state file, or artifacts left by an
-/// interrupted run). Unparseable dirs are never returned (and never
-/// deleted). Returns the orphans so callers can emit events / counts.
-///
-/// A missing ledger entry does NOT prove missing wiring: lockfiles can
-/// still point into `.socket/vendor/` after a deleted state.json or a
-/// partial commit. Deleting such a dir would break the next install, so
-/// every candidate is checked against the wiring-bearing files first — the
-/// same lockfile scan `repair` reports `vendor_ledger_missing` from — and a
-/// referenced dir is kept for the caller to warn about.
-async fn sweep_orphan_vendor_dirs(cwd: &Path, state: &VendorState, dry_run: bool) -> OrphanSweep {
-    sweep_orphan_vendor_dirs_where(cwd, state, dry_run, |_| true).await
-}
-
-/// [`sweep_orphan_vendor_dirs`] limited to the orphans `select` accepts:
-/// `rollback` and `remove` sweep only the ones in their scope (#1610).
-pub(crate) async fn sweep_orphan_vendor_dirs_where(
-    cwd: &Path,
-    state: &VendorState,
-    dry_run: bool,
-    select: impl Fn(&vendor::path::SweptVendorDir) -> bool,
-) -> OrphanSweep {
-    let recorded_units: HashSet<(&str, &str)> = state
-        .entries
-        .values()
-        .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
-        .collect();
-    let candidates: Vec<vendor::path::SweptVendorDir> = vendor::path::sweep_vendor_dirs(cwd)
-        .await
-        .into_iter()
-        .filter(|unit| !recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())))
-        .filter(|unit| select(unit))
-        .collect();
-    let mut out = OrphanSweep::default();
-    if candidates.is_empty() {
-        return out;
-    }
-    let wired: HashSet<(String, String)> =
-        crate::commands::vendored_backend::repair::scan_vendor_references(cwd)
-            .await
-            .into_iter()
-            .map(|(eco, uuid, _path)| (eco, uuid))
-            .collect();
-    // Each removal also prunes the `<eco>/` and `vendor/` levels it
-    // emptied (never `.socket/` — the lock guard owns that level): the
-    // sweep runs AFTER the per-entry reverts and their ledger saves, so it
-    // is the last thing that can leave a fully reverted project with empty
-    // `.socket/vendor/<eco>/` husks.
-    let stop_dir = cwd.join(SOCKET_DIR);
-    for unit in candidates {
-        if wired.contains(&(unit.eco.clone(), unit.uuid.clone())) {
-            out.still_wired.push(unit);
-            continue;
-        }
-        if !dry_run {
-            if let Err(e) = remove_tree_and_prune(&unit.dir, &stop_dir).await {
-                out.failed.push((unit, e.to_string()));
-                continue;
-            }
-        }
-        out.removed.push(unit);
-    }
-    out
-}
-
-/// How an orphan uuid dir is named in events: the PURL recovered from its
-/// leaf when the layout is recognizable, else `<eco>/<uuid>`.
-pub(crate) fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
-    unit.purls
-        .first()
-        .cloned()
-        .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
-}
-
-/// The advisory for an orphan uuid dir the sweep kept because a project
-/// lockfile still points into it.
-pub(crate) fn orphan_still_wired(unit: &vendor::path::SweptVendorDir) -> VendorWarning {
-    VendorWarning::new(
-        "vendor_orphan_still_wired",
-        format!(
-            "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
-             entry owns; the artifacts were kept (run `socket-patch repair` to re-adopt \
-             them into the ledger, then revert again)",
-            unit.eco, unit.uuid
-        ),
-    )
-}
-
-/// The advisory for an orphan uuid dir the sweep could not delete.
-pub(crate) fn orphan_removal_failed(
-    unit: &vendor::path::SweptVendorDir,
-    error: &str,
-) -> VendorWarning {
-    VendorWarning::new(
-        "cleanup_failed",
-        format!(
-            "could not delete .socket/vendor/{}/{}, which no ledger entry owns: {error}",
-            unit.eco, unit.uuid
-        ),
-    )
-}
-
-/// The `removed` event for an orphan uuid dir the sweep deleted (or, on a
-/// dry run, would delete).
-pub(crate) fn orphan_removed_event(unit: &vendor::path::SweptVendorDir) -> PatchEvent {
-    PatchEvent::new(PatchAction::Removed, orphan_label(unit))
-        .with_reason("vendor_orphan_removed", "vendored dir had no ledger entry")
-}
-
-/// Is the orphan `unit` one `target` names? By a package its leaves name,
-/// or, for a uuid target, by its own uuid (also when no leaf parses).
-pub(crate) fn orphan_in_target(
-    target: &socket_patch_core::utils::target::Target,
-    unit: &vendor::path::SweptVendorDir,
-) -> bool {
-    use socket_patch_core::utils::target::TargetKind;
-    (target.kind() == TargetKind::Uuid && target.matches_patch("", &unit.uuid))
-        || unit
-            .purls
-            .iter()
-            .any(|purl| target.matches_patch(purl, &unit.uuid))
-}
-
-/// The human lines for the orphan dirs a `rollback` / `remove` sweep
-/// deleted (would delete, on a dry run). Kept and failed ones are
-/// warnings, printed by the caller with its other warnings.
-pub(crate) fn print_orphan_sweep(dry_run: bool, sweep: &OrphanSweep) {
-    let verb = if dry_run { "Would remove" } else { "Removed" };
-    for unit in &sweep.removed {
-        println!(
-            "{verb} orphaned vendored dir .socket/vendor/{}/{} (no ledger entry)",
-            unit.eco, unit.uuid
-        );
-    }
 }
 
 /// Does `eco` fall inside this run's `--ecosystems` scope? A vendor-ledger
@@ -6532,41 +6388,6 @@ mod gc_tests {
     /// sweep must follow includes, not just the root requirements.txt —
     /// deleting the include-referenced wheel would brick the next
     /// `pip install`.
-    /// `rollback <target>` / `remove <target>` scope their orphan sweep
-    /// with [`orphan_in_target`]: a package target matches by the leaves'
-    /// purls, a uuid target by the dir's own uuid, even when no leaf
-    /// parses (#1610).
-    #[test]
-    fn orphan_in_target_matches_package_and_uuid_targets() {
-        use socket_patch_core::utils::target::Target;
-        let uuid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-        let unit = |purls: &[&str]| vendor::path::SweptVendorDir {
-            eco: "npm".into(),
-            uuid: uuid.into(),
-            dir: PathBuf::from("/x"),
-            purls: purls.iter().map(|p| p.to_string()).collect(),
-        };
-        let left_pad = unit(&["pkg:npm/left-pad@1.3.0"]);
-        for hit in [
-            "pkg:npm/left-pad@1.3.0",
-            "pkg:npm/left-pad",
-            "left-pad",
-            uuid,
-        ] {
-            assert!(orphan_in_target(&Target::parse(hit), &left_pad), "{hit}");
-        }
-        for miss in [
-            "pkg:npm/left-pad@1.2.0",
-            "right-pad",
-            "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
-        ] {
-            assert!(!orphan_in_target(&Target::parse(miss), &left_pad), "{miss}");
-        }
-        let unparsed = unit(&[]);
-        assert!(orphan_in_target(&Target::parse(uuid), &unparsed));
-        assert!(!orphan_in_target(&Target::parse("left-pad"), &unparsed));
-    }
-
     #[tokio::test]
     async fn orphan_sweep_keeps_include_referenced_dir() {
         let tmp = tempfile::tempdir().unwrap();

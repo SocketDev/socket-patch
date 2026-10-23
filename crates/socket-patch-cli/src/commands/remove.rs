@@ -1432,7 +1432,7 @@ async fn sweep_target_orphans(
     target: &Target,
     leg: &mut RemoveVendorLeg,
 ) {
-    use crate::commands::vendor::{
+    use crate::commands::vendor_orphans::{
         orphan_in_target, orphan_label, orphan_removal_failed, orphan_removed_event,
         orphan_still_wired, print_orphan_sweep, sweep_orphan_vendor_dirs_where,
     };

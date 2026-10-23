@@ -1746,21 +1746,23 @@ pub async fn run(args: RollbackArgs) -> i32 {
             && (!scoped
                 || identifiers
                     .iter()
-                    .any(|id| crate::commands::vendor::orphan_in_target(id, unit)))
+                    .any(|id| crate::commands::vendor_orphans::orphan_in_target(id, unit)))
     };
     if has_work && !args.common.dry_run && !args.preserve_state {
         // The orphans the sweep would delete, for the prompt: the reverts
         // only shrink the ledger, so the pre-run ledger finds the same set.
         let orphans = match &vendor_state_result {
-            Ok(state) if sweep_orphans => crate::commands::vendor::sweep_orphan_vendor_dirs_where(
-                &ledger_root,
-                state,
-                true,
-                &orphan_in_scope,
-            )
-            .await
-            .removed
-            .len(),
+            Ok(state) if sweep_orphans => {
+                crate::commands::vendor_orphans::sweep_orphan_vendor_dirs_where(
+                    &ledger_root,
+                    state,
+                    true,
+                    &orphan_in_scope,
+                )
+                .await
+                .removed
+                .len()
+            }
             _ => 0,
         };
         // Compose only the clauses that apply, so a hosted-only run never
@@ -1840,7 +1842,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .as_ref()
                 .or(vendor_state_result.as_ref().ok());
             if let Some(state) = ledger_now.filter(|_| sweep_orphans && !aborted) {
-                let sweep = crate::commands::vendor::sweep_orphan_vendor_dirs_where(
+                let sweep = crate::commands::vendor_orphans::sweep_orphan_vendor_dirs_where(
                     &ledger_root,
                     state,
                     args.common.dry_run,
@@ -1848,20 +1850,23 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 )
                 .await;
                 for unit in &sweep.still_wired {
-                    let warning = crate::commands::vendor::orphan_still_wired(unit);
+                    let warning = crate::commands::vendor_orphans::orphan_still_wired(unit);
                     run_warnings.push((warning.code.to_string(), warning.detail));
                 }
                 for (unit, e) in &sweep.failed {
-                    let warning = crate::commands::vendor::orphan_removal_failed(unit, e);
+                    let warning = crate::commands::vendor_orphans::orphan_removal_failed(unit, e);
                     run_warnings.push((warning.code.to_string(), warning.detail));
                 }
                 if !args.common.json && !args.common.silent {
-                    crate::commands::vendor::print_orphan_sweep(args.common.dry_run, &sweep);
+                    crate::commands::vendor_orphans::print_orphan_sweep(
+                        args.common.dry_run,
+                        &sweep,
+                    );
                 }
                 vendored_leg.orphans_removed = sweep
                     .removed
                     .iter()
-                    .map(crate::commands::vendor::orphan_removed_event)
+                    .map(crate::commands::vendor_orphans::orphan_removed_event)
                     .collect();
             }
 
