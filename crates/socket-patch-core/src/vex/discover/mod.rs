@@ -1128,27 +1128,56 @@ impl Discovery {
     /// pin of the same version in `requirements.txt` and its `-r` includes
     /// to the reference (#1086).
     fn contest_across_locks(&mut self) {
-        let wiring: BTreeSet<(String, PathBuf)> = self
-            .refs
-            .iter()
-            .map(|r| (r.purl.clone(), self.tree_of(&r.source_file).to_path_buf()))
-            .collect();
+        // The purls each install tree wires.
+        let mut wiring: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        for r in &self.refs {
+            wiring
+                .entry(self.tree_of(&r.source_file).to_path_buf())
+                .or_default()
+                .insert(r.purl.clone());
+        }
+        // Every entry a ref's purl can match ([`ResolvedElsewhere::covers`])
+        // is spelled either as that purl or as its versionless name, and a
+        // PyPI release match shares the name too. Index the entries under
+        // both spellings so each ref checks only its own package's entries
+        // instead of every entry of every lock (#1606, #1607).
+        let mut by_key: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (i, e) in self.elsewhere.iter().enumerate() {
+            by_key.entry(e.purl.as_str()).or_default().push(i);
+            if let Some(name) = purl_without_version(&e.purl) {
+                by_key.entry(name).or_default().push(i);
+            }
+        }
         let mut contested = Vec::new();
         let refs = std::mem::take(&mut self.refs);
         for r in refs {
             let other = (!is_script_lock(&r.source_file))
                 .then(|| {
                     let tree = self.tree_of(&r.source_file);
-                    self.elsewhere.iter().find(|e| {
-                        let other = self.tree_of(&e.file);
-                        // A tree that wires the release itself, in any
-                        // spelling, is no contester.
-                        e.covers(&r.purl)
-                            && other != tree
-                            && !wiring.iter().any(|(purl, t)| {
-                                t == other && (*purl == r.purl || same_pypi_release(purl, &r.purl))
-                            })
-                    })
+                    let mut candidates: Vec<usize> =
+                        [Some(r.purl.as_str()), purl_without_version(&r.purl)]
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|k| by_key.get(k))
+                            .flatten()
+                            .copied()
+                            .collect();
+                    candidates.sort_unstable();
+                    candidates.dedup();
+                    candidates
+                        .into_iter()
+                        .map(|i| &self.elsewhere[i])
+                        .find(|e| {
+                            let other = self.tree_of(&e.file);
+                            // A tree that wires the release itself, in any
+                            // spelling, is no contester.
+                            e.covers(&r.purl)
+                                && other != tree
+                                && !wiring.get(other).is_some_and(|purls| {
+                                    purls.contains(&r.purl)
+                                        || purls.iter().any(|purl| same_pypi_release(purl, &r.purl))
+                                })
+                        })
                 })
                 .flatten();
             match other {

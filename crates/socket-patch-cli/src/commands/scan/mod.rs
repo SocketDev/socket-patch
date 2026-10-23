@@ -104,18 +104,29 @@ const BATCH_BODY_BYTE_CAP: usize = 256 * 1024;
 /// PEP 440 spellings of the same release (#604), deduplicated in order.
 fn with_pypi_equivalents(purls: &[String], lockfile_only: &HashSet<PurlKey>) -> Vec<String> {
     let mut out = purls.to_vec();
-    let mut seen: HashSet<PurlKey> = purls.iter().map(|p| PurlKey::new(p)).collect();
+    // Keyed only once some purl has an equivalent: most scans have no
+    // PyPI pins, and keying every purl costs (#1606, #1607).
+    let mut seen: Option<HashSet<PurlKey>> = None;
     for purl in purls {
-        if !lockfile_only_contains(lockfile_only, purl) {
+        if !is_pypi_purl(purl) || !lockfile_only_contains(lockfile_only, purl) {
             continue;
         }
         for spelling in socket_patch_core::utils::purl_key::pypi_equivalent_purls(purl) {
+            let seen = seen.get_or_insert_with(|| purls.iter().map(|p| PurlKey::new(p)).collect());
             if seen.insert(PurlKey::new(&spelling)) {
                 out.push(spelling);
             }
         }
     }
     out
+}
+
+/// Whether `purl` is a PyPI purl, in any case of its type (the spellings
+/// [`PurlKey`] folds together).
+fn is_pypi_purl(purl: &str) -> bool {
+    purl.trim_start()
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pkg:pypi/"))
 }
 
 /// Mark each API purl that names a lockfile-only PyPI pin under another
@@ -128,11 +139,14 @@ fn adopt_pypi_equivalents(
     scanned: &[String],
     lockfile_only: &mut HashSet<PurlKey>,
 ) {
-    let scanned_keys: HashSet<PurlKey> = scanned.iter().map(|p| PurlKey::new(p)).collect();
     let lock_only_pypi: Vec<&String> = scanned
         .iter()
         .filter(|p| p.starts_with("pkg:pypi/") && lockfile_only_contains(lockfile_only, p))
         .collect();
+    if lock_only_pypi.is_empty() {
+        return;
+    }
+    let scanned_keys: HashSet<PurlKey> = scanned.iter().map(|p| PurlKey::new(p)).collect();
     for pkg in packages {
         let key = PurlKey::new(&pkg.purl);
         if scanned_keys.contains(&key) {

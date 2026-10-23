@@ -1,8 +1,10 @@
 //! `yarn.lock`, classic and berry: the entry models lockfile discovery
 //! shares ([`classic_entries`], [`berry_entries`]) and the registry views.
 
+use std::collections::HashSet;
 #[cfg(test)]
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::formats::yarn::blocks::{
     berry_field, classic_field, live_blocks, scan_blocks, LockBlock,
@@ -74,6 +76,56 @@ pub(crate) struct BerryLock {
     pub(crate) cache_key: Option<String>,
     /// Every block except the exact `__metadata` one, in lock order.
     pub(crate) entries: Vec<YarnEntry>,
+    /// What [`berry_selector_routes_nothing`] asks of the live entries,
+    /// built on its first call.
+    selector_index: OnceLock<SelectorIndex>,
+}
+
+/// The live entries of a [`BerryLock`] as [`berry_selector_routes_nothing`]
+/// reads them, collected once per lock instead of once per selector
+/// (#1607).
+#[derive(Default)]
+struct SelectorIndex {
+    /// Every url a live entry resolves: its locator's reference, and an
+    /// older pin's `__archiveUrl=` binding as written and percent-decoded.
+    urls: HashSet<String>,
+    /// The package names live entries are keyed by.
+    names: HashSet<String>,
+    /// `(name, descriptor)` of every live entry pattern, plus the
+    /// descriptor without its `npm:` protocol.
+    descriptors: HashSet<(String, String)>,
+}
+
+impl SelectorIndex {
+    fn new(entries: &[YarnEntry]) -> Self {
+        let mut index = Self::default();
+        for entry in entries.iter().filter(|e| e.live) {
+            if let Some(locator) = entry.locator() {
+                index.urls.insert(locator.reference.to_string());
+                if let Some(archive) = locator.archive_url() {
+                    index.urls.insert(archive.to_string());
+                    index.urls.insert(
+                        crate::utils::purl::percent_decode_purl_component(archive).into_owned(),
+                    );
+                }
+            }
+            for pattern in &entry.patterns {
+                let Some((name, descriptor)) = split_pattern(pattern) else {
+                    continue;
+                };
+                index.names.insert(name.to_string());
+                index
+                    .descriptors
+                    .insert((name.to_string(), descriptor.to_string()));
+                if let Some(bare) = descriptor.strip_prefix("npm:") {
+                    index
+                        .descriptors
+                        .insert((name.to_string(), bare.to_string()));
+                }
+            }
+        }
+        index
+    }
 }
 
 /// A berry (yarn 2+) `yarn.lock` text — berry reuses the classic block
@@ -84,7 +136,11 @@ pub(crate) fn berry_entries(text: &str) -> BerryLock {
     let cache_key = crate::formats::yarn::berry_gates::cache_key(&blocks).map(str::to_string);
     let mut entries = yarn_entries(blocks, split_berry_key_patterns);
     entries.retain(|e| e.block.key != "__metadata");
-    BerryLock { cache_key, entries }
+    BerryLock {
+        cache_key,
+        entries,
+        selector_index: OnceLock::new(),
+    }
 }
 
 /// Whether a root `package.json` `resolutions` selector routing to the
@@ -108,35 +164,18 @@ pub(crate) fn berry_selector_routes_nothing(lock: &BerryLock, selector: &str, ur
         .map(|i| &selector[i..])
         .unwrap_or(target);
     let range = split_pattern(last).map(|(_, range)| range);
-    for entry in lock.entries.iter().filter(|e| e.live) {
-        if let Some(locator) = entry.locator() {
-            if locator.reference == url
-                || locator.archive_url().is_some_and(|archive| {
-                    archive == url
-                        || crate::utils::purl::percent_decode_purl_component(archive) == url
-                })
-            {
-                return false;
-            }
-        }
-        for pattern in &entry.patterns {
-            let Some((name, descriptor)) = split_pattern(pattern) else {
-                continue;
-            };
-            if name != target {
-                continue;
-            }
-            match range {
-                None => return false,
-                Some(want) => {
-                    if descriptor == want || descriptor.strip_prefix("npm:") == Some(want) {
-                        return false;
-                    }
-                }
-            }
-        }
+    let index = lock
+        .selector_index
+        .get_or_init(|| SelectorIndex::new(&lock.entries));
+    if index.urls.contains(url) {
+        return false;
     }
-    true
+    match range {
+        None => !index.names.contains(target),
+        Some(want) => !index
+            .descriptors
+            .contains(&(target.to_string(), want.to_string())),
+    }
 }
 
 /// A berry `checksum:` value as the pin yarn enforces: `<cacheKey>/<hex>`,
