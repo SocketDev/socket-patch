@@ -5440,6 +5440,116 @@ snapshots:
         }
     }
 
+    /// #1688: bundler ≤ 2.1 writes ONE merged `GEM` section listing every
+    /// remote, so after an earlier redirect + `bundle install` the lock's
+    /// Socket remote names the earlier patch. A superseding patch (or a
+    /// rotated grant) moves the Gemfile's `source … do` block to the new
+    /// URL; the lock's remote must move with it, or discovery reads the
+    /// pair as naming two patches and the run skips the new one as
+    /// `redirect_unattributable` on every scan.
+    #[tokio::test]
+    async fn merged_section_supersede_moves_the_lock_remote_with_the_gemfile() {
+        const OLD_UUID: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        const OLD_TOKEN: &str = "22222222-2222-4222-8222-222222222222";
+        let new_url =
+            format!("https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/");
+        for (label, old_url) in [
+            (
+                "superseding patch",
+                format!("https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{OLD_UUID}/"),
+            ),
+            (
+                "rotated grant",
+                format!("https://patch.test/patch-registry/gem/{OLD_TOKEN}/{FIXTURE_UUID}/"),
+            ),
+        ] {
+            for eol in ["\n", "\r\n"] {
+                let gemfile = format!(
+                    "source \"https://rubygems.org\"\n\nsource \"{old_url}\" do\n  gem \"rails\", \"7.0.0\"\nend\n"
+                )
+                .replace('\n', eol);
+                let lock = format!(
+                    "GEM\n  remote: https://rubygems.org/\n  remote: {old_url}\n  specs:\n    \
+                     rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\n\
+                     BUNDLED WITH\n   2.1.4\n"
+                )
+                .replace('\n', eol);
+                let mut p = MemoryProject::new();
+                p.insert_text("Gemfile", gemfile.as_str());
+                p.insert_text("Gemfile.lock", lock.as_str());
+                let outer = OuterAllowRemote::default;
+                let options = RewriteOptions {
+                    dry_run: false,
+                    targets_pipenv_lock: false,
+                    pipenv_major: None,
+                    pipenv_unknown_detail: String::new(),
+                    trust_lockfile_config: true,
+                    npm_allow_remote_config: true,
+                    npm_outer: &outer,
+                    yarn_classic_outer: &OuterYarnMirror::default,
+                    cargo_outer: &no_cargo_outer,
+                    pnpm_env: &no_env,
+                    blocking: false,
+                    takeover_uuids: Default::default(),
+                    patch_server_origins: vec!["https://patch.test".to_string()],
+                    prior_discovery: None,
+                };
+                let mut candidate = gem_candidate();
+                if let Some(ov) = candidate.dep.registry_override.as_mut() {
+                    ov.index_url = new_url.clone();
+                }
+                let candidates = vec![candidate];
+                let view = ProjectView::Memory(&p);
+                let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+                let done = rewrite(
+                    &view,
+                    read,
+                    &candidates,
+                    BTreeMap::new(),
+                    &BTreeSet::new(),
+                    options,
+                )
+                .await;
+                let ctx = format!("{label} ({eol:?})");
+                assert!(
+                    done.unattributed.is_empty(),
+                    "{ctx}: {:?}",
+                    done.unattributed
+                );
+                assert_eq!(
+                    done.confirmed,
+                    vec![("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())],
+                    "{ctx}: {:?}",
+                    done.rewrite.warnings
+                );
+                assert_eq!(
+                    done.rewrite.files.get("Gemfile").map(String::as_str),
+                    Some(gemfile.replace(&old_url, &new_url).as_str()),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    done.rewrite.files.get("Gemfile.lock").map(String::as_str),
+                    Some(lock.replace(&old_url, &new_url).as_str()),
+                    "{ctx}: the merged section's Socket remote moves in place"
+                );
+                assert!(
+                    done.rewrite.edits.iter().any(|e| {
+                        e.path == "Gemfile.lock"
+                            && e.kind == "redirect_gemfile_lock_source_url"
+                            && e.original == Some(serde_json::Value::String(old_url.clone()))
+                    }),
+                    "{ctx}: {:?}",
+                    done.rewrite.edits
+                );
+                assert!(
+                    !warning_codes(&done).contains(&"redirect_gem_frozen_install"),
+                    "{ctx}: the refreshed pair stays converged: {:?}",
+                    done.rewrite.warnings
+                );
+            }
+        }
+    }
+
     /// A twin whose other spelling this run can't read (a symlink, an
     /// unreadable or a non-UTF-8 file) is still a twin: bundler's
     /// `File.file?` sees it, so neither pair is wired (Bugbot on #768).

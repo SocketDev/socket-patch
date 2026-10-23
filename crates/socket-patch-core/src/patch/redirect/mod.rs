@@ -63,7 +63,9 @@ use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, C
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
-use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
+use crate::formats::gem::hosted::{
+    checksum_entry_span, converge_gem_lock_source, refresh_merged_gem_lock_remote,
+};
 use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
@@ -7721,17 +7723,28 @@ fn rewrite_gem(
             // remote and refuses the pair outright (unfrozen: exit 37
             // "mismatched checksums"; frozen: exit 16). A pre-CHECKSUMS lock
             // has no sha to converge around, so it keeps the
-            // mixed-but-installable state + the frozen-install caveat.
-            if !checksums_era
-                || !converge_gem_lock_source(
+            // mixed-but-installable state + the frozen-install caveat —
+            // unless an earlier redirect already converged it into a merged
+            // multi-remote section, whose Socket remote follows the Gemfile
+            // block to the new URL (#1688).
+            let converged = (checksums_era
+                && converge_gem_lock_source(
                     lk,
                     dep,
                     &ov.index_url,
                     lock_name,
                     &mut lock_changed,
                     result,
-                )
-            {
+                ))
+                || refresh_merged_gem_lock_remote(
+                    lk,
+                    dep,
+                    &ov.index_url,
+                    lock_name,
+                    &mut lock_changed,
+                    result,
+                );
+            if !converged {
                 mixed_state = true;
             }
         }
