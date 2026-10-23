@@ -6189,6 +6189,103 @@ async fn pnpm_rollback_reads_the_scope_registry_for_a_scoped_name() {
     }
 }
 
+/// A v9 pnpm lock resolving `SCOPED_NAME@VERSION` with `resolution` next
+/// to a bare npmjs `left-pad@1.3.0`, whose bare entry shows
+/// `lockfileIncludeTarballUrl` off.
+fn scoped_and_npmjs_pnpm_lock(resolution: &str) -> String {
+    format!(
+        "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+         '{SCOPED_NAME}':\n        specifier: {VERSION}\n        version: {VERSION}\n      \
+         left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\n\
+         packages:\n\n  '{SCOPED_NAME}@{VERSION}':\n    resolution: {resolution}\n\n  \
+         left-pad@1.3.0:\n    resolution: {{integrity: sha512-LEFTPADleftpad==}}\n\n\
+         snapshots:\n\n  '{SCOPED_NAME}@{VERSION}': {{}}\n\n  left-pad@1.3.0: {{}}\n"
+    )
+}
+
+/// #1619: pnpm 12.0–12.12 compare a scoped package's tarball with the
+/// conventional URL under the default registry, not the scope's, so they
+/// record `tarball:` for every package from a scoped registry even with
+/// `lockfileIncludeTarballUrl` off. Rollback and remove of the scoped pin
+/// must give it back, while pnpm 11 and 12.13+ (pnpm#16866) keep it bare.
+/// The pnpm comes from `.modules.yaml` or package.json's `packageManager`,
+/// and the scope registry from `.npmrc` or pnpm-workspace.yaml.
+#[tokio::test]
+#[serial]
+async fn pnpm_12_restore_keeps_the_scoped_registry_tarball() {
+    let server = MockServer::start().await;
+    let scope_registry = format!("{}/scoped/", server.uri());
+    let conventional = format!("{scope_registry}{SCOPED_NAME}/-/scoped-pkg-{VERSION}.tgz");
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/scoped/@socktest%2[fF]scoped-pkg/{VERSION}$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": SCOPED_NAME,
+            "version": VERSION,
+            "dist": { "tarball": conventional, "integrity": "sha512-UPSTREAMupstream==" },
+        })))
+        .mount(&server)
+        .await;
+    let recorded = scoped_and_npmjs_pnpm_lock(&format!(
+        "{{integrity: sha512-UPSTREAMupstream==, tarball: {conventional}}}"
+    ));
+    let bare = scoped_and_npmjs_pnpm_lock("{integrity: sha512-UPSTREAMupstream==}");
+    let pinned = scoped_and_npmjs_pnpm_lock(&format!(
+        "{{integrity: {PATCHED_SHA512}, tarball: {SCOPED_HOSTED_URL}}}"
+    ));
+    let npmrc = format!("@socktest:registry={scope_registry}\n");
+    let workspace = format!("packages:\n  - '.'\nregistries:\n  '@socktest': {scope_registry}\n");
+    // (pnpm, read from .modules.yaml rather than package.json, scope
+    // registry in pnpm-workspace.yaml rather than .npmrc, pristine lock)
+    for (pnpm, modules, in_workspace, pristine) in [
+        ("12.12.1", true, false, &recorded),
+        ("12.12.1", true, true, &recorded),
+        ("12.0.0", false, false, &recorded),
+        ("12.11.2", false, true, &recorded),
+        ("12.13.0", true, false, &bare),
+        ("12.14.0", false, true, &bare),
+        ("11.28.6", true, false, &bare),
+    ] {
+        for command in ["rollback", "remove"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let package_manager = if modules {
+                std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+                write_pnpm_modules_json(tmp.path(), pnpm);
+                String::new()
+            } else {
+                format!(r#", "packageManager": "pnpm@{pnpm}""#)
+            };
+            std::fs::write(
+                tmp.path().join("package.json"),
+                format!(
+                    r#"{{ "name": "consumer", "version": "0.0.0"{package_manager}, "dependencies": {{ "{SCOPED_NAME}": "{VERSION}", "left-pad": "1.3.0" }} }}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(tmp.path().join("pnpm-lock.yaml"), &pinned).unwrap();
+            if in_workspace {
+                std::fs::write(tmp.path().join("pnpm-workspace.yaml"), &workspace).unwrap();
+            } else {
+                std::fs::write(tmp.path().join(".npmrc"), &npmrc).unwrap();
+            }
+
+            let args: &[&str] = if command == "rollback" {
+                &["rollback"]
+            } else {
+                &["remove", "pkg:npm/%40socktest/scoped-pkg@1.0.0"]
+            };
+            let (code, env) = hosted_unwind_json(tmp.path(), &server, "http://patch.test", args);
+            assert_eq!(code, Some(0), "pnpm {pnpm} {command}: {env:#}");
+            let restored = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+            assert_eq!(
+                &restored, pristine,
+                "pnpm {pnpm} {command} (modules {modules}, workspace {in_workspace})"
+            );
+        }
+    }
+}
+
 /// #919: when the `.npmrc` mirror cannot be read (here it answers 401),
 /// pnpm's restore falls back to the default registry's document, exits 0,
 /// and says so with `upstream_registry_fallback`.
