@@ -7760,7 +7760,8 @@ fn rewrite_gem(
                         result,
                     )
                 });
-            if !converged && !(merged_refreshed && bundled_before_2_2(lk)) {
+            let frozen_installable = converged || (merged_refreshed && bundled_before_2_2(lk));
+            if !frozen_installable {
                 mixed_state = true;
             }
         }
