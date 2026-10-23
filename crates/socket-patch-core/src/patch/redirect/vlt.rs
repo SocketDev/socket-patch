@@ -63,11 +63,10 @@ pub(super) struct HostedLock {
     index: NodeIndex,
 }
 
-/// A node whose id splits, with its slot [1].
+/// A node whose id splits.
 struct IndexedNode {
     id: String,
     dep_id: DepId,
-    slot1: Option<String>,
 }
 
 /// The lock's nodes with their ids split once per scan rather than once per
@@ -91,7 +90,6 @@ impl NodeIndex {
                 continue;
             };
             let at = index.nodes.len();
-            let slot1 = tuple.get(1).and_then(Value::as_str).map(str::to_string);
             match dep_id.kind {
                 DepIdKind::Registry => {
                     if let Some((name, version)) = dep_id.registry_identity() {
@@ -100,12 +98,9 @@ impl NodeIndex {
                     }
                 }
                 DepIdKind::Git | DepIdKind::File | DepIdKind::Remote => {
-                    if let Some(slot1) = &slot1 {
-                        index
-                            .non_registry
-                            .entry(slot1.clone())
-                            .or_default()
-                            .push(at);
+                    if let Some(slot1) = tuple.get(1).and_then(Value::as_str) {
+                        let entry = index.non_registry.entry(slot1.to_string());
+                        entry.or_default().push(at);
                     }
                 }
                 DepIdKind::Workspace => {}
@@ -113,7 +108,6 @@ impl NodeIndex {
             index.nodes.push(IndexedNode {
                 id: id.clone(),
                 dep_id,
-                slot1,
             });
         }
         index
@@ -190,12 +184,10 @@ fn partition_instances<'a>(
 /// The git, remote and local-directory node ids that also install
 /// `name@version`, in the lock's key order.
 fn outside_instances<'a>(lock: &'a HostedLock, name: &str, version: &str) -> Vec<&'a str> {
+    // `non_registry(name)` holds only nodes whose slot [1] is `name`.
     lock.index
         .non_registry(name)
-        .filter(|node| {
-            let slot1 = node.slot1.as_deref().unwrap_or_default();
-            installs_outside_registry(&node.dep_id, slot1, name, version)
-        })
+        .filter(|node| installs_outside_registry(&node.dep_id, name, name, version))
         .map(|node| node.id.as_str())
         .collect()
 }
@@ -373,14 +365,10 @@ fn instance_line(
 }
 
 /// The residual gate: re-parsed, every instance carries the patched slots.
-pub(super) fn every_instance_pinned(
-    text: &str,
-    ids: &[&str],
-    sha512: &str,
-    url: &str,
-) -> Option<()> {
-    let nodes = parse_nodes_of(text, ids)?;
-    instances_pinned(&nodes, ids, sha512, url).then_some(())
+/// `text` must be a lock [`parse_hosted_lock`] read, with only node lines
+/// re-rendered (see [`parse_nodes_of`]).
+fn every_instance_pinned(text: &str, ids: &[&str], sha512: &str, url: &str) -> bool {
+    parse_nodes_of(text, ids).is_some_and(|nodes| instances_pinned(&nodes, ids, sha512, url))
 }
 
 /// The nodes of `ids` in `text`'s `nodes` object, as `serde_json::Value`
@@ -640,7 +628,7 @@ fn rewrite_dep(
         candidate[splice.line].clone_from(&splice.text);
     }
     let ids: Vec<&str> = located.iter().map(|(_, id)| *id).collect();
-    if every_instance_pinned(&candidate.join("\n"), &ids, sha512, &dep.artifact_url).is_none() {
+    if !every_instance_pinned(&candidate.join("\n"), &ids, sha512, &dep.artifact_url) {
         unsupported_key(result, dep, ids[0]);
         return false;
     }
