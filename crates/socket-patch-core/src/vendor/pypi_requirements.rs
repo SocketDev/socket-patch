@@ -81,9 +81,9 @@ struct PinScan {
     other_branches: bool,
 }
 
-/// Whether the other version's marker branches (if any) are harmless given
-/// the target pins: every target pin must carry a marker too, and there
-/// must be one. That is the shape `uv pip compile --universal` writes when
+/// Whether the other version's marker branches (if any) in a requirement
+/// set are harmless given its target pins: every target pin must carry a
+/// marker too, and there must be one. That is the shape `uv pip compile --universal` writes when
 /// a package resolves differently per Python (#928), and pip installs
 /// exactly one branch. Only the target branches are rewritten; the other
 /// branch is left alone, as hosted requirements and vendored pylock already
@@ -91,11 +91,35 @@ struct PinScan {
 /// stays a refusal.
 ///
 /// pip merges the root file and its `-r` includes into one requirement set,
-/// so [`plan_requirements`] asks this once over every file's pins: the two
+/// so [`plan_requirements`] asks this once over every file's scan: the two
 /// branches may sit in different files (#1104).
-fn marker_split_ok<'a>(other_branches: bool, exact: impl Iterator<Item = &'a PinSpan>) -> bool {
-    let mut exact = exact.peekable();
-    !other_branches || (exact.peek().is_some() && exact.all(|(_, _, marker, _)| marker.is_some()))
+fn marker_split_ok(scans: &[PinScan]) -> bool {
+    let mut exact = scans.iter().flat_map(|s| s.exact.iter()).peekable();
+    !scans.iter().any(|s| s.other_branches)
+        || (exact.peek().is_some() && exact.all(|(_, _, marker, _)| marker.is_some()))
+}
+
+/// Why one file's pins refuse the vendor, in fail-closed precedence: any
+/// extras occurrence wins over any ambiguous occurrence wins over the other
+/// version's marker branch when the requirement set's target pins do not
+/// all carry a marker (`split_ok` from [`marker_split_ok`]).
+#[derive(Debug, PartialEq, Eq)]
+enum PinRefusal {
+    Extras,
+    NotPinned,
+    UnmarkedSplit,
+}
+
+fn pin_refusal(scan: &PinScan, split_ok: bool) -> Option<PinRefusal> {
+    if scan.extras {
+        Some(PinRefusal::Extras)
+    } else if scan.range {
+        Some(PinRefusal::NotPinned)
+    } else if scan.other_branches && !split_ok {
+        Some(PinRefusal::UnmarkedSplit)
+    } else {
+        None
+    }
 }
 
 /// Scan one file for the target package: every clean exact
@@ -173,18 +197,18 @@ pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
 }
 
 /// Find the target pin in one file's content, read as the whole
-/// requirement set. Precedence is fail-closed: any extras occurrence wins
-/// over any non-pin occurrence wins over a clean exact pin — a file that
-/// names the package ambiguously is never rewritten (a marker-split other
-/// version is not ambiguous; see [`marker_split_ok`]).
+/// requirement set, through the same [`pin_refusal`] precedence
+/// [`plan_requirements`] applies: a file that names the package ambiguously
+/// is never rewritten (a marker-split other version is not ambiguous; see
+/// [`marker_split_ok`]).
 #[cfg(test)]
 fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
     let scan = scan_pins(content, canon_name, version);
-    if scan.extras {
-        return PinSearch::Extras;
-    }
-    if scan.range || !marker_split_ok(scan.other_branches, scan.exact.iter()) {
-        return PinSearch::Range;
+    let split_ok = marker_split_ok(std::slice::from_ref(&scan));
+    match pin_refusal(&scan, split_ok) {
+        Some(PinRefusal::Extras) => return PinSearch::Extras,
+        Some(PinRefusal::NotPinned | PinRefusal::UnmarkedSplit) => return PinSearch::Range,
+        None => {}
     }
     match scan.exact.into_iter().next() {
         Some((line_start, line_count, marker, hashed)) => PinSearch::Exact {
@@ -746,34 +770,46 @@ async fn plan_requirements(
         .collect();
     // pip reads the root and its includes as one requirement set, so the
     // other version's marker branch may sit in a different file than the
-    // target's (#1104): decide that over the whole tree, and name the file
-    // holding the other version when it is ambiguous.
-    let split_ok = marker_split_ok(
-        scans.iter().any(|s| s.other_branches),
-        scans.iter().flat_map(|s| s.exact.iter()),
-    );
+    // target's (#1104): decide that over the whole tree.
+    let split_ok = marker_split_ok(&scans);
 
     for (file, scan) in files.iter().zip(scans) {
-        if scan.extras {
-            return Err((
-                "pypi_extras_unsupported",
-                format!(
-                    "{}: the {canon_name} pin declares extras, which a vendored wheel path \
-                     line cannot express; remove the extras or use agent mode \
-                     (`scan --mode agent` + `socket-patch apply`) instead",
-                    file.rel
-                ),
-            ));
-        }
-        if scan.range || (scan.other_branches && !split_ok) {
-            return Err((
-                "pypi_requirement_not_pinned",
-                format!(
-                    "{}: {canon_name} is not pinned to =={version}; pin it exactly or use \
-                     agent mode (`scan --mode agent` + `socket-patch apply`) instead",
-                    file.rel
-                ),
-            ));
+        match pin_refusal(&scan, split_ok) {
+            Some(PinRefusal::Extras) => {
+                return Err((
+                    "pypi_extras_unsupported",
+                    format!(
+                        "{}: the {canon_name} pin declares extras, which a vendored wheel path \
+                         line cannot express; remove the extras or use agent mode \
+                         (`scan --mode agent` + `socket-patch apply`) instead",
+                        file.rel
+                    ),
+                ));
+            }
+            Some(PinRefusal::NotPinned) => {
+                return Err((
+                    "pypi_requirement_not_pinned",
+                    format!(
+                        "{}: {canon_name} is not pinned to =={version}; pin it exactly or use \
+                         agent mode (`scan --mode agent` + `socket-patch apply`) instead",
+                        file.rel
+                    ),
+                ));
+            }
+            Some(PinRefusal::UnmarkedSplit) => {
+                return Err((
+                    "pypi_requirement_not_pinned",
+                    format!(
+                        "{}: pins another {canon_name} version on an environment-marker \
+                         branch, but not every =={version} pin in the requirements tree sits \
+                         on a marker branch of its own (or there is none), so pip may install \
+                         either version; pin =={version} on its own marker branch or use agent \
+                         mode (`scan --mode agent` + `socket-patch apply`) instead",
+                        file.rel
+                    ),
+                ));
+            }
+            None => {}
         }
         if scan.exact.is_empty() {
             continue;
@@ -2168,7 +2204,13 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.0, "pypi_requirement_not_pinned", "{root:?} / {base:?}");
-            assert!(err.1.starts_with(&format!("{named}: ")), "{}", err.1);
+            assert!(
+                err.1
+                    .starts_with(&format!("{named}: pins another six version"))
+                    && err.1.contains("pin ==1.16.0 on its own marker branch"),
+                "{}",
+                err.1
+            );
             assert_eq!(read_root(tmp.path()).await, root);
             assert_eq!(
                 tokio::fs::read_to_string(tmp.path().join("base.txt"))

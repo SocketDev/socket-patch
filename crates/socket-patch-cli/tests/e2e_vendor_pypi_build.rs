@@ -89,6 +89,19 @@ const VEX_VULNS: &[(&str, &[&str])] = &[("GHSA-vend-pypi-real", &["CVE-2024-8888
 /// API: the staged patch's `six.py` afterHash + advisory), `original`
 /// being the registry requirements the revert step restores.
 fn manifestless_vex(fresh: &Path, what: &str, patched: &[u8], original: &[u8]) {
+    manifestless_vex_reverting(fresh, what, patched, &|p: &Path| {
+        std::fs::write(p.join("requirements.txt"), original).unwrap()
+    });
+}
+
+/// [`manifestless_vex`] for a wiring that `revert` un-does (the vendor line
+/// may sit in a `-r` include rather than the root file).
+fn manifestless_vex_reverting(
+    fresh: &Path,
+    what: &str,
+    patched: &[u8],
+    revert: &(dyn Fn(&Path) + Sync),
+) {
     let view =
         vex_e2e_common::patch_view(UUID, PURL, &[("six.py", &git_sha256(patched))], VEX_VULNS);
     vex_pipenv_pip_steps::run_manifestless_steps(&vex_pipenv_pip_steps::Steps {
@@ -101,7 +114,7 @@ fn manifestless_vex(fresh: &Path, what: &str, patched: &[u8], original: &[u8]) {
         records: vex_pipenv_pip_steps::Records::Mock(vec![(UUID.to_string(), view)]),
         patch_server_url: None,
         product: "pkg:pypi/app@0.1.0",
-        revert: &|p: &Path| std::fs::write(p.join("requirements.txt"), original).unwrap(),
+        revert,
         envs: Vec::new(),
         on_step: None,
         expect_verified: true,
@@ -1962,16 +1975,15 @@ fn pip_vendored_requirements_marker_split_across_includes() {
             "install vendored cross-file marker-split requirements",
         );
         assert_eq!(python_oracle(&fresh_venv, &fresh), "1", "[{label}]");
-        // The VEX steps un-wire by restoring the root file, which holds the
-        // vendor line only in this layout.
-        if label == "root" {
-            manifestless_vex(
-                &fresh,
-                "pip vendored cross-file marker split",
-                &patched,
-                root_original.as_bytes(),
-            );
-        }
+        manifestless_vex_reverting(
+            &fresh,
+            &format!("pip vendored cross-file marker split {label}"),
+            &patched,
+            &|p: &Path| {
+                std::fs::write(p.join("requirements.txt"), &root_original).unwrap();
+                std::fs::write(p.join("base.txt"), &base_original).unwrap();
+            },
+        );
 
         let (code, stdout, stderr) =
             run_socket(&project, &["vendor", "--revert", "--offline", "--json"]);
