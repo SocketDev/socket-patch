@@ -219,8 +219,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
         Ok(p) => p,
         Err(e) => return fail(&args, e.error_code(), &e.to_string()).await,
     };
-    let channel = detect_channel(&install_path, &ChannelEnv::from_env());
-    let hint = upgrade_hint_for(channel, &install_path);
+    let channel_env = ChannelEnv::from_env();
+    let channel = detect_channel(&install_path, &channel_env);
+    let hint = upgrade_hint_for(channel, &install_path, &channel_env);
     if channel != InstallChannel::Standalone {
         if args.force {
             note_warning(
@@ -230,7 +231,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                 format!(
                     "this install is managed by {} — its next upgrade will overwrite \
                      the updated binary.",
-                    channel_label_for(channel, &install_path)
+                    channel_label_for(channel, &install_path, &channel_env)
                 ),
             );
         } else {
@@ -241,7 +242,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                     "this socket-patch binary ({}) is managed by {}; update it with `{}` \
                      instead, or pass --force to replace it in place",
                     install_path.display(),
-                    channel_label_for(channel, &install_path),
+                    channel_label_for(channel, &install_path, &channel_env),
                     hint
                 ),
             )

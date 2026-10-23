@@ -211,6 +211,99 @@ async fn yarn_global_refuses_with_yarn_hint() {
     install.assert_binary_intact();
 }
 
+/// #1629: a yarn global folder moved by yarn's `global-folder` setting
+/// to a dir not named `global` looks like a small yarn project on disk
+/// (yarn writes its package.json and yarn.lock there). Yarn's config
+/// names it, so the refusal must still say `yarn global add`: `yarn add`
+/// run from the user's cwd would edit some project and leave this copy
+/// stale.
+#[tokio::test]
+async fn yarn_configured_global_folder_refuses_with_yarn_global_hint() {
+    let rel_bin = "tools/yarn-g/node_modules/@socketsecurity/socket-patch-x/bin";
+    let staged = || {
+        let install = staged_install_at(rel_bin);
+        let folder = install.root.path().join("tools/yarn-g");
+        std::fs::write(
+            folder.join("package.json"),
+            r#"{"dependencies":{"@socketsecurity/socket-patch":"^4.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(folder.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        let home = install.root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        (install, folder, home)
+    };
+    let refuse = |install: &update_fixture::StagedInstall, env: &[(&str, &str)], case: &str| {
+        let mut env = env.to_vec();
+        env.push(("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL));
+        let (code, _stdout, stderr) = run_installed(install, &["--update", "--yes"], &env);
+        assert_eq!(code, 1, "{case}: managed install must refuse.\n{stderr}");
+        assert!(stderr.contains("managed by yarn"), "{case}: {stderr}");
+        assert!(
+            stderr.contains("`yarn global add @socketsecurity/socket-patch@latest`"),
+            "{case}: a configured yarn global folder must get `yarn global add`: {stderr}"
+        );
+        install.assert_binary_intact();
+    };
+
+    // `YARN_GLOBAL_FOLDER` (`yarn_*` env, any case).
+    let (install, folder, home) = staged();
+    let (folder, home) = (folder.display().to_string(), home.display().to_string());
+    for var in [
+        "YARN_GLOBAL_FOLDER",
+        "yarn_global_folder",
+        "npm_config_global_folder",
+    ] {
+        refuse(
+            &install,
+            &[("HOME", &home), ("USERPROFILE", &home), (var, &folder)],
+            var,
+        );
+    }
+
+    // `global-folder` in the user's `~/.yarnrc` and `~/.npmrc`.
+    let (install, folder, home) = staged();
+    std::fs::write(
+        home.join(".yarnrc"),
+        format!("global-folder \"{}\"\n", folder.display()).replace('\\', "/"),
+    )
+    .unwrap();
+    let home_s = home.display().to_string();
+    refuse(
+        &install,
+        &[("HOME", &home_s), ("USERPROFILE", &home_s)],
+        "~/.yarnrc",
+    );
+    std::fs::remove_file(home.join(".yarnrc")).unwrap();
+    std::fs::write(
+        home.join(".npmrc"),
+        format!("global-folder={}\n", folder.display()).replace('\\', "/"),
+    )
+    .unwrap();
+    refuse(
+        &install,
+        &[("HOME", &home_s), ("USERPROFILE", &home_s)],
+        "~/.npmrc",
+    );
+
+    // Without any config the folder is a yarn 1 project, as before.
+    std::fs::remove_file(home.join(".npmrc")).unwrap();
+    let (code, _stdout, stderr) = run_installed(
+        &install,
+        &["--update", "--yes"],
+        &[
+            ("HOME", &home_s),
+            ("USERPROFILE", &home_s),
+            ("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL),
+        ],
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("`yarn add @socketsecurity/socket-patch@latest`"),
+        "{stderr}"
+    );
+}
+
 /// An npm-bundled binary (any `node_modules` component) refuses with the
 /// npm upgrade command — and the refusal happens before ANY release
 /// traffic: a fully valid, newer release is mounted and its routes must

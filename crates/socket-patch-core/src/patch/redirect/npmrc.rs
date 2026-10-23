@@ -359,7 +359,7 @@ impl NpmConfigEnv {
 
     /// A variable as npm's `process.env[name]` reads it: exact case on
     /// Unix, case-insensitive on Windows. `Some("")` when set but empty.
-    fn var_raw(&self, name: &str) -> Option<&str> {
+    pub(crate) fn var_raw(&self, name: &str) -> Option<&str> {
         self.vars
             .iter()
             .find(|(k, _)| {
