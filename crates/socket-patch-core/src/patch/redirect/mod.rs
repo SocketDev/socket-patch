@@ -26365,6 +26365,7 @@ mod python_lock_warning_tests {
             ),
             // `:none:` clears only the values before it.
             (" --no-binary :none: --no-binary six", &[]),
+            ("", &[("uv.toml", "[pip]\nno-binary = [\":none:\", \"six\"]\n")]),
             // `uv pip sync` reads the settings `uv pip compile --no-config`
             // passed over.
             (" --no-config", &[("uv.toml", "no-binary = true\n")]),
@@ -26422,6 +26423,10 @@ mod python_lock_warning_tests {
                 ],
             ),
             (" --no-binary :all: --no-binary :none:", &[]),
+            (
+                "",
+                &[("uv.toml", "[pip]\nno-binary = [\":all:\", \":none:\"]\n")],
+            ),
             // The root's own settings stop the lookup above it.
             (
                 "",

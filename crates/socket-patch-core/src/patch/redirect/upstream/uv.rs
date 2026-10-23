@@ -756,13 +756,28 @@ fn binary_flag_covers(command: &[&str], flag: &str, name: &str) -> bool {
             None if *arg == flag => args.next().copied(),
             _ => None,
         };
-        for value in value.into_iter().flat_map(|v| v.split(',')) {
-            match value {
-                ":none:" => covered = false,
-                ":all:" => covered = true,
-                value if canonicalize_pypi_name(value) == name => covered = true,
-                _ => {}
-            }
+        if let Some(value) = value {
+            covered = specifiers_cover(covered, value.split(','), name);
+        }
+    }
+    covered
+}
+
+/// Whether pip-style package specifiers, applied in order to an earlier
+/// verdict `covered`, cover `name` (PEP 503 canonical): a value naming it
+/// or `:all:` covers it, and `:none:` clears the values before it (uv
+/// reads a settings list the same way as repeated flags).
+fn specifiers_cover<'a>(
+    mut covered: bool,
+    values: impl IntoIterator<Item = &'a str>,
+    name: &str,
+) -> bool {
+    for value in values {
+        match value {
+            ":none:" => covered = false,
+            ":all:" => covered = true,
+            value if canonicalize_pypi_name(value) == name => covered = true,
+            _ => {}
         }
     }
     covered
@@ -770,7 +785,8 @@ fn binary_flag_covers(command: &[&str], flag: &str, name: &str) -> bool {
 
 /// The uv setting in `files` under which `uv pip` installs `name` (PEP 503
 /// canonical) only from an sdist, as `(file that sets it, key)`. Checked
-/// against uv 0.11: `[pip] no-binary` (naming it or `:all:`) and the
+/// against uv 0.11: `[pip] no-binary` (naming it or `:all:`, read in order
+/// with `:none:` clearing the values before it) and the
 /// top-level settings add up rather than one replacing the other; at the
 /// top level the first file setting `no-binary` decides it for every
 /// package, and `no-binary = false` turns off the `no-binary-package`
@@ -782,7 +798,10 @@ fn settings_no_binary(
     let pip = files.iter().find(|(_, uv)| {
         pip_table(uv)
             .and_then(|pip| pip.get("no-binary"))
-            .is_some_and(|v| v.as_array().is_some() && names_package(v, name))
+            .and_then(Item::as_array)
+            .is_some_and(|list| {
+                specifiers_cover(false, list.iter().filter_map(Value::as_str), name)
+            })
     });
     if let Some((path, _)) = pip {
         return Some((path.clone(), "[pip] no-binary".to_string()));
