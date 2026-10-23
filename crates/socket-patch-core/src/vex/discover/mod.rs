@@ -682,7 +682,9 @@ pub struct Discovery {
     /// Refs withheld from `refs` only because the build ALSO installs an
     /// unpatched copy of the same `name@version` that no rewire can reach
     /// (a bundled copy unpacked from its parent's tarball, or a same-lock
-    /// [`Discovery::unpatched_copy`]), each diagnosed
+    /// [`Discovery::unpatched_copy`]), or, for a vendored bun ref, may
+    /// install one (a git / folder / URL copy whose version bun does not
+    /// record, #1600), each diagnosed
     /// [`DIAG_REF_UNATTRIBUTABLE`]. Never attested, but the wiring itself
     /// is the rewriters' own output and names exactly one package version,
     /// so the management commands (rollback, remove, list, the vendored
