@@ -5501,15 +5501,15 @@ fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) ->
 // deviations). Byte-for-byte twin of the TS `rewriteBun`.
 fn parse_bun_hosted_lock(
     content: &str,
-) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {
+) -> Result<std::sync::Arc<crate::formats::bun::BunTextLock>, RewriteWarning> {
     use crate::vendor::bun_lock_text::{has_workspace_packages, lock_version};
 
     // The shared gate's `Err` text IS the detail: hosted and vendored refuse
     // an unsupported head with one message (and one remedy per arm — a
     // future version means "update socket-patch", a missing integer means
     // "re-lock"), so the two modes cannot drift apart.
-    let (lines, entries) = match crate::formats::bun::BunTextLock::parse(content) {
-        Ok(lock) => (lock.lines, lock.entries),
+    let lock = match crate::formats::bun::BunTextLock::parse_shared(content) {
+        Ok(lock) => lock,
         Err(crate::formats::bun::BunTextError::Version(detail)) => {
             return Err(RewriteWarning {
                 code: "redirect_bun_lock_unsupported".into(),
@@ -5543,7 +5543,7 @@ fn parse_bun_hosted_lock(
     // workspaces is kept at 0 by an in-place install on 1.2.0, 1.2.23 and
     // 1.3.0 and bumped to 1 by 1.3.9 and every later release; that case is
     // accepted here either way.)
-    if lock_version(content) == Some(0) && has_workspace_packages(&entries) {
+    if lock_version(content) == Some(0) && has_workspace_packages(&lock.entries) {
         return Err(RewriteWarning {
             code: "redirect_bun_workspace_unsupported".into(),
             detail: "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen \
@@ -5556,7 +5556,7 @@ fn parse_bun_hosted_lock(
         });
     }
 
-    Ok((lines, entries))
+    Ok(lock)
 }
 
 /// The warning for a package the bun rewriters pinned to its hosted URL that
@@ -5627,13 +5627,16 @@ fn rewrite_bun_lock(
     let Some(content) = files.get("bun.lock") else {
         return;
     };
-    let (mut lines, entries) = match parse_bun_hosted_lock(content) {
-        Ok(parsed) => parsed,
+    let lock = match parse_bun_hosted_lock(content) {
+        Ok(lock) => lock,
         Err(warning) => {
             result.warnings.push(warning);
             return;
         }
     };
+    let entries = &lock.entries;
+    // The shared parse is never edited: the first splice copies its lines.
+    let mut lines = std::borrow::Cow::Borrowed(lock.lines.as_slice());
 
     let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
         files.get("package.json").map(String::as_str),
@@ -5788,7 +5791,7 @@ fn rewrite_bun_lock(
             if rebuilt == original {
                 continue;
             }
-            lines[entry.line_idx] = rebuilt.clone();
+            lines.to_mut()[entry.line_idx] = rebuilt.clone();
             result.edits.push(FileEdit {
                 path: "bun.lock".into(),
                 kind: "redirect_bun_lock_package".into(),
@@ -5830,7 +5833,7 @@ fn rewrite_bun_lock(
     // holds a pin is touched, and the manifests are the engine's advisory
     // `<dir>/package.json` reads.
     if pinned_any {
-        let heals = crate::vendor::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
+        let heals = crate::vendor::bun_lock_text::heal_workspace_literals(lines.to_mut(), |dir| {
             let rel = if dir.is_empty() {
                 "package.json".to_string()
             } else {

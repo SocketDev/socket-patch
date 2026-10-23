@@ -206,10 +206,9 @@ pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, 
         }
         Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
     };
-    let entries = BunTextLock::parse(&text)
-        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?
-        .entries;
-    check_workspace_compatibility(&text, &entries)
+    let lock = BunTextLock::parse_shared(&text)
+        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?;
+    check_workspace_compatibility(&text, &lock.entries)
 }
 
 /// Whether `bun.lock` already wires EVERY packages entry resolving the npm
@@ -281,13 +280,12 @@ pub async fn wired_instances_all_ours(
         }
         Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
     };
-    let entries = BunTextLock::parse(&text)
-        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?
-        .entries;
+    let lock = BunTextLock::parse_shared(&text)
+        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?;
     let target_spec = format!("{name}@{version}");
     let target_leaf = tgz_rel_leaf(&name, &version);
     let mut matched = 0usize;
-    for entry in &entries {
+    for entry in &lock.entries {
         match classify_rewritable(entry, &target_spec, &name, &target_leaf) {
             Some(TupleShape::Ours { .. }) => matched += 1,
             Some(TupleShape::Registry) => return Ok(false),
