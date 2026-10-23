@@ -159,9 +159,18 @@ impl WiringRecord {
     pub fn key_label(&self) -> std::borrow::Cow<'_, str> {
         match self.key.as_deref() {
             None | Some("") => "<unknown>".into(),
-            Some(key) if key.chars().any(char::is_control) => key.escape_debug().to_string().into(),
-            Some(key) => key.into(),
+            Some(key) => terminal_safe(key),
         }
+    }
+}
+
+/// `s` with control characters escaped, for warning text built from
+/// values read out of the committed, tamper-able state.json.
+pub fn terminal_safe(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().any(char::is_control) {
+        s.escape_debug().to_string().into()
+    } else {
+        s.into()
     }
 }
 
@@ -1110,6 +1119,8 @@ mod tests {
         assert_eq!(rec.key_label(), "<unknown>");
         rec.key = Some("default:six\x1b[2K\nforged".into());
         assert_eq!(rec.key_label(), "default:six\\u{1b}[2K\\nforged");
+        assert_eq!(terminal_safe("six"), "six");
+        assert_eq!(terminal_safe("six\x1b[2K"), "six\\u{1b}[2K");
     }
 
     fn sample_entry() -> VendorEntry {

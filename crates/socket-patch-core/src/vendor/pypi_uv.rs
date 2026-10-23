@@ -46,7 +46,7 @@ use super::common::{
     ensure_unchanged, item_get, pep508_name, pyproject_dependency_specs, record, refuse_symlinked,
 };
 use super::parse_memo::ParseMemo;
-use super::state::{UvMeta, VendorEntry, WiringAction, WiringRecord};
+use super::state::{terminal_safe, UvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::toml_surgery::{
     balanced_span, find_unit_span, line_index, remove_exact_line, remove_substring,
     remove_table_if_empty, replace_fragment, split_top_level_commas, top_level_brace_groups,
@@ -974,8 +974,9 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         warnings.push(VendorWarning::new(
                             "vendor_lock_entry_drifted",
                             format!(
-                                "uv.lock entry for {key} can't be restored to match \
-                                 pyproject.toml ({reason}); left untouched"
+                                "uv.lock entry for {} can't be restored to match \
+                                 pyproject.toml ({reason}); left untouched",
+                                rec.key_label()
                             ),
                         ));
                         continue;
@@ -1181,10 +1182,11 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
                     format!(
-                        "uv.lock entry for {canon} that `uv add` routed through {needle} \
+                        "uv.lock entry for {} that `uv add` routed through {needle} \
                          can't be put back on the registry ({reason}); left both files \
                          untouched (pin it with `==` in pyproject.toml or remove it, then \
-                         revert again)"
+                         revert again)",
+                        terminal_safe(&canon)
                     ),
                 ));
             }
