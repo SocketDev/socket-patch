@@ -47,6 +47,9 @@ pub(crate) struct Gate<'a> {
     /// (with the configured patch-server origins): the rewrite's
     /// attribution gate reuses it when nothing changed the project since.
     pub(crate) prior: Option<Prior<'a>>,
+    /// The withdrawn-pin sweep's reference answers: the redirect asks the
+    /// endpoint only about the selected uuids these do not cover.
+    pub(crate) references: Option<super::withdrawn::KnownReferences>,
 }
 
 /// Scan's discovery, made BEFORE the apply lock, with the paths it read.
@@ -76,12 +79,23 @@ impl<'a> Gate<'a> {
             stage,
             rows,
             prior: None,
+            references: None,
         }
     }
 
     /// This gate carrying scan's pre-redirect discovery (see [`Self::prior`]).
     pub(crate) fn with_prior(mut self, prior: Option<Prior<'a>>) -> Self {
         self.prior = prior;
+        self
+    }
+
+    /// This gate carrying the sweep's reference answers (see
+    /// [`Self::references`]).
+    pub(crate) fn with_references(
+        mut self,
+        references: Option<super::withdrawn::KnownReferences>,
+    ) -> Self {
+        self.references = references;
         self
     }
 

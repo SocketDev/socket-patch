@@ -525,3 +525,103 @@ async fn the_envelope_reports_the_restored_pin() {
     assert_eq!(restored[0]["details"]["mode"], "hosted");
     assert_eq!(lock(tmp.path()), pristine);
 }
+
+/// The uuids each reference request asked about, in request order.
+async fn reference_uuids(server: &MockServer) -> Vec<Vec<String>> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/patches/package"))
+        .map(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            let mut uuids: Vec<String> = body["uuids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u.as_str().unwrap().to_string())
+                .collect();
+            uuids.sort();
+            uuids
+        })
+        .collect()
+}
+
+/// A rescan of a pin whose patch is still offered asks the reference
+/// endpoint about its uuid once: the redirect reuses the sweep's answer
+/// instead of sending the same request again (#1606, #1607).
+async fn rescan_asks_once(json: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, wired) = wired_project(tmp.path()).await;
+
+    let server = MockServer::start().await;
+    mock_search(&server, &[UUID]).await;
+    mock_references(
+        &server,
+        serde_json::json!({ UUID: granted(HOSTED_URL, PATCHED_SHA512) }),
+    )
+    .await;
+    mock_view(&server, UUID).await;
+    std::env::set_var(
+        "SOCKET_NPM_REGISTRY",
+        format!("{}/npm-registry", server.uri()),
+    );
+    let mut args = scan_args(tmp.path(), server.uri(), false);
+    args.common.json = json;
+    args.common.silent = !json;
+    let code = scan_run(args).await;
+    for var in ["SOCKET_NPM_REGISTRY", "SOCKET_DRY_RUN"] {
+        std::env::remove_var(var);
+    }
+    assert_eq!(code, 0);
+
+    assert_eq!(lock(tmp.path()), wired, "the rescan keeps the pin");
+    assert_eq!(
+        reference_uuids(&server).await,
+        vec![vec![UUID.to_string()]],
+        "one reference request for the pinned uuid, not one per phase"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_json_rescan_asks_about_a_pinned_uuid_once() {
+    rescan_asks_once(true).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_human_rescan_asks_about_a_pinned_uuid_once() {
+    rescan_asks_once(false).await;
+}
+
+/// A replacement patch the sweep never asked about is still looked up, and
+/// only it: the withdrawn uuid's answer is reused.
+#[tokio::test]
+#[serial]
+async fn the_redirect_asks_only_about_uuids_the_sweep_did_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    wired_project(tmp.path()).await;
+
+    let server = MockServer::start().await;
+    mock_search(&server, &[UUID2]).await;
+    mock_references(
+        &server,
+        serde_json::json!({
+            UUID: { "status": "withdrawn" },
+            UUID2: granted(HOSTED_URL2, PATCHED_SHA512_2),
+        }),
+    )
+    .await;
+    mock_view(&server, UUID2).await;
+    mock_npm_registry(&server).await;
+    assert_eq!(scan(tmp.path(), &server, false).await, 0);
+
+    let wired = lock(tmp.path());
+    assert!(wired.contains(HOSTED_URL2), "re-pinned:\n{wired}");
+    assert_eq!(
+        reference_uuids(&server).await,
+        vec![vec![UUID.to_string()], vec![UUID2.to_string()]],
+    );
+}

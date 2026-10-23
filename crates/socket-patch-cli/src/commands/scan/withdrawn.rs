@@ -23,11 +23,16 @@
 //! entitlement looks like. A `forbidden`, `pending_build` or `build_failed`
 //! answer keeps the pin too. If the reference lookup fails (the patch API
 //! is down, say), every pin is kept and the run warns.
+//!
+//! The answers are kept ([`WithdrawnSweep::take_references`]): on a rescan
+//! the redirect selects the same uuids the lockfiles pin, and asks the
+//! endpoint only about the ones the sweep did not (#1606, #1607).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use socket_patch_core::api::client::ApiClient;
+use socket_patch_core::api::types::PackageVendorResult;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::utils::purl_key::PurlKey;
 
@@ -60,9 +65,45 @@ pub(super) struct WithdrawnSweep {
     events: Vec<PatchEvent>,
     /// `(code, detail)` run-level warnings.
     warnings: Vec<(String, String)>,
+    /// The reference endpoint's answers, when the lookup succeeded.
+    references: Option<KnownReferences>,
+}
+
+/// Reference lookups a run already made: the uuids it asked about and the
+/// endpoint's answers. A uuid asked about but absent from `results` is one
+/// the endpoint does not know (`not_found`), the same answer a second
+/// request would give.
+#[derive(Debug, Default)]
+pub(crate) struct KnownReferences {
+    asked: BTreeSet<String>,
+    results: HashMap<String, PackageVendorResult>,
+}
+
+impl KnownReferences {
+    /// The uuids in `uuids` this lookup did not ask about.
+    pub(crate) fn unasked(&self, uuids: &[String]) -> Vec<String> {
+        uuids
+            .iter()
+            .filter(|uuid| !self.asked.contains(*uuid))
+            .cloned()
+            .collect()
+    }
+
+    /// The known answers for `uuids`, as the reference fetch returns them.
+    pub(crate) fn answers_for(&self, uuids: &[String]) -> HashMap<String, PackageVendorResult> {
+        uuids
+            .iter()
+            .filter_map(|uuid| Some((uuid.clone(), self.results.get(uuid)?.clone())))
+            .collect()
+    }
 }
 
 impl WithdrawnSweep {
+    /// The reference answers the sweep fetched, for the redirect to reuse.
+    pub(super) fn take_references(&mut self) -> Option<KnownReferences> {
+        self.references.take()
+    }
+
     /// Fold the outcome into the scan envelope.
     pub(super) fn record_into(self, env: &mut Envelope) {
         for event in self.events {
@@ -140,6 +181,10 @@ pub(super) async fn sweep(
             is_gone(status).then(|| (pin.clone(), status.clone()))
         })
         .collect();
+    out.references = Some(KnownReferences {
+        asked: uuids.into_iter().collect(),
+        results: references,
+    });
     if gone.is_empty() {
         return out;
     }
@@ -270,5 +315,21 @@ mod tests {
         let pins = vec![pin("pkg:npm/b@2.0.0", "u2")];
         assert!(pins_in_scope(&pins, ["pkg:npm/b@2.0.1"]).is_empty());
         assert!(pins_in_scope(&pins, Vec::<String>::new()).is_empty());
+    }
+
+    #[test]
+    fn known_references_cover_only_the_uuids_asked_about() {
+        let granted: PackageVendorResult =
+            serde_json::from_value(serde_json::json!({ "status": "granted" })).unwrap();
+        let known = KnownReferences {
+            // `u2` was asked about but the endpoint left it out.
+            asked: ["u1", "u2"].map(String::from).into(),
+            results: HashMap::from([("u1".to_string(), granted)]),
+        };
+        let uuids = ["u1", "u2", "u3"].map(String::from);
+        assert_eq!(known.unasked(&uuids), ["u3"]);
+        let answers = known.answers_for(&uuids);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers["u1"].status, "granted");
     }
 }

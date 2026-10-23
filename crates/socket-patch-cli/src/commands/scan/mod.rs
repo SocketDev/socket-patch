@@ -2644,7 +2644,7 @@ async fn run_scan(
     // longer serves, before the rewrite below re-pins any replacement.
     // Runs ahead of every "nothing found" exit: a package whose only patch
     // was withdrawn has no search results at all.
-    let withdrawn_sweep = if hosted && !args.common.is_global() && policy.writes_allowed() {
+    let mut withdrawn_sweep = if hosted && !args.common.is_global() && policy.writes_allowed() {
         let pins = withdrawn::pins_in_scope(&hosted_pin_list, &all_purls);
         Some(withdrawn::sweep(&args.common, &api_client, &pins).await)
     } else {
@@ -2766,7 +2766,9 @@ async fn run_scan(
         // Hosted mode: the redirect engine records its events into this
         // envelope and prints it.
         if hosted {
-            if let Some(sweep) = withdrawn_sweep {
+            let mut references = None;
+            if let Some(mut sweep) = withdrawn_sweep {
+                references = sweep.take_references();
                 sweep.record_into(&mut env);
             }
             return run_redirect(
@@ -2782,6 +2784,7 @@ async fn run_scan(
                 batch_error_count > 0,
                 &mut stage,
                 prior_discovery,
+                references,
                 prune,
             )
             .await;
@@ -3255,7 +3258,15 @@ async fn run_scan(
             &pairs,
             None,
             npm_crawl.as_ref(),
-            Some(rollout::Gate::new(&mut stage, rows).with_prior(prior_discovery)),
+            Some(
+                rollout::Gate::new(&mut stage, rows)
+                    .with_prior(prior_discovery)
+                    .with_references(
+                        withdrawn_sweep
+                            .as_mut()
+                            .and_then(withdrawn::WithdrawnSweep::take_references),
+                    ),
+            ),
             "scan",
         )
         .await;
