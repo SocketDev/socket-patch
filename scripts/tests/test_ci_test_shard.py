@@ -71,6 +71,30 @@ class Partition(unittest.TestCase):
         self.assertEqual(run.call_count, 3)
         self.assertIn("--doc", run.call_args_list[-1].args[0])
 
+    def test_coverage_shards_run_llvm_cov_without_doctests(self):
+        # The unsharded `cargo llvm-cov --workspace` ran no doctests; the
+        # shards must neither add them nor drop a unit or integration target.
+        for count in (1, 2):
+            runs = [args for k in range(1, count + 1)
+                    for args in shard.invocations(k, count, self.NAMES, coverage=True)]
+            self.assertTrue(all(a[:5] == ["cargo", "llvm-cov", "--no-report", "--workspace", "--no-fail-fast"]
+                                for a in runs))
+            self.assertFalse(any("--doc" in a for a in runs))
+            self.assertEqual(sum("--lib" in a and "--bins" in a for a in runs), 1)
+            self.assertEqual(sorted(selected(runs)), self.NAMES)
+
+    def test_coverage_mode_comes_from_the_environment(self):
+        metadata = {"workspace_members": ["a"], "packages": [
+            {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
+        with patch.dict(shard.os.environ, {"CI_TEST_COVERAGE": "1"}), \
+                patch.object(shard.subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata)),
+                    subprocess.CompletedProcess([], 0),
+                ]) as run:
+            self.assertEqual(shard.main(["1", "2"]), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[-1].args[0][:3], ["cargo", "llvm-cov", "--no-report"])
+
     def test_negative_bad_shard(self):
         with self.assertRaises(ValueError):
             shard.invocations(3, 2, self.NAMES)
@@ -133,6 +157,24 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertIn("test-release", needs)
         self.assertIn("if: always()", verdict)
         self.assertIn('if v["result"] not in ("success", "skipped")', verdict)
+
+    def test_all_coverage_shards_are_required_and_upload_distinct_lcov(self):
+        # coverage is the gating Linux test run: every shard must run under
+        # cargo-llvm-cov, gate ci-ok, and upload an LCOV coverage-merge picks
+        # up (its `coverage-{host*,docker-*}` pattern) without name clashes.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        cov = workflow.split("\n  coverage:\n")[1].split("\n  docker-base:\n")[0]
+        count = json.loads(re.search(r"^        shard: (\[.*\])$", cov, re.M)[1])
+        self.assertEqual(count, list(range(1, len(count) + 1)))
+        self.assertIn("fail-fast: false", cov)
+        self.assertIn("CI_TEST_COVERAGE: '1'", cov)
+        self.assertIn('python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT"', cov)
+        self.assertIn("TEST_SHARD_COUNT: ${{ strategy.job-total }}", cov)
+        self.assertIn('--output-path "coverage-host-$TEST_SHARD.lcov"', cov)
+        self.assertIn("name: coverage-host-${{ matrix.shard }}", cov)
+        self.assertIn("pattern: coverage-{host*,docker-*}", workflow)
+        verdict = workflow.split("\n  ci-ok:\n")[1]
+        self.assertIn("coverage", re.search(r"^    needs: \[(.*)\]$", verdict, re.M)[1].split(", "))
 
 
 @unittest.skipUnless(shutil.which("cargo"), "cargo not available")

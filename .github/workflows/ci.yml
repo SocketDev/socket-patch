@@ -588,7 +588,17 @@ jobs:
     # numbers are report-only so contributors get visibility without flaky
     # CI when coverage shifts naturally with test edits. A failing TEST
     # fails the job: this is the Linux leg of `test`.
+    #
+    # Two shards (scripts/ci-test-shard.py, as `test` and `test-release`):
+    # the instrumented build takes ~110 s and running the tests ~220 s, so
+    # one leg was the queue's critical path (~6 min). Each shard compiles
+    # and runs only its targets and uploads its own LCOV; coverage-merge
+    # unions them. `ci-ok` waits for every shard.
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     timeout-minutes: 35
     permissions:
       contents: read
@@ -616,12 +626,14 @@ jobs:
       - name: Cache cargo
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
+        # The shards share one cache key; shard 1 alone writes it, from the
+        # warm step that builds every target.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
 
       - name: Warm the coverage cache after merge-queue validation
-        if: needs.release-readiness.outputs.reuse == 'true'
+        if: needs.release-readiness.outputs.reuse == 'true' && matrix.shard == 1
         run: |
           cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
           source "$RUNNER_TEMP/coverage-env.sh"
@@ -672,6 +684,9 @@ jobs:
         env:
           SOCKET_PATCH_GO_E2E_REQUIRED: '1'
           SOCKET_PATCH_GO_E2E_VERSION: '1.24'
+          CI_TEST_COVERAGE: '1'
+          TEST_SHARD: ${{ matrix.shard }}
+          TEST_SHARD_COUNT: ${{ strategy.job-total }}
         #
         # The test output is also teed to a file so that a failing test's
         # panic becomes an annotation (scripts/ci-test-failures.py): in a
@@ -680,27 +695,29 @@ jobs:
         # can't be diagnosed once the re-run has passed.
         run: |
           set -o pipefail
-          cargo llvm-cov --workspace --no-fail-fast \
-            --no-report 2>&1 | tee "$RUNNER_TEMP/coverage-tests.log" || {
+          python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" \
+            2>&1 | tee "$RUNNER_TEMP/coverage-tests.log" || {
             status=$?
             python3 scripts/ci-test-failures.py "$RUNNER_TEMP/coverage-tests.log" || true
             exit "$status"
           }
           set +o pipefail
-          cargo llvm-cov report --lcov --output-path coverage-host.lcov
-          python3 scripts/ci-lcov-summary.py coverage-host.lcov | tee coverage-summary.txt
+          cargo llvm-cov report --lcov --output-path "coverage-host-$TEST_SHARD.lcov"
+          python3 scripts/ci-lcov-summary.py "coverage-host-$TEST_SHARD.lcov" | tee coverage-summary.txt
 
       - name: Publish coverage summary to job summary
         if: needs.release-readiness.outputs.reuse != 'true'
         # Render the per-file LCOV line/function/branch totals as a fenced
         # block in the GitHub Actions job summary so reviewers don't
         # need to crack open the artifact for a quick look.
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
         run: |
           {
-            echo "## Host coverage summary"
+            echo "## Host coverage summary (shard $TEST_SHARD)"
             echo ""
-            echo "(In-process tests only. See coverage-merge for the"
-            echo "full picture including docker-e2e binary coverage.)"
+            echo "(This shard's in-process tests only. See coverage-merge"
+            echo "for the full picture including docker-e2e binary coverage.)"
             echo ""
             echo '```'
             cat coverage-summary.txt
@@ -711,8 +728,8 @@ jobs:
         if: needs.release-readiness.outputs.reuse != 'true'
         uses: ./.github/actions/upload-artifact
         with:
-          name: coverage-host
-          path: coverage-host.lcov
+          name: coverage-host-${{ matrix.shard }}
+          path: coverage-host-${{ matrix.shard }}.lcov
           if-no-files-found: error
           retention-days: 30
 
