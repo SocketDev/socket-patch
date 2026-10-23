@@ -261,6 +261,11 @@ enum Mirror {
     ParentRc,
     /// `YARN_YARN_OFFLINE_MIRROR` (#1013).
     Env,
+    /// Workspace member `a`'s `.yarnrc`, which yarn 1 reads only when it
+    /// runs in `a` (#1115). Needs [`Layout::EmptyRangeWorkspace`].
+    MemberYarnrc,
+    /// Workspace member `a`'s `.npmrc` (#1115).
+    MemberNpmrc,
 }
 
 /// Steps 1–3: real install, patched tarball + API mocks, the hosted rewrite
@@ -343,14 +348,34 @@ async fn classic_hosted_project(
             std::fs::create_dir_all(proj.join("mirror")).unwrap();
             mirror_env.push(("YARN_YARN_OFFLINE_MIRROR", mirror_dir));
         }
+        Mirror::MemberYarnrc => {
+            std::fs::write(
+                proj.join("a").join(".yarnrc"),
+                format!("yarn-offline-mirror {mirror_dir:?}\n"),
+            )
+            .unwrap();
+        }
+        Mirror::MemberNpmrc => {
+            std::fs::write(
+                proj.join("a").join(".npmrc"),
+                format!("yarn-offline-mirror={mirror_dir}\n"),
+            )
+            .unwrap();
+        }
     }
+    // A member's rc is read only by a yarn run in that member, which still
+    // installs the whole workspace into the root's lock.
+    let install_dir = match mirror {
+        Mirror::MemberYarnrc | Mirror::MemberNpmrc => proj.join("a"),
+        _ => proj.clone(),
+    };
 
     // 1. REAL fixture: yarn classic install (network here, private cache).
     let cache = tmp.path().join("yarn-cache");
     let mut install_env = vec![("YARN_CACHE_FOLDER", cache.to_str().unwrap())];
     install_env.extend_from_slice(&mirror_env);
     let install = corepack(
-        &proj,
+        &install_dir,
         &yarn_classic(),
         &["install", "--no-progress"],
         &install_env,
@@ -1090,6 +1115,39 @@ async fn classic_offline_mirror_outside_project_rc_refuses_hosted() {
                 .join(format!("{DEP}-{DEP_VERSION}.tgz"))
                 .is_file(),
             "{tag}: yarn must read this mirror config (the fixture install populates it)"
+        );
+    }
+}
+
+/// #1115: yarn 1 run in a workspace member directory takes the mirror
+/// from that member's `.yarnrc` or `.npmrc`, so either refuses the hosted
+/// rewrite of the root lock like a root rc (the fixture asserts no
+/// redirect, no attestation, an untouched lock), though the scan runs
+/// from the root.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_offline_mirror_in_workspace_member_rc_refuses_hosted() {
+    for (tag, mirror) in [
+        ("offline-mirror-member-yarnrc", Mirror::MemberYarnrc),
+        ("offline-mirror-member-npmrc", Mirror::MemberNpmrc),
+    ] {
+        let Some(fx) = classic_hosted_project(
+            tag,
+            false,
+            mirror,
+            HostedDriver::Scan,
+            Layout::EmptyRangeWorkspace,
+        )
+        .await
+        else {
+            continue;
+        };
+        assert!(
+            fx.proj
+                .join("mirror")
+                .join(format!("{DEP}-{DEP_VERSION}.tgz"))
+                .is_file(),
+            "{tag}: yarn run in the member must read this mirror config"
         );
     }
 }

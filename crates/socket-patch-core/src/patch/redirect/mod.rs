@@ -3934,13 +3934,15 @@ pub const YARNRC_REL: &str = ".yarnrc";
 /// The `yarn-offline-mirror` directory yarn 1 uses for the project, if
 /// any: the project's `.yarnrc` / `.npmrc` texts layered with the config
 /// yarn reads outside the project (`outer`, see [`yarnrc`]). `false` in
-/// either registry, or an empty value, means no mirror.
+/// either registry, or an empty value, means no mirror. A mirror that
+/// only an install run from a workspace member uses
+/// ([`yarnrc::OuterYarnMirror::member`]) counts too (#1115).
 pub fn yarn_classic_offline_mirror(
     yarnrc: Option<&str>,
     npmrc: Option<&str>,
     outer: &yarnrc::OuterYarnMirror,
 ) -> Option<yarnrc::MirrorSetting> {
-    yarnrc::effective_mirror(yarnrc, npmrc, outer)
+    yarnrc::effective_mirror(yarnrc, npmrc, outer).or_else(|| outer.member.clone())
 }
 
 /// The project-level refusal of the yarn classic hosted rewriter: a
@@ -12399,9 +12401,16 @@ mod tests {
             OuterYarnMirror {
                 yarn: env("YARN_YARN_OFFLINE_MIRROR"),
                 npm: env("YARN_YARN_OFFLINE_MIRROR"),
+                ..Default::default()
             },
             OuterYarnMirror {
                 npm: env("npm_config_yarn_offline_mirror"),
+                ..Default::default()
+            },
+            // #1115: a mirror only an install run from a workspace member
+            // uses.
+            OuterYarnMirror {
+                member: Some(setting("/w/root/packages/a/.yarnrc")),
                 ..Default::default()
             },
         ];
@@ -12455,6 +12464,15 @@ mod tests {
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.files["yarn.lock"].contains("left-pad-1.3.0.tgz"));
+        // ...but not a member's mirror (#1115): an install run from that
+        // member never reads the root's `.yarnrc` as its project file.
+        assert!(preflight_yarn_classic_hosted(
+            &files["yarn.lock"],
+            files.get(YARNRC_REL).map(String::as_str),
+            None,
+            refusing.last().unwrap(),
+        )
+        .is_err());
         // The full chain drives it too.
         let mut r = rewrite_registry_redirect_withholding_vlt(
             &BTreeMap::from([("yarn.lock".to_string(), classic_lock_two_entries())]),
