@@ -56,12 +56,15 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
         .values()
         .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
         .collect();
-    let candidates: Vec<vendor::path::SweptVendorDir> = vendor::path::sweep_vendor_dirs(cwd)
+    let mut candidates: Vec<vendor::path::SweptVendorDir> = vendor::path::sweep_vendor_dirs(cwd)
         .await
         .into_iter()
         .filter(|unit| !recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())))
         .filter(|unit| select(unit))
         .collect();
+    // Directory order is the filesystem's: report the orphans in a stable
+    // one, so a run's events and lines do not depend on it.
+    candidates.sort_by(|a, b| (&a.eco, &a.uuid).cmp(&(&b.eco, &b.uuid)));
     let mut out = OrphanSweep::default();
     if candidates.is_empty() {
         return out;
