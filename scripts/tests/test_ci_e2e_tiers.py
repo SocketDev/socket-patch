@@ -128,7 +128,7 @@ GRADLE_LINES = {"6.9.4": "11", "7.6.6": "17", "8.14.3": "21", "9.8.0": "21"}
 # HostedShards checks every hosted test runs in exactly one of them).
 HOSTED_SHARD_1 = ["gradle_hosted_3", "gradle_hosted_4", "gradle_hosted_5"]
 HOSTED_SHARD_2 = ["gradle_hosted_" + c for c in "bcdeflmnop"]
-AGENT_HOSTED = (
+AGENT_AND_HOSTED_SHARDS = (
     ("e2e_gradle_discovery_build e2e_gradle_agent_build", "--ignored gradle_agent_"),
     ("e2e_redirect_gradle_build", " ".join(["--ignored", *HOSTED_SHARD_1])),
     ("e2e_redirect_gradle_build", " ".join(["--ignored", *HOSTED_SHARD_2])),
@@ -171,7 +171,7 @@ class GradleRows(unittest.TestCase):
         gradle = [r for r in rows("e2e") if r.get("jvm_tool") == "gradle"]
         want = []
         for line, java in GRADLE_LINES.items():
-            for suite, test_filter in (*AGENT_HOSTED, VENDOR):
+            for suite, test_filter in (*AGENT_AND_HOSTED_SHARDS, VENDOR):
                 row = {"os": "ubuntu-latest", "suite": suite, "jvm_tool": "gradle", "gradle": line,
                        "java": java, "test_filter": test_filter}
                 # The allowance lasts only while a suite of the row is unlanded.

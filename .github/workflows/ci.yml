@@ -1336,9 +1336,9 @@ jobs:
           # Lines that run both capstones run them in one leg (one Maven
           # install; the run step loops over `suite`).
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          # Real-Gradle capstones, PR tier: one leg per Gradle line x {agent +
-          # hosted, vendor + multi-project} on ubuntu, each on its line's LTS
-          # JDK. Every other OS x line x mode cell (and the JDK-ceiling,
+          # Real-Gradle capstones, PR tier: legs per Gradle line x {agent,
+          # hosted (three shards), vendor + multi-project} on ubuntu, each on
+          # its line's LTS JDK. Every other OS x line x mode cell (and the JDK-ceiling,
           # configuration-cache, Isolated Projects and real-Central rows) runs
           # in gradle-compatibility.yml. `suite` lists every binary the leg
           # runs (space-separated); the libtest filters select by the prefix
@@ -1353,8 +1353,8 @@ jobs:
           # names, and a catch-all that `--skip`s exactly those words, so a
           # new test always lands in some leg (test_ci_gradle_prefixes.py
           # keeps the skip list in sync). The agent suites get a leg of their
-          # own: run before `gradle_hosted_[345]` in one leg they took 4.3-6.2
-          # min, past coverage on slow hosts.
+          # own: sharing one with `gradle_hosted_[345]`, that leg took 4.3-6.2
+          # min and often outlasted the `coverage` job, setting `ci-ok`.
           - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           # Real-sbt hosted (socket-patch.sbt) + vendored
