@@ -195,17 +195,9 @@ pub(crate) fn converge_gem_lock_source(
         // Already ours. Rotated grant or superseding patch: refresh the
         // remote.
         if remote_url != index_url {
-            let ending =
-                lines[remote_idx][gem_lock_line_content(&lines[remote_idx]).len()..].to_string();
-            lines[remote_idx] = Cow::Owned(format!("  remote: {index_url}{ending}"));
-            result.edits.push(FileEdit {
-                path: lock_name.into(),
-                kind: "redirect_gemfile_lock_source_url".into(),
-                action: "rewritten".into(),
-                key: Some(dep.name.clone()),
-                original: Some(Value::String(remote_url)),
-                new: Some(Value::String(index_url.to_string())),
-            });
+            refresh_remote_line(
+                &mut lines, remote_idx, remote_url, index_url, dep, lock_name, result,
+            );
             changed = true;
         }
         // The refreshed URL (a superseding patch uuid, a rotated grant) can
@@ -301,24 +293,24 @@ pub(crate) fn converge_gem_lock_source(
 /// section lists every rubygems remote, so the Socket remote a previous
 /// run's prescribed `bundle install` added is attributed to a gem only
 /// through the Gemfile's `source … do` block (`vex::discover::gem`, "Merged
-/// sections"). When a superseding patch or rotated grant moves that block to
-/// a new URL, the section's Socket remote must move with it, or discovery
-/// sees the block and the lock name different patches and the scan refuses
-/// the new pin as unattributable on every run.
+/// sections"). When a superseding patch or rotated grant moves that block
+/// from `prior_url` to `index_url`, the section's remote must move with it,
+/// or discovery sees the block and the lock name different patches and the
+/// scan refuses the new pin as unattributable on every run.
 ///
 /// Refreshes only the shape a converged earlier redirect leaves: the dep's
-/// spec listed once, in a merged section, which has exactly one remote
-/// matching the dep's token-wildcard index pattern, and a source-pinned
-/// (`!`) DEPENDENCIES entry. The remote keeps its position (bundler orders a
-/// merged section's remotes by the Gemfile's declarations, which the
-/// in-place Gemfile refresh keeps). Returns true when the lock is converged
-/// on `index_url` (already, or via the recorded
-/// `redirect_gemfile_lock_source_url` edit); false, touching nothing, for
-/// any other shape (a first redirect into a merged lock stays mixed until
-/// the next unfrozen install).
+/// spec listed once, in a merged section, which lists `prior_url` (the dep's
+/// own block URL, so another gem's Socket remote is never taken) exactly
+/// once, and a source-pinned (`!`) DEPENDENCIES entry. The remote keeps its
+/// position (bundler orders a merged section's remotes by the Gemfile's
+/// declarations, which the in-place Gemfile refresh keeps). Returns true
+/// when the section's remote reads `index_url` (already, or via the
+/// recorded `redirect_gemfile_lock_source_url` edit); false, touching
+/// nothing, for any other shape.
 pub(crate) fn refresh_merged_gem_lock_remote(
     lk: &mut String,
     dep: &DepOverride,
+    prior_url: &str,
     index_url: &str,
     lock_name: &str,
     lock_changed: &mut bool,
@@ -339,30 +331,45 @@ pub(crate) fn refresh_merged_gem_lock_remote(
     if sec.remotes.len() < 2 || sec.specs.iter().filter(|s| s.raw == spec_raw).count() != 1 {
         return false;
     }
-    let socket_remote_re = Regex::new(&format!("^{}$", gem_index_url_pattern(dep, index_url)))
-        .expect("anchored index-url pattern from the escaped URL is valid");
     let ours: Vec<(usize, &str)> = sec
         .remotes
         .iter()
         .zip(&sec.remote_line_nos)
-        .filter(|(remote, _)| socket_remote_re.is_match(remote))
+        .filter(|(remote, _)| super::same_remote(remote, prior_url))
         .map(|(remote, line_no)| (line_no - 1, *remote))
         .collect();
     let [(remote_idx, remote_url)] = ours.as_slice() else {
         return false;
     };
-    if *remote_url == index_url {
-        return true;
+    if *remote_url != index_url {
+        let (remote_idx, remote_url) = (*remote_idx, remote_url.to_string());
+        let mut lines: Vec<Cow<'_, str>> = lk.split_inclusive('\n').map(Cow::Borrowed).collect();
+        refresh_remote_line(
+            &mut lines, remote_idx, remote_url, index_url, dep, lock_name, result,
+        );
+        let text = lines.concat();
+        drop(lines);
+        drop(model);
+        *lk = text;
+        *lock_changed = true;
     }
-    let (remote_idx, remote_url) = (*remote_idx, remote_url.to_string());
-    let mut lines: Vec<&str> = lk.split_inclusive('\n').collect();
-    let ending = &lines[remote_idx][gem_lock_line_content(lines[remote_idx]).len()..];
-    let refreshed = format!("  remote: {index_url}{ending}");
-    lines[remote_idx] = &refreshed;
-    let text = lines.concat();
-    drop(model);
-    *lk = text;
-    *lock_changed = true;
+    true
+}
+
+/// Point the `remote:` line `idx` (reading `remote_url`) at `index_url`,
+/// keeping its line ending, and record the `redirect_gemfile_lock_source_url`
+/// edit a revert reads.
+fn refresh_remote_line(
+    lines: &mut [Cow<'_, str>],
+    idx: usize,
+    remote_url: String,
+    index_url: &str,
+    dep: &DepOverride,
+    lock_name: &str,
+    result: &mut RewriteResult,
+) {
+    let ending = lines[idx][gem_lock_line_content(&lines[idx]).len()..].to_string();
+    lines[idx] = Cow::Owned(format!("  remote: {index_url}{ending}"));
     result.edits.push(FileEdit {
         path: lock_name.into(),
         kind: "redirect_gemfile_lock_source_url".into(),
@@ -371,7 +378,26 @@ pub(crate) fn refresh_merged_gem_lock_remote(
         original: Some(Value::String(remote_url)),
         new: Some(Value::String(index_url.to_string())),
     });
-    true
+}
+
+/// Whether the lock's `BUNDLED WITH` names a bundler older than 2.2 — the
+/// era that writes one merged `GEM` section, where a refreshed merged
+/// section is proven frozen-installable. False when it names none.
+pub(crate) fn bundled_before_2_2(lock: &str) -> bool {
+    let mut lines = lock.lines().map(|l| l.trim_end_matches('\r'));
+    let Some(version) = lines
+        .by_ref()
+        .find(|l| *l == "BUNDLED WITH")
+        .and_then(|_| lines.next())
+        .map(str::trim)
+    else {
+        return false;
+    };
+    let mut parts = version.split('.').map(|p| p.parse::<u32>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) < (2, 2),
+        _ => false,
+    }
 }
 
 /// The byte span (line content, ending excluded) of the `CHECKSUMS` entry
@@ -660,14 +686,16 @@ DEPENDENCIES
         );
     }
 
-    /// `(converged, lock after, edit kinds)` for [`refresh_merged_gem_lock_remote`].
-    fn refresh(lock: &str, dep: &DepOverride) -> (bool, String, Vec<String>) {
+    /// `(refreshed, lock after, edit kinds)` for
+    /// [`refresh_merged_gem_lock_remote`] from the dep's block URL `prior`.
+    fn refresh(lock: &str, dep: &DepOverride, prior: &str) -> (bool, String, Vec<String>) {
         let mut lk = lock.to_string();
         let mut changed = false;
         let mut result = RewriteResult::default();
         let ok = refresh_merged_gem_lock_remote(
             &mut lk,
             dep,
+            prior,
             INDEX_URL,
             "Gemfile.lock",
             &mut changed,
@@ -683,74 +711,108 @@ DEPENDENCIES
     }
 
     /// A bundler ≤ 2.1 merged section an earlier redirect converged:
-    /// `remotes` listed in order, `rails` source-pinned when `bang`.
-    fn merged(remotes: &[&str], bang: &str) -> String {
+    /// `remotes` listed in order, `rails` source-pinned when `bang`, and
+    /// `extra` sections before PLATFORMS.
+    fn merged(remotes: &[&str], bang: &str, extra: &str) -> String {
         let remotes: String = remotes.iter().map(|r| format!("  remote: {r}\n")).collect();
         format!(
-            "GEM\n{remotes}  specs:\n    racc (1.7.3)\n    rails (7.0.0)\n      racc\n\n\
+            "GEM\n{remotes}  specs:\n    racc (1.7.3)\n    rails (7.0.0)\n      racc\n\n{extra}\
              PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0){bang}\n\nBUNDLED WITH\n   2.1.4\n"
         )
     }
 
-    /// #1688: the merged section's one Socket remote for the dep moves to
-    /// the new index URL in place (any earlier patch uuid or grant token),
-    /// CRLF kept; a lock already on the URL is converged with no edit.
+    const UPSTREAM: &str = "https://rubygems.org/";
+    const OLD: &str = "https://patch.test/gem/tok/older-uuid/";
+
+    /// #1688: the merged section's remote for the dep's own block moves to
+    /// the new index URL in place (an earlier patch uuid or grant token),
+    /// CRLF kept; a lock already on the URL is refreshed with no edit.
     #[test]
     fn merged_section_socket_remote_follows_the_new_index_url() {
-        let upstream = "https://rubygems.org/";
-        for old in [
-            "https://patch.test/gem/tok/older-uuid/",
-            "https://patch.test/gem/old-tok/uuid/",
-        ] {
+        for old in [OLD, "https://patch.test/gem/old-tok/uuid/"] {
             for eol in ["\n", "\r\n"] {
-                let lock = merged(&[upstream, old], "!").replace('\n', eol);
-                let (ok, out, edits) = refresh(&lock, &dep("rails", "7.0.0"));
+                let lock = merged(&[UPSTREAM, old], "!", "").replace('\n', eol);
+                let (ok, out, edits) = refresh(&lock, &dep("rails", "7.0.0"), old);
                 assert!(ok, "{old}");
                 assert_eq!(out, lock.replace(old, INDEX_URL), "{old} {eol:?}");
                 assert_eq!(edits, vec!["redirect_gemfile_lock_source_url:rewritten"]);
             }
         }
-        let current = merged(&[upstream, INDEX_URL], "!");
+        let current = merged(&[UPSTREAM, INDEX_URL], "!", "");
         assert_eq!(
-            refresh(&current, &dep("rails", "7.0.0")),
+            refresh(&current, &dep("rails", "7.0.0"), INDEX_URL),
             (true, current.clone(), vec![])
         );
     }
 
-    /// Every other shape is left alone (false, no edit): a merged section
-    /// with no Socket remote (a first redirect), a gem not source-pinned, a
-    /// second Socket remote, a single-remote section, a spec listed twice,
-    /// or a gem the lock does not list.
+    /// Every other shape is left alone (false, no edit): a remote that is
+    /// not the dep's own block URL (another gem's Socket remote, or none),
+    /// a gem not source-pinned, a single-remote section, a spec listed in
+    /// two sections, or a version the lock does not list.
     #[test]
     fn merged_section_refresh_refuses_other_shapes() {
-        let upstream = "https://rubygems.org/";
-        let old = "https://patch.test/gem/tok/older-uuid/";
-        let duplicated = format!(
-            "{}GEM\n  remote: https://gems.mirror.example/\n  specs:\n    rails (7.0.0)\n",
-            merged(&[upstream, old], "!").replace("\nPLATFORMS", "\nGEM_SPLIT")
-        )
-        .replace("GEM_SPLIT", "PLATFORMS");
+        let other_gem = "https://patch.test/gem/tok/other-gem-uuid/";
+        let second = "GEM\n  remote: https://gems.mirror.example/\n  specs:\n    rails (7.0.0)\n\n";
+        let rails = dep("rails", "7.0.0");
         let cases = [
             (
-                "no Socket remote",
-                merged(&[upstream, "https://gems.mirror.example/"], "!"),
+                "another gem's Socket remote",
+                merged(&[UPSTREAM, other_gem], "!", ""),
+                &rails,
             ),
-            ("not source-pinned", merged(&[upstream, old], "")),
             (
-                "two Socket remotes",
-                merged(&[upstream, old, "https://patch.test/gem/tok/third/"], "!"),
+                "no Socket remote",
+                merged(&[UPSTREAM, "https://gems.mirror.example/"], "!", ""),
+                &rails,
             ),
-            ("single remote", merged(&[old], "!")),
-            ("spec in two sections", duplicated),
+            (
+                "not source-pinned",
+                merged(&[UPSTREAM, OLD], "", ""),
+                &rails,
+            ),
+            ("single remote", merged(&[OLD], "!", ""), &rails),
+            (
+                "spec in two sections",
+                merged(&[UPSTREAM, OLD], "!", second),
+                &rails,
+            ),
+            (
+                "unlocked version",
+                merged(&[UPSTREAM, OLD], "!", ""),
+                &dep("rails", "7.1.0"),
+            ),
         ];
-        for (label, lock) in &cases {
-            let (ok, out, edits) = refresh(lock, &dep("rails", "7.0.0"));
+        for (label, lock, dep) in &cases {
+            assert!(
+                super::super::parse(lock).problems.is_empty(),
+                "{label}: the fixture must be a valid lock"
+            );
+            let (ok, out, edits) = refresh(lock, dep, OLD);
             assert!(!ok, "{label}");
             assert_eq!(&out, lock, "{label}");
             assert!(edits.is_empty(), "{label}: {edits:?}");
         }
-        let lock = merged(&[upstream, old], "!");
-        let (ok, out, _) = refresh(&lock, &dep("rails", "7.1.0"));
-        assert!(!ok && out == lock, "a version the lock does not list");
+    }
+
+    /// Only a lock bundler < 2.2 wrote counts as the merged era.
+    #[test]
+    fn bundled_before_2_2_reads_the_bundled_with_version() {
+        for (version, want) in [
+            ("1.17.3", true),
+            ("2.1.4", true),
+            ("2.2.0", false),
+            ("2.5.23", false),
+            ("4.0.18", false),
+            ("garbage", false),
+        ] {
+            let lock = format!("DEPENDENCIES\n  rails\n\nBUNDLED WITH\n   {version}\n");
+            assert_eq!(bundled_before_2_2(&lock), want, "{version}");
+            assert_eq!(
+                bundled_before_2_2(&lock.replace('\n', "\r\n")),
+                want,
+                "{version} CRLF"
+            );
+        }
+        assert!(!bundled_before_2_2("DEPENDENCIES\n  rails\n"));
     }
 }
