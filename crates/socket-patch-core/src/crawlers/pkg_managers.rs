@@ -177,9 +177,19 @@ pub(crate) struct YarnEnv {
     /// process's environment.
     pub vars: Option<std::collections::BTreeMap<String, String>>,
     /// The variables yarn 4 injects from the project's
-    /// `injectEnvironmentFiles` ([`Self::for_project`]): they win over
+    /// `injectEnvironmentFiles` ([`Self::with_env_files`]): they win over
     /// `vars`, as yarn applies them over its environment (#1611).
-    pub injected: std::collections::BTreeMap<String, String>,
+    pub env_files: EnvFiles,
+}
+
+/// The dotenv files a yarn run injects, read on the first `${NAME}`
+/// lookup: most runs expand none.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EnvFiles {
+    /// The folder yarn runs in and `YARN_INJECT_ENVIRONMENT_FILES`; `None`
+    /// injects nothing.
+    run: Option<(PathBuf, Option<String>)>,
+    vars: std::sync::OnceLock<std::collections::BTreeMap<String, String>>,
 }
 
 impl YarnEnv {
@@ -193,7 +203,7 @@ impl YarnEnv {
                 .unwrap_or_else(|| ".yarnrc.yml".to_string()),
             home: crate::utils::fs::home_dir(),
             vars: None,
-            injected: Default::default(),
+            env_files: Default::default(),
         }
     }
 
@@ -212,24 +222,42 @@ impl YarnEnv {
     pub(crate) fn with_env_files(mut self, project_root: &Path, env_list: Option<&str>) -> Self {
         let start =
             std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-        let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
-        let mut rcs: Vec<(PathBuf, String)> = start
-            .ancestors()
-            .filter_map(|dir| Some((dir.to_path_buf(), read(&dir.join(&self.rc_filename))?)))
-            .collect();
-        if let Some(home) = &self.home {
-            if !rcs.iter().any(|(dir, _)| dir == home) {
-                if let Some(rc) = read(&home.join(&self.rc_filename)) {
-                    rcs.push((home.clone(), rc));
+        self.env_files = EnvFiles {
+            run: Some((start, env_list.map(str::to_string))),
+            vars: Default::default(),
+        };
+        self
+    }
+
+    /// The variables the env files inject, read once.
+    fn injected(&self) -> &std::collections::BTreeMap<String, String> {
+        self.env_files.vars.get_or_init(|| {
+            let Some((start, env_list)) = &self.env_files.run else {
+                return Default::default();
+            };
+            let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
+            let mut rcs: Vec<(PathBuf, String)> = start
+                .ancestors()
+                .filter_map(|dir| Some((dir.to_path_buf(), read(&dir.join(&self.rc_filename))?)))
+                .collect();
+            if let Some(home) = &self.home {
+                if !rcs.iter().any(|(dir, _)| dir == home) {
+                    if let Some(rc) = read(&home.join(&self.rc_filename)) {
+                        rcs.push((home.clone(), rc));
+                    }
                 }
             }
-        }
-        let rcs: Vec<(&Path, &str)> = rcs.iter().map(|(d, t)| (d.as_path(), t.as_str())).collect();
-        let paths = crate::formats::yarn::rc::env_file_paths(env_list, &rcs, &start, &|name| {
-            self.var(name)
-        });
-        self.injected = crate::formats::yarn::rc::injected_env(&paths, &read);
-        self
+            let rcs: Vec<(&Path, &str)> =
+                rcs.iter().map(|(d, t)| (d.as_path(), t.as_str())).collect();
+            let base_var = |name: &str| self.base_var(name);
+            let paths = crate::formats::yarn::rc::env_file_paths(
+                env_list.as_deref(),
+                &rcs,
+                start,
+                &base_var,
+            );
+            crate::formats::yarn::rc::injected_env(&paths, &read, &base_var)
+        })
     }
 
     /// The repository alone, not the host it is scanned on: no
@@ -242,16 +270,21 @@ impl YarnEnv {
             rc_filename: ".yarnrc.yml".to_string(),
             home: None,
             vars: Some(Default::default()),
-            injected: Default::default(),
+            env_files: Default::default(),
         }
     }
 
     /// The value yarn expands `${name}` to: an injected variable, else
     /// one of `vars`.
     pub(crate) fn var(&self, name: &str) -> Option<String> {
-        if let Some(value) = self.injected.get(name) {
+        if let Some(value) = self.injected().get(name) {
             return Some(value.clone());
         }
+        self.base_var(name)
+    }
+
+    /// A variable of `vars`, or of this process's environment.
+    fn base_var(&self, name: &str) -> Option<String> {
         match &self.vars {
             Some(vars) => vars.get(name).cloned(),
             None => std::env::var(name).ok(),
@@ -754,7 +787,7 @@ mod tests {
             rc_filename: ".yarnrc.yml".into(),
             home: None,
             vars: Some(Default::default()),
-            injected: Default::default(),
+            env_files: Default::default(),
         }
     }
 

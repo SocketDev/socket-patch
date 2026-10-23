@@ -1168,7 +1168,7 @@ mod tests {
             rc_filename: ".yarnrc.yml".into(),
             home: Some(home.path().to_path_buf()),
             vars: Some(Default::default()),
-            injected: Default::default(),
+            env_files: Default::default(),
         };
         let (flavor, _) =
             detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
@@ -1184,7 +1184,7 @@ mod tests {
             rc_filename: ".yarnrc.ci.yml".into(),
             home: None,
             vars: Some(Default::default()),
-            injected: Default::default(),
+            env_files: Default::default(),
         };
         let (flavor, _) =
             detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
@@ -1216,7 +1216,7 @@ mod tests {
                 rc_filename: ".yarnrc.yml".into(),
                 home: None,
                 vars: Some([("SOCKET_PATCH_T_SECRET".to_string(), "secret".to_string())].into()),
-                injected: Default::default(),
+                env_files: Default::default(),
             };
             let (code, message) = detect_vendorable_npm_flavor_with(tmp.path(), || {
                 yarn_node_linker_in(tmp.path(), &env)

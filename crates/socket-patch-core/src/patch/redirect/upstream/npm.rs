@@ -617,9 +617,9 @@ fn yarn_expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<
 struct BerryRegistrySettings {
     rcs: Vec<String>,
     env_registry: Option<String>,
-    /// The variables yarn 4 injects from the project's
-    /// `injectEnvironmentFiles`, over this process's environment (#1611).
-    injected: BTreeMap<String, String>,
+    /// The variables a value's `${NAME}` reads: this process's
+    /// environment under the project's injected dotenv files (#1611).
+    env: crate::crawlers::pkg_managers::YarnEnv,
 }
 
 impl BerryRegistrySettings {
@@ -656,7 +656,7 @@ impl BerryRegistrySettings {
         BerryRegistrySettings {
             rcs,
             env_registry: std::env::var("YARN_NPM_REGISTRY_SERVER").ok(),
-            injected: crate::crawlers::pkg_managers::YarnEnv::for_project(&root).injected,
+            env: crate::crawlers::pkg_managers::YarnEnv::for_project(&root),
         }
     }
 
@@ -665,12 +665,7 @@ impl BerryRegistrySettings {
             &self.rcs,
             self.env_registry.as_deref(),
             name,
-            &|key: &str| {
-                self.injected
-                    .get(key)
-                    .cloned()
-                    .or_else(|| std::env::var(key).ok())
-            },
+            &|key: &str| self.env.var(key),
         )
     }
 }

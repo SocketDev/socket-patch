@@ -57,18 +57,59 @@ pub fn raw_setting(rc: &str, key: &str) -> Option<String> {
     if strip_bom(rc).len() < rc.len() {
         return line_scan(rc, key);
     }
-    match top_level_scalars(rc) {
-        Ok(mut settings) => settings.remove(key).flatten(),
+    match top_level_values(rc) {
+        Ok(mut settings) => match settings.remove(key) {
+            Some(RcValue::Scalar(value)) => Some(value),
+            _ => None,
+        },
         Err(()) => line_scan(rc, key),
     }
 }
 
-/// The root mapping's keys, each with its scalar value (`None` for a
-/// nested mapping, sequence or alias); the last occurrence of a key wins,
+/// The top-level list setting `key` of `rc` as written (nothing
+/// expanded): a sequence's scalar items, or a scalar split at its commas,
+/// as yarn reads an array setting given as a string. The last occurrence
+/// wins; `Some(vec![])` empties the list. `None` when the file does not
+/// set `key` to a list or scalar, or yarn would refuse it (not a single
+/// YAML document with a mapping root, or a second BOM).
+pub fn raw_list_setting(rc: &str, key: &str) -> Option<Vec<String>> {
+    let rc = strip_bom(rc);
+    if strip_bom(rc).len() < rc.len() {
+        return None;
+    }
+    match top_level_values(rc).ok()?.remove(key)? {
+        RcValue::Scalar(value) => Some(split_list(&value)),
+        RcValue::List(items) => Some(items),
+        RcValue::Other => None,
+    }
+}
+
+/// A string given for an array setting, split at its commas, each item
+/// trimmed and empty ones dropped.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// A top-level setting's value, as [`top_level_values`] reads it.
+enum RcValue {
+    Scalar(String),
+    /// A sequence: its scalar items.
+    List(Vec<String>),
+    /// A nested mapping or an alias.
+    Other,
+}
+
+/// The root mapping's keys, each with its value (a sequence's scalar
+/// items; nothing for a nested mapping or alias); the last occurrence of a key wins,
 /// as in yarn. A root that is not a mapping (a list, a lone scalar) sets
 /// nothing: yarn refuses such a file. `Err` when the text is not a single
 /// YAML document.
-fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
+fn top_level_values(rc: &str) -> Result<HashMap<String, RcValue>, ()> {
     let mut options = Options::default();
     options.emit_comments = false;
     let mut out = HashMap::new();
@@ -78,6 +119,8 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
     // Whether the next root-level node is a key (true) or a value.
     let mut at_key = true;
     let mut root_is_mapping = false;
+    // The setting whose sequence value is being read, with its items.
+    let mut list: Option<(String, Vec<String>)> = None;
     for event in Parser::new_from_str_with_options(rc, options) {
         let (event, _) = event.map_err(|_| ())?;
         match event {
@@ -93,7 +136,11 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
                     root_is_mapping = matches!(event, Event::MappingStart(..));
                 } else if depth == 1 && !at_key {
                     if let Some(key) = pending_key.take() {
-                        out.insert(key, None);
+                        if root_is_mapping && matches!(event, Event::SequenceStart(..)) {
+                            list = Some((key, Vec::new()));
+                        } else {
+                            out.insert(key, RcValue::Other);
+                        }
                     }
                     at_key = true;
                 } else if depth == 1 {
@@ -103,22 +150,34 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
                 }
                 depth += 1;
             }
-            Event::MappingEnd | Event::SequenceEnd => depth = depth.saturating_sub(1),
+            Event::MappingEnd | Event::SequenceEnd => {
+                depth = depth.saturating_sub(1);
+                if depth == 1 {
+                    if let Some((key, items)) = list.take() {
+                        out.insert(key, RcValue::List(items));
+                    }
+                }
+            }
             Event::Scalar(text, ..) if depth == 1 && root_is_mapping => {
                 if at_key {
                     pending_key = Some(text.into_owned());
                     at_key = false;
                 } else {
                     if let Some(key) = pending_key.take() {
-                        out.insert(key, Some(text.into_owned()));
+                        out.insert(key, RcValue::Scalar(text.into_owned()));
                     }
                     at_key = true;
+                }
+            }
+            Event::Scalar(text, ..) if depth == 2 => {
+                if let Some((_, items)) = list.as_mut() {
+                    items.push(text.into_owned());
                 }
             }
             Event::Alias(_) if depth == 1 && root_is_mapping => {
                 if !at_key {
                     if let Some(key) = pending_key.take() {
-                        out.insert(key, None);
+                        out.insert(key, RcValue::Other);
                     }
                 }
                 at_key = !at_key;
@@ -129,97 +188,27 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
     Ok(out)
 }
 
-/// The top-level list setting `key` of `rc` as written (nothing
-/// expanded): a sequence's scalar items, or a scalar split at its commas,
-/// as yarn reads an array setting given as a string. The last occurrence
-/// wins; `Some(vec![])` empties the list. `None` when the file does not
-/// set `key` or does not parse.
-pub fn raw_list_setting(rc: &str, key: &str) -> Option<Vec<String>> {
-    let mut options = Options::default();
-    options.emit_comments = false;
-    let mut depth = 0usize;
-    let mut at_key = true;
-    let mut current: Option<String> = None;
-    let mut collecting: Option<Vec<String>> = None;
-    let mut found = None;
-    for event in Parser::new_from_str_with_options(strip_bom(rc), options) {
-        let (event, _) = event.ok()?;
-        match event {
-            Event::MappingStart(..) | Event::SequenceStart(..) => {
-                if depth == 1 && !at_key {
-                    let ours = current.as_deref() == Some(key);
-                    if ours && matches!(event, Event::SequenceStart(..)) {
-                        collecting = Some(Vec::new());
-                    }
-                } else if depth == 1 {
-                    // A complex key: not a setting name.
-                    current = None;
-                    at_key = false;
-                }
-                depth += 1;
-            }
-            Event::MappingEnd | Event::SequenceEnd => {
-                depth = depth.saturating_sub(1);
-                if depth == 1 {
-                    if let Some(items) = collecting.take() {
-                        found = Some(items);
-                    }
-                    at_key = true;
-                }
-            }
-            Event::Scalar(text, ..) if depth == 1 => {
-                if at_key {
-                    current = Some(text.into_owned());
-                } else if current.as_deref() == Some(key) {
-                    found = Some(
-                        text.split(',')
-                            .map(str::trim)
-                            .filter(|item| !item.is_empty())
-                            .map(str::to_string)
-                            .collect(),
-                    );
-                }
-                at_key = !at_key;
-            }
-            Event::Scalar(text, ..) if depth == 2 => {
-                if let Some(items) = collecting.as_mut() {
-                    items.push(text.into_owned());
-                }
-            }
-            Event::Alias(_) if depth == 1 => at_key = !at_key,
-            _ => {}
-        }
-    }
-    found
-}
-
 /// `injectEnvironmentFiles`' default: the folder yarn runs in's
 /// `.env.yarn`, optional.
 pub const DEFAULT_ENV_FILES: &[&str] = &[".env.yarn?"];
 
 /// The environment files yarn 4 loads (`injectEnvironmentFiles`), in load
-/// order, each with whether it is optional (a trailing `?`). The list is
-/// `env_list` (`YARN_INJECT_ENVIRONMENT_FILES`, comma separated) when set,
-/// else that of the highest-precedence rc file in `rcs` (each with its
-/// folder, which its relative entries resolve against) that sets it, else
-/// [`DEFAULT_ENV_FILES`]; the environment's and the default entries
-/// resolve against `start`, the folder yarn runs in. An entry's `${NAME}`
-/// references expand through `var`; one that cannot is skipped.
+/// order. The list is `env_list` (`YARN_INJECT_ENVIRONMENT_FILES`, comma
+/// separated) when set, else that of the highest-precedence rc file in
+/// `rcs` (each with its folder, which its relative entries resolve
+/// against) that sets it, else [`DEFAULT_ENV_FILES`]; the environment's
+/// and the default entries resolve against `start`, the folder yarn runs
+/// in. An entry's `${NAME}` references expand through `var`; one that
+/// cannot is skipped. The optional marker (`?`) is dropped: yarn stops on
+/// a missing required file, so no run of it reads a value from one.
 pub fn env_file_paths(
     env_list: Option<&str>,
     rcs: &[(&Path, &str)],
     start: &Path,
     var: &dyn Fn(&str) -> Option<String>,
-) -> Vec<(PathBuf, bool)> {
-    let split = |list: &str| -> Vec<String> {
-        list.split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    let (base, entries) = match env_list.filter(|list| !list.trim().is_empty()) {
-        Some(list) => (start, split(list)),
+) -> Vec<PathBuf> {
+    let (base, entries) = match env_list {
+        Some(list) => (start, split_list(list)),
         None => rcs
             .iter()
             .find_map(|(dir, rc)| Some((*dir, raw_list_setting(rc, "injectEnvironmentFiles")?)))
@@ -234,27 +223,34 @@ pub fn env_file_paths(
         .iter()
         .filter_map(|entry| {
             let entry = expand_env(entry, &mut |name| Ok(var(name))).ok()?;
-            let (path, optional) = match entry.strip_suffix('?') {
-                Some(path) => (path, true),
-                None => (entry.as_str(), false),
-            };
-            (!path.is_empty()).then(|| (base.join(path), optional))
+            let path = entry.strip_suffix('?').unwrap_or(&entry);
+            (!path.is_empty()).then(|| base.join(path))
         })
         .collect()
 }
 
 /// The variables yarn adds to its environment from the dotenv files
 /// `paths` ([`env_file_paths`]), as `read` gives their text (`None`: the
-/// file is missing or unreadable, which injects nothing). A later file
-/// overrides an earlier one.
+/// file is missing or unreadable, which injects nothing). Each value has
+/// its `${NAME}` references expanded, as yarn does, against the variables
+/// injected so far, then `var` (the environment); one that cannot be
+/// stays as written. A later file overrides an earlier one.
 pub fn injected_env(
-    paths: &[(PathBuf, bool)],
+    paths: &[PathBuf],
     read: &dyn Fn(&Path) -> Option<String>,
+    var: &dyn Fn(&str) -> Option<String>,
 ) -> BTreeMap<String, String> {
-    let mut vars = BTreeMap::new();
-    for (path, _) in paths {
-        if let Some(text) = read(path) {
-            vars.extend(parse_dotenv(&text));
+    let mut vars: BTreeMap<String, String> = BTreeMap::new();
+    for path in paths {
+        let Some(text) = read(path) else {
+            continue;
+        };
+        for (key, value) in parse_dotenv(&text) {
+            let value = expand_env(&value, &mut |name| {
+                Ok(vars.get(name).cloned().or_else(|| var(name)))
+            })
+            .unwrap_or(value);
+            vars.insert(key, value);
         }
     }
     vars
@@ -444,22 +440,74 @@ mod tests {
         let none = |_: &str| None;
         assert_eq!(
             env_file_paths(None, &[], start, &none),
-            vec![(start.join(".env.yarn"), true)]
+            vec![start.join(".env.yarn")]
         );
         let rcs = [(rc_dir, "injectEnvironmentFiles: [\"${D:-env}/x\", y?]\n")];
         assert_eq!(
             env_file_paths(None, &rcs, start, &none),
-            vec![(rc_dir.join("env/x"), false), (rc_dir.join("y"), true)]
+            vec![rc_dir.join("env/x"), rc_dir.join("y")]
         );
         assert_eq!(
             env_file_paths(Some("a, b?"), &rcs, start, &none),
-            vec![(start.join("a"), false), (start.join("b"), true)]
+            vec![start.join("a"), start.join("b")]
         );
         // An entry yarn cannot expand is skipped.
         let rcs = [(rc_dir, "injectEnvironmentFiles: [\"${UNSET}\", z]\n")];
         assert_eq!(
             env_file_paths(None, &rcs, start, &none),
-            vec![(rc_dir.join("z"), false)]
+            vec![rc_dir.join("z")]
+        );
+    }
+
+    /// #1611: yarn expands a dotenv value's `${…}` against the variables
+    /// injected so far, then the environment; a later file wins.
+    #[test]
+    fn injected_values_expand_like_yarn() {
+        let files = [
+            ("/a", "A=node-modules\nL=${A}\nM=${CI:-pnp}\nN=${UNSET}\n"),
+            ("/b", "B=${L}-x\n"),
+        ];
+        let read = |p: &Path| {
+            files
+                .iter()
+                .find(|(f, _)| Path::new(f) == p)
+                .map(|(_, t)| t.to_string())
+        };
+        let paths = [
+            PathBuf::from("/a"),
+            PathBuf::from("/missing"),
+            PathBuf::from("/b"),
+        ];
+        let vars = injected_env(&paths, &read, &|n| (n == "CI").then(|| "pnpm".to_string()));
+        let get = |k: &str| vars.get(k).map(String::as_str);
+        assert_eq!(get("L"), Some("node-modules"));
+        assert_eq!(get("M"), Some("pnpm"));
+        assert_eq!(get("N"), Some("${UNSET}"));
+        assert_eq!(get("B"), Some("node-modules-x"));
+    }
+
+    /// #1611: a list setting in a file yarn refuses is not read.
+    #[test]
+    fn list_settings_need_a_file_yarn_reads() {
+        let key = "injectEnvironmentFiles";
+        assert_eq!(
+            raw_list_setting("- injectEnvironmentFiles\n- [a]\n", key),
+            None
+        );
+        assert_eq!(
+            raw_list_setting(
+                "injectEnvironmentFiles: [a]\n---\ninjectEnvironmentFiles: []\n",
+                key
+            ),
+            None
+        );
+        assert_eq!(
+            raw_list_setting("\u{feff}\u{feff}injectEnvironmentFiles: [a]\n", key),
+            None
+        );
+        assert_eq!(
+            raw_list_setting("injectEnvironmentFiles:\n  a: b\n", key),
+            None
         );
     }
 
