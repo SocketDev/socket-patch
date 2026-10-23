@@ -1520,6 +1520,51 @@ async fn berry_lock_only_pnp_project_refused_up_front() {
     }
 }
 
+/// #1611: yarn 4 loads the project's `injectEnvironmentFiles` (`.env.yarn`
+/// by default) before it expands `${NAME}` in `.yarnrc.yml`, so a linker
+/// that a `.env.yarn` variable turns into `node-modules` is not PnP:
+/// vendor wires the project instead of refusing it. An emptied
+/// `injectEnvironmentFiles` loads nothing, and the fallback (`pnp`) is
+/// refused as before.
+#[tokio::test]
+async fn berry_env_file_linker_decides_vendoring() {
+    const RC: &str = "nodeLinker: \"${SOCKET_PATCH_T1611_VL:-pnp}\"\nenableGlobalCache: false\n";
+    for (label, rc_extra, file, vendors) in [
+        ("default .env.yarn", "", ".env.yarn", true),
+        (
+            "custom file",
+            "injectEnvironmentFiles: [\".env.custom\"]\n",
+            ".env.custom",
+            true,
+        ),
+        (
+            "emptied list",
+            "injectEnvironmentFiles: []\n",
+            ".env.yarn",
+            false,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        stage_berry_project(root, BERRY_WIN_PKG, &berry_win_lock());
+        std::fs::write(root.join(".yarnrc.yml"), format!("{RC}{rc_extra}")).unwrap();
+        std::fs::write(root.join(file), "SOCKET_PATCH_T1611_VL=node-modules\n").unwrap();
+        let (code, env) = vendor_cli(root, &[]);
+        let wired = std::fs::read_to_string(root.join("yarn.lock"))
+            .unwrap()
+            .contains(".socket/vendor/npm/");
+        if vendors {
+            assert_eq!(code, 0, "{label}: {env:#}");
+            assert_eq!(env["summary"]["applied"], 1, "{label}: {env:#}");
+            assert!(wired, "{label}: wired");
+        } else {
+            assert_eq!(code, 1, "{label}: {env:#}");
+            find_event(&env, "failed", Some("vendor_yarn_berry_unsupported"));
+            assert!(!wired, "{label}: not wired");
+        }
+    }
+}
+
 /// Mount the hosted-mode API (batch discovery, per-package search, a granted
 /// reference carrying the yarn-berry-zip checksum, the patch view) for the
 /// berry takeover legs. Returns the hosted tarball URL.

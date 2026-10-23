@@ -349,11 +349,14 @@ fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
             rc.ok().map(|rc| (dir, rc))
         })
         .collect();
+    // Yarn expands `${…}` with the project's injected dotenv files applied
+    // (#1611).
+    let env = crate::crawlers::pkg_managers::YarnEnv::for_project(project);
     let nearest = |key: &str| {
         rcs.iter().find_map(|(dir, rc)| {
             // The value yarn uses (`${…}` expanded, #1100); one it cannot
             // expand admits nothing.
-            crate::formats::yarn::rc::process_setting(rc, key)
+            crate::formats::yarn::rc::setting(rc, key, &|name| env.var(name))
                 .map(|setting| (*dir, setting.value.unwrap_or_default()))
         })
     };

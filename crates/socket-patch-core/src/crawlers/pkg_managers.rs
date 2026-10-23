@@ -176,6 +176,10 @@ pub(crate) struct YarnEnv {
     /// The variables `${NAME}` references read; `None` reads this
     /// process's environment.
     pub vars: Option<std::collections::BTreeMap<String, String>>,
+    /// The variables yarn 4 injects from the project's
+    /// `injectEnvironmentFiles` ([`Self::for_project`]): they win over
+    /// `vars`, as yarn applies them over its environment (#1611).
+    pub injected: std::collections::BTreeMap<String, String>,
 }
 
 impl YarnEnv {
@@ -189,7 +193,43 @@ impl YarnEnv {
                 .unwrap_or_else(|| ".yarnrc.yml".to_string()),
             home: crate::utils::fs::home_dir(),
             vars: None,
+            injected: Default::default(),
         }
+    }
+
+    /// [`Self::current`] for a yarn run in `project_root`: with the
+    /// variables of the project's `injectEnvironmentFiles` (#1611).
+    pub(crate) fn for_project(project_root: &Path) -> Self {
+        let env_list = yarn_env_key(std::env::vars_os(), "YARN_INJECT_ENVIRONMENT_FILES", true);
+        Self::current().with_env_files(project_root, env_list.as_deref())
+    }
+
+    /// This environment with the variables yarn 4 injects for a run in
+    /// `project_root`: the dotenv files `injectEnvironmentFiles` names
+    /// (`env_list` when the environment sets it, else the nearest rc file
+    /// at or above the project that sets it, else the home rc file's,
+    /// else `.env.yarn`), a later file winning.
+    pub(crate) fn with_env_files(mut self, project_root: &Path, env_list: Option<&str>) -> Self {
+        let start =
+            std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
+        let mut rcs: Vec<(PathBuf, String)> = start
+            .ancestors()
+            .filter_map(|dir| Some((dir.to_path_buf(), read(&dir.join(&self.rc_filename))?)))
+            .collect();
+        if let Some(home) = &self.home {
+            if !rcs.iter().any(|(dir, _)| dir == home) {
+                if let Some(rc) = read(&home.join(&self.rc_filename)) {
+                    rcs.push((home.clone(), rc));
+                }
+            }
+        }
+        let rcs: Vec<(&Path, &str)> = rcs.iter().map(|(d, t)| (d.as_path(), t.as_str())).collect();
+        let paths = crate::formats::yarn::rc::env_file_paths(env_list, &rcs, &start, &|name| {
+            self.var(name)
+        });
+        self.injected = crate::formats::yarn::rc::injected_env(&paths, &read);
+        self
     }
 
     /// The repository alone, not the host it is scanned on: no
@@ -202,10 +242,16 @@ impl YarnEnv {
             rc_filename: ".yarnrc.yml".to_string(),
             home: None,
             vars: Some(Default::default()),
+            injected: Default::default(),
         }
     }
 
-    fn var(&self, name: &str) -> Option<String> {
+    /// The value yarn expands `${name}` to: an injected variable, else
+    /// one of `vars`.
+    pub(crate) fn var(&self, name: &str) -> Option<String> {
+        if let Some(value) = self.injected.get(name) {
+            return Some(value.clone());
+        }
         match &self.vars {
             Some(vars) => vars.get(name).cloned(),
             None => std::env::var(name).ok(),
@@ -274,7 +320,7 @@ pub(crate) fn rc_node_linker(rc: &str, env: &YarnEnv) -> Option<String> {
 /// is `YARN_RC_FILENAME` when set. `None` when nothing sets it: yarn berry
 /// then uses its default linker, `pnp`.
 pub fn yarn_node_linker(project_root: &Path) -> Option<String> {
-    yarn_node_linker_in(project_root, &YarnEnv::current())
+    yarn_node_linker_in(project_root, &YarnEnv::for_project(project_root))
 }
 
 pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<String> {
@@ -708,7 +754,83 @@ mod tests {
             rc_filename: ".yarnrc.yml".into(),
             home: None,
             vars: Some(Default::default()),
+            injected: Default::default(),
         }
+    }
+
+    /// #1611: yarn 4 expands `${…}` with `injectEnvironmentFiles` applied
+    /// (`.env.yarn` by default), a file's value winning over an exported
+    /// one; an rc file or `YARN_INJECT_ENVIRONMENT_FILES` renames or
+    /// empties the list, and a later file wins over an earlier one.
+    #[test]
+    fn env_files_feed_rc_references() {
+        let linker = |rc_extra: &str, files: &[(&str, &str)], env_list: Option<&str>| {
+            let d = tempfile::tempdir().unwrap();
+            let rc = format!("nodeLinker: \"${{L:-pnp}}\"\n{rc_extra}");
+            std::fs::write(d.path().join(".yarnrc.yml"), rc).unwrap();
+            for (name, text) in files {
+                std::fs::write(d.path().join(name), text).unwrap();
+            }
+            let mut env = bare_env(None);
+            env.vars = Some([("L".to_string(), "pnpm".to_string())].into());
+            let env = env.with_env_files(d.path(), env_list);
+            yarn_node_linker_in(d.path(), &env)
+        };
+        let nm = Some("node-modules".to_string());
+        // No file: the exported variable.
+        assert_eq!(linker("", &[], None).as_deref(), Some("pnpm"));
+        // `.env.yarn` overrides it.
+        assert_eq!(linker("", &[(".env.yarn", "L=node-modules\n")], None), nm);
+        // An rc list replaces the default; `[]` loads nothing.
+        let custom = [(".env.yarn", "L=pnp\n"), (".env.ci", "L=node-modules\n")];
+        assert_eq!(
+            linker("injectEnvironmentFiles: [.env.ci]\n", &custom, None),
+            nm
+        );
+        assert_eq!(
+            linker("injectEnvironmentFiles: []\n", &custom, None).as_deref(),
+            Some("pnpm")
+        );
+        // A later file wins; a missing optional one is skipped.
+        assert_eq!(
+            linker(
+                "injectEnvironmentFiles:\n  - .env.yarn\n  - .env.missing?\n  - .env.ci\n",
+                &custom,
+                None
+            ),
+            nm
+        );
+        // The environment's list beats the rc file's.
+        assert_eq!(
+            linker("injectEnvironmentFiles: []\n", &custom, Some(".env.ci")),
+            nm
+        );
+    }
+
+    /// #1611: an rc file's relative `injectEnvironmentFiles` entries
+    /// resolve against its own folder, and the nearest rc file setting the
+    /// list wins.
+    #[test]
+    fn env_files_resolve_against_their_rc_folder() {
+        let w = tempfile::tempdir().unwrap();
+        std::fs::write(
+            w.path().join(".yarnrc.yml"),
+            "nodeLinker: \"${L:-pnp}\"\ninjectEnvironmentFiles: [env/linker]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(w.path().join("env")).unwrap();
+        std::fs::write(w.path().join("env/linker"), "L=node-modules\n").unwrap();
+        let proj = w.path().join("packages/app");
+        std::fs::create_dir_all(&proj).unwrap();
+        let env = bare_env(None).with_env_files(&proj, None);
+        assert_eq!(
+            yarn_node_linker_in(&proj, &env).as_deref(),
+            Some("node-modules")
+        );
+        // A nearer rc file emptying the list wins.
+        std::fs::write(proj.join(".yarnrc.yml"), "injectEnvironmentFiles: []\n").unwrap();
+        let env = bare_env(None).with_env_files(&proj, None);
+        assert_eq!(yarn_node_linker_in(&proj, &env).as_deref(), Some("pnp"));
     }
 
     /// yarn reads the home folder's rc file after every project-side one,

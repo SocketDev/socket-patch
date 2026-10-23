@@ -11,8 +11,14 @@
 //! Every `.yarnrc.yml` scalar socket-patch decides on (`nodeLinker`,
 //! `compressionLevel`, `pnpmStoreFolder`) is read through [`setting`], so
 //! no reader takes the literal `${…}` text for the value yarn uses.
+//!
+//! Yarn 4 expands those references with the variables of its
+//! `injectEnvironmentFiles` (`.env.yarn` by default) applied, a file's
+//! value winning over an exported one (#1611): [`env_file_paths`] names
+//! the files and [`injected_env`] reads them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use serde_saphyr::granit_parser::{Event, Options, Parser};
 
@@ -37,12 +43,6 @@ pub fn setting(rc: &str, key: &str, var: &dyn Fn(&str) -> Option<String>) -> Opt
     let raw = raw_setting(rc, key)?;
     let value = expand_env(&raw, &mut |name| Ok(var(name))).ok();
     Some(YarnrcSetting { raw, value })
-}
-
-/// [`setting`] with the references expanded from this process's
-/// environment.
-pub fn process_setting(rc: &str, key: &str) -> Option<YarnrcSetting> {
-    setting(rc, key, &|name| std::env::var(name).ok())
 }
 
 /// The top-level scalar `key` of `rc` as written (quotes removed, nothing
@@ -127,6 +127,167 @@ fn top_level_scalars(rc: &str) -> Result<HashMap<String, Option<String>>, ()> {
         }
     }
     Ok(out)
+}
+
+/// The top-level list setting `key` of `rc` as written (nothing
+/// expanded): a sequence's scalar items, or a scalar split at its commas,
+/// as yarn reads an array setting given as a string. The last occurrence
+/// wins; `Some(vec![])` empties the list. `None` when the file does not
+/// set `key` or does not parse.
+pub fn raw_list_setting(rc: &str, key: &str) -> Option<Vec<String>> {
+    let mut options = Options::default();
+    options.emit_comments = false;
+    let mut depth = 0usize;
+    let mut at_key = true;
+    let mut current: Option<String> = None;
+    let mut collecting: Option<Vec<String>> = None;
+    let mut found = None;
+    for event in Parser::new_from_str_with_options(strip_bom(rc), options) {
+        let (event, _) = event.ok()?;
+        match event {
+            Event::MappingStart(..) | Event::SequenceStart(..) => {
+                if depth == 1 && !at_key {
+                    let ours = current.as_deref() == Some(key);
+                    if ours && matches!(event, Event::SequenceStart(..)) {
+                        collecting = Some(Vec::new());
+                    }
+                } else if depth == 1 {
+                    // A complex key: not a setting name.
+                    current = None;
+                    at_key = false;
+                }
+                depth += 1;
+            }
+            Event::MappingEnd | Event::SequenceEnd => {
+                depth = depth.saturating_sub(1);
+                if depth == 1 {
+                    if let Some(items) = collecting.take() {
+                        found = Some(items);
+                    }
+                    at_key = true;
+                }
+            }
+            Event::Scalar(text, ..) if depth == 1 => {
+                if at_key {
+                    current = Some(text.into_owned());
+                } else if current.as_deref() == Some(key) {
+                    found = Some(
+                        text.split(',')
+                            .map(str::trim)
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                    );
+                }
+                at_key = !at_key;
+            }
+            Event::Scalar(text, ..) if depth == 2 => {
+                if let Some(items) = collecting.as_mut() {
+                    items.push(text.into_owned());
+                }
+            }
+            Event::Alias(_) if depth == 1 => at_key = !at_key,
+            _ => {}
+        }
+    }
+    found
+}
+
+/// `injectEnvironmentFiles`' default: the folder yarn runs in's
+/// `.env.yarn`, optional.
+pub const DEFAULT_ENV_FILES: &[&str] = &[".env.yarn?"];
+
+/// The environment files yarn 4 loads (`injectEnvironmentFiles`), in load
+/// order, each with whether it is optional (a trailing `?`). The list is
+/// `env_list` (`YARN_INJECT_ENVIRONMENT_FILES`, comma separated) when set,
+/// else that of the highest-precedence rc file in `rcs` (each with its
+/// folder, which its relative entries resolve against) that sets it, else
+/// [`DEFAULT_ENV_FILES`]; the environment's and the default entries
+/// resolve against `start`, the folder yarn runs in. An entry's `${NAME}`
+/// references expand through `var`; one that cannot is skipped.
+pub fn env_file_paths(
+    env_list: Option<&str>,
+    rcs: &[(&Path, &str)],
+    start: &Path,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(PathBuf, bool)> {
+    let split = |list: &str| -> Vec<String> {
+        list.split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (base, entries) = match env_list.filter(|list| !list.trim().is_empty()) {
+        Some(list) => (start, split(list)),
+        None => rcs
+            .iter()
+            .find_map(|(dir, rc)| Some((*dir, raw_list_setting(rc, "injectEnvironmentFiles")?)))
+            .unwrap_or_else(|| {
+                (
+                    start,
+                    DEFAULT_ENV_FILES.iter().map(|f| f.to_string()).collect(),
+                )
+            }),
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let entry = expand_env(entry, &mut |name| Ok(var(name))).ok()?;
+            let (path, optional) = match entry.strip_suffix('?') {
+                Some(path) => (path, true),
+                None => (entry.as_str(), false),
+            };
+            (!path.is_empty()).then(|| (base.join(path), optional))
+        })
+        .collect()
+}
+
+/// The variables yarn adds to its environment from the dotenv files
+/// `paths` ([`env_file_paths`]), as `read` gives their text (`None`: the
+/// file is missing or unreadable, which injects nothing). A later file
+/// overrides an earlier one.
+pub fn injected_env(
+    paths: &[(PathBuf, bool)],
+    read: &dyn Fn(&Path) -> Option<String>,
+) -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
+    for (path, _) in paths {
+        if let Some(text) = read(path) {
+            vars.extend(parse_dotenv(&text));
+        }
+    }
+    vars
+}
+
+/// The `KEY=value` pairs of the dotenv text `text`, in file order, as
+/// yarn's dotenv parser reads them: an optional `export ` prefix, `=` or
+/// `: ` between key and value, a value in single, double or back quotes
+/// (which may span lines; a double-quoted one turns `\n` and `\r` into
+/// line breaks), or else unquoted up to a `#` comment and trimmed.
+pub fn parse_dotenv(text: &str) -> Vec<(String, String)> {
+    static LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?m)^\s*(?:export\s+)?([A-Za-z0-9_.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?$"#,
+        )
+        .expect("the dotenv line pattern compiles")
+    });
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    LINE.captures_iter(&text)
+        .map(|caps| {
+            let mut value = caps.get(2).map_or("", |m| m.as_str()).trim().to_string();
+            let quote = value.chars().next();
+            if let Some(q) = quote.filter(|q| matches!(q, '\'' | '"' | '`')) {
+                if value.len() >= 2 && value.ends_with(q) {
+                    value = value[1..value.len() - 1].to_string();
+                }
+                if q == '"' {
+                    value = value.replace("\\n", "\n").replace("\\r", "\r");
+                }
+            }
+            (caps[1].to_string(), value)
+        })
+        .collect()
 }
 
 /// The column-0 `key: value` line scan [`raw_setting`] falls back to: a
@@ -215,6 +376,91 @@ mod tests {
 
     fn value(rc: &str, key: &str, vars: &[(&str, &str)]) -> Option<Option<String>> {
         setting(rc, key, &env(vars)).map(|s| s.value)
+    }
+
+    /// #1611: dotenv text as yarn's parser reads it.
+    #[test]
+    fn dotenv_reads_like_yarn() {
+        let text = "# comment\r\nA=1\nexport B = two words # note\n\
+                    C='single # kept'\nD=\"line\\nbreak\"\nE=`back`\nF=\nG: colon\n\
+                    H=\"multi\nline\"\nnot a pair\nI.J-K=x\n";
+        let got: Vec<(String, String)> = parse_dotenv(text);
+        let want: Vec<(&str, &str)> = vec![
+            ("A", "1"),
+            ("B", "two words"),
+            ("C", "single # kept"),
+            ("D", "line\nbreak"),
+            ("E", "back"),
+            ("F", ""),
+            ("G", "colon"),
+            ("H", "multi\nline"),
+            ("I.J-K", "x"),
+        ];
+        let got: Vec<(&str, &str)> = got.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(got, want);
+    }
+
+    /// #1611: `injectEnvironmentFiles` as a sequence, a flow list, a comma
+    /// string or emptied; another key's list is not it.
+    #[test]
+    fn list_settings_read_like_yarn() {
+        let key = "injectEnvironmentFiles";
+        let list = |items: &[&str]| Some(items.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            raw_list_setting("injectEnvironmentFiles: [a, \"b?\"]\n", key),
+            list(&["a", "b?"])
+        );
+        assert_eq!(
+            raw_list_setting("x: [z]\ninjectEnvironmentFiles:\n  - a\n  - b\ny: 1\n", key),
+            list(&["a", "b"])
+        );
+        assert_eq!(
+            raw_list_setting("injectEnvironmentFiles: a, b\n", key),
+            list(&["a", "b"])
+        );
+        assert_eq!(
+            raw_list_setting("injectEnvironmentFiles: []\n", key),
+            list(&[])
+        );
+        assert_eq!(
+            raw_list_setting("x: [a]\nn:\n  injectEnvironmentFiles: [b]\n", key),
+            None
+        );
+        assert_eq!(
+            raw_list_setting(
+                "injectEnvironmentFiles: [a]\ninjectEnvironmentFiles: [b]\n",
+                key
+            ),
+            list(&["b"])
+        );
+    }
+
+    /// #1611: the default list, an rc list against its folder, the
+    /// environment's list against the start folder, `?` and `${…}`.
+    #[test]
+    fn env_file_paths_follow_precedence() {
+        let start = Path::new("/p/app");
+        let rc_dir = Path::new("/p");
+        let none = |_: &str| None;
+        assert_eq!(
+            env_file_paths(None, &[], start, &none),
+            vec![(start.join(".env.yarn"), true)]
+        );
+        let rcs = [(rc_dir, "injectEnvironmentFiles: [\"${D:-env}/x\", y?]\n")];
+        assert_eq!(
+            env_file_paths(None, &rcs, start, &none),
+            vec![(rc_dir.join("env/x"), false), (rc_dir.join("y"), true)]
+        );
+        assert_eq!(
+            env_file_paths(Some("a, b?"), &rcs, start, &none),
+            vec![(start.join("a"), false), (start.join("b"), true)]
+        );
+        // An entry yarn cannot expand is skipped.
+        let rcs = [(rc_dir, "injectEnvironmentFiles: [\"${UNSET}\", z]\n")];
+        assert_eq!(
+            env_file_paths(None, &rcs, start, &none),
+            vec![(rc_dir.join("z"), false)]
+        );
     }
 
     /// The #1100 shapes: yarn expands `${…}` in the value it uses.
