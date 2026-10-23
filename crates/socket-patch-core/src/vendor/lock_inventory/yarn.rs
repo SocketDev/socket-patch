@@ -1,8 +1,10 @@
 //! `yarn.lock`, classic and berry: the entry models lockfile discovery
 //! shares ([`classic_entries`], [`berry_entries`]) and the registry views.
 
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::formats::yarn::blocks::{
     berry_field, classic_field, live_blocks, scan_blocks, LockBlock,
@@ -74,6 +76,50 @@ pub(crate) struct BerryLock {
     pub(crate) cache_key: Option<String>,
     /// Every block except the exact `__metadata` one, in lock order.
     pub(crate) entries: Vec<YarnEntry>,
+    /// What [`berry_selector_routes_nothing`] asks of the live entries,
+    /// built on its first call.
+    selector_index: OnceLock<SelectorIndex>,
+}
+
+/// The live entries of a [`BerryLock`] as [`berry_selector_routes_nothing`]
+/// reads them, collected once per lock instead of once per selector
+/// (#1607).
+#[derive(Default)]
+struct SelectorIndex {
+    /// Every url a live entry resolves: its locator's reference, and an
+    /// older pin's `__archiveUrl=` binding as written and percent-decoded.
+    urls: HashSet<String>,
+    /// The descriptors live entries are keyed by, per package name, each
+    /// also without its `npm:` protocol.
+    descriptors: HashMap<String, HashSet<String>>,
+}
+
+impl SelectorIndex {
+    fn new(entries: &[YarnEntry]) -> Self {
+        let mut index = Self::default();
+        for entry in entries.iter().filter(|e| e.live) {
+            if let Some(locator) = entry.locator() {
+                index.urls.insert(locator.reference.to_string());
+                if let Some(archive) = locator.archive_url() {
+                    index.urls.insert(archive.to_string());
+                    index.urls.insert(
+                        crate::utils::purl::percent_decode_purl_component(archive).into_owned(),
+                    );
+                }
+            }
+            for pattern in &entry.patterns {
+                let Some((name, descriptor)) = split_pattern(pattern) else {
+                    continue;
+                };
+                let descriptors = index.descriptors.entry(name.to_string()).or_default();
+                descriptors.insert(descriptor.to_string());
+                if let Some(bare) = descriptor.strip_prefix("npm:") {
+                    descriptors.insert(bare.to_string());
+                }
+            }
+        }
+        index
+    }
 }
 
 /// A berry (yarn 2+) `yarn.lock` text — berry reuses the classic block
@@ -84,7 +130,11 @@ pub(crate) fn berry_entries(text: &str) -> BerryLock {
     let cache_key = crate::formats::yarn::berry_gates::cache_key(&blocks).map(str::to_string);
     let mut entries = yarn_entries(blocks, split_berry_key_patterns);
     entries.retain(|e| e.block.key != "__metadata");
-    BerryLock { cache_key, entries }
+    BerryLock {
+        cache_key,
+        entries,
+        selector_index: OnceLock::new(),
+    }
 }
 
 /// Whether a root `package.json` `resolutions` selector routing to the
@@ -108,35 +158,17 @@ pub(crate) fn berry_selector_routes_nothing(lock: &BerryLock, selector: &str, ur
         .map(|i| &selector[i..])
         .unwrap_or(target);
     let range = split_pattern(last).map(|(_, range)| range);
-    for entry in lock.entries.iter().filter(|e| e.live) {
-        if let Some(locator) = entry.locator() {
-            if locator.reference == url
-                || locator.archive_url().is_some_and(|archive| {
-                    archive == url
-                        || crate::utils::purl::percent_decode_purl_component(archive) == url
-                })
-            {
-                return false;
-            }
-        }
-        for pattern in &entry.patterns {
-            let Some((name, descriptor)) = split_pattern(pattern) else {
-                continue;
-            };
-            if name != target {
-                continue;
-            }
-            match range {
-                None => return false,
-                Some(want) => {
-                    if descriptor == want || descriptor.strip_prefix("npm:") == Some(want) {
-                        return false;
-                    }
-                }
-            }
-        }
+    let index = lock
+        .selector_index
+        .get_or_init(|| SelectorIndex::new(&lock.entries));
+    if index.urls.contains(url) {
+        return false;
     }
-    true
+    match (index.descriptors.get(target), range) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(descriptors), Some(want)) => !descriptors.contains(want),
+    }
 }
 
 /// A berry `checksum:` value as the pin yarn enforces: `<cacheKey>/<hex>`,
@@ -287,4 +319,57 @@ fn berry_registry_view(text: &str) -> Vec<LockfileEntry> {
         out.push(LockfileEntry::npm(locator.name, version, None, integrity));
     }
     out
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    const HOSTED: &str = "https://patch.socket.dev/npm/left-pad/-/left-pad-1.3.0.tgz";
+
+    fn lock() -> BerryLock {
+        berry_entries(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"lodash@npm:^4.17.0\":\n  version: 4.17.21\n  \
+             resolution: \"lodash@npm:4.17.21\"\n\n\
+             \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@npm:1.3.0::__archiveUrl=https%3A%2F%2Fpatch.socket.dev%2Fnpm%2Fleft-pad%2F-%2Fleft-pad-1.3.0.tgz\"\n\n\
+             \"chalk@https://patch.socket.dev/npm/chalk/-/chalk-5.0.0.tgz\":\n  version: 5.0.0\n  \
+             resolution: \"chalk@https://patch.socket.dev/npm/chalk/-/chalk-5.0.0.tgz\"\n",
+        )
+    }
+
+    #[test]
+    fn one_lock_answers_every_selector_from_its_index() {
+        let lock = lock();
+        // The url a live entry resolves, as a locator or a decoded
+        // `__archiveUrl=` binding, is still wired.
+        assert!(!berry_selector_routes_nothing(&lock, "left-pad", HOSTED));
+        let chalk = "https://patch.socket.dev/npm/chalk/-/chalk-5.0.0.tgz";
+        assert!(!berry_selector_routes_nothing(&lock, "nobody", chalk));
+        // A range-less selector matches any descriptor of its package.
+        let gone = "https://patch.socket.dev/npm/lodash/-/lodash-4.17.20.tgz";
+        assert!(!berry_selector_routes_nothing(&lock, "lodash", gone));
+        assert!(!berry_selector_routes_nothing(&lock, "**/lodash", gone));
+        // `name@range` matches that descriptor, with or without `npm:`.
+        assert!(!berry_selector_routes_nothing(
+            &lock,
+            "lodash@^4.17.0",
+            gone
+        ));
+        assert!(!berry_selector_routes_nothing(
+            &lock,
+            "lodash@npm:^4.17.0",
+            gone
+        ));
+        // Leftovers: another range, or a package the lock no longer has.
+        assert!(berry_selector_routes_nothing(&lock, "lodash@^3.0.0", gone));
+        let removed = "https://patch.socket.dev/npm/is-odd/-/is-odd-3.0.1.tgz";
+        assert!(berry_selector_routes_nothing(&lock, "is-odd", removed));
+        assert!(berry_selector_routes_nothing(
+            &lock,
+            "parent/is-odd@^3.0.0",
+            removed
+        ));
+    }
 }

@@ -104,18 +104,30 @@ const BATCH_BODY_BYTE_CAP: usize = 256 * 1024;
 /// PEP 440 spellings of the same release (#604), deduplicated in order.
 fn with_pypi_equivalents(purls: &[String], lockfile_only: &HashSet<PurlKey>) -> Vec<String> {
     let mut out = purls.to_vec();
-    let mut seen: HashSet<PurlKey> = purls.iter().map(|p| PurlKey::new(p)).collect();
+    // Keyed only once some purl has an equivalent: most scans have no
+    // PyPI pins, and keying every purl costs (#1606, #1607).
+    let mut seen: Option<HashSet<PurlKey>> = None;
     for purl in purls {
-        if !lockfile_only_contains(lockfile_only, purl) {
+        if !is_pypi_purl(purl) || !lockfile_only_contains(lockfile_only, purl) {
             continue;
         }
         for spelling in socket_patch_core::utils::purl_key::pypi_equivalent_purls(purl) {
+            let seen = seen.get_or_insert_with(|| purls.iter().map(|p| PurlKey::new(p)).collect());
             if seen.insert(PurlKey::new(&spelling)) {
                 out.push(spelling);
             }
         }
     }
     out
+}
+
+/// Whether `purl` is a PyPI purl, in any case of its type (the spellings
+/// [`PurlKey`] folds together).
+fn is_pypi_purl(purl: &str) -> bool {
+    purl.trim_start()
+        .strip_prefix("pkg:")
+        .and_then(|rest| rest.get(..5))
+        .is_some_and(|ty| ty.eq_ignore_ascii_case("pypi/"))
 }
 
 /// Mark each API purl that names a lockfile-only PyPI pin under another
@@ -128,11 +140,14 @@ fn adopt_pypi_equivalents(
     scanned: &[String],
     lockfile_only: &mut HashSet<PurlKey>,
 ) {
-    let scanned_keys: HashSet<PurlKey> = scanned.iter().map(|p| PurlKey::new(p)).collect();
     let lock_only_pypi: Vec<&String> = scanned
         .iter()
-        .filter(|p| p.starts_with("pkg:pypi/") && lockfile_only_contains(lockfile_only, p))
+        .filter(|p| is_pypi_purl(p) && lockfile_only_contains(lockfile_only, p))
         .collect();
+    if lock_only_pypi.is_empty() {
+        return;
+    }
+    let scanned_keys: HashSet<PurlKey> = scanned.iter().map(|p| PurlKey::new(p)).collect();
     for pkg in packages {
         let key = PurlKey::new(&pkg.purl);
         if scanned_keys.contains(&key) {
@@ -3568,6 +3583,41 @@ async fn run_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pypi_equivalents_add_spellings_only_for_lockfile_only_pypi_pins() {
+        let purls: Vec<String> = [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:pypi/six@1.16",
+            "pkg:PyPI/attrs@23.1",
+            "pkg:pypi/idna@3.4",
+        ]
+        .map(String::from)
+        .to_vec();
+        let lockfile_only: HashSet<PurlKey> = ["pkg:pypi/six@1.16", "pkg:pypi/attrs@23.1"]
+            .into_iter()
+            .map(PurlKey::new)
+            .collect();
+        let out = with_pypi_equivalents(&purls, &lockfile_only);
+        assert_eq!(out[..purls.len()], purls[..]);
+        let added = &out[purls.len()..];
+        assert!(
+            added.contains(&"pkg:pypi/six@1.16.0".to_string()),
+            "{added:?}"
+        );
+        assert!(
+            added.contains(&"pkg:pypi/attrs@23.1.0".to_string()),
+            "{added:?}"
+        );
+        assert!(added
+            .iter()
+            .all(|p| !p.contains("idna") && !p.contains("npm")));
+        // No PyPI pin: the list goes out as it came in.
+        let npm_only = vec!["pkg:npm/left-pad@1.3.0".to_string()];
+        assert_eq!(with_pypi_equivalents(&npm_only, &lockfile_only), npm_only);
+        assert!(is_pypi_purl(" pkg:PYPI/six@1.16") && !is_pypi_purl("pkg:pypi"));
+        assert!(!is_pypi_purl("PKG:pypi/six@1.16"));
+    }
 
     #[test]
     fn project_dirs_resolve_directories_and_globs() {

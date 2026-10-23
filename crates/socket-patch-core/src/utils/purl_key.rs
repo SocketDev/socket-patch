@@ -49,6 +49,37 @@ use crate::vendor::nuget_feed::normalize_nuget_version;
 /// release spellings still differ here; compare with [`PurlKey`], which
 /// folds them.
 pub fn canonical_base_purl(purl: &str) -> String {
+    // Scans key thousands of crawled purls, nearly all already canonical:
+    // skip the rebuild for those (#1606, #1607).
+    if is_canonical_base(purl) {
+        return purl.to_string();
+    }
+    rebuild_canonical_base_purl(purl)
+}
+
+/// Whether [`canonical_base_purl`] would return `purl` unchanged: trimmed,
+/// no qualifiers, subpath or percent escapes, and a lowercase type whose
+/// names and versions keep their spelling.
+fn is_canonical_base(purl: &str) -> bool {
+    if purl.trim().len() != purl.len() || purl.contains(['?', '#', '%']) {
+        return false;
+    }
+    let Some((ty, _)) = purl
+        .strip_prefix("pkg:")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return true;
+    };
+    !ty.bytes().any(|b| b.is_ascii_uppercase()) && !folds_spelling(ty)
+}
+
+/// Whether [`canonical_base_purl`] folds the name or version spelling of
+/// a (lowercase) purl type; every other type keeps its spelling.
+fn folds_spelling(ty: &str) -> bool {
+    matches!(ty, "pypi" | "nuget" | "composer")
+}
+
+fn rebuild_canonical_base_purl(purl: &str) -> String {
     let base = normalize_purl(strip_purl_qualifiers(purl.trim())).into_owned();
     let Some(rest) = base.strip_prefix("pkg:") else {
         return base;
@@ -65,7 +96,10 @@ pub fn canonical_base_purl(purl: &str) -> String {
         "pypi" => (canonicalize_pypi_name(name), version.map(str::to_string)),
         "nuget" => (name.to_lowercase(), version.map(str::to_lowercase)),
         "composer" => (name.to_lowercase(), version.map(str::to_string)),
-        _ => (name.to_string(), version.map(str::to_string)),
+        _ => {
+            debug_assert!(!folds_spelling(&ty), "{ty} folds but has no arm");
+            (name.to_string(), version.map(str::to_string))
+        }
     };
     match version {
         Some(version) => format!("pkg:{ty}/{name}@{version}"),
@@ -218,6 +252,39 @@ mod nuget_vendor_tests;
 mod tests {
     use super::*;
     use crate::utils::composer_version::composer_versions_equivalent;
+
+    #[test]
+    fn canonical_fast_path_matches_the_rebuild() {
+        for purl in [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:npm/@scope/name@1.0.0",
+            "pkg:npm/%40scope/name@1.0.0",
+            "pkg:NPM/left-pad@1.3.0",
+            "pkg:Npm/left-pad@1.3.0",
+            " pkg:npm/left-pad@1.3.0",
+            "pkg:npm/left-pad@1.3.0\n",
+            "pkg:npm/left-pad@1.3.0?vcs_url=x",
+            "pkg:golang/github.com/Foo/Bar@v1.0.0#cmd/tool",
+            "pkg:pypi/Six@1.16",
+            "pkg:PyPI/six@1.16",
+            "pkg:nuget/Newtonsoft.Json@13.0.3",
+            "pkg:composer/Vendor/Name@v1.0",
+            "pkg:maven/org.Example/Lib@1.0",
+            "pkg:gem/nokogiri@1.16.5",
+            "pkg:cargo/serde@1.0.0",
+            "pkg:npm/no-version",
+            "pkg:npm/@scope",
+            "pkg:npm",
+            "not-a-purl",
+            "",
+        ] {
+            assert_eq!(
+                canonical_base_purl(purl),
+                rebuild_canonical_base_purl(purl),
+                "{purl:?}"
+            );
+        }
+    }
 
     #[test]
     fn canonical_base_purl_folds_only_insensitive_ecosystems() {
