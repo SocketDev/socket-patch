@@ -1614,7 +1614,12 @@ async fn engine_nested_apply_preserves_conflicts_introduced_during_fetch() {
             let server = MockServer::start().await;
             let tmp = tempfile::tempdir().unwrap();
             write_project(tmp.path());
-            let patch = tmp.path().join(format!("patches/{NAME}+1.0.0.patch"));
+            // Joined per component: the reason names the path discovery
+            // built, which uses `\` throughout on Windows.
+            let patch = tmp
+                .path()
+                .join("patches")
+                .join(format!("{NAME}+1.0.0.patch"));
             let patch_at_fetch = patch.clone();
             let response = view_json(
                 UUID,
