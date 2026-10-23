@@ -28,7 +28,8 @@ when the catalog changes, updating both suites.
 | --- | --- |
 | Native production installs | npm, pnpm, Yarn Classic, Yarn Berry with node-modules, Bun text locks, vlt, pip requirements, uv, and Bundler |
 | Catalog canaries | Cargo, Maven, NuGet, and Composer; require a published free fixture before adding full install proofs |
-| Go / Deno | Catalog/unsupported-mode assertions, not production vendor install proofs |
+| Go | pgx/v5 v5.7.0: vendored and agent get/scan, decoder regression, fresh-cache build, rollback after tidy, cold-cache agent refusal |
+| Deno | Unsupported-mode assertion |
 
 The vlt case installs a committed directory artifact with `vlt ci`. The CLI
 decodes the service download before vendoring it, so the hosted vlt

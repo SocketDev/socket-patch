@@ -1256,6 +1256,13 @@ async fn run_check(args: &VendorArgs) -> i32 {
         // project no longer builds: vendor/modules.txt or the go.mod
         // requirements out of step with the `replace` (#343, #618).
         if failure.is_none() && entry.ecosystem == "golang" {
+            if let Some(record) = record {
+                failure = socket_patch_core::vendor::go_consumer_sync::verify_native_vendor(
+                    root, key, record,
+                )
+                .await
+                .err();
+            }
             if let Some((module, _)) = socket_patch_core::utils::purl::parse_golang_purl(key) {
                 let issues: Vec<String> = go_sync_issues
                     .get_or_init(|| async {

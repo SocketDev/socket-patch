@@ -158,6 +158,57 @@ pub fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
     path_safety::is_safe_multi_segment(module) && path_safety::is_safe_single_segment(version)
 }
 
+/// Reuse an installed project-local redirect after Go's module cache was
+/// cleared. Never treat this copy as a pristine rebuild source: drift needs
+/// the original module, and copying the tree onto itself would delete it.
+pub async fn reuse_go_redirect(
+    purl: &str,
+    project_root: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Option<ApplyResult> {
+    let (module, version) = parse_golang_purl(purl)?;
+    if !are_safe_redirect_coords(&module, &version) || files.is_empty() {
+        return None;
+    }
+    let copy = copy_dir_for(project_root, GO_PATCHES_DIR, &module, &version);
+    if !copy.is_dir() {
+        return None;
+    }
+    let refusal = crate::vendor::go_consumer_sync::replace_refusal(
+        project_root,
+        &module,
+        &version,
+        GO_PATCHES_DIR,
+    )
+    .await
+    .or(selection_refusal(project_root, &module, &version).await);
+    if let Some(refusal) = refusal {
+        return Some(synthesized_result(
+            purl,
+            &copy,
+            Vec::new(),
+            false,
+            Some(refusal),
+        ));
+    }
+    if copy.join("go.mod").is_file()
+        && redirect_in_sync(
+            &copy,
+            files,
+            project_root,
+            &module,
+            &version,
+            GO_PATCHES_DIR,
+        )
+        .await
+    {
+        return Some(already_patched_result(purl, &copy, files));
+    }
+    Some(synthesized_result(purl, &copy, Vec::new(), false, Some(format!(
+        "the local Go patch copy or replace for {module} {version} is out of sync and the upstream module is not installed; restore the committed patch files or download the upstream module before reapplying"
+    ))))
+}
+
 /// Materialise a project-local patched copy and wire up the `replace` redirect.
 ///
 /// * `pristine_src` — the pristine module-cache source dir (the crawler's
@@ -355,11 +406,17 @@ pub async fn remove_go_redirect(
         ));
     }
 
+    let entries: Vec<_> = read_replace_entries(project_root)
+        .await
+        .into_iter()
+        .filter(|entry| entry.module == module && entry.owner == Some(owner))
+        .collect();
     go_mod_edit::drop_replace_entry(project_root, module, owner, dry_run)
         .await
         .map_err(std::io::Error::other)?;
 
     if !dry_run {
+        crate::vendor::go_sum_backup::forget(project_root, &entries).await;
         let copy_dir = copy_dir_for(project_root, base_rel, module, version);
         // Ignore NotFound. Prunes the emptied `<host>/<org>/` levels and
         // `go-patches/` itself when this was its last module, stopping at
@@ -378,7 +435,7 @@ pub async fn reconcile_go_redirects(
     project_root: &Path,
     desired: &HashSet<String>,
     dry_run: bool,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let desired_modules: HashSet<String> = desired
         .iter()
         .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m.into_owned()))
@@ -391,13 +448,17 @@ pub async fn reconcile_go_redirects(
         if entry.owner == Some(ReplaceOwner::GoPatches)
             && !desired_modules.contains(entry.module.as_str())
         {
-            let _ = go_mod_edit::drop_replace_entry(
+            go_mod_edit::drop_replace_entry(
                 project_root,
                 &entry.module,
                 ReplaceOwner::GoPatches,
                 dry_run,
             )
-            .await;
+            .await?;
+            if !dry_run {
+                crate::vendor::go_sum_backup::forget(project_root, std::slice::from_ref(&entry))
+                    .await;
+            }
             if let Some(v) = &entry.version {
                 let purl = build_golang_purl(&entry.module, v);
                 if !removed.contains(&purl) {
@@ -437,13 +498,23 @@ pub async fn reconcile_go_redirects(
                         && e.module == module
                         && e.path.as_deref() == Some(target.as_str())
                 }) {
-                    let _ = go_mod_edit::drop_replace_entry(
+                    go_mod_edit::drop_replace_entry(
                         project_root,
                         module,
                         ReplaceOwner::GoPatches,
                         dry_run,
                     )
-                    .await;
+                    .await?;
+                    if !dry_run {
+                        let matching: Vec<_> = entries
+                            .iter()
+                            .filter(|e| {
+                                e.module == module && e.owner == Some(ReplaceOwner::GoPatches)
+                            })
+                            .cloned()
+                            .collect();
+                        crate::vendor::go_sum_backup::forget(project_root, &matching).await;
+                    }
                 }
             }
             if !dry_run {
@@ -455,7 +526,7 @@ pub async fn reconcile_go_redirects(
         }
     }
 
-    removed
+    Ok(removed)
 }
 
 /// Registry-independent verification for `apply --check` (CI / GitHub-App
@@ -1377,7 +1448,7 @@ mod tests {
         .await;
 
         let desired: HashSet<String> = HashSet::new();
-        let removed = reconcile_go_redirects(root, &desired, false).await;
+        let removed = reconcile_go_redirects(root, &desired, false).await.unwrap();
         assert!(removed.contains(&PURL.to_string()));
         assert!(!root
             .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
@@ -1455,7 +1526,7 @@ mod tests {
         tokio::fs::write(root.join("go.mod"), body).await.unwrap();
 
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
-        let removed = reconcile_go_redirects(root, &desired, false).await;
+        let removed = reconcile_go_redirects(root, &desired, false).await.unwrap();
         assert!(removed.is_empty());
         let entries = read_replace_entries(root).await;
         assert!(entries
@@ -1498,7 +1569,7 @@ mod tests {
         let desired: HashSet<String> = ["pkg:golang/github.com/foo/bar@v1.5.0".to_string()]
             .into_iter()
             .collect();
-        let removed = reconcile_go_redirects(root, &desired, false).await;
+        let removed = reconcile_go_redirects(root, &desired, false).await.unwrap();
         assert!(removed.contains(&PURL.to_string()));
         assert!(
             !root
@@ -1553,7 +1624,7 @@ mod tests {
         let desired: HashSet<String> = ["pkg:golang/github.com/foo/bar@v1.5.0".to_string()]
             .into_iter()
             .collect();
-        let removed = reconcile_go_redirects(root, &desired, false).await;
+        let removed = reconcile_go_redirects(root, &desired, false).await.unwrap();
         assert!(removed.contains(&PURL.to_string()));
         assert!(
             !root
@@ -2052,7 +2123,7 @@ mod tests {
         assert!(result.success, "apply failed: {:?}", result.error);
 
         let desired: HashSet<String> = [qualified.to_string()].into_iter().collect();
-        let removed = reconcile_go_redirects(root, &desired, false).await;
+        let removed = reconcile_go_redirects(root, &desired, false).await.unwrap();
         assert!(
             removed.is_empty(),
             "a desired (qualified) redirect must not be pruned: {removed:?}"
@@ -2113,7 +2184,7 @@ mod tests {
         // Reconcile with the same encoded manifest key — PurlKey
         // decodes both sides, so they match.
         let desired: HashSet<String> = [encoded_purl.to_string()].into_iter().collect();
-        let removed = reconcile_go_redirects(root, &desired, false).await;
+        let removed = reconcile_go_redirects(root, &desired, false).await.unwrap();
         assert!(
             removed.is_empty(),
             "a desired encoded version must not be pruned: {removed:?}"
@@ -2449,7 +2520,9 @@ mod tests {
             .await
             .unwrap();
 
-        let removed = reconcile_go_redirects(root, &HashSet::new(), true).await;
+        let removed = reconcile_go_redirects(root, &HashSet::new(), true)
+            .await
+            .unwrap();
         assert!(
             removed.contains(&PURL.to_string()),
             "dry-run must still report the orphan: {removed:?}"
@@ -2471,7 +2544,9 @@ mod tests {
         );
 
         // Parity: the real run removes exactly what the dry run reported.
-        let removed_wet = reconcile_go_redirects(root, &HashSet::new(), false).await;
+        let removed_wet = reconcile_go_redirects(root, &HashSet::new(), false)
+            .await
+            .unwrap();
         assert_eq!(
             removed_wet, removed,
             "dry-run report must match the real run"
@@ -2502,7 +2577,9 @@ mod tests {
         assert_eq!(entries[0].owner, Some(ReplaceOwner::GoPatches));
         assert_eq!(entries[0].version, None);
 
-        let removed = reconcile_go_redirects(root, &HashSet::new(), false).await;
+        let removed = reconcile_go_redirects(root, &HashSet::new(), false)
+            .await
+            .unwrap();
         assert!(
             read_replace_entries(root).await.is_empty(),
             "the version-less orphan directive must be dropped"
@@ -2546,7 +2623,9 @@ mod tests {
             .await
             .unwrap();
 
-        let removed = reconcile_go_redirects(root, &HashSet::new(), false).await;
+        let removed = reconcile_go_redirects(root, &HashSet::new(), false)
+            .await
+            .unwrap();
         assert_eq!(
             removed,
             vec!["pkg:golang/foo@v1.0.0".to_string()],

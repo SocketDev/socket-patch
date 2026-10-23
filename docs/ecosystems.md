@@ -1391,6 +1391,25 @@ commit it, and review it like any other vendored code. The wiring survives
 `go mod tidy`, and `apply --check` gives CI a read-only audit that the committed
 redirects still match the manifest.
 
+Reinstalling the same module version (`go clean -modcache`, `go mod download`,
+`go get module@version`, and `go mod tidy`) preserves the local replacement.
+Agent reapplication can reuse the committed copy after cache removal, but only
+after verifying its patch hashes and replacement wiring. Changing the required
+module version needs a matching patch for that version; the old version-pinned
+replacement does not patch a different release.
+
+Local modes keep the replaced module's original checksum lines in
+`.upstream-go.sum` beside the patched module tree. Commit that file with `.socket/`:
+rollback restores those lines offline even after `go mod tidy` removes them from
+`go.sum`. A conflicting checksum fails rollback without removing the replacement.
+Projects patched by older releases without this backup may still need
+`go mod download <module>@<version>` after rollback.
+
+When native Go vendoring is active, VEX and the audit commands also verify
+`vendor/`, including the workspace vendor tree. A pristine or modified runtime
+file there fails verification even when the `.socket` copy remains intact.
+Regenerate it with `go mod vendor` or `go work vendor`.
+
 Hosted mode uses a fork-style module replacement and two committed checksums:
 
 ```text

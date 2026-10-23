@@ -50,10 +50,9 @@
 //!   a full sparse-registry install proof until 2026-09-01: production's free
 //!   cargo tier emptied on 2026-08-28, so the leg was demoted to the canary
 //!   (`docs/testing/hosted-production-e2e.md` says how to re-promote it).
-//! * **golang** — hosted mode is supported for free-tier references carrying
-//!   a `goproxy` override (`docs/ecosystems.md#go-directory-replaces-and-gosum`), but production
-//!   publishes no golang hosted modules yet. Covered as a shape guard that
-//!   holds in both worlds.
+//! * **golang** — pgx/v5 v5.7.0 must deliver the function-call decoder fix
+//!   through a hosted `/v5` module with both go.sum pins, including a fresh
+//!   checkout. Missing hosted metadata is a failure.
 //! * **deno** — hosted mode is not supported. Covered as a negative assertion.
 //!
 //! # Prerequisites
@@ -2447,55 +2446,16 @@ fn statements_for_opt(doc: Option<&serde_json::Value>, purl: &str) -> usize {
 // Documented negative cases
 // ===========================================================================
 
-/// Go hosted mode: supported for free-tier references that carry a `goproxy`
-/// override (`docs/ecosystems.md#go-directory-replaces-and-gosum`); refused with
-/// `redirect_golang_unsupported` otherwise (`golang-hosted-no-go.md`, the
-/// paid-tier analysis).
-///
-/// Production publishes no golang hosted modules today, so this guards BOTH
-/// worlds without edits: while prod ships no `goproxy` overrides, nothing may
-/// be redirected (an empty-project scan must not invent a redirect); the day
-/// prod starts shipping them, any redirect this scan performs must be the
-/// documented shape — a socket-namespace replace in go.mod plus go.sum lines.
-#[test]
-#[ignore = "live production API. Run with --ignored."]
-fn golang_hosted_redirects_only_via_goproxy_override() {
-    const LEG: &str = "golang_hosted_redirects_only_via_goproxy_override";
-    if !has_command("go") {
-        soft_skip!(LEG, "`go` not on PATH");
-    }
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(&proj).expect("mkdir proj");
-    std::fs::write(
-        proj.join("go.mod"),
-        "module example.com/hosted-e2e\n\ngo 1.21\n",
-    )
-    .expect("write go.mod");
+#[path = "golang_production/mod.rs"]
+mod golang_production;
 
-    let env_json = scan_hosted(&proj, &["--ecosystems", "golang"]);
-    let redirected = hosted_pin_count(&env_json);
-    if redirected == 0 {
-        println!(
-            "{LEG}: production publishes no golang hosted modules (or none \
-             matched an empty project); nothing redirected, as documented."
-        );
-    } else {
-        // The moment prod ships goproxy overrides, every golang redirect must
-        // be the committable fork-replace shape.
-        let go_mod = std::fs::read_to_string(proj.join("go.mod")).expect("read go.mod");
-        assert!(
-            go_mod.contains("patch.socket.dev/gopatch/"),
-            "{LEG}: {redirected} golang redirect(s) reported but go.mod has no \
-             socket-namespace replace:\n{go_mod}\n{env_json:#}"
-        );
-        assert!(
-            proj.join("go.sum").is_file(),
-            "{LEG}: golang redirect without a go.sum pin bricks -mod=readonly \
-             builds:\n{env_json:#}"
-        );
-        println!("{LEG}: production now serves golang hosted modules; shape verified.");
+#[test]
+#[ignore = "live production API + real Go >= 1.21. Run with --ignored."]
+fn golang_hosted_pgx_delivery() {
+    if !has_command("go") {
+        soft_skip!("golang_hosted", "go not on PATH");
     }
+    golang_production::delivery("hosted");
 }
 
 /// Deno hosted mode is not supported. Same shape as the golang guard.
