@@ -446,7 +446,7 @@ fn find_target(doc: &LockDoc, name: &str, version: &str) -> Result<Target, Refus
             UNSUPPORTED,
             format!(
                 "vlt-lock.json resolves {name}@{version} as {}, which is not from vlt's default \
-                 registry; vendoring rewires only default-registry packages",
+                 registry; vendoring rewires only default-registry packages, so use agent mode",
                 key(i)
             ),
         ));
@@ -2410,7 +2410,8 @@ mod tests {
                 render(1, &[r#""~acme~left-pad@1.3.0": [0,"left-pad","sha512-A=="]"#], &[r#""file~_d left-pad": "prod 1.3.0 ~acme~left-pad@1.3.0""#]),
                 ROOT_PKG,
                 UNSUPPORTED,
-                "not from vlt's default registry",
+                "not from vlt's default registry; vendoring rewires only default-registry \
+                 packages, so use agent mode",
             ),
             (
                 render(1, &[r#""remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz": [0,"left-pad","sha512-R=="]"#, REG_NODE], &[r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#, r#""file~_d lp2": "prod https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz""#]),

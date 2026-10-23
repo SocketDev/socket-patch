@@ -366,8 +366,8 @@ fn rewrite_dep(
         result.warnings.push(RewriteWarning {
             code: "redirect_vlt_custom_registry_skipped".into(),
             detail: format!(
-                "hosted mode only redirects packages from vlt's default registry; {} left \
-                 unchanged (use --mode vendored or agent mode)",
+                "hosted mode only redirects packages from vlt's default registry; \
+                 {name}@{version} at {} left unchanged (use agent mode)",
                 foreign.join(", ")
             ),
         });
@@ -412,6 +412,11 @@ fn rewrite_dep(
                      a ledger that owns it, or `socket-patch vendor --revert`"
                 ),
             }
+        } else if !foreign.is_empty() || !outside.is_empty() {
+            // The skip warning above already names the package and the
+            // remedy; `vlt install` can't add a default-registry node for
+            // it (#1601).
+            return false;
         } else {
             RewriteWarning {
                 code: "redirect_vlt_entry_not_found".into(),
@@ -800,6 +805,88 @@ mod tests {
         let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         assert!(result.vlt_foreign_uuids.is_empty());
+    }
+
+    /// #1601: a package that resolves only from a named alias or a
+    /// scoped registry is skipped with one warning whose remedy is
+    /// agent mode. Vendored mode refuses such an instance too, and a
+    /// fresh `vlt install` can't move it to the default registry, so
+    /// neither may be suggested.
+    #[test]
+    fn a_foreign_only_package_points_to_agent_mode_alone() {
+        let scoped = |name: &str| {
+            let mut d = dep(name, "1.3.0", Some(SHA));
+            d.namespace = Some("@sc".into());
+            d
+        };
+        let cases = [
+            (
+                "\"~acme~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-A==\"]".to_string(),
+                dep("left-pad", "1.3.0", Some(SHA)),
+                "~acme~left-pad@1.3.0",
+            ),
+            (
+                "\"~http_c++127.0.0.1_c18557+~@sc+sp@1.3.0\": [0,\"@sc/sp\",\"sha512-S==\"]"
+                    .to_string(),
+                scoped("sp"),
+                "~http_c++127.0.0.1_c18557+~@sc+sp@1.3.0",
+            ),
+        ];
+        for (node, dep, id) in cases {
+            let lock = lock_with(&[&node]);
+            let result = rewrite(&lock, std::slice::from_ref(&dep));
+            assert_eq!(
+                codes(&result),
+                ["redirect_vlt_custom_registry_skipped"],
+                "{id}"
+            );
+            let detail = &result.warnings[0].detail;
+            assert!(detail.contains(id), "{detail}");
+            assert!(detail.ends_with("(use agent mode)"), "{detail}");
+            assert!(!detail.contains("vendored"), "{detail}");
+            assert!(result.vlt_foreign_uuids.contains(&dep.patch_uuid), "{id}");
+            assert!(result.edits.is_empty(), "{id}");
+        }
+
+        // A lock whose only nodes install the package from git or a
+        // remote tarball gets the same single agent-mode warning.
+        let remote = "\"remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz\": \
+                      [0,\"left-pad\",\"sha512-r\"]";
+        let result = rewrite(
+            &lock_with(&[remote]),
+            &[dep("left-pad", "1.3.0", Some(SHA))],
+        );
+        assert_eq!(codes(&result), ["redirect_vlt_custom_registry_skipped"]);
+        assert!(result.warnings[0].detail.ends_with("(use agent mode)"));
+
+        // A vendored node beside a foreign one keeps its own remedy.
+        let vendored = "\"file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+\
+                        left-pad-1.3.0+node__modules+left-pad\": [0,\"left-pad\",null,\
+                        \".socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0/\
+                        node_modules/left-pad\"]";
+        let lock = lock_with(&[
+            "\"~acme~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-A==\"]",
+            vendored,
+        ]);
+        let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
+        assert_eq!(
+            codes(&result),
+            [
+                "redirect_vlt_custom_registry_skipped",
+                "redirect_vlt_entry_vendored"
+            ]
+        );
+
+        // Beside a default-registry instance the foreign one is still
+        // named, with the same agent-only remedy.
+        let lock = lock_with(&[
+            "\"~acme~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-A==\"]",
+            &registry_entry(),
+        ]);
+        let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
+        assert_eq!(codes(&result), ["redirect_vlt_custom_registry_skipped"]);
+        assert!(result.warnings[0].detail.ends_with("(use agent mode)"));
+        assert_eq!(result.edits.len(), 1);
     }
 
     #[test]
