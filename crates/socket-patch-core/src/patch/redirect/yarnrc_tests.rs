@@ -292,3 +292,105 @@ fn outer_env_layers() {
     let h = Host::new().var("YARN_YARN_OFFLINE_MIRROR_PRUNING", "true");
     assert_eq!(h.mirror(), None);
 }
+
+impl Host {
+    fn member(&self, members: &[&str]) -> Option<(String, String)> {
+        let env = NpmConfigEnv::from_parts(
+            self.vars.clone(),
+            Some(PathBuf::from("/opt/node/bin/node")),
+            false,
+        );
+        let members: Vec<PathBuf> = members.iter().map(PathBuf::from).collect();
+        mirror_of(resolve_member_yarn_mirror(
+            &env,
+            self.root_user,
+            &members,
+            |p| self.files.get(p).cloned(),
+        ))
+        .map(|(p, origin)| (p, origin.replace('\\', "/")))
+    }
+}
+
+/// #1115: yarn 1 run in a workspace member reads the member's own
+/// `.yarnrc` / `.npmrc` as the project files, which the root's layers
+/// never read.
+#[test]
+fn member_layers_read_the_members_own_rc_files() {
+    let some = |p: &str, o: &str| Some((p.to_string(), o.to_string()));
+    let members = ["/w/root/packages/a", "/w/root/packages/b"];
+    // A member `.yarnrc` (the issue's repro) and a member `.npmrc` (its
+    // follow-up comment) each set the mirror.
+    let h = Host::new().file("/w/root/packages/b/.yarnrc", "yarn-offline-mirror \"/m\"\n");
+    assert_eq!(h.member(&members), some("/m", "/w/root/packages/b/.yarnrc"));
+    let h = Host::new().file(
+        "/w/root/packages/a/.npmrc",
+        "yarn-offline-mirror=./mirror\n",
+    );
+    assert_eq!(
+        h.member(&members),
+        some("./mirror", "/w/root/packages/a/.npmrc")
+    );
+    // A member run reads the root's rc only as an ancestor's, below the
+    // user rc: a root `false` does not hide a user mirror there.
+    let h = Host::new()
+        .file("/w/root/.yarnrc", "yarn-offline-mirror false\n")
+        .file("/home/u/.yarnrc", "yarn-offline-mirror /u\n");
+    assert_eq!(h.member(&members), some("/u", "/home/u/.yarnrc"));
+    // A member's own `false` turns off what it would inherit.
+    let h = Host::new()
+        .file("/w/root/.yarnrc", "yarn-offline-mirror /r\n")
+        .file("/w/root/packages/a/.yarnrc", "yarn-offline-mirror false\n");
+    assert_eq!(
+        h.member(&members[..1]),
+        None,
+        "a member that turns the mirror off uses none"
+    );
+    // No member rc, no other layer: no mirror; no members: none.
+    assert_eq!(Host::new().member(&members), None);
+    let h = Host::new().file("/w/root/packages/a/.yarnrc", "yarn-offline-mirror /m\n");
+    assert_eq!(h.member(&[]), None);
+}
+
+/// #1115: the members are the root `package.json` `workspaces` matches
+/// that hold a `package.json`, only for a classic `yarn.lock`.
+#[test]
+fn yarn_classic_workspace_members_follow_the_root_globs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let write = |rel: &str, text: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    write("yarn.lock", "# yarn lockfile v1\n\n");
+    write(
+        "package.json",
+        r#"{"private":true,"workspaces":{"packages":["packages/*","tools/x"]}}"#,
+    );
+    write("packages/a/package.json", "{}");
+    write("packages/b/README", "not a package");
+    write("packages/a/node_modules/dep/package.json", "{}");
+    write("tools/x/package.json", "{}");
+    write("tools/y/package.json", "{}");
+    write("node_modules/packages/z/package.json", "{}");
+    assert_eq!(
+        yarn_classic_workspace_members(root),
+        vec![root.join("packages/a"), root.join("tools/x")]
+    );
+    // `**` searches deeper.
+    write(
+        "package.json",
+        r#"{"private":true,"workspaces":["apps/**"]}"#,
+    );
+    write("apps/web/site/package.json", "{}");
+    assert_eq!(
+        yarn_classic_workspace_members(root),
+        vec![root.join("apps/web/site")]
+    );
+    // A berry lock, or no workspaces: none.
+    write("yarn.lock", "__metadata:\n  version: 8\n");
+    assert!(yarn_classic_workspace_members(root).is_empty());
+    write("yarn.lock", "# yarn lockfile v1\n\n");
+    write("package.json", r#"{"private":true}"#);
+    assert!(yarn_classic_workspace_members(root).is_empty());
+}

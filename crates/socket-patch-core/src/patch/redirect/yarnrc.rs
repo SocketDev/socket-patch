@@ -58,6 +58,11 @@ pub struct OuterRegistryMirror {
 pub struct OuterYarnMirror {
     pub npm: OuterRegistryMirror,
     pub yarn: OuterRegistryMirror,
+    /// The mirror yarn 1 uses when it runs in a workspace member directory
+    /// (`cd packages/a && yarn install`, `yarn --cwd packages/a install`),
+    /// whose own `.yarnrc` / `.npmrc` the root's layers never read (#1115).
+    /// See [`resolve_member_yarn_mirror`].
+    pub member: Option<MirrorSetting>,
 }
 
 /// The mirror yarn 1 uses for a project, if any: per registry the env
@@ -305,6 +310,7 @@ pub fn resolve_outer_yarn_mirror(
                 yarnrc_value,
             ),
         },
+        member: None,
     }
 }
 
@@ -321,17 +327,124 @@ pub fn process_is_root_user() -> bool {
     }
 }
 
+/// The mirror yarn 1 uses when it runs in one of the workspace `members`
+/// of `root` (absolute member directories), if any (#1115). Yarn 1 builds
+/// its config from the directory it runs in, so a member run reads the
+/// member's `.yarnrc` / `.npmrc` as the project files and the root's only
+/// as an ancestor's; the lock is still the root's. The first member (in
+/// the given order) whose effective mirror is set wins, its origin spelled
+/// as the full path of the file that set it.
+pub fn resolve_member_yarn_mirror(
+    env: &NpmConfigEnv,
+    root_user: bool,
+    members: &[PathBuf],
+    read: impl Fn(&Path) -> Option<String>,
+) -> Option<MirrorSetting> {
+    members.iter().find_map(|member| {
+        let outer = resolve_outer_yarn_mirror(env, root_user, member, &read);
+        let yarnrc = read(&member.join(super::YARNRC_REL));
+        let npmrc = read(&member.join(super::npmrc::NPMRC_REL));
+        let mut setting = effective_mirror(yarnrc.as_deref(), npmrc.as_deref(), &outer)?;
+        if setting.origin == super::YARNRC_REL || setting.origin == super::npmrc::NPMRC_REL {
+            setting.origin = member.join(&setting.origin).display().to_string();
+        }
+        Some(setting)
+    })
+}
+
+/// The workspace members yarn 1 installs for a classic `yarn.lock` at
+/// `root`: the directories below it that hold a `package.json` and match
+/// the root `package.json`'s `workspaces` in yarn classic's reading,
+/// sorted. Empty when the root has no classic `yarn.lock` or declares no
+/// workspaces. `node_modules` and `.git` are never searched, nor is a
+/// directory deeper than the deepest pattern (`**` searches down to
+/// [`MEMBER_SEARCH_DEPTH`]).
+pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
+    use crate::utils::fs::read_regular_to_string_sync;
+    use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
+
+    let classic = read_regular_to_string_sync(&root.join("yarn.lock"))
+        .is_ok_and(|lock| !super::is_berry_lock(&lock));
+    if !classic {
+        return Vec::new();
+    }
+    let Some(patterns) = read_regular_to_string_sync(&root.join("package.json"))
+        .ok()
+        .and_then(|text| crate::hosted::governing_root::workspace_patterns(&text))
+        .filter(|patterns| !patterns.is_empty())
+    else {
+        return Vec::new();
+    };
+    let depth = patterns
+        .iter()
+        .map(|p| {
+            if p.contains("**") {
+                MEMBER_SEARCH_DEPTH
+            } else {
+                p.trim_start_matches('!')
+                    .split('/')
+                    .filter(|c| !c.is_empty() && *c != ".")
+                    .count()
+            }
+        })
+        .max()
+        .unwrap_or(0)
+        .min(MEMBER_SEARCH_DEPTH);
+    let mut members = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), Vec::<String>::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        if !rel.is_empty()
+            && dir.join("package.json").is_file()
+            && workspaces_include_as(&patterns, &rel, WorkspacesDialect::YARN_CLASSIC)
+        {
+            members.push(dir.clone());
+        }
+        if rel.len() >= depth {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // `file_type` does not follow symlinks, so a link cycle is
+            // never walked.
+            if name == "node_modules"
+                || name == ".git"
+                || !entry.file_type().is_ok_and(|t| t.is_dir())
+            {
+                continue;
+            }
+            let mut child = rel.clone();
+            child.push(name);
+            stack.push((entry.path(), child));
+        }
+    }
+    members.sort();
+    members
+}
+
+/// How deep [`yarn_classic_workspace_members`] searches for a `**`
+/// pattern's members.
+pub const MEMBER_SEARCH_DEPTH: usize = 8;
+
 /// [`resolve_outer_yarn_mirror`] for this process, reading regular files
-/// only. A relative `project` is taken against the process cwd, as yarn
-/// run there would (its ancestors must be walkable).
+/// only, with [`OuterYarnMirror::member`] from the project's yarn classic
+/// workspace members. A relative `project` is taken against the process
+/// cwd, as yarn run there would (its ancestors must be walkable).
 pub fn resolve_outer_yarn_mirror_for_process(project: &Path) -> OuterYarnMirror {
     let project = std::path::absolute(project).unwrap_or_else(|_| project.to_path_buf());
-    resolve_outer_yarn_mirror(
-        &NpmConfigEnv::from_process(),
-        process_is_root_user(),
-        &project,
-        |path| crate::utils::fs::read_regular_to_string_sync(path).ok(),
-    )
+    let env = NpmConfigEnv::from_process();
+    let root_user = process_is_root_user();
+    let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
+    let mut outer = resolve_outer_yarn_mirror(&env, root_user, &project, read);
+    outer.member = resolve_member_yarn_mirror(
+        &env,
+        root_user,
+        &yarn_classic_workspace_members(&project),
+        read,
+    );
+    outer
 }
 
 #[cfg(test)]

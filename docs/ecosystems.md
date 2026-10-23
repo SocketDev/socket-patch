@@ -265,7 +265,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `<prefix>/etc/yarnrc` / `npmrc`, every ancestor directory's, and the
   `YARN_*` / `npm_config_*` environment variables. A file saved with a UTF-8
   BOM counts too, and `false` in a higher-precedence layer turns the mirror
-  off. Yarn looks mirror tarballs up by
+  off. In a workspace, a mirror that yarn 1 run in a member directory
+  would use (from the member's own `.yarnrc` / `.npmrc`) is refused the
+  same way, since installs run there read the root's lock. Yarn looks mirror tarballs up by
   file name, and the hosted tarball has the same name as the upstream one
   already in the mirror, so installs would get the unpatched bytes and fail
   the integrity check. Use `--mode vendored` there; it works with a mirror.
