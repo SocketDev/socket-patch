@@ -250,12 +250,7 @@ impl YarnEnv {
             let rcs: Vec<(&Path, &str)> =
                 rcs.iter().map(|(d, t)| (d.as_path(), t.as_str())).collect();
             let base_var = |name: &str| self.base_var(name);
-            let paths = crate::formats::yarn::rc::env_file_paths(
-                env_list.as_deref(),
-                &rcs,
-                start,
-                &base_var,
-            );
+            let paths = crate::formats::yarn::rc::env_file_paths(env_list.as_deref(), &rcs, start);
             crate::formats::yarn::rc::injected_env(&paths, &read, &base_var)
         })
     }

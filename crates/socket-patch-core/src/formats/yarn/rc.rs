@@ -108,12 +108,14 @@ pub fn list_setting(rc: &str, key: &str) -> Option<ListSetting> {
     })
 }
 
-/// A string given for an array setting, split at its commas, each item
-/// trimmed and empty ones dropped.
+/// A string given for an array setting, split at its commas as yarn
+/// splits it.
 fn split_list(value: &str) -> Vec<String> {
+    // Yarn's `split(/,/)`: an item keeps its spaces (` .env.b` names a
+    // file with a leading space), and an empty one names the folder
+    // itself, which no dotenv read accepts.
     value
         .split(',')
-        .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(str::to_string)
         .collect()
@@ -344,16 +346,12 @@ pub const DEFAULT_ENV_FILES: &[&str] = &[".env.yarn?"];
 /// before one whose `onConflict` is `hardReset` or that is a string while
 /// the first was a sequence (or the reverse); a string from the first
 /// file that sets the list is the whole list. When no rc file sets it,
-/// the list is [`DEFAULT_ENV_FILES`] against `start`. An entry's
-/// `${NAME}` references expand through `var`; one that cannot is
-/// skipped. The optional marker (`?`) is dropped: yarn stops on a missing
+/// the list is [`DEFAULT_ENV_FILES`] against `start`. A string's entries
+/// resolve against `start` too. An entry's `${NAME}` references expand
+/// with no variable set, as yarn reads the list before its environment;
+/// one that cannot (yarn refuses to run) is skipped. The optional marker (`?`) is dropped: yarn stops on a missing
 /// required file, so no run of it reads a value from one.
-pub fn env_file_paths(
-    env_list: Option<&str>,
-    rcs: &[(&Path, &str)],
-    start: &Path,
-    var: &dyn Fn(&str) -> Option<String>,
-) -> Vec<PathBuf> {
+pub fn env_file_paths(env_list: Option<&str>, rcs: &[(&Path, &str)], start: &Path) -> Vec<PathBuf> {
     let entries: Vec<(&Path, String)> = match env_list {
         Some(list) => split_list(list).into_iter().map(|e| (start, e)).collect(),
         None => {
@@ -368,7 +366,9 @@ pub fn env_file_paths(
                 if setting.scalar != scalar || setting.on_conflict.as_deref() == Some("hardReset") {
                     break;
                 }
-                taken.insert(0, (*dir, setting.items));
+                // A string's items carry no source file, so yarn resolves
+                // them against the folder it runs in.
+                taken.insert(0, (if scalar { start } else { *dir }, setting.items));
                 if scalar || setting.on_conflict.as_deref() == Some("reset") {
                     break;
                 }
@@ -389,7 +389,9 @@ pub fn env_file_paths(
     entries
         .iter()
         .filter_map(|(base, entry)| {
-            let entry = expand_env(entry, &mut |name| Ok(var(name))).ok()?;
+            // Yarn reads this list before it loads any environment, so
+            // `${NAME}` sees no variable: its fallback or nothing.
+            let entry = expand_env(entry, &mut |_| Ok(None)).ok()?;
             let path = entry.strip_suffix('?').unwrap_or(&entry);
             (!path.is_empty()).then(|| base.join(path))
         })
@@ -579,7 +581,7 @@ mod tests {
         );
         assert_eq!(
             raw_list_setting("injectEnvironmentFiles: a, b\n", key),
-            list(&["a", "b"])
+            list(&["a", " b"])
         );
         assert_eq!(
             raw_list_setting("injectEnvironmentFiles: []\n", key),
@@ -604,19 +606,18 @@ mod tests {
     fn env_file_paths_follow_precedence() {
         let start = Path::new("/p/app");
         let rc_dir = Path::new("/p");
-        let none = |_: &str| None;
         assert_eq!(
-            env_file_paths(None, &[], start, &none),
+            env_file_paths(None, &[], start),
             vec![start.join(".env.yarn")]
         );
         let rcs = [(rc_dir, "injectEnvironmentFiles: [\"${D:-env}/x\", y?]\n")];
         assert_eq!(
-            env_file_paths(None, &rcs, start, &none),
+            env_file_paths(None, &rcs, start),
             vec![rc_dir.join("env/x"), rc_dir.join("y")]
         );
         assert_eq!(
-            env_file_paths(Some("a, b?"), &rcs, start, &none),
-            vec![start.join("a"), start.join("b")]
+            env_file_paths(Some("a, b?"), &rcs, start),
+            vec![start.join("a"), start.join(" b")]
         );
         // Every rc file's list, lowest precedence (home, the farthest
         // ancestor) first; a nearer `[]` clears nothing.
@@ -628,13 +629,36 @@ mod tests {
             (home, "injectEnvironmentFiles: [h]\n"),
         ];
         assert_eq!(
-            env_file_paths(None, &rcs, start, &none),
+            env_file_paths(None, &rcs, start),
             vec![home.join("h"), rc_dir.join("r")]
         );
         let rcs = [(near, "injectEnvironmentFiles: [n]\n"), rcs[1]];
         assert_eq!(
-            env_file_paths(None, &rcs, start, &none),
+            env_file_paths(None, &rcs, start),
             vec![rc_dir.join("r"), near.join("n")]
+        );
+        // Yarn 4.9.1 resolves a string's entries against the folder it
+        // runs in (a root `".env.local?"` reads `packages/app/.env.local`),
+        // expands `${…}` with no variable set (`${HOME:-.}` is `.` though
+        // HOME is exported), and keeps the spaces of a comma-split item.
+        let string = (rc_dir, "injectEnvironmentFiles: \".env.local?\"\n");
+        assert_eq!(
+            env_file_paths(None, &[string], start),
+            vec![start.join(".env.local")]
+        );
+        let set = (rc_dir, "injectEnvironmentFiles: [\"${HOME:-.}/x?\"]\n");
+        assert_eq!(
+            env_file_paths(None, &[set], start),
+            vec![rc_dir.join("./x")]
+        );
+        assert_eq!(
+            env_file_paths(Some("${HOME:-.}/x?"), &[], start),
+            vec![start.join("./x")]
+        );
+        let spaced = (rc_dir, "injectEnvironmentFiles: \".env.a?, .env.b?\"\n");
+        assert_eq!(
+            env_file_paths(None, &[spaced], start),
+            vec![start.join(".env.a"), start.join(" .env.b")]
         );
         // `reset` keeps its own list and drops lower-precedence ones;
         // `hardReset` drops its own too; a type change stops the walk.
@@ -644,7 +668,7 @@ mod tests {
             "injectEnvironmentFiles: {onConflict: reset, value: [n]}\n",
         );
         assert_eq!(
-            env_file_paths(None, &[reset, parent], start, &none),
+            env_file_paths(None, &[reset, parent], start),
             vec![near.join("n")]
         );
         let reset = (
@@ -652,24 +676,21 @@ mod tests {
             "injectEnvironmentFiles:\n  onConflict: hardReset\n  value:\n    - n\n",
         );
         assert_eq!(
-            env_file_paths(None, &[reset, parent], start, &none),
+            env_file_paths(None, &[reset, parent], start),
             Vec::<PathBuf>::new()
         );
         let string = (near, "injectEnvironmentFiles: n\n");
         assert_eq!(
-            env_file_paths(None, &[string, parent], start, &none),
+            env_file_paths(None, &[string, parent], start),
             vec![near.join("n")]
         );
         assert_eq!(
-            env_file_paths(None, &[parent, string], start, &none),
+            env_file_paths(None, &[parent, string], start),
             vec![rc_dir.join("r")]
         );
         // An entry yarn cannot expand is skipped.
         let rcs = [(rc_dir, "injectEnvironmentFiles: [\"${UNSET}\", z]\n")];
-        assert_eq!(
-            env_file_paths(None, &rcs, start, &none),
-            vec![rc_dir.join("z")]
-        );
+        assert_eq!(env_file_paths(None, &rcs, start), vec![rc_dir.join("z")]);
     }
 
     /// #1611: yarn expands a dotenv value's `${…}` against the variables
