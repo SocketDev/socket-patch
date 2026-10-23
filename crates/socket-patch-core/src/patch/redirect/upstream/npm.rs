@@ -1167,6 +1167,9 @@ struct PnpmTarballPolicy {
     workspace: Option<String>,
     npmrc: Option<String>,
     major: Option<u32>,
+    /// The pnpm that wrote the lock records a scoped-registry package's
+    /// `tarball:` ([`pnpm_records_scoped_tarballs`]).
+    scoped_tarballs: bool,
     /// The `dir/` prefix those settings were read from
     /// ([`pnpm_settings_prefix`]), for the guess warning.
     settings_prefix: String,
@@ -1181,6 +1184,42 @@ impl PnpmTarballPolicy {
             name,
         )
     }
+
+    /// Whether pnpm derives `name@version`'s `tarball` itself and so
+    /// leaves it out of the lock ([`registry_derives_tarball`]);
+    /// `from_project` says the version document came from
+    /// [`Self::registry`].
+    fn derives_tarball(
+        &self,
+        name: &str,
+        version: &str,
+        tarball: &str,
+        from_project: bool,
+    ) -> bool {
+        let own = self.registry(name);
+        let compared = pnpm_tarball_registry(
+            self.workspace.as_deref(),
+            self.npmrc.as_deref(),
+            self.major,
+            self.scoped_tarballs,
+            name,
+        );
+        // pnpm compares with the default registry, not the scope one the
+        // document came from (#1619).
+        let from_project = if compared == own {
+            from_project
+        } else {
+            pnpm_registry_is_own(compared.as_deref())
+        };
+        registry_derives_tarball(compared.as_deref(), from_project, name, version, tarball)
+    }
+}
+
+/// Whether a registry pnpm names is the project's own rather than the
+/// default one, as [`registry_derives_tarball`]'s `from_project` reads it
+/// when no version document was read from it.
+fn pnpm_registry_is_own(registry: Option<&str>) -> bool {
+    registry.is_some_and(|r| non_default_registry(r).is_some())
 }
 
 /// The pnpm major whose settings reading applies to the lock `text`: the
@@ -1362,12 +1401,14 @@ fn pnpm_include_tarball(
     workspace: Option<&str>,
     npmrc: Option<&str>,
     pm_major: Option<u32>,
+    scoped_tarballs: bool,
     is_hosted: impl Fn(&str) -> bool,
 ) -> PnpmIncludeTarball {
     use super::super::npmrc::npmrc_top_level_value;
 
     let major = pnpm_settings_major(text, pm_major);
-    let registry = |name: &str| pnpm_lookup_registry(workspace, npmrc, major, name);
+    let registry =
+        |name: &str| pnpm_tarball_registry(workspace, npmrc, major, scoped_tarballs, name);
     if let Some(on) = pnpm_lock_tarball_evidence(text, registry, is_hosted) {
         return PnpmIncludeTarball { on, guess: None };
     }
@@ -1447,9 +1488,7 @@ fn pnpm_lock_tarball_evidence(
                 // No document was read: the lock's URL came from the
                 // registry pnpm names, the default one when it names none.
                 let registry = registry(name);
-                let own = registry
-                    .as_deref()
-                    .is_some_and(|r| non_default_registry(r).is_some());
+                let own = pnpm_registry_is_own(registry.as_deref());
                 derived |=
                     registry_derives_tarball(registry.as_deref(), own, name, version, tarball);
             }
@@ -1458,39 +1497,87 @@ fn pnpm_lock_tarball_evidence(
     derived.then_some(true)
 }
 
-/// The major of a `pnpm@<version>` package-manager spec (`.modules.yaml`'s
-/// `packageManager`, package.json's corepack pin, `+sha…` suffix allowed).
-fn pnpm_spec_major(spec: &str) -> Option<u32> {
+/// The major and minor of a `pnpm@<version>` package-manager spec
+/// (`.modules.yaml`'s `packageManager`, package.json's corepack pin,
+/// `+sha…` suffix allowed).
+fn pnpm_spec_version(spec: &str) -> Option<PnpmVersion> {
     let version = spec
         .trim()
         .trim_matches(['"', '\''])
         .strip_prefix("pnpm@")?;
-    let major = version.split(['.', '+', '-']).next()?;
-    major.parse().ok()
+    pnpm_version(version)
+}
+
+/// A pnpm release's major and minor (`None` when the version has none).
+type PnpmVersion = (u32, Option<u32>);
+
+/// The major and minor of a bare pnpm version such as `12.12.1`.
+fn pnpm_version(version: &str) -> Option<PnpmVersion> {
+    let mut parts = version.trim().split(['.', '+', '-']);
+    let major = parts.next()?.parse().ok()?;
+    Some((major, parts.next().and_then(|minor| minor.parse().ok())))
+}
+
+/// pnpm 12.0–12.12 compare a scoped-registry package's tarball with the
+/// conventional URL under the default registry rather than the scope's, so
+/// they record `tarball:` for every package from a scoped registry other
+/// than the default one; 12.13.0 derives it from the scope's (pnpm#16866,
+/// #1619).
+fn pnpm_records_scoped_tarballs(version: Option<PnpmVersion>) -> bool {
+    matches!(version, Some((12, Some(minor))) if minor < 13)
+}
+
+/// The registry pnpm compares `name`'s tarball with to decide whether it
+/// derives it ([`pnpm_lookup_registry`]): the one it resolves `name`
+/// against, except that a pnpm that [`pnpm_records_scoped_tarballs`]
+/// compares a scoped name with the default registry, the one its unscoped
+/// part resolves against.
+fn pnpm_tarball_registry(
+    workspace: Option<&str>,
+    npmrc: Option<&str>,
+    major: Option<u32>,
+    scoped_tarballs: bool,
+    name: &str,
+) -> Option<String> {
+    let name = match name.split_once('/') {
+        Some((_, unscoped)) if scoped_tarballs && name.starts_with('@') => unscoped,
+        _ => name,
+    };
+    pnpm_lookup_registry(workspace, npmrc, major, name)
 }
 
 /// The pnpm major an install record names: `node_modules/.modules.yaml`'s
 /// `packageManager` (JSON on pnpm 10+, a top-level YAML scalar before).
 pub(crate) fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
+    modules_yaml_pnpm_version(text).map(|(major, _)| major)
+}
+
+/// [`modules_yaml_pnpm_major`] with the minor.
+fn modules_yaml_pnpm_version(text: &str) -> Option<PnpmVersion> {
     let text = crate::formats::text::strip_bom(text);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         return value
             .get("packageManager")
             .and_then(|v| v.as_str())
-            .and_then(pnpm_spec_major);
+            .and_then(pnpm_spec_version);
     }
     yaml_top_level_value(text, "packageManager")
         .as_deref()
-        .and_then(pnpm_spec_major)
+        .and_then(pnpm_spec_version)
 }
 
 /// The pnpm major package.json's corepack `packageManager` pins.
 pub(crate) fn package_json_pnpm_major(text: &str) -> Option<u32> {
+    package_json_pnpm_version(text).map(|(major, _)| major)
+}
+
+/// [`package_json_pnpm_major`] with the minor.
+fn package_json_pnpm_version(text: &str) -> Option<PnpmVersion> {
     serde_json::from_str::<serde_json::Value>(crate::formats::text::strip_bom(text))
         .ok()?
         .get("packageManager")?
         .as_str()
-        .and_then(pnpm_spec_major)
+        .and_then(pnpm_spec_version)
 }
 
 /// The Rush root (`""` or a `dir/` prefix) of a Rush lock path: the common
@@ -1513,18 +1600,16 @@ fn rush_lock_root(rel: &str) -> Option<&str> {
     (root.is_empty() || root.ends_with('/')).then_some(root)
 }
 
-/// The pnpm major rush.json's `pnpmVersion` names (rush.json is JSONC).
-fn rush_json_pnpm_major(text: &str) -> Option<u32> {
+/// The pnpm major and minor rush.json's `pnpmVersion` names (rush.json is
+/// JSONC).
+fn rush_json_pnpm_version(text: &str) -> Option<PnpmVersion> {
     let text = crate::vendor::bun_lock_text::strip_jsonc(crate::formats::text::strip_bom(text));
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()?
-        .get("pnpmVersion")?
-        .as_str()?
-        .trim()
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
+    pnpm_version(
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()?
+            .get("pnpmVersion")?
+            .as_str()?,
+    )
 }
 
 /// The text of `name` next to the lock (`dir_prefix`); `None` when absent
@@ -1698,8 +1783,8 @@ async fn pnpm_tarball_policy(
         None => None,
     };
     let rush = rush_json.is_some();
-    let pm_major = if let Some(rush_json) = rush_json.as_deref() {
-        rush_json_pnpm_major(rush_json)
+    let pm_version = if let Some(rush_json) = rush_json.as_deref() {
+        rush_json_pnpm_version(rush_json)
     } else {
         // What installed the project (the workspace root's install
         // record, else the member's own), else what it pins.
@@ -1708,24 +1793,27 @@ async fn pnpm_tarball_policy(
             installed = read_sibling(view, prefix, "node_modules/.modules.yaml")
                 .await
                 .as_deref()
-                .and_then(modules_yaml_pnpm_major);
+                .and_then(modules_yaml_pnpm_version);
             if installed.is_some() || dir_prefix == lock_prefix {
                 break;
             }
         }
         match installed {
-            Some(major) => Some(major),
+            Some(version) => Some(version),
             None => read_sibling(view, &dir_prefix, "package.json")
                 .await
                 .as_deref()
-                .and_then(package_json_pnpm_major),
+                .and_then(package_json_pnpm_version),
         }
     };
+    let pm_major = pm_version.map(|(major, _)| major);
+    let scoped_tarballs = pnpm_records_scoped_tarballs(pm_version);
     let include = pnpm_include_tarball(
         text,
         workspace.as_deref(),
         npmrc.as_deref(),
         pm_major,
+        scoped_tarballs,
         |url| ctx.hosted_uuid(url).is_some(),
     );
     PnpmTarballPolicy {
@@ -1735,6 +1823,7 @@ async fn pnpm_tarball_policy(
         workspace,
         npmrc,
         major: pnpm_settings_major(text, pm_major),
+        scoped_tarballs,
         settings_prefix: dir_prefix,
     }
 }
@@ -1814,13 +1903,7 @@ pub(crate) async fn restore_pnpm_locks(
             };
             // pnpm records `tarball:` under lockfileIncludeTarballUrl and for
             // a URL it cannot derive from the registry (#557).
-            let derived = registry_derives_tarball(
-                policy.registry(name).as_deref(),
-                found.from_project,
-                name,
-                version,
-                &dist.tarball,
-            );
+            let derived = policy.derives_tarball(name, version, &dist.tarball, found.from_project);
             let restored = if policy.always || !derived {
                 resolution.rewrite(integrity, &dist.tarball)
             } else {
@@ -2711,10 +2794,12 @@ mod tests {
     use super::{
         berry_lookup_registry, berry_registry_locator, bun_env_registry, bun_lookup_registry,
         bun_registry_slot, bun_tarball_url, expand_url_env, modules_yaml_pnpm_major,
-        non_default_registry, package_json_pnpm_major, pnpm_include_tarball,
-        pnpm_lock_tarball_evidence, pnpm_lookup_registry, pnpm_tarball_guess_warning,
-        registry_derives_tarball, rush_json_pnpm_major, rush_lock_root, split_userinfo,
-        yaml_top_level_value, yarn_expand_env, PnpmTarballGuess, ProjectDist,
+        modules_yaml_pnpm_version, non_default_registry, package_json_pnpm_major,
+        package_json_pnpm_version, pnpm_include_tarball, pnpm_lock_tarball_evidence,
+        pnpm_lookup_registry, pnpm_records_scoped_tarballs, pnpm_spec_version,
+        pnpm_tarball_guess_warning, pnpm_tarball_registry, registry_derives_tarball,
+        rush_json_pnpm_version, rush_lock_root, split_userinfo, yaml_top_level_value,
+        yarn_expand_env, PnpmTarballGuess, PnpmTarballPolicy, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
@@ -3443,11 +3528,11 @@ mod tests {
     }
 
     fn include(text: &str, ws: Option<&str>, rc: Option<&str>, major: Option<u32>) -> bool {
-        pnpm_include_tarball(text, ws, rc, major, |url| url == HOSTED).on
+        pnpm_include_tarball(text, ws, rc, major, false, |url| url == HOSTED).on
     }
 
     fn guessed(text: &str, ws: Option<&str>, rc: Option<&str>, major: Option<u32>) -> bool {
-        pnpm_include_tarball(text, ws, rc, major, |url| url == HOSTED)
+        pnpm_include_tarball(text, ws, rc, major, false, |url| url == HOSTED)
             .guess
             .is_some()
     }
@@ -3586,8 +3671,11 @@ mod tests {
         let rush_json =
             "{\n  // \"pnpmVersion\": \"8.0.0\",\n  /* c */ \"pnpmVersion\": \"9.15.9\",\n  \
                          \"projects\": [],\n}\n";
-        assert_eq!(rush_json_pnpm_major(rush_json), Some(9));
-        assert_eq!(rush_json_pnpm_major("{ \"npmVersion\": \"10.0.0\" }"), None);
+        assert_eq!(rush_json_pnpm_version(rush_json), Some((9, Some(15))));
+        assert_eq!(
+            rush_json_pnpm_version("{ \"npmVersion\": \"10.0.0\" }"),
+            None
+        );
     }
 
     /// #902 tier 1: the lock's unpinned registry resolutions decide.
@@ -3720,6 +3808,92 @@ mod tests {
             None
         );
         assert_eq!(package_json_pnpm_major("not json"), None);
+    }
+
+    /// #1619: only pnpm 12.0–12.12 record a scoped-registry package's
+    /// conventional `tarball:`.
+    #[test]
+    fn pnpm_12_before_13_records_scoped_tarballs() {
+        let records = |spec: &str| pnpm_records_scoped_tarballs(pnpm_spec_version(spec));
+        for spec in ["pnpm@12.0.0", "pnpm@12.11.2", "pnpm@12.12.1+sha512.abc"] {
+            assert!(records(spec), "{spec}");
+        }
+        for spec in [
+            "pnpm@11.28.6",
+            "pnpm@12.13.0",
+            "pnpm@12.14.0",
+            "pnpm@13.0.0",
+            "pnpm@12",
+        ] {
+            assert!(!records(spec), "{spec}");
+        }
+        assert_eq!(
+            modules_yaml_pnpm_version("{\"packageManager\": \"pnpm@12.12.1\"}"),
+            Some((12, Some(12)))
+        );
+        assert_eq!(
+            package_json_pnpm_version(r#"{"packageManager":"pnpm@12.13.0"}"#),
+            Some((12, Some(13)))
+        );
+    }
+
+    /// #1619: a lock whose only registry entry is a scoped one with its
+    /// conventional URL proves `lockfileIncludeTarballUrl` on for a pnpm
+    /// that compares it with the scope registry, but shows nothing for pnpm
+    /// 12.0–12.12, which records it anyway; their scoped URL is not one
+    /// pnpm derives either, unless the scope registry is the default one.
+    #[test]
+    fn pnpm_12_scoped_tarball_is_no_include_tarball_evidence() {
+        let scoped = "https://s.example/@s/a/-/a-1.0.0.tgz";
+        let text = format!(
+            "lockfileVersion: '9.0'\n\npackages:\n  '@s/a@1.0.0':\n    \
+             resolution: {{integrity: sha512-A==, tarball: {scoped}}}\n\n\
+             snapshots:\n  '@s/a@1.0.0': {{}}\n"
+        );
+        let rc = "@s:registry=https://s.example/\n";
+        let on = |quirk| pnpm_include_tarball(&text, None, Some(rc), Some(12), quirk, |_| false).on;
+        assert!(on(false));
+        assert!(!on(true));
+        let derives = |rc: &str, quirk| {
+            let registry = pnpm_tarball_registry(None, Some(rc), Some(12), quirk, "@s/a");
+            registry_derives_tarball(registry.as_deref(), true, "@s/a", "1.0.0", scoped)
+        };
+        assert!(derives(rc, false));
+        assert!(!derives(rc, true));
+        let both = "registry=https://s.example/\n@s:registry=https://s.example/\n";
+        assert!(derives(both, true));
+    }
+
+    /// #1619 through the restore's policy: pnpm 12.0–12.12 derive a scoped
+    /// URL only when it is conventional under the default registry, a
+    /// configured mirror included, while other pnpm compare with the scope
+    /// registry the document came from.
+    #[test]
+    fn pnpm_12_policy_compares_scoped_tarballs_with_the_default_registry() {
+        let policy = |npmrc: &str, scoped_tarballs| PnpmTarballPolicy {
+            always: false,
+            guess: None,
+            rush: false,
+            workspace: None,
+            npmrc: Some(npmrc.to_string()),
+            major: Some(12),
+            scoped_tarballs,
+            settings_prefix: String::new(),
+        };
+        let rc = "registry=https://m.example/npm/\n@s:registry=https://s.example/\n";
+        let scoped = "https://s.example/@s/a/-/a-1.0.0.tgz";
+        let mirrored = "https://m.example/npm/@s/a/-/a-1.0.0.tgz";
+        let derives = |quirk, name: &str, tarball| {
+            policy(rc, quirk).derives_tarball(name, "1.0.0", tarball, true)
+        };
+        assert!(derives(false, "@s/a", scoped));
+        assert!(!derives(true, "@s/a", scoped));
+        assert!(!derives(false, "@s/a", mirrored));
+        assert!(derives(true, "@s/a", mirrored));
+        // An unscoped name resolves against the default registry anyway.
+        let plain = "https://m.example/npm/a/-/a-1.0.0.tgz";
+        assert!(derives(false, "a", plain));
+        assert!(derives(true, "a", plain));
     }
 
     #[test]
