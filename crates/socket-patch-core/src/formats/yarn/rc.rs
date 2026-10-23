@@ -194,34 +194,48 @@ pub const DEFAULT_ENV_FILES: &[&str] = &[".env.yarn?"];
 
 /// The environment files yarn 4 loads (`injectEnvironmentFiles`), in load
 /// order. The list is `env_list` (`YARN_INJECT_ENVIRONMENT_FILES`, comma
-/// separated) when set, else that of the highest-precedence rc file in
-/// `rcs` (each with its folder, which its relative entries resolve
-/// against) that sets it, else [`DEFAULT_ENV_FILES`]; the environment's
-/// and the default entries resolve against `start`, the folder yarn runs
-/// in. An entry's `${NAME}` references expand through `var`; one that
-/// cannot is skipped. The optional marker (`?`) is dropped: yarn stops on
-/// a missing required file, so no run of it reads a value from one.
+/// separated, against `start`, the folder yarn runs in) when set. Else
+/// yarn concatenates the list of every rc file in `rcs` (highest
+/// precedence first, each with the folder its relative entries resolve
+/// against) that sets it, lowest precedence first: the home rc file's,
+/// then each ancestor's from the farthest to the nearest, so a nearer
+/// `[]` adds nothing and clears nothing. When no rc file sets it, the list
+/// is [`DEFAULT_ENV_FILES`] against `start`. An entry's `${NAME}`
+/// references expand through `var`; one that cannot is skipped. The
+/// optional marker (`?`) is dropped: yarn stops on a missing required
+/// file, so no run of it reads a value from one.
 pub fn env_file_paths(
     env_list: Option<&str>,
     rcs: &[(&Path, &str)],
     start: &Path,
     var: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<PathBuf> {
-    let (base, entries) = match env_list {
-        Some(list) => (start, split_list(list)),
-        None => rcs
-            .iter()
-            .find_map(|(dir, rc)| Some((*dir, raw_list_setting(rc, "injectEnvironmentFiles")?)))
-            .unwrap_or_else(|| {
-                (
-                    start,
-                    DEFAULT_ENV_FILES.iter().map(|f| f.to_string()).collect(),
-                )
-            }),
+    let entries: Vec<(&Path, String)> = match env_list {
+        Some(list) => split_list(list).into_iter().map(|e| (start, e)).collect(),
+        None => {
+            let lists: Vec<(&Path, Vec<String>)> = rcs
+                .iter()
+                .rev()
+                .filter_map(|(dir, rc)| {
+                    Some((*dir, raw_list_setting(rc, "injectEnvironmentFiles")?))
+                })
+                .collect();
+            if lists.is_empty() {
+                DEFAULT_ENV_FILES
+                    .iter()
+                    .map(|f| (start, f.to_string()))
+                    .collect()
+            } else {
+                lists
+                    .into_iter()
+                    .flat_map(|(dir, list)| list.into_iter().map(move |e| (dir, e)))
+                    .collect()
+            }
+        }
     };
     entries
         .iter()
-        .filter_map(|entry| {
+        .filter_map(|(base, entry)| {
             let entry = expand_env(entry, &mut |name| Ok(var(name))).ok()?;
             let path = entry.strip_suffix('?').unwrap_or(&entry);
             (!path.is_empty()).then(|| base.join(path))
@@ -450,6 +464,24 @@ mod tests {
         assert_eq!(
             env_file_paths(Some("a, b?"), &rcs, start, &none),
             vec![start.join("a"), start.join("b")]
+        );
+        // Every rc file's list, lowest precedence (home, the farthest
+        // ancestor) first; a nearer `[]` clears nothing.
+        let (home, near) = (Path::new("/home/u"), Path::new("/p/app"));
+        let rcs = [
+            (near, "injectEnvironmentFiles: []\n"),
+            (rc_dir, "injectEnvironmentFiles: [r]\n"),
+            (Path::new("/"), "nodeLinker: pnp\n"),
+            (home, "injectEnvironmentFiles: [h]\n"),
+        ];
+        assert_eq!(
+            env_file_paths(None, &rcs, start, &none),
+            vec![home.join("h"), rc_dir.join("r")]
+        );
+        let rcs = [(near, "injectEnvironmentFiles: [n]\n"), rcs[1]];
+        assert_eq!(
+            env_file_paths(None, &rcs, start, &none),
+            vec![rc_dir.join("r"), near.join("n")]
         );
         // An entry yarn cannot expand is skipped.
         let rcs = [(rc_dir, "injectEnvironmentFiles: [\"${UNSET}\", z]\n")];

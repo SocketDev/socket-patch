@@ -841,8 +841,8 @@ mod tests {
     }
 
     /// #1611: an rc file's relative `injectEnvironmentFiles` entries
-    /// resolve against its own folder, and the nearest rc file setting the
-    /// list wins.
+    /// resolve against its own folder, and every rc file's list loads, the
+    /// nearest last.
     #[test]
     fn env_files_resolve_against_their_rc_folder() {
         let w = tempfile::tempdir().unwrap();
@@ -860,10 +860,23 @@ mod tests {
             yarn_node_linker_in(&proj, &env).as_deref(),
             Some("node-modules")
         );
-        // A nearer rc file emptying the list wins.
+        // Yarn concatenates every rc file's list: a nearer `[]` clears
+        // nothing (yarn 4.9.1 resolves `node-modules` here)...
         std::fs::write(proj.join(".yarnrc.yml"), "injectEnvironmentFiles: []\n").unwrap();
         let env = bare_env(None).with_env_files(&proj, None);
-        assert_eq!(yarn_node_linker_in(&proj, &env).as_deref(), Some("pnp"));
+        assert_eq!(
+            yarn_node_linker_in(&proj, &env).as_deref(),
+            Some("node-modules")
+        );
+        // ...and a nearer file loads last, so its value wins.
+        std::fs::write(
+            proj.join(".yarnrc.yml"),
+            "injectEnvironmentFiles: [.env.app]\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join(".env.app"), "L=pnpm\n").unwrap();
+        let env = bare_env(None).with_env_files(&proj, None);
+        assert_eq!(yarn_node_linker_in(&proj, &env).as_deref(), Some("pnpm"));
     }
 
     /// yarn reads the home folder's rc file after every project-side one,
