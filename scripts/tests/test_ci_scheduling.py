@@ -45,10 +45,16 @@ class Scheduling(unittest.TestCase):
         # on its critical path, so it starts in parallel with clippy;
         # merge-queue fail-fast cancels it when clippy fails.
         parallel = {"windows-compile-check"}
+        # coverage and e2e-build head the two critical-path chains and wait
+        # only for the ~10 s release-readiness job, not clippy (#1681).
+        early = {"coverage", "e2e-build"}
+        for job in early:
+            self.assertEqual(dependencies(job), {"release-readiness"})
         for job in set(JOBS) - cheap:
             with self.subTest(job=job):
                 if job not in parallel:
-                    self.assertIn("clippy", ancestors(job))
+                    self.assertTrue(ancestors(job) & {"clippy", "release-readiness"})
+                    self.assertTrue(({job} | ancestors(job)) & ({"clippy"} | early))
                 # Job-level always() would defeat failure/skip propagation.
                 self.assertFalse(any(line.startswith("    if:") and "always()" in line
                                      for line in JOBS[job]))
@@ -66,7 +72,8 @@ class Scheduling(unittest.TestCase):
                     self.assertEqual(dependencies(job), {builder})
                     self.assertEqual({row["os"] for row in reader.matrix_include(JOBS[job])}, {os_name})
                     self.assertIn(f"        os: [{os_name}]", JOBS[builder])
-                    self.assertEqual(ancestors(job), {builder, "clippy"})
+                    preflight = {"release-readiness"} if builder == "e2e-build" else {"release-readiness", "clippy"}
+                    self.assertEqual(ancestors(job), {builder} | preflight)
 
     def test_os_builds_use_the_same_artifact_contract(self):
         producer = "\n".join(JOBS["e2e-build"])
@@ -107,7 +114,7 @@ class Scheduling(unittest.TestCase):
         build = next(line for line in JOBS["e2e-build-windows"] if line.startswith("    if:"))
         self.assertEqual(build, "    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full'"
                                 " || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'))"
-                                " && needs.clippy.outputs.pr_unchanged != 'true'")
+                                " && needs.release-readiness.outputs.pr_unchanged != 'true'")
 
     def test_reused_push_keeps_cache_writers_and_unqueued_jobs(self):
         # A push whose SHA passed the merge queue still compiles (main is the
@@ -124,31 +131,40 @@ class Scheduling(unittest.TestCase):
                 if name.startswith(("Bundle ", "Compress ")) or "upload-artifact" in body]
         self.assertEqual(len(ship), 3)
         for body in ship:
-            self.assertIn("if: needs.clippy.outputs.reuse != 'true'"
+            self.assertIn("if: needs.release-readiness.outputs.reuse != 'true'"
                           " || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')", body)
         for job in ("docker-base", "yarn-classic-matrix", "yarn-berry-e2e", "yarn-berry-e2e-macos"):
             with self.subTest(job=job):
                 condition = next(line for line in JOBS[job] if line.startswith("    if:"))
-                self.assertIn("needs.clippy.outputs.reuse != 'true'", condition)
+                self.assertIn("needs.release-readiness.outputs.reuse != 'true'", condition)
         for family in ("e2e", "cargo-vex-matrix"):
             for suffix in ("", "-windows", "-macos"):
                 build = "e2e-build" + suffix
                 with self.subTest(job=family + suffix):
                     condition = next(line for line in JOBS[family + suffix] if line.startswith("    if:"))
                     self.assertIn(f"needs.{build}.outputs.reuse != 'true'", condition)
-                    self.assertIn("      reuse: ${{ needs.clippy.outputs.reuse }}", JOBS[build])
+                    self.assertIn("      reuse: ${{ needs.release-readiness.outputs.reuse }}", JOBS[build])
         self.assertIn("needs.e2e-build.outputs.reuse != 'true'",
                       next(line for line in JOBS["e2e-extended"] if line.startswith("    if:")))
         for job in ("test", "coverage", "cargo-old-toolchains"):
             with self.subTest(job=job):
                 warm = [body for name, body in reader.steps(JOBS[job]) if name.startswith("Warm ")]
                 self.assertEqual(len(warm), 1)
-                self.assertIn("if: needs.clippy.outputs.reuse == 'true'", warm[0])
+                self.assertIn("if: needs.release-readiness.outputs.reuse == 'true'", warm[0])
                 self.assertIn("--no-run", warm[0])
-        clippy = "\n".join(JOBS["clippy"])
-        self.assertIn("actions: read", clippy)
-        self.assertIn("reuse: ${{ steps.merge-queue.outputs.reuse }}", clippy)
-        self.assertIn("python3 scripts/ci-reuse-merge-group.py", clippy)
+        owner = "\n".join(JOBS["release-readiness"])
+        self.assertIn("actions: read", owner)
+        self.assertIn("reuse: ${{ steps.merge-queue.outputs.reuse }}", owner)
+        self.assertIn("python3 scripts/ci-reuse-merge-group.py", owner)
+        self.assertNotIn("ci-reuse-", "\n".join(JOBS["clippy"]))
+
+    def test_every_needs_output_reader_needs_that_job(self):
+        # `needs.<job>.outputs` is empty unless <job> is a direct `needs:`
+        # entry, which would silently turn every reuse gate off.
+        for job in JOBS:
+            for parent in set(re.findall(r"needs\.([a-z0-9-]+)\.outputs", "\n".join(JOBS[job]))):
+                with self.subTest(job=job, parent=parent):
+                    self.assertIn(parent, dependencies(job))
 
     def test_unchanged_pr_merge_skips_only_what_the_queue_re_tests(self):
         # A PR push that only merged main keeps clippy and the cheap preflight
@@ -167,11 +183,11 @@ class Scheduling(unittest.TestCase):
         for job in JOBS:
             condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
             with self.subTest(job=job):
-                self.assertEqual("needs.clippy.outputs.pr_unchanged != 'true'" in condition,
+                self.assertEqual("needs.release-readiness.outputs.pr_unchanged != 'true'" in condition,
                                  job in gated)
                 if job in gated:
-                    self.assertTrue(condition.endswith(") && needs.clippy.outputs.pr_unchanged != 'true'"))
-        pr_tier = {job for job in JOBS if "clippy" in ancestors(job)}
+                    self.assertTrue(condition.endswith(") && needs.release-readiness.outputs.pr_unchanged != 'true'"))
+        pr_tier = {job for job in JOBS if ancestors(job) & {"clippy", "release-readiness"}}
         for job in sorted(pr_tier - gated - {"hosted-e2e", "test-release"}):
             condition = next(line for line in JOBS[job] if line.startswith("    if:"))
             with self.subTest(job=job):
@@ -179,11 +195,11 @@ class Scheduling(unittest.TestCase):
                 # only on the v5 integration PR, which never reuses (below).
                 self.assertTrue(ancestors(job) & gated or condition == full_tier
                                 or condition.startswith(never_on_pr) and "head_ref" not in condition, job)
-        clippy = "\n".join(JOBS["clippy"])
-        self.assertIn("pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}", clippy)
-        self.assertIn("python3 scripts/ci-reuse-pr-head.py", clippy)
+        owner = "\n".join(JOBS["release-readiness"])
+        self.assertIn("pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}", owner)
+        self.assertIn("python3 scripts/ci-reuse-pr-head.py", owner)
         self.assertIn("if: github.event_name == 'pull_request' && github.base_ref == 'main'"
-                      " && github.head_ref != 'release/v5-prerelease'", clippy)
+                      " && github.head_ref != 'release/v5-prerelease'", owner)
 
     def test_row_reader_preserves_both_os_siblings(self):
         jobs = reader.jobs("""jobs:
