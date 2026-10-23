@@ -2277,9 +2277,11 @@ async fn gem_hosted_superseding_patch_keeps_gem_sections_in_bundler_order() {
 /// the lock keeps pinning the old one until a `bundle install`. A
 /// `rollback` / `remove` in that window must undo the new block along with
 /// the lock, or the pair stays inconsistent (frozen installs fail) and the
-/// next unfrozen install re-patches.
+/// next unfrozen install re-patches. Bundler < 2.2 never opens that
+/// window (its merged GEM section makes the superseding scan refuse), so
+/// there the test asserts the refusal and unwinds the converged gen 2 pair.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler; \
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (unconverged window >= 2.2); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_unwind_after_unconverged_supersede_undoes_the_new_block() {
     for command in ["rollback", "remove"] {
@@ -2329,6 +2331,10 @@ async fn unwind_after_unconverged_supersede(command: &str) {
         "{command}: converge gen 2:\n{}",
         String::from_utf8_lossy(&install.stderr)
     );
+    let gemfile_path = fx.proj.join(fx.gemfile_name);
+    let lock_path = fx.proj.join(fx.lock_name);
+    let gen2_gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    let gen2_lock = std::fs::read_to_string(&lock_path).unwrap();
     mount_patch_generation(
         &fx._server,
         1,
@@ -2337,42 +2343,41 @@ async fn unwind_after_unconverged_supersede(command: &str) {
     .await;
     let (code, out, err) = run_hosted_scan(&fx.proj, &api);
     assert_eq!(code, 0, "{command}: gen 3 scan: {out}\n{err}");
-    let gemfile_path = fx.proj.join(fx.gemfile_name);
-    let lock_path = fx.proj.join(fx.lock_name);
-    // Bundler < 2.2 merges every rubygems source into one GEM section, so
-    // discovery can't attribute the new pin and the superseding scan
-    // refuses it, writing nothing. The unconverged window never opens.
-    if !fx.bundler.at_least(2, 2) {
-        assert!(
-            out.contains("\"errorCode\": \"redirect_unattributable\""),
-            "{command}: gen 3 scan on a merged GEM section must refuse:\n{out}"
-        );
-        let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
-        let lock = std::fs::read_to_string(&lock_path).unwrap();
-        assert!(
-            gemfile.contains(GEN2) && !gemfile.contains(GEN3),
-            "{command}: the refused scan leaves the Gemfile on gen 2:\n{gemfile}"
-        );
-        assert!(
-            lock.contains(GEN2) && !lock.contains(GEN3),
-            "{command}: the refused scan leaves the lock on gen 2:\n{lock}"
-        );
-        println!(
-            "SKIP e2e_redirect_gem_build (unconverged-supersede {command}): bundler {} \
-             refuses the superseding scan on its merged GEM section",
-            fx.bundler.version
-        );
-        return;
-    }
-    // The unconverged window this test is about: Gemfile on gen 3, lock on
-    // gen 2.
     let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
     let lock = std::fs::read_to_string(&lock_path).unwrap();
-    assert!(gemfile.contains(GEN3), "{command}: Gemfile:\n{gemfile}");
-    assert!(
-        lock.contains(GEN2) && !lock.contains(GEN3),
-        "{command}: lock:\n{lock}"
-    );
+    if fx.bundler.at_least(2, 2) {
+        // The unconverged window this test is about: Gemfile on gen 3,
+        // lock on gen 2.
+        assert!(gemfile.contains(GEN3), "{command}: Gemfile:\n{gemfile}");
+        assert!(
+            lock.contains(GEN2) && !lock.contains(GEN3),
+            "{command}: lock:\n{lock}"
+        );
+    } else {
+        // Bundler < 2.2 merges every rubygems source into one GEM section,
+        // where discovery can't attribute the new pin, so the superseding
+        // scan refuses it and writes nothing (#1688). The window never
+        // opens; the unwind below then undoes the converged gen 2 pair.
+        let env: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("{command}: gen 3 scan JSON ({e}):\n{out}"));
+        assert!(
+            env["events"].as_array().into_iter().flatten().any(|e| {
+                e["action"] == "skipped"
+                    && e["purl"] == PURL
+                    && e["uuid"] == GEN3
+                    && e["errorCode"] == "redirect_unattributable"
+            }),
+            "{command}: gen 3 scan on a merged GEM section must refuse:\n{out}"
+        );
+        assert_eq!(
+            gemfile, gen2_gemfile,
+            "{command}: the refused scan wrote the Gemfile"
+        );
+        assert_eq!(
+            lock, gen2_lock,
+            "{command}: the refused scan wrote the lock"
+        );
+    }
 
     let upstream = format!("{api}/upstream");
     let cwd = fx.proj.to_str().expect("utf8 tmp path");
