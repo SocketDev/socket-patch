@@ -18,7 +18,9 @@ was rewired still runs the registry copy, so `vex` omits the package
 decided by the configured linker (`YARN_NODE_LINKER`, else the nearest rc file
 at or above the project that sets `nodeLinker`, else the home folder's rc file;
 the rc file is `.yarnrc.yml` unless `YARN_RC_FILENAME` renames it; unset means
-berry's default, `pnp`), not by whether a `.pnp.*` loader happens to exist:
+berry's default, `pnp`; a `${NAME}` in the value expands as yarn 4 expands it,
+with the `injectEnvironmentFiles` files, `.env.yarn` by default, applied over
+the environment), not by whether a `.pnp.*` loader happens to exist:
 `vendor` refuses a lock-only PnP checkout up front, and a stale `.pnp.js` left
 by a Yarn 2 migration to `node-modules` or `pnpm` is ignored. Yarn 1 PnP
 (`installConfig.pnp`, a classic `yarn.lock`) has no `nodeLinker`, so its
