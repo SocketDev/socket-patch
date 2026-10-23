@@ -540,3 +540,70 @@ fn global_folder_paths_resolve_like_yarn() {
         );
     }
 }
+
+/// #1629: `global-folder` values decode as yarn 1.22.22 decodes them
+/// (each expectation checked with `yarn global dir`).
+#[test]
+fn global_folder_values_read_like_yarn() {
+    let yarnrc = |text: &str| {
+        Host::new()
+            .file("/home/u/.yarnrc", text)
+            .global_folders("/w")
+    };
+    // A default `--global-folder` flag.
+    assert_eq!(yarnrc("--global-folder \"/opt/rc\"\n"), paths(&["/opt/rc"]));
+    assert_eq!(yarnrc("--global-folder /opt/rc\n"), paths(&["/opt/rc"]));
+    // A trailing comment is its own token.
+    assert_eq!(
+        yarnrc("global-folder /opt/yg # moved\n"),
+        paths(&["/opt/yg"])
+    );
+    // A double-quoted value is JSON.
+    assert_eq!(
+        yarnrc("global-folder \"/opt/a\\\\b\"\n"),
+        paths(&["/opt/a\\b"])
+    );
+    // yarn's YAML fallback reads a single-quoted value.
+    assert_eq!(
+        yarnrc("\"global-folder\": '/opt/yg'\n"),
+        paths(&["/opt/yg"])
+    );
+    // `~` can't start a bare word: yarn ignores the line.
+    assert_eq!(yarnrc("global-folder ~/yg\n"), Vec::<PathBuf>::new());
+
+    let npmrc = |host: Host, text: &str| host.file("/home/u/.npmrc", text).global_folders("/w");
+    // `${NAME}` expands; an unset name makes yarn drop its config.
+    assert_eq!(
+        npmrc(Host::new(), "global-folder=${HOME}/x\n"),
+        paths(&["/home/u/x"])
+    );
+    assert_eq!(
+        npmrc(Host::new().var("YG", "/opt/yg"), "global-folder=${YG}\n"),
+        paths(&["/opt/yg"])
+    );
+    assert_eq!(
+        npmrc(Host::new(), "global-folder=${NOPE}/x\n"),
+        Vec::<PathBuf>::new()
+    );
+    // An escaped expression stays verbatim (`ini` reads `\\` as `\`
+    // first).
+    for text in [
+        "global-folder=\\${HOME}/x\n",
+        "global-folder=\\\\${HOME}/x\n",
+    ] {
+        assert_eq!(
+            npmrc(Host::new(), text),
+            paths(&["/w/\\${HOME}/x"]),
+            "{text:?}"
+        );
+    }
+    // `ini` ends an unquoted value at a comment and unquotes a quoted one.
+    assert_eq!(
+        npmrc(Host::new(), "global-folder=/opt/n ; moved\n"),
+        paths(&["/opt/n"])
+    );
+    assert_eq!(
+        npmrc(Host::new(), "global-folder=\"/opt/nq\"\n"),
+        paths(&["/opt/nq"])
+    );
+}

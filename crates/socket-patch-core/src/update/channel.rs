@@ -15,6 +15,7 @@
 
 use crate::formats::yarn::berry_gates::{YARNRC, YARN_LOCK};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 /// How the currently-running binary appears to have been installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +48,12 @@ pub struct ChannelEnv {
     pub local_app_data: Option<PathBuf>,
     /// The canonicalized folders yarn 1's `global-folder` config names
     /// (`YARN_GLOBAL_FOLDER`, `~/.yarnrc`, ...): a `yarn global add`
-    /// moved there looks like a small yarn project on disk (#1629).
-    pub yarn_global_folders: Vec<PathBuf>,
+    /// moved there looks like a small yarn project on disk (#1629). Read
+    /// through [`ChannelEnv::yarn_global_folders`]; tests set it directly.
+    pub yarn_global_folders: OnceLock<Vec<PathBuf>>,
+    /// Whether [`ChannelEnv::yarn_global_folders`] reads yarn's config
+    /// from this process when it is first asked (set by `from_env`).
+    read_yarn_config: bool,
 }
 
 impl ChannelEnv {
@@ -66,12 +71,24 @@ impl ChannelEnv {
             xdg_cache_home: path_var("XDG_CACHE_HOME"),
             home: crate::utils::fs::home_dir(),
             local_app_data: path_var("LOCALAPPDATA"),
-            yarn_global_folders:
-                crate::patch::redirect::yarnrc::configured_yarn_global_folders_for_process()
-                    .into_iter()
-                    .filter_map(|dir| std::fs::canonicalize(dir).ok())
-                    .collect(),
+            yarn_global_folders: OnceLock::new(),
+            read_yarn_config: true,
         }
+    }
+
+    /// [`ChannelEnv::yarn_global_folders`], reading yarn's config on first
+    /// use: only a yarn-owned `node_modules` install needs it, so the
+    /// other channels never walk the rc files.
+    pub fn yarn_global_folders(&self) -> &[PathBuf] {
+        self.yarn_global_folders.get_or_init(|| {
+            if !self.read_yarn_config {
+                return Vec::new();
+            }
+            crate::patch::redirect::yarnrc::configured_yarn_global_folders_for_process()
+                .into_iter()
+                .filter_map(|dir| std::fs::canonicalize(dir).ok())
+                .collect()
+        })
     }
 }
 
@@ -293,11 +310,11 @@ fn node_manager(path: &Path, env: &ChannelEnv) -> NodeManager {
     {
         return NodeManager::Bun;
     }
-    if is_yarn_global_store(path, env)
-        || (holder_has(YARN_LOCK)
-            && !crate::constants::npm_family::NPM_LOCKS
-                .iter()
-                .any(|lock| holder_has(lock)))
+    if (holder_has(YARN_LOCK)
+        && !crate::constants::npm_family::NPM_LOCKS
+            .iter()
+            .any(|lock| holder_has(lock)))
+        || is_yarn_global_store(path, env)
     {
         return NodeManager::Yarn;
     }
@@ -312,11 +329,13 @@ fn node_manager(path: &Path, env: &ChannelEnv) -> NodeManager {
 /// Any folder yarn's config names as its global folder is, whatever its
 /// name (#1629).
 fn is_yarn_global_store(path: &Path, env: &ChannelEnv) -> bool {
-    if outermost_node_modules_holder(path)
-        .is_some_and(|dir| env.yarn_global_folders.iter().any(|g| g == dir))
-    {
-        return true;
-    }
+    is_default_yarn_global_store(path)
+        || outermost_node_modules_holder(path)
+            .is_some_and(|dir| env.yarn_global_folders().iter().any(|g| g == dir))
+}
+
+/// [`is_yarn_global_store`] by the folder's name alone.
+fn is_default_yarn_global_store(path: &Path) -> bool {
     let names = normal_components(path);
     let Some(first_nm) = names.iter().position(|n| *n == "node_modules") else {
         return false;
@@ -1281,7 +1300,7 @@ mod tests {
         );
 
         let env = ChannelEnv {
-            yarn_global_folders: vec![folder.clone()],
+            yarn_global_folders: OnceLock::from(vec![folder.clone()]),
             ..Default::default()
         };
         assert_eq!(

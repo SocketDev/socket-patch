@@ -378,15 +378,18 @@ const GLOBAL_FOLDER_KEY: &str = "global-folder";
 
 /// Every folder yarn 1 run in `cwd` is configured to use as its global
 /// folder (`yarn global dir`) by a `global-folder` setting: the `YARN_*`
-/// and `npm_config_*` env layers, the `.yarnrc` files and the `.npmrc`
-/// files (the project's in `cwd`, then the outer ones). Yarn uses the
-/// first of them by its precedence, but a folder any layer names was set
-/// up as a yarn global folder, so all of them count.
+/// and `npm_config_*` env layers, the `.yarnrc` files (also as a
+/// `--global-folder` default flag) and the `.npmrc` files (the project's
+/// in `cwd`, then the outer ones). Yarn uses the first of them by its
+/// precedence, but a folder any layer names was set up as a yarn global
+/// folder, so all of them count.
 ///
-/// Paths resolve as in `yarn@1.22.22`: a `.yarnrc` value against the
-/// folder of its file (`RELATIVE_KEYS`), anything else through
-/// `resolveWithHome` (`~/` is yarn's `userHome`, else the cwd). Empty
-/// values set nothing.
+/// Values read as in `yarn@1.22.22`: a `.yarnrc` value is one token of
+/// yarn's rc grammar ([`yarnrc_token`]) resolved against the folder of
+/// its file (`RELATIVE_KEYS`); an `.npmrc` value has its `${NAME}`
+/// references expanded ([`yarn_env_replace`]); env and `.npmrc` values
+/// then go through `resolveWithHome` (`~/` is yarn's `userHome`, else the
+/// cwd). Empty values set nothing.
 pub fn configured_yarn_global_folders(
     env: &NpmConfigEnv,
     root_user: bool,
@@ -394,16 +397,18 @@ pub fn configured_yarn_global_folders(
     read: impl Fn(&Path) -> Option<String>,
 ) -> Vec<PathBuf> {
     let layout = RcLayout::new(env, root_user);
-    let resolve = |value: &str| layout.resolve_with_home(value, cwd, env.windows);
     let mut out = Vec::new();
-    for prefix in ["yarn_", "npm_config_"] {
-        if let Some((_, value)) = env_value(env, &[prefix], GLOBAL_FOLDER_KEY) {
-            out.extend(
-                Some(value)
-                    .filter(|v| !v.is_empty())
-                    .and_then(|v| resolve(&v)),
-            );
+    let mut push = |value: Option<String>, resolve: &dyn Fn(&str) -> Option<PathBuf>| {
+        if let Some(path) = value.filter(|v| !v.is_empty()).and_then(|v| resolve(&v)) {
+            out.push(path);
         }
+    };
+    let with_home = |value: &str| layout.resolve_with_home(value, cwd, env.windows);
+    for prefix in ["yarn_", "npm_config_"] {
+        push(
+            env_value(env, &[prefix], GLOBAL_FOLDER_KEY).map(|(_, value)| value),
+            &with_home,
+        );
     }
     let rc_files = |rc: &str, prefixes: &[&str]| {
         let mut files = vec![cwd.join(format!(".{rc}"))];
@@ -412,21 +417,140 @@ pub fn configured_yarn_global_folders(
     };
     for path in rc_files("yarnrc", &["yarn_"]) {
         let Some(text) = read(&path) else { continue };
-        let Some(value) = yarnrc_setting(&text, GLOBAL_FOLDER_KEY).map(unquote_rc_value) else {
-            continue;
-        };
-        if let (false, Some(dir)) = (value.is_empty(), path.parent()) {
-            out.push(dir.join(value));
+        let Some(dir) = path.parent() else { continue };
+        for key in [GLOBAL_FOLDER_KEY, "--global-folder"] {
+            push(
+                yarnrc_setting(&text, key).and_then(yarnrc_token),
+                &|value| Some(dir.join(value)),
+            );
         }
     }
     for path in rc_files("npmrc", &["yarn_", "npm_config_"]) {
         let Some(text) = read(&path) else { continue };
-        let Some(value) = npmrc_setting(&text, GLOBAL_FOLDER_KEY).map(unquote_rc_value) else {
-            continue;
-        };
-        out.extend(Some(value).filter(|v| !v.is_empty()).and_then(resolve));
+        push(
+            npmrc_setting(&text, GLOBAL_FOLDER_KEY)
+                .map(ini_value)
+                .and_then(|value| yarn_env_replace(env, &value)),
+            &with_home,
+        );
     }
     out
+}
+
+/// The value token that starts `rest` (what follows a key in a `.yarnrc`
+/// line), read like yarn's lockfile tokenizer: a double-quoted string is
+/// JSON (escapes decoded), a bare word starts with a letter, `/`, `.` or
+/// `-` and ends at a space, `:` or `,` (so a trailing `# comment` is not
+/// part of it), and a run of digits is a number. A single-quoted string
+/// is what yarn's YAML fallback reads in a `"key": '…'` line. Anything
+/// else (`~/x`) is a token yarn can't read: `None`.
+fn yarnrc_token(rest: &str) -> Option<String> {
+    let rest = rest.trim_start_matches([' ', '\t']);
+    if let Some(quoted) = rest.strip_prefix('\'') {
+        let mut out = String::new();
+        let mut chars = quoted.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    out.push('\'');
+                }
+                '\'' => return Some(out),
+                c => out.push(c),
+            }
+        }
+        return None;
+    }
+    if rest.starts_with('"') {
+        let bytes = rest.as_bytes();
+        let mut end = rest.len();
+        for i in 1..bytes.len() {
+            let escaped = bytes[i - 1] == b'\\' && (i < 2 || bytes[i - 2] != b'\\');
+            if bytes[i] == b'"' && !escaped {
+                end = i + 1;
+                break;
+            }
+        }
+        return serde_json::from_str(&rest[..end]).ok();
+    }
+    let first = rest.chars().next()?;
+    let word = if first.is_ascii_digit() {
+        rest.split(|c: char| !c.is_ascii_digit()).next()
+    } else if first.is_ascii_alphabetic() || matches!(first, '/' | '.' | '-') {
+        rest.split([':', ' ', ',', '\r', '\n']).next()
+    } else {
+        None
+    };
+    word.map(str::to_string)
+}
+
+/// An `.npmrc` value as the `ini` parser yarn 1 bundles decodes it: a
+/// quoted value loses its quotes (a double-quoted one is JSON), and an
+/// unquoted one ends at an unescaped `;` or `#` (an inline comment),
+/// with `\\`, `\;` and `\#` read as the escaped character.
+fn ini_value(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        if let Ok(value) = serde_json::from_str::<String>(raw) {
+            return value;
+        }
+    }
+    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
+        return raw[1..raw.len() - 1].to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut escaped = false;
+    for c in raw.chars() {
+        if escaped {
+            if !matches!(c, '\\' | ';' | '#') {
+                out.push('\\');
+            }
+            out.push(c);
+            escaped = false;
+        } else if matches!(c, ';' | '#') {
+            break;
+        } else if c == '\\' {
+            escaped = true;
+        } else {
+            out.push(c);
+        }
+    }
+    if escaped {
+        out.push('\\');
+    }
+    out.trim().to_string()
+}
+
+/// yarn 1's `envReplace` over an `.npmrc` value: `${NAME}` becomes the
+/// variable (`HOME` is the user's home), and an odd run of backslashes
+/// before it keeps the whole expression verbatim, while an even run is
+/// replaced with it. An unset variable makes yarn fail to load its
+/// config: `None`.
+fn yarn_env_replace(env: &NpmConfigEnv, value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start + 2..].find('}') else {
+            break;
+        };
+        let name = &rest[start + 2..start + 2 + len];
+        let before = &rest[..start];
+        let slashes = before.len() - before.trim_end_matches('\\').len();
+        let expr_end = start + 2 + len + 1;
+        if name.is_empty() || slashes % 2 == 1 {
+            out.push_str(&rest[..expr_end]);
+        } else {
+            out.push_str(&before[..before.len() - slashes]);
+            let home = env.home.as_ref().and_then(|h| h.to_str());
+            out.push_str(match name {
+                "HOME" => home?,
+                _ => env.var_raw(name)?,
+            });
+        }
+        rest = &rest[expr_end..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// [`configured_yarn_global_folders`] for this process, run in its cwd,
