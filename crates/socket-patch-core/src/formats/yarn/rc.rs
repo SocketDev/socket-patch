@@ -58,8 +58,8 @@ pub fn raw_setting(rc: &str, key: &str) -> Option<String> {
         return line_scan(rc, key);
     }
     match top_level_values(rc) {
-        Ok(mut settings) => match settings.remove(key) {
-            Some(RcValue::Scalar(value)) => Some(value),
+        Ok(mut settings) => match settings.remove(key)?.value {
+            RcValue::Scalar(value) => Some(value),
             _ => None,
         },
         Err(()) => line_scan(rc, key),
@@ -73,15 +73,39 @@ pub fn raw_setting(rc: &str, key: &str) -> Option<String> {
 /// set `key` to a list or scalar, or yarn would refuse it (not a single
 /// YAML document with a mapping root, or a second BOM).
 pub fn raw_list_setting(rc: &str, key: &str) -> Option<Vec<String>> {
+    list_setting(rc, key).map(|setting| setting.items)
+}
+
+/// A list setting as one rc file sets it ([`list_setting`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListSetting {
+    pub items: Vec<String>,
+    /// Given as a string, not a sequence: yarn takes it as is instead of
+    /// merging it with other rc files' lists.
+    pub scalar: bool,
+    /// Yarn's `onConflict` for the value (`{onConflict: reset, value:
+    /// [...]}`): `reset` keeps this list and drops lower-precedence ones,
+    /// `hardReset` drops this one too.
+    pub on_conflict: Option<String>,
+}
+
+/// [`raw_list_setting`] with how yarn merges it across rc files.
+pub fn list_setting(rc: &str, key: &str) -> Option<ListSetting> {
     let rc = strip_bom(rc);
     if strip_bom(rc).len() < rc.len() {
         return None;
     }
-    match top_level_values(rc).ok()?.remove(key)? {
-        RcValue::Scalar(value) => Some(split_list(&value)),
-        RcValue::List(items) => Some(items),
-        RcValue::Other => None,
-    }
+    let setting = top_level_values(rc).ok()?.remove(key)?;
+    let (items, scalar) = match setting.value {
+        RcValue::Scalar(value) => (split_list(&value), true),
+        RcValue::List(items) => (items, false),
+        RcValue::Other => return None,
+    };
+    Some(ListSetting {
+        items,
+        scalar,
+        on_conflict: setting.on_conflict,
+    })
 }
 
 /// A string given for an array setting, split at its commas, each item
@@ -109,7 +133,7 @@ enum RcValue {
 /// as in yarn. A root that is not a mapping (a list, a lone scalar) sets
 /// nothing: yarn refuses such a file. `Err` when the text is not a single
 /// YAML document.
-fn top_level_values(rc: &str) -> Result<HashMap<String, RcValue>, ()> {
+fn top_level_values(rc: &str) -> Result<HashMap<String, RcSetting>, ()> {
     let mut options = Options::default();
     options.emit_comments = false;
     let mut out = HashMap::new();
@@ -121,6 +145,9 @@ fn top_level_values(rc: &str) -> Result<HashMap<String, RcValue>, ()> {
     let mut root_is_mapping = false;
     // The setting whose sequence value is being read, with its items.
     let mut list: Option<(String, Vec<String>)> = None;
+    // The setting whose mapping value is being read: yarn's
+    // `{onConflict, value}` wrapper when it has a string `onConflict`.
+    let mut wrapped: Option<Wrapped> = None;
     for event in Parser::new_from_str_with_options(rc, options) {
         let (event, _) = event.map_err(|_| ())?;
         match event {
@@ -136,10 +163,11 @@ fn top_level_values(rc: &str) -> Result<HashMap<String, RcValue>, ()> {
                     root_is_mapping = matches!(event, Event::MappingStart(..));
                 } else if depth == 1 && !at_key {
                     if let Some(key) = pending_key.take() {
-                        if root_is_mapping && matches!(event, Event::SequenceStart(..)) {
+                        if !root_is_mapping {
+                        } else if matches!(event, Event::SequenceStart(..)) {
                             list = Some((key, Vec::new()));
                         } else {
-                            out.insert(key, RcValue::Other);
+                            wrapped = Some(Wrapped::new(key));
                         }
                     }
                     at_key = true;
@@ -147,6 +175,8 @@ fn top_level_values(rc: &str) -> Result<HashMap<String, RcValue>, ()> {
                     // A complex key: not a setting name.
                     pending_key = None;
                     at_key = false;
+                } else if let Some(w) = wrapped.as_mut() {
+                    w.nested(depth, matches!(event, Event::SequenceStart(..)));
                 }
                 depth += 1;
             }
@@ -154,7 +184,15 @@ fn top_level_values(rc: &str) -> Result<HashMap<String, RcValue>, ()> {
                 depth = depth.saturating_sub(1);
                 if depth == 1 {
                     if let Some((key, items)) = list.take() {
-                        out.insert(key, RcValue::List(items));
+                        out.insert(key, RcSetting::plain(RcValue::List(items)));
+                    }
+                    if let Some(w) = wrapped.take() {
+                        let (key, setting) = w.finish();
+                        out.insert(key, setting);
+                    }
+                } else if depth == 2 {
+                    if let Some(w) = wrapped.as_mut() {
+                        w.end_nested();
                     }
                 }
             }
@@ -164,28 +202,130 @@ fn top_level_values(rc: &str) -> Result<HashMap<String, RcValue>, ()> {
                     at_key = false;
                 } else {
                     if let Some(key) = pending_key.take() {
-                        out.insert(key, RcValue::Scalar(text.into_owned()));
+                        out.insert(key, RcSetting::plain(RcValue::Scalar(text.into_owned())));
                     }
                     at_key = true;
                 }
             }
-            Event::Scalar(text, ..) if depth == 2 => {
+            Event::Scalar(text, ..) if depth == 2 && list.is_some() => {
                 if let Some((_, items)) = list.as_mut() {
                     items.push(text.into_owned());
+                }
+            }
+            Event::Scalar(text, ..) if depth >= 2 => {
+                if let Some(w) = wrapped.as_mut() {
+                    w.scalar(depth, text.into_owned());
                 }
             }
             Event::Alias(_) if depth == 1 && root_is_mapping => {
                 if !at_key {
                     if let Some(key) = pending_key.take() {
-                        out.insert(key, RcValue::Other);
+                        out.insert(key, RcSetting::plain(RcValue::Other));
                     }
                 }
                 at_key = !at_key;
+            }
+            Event::Alias(_) if depth == 2 => {
+                if let Some(w) = wrapped.as_mut() {
+                    w.other_value();
+                }
             }
             _ => {}
         }
     }
     Ok(out)
+}
+
+/// A top-level setting: its value and yarn's `onConflict` for it.
+struct RcSetting {
+    value: RcValue,
+    on_conflict: Option<String>,
+}
+
+impl RcSetting {
+    fn plain(value: RcValue) -> Self {
+        Self {
+            value,
+            on_conflict: None,
+        }
+    }
+}
+
+/// A mapping value being read: `{onConflict: reset, value: [...]}` is
+/// the value with an `onConflict`, any other mapping is [`RcValue::Other`].
+struct Wrapped {
+    key: String,
+    on_conflict: Option<String>,
+    value: Option<RcValue>,
+    /// The mapping key the next depth-2 node is the value of.
+    entry: Option<String>,
+    /// The `value` entry's sequence items, while it is read.
+    items: Option<Vec<String>>,
+}
+
+impl Wrapped {
+    fn new(key: String) -> Self {
+        Self {
+            key,
+            on_conflict: None,
+            value: None,
+            entry: None,
+            items: None,
+        }
+    }
+
+    /// A scalar at `depth` (the mapping's own entries sit at depth 2).
+    fn scalar(&mut self, depth: usize, text: String) {
+        if depth == 3 {
+            if let Some(items) = self.items.as_mut() {
+                items.push(text);
+            }
+            return;
+        }
+        match self.entry.take() {
+            None => self.entry = Some(text),
+            Some(entry) if entry == "onConflict" => self.on_conflict = Some(text),
+            Some(entry) if entry == "value" => self.value = Some(RcValue::Scalar(text)),
+            Some(_) => {}
+        }
+    }
+
+    /// A collection opening at `depth`.
+    fn nested(&mut self, depth: usize, sequence: bool) {
+        if depth != 2 {
+            return;
+        }
+        match self.entry.take() {
+            Some(entry) if entry == "value" && sequence => self.items = Some(Vec::new()),
+            Some(entry) if entry == "value" => self.value = Some(RcValue::Other),
+            // A complex key, or another entry's collection.
+            _ => {}
+        }
+    }
+
+    /// A depth-2 collection closing.
+    fn end_nested(&mut self) {
+        if let Some(items) = self.items.take() {
+            self.value = Some(RcValue::List(items));
+        }
+    }
+
+    fn other_value(&mut self) {
+        if self.entry.take().as_deref() == Some("value") {
+            self.value = Some(RcValue::Other);
+        }
+    }
+
+    fn finish(self) -> (String, RcSetting) {
+        let setting = match (self.on_conflict, self.value) {
+            (Some(on_conflict), Some(value)) => RcSetting {
+                value,
+                on_conflict: Some(on_conflict),
+            },
+            _ => RcSetting::plain(RcValue::Other),
+        };
+        (self.key, setting)
+    }
 }
 
 /// `injectEnvironmentFiles`' default: the folder yarn runs in's
@@ -195,15 +335,19 @@ pub const DEFAULT_ENV_FILES: &[&str] = &[".env.yarn?"];
 /// The environment files yarn 4 loads (`injectEnvironmentFiles`), in load
 /// order. The list is `env_list` (`YARN_INJECT_ENVIRONMENT_FILES`, comma
 /// separated, against `start`, the folder yarn runs in) when set. Else
-/// yarn concatenates the list of every rc file in `rcs` (highest
-/// precedence first, each with the folder its relative entries resolve
-/// against) that sets it, lowest precedence first: the home rc file's,
-/// then each ancestor's from the farthest to the nearest, so a nearer
-/// `[]` adds nothing and clears nothing. When no rc file sets it, the list
-/// is [`DEFAULT_ENV_FILES`] against `start`. An entry's `${NAME}`
-/// references expand through `var`; one that cannot is skipped. The
-/// optional marker (`?`) is dropped: yarn stops on a missing required
-/// file, so no run of it reads a value from one.
+/// yarn merges the lists of the rc files in `rcs` (highest precedence
+/// first: the nearest folder's, each ancestor's, the home folder's; each
+/// with the folder its relative entries resolve against), walking from
+/// the highest: each sequence goes before those already taken, so the
+/// lowest-precedence file's entries load first and a nearer `[]` clears
+/// nothing. The walk stops after a list whose `onConflict` is `reset`,
+/// before one whose `onConflict` is `hardReset` or that is a string while
+/// the first was a sequence (or the reverse); a string from the first
+/// file that sets the list is the whole list. When no rc file sets it,
+/// the list is [`DEFAULT_ENV_FILES`] against `start`. An entry's
+/// `${NAME}` references expand through `var`; one that cannot is
+/// skipped. The optional marker (`?`) is dropped: yarn stops on a missing
+/// required file, so no run of it reads a value from one.
 pub fn env_file_paths(
     env_list: Option<&str>,
     rcs: &[(&Path, &str)],
@@ -213,20 +357,29 @@ pub fn env_file_paths(
     let entries: Vec<(&Path, String)> = match env_list {
         Some(list) => split_list(list).into_iter().map(|e| (start, e)).collect(),
         None => {
-            let lists: Vec<(&Path, Vec<String>)> = rcs
-                .iter()
-                .rev()
-                .filter_map(|(dir, rc)| {
-                    Some((*dir, raw_list_setting(rc, "injectEnvironmentFiles")?))
-                })
-                .collect();
-            if lists.is_empty() {
+            // yarn's `resolveValueAt` over the rc files.
+            let mut taken: Vec<(&Path, Vec<String>)> = Vec::new();
+            let mut first_scalar = None;
+            for (dir, rc) in rcs {
+                let Some(setting) = list_setting(rc, "injectEnvironmentFiles") else {
+                    continue;
+                };
+                let scalar = *first_scalar.get_or_insert(setting.scalar);
+                if setting.scalar != scalar || setting.on_conflict.as_deref() == Some("hardReset") {
+                    break;
+                }
+                taken.insert(0, (*dir, setting.items));
+                if scalar || setting.on_conflict.as_deref() == Some("reset") {
+                    break;
+                }
+            }
+            if first_scalar.is_none() {
                 DEFAULT_ENV_FILES
                     .iter()
                     .map(|f| (start, f.to_string()))
                     .collect()
             } else {
-                lists
+                taken
                     .into_iter()
                     .flat_map(|(dir, list)| list.into_iter().map(move |e| (dir, e)))
                     .collect()
@@ -482,6 +635,34 @@ mod tests {
         assert_eq!(
             env_file_paths(None, &rcs, start, &none),
             vec![rc_dir.join("r"), near.join("n")]
+        );
+        // `reset` keeps its own list and drops lower-precedence ones;
+        // `hardReset` drops its own too; a type change stops the walk.
+        let parent = (rc_dir, "injectEnvironmentFiles: [r]\n");
+        let reset = (
+            near,
+            "injectEnvironmentFiles: {onConflict: reset, value: [n]}\n",
+        );
+        assert_eq!(
+            env_file_paths(None, &[reset, parent], start, &none),
+            vec![near.join("n")]
+        );
+        let reset = (
+            near,
+            "injectEnvironmentFiles:\n  onConflict: hardReset\n  value:\n    - n\n",
+        );
+        assert_eq!(
+            env_file_paths(None, &[reset, parent], start, &none),
+            Vec::<PathBuf>::new()
+        );
+        let string = (near, "injectEnvironmentFiles: n\n");
+        assert_eq!(
+            env_file_paths(None, &[string, parent], start, &none),
+            vec![near.join("n")]
+        );
+        assert_eq!(
+            env_file_paths(None, &[parent, string], start, &none),
+            vec![rc_dir.join("r")]
         );
         // An entry yarn cannot expand is skipped.
         let rcs = [(rc_dir, "injectEnvironmentFiles: [\"${UNSET}\", z]\n")];
