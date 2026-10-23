@@ -101,8 +101,9 @@ use std::collections::BTreeSet;
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use super::{
-    mentions_vendor_dir, pypi_purl, toml_or_diag, vendored_leaf_purl, DiscoverCtx, Discovery,
-    LocateOpts, PatchedRef, TomlDiag, Wired, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
+    mentions_vendor_dir, pypi_purl, toml_or_diag, toml_result_or_diag, vendored_leaf_purl,
+    DiscoverCtx, Discovery, LocateOpts, PatchedRef, TomlDiag, Wired, DIAG_LOCKFILE_UNPARSEABLE,
+    DIAG_REF_INVALID,
 };
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::{sha256_hex, sha256_prefixed};
@@ -795,7 +796,10 @@ async fn extract_poetry(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Some(text) = ctx.read_text(file, out).await else {
         return;
     };
-    let Some(doc) = toml_or_diag(file, &text, TomlDiag::Raw, out) else {
+    // The shared parse: the lock inventory and the redirect read these
+    // same bytes (#1473, #1624).
+    let parsed = crate::utils::lock_fragments::parse_lock(&text);
+    let Some(doc) = toml_result_or_diag(file, parsed, TomlDiag::Raw, out) else {
         return;
     };
     let format = crate::utils::poetry_lock::lock_version(&doc)
@@ -931,7 +935,10 @@ async fn extract_pdm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Some(text) = ctx.read_text(file, out).await else {
         return;
     };
-    let Some(doc) = toml_or_diag(file, &text, TomlDiag::Raw, out) else {
+    // The shared parse: the lock inventory and the redirect read these
+    // same bytes (#1473, #1624).
+    let parsed = crate::utils::lock_fragments::parse_lock(&text);
+    let Some(doc) = toml_result_or_diag(file, parsed, TomlDiag::Raw, out) else {
         return;
     };
     let lock_version = doc
@@ -2032,5 +2039,103 @@ mod tests {
         let elsewhere: Vec<&str> = out.elsewhere.iter().map(|e| e.purl.as_str()).collect();
         assert_eq!(elsewhere, ["pkg:pypi/click@8.1.7", "pkg:pypi/idna@3.6"]);
         assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    // ── one parse per lock text (#1473, #1624) ───────────────────────────
+
+    /// What a hosted scan does to one lock: the lock inventory reads it,
+    /// VEX discovery reads it, the batch rewrite rewrites it, and VEX
+    /// discovery reads the written lock back. Each distinct text costs one
+    /// whole-lock parse: the original, and the rewrite's rendering.
+    async fn scan_parses(lock: &str, file: &str, rewritten: &str) -> usize {
+        use crate::utils::lock_fragments::PARSES;
+        let p = Project::new();
+        p.write(file, lock);
+        PARSES.with(|parses| parses.set(0));
+        let inventory = crate::vendor::lock_inventory::inventory_project(p.root()).await;
+        assert!(
+            inventory.iter().any(|entry| entry.name == "urllib3"),
+            "{file}: {inventory:?}"
+        );
+        assert_refs(&run(&p).await, &[]);
+        let written = rewritten_lock(file, lock);
+        assert_eq!(written, rewritten, "{file}: the batch output");
+        p.write(file, &written);
+        assert_refs(&run(&p).await, &[(URLLIB3, UUID_A, WiringMode::Hosted)]);
+        PARSES.with(|parses| parses.get())
+    }
+
+    fn rewritten_lock(file: &str, lock: &str) -> String {
+        use crate::utils::lock_fragments::{LockBatch, LockStep};
+        let url = hosted_url("pypi", "urllib3", "1.26.18", UUID_A, URLLIB3_WHEEL);
+        let LockBatch { text, steps } = if file == super::POETRY_LOCK {
+            crate::utils::poetry_lock::rewrite_poetry_lock_all(
+                lock,
+                &[crate::utils::poetry_lock::PoetryLockDep {
+                    name: "urllib3",
+                    version: "1.26.18",
+                    source_type: "url",
+                    source_url: &url,
+                    filename: URLLIB3_WHEEL,
+                    sha256: SHA,
+                }],
+            )
+        } else {
+            crate::utils::pdm_lock::rewrite_pdm_lock_all(
+                lock,
+                &[crate::utils::pdm_lock::PdmLockDep {
+                    name: "urllib3",
+                    version: "1.26.18",
+                    source: ("url", &url),
+                    filename: URLLIB3_WHEEL,
+                    sha256: SHA,
+                }],
+            )
+        };
+        assert!(
+            matches!(steps[..], [LockStep::Rewritten(_)]),
+            "{file}: {steps:?}"
+        );
+        text
+    }
+
+    /// #1473: a hosted Poetry scan parsed `poetry.lock` five times.
+    #[tokio::test]
+    async fn poetry_scan_parses_each_lock_text_once() {
+        for version in ["1.2.2", "1.8.5", "2.1.4"] {
+            let native = poetry_fixture(version);
+            // The expected output, rewritten on another thread so its
+            // parses neither count here nor seed this thread's shared parse.
+            let rewritten = {
+                let native = native.clone();
+                std::thread::spawn(move || rewritten_lock(super::POETRY_LOCK, &native))
+                    .join()
+                    .unwrap()
+            };
+            assert_eq!(
+                scan_parses(&native, super::POETRY_LOCK, &rewritten).await,
+                2,
+                "poetry {version}"
+            );
+        }
+    }
+
+    /// #1624: a hosted PDM scan parsed `pdm.lock` six times.
+    #[tokio::test]
+    async fn pdm_scan_parses_each_lock_text_once() {
+        for version in ["2.11.2", "2.17.3", "2.29.2"] {
+            let native = pdm_fixture(version);
+            let rewritten = {
+                let native = native.clone();
+                std::thread::spawn(move || rewritten_lock(super::PDM_LOCK, &native))
+                    .join()
+                    .unwrap()
+            };
+            assert_eq!(
+                scan_parses(&native, super::PDM_LOCK, &rewritten).await,
+                2,
+                "pdm {version}"
+            );
+        }
     }
 }
