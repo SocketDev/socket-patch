@@ -732,16 +732,19 @@ fn locator_target(locator: &str) -> (&str, Option<&str>) {
 /// The lines of `text` that contain `needle`, each once, as `str::lines`
 /// spells them (a `\r` before a `\n` is dropped, a final bare one kept). Searching for the
 /// needle skips the rest of the text instead of splitting every line.
+/// `needle` must be non-empty and on one line, so each match moves on.
 fn lines_containing<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    debug_assert!(!needle.is_empty() && !needle.contains('\n'));
     let mut from = 0;
     std::iter::from_fn(move || {
         let at = from + text.get(from..)?.find(needle)?;
         let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
         let Some(end) = text[at..].find('\n').map(|i| at + i) else {
-            from = text.len();
+            // Past the end: the next call finds nothing.
+            from = text.len() + 1;
             return Some(&text[start..]);
         };
-        from = end;
+        from = end + 1;
         let line = &text[start..end];
         Some(line.strip_suffix('\r').unwrap_or(line))
     })
@@ -876,6 +879,9 @@ mod tests {
             let fast: Vec<&str> = lines_containing(text, "@patch:").collect();
             assert_eq!(fast, slow, "{text:?}");
         }
+        // The documented contract, independent of the toolchain's `lines`.
+        let got: Vec<&str> = lines_containing("a@patch:\r\nb@patch:\r", "@patch:").collect();
+        assert_eq!(got, ["a@patch:", "b@patch:\r"]);
     }
 
     #[tokio::test]
