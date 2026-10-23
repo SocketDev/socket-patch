@@ -877,7 +877,7 @@ pub async fn revert_nuget_opts(
                             .iter()
                             .find(|c| c.kind == CONFIG_SOURCE_WIRING_KIND)
                             .map_or("nuget.config", |c| c.file.as_str()),
-                        w.key.as_deref().unwrap_or("<unknown>"),
+                        w.key_label(),
                         w.file
                     ),
                 ));
@@ -905,7 +905,7 @@ pub async fn revert_nuget_opts(
                 format!(
                     "{} no longer carries what vendor wrote for {}; left alone",
                     w.file,
-                    w.key.as_deref().unwrap_or("<unknown>")
+                    w.key_label()
                 ),
             )),
             Err(e) => {

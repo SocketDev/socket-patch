@@ -1181,7 +1181,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
                     format!(
-                        "uv.lock entry for {canon:?} that `uv add` routed through {needle} \
+                        "uv.lock entry for {canon} that `uv add` routed through {needle} \
                          can't be put back on the registry ({reason}); left both files \
                          untouched (pin it with `==` in pyproject.toml or remove it, then \
                          revert again)"

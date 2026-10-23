@@ -926,7 +926,7 @@ pub fn check_entry(
             if !gradle::metadata_record_present(text, w) {
                 return Err(format!(
                     "upstream verification entry drifted: {}",
-                    w.key.as_deref().unwrap_or("")
+                    w.key_label()
                 ));
             }
         }

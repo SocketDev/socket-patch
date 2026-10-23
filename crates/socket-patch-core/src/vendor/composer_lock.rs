@@ -556,7 +556,7 @@ pub async fn revert_composer_opts(
                 "vendor_lock_entry_drifted",
                 format!(
                     "composer.lock entry for {} no longer points into .socket/vendor/composer/; left alone",
-                    w.key.as_deref().unwrap_or("<unknown>")
+                    w.key_label()
                 ),
             )),
             Err(e) => {

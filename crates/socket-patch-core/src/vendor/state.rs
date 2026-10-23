@@ -153,9 +153,15 @@ pub struct WiringRecord {
 
 impl WiringRecord {
     /// The key as user-facing warning text: verbatim, or `<unknown>` for a
-    /// record without one (an older or hand-written ledger).
-    pub fn key_label(&self) -> &str {
-        self.key.as_deref().unwrap_or("<unknown>")
+    /// record without one (an older or hand-written ledger). SECURITY: the
+    /// key comes from the committed, tamper-able state.json, so control
+    /// characters are escaped rather than written to the terminal.
+    pub fn key_label(&self) -> std::borrow::Cow<'_, str> {
+        match self.key.as_deref() {
+            None | Some("") => "<unknown>".into(),
+            Some(key) if key.chars().any(char::is_control) => key.escape_debug().to_string().into(),
+            Some(key) => key.into(),
+        }
     }
 }
 
@@ -1100,6 +1106,10 @@ mod tests {
         assert_eq!(rec.key_label(), "default:six");
         rec.key = None;
         assert_eq!(rec.key_label(), "<unknown>");
+        rec.key = Some(String::new());
+        assert_eq!(rec.key_label(), "<unknown>");
+        rec.key = Some("default:six\x1b[2K\nforged".into());
+        assert_eq!(rec.key_label(), "default:six\\u{1b}[2K\\nforged");
     }
 
     fn sample_entry() -> VendorEntry {

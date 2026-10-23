@@ -3332,8 +3332,7 @@ pub async fn revert_pypi_opts(
             .filter(|f| !KNOWN_PYPI_FLAVORS.contains(f))
         {
             return RevertOutcome::failed(format!(
-                "unknown pypi vendor flavor {:?}; cannot revert",
-                Some(flavor)
+                "unknown pypi vendor flavor {flavor:?}; cannot revert"
             ));
         }
         let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
@@ -3360,9 +3359,12 @@ pub async fn revert_pypi_opts(
         match flavor {
             Some(flavor) => revert_by_record_kind(entry, project_root, flavor, dry_run).await,
             None => {
-                let other = entry.flavor.as_deref();
+                let other = entry
+                    .flavor
+                    .as_deref()
+                    .map_or_else(|| "<none>".to_string(), |f| format!("{f:?}"));
                 return RevertOutcome::failed(format!(
-                    "unknown pypi vendor flavor {other:?}; cannot revert"
+                    "unknown pypi vendor flavor {other}; cannot revert"
                 ));
             }
         }
@@ -6858,7 +6860,7 @@ wheels = [
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("unknown pypi vendor flavor")),
+                .is_some_and(|e| e.contains("unknown pypi vendor flavor \"frobnicate\";")),
             "{outcome:?}"
         );
         let mut wired = revert_entry("uv", &rel_wheel, Vec::new());
@@ -6877,7 +6879,7 @@ wheels = [
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("unknown pypi vendor flavor")),
+                .is_some_and(|e| e.contains("unknown pypi vendor flavor \"frobnicate\";")),
             "{outcome:?}"
         );
     }

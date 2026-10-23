@@ -251,7 +251,7 @@ pub async fn revert_maven_opts(
                 format!(
                     "{} no longer carries the vendored <repository> {}; left alone",
                     w.file,
-                    w.key.as_deref().unwrap_or("<unknown>")
+                    w.key_label()
                 ),
             )),
             Err(e) => {

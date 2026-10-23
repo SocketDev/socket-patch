@@ -1114,7 +1114,7 @@ pub async fn revert_gem_opts(
                 continue;
             }
         };
-        let key = w.key.as_deref().unwrap_or("<unknown>");
+        let key = w.key_label();
         match restored {
             Ok(RecordRevert::Done) => {}
             Ok(RecordRevert::Drifted) => {
