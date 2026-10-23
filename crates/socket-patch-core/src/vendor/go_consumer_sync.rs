@@ -280,6 +280,107 @@ fn modules_txt_location(project_root: &Path) -> (PathBuf, &'static str) {
     )
 }
 
+// GOFLAGS uses Go's quoted.Split: quotes surround a whole argument and do
+// not unescape its contents. Both -flag and --flag are accepted.
+fn go_mod_flag(mut flags: &str) -> Option<&str> {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let mut mode = None;
+    loop {
+        flags = flags.trim_start_matches(space);
+        if flags.is_empty() {
+            return mode;
+        }
+        let (word, rest) =
+            if let Some(quote) = flags.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                let (word, rest) = flags[1..].split_once(quote)?;
+                (word, rest)
+            } else {
+                let end = flags.find(space).unwrap_or(flags.len());
+                (&flags[..end], &flags[end..])
+            };
+        if let Some(value) = word
+            .strip_prefix("-mod=")
+            .or_else(|| word.strip_prefix("--mod="))
+        {
+            mode = Some(value);
+        }
+        flags = rest;
+    }
+}
+
+/// The native vendor tree selected by Go, including GOFLAGS and go.work.
+/// An absent modules.txt does not disable vendor mode; it makes it invalid.
+pub async fn native_vendor_dir(project_root: &Path) -> Option<PathBuf> {
+    let flags = crate::utils::go_env::go_env("GOFLAGS").unwrap_or_default();
+    let mode = go_mod_flag(&flags);
+    if mode.is_some_and(|mode| mode != "vendor") {
+        return None;
+    }
+    let (modules_txt, _) = modules_txt_location(project_root);
+    let dir = modules_txt.parent()?.to_path_buf();
+    if mode == Some("vendor") {
+        return Some(dir);
+    }
+    if !dir.is_dir() {
+        return None;
+    }
+    let work = workspace_file(project_root);
+    // Go only automatically selects a tree generated in the same mode. A
+    // module vendor tree at a workspace root is otherwise ignored.
+    let modules = read_regular_to_string(&modules_txt)
+        .await
+        .unwrap_or_default();
+    let workspace_tree = modules.lines().next().is_some_and(|line| {
+        line.strip_prefix("## ")
+            .is_some_and(|annotations| annotations.split(';').any(|a| a.trim() == "workspace"))
+    });
+    if workspace_tree != work.is_some() {
+        return None;
+    }
+    let config = work.clone().unwrap_or_else(|| project_root.join("go.mod"));
+    let text = read_regular_to_string(&config).await.ok()?;
+    let normalized = go_mod_edit::normalize_for_read(&text);
+    let version = normalized.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next()? == "go").then(|| words.next()).flatten()
+    })?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    (major > 1 || major == 1 && minor >= 14).then_some(dir)
+}
+
+/// Native vendoring copies runtime files and omits dependency tests and
+/// manifests. Its bytes must agree with the patch even when the Socket copy
+/// is intact: Go builds this tree without reading the replacement directory.
+pub async fn verify_native_vendor(
+    project_root: &Path,
+    purl: &str,
+    record: &crate::manifest::schema::PatchRecord,
+) -> Result<(), String> {
+    let Some((module, version)) = crate::utils::purl::parse_golang_purl(purl) else {
+        return Ok(());
+    };
+    let Some(dir) = native_vendor_dir(project_root).await else {
+        return Ok(());
+    };
+    if !crate::patch::redirect::golang_local::are_safe_redirect_coords(&module, &version) {
+        return Err("invalid Go module coordinates".into());
+    }
+    let replaces = go_mod_edit::read_replace_entries(project_root).await;
+    if let Some(issue) = vendor_modules_txt_issues(project_root, &replaces)
+        .await
+        .into_iter()
+        .find(|issue| issue.module() == module)
+    {
+        return Err(issue.to_string());
+    }
+    let (_, command) = modules_txt_location(project_root);
+    super::go_native_vendor::verify(project_root, &dir, &module, &version, record, &replaces)
+        .await
+        .map_err(|detail| format!("{detail}; run `{command}` and commit vendor/"))
+}
+
 /// Whether the go command builds `project_root` in workspace mode (a
 /// `go.work` from `GOWORK` or at or above the project), so its build list
 /// spans every member's requirements, not only the project go.mod's.
@@ -693,6 +794,21 @@ fn go_semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goflags_uses_whole_argument_quotes_and_last_mod_flag() {
+        assert_eq!(
+            go_mod_flag("-mod=vendor '--mod=readonly'"),
+            Some("readonly")
+        );
+        assert_eq!(go_mod_flag("\"--mod=mod\" -tags=linux"), Some("mod"));
+        assert_eq!(
+            go_mod_flag("'-ldflags=-X main.flag=-mod=vendor' --mod=mod"),
+            Some("mod")
+        );
+        assert_eq!(go_mod_flag("'-ldflags=-X main.flag=-mod=vendor'"), None);
+        assert_eq!(go_mod_flag("'unterminated"), None);
+    }
 
     const COPY: &str = ".socket/go-patches/example.com/upstream@v1.0.0";
 

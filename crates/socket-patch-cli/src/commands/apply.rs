@@ -256,16 +256,19 @@ async fn try_local_go_apply(
 
 /// After the apply loop: prune local-go redirects whose patches were dropped
 /// from the manifest. No-op unless local go is in scope.
-async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet<String>) {
+async fn reconcile_local_go(
+    common: &GlobalArgs,
+    target_manifest_purls: &HashSet<String>,
+) -> Result<(), String> {
     if !eco_in_local_scope(common, Ecosystem::Golang) {
-        return;
+        return Ok(());
     }
     let desired: HashSet<String> = target_manifest_purls
         .iter()
         .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Golang))
         .cloned()
         .collect();
-    let removed = reconcile_go_redirects(&common.cwd, &desired, common.dry_run).await;
+    let removed = reconcile_go_redirects(&common.cwd, &desired, common.dry_run).await?;
     if !removed.is_empty() && !common.silent && !common.json {
         let verb = if common.dry_run {
             "Would remove"
@@ -284,6 +287,7 @@ async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet
             println!("  {purl}");
         }
     }
+    Ok(())
 }
 
 /// Read-only verification that the manifest's patches are in place, for CI
@@ -381,6 +385,20 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                         GoDrift::OrphanReplace { module } => module.clone(),
                     };
                     drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));
+                }
+            }
+            for (purl, record) in &manifest.patches {
+                if in_scope.contains(purl) {
+                    if let Err(detail) =
+                        socket_patch_core::vendor::go_consumer_sync::verify_native_vendor(
+                            &args.common.cwd,
+                            purl,
+                            record,
+                        )
+                        .await
+                    {
+                        drifts.push((purl.clone(), "go_vendor_content_mismatch".into(), detail));
+                    }
                 }
             }
             // The redirects can be intact while the project no longer
@@ -1358,11 +1376,6 @@ pub(crate) async fn run_locked(
                 .map(|(code, detail)| RunWarning { code, detail })
                 .collect();
             run_warnings.extend(user_patch_warnings.iter().cloned());
-            let nested_skip_warnings = if args.nested.is_some() {
-                user_patch_warnings
-            } else {
-                Vec::new()
-            };
             run_warnings.extend(results.iter().filter_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success)?;
                 note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)
@@ -1632,8 +1645,7 @@ pub(crate) async fn run_locked(
             // The mismatch overwrites, for a nested caller's envelope (the
             // JSON events above are the standalone apply's copy).
             let mut warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
-            warnings.extend(cache_warnings);
-            warnings.extend(nested_skip_warnings);
+            warnings.extend(run_warnings.iter().cloned());
             let (applied, skipped) = collect_apply_outcomes(
                 &results,
                 &unmatched,
@@ -2151,7 +2163,7 @@ async fn apply_patches_inner(
         .chain(user_patched)
         .cloned()
         .collect();
-    reconcile_local_go(&args.common, &recorded).await;
+    reconcile_local_go(&args.common, &recorded).await?;
 
     if partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was

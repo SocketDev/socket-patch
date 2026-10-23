@@ -188,6 +188,13 @@ pub async fn ensure_replace_entry(
     {
         return Err(refusal);
     }
+    if !dry_run {
+        let content = read_regular_to_string(&go_mod_path(project_root))
+            .await
+            .map_err(|e| e.to_string())?;
+        upsert_replace_entry(&content, module, version, base_rel)?;
+        super::go_sum_backup::save(project_root, base_rel, module, version).await?;
+    }
     edit_go_mod(project_root, dry_run, |c| {
         upsert_replace_entry(c, module, version, base_rel)
     })
@@ -205,10 +212,19 @@ pub async fn drop_replace_entry(
     owner: ReplaceOwner,
     dry_run: bool,
 ) -> Result<bool, String> {
-    edit_go_mod(project_root, dry_run, |c| {
+    let entries: Vec<_> = read_replace_entries(project_root)
+        .await
+        .into_iter()
+        .filter(|entry| entry.module == module && entry.owner == Some(owner))
+        .collect();
+    if !dry_run && !entries.is_empty() {
+        super::go_sum_backup::restore(project_root, &entries).await?;
+    }
+    let changed = edit_go_mod(project_root, dry_run, |c| {
         remove_replace_entry(c, module, owner)
     })
-    .await
+    .await?;
+    Ok(changed)
 }
 
 // ── file resolution + read/write ──────────────────────────────────────────────

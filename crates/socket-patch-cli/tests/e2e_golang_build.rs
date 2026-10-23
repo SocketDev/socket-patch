@@ -32,7 +32,7 @@ mod golang_e2e_matrix;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
-use common::{binary, cache_env, git_sha256};
+use common::{cache_env, git_sha256};
 use vex_e2e_common::{
     assert_absent, assert_attested, run_vex, strip_manifest, Marker, VexRun, VexVia,
 };
@@ -84,10 +84,15 @@ fn go(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
 /// Build the upstream module into a file-proxy and `go mod download` it into a
 /// temp GOMODCACHE. Returns (consumer_dir, modcache, proxy_url).
 fn stage(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let godir = golang_e2e_matrix::go_directive();
     // Staging dir holding `<mod>@<ver>/` for zipping.
     let stage = tmp.join("stage").join(format!("{UMOD}@{UVER}"));
     std::fs::create_dir_all(&stage).unwrap();
-    std::fs::write(stage.join("go.mod"), format!("module {UMOD}\n\ngo 1.21\n")).unwrap();
+    std::fs::write(
+        stage.join("go.mod"),
+        format!("module {UMOD}\n\ngo {godir}\n"),
+    )
+    .unwrap();
     std::fs::write(stage.join("lib.go"), PRISTINE_LIB).unwrap();
 
     // File-proxy layout: proxy/<mod>/@v/<ver>.{info,mod,zip}.
@@ -100,7 +105,7 @@ fn stage(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf, String) {
     .unwrap();
     std::fs::write(
         pxv.join(format!("{UVER}.mod")),
-        format!("module {UMOD}\n\ngo 1.21\n"),
+        format!("module {UMOD}\n\ngo {godir}\n"),
     )
     .unwrap();
     let zip_out = pxv.join(format!("{UVER}.zip"));
@@ -125,7 +130,7 @@ fn stage(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf, String) {
     std::fs::create_dir_all(&consumer).unwrap();
     std::fs::write(
         consumer.join("go.mod"),
-        format!("module example.com/consumer\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+        format!("module example.com/consumer\n\ngo {godir}\n\nrequire {UMOD} {UVER}\n"),
     )
     .unwrap();
     std::fs::write(
@@ -467,6 +472,44 @@ fn committed_vendor_dir_needs_go_mod_vendor_after_apply_and_rollback() {
     );
     assert_eq!(code, 0, "in sync after go mod vendor:\n{so}\n{se}");
 
+    std::fs::write(
+        consumer.join("vendor").join(UMOD).join("lib.go"),
+        PRISTINE_LIB,
+    )
+    .unwrap();
+    let native = go(&consumer, &["run", "."], &goenv);
+    assert!(String::from_utf8_lossy(&native.stdout).contains("OUT: PRISTINE"));
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "apply",
+            "--check",
+            "--offline",
+            "--json",
+            "--ecosystems",
+            "golang",
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 1, "native vendor drift must fail audit: {so} {se}");
+    assert!(so.contains("go_vendor_content_mismatch"), "{so}");
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "vex",
+            "--offline",
+            "--json",
+            "--product",
+            "pkg:golang/example.com/consumer@v1.0.0",
+            "--output",
+            "vex.json",
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 1, "native vendor drift must not attest: {so} {se}");
+    assert!(so.contains("go_vendor_content_mismatch"), "{so}");
+    assert!(go(&consumer, &["mod", "vendor"], &goenv).status.success());
+
     // Rollback drops the replace; modules.txt still records it.
     let (code, so, se) = run_socket(
         &consumer,
@@ -506,6 +549,15 @@ fn committed_vendor_dir_needs_go_mod_vendor_after_apply_and_rollback() {
 /// the drift until it is run, and after it the patched bytes build.
 #[test]
 fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
+    requirement_bump(false);
+}
+
+#[test]
+fn dependency_only_patch_attests_after_native_vendoring() {
+    requirement_bump(true);
+}
+
+fn requirement_bump(dependency_only: bool) {
     if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(requirements)") {
         return;
     }
@@ -536,7 +588,12 @@ fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
         )
     };
     let (before_mod, after_mod) = (up_mod("v1.0.0"), up_mod("v1.1.0"));
-    let (before_lib, after_lib) = (up_lib("PRISTINE"), up_lib("PATCHED"));
+    let marker = if dependency_only {
+        "PRISTINE"
+    } else {
+        "PATCHED"
+    };
+    let (before_lib, after_lib) = (up_lib("PRISTINE"), up_lib(marker));
     publish(
         t,
         UMOD,
@@ -584,7 +641,7 @@ fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
     for body in [&after_lib, &after_mod] {
         std::fs::write(socket.join("blobs").join(git_sha256(body.as_bytes())), body).unwrap();
     }
-    let manifest = serde_json::json!({"patches": {UPURL: {
+    let mut manifest = serde_json::json!({"patches": {UPURL: {
         "uuid": UUID, "exportedAt": "t",
         "files": {
             "lib.go": {"beforeHash": git_sha256(before_lib.as_bytes()),
@@ -595,6 +652,12 @@ fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
         "vulnerabilities": {GHSA: {"cves": [CVE], "summary": "s", "severity": "high",
                                    "description": "d"}},
         "description": "", "license": "", "tier": ""}}});
+    if dependency_only {
+        manifest["patches"][UPURL]["files"]
+            .as_object_mut()
+            .unwrap()
+            .remove("lib.go");
+    }
     std::fs::write(socket.join("manifest.json"), manifest.to_string()).unwrap();
 
     let cs = consumer.to_str().unwrap();
@@ -643,7 +706,7 @@ fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
     );
     let run = go(&consumer, &["run", "."], &goenv);
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains("OUT: FIXED-PATCHED"),
+        String::from_utf8_lossy(&run.stdout).contains(&format!("OUT: FIXED-{marker}")),
         "{}{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
@@ -654,6 +717,47 @@ fn patched_go_mod_requirement_bump_needs_go_mod_tidy() {
         &modcache,
     );
     assert_eq!(code, 0, "in sync after go mod tidy:\n{so}\n{se}");
+    assert!(go(&consumer, &["mod", "vendor"], &goenv).status.success());
+    assert!(go_out(&consumer, &goenv).contains(&format!("OUT: FIXED-{marker}")));
+    let (code, so, se) = check(&consumer, &modcache);
+    assert_eq!(code, 0, "native vendor requirements in sync: {so} {se}");
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "vex",
+            "--offline",
+            "--json",
+            "--product",
+            "pkg:golang/example.com/consumer@v1.0.0",
+            "--output",
+            "vex.json",
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 0, "dependency patch must attest: {so} {se}");
+    assert!(std::fs::read_to_string(consumer.join("vex.json"))
+        .unwrap()
+        .contains(GHSA));
+    let modules = consumer.join("vendor/modules.txt");
+    let text = std::fs::read_to_string(&modules)
+        .unwrap()
+        .replace("# example.com/dep v1.1.0", "# example.com/dep v1.0.0");
+    std::fs::write(modules, text).unwrap();
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "vex",
+            "--offline",
+            "--json",
+            "--product",
+            "pkg:golang/example.com/consumer@v1.0.0",
+            "--output",
+            "vex.json",
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 1, "old dependency must not attest: {so} {se}");
+    assert!(so.contains("go_vendor_content_mismatch"), "{so}");
 
     chmod_writable(tmp.path());
 }
@@ -672,10 +776,11 @@ fn workspace_env<'a>(modcache: &'a str, proxy_url: &'a str) -> Vec<(&'a str, &'a
 /// A module at `dir` that requires the upstream and prints its greeting,
 /// with the go.sum `go mod tidy` writes (outside any workspace).
 fn consumer_module(dir: &Path, module: &str, modcache: &str, proxy_url: &str) {
+    let godir = golang_e2e_matrix::go_directive();
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
         dir.join("go.mod"),
-        format!("module {module}\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+        format!("module {module}\n\ngo {godir}\n\nrequire {UMOD} {UVER}\n"),
     )
     .unwrap();
     std::fs::write(
@@ -980,5 +1085,279 @@ fn go_work_member_replaces_must_not_conflict() {
     }
     assert_vex_omits(&b, &modcache, "pkg:golang/example.com/b@v0.0.1");
 
+    chmod_writable(tmp.path());
+}
+
+#[test]
+fn go_rollback_after_tidy_restores_upstream_sums_offline() {
+    if !golang_e2e_matrix::toolchain_ready("rollback after tidy") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy) = stage(tmp.path());
+    let original_sums = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+    write_patch(&consumer);
+    let (code, so, se) = run_socket(
+        &consumer,
+        &["apply", "--offline", "--ecosystems", "golang"],
+        &modcache,
+    );
+    assert_eq!(code, 0, "{so} {se}");
+    let mut env = go_env(modcache.to_str().unwrap(), &proxy);
+    assert!(go(&consumer, &["mod", "tidy"], &env).status.success());
+    assert!(!std::fs::read_to_string(consumer.join("go.sum"))
+        .unwrap()
+        .contains(UMOD));
+    let (code, so, se) = run_socket(
+        &consumer,
+        &["rollback", "--offline", "--ecosystems", "golang"],
+        &modcache,
+    );
+    assert_eq!(code, 0, "{so} {se}");
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.sum")).unwrap(),
+        original_sums
+    );
+    env.push(("GOFLAGS", "-mod=readonly"));
+    let built = go(&consumer, &["run", "."], &env);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(String::from_utf8_lossy(&built.stdout).contains("OUT: PRISTINE"));
+    chmod_writable(tmp.path());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_get_preserves_native_vendor_warning() {
+    use base64::Engine as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    if !golang_e2e_matrix::toolchain_ready("agent get warning") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, cache, proxy) = stage(tmp.path());
+    let env = go_env(cache.to_str().unwrap(), &proxy);
+    assert!(go(&consumer, &["mod", "vendor"], &env).status.success());
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/test/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID, "purl": UPURL, "publishedAt": "2026-10-23T00:00:00Z",
+            "files": {"lib.go": {"beforeHash": git_sha256(PRISTINE_LIB.as_bytes()),
+                "afterHash": git_sha256(PATCHED_LIB.as_bytes()),
+                "blobContent": base64::engine::general_purpose::STANDARD.encode(PATCHED_LIB)}},
+            "vulnerabilities": {}, "description": "fixture", "license": "MIT", "tier": "free"
+        })))
+        .mount(&server)
+        .await;
+    let (code, so, se) = common::run_with_env(
+        &consumer,
+        &[
+            "get",
+            UUID,
+            "--mode",
+            "agent",
+            "--json",
+            "--yes",
+            "--ecosystems",
+            "golang",
+            "--api-url",
+            &server.uri(),
+            "--org",
+            "test",
+            "--api-token",
+            "fake",
+        ],
+        &[("GOMODCACHE", cache.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{so} {se}");
+    assert!(
+        warnings_of(&so).contains(&"go_vendor_modules_txt_out_of_sync".into()),
+        "{so}"
+    );
+    chmod_writable(tmp.path());
+}
+
+#[test]
+fn native_vendor_projection_and_workspace_selection() {
+    if !golang_e2e_matrix::toolchain_ready("native vendor projection") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy) = stage(tmp.path());
+    write_patch(&consumer);
+    let mut go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    go_mod.push_str(&format!("\nreplace {UMOD} v0.9.0 => ./unused\n"));
+    std::fs::write(consumer.join("go.mod"), go_mod).unwrap();
+    let manifest_path = consumer.join(".socket/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    for (name, body) in [
+        ("data/fix.txt", "fixed asset\n"),
+        ("data/other.txt", "other asset\n"),
+        ("embeds.go", "package upstream\nimport \"embed\"\n//go:embed \"data/*.txt\"\nvar assets embed.FS\nfunc AssetCount() int { entries, _ := assets.ReadDir(\"data\"); return len(entries) }\n"),
+        ("unused/unused.go", "package unused\nconst Fixed = true\n"),
+        ("testdata/case.txt", "patched test data\n"),
+        (
+            "generate.go",
+            "//go:build ignore && (linux || windows)\n\npackage main\nfunc main() {}\n",
+        ),
+        ("extra.go", "package upstream\nconst Fixed = true\n"),
+    ] {
+        let hash = git_sha256(body.as_bytes());
+        std::fs::write(consumer.join(".socket/blobs").join(&hash), body).unwrap();
+        manifest["patches"][UPURL]["files"][name] =
+            serde_json::json!({"beforeHash": "", "afterHash": hash});
+    }
+    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 0, "{so} {se}");
+    std::fs::create_dir_all(consumer.join("embed-probe")).unwrap();
+    std::fs::write(consumer.join("embed-probe/main.go"), format!("package main\nimport (\"fmt\"; \"{UMOD}\")\nfunc main() {{ fmt.Println(upstream.AssetCount()) }}\n")).unwrap();
+    let env = workspace_env(modcache.to_str().unwrap(), &proxy);
+    assert!(go(&consumer, &["mod", "vendor"], &env).status.success());
+    let native = consumer.join("vendor").join(UMOD);
+    for missing in ["unused/unused.go", "testdata/case.txt", "generate.go"] {
+        assert!(!native.join(missing).exists(), "Go should omit {missing}");
+    }
+    let audit = |wanted| {
+        let (code, so, se) = check(&consumer, &modcache);
+        assert_eq!(code, wanted, "audit: {so} {se}");
+        let (code, so, se) = run_socket(
+            &consumer,
+            &[
+                "vex",
+                "--offline",
+                "--json",
+                "--product",
+                "pkg:golang/example.com/consumer@v1.0.0",
+                "--output",
+                "vex.json",
+            ],
+            &modcache,
+        );
+        assert_eq!(code, wanted, "vex: {so} {se}");
+        if wanted == 0 {
+            assert!(std::fs::read_to_string(consumer.join("vex.json"))
+                .unwrap()
+                .contains(GHSA));
+        } else {
+            assert!(so.contains("go_vendor_content_mismatch"), "{so}");
+        }
+    };
+    assert!(go_out(&consumer, &env).contains("OUT: PATCHED"));
+    audit(0);
+    let count = go(&consumer, &["run", "./embed-probe"], &env);
+    assert!(count.status.success());
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2");
+    std::fs::remove_file(native.join("data/fix.txt")).unwrap();
+    let count = go(&consumer, &["run", "./embed-probe"], &env);
+    assert!(count.status.success());
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    audit(1);
+    assert!(go(&consumer, &["mod", "vendor"], &env).status.success());
+    // A missing source in a selected package is drift, not an omitted package.
+    std::fs::remove_file(native.join("extra.go")).unwrap();
+    audit(1);
+    assert!(go(&consumer, &["mod", "vendor"], &env).status.success());
+    std::fs::write(native.join("lib.go"), PRISTINE_LIB).unwrap();
+    for flags in [
+        "--mod=mod",
+        "--mod=readonly",
+        "'--mod=readonly'",
+        "\"-mod=mod\"",
+    ] {
+        let mut bypass = env.clone();
+        bypass.push(("GOFLAGS", flags));
+        assert!(
+            go_out(&consumer, &bypass).contains("OUT: PATCHED"),
+            "{flags}"
+        );
+        let (code, so, se) = common::run_with_env(
+            &consumer,
+            &["apply", "--check", "--offline", "--json"],
+            &[
+                ("GOMODCACHE", modcache.to_str().unwrap()),
+                ("GOFLAGS", flags),
+            ],
+        );
+        assert_eq!(code, 0, "{flags}: {so} {se}");
+    }
+    assert!(go(&consumer, &["mod", "vendor"], &env).status.success());
+    if golang_e2e_matrix::go_minor() >= 22 {
+        // Go 1.22+ selects workspace vendoring even with a go 1.21 directive.
+        // It first ignores the pre-existing module-mode vendor tree.
+        std::fs::write(native.join("lib.go"), PRISTINE_LIB).unwrap();
+        std::fs::write(consumer.join("go.work"), "go 1.21\nuse .\n").unwrap();
+        assert!(go_out(&consumer, &env).contains("OUT: PATCHED"));
+        audit(0);
+        let out = go(&consumer, &["work", "vendor"], &env);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(std::fs::read_to_string(consumer.join("go.work"))
+            .unwrap()
+            .starts_with("go 1.21\n"));
+        audit(0);
+        std::fs::write(native.join("lib.go"), PRISTINE_LIB).unwrap();
+        assert!(go_out(&consumer, &env).contains("OUT: PRISTINE"));
+        audit(1);
+        // Conversely module mode ignores a workspace vendor tree.
+        std::fs::remove_file(consumer.join("go.work")).unwrap();
+        assert!(go_out(&consumer, &env).contains("OUT: PATCHED"));
+        audit(0);
+    }
+    chmod_writable(tmp.path());
+}
+
+#[test]
+fn checksum_conflict_preserves_orphan_redirect_and_reports_failure() {
+    if !golang_e2e_matrix::toolchain_ready("checksum-conflict reconciliation") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy) = stage(tmp.path());
+    write_patch(&consumer);
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 0, "{so} {se}");
+    let saved = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+    let conflict = saved
+        .lines()
+        .map(|line| {
+            let mut words: Vec<_> = line.split_whitespace().collect();
+            words[2] = "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            words.join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(consumer.join("go.sum"), &conflict).unwrap();
+    std::fs::write(consumer.join(".socket/manifest.json"), "{\"patches\":{}}").unwrap();
+    let go_mod = std::fs::read(consumer.join("go.mod")).unwrap();
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 1, "{so} {se}");
+    assert!(so.contains("conflicts"), "{so}");
+    assert_eq!(std::fs::read(consumer.join("go.mod")).unwrap(), go_mod);
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.sum")).unwrap(),
+        conflict
+    );
+    let copy = consumer
+        .join(".socket/go-patches")
+        .join(format!("{UMOD}@{UVER}"));
+    assert!(copy.join("lib.go").is_file());
+    let env = workspace_env(modcache.to_str().unwrap(), &proxy);
+    assert!(go_out(&consumer, &env).contains("OUT: PATCHED"));
+    // Resolving the conflict permits reconciliation and removes the backup.
+    std::fs::write(consumer.join("go.sum"), saved).unwrap();
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 0, "{so} {se}");
+    assert!(!consumer.join(".socket/go-patches").exists());
+    assert!(go_out(&consumer, &env).contains("OUT: PRISTINE"));
     chmod_writable(tmp.path());
 }

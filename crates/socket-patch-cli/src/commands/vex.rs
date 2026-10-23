@@ -1898,6 +1898,7 @@ fn omission_phrase(reason: &str) -> &'static str {
         "file_not_found" => "a patched file is missing",
         "no_files" => "the patch record lists no files",
         "vendor_hash_mismatch" => "the vendored artifact does not match the patch",
+        "go_vendor_content_mismatch" => "the native Go vendor tree does not contain the patch; run go mod vendor (or go work vendor for a workspace)",
         "vendor_artifact_missing" => "the vendored artifact is missing",
         "vendor_artifact_unreadable" => "the vendored artifact cannot be read",
         "vendor_path_unsafe" => "the vendored artifact path is unsafe",
