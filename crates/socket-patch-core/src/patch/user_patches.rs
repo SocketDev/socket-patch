@@ -736,10 +736,14 @@ fn lock_options() -> serde_saphyr::Options {
     options
 }
 
+/// An npm `name@selector` key split at the first `@` past a scope, as Bun
+/// and pnpm split it: the selector may hold an `@` of its own, such as the
+/// hosted URL or vendored path Bun 1.4 keys a patch by after a rewire
+/// (`@s/p@.socket/vendor/npm/<uuid>/@s/p-1.0.0.tgz`, #1019).
 fn split_selector(key: &str) -> (&str, Option<&str>) {
-    match key.rsplit_once('@') {
-        Some((name, version)) if !name.is_empty() => (name, Some(version)),
-        _ => (key, None),
+    match crate::vendor::bun_lock_text::split_name_spec(key) {
+        Some((name, selector)) => (name, Some(selector)),
+        None => (key, None),
     }
 }
 
@@ -751,6 +755,27 @@ mod tests {
         let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// #1019: after a rewire, Bun 1.4 keys a later `bun patch` by the
+    /// package's resolution. A hosted URL or vendored path can hold an `@`
+    /// of its own, so the key splits at the first `@` past a scope, as Bun
+    /// splits it.
+    #[tokio::test]
+    async fn bun_resolution_keys_protect_scoped_and_unscoped_packages() {
+        for (key, purl) in [
+            ("plainpkg@https://patch.socket.dev/patch/npm/plainpkg/1.0.0/tok/u1/plainpkg-1.0.0.tgz", "pkg:npm/plainpkg@1.0.0"),
+            ("plainpkg@.socket/vendor/npm/u1/plainpkg-1.0.0.tgz", "pkg:npm/plainpkg@1.0.0"),
+            ("@s/p@https://patch.socket.dev/patch/npm/@s/p/1.0.0/tok/u1/p-1.0.0.tgz", "pkg:npm/%40s/p@1.0.0"),
+            ("@s/p@.socket/vendor/npm/u1/@s/p-1.0.0.tgz", "pkg:npm/%40s/p@1.0.0"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let manifest = format!(r#"{{"patchedDependencies":{{"{key}":"patches/x.patch"}}}}"#);
+            write(tmp.path(), "package.json", &manifest);
+            let index = UserPatchIndex::discover(tmp.path()).await;
+            assert!(!index.conflicts(purl).is_empty(), "{key}: {index:?}");
+            assert!(index.conflicts("pkg:npm/other@1.0.0").is_empty(), "{key}");
+        }
     }
 
     #[tokio::test]
