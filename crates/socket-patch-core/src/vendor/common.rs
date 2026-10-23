@@ -823,8 +823,8 @@ async fn revert_lock_fragment_splice_inner(
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
                     format!(
-                        "{lock_file} fragment for {:?} changed since vendoring; left untouched",
-                        rec.key
+                        "{lock_file} fragment for {} changed since vendoring; left untouched",
+                        rec.key_label()
                     ),
                 ));
             }

@@ -589,8 +589,8 @@ fn drift_warning(file: &str, rec: &WiringRecord) -> VendorWarning {
     VendorWarning::new(
         "vendor_revert_line_drifted",
         format!(
-            "{file}: the vendor line for {:?} changed since vendoring; left untouched",
-            rec.key
+            "{file}: the vendor line for {} changed since vendoring; left untouched",
+            rec.key_label()
         ),
     )
 }
@@ -2354,6 +2354,14 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.code == "vendor_revert_line_drifted"));
+        // The ledger key reads as recorded, never as `Some("…")` (#1608).
+        assert!(
+            outcome.warnings.iter().any(|w| w.detail.contains(
+                "requirements.txt: the vendor line for requirements.txt:1 changed since vendoring"
+            )),
+            "{:?}",
+            outcome.warnings
+        );
         // A drifted edit (still referencing the uuid dir) also raises the
         // residual-reference warning.
         assert!(outcome

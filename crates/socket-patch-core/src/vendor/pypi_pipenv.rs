@@ -587,8 +587,8 @@ pub(super) async fn revert_pipenv(
             VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
-                    "{LOCK_FILE} entry for {:?} changed since vendoring; left untouched",
-                    rec.key
+                    "{LOCK_FILE} entry for {} changed since vendoring; left untouched",
+                    rec.key_label()
                 ),
             )
         };
@@ -625,7 +625,7 @@ pub(super) async fn revert_pipenv(
             {
                 VendorWarning::new(
                     "vendor_lock_entry_relocked",
-                    format!("{LOCK_FILE} entry for {:?} was removed by a relock; the vendored reference is already gone, so the record is retired", rec.key),
+                    format!("{LOCK_FILE} entry for {} was removed by a relock; the vendored reference is already gone, so the record is retired", rec.key_label()),
                 )
             } else {
                 drifted()
@@ -683,8 +683,8 @@ pub(super) async fn revert_pipenv(
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_relocked",
                     format!(
-                        "{LOCK_FILE} entry for {:?} was regenerated to a registry reference by a relock; the vendored reference is already gone, so the record is retired",
-                        rec.key
+                        "{LOCK_FILE} entry for {} was regenerated to a registry reference by a relock; the vendored reference is already gone, so the record is retired",
+                        rec.key_label()
                     ),
                 ));
                 continue;
@@ -1741,6 +1741,14 @@ mod tests {
             "drifted entry + unknown kind: {:?}",
             outcome.warnings
         );
+        // The ledger key reads as recorded, never as `Some("…")` (#1608).
+        assert!(
+            outcome.warnings.iter().any(|w| w
+                .detail
+                .contains("Pipfile.lock entry for default:six changed since vendoring")),
+            "{:?}",
+            outcome.warnings
+        );
         assert_eq!(
             read_lock(tmp.path()).await,
             drifted,
@@ -2013,7 +2021,9 @@ mod tests {
             };
             assert_eq!(outcome.warnings[0].code, expected, "{label}");
             assert!(
-                outcome.warnings[0].detail.contains(key),
+                outcome.warnings[0]
+                    .detail
+                    .contains(&format!("entry for {key} ")),
                 "{label}: {}",
                 outcome.warnings[0].detail
             );
@@ -2062,7 +2072,13 @@ mod tests {
         assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
         assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
         assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_relocked");
-        assert!(outcome.warnings[0].detail.contains("docs:six"));
+        assert!(
+            outcome.warnings[0]
+                .detail
+                .contains("entry for docs:six was removed by a relock"),
+            "{}",
+            outcome.warnings[0].detail
+        );
         assert_eq!(read_lock(tmp.path()).await, relocked_text);
 
         // The same record while another category still routes through the

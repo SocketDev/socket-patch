@@ -946,9 +946,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             VendorWarning::new(
                 super::LOCK_ENTRY_REMOVED_CODE,
                 format!(
-                    "{} entry for {:?} no longer exists and nothing else references {needle} \
+                    "{} entry for {} no longer exists and nothing else references {needle} \
                      (the dependency was removed); nothing to restore",
-                    rec.kind, rec.key
+                    rec.kind,
+                    rec.key_label()
                 ),
             )
         })
@@ -973,7 +974,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         warnings.push(VendorWarning::new(
                             "vendor_lock_entry_drifted",
                             format!(
-                                "uv.lock entry for {key:?} can't be restored to match \
+                                "uv.lock entry for {key} can't be restored to match \
                                  pyproject.toml ({reason}); left untouched"
                             ),
                         ));
@@ -988,8 +989,8 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
-                    "{what} fragment for {:?} changed since vendoring; left untouched",
-                    rec.key
+                    "{what} fragment for {} changed since vendoring; left untouched",
+                    rec.key_label()
                 ),
             )
         };
@@ -5250,6 +5251,14 @@ wheels = [
         assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
         assert!(
             outcome.warnings[0].detail.contains("pyproject.toml"),
+            "{}",
+            outcome.warnings[0].detail
+        );
+        // The ledger key reads as recorded, never as `Some("…")` (#1608).
+        assert!(
+            outcome.warnings[0]
+                .detail
+                .contains("fragment for six changed since vendoring"),
             "{}",
             outcome.warnings[0].detail
         );

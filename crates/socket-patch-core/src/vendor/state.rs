@@ -151,6 +151,14 @@ pub struct WiringRecord {
     pub new: Option<serde_json::Value>,
 }
 
+impl WiringRecord {
+    /// The key as user-facing warning text: verbatim, or `<unknown>` for a
+    /// record without one (an older or hand-written ledger).
+    pub fn key_label(&self) -> &str {
+        self.key.as_deref().unwrap_or("<unknown>")
+    }
+}
+
 /// Original Cargo.lock fields removed by the path-dep surgery; not
 /// recomputable offline (the checksum is the sha256 of the registry `.crate`
 /// tarball, not of the extracted tree).
@@ -1076,6 +1084,23 @@ mod tests {
     use super::*;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    /// Warnings name the ledger key as recorded, never in debug form
+    /// (`Some("default:six")`, #1608).
+    #[test]
+    fn key_label_is_plain_text() {
+        let mut rec = WiringRecord {
+            file: "Pipfile.lock".into(),
+            kind: "pipenv_lock_entry".into(),
+            action: WiringAction::Rewritten,
+            key: Some("default:six".into()),
+            original: None,
+            new: None,
+        };
+        assert_eq!(rec.key_label(), "default:six");
+        rec.key = None;
+        assert_eq!(rec.key_label(), "<unknown>");
+    }
 
     fn sample_entry() -> VendorEntry {
         VendorEntry::new(
