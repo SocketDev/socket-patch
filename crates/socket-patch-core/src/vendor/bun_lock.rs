@@ -930,7 +930,8 @@ pub async fn live_user_patch_keys(project_root: &Path) -> std::collections::BTre
             .collect();
         return live_resolution_keys(&keys, specs.iter().map(String::as_str));
     }
-    let Ok(bytes) = tokio::fs::read(project_root.join("bun.lockb")).await else {
+    let Ok(bytes) = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb")).await
+    else {
         return Default::default();
     };
     let specs: Vec<String> = super::bun_lockb::BunLockb::parse_packages(&bytes)
