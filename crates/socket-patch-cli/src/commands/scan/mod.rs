@@ -3584,6 +3584,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pypi_equivalents_add_spellings_only_for_lockfile_only_pypi_pins() {
+        let purls: Vec<String> = [
+            "pkg:npm/left-pad@1.3.0",
+            "pkg:pypi/six@1.16",
+            "pkg:PyPI/attrs@23.1",
+            "pkg:pypi/idna@3.4",
+        ]
+        .map(String::from)
+        .to_vec();
+        let lockfile_only: HashSet<PurlKey> = ["pkg:pypi/six@1.16", "pkg:pypi/attrs@23.1"]
+            .into_iter()
+            .map(PurlKey::new)
+            .collect();
+        let out = with_pypi_equivalents(&purls, &lockfile_only);
+        assert_eq!(out[..purls.len()], purls[..]);
+        let added = &out[purls.len()..];
+        assert!(
+            added.contains(&"pkg:pypi/six@1.16.0".to_string()),
+            "{added:?}"
+        );
+        assert!(
+            added.contains(&"pkg:pypi/attrs@23.1.0".to_string()),
+            "{added:?}"
+        );
+        assert!(added
+            .iter()
+            .all(|p| !p.contains("idna") && !p.contains("npm")));
+        // No PyPI pin: the list goes out as it came in.
+        let npm_only = vec!["pkg:npm/left-pad@1.3.0".to_string()];
+        assert_eq!(with_pypi_equivalents(&npm_only, &lockfile_only), npm_only);
+        assert!(is_pypi_purl(" pkg:PYPI/six@1.16") && !is_pypi_purl("pkg:pypi"));
+    }
+
+    #[test]
     fn project_dirs_resolve_directories_and_globs() {
         let tmp = tempfile::tempdir().unwrap();
         for d in ["apps/web", "apps/api", "libs/core"] {

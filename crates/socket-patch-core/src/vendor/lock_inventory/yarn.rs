@@ -327,3 +327,56 @@ fn berry_registry_view(text: &str) -> Vec<LockfileEntry> {
     }
     out
 }
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    const HOSTED: &str = "https://patch.socket.dev/npm/left-pad/-/left-pad-1.3.0.tgz";
+
+    fn lock() -> BerryLock {
+        berry_entries(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+             \"lodash@npm:^4.17.0\":\n  version: 4.17.21\n  \
+             resolution: \"lodash@npm:4.17.21\"\n\n\
+             \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@npm:1.3.0::__archiveUrl=https%3A%2F%2Fpatch.socket.dev%2Fnpm%2Fleft-pad%2F-%2Fleft-pad-1.3.0.tgz\"\n\n\
+             \"chalk@https://patch.socket.dev/npm/chalk/-/chalk-5.0.0.tgz\":\n  version: 5.0.0\n  \
+             resolution: \"chalk@https://patch.socket.dev/npm/chalk/-/chalk-5.0.0.tgz\"\n",
+        )
+    }
+
+    #[test]
+    fn one_lock_answers_every_selector_from_its_index() {
+        let lock = lock();
+        // The url a live entry resolves, as a locator or a decoded
+        // `__archiveUrl=` binding, is still wired.
+        assert!(!berry_selector_routes_nothing(&lock, "left-pad", HOSTED));
+        let chalk = "https://patch.socket.dev/npm/chalk/-/chalk-5.0.0.tgz";
+        assert!(!berry_selector_routes_nothing(&lock, "nobody", chalk));
+        // A range-less selector matches any descriptor of its package.
+        let gone = "https://patch.socket.dev/npm/lodash/-/lodash-4.17.20.tgz";
+        assert!(!berry_selector_routes_nothing(&lock, "lodash", gone));
+        assert!(!berry_selector_routes_nothing(&lock, "**/lodash", gone));
+        // `name@range` matches that descriptor, with or without `npm:`.
+        assert!(!berry_selector_routes_nothing(
+            &lock,
+            "lodash@^4.17.0",
+            gone
+        ));
+        assert!(!berry_selector_routes_nothing(
+            &lock,
+            "lodash@npm:^4.17.0",
+            gone
+        ));
+        // Leftovers: another range, or a package the lock no longer has.
+        assert!(berry_selector_routes_nothing(&lock, "lodash@^3.0.0", gone));
+        let removed = "https://patch.socket.dev/npm/is-odd/-/is-odd-3.0.1.tgz";
+        assert!(berry_selector_routes_nothing(&lock, "is-odd", removed));
+        assert!(berry_selector_routes_nothing(
+            &lock,
+            "parent/is-odd@^3.0.0",
+            removed
+        ));
+    }
+}
