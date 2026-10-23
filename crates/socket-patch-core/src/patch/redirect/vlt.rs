@@ -385,11 +385,13 @@ pub(super) fn every_instance_pinned(
 
 /// The nodes of `ids` in `text`'s `nodes` object, as `serde_json::Value`
 /// would read them (the last `nodes` and the last duplicate key win).
-/// Every byte is still parsed, so a document `Value` refuses is refused
-/// here too, but the other nodes are skipped instead of built: the gate
-/// runs once per override, and building a 1500-node lock each time was
-/// most of a hosted vlt scan (#1570). `None` when `text` is not a JSON
-/// object or its `nodes` is not an object.
+/// The whole document is still parsed, so broken JSON anywhere is refused,
+/// but every other value is skipped instead of built: the gate runs once
+/// per override, and building a 1500-node lock each time was most of a
+/// hosted vlt scan (#1570). Skipping does not range-check numbers or pair
+/// `\u` surrogates; the text it reads is a lock `sniff_lock` already read
+/// whole, with only node lines re-rendered. `None` when `text` is not a
+/// JSON object or its `nodes` is not an object.
 fn parse_nodes_of(text: &str, ids: &[&str]) -> Option<Map<String, Value>> {
     use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
     use std::fmt;
