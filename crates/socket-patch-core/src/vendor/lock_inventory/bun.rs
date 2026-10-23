@@ -1,9 +1,10 @@
 //! `bun.lock` / `bun.lockb`: the registry views.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
-use crate::formats::bun::{BunEntries, BunTextError, BunTextLock};
+use crate::formats::bun::{BunTextError, BunTextLock};
 use crate::patch::redirect::hosted_url_version;
 use crate::vendor::bun_lock_text::{self, BunEntry};
 use crate::vendor::bun_lockb::BunLockb;
@@ -19,9 +20,9 @@ use super::{http_url, LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
 /// elements. `Err` is the user-facing refusal detail (it names the file): a
 /// lock the backends refuse — a hand re-indented one included — is one
 /// neither the inventory nor lockfile discovery reads.
-pub(crate) fn bun_text_entries(text: &str) -> Result<BunEntries, String> {
+pub(crate) fn bun_text_entries(text: &str) -> Result<Arc<BunTextLock>, String> {
     match BunTextLock::parse_shared(text) {
-        Ok(lock) => Ok(BunEntries::new(lock)),
+        Ok(lock) => Ok(lock),
         Err(BunTextError::Version(detail)) => Err(detail),
         Err(BunTextError::Packages(e)) => Err(format!("{BUN_LOCK}: {e}")),
     }
@@ -115,10 +116,10 @@ pub(super) async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
 
 pub(super) async fn inventory_bun_in(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text(BUN_LOCK).await.ok()?;
-    let entries = bun_text_entries(&text).ok()?;
+    let lock = bun_text_entries(&text).ok()?;
 
     let mut out = Vec::new();
-    for entry in &entries {
+    for entry in &lock.entries {
         if let Some(hosted) = hosted_pin_entry(entry) {
             out.push(hosted);
             continue;

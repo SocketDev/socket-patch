@@ -50,8 +50,9 @@ impl BunTextLock {
     }
 
     /// [`Self::parse`], shared: a scan reads one `bun.lock` in the lock
-    /// inventory, in VEX discovery and in the hosted redirect, and parsing
-    /// a large lock is most of a Bun rescan's CPU (#1606). The last lock
+    /// inventory, in VEX discovery and in the hosted redirect (and the
+    /// vendored preflight once per package), and parsing a large lock is
+    /// most of a Bun rescan's CPU (#1606). The last lock
     /// parsed is kept, and a text whose lines are exactly its
     /// [`Self::lines`] gets it back; any other text (a changed lock) is
     /// parsed again. A refused lock is not kept. Readers only; a splice
@@ -86,33 +87,6 @@ impl ParseMemo {
         let lock = Arc::new(BunTextLock::parse(text)?);
         *last() = Some(Arc::clone(&lock));
         Ok(lock)
-    }
-}
-
-/// The `packages` entries of a [`BunTextLock::parse_shared`] lock.
-#[derive(Clone)]
-pub(crate) struct BunEntries(Arc<BunTextLock>);
-
-impl BunEntries {
-    pub(crate) fn new(lock: Arc<BunTextLock>) -> Self {
-        BunEntries(lock)
-    }
-}
-
-impl std::ops::Deref for BunEntries {
-    type Target = [BunEntry];
-
-    fn deref(&self) -> &[BunEntry] {
-        &self.0.entries
-    }
-}
-
-impl<'a> IntoIterator for &'a BunEntries {
-    type Item = &'a BunEntry;
-    type IntoIter = std::slice::Iter<'a, BunEntry>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.entries.iter()
     }
 }
 
@@ -191,12 +165,11 @@ mod tests {
     }
 
     #[test]
-    fn shared_entries_read_like_the_parse() {
-        let shared = BunEntries::new(BunTextLock::parse_shared(LOCK).unwrap());
+    fn shared_parse_reads_like_the_parse() {
+        let shared = BunTextLock::parse_shared(LOCK).unwrap();
         let parsed = BunTextLock::parse(LOCK).unwrap();
-        let keys: Vec<&str> = (&shared).into_iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, ["left-pad"]);
-        assert_eq!(shared.len(), parsed.entries.len());
-        assert_eq!(shared[0].elems, parsed.entries[0].elems);
+        assert_eq!(shared.lines, parsed.lines);
+        assert_eq!(shared.entries.len(), parsed.entries.len());
+        assert_eq!(shared.entries[0].elems, parsed.entries[0].elems);
     }
 }
