@@ -379,9 +379,108 @@ pub(super) fn every_instance_pinned(
     sha512: &str,
     url: &str,
 ) -> Option<()> {
-    let json: Value = serde_json::from_str(text).ok()?;
-    let nodes = json.get("nodes")?.as_object()?;
-    instances_pinned(nodes, ids, sha512, url).then_some(())
+    let nodes = parse_nodes_of(text, ids)?;
+    instances_pinned(&nodes, ids, sha512, url).then_some(())
+}
+
+/// The nodes of `ids` in `text`'s `nodes` object, as `serde_json::Value`
+/// would read them (the last `nodes` and the last duplicate key win).
+/// Every byte is still parsed, so a document `Value` refuses is refused
+/// here too, but the other nodes are skipped instead of built: the gate
+/// runs once per override, and building a 1500-node lock each time was
+/// most of a hosted vlt scan (#1570). `None` when `text` is not a JSON
+/// object or its `nodes` is not an object.
+fn parse_nodes_of(text: &str, ids: &[&str]) -> Option<Map<String, Value>> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+    use std::fmt;
+
+    struct Lock<'a>(&'a [&'a str]);
+    struct Nodes<'a>(&'a [&'a str]);
+
+    impl<'de> Visitor<'de> for Lock<'_> {
+        type Value = Option<Map<String, Value>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut nodes = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "nodes" {
+                    nodes = map.next_value_seed(Nodes(self.0))?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(nodes)
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for Nodes<'_> {
+        type Value = Option<Map<String, Value>>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Nodes<'_> {
+        type Value = Option<Map<String, Value>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("any JSON value")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut nodes = Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if self.0.contains(&key.as_str()) {
+                    nodes.insert(key, map.next_value::<Value>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(Some(nodes))
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(text);
+    let nodes = serde::Deserializer::deserialize_map(&mut de, Lock(ids)).ok()?;
+    de.end().ok()?;
+    nodes
 }
 
 /// Does every node of `ids` carry the patched sha512 and URL?
@@ -875,6 +974,51 @@ mod tests {
         assert_eq!(outside.len(), 3, "{outside:?}");
         assert!(vendored);
         assert_eq!(hosted.index.nodes.len(), nodes.len() - 1);
+    }
+
+    /// The gate's skipping parse reads exactly the nodes a full
+    /// `serde_json::Value` parse would, and refuses what it refuses.
+    #[test]
+    fn the_gate_parse_matches_a_full_value_parse() {
+        let ids = ["a", "b"];
+        let full = |text: &str| -> Option<Map<String, Value>> {
+            let json: Value = serde_json::from_str(text).ok()?;
+            let nodes = json.get("nodes")?.as_object()?;
+            Some(
+                nodes
+                    .iter()
+                    .filter(|(id, _)| ids.contains(&id.as_str()))
+                    .map(|(id, tuple)| (id.clone(), tuple.clone()))
+                    .collect(),
+            )
+        };
+        for text in [
+            r#"{"nodes": {"a": [0, "a", "s", "u"], "c": [0, "c"], "b": 1}}"#,
+            r#"{"lockfileVersion": 1, "options": {"x": [1.5, -2, null, true, {"y": "z"}]}, "nodes": {"a": [0, "a"]}, "edges": {"e": "f"}}"#,
+            r#"{"nodes": {"a": [0, "old"]}, "nodes": {"a": [0, "new"]}}"#,
+            r#"{"nodes": {"a": [0, "first"], "a": [0, "last"]}}"#,
+            r#"{"nodes": {"a": [0, "a"]}, "nodes": []}"#,
+            r#"{"nodes": [], "nodes": {"b": [0, "b"]}}"#,
+            r#"{"nodes": {"a": [0, "a"]}}"#,
+            r#"{"nodes": "x"}"#,
+            r#"{"nodes": null}"#,
+            r#"{"nodes": 7}"#,
+            r#"{"nodes": -7.5}"#,
+            r#"{"nodes": false}"#,
+            r#"{"other": {}}"#,
+            r#"{}"#,
+            "  {\"nodes\": {}}\r\n",
+            r#"{"nodes": {"a": [0, "a"]}, "edges": {"e": }}"#,
+            r#"{"nodes": {"a": [0, "a"]}} trailing"#,
+            r#"{"nodes": {"a": [0, "a"],}}"#,
+            r#"{"nodes": {"a": [0, "a"]}, "x": "\q"}"#,
+            r#"{"nodes": {"a": [0, "a"]}"#,
+            r#"[{"nodes": {}}]"#,
+            r#""nodes""#,
+            "",
+        ] {
+            assert_eq!(parse_nodes_of(text, &ids), full(text), "{text}");
+        }
     }
 
     #[test]
