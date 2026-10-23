@@ -1196,29 +1196,30 @@ impl PnpmTarballPolicy {
         tarball: &str,
         from_project: bool,
     ) -> bool {
-        let registry = pnpm_tarball_registry(
+        let own = self.registry(name);
+        let compared = pnpm_tarball_registry(
             self.workspace.as_deref(),
             self.npmrc.as_deref(),
             self.major,
             self.scoped_tarballs,
             name,
         );
-        if registry == self.registry(name) {
-            return registry_derives_tarball(
-                registry.as_deref(),
-                from_project,
-                name,
-                version,
-                tarball,
-            );
-        }
         // pnpm compares with the default registry, not the scope one the
         // document came from (#1619).
-        let own = registry
-            .as_deref()
-            .is_some_and(|r| non_default_registry(r).is_some());
-        registry_derives_tarball(registry.as_deref(), own, name, version, tarball)
+        let from_project = if compared == own {
+            from_project
+        } else {
+            pnpm_registry_is_own(compared.as_deref())
+        };
+        registry_derives_tarball(compared.as_deref(), from_project, name, version, tarball)
     }
+}
+
+/// Whether a registry pnpm names is the project's own rather than the
+/// default one, as [`registry_derives_tarball`]'s `from_project` reads it
+/// when no version document was read from it.
+fn pnpm_registry_is_own(registry: Option<&str>) -> bool {
+    registry.is_some_and(|r| non_default_registry(r).is_some())
 }
 
 /// The pnpm major whose settings reading applies to the lock `text`: the
@@ -1487,9 +1488,7 @@ fn pnpm_lock_tarball_evidence(
                 // No document was read: the lock's URL came from the
                 // registry pnpm names, the default one when it names none.
                 let registry = registry(name);
-                let own = registry
-                    .as_deref()
-                    .is_some_and(|r| non_default_registry(r).is_some());
+                let own = pnpm_registry_is_own(registry.as_deref());
                 derived |=
                     registry_derives_tarball(registry.as_deref(), own, name, version, tarball);
             }
@@ -2800,7 +2799,7 @@ mod tests {
         pnpm_lookup_registry, pnpm_records_scoped_tarballs, pnpm_spec_version,
         pnpm_tarball_guess_warning, pnpm_tarball_registry, registry_derives_tarball,
         rush_json_pnpm_version, rush_lock_root, split_userinfo, yaml_top_level_value,
-        yarn_expand_env, PnpmTarballGuess, ProjectDist,
+        yarn_expand_env, PnpmTarballGuess, PnpmTarballPolicy, ProjectDist,
     };
     use crate::patch::redirect::upstream::client::NpmDist;
 
@@ -3863,6 +3862,38 @@ mod tests {
         assert!(!derives(rc, true));
         let both = "registry=https://s.example/\n@s:registry=https://s.example/\n";
         assert!(derives(both, true));
+    }
+
+    /// #1619 through the restore's policy: pnpm 12.0–12.12 derive a scoped
+    /// URL only when it is conventional under the default registry, a
+    /// configured mirror included, while other pnpm compare with the scope
+    /// registry the document came from.
+    #[test]
+    fn pnpm_12_policy_compares_scoped_tarballs_with_the_default_registry() {
+        let policy = |npmrc: &str, scoped_tarballs| PnpmTarballPolicy {
+            always: false,
+            guess: None,
+            rush: false,
+            workspace: None,
+            npmrc: Some(npmrc.to_string()),
+            major: Some(12),
+            scoped_tarballs,
+            settings_prefix: String::new(),
+        };
+        let rc = "registry=https://m.example/npm/\n@s:registry=https://s.example/\n";
+        let scoped = "https://s.example/@s/a/-/a-1.0.0.tgz";
+        let mirrored = "https://m.example/npm/@s/a/-/a-1.0.0.tgz";
+        let derives = |quirk, name: &str, tarball| {
+            policy(rc, quirk).derives_tarball(name, "1.0.0", tarball, true)
+        };
+        assert!(derives(false, "@s/a", scoped));
+        assert!(!derives(true, "@s/a", scoped));
+        assert!(!derives(false, "@s/a", mirrored));
+        assert!(derives(true, "@s/a", mirrored));
+        // An unscoped name resolves against the default registry anyway.
+        let plain = "https://m.example/npm/a/-/a-1.0.0.tgz";
+        assert!(derives(false, "a", plain));
+        assert!(derives(true, "a", plain));
     }
 
     #[test]
