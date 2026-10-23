@@ -706,6 +706,161 @@ fn uv_header_command(text: &str) -> Option<Vec<&str>> {
         })
 }
 
+/// #1603: why uv would refuse a patched wheel wired into the PEP 751 lock
+/// `text` for `name`, if it would. uv installs a package only from an sdist
+/// under `--no-binary` (naming it or `:all:`), and every Socket artifact is
+/// a wheel, so `uv pip sync` / `uv pip install -r` of the wired lock fails
+/// ("marked as `--no-binary` but is itself a binary distribution"). The
+/// signals are the `uv pip compile` command line the header records and
+/// the uv `settings` files (as [`settings_no_binary`] reads them), which
+/// `uv pip sync` reads whether or not `uv pip compile` ran with
+/// `--no-config`. Only a lock uv wrote is checked: another installer reads
+/// no uv setting.
+pub(crate) fn pylock_no_binary(
+    text: &str,
+    name: &str,
+    settings: &[(String, toml_edit::Table)],
+) -> Option<String> {
+    let doc = text.parse::<DocumentMut>().ok()?;
+    if doc.get("created-by").and_then(Item::as_str) != Some("uv") {
+        return None;
+    }
+    let name = canonicalize_pypi_name(name);
+    let command = uv_header_command(text).filter(|c| is_pip_compile(c));
+    let consequence = format!(
+        "so uv installs {name} only from an sdist and `uv pip sync` of the lock would fail on \
+         the patched wheel (\"marked as `--no-binary` but is itself a binary distribution\"); \
+         patches ship as wheels, so to wire one let uv install {name} from a wheel"
+    );
+    if command.is_some_and(|command| binary_flag_covers(&command, "--no-binary", &name)) {
+        return Some(format!(
+            "the lock's `uv pip compile --no-binary` covers {name}, {consequence}"
+        ));
+    }
+    let (path, key) = settings_no_binary(settings, &name)?;
+    Some(format!(
+        "{path}'s uv `{key}` setting covers {name}, {consequence}"
+    ))
+}
+
+/// Whether the `uv pip compile` `command`'s `flag` (`--no-binary` or
+/// `--only-binary`) covers `name` (PEP 503 canonical): pip's
+/// comma-separated values naming it or `:all:`, where `:none:` clears the
+/// values before it.
+fn binary_flag_covers(command: &[&str], flag: &str, name: &str) -> bool {
+    let mut covered = false;
+    let mut args = command.iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.split_once('=') {
+            Some((f, value)) if f == flag => Some(value),
+            None if *arg == flag => args.next().copied(),
+            _ => None,
+        };
+        if let Some(value) = value {
+            covered = specifiers_cover(covered, value.split(','), name);
+        }
+    }
+    covered
+}
+
+/// Whether pip-style package specifiers, applied in order to an earlier
+/// verdict `covered`, cover `name` (PEP 503 canonical): a value naming it
+/// or `:all:` covers it, and `:none:` clears the values before it (uv
+/// reads a settings list the same way as repeated flags).
+fn specifiers_cover<'a>(
+    mut covered: bool,
+    values: impl IntoIterator<Item = &'a str>,
+    name: &str,
+) -> bool {
+    for value in values {
+        match value {
+            ":none:" => covered = false,
+            ":all:" => covered = true,
+            value if canonicalize_pypi_name(value) == name => covered = true,
+            _ => {}
+        }
+    }
+    covered
+}
+
+/// The uv setting in `files` under which `uv pip` installs `name` (PEP 503
+/// canonical) only from an sdist, as `(file that sets it, key)`. Checked
+/// against uv 0.11: `[pip] no-binary` (naming it or `:all:`, read in order
+/// with `:none:` clearing the values before it) and the
+/// top-level settings add up rather than one replacing the other; at the
+/// top level the first file setting `no-binary` decides it for every
+/// package, and `no-binary = false` turns off the `no-binary-package`
+/// lists, which otherwise add up across files.
+fn settings_no_binary(
+    files: &[(String, toml_edit::Table)],
+    name: &str,
+) -> Option<(String, String)> {
+    let pip = files.iter().find(|(_, uv)| {
+        pip_table(uv)
+            .and_then(|pip| pip.get("no-binary"))
+            .and_then(Item::as_array)
+            .is_some_and(|list| {
+                specifiers_cover(false, list.iter().filter_map(Value::as_str), name)
+            })
+    });
+    if let Some((path, _)) = pip {
+        return Some((path.clone(), "[pip] no-binary".to_string()));
+    }
+    let all = files
+        .iter()
+        .find_map(|(path, uv)| Some((path, uv.get("no-binary")?.as_bool()?)));
+    match all {
+        Some((path, true)) => return Some((path.clone(), "no-binary".to_string())),
+        Some((_, false)) => return None,
+        None => {}
+    }
+    files
+        .iter()
+        .find(|(_, uv)| {
+            uv.get("no-binary-package")
+                .is_some_and(|v| v.as_array().is_some() && names_package(v, name))
+        })
+        .map(|(path, _)| (path.clone(), "no-binary-package".to_string()))
+}
+
+/// The uv settings table `uv pip` reads for a lock in the project root,
+/// labelled with the file it came from: the root's `uv.toml` text, else
+/// its `pyproject` text's `[tool.uv]`, else (when the root sets none) the
+/// `ancestor` settings file above it ([`find_ancestor_uv_config`]). Like
+/// uv, a `uv.toml` replaces pyproject's settings. A file that does not
+/// parse sets nothing here: uv reports it itself.
+///
+/// [`find_ancestor_uv_config`]: crate::utils::python_script::find_ancestor_uv_config
+pub(crate) fn root_uv_settings(
+    uv_toml: Option<&str>,
+    pyproject: Option<&str>,
+    ancestor: Option<&crate::utils::python_script::UvConfig>,
+) -> Option<(String, toml_edit::Table)> {
+    if let Some(text) = uv_toml {
+        let doc = text.parse::<DocumentMut>().ok()?;
+        return Some(("uv.toml".to_string(), doc.as_table().clone()));
+    }
+    if let Some(uv) = pyproject.and_then(pyproject_uv_table) {
+        return Some(("pyproject.toml".to_string(), uv));
+    }
+    let ancestor = ancestor?;
+    if ancestor.is_uv_toml() {
+        let doc = ancestor.text.parse::<DocumentMut>().ok()?;
+        Some((ancestor.rel.clone(), doc.as_table().clone()))
+    } else {
+        Some((ancestor.rel.clone(), pyproject_uv_table(&ancestor.text)?))
+    }
+}
+
+/// A pyproject text's `[tool.uv]` table (also spelled inline).
+fn pyproject_uv_table(text: &str) -> Option<toml_edit::Table> {
+    let doc = text.parse::<DocumentMut>().ok()?;
+    let uv = doc.get("tool")?.get("uv")?;
+    uv.as_table()
+        .cloned()
+        .or_else(|| uv.as_inline_table().map(|t| t.clone().into_table()))
+}
+
 /// Whether a filter setting's value reaches `name`: `true`, a cutoff date,
 /// a list naming it (or `:all:`), or a per-package cutoff table naming it
 /// with anything but `false` (uv's "no cutoff").
@@ -775,19 +930,19 @@ fn compile_filter(command: &[&str], name: &str, exempt: bool) -> Option<String> 
             "--exclude-newer" => {
                 inline.or_else(|| args.next().copied()) != Some("false") && !exempt
             }
-            "--only-binary" | "--no-binary" | "--exclude-newer-package" => {
+            "--only-binary" | "--no-binary" => {
+                if inline.is_none() {
+                    args.next();
+                }
+                binary_flag_covers(command, flag, name)
+            }
+            "--exclude-newer-package" => {
                 let Some(value) = inline.or_else(|| args.next().copied()) else {
                     continue;
                 };
-                if flag == "--exclude-newer-package" {
-                    value.split_once('=').is_some_and(|(package, cutoff)| {
-                        canonicalize_pypi_name(package) == name && cutoff != "false"
-                    })
-                } else {
-                    value
-                        .split(',')
-                        .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name)
-                }
+                value.split_once('=').is_some_and(|(package, cutoff)| {
+                    canonicalize_pypi_name(package) == name && cutoff != "false"
+                })
             }
             _ => false,
         };
@@ -824,13 +979,7 @@ async fn pip_settings(
         }
         let pyproject = path("pyproject.toml");
         if let Some(text) = view.read(&pyproject).await? {
-            let uv = text.parse::<DocumentMut>().ok().and_then(|doc| {
-                let uv = doc.get("tool")?.get("uv")?;
-                uv.as_table()
-                    .cloned()
-                    .or_else(|| uv.as_inline_table().map(|t| t.clone().into_table()))
-            });
-            if let Some(uv) = uv {
+            if let Some(uv) = pyproject_uv_table(&text) {
                 return Ok(Some((pyproject, uv)));
             }
         }

@@ -709,16 +709,22 @@ pub async fn read_candidate_files(
         .files
         .keys()
         .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path));
-    if uv_lane {
+    // A PEP 751 lock is installed with `uv pip`, which refuses the patched
+    // wheel under the `no-binary` settings of the root's `uv.toml` (#1603).
+    let pylock_lane = out
+        .files
+        .keys()
+        .any(|path| crate::utils::python_lock::is_pep751_lock_name(path));
+    if uv_lane || pylock_lane {
         let rel = crate::utils::python_script::UV_TOML;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
             out.files.insert(rel.to_string(), text);
         }
     }
-    // A PEP 723 script (#1501) or a project (#1545) also takes uv's
-    // settings from above the root when the root holds none; only a disk
-    // view has an above.
-    if uv_lane
+    // A PEP 723 script (#1501), a project (#1545) or `uv pip` installing a
+    // PEP 751 lock (#1603) also takes uv's settings from above the root
+    // when the root holds none; only a disk view has an above.
+    if (uv_lane || pylock_lane)
         && !crate::utils::python_script::root_governs_script(
             out.files.get("pyproject.toml").map(String::as_str),
             out.files
