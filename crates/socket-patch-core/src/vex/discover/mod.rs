@@ -2540,7 +2540,18 @@ pub(crate) fn toml_or_diag<S: AsRef<str>>(
     style: TomlDiag,
     out: &mut Discovery,
 ) -> Option<toml_edit::Document<S>> {
-    match toml_edit::Document::parse(text) {
+    toml_result_or_diag(file, toml_edit::Document::parse(text), style, out)
+}
+
+/// [`toml_or_diag`] for a parse the caller already took (a shared one, as
+/// `lock_fragments::parse_lock` hands out).
+pub(crate) fn toml_result_or_diag<T>(
+    file: &str,
+    parsed: Result<T, toml_edit::TomlError>,
+    style: TomlDiag,
+    out: &mut Discovery,
+) -> Option<T> {
+    match parsed {
         Ok(doc) => Some(doc),
         Err(e) => {
             let reason = match style {

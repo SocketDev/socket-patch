@@ -396,7 +396,8 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// can be chosen there). A lock that is not TOML contributes nothing.
 async fn inventory_poetry_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text("poetry.lock").await.ok()?;
-    let document = toml_edit::Document::parse(text.as_str()).ok()?;
+    // The parse VEX discovery and the redirect share (#1473, #1624).
+    let document = crate::utils::lock_fragments::parse_lock(&text).ok()?;
     let pure_wheel_sha = |files: Vec<&dyn TableLike>| {
         files.into_iter().find_map(|entry| {
             let file = entry.get("file")?.as_str()?;
@@ -589,7 +590,8 @@ async fn inventory_pipfile_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEn
 /// does not probe, so a lock-only vendored path would not survive a re-scan.
 async fn inventory_pdm_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text("pdm.lock").await.ok()?;
-    let document = toml_edit::Document::parse(text.as_str()).ok()?;
+    // The parse VEX discovery and the redirect share (#1473, #1624).
+    let document = crate::utils::lock_fragments::parse_lock(&text).ok()?;
     let out: Vec<LockfileEntry> = toml_package_coords(&document)
         .into_iter()
         .map(|(name, version, purl, _)| LockfileEntry {
