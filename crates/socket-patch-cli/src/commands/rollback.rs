@@ -852,6 +852,9 @@ struct VendoredLegOutcome {
     /// could not be saved.
     failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
+    /// Orphan uuid dirs (no ledger entry) swept, by
+    /// [`crate::commands::vendor::orphan_label`] (previewed on dry-run).
+    orphans_removed: Vec<String>,
 }
 
 /// Unwire the in-scope vendored entries. `preserve` keeps artifacts and
@@ -1062,6 +1065,15 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
                 .with_details(vendored(serde_json::json!({}))),
             vendor_uuid(key),
         ));
+    }
+    // Swept orphan dirs are `removed` on a dry run too (as in
+    // `vendor --revert`): `verified` would read as a vendored restore.
+    for label in &leg.orphans_removed {
+        env.record(
+            PatchEvent::new(PatchAction::Removed, label.clone())
+                .with_reason("vendor_orphan_removed", "vendored dir had no ledger entry")
+                .with_details(vendored(serde_json::json!({}))),
+        );
     }
 
     // ── hosted leg ──
@@ -1773,16 +1785,61 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // `--preserve-state` keeps artifacts and entries. Skipped
             // fail-closed when the ledger is unreadable.
             let mut vendored_leg = VendoredLegOutcome::default();
+            let mut vs = vendor_state_result
+                .as_ref()
+                .ok()
+                .cloned()
+                .unwrap_or_default();
             if !vendor_corrupt && !vendor_scope.is_empty() {
-                let mut vs = vendor_state_result
-                    .as_ref()
-                    .ok()
-                    .cloned()
-                    .unwrap_or_default();
                 let mut keys: Vec<String> = vendor_scope.iter().cloned().collect();
                 keys.sort();
                 vendored_leg =
                     run_vendored_leg(&args.common, &keys, &mut vs, args.preserve_state).await;
+            }
+
+            // ── orphan vendored dirs ─────────────────────────────────────
+            // Uuid dirs no ledger entry owns (the losing side of a git
+            // merge of two vendor runs, an interrupted run) are local state
+            // too: swept like `vendor --revert` does, within the run's
+            // scope, keeping any a lockfile still points into (#1610).
+            if project_state && !args.preserve_state && !aborted && !ledger_unreadable {
+                let sweep = crate::commands::vendor::sweep_orphan_vendor_dirs_where(
+                    &ledger_root,
+                    &vs,
+                    args.common.dry_run,
+                    |unit| {
+                        crate::commands::vendor::ecosystem_in_scope(&args.common, &unit.eco)
+                            && (!scoped
+                                || identifiers.iter().any(|id| {
+                                    unit.purls
+                                        .iter()
+                                        .any(|purl| id.matches_patch(purl, &unit.uuid))
+                                }))
+                    },
+                )
+                .await;
+                for unit in &sweep.still_wired {
+                    let warning = crate::commands::vendor::orphan_still_wired(unit);
+                    run_warnings.push((warning.code.to_string(), warning.detail));
+                }
+                if !args.common.json && !args.common.silent {
+                    let verb = if args.common.dry_run {
+                        "Would remove"
+                    } else {
+                        "Removed"
+                    };
+                    for unit in &sweep.removed {
+                        println!(
+                            "{verb} orphaned vendored dir .socket/vendor/{}/{} (no ledger entry)",
+                            unit.eco, unit.uuid
+                        );
+                    }
+                }
+                vendored_leg.orphans_removed = sweep
+                    .removed
+                    .iter()
+                    .map(crate::commands::vendor::orphan_label)
+                    .collect();
             }
 
             // ── hosted leg ───────────────────────────────────────────────
@@ -5960,6 +6017,7 @@ mod tests {
                 "boom".to_string(),
             )],
             warnings: Vec::new(),
+            orphans_removed: Vec::new(),
         };
         let hosted = HostedLegOutcome {
             reverted: vec!["pkg:npm/h@1.0.0".to_string()],

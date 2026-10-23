@@ -9,6 +9,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed, TelemetryAuth};
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::target::Target;
 use socket_patch_core::vendor::{
@@ -1117,6 +1118,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         use crate::commands::vendored_backend::tag_event_mode;
         use crate::commands::{HOSTED_MODE_LABEL, VENDORED_MODE_LABEL};
         let mut vendor_reverted = vendor_leg.reverted;
+        vendor_reverted.extend(vendor_leg.orphans);
         tag_event_mode(&mut vendor_reverted, VENDORED_MODE_LABEL);
         env.events.extend(vendor_reverted);
         // Hosted unwinds likewise bypass `record` — summary.removed stays
@@ -1257,6 +1259,10 @@ struct RemoveVendorLeg {
     kept: Vec<String>,
     /// Why each [`Self::kept`] entry was kept (same order).
     kept_causes: Vec<KeepCause>,
+    /// `Removed`/`vendor_orphan_removed` events (dry runs too, as in
+    /// `vendor --revert`): uuid dirs of the reverted packages that no
+    /// ledger entry owns, swept after the reverts (#1610).
+    orphans: Vec<PatchEvent>,
     /// Entries actually reverted and dropped from the ledger (wet runs).
     reverted_count: usize,
     /// Entries unwired with their artifact and ledger entry kept
@@ -1286,6 +1292,13 @@ async fn revert_vendored_matches(
         keep_artifact: args.preserve_state,
     };
     let mut leg = RemoveVendorLeg::default();
+    // Read before the reverts drop the entries: the packages whose orphan
+    // uuid dirs this remove sweeps.
+    let bases: HashSet<PurlKey> = keys
+        .iter()
+        .filter_map(|key| state.entries.get(key))
+        .map(|entry| PurlKey::new(strip_purl_qualifiers(&entry.base_purl)))
+        .collect();
     // Stops at the first hard failure: remove aborts there, leaving the
     // remaining matches (and the manifest) untouched.
     let reverted = VendoredBackend::new(&args.common, None)
@@ -1407,6 +1420,52 @@ async fn revert_vendored_matches(
                 );
                 return Err(1);
             }
+        }
+    }
+    // The removed packages' other uuid dirs (a git merge of two vendor
+    // runs keeps both, #1610) go too, unless a lockfile still points into
+    // one. `--preserve-state` keeps local state, orphans included.
+    if !args.preserve_state {
+        let sweep = crate::commands::vendor::sweep_orphan_vendor_dirs_where(
+            &args.common.project_root(),
+            state,
+            args.common.dry_run,
+            |unit| {
+                unit.purls
+                    .iter()
+                    .any(|purl| bases.contains(&PurlKey::new(strip_purl_qualifiers(purl))))
+            },
+        )
+        .await;
+        for unit in &sweep.still_wired {
+            let warning = crate::commands::vendor::orphan_still_wired(unit);
+            if loud {
+                eprintln!("Warning: {}", warning.detail);
+            }
+            leg.skipped.push(
+                PatchEvent::new(
+                    PatchAction::Skipped,
+                    crate::commands::vendor::orphan_label(unit),
+                )
+                .with_reason(warning.code, warning.detail),
+            );
+        }
+        for unit in &sweep.removed {
+            if loud {
+                println!(
+                    "{} orphaned vendored dir .socket/vendor/{}/{} (no ledger entry)",
+                    if args.common.dry_run {
+                        "Would remove"
+                    } else {
+                        "Removed"
+                    },
+                    unit.eco,
+                    unit.uuid
+                );
+                leg.printed = true;
+            }
+            leg.orphans
+                .push(crate::commands::vendor::orphan_removed_event(unit));
         }
     }
     Ok(leg)
@@ -1667,7 +1726,12 @@ async fn remove_ledger_only(
     // The reverts ARE the removal: every event is recorded, so
     // `summary.removed` counts the reverted entries (`summary.verified`
     // the would-be removals on --dry-run).
-    let mut events: Vec<PatchEvent> = leg.reverted.into_iter().chain(leg.skipped).collect();
+    let mut events: Vec<PatchEvent> = leg
+        .reverted
+        .into_iter()
+        .chain(leg.orphans)
+        .chain(leg.skipped)
+        .collect();
     crate::commands::vendored_backend::tag_event_mode(
         &mut events,
         crate::commands::VENDORED_MODE_LABEL,

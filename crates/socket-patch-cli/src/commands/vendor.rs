@@ -517,11 +517,11 @@ async fn unwired_check_failure(
 
 /// What the orphan sweep did with the uuid dirs no ledger entry owns.
 #[derive(Default)]
-struct OrphanSweep {
+pub(crate) struct OrphanSweep {
     /// Un-ledgered AND unreferenced — deleted (unless `dry_run`).
-    removed: Vec<vendor::path::SweptVendorDir>,
+    pub(crate) removed: Vec<vendor::path::SweptVendorDir>,
     /// Un-ledgered but a project lockfile still points into them — kept.
-    still_wired: Vec<vendor::path::SweptVendorDir>,
+    pub(crate) still_wired: Vec<vendor::path::SweptVendorDir>,
 }
 
 /// Uuid dirs under `.socket/vendor/<eco>/` with no owning `(eco, uuid)`
@@ -536,6 +536,17 @@ struct OrphanSweep {
 /// same lockfile scan `repair` reports `vendor_ledger_missing` from — and a
 /// referenced dir is kept for the caller to warn about.
 async fn sweep_orphan_vendor_dirs(cwd: &Path, state: &VendorState, dry_run: bool) -> OrphanSweep {
+    sweep_orphan_vendor_dirs_where(cwd, state, dry_run, |_| true).await
+}
+
+/// [`sweep_orphan_vendor_dirs`] limited to the orphans `select` accepts:
+/// `rollback` and `remove` sweep only the ones in their scope (#1610).
+pub(crate) async fn sweep_orphan_vendor_dirs_where(
+    cwd: &Path,
+    state: &VendorState,
+    dry_run: bool,
+    select: impl Fn(&vendor::path::SweptVendorDir) -> bool,
+) -> OrphanSweep {
     let recorded_units: HashSet<(&str, &str)> = state
         .entries
         .values()
@@ -545,6 +556,7 @@ async fn sweep_orphan_vendor_dirs(cwd: &Path, state: &VendorState, dry_run: bool
         .await
         .into_iter()
         .filter(|unit| !recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())))
+        .filter(|unit| select(unit))
         .collect();
     let mut out = OrphanSweep::default();
     if candidates.is_empty() {
@@ -577,11 +589,32 @@ async fn sweep_orphan_vendor_dirs(cwd: &Path, state: &VendorState, dry_run: bool
 
 /// How an orphan uuid dir is named in events: the PURL recovered from its
 /// leaf when the layout is recognizable, else `<eco>/<uuid>`.
-fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
+pub(crate) fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
     unit.purls
         .first()
         .cloned()
         .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
+}
+
+/// The advisory for an orphan uuid dir the sweep kept because a project
+/// lockfile still points into it.
+pub(crate) fn orphan_still_wired(unit: &vendor::path::SweptVendorDir) -> VendorWarning {
+    VendorWarning::new(
+        "vendor_orphan_still_wired",
+        format!(
+            "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
+             entry owns; the artifacts were kept (run `socket-patch repair` to re-adopt \
+             them into the ledger, then revert again)",
+            unit.eco, unit.uuid
+        ),
+    )
+}
+
+/// The `removed` event for an orphan uuid dir the sweep deleted (or, on a
+/// dry run, would delete).
+pub(crate) fn orphan_removed_event(unit: &vendor::path::SweptVendorDir) -> PatchEvent {
+    PatchEvent::new(PatchAction::Removed, orphan_label(unit))
+        .with_reason("vendor_orphan_removed", "vendored dir had no ledger entry")
 }
 
 /// Does `eco` fall inside this run's `--ecosystems` scope? A vendor-ledger
@@ -4530,27 +4563,10 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // points at (their wiring outlived the ledger).
     let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, common.dry_run).await;
     for unit in &sweep.still_wired {
-        let label = orphan_label(unit);
-        record_warning(
-            env,
-            &label,
-            &VendorWarning::new(
-                "vendor_orphan_still_wired",
-                format!(
-                    "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
-                     entry owns; the artifacts were kept (run `socket-patch repair` to re-adopt \
-                     them into the ledger, then revert again)",
-                    unit.eco, unit.uuid
-                ),
-            ),
-            common,
-        );
+        record_warning(env, &orphan_label(unit), &orphan_still_wired(unit), common);
     }
     for unit in &sweep.removed {
-        env.record(
-            PatchEvent::new(PatchAction::Removed, orphan_label(unit))
-                .with_reason("vendor_orphan_removed", "vendored dir had no ledger entry"),
-        );
+        env.record(orphan_removed_event(unit));
     }
 
     if env.events.is_empty() {

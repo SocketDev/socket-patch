@@ -891,3 +891,173 @@ async fn vendor_refuses_a_linked_vendor_dir_before_writing() {
     );
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// orphan uuid dirs: rollback and remove sweep them like `vendor --revert`
+// ─────────────────────────────────────────────────────────────────────
+
+/// Another vendor run's uuid for the same package: the side a git merge
+/// of two vendor branches drops from state.json but keeps on disk (#1610).
+const ORPHAN_UUID: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+/// An orphan for a package the scoped runs below do not target.
+const OTHER_ORPHAN_UUID: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+/// Vendor the fixture, then plant two uuid dirs no ledger entry owns:
+/// a copy of the live left-pad artifact under [`ORPHAN_UUID`] and a
+/// `right-pad` tarball under [`OTHER_ORPHAN_UUID`].
+async fn vendored_fixture_with_orphans() -> NpmFixture {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+    let orphan = fx.root().join(format!(".socket/vendor/npm/{ORPHAN_UUID}"));
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::copy(fx.tgz_path(), orphan.join("left-pad-1.3.0.tgz")).unwrap();
+    let other = fx
+        .root()
+        .join(format!(".socket/vendor/npm/{OTHER_ORPHAN_UUID}"));
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("right-pad-1.0.0.tgz"), b"not a real tarball").unwrap();
+    fx
+}
+
+fn orphan_dir(fx: &NpmFixture, uuid: &str) -> PathBuf {
+    fx.root().join(format!(".socket/vendor/npm/{uuid}"))
+}
+
+/// The `vendor_orphan_removed` events' purls, in event order.
+fn orphans_removed(env: &Value) -> Vec<String> {
+    env["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["action"] == "removed" && e["errorCode"] == "vendor_orphan_removed")
+        .map(|e| e["purl"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A bare `rollback` promises to clean up the local state, so it sweeps
+/// the uuid dirs no ledger entry owns, as `vendor --revert` does (#1610).
+/// Before the fix the orphans stayed committed and nothing reported them.
+#[tokio::test]
+async fn unscoped_rollback_sweeps_orphan_vendor_dirs() {
+    let fx = vendored_fixture_with_orphans().await;
+
+    // A dry run reports both orphans and deletes nothing.
+    let (code, env) = rollback_cli(fx.root(), &["--dry-run"]);
+    assert_eq!(code, 0, "dry run exits 0: {env:#}");
+    rollback_json::assert_rollback_envelope(&env);
+    assert_eq!(
+        orphans_removed(&env),
+        vec![PURL.to_string(), "pkg:npm/right-pad@1.0.0".to_string()],
+        "{env:#}"
+    );
+    assert!(
+        orphan_dir(&fx, ORPHAN_UUID).is_dir(),
+        "dry run deletes nothing"
+    );
+    assert!(orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir());
+
+    let (code, env) = rollback_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "rollback exits 0: {env:#}");
+    assert_eq!(env["status"], "success", "{env:#}");
+    rollback_json::assert_rollback_envelope(&env);
+    assert_eq!(
+        rollback_json::vendored_reverted(&env),
+        json!([PURL]),
+        "{env:#}"
+    );
+    assert_eq!(
+        orphans_removed(&env),
+        vec![PURL.to_string(), "pkg:npm/right-pad@1.0.0".to_string()],
+        "both orphans are reported: {env:#}"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+    assert!(
+        !fx.root().join(".socket/vendor").exists(),
+        "a full rollback leaves no .socket/vendor/ behind"
+    );
+}
+
+/// An orphan a lockfile still points at is kept and named with
+/// `vendor_orphan_still_wired`: deleting it would break the next install.
+#[tokio::test]
+async fn unscoped_rollback_keeps_a_still_wired_orphan() {
+    let fx = vendored_fixture_with_orphans().await;
+    // Wire `right-pad` to its orphan dir behind the ledger's back.
+    let mut lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
+    lock["packages"]["node_modules/right-pad"] = json!({
+        "version": "1.0.0",
+        "resolved": format!("file:.socket/vendor/npm/{OTHER_ORPHAN_UUID}/right-pad-1.0.0.tgz"),
+    });
+    std::fs::write(fx.lock_path(), serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+    let (code, env) = rollback_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "rollback exits 0: {env:#}");
+    rollback_json::assert_rollback_envelope(&env);
+    assert_eq!(orphans_removed(&env), vec![PURL.to_string()], "{env:#}");
+    assert!(
+        rollback_json::warning_codes(&env).contains(&"vendor_orphan_still_wired".to_string()),
+        "the kept orphan is named: {env:#}"
+    );
+    assert!(
+        !orphan_dir(&fx, ORPHAN_UUID).exists(),
+        "unwired orphan swept"
+    );
+    assert!(
+        orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir(),
+        "a wired orphan is never deleted"
+    );
+}
+
+/// A scoped rollback sweeps only the orphans of the package it targets.
+#[tokio::test]
+async fn scoped_rollback_sweeps_only_the_targets_orphans() {
+    let fx = vendored_fixture_with_orphans().await;
+    let (code, env) = rollback_cli(fx.root(), &[PURL]);
+    assert_eq!(code, 0, "rollback <purl> exits 0: {env:#}");
+    rollback_json::assert_rollback_envelope(&env);
+    assert_eq!(orphans_removed(&env), vec![PURL.to_string()], "{env:#}");
+    assert!(
+        !orphan_dir(&fx, ORPHAN_UUID).exists(),
+        "target's orphan swept"
+    );
+    assert!(
+        orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir(),
+        "another package's orphan is out of scope"
+    );
+}
+
+/// `--preserve-state` keeps local state, orphans included.
+#[tokio::test]
+async fn preserve_state_rollback_keeps_orphans() {
+    let fx = vendored_fixture_with_orphans().await;
+    let (code, env) = rollback_cli(fx.root(), &["--preserve-state"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(orphans_removed(&env).is_empty(), "{env:#}");
+    assert!(orphan_dir(&fx, ORPHAN_UUID).is_dir());
+    assert!(orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir());
+}
+
+/// `remove <purl>` sweeps the orphans of the package it removes (#1610).
+#[tokio::test]
+async fn remove_sweeps_the_targets_orphans() {
+    let fx = vendored_fixture_with_orphans().await;
+    let cwd = fx.root().to_str().unwrap().to_string();
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["remove", PURL, "--json", "--offline", "--cwd", &cwd],
+    );
+    let env: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("remove --json envelope: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "remove exits 0: {env:#}");
+    assert_eq!(env["status"], "success", "{env:#}");
+    assert_eq!(orphans_removed(&env), vec![PURL.to_string()], "{env:#}");
+    assert!(!fx.tgz_path().exists(), "the ledgered artifact is reverted");
+    assert!(
+        !orphan_dir(&fx, ORPHAN_UUID).exists(),
+        "target's orphan swept"
+    );
+    assert!(
+        orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir(),
+        "another package's orphan is out of scope"
+    );
+}
