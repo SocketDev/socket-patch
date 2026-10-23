@@ -217,6 +217,23 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   upgrading to pnpm >=11. When no pin says which pnpm runs, the file is
   created, and pnpm 9.0–10.4 then need `pnpm add -w <pkg>`. Vendored mode
   follows the same rule for its `overrides:` mirror.
+  **Vendored build approvals (#1597):** pnpm 10.34.2+ and 11.5.3+ match
+  `allowBuilds` / `onlyBuiltDependencies` against the id a package installs
+  as, and a vendored package installs as `name@file:.socket/vendor/npm/…`.
+  A decision keyed by the name (`sp-build`, `sp-build@1.0.0`) would stop
+  applying: pnpm 10 skips the approved script, pnpm 11 and 12 fail every
+  install with `ERR_PNPM_IGNORED_BUILDS`. Vendoring adds the same decision
+  under the vendored key next to the user's entry (`pnpm-workspace.yaml`, or
+  `package.json#pnpm` for pnpm 10), replaces a key an older patch left, and
+  revert removes it. The key is written only when the project's pnpm pins
+  (`packageManager`, `devEngines`, `engines.pnpm`, or the pnpm that last
+  installed `node_modules`) say 10.34.2+ (within 10.x), 11.5.3+ (within 11.x) or
+  12+: pnpm 10.20–10.34.1 and 11.0–11.5.2 refuse such a key (`ERR_PNPM_INVALID_VERSION_UNION`) and still match the name, so
+  nothing is needed there. Without a usable pin, or for a decision the
+  rewriter can't extend (a flow-style value such as
+  `onlyBuiltDependencies: [pkg]`, a non-boolean `allowBuilds` value), the
+  setting is left alone with the `vendor_pnpm_build_approval_lost` warning
+  naming the key to add. Re-run the scan after upgrading pnpm past 10.34.1 or 11.5.2.
   **Reinstall after redirecting:** a successful warm-cache install can retain
   upstream bytes. Use a clean install tree and an empty store; `--force` is not
   a reliable substitute. Run `socket-patch vex` after installation to verify

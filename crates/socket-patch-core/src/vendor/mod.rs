@@ -81,6 +81,7 @@ mod npm_pack;
 pub(crate) mod nuget_config;
 pub mod nuget_feed;
 pub(crate) mod parse_memo;
+mod pnpm_build_approvals;
 pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
 pub mod prestage;
