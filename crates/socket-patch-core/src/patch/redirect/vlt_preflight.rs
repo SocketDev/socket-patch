@@ -209,8 +209,8 @@ pub fn preflight_scope(
             if ids.is_empty() && !vendored {
                 return None;
             }
-            let already_pinned = !vendored
-                && vlt::every_instance_pinned(text, &ids, sha512, &dep.artifact_url).is_some();
+            let already_pinned =
+                !vendored && vlt::already_pinned(&lock, &ids, sha512, &dep.artifact_url);
             Some(PreflightDep {
                 patch_uuid: dep.patch_uuid.clone(),
                 artifact_url: dep.artifact_url.clone(),
