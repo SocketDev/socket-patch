@@ -131,6 +131,18 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
                 bun_lock::reinstall_advisory(&stale),
             ));
         }
+        // A `bun patch` keyed by the hosted URL stops applying (#1019).
+        let bun_purls = outcome
+            .restored()
+            .filter(|pin| pin.files.iter().any(|f| f == BUN_LOCK || f == BUN_LOCKB));
+        for detail in
+            bun_lock::dropped_user_patches(&common.cwd, bun_purls.map(|p| p.purl.as_str())).await
+        {
+            out.warnings.push((
+                "redirect_bun_patched_dependency_dropped".to_string(),
+                detail,
+            ));
+        }
     }
     // PDM, uv and Pipenv keep a same-version install through a plain sync
     // (#477): name the reinstall that restores the upstream bytes.

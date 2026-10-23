@@ -43,8 +43,8 @@ use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
     decode_json_string, default_trust_detail, has_workspace_packages, is_bundled_entry,
     is_user_tarball_entry, lock_version, loses_default_trust, packages_bounds, parse_entry_line,
-    patched_dependency_detail, patched_dependency_key, patched_dependency_keys, split_name_spec,
-    BunEntry,
+    patched_dependency_detail, patched_dependency_key, patched_dependency_keys,
+    resolution_patch_key, split_name_spec, BunEntry,
 };
 
 use super::common::refused;
@@ -377,7 +377,7 @@ impl NpmLockBackend for BunTextBackend {
         let project = read_project(project_root).await?;
 
         // ── 3. Pre-flight: at least one rewritable instance ──────────────
-        let (target_spec, target_leaf) = preflight_package(&project, name, version)?;
+        let (target_spec, target_leaf) = preflight_package(&project, coords)?;
         for key in bundled_matches(&project.entries, &target_spec, name, &target_leaf) {
             // LOUD: this copy ships inside its PARENT's tarball, which we do
             // not repack — it stays the unpatched bytes after vendor (#469).
@@ -670,14 +670,17 @@ pub(super) fn default_trust_warning(
 }
 
 /// Refuse to vendor a package the project patches itself with `bun patch`
-/// (#367): Bun applies that patch only to the registry `name@version`, so
-/// a local tarball tuple would silently drop it from every install.
+/// (#367): Bun applies that patch only to the resolution it is keyed on
+/// (the registry `name@version`, or a hosted or older vendored tarball,
+/// #1019), so the tuple for `coords` would silently drop it from every
+/// install.
 pub(super) fn refuse_user_patched(
     user_patched: &[String],
-    name: &str,
-    version: &str,
+    coords: &NpmCoords,
 ) -> Result<(), Box<VendorOutcome>> {
-    match patched_dependency_key(user_patched, name, version) {
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
+    let target = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
+    match patched_dependency_key(user_patched, name, version, &target) {
         Some(key) => Err(Box::new(refused(
             "vendor_lock_entry_unsupported",
             patched_dependency_detail(key, name, version),
@@ -733,10 +736,10 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BunProject, Box<
 /// asks the service, so the download plan evaluates it ahead of the loop.
 pub(super) fn preflight_package(
     project: &BunProject,
-    name: &str,
-    version: &str,
+    coords: &NpmCoords,
 ) -> Result<(String, String), Box<VendorOutcome>> {
-    refuse_user_patched(&project.user_patched, name, version)?;
+    refuse_user_patched(&project.user_patched, coords)?;
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let target_spec = format!("{name}@{version}");
     let target_leaf = tgz_rel_leaf(name, version);
     let has_match = project
@@ -826,7 +829,7 @@ pub(crate) async fn preflight_packages(
             .map_err(|o| refusal_code(&o)),
         packages,
         |project, coords| {
-            preflight_package(project, &coords.name, &coords.version)
+            preflight_package(project, coords)
                 .map(drop)
                 .map_err(|o| refusal_code(&o))
         },
@@ -876,7 +879,59 @@ pub(crate) async fn revert_bun_opts(
             ));
         }
     }
+    if outcome.success && !restored_nothing {
+        for detail in dropped_user_patches(project_root, [entry.base_purl.as_str()]).await {
+            outcome
+                .warnings
+                .push(VendorWarning::new(PATCHED_DEPENDENCY_DROPPED, detail));
+        }
+    }
     outcome
+}
+
+/// A revert put back the lock entry of a package whose own `bun patch` is
+/// keyed by the vendored tarball it resolved to (#1019): Bun stops applying
+/// that patch, without failing. The hosted unwind warns the same way as
+/// `redirect_bun_patched_dependency_dropped`.
+pub const PATCHED_DEPENDENCY_DROPPED: &str = "vendor_bun_patched_dependency_dropped";
+
+/// One detail for each npm purl in `purls` whose project-authored Bun
+/// patch is keyed by the hosted or vendored tarball the package resolved
+/// to before an unwind returned it to the registry (Bun 1.4, #1019; see
+/// [`resolution_patch_key`]). The keys are read from the root
+/// `package.json` and the copy a text `bun.lock` mirrors, as Bun reads
+/// them.
+pub async fn dropped_user_patches<'a>(
+    project_root: &Path,
+    purls: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let manifest = read_manifest(project_root).await;
+    let lock = read_regular_to_string(&project_root.join(BUN_LOCK))
+        .await
+        .ok();
+    let keys = patched_dependency_keys(manifest.as_deref(), lock.as_deref());
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mut details = Vec::new();
+    for purl in purls {
+        let Some((name, version)) = super::npm_common::parse_npm_purl(purl) else {
+            continue;
+        };
+        if let Some(key) = resolution_patch_key(&keys, &name, &version) {
+            let detail = format!(
+                "package.json `patchedDependencies` has `{key}`, a patch the project applies \
+                 with `bun patch` only while {name}@{version} resolves to that tarball; now that \
+                 it resolves to the registry again, `bun install` stops applying that patch \
+                 without failing. Re-create it with `bun patch {name}` and \
+                 `bun patch --commit`, or remove the entry"
+            );
+            if !details.contains(&detail) {
+                details.push(detail);
+            }
+        }
+    }
+    details
 }
 
 /// A revert (or hosted unwind) left an installed copy Bun may keep: its
@@ -2525,6 +2580,67 @@ mod tests {
         .unwrap();
         let (result, _, _) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
+    }
+
+    /// REGRESSION (#1019): after a hosted or vendored rewire, Bun 1.4 keys a
+    /// `bun patch` by the tarball the package resolves to. Vendoring onto a
+    /// new uuid (a takeover, or a superseding re-run) would orphan that key
+    /// just as it would a registry one, so it refuses the same way.
+    #[tokio::test]
+    async fn user_bun_patch_keyed_by_resolution_refuses_before_any_write() {
+        for key in [
+            "left-pad@https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/old/left-pad-1.3.0.tgz",
+            "left-pad@.socket/vendor/npm/00000000-0000-4000-8000-000000000000/left-pad-1.3.0.tgz",
+        ] {
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            let mut manifest: Value = serde_json::from_str(BN3_PKG).unwrap();
+            manifest["patchedDependencies"] = serde_json::json!({ key: "patches/x.patch" });
+            tokio::fs::write(
+                fx.root().join("package.json"),
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+            let (planned, looped) = preflight_then_vendor(&fx).await;
+            assert_eq!(planned, Err("vendor_lock_entry_unsupported"), "{key}");
+            assert_eq!(looped, Err("vendor_lock_entry_unsupported"), "{key}");
+            let detail = expect_refused(fx.vendor(true).await, "vendor_lock_entry_unsupported");
+            assert!(
+                detail.contains(key) && detail.contains("resolves to"),
+                "{detail}"
+            );
+            assert_eq!(
+                fx.read_lock().await,
+                BN3_BEFORE_LOCK,
+                "refusal writes nothing"
+            );
+            assert!(!fx.root().join(".socket/vendor").exists());
+        }
+
+        // The key for this run's own tarball (an in-sync re-run) moves
+        // nothing, so it vendors; reverting that wiring then warns that the
+        // patch stops applying, and still reverts.
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let key = format!("left-pad@{}", fx.rel_tgz());
+        let mut manifest: Value = serde_json::from_str(BN3_PKG).unwrap();
+        manifest["patchedDependencies"] = serde_json::json!({ &key: "patches/x.patch" });
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let outcome = revert_bun(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let dropped = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == PATCHED_DEPENDENCY_DROPPED)
+            .unwrap_or_else(|| panic!("{:?}", outcome.warnings));
+        assert!(dropped.detail.contains(&key), "{}", dropped.detail);
+        assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "lock byte-restored");
     }
 
     /// REGRESSION (#367), `bun.lockb`: the binary lock has no text mirror,

@@ -1255,6 +1255,7 @@ fn rewrite_npm_lock(
                 &user_patched,
                 &fname,
                 &dep.version,
+                &dep.artifact_url,
             ) {
                 format!("package.json `patchedDependencies` has `{key}`")
             } else if let Some((_, _, lockfile, key)) = lock_patched
@@ -5572,10 +5573,11 @@ pub(crate) fn bun_default_trust_warning(name: &str, version: &str) -> RewriteWar
     }
 }
 
-/// Leave `dep` on its registry resolution when the project's own
+/// Leave `dep` on its current resolution when the project's own
 /// `patchedDependencies` patches it (#367): Bun applies that patch only to
-/// the registry `name@version`, so a hosted pin would silently drop it from
-/// every install. Warns, keeps the in-run VEX from assuming the uuid
+/// the resolution it is keyed on (the registry `name@version`, or an older
+/// hosted or vendored tarball, #1019), so a pin to `dep`'s URL would
+/// silently drop it from every install. Warns, keeps the in-run VEX from assuming the uuid
 /// patched, and keeps any other lock from confirming it. `true` when `dep`
 /// was skipped.
 pub(crate) fn skip_bun_user_patched(
@@ -5585,7 +5587,8 @@ pub(crate) fn skip_bun_user_patched(
     result: &mut RewriteResult,
 ) -> bool {
     use crate::vendor::bun_lock_text::{patched_dependency_detail, patched_dependency_key};
-    let Some(key) = patched_dependency_key(user_patched, name, &dep.version) else {
+    let Some(key) = patched_dependency_key(user_patched, name, &dep.version, &dep.artifact_url)
+    else {
         return false;
     };
     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
@@ -13918,6 +13921,81 @@ mod tests {
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// REGRESSION (#1019): a `bun patch` made after a hosted rewire is keyed
+    /// by the hosted URL the package resolves to (Bun 1.4). A re-run that
+    /// picks up a superseding patch would move the entry to a new URL and
+    /// orphan that key, silently dropping the user's patch, so the entry
+    /// keeps its current URL and the run says why. Scoped packages too,
+    /// whose URL holds an `@` of its own.
+    #[test]
+    fn bun_lock_patch_keyed_by_hosted_url_survives_superseding_rerun() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        for (key, name, namespace, old_url) in [
+            (
+                "left-pad",
+                "left-pad",
+                None,
+                "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/old/left-pad-1.3.0.tgz",
+            ),
+            (
+                "@s/left-pad",
+                "left-pad",
+                Some("@s"),
+                "https://patch.socket.dev/patch/npm/@s/left-pad/1.3.0/tok/old/left-pad-1.3.0.tgz",
+            ),
+        ] {
+            let new_url = old_url.replace("/old/", "/new/");
+            let mut ovr = npm_override(name, "1.3.0", &new_url, &sha512);
+            ovr.namespace = namespace.map(String::from);
+            let entry = format!("\"{key}\": [\"{key}@{old_url}\", {{}}, \"{sha512}\"],");
+            let manifest = format!(
+                r#"{{"name":"app","dependencies":{{"{key}":"1.3.0"}},"patchedDependencies":{{"{key}@{old_url}":"patches/x.patch"}}}}"#
+            );
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(&entry, 1));
+            files.insert("package.json".to_string(), manifest);
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.edits.is_empty(), "{key}: {:?}", r.edits);
+            assert!(
+                r.files
+                    .get("bun.lock")
+                    .is_none_or(|out| !out.contains(&new_url)),
+                "{key}: the entry keeps its current URL"
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_patched_dependency_skipped"],
+                "{key}: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.warnings[0]
+                    .detail
+                    .contains(&format!("resolves to {old_url}")),
+                "{}",
+                r.warnings[0].detail
+            );
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+            // An in-sync re-run (the keyed URL is the pin's own) moves
+            // nothing, so it neither skips nor warns.
+            let in_sync = npm_override(name, "1.3.0", old_url, &sha512);
+            let mut in_sync = DepOverride {
+                namespace: namespace.map(String::from),
+                ..in_sync
+            };
+            in_sync.patch_uuid = ovr.patch_uuid.clone();
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&in_sync), &mut r);
+            assert!(r.warnings.is_empty(), "{key}: {:?}", r.warnings);
+            assert!(
+                !r.bundled_skipped_uuids.contains(&in_sync.patch_uuid),
+                "{key}"
+            );
+        }
     }
 
     /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
