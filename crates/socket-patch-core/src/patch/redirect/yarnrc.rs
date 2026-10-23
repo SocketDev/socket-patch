@@ -13,6 +13,10 @@
 //! mirror is the npm value overridden by the yarn value, and `false` in
 //! either one turns it off.
 //!
+//! [`configured_yarn_global_folders`] reads yarn 1's `global-folder`
+//! from the same layers, for self-update's install-channel detection
+//! (#1629).
+//!
 //! Every text is read BOM-stripped: yarn honours a `.yarnrc` / `.npmrc`
 //! saved as "UTF-8 with signature" (#1078).
 
@@ -129,6 +133,11 @@ fn unquote_rc_value(raw: &str) -> &str {
 /// `key: value` lines, key optionally quoted, `#` comments); later lines
 /// override earlier ones.
 pub fn yarnrc_value(text: &str) -> Option<MirrorValue> {
+    yarnrc_setting(text, KEY).map(mirror_value)
+}
+
+/// The last raw `key` value in a `.yarnrc` (see [`yarnrc_value`]).
+fn yarnrc_setting<'a>(text: &'a str, key_name: &str) -> Option<&'a str> {
     let mut found = None;
     for line in strip_bom(text).lines() {
         let line = line.trim();
@@ -147,10 +156,9 @@ pub fn yarnrc_value(text: &str) -> Option<MirrorValue> {
                 None => (line, ""),
             },
         };
-        if key == KEY {
+        if key == key_name {
             let rest = rest.trim_start();
-            let rest = rest.strip_prefix(':').unwrap_or(rest);
-            found = Some(mirror_value(rest));
+            found = Some(rest.strip_prefix(':').unwrap_or(rest));
         }
     }
     found
@@ -160,6 +168,12 @@ pub fn yarnrc_value(text: &str) -> Option<MirrorValue> {
 /// `key = value` lines, `#`/`;` comments, `[section]` headers end the
 /// top level).
 pub fn npmrc_value(text: &str) -> Option<MirrorValue> {
+    npmrc_setting(text, KEY).map(mirror_value)
+}
+
+/// The last raw top-level `key` value in an `.npmrc` (see
+/// [`npmrc_value`]).
+fn npmrc_setting<'a>(text: &'a str, key_name: &str) -> Option<&'a str> {
     let mut found = None;
     for line in strip_bom(text).lines() {
         let line = line.trim();
@@ -172,8 +186,8 @@ pub fn npmrc_value(text: &str) -> Option<MirrorValue> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if unquote_rc_value(key) == KEY {
-            found = Some(mirror_value(value));
+        if unquote_rc_value(key) == key_name {
+            found = Some(value);
         }
     }
     found
@@ -233,47 +247,8 @@ pub fn resolve_outer_yarn_mirror(
     project: &Path,
     read: impl Fn(&Path) -> Option<String>,
 ) -> OuterYarnMirror {
-    let home = env.home.clone();
-    let user_home = if root_user && !env.windows && env.var("FAKEROOTKEY").is_none() {
-        Some(PathBuf::from("/usr/local/share"))
-    } else {
-        home.clone()
-    };
-    // yarn's `getGlobalPrefix`: `PREFIX`, else node's directory (Windows)
-    // or its install root (Unix, `DESTDIR`-rooted).
-    let prefix: Option<PathBuf> = env.var("PREFIX").map(PathBuf::from).or_else(|| {
-        let bin = env.node_exe.as_deref()?.parent()?;
-        if env.windows {
-            return Some(bin.to_path_buf());
-        }
-        let root = bin.parent()?;
-        Some(match env.var("DESTDIR") {
-            Some(dest) => Path::new(dest).join(root.strip_prefix("/").unwrap_or(root)),
-            None => root.to_path_buf(),
-        })
-    });
-    let files = |rc: &str, userconfig: Option<(String, String)>| -> Vec<PathBuf> {
-        let local = format!(".{rc}");
-        let mut out = Vec::new();
-        match userconfig {
-            Some((_, path)) if !path.is_empty() => out.push(project.join(path)),
-            _ => out.extend(user_home.as_ref().map(|h| h.join(&local))),
-        }
-        out.extend(prefix.as_ref().map(|p| p.join("etc").join(rc)));
-        if let (Some(home), Some(user_home)) = (&home, &user_home) {
-            if home != user_home {
-                out.push(home.join(&local));
-            }
-        }
-        out.extend(
-            project
-                .ancestors()
-                .skip(1)
-                .filter(|dir| dir.parent().is_some())
-                .map(|dir| dir.join(&local)),
-        );
-        out
-    };
+    let layout = RcLayout::new(env, root_user);
+    let files = |rc: &str, userconfig| layout.files(project, rc, userconfig);
     let first_file = |paths: Vec<PathBuf>, parse: fn(&str) -> Option<MirrorValue>| {
         paths.into_iter().find_map(|path| {
             let value = parse(&read(&path)?)?;
@@ -312,6 +287,160 @@ pub fn resolve_outer_yarn_mirror(
         },
         member: None,
     }
+}
+
+/// Where yarn 1 looks for rc files outside the project (see the module
+/// docs).
+struct RcLayout {
+    /// `~`, from `HOME` (`USERPROFILE` on Windows).
+    home: Option<PathBuf>,
+    /// yarn's `userHome`: `/usr/local/share` for root, else `home`.
+    user_home: Option<PathBuf>,
+    /// yarn's `getGlobalPrefix`.
+    prefix: Option<PathBuf>,
+}
+
+impl RcLayout {
+    /// `root_user` is whether yarn runs as uid 0 (its user rc then lives
+    /// in `/usr/local/share`, unless `FAKEROOTKEY` is set or on Windows).
+    fn new(env: &NpmConfigEnv, root_user: bool) -> Self {
+        let home = env.home.clone();
+        let user_home = if root_user && !env.windows && env.var("FAKEROOTKEY").is_none() {
+            Some(PathBuf::from("/usr/local/share"))
+        } else {
+            home.clone()
+        };
+        // yarn's `getGlobalPrefix`: `PREFIX`, else node's directory (Windows)
+        // or its install root (Unix, `DESTDIR`-rooted).
+        let prefix: Option<PathBuf> = env.var("PREFIX").map(PathBuf::from).or_else(|| {
+            let bin = env.node_exe.as_deref()?.parent()?;
+            if env.windows {
+                return Some(bin.to_path_buf());
+            }
+            let root = bin.parent()?;
+            Some(match env.var("DESTDIR") {
+                Some(dest) => Path::new(dest).join(root.strip_prefix("/").unwrap_or(root)),
+                None => root.to_path_buf(),
+            })
+        });
+        RcLayout {
+            home,
+            user_home,
+            prefix,
+        }
+    }
+
+    /// The `<rc>` files yarn run in `project` reads after the project's
+    /// own, in its order; `userconfig` is the env override of the user
+    /// file.
+    fn files(
+        &self,
+        project: &Path,
+        rc: &str,
+        userconfig: Option<(String, String)>,
+    ) -> Vec<PathBuf> {
+        let local = format!(".{rc}");
+        let mut out = Vec::new();
+        match userconfig {
+            Some((_, path)) if !path.is_empty() => out.push(project.join(path)),
+            _ => out.extend(self.user_home.as_ref().map(|h| h.join(&local))),
+        }
+        out.extend(self.prefix.as_ref().map(|p| p.join("etc").join(rc)));
+        if let (Some(home), Some(user_home)) = (&self.home, &self.user_home) {
+            if home != user_home {
+                out.push(home.join(&local));
+            }
+        }
+        out.extend(
+            project
+                .ancestors()
+                .skip(1)
+                .filter(|dir| dir.parent().is_some())
+                .map(|dir| dir.join(&local)),
+        );
+        out
+    }
+
+    /// yarn's `resolveWithHome`: a leading `~/` (also `~\` on Windows)
+    /// is `userHome`, anything else resolves against `cwd`.
+    fn resolve_with_home(&self, value: &str, cwd: &Path, windows: bool) -> Option<PathBuf> {
+        let tilde = value
+            .strip_prefix("~/")
+            .or_else(|| value.strip_prefix("~\\").filter(|_| windows));
+        match tilde {
+            Some(rest) => self.user_home.as_ref().map(|h| h.join(rest)),
+            None => Some(cwd.join(value)),
+        }
+    }
+}
+
+const GLOBAL_FOLDER_KEY: &str = "global-folder";
+
+/// Every folder yarn 1 run in `cwd` is configured to use as its global
+/// folder (`yarn global dir`) by a `global-folder` setting: the `YARN_*`
+/// and `npm_config_*` env layers, the `.yarnrc` files and the `.npmrc`
+/// files (the project's in `cwd`, then the outer ones). Yarn uses the
+/// first of them by its precedence, but a folder any layer names was set
+/// up as a yarn global folder, so all of them count.
+///
+/// Paths resolve as in `yarn@1.22.22`: a `.yarnrc` value against the
+/// folder of its file (`RELATIVE_KEYS`), anything else through
+/// `resolveWithHome` (`~/` is yarn's `userHome`, else the cwd). Empty
+/// values set nothing.
+pub fn configured_yarn_global_folders(
+    env: &NpmConfigEnv,
+    root_user: bool,
+    cwd: &Path,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Vec<PathBuf> {
+    let layout = RcLayout::new(env, root_user);
+    let resolve = |value: &str| layout.resolve_with_home(value, cwd, env.windows);
+    let mut out = Vec::new();
+    for prefix in ["yarn_", "npm_config_"] {
+        if let Some((_, value)) = env_value(env, &[prefix], GLOBAL_FOLDER_KEY) {
+            out.extend(
+                Some(value)
+                    .filter(|v| !v.is_empty())
+                    .and_then(|v| resolve(&v)),
+            );
+        }
+    }
+    let rc_files = |rc: &str, prefixes: &[&str]| {
+        let mut files = vec![cwd.join(format!(".{rc}"))];
+        files.extend(layout.files(cwd, rc, env_value(env, prefixes, "userconfig")));
+        files
+    };
+    for path in rc_files("yarnrc", &["yarn_"]) {
+        let Some(text) = read(&path) else { continue };
+        let Some(value) = yarnrc_setting(&text, GLOBAL_FOLDER_KEY).map(unquote_rc_value) else {
+            continue;
+        };
+        if let (false, Some(dir)) = (value.is_empty(), path.parent()) {
+            out.push(dir.join(value));
+        }
+    }
+    for path in rc_files("npmrc", &["yarn_", "npm_config_"]) {
+        let Some(text) = read(&path) else { continue };
+        let Some(value) = npmrc_setting(&text, GLOBAL_FOLDER_KEY).map(unquote_rc_value) else {
+            continue;
+        };
+        out.extend(Some(value).filter(|v| !v.is_empty()).and_then(resolve));
+    }
+    out
+}
+
+/// [`configured_yarn_global_folders`] for this process, run in its cwd,
+/// reading regular files only.
+pub fn configured_yarn_global_folders_for_process() -> Vec<PathBuf> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    configured_yarn_global_folders(
+        &NpmConfigEnv::from_process(),
+        process_is_root_user(),
+        &cwd,
+        |path| crate::utils::fs::read_regular_to_string_sync(path).ok(),
+    )
 }
 
 /// Whether this process runs as uid 0 (yarn's `getuid() === 0`).

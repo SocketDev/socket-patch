@@ -427,3 +427,116 @@ fn yarn_classic_workspace_members_follow_the_root_globs() {
     write("package.json", r#"{"private":true}"#);
     assert!(yarn_classic_workspace_members(root).is_empty());
 }
+
+impl Host {
+    /// [`configured_yarn_global_folders`] for yarn run in `cwd`.
+    fn global_folders(&self, cwd: &str) -> Vec<PathBuf> {
+        let env = NpmConfigEnv::from_parts(
+            self.vars.clone(),
+            Some(PathBuf::from("/opt/node/bin/node")),
+            false,
+        );
+        configured_yarn_global_folders(&env, self.root_user, Path::new(cwd), |p| {
+            self.files.get(p).cloned()
+        })
+    }
+}
+
+fn paths(list: &[&str]) -> Vec<PathBuf> {
+    list.iter().map(PathBuf::from).collect()
+}
+
+/// #1629: every layer yarn 1 reads `global-folder` from names a global
+/// folder. Each expectation matches `yarn global dir` on yarn 1.22.22.
+#[test]
+fn global_folder_layers_match_yarn() {
+    // Env, any prefix spelling yarn's `mergeEnv` accepts.
+    for var in [
+        "YARN_GLOBAL_FOLDER",
+        "yarn_global_folder",
+        "npm_config_global_folder",
+    ] {
+        assert_eq!(
+            Host::new().var(var, "/opt/yg").global_folders("/w"),
+            paths(&["/opt/yg"]),
+            "{var}"
+        );
+    }
+    // The project's own rc, the user's, the global prefix's and an
+    // ancestor's.
+    for (file, text) in [
+        ("/w/.yarnrc", "global-folder \"/opt/yg\"\n"),
+        ("/home/u/.yarnrc", "global-folder /opt/yg\n"),
+        ("/home/u/.yarnrc", "\"global-folder\": '/opt/yg'\n"),
+        ("/opt/node/etc/yarnrc", "global-folder /opt/yg\n"),
+        ("/w/.npmrc", "global-folder=/opt/yg\n"),
+        ("/home/u/.npmrc", "global-folder = \"/opt/yg\"\n"),
+        ("/opt/node/etc/npmrc", "global-folder=/opt/yg\n"),
+    ] {
+        assert_eq!(
+            Host::new().file(file, text).global_folders("/w"),
+            paths(&["/opt/yg"]),
+            "{file}: {text:?}"
+        );
+    }
+    assert_eq!(
+        Host::new()
+            .file("/w/.yarnrc", "global-folder /opt/yg\n")
+            .global_folders("/w/sub"),
+        paths(&["/opt/yg"]),
+        "an ancestor's .yarnrc"
+    );
+    // Every layer counts, env first.
+    assert_eq!(
+        Host::new()
+            .var("YARN_GLOBAL_FOLDER", "/opt/a")
+            .var("npm_config_global_folder", "/opt/b")
+            .file("/home/u/.yarnrc", "global-folder /opt/c\n")
+            .file("/home/u/.npmrc", "global-folder=/opt/d\n")
+            .global_folders("/w"),
+        paths(&["/opt/a", "/opt/b", "/opt/c", "/opt/d"])
+    );
+    // Unset, empty, commented out or under an `.npmrc` section: nothing.
+    for host in [
+        Host::new(),
+        Host::new().var("YARN_GLOBAL_FOLDER", ""),
+        Host::new().file("/home/u/.yarnrc", "# global-folder /opt/yg\n"),
+        Host::new().file("/home/u/.yarnrc", "global-folder \"\"\n"),
+        Host::new().file("/home/u/.npmrc", "[x]\nglobal-folder=/opt/yg\n"),
+        Host::new().file("/home/u/.yarnrc", "global-folders /opt/yg\n"),
+    ] {
+        assert_eq!(host.global_folders("/w"), Vec::<PathBuf>::new());
+    }
+}
+
+/// #1629: yarn resolves a `.yarnrc` `global-folder` against that file's
+/// folder (no `~` expansion), and an env or `.npmrc` value through
+/// `resolveWithHome`: `~/` is yarn's user home (`/usr/local/share` for
+/// root), anything else is taken against the cwd.
+#[test]
+fn global_folder_paths_resolve_like_yarn() {
+    let home = Host::new().file("/home/u/.yarnrc", "global-folder gf\n");
+    assert_eq!(home.global_folders("/w"), paths(&["/home/u/gf"]));
+    let tilde = Host::new().file("/home/u/.yarnrc", "global-folder \"~/gf\"\n");
+    assert_eq!(tilde.global_folders("/w"), paths(&["/home/u/~/gf"]));
+    let ancestor = Host::new().file("/w/.yarnrc", "global-folder ../gf\n");
+    assert_eq!(ancestor.global_folders("/w/sub"), paths(&["/w/../gf"]));
+
+    for host in [
+        Host::new().var("YARN_GLOBAL_FOLDER", "gf"),
+        Host::new().file("/home/u/.npmrc", "global-folder=gf\n"),
+    ] {
+        assert_eq!(host.global_folders("/w"), paths(&["/w/gf"]));
+    }
+    for host in [
+        Host::new().var("YARN_GLOBAL_FOLDER", "~/gf"),
+        Host::new().file("/home/u/.npmrc", "global-folder=~/gf\n"),
+    ] {
+        assert_eq!(host.global_folders("/w"), paths(&["/home/u/gf"]));
+        assert_eq!(
+            host.root().global_folders("/w"),
+            paths(&["/usr/local/share/gf"]),
+            "root's userHome"
+        );
+    }
+}
