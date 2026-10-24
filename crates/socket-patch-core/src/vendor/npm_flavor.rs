@@ -520,8 +520,34 @@ pub async fn vendor_npm_any<'a>(
                 }
             }
         }
+        // Every flavor's lock is one `deno install` never reads (#406).
+        if result.success {
+            if let Some(detail) = deno_lock_detail(project_root, purl).await {
+                warnings.push(VendorWarning::new(DENO_LOCK_WARNING, detail));
+            }
+        }
     }
     outcome
+}
+
+/// The warning of a vendored npm package that `deno.lock` also locks.
+pub const DENO_LOCK_WARNING: &str = "vendor_npm_deno_lock";
+
+/// #406: `deno install` installs a `package.json` project's npm
+/// dependencies from `deno.lock` and never reads the npm-family lock the
+/// vendoring rewired, so when `deno.lock` locks `purl`'s `name@version`
+/// the installs Deno runs keep the registry copy. Advisory read: no
+/// readable `deno.lock`, no detail.
+async fn deno_lock_detail(project_root: &Path, purl: &str) -> Option<String> {
+    use crate::patch::redirect::{npm_deno_lock_detail, DENO_LOCK};
+    let (name, version) = super::npm_common::parse_npm_purl(purl)?;
+    let text = crate::utils::fs::read_regular_to_string(&project_root.join(DENO_LOCK))
+        .await
+        .ok()?;
+    let key = format!("{name}@{version}");
+    crate::crawlers::deno_crawler::lock_text_npm_packages(&text)
+        .contains(&key)
+        .then(|| npm_deno_lock_detail(&[key], "is vendored"))
 }
 
 /// The refusal for re-vendoring `purl` under `detected` when its ledger
@@ -1830,6 +1856,65 @@ mod tests {
         assert!(lock.contains(&format!(
             "file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
         )));
+    }
+
+    /// REGRESSION (#406): `deno install` installs a `package.json`
+    /// project's npm deps from `deno.lock` and never reads the lock the
+    /// vendoring rewired, so a vendored `name@version` that deno.lock also
+    /// locks is SAID (`vendor_npm_deno_lock`), on the in-sync re-run too;
+    /// the lock is still wired. Another version in deno.lock says nothing.
+    #[tokio::test]
+    async fn a_deno_lock_of_the_vendored_version_is_said() {
+        for (key, expect) in [
+            ("left-pad@1.3.0", true),
+            ("left-pad@1.3.0_react@18.2.0", true),
+            ("left-pad@1.2.0", false),
+        ] {
+            let (tmp, record) = npm_project().await;
+            touch(
+                tmp.path(),
+                "deno.lock",
+                &format!(r#"{{"version":"5","npm":{{"{key}":{{"integrity":"sha512-X=="}}}}}}"#),
+            )
+            .await;
+            for run in ["first", "re-run"] {
+                let outcome = vendor_any(tmp.path(), &record).await;
+                let VendorOutcome::Done {
+                    result, warnings, ..
+                } = outcome
+                else {
+                    panic!("expected Done, got {outcome:?}");
+                };
+                assert!(result.success, "{:?}", result.error);
+                let found: Vec<&VendorWarning> = warnings
+                    .iter()
+                    .filter(|w| w.code == DENO_LOCK_WARNING)
+                    .collect();
+                assert_eq!(
+                    found.len(),
+                    usize::from(expect),
+                    "{key} {run}: {warnings:?}"
+                );
+                if let Some(w) = found.first() {
+                    assert!(
+                        w.detail.starts_with("left-pad@1.3.0 is vendored"),
+                        "{}",
+                        w.detail
+                    );
+                    assert!(w.detail.contains("deno install"), "{}", w.detail);
+                }
+            }
+            let lock = tokio::fs::read_to_string(tmp.path().join("package-lock.json"))
+                .await
+                .unwrap();
+            assert!(lock.contains(&format!(
+                "file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
+            )));
+            assert!(tokio::fs::read_to_string(tmp.path().join("deno.lock"))
+                .await
+                .unwrap()
+                .contains(key));
+        }
     }
 
     /// #969: a project `.npmrc` whose `allow-file` refuses the vendored

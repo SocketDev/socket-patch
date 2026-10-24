@@ -110,7 +110,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   (`redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only`), and `vex`
   omits those patches (`vex_npm_shrinkwrap_only`) while `list`, `rollback` and
   `remove` still manage them; rename the lock to package-lock.json (or commit
-  a copy under that name) and re-run. npm 12 defaults `allow-remote=none` and refuses the
+  a copy under that name) and re-run. A Deno project's `deno install` reads
+  only `deno.lock`, never an npm-family lock, so a hosted or vendored npm pin
+  of a `name@version` that `deno.lock` also locks warns
+  (`redirect_npm_deno_lock` / `vendor_npm_deno_lock`) and `vex` omits it
+  (`vex_deno_lock_copy`); patch Deno installs with `--mode agent` after
+  `deno install`. npm 12 defaults `allow-remote=none` and refuses the
   redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
   `allow-remote=all`, so the hosted run writes it (new file, or one appended
   line; once `rollback` / `remove` / the vendored takeover has restored the last
