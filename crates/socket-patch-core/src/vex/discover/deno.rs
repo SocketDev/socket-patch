@@ -27,11 +27,9 @@
 //! (`name@1.0.0_peer@2.0.0`). The read is advisory: an unreadable or
 //! unparseable `deno.lock` marks nothing.
 
-use serde_json::Value;
-
 use std::path::PathBuf;
 
-use crate::crawlers::deno_crawler::lock_section;
+use crate::crawlers::deno_crawler::lock_npm_packages;
 
 use super::{
     canonical_base_purl, npm_purl, parse_json, CopyTarget, DiscoverCtx, Discovery, UnattestedKind,
@@ -47,7 +45,10 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Ok(lock) = parse_json(DENO_LOCK, text.as_bytes()) else {
         return;
     };
-    for purl in deno_npm_keys(&lock).into_iter().filter_map(deno_npm_purl) {
+    let purls = lock_npm_packages(&lock)
+        .into_iter()
+        .filter_map(|(name, version)| npm_purl(name, version));
+    for purl in purls {
         out.unwired_copy(UnwiredCopy {
             scope: None,
             target: CopyTarget::Purl(canonical_base_purl(&purl)),
@@ -59,23 +60,6 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             kind: UnattestedKind::DenoLock,
         });
     }
-}
-
-/// The keys of `deno.lock`'s npm package map, in any lockfile version
-/// ([`lock_section`]).
-fn deno_npm_keys(lock: &Value) -> Vec<&str> {
-    lock_section(lock, "npm")
-        .map(|m| m.keys().map(String::as_str).collect())
-        .unwrap_or_default()
-}
-
-/// The purl of one npm package key (`name@version`, `@scope/name@version`,
-/// either with Deno's `_peer@x` suffix).
-fn deno_npm_purl(key: &str) -> Option<String> {
-    let at = key.get(1..)?.find('@')? + 1;
-    let (name, version) = (&key[..at], &key[at + 1..]);
-    let version = version.split('_').next()?;
-    npm_purl(name, version)
 }
 
 #[cfg(test)]
@@ -103,11 +87,12 @@ mod tests {
 
     #[test]
     fn deno_npm_keys_cover_every_lock_version() {
+        use crate::crawlers::deno_crawler::{lock_npm_packages, lock_text_npm_packages};
         let keys = |text: &str| {
             let lock: serde_json::Value = serde_json::from_str(text).unwrap();
-            super::deno_npm_keys(&lock)
+            lock_npm_packages(&lock)
                 .into_iter()
-                .filter_map(super::deno_npm_purl)
+                .filter_map(|(name, version)| super::super::npm_purl(name, version))
                 .collect::<Vec<_>>()
         };
         let want = vec!["pkg:npm/left-pad@1.3.0".to_string()];
@@ -122,15 +107,21 @@ mod tests {
             want
         );
         assert_eq!(keys(r#"{"version":"5"}"#), Vec::<String>::new());
+        let packages = |text: &str| lock_text_npm_packages(text).into_iter().collect::<Vec<_>>();
         assert_eq!(
-            super::deno_npm_purl("@types/node@20.0.0"),
-            super::super::npm_purl("@types/node", "20.0.0")
+            packages(
+                r#"{"version":"5","npm":{"@types/node@20.0.0":{},
+                "left-pad@1.3.0_react@18.2.0":{},"nonsense":{},"empty@":{}}}"#
+            ),
+            ["@types/node@20.0.0", "left-pad@1.3.0"]
         );
+        // Not a lock Deno wrote, or not JSON: locks nothing.
+        assert!(packages(r#"{"npm":{"left-pad@1.3.0":{}}}"#).is_empty());
+        assert!(packages("not json").is_empty());
         assert_eq!(
-            super::deno_npm_purl("left-pad@1.3.0_react@18.2.0"),
-            super::super::npm_purl("left-pad", "1.3.0")
+            packages("\u{feff}{\"version\":\"5\",\"npm\":{\"a@1.0.0\":{}}}"),
+            ["a@1.0.0"]
         );
-        assert_eq!(super::deno_npm_purl("nonsense"), None);
     }
 
     /// REGRESSION (#406): `deno install` installs a `package.json`

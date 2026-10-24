@@ -1336,6 +1336,26 @@ pub fn npm_shrinkwrap_only_detail(packages: &[String], how: &str) -> String {
     )
 }
 
+/// The project's Deno lock. `deno install` installs a `package.json`
+/// project's npm dependencies from it and never reads an npm-family lock.
+pub const DENO_LOCK: &str = "deno.lock";
+
+/// The shared detail of the hosted (`redirect_npm_deno_lock`) and vendored
+/// (`vendor_npm_deno_lock`) warnings (#406): `packages` (`name@version`)
+/// are wired in the npm-family lock, but `deno.lock` also locks them, so
+/// installs Deno runs keep the registry copy.
+pub fn npm_deno_lock_detail(packages: &[String], how: &str) -> String {
+    format!(
+        "{} {how} in the npm lockfile, but {DENO_LOCK} locks the same version and \
+         `deno install` installs this project's npm dependencies from {DENO_LOCK}, never \
+         from package-lock.json / pnpm-lock.yaml / yarn.lock / bun.lock — so installs run \
+         by Deno stay UNPATCHED, and `vex` leaves the package out (npm / pnpm / yarn / bun \
+         installs are patched); to patch what Deno installs, run `deno install` and then \
+         `socket-patch scan --mode agent`",
+        packages.join(", ")
+    )
+}
+
 /// Leave `dep` on its registry entry because the project patches it with
 /// npm 12's native `npm patch` (#711). npm extracts whatever tarball the
 /// lock names and then applies the user's diff, failing the whole install

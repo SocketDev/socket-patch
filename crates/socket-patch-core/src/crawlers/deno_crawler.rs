@@ -40,7 +40,7 @@
 //! scope: same content-addressed-by-hash storage as JSR, plus no
 //! upstream PURL convention.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -217,6 +217,40 @@ pub(crate) fn lock_section<'a>(lock: &'a Value, section: &str) -> Option<&'a Map
         .or(top)
         .or_else(|| lock.get("packages").and_then(|p| p.get(section)))
         .and_then(Value::as_object)
+}
+
+/// The `(name, version)` of every package in a parsed `deno.lock`'s npm
+/// section ([`lock_section`]), in key order. A key is `name@version` or
+/// `@scope/name@version`, either with Deno's peer suffix
+/// (`name@1.0.0_peer@2.0.0`), which is dropped; a key of no such shape is
+/// skipped. Shared by VEX discovery (`vex::discover::deno`) and the hosted
+/// and vendored npm writers' `deno.lock` warnings (#406).
+pub(crate) fn lock_npm_packages(lock: &Value) -> Vec<(&str, &str)> {
+    lock_section(lock, "npm")
+        .map(|m| m.keys().filter_map(|key| npm_key(key)).collect())
+        .unwrap_or_default()
+}
+
+/// [`lock_npm_packages`] of a `deno.lock` text, as `name@version` strings.
+/// Advisory: text that is not JSON, or carries no `version` (not a lock
+/// Deno wrote), locks nothing.
+pub(crate) fn lock_text_npm_packages(text: &str) -> BTreeSet<String> {
+    let Ok(lock) = serde_json::from_str::<Value>(crate::formats::text::strip_bom(text)) else {
+        return BTreeSet::new();
+    };
+    if lock.get("version").is_none() {
+        return BTreeSet::new();
+    }
+    lock_npm_packages(&lock)
+        .into_iter()
+        .map(|(name, version)| format!("{name}@{version}"))
+        .collect()
+}
+
+fn npm_key(key: &str) -> Option<(&str, &str)> {
+    let at = key.get(1..)?.find('@')? + 1;
+    let version = key[at + 1..].split('_').next()?;
+    (!version.is_empty()).then_some((&key[..at], version))
 }
 
 /// Walk `<root>/@<scope>/<name>/<version>/` and emit a
