@@ -6,6 +6,8 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/cargo_lock_source.rs"]
+mod cargo_lock_source_fixture;
 #[path = "../common/rollback_json.rs"]
 mod rollback_json;
 #[path = "../vlt_hosted_common/mod.rs"]
@@ -20,6 +22,7 @@ mod apply_network;
 mod apply_render;
 mod apply_silent_staging_errors;
 mod bun_global_store;
+mod cargo_lock_source;
 mod check_verifies_installed_tree;
 mod cli_gem_variant_mismatch_policy;
 mod e2e_safety_advisories;
