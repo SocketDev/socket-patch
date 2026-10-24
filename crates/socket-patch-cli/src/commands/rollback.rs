@@ -329,7 +329,12 @@ async fn patched_in_other_scope(
             }
             for (file, info) in &record.files {
                 let v = verify_file_rollback(path, file, info, &blobs).await;
-                if v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
+                // A file that is there but cannot be hashed may still hold
+                // the patched bytes: keep the record rather than strand it.
+                let unverifiable = v.current_hash.is_none()
+                    && v.status != VerifyRollbackStatus::AlreadyOriginal
+                    && !v.is_absent();
+                if unverifiable || v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
                     patched.push((purl.clone(), path.clone()));
                     break 'copies;
                 }
@@ -339,21 +344,24 @@ async fn patched_in_other_scope(
     patched
 }
 
-/// `rollback`'s pointer at the scope that still holds a patched copy,
-/// naming `--cwd` when the run used one (the record lives in that
+/// `rollback`'s pointer at the scope that still holds a patched copy: a
+/// rollback of just that purl, naming `--cwd` when the run used one (the record lives in that
 /// project's manifest).
 fn patched_in_other_scope_warning(purl: &str, path: &Path, common: &GlobalArgs) -> String {
     let (scope, mut command) = if common.is_global() {
-        ("the project", "socket-patch rollback".to_string())
+        ("the project", format!("socket-patch rollback {purl}"))
     } else {
-        ("the global install", "socket-patch rollback -g".to_string())
+        (
+            "the global install",
+            format!("socket-patch rollback {purl} -g"),
+        )
     };
     if common.cwd != Path::new(".") {
         command.push_str(&format!(" --cwd {}", common.cwd.display()));
     }
     format!(
-        "{purl}: its copy in {scope} ({}) is still patched, so its manifest record was \
-         kept; run `{command}` to restore it",
+        "{purl}: its copy in {scope} ({}) is still patched or could not be \
+         verified, so its manifest record was kept; run `{command}` to restore it",
         path.display()
     )
 }

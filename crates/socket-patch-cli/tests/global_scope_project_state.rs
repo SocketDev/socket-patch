@@ -1003,11 +1003,40 @@ fn project_rollback_restoring_its_copy_keeps_a_record_patched_globally() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
         stderr.contains(&format!(
-            "Warning: {V_PURL}: its copy in the global install ({}) is still patched, so its \
-             manifest record was kept; run `socket-patch rollback -g` to restore it",
+            "Warning: {V_PURL}: its copy in the global install ({}) is still patched or could \
+             not be verified, so its manifest record was kept; run `socket-patch rollback \
+             {V_PURL} -g` to restore it",
             global.root.join("left-pad").display()
         )),
         "{stderr}"
     );
     assert!(!stdout.contains("Removed"), "{stdout}");
+}
+
+/// A copy in the other scope whose patched file exists but cannot be
+/// hashed (here a directory where `index.js` should be) may still be
+/// patched, so the record stays rather than being stranded (#450).
+#[test]
+fn global_rollback_keeps_a_record_unverifiable_in_the_project() {
+    let project = agent_project(ORIG_INDEX);
+    let root = project.path();
+    let index = root.join("node_modules/left-pad/index.js");
+    std::fs::remove_file(&index).unwrap();
+    std::fs::create_dir(&index).unwrap();
+    let prefix = empty_prefix();
+    write_left_pad(&prefix.path().join("left-pad"), ORIG_INDEX);
+    let (code, stdout, stderr) = run(
+        root,
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--offline",
+            "--global-prefix",
+            prefix.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse(&stdout, &stderr);
+    assert_record_kept(root, &v, "rollback --global-prefix (unverifiable)");
 }
