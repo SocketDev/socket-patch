@@ -840,16 +840,21 @@ async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
 }
 
 /// #1105: a project hosted at patch A whose venv was then synced from the
-/// hosted lock (`uv sync` / `poetry install`), so six holds A's patched
-/// bytes, moves to vendored at the superseding patch B. The installed copy
-/// matches neither the pristine release nor B's output; it used to be
-/// dropped as `package_not_installed` (exit 1, the project left hosted on
-/// A) while `scan --mode vendored --dry-run` previewed success. The
-/// takeover must restore the upstream entry and vendor B.
+/// hosted lock (`uv sync`, `poetry install`, `uv pip install -r`), so six
+/// holds A's patched bytes, moves to vendored at the superseding patch B.
+/// The installed copy matches neither the pristine release nor B's
+/// output; it used to be dropped as `package_not_installed` (exit 1, the
+/// project left hosted on A) while `scan --mode vendored --dry-run`
+/// previewed success. The takeover must restore the upstream entry and
+/// vendor B.
 #[tokio::test]
 async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
     const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
-    let lanes: [(&str, StageFn); 2] = [("uv", stage_uv_with_sibling), ("poetry", stage_poetry)];
+    let lanes: [(&str, StageFn); 3] = [
+        ("uv", stage_uv_with_sibling),
+        ("poetry", stage_poetry),
+        ("requirements", stage_requirements),
+    ];
     for (lane, stage) in lanes {
         let (_tmp, root) = project();
         let files = stage(&root);
