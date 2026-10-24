@@ -2538,20 +2538,24 @@ impl StagedSource {
 /// then takes the pristine artifact from the lock / registry / service, as
 /// a lock-only checkout does, instead of reporting it not installed.
 ///
-/// A live hosted pin at another uuid (`hosted_uuid`) is the same story
-/// after a hosted scan (#1105): `uv sync` / `poetry install` from the
-/// hosted lock installs that patch's bytes. The pin names no release
-/// variant, so it only answers for a sole candidate.
+/// A PyPI install under a live hosted pin (`hosted_pinned`) is the same
+/// story after a hosted scan (#1105): `uv sync` / `poetry install` from
+/// the hosted lock installs a hosted patch's bytes, whichever generation
+/// the pin names now. The pin names no release variant, so it only answers
+/// for a sole candidate; gems keep their installed dir, which the gem
+/// backend reads to refuse a platform gem.
 fn superseded_install(
     ledger: &VendorState,
     candidate: &str,
     record: &PatchRecord,
     sole_candidate: bool,
-    hosted_uuid: Option<&str>,
+    hosted_pinned: bool,
 ) -> bool {
     lookup_entry_kv(&ledger.entries, candidate).is_some_and(|(key, entry)| {
         entry.uuid != record.uuid && (sole_candidate || key == candidate)
-    }) || (sole_candidate && hosted_uuid.is_some_and(|uuid| uuid != record.uuid))
+    }) || (sole_candidate
+        && hosted_pinned
+        && matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Pypi)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2616,9 +2620,7 @@ async fn plan_service_downloads(
                                 candidate,
                                 record,
                                 candidates.len() == 1,
-                                // A hosted-pinned candidate is left out
-                                // below (`takeover_blocked`) either way.
-                                None,
+                                takeover_blocked(candidate),
                             ) {
                                 continue;
                             }
@@ -3111,7 +3113,7 @@ pub(crate) async fn vendor_records_reusing(
                                 candidate,
                                 record,
                                 candidates.len() == 1,
-                                hosted_pin_of(candidate).map(|pin| pin.uuid.as_str()),
+                                hosted_pin_of(candidate).is_some(),
                             ) {
                                 continue;
                             }
@@ -4927,19 +4929,26 @@ mod plan_gate_tests {
         }
     }
 
-    /// #1105: a live hosted pin at an older uuid marks the installed copy
-    /// superseded (a hosted sync installed that patch's bytes), so the
-    /// takeover vendors the newer patch instead of reporting it not
-    /// installed. The pin names no variant: only a sole candidate counts.
+    /// #1105: a live hosted pin marks a PyPI install superseded (a hosted
+    /// sync installed a hosted patch's bytes), so the takeover vendors the
+    /// record instead of reporting it not installed. The pin names no
+    /// variant, so only a sole candidate counts, and gems keep their
+    /// installed dir for the platform-gem refusal.
     #[test]
-    fn hosted_pin_at_another_uuid_is_a_superseded_install() {
+    fn hosted_pin_marks_a_pypi_install_superseded() {
         let ledger = VendorState::default();
-        let purl = "pkg:pypi/six@1.16.0";
+        let pypi = "pkg:pypi/six@1.16.0";
         let b = record(UUID_B);
-        assert!(superseded_install(&ledger, purl, &b, true, Some(UUID_A)));
-        assert!(!superseded_install(&ledger, purl, &b, true, Some(UUID_B)));
-        assert!(!superseded_install(&ledger, purl, &b, false, Some(UUID_A)));
-        assert!(!superseded_install(&ledger, purl, &b, true, None));
+        assert!(superseded_install(&ledger, pypi, &b, true, true));
+        assert!(!superseded_install(&ledger, pypi, &b, false, true));
+        assert!(!superseded_install(&ledger, pypi, &b, true, false));
+        assert!(!superseded_install(
+            &ledger,
+            "pkg:gem/nokogiri@1.16.0",
+            &b,
+            true,
+            true
+        ));
     }
 
     /// The download plan runs every record through its backend's own gate:

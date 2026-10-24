@@ -849,7 +849,6 @@ async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
 /// vendor B.
 #[tokio::test]
 async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
-    const UUID_B: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6d";
     let lanes: [(&str, StageFn); 3] = [
         ("uv", stage_uv_with_sibling),
         ("poetry", stage_poetry),
