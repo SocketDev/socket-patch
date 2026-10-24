@@ -1346,11 +1346,11 @@ pub const DENO_LOCK: &str = "deno.lock";
 /// installs Deno runs keep the registry copy.
 pub fn npm_deno_lock_detail(packages: &[String], how: &str) -> String {
     format!(
-        "{} {how} in the npm lockfile, but {DENO_LOCK} locks the same version and \
-         `deno install` installs this project's npm dependencies from {DENO_LOCK}, never \
-         from package-lock.json / pnpm-lock.yaml / yarn.lock / bun.lock — so installs run \
-         by Deno stay UNPATCHED, and `vex` leaves the package out (npm / pnpm / yarn / bun \
-         installs are patched); to patch what Deno installs, run `deno install` and then \
+        "{} {how} in the project's npm-family lock, but {DENO_LOCK} locks the same \
+         version and `deno install` installs this project's npm dependencies from \
+         {DENO_LOCK}, never from that lock — so installs run by Deno stay UNPATCHED, and \
+         `vex` leaves the package out (installs the other package manager runs from its \
+         lock are unaffected); to patch what Deno installs, run `deno install` and then \
          `socket-patch scan --mode agent`",
         packages.join(", ")
     )

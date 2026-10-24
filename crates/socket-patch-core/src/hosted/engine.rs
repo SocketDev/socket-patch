@@ -2985,22 +2985,26 @@ fn npm_deno_lock(
     confirmed: &[(String, String)],
 ) -> Option<RewriteWarning> {
     use crate::patch::redirect::{full_name, npm_deno_lock_detail, DENO_LOCK};
-    let mut npm = overrides
+    let npm: Vec<&DepOverride> = overrides
         .iter()
         .filter(|o| o.ecosystem == "npm")
         .filter(|o| confirmed.iter().any(|(_, uuid)| *uuid == o.patch_uuid))
-        .peekable();
-    npm.peek()?;
+        .collect();
+    if npm.is_empty() {
+        return None;
+    }
     let text = read_advisory_text(view, DENO_LOCK)?;
     let locked = crate::crawlers::deno_crawler::lock_text_npm_packages(&text);
-    let packages: BTreeSet<String> = npm
+    let mut packages: Vec<String> = npm
+        .into_iter()
         .map(|o| format!("{}@{}", full_name(o), o.version))
         .filter(|key| locked.contains(key))
         .collect();
+    packages.sort();
+    packages.dedup();
     if packages.is_empty() {
         return None;
     }
-    let packages: Vec<String> = packages.into_iter().collect();
     Some(warning(
         "redirect_npm_deno_lock",
         npm_deno_lock_detail(&packages, "redirected"),

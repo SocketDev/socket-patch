@@ -115,8 +115,12 @@ mod tests {
             ),
             ["@types/node@20.0.0", "left-pad@1.3.0"]
         );
-        // Not a lock Deno wrote, or not JSON: locks nothing.
-        assert!(packages(r#"{"npm":{"left-pad@1.3.0":{}}}"#).is_empty());
+        // Read without a `version`, as discovery reads it; not JSON locks
+        // nothing.
+        assert_eq!(
+            packages(r#"{"npm":{"left-pad@1.3.0":{}}}"#),
+            ["left-pad@1.3.0"]
+        );
         assert!(packages("not json").is_empty());
         assert_eq!(
             packages("\u{feff}{\"version\":\"5\",\"npm\":{\"a@1.0.0\":{}}}"),

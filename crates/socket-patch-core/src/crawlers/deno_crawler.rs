@@ -232,15 +232,13 @@ pub(crate) fn lock_npm_packages(lock: &Value) -> Vec<(&str, &str)> {
 }
 
 /// [`lock_npm_packages`] of a `deno.lock` text, as `name@version` strings.
-/// Advisory: text that is not JSON, or carries no `version` (not a lock
-/// Deno wrote), locks nothing.
+/// Advisory: text that is not JSON locks nothing. Like VEX discovery, a
+/// lock without a `version` is still read, so the warnings name exactly
+/// the pins `vex` omits.
 pub(crate) fn lock_text_npm_packages(text: &str) -> BTreeSet<String> {
     let Ok(lock) = serde_json::from_str::<Value>(crate::formats::text::strip_bom(text)) else {
         return BTreeSet::new();
     };
-    if lock.get("version").is_none() {
-        return BTreeSet::new();
-    }
     lock_npm_packages(&lock)
         .into_iter()
         .map(|(name, version)| format!("{name}@{version}"))
