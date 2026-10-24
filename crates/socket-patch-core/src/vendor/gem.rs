@@ -485,10 +485,41 @@ fn gem_edits(
             )))
         }
     };
+    // ── DEPENDENCIES requirement ──────────────────────────────────────────
+    // Bundler 2.7+ folds a `gemspec` development dependency on the gem into
+    // the vendored `gem` line's requirement; the lock must pin that union or
+    // the frozen install vendored mode promises fails (#985). Read on the
+    // Gemfile as the plan leaves it.
+    let project_root = prelude.gemfile_path.parent().unwrap_or(Path::new("."));
+    let requirement = match crate::formats::gem::gemspec::locked_exact_requirement(
+        &apply_gemfile_plan(&prelude.gemfile_text, &plan),
+        &prelude.lock_text,
+        name,
+        version,
+        &mut |dir| gemspec_listing(project_root, dir),
+    ) {
+        Ok(requirement) => requirement,
+        Err(why) => {
+            return Err(Box::new(refused(
+                "gemfile_declaration_not_editable",
+                format!(
+                    "bundler 2.7+ merges a gemspec development dependency on `{name}` into the \
+                     vendored requirement, and {why}; refusing to write a Gemfile.lock frozen \
+                     installs could reject"
+                ),
+            )))
+        }
+    };
     // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
     // A lock-shape failure therefore costs no download / copy / patch and no
     // Gemfile write.
-    let lock_edit = match edit_lock(&prelude.lock_text, name, version, &prelude.copy_rel) {
+    let lock_edit = match edit_lock(
+        &prelude.lock_text,
+        name,
+        version,
+        &requirement,
+        &prelude.copy_rel,
+    ) {
         Ok(edit) => edit,
         Err(e) => {
             return Err(Box::new(done(
@@ -1655,11 +1686,42 @@ fn lock_record_lines(edit: &LockEdit) -> (Vec<String>, Vec<String>) {
     (original, new)
 }
 
+/// The `*.gemspec` files of the root-relative directory `dir` under
+/// `project_root`, for [`crate::formats::gem::gemspec::locked_exact_requirement`].
+fn gemspec_listing(project_root: &Path, dir: &str) -> crate::formats::gem::gemspec::GemspecListing {
+    let path = project_root.join(dir);
+    let entries = std::fs::read_dir(&path).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Some(file) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !crate::formats::gem::gemspec::is_gemspec_file(&file)
+            || entry.file_type().is_ok_and(|t| t.is_dir())
+        {
+            continue;
+        }
+        let text = crate::utils::fs::read_regular_to_string_sync(&path.join(&file)).ok();
+        out.push((file, text));
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Produce the pair-edited lock text (see the module doc for the canonical
 /// form). Pure string surgery on exact line spans — every byte not
 /// deliberately changed is preserved, which is what keeps the result
-/// byte-identical to what bundler regenerates.
-fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdit, String> {
+/// byte-identical to what bundler regenerates. `requirement` is what the
+/// DEPENDENCIES pin carries inside its parentheses (`= <version>`, or the
+/// gemspec-merged union).
+fn edit_lock(
+    text: &str,
+    name: &str,
+    version: &str,
+    requirement: &str,
+    rel: &str,
+) -> Result<LockEdit, String> {
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
 
     // 1. Lift the gem's spec block out of GEM/specs — or, on a re-vendor to
@@ -1787,7 +1849,7 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
     // Gemfile dependency now.
     let (dep_start, dep_end) = section_span(&lines, "DEPENDENCIES")
         .ok_or_else(|| "Gemfile.lock has no DEPENDENCIES section".to_string())?;
-    let new_dep_line = format!("  {name} (= {version})!");
+    let new_dep_line = format!("  {name} ({requirement})!");
     let mut old_dep_line: Option<String> = None;
     let mut insert_at = dep_start + 1;
     let mut existing_idx: Option<usize> = None;
@@ -3087,6 +3149,77 @@ mod tests {
                 .await
                 .unwrap(),
             GEMFILE_DIRECT
+        );
+    }
+
+    /// #985: on bundler 2.7+ a `gemspec` development dependency on the gem
+    /// merges into the vendored `gem` line after the directive, so the lock
+    /// pins the union bundler writes (`rack (>= 3, = 3.2.6)!`); the bare
+    /// exact pin fails the frozen install vendored mode promises. A gemspec
+    /// that cannot be read refuses before any write.
+    #[tokio::test]
+    async fn gemspec_dev_dependency_merges_into_the_lock_pin() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngemspec\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\"\n";
+        let lock = LOCK_DIRECT
+            .replace(
+                "  puma\n  rack (~> 3.1)\n",
+                "  mylib!\n  puma\n  rack (~> 3.1, >= 3)\n",
+            )
+            .replace("2.5.22", "2.7.2");
+        let spec = "Gem::Specification.new do |s|\n  s.name = \"mylib\"\n  \
+                    s.add_development_dependency \"rack\", \">= 3\"\nend\n";
+
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, &lock).await;
+        tokio::fs::write(root.join("mylib.gemspec"), spec)
+            .await
+            .unwrap();
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        assert!(
+            wired.contains("\nDEPENDENCIES\n  mylib!\n  puma\n  rack (>= 3, = 3.2.6)!\n"),
+            "{wired}"
+        );
+
+        // Bundler < 2.7 keeps the exact pin.
+        let (_tmp, root, installed, blobs, record) =
+            fixture(gemfile, &lock.replace("2.7.2", "2.6.9")).await;
+        tokio::fs::write(root.join("mylib.gemspec"), spec)
+            .await
+            .unwrap();
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        assert!(wired.contains("\n  rack (= 3.2.6)!\n"), "{wired}");
+
+        // Two gemspecs and no `name:`: bundler's choice is unknown, refuse.
+        let (_tmp, root, installed, blobs, record) = fixture(gemfile, &lock).await;
+        tokio::fs::write(root.join("mylib.gemspec"), spec)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("other.gemspec"), spec)
+            .await
+            .unwrap();
+        let outcome = run_vendor(&root, &blobs, &installed, &record, false).await;
+        assert!(
+            matches!(&outcome, VendorOutcome::Refused { code, .. } if *code == "gemfile_declaration_not_editable"),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            lock
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
         );
     }
 
@@ -4488,7 +4621,7 @@ mod tests {
             SPIKE_RACK_SHA_LINE,
             &format!("{SPIKE_RACK_SHA_LINE}\n{SPIKE_RACK_SHA_LINE}"),
         );
-        let err = match edit_lock(&lock, "rack", "3.1.8", &copy_rel_318()) {
+        let err = match edit_lock(&lock, "rack", "3.1.8", "= 3.1.8", &copy_rel_318()) {
             Err(e) => e,
             Ok(_) => panic!("duplicate CHECKSUMS entries must fail closed"),
         };
@@ -4499,7 +4632,7 @@ mod tests {
     fn test_no_checksums_lock_records_no_checksum_wiring() {
         // A lock WITHOUT a CHECKSUMS section must keep producing
         // the exact pre-CHECKSUMS output and no checksum record.
-        let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
+        let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", "= 3.2.6", &copy_rel()).unwrap();
         assert!(edit.checksum_rewrite.is_none());
         assert_eq!(edit.text, expected_lock_direct());
     }
@@ -4956,7 +5089,7 @@ mod tests {
     fn test_gem_specs_platform_sibling_fails_closed() {
         let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    nokogiri (1.16.0)\n      racc (~> 1.4)\n    nokogiri (1.16.0-arm64-darwin)\n      racc (~> 1.4)\n\nPLATFORMS\n  arm64-darwin\n  ruby\n\nDEPENDENCIES\n  nokogiri\n\nBUNDLED WITH\n   2.5.22\n";
         let rel = format!(".socket/vendor/gem/{UUID}/nokogiri-1.16.0");
-        let err = match edit_lock(lock, "nokogiri", "1.16.0", &rel) {
+        let err = match edit_lock(lock, "nokogiri", "1.16.0", "= 1.16.0", &rel) {
             Err(e) => e,
             Ok(_) => panic!("a platform-suffixed GEM specs sibling must fail closed"),
         };
@@ -7493,7 +7626,7 @@ mod tests {
     fn edit_lock_missing_specs_stanza_fails_closed() {
         let lock = LOCK_DIRECT.replace("  specs:\n", "");
         assert_ne!(lock, LOCK_DIRECT);
-        let err = edit_lock(&lock, "rack", "3.2.6", &copy_rel())
+        let err = edit_lock(&lock, "rack", "3.2.6", "= 3.2.6", &copy_rel())
             .err()
             .expect("a specs:-less GEM section must fail closed");
         assert!(err.contains("no specs: stanza"), "{err}");
@@ -7510,7 +7643,7 @@ mod tests {
             "PATH\n  remote: {rel}\n  specs:\n    other (1.0)\n{tail}",
             rel = copy_rel()
         );
-        let err = edit_lock(&lost, "rack", "3.2.6", &copy_rel())
+        let err = edit_lock(&lost, "rack", "3.2.6", "= 3.2.6", &copy_rel())
             .err()
             .expect("a PATH section without its spec entry must fail closed");
         assert!(err.contains("lost its"), "{err}");
@@ -7519,7 +7652,7 @@ mod tests {
             "PATH\n  remote: {rel}\n  specs:\n    rack (3.2.6)\n  hand: edit\n{tail}",
             rel = copy_rel()
         );
-        let err = edit_lock(&edited, "rack", "3.2.6", &copy_rel())
+        let err = edit_lock(&edited, "rack", "3.2.6", "= 3.2.6", &copy_rel())
             .err()
             .expect("a hand-edited PATH section must fail closed");
         assert!(err.contains("not the shape vendor wrote"), "{err}");
@@ -7533,7 +7666,7 @@ mod tests {
         let git =
             "GIT\n  remote: https://example.com/dep.git\n  revision: abc123\n  specs:\n    dep (1.0)\n\n";
         let lock = format!("{git}{LOCK_DIRECT}");
-        let edit = edit_lock(&lock, "rack", "3.2.6", &copy_rel()).unwrap();
+        let edit = edit_lock(&lock, "rack", "3.2.6", "= 3.2.6", &copy_rel()).unwrap();
         assert_eq!(edit.text, format!("{git}{}", expected_lock_direct()));
     }
 
@@ -8461,7 +8594,7 @@ mod tests {
     /// "GEM specs has no entry" although the lock lists it.
     #[test]
     fn edit_lock_lifts_spec_from_second_gem_section() {
-        let edit = edit_lock(LOCK_TWO_SOURCES, "rack", "3.2.6", &copy_rel()).unwrap();
+        let edit = edit_lock(LOCK_TWO_SOURCES, "rack", "3.2.6", "= 3.2.6", &copy_rel()).unwrap();
         assert_eq!(edit.text, expected_lock_two_sources());
         assert!(!edit.rewired_ours);
         assert_eq!(
@@ -8478,7 +8611,7 @@ mod tests {
     /// recorded, so ledgers written before #779 and after it agree.
     #[test]
     fn edit_lock_first_gem_section_records_no_source_remote() {
-        let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
+        let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", "= 3.2.6", &copy_rel()).unwrap();
         assert_eq!(edit.source_remote, None);
         let (original, _new) = lock_record_lines(&edit);
         assert!(original.iter().all(|l| !l.starts_with("  remote: ")));
@@ -8493,7 +8626,7 @@ mod tests {
             "    aaa-internal (1.0.0)\n",
             "    aaa-internal (1.0.0)\n    rack (3.2.6)\n",
         );
-        let err = edit_lock(&lock, "rack", "3.2.6", &copy_rel())
+        let err = edit_lock(&lock, "rack", "3.2.6", "= 3.2.6", &copy_rel())
             .err()
             .expect("a spec listed in two GEM sections must fail closed");
         assert!(err.contains("more than one GEM section"), "{err}");
@@ -8507,7 +8640,7 @@ mod tests {
             "    aaa-internal (1.0.0)\n",
             "    aaa-internal (1.0.0)\n    rack (3.2.6-x86_64-linux)\n",
         );
-        let err = edit_lock(&lock, "rack", "3.2.6", &copy_rel())
+        let err = edit_lock(&lock, "rack", "3.2.6", "= 3.2.6", &copy_rel())
             .err()
             .expect("a platform sibling in any GEM section must fail closed");
         assert!(err.contains("platform-suffixed"), "{err}");
@@ -8570,7 +8703,7 @@ mod tests {
     /// later revert still targets the second GEM section.
     #[test]
     fn revert_lock_text_targets_recorded_gem_section() {
-        let edit = edit_lock(LOCK_TWO_SOURCES, "rack", "3.2.6", &copy_rel()).unwrap();
+        let edit = edit_lock(LOCK_TWO_SOURCES, "rack", "3.2.6", "= 3.2.6", &copy_rel()).unwrap();
         let (original, new) = lock_record_lines(&edit);
         assert_eq!(
             revert_lock_text(&edit.text, &original, &new).as_deref(),

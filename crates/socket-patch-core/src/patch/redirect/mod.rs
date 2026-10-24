@@ -7800,12 +7800,48 @@ fn rewrite_gem(
             // lock bundler < 2.2 wrote is proven frozen-installable after
             // that refresh (e2e_redirect_gem_build); a later bundler keeping
             // a merged lock keeps the caveat.
+            // Bundler 2.7+ folds a `gemspec` development dependency on the
+            // gem into its Gemfile requirement, so the lock must pin the
+            // union or every frozen install rejects the pair (#985). When
+            // that cannot be read, the plain exact pin still installs
+            // unfrozen; say so.
+            let requirement = gemfile
+                .as_deref()
+                .map(|gf| {
+                    crate::formats::gem::gemspec::locked_exact_requirement(
+                        gf,
+                        lk,
+                        &dep.name,
+                        &dep.version,
+                        &mut |dir| crate::formats::gem::gemspec::candidate_listing(files, dir),
+                    )
+                })
+                .unwrap_or_else(|| Ok(format!("= {}", dep.version)))
+                .unwrap_or_else(|why| {
+                    if checksums_era {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_gemspec_dependency_unreadable".into(),
+                            detail: format!(
+                                "{lock_name} pins {name} (= {version})!, but bundler 2.7+ merges \
+                                 a gemspec development dependency on {name} into that \
+                                 requirement and {why}; if the gemspec declares one, \
+                                 frozen/deployment installs reject the pair — run `bundle \
+                                 install` (unfrozen) once to record bundler's requirement in \
+                                 {lock_name}",
+                                name = dep.name,
+                                version = dep.version,
+                            ),
+                        });
+                    }
+                    format!("= {}", dep.version)
+                });
             let converged = checksums_era
                 && converge_gem_lock_source(
                     lk,
                     dep,
                     &ov.index_url,
                     lock_name,
+                    &requirement,
                     &mut lock_changed,
                     result,
                 );
@@ -17919,6 +17955,82 @@ mod tests {
             ))),
             "pre-edit CHECKSUMS line captured for revert"
         );
+    }
+
+    /// #985: on bundler 2.7+ a `gemspec` development dependency on the gem
+    /// merges into the redirected `gem` line that follows the directive, so
+    /// the DEPENDENCIES pin carries the union (`>= 0, = 7.0.0`) bundler
+    /// writes; a bare `(= 7.0.0)!` fails every frozen install. Bundler
+    /// 2.6, a `gem` line before the directive, and an unreadable gemspec
+    /// keep the exact pin (the last one with a warning).
+    #[test]
+    fn gem_pin_carries_the_gemspec_dev_dependency_bundler_merges() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngemspec\n\ngroup :development do\n  \
+                       gem \"rails\"\nend\n";
+        let gemspec = "Gem::Specification.new do |s|\n  s.name = \"mylib\"\n  \
+                       s.add_development_dependency \"rails\", \">= 6\"\nend\n";
+        let listing = serde_json::json!({ "": { "mylib.gemspec": gemspec } }).to_string();
+        let lock = |bundler: &str| {
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64)))
+                .replace("rails (= 7.0.0)", "rails (>= 6)")
+                .replace("2.6.2", bundler)
+        };
+        let pin = |files: &BTreeMap<String, String>| {
+            let r = rewrite_registry_redirect(files, &[gem_override("rails", "7.0.0")]);
+            let lock = r.files.get("Gemfile.lock").expect("lock rewritten").clone();
+            let pin = lock
+                .lines()
+                .skip_while(|l| *l != "DEPENDENCIES")
+                .nth(1)
+                .unwrap()
+                .to_string();
+            (
+                pin,
+                warning_codes(&r)
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut files = BTreeMap::new();
+        files.insert("Gemfile".to_string(), gemfile.to_string());
+        files.insert("Gemfile.lock".to_string(), lock("2.7.2"));
+        files.insert(
+            crate::formats::gem::gemspec::GEMSPECS_KEY.to_string(),
+            listing.clone(),
+        );
+        let (merged, warnings) = pin(&files);
+        assert_eq!(merged, "  rails (>= 6, = 7.0.0)!");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Bundler 4 merges too.
+        files.insert("Gemfile.lock".to_string(), lock("4.0.22"));
+        assert_eq!(pin(&files).0, "  rails (>= 6, = 7.0.0)!");
+        // Re-running over the converged pair changes nothing.
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let mut again = files.clone();
+        again.extend(r.files.clone());
+        let r2 = rewrite_registry_redirect(&again, &[gem_override("rails", "7.0.0")]);
+        assert!(r2.edits.is_empty(), "{:?}", r2.edits);
+
+        // Bundler 2.6 never merges.
+        files.insert("Gemfile.lock".to_string(), lock("2.6.9"));
+        assert_eq!(pin(&files).0, "  rails (= 7.0.0)!");
+        // A `gem` line before the directive keeps its own requirement.
+        files.insert("Gemfile.lock".to_string(), lock("2.7.2"));
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\"\ngemspec\n".to_string(),
+        );
+        assert_eq!(pin(&files).0, "  rails (= 7.0.0)!");
+        // The gemspec cannot be read: the exact pin, and a warning.
+        files.insert("Gemfile".to_string(), gemfile.to_string());
+        files.insert(
+            crate::formats::gem::gemspec::GEMSPECS_KEY.to_string(),
+            serde_json::json!({ "": { "mylib.gemspec": null } }).to_string(),
+        );
+        let (exact, warnings) = pin(&files);
+        assert_eq!(exact, "  rails (= 7.0.0)!");
+        assert_eq!(warnings, ["redirect_gem_gemspec_dependency_unreadable"]);
     }
 
     /// CHECKSUMS-era locks (bundler >= 4 writes the section by default) must

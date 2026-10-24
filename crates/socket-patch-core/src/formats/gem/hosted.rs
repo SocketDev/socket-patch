@@ -70,9 +70,11 @@ fn place_gem_section_sorted<'a>(
 /// from the redirected Gemfile (verified frozen-installable on bundler 4):
 /// the dep's spec entry (+ its dependency sublines) moves out of the
 /// upstream `GEM` section into a patch-registry `GEM` section
-/// (`remote: <index-url>`), and DEPENDENCIES pins `<name> (= <version>)!`
-/// (bundler's source-pin spelling for a block-scoped exact-version gem) —
-/// added in sorted position when the dep was transitive. Without this the
+/// (`remote: <index-url>`), and DEPENDENCIES pins `<name> (<requirement>)!`
+/// (bundler's source-pin spelling for a block-scoped exact-version gem:
+/// `requirement` is `= <version>`, plus any gemspec development dependency
+/// bundler 2.7+ merges in, see [`super::gemspec`]) — added in sorted
+/// position when the dep was transitive. Without this the
 /// CHECKSUMS pin leaves a MIXED state bundler refuses: the lock still
 /// attributes the gem to the upstream remote, so the prescribed unfrozen
 /// install exits 37 "mismatched checksums" and a frozen install exits 16.
@@ -94,6 +96,7 @@ pub(crate) fn converge_gem_lock_source(
     dep: &DepOverride,
     index_url: &str,
     lock_name: &str,
+    requirement: &str,
     lock_changed: &mut bool,
     result: &mut RewriteResult,
 ) -> bool {
@@ -140,7 +143,7 @@ pub(crate) fn converge_gem_lock_source(
 
     // DEPENDENCIES pin first — its lines sit AFTER the GEM sections, so the
     // spec move below never invalidates these indices (and vice versa would).
-    let target = format!("  {} (= {})!", dep.name, dep.version);
+    let target = format!("  {} ({requirement})!", dep.name);
     let entry_idx = deps
         .entries
         .iter()
@@ -470,6 +473,7 @@ mod tests {
             dep,
             INDEX_URL,
             "Gemfile.lock",
+            &format!("= {}", dep.version),
             &mut changed,
             &mut result,
         );
