@@ -612,10 +612,13 @@ fn resolutions_gate(
                 continue;
             }
             // Our own (possibly stale-uuid) entry is fine to overwrite; a
-            // user-authored override is never clobbered silently.
-            let ours = value
-                .as_str()
-                .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
+            // user-authored override is never clobbered silently. Vendoring
+            // only ever writes the bare `name` key, so a parent-scoped
+            // selector pointing into .socket/vendor is not ours.
+            let ours = selector == name
+                && value
+                    .as_str()
+                    .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
             if ours {
                 continue;
             }
@@ -627,9 +630,9 @@ fn resolutions_gate(
                 "vendor_override_conflict",
                 format!(
                     "{PACKAGE_JSON} already has a resolutions entry for `{selector}` \
-                     ({value}); vendor will not overwrite a user-authored override (an \
-                     exact-version pin `\"{name}\": \"{version}\"` is taken over \
-                     automatically)"
+                     ({value}); vendor will not overwrite a user-authored override (only \
+                     a bare exact-version pin `\"{name}\": \"{version}\"` is taken over \
+                     automatically; parent-scoped selectors always refuse)"
                 ),
             )));
         }
@@ -2329,6 +2332,19 @@ __metadata:
             assert!(detail.contains(selector), "{selector}: {detail}");
             fx.assert_untouched().await;
         }
+
+        // Vendoring only writes the bare key, so a parent-scoped selector
+        // pointing into .socket/vendor (hand-copied, or another uuid) is
+        // not ours to overwrite: it still refuses.
+        let pkg = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            &format!(
+                "  }},\n  \"resolutions\": {{\n    \"pkg-a/left-pad\": \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"\n  }}\n}}"
+            ),
+        );
+        let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+        expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        fx.assert_untouched().await;
 
         let pkg = B3_BEFORE_PKG.replace(
             "  }\n}",

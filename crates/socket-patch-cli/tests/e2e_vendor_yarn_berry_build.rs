@@ -1099,7 +1099,7 @@ fn issue_783_parent_scoped_resolution_refuses_vendoring() {
                 "SKIP e2e_vendor_yarn_berry_build (#783 {selector}): fixture install failed:\n{}",
                 yarn_berry_common::yarn_output(&out)
             );
-            return;
+            continue;
         }
         let pkg_before = std::fs::read(proj.join("package.json")).unwrap();
         let lock_before = std::fs::read(proj.join("yarn.lock")).unwrap();
