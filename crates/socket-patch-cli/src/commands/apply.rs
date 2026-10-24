@@ -1394,6 +1394,19 @@ pub(crate) async fn run_locked(
                     .into_iter()
                     .map(|(code, detail)| RunWarning { code, detail }),
                 );
+                // A global Go apply patches the module cache in place: a
+                // tool already built from it with `go install` keeps the
+                // unpatched code until it is rebuilt (#422).
+                if args.common.is_global() {
+                    let (patched, dirs) = rewritten_go_modules(&results);
+                    let (warnings, _) =
+                        socket_patch_core::utils::go_installed_tools::audit(patched, dirs).await;
+                    cache_warnings.extend(
+                        warnings
+                            .into_iter()
+                            .map(|(code, detail)| RunWarning { code, detail }),
+                    );
+                }
                 run_warnings.extend(cache_warnings.iter().cloned());
             }
 
@@ -2791,6 +2804,40 @@ async fn apply_patches_inner(
         targeted: target_manifest_purls.len(),
         show_summary: true,
     })
+}
+
+/// The Go modules a (global, in-place) apply rewrote in the module cache,
+/// and their cache copies, for the installed-tool check (#422).
+fn rewritten_go_modules(
+    results: &[ApplyResult],
+) -> (
+    Vec<socket_patch_core::utils::go_installed_tools::PatchedModule>,
+    Vec<PathBuf>,
+) {
+    use socket_patch_core::utils::go_installed_tools::{patched_at, PatchedModule};
+    let mut patched = Vec::new();
+    let mut dirs = Vec::new();
+    for r in results {
+        if !r.success || r.files_patched.is_empty() || r.package_path == VENDOR_OWNED_MARKER {
+            continue;
+        }
+        if Ecosystem::from_purl(&r.package_key) != Some(Ecosystem::Golang) {
+            continue;
+        }
+        let Some((module, version)) = parse_golang_purl(&r.package_key) else {
+            continue;
+        };
+        let dir = PathBuf::from(&r.package_path);
+        let at = patched_at(&dir, r.files_patched.iter().map(String::as_str))
+            .unwrap_or_else(std::time::SystemTime::now);
+        patched.push(PatchedModule {
+            module: module.into_owned(),
+            version: version.into_owned(),
+            patched_at: at,
+        });
+        dirs.push(dir);
+    }
+    (patched, dirs)
 }
 
 /// One Maven base purl for [`apply_maven_base`].

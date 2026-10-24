@@ -9,6 +9,7 @@ pub mod env_compat;
 pub mod failpoint;
 pub mod fs;
 pub(crate) mod go_env;
+pub mod go_installed_tools;
 pub mod group_commit;
 pub(crate) mod http;
 pub(crate) mod line_endings;

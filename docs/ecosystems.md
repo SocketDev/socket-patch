@@ -1415,6 +1415,27 @@ lines, so `go mod tidy -diff` stays clean after a patch update.
 This requires a free, publicly retrievable patch reference carrying a `goproxy`
 override. CLI support does not imply a patch is published for a particular module.
 
+### Global mode: tools built with `go install`
+
+With `--global` / `--global-prefix` there is no project to redirect, so `apply`
+patches the module cache copy (`$GOMODCACHE/<module>@<version>/`) in place. That
+changes what the next build compiles, and nothing else: a tool installed earlier
+with `go install pkg@version` is a static binary that keeps running the unpatched
+code. After a global apply, socket-patch reads the build info of the binaries in
+`$GOBIN` (else `bin/` of each `GOPATH` entry, default `~/go/bin`, plus
+`<root>/bin` for a cache at `<root>/pkg/mod`) with `go version -m`, and warns
+`go_installed_tool_stale` for each one built from a patched module before it was
+patched, with the command that rebuilds it:
+
+```sh
+go install example.com/tool@v1.0.0   # rebuilds from the patched cache
+```
+
+`vex -g` omits the patch with the same code while such a tool remains. A binary
+copied out of those directories can't be found; rebuild it the same way. While
+the cache copy stays patched, `go mod verify` reports `dir has been modified`
+for it until `rollback -g`.
+
 ### Files go derives from go.mod
 
 Two files the go command derives from `go.mod` can disagree with a new or removed
