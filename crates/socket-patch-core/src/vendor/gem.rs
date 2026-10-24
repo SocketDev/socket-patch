@@ -185,7 +185,8 @@ pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, 
 /// The per-gem twin of [`gem_manifest_refusal`] for the hosted→vendored
 /// takeover: the backend's Gemfile declaration gate ([`plan_gemfile_edit`]
 /// and [`refuse_append_of_direct_dependency`], refused as
-/// `gemfile_declaration_not_editable`) for `purl`. Evaluated on the files
+/// `gemfile_declaration_not_editable`, with [`gemspec_merge_refusal`]) for
+/// `purl`. Evaluated on the files
 /// as the takeover's restore of `pin` will leave them: a dry-run
 /// [`restore_upstream`] supplies the restored `Gemfile` / `Gemfile.lock`
 /// text, so the hosted `source … do` block socket-patch itself wrote is
@@ -235,6 +236,11 @@ pub async fn gem_vendor_target_preflight(
     };
     plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
         .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
+        .and_then(|plan| {
+            let after = apply_gemfile_plan(&gemfile_text, &plan);
+            gemspec_merge_refusal(project_root, &after, &lock_text, &name, &version)
+                .map_or(Ok(()), Err)
+        })
         .err()
         .map(|detail| ("gemfile_declaration_not_editable", detail))
 }
@@ -486,42 +492,17 @@ fn gem_edits(
         }
     };
     // ── gemspec development dependency (#985) ────────────────────────────
-    // Bundler 2.7+ folds a `gemspec` development dependency on the gem into
-    // a `gem` line that follows the directive. For a path gem bundler then
-    // rejects even the lock it writes itself under frozen/deployment mode
-    // ("rack from `<path>` to `<path>`", verified on 2.7.2 and 4.0.18), so
-    // no lock this backend could write keeps vendored mode's frozen-install
-    // promise. Refuse with the remedy: declared before the directive, the
-    // gem keeps its own requirement and installs frozen. Read on the
-    // Gemfile as the plan leaves it.
     let project_root = prelude.gemfile_path.parent().unwrap_or(Path::new("."));
-    let merged = crate::formats::gem::gemspec::locked_exact_requirement(
+    if let Some(detail) = gemspec_merge_refusal(
+        project_root,
         &apply_gemfile_plan(&prelude.gemfile_text, &plan),
         &prelude.lock_text,
         name,
         version,
-        &mut |dir| gemspec_listing(project_root, dir),
-    );
-    let refusal = match merged {
-        Ok(requirement) if requirement == format!("= {version}") => None,
-        Ok(requirement) => Some(format!(
-            "the gemspec the Gemfile's `gemspec` directive loads declares a development \
-             dependency on `{name}`, so bundler 2.7+ locks the vendored gem as `{name} \
-             ({requirement})!` and then rejects that lock under frozen/deployment mode (a \
-             bundler limitation for path gems)"
-        )),
-        Err(why) => Some(format!(
-            "bundler 2.7+ merges a gemspec development dependency on `{name}` into the \
-             vendored gem's requirement, and {why}"
-        )),
-    };
-    if let Some(why) = refusal {
+    ) {
         return Err(Box::new(refused(
             "gemfile_declaration_not_editable",
-            format!(
-                "{why}; move the `gem \"{name}\"` declaration above `gemspec` in the Gemfile \
-                 (bundler then keeps its own requirement), or use hosted mode"
-            ),
+            detail,
         )));
     }
     // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
@@ -1692,6 +1673,46 @@ fn lock_record_lines(edit: &LockEdit) -> (Vec<String>, Vec<String>) {
     let mut new = edit.path_section.clone();
     new.push(edit.new_dep_line.clone());
     (original, new)
+}
+
+/// Why vendored mode must not wire `name`@`version` into the Gemfile as
+/// `plan` leaves it (`gemfile_after`), if it must not (#985). Bundler 2.7+
+/// folds a `gemspec` development dependency on the gem into a `gem` line
+/// that follows the directive. For a path gem bundler then rejects even
+/// the lock it writes itself under frozen/deployment mode ("rack from
+/// `<path>` to `<path>`", verified on 2.7.2 and 4.0.18), so no lock this
+/// backend could write keeps vendored mode's frozen-install promise.
+/// Declared before the directive, the gem keeps its own requirement and
+/// installs frozen: the refusal names that remedy.
+fn gemspec_merge_refusal(
+    project_root: &Path,
+    gemfile_after: &str,
+    lock: &str,
+    name: &str,
+    version: &str,
+) -> Option<String> {
+    match crate::formats::gem::gemspec::locked_exact_requirement(
+        gemfile_after,
+        lock,
+        name,
+        version,
+        &mut |dir| gemspec_listing(project_root, dir),
+    ) {
+        Ok(requirement) if requirement == format!("= {version}") => None,
+        Ok(requirement) => Some(format!(
+            "the gemspec the Gemfile's `gemspec` directive loads declares a development \
+             dependency on `{name}`, so bundler 2.7+ locks the vendored gem as `{name} \
+             ({requirement})!` and then rejects that lock under frozen/deployment mode (a \
+             bundler limitation for path gems); move the `gem \"{name}\"` declaration above \
+             `gemspec` in the Gemfile (bundler then keeps its own requirement), or use hosted \
+             mode"
+        )),
+        Err(why) => Some(format!(
+            "cannot tell whether bundler 2.7+ merges a gemspec development dependency on \
+             `{name}` into the vendored requirement ({why}), so a frozen install of the \
+             vendored pair is not guaranteed; use hosted mode"
+        )),
+    }
 }
 
 /// The `*.gemspec` files of the root-relative directory `dir` under
@@ -3186,7 +3207,12 @@ mod tests {
             let outcome = run_vendor(&root, &blobs, &installed, &record, false).await;
             let (code, detail) = refusal(&outcome).unwrap_or_else(|| panic!("{outcome:?}"));
             assert_eq!(code, "gemfile_declaration_not_editable");
-            assert!(detail.contains("above `gemspec`"), "{detail}");
+            let want = if extra.is_some() {
+                "cannot tell"
+            } else {
+                "above `gemspec`"
+            };
+            assert!(detail.contains(want), "{detail}");
             assert_eq!(
                 tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
                     .await
