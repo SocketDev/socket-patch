@@ -39,9 +39,13 @@ permissions:
 # queued push but the newest during a merge burst, and most main commits never
 # got a verdict. Merge-group refs (gh-readonly-queue/...) are unique per queue
 # entry already. The nightly keeps its own group so it never queues behind (or
-# cancels) a push.
+# cancels) a push. Draft PR runs get their own group too: a push followed at
+# once by `gh pr ready` can deliver the push's `synchronize` (payload still
+# draft) after `ready_for_review`. In a shared group that late draft run
+# cancelled the real run, skipped every job, and left ci-ok green on a head
+# nothing had tested.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event.pull_request.draft && '-draft' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Linux jobs run on Depot's runners (depot-ubuntu-*-4: 4 vCPU, like GitHub's

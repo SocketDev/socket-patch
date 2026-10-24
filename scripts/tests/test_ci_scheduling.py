@@ -203,6 +203,13 @@ class Scheduling(unittest.TestCase):
         self.assertIn("if: github.event_name == 'pull_request' && github.base_ref == 'main'"
                       " && github.head_ref != 'release/v5-prerelease'", owner)
 
+    def test_late_draft_run_cannot_cancel_the_ready_run(self):
+        # A push's draft-payload `synchronize` can land after `ready_for_review`
+        # on the same head; sharing a group, it cancelled the real run and left
+        # ci-ok green with every job skipped.
+        group = re.search(r"^concurrency:\n  group: (.*)$", TEXT, re.M)[1]
+        self.assertIn("github.event.pull_request.draft && '-draft'", group)
+
     def test_row_reader_preserves_both_os_siblings(self):
         jobs = reader.jobs("""jobs:
   example:
