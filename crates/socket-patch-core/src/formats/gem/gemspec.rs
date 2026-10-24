@@ -243,10 +243,18 @@ pub(crate) fn dev_dependency_requirements(
             continue;
         };
         let after = &trimmed[at + "add_development_dependency".len()..];
-        let mentions = after.contains(&format!("\"{gem}\""))
-            || after.contains(&format!("'{gem}'"))
-            || after.contains(&format!("<{gem}>"))
-            || after.contains(&format!("{{{gem}}}"));
+        // Every literal spelling [`literal`] reads: quoted, or `%q` with any
+        // of its bracket pairs.
+        let mentions = [
+            ('"', '"'),
+            ('\'', '\''),
+            ('<', '>'),
+            ('{', '}'),
+            ('(', ')'),
+            ('[', ']'),
+        ]
+        .iter()
+        .any(|(open, close)| after.contains(&format!("{open}{gem}{close}")));
         let unreadable = || format!("line {}: `{trimmed}`", i + 1);
         let Some(reqs) = read_dev_call(after) else {
             if mentions {
@@ -552,6 +560,8 @@ mod tests {
             "s.add_development_dependency \"vuln-gem\", VERSION\n",
             "s.add_development_dependency \"vuln-gem\",\n  \"~> 1.0\"\n",
             "s.add_development_dependency \"vuln-gem\", \"~> 1\"\ns.add_development_dependency \"vuln-gem\", \"~> 2\"\n",
+            "s.add_development_dependency(%q(vuln-gem), VERSION)\n",
+            "s.add_development_dependency(%q[vuln-gem].freeze, [VERSION])\n",
         ] {
             let text: &'static str = Box::leak(spec.to_string().into_boxed_str());
             assert!(
