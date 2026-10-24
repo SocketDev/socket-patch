@@ -94,6 +94,18 @@ pub fn unchecked_detail(patched: &[PatchedModule], dirs: &[PathBuf]) -> String {
 }
 
 impl PatchedModule {
+    /// The patched module of `purl` whose files this run writes (or, in a
+    /// dry run, would write) now: every tool already built from it is
+    /// stale. `None` for a non-Go purl.
+    pub fn written_now(purl: &str) -> Option<Self> {
+        let (module, version) = crate::utils::purl::parse_golang_purl(purl)?;
+        Some(Self {
+            module: module.into_owned(),
+            version: version.into_owned(),
+            patched_at: SystemTime::now(),
+        })
+    }
+
     /// The patched module of `purl` whose cache copy is `dir`, dated by the
     /// newest of the patch record's `files` there (keys may carry the
     /// API's `package/` prefix), or `None` for a non-Go purl or when no
@@ -131,8 +143,14 @@ pub struct BinDirs {
 /// The directories `go install` writes to, for module cache copies at
 /// `module_dirs`, reading the process environment.
 pub fn bin_dirs(module_dirs: &[&Path]) -> BinDirs {
+    // A relative `--global-prefix` resolves against the working directory.
+    let module_dirs: Vec<PathBuf> = module_dirs
+        .iter()
+        .map(|d| std::path::absolute(d).unwrap_or_else(|_| d.to_path_buf()))
+        .collect();
+    let module_dirs: Vec<&Path> = module_dirs.iter().map(PathBuf::as_path).collect();
     bin_dirs_with(
-        module_dirs,
+        &module_dirs,
         &crate::utils::go_env::go_env,
         crate::utils::fs::home_dir(),
     )
@@ -183,7 +201,11 @@ pub fn bin_dirs_with(
             .last()
             .and_then(|m| m.parent()?.parent())
         {
-            push(root.join("bin"));
+            if root.is_absolute() {
+                push(root.join("bin"));
+            } else if !in_user_cache(dir) {
+                unlocated.push(dir.to_path_buf());
+            }
         } else if !in_user_cache(dir) {
             unlocated.push(dir.to_path_buf());
         }
@@ -549,10 +571,18 @@ mod tests {
         );
         // A bare --global-prefix module cache: nowhere known to look.
         let bare = Path::new("/img/cache/x@v1.0.0");
-        let found = bin_dirs_with(&[bare], &env(vec![("GOBIN", "/gobin")]), home);
+        let found = bin_dirs_with(&[bare], &env(vec![("GOBIN", "/gobin")]), home.clone());
         assert_eq!(found.dirs, Vec::<PathBuf>::new());
         assert_eq!(found.unlocated, vec![bare.to_path_buf()]);
         assert!(unlocated_detail(&found.unlocated).contains("/img/cache/x@v1.0.0"));
+        // A relative root has no usable bin directory: reported, not dropped.
+        let rel = Path::new("gp/pkg/mod/x@v1.0.0");
+        let found = bin_dirs_with(&[rel], &env(Vec::new()), home.clone());
+        assert_eq!(found.dirs, Vec::<PathBuf>::new());
+        assert_eq!(found.unlocated, vec![rel.to_path_buf()]);
+        // bin_dirs itself resolves it against the working directory.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(bin_dirs(&[rel]).dirs.contains(&cwd.join("gp").join("bin")));
     }
 
     #[test]

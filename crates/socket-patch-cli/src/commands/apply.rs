@@ -2812,7 +2812,7 @@ async fn apply_patches_inner(
 /// The Go modules a (global, in-place) apply left patched in the module
 /// cache, and their cache copies, for the installed-tool check (#422).
 /// Already-patched copies count too: a tool built before an earlier run
-/// is just as stale.
+/// is just as stale. A dry run reports what the real run would.
 fn patched_go_modules(
     results: &[ApplyResult],
 ) -> (
@@ -2827,8 +2827,19 @@ fn patched_go_modules(
             continue;
         }
         let dir = PathBuf::from(&r.package_path);
-        let files = r.files_verified.iter().map(|f| f.file.as_str());
-        if let Some(module) = PatchedModule::of_copy(&r.package_key, &dir, files) {
+        // Files this run writes (or, dry, would write) are patched now; an
+        // already-patched copy is dated by its files on disk.
+        let writes = !r.files_patched.is_empty()
+            || r.files_verified
+                .iter()
+                .any(|f| f.status == VerifyStatus::Ready);
+        let module = if writes {
+            PatchedModule::written_now(&r.package_key)
+        } else {
+            let files = r.files_verified.iter().map(|f| f.file.as_str());
+            PatchedModule::of_copy(&r.package_key, &dir, files)
+        };
+        if let Some(module) = module {
             patched.push(module);
             dirs.push(dir);
         }

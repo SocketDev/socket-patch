@@ -1088,8 +1088,12 @@ fn global_apply_flags_tools_built_from_the_unpatched_module() {
         stale
     };
     let apply = || apply_with(&[]);
-    let stale = apply();
+    // The preview names the tool the real run will leave stale.
+    let preview = apply_with(&["--dry-run"]);
     let lib = modcache.join(format!("{UMOD}@{UVER}")).join("lib.go");
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), PRISTINE_LIB);
+    let stale = apply();
+    assert_eq!(preview, stale);
     assert_eq!(std::fs::read_to_string(&lib).unwrap(), PATCHED_LIB);
     // The cache is patched; the installed binary is not.
     assert_eq!(run_tool(&gobin), "TOOL: PRISTINE");
