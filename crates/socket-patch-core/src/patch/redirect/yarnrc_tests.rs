@@ -586,8 +586,9 @@ fn global_folder_values_read_like_yarn() {
         Vec::<PathBuf>::new()
     );
     // An escaped expression stays verbatim (`ini` reads `\\` as `\`
-    // first). On Windows the leading `\` makes it root-relative, so it
-    // replaces the cwd's root as `path.resolve` does.
+    // first). On Windows the leading `\` makes it root-relative: it keeps
+    // the cwd's drive and replaces the rest, as `path.resolve` does
+    // (`/w` has no drive, so nothing of it is kept).
     let escaped = if cfg!(windows) {
         "\\${HOME}/x"
     } else {
