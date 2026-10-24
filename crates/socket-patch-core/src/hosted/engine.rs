@@ -1930,7 +1930,7 @@ async fn unattributed_pins(
     // [`Discovery::shadowed`]: crate::vex::discover::Discovery::shadowed
     let mut copy_left: Vec<RewriteWarning> = Vec::new();
     let mut copy_shadowed: BTreeSet<String> = BTreeSet::new();
-    let mut named: BTreeSet<(&std::path::Path, &str)> = BTreeSet::new();
+    let mut named: BTreeSet<(&std::path::Path, &str, &str)> = BTreeSet::new();
     for r in &discovery.shadowed {
         if r.mode != crate::vex::discover::WiringMode::Hosted
             || !done.confirmed.iter().any(|(_, uuid)| *uuid == r.uuid)
@@ -1947,7 +1947,7 @@ async fn unattributed_pins(
         }) {
             copy_shadowed.insert(r.uuid.clone());
             if yarn_rewriter_named(&done.rewrite.warnings, &c.file, &c.key)
-                || !named.insert((c.file.as_path(), c.key.as_str()))
+                || !named.insert((c.file.as_path(), c.key.as_str(), c.how.as_str()))
             {
                 continue;
             }
@@ -1955,14 +1955,16 @@ async fn unattributed_pins(
                 REDIRECT_COPY_UNPATCHED,
                 format!(
                     "{}: {} is pinned to patch {}, but lock entry `{}` {}; that copy stays \
-                     UNPATCHED, so `vex` attests nothing for {}. Depend on the registry \
-                     release instead of that copy to patch it",
+                     UNPATCHED, so `vex` attests nothing for {}. {}",
                     c.file.display(),
                     r.purl,
                     r.uuid,
                     c.key,
                     c.how,
-                    r.purl
+                    r.purl,
+                    c.remedy.as_deref().unwrap_or(
+                        "Depend on the registry release instead of that copy to patch it"
+                    ),
                 ),
             ));
         }

@@ -532,6 +532,9 @@ pub struct UnpatchedCopy {
     pub key: String,
     /// How that entry installs, completing "lock entry `<key>` …".
     pub how: String,
+    /// What makes the build patch that copy, when it is not the usual
+    /// "depend on the registry release instead" (a bundled copy, #758).
+    pub remedy: Option<String>,
 }
 
 /// A lock entry that installs SOME package (at `version`, when known) under
@@ -1023,7 +1026,20 @@ impl Discovery {
             file: PathBuf::from(file),
             key: key.to_string(),
             how: how.to_string(),
+            remedy: None,
         });
+    }
+
+    /// [`Discovery::unpatched_copy`] for a copy lock entry `key` unpacks
+    /// from its own tarball (`bundleDependencies`, #758): no dependency the
+    /// user declares installs it, so the remedy is the bundling package.
+    pub(crate) fn bundled_copy(&mut self, file: &str, purl: Option<String>, key: &str, how: &str) {
+        self.unpatched_copy(file, purl, key, how);
+        if let Some(copy) = self.unpatched_copies.last_mut() {
+            copy.remedy = Some(format!(
+                "Vendor or update the bundling package (lock entry `{key}`) to cover it"
+            ));
+        }
     }
 
     /// A lock entry of `file` that installs a copy of some package at
@@ -1080,6 +1096,7 @@ impl Discovery {
                     file: u.file.clone(),
                     key: u.key.clone(),
                     how: u.how.clone(),
+                    remedy: None,
                 });
             }
         }
