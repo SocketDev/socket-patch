@@ -439,18 +439,29 @@ fn refuse_uv_source(round: &mut Round, index: usize) {
 
 /// The canonical names of `[tool.uv.sources]` entries other than index
 /// sources (which a direct URL overrides) when a Hatch environment uses
-/// the uv installer, else none: pip ignores the table.
-fn uv_source_names(documents: &BTreeMap<&'static str, DocumentMut>) -> HashSet<String> {
-    if require_pip_installer_documents(documents.values()).is_ok() {
+/// the uv installer, else none: pip ignores the table. `uv_env` is a
+/// non-empty `HATCH_ENV_TYPE_VIRTUAL_UV_PATH`, which switches every
+/// environment to uv as `uv-path` does.
+fn uv_source_names(
+    documents: &BTreeMap<&'static str, DocumentMut>,
+    uv_env: bool,
+) -> HashSet<String> {
+    if !uv_env && require_pip_installer_documents(documents.values()).is_ok() {
         return HashSet::new();
     }
+    // An empty array is never judged index-only.
     let index_only = |source: &Item| match source {
-        Item::Value(Value::Array(sources)) => sources.iter().all(|source| {
-            source
-                .as_inline_table()
-                .is_some_and(|table| table.contains_key("index"))
-        }),
-        Item::ArrayOfTables(sources) => sources.iter().all(|table| table.contains_key("index")),
+        Item::Value(Value::Array(sources)) => {
+            !sources.is_empty()
+                && sources.iter().all(|source| {
+                    source
+                        .as_inline_table()
+                        .is_some_and(|table| table.contains_key("index"))
+                })
+        }
+        Item::ArrayOfTables(sources) => {
+            !sources.is_empty() && sources.iter().all(|table| table.contains_key("index"))
+        }
         source => source
             .as_table_like()
             .is_some_and(|table| table.contains_key("index")),
@@ -573,7 +584,10 @@ fn run_round(documents: &mut BTreeMap<&'static str, DocumentMut>, round: &mut Ro
             }
         }
     }
-    round.uv_sources = uv_source_names(documents);
+    round.uv_sources = uv_source_names(
+        documents,
+        std::env::var("HATCH_ENV_TYPE_VIRTUAL_UV_PATH").is_ok_and(|path| !path.is_empty()),
+    );
     round.apply = false;
     if let Err(error) = walk(documents, round) {
         round.fail_rest(&error);
@@ -1225,6 +1239,23 @@ mod tests {
             "[project]\ndependencies = [\"six==1.16.0\"]\n{uv}[tool.uv.sources]\nidna = {{ path = \"/abs/idna.whl\" }}\n"
         ));
         assert!(rewrite(&other, "six", "1.16.0", url).is_ok());
+        // HATCH_ENV_TYPE_VIRTUAL_UV_PATH switches Hatch to uv with no
+        // file setting; an empty source array is not index-only.
+        let sourced = |source: &str| -> BTreeMap<&'static str, DocumentMut> {
+            [(
+                HATCH_FILES[0],
+                format!("[project]\ndependencies = [\"six==1.16.0\"]\n[tool.uv.sources]\nsix = {source}\n")
+                    .parse()
+                    .unwrap(),
+            )]
+            .into_iter()
+            .collect()
+        };
+        let path = sourced("{ path = \"/abs/six.whl\" }");
+        assert!(uv_source_names(&path, false).is_empty());
+        assert!(uv_source_names(&path, true).contains("six"));
+        assert!(uv_source_names(&sourced("[]"), true).contains("six"));
+        assert!(uv_source_names(&sourced("{ index = \"internal\" }"), true).is_empty());
         // Environment dependencies reach uv as plain strings.
         let env = files(&format!(
             "[project]\nname = \"app\"\n[tool.hatch.envs.default]\ninstaller = \"uv\"\ndependencies = [\"six==1.16.0\"]\n[tool.uv.sources]\nsix = {{ path = \"/abs/six.whl\" }}\n"
