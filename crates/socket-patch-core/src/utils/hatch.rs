@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use toml_edit::{DocumentMut, Item, Value};
 
@@ -295,6 +295,9 @@ struct Round<'a> {
     targets: Vec<Target<'a>>,
     index: HashMap<String, usize>,
     apply: bool,
+    /// Canonical names whose `[tool.uv.sources]` entry Hatch's uv
+    /// installer applies over a project-table direct reference.
+    uv_sources: HashSet<String>,
 }
 
 impl Round<'_> {
@@ -380,7 +383,9 @@ fn rewrite_project(document: &mut DocumentMut, round: &mut Round) -> Result<(), 
             .as_table_like_mut()
             .and_then(|table| table.get_mut("dependencies"))
         {
-            rewrite_array(dependencies, round, file, true)?;
+            for index in rewrite_array(dependencies, round, file, true)? {
+                refuse_uv_source(round, index);
+            }
         }
         if let Some(groups) = project
             .as_table_like_mut()
@@ -391,7 +396,9 @@ fn rewrite_project(document: &mut DocumentMut, round: &mut Round) -> Result<(), 
                 .ok_or("optional dependencies must be a table")?
                 .iter_mut()
             {
-                rewrite_array(dependencies, round, file, true)?;
+                for index in rewrite_array(dependencies, round, file, true)? {
+                    refuse_uv_source(round, index);
+                }
             }
         }
     }
@@ -410,6 +417,55 @@ fn rewrite_project(document: &mut DocumentMut, round: &mut Round) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// #673: Hatch's uv installer runs `uv pip install -e .`, which resolves a
+/// project requirement through `[tool.uv.sources]` instead of its direct
+/// reference: a url or path source installs the unpatched copy, a git
+/// source makes every install fail on conflicting URLs. Environment
+/// dependencies reach uv as plain strings, so only the project tables
+/// (`dependencies`, `optional-dependencies`) are refused.
+fn refuse_uv_source(round: &mut Round, index: usize) {
+    let target = &mut round.targets[index];
+    if round.uv_sources.contains(&target.name) {
+        target.error.get_or_insert_with(|| {
+            format!(
+                "{}: Hatch's uv installer resolves it through its [tool.uv.sources] entry instead of the hosted reference; use agent mode",
+                target.name
+            )
+        });
+    }
+}
+
+/// The canonical names of `[tool.uv.sources]` entries other than index
+/// sources (which a direct URL overrides) when a Hatch environment uses
+/// the uv installer, else none: pip ignores the table.
+fn uv_source_names(documents: &BTreeMap<&'static str, DocumentMut>) -> HashSet<String> {
+    if require_pip_installer_documents(documents.values()).is_ok() {
+        return HashSet::new();
+    }
+    let index_only = |source: &Item| match source {
+        Item::Value(Value::Array(sources)) => sources.iter().all(|source| {
+            source
+                .as_inline_table()
+                .is_some_and(|table| table.contains_key("index"))
+        }),
+        Item::ArrayOfTables(sources) => sources.iter().all(|table| table.contains_key("index")),
+        source => source
+            .as_table_like()
+            .is_some_and(|table| table.contains_key("index")),
+    };
+    documents
+        .get(HATCH_FILES[0])
+        .and_then(|document| document.get("tool"))
+        .and_then(|tool| tool.get("uv"))
+        .and_then(|uv| uv.get("sources"))
+        .and_then(Item::as_table_like)
+        .into_iter()
+        .flat_map(|sources| sources.iter())
+        .filter(|(_, source)| !index_only(source))
+        .map(|(name, _)| canonicalize_pypi_name(name))
+        .collect()
 }
 
 fn rewrite_environments(hatch: &mut Item, round: &mut Round, file: &str) -> Result<(), String> {
@@ -517,6 +573,7 @@ fn run_round(documents: &mut BTreeMap<&'static str, DocumentMut>, round: &mut Ro
             }
         }
     }
+    round.uv_sources = uv_source_names(documents);
     round.apply = false;
     if let Err(error) = walk(documents, round) {
         round.fail_rest(&error);
@@ -679,6 +736,7 @@ pub fn rewrite_all(files: &BTreeMap<String, String>, deps: &[HatchDep]) -> Hatch
                 .map(|(index, &position)| (names[position].clone(), index))
                 .collect(),
             apply: false,
+            uv_sources: HashSet::new(),
         };
         run_round(&mut documents, &mut round);
         for (position, target) in positions.into_iter().zip(round.targets) {
@@ -850,6 +908,7 @@ pub fn plan(
         }],
         index: HashMap::from([(name, 0)]),
         apply: false,
+        uv_sources: HashSet::new(),
     };
     run_round(&mut documents, &mut round);
     let target = round.targets.pop().ok_or("missing Hatch target")?;
@@ -1109,6 +1168,95 @@ mod tests {
             .unwrap_err()
             .contains("pip installer"));
         }
+    }
+
+    /// #673: Hatch's uv installer runs `uv pip install -e .`, which applies
+    /// the project's `[tool.uv.sources]` over a direct reference in the
+    /// project tables, so a url, path or git source would keep the
+    /// unpatched copy (or break every install). Environment dependencies
+    /// reach uv as plain strings, index sources lose to the direct URL, and
+    /// pip ignores the table: those still rewrite.
+    #[test]
+    fn uv_sources_refuse_project_rewrites_under_the_uv_installer() {
+        let url = "https://patch.test/six-1.16.0-py2.py3-none-any.whl";
+        let sources = [
+            "six = { url = \"https://files.test/six-1.16.0-py2.py3-none-any.whl\" }",
+            "six = { path = \"/abs/six-1.16.0-py2.py3-none-any.whl\" }",
+            "six = { git = \"https://github.com/benjaminp/six\", tag = \"1.16.0\" }",
+            "Six = { url = \"https://files.test/six.whl\" }",
+            "six = [{ index = \"internal\", marker = \"sys_platform == 'win32'\" }, { path = \"/abs/six.whl\" }]",
+        ];
+        let declarations = [
+            "[project]\ndependencies = [\"six==1.16.0\"]\n",
+            "[project]\noptional-dependencies.x = [\"six==1.16.0\"]\n",
+        ];
+        for source in sources {
+            for declaration in declarations {
+                for setting in ["installer = \"uv\"", "uv-path = \"uv\""] {
+                    let inputs = files(&format!(
+                        "{declaration}[tool.hatch.envs.default]\n{setting}\n[tool.uv.sources]\n{source}\n"
+                    ));
+                    let error = rewrite(&inputs, "six", "1.16.0", url).unwrap_err();
+                    assert!(
+                        error.contains("[tool.uv.sources]"),
+                        "{source} {declaration}: {error}"
+                    );
+                    let external = both(
+                        &format!("{declaration}[tool.uv.sources]\n{source}\n"),
+                        Some(&format!("[envs.default]\n{setting}\n")),
+                    );
+                    assert!(rewrite(&external, "six", "1.16.0", url)
+                        .unwrap_err()
+                        .contains("[tool.uv.sources]"));
+                }
+                // pip ignores [tool.uv.sources].
+                let pip = files(&format!("{declaration}[tool.uv.sources]\n{source}\n"));
+                assert!(rewrite(&pip, "six", "1.16.0", url).is_ok(), "{source}");
+            }
+        }
+        let uv = "[tool.hatch.envs.default]\ninstaller = \"uv\"\n";
+        // Index sources lose to the direct URL.
+        let index = files(&format!(
+            "[project]\ndependencies = [\"six==1.16.0\"]\n{uv}[tool.uv.sources]\nsix = {{ index = \"internal\" }}\n"
+        ));
+        assert!(rewrite(&index, "six", "1.16.0", url).is_ok());
+        // A source for another package leaves this one alone.
+        let other = files(&format!(
+            "[project]\ndependencies = [\"six==1.16.0\"]\n{uv}[tool.uv.sources]\nidna = {{ path = \"/abs/idna.whl\" }}\n"
+        ));
+        assert!(rewrite(&other, "six", "1.16.0", url).is_ok());
+        // Environment dependencies reach uv as plain strings.
+        let env = files(&format!(
+            "[project]\nname = \"app\"\n[tool.hatch.envs.default]\ninstaller = \"uv\"\ndependencies = [\"six==1.16.0\"]\n[tool.uv.sources]\nsix = {{ path = \"/abs/six.whl\" }}\n"
+        ));
+        assert!(rewrite(&env, "six", "1.16.0", url).is_ok());
+        // One refused package writes nothing for itself, and the other
+        // package of the batch still rewrites.
+        let mixed = files(&format!(
+            "[project]\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n{uv}[tool.uv.sources]\nsix = {{ path = \"/abs/six.whl\" }}\n"
+        ));
+        let deps = [
+            HatchDep {
+                name: "six",
+                version: "1.16.0",
+                url,
+            },
+            HatchDep {
+                name: "idna",
+                version: "3.7",
+                url: "https://patch.test/idna-3.7-py3-none-any.whl",
+            },
+        ];
+        assert_batch_matches_sequential(&mixed, &deps);
+        let batch = rewrite_all(&mixed, &deps);
+        assert!(batch.steps[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("[tool.uv.sources]"));
+        assert!(batch.steps[1].is_ok());
+        let pyproject = &batch.files["pyproject.toml"];
+        assert!(pyproject.contains("\"six==1.16.0\""));
+        assert!(pyproject.contains("idna @ https://patch.test/"));
     }
 
     #[test]
