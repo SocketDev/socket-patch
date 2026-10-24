@@ -6697,7 +6697,7 @@ mod tests {
 
         let (code, detail) =
             unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_pending");
         assert!(detail.contains("still building"), "{detail}");
         assert!(!root.join(".socket").exists());
         assert_eq!(
@@ -6734,7 +6734,7 @@ mod tests {
 
         let (code, detail) =
             unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_unavailable");
         assert!(detail.contains("unavailable"), "{detail}");
         assert!(!root.join(".socket").exists());
     }

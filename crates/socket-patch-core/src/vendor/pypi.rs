@@ -10594,7 +10594,7 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         let VendorOutcome::Refused { code, detail } = outcome else {
             panic!("expected Refused, got {outcome:?}");
         };
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_pending");
         assert!(detail.contains("still building"), "{detail}");
         assert!(!fx.root.join(".socket").exists());
         assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
@@ -10644,7 +10644,7 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         let VendorOutcome::Refused { code, detail } = outcome else {
             panic!("expected Refused, got {outcome:?}");
         };
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_unavailable");
         assert!(detail.contains("unavailable: not_found"), "{detail}");
         assert!(!fx.root.join(".socket").exists());
     }
