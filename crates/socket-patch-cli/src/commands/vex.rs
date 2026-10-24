@@ -1418,28 +1418,21 @@ async fn withhold_stale_go_tools(
     common: &GlobalArgs,
     warnings: &mut Vec<RunWarning>,
 ) {
-    use socket_patch_core::utils::go_installed_tools::{audit, patched_at, PatchedModule};
+    use socket_patch_core::utils::go_installed_tools::{audit, PatchedModule};
     use socket_patch_core::utils::purl::parse_golang_purl;
     let mut patched = Vec::new();
     let mut dirs = Vec::new();
     for purl in &outcome.applied {
-        let (Some(record), Some(paths), Some((module, version))) = (
-            manifest.patches.get(purl),
-            copies.get(purl),
-            parse_golang_purl(purl),
-        ) else {
+        let (Some(record), Some(paths)) = (manifest.patches.get(purl), copies.get(purl)) else {
             continue;
         };
         for dir in paths {
-            let Some(at) = patched_at(dir, record.files.keys().map(String::as_str)) else {
-                continue;
-            };
-            patched.push(PatchedModule {
-                module: module.to_string(),
-                version: version.to_string(),
-                patched_at: at,
-            });
-            dirs.push(dir.clone());
+            // An attested copy's patched files are there to date it.
+            let files = record.files.keys().map(String::as_str);
+            if let Some(module) = PatchedModule::of_copy(purl, dir, files) {
+                patched.push(module);
+                dirs.push(dir.clone());
+            }
         }
     }
     let (notes, stale) = audit(patched, dirs).await;
@@ -2202,6 +2195,7 @@ mod tests {
             WIRING_CONFLICT,
             GO_WORKSPACE_OVERRIDE,
             GO_VERSION_NOT_SELECTED,
+            GO_INSTALLED_TOOL_STALE,
         ] {
             assert_ne!(
                 omission_phrase(tag),

@@ -1396,9 +1396,10 @@ pub(crate) async fn run_locked(
                 );
                 // A global Go apply patches the module cache in place: a
                 // tool already built from it with `go install` keeps the
-                // unpatched code until it is rebuilt (#422).
+                // unpatched code until it is rebuilt (#422). An embedded
+                // `--vex` checks again and says so itself.
                 if args.common.is_global() {
-                    let (patched, dirs) = rewritten_go_modules(&results);
+                    let (patched, dirs) = patched_go_modules(&results);
                     let (warnings, _) =
                         socket_patch_core::utils::go_installed_tools::audit(patched, dirs).await;
                     cache_warnings.extend(
@@ -2806,36 +2807,29 @@ async fn apply_patches_inner(
     })
 }
 
-/// The Go modules a (global, in-place) apply rewrote in the module cache,
-/// and their cache copies, for the installed-tool check (#422).
-fn rewritten_go_modules(
+/// The Go modules a (global, in-place) apply left patched in the module
+/// cache, and their cache copies, for the installed-tool check (#422).
+/// Already-patched copies count too: a tool built before an earlier run
+/// is just as stale.
+fn patched_go_modules(
     results: &[ApplyResult],
 ) -> (
     Vec<socket_patch_core::utils::go_installed_tools::PatchedModule>,
     Vec<PathBuf>,
 ) {
-    use socket_patch_core::utils::go_installed_tools::{patched_at, PatchedModule};
+    use socket_patch_core::utils::go_installed_tools::PatchedModule;
     let mut patched = Vec::new();
     let mut dirs = Vec::new();
     for r in results {
-        if !r.success || r.files_patched.is_empty() || r.package_path == VENDOR_OWNED_MARKER {
+        if !r.success || r.package_path == VENDOR_OWNED_MARKER {
             continue;
         }
-        if Ecosystem::from_purl(&r.package_key) != Some(Ecosystem::Golang) {
-            continue;
-        }
-        let Some((module, version)) = parse_golang_purl(&r.package_key) else {
-            continue;
-        };
         let dir = PathBuf::from(&r.package_path);
-        let at = patched_at(&dir, r.files_patched.iter().map(String::as_str))
-            .unwrap_or_else(std::time::SystemTime::now);
-        patched.push(PatchedModule {
-            module: module.into_owned(),
-            version: version.into_owned(),
-            patched_at: at,
-        });
-        dirs.push(dir);
+        let files = r.files_verified.iter().map(|f| f.file.as_str());
+        if let Some(module) = PatchedModule::of_copy(&r.package_key, &dir, files) {
+            patched.push(module);
+            dirs.push(dir);
+        }
     }
     (patched, dirs)
 }

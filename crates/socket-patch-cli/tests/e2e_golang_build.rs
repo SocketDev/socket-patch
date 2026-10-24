@@ -1059,39 +1059,45 @@ fn global_apply_flags_tools_built_from_the_unpatched_module() {
     let outside = tmp.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     write_patch(&outside);
-    let (code, stdout, stderr) = common::run_with_env(
-        &outside,
-        &[
-            "apply",
-            "--global",
-            "--offline",
-            "--ecosystems",
-            "golang",
-            "--json",
-            "--cwd",
-            outside.to_str().unwrap(),
-        ],
-        &[("GOMODCACHE", mc), ("GOBIN", gobin.to_str().unwrap())],
-    );
-    assert_eq!(code, 0, "apply -g: {stdout}\n{stderr}");
+    let apply = || {
+        let (code, stdout, stderr) = common::run_with_env(
+            &outside,
+            &[
+                "apply",
+                "--global",
+                "--offline",
+                "--ecosystems",
+                "golang",
+                "--json",
+                "--cwd",
+                outside.to_str().unwrap(),
+            ],
+            &[("GOMODCACHE", mc), ("GOBIN", gobin.to_str().unwrap())],
+        );
+        assert_eq!(code, 0, "apply -g: {stdout}\n{stderr}");
+        let env = common::envelope::parse_json_envelope(&stdout);
+        let stale: Vec<String> = env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["code"] == "go_installed_tool_stale")
+            .map(|w| w["detail"].as_str().unwrap().to_string())
+            .collect();
+        stale
+    };
+    let stale = apply();
     let lib = modcache.join(format!("{UMOD}@{UVER}")).join("lib.go");
     assert_eq!(std::fs::read_to_string(&lib).unwrap(), PATCHED_LIB);
     // The cache is patched; the installed binary is not.
     assert_eq!(run_tool(&gobin), "TOOL: PRISTINE");
-    let env = common::envelope::parse_json_envelope(&stdout);
-    let stale: Vec<&serde_json::Value> = env["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|w| w["code"] == "go_installed_tool_stale")
-        .collect();
-    assert_eq!(stale.len(), 1, "{stdout}");
-    let detail = stale[0]["detail"].as_str().unwrap();
+    assert_eq!(stale.len(), 1, "{stale:?}");
     assert!(
-        detail.contains(&format!("go install {TOOL}@{UVER}"))
-            && detail.contains(&format!("{UMOD}@{UVER}")),
-        "{detail}"
+        stale[0].contains(&format!("go install {TOOL}@{UVER}"))
+            && stale[0].contains(&format!("{UMOD}@{UVER}")),
+        "{stale:?}"
     );
+    // A re-run over the already-patched cache still names the tool.
+    assert_eq!(apply(), stale);
 
     let out = global_vex(&outside, &modcache, &gobin);
     assert_absent(out.doc.as_ref(), UPURL);

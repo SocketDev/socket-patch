@@ -76,7 +76,8 @@ impl StaleTool {
     }
 }
 
-/// The warning detail when `go` itself can't be run to inspect `dirs`.
+/// The warning detail for `dirs` whose tools `go version -m` could not
+/// list (`go` not on `PATH`, or the run failed or timed out).
 pub fn unchecked_detail(patched: &[PatchedModule], dirs: &[PathBuf]) -> String {
     let modules: Vec<String> = patched
         .iter()
@@ -92,13 +93,28 @@ pub fn unchecked_detail(patched: &[PatchedModule], dirs: &[PathBuf]) -> String {
     )
 }
 
-/// The newest modification time among `files` under `dir` (the patched
-/// files of a module cache copy), or `None` when none can be read.
-pub fn patched_at<'a>(dir: &Path, files: impl IntoIterator<Item = &'a str>) -> Option<SystemTime> {
-    files
-        .into_iter()
-        .filter_map(|f| std::fs::metadata(dir.join(f)).ok()?.modified().ok())
-        .max()
+impl PatchedModule {
+    /// The patched module of `purl` whose cache copy is `dir`, dated by the
+    /// newest of the patch record's `files` there (keys may carry the
+    /// API's `package/` prefix), or `None` for a non-Go purl or when no
+    /// patched file can be read.
+    pub fn of_copy<'a>(
+        purl: &str,
+        dir: &Path,
+        files: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Self> {
+        let (module, version) = crate::utils::purl::parse_golang_purl(purl)?;
+        let patched_at = files
+            .into_iter()
+            .map(crate::patch::apply::normalize_file_path)
+            .filter_map(|f| std::fs::metadata(dir.join(f)).ok()?.modified().ok())
+            .max()?;
+        Some(Self {
+            module: module.into_owned(),
+            version: version.into_owned(),
+            patched_at,
+        })
+    }
 }
 
 /// The directories `go install` writes to, for module cache copies at
@@ -112,6 +128,10 @@ pub fn bin_dirs(module_dirs: &[&Path]) -> Vec<PathBuf> {
 }
 
 /// [`bin_dirs`] with an injected Go setting lookup and home directory.
+///
+/// The user's own `$GOBIN` / `GOPATH` bin directories are searched only
+/// for copies in the user's own module cache: a `--global-prefix` tree is
+/// some other cache, which the user's tools were never built from.
 pub fn bin_dirs_with(
     module_dirs: &[&Path],
     go_env: &dyn Fn(&str) -> Option<String>,
@@ -123,26 +143,31 @@ pub fn bin_dirs_with(
             dirs.push(p);
         }
     };
-    if let Some(gobin) = go_env("GOBIN").filter(|v| !v.is_empty()) {
-        push(PathBuf::from(gobin));
-    } else {
-        match go_env("GOPATH").filter(|v| !v.is_empty()) {
-            Some(gopath) => std::env::split_paths(&gopath)
-                .filter(|p| !p.as_os_str().is_empty())
-                .for_each(|p| push(p.join("bin"))),
-            None => {
-                if let Some(home) = home {
-                    push(home.join("go").join("bin"));
-                }
-            }
+    let gopaths: Vec<PathBuf> = match go_env("GOPATH").filter(|v| !v.is_empty()) {
+        Some(gopath) => std::env::split_paths(&gopath)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect(),
+        None => home.map(|h| h.join("go")).into_iter().collect(),
+    };
+    // go's own default: GOMODCACHE, else the first GOPATH's pkg/mod.
+    let user_cache = go_env("GOMODCACHE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| gopaths.first().map(|g| g.join("pkg").join("mod")));
+    if user_cache.is_some_and(|c| module_dirs.iter().any(|d| d.starts_with(&c))) {
+        match go_env("GOBIN").filter(|v| !v.is_empty()) {
+            Some(gobin) => push(PathBuf::from(gobin)),
+            None => gopaths.iter().for_each(|g| push(g.join("bin"))),
         }
     }
     // A cache at `<root>/pkg/mod/<module>@<version>`: `<root>` is the
-    // GOPATH that `go install` used with it.
+    // GOPATH that `go install` used with it. The outermost `pkg/mod`: a
+    // module path may itself contain one.
     for dir in module_dirs {
         if let Some(root) = dir
             .ancestors()
-            .find(|a| a.ends_with(Path::new("pkg").join("mod")))
+            .filter(|a| a.ends_with(Path::new("pkg").join("mod")))
+            .last()
             .and_then(|m| m.parent()?.parent())
         {
             push(root.join("bin"));
@@ -198,14 +223,26 @@ pub fn parse_version_m(output: &str) -> Vec<GoBinary> {
     out
 }
 
-/// The installed Go binaries under `dirs`, or `None` when `go` is not on
-/// `PATH` (nothing can be checked). Missing directories are skipped.
-/// Blocking.
-pub fn installed_binaries(dirs: &[PathBuf]) -> Option<Vec<GoBinary>> {
-    let go = crate::utils::process::resolve_tool("go")?;
-    let mut out = Vec::new();
-    for dir in dirs.iter().filter(|d| d.is_dir()) {
-        let mut cmd = crate::utils::process::command_for(&go);
+/// What `go version -m` found under a set of directories.
+#[derive(Debug, Default)]
+pub struct Inspection {
+    pub binaries: Vec<GoBinary>,
+    /// Directories holding files whose tools could not be listed: `go` is
+    /// not on `PATH`, or its run failed or timed out.
+    pub unchecked: Vec<PathBuf>,
+}
+
+/// The installed Go binaries under `dirs`. Missing and empty directories
+/// are skipped. Blocking.
+pub fn installed_binaries(dirs: &[PathBuf]) -> Inspection {
+    let mut out = Inspection::default();
+    let go = crate::utils::process::resolve_tool("go");
+    for dir in dirs.iter().filter(|d| dir_has_entries(d)) {
+        let Some(go) = &go else {
+            out.unchecked.push(dir.clone());
+            continue;
+        };
+        let mut cmd = crate::utils::process::command_for(go);
         // `go version` reads files only; keep a `toolchain` line in an
         // ambient go.mod or GOTOOLCHAIN from fetching another toolchain.
         cmd.arg("version")
@@ -213,12 +250,14 @@ pub fn installed_binaries(dirs: &[PathBuf]) -> Option<Vec<GoBinary>> {
             .arg(dir)
             .current_dir(dir)
             .env("GOTOOLCHAIN", "local");
-        let Ok(output) = crate::utils::process::output_within(cmd, VERSION_BUDGET) else {
-            continue;
-        };
-        out.extend(parse_version_m(&String::from_utf8_lossy(&output.stdout)));
+        match crate::utils::process::output_within(cmd, VERSION_BUDGET) {
+            Ok(output) if output.status.success() => out
+                .binaries
+                .extend(parse_version_m(&String::from_utf8_lossy(&output.stdout))),
+            _ => out.unchecked.push(dir.clone()),
+        }
     }
-    Some(out)
+    out
 }
 
 /// Every installed tool in `binaries` built from one of `patched` before it
@@ -235,7 +274,7 @@ pub fn stale_tools_with(
     patched: &[PatchedModule],
     built_at: &dyn Fn(&Path) -> Option<SystemTime>,
 ) -> Vec<StaleTool> {
-    let mut out = Vec::new();
+    let mut out: Vec<StaleTool> = Vec::new();
     for bin in binaries {
         for p in patched {
             if !bin
@@ -249,18 +288,24 @@ pub fn stale_tools_with(
             if built_at(&bin.path).is_some_and(|t| t > p.patched_at) {
                 continue;
             }
+            // A local build has no version to reinstall: `(devel)`, or
+            // (Go 1.24+) a VCS-stamped `+dirty` one.
             let reinstall = match (&bin.main_package, &bin.main_version) {
-                (Some(pkg), Some(ver)) if ver.starts_with('v') => {
+                (Some(pkg), Some(ver)) if ver.starts_with('v') && !ver.ends_with("+dirty") => {
                     Some(format!("go install {pkg}@{ver}"))
                 }
                 _ => None,
             };
-            out.push(StaleTool {
+            let tool = StaleTool {
                 binary: bin.path.clone(),
                 module: p.module.clone(),
                 version: p.version.clone(),
                 reinstall,
-            });
+            };
+            // Two cache copies of one module@version: one tool, one line.
+            if !out.contains(&tool) {
+                out.push(tool);
+            }
         }
     }
     out
@@ -288,21 +333,19 @@ pub fn audit_sync(
     patched: &[PatchedModule],
     dirs: &[PathBuf],
 ) -> (Vec<(String, String)>, Vec<StaleTool>) {
-    match installed_binaries(dirs) {
-        Some(binaries) => {
-            let stale = stale_tools(&binaries, patched);
-            let warnings = stale
-                .iter()
-                .map(|t| (STALE_WARNING.to_string(), t.detail()))
-                .collect();
-            (warnings, stale)
-        }
-        None if dirs.iter().any(|d| dir_has_entries(d)) => (
-            vec![(STALE_WARNING.to_string(), unchecked_detail(patched, dirs))],
-            Vec::new(),
-        ),
-        None => (Vec::new(), Vec::new()),
+    let inspection = installed_binaries(dirs);
+    let stale = stale_tools(&inspection.binaries, patched);
+    let mut warnings: Vec<(String, String)> = stale
+        .iter()
+        .map(|t| (STALE_WARNING.to_string(), t.detail()))
+        .collect();
+    if !inspection.unchecked.is_empty() {
+        warnings.push((
+            STALE_WARNING.to_string(),
+            unchecked_detail(patched, &inspection.unchecked),
+        ));
     }
+    (warnings, stale)
 }
 
 fn dir_has_entries(dir: &Path) -> bool {
@@ -416,7 +459,6 @@ mod tests {
     #[test]
     fn bin_dirs_follow_gobin_then_gopath_then_home_and_the_cache_root() {
         let home = Some(PathBuf::from("/home/u"));
-        let cache = PathBuf::from("/opt/gp/pkg/mod/example.com/upstream@v1.0.0");
         let env = |vars: Vec<(&'static str, &'static str)>| {
             move |k: &str| {
                 vars.iter()
@@ -424,22 +466,96 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             }
         };
+        let user = Path::new("/home/u/go/pkg/mod/example.com/upstream@v1.0.0");
         assert_eq!(
-            bin_dirs_with(&[&cache], &env(vec![("GOBIN", "/gobin")]), home.clone()),
-            vec![PathBuf::from("/gobin"), PathBuf::from("/opt/gp/bin")]
-        );
-        assert_eq!(
-            bin_dirs_with(&[], &env(vec![("GOPATH", "/a:/b")]), home.clone()),
-            vec![PathBuf::from("/a/bin"), PathBuf::from("/b/bin")]
+            bin_dirs_with(&[user], &env(vec![("GOBIN", "/gobin")]), home.clone()),
+            vec![PathBuf::from("/gobin"), PathBuf::from("/home/u/go/bin")]
         );
         assert_eq!(
             bin_dirs_with(
-                &[Path::new("/home/u/go/pkg/mod/x@v1.0.0")],
-                &env(Vec::new()),
-                home
+                &[Path::new("/a/pkg/mod/x@v1.0.0")],
+                &env(vec![("GOPATH", "/a:/b")]),
+                home.clone()
+            ),
+            vec![PathBuf::from("/a/bin"), PathBuf::from("/b/bin")]
+        );
+        assert_eq!(
+            bin_dirs_with(&[user], &env(Vec::new()), home.clone()),
+            vec![PathBuf::from("/home/u/go/bin")]
+        );
+        // A GOMODCACHE outside GOPATH: the user's tools, not `<root>/bin`.
+        assert_eq!(
+            bin_dirs_with(
+                &[Path::new("/cache/x@v1.0.0")],
+                &env(vec![("GOMODCACHE", "/cache")]),
+                home.clone()
             ),
             vec![PathBuf::from("/home/u/go/bin")]
         );
+        // A --global-prefix tree: never the user's own tools.
+        assert_eq!(
+            bin_dirs_with(
+                &[Path::new("/img/gp/pkg/mod/x@v1.0.0")],
+                &env(vec![("GOBIN", "/gobin")]),
+                home.clone()
+            ),
+            vec![PathBuf::from("/img/gp/bin")]
+        );
+        // A module path that itself contains `pkg/mod`: the outermost one.
+        assert_eq!(
+            bin_dirs_with(
+                &[Path::new("/img/gp/pkg/mod/github.com/foo/pkg/mod/x@v1.0.0")],
+                &env(Vec::new()),
+                home
+            ),
+            vec![PathBuf::from("/img/gp/bin")]
+        );
+    }
+
+    #[test]
+    fn a_dirty_local_build_gets_no_reinstall_command() {
+        let mut b = bins();
+        b[0].main_version = Some("v1.2.4-0.20240101120000-abcdef123456+dirty".into());
+        let stale = stale_tools_with(
+            &b[..1],
+            &[patched("example.com/upstream", "v1.0.0", 1)],
+            &|_| None,
+        );
+        assert_eq!(stale[0].reinstall, None);
+    }
+
+    #[test]
+    fn a_copy_is_dated_by_its_patched_files_with_or_without_the_package_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.go"), "x").unwrap();
+        let purl = "pkg:golang/example.com/upstream@v1.0.0";
+        for key in ["lib.go", "package/lib.go"] {
+            let p = PatchedModule::of_copy(purl, dir.path(), [key]).expect(key);
+            assert_eq!(
+                (p.module.as_str(), p.version.as_str()),
+                ("example.com/upstream", "v1.0.0")
+            );
+        }
+        assert_eq!(PatchedModule::of_copy(purl, dir.path(), ["gone.go"]), None);
+        assert_eq!(
+            PatchedModule::of_copy("pkg:npm/x@1.0.0", dir.path(), ["lib.go"]),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unlistable_directory_is_reported_unchecked() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not a Go binary: `go version -m` on the directory lists nothing,
+        // which is a clean check; a missing `go` is not.
+        std::fs::write(dir.path().join("tool"), "#!/bin/sh\n").unwrap();
+        let (warnings, stale) = audit_sync(
+            &[patched("example.com/upstream", "v1.0.0", 1)],
+            &[dir.path().to_path_buf(), dir.path().join("missing")],
+        );
+        assert!(stale.is_empty());
+        let go_on_path = crate::utils::process::resolve_tool("go").is_some();
+        assert_eq!(warnings.len(), usize::from(!go_on_path), "{warnings:?}");
     }
 
     #[test]
