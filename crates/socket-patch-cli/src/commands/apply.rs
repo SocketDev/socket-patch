@@ -3343,7 +3343,9 @@ fn lock_resolution_is_calm(purl: &str) -> bool {
 }
 
 /// The `package_not_installed` detail of an unmatched purl the lock does
-/// not calmly account for: Cargo's carries the `cargo fetch` remedy.
+/// not calmly account for: Cargo's carries the `cargo fetch` remedy, and
+/// says why a crate the lock takes from a path, git or `[patch]` source
+/// is never found (#506).
 fn not_installed_detail(purl: &str) -> &'static str {
     if Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo) {
         CARGO_NOT_FETCHED_DETAIL
@@ -3355,7 +3357,8 @@ fn not_installed_detail(purl: &str) -> &'static str {
 /// [`not_installed_detail`] for a Cargo crate.
 const CARGO_NOT_FETCHED_DETAIL: &str =
     "No unpacked crate source matches this PURL; run `cargo fetch` first so the crate is in \
-     the Cargo registry cache, then re-run apply";
+     the Cargo registry cache, then re-run apply. A crate Cargo.lock takes from a path, git or \
+     [patch] source is never patched: cargo does not build its registry copy";
 
 /// The `unmatched` purls with no lock evidence (sorted input, sorted
 /// output): the ones that can still fail an all-miss run.
@@ -3431,7 +3434,8 @@ fn cargo_fetch_hint(unmatched: &[String]) -> Option<&'static str> {
         .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
         .then_some(
             "Cargo crates are patched in the registry cache: run `cargo fetch` first so every \
-             locked crate is unpacked there, then re-run apply.",
+             locked crate is unpacked there, then re-run apply. A crate Cargo.lock takes from a \
+             path, git or [patch] source is never patched there: cargo does not build that copy.",
         )
 }
 

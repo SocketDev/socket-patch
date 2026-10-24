@@ -14,6 +14,8 @@
 //!   4. verify-mode against patched files laid on disk
 //!   5. verify-mode where one patch file is missing → omitted + warning
 
+#[path = "common/cargo_lock_source.rs"]
+mod cargo_lock_source;
 #[path = "common/mod.rs"]
 mod common;
 
@@ -1869,4 +1871,88 @@ fn find_vexctl_on_path() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Cargo: verify the copy the build consumes (#506)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Run verify-mode `vex` over an agent record for `cfg-if 1.0.4` whose
+/// crates.io copy in the registry cache IS patched, in a project that
+/// takes the crate the way `shape` says. Returns (success, stdout, stderr).
+fn vex_over_patched_registry_copy(shape: cargo_lock_source::Shape) -> (bool, String, String) {
+    use cargo_lock_source::{stage_registry_copy, write_project, AFTER, BEFORE, PURL};
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("app");
+    std::fs::create_dir_all(&project).unwrap();
+    write_project(&project, shape);
+    let cargo_home = tmp.path().join("cargo-home");
+    stage_registry_copy(&cargo_home, AFTER);
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        PURL.to_string(),
+        make_record(
+            "50650650-0000-4000-8000-000000000506",
+            "package/src/lib.rs",
+            compute_git_sha256_from_bytes(BEFORE).as_str(),
+            compute_git_sha256_from_bytes(AFTER).as_str(),
+            "GHSA-cfg-if-506",
+            &["CVE-2024-506"],
+        ),
+    );
+    write_manifest(&project, &manifest);
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            project.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/app@0.1.0",
+        ])
+        .env("CARGO_HOME", &cargo_home)
+        .output()
+        .expect("invoke vex");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Control: a crate the lock takes from crates.io is attested from its
+/// patched registry copy.
+#[test]
+fn verify_mode_attests_registry_sourced_cargo_crate() {
+    let (ok, stdout, stderr) = vex_over_patched_registry_copy(cargo_lock_source::Shape::Registry);
+    assert!(ok, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("GHSA-cfg-if-506") && stdout.contains(cargo_lock_source::PURL),
+        "the registry copy is the one the build consumes:\n{stdout}"
+    );
+}
+
+/// #506: when `Cargo.lock` resolves the crate to a `[patch.crates-io]`
+/// path (in `Cargo.toml` or `.cargo/config.toml`) or a git source, cargo
+/// never builds the registry copy, so its patched bytes attest nothing.
+#[test]
+fn verify_mode_does_not_attest_cargo_crate_overridden_away_from_registry() {
+    use cargo_lock_source::Shape;
+    for shape in [
+        Shape::ManifestPatch,
+        Shape::ConfigPatch,
+        Shape::GitDependency,
+    ] {
+        let (ok, stdout, stderr) = vex_over_patched_registry_copy(shape);
+        assert!(
+            !stdout.contains("GHSA-cfg-if-506"),
+            "{shape:?}: must not attest a crate the build takes from elsewhere:\n\
+             {stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !ok,
+            "{shape:?}: nothing left to attest is a non-zero exit:\n{stderr}"
+        );
+    }
 }
