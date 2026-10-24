@@ -35,7 +35,10 @@ use super::common::refuse_symlinked;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
-/// Classification of the target package within the requirements tree.
+/// Classification of the target package within one requirements file read
+/// as the whole requirement set ([`find_pin`], the tests' view of
+/// [`scan_pins`]).
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum PinSearch {
     /// A clean `name==version` pin (no extras). `line_start` / `line_count`
@@ -64,18 +67,66 @@ enum PinSearch {
 /// marker to carry over, and whether the pin carried `--hash` options.
 type PinSpan = (usize, usize, Option<String>, bool);
 
-/// Scan one file for the target package: every clean exact
-/// `canon_name==version` pin, plus whether any occurrence carries extras or
-/// names the package ambiguously.
+/// What one file says about the target package ([`scan_pins`]).
+struct PinScan {
+    /// Every clean exact `canon_name==version` pin.
+    exact: Vec<PinSpan>,
+    /// Some occurrence carries extras.
+    extras: bool,
+    /// Some occurrence names the package ambiguously on its own.
+    range: bool,
+    /// Some occurrence exactly pins a DIFFERENT version on its own
+    /// environment-marker branch; whether that is ambiguous depends on the
+    /// target pins of the whole requirement set ([`marker_split_ok`]).
+    other_branches: bool,
+}
+
+/// Whether the other version's marker branches (if any) in a requirement
+/// set are harmless given its target pins: every target pin must carry a
+/// marker too, and there must be one. That is the shape `uv pip compile --universal` writes when
+/// a package resolves differently per Python (#928), and pip installs
+/// exactly one branch. Only the target branches are rewritten; the other
+/// branch is left alone, as hosted requirements and vendored pylock already
+/// do. Without markers on both sides pip could see both pins at once, so it
+/// stays a refusal.
 ///
-/// An exact pin of a DIFFERENT version is not ambiguous when it sits on its
-/// own environment-marker branch and every target pin does too: that is
-/// the shape `uv pip compile --universal` writes when a package resolves
-/// differently per Python (#928), and pip installs exactly one branch.
-/// Only the target branches are rewritten; the other branch is left alone,
-/// as hosted requirements and vendored pylock already do. Without markers
-/// on both sides pip could see both pins at once, so it stays a refusal.
-fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, bool, bool) {
+/// pip merges the root file and its `-r` includes into one requirement set,
+/// so [`plan_requirements`] asks this once over every file's scan: the two
+/// branches may sit in different files (#1104).
+fn marker_split_ok(scans: &[PinScan]) -> bool {
+    let mut exact = scans.iter().flat_map(|s| s.exact.iter()).peekable();
+    !scans.iter().any(|s| s.other_branches)
+        || (exact.peek().is_some() && exact.all(|(_, _, marker, _)| marker.is_some()))
+}
+
+/// Why one file's pins refuse the vendor, in fail-closed precedence: any
+/// extras occurrence wins over any ambiguous occurrence wins over the other
+/// version's marker branch when the requirement set's target pins do not
+/// all carry a marker (`split_ok` from [`marker_split_ok`]).
+#[derive(Debug, PartialEq, Eq)]
+enum PinRefusal {
+    Extras,
+    NotPinned,
+    UnmarkedSplit,
+}
+
+fn pin_refusal(scan: &PinScan, split_ok: bool) -> Option<PinRefusal> {
+    if scan.extras {
+        Some(PinRefusal::Extras)
+    } else if scan.range {
+        Some(PinRefusal::NotPinned)
+    } else if scan.other_branches && !split_ok {
+        Some(PinRefusal::UnmarkedSplit)
+    } else {
+        None
+    }
+}
+
+/// Scan one file for the target package: every clean exact
+/// `canon_name==version` pin, plus whether any occurrence carries extras,
+/// names the package ambiguously, or pins another version on its own
+/// marker branch ([`marker_split_ok`]).
+fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
     let mut exact: Vec<PinSpan> = Vec::new();
     let mut found_extras = false;
     let mut found_range = false;
@@ -128,10 +179,12 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
             found_range = true;
         }
     }
-    if other_branches && (exact.is_empty() || exact.iter().any(|(_, _, m, _)| m.is_none())) {
-        found_range = true;
+    PinScan {
+        exact,
+        extras: found_extras,
+        range: found_range,
+        other_branches,
     }
-    (exact, found_extras, found_range)
 }
 
 /// Whether one requirements file's content names the package at all (any
@@ -143,19 +196,21 @@ pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
     })
 }
 
-/// Find the target pin in one file's content. Precedence is fail-closed:
-/// any extras occurrence wins over any non-pin occurrence wins over a clean
-/// exact pin — a file that names the package ambiguously is never rewritten
-/// (a marker-split other version is not ambiguous; see [`scan_pins`]).
+/// Find the target pin in one file's content, read as the whole
+/// requirement set, through the same [`pin_refusal`] precedence
+/// [`plan_requirements`] applies: a file that names the package ambiguously
+/// is never rewritten (a marker-split other version is not ambiguous; see
+/// [`marker_split_ok`]).
+#[cfg(test)]
 fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
-    let (exact, found_extras, found_range) = scan_pins(content, canon_name, version);
-    if found_extras {
-        return PinSearch::Extras;
+    let scan = scan_pins(content, canon_name, version);
+    let split_ok = marker_split_ok(std::slice::from_ref(&scan));
+    match pin_refusal(&scan, split_ok) {
+        Some(PinRefusal::Extras) => return PinSearch::Extras,
+        Some(PinRefusal::NotPinned | PinRefusal::UnmarkedSplit) => return PinSearch::Range,
+        None => {}
     }
-    if found_range {
-        return PinSearch::Range;
-    }
-    match exact.into_iter().next() {
+    match scan.exact.into_iter().next() {
         Some((line_start, line_count, marker, hashed)) => PinSearch::Exact {
             line_start,
             line_count,
@@ -709,9 +764,18 @@ async fn plan_requirements(
     let mut planned: Vec<PlannedFile> = Vec::new();
     let mut rewrote_any = false;
 
-    for file in &files {
-        match find_pin(&file.content, canon_name, version) {
-            PinSearch::Extras => {
+    let scans: Vec<PinScan> = files
+        .iter()
+        .map(|f| scan_pins(&f.content, canon_name, version))
+        .collect();
+    // pip reads the root and its includes as one requirement set, so the
+    // other version's marker branch may sit in a different file than the
+    // target's (#1104): decide that over the whole tree.
+    let split_ok = marker_split_ok(&scans);
+
+    for (file, scan) in files.iter().zip(scans) {
+        match pin_refusal(&scan, split_ok) {
+            Some(PinRefusal::Extras) => {
                 return Err((
                     "pypi_extras_unsupported",
                     format!(
@@ -722,7 +786,7 @@ async fn plan_requirements(
                     ),
                 ));
             }
-            PinSearch::Range => {
+            Some(PinRefusal::NotPinned) => {
                 return Err((
                     "pypi_requirement_not_pinned",
                     format!(
@@ -732,8 +796,23 @@ async fn plan_requirements(
                     ),
                 ));
             }
-            PinSearch::Absent => continue,
-            PinSearch::Exact { .. } => {}
+            Some(PinRefusal::UnmarkedSplit) => {
+                return Err((
+                    "pypi_requirement_not_pinned",
+                    format!(
+                        "{}: pins another {canon_name} version on an environment-marker \
+                         branch, but not every =={version} pin in the requirements tree sits \
+                         on a marker branch of its own (or there is none), so pip may install \
+                         either version; pin =={version} on its own marker branch or use agent \
+                         mode (`scan --mode agent` + `socket-patch apply`) instead",
+                        file.rel
+                    ),
+                ));
+            }
+            None => {}
+        }
+        if scan.exact.is_empty() {
+            continue;
         }
         if !file.editable {
             // SECURITY/scope: an include outside the project root cannot be
@@ -752,10 +831,7 @@ async fn plan_requirements(
 
         // Rewrite EVERY exact-pin occurrence in this file, bottom-up so the
         // recorded spans (against the original content) stay valid.
-        let (spans, _, _) = scan_pins(&file.content, canon_name, version);
-        if spans.is_empty() {
-            continue;
-        }
+        let spans = scan.exact;
         let original_lines = split_lines(&file.content);
         let mut lines = original_lines.clone();
         let mut records = Vec::new();
@@ -2034,6 +2110,115 @@ mod tests {
                  six==1.17.0 ; python_full_version >= '3.12'\n"
             )
         );
+    }
+
+    /// #1104: pip merges the root and its `-r` includes into one
+    /// requirement set, so a marker split is a split across the whole tree,
+    /// not per file. Either way round, the vendored version's branch is
+    /// rewritten where it lives (marker kept), the other branch is left
+    /// alone, and revert is byte-identical.
+    #[tokio::test]
+    async fn marker_split_across_an_include_rewrites_only_the_vendored_branch() {
+        let target = "six==1.16.0 ; python_version < \"3.12\"\n";
+        let other = "six==1.17.0 ; python_version >= \"3.12\"\n";
+        let rewritten = format!(
+            "./{REL_WHEEL} ; python_version < \"3.12\"  # socket-patch vendor: six==1.16.0\n"
+        );
+        // (root body after `-r base.txt`, base.txt) and the expected rewrites.
+        let layouts = [
+            (target, format!("idna==3.7\n{other}"), true),
+            (other, format!("idna==3.7\n{target}"), false),
+        ];
+        for (root_pin, base, target_in_root) in layouts {
+            let root_original = format!("-r base.txt\n{root_pin}");
+            let tmp = write_root(&root_original).await;
+            tokio::fs::write(tmp.path().join("base.txt"), &base)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    preflight_requirements(tmp.path(), "six", "1.16.0", "u").await,
+                    Ok(RequirementsTarget::Fresh)
+                ),
+                "target in root: {target_in_root}"
+            );
+            assert!(sibling_pin_wirable(tmp.path(), "six", "1.16.0").await);
+            let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, "")
+                .await
+                .unwrap();
+            assert_eq!(wiring.len(), 1);
+            assert_eq!(wiring[0].action, WiringAction::Rewritten);
+            let base_now = tokio::fs::read_to_string(tmp.path().join("base.txt"))
+                .await
+                .unwrap();
+            if target_in_root {
+                assert_eq!(
+                    read_root(tmp.path()).await,
+                    format!("-r base.txt\n{rewritten}")
+                );
+                assert_eq!(base_now, base);
+            } else {
+                assert_eq!(read_root(tmp.path()).await, root_original);
+                assert_eq!(base_now, format!("idna==3.7\n{rewritten}"));
+            }
+
+            let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert_eq!(read_root(tmp.path()).await, root_original);
+            assert_eq!(
+                tokio::fs::read_to_string(tmp.path().join("base.txt"))
+                    .await
+                    .unwrap(),
+                base
+            );
+        }
+    }
+
+    /// #1104's guard rails: across the tree, the other version's branch is
+    /// only tolerated when every target pin carries a marker too. An
+    /// unmarked target pin, or no target pin at all, means pip could pick
+    /// the other version, so the vendor still refuses (naming the file
+    /// that pins the other version) and writes nothing.
+    #[tokio::test]
+    async fn marker_split_across_an_include_still_refuses_an_unmarked_or_missing_target() {
+        let other = "six==1.17.0 ; python_version >= \"3.12\"\n";
+        let cases = [
+            // An unmarked target pin in the root next to a marked other
+            // branch in the include.
+            ("-r base.txt\nsix==1.16.0\n", other.to_string(), "base.txt"),
+            // The unmarked target in the include, the other branch in the root.
+            (
+                &*format!("-r base.txt\n{other}"),
+                "six==1.16.0\n".to_string(),
+                "requirements.txt",
+            ),
+            // Only the other version's branch anywhere in the tree.
+            ("-r base.txt\nidna==3.7\n", other.to_string(), "base.txt"),
+        ];
+        for (root, base, named) in cases {
+            let tmp = write_root(root).await;
+            tokio::fs::write(tmp.path().join("base.txt"), &base)
+                .await
+                .unwrap();
+            let err = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, "pypi_requirement_not_pinned", "{root:?} / {base:?}");
+            assert!(
+                err.1
+                    .starts_with(&format!("{named}: pins another six version"))
+                    && err.1.contains("pin ==1.16.0 on its own marker branch"),
+                "{}",
+                err.1
+            );
+            assert_eq!(read_root(tmp.path()).await, root);
+            assert_eq!(
+                tokio::fs::read_to_string(tmp.path().join("base.txt"))
+                    .await
+                    .unwrap(),
+                base
+            );
+        }
     }
 
     #[tokio::test]
