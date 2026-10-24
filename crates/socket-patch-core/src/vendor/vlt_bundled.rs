@@ -153,7 +153,7 @@ impl RealDirs {
 
 /// Root-relative paths of the real (not symlinked) package directories in
 /// the `node_modules` dir `dir`, one `@scope` level deep.
-fn real_package_dirs(root: &Path, dir: &str, budget: &mut usize) -> Vec<String> {
+pub(super) fn real_package_dirs(root: &Path, dir: &str, budget: &mut usize) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![(dir.to_string(), true)];
     while let Some((dir, scopes)) = pending.pop() {
@@ -188,7 +188,7 @@ fn real_package_dirs(root: &Path, dir: &str, budget: &mut usize) -> Vec<String> 
 }
 
 /// The npm purl a package directory's `package.json` declares.
-fn installed_purl(root: &Path, dir: &str) -> Option<String> {
+pub(super) fn installed_purl(root: &Path, dir: &str) -> Option<String> {
     let text =
         crate::utils::fs::read_regular_to_string_sync(&root.join(dir).join("package.json")).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -204,7 +204,7 @@ fn is_plain_segment(s: &str) -> bool {
 }
 
 /// An npm package name (`name` or `@scope/name`) made of plain segments.
-fn is_package_name(name: &str) -> bool {
+pub(super) fn is_package_name(name: &str) -> bool {
     match name.split_once('/') {
         Some((scope, bare)) => {
             scope.starts_with('@') && is_plain_segment(scope) && is_plain_segment(bare)

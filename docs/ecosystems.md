@@ -408,6 +408,14 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   records no package name in the lock and is not detected. When every entry of the package is such a copy (git, `file:` directory,
   non-registry tarball or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,
   since `yarn install` can't help.
+- **yarn classic bundled copies** — yarn 1 unpacks a package's `bundleDependencies`
+  from its tarball into the package's own `node_modules` and `yarn.lock` records
+  nothing about them (#758), so no pin or vendored wiring reaches such a copy. When
+  `yarn.lock` holds a Socket wiring, the installed `node_modules` is read for them:
+  hosted scans name a bundled copy of the patched `name@version` with
+  `redirect_copy_unpatched`, vendored scans with `vendor_bundled_instance_skipped`, and
+  `vex` attests nothing for the package while the copy is installed. A lock-only `vex`
+  (no `node_modules`) can't see the copy.
 - **bun** — text `bun.lock` lockfileVersion 0, 1 or 2: 0 is the `--save-text-lockfile`
   opt-in lock of Bun 1.1.39–1.1.45, 1 the 1.2–1.3 default, 2 the 1.4+ default; all three
   emit one `packages` grammar, so registry entries rewrite identically. Any other or

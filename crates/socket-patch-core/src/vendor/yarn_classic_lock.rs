@@ -128,6 +128,24 @@ impl NpmLockBackend for YarnClassicBackend {
             })?;
         warnings.extend(skipped);
         warnings.extend(other_name.into_iter().map(|(w, _)| w));
+        // A copy yarn unpacked from a parent's `bundleDependencies` has no
+        // block (#758): it stays unpatched beside whatever this run wires.
+        let bundled = match crate::utils::purl::npm_purl(&coords.name, &coords.version) {
+            Some(purl) => super::yarn_classic_bundled::bundled_copies(project_root)
+                .await
+                .remove(&purl),
+            None => None,
+        };
+        if let Some(copy) = bundled {
+            warnings.push(VendorWarning::new(
+                "vendor_bundled_instance_skipped",
+                super::yarn_classic_bundled::bundled_copy_detail(
+                    &coords.name,
+                    &coords.version,
+                    &copy,
+                ),
+            ));
+        }
         Ok(YarnClassicPlan {
             text,
             candidate_keys,
@@ -1969,6 +1987,49 @@ wow@^1.0.0:
             assert_eq!(url.len(), 1, "{fork}: {warnings:?}");
             let text = fx.lock_text().await;
             assert!(text.contains("\"lp2@file:./lpdir\":\n  version \"1.3.0\""));
+        }
+    }
+
+    /// #758: yarn 1 unpacks a parent's `bundleDependencies` copy of
+    /// left-pad@1.3.0 into `node_modules/<parent>/node_modules/left-pad`
+    /// with no yarn.lock block, so vendoring can't reach it: the registry
+    /// block is still wired and the run names the bundled copy. Control: a
+    /// parent that bundles nothing (yarn placed the nested copy from the
+    /// lock) is not named.
+    #[tokio::test]
+    async fn issue_758_bundled_copy_is_named() {
+        for (bundles, named) in [(true, true), (false, false)] {
+            let fx = fixture_with_lock(Y2_BEFORE).await;
+            let parent = fx.root().join("node_modules/bund");
+            tokio::fs::create_dir_all(parent.join("node_modules/left-pad"))
+                .await
+                .unwrap();
+            let manifest = if bundles {
+                r#"{"name":"bund","version":"1.0.0","dependencies":{"left-pad":"1.3.0"},"bundledDependencies":["left-pad"]}"#
+            } else {
+                r#"{"name":"bund","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#
+            };
+            tokio::fs::write(parent.join("package.json"), manifest)
+                .await
+                .unwrap();
+            tokio::fs::write(
+                parent.join("node_modules/left-pad/package.json"),
+                r#"{"name":"left-pad","version":"1.3.0"}"#,
+            )
+            .await
+            .unwrap();
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(entry.unwrap().wiring.len(), 1, "the registry block");
+            let bundled: Vec<&VendorWarning> = warnings
+                .iter()
+                .filter(|w| {
+                    w.code == "vendor_bundled_instance_skipped"
+                        && w.detail.contains("node_modules/bund/node_modules/left-pad")
+                        && w.detail.contains("bund@1.0.0")
+                })
+                .collect();
+            assert_eq!(bundled.len(), usize::from(named), "{bundles}: {warnings:?}");
         }
     }
 
