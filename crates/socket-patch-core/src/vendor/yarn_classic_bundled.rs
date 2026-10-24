@@ -67,6 +67,13 @@ fn bundled_copies_sync(root: &Path) -> BTreeMap<String, BundledCopy> {
     // Directories inside a bundle, recorded with their whole subtree.
     let mut bundled: HashSet<String> = HashSet::new();
     let mut pending = vec!["node_modules".to_string()];
+    // A workspace member's own `node_modules` (what the hoist couldn't
+    // share) is reached through its link in the root `node_modules`.
+    pending.extend(
+        linked_members(root)
+            .into_iter()
+            .map(|member| format!("{member}/node_modules")),
+    );
     while let Some(dir) = pending.pop() {
         if !is_real_dir(root, &dir) {
             continue;
@@ -136,6 +143,49 @@ fn bundle_closure(root: &Path, nested: &str, names: Vec<String>) -> BTreeSet<Str
     found
 }
 
+/// Root-relative directories of the packages the root `node_modules`
+/// links to inside the project (yarn classic links each workspace member
+/// there), outside any `node_modules`.
+fn linked_members(root: &Path) -> Vec<String> {
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return Vec::new();
+    };
+    let mut links = Vec::new();
+    let mut pending = vec![(root.join("node_modules"), true)];
+    while let Some((dir, scopes)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if scopes && file_type.is_dir() && name.to_string_lossy().starts_with('@') {
+                pending.push((entry.path(), false));
+            } else if file_type.is_symlink() {
+                links.push(entry.path());
+            }
+        }
+    }
+    let mut members: Vec<String> = links
+        .into_iter()
+        .filter_map(|link| {
+            let real = std::fs::canonicalize(link).ok()?;
+            let rel = real.strip_prefix(&canonical_root).ok()?;
+            let rel: Vec<&str> = rel
+                .components()
+                .map(|c| c.as_os_str().to_str())
+                .collect::<Option<_>>()?;
+            (!rel.is_empty() && !rel.contains(&"node_modules") && real.is_dir())
+                .then(|| rel.join("/"))
+        })
+        .collect();
+    members.sort();
+    members.dedup();
+    members
+}
+
 /// `dir` and every real package directory nested in its `node_modules`.
 fn subtree(root: &Path, dir: &str, budget: &mut usize) -> Vec<String> {
     let mut out = vec![dir.to_string()];
@@ -177,9 +227,11 @@ fn bundled_names(manifest: &Value) -> Vec<String> {
     names
 }
 
-/// The `dependencies` and `optionalDependencies` keys of a manifest.
+/// The `dependencies`, `optionalDependencies` and `peerDependencies` keys
+/// of a manifest (npm 7+ packs a bundled package's peers into the bundle
+/// too).
 fn dependency_names(manifest: &Value) -> Vec<String> {
-    ["dependencies", "optionalDependencies"]
+    ["dependencies", "optionalDependencies", "peerDependencies"]
         .iter()
         .filter_map(|k| manifest.get(*k).and_then(Value::as_object))
         .flat_map(|deps| deps.keys().cloned())
@@ -196,4 +248,108 @@ fn read_manifest(root: &Path, dir: &str) -> Option<Value> {
 /// may point outside the project, and yarn never links a bundled copy).
 fn is_real_dir(root: &Path, rel: &str) -> bool {
     std::fs::symlink_metadata(root.join(rel)).is_ok_and(|m| m.is_dir())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn package(root: &Path, dir: &str, manifest: &str) {
+        write(root, &format!("{dir}/package.json"), manifest);
+    }
+
+    async fn locations(root: &Path) -> Vec<(String, String)> {
+        bundled_copies(root)
+            .await
+            .into_iter()
+            .map(|(purl, copy)| (purl, copy.location))
+            .collect()
+    }
+
+    const LEFT_PAD: &str = r#"{"name":"left-pad","version":"1.3.0"}"#;
+
+    /// A bundled package's peer is packed beside it (npm 7+), so it is part
+    /// of the bundle; a sibling the parent merely depends on is not.
+    #[tokio::test]
+    async fn a_bundled_packages_peer_is_bundled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        package(
+            root,
+            "node_modules/bund",
+            r#"{"name":"bund","version":"1.0.0","dependencies":{"plugin":"1.0.0","other":"1.0.0"},"bundleDependencies":["plugin"]}"#,
+        );
+        package(
+            root,
+            "node_modules/bund/node_modules/plugin",
+            r#"{"name":"plugin","version":"1.0.0","peerDependencies":{"left-pad":"^1.3.0"}}"#,
+        );
+        package(root, "node_modules/bund/node_modules/left-pad", LEFT_PAD);
+        package(
+            root,
+            "node_modules/bund/node_modules/other",
+            r#"{"name":"other","version":"1.0.0"}"#,
+        );
+        assert_eq!(
+            locations(root).await,
+            [
+                (
+                    "pkg:npm/left-pad@1.3.0".to_string(),
+                    "node_modules/bund/node_modules/left-pad".to_string()
+                ),
+                (
+                    "pkg:npm/plugin@1.0.0".to_string(),
+                    "node_modules/bund/node_modules/plugin".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// A workspace member's own `node_modules` is walked through the
+    /// member's link in the root `node_modules`; a link leaving the project
+    /// is not followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_member_node_modules_are_walked_and_links_stay_inside() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let bund = r#"{"name":"bund","version":"2.0.0","bundleDependencies":["left-pad"]}"#;
+        package(
+            &root,
+            "packages/app",
+            r#"{"name":"@ws/app","version":"1.0.0"}"#,
+        );
+        package(&root, "packages/app/node_modules/bund", bund);
+        package(
+            &root,
+            "packages/app/node_modules/bund/node_modules/left-pad",
+            LEFT_PAD,
+        );
+        std::fs::create_dir_all(root.join("node_modules/@ws")).unwrap();
+        symlink(root.join("packages/app"), root.join("node_modules/@ws/app")).unwrap();
+        // A link outside the project holding a bundle is never read.
+        let outside = tmp.path().join("outside");
+        package(&outside, "ext", r#"{"name":"ext","version":"1.0.0"}"#);
+        package(&outside, "ext/node_modules/bund", bund);
+        package(
+            &outside,
+            "ext/node_modules/bund/node_modules/left-pad",
+            LEFT_PAD,
+        );
+        symlink(outside.join("ext"), root.join("node_modules/ext")).unwrap();
+        assert_eq!(
+            locations(&root).await,
+            [(
+                "pkg:npm/left-pad@1.3.0".to_string(),
+                "packages/app/node_modules/bund/node_modules/left-pad".to_string()
+            )]
+        );
+    }
 }

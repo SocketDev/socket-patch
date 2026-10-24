@@ -191,7 +191,7 @@ async fn record_bundled_copies(ctx: &DiscoverCtx<'_>, entries: &[YarnEntry], out
             })
             .map(|e| e.block.key.clone())
             .unwrap_or_else(|| format!("{}@{}", copy.parent_name, copy.parent_version));
-        out.unpatched_copy(
+        out.bundled_copy(
             YARN_LOCK,
             Some(purl),
             &parent_key,
