@@ -4,10 +4,10 @@
 //!
 //! One test binary per command: each module was its own binary.
 
-#[path = "../common/mod.rs"]
-mod common;
 #[path = "../common/cargo_lock_source.rs"]
 mod cargo_lock_source_fixture;
+#[path = "../common/mod.rs"]
+mod common;
 #[path = "../common/rollback_json.rs"]
 mod rollback_json;
 #[path = "../vlt_hosted_common/mod.rs"]

@@ -63,6 +63,29 @@ impl CargoCrawler {
         }
     }
 
+    /// The crates a local Cargo project's build takes from the shared
+    /// registry cache: one per registry-sourced `Cargo.lock` entry
+    /// ([`lock_scope`]), the crates [`Self::crawl_all`] looks up there.
+    /// `None` when the cache is not scoped to a lock (a global run, a
+    /// `cargo vendor` directory source, no readable `Cargo.lock`).
+    ///
+    /// [`Self::find_by_purls`] matches a registry dir by name and version
+    /// alone, so it also finds a copy another project left behind of a
+    /// crate this lock takes from a path, git or `[patch]` source. Cargo
+    /// never builds that copy: callers that patch or attest the build's
+    /// copy keep only these crates (#506).
+    pub async fn locked_registry_crates(
+        &self,
+        options: &CrawlerOptions,
+    ) -> Option<LockedRegistryCrates> {
+        if !source_roots(options).await.1 {
+            return None;
+        }
+        Some(LockedRegistryCrates(
+            lock_scope(&options.cwd).await?.into_iter().collect(),
+        ))
+    }
+
     /// Crawl all discovered crate source directories and return every
     /// package found.
     ///
@@ -258,6 +281,21 @@ impl CargoCrawler {
     /// Blocking file reads; the hosted scan's cargo refusal reads it too.
     pub fn crates_io_source_for(cwd: &Path) -> CratesIoSource {
         resolve_for(cwd, Self::cargo_home().as_deref())
+    }
+}
+
+/// The registry-sourced `(name, version)`s of a project's `Cargo.lock`
+/// ([`CargoCrawler::locked_registry_crates`]).
+#[derive(Debug, Clone, Default)]
+pub struct LockedRegistryCrates(HashSet<(String, String)>);
+
+impl LockedRegistryCrates {
+    /// Whether the lock takes `purl`'s `name@version` from a registry.
+    /// A purl that is not a Cargo one never is.
+    pub fn contains_purl(&self, purl: &str) -> bool {
+        crate::utils::purl::parse_cargo_purl(purl).is_some_and(|(name, version)| {
+            self.0.contains(&(name.into_owned(), version.into_owned()))
+        })
     }
 }
 

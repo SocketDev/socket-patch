@@ -13,7 +13,9 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::cargo_lock_source_fixture::{stage_registry_copy, write_project, Shape, AFTER, BEFORE, PURL};
+use crate::cargo_lock_source_fixture::{
+    stage_registry_copy, write_project, Shape, AFTER, BEFORE, PURL,
+};
 use crate::common;
 
 use common::{git_sha256, parse_json_envelope, run_with_env};
@@ -78,7 +80,7 @@ fn registry_sourced_crate_is_patched_in_the_registry_cache() {
 
 /// #506: a crate the lock resolves to a path, git or `[patch]` source is
 /// never built from the registry cache, so apply must not patch that copy
-/// and report it applied.
+/// or report it applied.
 #[test]
 fn crate_overridden_away_from_the_registry_is_not_patched() {
     for shape in [
@@ -91,21 +93,33 @@ fn crate_overridden_away_from_the_registry_is_not_patched() {
             lib, BEFORE,
             "{shape:?}: the unused registry copy must stay untouched: {v}"
         );
-        assert_ne!(code, 0, "{shape:?}: must not report success: {v}");
-        let events = v["events"].as_array().expect("events array");
-        assert!(
-            !events
-                .iter()
-                .any(|e| e["purl"] == PURL && e["action"] == "applied"),
-            "{shape:?}: no applied event for the overridden crate: {v}"
-        );
-        let ev = events
-            .iter()
-            .find(|e| e["purl"] == PURL)
-            .unwrap_or_else(|| panic!("{shape:?}: no event for {PURL}: {v}"));
-        assert!(
-            ev.to_string().contains("[patch]"),
-            "{shape:?}: the detail names the override case: {ev}"
-        );
+        let ev = event(&v, shape);
+        assert_eq!(ev["action"], "skipped", "{shape:?}: {v}");
+        match shape {
+            // The user's own `[patch]` entry: the consent gate's calm skip.
+            Shape::ManifestPatch | Shape::ConfigPatch => {
+                assert_eq!(code, 0, "{shape:?}: {v}");
+                assert_eq!(ev["errorCode"], "user_patch_conflict", "{shape:?}: {ev}");
+            }
+            // Nothing else protects a git dependency: the crate is not
+            // installed where agent mode patches, and the run says why.
+            _ => {
+                assert_eq!(code, 1, "{shape:?}: must not report success: {v}");
+                assert_eq!(ev["errorCode"], "package_not_installed", "{shape:?}: {ev}");
+                assert!(
+                    ev.to_string().contains("path, git or [patch] source"),
+                    "{shape:?}: the detail names the override case: {ev}"
+                );
+            }
+        }
     }
+}
+
+fn event(v: &Value, shape: Shape) -> &Value {
+    v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .find(|e| e["purl"] == PURL)
+        .unwrap_or_else(|| panic!("{shape:?}: no event for {PURL}: {v}"))
 }

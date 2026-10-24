@@ -14,10 +14,10 @@
 //!   4. verify-mode against patched files laid on disk
 //!   5. verify-mode where one patch file is missing → omitted + warning
 
-#[path = "common/mod.rs"]
-mod common;
 #[path = "common/cargo_lock_source.rs"]
 mod cargo_lock_source;
+#[path = "common/mod.rs"]
+mod common;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -1939,7 +1939,11 @@ fn verify_mode_attests_registry_sourced_cargo_crate() {
 #[test]
 fn verify_mode_does_not_attest_cargo_crate_overridden_away_from_registry() {
     use cargo_lock_source::Shape;
-    for shape in [Shape::ManifestPatch, Shape::ConfigPatch, Shape::GitDependency] {
+    for shape in [
+        Shape::ManifestPatch,
+        Shape::ConfigPatch,
+        Shape::GitDependency,
+    ] {
         let (ok, stdout, stderr) = vex_over_patched_registry_copy(shape);
         assert!(
             !stdout.contains("GHSA-cfg-if-506"),
