@@ -233,6 +233,34 @@ async fn mount_hosted_api_serving(
     hosted_url
 }
 
+/// The patch API's record of `UUID` (the one [`stage_manifest`] stages):
+/// plain `vendor` over a hosted pin ejects it, fetching the pinned UUID's
+/// record from the API rather than reading the agent manifest.
+async fn mount_patch_view(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "six.py": {
+                "beforeHash": compute_git_sha256_from_bytes(ORIG),
+                "afterHash": compute_git_sha256_from_bytes(PATCHED),
+            }},
+            "vulnerabilities": {},
+            "description": "pypi mode takeover fixture",
+            "license": "MIT",
+            "tier": "free"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The flags pointing a `vendor` eject's record fetch at `uri`.
+fn api_args(uri: &str) -> [&str; 6] {
+    ["--api-url", uri, "--org", ORG, "--api-token", "fake-token"]
+}
+
 /// Stage the manifest and vendor the project; `files` carry the wiring.
 fn vendor_project(root: &Path, files: &[&str]) {
     stage_manifest(root);
@@ -458,12 +486,17 @@ async fn assert_all_hosted_requirements_unwind(pristine: &str) {
 
         if unwind[0] == "vendor" {
             stage_manifest(&root);
-            // `--patch-server-url` (which names the hosted origin to take
-            // over) also moves the vendored download onto this server.
+            // `--patch-server-url` (which names the hosted origin) also
+            // moves the vendored download onto this server; the eject
+            // fetches the pinned record from its API.
             prebuilt_common::mount_project(&server, &root).await;
+            mount_patch_view(&server).await;
         }
         let mut args = unwind.clone();
         args.extend(["--patch-server-url", uri.as_str()]);
+        if unwind[0] == "vendor" {
+            args.extend(api_args(&uri));
+        }
         let (code, env) = run_cli(&root, &args, &[]);
         assert_eq!(code, 0, "{unwind:?} over {pristine:?}: {env:#}");
         let after = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
@@ -471,7 +504,7 @@ async fn assert_all_hosted_requirements_unwind(pristine: &str) {
             assert!(
                 after.contains(&format!(".socket/vendor/pypi/{UUID}/"))
                     && !after.contains(&hosted_url),
-                "the takeover leaves the project vendored:\n{after}"
+                "the eject leaves the project vendored:\n{after}"
             );
         } else {
             assert_eq!(after, pristine, "{unwind:?} restores the pristine file");
@@ -2900,12 +2933,11 @@ async fn pipenv_hosted_to_vendored_keeps_the_requirements_patched() {
     // which also rehosts the prebuilt download: serve the vendored wheel
     // from the same mock.
     prebuilt_common::mount_project(&server, &root).await;
+    mount_patch_view(&server).await;
     let uri = server.uri();
-    let (code, env) = run_cli(
-        &root,
-        &["vendor", "--patch-server-url", &uri, "--vendor-url", &uri],
-        &[],
-    );
+    let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+    args.extend(api_args(&uri));
+    let (code, env) = run_cli(&root, &args, &[]);
     assert_eq!(code, 0, "vendor takeover: {env:#}");
     let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
     assert!(
@@ -3030,7 +3062,10 @@ async fn pipenv_vendor_wires_the_exported_requirements_too() {
     }
     stage_manifest(&root);
     prebuilt_common::mount_project(&server, &root).await;
-    let (code, env) = run_cli(&root, &["vendor", "--patch-server-url", uri.as_str()], &[]);
+    mount_patch_view(&server).await;
+    let mut args = vec!["vendor", "--patch-server-url", uri.as_str()];
+    args.extend(api_args(&uri));
+    let (code, env) = run_cli(&root, &args, &[]);
     assert_eq!(code, 0, "takeover: {env:#}");
     assert_both_vendored(&root, "takeover");
 }

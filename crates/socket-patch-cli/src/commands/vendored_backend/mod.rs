@@ -72,6 +72,9 @@ pub(crate) struct ApplyRequest<'a> {
     /// rollback undoes exactly these), and the wired flavors. With it, the
     /// run's human summary and "Next steps:" are left to the eject, which
     /// prints them only once it knows the eject stands.
+    /// The records are exact lockfile-selected patches with their hosted
+    /// wiring already restored upstream; skip installed-package discovery
+    /// and per-package hosted takeover.
     pub(crate) eject: Option<&'a mut EjectCapture>,
 }
 

@@ -87,11 +87,12 @@ pub enum Commands {
     /// Generate OpenVEX for vulnerabilities addressed by verified patches
     Vex(commands::vex::VexArgs),
 
-    /// Store patched dependencies in .socket/vendor/ for offline installs
+    /// Download hosted patches from lockfiles into .socket/vendor/
     ///
-    /// Rewire dependency files to use the committed artifacts. Unpatched
-    /// dependencies still need their normal registry or cache. Use --revert
-    /// to undo vendoring.
+    /// Works before installing dependencies and rewires dependency files to
+    /// use the committed artifacts. Falls back to the agent manifest when no
+    /// hosted patches are in scope. Unpatched dependencies still need their
+    /// normal registry or cache. Use --revert to undo vendoring.
     Vendor(commands::vendor::VendorArgs),
 
     /// Reapply agent-mode patches after installing dependencies

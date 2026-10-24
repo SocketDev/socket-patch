@@ -432,9 +432,20 @@ fn vendored_scan(proj: &Path, api: &str, extra: &[&str]) -> (i32, String, String
 /// `vendor --json` (+ extra) over the staged manifest. Online: vendoring
 /// over a hosted pin restores its upstream registry entry first, which reads
 /// the registry (the [`ONLINE_ENV`] mirror); the staged manifest + blob keep
-/// everything else local.
+/// everything else local. With a hosted pin in scope `vendor` instead ejects
+/// that pin (the manifest is ignored) and fetches its record from the API,
+/// so an online run also points `--api-url` at the mock server.
 fn vendor_cmd(proj: &Path, extra: &[&str]) -> (i32, String, String) {
+    let server = ONLINE_ENV
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(k, _)| k == "SOCKET_PATCH_SERVER_URL")
+        .map(|(_, v)| v.clone());
     let mut args = vec!["vendor", "--json", "--cwd", proj.to_str().unwrap()];
+    if let Some(server) = server.as_deref() {
+        args.extend_from_slice(&["--api-url", server, "--org", ORG, "--api-token", "fake"]);
+    }
     args.extend_from_slice(extra);
     run_socket(proj, &args)
 }
@@ -1359,15 +1370,17 @@ fn take_over_to_hosted(fx: &Fixture, proj: &Path, api: &str, hp: &HostedPatch, t
 }
 
 /// The hosted → vendored takeover on `proj` (already hosted for DEP_A),
-/// driven by `driver`: the takeover must be announced, the project left
-/// purely vendored at the uuid the driver vendors under, the vendor ledger
-/// must hold that record (manifest-free for `scan --mode vendored`; the
-/// manifest-fed `vendor` driver keeps its manifest record too), and a fresh
-/// frozen install from an empty cache must land the MARKER bytes from the
-/// committed artifact. Returns that uuid.
+/// driven by `driver`: the project must be left purely vendored at the
+/// HOSTED patch's uuid (both drivers vendor uuid_h), the vendor ledger must
+/// hold that record as a detached entry, and a fresh frozen install from an
+/// empty cache must land the MARKER bytes from the committed artifact.
+/// Returns that uuid.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum VendoredDriver {
-    /// `vendor --json` over a hand-staged manifest (uuid_v).
+    /// `vendor --json` with a hand-staged manifest naming uuid_v. A hosted
+    /// pin is in scope, so `vendor` ejects the lockfile's hosted patch
+    /// (uuid_h) and ignores the manifest: vendoring the manifest's patches
+    /// takes a full `scan --mode vendored`.
     VendorManifest,
     /// `scan --mode vendored --json --yes` — discovery + download from the
     /// mock API (uuid_h), then the same vendor engine.
@@ -1386,13 +1399,12 @@ fn take_over_to_vendored(
     // Kept apart from the envelope on purpose (no tuple): CodeQL's
     // cleartext-logging heuristic would otherwise taint every `{vendor_env}`
     // assertion message with the `uuid`-named half.
-    let uuid = match driver {
-        VendoredDriver::VendorManifest => dep.uuid_v,
-        VendoredDriver::ScanVendored => dep.uuid_h,
-    };
+    let uuid = dep.uuid_h;
+    let mut staged_manifest = None;
     let vendor_env = match driver {
         VendoredDriver::VendorManifest => {
             stage_manifest(fx, proj, dep);
+            staged_manifest = Some(read(proj, ".socket/manifest.json"));
             let (code, stdout, stderr) = vendor_cmd(proj, &[]);
             assert_eq!(code, 0, "vendor failed ({tag}): {stdout}\n{stderr}");
             envelope(&stdout, &stderr)
@@ -1414,13 +1426,15 @@ fn take_over_to_vendored(
     assert_eq!(vendor_env["summary"]["applied"], 1, "{vendor_env:#}");
     assert_eq!(vendor_env["summary"]["failed"], 0, "{vendor_env:#}");
     let codes = event_codes(&vendor_env);
-    assert!(
-        codes
-            .iter()
-            .any(|c| c == "vendor_takeover_reverted_redirect"),
-        "the takeover must be announced ({tag}, {driver:?}): event codes = {codes:?}\n\
-         {vendor_env:#}"
-    );
+    if driver == VendoredDriver::ScanVendored {
+        assert!(
+            codes
+                .iter()
+                .any(|c| c == "vendor_takeover_reverted_redirect"),
+            "the takeover must be announced ({tag}, {driver:?}): event codes = {codes:?}\n\
+             {vendor_env:#}"
+        );
+    }
     assert!(
         !codes.iter().any(|c| c == "redirect_revert_failed"),
         "the hosted revert must not be refused ({tag}, {driver:?}): {vendor_env:#}"
@@ -1431,33 +1445,40 @@ fn take_over_to_vendored(
         state["entries"][dep.purl]["uuid"], uuid,
         "the vendor ledger must record the vendored patch ({tag}, {driver:?}): {state:#}"
     );
-    match driver {
-        // Standalone `vendor` is fed by the staged manifest and leaves its
-        // record in place — the legacy manifest-tracked shape.
-        VendoredDriver::VendorManifest => {
-            let manifest = read_json(proj, ".socket/manifest.json");
+    // Both drivers write a detached entry embedding the hosted record.
+    assert_eq!(
+        state["entries"][dep.purl]["detached"],
+        json!(true),
+        "the vendored entry is detached ({tag}, {driver:?}): {state:#}"
+    );
+    assert_eq!(
+        state["entries"][dep.purl]["record"]["uuid"], uuid,
+        "the embedded record is the vendored patch ({tag}, {driver:?}): {state:#}"
+    );
+    match staged_manifest {
+        // The eject neither used nor rewrote the manifest, and its
+        // manifest-only patch was not vendored or reported.
+        Some(staged) => {
             assert_eq!(
-                manifest["patches"][dep.purl]["uuid"], uuid,
-                "the manifest must record the vendored patch ({tag}, {driver:?}): {manifest:#}"
-            );
-        }
-        // Vendored mode is manifest-free: the ledger entry embeds the record
-        // and nothing else is written under `.socket/`.
-        VendoredDriver::ScanVendored => {
-            assert_eq!(
-                state["entries"][dep.purl]["detached"],
-                json!(true),
-                "scan --mode vendored writes a detached entry ({tag}): {state:#}"
-            );
-            assert_eq!(
-                state["entries"][dep.purl]["record"]["uuid"], uuid,
-                "the embedded record is the vendored patch ({tag}): {state:#}"
+                read(proj, ".socket/manifest.json"),
+                staged,
+                "the eject must not rewrite the manifest ({tag})"
             );
             assert!(
-                !proj.join(".socket/manifest.json").exists(),
-                "scan --mode vendored must not write a manifest ({tag})"
+                !vendor_env.to_string().contains(dep.uuid_v),
+                "the manifest-only patch is not part of the eject ({tag}): {vendor_env:#}"
+            );
+            assert!(
+                !proj.join(dep.vendored_rel(dep.uuid_v)).exists(),
+                "the manifest-only patch must not be vendored ({tag})"
             );
         }
+        // Vendored mode is manifest-free: nothing else is written under
+        // `.socket/`.
+        None => assert!(
+            !proj.join(".socket/manifest.json").exists(),
+            "scan --mode vendored must not write a manifest ({tag})"
+        ),
     }
     let fresh = fresh_frozen_install(fx, proj, &format!("fresh-vendored-{tag}"));
     assert_installed(&fresh, &DEP_A, &fx.a.patched, "vendored fresh install");
@@ -1468,16 +1489,12 @@ fn take_over_to_vendored(
         "vendored fresh install (bystander)",
     );
     eprintln!("HOSTED→VENDORED OK ({tag}, {driver:?}, bun {})", fx.bun_raw);
-    let cve = match driver {
-        VendoredDriver::VendorManifest => CVE_MANIFEST,
-        VendoredDriver::ScanVendored => CVE_VIEW,
-    };
     manifestless_vex(
         fx,
         proj,
         bun_vex::BunMode::Vendored,
         uuid,
-        cve,
+        CVE_VIEW,
         api,
         &format!("vendored-{tag}"),
     );
@@ -1642,24 +1659,31 @@ async fn bun_dry_run_previews_match_wet_outcomes() {
     stage_manifest(&fx, &hosted, &DEP_A);
     let before = snapshot(&hosted);
 
-    // `vendor --dry-run`: the takeover's upstream restore is resolved
-    // write-free (registry lookup included) and previewed; the backend
-    // preview does not run against the still-hosted lock, so no false
-    // `vendor_lock_entry_not_found` and no refusal.
+    // `vendor --dry-run`: a hosted pin is in scope, so `vendor` plans an
+    // EJECT of the lockfile's hosted patch (the staged manifest is ignored).
+    // The upstream restore is resolved write-free (registry lookup
+    // included) and the backend preview runs against the restored text, so
+    // no false `vendor_lock_entry_not_found` and no refusal.
     let (code, stdout, stderr) = vendor_cmd(&hosted, &["--dry-run"]);
     assert_eq!(code, 0, "vendor --dry-run must succeed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["dryRun"], true, "{env:#}");
     assert_eq!(env["summary"]["failed"], 0, "{env:#}");
-    let advisory = env["events"]
+    let planned = env["events"]
         .as_array()
         .and_then(|evs| {
             evs.iter()
-                .find(|e| e["errorCode"] == "vendor_would_revert_redirect")
+                .find(|e| e["action"] == "applied" && e["purl"] == DEP_A.purl)
         })
-        .unwrap_or_else(|| panic!("expected a `vendor_would_revert_redirect` preview: {env:#}"));
-    assert_eq!(advisory["action"], "skipped", "{advisory:#}");
-    assert_eq!(advisory["purl"], DEP_A.purl, "{advisory:#}");
+        .unwrap_or_else(|| panic!("expected an eject preview for {}: {env:#}", DEP_A.purl));
+    assert!(
+        planned.to_string().contains("eject_planned"),
+        "the preview is the planned eject: {planned:#}"
+    );
+    assert!(
+        !env.to_string().contains(DEP_A.uuid_v),
+        "the manifest-only patch is not previewed: {env:#}"
+    );
     let codes = event_codes(&env);
     for forbidden in ["vendor_lock_entry_not_found", "redirect_revert_failed"] {
         assert!(
@@ -1706,18 +1730,17 @@ async fn bun_dry_run_previews_match_wet_outcomes() {
     );
     assert_unchanged(&before, &hosted, "scan --mode vendored --dry-run");
 
-    // The WET vendor lands exactly the takeover previewed.
+    // The WET vendor lands exactly the eject previewed: the hosted patch,
+    // not the manifest's.
     let (code, stdout, stderr) = vendor_cmd(&hosted, &[]);
     assert_eq!(code, 0, "wet vendor failed: {stdout}\n{stderr}");
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["summary"]["applied"], 1, "{env:#}");
     assert!(
-        event_codes(&env)
-            .iter()
-            .any(|c| c == "vendor_takeover_reverted_redirect"),
-        "the wet vendor must perform the takeover the preview promised: {env:#}"
+        !env.to_string().contains(DEP_A.uuid_v),
+        "the wet vendor ejects only the hosted pin: {env:#}"
     );
-    assert_pure_vendored(&fx, &hosted, &DEP_A, DEP_A.uuid_v, &hp.url);
+    assert_pure_vendored(&fx, &hosted, &DEP_A, DEP_A.uuid_h, &hp.url);
 
     // ── over a LIVE VENDORED state ───────────────────────────────────────
     let vendored = fx.dir("live-vendored");
