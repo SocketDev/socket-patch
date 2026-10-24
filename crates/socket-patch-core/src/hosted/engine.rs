@@ -4199,7 +4199,7 @@ mod tests {
             let mut p = MemoryProject::new();
             p.insert_text("package-lock.json", LOCK);
             if let Some(text) = &deno {
-                p.insert_text("deno.lock", text);
+                p.insert_text("deno.lock", text.as_str());
             }
             let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
             let detail = said(&done);
