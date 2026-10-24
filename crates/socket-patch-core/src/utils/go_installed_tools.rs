@@ -117,9 +117,20 @@ impl PatchedModule {
     }
 }
 
+/// Where to look for the tools built from a set of module cache copies.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BinDirs {
+    /// The directories `go install` writes to, deduplicated.
+    pub dirs: Vec<PathBuf>,
+    /// Copies in a cache that is neither the user's own nor at
+    /// `<root>/pkg/mod` (a bare `--global-prefix` module cache): no
+    /// `go install` directory is known for them.
+    pub unlocated: Vec<PathBuf>,
+}
+
 /// The directories `go install` writes to, for module cache copies at
 /// `module_dirs`, reading the process environment.
-pub fn bin_dirs(module_dirs: &[&Path]) -> Vec<PathBuf> {
+pub fn bin_dirs(module_dirs: &[&Path]) -> BinDirs {
     bin_dirs_with(
         module_dirs,
         &crate::utils::go_env::go_env,
@@ -136,8 +147,9 @@ pub fn bin_dirs_with(
     module_dirs: &[&Path],
     go_env: &dyn Fn(&str) -> Option<String>,
     home: Option<PathBuf>,
-) -> Vec<PathBuf> {
+) -> BinDirs {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut unlocated: Vec<PathBuf> = Vec::new();
     let mut push = |p: PathBuf| {
         if p.is_absolute() && !dirs.contains(&p) {
             dirs.push(p);
@@ -154,7 +166,8 @@ pub fn bin_dirs_with(
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| gopaths.first().map(|g| g.join("pkg").join("mod")));
-    if user_cache.is_some_and(|c| module_dirs.iter().any(|d| d.starts_with(&c))) {
+    let in_user_cache = |d: &Path| user_cache.as_ref().is_some_and(|c| d.starts_with(c));
+    if module_dirs.iter().any(|d| in_user_cache(d)) {
         match go_env("GOBIN").filter(|v| !v.is_empty()) {
             Some(gobin) => push(PathBuf::from(gobin)),
             None => gopaths.iter().for_each(|g| push(g.join("bin"))),
@@ -171,9 +184,24 @@ pub fn bin_dirs_with(
             .and_then(|m| m.parent()?.parent())
         {
             push(root.join("bin"));
+        } else if !in_user_cache(dir) {
+            unlocated.push(dir.to_path_buf());
         }
     }
-    dirs
+    BinDirs { dirs, unlocated }
+}
+
+/// The warning detail for cache copies no `go install` directory is known
+/// for.
+pub fn unlocated_detail(dirs: &[PathBuf]) -> String {
+    let dirs: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+    format!(
+        "no `go install` directory is known for the module cache copies at {} (not under \
+         your GOMODCACHE or a `<root>/pkg/mod`), so the tools built from them were not \
+         checked; a tool built with `go install` before this patch keeps running the \
+         unpatched code until you rebuild it with `go install <pkg>@<version>`",
+        dirs.join(", ")
+    )
 }
 
 /// Parse `go version -m` output: one `<path>: <go version>` header per
@@ -323,7 +351,12 @@ pub async fn audit(
     }
     crate::utils::fs::run_blocking(move || {
         let dirs: Vec<&Path> = module_dirs.iter().map(PathBuf::as_path).collect();
-        audit_sync(&patched, &bin_dirs(&dirs))
+        let bins = bin_dirs(&dirs);
+        let (mut warnings, stale) = audit_sync(&patched, &bins.dirs);
+        if !bins.unlocated.is_empty() {
+            warnings.push((STALE_WARNING.to_string(), unlocated_detail(&bins.unlocated)));
+        }
+        (warnings, stale)
     })
     .await
 }
@@ -468,7 +501,7 @@ mod tests {
         };
         let user = Path::new("/home/u/go/pkg/mod/example.com/upstream@v1.0.0");
         assert_eq!(
-            bin_dirs_with(&[user], &env(vec![("GOBIN", "/gobin")]), home.clone()),
+            bin_dirs_with(&[user], &env(vec![("GOBIN", "/gobin")]), home.clone()).dirs,
             vec![PathBuf::from("/gobin"), PathBuf::from("/home/u/go/bin")]
         );
         assert_eq!(
@@ -476,11 +509,12 @@ mod tests {
                 &[Path::new("/a/pkg/mod/x@v1.0.0")],
                 &env(vec![("GOPATH", "/a:/b")]),
                 home.clone()
-            ),
+            )
+            .dirs,
             vec![PathBuf::from("/a/bin"), PathBuf::from("/b/bin")]
         );
         assert_eq!(
-            bin_dirs_with(&[user], &env(Vec::new()), home.clone()),
+            bin_dirs_with(&[user], &env(Vec::new()), home.clone()).dirs,
             vec![PathBuf::from("/home/u/go/bin")]
         );
         // A GOMODCACHE outside GOPATH: the user's tools, not `<root>/bin`.
@@ -489,7 +523,8 @@ mod tests {
                 &[Path::new("/cache/x@v1.0.0")],
                 &env(vec![("GOMODCACHE", "/cache")]),
                 home.clone()
-            ),
+            )
+            .dirs,
             vec![PathBuf::from("/home/u/go/bin")]
         );
         // A --global-prefix tree: never the user's own tools.
@@ -498,7 +533,8 @@ mod tests {
                 &[Path::new("/img/gp/pkg/mod/x@v1.0.0")],
                 &env(vec![("GOBIN", "/gobin")]),
                 home.clone()
-            ),
+            )
+            .dirs,
             vec![PathBuf::from("/img/gp/bin")]
         );
         // A module path that itself contains `pkg/mod`: the outermost one.
@@ -506,10 +542,17 @@ mod tests {
             bin_dirs_with(
                 &[Path::new("/img/gp/pkg/mod/github.com/foo/pkg/mod/x@v1.0.0")],
                 &env(Vec::new()),
-                home
-            ),
+                home.clone()
+            )
+            .dirs,
             vec![PathBuf::from("/img/gp/bin")]
         );
+        // A bare --global-prefix module cache: nowhere known to look.
+        let bare = Path::new("/img/cache/x@v1.0.0");
+        let found = bin_dirs_with(&[bare], &env(vec![("GOBIN", "/gobin")]), home);
+        assert_eq!(found.dirs, Vec::<PathBuf>::new());
+        assert_eq!(found.unlocated, vec![bare.to_path_buf()]);
+        assert!(unlocated_detail(&found.unlocated).contains("/img/cache/x@v1.0.0"));
     }
 
     #[test]

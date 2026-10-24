@@ -1394,21 +1394,23 @@ pub(crate) async fn run_locked(
                     .into_iter()
                     .map(|(code, detail)| RunWarning { code, detail }),
                 );
-                // A global Go apply patches the module cache in place: a
-                // tool already built from it with `go install` keeps the
-                // unpatched code until it is rebuilt (#422). An embedded
-                // `--vex` checks again and says so itself.
-                if args.common.is_global() {
-                    let (patched, dirs) = patched_go_modules(&results);
-                    let (warnings, _) =
-                        socket_patch_core::utils::go_installed_tools::audit(patched, dirs).await;
-                    cache_warnings.extend(
-                        warnings
-                            .into_iter()
-                            .map(|(code, detail)| RunWarning { code, detail }),
-                    );
-                }
                 run_warnings.extend(cache_warnings.iter().cloned());
+            }
+            // A global Go apply patches the module cache in place: a tool
+            // already built from it with `go install` keeps the unpatched
+            // code until it is rebuilt (#422). Read-only, so a dry run
+            // over an already-patched cache says so too. An embedded
+            // `--vex` checks again and says so itself.
+            if args.common.is_global() {
+                let (patched, dirs) = patched_go_modules(&results);
+                let (warnings, _) =
+                    socket_patch_core::utils::go_installed_tools::audit(patched, dirs).await;
+                let warnings: Vec<RunWarning> = warnings
+                    .into_iter()
+                    .map(|(code, detail)| RunWarning { code, detail })
+                    .collect();
+                run_warnings.extend(warnings.iter().cloned());
+                cache_warnings.extend(warnings);
             }
 
             // Run-level advisories + best-effort fallback-home skips on the

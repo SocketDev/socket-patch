@@ -1059,19 +1059,21 @@ fn global_apply_flags_tools_built_from_the_unpatched_module() {
     let outside = tmp.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     write_patch(&outside);
-    let apply = || {
+    let apply_with = |extra: &[&str]| {
+        let mut args = vec![
+            "apply",
+            "--global",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            outside.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
         let (code, stdout, stderr) = common::run_with_env(
             &outside,
-            &[
-                "apply",
-                "--global",
-                "--offline",
-                "--ecosystems",
-                "golang",
-                "--json",
-                "--cwd",
-                outside.to_str().unwrap(),
-            ],
+            &args,
             &[("GOMODCACHE", mc), ("GOBIN", gobin.to_str().unwrap())],
         );
         assert_eq!(code, 0, "apply -g: {stdout}\n{stderr}");
@@ -1085,6 +1087,7 @@ fn global_apply_flags_tools_built_from_the_unpatched_module() {
             .collect();
         stale
     };
+    let apply = || apply_with(&[]);
     let stale = apply();
     let lib = modcache.join(format!("{UMOD}@{UVER}")).join("lib.go");
     assert_eq!(std::fs::read_to_string(&lib).unwrap(), PATCHED_LIB);
@@ -1096,8 +1099,10 @@ fn global_apply_flags_tools_built_from_the_unpatched_module() {
             && stale[0].contains(&format!("{UMOD}@{UVER}")),
         "{stale:?}"
     );
-    // A re-run over the already-patched cache still names the tool.
+    // A re-run over the already-patched cache still names the tool, a
+    // dry run included (the check is read-only).
     assert_eq!(apply(), stale);
+    assert_eq!(apply_with(&["--dry-run"]), stale);
 
     let out = global_vex(&outside, &modcache, &gobin);
     assert_absent(out.doc.as_ref(), UPURL);
