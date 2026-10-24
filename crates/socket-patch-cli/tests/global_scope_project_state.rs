@@ -732,3 +732,188 @@ fn global_vendor_check_is_refused() {
         |what| project.assert_untouched(what),
     );
 }
+
+// ═══════════════ 6. agent records patched in the other scope (#450) ═══════════════
+
+/// `manifest_project` with its `node_modules/left-pad` copy holding `index`.
+fn agent_project(index: &[u8]) -> tempfile::TempDir {
+    let (tmp, _) = manifest_project();
+    write_left_pad(&tmp.path().join("node_modules/left-pad"), index);
+    tmp
+}
+
+fn manifest_of(root: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(root.join(".socket/manifest.json")).unwrap()).unwrap()
+}
+
+/// The record and both of its blobs are still on disk.
+fn assert_record_kept(root: &Path, v: &Value, what: &str) {
+    assert!(
+        manifest_of(root)["patches"].get(V_PURL).is_some(),
+        "{what}: the record of the copy patched in the other scope must stay; {v}"
+    );
+    for blob in [git_sha256(ORIG_INDEX), git_sha256(PATCHED_INDEX)] {
+        assert!(
+            root.join(".socket/blobs").join(&blob).is_file(),
+            "{what}: blob {blob} must survive GC; {v}"
+        );
+    }
+    let warning = v["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .find(|w| w["code"] == "patched_in_other_scope")
+        .unwrap_or_else(|| panic!("{what}: expected a patched_in_other_scope warning; {v}"));
+    assert!(
+        warning["detail"].as_str().unwrap().contains(V_PURL),
+        "{what}: the warning names the purl; {v}"
+    );
+}
+
+/// Project apply, then `rollback --global-prefix` (#450, direction 1): the
+/// global copy is already original, but the project's copy is still
+/// patched, so the record and its blobs stay and the run says where the
+/// patched copy is.
+#[test]
+fn global_rollback_keeps_a_record_patched_in_the_project() {
+    let project = agent_project(PATCHED_INDEX);
+    let root = project.path();
+    let prefix = empty_prefix();
+    write_left_pad(&prefix.path().join("left-pad"), ORIG_INDEX);
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "rollback",
+            "--json",
+            "--yes",
+            "--offline",
+            "--global-prefix",
+            prefix.path().to_str().unwrap(),
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, stdout, stderr) = run(root, &args);
+        assert_eq!(code, 0, "{args:?}: stdout={stdout}\nstderr={stderr}");
+        let v = parse(&stdout, &stderr);
+        assert_record_kept(root, &v, &format!("{args:?}"));
+        assert!(
+            !v["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .any(|e| e["action"] == "removed"),
+            "{args:?}: nothing leaves the manifest; {v}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(root.join("node_modules/left-pad/index.js")).unwrap(),
+        PATCHED_INDEX,
+        "a global rollback leaves the project's copy alone"
+    );
+
+    // The rollback in the right scope then restores it and drops the record.
+    let (code, stdout, stderr) = run(root, &["rollback", "--json", "--yes", "--offline"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(
+        std::fs::read(root.join("node_modules/left-pad/index.js")).unwrap(),
+        ORIG_INDEX
+    );
+    assert!(
+        manifest_of(root)["patches"].get(V_PURL).is_none(),
+        "{stdout}"
+    );
+}
+
+/// Every copy original in both scopes (the user reinstalled): rollback's
+/// end state holds, so a global run still drops the record as before.
+#[test]
+fn global_rollback_drops_a_record_original_in_both_scopes() {
+    let project = agent_project(ORIG_INDEX);
+    let root = project.path();
+    let prefix = empty_prefix();
+    write_left_pad(&prefix.path().join("left-pad"), ORIG_INDEX);
+    let (code, stdout, stderr) = run(
+        root,
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--offline",
+            "--global-prefix",
+            prefix.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse(&stdout, &stderr);
+    assert!(manifest_of(root)["patches"].get(V_PURL).is_none(), "{v}");
+    assert!(
+        !v["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "patched_in_other_scope")),
+        "{v}"
+    );
+}
+
+/// `-g` apply, then a project `rollback` (#450, direction 2): the project's
+/// copy is already original, but the default global install (here the
+/// root a stub `npm root -g` prints) is still patched, so the record and
+/// its blobs stay for `rollback -g`.
+#[cfg(unix)]
+#[test]
+fn project_rollback_keeps_a_record_patched_globally() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = agent_project(ORIG_INDEX);
+    let root = project.path();
+    let global = empty_prefix();
+    let global_root = global.path().join("lib/node_modules");
+    write_left_pad(&global_root.join("left-pad"), PATCHED_INDEX);
+    let bin = tempfile::tempdir().unwrap();
+    let npm = bin.path().join("npm");
+    std::fs::write(
+        &npm,
+        format!("#!/bin/sh\necho '{}'\n", global_root.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = bin.path().to_str().unwrap();
+
+    let (code, stdout, stderr) = common::run_with_env(
+        root,
+        &["rollback", "--json", "--yes", "--offline"],
+        &[("SOCKET_PATCH_SERVER_URL", PATCH_HOST), ("PATH", path)],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse(&stdout, &stderr);
+    assert_record_kept(root, &v, "project rollback");
+    assert!(
+        !v["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .any(|e| e["action"] == "removed"),
+        "nothing leaves the manifest; {v}"
+    );
+    assert_eq!(
+        std::fs::read(global_root.join("left-pad/index.js")).unwrap(),
+        PATCHED_INDEX,
+        "a project rollback leaves the global copy alone"
+    );
+
+    // `rollback -g` restores the global copy and drops the record.
+    let (code, stdout, stderr) = common::run_with_env(
+        root,
+        &["rollback", "-g", "--json", "--yes", "--offline"],
+        &[("SOCKET_PATCH_SERVER_URL", PATCH_HOST), ("PATH", path)],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(
+        std::fs::read(global_root.join("left-pad/index.js")).unwrap(),
+        ORIG_INDEX,
+        "{stdout}"
+    );
+    assert!(
+        manifest_of(root)["patches"].get(V_PURL).is_none(),
+        "{stdout}"
+    );
+}

@@ -289,6 +289,88 @@ fn handled_in_place(results: &[RollbackResult]) -> HashSet<&str> {
         .collect()
 }
 
+/// Purls whose every copy this run found is already original (they would
+/// leave the manifest as rolled back), restricted to those not failed.
+fn all_copies_already_original(results: &[RollbackResult]) -> Vec<String> {
+    let mut by_key: std::collections::BTreeMap<&str, Vec<&RollbackResult>> =
+        std::collections::BTreeMap::new();
+    for r in results {
+        by_key.entry(r.package_key.as_str()).or_default().push(r);
+    }
+    by_key
+        .into_iter()
+        .filter(|(_, copies)| {
+            copies
+                .iter()
+                .all(|r| r.success && all_files_already_original(r))
+        })
+        .map(|(key, _)| key.to_string())
+        .collect()
+}
+
+/// The manifest records no scope (#450), so a copy that is already
+/// original in this run's scope says nothing about the copy the patch was
+/// applied to: a project apply rolled back with `-g` (or a `-g` apply
+/// rolled back from the project) finds an untouched copy here while the
+/// patched one sits in the other scope. Of `purls`, those with a copy in
+/// the other scope (the project at `--cwd` for a global run, the default
+/// global install otherwise) whose files still hold the patch's
+/// afterHash content, with that copy's path. Their records must stay.
+async fn patched_in_other_scope(
+    purls: &[String],
+    manifest: &PatchManifest,
+    common: &GlobalArgs,
+    socket_dir: &Path,
+    this_scope: &HashSet<&str>,
+) -> Vec<(String, PathBuf)> {
+    if purls.is_empty() {
+        return Vec::new();
+    }
+    let partitioned = partition_purls(purls, common.ecosystems.as_deref());
+    let other = CrawlerOptions {
+        cwd: common.cwd.clone(),
+        global: !common.is_global(),
+        global_prefix: None,
+    };
+    let found = find_all_packages_for_rollback(&partitioned, &other, true).await;
+    let blobs = socket_dir.join("blobs");
+    let mut patched = Vec::new();
+    for purl in purls {
+        let (Some(record), Some(paths)) = (manifest.patches.get(purl), found.get(purl)) else {
+            continue;
+        };
+        'copies: for path in paths {
+            // Both scopes can resolve to one tree (a `--cwd` inside the
+            // global root): this run already verified that copy.
+            if this_scope.contains(path.to_string_lossy().as_ref()) {
+                continue;
+            }
+            for (file, info) in &record.files {
+                let v = verify_file_rollback(path, file, info, &blobs).await;
+                if v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
+                    patched.push((purl.clone(), path.clone()));
+                    break 'copies;
+                }
+            }
+        }
+    }
+    patched
+}
+
+/// `rollback`'s pointer at the scope that still holds a patched copy.
+fn patched_in_other_scope_warning(purl: &str, path: &Path, global_run: bool) -> String {
+    let (scope, command) = if global_run {
+        ("the project", "socket-patch rollback")
+    } else {
+        ("the global install", "socket-patch rollback -g")
+    };
+    format!(
+        "{purl} is already original in this scope, but its copy in {scope} ({}) is still \
+         patched; its manifest record was kept — run `{command}` to restore it",
+        path.display()
+    )
+}
+
 /// The wet run's per-package blocks: what was rolled back (naming each
 /// physical copy when a package has several) and what failed.
 fn format_rollback_results(results: &[RollbackResult], cwd: &Path) -> Vec<String> {
@@ -1924,10 +2006,31 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         .is_some_and(|(k, e)| e.covers_purl(k, purl))
                 })
             };
+            let this_scope: HashSet<&str> =
+                results.iter().map(|r| r.package_path.as_str()).collect();
+            let elsewhere = if cleanup_allowed {
+                patched_in_other_scope(
+                    &all_copies_already_original(&results),
+                    &manifest,
+                    &args.common,
+                    &socket_dir,
+                    &this_scope,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            for (purl, path) in &elsewhere {
+                run_warnings.push((
+                    "patched_in_other_scope".into(),
+                    patched_in_other_scope_warning(purl, path, args.common.is_global()),
+                ));
+            }
             let succeeded_purls: HashSet<String> = results
                 .iter()
                 .filter(|r| r.success)
                 .map(|r| r.package_key.clone())
+                .filter(|key| !elsewhere.iter().any(|(purl, _)| purl == key))
                 .collect();
             // Bases whose attempted variant(s) failed hold their whole
             // group in the manifest (narrowed-away siblings included).
