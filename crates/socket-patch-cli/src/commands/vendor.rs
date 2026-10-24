@@ -2537,15 +2537,21 @@ impl StagedSource {
 /// neither the pristine release nor this patch's output. The re-vendor
 /// then takes the pristine artifact from the lock / registry / service, as
 /// a lock-only checkout does, instead of reporting it not installed.
+///
+/// A live hosted pin at another uuid (`hosted_uuid`) is the same story
+/// after a hosted scan (#1105): `uv sync` / `poetry install` from the
+/// hosted lock installs that patch's bytes. The pin names no release
+/// variant, so it only answers for a sole candidate.
 fn superseded_install(
     ledger: &VendorState,
     candidate: &str,
     record: &PatchRecord,
     sole_candidate: bool,
+    hosted_uuid: Option<&str>,
 ) -> bool {
     lookup_entry_kv(&ledger.entries, candidate).is_some_and(|(key, entry)| {
         entry.uuid != record.uuid && (sole_candidate || key == candidate)
-    })
+    }) || (sole_candidate && hosted_uuid.is_some_and(|uuid| uuid != record.uuid))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2605,8 +2611,15 @@ async fn plan_service_downloads(
                         if !variant_matches_installed(Some(
                             &verify_file_patch(dir, file, info).await.status,
                         )) {
-                            if !superseded_install(ledger, candidate, record, candidates.len() == 1)
-                            {
+                            if !superseded_install(
+                                ledger,
+                                candidate,
+                                record,
+                                candidates.len() == 1,
+                                // A hosted-pinned candidate is left out
+                                // below (`takeover_blocked`) either way.
+                                None,
+                            ) {
                                 continue;
                             }
                             source_path = &uninstalled;
@@ -3093,8 +3106,13 @@ pub(crate) async fn vendor_records_reusing(
                                 .await
                                 .status,
                         )) {
-                            if !superseded_install(&state, candidate, record, candidates.len() == 1)
-                            {
+                            if !superseded_install(
+                                &state,
+                                candidate,
+                                record,
+                                candidates.len() == 1,
+                                hosted_pin_of(candidate).map(|pin| pin.uuid.as_str()),
+                            ) {
                                 continue;
                             }
                             candidate_source = PackageSource::Installed(&uninstalled);
@@ -4907,6 +4925,21 @@ mod plan_gate_tests {
             license: String::new(),
             tier: String::new(),
         }
+    }
+
+    /// #1105: a live hosted pin at an older uuid marks the installed copy
+    /// superseded (a hosted sync installed that patch's bytes), so the
+    /// takeover vendors the newer patch instead of reporting it not
+    /// installed. The pin names no variant: only a sole candidate counts.
+    #[test]
+    fn hosted_pin_at_another_uuid_is_a_superseded_install() {
+        let ledger = VendorState::default();
+        let purl = "pkg:pypi/six@1.16.0";
+        let b = record(UUID_B);
+        assert!(superseded_install(&ledger, purl, &b, true, Some(UUID_A)));
+        assert!(!superseded_install(&ledger, purl, &b, true, Some(UUID_B)));
+        assert!(!superseded_install(&ledger, purl, &b, false, Some(UUID_A)));
+        assert!(!superseded_install(&ledger, purl, &b, true, None));
     }
 
     /// The download plan runs every record through its backend's own gate:
