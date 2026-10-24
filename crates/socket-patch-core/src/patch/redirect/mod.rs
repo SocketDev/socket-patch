@@ -27165,6 +27165,32 @@ mod hatch_tests {
         assert!(result.confirmed_hatch_uuids.is_empty());
     }
 
+    /// #673: Hatch's uv installer applies `[tool.uv.sources]` over the
+    /// hosted reference, so the dep stays unconfirmed (nothing written)
+    /// instead of reporting a redirect that installs the unpatched copy.
+    #[test]
+    fn hatch_uv_source_leaves_the_dep_unconfirmed() {
+        let files: BTreeMap<String, String> = [(
+            "pyproject.toml".to_string(),
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"urllib3==1.26.18\"]\n\n[tool.hatch.envs.default]\ninstaller = \"uv\"\n\n[tool.uv.sources]\nurllib3 = { url = \"https://files.test/urllib3-1.26.18-py2.py3-none-any.whl\" }\n".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        assert!(result.hatch_uuids.contains("test-uuid"));
+        assert!(result.confirmed_hatch_uuids.is_empty());
+        assert!(!result.files.contains_key("pyproject.toml"));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_hatch_unsupported"
+                    && w.detail.contains("[tool.uv.sources]")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
     #[test]
     fn hatch_confirmation_ignores_inactive_sources_and_comments() {
         let dep = patch();
