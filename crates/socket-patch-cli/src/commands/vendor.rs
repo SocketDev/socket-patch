@@ -146,13 +146,9 @@ async fn keep_older_vendored_patch(
     uuid: &str,
     common: &GlobalArgs,
 ) -> Option<VendorOutcome> {
-    let ((code, detail), not_kept) = match outcome {
+    let (code, detail, failed_done) = match outcome {
         Some(VendorOutcome::Refused { code, detail }) if vendor::is_unserved(code) => {
-            let not_kept = VendorOutcome::Refused {
-                code: vendor::VENDOR_PREBUILT_REQUIRED,
-                detail: detail.clone(),
-            };
-            ((code, detail), not_kept)
+            (code, detail, None)
         }
         Some(VendorOutcome::Done {
             result,
@@ -167,12 +163,11 @@ async fn keep_older_vendored_patch(
                 });
             };
             let unserved = warnings.remove(i);
-            let not_kept = VendorOutcome::Done {
-                result,
-                entry,
-                warnings,
-            };
-            ((unserved.code, unserved.detail), not_kept)
+            (
+                unserved.code,
+                unserved.detail,
+                Some((result, entry, warnings)),
+            )
         }
         other => return other,
     };
@@ -192,7 +187,17 @@ async fn keep_older_vendored_patch(
             });
         }
     }
-    Some(not_kept)
+    Some(match failed_done {
+        Some((result, entry, warnings)) => VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        },
+        None => VendorOutcome::Refused {
+            code: vendor::VENDOR_PREBUILT_REQUIRED,
+            detail,
+        },
+    })
 }
 
 /// The `vendor_dir_symlink_unsupported` detail when `purl`'s vendor dir
