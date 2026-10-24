@@ -24,6 +24,8 @@ pub enum Shape {
     ConfigPatch,
     /// `cfg-if = { git = "file:///…" }`, no `[patch]` at all.
     GitDependency,
+    /// `cfg-if = { path = "local/cfg-if" }`, no `[patch]` at all.
+    PathDependency,
 }
 
 /// A crates.io copy of `cfg-if-1.0.4` in `<cargo_home>/registry/src`,
@@ -45,6 +47,7 @@ pub fn stage_registry_copy(cargo_home: &Path, lib: &[u8]) -> PathBuf {
 pub fn write_project(root: &Path, shape: Shape) {
     let dep = match shape {
         Shape::GitDependency => "cfg-if = { git = \"file:///srv/git/cfg-if\" }",
+        Shape::PathDependency => "cfg-if = { path = \"local/cfg-if\" }",
         _ => "cfg-if = \"=1.0.4\"",
     };
     let mut manifest = format!(
@@ -58,9 +61,12 @@ pub fn write_project(root: &Path, shape: Shape) {
             std::fs::create_dir_all(root.join(".cargo")).unwrap();
             std::fs::write(root.join(".cargo/config.toml"), patch).unwrap();
         }
-        Shape::Registry | Shape::GitDependency => {}
+        Shape::Registry | Shape::GitDependency | Shape::PathDependency => {}
     }
-    if matches!(shape, Shape::ManifestPatch | Shape::ConfigPatch) {
+    if matches!(
+        shape,
+        Shape::ManifestPatch | Shape::ConfigPatch | Shape::PathDependency
+    ) {
         let fork = root.join("local/cfg-if");
         std::fs::create_dir_all(fork.join("src")).unwrap();
         std::fs::write(
@@ -77,7 +83,7 @@ pub fn write_project(root: &Path, shape: Shape) {
             "source = \"{CRATES_IO}\"\nchecksum = \
              \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"\n"
         ),
-        Shape::ManifestPatch | Shape::ConfigPatch => String::new(),
+        Shape::ManifestPatch | Shape::ConfigPatch | Shape::PathDependency => String::new(),
         Shape::GitDependency => "source = \"git+file:///srv/git/cfg-if#\
              0123456789abcdef0123456789abcdef01234567\"\n"
             .to_string(),

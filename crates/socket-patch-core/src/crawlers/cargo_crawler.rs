@@ -78,11 +78,12 @@ impl CargoCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Option<LockedRegistryCrates> {
-        if !source_roots(options).await.1 {
-            return None;
-        }
+        let project_registry = source_roots(options).await.1;
         Some(LockedRegistryCrates(
-            lock_scope(&options.cwd).await?.into_iter().collect(),
+            registry_lock_scope(options, project_registry)
+                .await?
+                .into_iter()
+                .collect(),
         ))
     }
 
@@ -107,11 +108,7 @@ impl CargoCrawler {
         if src_paths.is_empty() {
             return Vec::new();
         }
-        let scope = if project_registry {
-            lock_scope(&options.cwd).await
-        } else {
-            None
-        };
+        let scope = registry_lock_scope(options, project_registry).await;
 
         run_blocking(move || {
             let mut packages = Vec::new();
@@ -410,6 +407,22 @@ async fn crates_io_source(cwd: &Path) -> CratesIoSource {
     let cwd = cwd.to_path_buf();
     let cargo_home = CargoCrawler::cargo_home();
     run_blocking(move || resolve_for(&cwd, cargo_home.as_deref())).await
+}
+
+/// The registry crates `options`' build takes from the shared registry
+/// cache when its roots are that cache for a local project
+/// (`project_registry`, from [`source_roots`]): the one scope
+/// [`CargoCrawler::crawl_all`] walks and
+/// [`CargoCrawler::locked_registry_crates`] reports.
+async fn registry_lock_scope(
+    options: &CrawlerOptions,
+    project_registry: bool,
+) -> Option<Vec<(String, String)>> {
+    if project_registry {
+        lock_scope(&options.cwd).await
+    } else {
+        None
+    }
 }
 
 /// The `(name, version)` of every registry-sourced `[[package]]` in

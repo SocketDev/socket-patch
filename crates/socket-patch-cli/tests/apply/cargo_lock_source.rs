@@ -47,7 +47,7 @@ fn write_manifest(root: &Path) {
 
 /// Stage `shape`, run `apply --offline --json`, and return the exit code,
 /// the envelope and the registry copy's `src/lib.rs` afterwards.
-fn apply(shape: Shape) -> (i32, Value, Vec<u8>) {
+fn apply(shape: Shape, extra: &[&str]) -> (i32, Value, Vec<u8>) {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("app");
     std::fs::create_dir_all(&project).unwrap();
@@ -56,9 +56,11 @@ fn apply(shape: Shape) -> (i32, Value, Vec<u8>) {
     let cargo_home = tmp.path().join("cargo-home");
     let lib = stage_registry_copy(&cargo_home, BEFORE);
 
+    let mut argv = vec!["apply", "--offline", "--json"];
+    argv.extend_from_slice(extra);
     let (code, stdout, stderr) = run_with_env(
         &project,
-        &["apply", "--offline", "--json"],
+        &argv,
         &[
             ("SOCKET_TELEMETRY_DISABLED", "1"),
             ("CARGO_HOME", cargo_home.to_str().unwrap()),
@@ -73,7 +75,7 @@ fn apply(shape: Shape) -> (i32, Value, Vec<u8>) {
 /// registry cache, so the fixture really reaches the agent apply path.
 #[test]
 fn registry_sourced_crate_is_patched_in_the_registry_cache() {
-    let (code, v, lib) = apply(Shape::Registry);
+    let (code, v, lib) = apply(Shape::Registry, &[]);
     assert_eq!(code, 0, "{v}");
     assert_eq!(lib, AFTER, "the registry copy is the build's: {v}");
 }
@@ -87,8 +89,9 @@ fn crate_overridden_away_from_the_registry_is_not_patched() {
         Shape::ManifestPatch,
         Shape::ConfigPatch,
         Shape::GitDependency,
+        Shape::PathDependency,
     ] {
-        let (code, v, lib) = apply(shape);
+        let (code, v, lib) = apply(shape, &[]);
         assert_eq!(
             lib, BEFORE,
             "{shape:?}: the unused registry copy must stay untouched: {v}"
@@ -101,7 +104,7 @@ fn crate_overridden_away_from_the_registry_is_not_patched() {
                 assert_eq!(code, 0, "{shape:?}: {v}");
                 assert_eq!(ev["errorCode"], "user_patch_conflict", "{shape:?}: {ev}");
             }
-            // Nothing else protects a git dependency: the crate is not
+            // Nothing else protects a git or path dependency: the crate is not
             // installed where agent mode patches, and the run says why.
             _ => {
                 assert_eq!(code, 1, "{shape:?}: must not report success: {v}");
@@ -112,6 +115,20 @@ fn crate_overridden_away_from_the_registry_is_not_patched() {
                 );
             }
         }
+    }
+}
+
+/// #506: `--allow-patch-conflicts` lets apply try a crate the user's own
+/// `[patch]` entry replaces, but the registry copy is still not the one
+/// cargo builds, so it stays untouched and the run does not succeed.
+#[test]
+fn allowed_patch_conflict_still_leaves_the_unused_registry_copy() {
+    for shape in [Shape::ManifestPatch, Shape::ConfigPatch] {
+        let (code, v, lib) = apply(shape, &["--allow-patch-conflicts"]);
+        assert_eq!(lib, BEFORE, "{shape:?}: {v}");
+        assert_eq!(code, 1, "{shape:?}: must not report success: {v}");
+        let ev = event(&v, shape);
+        assert_eq!(ev["errorCode"], "package_not_installed", "{shape:?}: {ev}");
     }
 }
 
