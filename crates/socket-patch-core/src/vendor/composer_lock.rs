@@ -3000,7 +3000,7 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_pending");
         assert!(detail.contains("still building"), "{detail}");
         assert!(!root.join(".socket").exists(), "nothing written");
         assert_eq!(
@@ -3053,7 +3053,7 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_unavailable");
         assert!(detail.contains("unavailable"), "{detail}");
         assert!(!root.join(".socket").exists(), "nothing written");
     }
