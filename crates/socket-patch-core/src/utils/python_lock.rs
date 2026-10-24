@@ -653,7 +653,7 @@ fn prepare_metadata_completion(
             let project: DocumentMut = project
                 .parse()
                 .map_err(|error| format!("invalid pyproject.toml: {error}"))?;
-            refuse_undeclared_root_requirement(document, &project, &name)?;
+            refuse_dynamic_root_requirement(document, &project, &name)?;
             let overridden = project
                 .get("tool")
                 .and_then(Item::as_table_like)
@@ -719,53 +719,19 @@ fn prepare_metadata_completion(
     }))
 }
 
-/// Refuse when the lock's root package requires `name` (in
-/// `requires-dist` or `requires-dev`) but `project` declares no `name`
-/// requirement statically, as with PEP 621 `dynamic = ["dependencies"]`
-/// where the build backend supplies the list (#639). Upstream restore
-/// derives the entry's specifier from that declaration, so a repointed
-/// entry could never be unwound by rollback, remove or a vendored takeover.
-fn refuse_undeclared_root_requirement(
+/// Refuse when `project` declares PEP 621 `dynamic` dependencies (or
+/// optional-dependencies) and the lock's root package lists `name` in
+/// `requires-dist` (#639). That entry came from the build backend, not from
+/// pyproject.toml, so upstream restore has no declaration to derive its
+/// specifier from, and rollback, remove and a vendored takeover could never
+/// undo the repointed entry. `requires-dev` comes from PEP 735 groups,
+/// which can't be dynamic, and a transitive package (absent from
+/// `requires-dist`) is wired through an override that unwinds cleanly.
+fn refuse_dynamic_root_requirement(
     document: &DocumentMut,
     project: &DocumentMut,
     name: &str,
 ) -> Result<(), String> {
-    let names = |item: Option<&Item>| -> Vec<String> {
-        item.and_then(Item::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(|spec| canonicalize_pypi_name(crate::vendor::common::pep508_name(spec)))
-            .collect()
-    };
-    let legacy_dev = project
-        .get("tool")
-        .and_then(|tool| tool.get("uv"))
-        .and_then(|uv| uv.get("dev-dependencies"));
-    let declared = crate::vendor::common::pyproject_dependency_specs(project)
-        .into_iter()
-        .any(|(_, spec)| canonicalize_pypi_name(crate::vendor::common::pep508_name(spec)) == name)
-        || names(legacy_dev).iter().any(|n| n == name);
-    if declared {
-        return Ok(());
-    }
-    let required = document
-        .get("package")
-        .and_then(Item::as_array_of_tables)
-        .into_iter()
-        .flatten()
-        .filter(|package| is_root_package(package))
-        .filter_map(|package| package.get("metadata").and_then(Item::as_table_like))
-        .any(|metadata| {
-            ["requires-dist", "requires-dev"].into_iter().any(|key| {
-                requirement_names(metadata.get(key))
-                    .iter()
-                    .any(|n| n == name)
-            })
-        });
-    if !required {
-        return Ok(());
-    }
     let dynamic: Vec<&str> = project
         .get("project")
         .and_then(|p| p.get("dynamic"))
@@ -775,21 +741,34 @@ fn refuse_undeclared_root_requirement(
         .filter_map(Value::as_str)
         .filter(|field| ["dependencies", "optional-dependencies"].contains(field))
         .collect();
-    let source = if dynamic.is_empty() {
-        "pyproject.toml declares no such requirement".to_string()
-    } else {
-        format!(
-            "pyproject.toml declares dynamic = [{}], so the build backend supplies it",
-            dynamic
-                .iter()
-                .map(|field| format!("\"{field}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
+    if dynamic.is_empty() {
+        return Ok(());
+    }
+    let required = document
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .into_iter()
+        .flatten()
+        .filter(|package| is_root_package(package))
+        .filter_map(|package| package.get("metadata"))
+        .filter_map(|metadata| metadata.get("requires-dist"))
+        .filter_map(Item::as_array)
+        .flatten()
+        .filter_map(Value::as_inline_table)
+        .filter_map(|requirement| requirement.get("name").and_then(Value::as_str))
+        .any(|value| canonicalize_pypi_name(value) == name);
+    if !required {
+        return Ok(());
+    }
+    let fields = dynamic
+        .iter()
+        .map(|field| format!("\"{field}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     Err(format!(
-        "the lock's root package requires {name}, but {source}; hosted mode leaves it \
-         unpinned because rollback could not restore the lock's requirement entry"
+        "pyproject.toml declares dynamic = [{fields}], so the build backend supplies the \
+         project's {name} requirement; hosted mode does not redirect it, since rollback \
+         could not restore that requirement in the lock"
     ))
 }
 
@@ -804,29 +783,6 @@ fn is_root_package(package: &Table) -> bool {
                 .into_iter()
                 .any(|key| source.get(key).and_then(Item::as_str) == Some("."))
         })
-}
-
-/// The canonical names of a lock `requires-dist` array, or of every group
-/// of a `requires-dev` table.
-fn requirement_names(item: Option<&Item>) -> Vec<String> {
-    let Some(item) = item else {
-        return Vec::new();
-    };
-    if let Some(array) = item.as_array() {
-        array
-            .iter()
-            .filter_map(Value::as_inline_table)
-            .filter_map(|requirement| requirement.get("name").and_then(Value::as_str))
-            .map(canonicalize_pypi_name)
-            .collect()
-    } else if let Some(table) = item.as_table_like() {
-        table
-            .iter()
-            .flat_map(|(_, item)| requirement_names(Some(item)))
-            .collect()
-    } else {
-        Vec::new()
-    }
 }
 
 fn finish_metadata_completion(

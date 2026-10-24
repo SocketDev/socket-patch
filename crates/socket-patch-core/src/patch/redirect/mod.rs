@@ -28215,9 +28215,8 @@ mod uv_old_release_advisories {
 /// #639: a PEP 621 `dynamic = ["dependencies"]` project gets its dependency
 /// list from the build backend, so pyproject.toml declares nothing uv's
 /// root `requires-dist` can be restored from. Hosted mode must refuse to
-/// repoint such an entry (vendored refuses the shape with
-/// `pypi_uv_dynamic_dependencies`) rather than write wiring that rollback,
-/// remove and the vendored takeover can never undo.
+/// repoint such an entry rather than write wiring that rollback, remove
+/// and the vendored takeover can never undo.
 #[cfg(test)]
 mod uv_dynamic_dependencies {
     use super::*;
@@ -28266,24 +28265,29 @@ mod uv_dynamic_dependencies {
     }
 
     /// The backend-supplied `six==1.16.0` is refused for every newline
-    /// style and for a dynamic optional-dependencies extra: nothing is
-    /// written, and the warning names the dynamic declaration.
+    /// style, for a dynamic optional-dependencies extra, and when a static
+    /// dependency group also names six (restore matches `requires-dist`
+    /// only against `[project]` declarations): nothing is written, and the
+    /// warning names the dynamic declaration.
     #[test]
     fn backend_declared_dependency_is_refused_before_writing() {
+        let six_dist = "{ name = \"six\", specifier = \"==1.16.0\" }";
         let cases = [
+            (project("\"dependencies\""), six_dist),
             (
-                "\"dependencies\"",
-                "{ name = \"six\", specifier = \"==1.16.0\" }",
-            ),
-            (
-                "\"optional-dependencies\"",
+                project("\"optional-dependencies\""),
                 "{ name = \"six\", marker = \"extra == 'compat'\", specifier = \"==1.16.0\" }",
             ),
+            (
+                project("\"dependencies\"") + "\n[dependency-groups]\ntest = [\"six\"]\n",
+                six_dist,
+            ),
         ];
-        for (dynamic, requires) in cases {
+        for (pyproject, requires) in cases {
+            let dynamic = &pyproject;
             for newline in ["\n", "\r\n"] {
                 let input = files(
-                    project(dynamic).replace('\n', newline),
+                    pyproject.replace('\n', newline),
                     lock("{ name = \"six\" }", requires, &[SIX]).replace('\n', newline),
                 );
                 let result = rewrite_registry_redirect(&input, &[six()]);
