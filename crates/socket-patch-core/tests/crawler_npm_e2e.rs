@@ -4272,3 +4272,150 @@ async fn apply_breaks_hardlink_to_shared_store_file() {
         assert_eq!(target_meta.nlink(), 1);
     }
 }
+
+// ── Deno's npm cache (#444) ────────────────────────────────────
+
+/// Stage a package in Deno's npm cache layout:
+/// `<registry>/<name>/<dir>/package.json`, where `<dir>` is the version
+/// (or `<version>_<n>` for a peer-dependency copy). `name` may include a
+/// `@scope/` prefix.
+async fn stage_deno_npm_pkg(registry: &Path, name: &str, dir: &str, version: &str) -> PathBuf {
+    let pkg_dir = registry.join(name).join(dir);
+    tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+    let pkg_json = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+    tokio::fs::write(pkg_dir.join("package.json"), pkg_json)
+        .await
+        .unwrap();
+    tokio::fs::write(registry.join(name).join("registry.json"), "{}")
+        .await
+        .unwrap();
+    pkg_dir
+}
+
+/// The copy each purl resolves to, as paths.
+fn found_paths(
+    found: &HashMap<String, Vec<socket_patch_core::crawlers::types::CrawledPackage>>,
+    purl: &str,
+) -> Vec<PathBuf> {
+    found
+        .get(purl)
+        .map(|copies| copies.iter().map(|c| c.path.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// #444: a `--global-prefix` naming Deno's npm cache registry dir
+/// (`$DENO_DIR/npm/registry.npmjs.org`) is read in Deno's
+/// `<name>/<version>` layout, not as a `node_modules` tree, so the scan
+/// finds the packages `deno install -g` tools run.
+#[tokio::test]
+#[serial_test::parallel]
+async fn deno_npm_cache_prefix_crawls_name_version_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("npm").join("registry.npmjs.org");
+    stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
+    stage_deno_npm_pkg(&registry, "is-number", "6.0.0", "6.0.0").await;
+    stage_deno_npm_pkg(&registry, "@types/node", "20.0.0", "20.0.0").await;
+
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: false,
+        global_prefix: Some(registry.clone()),
+    };
+    let mut purls: Vec<String> = NpmCrawler
+        .crawl_all(&opts)
+        .await
+        .into_iter()
+        .map(|p| p.purl)
+        .collect();
+    purls.sort();
+    assert_eq!(
+        purls,
+        vec![
+            "pkg:npm/@types/node@20.0.0",
+            "pkg:npm/is-number@6.0.0",
+            "pkg:npm/is-odd@3.0.1",
+        ]
+    );
+}
+
+/// #444: apply / rollback / vex resolve a purl in Deno's npm cache to its
+/// `<name>/<version>` dir, plus every `<version>_<n>` peer-dependency copy
+/// Deno made of it, and to nothing whose package.json says otherwise.
+#[tokio::test]
+#[serial_test::parallel]
+async fn deno_npm_cache_find_by_purls_returns_every_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("npm").join("registry.npmjs.org");
+    let plain = stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
+    let copy = stage_deno_npm_pkg(&registry, "is-odd", "3.0.1_1", "3.0.1").await;
+    stage_deno_npm_pkg(&registry, "is-odd", "3.0.10", "3.0.10").await;
+    let scoped = stage_deno_npm_pkg(&registry, "@types/node", "20.0.0", "20.0.0").await;
+    // A dir spelled like the version whose package.json disagrees is not it.
+    stage_deno_npm_pkg(&registry, "left-pad", "1.3.0", "9.9.9").await;
+
+    let purls = vec![
+        "pkg:npm/is-odd@3.0.1".to_string(),
+        "pkg:npm/%40types/node@20.0.0".to_string(),
+        "pkg:npm/left-pad@1.3.0".to_string(),
+        "pkg:npm/absent@1.0.0".to_string(),
+    ];
+    let found = NpmCrawler.find_by_purls(&registry, &purls).await.unwrap();
+    assert_eq!(
+        found_paths(&found, "pkg:npm/is-odd@3.0.1"),
+        vec![plain, copy]
+    );
+    assert_eq!(
+        found_paths(&found, "pkg:npm/%40types/node@20.0.0"),
+        vec![scoped]
+    );
+    assert!(found_paths(&found, "pkg:npm/left-pad@1.3.0").is_empty());
+    assert!(found_paths(&found, "pkg:npm/absent@1.0.0").is_empty());
+}
+
+/// #444: a traversal purl never escapes Deno's npm cache root.
+#[tokio::test]
+#[serial_test::parallel]
+async fn deno_npm_cache_find_by_purls_rejects_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("npm").join("registry.npmjs.org");
+    stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
+    stage_deno_npm_pkg(tmp.path(), "evil", "1.0.0", "1.0.0").await;
+
+    let purls = vec!["pkg:npm/..%2F..%2Fevil@1.0.0".to_string()];
+    let found = NpmCrawler.find_by_purls(&registry, &purls).await.unwrap();
+    assert!(found.values().all(|copies| copies.is_empty()), "{found:?}");
+}
+
+/// #444: `-g` discovers `$DENO_DIR/npm/<registry>` beside the npm, pnpm,
+/// yarn and bun global roots, so `scan -g` sees the packages
+/// `deno install -g` tools load.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_mode_includes_deno_npm_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deno_dir = tmp.path().join("deno");
+    let registry = deno_dir.join("npm").join("registry.npmjs.org");
+    let pkg = stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
+
+    let prev = std::env::var_os("DENO_DIR");
+    std::env::set_var("DENO_DIR", &deno_dir);
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+    };
+    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let crawled = NpmCrawler.crawl_all(&opts).await;
+    match prev {
+        Some(v) => std::env::set_var("DENO_DIR", v),
+        None => std::env::remove_var("DENO_DIR"),
+    }
+
+    assert!(roots.contains(&registry), "{roots:?}");
+    assert!(
+        crawled
+            .iter()
+            .any(|p| p.purl == "pkg:npm/is-odd@3.0.1" && p.path == pkg),
+        "{crawled:?}"
+    );
+}
