@@ -497,6 +497,13 @@ impl crate::patch::store_copies::CopyFold for RollbackResult {
 /// Best effort: the file delete already committed the rollback, so a
 /// directory that can't be removed is left in place rather than failing it.
 async fn prune_emptied_parents(pkg_path: &Path, filepath: &Path) {
+    // The bytecode goes whatever the pruning below decides: a stale
+    // `.pyc` of a deleted module must not outlive it.
+    if filepath.extension().is_some_and(|ext| ext == "py") {
+        use crate::patch::apply::{remove_stale_bytecode, StaleBytecode};
+        remove_stale_bytecode(filepath, StaleBytecode::All).await;
+        remove_dir_if_empty(&filepath.with_file_name("__pycache__")).await;
+    }
     let Some(rel) = filepath
         .parent()
         .and_then(|parent| parent.strip_prefix(pkg_path).ok())
@@ -514,10 +521,6 @@ async fn prune_emptied_parents(pkg_path: &Path, filepath: &Path) {
             Ok(meta) if meta.is_dir() => chain.push(cur.clone()),
             _ => return,
         }
-    }
-    if filepath.extension().is_some_and(|ext| ext == "py") {
-        crate::patch::apply::remove_stale_bytecode(filepath).await;
-        remove_dir_if_empty(&filepath.with_file_name("__pycache__")).await;
     }
     for dir in chain.iter().rev() {
         if !remove_dir_if_empty(dir).await {

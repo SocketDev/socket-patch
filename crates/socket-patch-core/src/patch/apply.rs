@@ -554,81 +554,126 @@ pub(crate) async fn apply_file_patch_at(
 
     // A rewritten `.py` file can't be trusted to invalidate its bytecode
     // (#819): drop it so the next import compiles the new source.
-    remove_stale_bytecode(&filepath).await;
+    let bytecode_warning = remove_stale_bytecode(&filepath, StaleBytecode::All).await;
 
     // Restore (or set) the final permissions on the post-rename inode.
     // On Unix this includes chown back to the pre-patch uid/gid (or
     // to the parent dir's uid/gid for new files); on Windows we only
     // manage the readonly attribute.
-    restore_file_permissions(&filepath, existing_meta.as_ref()).await
+    let owner_warning = restore_file_permissions(&filepath, existing_meta.as_ref()).await?;
+    let warnings: Vec<String> = owner_warning.into_iter().chain(bytecode_warning).collect();
+    Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 
-/// Delete the bytecode CPython compiled from the `.py` file `source`: the
-/// `<stem>.<tag>[.opt-N].pyc` files in the sibling `__pycache__/`, and a
-/// legacy (Python 2) `<stem>.pyc` / `<stem>.pyo` beside it. A no-op for
-/// any other file.
+/// Which `__pycache__` entries of a module [`remove_stale_bytecode`]
+/// deletes.
+#[derive(Clone, Copy)]
+pub(crate) enum StaleBytecode {
+    /// Every `.pyc` of the module: its source was just rewritten (or
+    /// deleted), so none of them was compiled from what is on disk now.
+    All,
+    /// Only `.pyc` files no newer than the source: compiled before the
+    /// source was last written, so possibly from older bytes. Bytecode
+    /// compiled after it (the first import following an earlier apply)
+    /// is kept.
+    NotNewerThanSource,
+}
+
+/// Delete the `__pycache__/<stem>.<tag>[.opt-N].pyc` bytecode CPython
+/// compiled from the `.py` file `source`. A no-op for any other file.
 ///
 /// A timestamp-validated `.pyc` records only the source's mtime in whole
 /// seconds and its size, so after a same-size rewrite in the same second
-/// it still matches and the old code keeps running (#819). An
+/// it still matches and the old code keeps running (#819); an
 /// unchecked-hash `.pyc` is never revalidated at all. Bytecode is a cache:
-/// the next import recompiles it from the source on disk.
+/// the next import recompiles it from the source on disk. A `<stem>.pyc`
+/// beside the source is not touched: under Python 3 that is sourceless
+/// bytecode a package may ship, not a cache.
 ///
-/// Only regular files are removed (never through a symlink), a read-only
-/// directory is relaxed for the delete and put back, and failures are
-/// ignored: the source write has already committed.
-pub(crate) async fn remove_stale_bytecode(source: &Path) {
+/// Only regular files are removed (never through a symlink), and a
+/// read-only `__pycache__` is relaxed for the delete and put back. Returns
+/// a warning when a stale file could not be removed; the source write has
+/// already committed either way.
+pub(crate) async fn remove_stale_bytecode(source: &Path, which: StaleBytecode) -> Option<String> {
     if source.extension().is_none_or(|ext| ext != "py") {
-        return;
+        return None;
     }
     let (Some(stem), Some(dir)) = (source.file_stem().and_then(|s| s.to_str()), source.parent())
     else {
-        return;
+        return None;
     };
-    let legacy = ["pyc", "pyo"].map(|ext| dir.join(format!("{stem}.{ext}")));
-    remove_regular_files(dir, &legacy).await;
-
+    let cutoff = match which {
+        StaleBytecode::All => None,
+        StaleBytecode::NotNewerThanSource => {
+            match tokio::fs::metadata(source).await.and_then(|m| m.modified()) {
+                Ok(mtime) => Some(mtime),
+                Err(_) => return None,
+            }
+        }
+    };
     let cache = dir.join("__pycache__");
     match tokio::fs::symlink_metadata(&cache).await {
         Ok(meta) if meta.is_dir() => {}
-        _ => return,
+        _ => return None,
     }
     let Ok(mut entries) = tokio::fs::read_dir(&cache).await else {
-        return;
+        return None;
     };
-    let prefix = format!("{stem}.");
     let mut stale = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        if name
+        if !entry
+            .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".pyc"))
+            .is_some_and(|name| is_bytecode_of(name, stem))
         {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow a symlink.
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        let newer = cutoff.is_some_and(|cutoff| meta.modified().is_ok_and(|m| m > cutoff));
+        if meta.is_file() && !newer {
             stale.push(entry.path());
         }
     }
-    remove_regular_files(&cache, &stale).await;
-}
-
-/// Remove each of `paths` (all directly in `dir`) that is a regular file.
-async fn remove_regular_files(dir: &Path, paths: &[PathBuf]) {
-    let mut doomed = Vec::new();
-    for path in paths {
-        if tokio::fs::symlink_metadata(path)
-            .await
-            .is_ok_and(|meta| meta.is_file())
-        {
-            doomed.push(path);
+    if stale.is_empty() {
+        return None;
+    }
+    let guard = DirWriteGuard::acquire(Some(&cache)).await;
+    let mut failed = Vec::new();
+    for path in stale {
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            if !is_missing_path(&e) {
+                failed.push(format!("{}: {e}", path.display()));
+            }
         }
     }
-    if doomed.is_empty() {
-        return;
-    }
-    let guard = DirWriteGuard::acquire(Some(dir)).await;
-    for path in doomed {
-        let _ = tokio::fs::remove_file(path).await;
-    }
     guard.restore().await;
+    (!failed.is_empty()).then(|| {
+        format!(
+            "could not remove stale Python bytecode ({}); Python may keep running \
+             the old code until it is deleted",
+            failed.join(", ")
+        )
+    })
+}
+
+/// Whether `name` is CPython's cache file for module `stem`:
+/// `<stem>.<tag>.pyc` or `<stem>.<tag>.opt-<N>.pyc` (PEP 3147 / PEP 488),
+/// and not the bytecode of a dotted sibling such as `<stem>.x.py`.
+fn is_bytecode_of(name: &str, stem: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(stem)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.strip_suffix(".pyc"))
+    else {
+        return false;
+    };
+    match rest.split_once('.') {
+        None => !rest.is_empty(),
+        Some((tag, opt)) => !tag.is_empty() && opt.starts_with("opt-") && !opt.contains('.'),
+    }
 }
 
 /// Guard that temporarily grants owner-write on a directory so the
@@ -1025,6 +1070,23 @@ async fn apply_package_patch_at(
         result.files_verified.push(verify_result);
     }
 
+    // A file an earlier run already patched may still have bytecode
+    // compiled from the unpatched source beside it (written by a release
+    // without the #819 fix, or a run that stopped between the rename and
+    // the cleanup). Drop whatever predates the source.
+    if !dry_run {
+        for v in &result.files_verified {
+            if v.status == VerifyStatus::AlreadyPatched {
+                let source = pkg_path.join(normalize_file_path(&v.file));
+                if let Some(warning) =
+                    remove_stale_bytecode(&source, StaleBytecode::NotNewerThanSource).await
+                {
+                    result.error = Some(warning);
+                }
+            }
+        }
+    }
+
     // Check if all files are already patched
     let all_already_patched = result
         .files_verified
@@ -1106,7 +1168,7 @@ async fn apply_package_patch_at(
     // Advisory notes from writes that committed but could not fully restore
     // metadata (see `apply_file_patch_at`); reported on `error` alongside
     // `success` — the success-with-note shape the `--force` skip uses.
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = result.error.take().into_iter().collect();
 
     // Apply patches to files that need it.
     for (file_name, file_info) in files_in_order(files) {
@@ -3596,7 +3658,8 @@ mod tests {
     /// from the old source. A timestamp `.pyc` only records the source's
     /// mtime (whole seconds) and size, so a same-size patch in the same
     /// second as the install would otherwise keep the unpatched bytecode
-    /// running. Bytecode for other modules stays.
+    /// running. Bytecode for other modules (a dotted `mod.x.py` too) and
+    /// sourceless `.pyc` files beside the source stay.
     #[tokio::test]
     async fn test_apply_file_patch_py_removes_stale_bytecode() {
         let site = tempfile::tempdir().unwrap();
@@ -3611,9 +3674,9 @@ mod tests {
                 "pkg/__pycache__/mod.cpython-313.opt-2.pyc",
                 "pkg/__pycache__/modx.cpython-311.pyc",
                 "pkg/__pycache__/other.cpython-311.pyc",
+                "pkg/__pycache__/mod.x.cpython-311.pyc",
+                "pkg/__pycache__/mod.x.cpython-311.opt-1.pyc",
                 "pkg/mod.pyc",
-                "pkg/mod.pyo",
-                "pkg/other.pyc",
             ],
         )
         .await;
@@ -3636,15 +3699,15 @@ mod tests {
             "__pycache__/mod.cpython-311.pyc",
             "__pycache__/mod.cpython-311.opt-1.pyc",
             "__pycache__/mod.cpython-313.opt-2.pyc",
-            "mod.pyc",
-            "mod.pyo",
         ] {
             assert!(!pkg.join(stale).exists(), "{stale} must be removed");
         }
         for kept in [
             "__pycache__/modx.cpython-311.pyc",
             "__pycache__/other.cpython-311.pyc",
-            "other.pyc",
+            "__pycache__/mod.x.cpython-311.pyc",
+            "__pycache__/mod.x.cpython-311.opt-1.pyc",
+            "mod.pyc",
         ] {
             assert!(pkg.join(kept).exists(), "{kept} must be kept");
         }
@@ -3679,11 +3742,7 @@ mod tests {
     async fn test_apply_file_patch_non_py_keeps_bytecode() {
         let site = tempfile::tempdir().unwrap();
         let patched = b"patched";
-        touch(
-            site.path(),
-            &["pkg/__pycache__/mod.cpython-311.pyc", "pkg/mod.pyc"],
-        )
-        .await;
+        touch(site.path(), &["pkg/__pycache__/mod.cpython-311.pyc"]).await;
         for name in ["pkg/mod.js", "pkg/mod.pyi"] {
             tokio::fs::write(site.path().join(name), b"original")
                 .await
@@ -3702,7 +3761,6 @@ mod tests {
             .path()
             .join("pkg/__pycache__/mod.cpython-311.pyc")
             .exists());
-        assert!(site.path().join("pkg/mod.pyc").exists());
     }
 
     /// A read-only `__pycache__` (a root-owned system site-packages, or a
@@ -3734,5 +3792,79 @@ mod tests {
         std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!cache.join("m.cpython-312.pyc").exists());
         assert_eq!(mode, 0o555, "the cache dir mode must be restored");
+    }
+
+    /// #819: a re-run over a module an earlier release already patched
+    /// (without dropping its bytecode) removes the bytecode that predates
+    /// the patched source, and keeps bytecode compiled after it.
+    #[tokio::test]
+    async fn test_apply_already_patched_py_removes_older_bytecode() {
+        use std::time::{Duration, SystemTime};
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let patched = b"x = 2\n";
+        let source = site.path().join("pkg/mod.py");
+        let cache = site.path().join("pkg/__pycache__");
+        touch(
+            site.path(),
+            &[
+                "pkg/__pycache__/mod.cpython-311.pyc",
+                "pkg/__pycache__/mod.cpython-312.pyc",
+            ],
+        )
+        .await;
+        tokio::fs::write(&source, patched).await.unwrap();
+        let mtime = SystemTime::now() - Duration::from_secs(60);
+        let set = |path: &Path, t: SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        set(&source, mtime);
+        set(
+            &cache.join("mod.cpython-311.pyc"),
+            mtime - Duration::from_secs(1),
+        );
+        set(
+            &cache.join("mod.cpython-312.pyc"),
+            mtime + Duration::from_secs(1),
+        );
+        let mut files = HashMap::new();
+        files.insert(
+            "pkg/mod.py".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"x = 1\n"),
+                after_hash: compute_git_sha256_from_bytes(patched),
+            },
+        );
+
+        let result = apply_package_patch(
+            "pkg:pypi/pkg@1.0.0",
+            site.path(),
+            &files,
+            &PatchSources::blobs_only(blobs.path()),
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.files_patched.is_empty());
+        assert!(!cache.join("mod.cpython-311.pyc").exists());
+        assert!(cache.join("mod.cpython-312.pyc").exists());
+    }
+
+    #[test]
+    fn test_is_bytecode_of() {
+        assert!(is_bytecode_of("six.cpython-311.pyc", "six"));
+        assert!(is_bytecode_of("six.pypy39.opt-1.pyc", "six"));
+        assert!(!is_bytecode_of("six.pyc", "six"));
+        assert!(!is_bytecode_of("sixx.cpython-311.pyc", "six"));
+        assert!(!is_bytecode_of("six.moves.cpython-311.pyc", "six"));
+        assert!(!is_bytecode_of("six.cpython-311.opt-1.x.pyc", "six"));
+        assert!(!is_bytecode_of("six.cpython-311.pyo", "six"));
     }
 }
