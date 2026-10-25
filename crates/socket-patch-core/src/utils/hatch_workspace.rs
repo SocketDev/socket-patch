@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::utils::fs::read_regular_to_string_sync;
 use crate::utils::hatch::{environments, HATCH_FILES};
+use crate::utils::repo_root;
 use crate::vendor::common::pep508_name;
 
 /// How deep below the checkout root a workspace root is looked for.
@@ -47,7 +49,10 @@ pub fn raw_consumer(member: &Path, member_pyproject: &str, name: &str) -> Option
     {
         return None;
     }
-    let member = absolute(member)?;
+    // The same spelling as the canonical walk in [`roots`].
+    let member = std::fs::canonicalize(member)
+        .ok()
+        .or_else(|| absolute(member))?;
     let name = canonicalize_pypi_name(name);
     roots(&member).into_iter().find_map(|root| {
         workspace_features(&root, &member)
@@ -58,27 +63,19 @@ pub fn raw_consumer(member: &Path, member_pyproject: &str, name: &str) -> Option
 }
 
 /// `path` made absolute and normalized lexically, the way Python's
-/// `os.path.abspath` reads it: Hatch compares member paths without
-/// resolving symlinks.
+/// `os.path.abspath` reads it.
 fn absolute(path: &Path) -> Option<PathBuf> {
     crate::utils::relpath::normalize_lexically(&std::path::absolute(path).ok()?)
 }
 
-/// The directories that may declare a workspace listing `member`: its
-/// ancestors up to the checkout root (every ancestor outside a checkout),
-/// then the other projects of the checkout.
+/// The directories that may declare a workspace listing `member` (a
+/// canonical path): its ancestors as far as a repository lookup goes
+/// ([`repo_root::search_dirs`]: through the checkout root, never into the
+/// home directory or past a `GIT_CEILING_DIRECTORIES` entry), then the
+/// other projects of that checkout.
 fn roots(member: &Path) -> Vec<PathBuf> {
-    let checkout = member
-        .ancestors()
-        .find(|dir| dir.join(".git").exists())
-        .map(Path::to_path_buf);
-    let mut roots: Vec<PathBuf> = member
-        .ancestors()
-        .skip(1)
-        .take_while(|dir| checkout.as_deref().is_none_or(|top| dir.starts_with(top)))
-        .map(Path::to_path_buf)
-        .collect();
-    let Some(checkout) = checkout else {
+    let mut roots: Vec<PathBuf> = repo_root::search_dirs(member).into_iter().skip(1).collect();
+    let Some(checkout) = repo_root::find_git_repo(member).map(|repo| repo.root) else {
         return roots;
     };
     let walk = ignore::WalkBuilder::new(&checkout)
@@ -102,7 +99,7 @@ fn roots(member: &Path) -> Vec<PathBuf> {
         {
             continue;
         }
-        if std::fs::read_to_string(path).is_ok_and(|text| text.contains("workspace")) {
+        if read_regular_to_string_sync(path).is_ok_and(|text| text.contains("workspace")) {
             roots.push(dir.to_path_buf());
         }
     }
@@ -118,7 +115,10 @@ fn strings(item: Option<&Item>) -> Vec<&str> {
 }
 
 fn parse(dir: &Path, file: &str) -> Option<DocumentMut> {
-    std::fs::read_to_string(dir.join(file)).ok()?.parse().ok()
+    read_regular_to_string_sync(&dir.join(file))
+        .ok()?
+        .parse()
+        .ok()
 }
 
 /// One `workspace.members` entry: its path spec and normalized features.
@@ -571,6 +571,29 @@ mod tests {
         assert_eq!(consumer(&top, MEMBER, "six").as_deref(), Some("default"));
         std::fs::create_dir_all(top.join(".git")).unwrap();
         assert_eq!(consumer(&top, MEMBER, "six"), None);
+    }
+
+    /// A FIFO squatting an ancestor's or a checkout project's
+    /// pyproject.toml / hatch.toml is skipped, never opened blocking.
+    #[cfg(unix)]
+    #[test]
+    fn fifos_in_place_of_workspace_files_never_block() {
+        let (temp, dir) = layout(ROOT, None, "libs/lib1");
+        let ws = temp.path().join("ws");
+        std::fs::remove_file(ws.join("pyproject.toml")).unwrap();
+        std::fs::create_dir_all(ws.join("apps/web")).unwrap();
+        for fifo in [
+            ws.join("pyproject.toml"),
+            ws.join("hatch.toml"),
+            ws.join("apps/web/pyproject.toml"),
+        ] {
+            let status = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        assert_eq!(consumer(&dir, MEMBER, "six"), None);
     }
 
     #[test]
