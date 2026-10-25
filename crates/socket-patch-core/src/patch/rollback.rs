@@ -516,51 +516,14 @@ async fn prune_emptied_parents(pkg_path: &Path, filepath: &Path) {
         }
     }
     if filepath.extension().is_some_and(|ext| ext == "py") {
-        if let Some(stem) = filepath.file_stem().and_then(|s| s.to_str()) {
-            let cache = filepath.with_file_name("__pycache__");
-            remove_stale_bytecode(&cache, stem).await;
-            remove_dir_if_empty(&cache).await;
-        }
+        crate::patch::apply::remove_stale_bytecode(filepath).await;
+        remove_dir_if_empty(&filepath.with_file_name("__pycache__")).await;
     }
     for dir in chain.iter().rev() {
         if !remove_dir_if_empty(dir).await {
             return;
         }
     }
-}
-
-/// Delete the regular `<stem>.*.pyc` files in `cache`: bytecode compiled
-/// from a module the rollback just removed.
-async fn remove_stale_bytecode(cache: &Path, stem: &str) {
-    match tokio::fs::symlink_metadata(cache).await {
-        Ok(meta) if meta.is_dir() => {}
-        _ => return,
-    }
-    let Ok(mut entries) = tokio::fs::read_dir(cache).await else {
-        return;
-    };
-    let prefix = format!("{stem}.");
-    let mut stale = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with(&prefix)
-            && name.ends_with(".pyc")
-            && entry.file_type().await.is_ok_and(|t| t.is_file())
-        {
-            stale.push(entry.path());
-        }
-    }
-    if stale.is_empty() {
-        return;
-    }
-    let guard = crate::patch::apply::DirWriteGuard::acquire(Some(cache)).await;
-    for path in stale {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-    guard.restore().await;
 }
 
 /// Remove `dir` if it is a real (non-symlink) empty directory. Returns

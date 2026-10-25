@@ -1,8 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::PatchFileInfo;
@@ -554,11 +552,83 @@ pub(crate) async fn apply_file_patch_at(
     dir_guard.restore().await;
     write_result?;
 
+    // A rewritten `.py` file can't be trusted to invalidate its bytecode
+    // (#819): drop it so the next import compiles the new source.
+    remove_stale_bytecode(&filepath).await;
+
     // Restore (or set) the final permissions on the post-rename inode.
     // On Unix this includes chown back to the pre-patch uid/gid (or
     // to the parent dir's uid/gid for new files); on Windows we only
     // manage the readonly attribute.
     restore_file_permissions(&filepath, existing_meta.as_ref()).await
+}
+
+/// Delete the bytecode CPython compiled from the `.py` file `source`: the
+/// `<stem>.<tag>[.opt-N].pyc` files in the sibling `__pycache__/`, and a
+/// legacy (Python 2) `<stem>.pyc` / `<stem>.pyo` beside it. A no-op for
+/// any other file.
+///
+/// A timestamp-validated `.pyc` records only the source's mtime in whole
+/// seconds and its size, so after a same-size rewrite in the same second
+/// it still matches and the old code keeps running (#819). An
+/// unchecked-hash `.pyc` is never revalidated at all. Bytecode is a cache:
+/// the next import recompiles it from the source on disk.
+///
+/// Only regular files are removed (never through a symlink), a read-only
+/// directory is relaxed for the delete and put back, and failures are
+/// ignored: the source write has already committed.
+pub(crate) async fn remove_stale_bytecode(source: &Path) {
+    if !source.extension().is_some_and(|ext| ext == "py") {
+        return;
+    }
+    let (Some(stem), Some(dir)) = (source.file_stem().and_then(|s| s.to_str()), source.parent())
+    else {
+        return;
+    };
+    let legacy = ["pyc", "pyo"].map(|ext| dir.join(format!("{stem}.{ext}")));
+    remove_regular_files(dir, &legacy).await;
+
+    let cache = dir.join("__pycache__");
+    match tokio::fs::symlink_metadata(&cache).await {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return,
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(&cache).await else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    let mut stale = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".pyc"))
+        {
+            stale.push(entry.path());
+        }
+    }
+    remove_regular_files(&cache, &stale).await;
+}
+
+/// Remove each of `paths` (all directly in `dir`) that is a regular file.
+async fn remove_regular_files(dir: &Path, paths: &[PathBuf]) {
+    let mut doomed = Vec::new();
+    for path in paths {
+        if tokio::fs::symlink_metadata(path)
+            .await
+            .is_ok_and(|meta| meta.is_file())
+        {
+            doomed.push(path);
+        }
+    }
+    if doomed.is_empty() {
+        return;
+    }
+    let guard = DirWriteGuard::acquire(Some(dir)).await;
+    for path in doomed {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    guard.restore().await;
 }
 
 /// Guard that temporarily grants owner-write on a directory so the

@@ -164,7 +164,10 @@ fn same_second_same_size_apply_and_rollback_change_imported_code() {
     };
     let site = PathBuf::from(python(
         &py,
-        &["-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        &[
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ],
     ));
 
     // Install dupkit 1.0.0 the way pip leaves it: dist-info, module, and
@@ -181,7 +184,12 @@ fn same_second_same_size_apply_and_rollback_change_imported_code() {
     std::fs::write(&module, ORIGINAL).unwrap();
     python(
         &py,
-        &["-m", "compileall", "-q", module.parent().unwrap().to_str().unwrap()],
+        &[
+            "-m",
+            "compileall",
+            "-q",
+            module.parent().unwrap().to_str().unwrap(),
+        ],
     );
     assert_eq!(imported_version(&py), "original");
     stage_patch(&project);
