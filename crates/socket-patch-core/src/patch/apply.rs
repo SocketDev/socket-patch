@@ -578,7 +578,7 @@ pub(crate) async fn apply_file_patch_at(
 /// directory is relaxed for the delete and put back, and failures are
 /// ignored: the source write has already committed.
 pub(crate) async fn remove_stale_bytecode(source: &Path) {
-    if !source.extension().is_some_and(|ext| ext == "py") {
+    if source.extension().is_none_or(|ext| ext != "py") {
         return;
     }
     let (Some(stem), Some(dir)) = (source.file_stem().and_then(|s| s.to_str()), source.parent())
