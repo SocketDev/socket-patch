@@ -504,7 +504,10 @@ moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
 `node_modules/.vlt`, Bun's isolated-linker store `node_modules/.bun`,
 Deno's isolated `nodeModulesDir` store `node_modules/.deno`, and
 `node_modules/.store`, written by npm's `install-strategy=linked` and by
-Yarn 4's pnpm linker (where each entry's `package/` dir is the copy).
+Yarn 4's pnpm linker (where each entry's `package/` dir is the copy), or
+the folder a Yarn `pnpmStoreFolder` setting moved that store to (from the
+nearest `.yarnrc.yml` that sets it, the home `.yarnrc.yml`, or
+`YARN_PNPM_STORE_FOLDER`, while the active linker is `pnpm`).
 pnpm 7–12 keep the entry of a removed or upgraded-away package for a
 while after `pnpm remove` or an upgrade (pnpm 7–11 for up to 7 days, pnpm
 12 until `pnpm prune`). Scans skip such an entry when the current
@@ -548,8 +551,10 @@ vendored and the local source is skipped with `vendor_workspace_member_skipped`)
 Links into a store inside a `node_modules` tree, including a workspace member's link
 into the root `node_modules/.pnpm`, are patched as usual. So are links into
 Yarn's pnpm-linker store relocated outside `node_modules`, but only for an
-active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with
-`pnpmStoreFolder` in the nearest `.yarnrc.yml`), only to the
+active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with a
+`pnpmStoreFolder`, each read from the environment, the nearest
+`.yarnrc.yml` that sets it, or the home `.yarnrc.yml`, as Yarn reads
+them), only to the
 `<store>/<entry>/package` directory of a package Yarn installs as a copy
 (`npm:`, peer-instantiated `virtual:`, a `file:` tarball, `patch:`, a URL or
 git; never `workspace:`, `portal:` or `link:`), and only when that store

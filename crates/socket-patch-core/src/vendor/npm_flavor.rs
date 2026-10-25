@@ -1165,6 +1165,7 @@ mod tests {
         touch(tmp.path(), ".yarnrc.yml", "enableGlobalCache: false\n").await;
         let env = YarnEnv {
             node_linker: None,
+            pnpm_store_folder: None,
             rc_filename: ".yarnrc.yml".into(),
             home: Some(home.path().to_path_buf()),
             vars: Some(Default::default()),
@@ -1181,6 +1182,7 @@ mod tests {
         touch(tmp.path(), ".yarnrc.ci.yml", "nodeLinker: node-modules\n").await;
         let env = YarnEnv {
             node_linker: None,
+            pnpm_store_folder: None,
             rc_filename: ".yarnrc.ci.yml".into(),
             home: None,
             vars: Some(Default::default()),
@@ -1213,6 +1215,7 @@ mod tests {
             touch(tmp.path(), ".yarnrc.yml", &rc).await;
             let env = YarnEnv {
                 node_linker: env_linker,
+                pnpm_store_folder: None,
                 rc_filename: ".yarnrc.yml".into(),
                 home: None,
                 vars: Some([("SOCKET_PATCH_T_SECRET".to_string(), "secret".to_string())].into()),
