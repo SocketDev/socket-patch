@@ -817,6 +817,39 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "redirect/composer/composer-lock/vendored-entry/input": {
+    "refs": [
+      {
+        "purl": "pkg:composer/monolog/monolog@2.0.0",
+        "uuid": "44444444-4444-4444-4444-444444444444",
+        "mode": "vendored",
+        "source_file": "composer.lock",
+        "artifact_rel": ".socket/vendor/composer/44444444-4444-4444-4444-444444444444/monolog/monolog@2.0.0",
+        "locked_integrity": null,
+        "integrity_required": false,
+        "url": null,
+        "lockfile_basis_ok": false
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "44444444-4444-4444-4444-444444444444",
+        "mode": "vendored",
+        "file": "composer.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "vendored",
+        "uuid": "44444444-4444-4444-4444-444444444444",
+        "purl": "pkg:composer/monolog/monolog@2.0.0",
+        "artifact_rel": ".socket/vendor/composer/44444444-4444-4444-4444-444444444444/monolog/monolog@2.0.0"
+      }
+    ]
+  },
   "redirect/composer/composer-lock/version-mismatch/input": {
     "refs": [],
     "diagnostics": [],

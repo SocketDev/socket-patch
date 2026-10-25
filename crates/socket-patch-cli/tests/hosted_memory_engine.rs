@@ -680,6 +680,10 @@ async fn vendored_composer_takeover_is_refused_like_the_disk_flow() {
         project.skipped
     );
     assert!(project.redirected.is_empty());
+    let warnings = project.redirect["warnings"].as_array().unwrap();
+    assert!(warnings
+        .iter()
+        .any(|w| w["code"] == "vendored_takeover_unsupported_in_memory"));
     assert!(output.changed_files.is_empty());
 }
 

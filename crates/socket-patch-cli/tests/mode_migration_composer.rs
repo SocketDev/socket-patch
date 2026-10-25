@@ -329,3 +329,33 @@ async fn scan_hosted_takes_over_a_vendored_composer_package() {
 async fn get_hosted_takes_over_a_vendored_composer_package() {
     assert_vendored_to_hosted(get_hosted_args).await;
 }
+
+/// With the vendored ledger lost, the takeover cannot revert the entry, so
+/// the composer.lock rewriter must leave socket-patch's vendored entry
+/// alone rather than repoint it in place with the patch-uuid
+/// `dist.reference` (#536).
+#[tokio::test]
+async fn scan_hosted_leaves_a_vendored_entry_without_a_ledger_alone() {
+    let server = MockServer::start().await;
+    mount_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    write_project(&root);
+    stage_manifest(&root);
+    let (code, env) = run_json(&root, &["vendor", "--offline"], &server);
+    assert_eq!(code, 0, "vendor: {env:#}");
+    std::fs::remove_file(root.join(".socket/vendor/state.json")).unwrap();
+    let vendored = std::fs::read_to_string(root.join("composer.lock")).unwrap();
+
+    let (code, env) = run_json(&root, &scan_hosted_args(&server.uri()), &server);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        env.to_string().contains("redirect_composer_vendored_entry"),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("composer.lock")).unwrap(),
+        vendored,
+        "the vendored entry is left byte-identical"
+    );
+}
