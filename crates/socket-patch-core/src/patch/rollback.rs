@@ -3077,4 +3077,56 @@ mod tests {
         }
         assert_eq!(std::fs::read(member.join("index.js")).unwrap(), patched);
     }
+
+    /// #819: rolling a modified `.py` file back to its original bytes
+    /// removes the bytecode compiled from the patched source, or a
+    /// same-size patch rolled back in the same second keeps running.
+    #[tokio::test]
+    async fn test_rollback_modified_py_removes_stale_bytecode() {
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let original = b"AUTHOR = 'original'\n";
+        let patched = b"AUTHOR = 'patchedX'\n";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        tokio::fs::write(blobs.path().join(&before_hash), original)
+            .await
+            .unwrap();
+        let cache = site.path().join("pkg/__pycache__");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(site.path().join("pkg/mod.py"), patched)
+            .await
+            .unwrap();
+        tokio::fs::write(cache.join("mod.cpython-311.pyc"), b"pyc")
+            .await
+            .unwrap();
+        tokio::fs::write(cache.join("other.cpython-311.pyc"), b"pyc")
+            .await
+            .unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "pkg/mod.py".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash,
+            },
+        );
+
+        let result = rollback_package_patch(
+            "pkg:pypi/pkg@1.0.0",
+            site.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            std::fs::read(site.path().join("pkg/mod.py")).unwrap(),
+            original
+        );
+        assert!(!cache.join("mod.cpython-311.pyc").exists());
+        assert!(cache.join("other.cpython-311.pyc").exists());
+    }
 }

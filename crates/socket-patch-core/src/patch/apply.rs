@@ -3510,4 +3510,159 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert_eq!(std::fs::read(real.join("index.js")).unwrap(), patched);
     }
+
+    /// Write `name` (and its parents) under `root` with placeholder bytes.
+    async fn touch(root: &Path, names: &[&str]) {
+        for name in names {
+            let path = root.join(name);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, b"pyc").await.unwrap();
+        }
+    }
+
+    /// #819: rewriting a `.py` file removes the bytecode CPython compiled
+    /// from the old source. A timestamp `.pyc` only records the source's
+    /// mtime (whole seconds) and size, so a same-size patch in the same
+    /// second as the install would otherwise keep the unpatched bytecode
+    /// running. Bytecode for other modules stays.
+    #[tokio::test]
+    async fn test_apply_file_patch_py_removes_stale_bytecode() {
+        let site = tempfile::tempdir().unwrap();
+        let original = b"AUTHOR = 'original'\n";
+        let patched = b"AUTHOR = 'patchedX'\n";
+        assert_eq!(original.len(), patched.len());
+        touch(
+            site.path(),
+            &[
+                "pkg/__pycache__/mod.cpython-311.pyc",
+                "pkg/__pycache__/mod.cpython-311.opt-1.pyc",
+                "pkg/__pycache__/mod.cpython-313.opt-2.pyc",
+                "pkg/__pycache__/modx.cpython-311.pyc",
+                "pkg/__pycache__/other.cpython-311.pyc",
+                "pkg/mod.pyc",
+                "pkg/mod.pyo",
+                "pkg/other.pyc",
+            ],
+        )
+        .await;
+        tokio::fs::write(site.path().join("pkg/mod.py"), original)
+            .await
+            .unwrap();
+
+        apply_file_patch_at(
+            site.path(),
+            "pkg/mod.py",
+            patched,
+            &compute_git_sha256_from_bytes(patched),
+        )
+        .await
+        .unwrap();
+
+        let pkg = site.path().join("pkg");
+        assert_eq!(std::fs::read(pkg.join("mod.py")).unwrap(), patched);
+        for stale in [
+            "__pycache__/mod.cpython-311.pyc",
+            "__pycache__/mod.cpython-311.opt-1.pyc",
+            "__pycache__/mod.cpython-313.opt-2.pyc",
+            "mod.pyc",
+            "mod.pyo",
+        ] {
+            assert!(!pkg.join(stale).exists(), "{stale} must be removed");
+        }
+        for kept in [
+            "__pycache__/modx.cpython-311.pyc",
+            "__pycache__/other.cpython-311.pyc",
+            "other.pyc",
+        ] {
+            assert!(pkg.join(kept).exists(), "{kept} must be kept");
+        }
+    }
+
+    /// #819: a top-level module (`six.py` directly in site-packages) has
+    /// its bytecode in site-packages' own `__pycache__`.
+    #[tokio::test]
+    async fn test_apply_file_patch_top_level_py_removes_stale_bytecode() {
+        let site = tempfile::tempdir().unwrap();
+        let patched = b"x = 2\n";
+        touch(site.path(), &["__pycache__/six.cpython-312.pyc"]).await;
+        tokio::fs::write(site.path().join("six.py"), b"x = 1\n")
+            .await
+            .unwrap();
+
+        apply_file_patch_at(
+            site.path(),
+            "six.py",
+            patched,
+            &compute_git_sha256_from_bytes(patched),
+        )
+        .await
+        .unwrap();
+
+        assert!(!site.path().join("__pycache__/six.cpython-312.pyc").exists());
+    }
+
+    /// Only a `.py` write touches bytecode: patching `mod.js` (or
+    /// `mod.pyi`) leaves `mod.*.pyc` alone.
+    #[tokio::test]
+    async fn test_apply_file_patch_non_py_keeps_bytecode() {
+        let site = tempfile::tempdir().unwrap();
+        let patched = b"patched";
+        touch(
+            site.path(),
+            &["pkg/__pycache__/mod.cpython-311.pyc", "pkg/mod.pyc"],
+        )
+        .await;
+        for name in ["pkg/mod.js", "pkg/mod.pyi"] {
+            tokio::fs::write(site.path().join(name), b"original")
+                .await
+                .unwrap();
+            apply_file_patch_at(
+                site.path(),
+                name,
+                patched,
+                &compute_git_sha256_from_bytes(patched),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(site
+            .path()
+            .join("pkg/__pycache__/mod.cpython-311.pyc")
+            .exists());
+        assert!(site.path().join("pkg/mod.pyc").exists());
+    }
+
+    /// A read-only `__pycache__` (a root-owned system site-packages, or a
+    /// Nix/Go-style read-only tree) is relaxed for the delete and put back
+    /// exactly as found.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_py_removes_bytecode_in_readonly_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let site = tempfile::tempdir().unwrap();
+        let patched = b"x = 2\n";
+        let cache = site.path().join("__pycache__");
+        touch(site.path(), &["__pycache__/m.cpython-312.pyc"]).await;
+        tokio::fs::write(site.path().join("m.py"), b"x = 1\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        apply_file_patch_at(
+            site.path(),
+            "m.py",
+            patched,
+            &compute_git_sha256_from_bytes(patched),
+        )
+        .await
+        .unwrap();
+
+        let mode = std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!cache.join("m.cpython-312.pyc").exists());
+        assert_eq!(mode, 0o555, "the cache dir mode must be restored");
+    }
 }
