@@ -400,18 +400,37 @@ mod tests {
 
     /// A `--global-prefix` naming Deno's npm cache registry dir is the npm
     /// crawler's (#444): its scoped `@types/node/20.0.0` must not also
-    /// surface as `pkg:jsr/@types/node@20.0.0`.
+    /// surface as `pkg:jsr/@types/node@20.0.0`. A JSR tree under a dir
+    /// named `npm` (no `registry.json`) is still walked.
     #[tokio::test]
     async fn crawl_all_skips_deno_npm_cache_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         let registry = tmp.path().join("npm").join("registry.npmjs.org");
         stage(&registry, "@types", "node", "20.0.0").await;
+        tokio::fs::write(registry.join("@types/node/registry.json"), b"{}")
+            .await
+            .unwrap();
         let opts = CrawlerOptions {
             cwd: tmp.path().to_path_buf(),
             global: true,
             global_prefix: Some(registry),
         };
         assert!(DenoCrawler.crawl_all(&opts).await.is_empty());
+
+        let mirror = tmp.path().join("npm").join("jsr-mirror");
+        stage(&mirror, "@std", "path", "1.0.8").await;
+        let opts = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: true,
+            global_prefix: Some(mirror),
+        };
+        let purls: Vec<String> = DenoCrawler
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
+        assert_eq!(purls, vec!["pkg:jsr/@std/path@1.0.8"]);
     }
 
     #[tokio::test]

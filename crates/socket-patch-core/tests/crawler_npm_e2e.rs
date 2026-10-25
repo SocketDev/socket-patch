@@ -4397,7 +4397,17 @@ async fn global_mode_includes_deno_npm_cache() {
     let registry = deno_dir.join("npm").join("registry.npmjs.org");
     let pkg = stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
 
-    let prev = std::env::var_os("DENO_DIR");
+    /// Restores `DENO_DIR` however the test ends.
+    struct DenoDirGuard(Option<std::ffi::OsString>);
+    impl Drop for DenoDirGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("DENO_DIR", v),
+                None => std::env::remove_var("DENO_DIR"),
+            }
+        }
+    }
+    let _guard = DenoDirGuard(std::env::var_os("DENO_DIR"));
     std::env::set_var("DENO_DIR", &deno_dir);
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
@@ -4406,10 +4416,6 @@ async fn global_mode_includes_deno_npm_cache() {
     };
     let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
     let crawled = NpmCrawler.crawl_all(&opts).await;
-    match prev {
-        Some(v) => std::env::set_var("DENO_DIR", v),
-        None => std::env::remove_var("DENO_DIR"),
-    }
 
     assert!(roots.contains(&registry), "{roots:?}");
     assert!(
@@ -4418,4 +4424,73 @@ async fn global_mode_includes_deno_npm_cache() {
             .any(|p| p.purl == "pkg:npm/is-odd@3.0.1" && p.path == pkg),
         "{crawled:?}"
     );
+}
+
+/// #444 review: a root that merely sits under a dir named `npm` (a
+/// project checked out at `~/src/npm` with a custom modules folder) has no
+/// Deno packument, so it keeps the `node_modules` walk.
+#[tokio::test]
+#[serial_test::parallel]
+async fn non_deno_root_under_npm_dir_keeps_node_modules_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deps = tmp.path().join("npm").join("deps");
+    stage_npm_pkg(&deps, "left-pad", "1.3.0").await;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: false,
+        global_prefix: Some(deps.clone()),
+    };
+    let purls: Vec<String> = NpmCrawler
+        .crawl_all(&opts)
+        .await
+        .into_iter()
+        .map(|p| p.purl)
+        .collect();
+    assert_eq!(purls, vec!["pkg:npm/left-pad@1.3.0"]);
+    let found = NpmCrawler
+        .find_by_purls(&deps, &["pkg:npm/left-pad@1.3.0".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(found_paths(&found, "pkg:npm/left-pad@1.3.0").len(), 1);
+}
+
+/// #444 review: a purl listed twice resolves each Deno cache copy once.
+#[tokio::test]
+#[serial_test::parallel]
+async fn deno_npm_cache_find_by_purls_records_each_copy_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("npm").join("registry.npmjs.org");
+    let plain = stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
+    let purl = "pkg:npm/is-odd@3.0.1".to_string();
+    let found = NpmCrawler
+        .find_by_purls(&registry, &[purl.clone(), purl.clone()])
+        .await
+        .unwrap();
+    assert_eq!(found_paths(&found, &purl), vec![plain]);
+}
+
+/// #444: Deno stores a name with capitals under an encoded `_<...>` dir;
+/// the purl still resolves to it by its package.json.
+#[tokio::test]
+#[serial_test::parallel]
+async fn deno_npm_cache_find_by_purls_resolves_encoded_capital_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("npm").join("registry.npmjs.org");
+    let pkg = registry.join("_jjjvatsuojxgc3nonu").join("1.3.5");
+    tokio::fs::create_dir_all(&pkg).await.unwrap();
+    tokio::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"JSONStream","version":"1.3.5"}"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(pkg.parent().unwrap().join("registry.json"), "{}")
+        .await
+        .unwrap();
+    let purl = "pkg:npm/JSONStream@1.3.5".to_string();
+    let found = NpmCrawler
+        .find_by_purls(&registry, std::slice::from_ref(&purl))
+        .await
+        .unwrap();
+    assert_eq!(found_paths(&found, &purl), vec![pkg]);
 }

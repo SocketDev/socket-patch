@@ -1025,6 +1025,8 @@ fn deno_npm_cache_fixture(
         r#"{"name":"__deno_global_dispatch__","version":"1.0.0"}"#,
     )
     .unwrap();
+    // Deno caches the package's packument beside its version dirs.
+    std::fs::write(pkg.parent().unwrap().join("registry.json"), "{}").unwrap();
     let verify_file = pkg.join("index.js");
     std::fs::write(&verify_file, PATCHED).unwrap();
     let purl = "pkg:npm/__deno_global_dispatch__@1.0.0";
