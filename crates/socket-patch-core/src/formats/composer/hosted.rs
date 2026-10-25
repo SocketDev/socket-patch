@@ -237,9 +237,11 @@ pub(crate) fn rewrite_composer_lock(
                 detail: format!(
                     "{composer_name} is wired to socket-patch's vendored copy, whose \
                      vendored ledger entry is missing, so it cannot be reverted for you; NOT \
-                     redirected — restore its registry entry (`composer update \
-                     {composer_name}`, or the pre-vendor composer.lock from version control), \
-                     then re-run"
+                     redirected — restore its registry entry at {} (check out the \
+                     pre-vendor composer.lock from version control, or re-resolve it with \
+                     `composer update --no-install {composer_name}`, which may also move it \
+                     and its dependents to newer versions), then re-run",
+                    dep.version
                 ),
             });
             continue;
