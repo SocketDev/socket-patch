@@ -86,10 +86,11 @@ mod tests {
             "pkg:npm/a@1",
             "pkg:golang/a@v1",
             "pkg:pypi/a@1",
+            "pkg:composer/a/b@1",
         ] {
             assert!(in_reach(purl, None), "{purl}");
         }
-        for purl in ["pkg:gem/a@1", "pkg:composer/a/b@1", "pkg:nuget/a@1"] {
+        for purl in ["pkg:gem/a@1", "pkg:nuget/a@1"] {
             assert!(!in_reach(purl, None), "{purl}");
         }
     }

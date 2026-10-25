@@ -637,6 +637,50 @@ async fn vendored_pypi_takeover_is_refused_like_the_disk_flow() {
     assert!(output.changed_files.is_empty());
 }
 
+/// #536: a vendored composer package is refused as a takeover too, rather
+/// than handed to the composer.lock rewriter, which would edit the vendored
+/// entry in place and keep its patch-uuid `dist.reference`.
+#[tokio::test]
+async fn vendored_composer_takeover_is_refused_like_the_disk_flow() {
+    const COMPOSER_FIXTURE: &str = "redirect/composer/composer-lock/basic";
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(
+        &fixtures_root().join(COMPOSER_FIXTURE).join("overrides.json"),
+        None,
+    );
+    mount_api(&server, &patches).await;
+    let mut files = fixture_files(&fixtures_root().join(COMPOSER_FIXTURE).join("input"));
+    let uuid = "44444444-4444-4444-4444-444444444444";
+    files.insert(
+        ".socket/vendor/state.json".into(),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "entries": {
+                "pkg:composer/monolog/monolog@2.0.0": {
+                    "ecosystem": "composer",
+                    "basePurl": "pkg:composer/monolog/monolog@2.0.0",
+                    "uuid": uuid,
+                    "artifact": {"path": format!(".socket/vendor/composer/{uuid}/monolog/monolog@2.0.0")},
+                    "wiring": []
+                }
+            }
+        }))
+        .unwrap(),
+    );
+    let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+    let project = &output.projects[0];
+    assert!(
+        project
+            .skipped
+            .iter()
+            .any(|s| s.reason == "vendored_takeover_unsupported_in_memory"),
+        "{:?}",
+        project.skipped
+    );
+    assert!(project.redirected.is_empty());
+    assert!(output.changed_files.is_empty());
+}
+
 /// A pre-v5 redirect ledger (`.socket/vendor/redirect-state.json`) is
 /// never read by the v5 engine: a torn one neither fails its project nor
 /// changes its plan, and the engine never emits (or rewrites) the file.
