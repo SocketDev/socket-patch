@@ -263,3 +263,50 @@ async fn scan_discovers_composer1_packages() {
     );
     assert_proxy_served_scans(&proxy, 2).await;
 }
+
+/// #463: on Composer 1, installed.json has no `install-path`, so a package
+/// composer/installers placed outside `vendor/` (here a WordPress plugin
+/// under `extra.installer-paths`) was skipped as "not installed". scan must
+/// find it where the installer put it and send it to the patch lookup.
+#[tokio::test]
+async fn scan_discovers_composer1_installer_paths_package() {
+    let proxy = start_proxy().await;
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(
+        project_dir.join("composer.json"),
+        r#"{"require": {"acme/tool": "1.0.0", "composer/installers": "*"},
+            "extra": {"installer-paths":
+                {"wp-content/plugins/{$name}/": ["type:wordpress-plugin"]}}}"#,
+    )
+    .unwrap();
+
+    // What composer-1.10.28 writes: a bare array, no install-path.
+    let vendor_dir = project_dir.join("vendor");
+    let composer_dir = vendor_dir.join("composer");
+    std::fs::create_dir_all(&composer_dir).unwrap();
+    std::fs::write(
+        composer_dir.join("installed.json"),
+        r#"[
+            {"name": "composer/installers", "version": "v1.12.0", "type": "composer-plugin"},
+            {"name": "acme/tool", "version": "1.0.0", "type": "wordpress-plugin"}
+        ]"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(vendor_dir.join("composer").join("installers")).unwrap();
+    std::fs::create_dir_all(project_dir.join("wp-content").join("plugins").join("tool")).unwrap();
+
+    let json = scan_json(&project_dir, &proxy.uri()).await;
+    assert_eq!(
+        json["scannedPackages"], 2,
+        "scan must discover composer/installers and the relocated plugin; got:\n{json:#}"
+    );
+    let requests = proxy.received_requests().await.unwrap_or_default();
+    assert!(
+        requests
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("pkg:composer/acme/tool@1.0.0")),
+        "the relocated plugin must be sent to the patch lookup"
+    );
+}
