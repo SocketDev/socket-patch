@@ -392,8 +392,8 @@ pub(crate) fn yarn_pnpm_store_folder_in(project_root: &Path, env: &YarnEnv) -> O
     }
     let from_rc = |dir: &Path| {
         let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(&env.rc_filename)).ok()?;
+        // An empty value is still the nearest setting: it admits nothing.
         crate::formats::yarn::rc::raw_setting(&rc, "pnpmStoreFolder")
-            .filter(|raw| !raw.is_empty())
             .map(|raw| expand(&raw).map(|value| dir.join(value)))
     };
     let found = start
@@ -860,6 +860,8 @@ mod tests {
         assert_eq!(store(&env), Some(member.join("x")), "fallback");
         std::fs::write(member.join(".yarnrc.yml"), "pnpmStoreFolder: \"${S}\"\n").unwrap();
         assert_eq!(store(&env), None, "unset variable");
+        std::fs::write(member.join(".yarnrc.yml"), "pnpmStoreFolder: ''\n").unwrap();
+        assert_eq!(store(&env), None, "empty nearest setting");
         env.pnpm_store_folder = Some("from-env".into());
         assert_eq!(store(&env), Some(member.join("from-env")), "environment");
     }

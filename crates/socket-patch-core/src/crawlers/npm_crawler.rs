@@ -1519,37 +1519,53 @@ fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// The store of Yarn's pnpm linker for the project whose `node_modules`
-/// is `nm`, when `pnpmStoreFolder` moved it out of `node_modules/.store`
-/// (#859): `.cache/.store`, `store`, set in an rc file, the home rc file
-/// or `YARN_PNPM_STORE_FOLDER`. Yarn then keeps every package there, at
-/// `<store>/<slug>/package`, and `nm` holds only links to the direct
-/// dependencies: the store is the only home of the transitive ones, which
-/// a walk of `nm` alone never reaches (or a hidden name hides from the
-/// workspace walk). Its entries have the `node_modules/.store` shape, so
-/// the same enumeration applies ([`NpmCrawler::list_npm_store_entries_sync`]).
+/// The store of Yarn's pnpm linker for the project `nm` belongs to, when
+/// `pnpmStoreFolder` moved it out of `node_modules/.store` (#859):
+/// `.cache/.store`, `store`, set in an rc file, the home rc file or
+/// `YARN_PNPM_STORE_FOLDER`. Yarn then keeps every package there, at
+/// `<store>/<slug>/package`, and the `node_modules` dirs hold only links
+/// to the direct dependencies: the store is the only home of the
+/// transitive ones, which a walk of `nm` alone never reaches (or a hidden
+/// name hides from the workspace walk). Its entries have the
+/// `node_modules/.store` shape, so the same enumeration applies
+/// ([`NpmCrawler::list_npm_store_entries_sync`]).
 ///
-/// Only for a Yarn project (`yarn.lock` beside `nm`) whose active linker
-/// is pnpm, and only for a real directory that is not the default
-/// location (walked by name) and does not contain the project. Returned
-/// canonical.
+/// The project is the nearest folder at or above `nm`'s parent holding a
+/// `yarn.lock` (a workspace member's `node_modules` uses the root's
+/// store), and its active linker must be pnpm. Like a relocated pnpm
+/// virtual store ([`relocated_pnpm_virtual_store_sync`]), only a store
+/// strictly inside the project, reached through real directories, counts:
+/// one elsewhere (a home rc's folder) may be shared with other projects,
+/// and patching it would patch them too. `None` for the default location,
+/// which the walks find by name. The path keeps the project's spelling.
 fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
-    if nm.file_name() != Some(OsStr::new("node_modules")) {
+    if nm.file_name() != Some(OsStr::new("node_modules")) || !is_dir_sync(nm) {
         return None;
     }
-    let project = nm.parent()?;
-    if !project.join("yarn.lock").is_file() {
-        return None;
-    }
+    let project = nm
+        .parent()?
+        .ancestors()
+        .find(|dir| dir.join("yarn.lock").is_file())?;
     let store = super::pkg_managers::active_yarn_pnpm_store(project)?;
-    let store = std::fs::canonicalize(store).ok()?;
-    if !is_dir_sync(&store)
-        || std::fs::canonicalize(project).is_ok_and(|p| p.starts_with(&store))
-        || std::fs::canonicalize(nm.join(NPM_LINKED_STORE_NAME)).is_ok_and(|d| d == store)
+    let (Ok(real_store), Ok(real_project)) =
+        (std::fs::canonicalize(store), std::fs::canonicalize(project))
+    else {
+        return None;
+    };
+    let below = path_below(&real_project, &real_store)?;
+    if below == Path::new("node_modules").join(NPM_LINKED_STORE_NAME)
+        || std::fs::canonicalize(nm.join(NPM_LINKED_STORE_NAME)).is_ok_and(|d| d == real_store)
     {
         return None;
     }
-    Some(store)
+    let mut dir = project.to_path_buf();
+    for component in below.components() {
+        dir.push(component);
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            return None;
+        }
+    }
+    Some(dir)
 }
 
 /// The entries of pnpm's global virtual store (`enableGlobalVirtualStore`)
@@ -1731,6 +1747,16 @@ struct StoreEntry {
 }
 
 impl StoreEntry {
+    /// The entries of a store enumeration, keeping what each advertises.
+    fn from_dirs(dirs: Vec<StoreEntryDir>) -> Vec<StoreEntry> {
+        dirs.into_iter()
+            .map(|e| StoreEntry {
+                advertised: e.advertised,
+                node_modules: e.node_modules,
+            })
+            .collect()
+    }
+
     fn pnpm(entries: Vec<(String, PathBuf)>) -> Vec<StoreEntry> {
         entries
             .into_iter()
@@ -2388,11 +2414,21 @@ impl NpmCrawler {
 
     fn crawl_all_sync(options: &CrawlerOptions) -> (Vec<CrawledPackage>, Vec<PathBuf>) {
         let nm_paths = Self::node_modules_paths_sync(options);
-        let gathered: Vec<Vec<ScanEvent>> = par_map(&nm_paths, |nm_path| {
+        // Yarn's relocated pnpm-linker store (#859), walked once, from the
+        // first root of its project, after that root's own entries like
+        // the stores found by name.
+        let mut seen_stores = HashSet::new();
+        let roots: Vec<(&PathBuf, Option<PathBuf>)> = nm_paths
+            .iter()
+            .map(|nm| {
+                let store = relocated_yarn_pnpm_store_sync(nm)
+                    .filter(|store| seen_stores.insert(store.clone()));
+                (nm, store)
+            })
+            .collect();
+        let gathered: Vec<Vec<ScanEvent>> = par_map(roots, |(nm_path, store)| {
             let mut events = Self::gather_node_modules(nm_path, None, false);
-            // Yarn's relocated pnpm-linker store, after the importer's own
-            // entries like the stores found by name (#859).
-            if let Some(store) = relocated_yarn_pnpm_store_sync(nm_path) {
+            if let Some(store) = store {
                 let entries = Self::list_npm_store_entries_sync(&store, true);
                 events.extend(Self::gather_store_entries(entries));
             }
@@ -2551,15 +2587,9 @@ impl NpmCrawler {
         // The root's relocated Yarn pnpm-linker store (#859), contributed
         // by the root's visit like a store found there by name.
         let mut yarn_store = relocated_yarn_pnpm_store_sync(node_modules_path).map(|store| {
-            NestedNodeModules::StoreEntries(
-                Self::list_npm_store_entries_sync(&store, false)
-                    .into_iter()
-                    .map(|e| StoreEntry {
-                        advertised: e.advertised,
-                        node_modules: e.node_modules,
-                    })
-                    .collect(),
-            )
+            NestedNodeModules::StoreEntries(StoreEntry::from_dirs(
+                Self::list_npm_store_entries_sync(&store, false),
+            ))
         });
         while !level.is_empty() {
             // A bundled node_modules may link back to an ancestor (or to
@@ -2847,13 +2877,9 @@ impl NpmCrawler {
                 return Vec::new();
             }
             let store = nm_path.join(&entry.name);
-            let entries = Self::list_pnpm_shaped_store_entries_sync(&store, layout, false, false)
-                .into_iter()
-                .map(|e| StoreEntry {
-                    advertised: e.advertised,
-                    node_modules: e.node_modules,
-                })
-                .collect();
+            let entries = StoreEntry::from_dirs(Self::list_pnpm_shaped_store_entries_sync(
+                &store, layout, false, false,
+            ));
             return vec![NestedNodeModules::StoreEntries(entries)];
         }
         // vlt's store has the same transitive-only-home property: every
@@ -2872,13 +2898,10 @@ impl NpmCrawler {
             if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
                 return Vec::new();
             }
-            let entries = Self::list_npm_store_entries_sync(&nm_path.join(&entry.name), false)
-                .into_iter()
-                .map(|e| StoreEntry {
-                    advertised: e.advertised,
-                    node_modules: e.node_modules,
-                })
-                .collect();
+            let entries = StoreEntry::from_dirs(Self::list_npm_store_entries_sync(
+                &nm_path.join(&entry.name),
+                false,
+            ));
             return vec![NestedNodeModules::StoreEntries(entries)];
         }
         // A pnpm virtual store relocated by `virtualStoreDir`, found
@@ -2893,13 +2916,7 @@ impl NpmCrawler {
                 let entries = reachable_pnpm_global_virtual_store_entries_sync(nm_path);
                 return vec![NestedNodeModules::StoreEntries(entries)];
             };
-            let entries = Self::list_pnpm_store_entries_sync(&store, false)
-                .into_iter()
-                .map(|e| StoreEntry {
-                    advertised: e.advertised,
-                    node_modules: e.node_modules,
-                })
-                .collect();
+            let entries = StoreEntry::from_dirs(Self::list_pnpm_store_entries_sync(&store, false));
             return vec![NestedNodeModules::StoreEntries(entries)];
         }
         // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
@@ -3103,6 +3120,7 @@ impl NpmCrawler {
         let stores: Vec<PathBuf> = results
             .iter()
             .filter_map(|nm| relocated_yarn_pnpm_store_sync(nm))
+            .filter_map(|store| std::fs::canonicalize(store).ok())
             .collect();
         if !stores.is_empty() {
             results.retain(|nm| {
@@ -4140,21 +4158,22 @@ async fn find_store_peer_variant_copies_reusing(
     // project's `node_modules` names no such store, its settings do. Only
     // a store holding the primary itself counts, as above.
     if let Some(canonical) = canonical_pkg.clone() {
-        let projects: Vec<PathBuf> = chains
-            .into_iter()
-            .flatten()
-            .flat_map(|start| {
-                start
-                    .ancestors()
-                    .skip(1)
-                    .map(|dir| dir.join("node_modules"))
-            })
-            .collect();
+        let mut projects: Vec<PathBuf> = Vec::new();
+        for start in chains.into_iter().flatten() {
+            for dir in start.ancestors().skip(1) {
+                let nm = dir.join("node_modules");
+                if !projects.contains(&nm) {
+                    projects.push(nm);
+                }
+            }
+        }
         let yarn_stores = run_walk(move || {
             projects
                 .iter()
                 .filter_map(|nm| relocated_yarn_pnpm_store_sync(nm))
-                .filter(|store| canonical.starts_with(store))
+                .filter(|store| {
+                    std::fs::canonicalize(store).is_ok_and(|real| canonical.starts_with(real))
+                })
                 .collect::<Vec<_>>()
         })
         .await;
@@ -7513,7 +7532,8 @@ mod tests {
     async fn test_yarn4_pnpm_linker_relocated_store_transitive_packages_are_found() {
         for folder in [".cache/.store", "store"] {
             let tmp = tempfile::tempdir().unwrap();
-            let root: PathBuf = tmp.path().components().collect();
+            let root: PathBuf = tmp.path().join("proj").components().collect();
+            std::fs::create_dir_all(&root).unwrap();
             let nm = root.join("node_modules");
             let store = root.join(folder);
             std::fs::write(root.join("yarn.lock"), "").unwrap();
@@ -7552,6 +7572,26 @@ mod tests {
                 vec![number_twin.clone()],
             )
             .await;
+
+            // A workspace member's `node_modules` uses the root's store.
+            let member_nm = root.join("packages").join("a").join("node_modules");
+            std::fs::create_dir_all(&member_nm).unwrap();
+            assert_eq!(
+                relocated_yarn_pnpm_store_sync(&member_nm),
+                Some(store.clone()),
+                "{folder}: member"
+            );
+            // A store outside the project may be shared: never walked.
+            std::fs::write(
+                root.join(".yarnrc.yml"),
+                "nodeLinker: pnpm\npnpmStoreFolder: ../shared\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("../shared")).unwrap();
+            assert!(
+                relocated_yarn_pnpm_store_sync(&nm).is_none(),
+                "{folder}: outside the project"
+            );
 
             // An inactive linker leaves the folder alone.
             std::fs::write(
