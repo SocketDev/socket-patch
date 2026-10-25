@@ -7,7 +7,7 @@ use std::path::Path;
 
 use super::{
     normalize_version, read_installed_json, resolve_package_dir, resolve_project_root,
-    ComposerCrawler, ComposerPackageEntry,
+    ComposerCrawler, ComposerPackageEntry, InstallerLayout,
 };
 use crate::crawlers::types::{CrawledPackage, CrawlerOptions};
 use crate::utils::composer_version::composer_versions_equivalent;
@@ -28,15 +28,19 @@ impl LegacyComposerCrawler {
         for vendor_path in &vendor_paths {
             let project_root = resolve_project_root(vendor_path).await;
             let entries = read_installed_json(vendor_path).await;
-            for entry in entries {
+            let installers = InstallerLayout::load(&project_root, &entries).await;
+            for entry in &entries {
                 if let Some((namespace, name)) = entry.name.split_once('/') {
-                    let Some(pkg_path) = resolve_package_dir(vendor_path, &project_root, &entry)
+                    let Some(pkg_path) = first_dir(resolve_package_dir(
+                        vendor_path,
+                        &project_root,
+                        &installers,
+                        entry,
+                    ))
+                    .await
                     else {
                         continue;
                     };
-                    if !is_dir(&pkg_path).await {
-                        continue;
-                    }
 
                     let version = normalize_version(&entry.version).to_string();
 
@@ -70,11 +74,12 @@ impl LegacyComposerCrawler {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
         let entries = read_installed_json(vendor_path).await;
+        let project_root = resolve_project_root(vendor_path).await;
+        let installers = InstallerLayout::load(&project_root, &entries).await;
         let installed: HashMap<String, ComposerPackageEntry> = entries
             .into_iter()
             .map(|e| (e.name.to_ascii_lowercase(), e))
             .collect();
-        let project_root = resolve_project_root(vendor_path).await;
 
         for purl in purls {
             if let Some(((namespace, name), version)) =
@@ -93,13 +98,16 @@ impl LegacyComposerCrawler {
                     continue;
                 }
 
-                let Some(pkg_dir) = resolve_package_dir(vendor_path, &project_root, entry) else {
+                let Some(pkg_dir) = first_dir(resolve_package_dir(
+                    vendor_path,
+                    &project_root,
+                    &installers,
+                    entry,
+                ))
+                .await
+                else {
                     continue;
                 };
-
-                if !is_dir(&pkg_dir).await {
-                    continue;
-                }
 
                 result.insert(
                     purl.clone(),
@@ -116,4 +124,14 @@ impl LegacyComposerCrawler {
 
         result
     }
+}
+
+/// The first candidate that is a directory, one `is_dir` hop at a time.
+async fn first_dir(candidates: Vec<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    for dir in candidates {
+        if is_dir(&dir).await {
+            return Some(dir);
+        }
+    }
+    None
 }
