@@ -652,7 +652,7 @@ pub(crate) async fn remove_stale_bytecode(source: &Path, which: StaleBytecode) -
     guard.restore().await;
     (!failed.is_empty()).then(|| {
         format!(
-            "could not remove stale Python bytecode ({}); Python may keep running \
+            "{STALE_BYTECODE_NOT_REMOVED_MARKER} ({}); Python may keep running \
              the old code until it is deleted",
             failed.join(", ")
         )
@@ -951,6 +951,28 @@ impl crate::patch::store_copies::CopyFold for ApplyResult {
 /// keys on the same text.
 pub const OWNERSHIP_NOT_RESTORED_MARKER: &str = "ownership could not be restored";
 
+/// The substring every failed bytecode cleanup carries (see
+/// [`remove_stale_bytecode`]); the CLI's `stale_bytecode_not_removed`
+/// warning keys on the same text.
+pub const STALE_BYTECODE_NOT_REMOVED_MARKER: &str = "could not remove stale Python bytecode";
+
+/// The run-level warning codes a successful apply's or rollback's advisory
+/// `note` (its `error` with `success: true`) carries, by marker. One note
+/// can join several advisories with `"; "`.
+pub fn advisory_warning_codes(note: &str) -> Vec<&'static str> {
+    [
+        (OWNERSHIP_NOT_RESTORED_MARKER, "ownership_not_restored"),
+        (
+            STALE_BYTECODE_NOT_REMOVED_MARKER,
+            "stale_bytecode_not_removed",
+        ),
+    ]
+    .into_iter()
+    .filter(|(marker, _)| note.contains(marker))
+    .map(|(_, code)| code)
+    .collect()
+}
+
 /// The message of a new-file collision (see [`mark_new_file_collision`]).
 pub const NEW_FILE_COLLISION_MESSAGE: &str =
     "File already exists, but the patch adds it as a new file (its content matches neither hash)";
@@ -1074,18 +1096,19 @@ async fn apply_package_patch_at(
     // compiled from the unpatched source beside it (written by a release
     // without the #819 fix, or a run that stopped between the rename and
     // the cleanup). Drop whatever predates the source.
+    // Its warnings ride `error` (with `success: true`) on every exit below.
+    let mut bytecode_warnings: Vec<String> = Vec::new();
     if !dry_run {
         for v in &result.files_verified {
             if v.status == VerifyStatus::AlreadyPatched {
                 let source = pkg_path.join(normalize_file_path(&v.file));
-                if let Some(warning) =
-                    remove_stale_bytecode(&source, StaleBytecode::NotNewerThanSource).await
-                {
-                    result.error = Some(warning);
-                }
+                bytecode_warnings.extend(
+                    remove_stale_bytecode(&source, StaleBytecode::NotNewerThanSource).await,
+                );
             }
         }
     }
+    let join_notes = |notes: Vec<String>| (!notes.is_empty()).then(|| notes.join("; "));
 
     // Check if all files are already patched
     let all_already_patched = result
@@ -1117,6 +1140,7 @@ async fn apply_package_patch_at(
     if all_already_patched {
         coursier_retry(&mut result);
         result.success = true;
+        result.error = join_notes(bytecode_warnings);
         return result;
     }
 
@@ -1135,10 +1159,11 @@ async fn apply_package_patch_at(
             .filter(|v| v.status == VerifyStatus::NotFound)
             .count();
         result.success = true;
-        result.error = Some(format!(
+        let skipped = format!(
             "All patch files were skipped: {} not found on disk (--force)",
             not_found_count
-        ));
+        );
+        result.error = join_notes([skipped].into_iter().chain(bytecode_warnings).collect());
         return result;
     }
 
@@ -1168,7 +1193,7 @@ async fn apply_package_patch_at(
     // Advisory notes from writes that committed but could not fully restore
     // metadata (see `apply_file_patch_at`); reported on `error` alongside
     // `success` — the success-with-note shape the `--force` skip uses.
-    let mut warnings: Vec<String> = result.error.take().into_iter().collect();
+    let mut warnings: Vec<String> = bytecode_warnings;
 
     // Apply patches to files that need it.
     for (file_name, file_info) in files_in_order(files) {
@@ -1272,9 +1297,7 @@ async fn apply_package_patch_at(
         }
     }
 
-    if !warnings.is_empty() {
-        result.error = Some(warnings.join("; "));
-    }
+    result.error = join_notes(warnings);
     result.success = true;
     result
 }
@@ -3866,5 +3889,25 @@ mod tests {
         assert!(!is_bytecode_of("six.moves.cpython-311.pyc", "six"));
         assert!(!is_bytecode_of("six.cpython-311.opt-1.x.pyc", "six"));
         assert!(!is_bytecode_of("six.cpython-311.pyo", "six"));
+    }
+
+    #[test]
+    fn test_advisory_warning_codes() {
+        let ownership =
+            format!("a.js: patched, but {OWNERSHIP_NOT_RESTORED_MARKER} to uid 1 gid 2: EPERM");
+        let bytecode = format!("{STALE_BYTECODE_NOT_REMOVED_MARKER} (x.pyc: EACCES); Python may keep running the old code until it is deleted");
+        assert_eq!(
+            advisory_warning_codes(&ownership),
+            ["ownership_not_restored"]
+        );
+        assert_eq!(
+            advisory_warning_codes(&bytecode),
+            ["stale_bytecode_not_removed"]
+        );
+        assert_eq!(
+            advisory_warning_codes(&format!("{ownership}; {bytecode}")),
+            ["ownership_not_restored", "stale_bytecode_not_removed"]
+        );
+        assert!(advisory_warning_codes("All patch files were skipped").is_empty());
     }
 }

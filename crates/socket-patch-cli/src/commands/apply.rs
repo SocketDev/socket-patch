@@ -1363,11 +1363,12 @@ pub(crate) async fn run_locked(
             } else {
                 Vec::new()
             };
-            run_warnings.extend(results.iter().filter_map(|r| {
-                let note = r.error.as_deref().filter(|_| r.success)?;
-                note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)
-                    .then(|| RunWarning {
-                        code: "ownership_not_restored".to_string(),
+            run_warnings.extend(results.iter().flat_map(|r| {
+                let note = r.error.as_deref().filter(|_| r.success).unwrap_or_default();
+                socket_patch_core::patch::apply::advisory_warning_codes(note)
+                    .into_iter()
+                    .map(move |code| RunWarning {
+                        code: code.to_string(),
                         detail: format!("{}: {note}", normalize_purl(&r.package_key)),
                     })
             }));

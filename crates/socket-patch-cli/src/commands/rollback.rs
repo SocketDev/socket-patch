@@ -2092,17 +2092,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .iter()
                 .chain(hosted_leg.warnings.iter())
                 .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
-            // A restored package whose ownership could not be put back
-            // (the engine reports it on `error` with `success: true`) is
-            // restored but worth a note, here and in the envelope.
+            // A restored package whose ownership could not be put back, or
+            // whose stale bytecode could not be removed (the engine reports
+            // it on `error` with `success: true`), is restored but worth a
+            // note, here and in the envelope.
             for r in results.iter().filter(|r| r.success) {
                 if let Some(note) = &r.error {
-                    let warning = (
-                        "ownership_not_restored".to_string(),
-                        format!("{}: {note}", r.package_key),
-                    );
-                    human_warnings.push(warning.clone());
-                    run_warnings.push(warning);
+                    let codes = socket_patch_core::patch::apply::advisory_warning_codes(note);
+                    let codes = if codes.is_empty() {
+                        vec!["ownership_not_restored"]
+                    } else {
+                        codes
+                    };
+                    let detail = format!("{}: {note}", r.package_key);
+                    // One human line per note, one envelope entry per code.
+                    human_warnings.push((codes[0].to_string(), detail.clone()));
+                    run_warnings.extend(codes.iter().map(|c| (c.to_string(), detail.clone())));
                 }
             }
 
