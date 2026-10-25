@@ -138,6 +138,26 @@ pub(crate) fn dependency_specs<'d>(
     specs
 }
 
+/// The `envs` item Hatch reads and the [`HATCH_FILES`] entry holding it:
+/// hatch.toml's when that document has an `envs` key (Hatch merges an
+/// external config by TOP-LEVEL key, so it replaces pyproject's whole
+/// table), else pyproject's `[tool.hatch.envs]`.
+pub(crate) fn environments<'d>(
+    pyproject: Option<&'d DocumentMut>,
+    hatch_toml: Option<&'d DocumentMut>,
+) -> (&'static str, Option<&'d Item>) {
+    match hatch_toml.filter(|d| d.contains_key("envs")) {
+        Some(doc) => (HATCH_FILES[1], doc.get("envs")),
+        None => (
+            HATCH_FILES[0],
+            pyproject
+                .and_then(|d| d.get("tool"))
+                .and_then(|t| t.get("hatch"))
+                .and_then(|h| h.get("envs")),
+        ),
+    }
+}
+
 /// The Hatch environment tables: `envs` of the hatch.toml document, else of
 /// pyproject's `[tool.hatch]` (Hatch merges an external config by TOP-LEVEL
 /// key, so a hatch.toml `envs` key — whatever its value — replaces
@@ -146,18 +166,8 @@ fn environment_specs<'d>(
     pyproject: Option<&'d DocumentMut>,
     hatch_toml: Option<&'d DocumentMut>,
 ) -> Vec<HatchSpec<'d>> {
-    let (file, hatch) = match hatch_toml.filter(|d| d.contains_key("envs")) {
-        Some(doc) => (HATCH_FILES[1], Some(doc.as_item())),
-        None => (
-            HATCH_FILES[0],
-            pyproject
-                .and_then(|d| d.get("tool"))
-                .and_then(|t| t.get("hatch")),
-        ),
-    };
-    hatch
-        .and_then(|h| h.get("envs"))
-        .and_then(Item::as_table_like)
+    let (file, envs) = environments(pyproject, hatch_toml);
+    envs.and_then(Item::as_table_like)
         .into_iter()
         .flat_map(|envs| envs.iter())
         .flat_map(|(_, env)| {

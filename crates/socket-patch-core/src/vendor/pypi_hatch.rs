@@ -149,18 +149,27 @@ async fn require_no_raw_workspace(
     files: &BTreeMap<String, String>,
     name: &str,
 ) -> Result<(), Failure> {
-    let (member, files, owned) = (root.to_path_buf(), files.clone(), name.to_owned());
+    let Some(pyproject) = files.get(hatch::HATCH_FILES[0]).cloned() else {
+        return Ok(());
+    };
+    let vendored = pyproject.contains("{root:uri}/.socket/vendor/");
+    let (member, owned) = (root.to_path_buf(), name.to_owned());
     let consumer = crate::utils::fs::run_blocking(move || {
-        crate::utils::hatch_workspace::raw_consumer(&member, &files, &owned)
+        crate::utils::hatch_workspace::raw_consumer(&member, &pyproject, &owned)
     })
     .await;
     match consumer {
         Some(consumer) => Err((
             "pypi_hatch_unsupported",
             format!(
-                "this project is a member of the Hatch workspace at {} (environment {:?}), which installs {name} from this project's dependencies without expanding {{root:uri}}, so a vendored reference would break that workspace's environments; use hosted or agent mode",
+                "this project is a member of the Hatch workspace at {} (environment {:?}), which installs {name} from this project's dependencies without expanding {{root:uri}}, so a vendored reference would break that workspace's environments; use hosted or agent mode{}",
                 consumer.root.display(),
                 consumer.env,
+                if vendored {
+                    " (undo references an earlier run vendored here with `socket-patch vendor --revert`)"
+                } else {
+                    ""
+                },
             ),
         )),
         None => Ok(()),
