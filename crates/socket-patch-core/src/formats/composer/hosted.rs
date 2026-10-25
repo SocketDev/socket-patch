@@ -235,8 +235,11 @@ pub(crate) fn rewrite_composer_lock(
             result.warnings.push(RewriteWarning {
                 code: "redirect_composer_vendored_entry".into(),
                 detail: format!(
-                    "{composer_name} is wired to socket-patch's vendored copy; NOT redirected \
-                     — run `socket-patch vendor --revert` first, then re-run"
+                    "{composer_name} is wired to socket-patch's vendored copy, whose \
+                     vendored ledger entry is missing, so it cannot be reverted for you; NOT \
+                     redirected — restore its registry entry (`composer update \
+                     {composer_name}`, or the pre-vendor composer.lock from version control), \
+                     then re-run"
                 ),
             });
             continue;
