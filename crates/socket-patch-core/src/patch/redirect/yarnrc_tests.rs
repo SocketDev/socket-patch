@@ -586,16 +586,19 @@ fn global_folder_values_read_like_yarn() {
         Vec::<PathBuf>::new()
     );
     // An escaped expression stays verbatim (`ini` reads `\\` as `\`
-    // first).
+    // first). On Windows the leading `\` is a separator, so the value is
+    // root-relative and doesn't resolve against the cwd (as with node's
+    // `path.win32.resolve`).
+    let escaped = if cfg!(windows) {
+        "\\${HOME}/x"
+    } else {
+        "/w/\\${HOME}/x"
+    };
     for text in [
         "global-folder=\\${HOME}/x\n",
         "global-folder=\\\\${HOME}/x\n",
     ] {
-        assert_eq!(
-            npmrc(Host::new(), text),
-            paths(&["/w/\\${HOME}/x"]),
-            "{text:?}"
-        );
+        assert_eq!(npmrc(Host::new(), text), paths(&[escaped]), "{text:?}");
     }
     // `ini` ends an unquoted value at a comment and unquotes a quoted one.
     assert_eq!(
