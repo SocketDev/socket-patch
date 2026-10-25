@@ -49,12 +49,13 @@ pub fn raw_consumer(member: &Path, member_pyproject: &str, name: &str) -> Option
     {
         return None;
     }
-    // The same spelling as the canonical walk in [`roots`].
-    let member = std::fs::canonicalize(member)
-        .ok()
-        .or_else(|| absolute(member))?;
+    // Hatch reaches a member through symlinks without resolving them, so
+    // roots are looked for above both spellings and found members are
+    // compared by their real path.
+    let lexical = absolute(member)?;
+    let member = std::fs::canonicalize(&lexical).unwrap_or_else(|_| lexical.clone());
     let name = canonicalize_pypi_name(name);
-    roots(&member).into_iter().find_map(|root| {
+    roots(&member, &lexical).into_iter().find_map(|root| {
         workspace_features(&root, &member)
             .into_iter()
             .find(|(_, features)| consumed(project, features).contains(&name))
@@ -68,14 +69,28 @@ fn absolute(path: &Path) -> Option<PathBuf> {
     crate::utils::relpath::normalize_lexically(&std::path::absolute(path).ok()?)
 }
 
-/// The directories that may declare a workspace listing `member` (a
-/// canonical path): its ancestors as far as a repository lookup goes
-/// ([`repo_root::search_dirs`]: through the checkout root, never into the
-/// home directory or past a `GIT_CEILING_DIRECTORIES` entry), then the
-/// other projects of that checkout.
-fn roots(member: &Path) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = repo_root::search_dirs(member).into_iter().skip(1).collect();
-    let Some(checkout) = repo_root::find_git_repo(member).map(|repo| repo.root) else {
+/// The directories that may declare a workspace listing the member at
+/// `real` (its canonical path) or `lexical` (as spelled): their ancestors
+/// as far as a repository lookup goes ([`repo_root::search_dirs`]: through
+/// the checkout root, never into the home directory or past a
+/// `GIT_CEILING_DIRECTORIES` entry), then the other projects of the
+/// checkout.
+fn roots(real: &Path, lexical: &Path) -> Vec<PathBuf> {
+    let home = repo_root::home();
+    let mut roots: Vec<PathBuf> = repo_root::search_dirs(real).into_iter().skip(1).collect();
+    let at_checkout = lexical.join(".git").exists();
+    for dir in lexical.ancestors().skip(1).take_while(|_| !at_checkout) {
+        if home.as_deref() == Some(dir) {
+            break;
+        }
+        if !roots.iter().any(|root| root == dir) {
+            roots.push(dir.to_path_buf());
+        }
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    let Some(checkout) = repo_root::find_git_repo(real).map(|repo| repo.root) else {
         return roots;
     };
     let walk = ignore::WalkBuilder::new(&checkout)
@@ -94,7 +109,7 @@ fn roots(member: &Path) -> Vec<PathBuf> {
         if !HATCH_FILES
             .iter()
             .any(|file| path.file_name() == Some(file.as_ref()))
-            || dir == member
+            || dir == real
             || roots.iter().any(|root| root == dir)
         {
             continue;
@@ -184,12 +199,14 @@ fn expand(root: &Path, spec: &str) -> Option<String> {
 }
 
 /// Whether the member spec `spec` of the workspace at `root` lists
-/// `member`, as Hatch's `find_members` resolves it: the spec is joined to
-/// the root and normalized, the part below the root and the spec's shared
-/// prefix is matched one component at a time (a component with `*`, `?` or
-/// `[` as an fnmatch pattern Python searches for, so it may match a suffix
-/// of the directory name), and a member any `exclude` pattern matches, by
-/// its path relative to that prefix or its absolute path, is dropped.
+/// `member` (a canonical path), as Hatch's `find_members` resolves it: the
+/// spec is joined to the root and normalized, and the part below the root
+/// and the spec's shared prefix is matched one directory level at a time
+/// (a component with `*`, `?` or `[` as an fnmatch pattern Python searches
+/// for, so it may match a suffix of the directory name; symlinked
+/// directories are followed). A found directory whose real path is
+/// `member` lists it unless an `exclude` pattern matches its path relative
+/// to that prefix or its absolute path.
 fn lists(root: &Path, spec: &str, exclude: &[&str], member: &Path) -> bool {
     let Some(spec) = expand(root, spec).filter(|spec| !spec.is_empty()) else {
         return false;
@@ -203,28 +220,32 @@ fn lists(root: &Path, spec: &str, exclude: &[&str], member: &Path) -> bool {
         .take_while(|(a, b)| a == b)
         .map(|(a, _)| a)
         .collect();
-    let (Ok(pattern), Ok(relative)) = (target.strip_prefix(&prefix), member.strip_prefix(&prefix))
-    else {
+    let Ok(pattern) = target.strip_prefix(&prefix) else {
         return false;
     };
-    let pattern: Vec<String> = pattern.iter().map(|c| c.to_string_lossy().into()).collect();
-    let relative: Vec<String> = relative
-        .iter()
-        .map(|c| c.to_string_lossy().into())
-        .collect();
-    if pattern.len() != relative.len()
-        || !pattern.iter().zip(&relative).all(|(pattern, name)| {
-            if pattern.contains(['*', '?', '[']) {
-                fnmatch(&format!("*{pattern}"), name)
-            } else {
-                pattern == name
+    let mut found = vec![prefix.clone()];
+    for component in pattern.iter().map(|c| c.to_string_lossy().into_owned()) {
+        let globbed = component.contains(['*', '?', '[']);
+        let search = format!("*{component}");
+        let mut next = Vec::new();
+        for dir in &found {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let matched = if globbed {
+                    fnmatch(&search, &name)
+                } else {
+                    name == component
+                };
+                if matched && entry.path().is_dir() {
+                    next.push(entry.path());
+                }
             }
-        })
-    {
-        return false;
+        }
+        found = next;
     }
-    let relative = relative.join(std::path::MAIN_SEPARATOR_STR);
-    let absolute = member.to_string_lossy();
     // `fnmatch.fnmatch` applies `os.path.normcase` to both sides.
     let normcase = |text: &str| {
         if cfg!(windows) {
@@ -233,11 +254,21 @@ fn lists(root: &Path, spec: &str, exclude: &[&str], member: &Path) -> bool {
             text.to_owned()
         }
     };
-    !exclude.iter().any(|pattern| {
-        let pattern = normcase(pattern);
-        [relative.as_str(), &absolute]
-            .iter()
-            .any(|text| fnmatch(&pattern, &normcase(text)))
+    found.iter().any(|path| {
+        if std::fs::canonicalize(path).ok().as_deref() != Some(member) {
+            return false;
+        }
+        let relative = path
+            .strip_prefix(&prefix)
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let absolute = path.to_string_lossy();
+        !exclude.iter().any(|pattern| {
+            let pattern = normcase(pattern);
+            [relative.as_str(), &absolute]
+                .iter()
+                .any(|text| fnmatch(&pattern, &normcase(text)))
+        })
     })
 }
 
@@ -571,6 +602,24 @@ mod tests {
         assert_eq!(consumer(&top, MEMBER, "six").as_deref(), Some("default"));
         std::fs::create_dir_all(top.join(".git")).unwrap();
         assert_eq!(consumer(&top, MEMBER, "six"), None);
+    }
+
+    /// Bugbot: a member Hatch reaches through a symlinked directory is
+    /// still listed, whichever spelling the scan was given.
+    #[cfg(unix)]
+    #[test]
+    fn members_reached_through_symlinks_are_listed() {
+        let (temp, real) = layout(&workspace("[\"libs/*\"]"), None, "vendor/lib1");
+        let ws = temp.path().join("ws");
+        std::fs::create_dir_all(ws.join("libs")).unwrap();
+        std::os::unix::fs::symlink(&real, ws.join("libs/lib1")).unwrap();
+        assert_eq!(consumer(&real, MEMBER, "six").as_deref(), Some("default"));
+        assert_eq!(
+            consumer(&ws.join("libs/lib1"), MEMBER, "six").as_deref(),
+            Some("default")
+        );
+        let (_temp, real) = layout(&workspace("[\"other/*\"]"), None, "vendor/lib1");
+        assert_eq!(consumer(&real, MEMBER, "six"), None);
     }
 
     /// A FIFO squatting an ancestor's or a checkout project's
