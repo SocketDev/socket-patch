@@ -1149,6 +1149,22 @@ fn yarn4_pnpm_linker_agent_apply_patches_relocated_store_copies() {
         return;
     }
 
+    // `pnpmStoreFolder` arrived in yarn 4.8.0; older releases refuse it as
+    // an unrecognized setting, so there is nothing to relocate.
+    let minor = yarn_berry()
+        .trim_start_matches("yarn@")
+        .split('.')
+        .nth(1)
+        .and_then(|m| m.parse::<u32>().ok());
+    if minor.is_some_and(|m| m < 8) {
+        println!(
+            "SKIP e2e_yarn4_pnpm_linker_build (agent relocated store): {} predates \
+             pnpmStoreFolder (4.8.0)",
+            yarn_berry()
+        );
+        return;
+    }
+
     let env_store: &[(&str, &str)] = &[
         ("YARN_NODE_LINKER", "pnpm"),
         ("YARN_PNPM_STORE_FOLDER", ".cache/.store"),
