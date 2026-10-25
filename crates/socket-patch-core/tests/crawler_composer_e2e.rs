@@ -1931,3 +1931,105 @@ async fn composer1_installer_path_escaping_project_is_rejected() {
         assert_eq!(tool_paths(&root).await, (vec![], None), "{extra} {entry}");
     }
 }
+
+/// composer/installers leaves a package in `vendor/` when it does not
+/// handle the type (`wordpress-core`, a `drupal-multisite` that is not
+/// DrupalInstaller's `drupal-drupal-multisite`), when the framework
+/// rewrites `{$name}` (`cakephp-plugin` is installed camel-cased, so the
+/// raw name would point at the wrong directory), and when the root
+/// `extra.installer-disable` switches the framework off. A directory where
+/// a rule would otherwise point must not be taken for the package.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_unrelocated_types_and_disabled_installers_stay_in_vendor() {
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-core",
+        ),
+        (
+            r#"{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "cakephp-plugin",
+        ),
+        (
+            r#"{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "drupal-multisite",
+        ),
+        (
+            r#"{"installer-disable":true,
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":["cakephp","wordpress"],
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":"all",
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+    ];
+    for (extra, package_type) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        composer1_project(
+            root,
+            extra,
+            &format!(r#"{{"name":"acme/tool","version":"1.0.0","type":"{package_type}"}}"#),
+        )
+        .await;
+        tokio::fs::create_dir_all(root.join("wp-content").join("plugins").join("tool"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("sites").join("tool"))
+            .await
+            .unwrap();
+        let vendored = root.join("vendor").join("acme").join("tool");
+        tokio::fs::create_dir_all(&vendored).await.unwrap();
+        assert_eq!(
+            tool_paths(root).await,
+            (vec![vendored.clone()], Some(vendored)),
+            "{package_type} {extra}"
+        );
+    }
+
+    // DrupalInstaller's real multisite type is relocated to sites/{$name}.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    composer1_project(
+        root,
+        "{}",
+        r#"{"name":"acme/tool","version":"1.0.0","type":"drupal-drupal-multisite"}"#,
+    )
+    .await;
+    let site = root.join("sites").join("tool");
+    tokio::fs::create_dir_all(&site).await.unwrap();
+    assert_eq!(tool_paths(root).await, (vec![site.clone()], Some(site)));
+}
+
+/// An installer-name is a directory name. One that is a path (`..`,
+/// `a/b`) could aim the patch at another directory inside the project,
+/// such as the project root itself, so it is refused.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_installer_name_must_be_one_segment() {
+    for installer_name in ["..", ".", "../../vendor/acme", "a/b"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        composer1_project(
+            &root,
+            "{}",
+            &format!(
+                r#"{{"name":"acme/tool","version":"1.0.0","type":"wordpress-plugin",
+                    "extra":{{"installer-name":"{installer_name}"}}}}"#
+            ),
+        )
+        .await;
+        tokio::fs::create_dir_all(root.join("wp-content").join("plugins").join("a").join("b"))
+            .await
+            .unwrap();
+        assert_eq!(tool_paths(&root).await, (vec![], None), "{installer_name}");
+    }
+}

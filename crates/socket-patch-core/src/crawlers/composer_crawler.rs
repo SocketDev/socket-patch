@@ -46,117 +46,21 @@ struct InstallerLayout {
     /// composer/installers is installed. Without it Composer puts every
     /// package under `vendor/`, whatever its type or `installer-paths`.
     active: bool,
+    /// Frameworks the root `extra.installer-disable` switches off (`all`
+    /// for every one); their packages stay in `vendor/`.
+    disabled: Vec<String>,
     /// The root composer.json `extra.installer-paths`, in file order:
     /// (path template, rules such as `acme/tool`, `type:x`, `vendor:y`).
     paths: Vec<(String, Vec<String>)>,
 }
 
-/// Framework prefixes of the package types composer/installers handles
-/// (`<framework>-<kind>`, e.g. `wordpress-plugin`). Any other type
-/// (`library`, `composer-plugin`, `symfony-bundle`, ...) stays in
-/// `vendor/` even when an `installer-paths` rule names it.
-const INSTALLER_FRAMEWORKS: &[&str] = &[
-    "agl",
-    "akaunting",
-    "annotatecms",
-    "asgard",
-    "attogram",
-    "bitrix",
-    "bonefish",
-    "cakephp",
-    "chef",
-    "civicrm",
-    "ccframework",
-    "cockpit",
-    "codeigniter",
-    "concrete5",
-    "craft",
-    "croogo",
-    "dframe",
-    "decibel",
-    "dokuwiki",
-    "dolibarr",
-    "drupal",
-    "ee2",
-    "ee3",
-    "elgg",
-    "eliasis",
-    "ezplatform",
-    "fuel",
-    "fuelphp",
-    "grav",
-    "hurad",
-    "imagecms",
-    "itop",
-    "joomla",
-    "kanboard",
-    "known",
-    "kodicms",
-    "kohana",
-    "lms",
-    "laravel",
-    "lavalite",
-    "lithium",
-    "magento",
-    "majima",
-    "mako",
-    "mantisbt",
-    "matomo",
-    "mautic",
-    "maya",
-    "mediawiki",
-    "miaoxing",
-    "microweber",
-    "modulework",
-    "modx",
-    "modxevo",
-    "moodle",
-    "october",
-    "ontowiki",
-    "osclass",
-    "oxid",
-    "phpbb",
-    "piwik",
-    "pimcore",
-    "plentymarkets",
-    "porto",
-    "ppi",
-    "processwire",
-    "puppet",
-    "pxcms",
-    "radphp",
-    "redaxo",
-    "redaxo5",
-    "reindex",
-    "roundcube",
-    "shopware",
-    "silverstripe",
-    "smf",
-    "starbug",
-    "sydes",
-    "sylius",
-    "symfony1",
-    "tao",
-    "tastyigniter",
-    "thelia",
-    "tusk",
-    "typo3",
-    "userfrosting",
-    "vanilla",
-    "whmcs",
-    "winter",
-    "wolfcms",
-    "wordpress",
-    "yawik",
-    "zend",
-    "zikula",
-];
-
-/// composer/installers' built-in locations for the frameworks whose
-/// installers leave `{$name}` as is (WordPress, Drupal), used when no
-/// `installer-paths` rule matches. Other frameworks transform the name
-/// (CakePHP camel-cases it, ...), so they are found only through an
-/// explicit `installer-paths` rule.
+/// composer/installers' built-in locations, keyed by the package type
+/// they apply to (`<framework>-<location key>`), for the frameworks whose
+/// installers leave `{$name}` as is. A type missing here stays in
+/// `vendor/`: the plugin does not handle it (`library`, `wordpress-core`,
+/// ...), or handles it under a framework that rewrites `{$name}`
+/// (CakePHP camel-cases it, MediaWiki, October, ...), whose directory
+/// cannot be worked out from the name alone.
 const INSTALLER_DEFAULT_LOCATIONS: &[(&str, &str)] = &[
     ("wordpress-plugin", "wp-content/plugins/{$name}/"),
     ("wordpress-theme", "wp-content/themes/{$name}/"),
@@ -175,7 +79,8 @@ const INSTALLER_DEFAULT_LOCATIONS: &[(&str, &str)] = &[
     ("drupal-custom-theme", "themes/custom/{$name}/"),
     ("drupal-custom-module", "modules/custom/{$name}/"),
     ("drupal-custom-profile", "profiles/custom/{$name}/"),
-    ("drupal-multisite", "sites/{$name}/"),
+    // DrupalInstaller's location key is `drupal-multisite`.
+    ("drupal-drupal-multisite", "sites/{$name}/"),
     ("drupal-console", "console/{$name}/"),
     ("drupal-console-language", "console/language/{$name}/"),
     ("drupal-config", "config/sync/"),
@@ -183,20 +88,33 @@ const INSTALLER_DEFAULT_LOCATIONS: &[(&str, &str)] = &[
 
 impl InstallerLayout {
     /// Read the layout for one vendor tree: whether composer/installers is
-    /// among its installed packages, and the project's `installer-paths`.
+    /// among its installed packages and not switched off by the root
+    /// `extra.installer-disable`, and the project's `installer-paths`.
+    /// composer.json is read only when some entry lacks an `install-path`;
+    /// a Composer 2 tree never needs the layout.
     async fn load(project_root: &Path, entries: &[ComposerPackageEntry]) -> Self {
-        let active = entries
+        let installed = entries
             .iter()
             .any(|e| e.name.eq_ignore_ascii_case("composer/installers"));
-        if !active {
+        if !installed || entries.iter().all(|e| e.install_path.is_some()) {
             return Self::default();
         }
-        let paths = crate::utils::fs::read_regular_to_string(&project_root.join("composer.json"))
+        let root = crate::utils::fs::read_regular_to_string(&project_root.join("composer.json"))
             .await
             .ok()
-            .map(|content| parse_installer_paths(&content))
-            .unwrap_or_default();
-        Self { active, paths }
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+        let extra = root.as_ref().and_then(|r| r.get("extra"));
+        Self {
+            active: true,
+            disabled: extra
+                .and_then(|e| e.get("installer-disable"))
+                .map(parse_installer_disable)
+                .unwrap_or_default(),
+            paths: extra
+                .and_then(|e| e.get("installer-paths"))
+                .map(parse_installer_paths)
+                .unwrap_or_default(),
+        }
     }
 
     /// Where composer/installers put `entry`, mirroring its
@@ -209,8 +127,11 @@ impl InstallerLayout {
             return None;
         }
         let package_type = entry.package_type.as_deref()?;
+        let (_, default) = INSTALLER_DEFAULT_LOCATIONS
+            .iter()
+            .find(|(t, _)| *t == package_type)?;
         let (framework, _) = package_type.split_once('-')?;
-        if !INSTALLER_FRAMEWORKS.contains(&framework) {
+        if self.disabled.iter().any(|d| d == "all" || d == framework) {
             return None;
         }
         let (vendor, name) = entry.name.split_once('/')?;
@@ -224,30 +145,38 @@ impl InstallerLayout {
                         || rule.strip_prefix("vendor:") == Some(vendor)
                 })
             })
-            .map(|(path, _)| path.as_str())
-            .or_else(|| {
-                INSTALLER_DEFAULT_LOCATIONS
-                    .iter()
-                    .find(|(t, _)| *t == package_type)
-                    .map(|(_, path)| *path)
-            })?;
-        let name = entry.installer_name.as_deref().unwrap_or(name);
+            .map_or(*default, |(path, _)| path.as_str());
+        // installed.json is untrusted: an installer-name is a directory
+        // name, never a path that could aim the patch at another directory.
+        let name = match entry.installer_name.as_deref() {
+            Some(n) if path_safety::is_safe_single_segment(n) => n,
+            Some(_) => return None,
+            None => name,
+        };
         let rendered = render_installer_path(template, name, vendor, package_type)?;
         contain_in_project(project_root, &project_root.join(rendered))
+            .filter(|dir| dir.as_path() != project_root)
+    }
+}
+
+/// The root `extra.installer-disable`: `true` (every framework), one
+/// framework name, or a list of them (`all` meaning every framework).
+fn parse_installer_disable(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Bool(true) => vec!["all".to_string()],
+        serde_json::Value::String(name) => vec![name.to_ascii_lowercase()],
+        serde_json::Value::Array(list) => list
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_ascii_lowercase))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
 /// The root composer.json `extra.installer-paths` map, in file order. A
 /// path's value is a list of rules or a single rule string.
-fn parse_installer_paths(composer_json: &str) -> Vec<(String, Vec<String>)> {
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(composer_json) else {
-        return Vec::new();
-    };
-    let Some(map) = root
-        .get("extra")
-        .and_then(|e| e.get("installer-paths"))
-        .and_then(|p| p.as_object())
-    else {
+fn parse_installer_paths(value: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    let Some(map) = value.as_object() else {
         return Vec::new();
     };
     map.iter()
