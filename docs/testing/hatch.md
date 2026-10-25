@@ -37,7 +37,13 @@ A range, transitive-only declaration, dynamic dependency metadata, custom
 environment plugin, source table or conditional override is refused before
 writing. Use agent mode (`scan --mode agent` + `socket-patch apply` in CI) for these shapes. Hosted PEP 735 groups are
 supported; vendored groups are refused because Hatch does not expand
-`{root:uri}` within dependency groups. Unknown direct sources require an
+`{root:uri}` within dependency groups. Vendoring a member of a Hatch 1.16+
+workspace is refused the same way when a workspace environment declared in
+an ancestor `pyproject.toml` or `hatch.toml` (up to the checkout root)
+installs the package from the member's static `[project]` dependencies or
+the optional dependencies of the member's `features`: Hatch reads those
+strings raw, so the workspace environments would get an unexpanded
+`{root:uri}` (#505). Unknown direct sources require an
 explicit revert before patching. A hosted scan re-pins socket-patch's own
 earlier hosted reference (same package and version on the patch server)
 when the grant rotates or a newer patch supersedes it. A vendored scan
