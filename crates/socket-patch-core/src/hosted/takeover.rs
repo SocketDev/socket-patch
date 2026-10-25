@@ -17,6 +17,9 @@ use crate::vendor::VendorEntry;
 /// * golang: the vendor-owned go.mod `replace` shadows the hosted one;
 /// * pypi: every Python rewriter refuses a non-registry source, including
 ///   the vendored one socket-patch wrote itself (#328);
+/// * composer: the composer.lock rewriter would repoint the vendored entry
+///   in place, keeping its patch-uuid `dist.reference`, which no upstream
+///   restore can match (#536);
 /// * maven: only a Gradle build's vendored JVM entry (see
 ///   [`is_gradle_jvm_entry`]); a pom-only vendored entry stays.
 fn takeover_ecosystem(purl: &str) -> bool {
@@ -25,6 +28,7 @@ fn takeover_ecosystem(purl: &str) -> bool {
         "pkg:npm/",
         "pkg:golang/",
         "pkg:pypi/",
+        "pkg:composer/",
         "pkg:maven/",
     ]
     .iter()

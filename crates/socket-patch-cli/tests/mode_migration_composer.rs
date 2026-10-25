@@ -163,7 +163,6 @@ async fn mount_api(server: &MockServer) {
         "vulnerabilities": {},
         "description": "x", "license": "MIT", "tier": "free"
     });
-    prebuilt_common::mount_view(server, &view, None).await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(view))
@@ -297,7 +296,9 @@ async fn assert_vendored_to_hosted(hosted: fn(&str) -> Vec<&str>) {
          (upstream dist.reference, no vendored transport-options)"
     );
     assert!(
-        !root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+        !root
+            .join(format!(".socket/vendor/composer/{UUID}"))
+            .exists(),
         "the vendored copy is reclaimed"
     );
     let state = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap_or_default();
@@ -306,7 +307,11 @@ async fn assert_vendored_to_hosted(hosted: fn(&str) -> Vec<&str>) {
         "the vendored ledger entry is removed: {state}"
     );
 
-    let (code, env) = run_json(&root, &["rollback", "--yes"], &server);
+    let (code, env) = run_json(
+        &root,
+        &["rollback", "--yes", "--patch-server-url", &uri],
+        &server,
+    );
     assert_eq!(code, 0, "rollback of the hosted pin: {env:#}");
     assert_eq!(
         std::fs::read_to_string(root.join("composer.lock")).unwrap(),

@@ -645,7 +645,9 @@ async fn vendored_composer_takeover_is_refused_like_the_disk_flow() {
     const COMPOSER_FIXTURE: &str = "redirect/composer/composer-lock/basic";
     let server = MockServer::start().await;
     let patches = patches_from_overrides(
-        &fixtures_root().join(COMPOSER_FIXTURE).join("overrides.json"),
+        &fixtures_root()
+            .join(COMPOSER_FIXTURE)
+            .join("overrides.json"),
         None,
     );
     mount_api(&server, &patches).await;

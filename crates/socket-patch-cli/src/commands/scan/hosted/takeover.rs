@@ -5,7 +5,8 @@
 //! a committed copy; for the npm family a `file:./.socket/vendor/…` lock
 //! resolution (plus a berry `resolutions` pin) and its committed tarball;
 //! for golang the vendor-owned go.mod `replace` and its module copy; for
-//! pypi the vendored lock / requirements source; for a Gradle build the
+//! pypi the vendored lock / requirements source; for composer the
+//! vendored `composer.lock` path entry and its copy; for a Gradle build the
 //! vendored JVM wiring — each with its vendored ledger entry. The hosted
 //! rewriters cannot pin over that wiring, so the takeover reverts it first
 //! (the per-purl machinery `vendor --revert` runs), which also hands the
