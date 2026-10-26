@@ -527,6 +527,14 @@ async fn requirements_read_as_constraints_warn_in_both_modes() {
             want,
             "{env:#}"
         );
+        // A re-run rewrites nothing; the URL pin still breaks the readers.
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            reported(&env, "redirect_requirements_constraints_link"),
+            want,
+            "re-run: {env:#}"
+        );
 
         let (_tmp, root) = project();
         stage(&root, readers);
@@ -555,6 +563,13 @@ async fn requirements_read_as_constraints_warn_in_both_modes() {
         assert!(
             !readers || env.to_string().contains("now pins six==1.16.0"),
             "{env:#}"
+        );
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            reported(&env, "vendor_requirements_constraints_link"),
+            want,
+            "in-sync re-run: {env:#}"
         );
     }
 }
