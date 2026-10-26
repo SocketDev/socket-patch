@@ -1385,6 +1385,14 @@ async fn pypi_prelude<'p>(
             .await);
         }
         if artifact_present || dry_run {
+            // The wiring stays a link in place: keep naming its `-c`
+            // readers on every run (#740).
+            if let Ok(prior) = reuse::prior_entry(project_root, "pypi", record, None).await {
+                warnings.extend(
+                    constraint_link_warnings(project_root, &prior.wiring, &canon_name, version)
+                        .await,
+                );
+            }
             return Err(done(
                 already_patched_result(base, Path::new(""), &record.files),
                 None,
@@ -1908,16 +1916,12 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                 return done(result, None, warnings);
             }
         }
-        if matches!(
-            plan,
-            WiringPlan::Requirements | WiringPlan::RequirementsRewire(_)
-        ) {
-            let targets = super::pypi_requirements::files_naming(project_root, &canon_name).await;
-            warnings.extend(
-                constraint_reader_warnings(project_root, &targets, &canon_name, version, true)
-                    .await,
-            );
-        }
+        let targets =
+            planned_requirements_targets(project_root, &plan, &canon_name, version, &rel_wheel)
+                .await;
+        warnings.extend(
+            constraint_reader_warnings(project_root, &targets, &canon_name, version, true).await,
+        );
         return done(result, None, warnings);
     }
     let Some(artifact) = artifact else {
@@ -2325,14 +2329,52 @@ async fn constraint_link_warnings(
     canon_name: &str,
     version: &str,
 ) -> Vec<VendorWarning> {
-    let mut targets: Vec<String> = wiring
+    let targets = requirements_record_files(wiring);
+    constraint_reader_warnings(project_root, &targets, canon_name, version, false).await
+}
+
+/// The requirements files `wiring` holds vendor lines in.
+fn requirements_record_files(wiring: &[super::state::WiringRecord]) -> Vec<String> {
+    let mut files: Vec<String> = wiring
         .iter()
         .filter(|r| r.kind == super::pypi_requirements::RECORD_KIND)
         .map(|r| r.file.clone())
         .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The requirements files the wet run of `plan` writes vendor lines into,
+/// for the dry run's [`constraint_reader_warnings`]: a fresh requirements
+/// wiring's (directly, or as the exported sibling of a uv / Pipenv lock)
+/// as the planner would write it, and a re-wire's as the superseded entry
+/// recorded them.
+async fn planned_requirements_targets(
+    project_root: &Path,
+    plan: &WiringPlan,
+    canon_name: &str,
+    version: &str,
+    rel_wheel: &str,
+) -> Vec<String> {
+    let fresh =
+        || super::pypi_requirements::planned_files(project_root, canon_name, version, rel_wheel);
+    let mut targets = match plan {
+        WiringPlan::Requirements | WiringPlan::Uv(_, true) => fresh().await,
+        WiringPlan::Pipenv(_, superseded, true, _) => {
+            let mut files = fresh().await;
+            if let Some(prev) = superseded {
+                files.extend(requirements_record_files(&prev.wiring));
+            }
+            files
+        }
+        WiringPlan::RequirementsRewire(prev) => requirements_record_files(&prev.wiring),
+        WiringPlan::Supersede(superseded) => requirements_record_files(&superseded.prev.wiring),
+        _ => Vec::new(),
+    };
     targets.sort();
     targets.dedup();
-    constraint_reader_warnings(project_root, &targets, canon_name, version, false).await
+    targets
 }
 
 /// [`constraint_link_warnings`] for the requirements files `targets`;

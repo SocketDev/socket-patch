@@ -1766,6 +1766,8 @@ pub async fn rewrite(
         )
         .await;
         if vetoed.is_empty() {
+            let constraints = constraints_link_warnings(view, &done, &kept).await;
+            done.rewrite.warnings.extend(constraints);
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
             done.rewrite.warnings.extend(copy_left);
@@ -1776,6 +1778,48 @@ pub async fn rewrite(
         kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
         unattributed.extend(vetoed);
     }
+}
+
+/// A `redirect_requirements_constraints_link` warning for each sibling
+/// requirements file that reads the root requirements.txt as `-c`
+/// constraints while a hosted pin there is a URL (#740), which pip 20.3
+/// and 21.0 refuse in a constraints file. Said on every run that confirms
+/// such a pin, not only the one that writes it: the hazard lasts as long
+/// as the pin does.
+async fn constraints_link_warnings(
+    view: &ProjectView<'_>,
+    done: &Rewritten,
+    kept: &[Candidate],
+) -> Vec<RewriteWarning> {
+    let confirmed = &done.rewrite.confirmed_requirements_uuids;
+    let mut pinned: Vec<&str> = kept
+        .iter()
+        .filter(|c| confirmed.contains(&c.dep.patch_uuid))
+        .map(|c| c.dep.name.as_str())
+        .collect();
+    pinned.sort_unstable();
+    pinned.dedup();
+    if pinned.is_empty() {
+        return Vec::new();
+    }
+    crate::vendor::pypi_requirements::constraint_readers_in(*view, &[PYPI_REQUIREMENTS.to_string()])
+        .await
+        .into_iter()
+        .map(|found| {
+            warning(
+                "redirect_requirements_constraints_link",
+                format!(
+                "{} reads {} as a constraints file (`-c`), and the hosted pin of {} in {} is a \
+                 URL; {}",
+                found.reader,
+                found.target,
+                pinned.join(", "),
+                found.target,
+                crate::vendor::pypi_requirements::CONSTRAINT_LINK_REMEDY
+            ),
+            )
+        })
+        .collect()
 }
 
 /// Lockfile discovery over the project as `done` would leave it, read as
@@ -2219,34 +2263,6 @@ async fn rewrite_once(
             w.code != "redirect_pnpm_no_lockfile" && w.code != "redirect_npm_no_lockfile"
         });
         rewrite.warnings.push(warning);
-    }
-    // A rewritten root requirements.txt pins by link, which pip 20.3 and
-    // 21.0 refuse in a constraints file: name each file reading it as one.
-    if rewrite.files.contains_key(PYPI_REQUIREMENTS) {
-        let pinned: Vec<&str> = rewrite
-            .edits
-            .iter()
-            .filter(|e| e.path == PYPI_REQUIREMENTS)
-            .filter_map(|e| e.key.as_deref())
-            .collect();
-        let readers = crate::vendor::pypi_requirements::constraint_readers_in(
-            *view,
-            &[PYPI_REQUIREMENTS.to_string()],
-        )
-        .await;
-        for found in readers {
-            rewrite.warnings.push(warning(
-                "redirect_requirements_constraints_link",
-                format!(
-                    "{} reads {} as a constraints file (`-c`), and {} now pins {} by URL; {}",
-                    found.reader,
-                    found.target,
-                    found.target,
-                    pinned.join(", "),
-                    crate::vendor::pypi_requirements::CONSTRAINT_LINK_REMEDY
-                ),
-            ));
-        }
     }
     if let Some(content) = binary_content {
         rewrite

@@ -1118,24 +1118,20 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
     Ok(out)
 }
 
-/// The editable requirements files (the root and its in-root `-r`
-/// includes) that name `canon_name`: the files a requirements wiring of it
-/// rewrites. The root alone when none does, where the wiring appends its
-/// `(transitive)` line. Empty when the tree cannot be read.
-pub(super) async fn files_naming(root: &Path, canon_name: &str) -> Vec<String> {
-    let Ok(files) = collect_requirements_files(root).await else {
-        return Vec::new();
-    };
-    let naming: Vec<String> = files
-        .iter()
-        .filter(|f| f.editable && names_package(&f.content, canon_name))
-        .map(|f| f.rel.clone())
-        .collect();
-    if naming.is_empty() {
-        vec![crate::formats::governing_locks::PYPI_REQUIREMENTS.to_string()]
-    } else {
-        naming
-    }
+/// The requirements files a fresh wiring of `canon_name==version` would
+/// write (the dry run's view of [`wire_requirements`]). Empty when the
+/// planner refuses: the wet run reports that refusal instead.
+pub(super) async fn planned_files(
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+    rel_wheel: &str,
+) -> Vec<String> {
+    let placeholder = "0".repeat(64);
+    plan_requirements(root, canon_name, version, rel_wheel, &placeholder)
+        .await
+        .map(|plan| plan.into_iter().map(|file| file.rel).collect())
+        .unwrap_or_default()
 }
 
 /// Every requirements file the vendor planner may have written a pin into:
@@ -1236,20 +1232,48 @@ async fn walk_requirements_tree<E>(
 /// (`requirements/../x.txt` → `x.txt`; an escape keeps its `../`). The one
 /// include grammar behind the planner's walk and the lock inventory's.
 pub(crate) fn requirements_includes(rel: &str, content: &str) -> Vec<String> {
-    let include_dir = match rel.rfind('/') {
+    nested_files(rel, content)
+        .into_iter()
+        .filter_map(|nested| match nested {
+            NestedFile::Requirements(target) => Some(target),
+            NestedFile::Constraints(_) => None,
+        })
+        .collect()
+}
+
+/// The `-c`/`--constraint` targets of the requirements file `rel`,
+/// resolved as [`requirements_includes`] resolves `-r`.
+fn requirements_constraints(rel: &str, content: &str) -> Vec<String> {
+    nested_files(rel, content)
+        .into_iter()
+        .filter_map(|nested| match nested {
+            NestedFile::Constraints(target) => Some(target),
+            NestedFile::Requirements(_) => None,
+        })
+        .collect()
+}
+
+/// The nested files of the requirements file `rel` with `content`, in file
+/// order, each resolved against `rel`'s directory and lexically normalized.
+fn nested_files(rel: &str, content: &str) -> Vec<NestedFile> {
+    let dir = match rel.rfind('/') {
         Some(i) => &rel[..i],
         None => "",
     };
+    let resolve = |target: String| {
+        let joined = if dir.is_empty() {
+            target
+        } else {
+            format!("{dir}/{target}")
+        };
+        crate::utils::relpath::normalize_rel_keeping_escapes(&joined)
+    };
     logical_lines(content)
         .iter()
-        .filter_map(|ll| include_target(&ll.text))
-        .map(|target| {
-            let joined = if include_dir.is_empty() {
-                target
-            } else {
-                format!("{include_dir}/{target}")
-            };
-            crate::utils::relpath::normalize_rel_keeping_escapes(&joined)
+        .filter_map(|ll| nested_file(&ll.text))
+        .map(|nested| match nested {
+            NestedFile::Requirements(target) => NestedFile::Requirements(resolve(target)),
+            NestedFile::Constraints(target) => NestedFile::Constraints(resolve(target)),
         })
         .collect()
 }
@@ -1264,31 +1288,6 @@ pub(crate) struct ConstraintReader {
     pub target: String,
 }
 
-/// The `-c`/`--constraint` targets of the requirements file `rel`
-/// (root-relative) with `content`, in file order, resolved against the
-/// file's directory and lexically normalized as [`requirements_includes`]
-/// resolves `-r`.
-fn requirements_constraints(rel: &str, content: &str) -> Vec<String> {
-    let dir = rel.rfind('/').map_or("", |i| &rel[..i]);
-    logical_lines(content)
-        .iter()
-        .filter_map(
-            |ll| match nested_file_with(&ll.text, |name| std::env::var(name).ok()) {
-                Some(NestedFile::Constraints(target)) => Some(target),
-                _ => None,
-            },
-        )
-        .map(|target| {
-            let joined = if dir.is_empty() || Path::new(&target).is_absolute() {
-                target
-            } else {
-                format!("{dir}/{target}")
-            };
-            crate::utils::relpath::normalize_rel_keeping_escapes(&joined)
-        })
-        .collect()
-}
-
 /// Whether `name` looks like a pip requirements file: `*.txt`, or a
 /// pip-tools `*.in` input.
 fn requirements_file_name(name: &str) -> bool {
@@ -1296,18 +1295,33 @@ fn requirements_file_name(name: &str) -> bool {
     lower.ends_with(".txt") || lower.ends_with(".in")
 }
 
+/// Top-level directories never searched for constraint readers: installed
+/// packages and build output, not the project's own requirements.
+const NOT_READER_DIRS: &[&str] = &[
+    "node_modules",
+    "site-packages",
+    "venv",
+    "env",
+    "target",
+    "build",
+    "dist",
+    "__pycache__",
+];
+
 /// Every requirements file beside `targets` that names one of them as a
 /// `-c` / `--constraint` file (#740). The writers turn a pin in a target
 /// into a link (a hosted `@ <url>` or a vendored wheel path), which pip
 /// 20.3.x and 21.0.x refuse in a constraints file ("Links are not allowed
 /// as constraints"), so each reader found is an install that breaks there.
 ///
-/// The files read are the `*.txt` / `*.in` files in the project root and in
-/// each root directory whose name mentions `requirement` (`requirements/`,
-/// `requirements-dev/`), the usual homes of a `requirements-dev.txt` that
-/// reuses the root pins as constraints. A file that cannot be read or
-/// decoded is skipped (this only warns). A constraints file named only on
-/// the pip command line (`pip install -c requirements.txt`) is not
+/// Read: each `*.txt` / `*.in` file in the project root and in a root
+/// directory whose name mentions `requirement` (`requirements/`), and each
+/// one named like requirements (`requirements.txt`, `dev.in`) in the other
+/// top-level directories (`docs/requirements.txt`, the Read the Docs
+/// layout). Hidden directories and [`NOT_READER_DIRS`] are skipped, and a
+/// file whose bytes never hold `-c` is not parsed. A file that cannot be
+/// read or decoded is skipped (this only warns). A constraints file named
+/// only on the pip command line (`pip install -c requirements.txt`) is not
 /// visible here.
 pub(crate) async fn constraint_readers_in(
     view: crate::vendor::lock_inventory::ProjectView<'_>,
@@ -1316,31 +1330,42 @@ pub(crate) async fn constraint_readers_in(
     if targets.is_empty() {
         return Vec::new();
     }
-    let mut dirs = vec![String::new()];
     let mut candidates: Vec<String> = Vec::new();
-    while let Some(dir) = dirs.pop() {
-        let Ok(entries) = view.list_dir(&dir).await else {
-            continue;
-        };
-        for entry in entries {
-            let rel = if dir.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{dir}/{}", entry.name)
-            };
-            if entry.is_dir {
-                if dir.is_empty() && entry.name.to_ascii_lowercase().contains("requirement") {
-                    dirs.push(rel);
-                }
-            } else if requirements_file_name(&entry.name) {
-                candidates.push(rel);
+    let mut dirs: Vec<(String, bool)> = Vec::new();
+    for entry in view.list_dir("").await.unwrap_or_default() {
+        let lower = entry.name.to_ascii_lowercase();
+        if !entry.is_dir {
+            if requirements_file_name(&entry.name) {
+                candidates.push(entry.name);
+            }
+        } else if !entry.name.starts_with('.') && !NOT_READER_DIRS.contains(&lower.as_str()) {
+            dirs.push((entry.name, lower.contains("requirement")));
+        }
+    }
+    for (dir, every_file) in dirs {
+        for entry in view.list_dir(&dir).await.unwrap_or_default() {
+            let lower = entry.name.to_ascii_lowercase();
+            if !entry.is_dir
+                && requirements_file_name(&entry.name)
+                && (every_file || lower.contains("requirement") || lower.ends_with(".in"))
+            {
+                candidates.push(format!("{dir}/{}", entry.name));
             }
         }
     }
     candidates.sort();
     let mut readers = Vec::new();
     for rel in candidates {
-        let Ok(content) = view.read_bytes(&rel).await.and_then(decode_requirements) else {
+        let Ok(bytes) = view.read_bytes(&rel).await else {
+            continue;
+        };
+        // Every `-c` / `--constraint` spelling holds the bytes `-c`; a
+        // file without them (UTF-16 aside) is never parsed.
+        let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+        if !utf16 && !bytes.windows(2).any(|w| w == b"-c") {
+            continue;
+        }
+        let Ok(content) = decode_requirements(bytes) else {
             continue;
         };
         for target in requirements_constraints(&rel, &content) {
@@ -1369,8 +1394,14 @@ pub(crate) const CONSTRAINT_LINK_REMEDY: &str =
 /// expanded from the environment, then the options `shlex`-split, so
 /// `-r "dev reqs.txt"`, `-r dev\\ reqs.txt`, `--requirement="dev.txt"` and
 /// `-r ${REQDIR}/dev.txt` name the file pip opens (#994).
+#[cfg(test)]
 fn include_target(text: &str) -> Option<String> {
     include_target_with(text, |name| std::env::var(name).ok())
+}
+
+/// [`nested_file_with`] over the process environment.
+fn nested_file(text: &str) -> Option<NestedFile> {
+    nested_file_with(text, |name| std::env::var(name).ok())
 }
 
 /// The long options pip's requirements-file parser knows that take a
@@ -1423,6 +1454,7 @@ fn resolve_long_option(name: &str) -> Option<&'static str> {
 /// requirement, never an include; otherwise the first `-r` value is the
 /// file pip follows (`opts.requirements[0]`). An option's value is
 /// consumed even when it looks like `-r`, as optparse does.
+#[cfg(test)]
 fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
     match nested_file_with(text, env)? {
         NestedFile::Requirements(target) => Some(target),
@@ -1475,9 +1507,7 @@ fn nested_file_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Option<
             let value = match attached {
                 // `--requirement= dev.txt` (a space after the `=`) is
                 // read as the next word, as before the shlex split.
-                Some(v) if v.is_empty() && matches!(option, "--requirement" | "--constraint") => {
-                    words.next()
-                }
+                Some(v) if v.is_empty() && option == "--requirement" => words.next(),
                 Some(v) => Some(v),
                 None => words.next(),
             };
@@ -1546,9 +1576,10 @@ mod tests {
                 "--constraint=requirements.txt",
                 constraint("requirements.txt"),
             ),
+            // Only `--requirement=` reads past an empty attached value.
             (
-                "--constraint= requirements.txt",
-                constraint("requirements.txt"),
+                "--constraint= -r dev.txt",
+                Some(NestedFile::Requirements("dev.txt".into())),
             ),
             (
                 "--constr requirements.txt  # pins",
@@ -1570,9 +1601,10 @@ mod tests {
     }
 
     /// #740: the readers of a constraints file are the root and
-    /// `requirements*/` files whose `-c` resolves to it, against each
-    /// reader's own directory; `-r` lines, other targets, the file itself
-    /// and deeper directories are not.
+    /// `requirements*/` files, and the requirements-named files of other
+    /// top-level directories, whose `-c` resolves to it against the
+    /// reader's own directory. `-r` lines, other targets, the file itself,
+    /// deeper, hidden and dependency directories are not.
     #[tokio::test]
     async fn constraint_readers_resolve_against_the_reading_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1582,6 +1614,8 @@ mod tests {
             "Requirements-CI",
             "docs",
             "requirements/nested",
+            "node_modules/pkg",
+            ".tox",
         ] {
             tokio::fs::create_dir_all(root.join(dir)).await.unwrap();
         }
@@ -1602,6 +1636,9 @@ mod tests {
                 "-c ../../requirements.txt\n",
             ),
             ("docs/requirements.txt", "-c ../requirements.txt\n"),
+            ("docs/notes.txt", "-c ../requirements.txt\n"),
+            ("node_modules/requirements.txt", "-c ../requirements.txt\n"),
+            (".tox/requirements.txt", "-c ../requirements.txt\n"),
             ("setup.cfg", "-c requirements.txt\n"),
         ] {
             tokio::fs::write(root.join(rel), content).await.unwrap();
@@ -1617,6 +1654,7 @@ mod tests {
             readers(constraint_readers_in(view, &["requirements.txt".into()]).await),
             vec![
                 "dev.in -> requirements.txt",
+                "docs/requirements.txt -> requirements.txt",
                 "requirements-dev.txt -> requirements.txt",
                 "requirements/test.txt -> requirements.txt",
             ]
@@ -1632,6 +1670,7 @@ mod tests {
             vec![
                 "Requirements-CI/ci.txt -> requirements/base.txt",
                 "dev.in -> requirements.txt",
+                "docs/requirements.txt -> requirements.txt",
                 "requirements-dev.txt -> requirements.txt",
                 "requirements/test.txt -> requirements.txt",
             ]
