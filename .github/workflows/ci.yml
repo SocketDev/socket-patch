@@ -1511,9 +1511,10 @@ jobs:
           uv --version
 
       - name: Install uv (PDM / Hatch legs)
-        if: matrix.pdm != '' || matrix.hatch != ''
+        if: (matrix.pdm != '' || matrix.hatch != '') && matrix.poetry == ''
         # The suites bootstrap the pinned PDM / Hatch into their own venv
-        # with uv; this uv is tooling, not the release under test.
+        # with uv; this uv is tooling, not the release under test. A leg that
+        # also runs Poetry gets the same uv from 'Install pinned Poetry'.
         shell: bash
         run: scripts/pip-install-retry.sh uv==0.11.19
 
@@ -1859,6 +1860,14 @@ jobs:
               continue
             fi
             for filter in "${filters[@]}"; do
+              # A blank `;` segment would run the binary with no arguments
+              # (every non-ignored test), which the empty-run check below
+              # can't tell from a real selection.
+              if [ -z "${filter// /}" ]; then
+                echo "::error::$suite has an empty test_filter segment ($E2E_TEST_FILTER). Drop the stray ';'."
+                status=1
+                continue
+              fi
               n=$((n + 1))
               log="../../target/e2e-$suite-$n.log"
               echo "::group::$suite $filter"
