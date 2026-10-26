@@ -1873,8 +1873,8 @@ fn list_dir_sync(path: &Path) -> Listing {
 const DENO_NPM_REGISTRY_MAX_DEPTH: usize = 8;
 
 /// The registry dirs of Deno's npm cache (#444): every dir under
-/// `$DENO_DIR/npm` that holds Deno's packuments
-/// ([`holds_deno_packument`]), `<host>` for a registry at a host's root
+/// `$DENO_DIR/npm` that holds packages in Deno's layout
+/// ([`holds_deno_packages`]), `<host>` for a registry at a host's root
 /// (`registry.npmjs.org`) and `<host>/<path...>` for one served below a
 /// path (`https://host/api/npm/` → `<host>/api/npm`, as Artifactory,
 /// CodeArtifact and GitLab registries are). `deno install -g` tools load
@@ -1897,7 +1897,7 @@ fn deno_npm_cache_roots() -> Vec<PathBuf> {
     for _ in 0..DENO_NPM_REGISTRY_MAX_DEPTH {
         let mut next = Vec::new();
         for dir in level {
-            if holds_deno_packument(&dir) {
+            if holds_deno_packages(&dir) {
                 roots.push(dir);
             } else {
                 next.extend(sorted_subdirs_sync(&dir).into_iter().map(|n| dir.join(n)));
@@ -1916,10 +1916,10 @@ fn deno_npm_cache_roots() -> Vec<PathBuf> {
 /// (`$DENO_DIR/npm/registry.npmjs.org`, or a nested
 /// `$DENO_DIR/npm/<host>/<path...>` for a registry served below a path)
 /// rather than a `node_modules` tree: a dir below one named `npm`, other
-/// than a `node_modules` and Deno's `jsr.io` root, that holds Deno's
-/// cached packument (`<name>/registry.json`) for at least one package. A
-/// `node_modules` tree never has that file, so a project root that merely
-/// sits under a dir named `npm` keeps its usual walk. Deno lays a package
+/// than a `node_modules` and Deno's `jsr.io` root, with at least one
+/// package dir in Deno's layout ([`is_deno_package_dir`]). A
+/// `node_modules` package dir has its own `package.json`, so a project
+/// root that merely sits under a dir named `npm` keeps its usual walk. Deno lays a package
 /// out at `<name>/<version>/` (scoped: `@scope/name/<version>/`), and each
 /// further copy it makes for a different peer-dependency resolution at
 /// `<version>_<n>/`. A relative `--global-prefix` is judged by its
@@ -1933,22 +1933,40 @@ pub(super) fn is_deno_npm_cache_root(root: &Path) -> bool {
             .ancestors()
             .skip(1)
             .any(|dir| dir.file_name().is_some_and(|name| name == "npm"));
-    named && holds_deno_packument(&root)
+    named && holds_deno_packages(&root)
 }
 
-/// Whether some package dir of `root` (`<name>` or `@scope/<name>`) holds
-/// Deno's `registry.json`, stopping at the first that does.
-fn holds_deno_packument(root: &Path) -> bool {
+/// Whether some package dir of `root` (`<name>` or `@scope/<name>`) is laid
+/// out the way Deno's npm cache lays one out ([`is_deno_package_dir`]),
+/// stopping at the first that is.
+fn holds_deno_packages(root: &Path) -> bool {
     sorted_subdirs_sync(root).into_iter().any(|name| {
         let dir = root.join(&name);
         if name.starts_with('@') {
             sorted_subdirs_sync(&dir)
                 .into_iter()
-                .any(|child| dir.join(child).join("registry.json").is_file())
+                .any(|child| is_deno_package_dir(&dir.join(child)))
         } else {
-            dir.join("registry.json").is_file()
+            is_deno_package_dir(&dir)
         }
     })
+}
+
+/// Whether `dir` is a package dir of Deno's npm cache: it has no
+/// `package.json` of its own (a `node_modules` package dir always does)
+/// and holds Deno's cached packument (`registry.json`) or a version dir
+/// (a name starting with a digit) with a `package.json`. Deno skips the
+/// packument when a `deno.lock` already pins the tarball, so the version
+/// dirs alone must count.
+fn is_deno_package_dir(dir: &Path) -> bool {
+    if dir.join("package.json").exists() {
+        return false;
+    }
+    dir.join("registry.json").is_file()
+        || sorted_subdirs_sync(dir).into_iter().any(|version| {
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && dir.join(version).join("package.json").is_file()
+        })
 }
 
 /// The copy index of the Deno npm cache dir `dir_name` when it holds

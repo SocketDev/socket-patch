@@ -4569,3 +4569,43 @@ async fn global_mode_includes_nested_deno_npm_registry() {
         "intermediate dirs are not roots: {roots:?}"
     );
 }
+
+/// #444: when a global tool's `deno.lock` already pins the tarball, Deno
+/// downloads only the tarball and writes no `registry.json` (checked
+/// against Deno 2.9.7). Such a registry dir is still Deno's cache, both
+/// under `-g` and as a `--global-prefix`, while a `node_modules` tree
+/// whose package dirs have their own `package.json` is not.
+#[tokio::test]
+#[serial_test::parallel]
+async fn deno_npm_cache_without_packument_is_still_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("npm").join("registry.npmjs.org");
+    let pkg = registry.join("is-odd").join("3.0.1");
+    tokio::fs::create_dir_all(&pkg).await.unwrap();
+    tokio::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"is-odd","version":"3.0.1"}"#,
+    )
+    .await
+    .unwrap();
+    let purl = "pkg:npm/is-odd@3.0.1".to_string();
+    let found = NpmCrawler
+        .find_by_purls(&registry, std::slice::from_ref(&purl))
+        .await
+        .unwrap();
+    assert_eq!(found_paths(&found, &purl), vec![pkg]);
+
+    // A node_modules-shaped root under a dir named npm, whose package
+    // ships a version-like subdir with a package.json, keeps its walk.
+    let deps = tmp.path().join("npm").join("deps");
+    stage_npm_pkg(&deps, "rxjs", "7.8.1").await;
+    stage_npm_pkg(&deps.join("rxjs"), "7.8.1", "0.0.0").await;
+    let found = NpmCrawler
+        .find_by_purls(&deps, &["pkg:npm/rxjs@7.8.1".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        found_paths(&found, "pkg:npm/rxjs@7.8.1"),
+        vec![deps.join("rxjs")]
+    );
+}
