@@ -1970,6 +1970,21 @@ async fn composer1_unrelocated_types_and_disabled_installers_stay_in_vendor() {
                 "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
             "wordpress-plugin",
         ),
+        (
+            r#"{"installer-disable":"*",
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":["cakephp",true],
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":["*"],
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
     ];
     for (extra, package_type) in cases {
         let tmp = tempfile::tempdir().unwrap();
@@ -1994,6 +2009,18 @@ async fn composer1_unrelocated_types_and_disabled_installers_stay_in_vendor() {
             "{package_type} {extra}"
         );
     }
+
+    // Framework names match case-sensitively, as composer/installers'
+    // `key_exists` does: `WordPress` does not switch off `wordpress`.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    composer1_project(root, r#"{"installer-disable":["WordPress"]}"#, WP_TOOL).await;
+    let plugin = root.join("wp-content").join("plugins").join("tool");
+    tokio::fs::create_dir_all(&plugin).await.unwrap();
+    tokio::fs::create_dir_all(root.join("vendor").join("acme").join("tool"))
+        .await
+        .unwrap();
+    assert_eq!(tool_paths(root).await, (vec![plugin.clone()], Some(plugin)));
 
     // DrupalInstaller's real multisite type is relocated to sites/{$name}.
     let tmp = tempfile::tempdir().unwrap();

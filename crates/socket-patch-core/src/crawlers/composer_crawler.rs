@@ -159,17 +159,32 @@ impl InstallerLayout {
     }
 }
 
-/// The root `extra.installer-disable`: `true` (every framework), one
-/// framework name, or a list of them (`all` meaning every framework).
+/// The root `extra.installer-disable`, as composer/installers'
+/// `removeDisabledInstallers` reads it: a scalar is a one-item list, and
+/// a list holding `true`, `"all"` or `"*"` switches every framework off
+/// (`array_intersect` compares the string forms, so `true` is `"1"`).
+/// Otherwise each string names a framework, matched case-sensitively.
 fn parse_installer_disable(value: &serde_json::Value) -> Vec<String> {
-    match value {
-        serde_json::Value::Bool(true) => vec!["all".to_string()],
-        serde_json::Value::String(name) => vec![name.to_ascii_lowercase()],
-        serde_json::Value::Array(list) => list
-            .iter()
-            .filter_map(|n| n.as_str().map(str::to_ascii_lowercase))
-            .collect(),
-        _ => Vec::new(),
+    let items = match value {
+        serde_json::Value::Array(list) => list.as_slice(),
+        scalar => std::slice::from_ref(scalar),
+    };
+    let names: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            serde_json::Value::Bool(true) => Some("1".to_string()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::String(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    if names
+        .iter()
+        .any(|n| matches!(n.as_str(), "1" | "all" | "*"))
+    {
+        vec!["all".to_string()]
+    } else {
+        names
     }
 }
 
