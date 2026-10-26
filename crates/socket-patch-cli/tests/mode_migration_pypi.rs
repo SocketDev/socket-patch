@@ -571,6 +571,21 @@ async fn requirements_read_as_constraints_warn_in_both_modes() {
             want,
             "in-sync re-run: {env:#}"
         );
+        // An in-sync run that rebuilds a missing wheel keeps the wiring too.
+        std::fs::remove_dir_all(root.join(format!(".socket/vendor/pypi/{UUID}"))).unwrap();
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert!(
+            env["events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|e| e["action"] == "rebuilt")),
+            "{env:#}"
+        );
+        assert_eq!(
+            reported(&env, "vendor_requirements_constraints_link"),
+            want,
+            "in-sync rebuild: {env:#}"
+        );
     }
 }
 

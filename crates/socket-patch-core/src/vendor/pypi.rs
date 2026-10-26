@@ -1609,6 +1609,7 @@ async fn wire_in_sync_sibling(
         return done(result, None, warnings);
     };
     if dry_run {
+        let mut targets = requirements_record_files(&entry.wiring);
         if export_pending {
             warnings.push(VendorWarning::new(
                 "pypi_requirements_sibling_wired",
@@ -1618,7 +1619,21 @@ async fn wire_in_sync_sibling(
                     crate::formats::governing_locks::PYPI_REQUIREMENTS
                 ),
             ));
+            targets.extend(
+                super::pypi_requirements::planned_files(
+                    project_root,
+                    canon_name,
+                    version,
+                    &entry.artifact.path,
+                )
+                .await,
+            );
+            targets.sort();
+            targets.dedup();
         }
+        warnings.extend(
+            constraint_reader_warnings(project_root, &targets, canon_name, version, true).await,
+        );
         if !pylocks.is_empty() {
             warnings.push(pylock_dry_run_notice(&pylocks, canon_name, version));
         }
@@ -1679,9 +1694,6 @@ async fn wire_in_sync_sibling(
         .await
         {
             Ok(records) => {
-                warnings.extend(
-                    constraint_link_warnings(project_root, &records, canon_name, version).await,
-                );
                 warnings.push(VendorWarning::new(
                     "pypi_requirements_sibling_wired",
                     format!(
@@ -1701,6 +1713,10 @@ async fn wire_in_sync_sibling(
             }
         }
     }
+    // Every requirements file the entry wires, this run's or earlier: the
+    // link pins stay in place, so their `-c` readers are named each run.
+    warnings
+        .extend(constraint_link_warnings(project_root, &entry.wiring, canon_name, version).await);
     done(result, Some(entry), warnings)
 }
 
@@ -2028,6 +2044,11 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                 warnings,
             )
             .await;
+        }
+        if let Ok(prior) = reuse::prior_entry(project_root, "pypi", record, None).await {
+            warnings.extend(
+                constraint_link_warnings(project_root, &prior.wiring, &canon_name, version).await,
+            );
         }
         return done(result, None, warnings);
     }
