@@ -40,12 +40,14 @@ supported; vendored groups are refused because Hatch does not expand
 `{root:uri}` within dependency groups. Vendoring a member of a Hatch 1.16+
 workspace is refused the same way when a workspace environment, declared
 in a `pyproject.toml` or `hatch.toml` of an ancestor or of another project
-in the same checkout (a root may list a sibling through `../`), installs
-the package from the member's static `[project]` dependencies, from the
-optional dependencies of the member's `features`, or from an extra the
-workspace names as `<member>[extra]`: Hatch reads those
-strings raw, so the workspace environments would get an unexpanded
-`{root:uri}` (#505). Unknown direct sources require an
+in the same checkout (a root may list a sibling through `../`), lists the
+member and the package is one of the member's static `[project]`
+dependencies or optional dependencies. Hatch reads those strings raw, and
+which extras it installs depends on the whole workspace (member
+`features`, `<member>[extra]` references from the root, environments,
+templates, dependency groups and other members), so every optional
+dependency of a listed member is treated as installed; hosted and agent
+mode are unaffected (#505). Unknown direct sources require an
 explicit revert before patching. A hosted scan re-pins socket-patch's own
 earlier hosted reference (same package and version on the patch server)
 when the grant rotates or a newer patch supersedes it. A vendored scan

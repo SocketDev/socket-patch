@@ -140,10 +140,10 @@ fn require_expandable_root(root: &Path) -> Result<(), Failure> {
     }
 }
 
-/// Refuse a member of a Hatch workspace whose environment installs `name`
-/// from this project's `[project]` table (#505): Hatch reads a member's
-/// static dependencies raw, so the workspace root's environments would get
-/// an unexpanded `{root:uri}` and fail every sync.
+/// Refuse `name` in this project's `[project]` dependencies or optional
+/// dependencies when a Hatch workspace lists the project (#505): Hatch
+/// reads a member's static dependencies raw, so the workspace root's
+/// environments would get an unexpanded `{root:uri}` and fail every sync.
 async fn require_no_raw_workspace(
     root: &Path,
     files: &BTreeMap<String, String>,
@@ -162,7 +162,7 @@ async fn require_no_raw_workspace(
         Some(consumer) => Err((
             "pypi_hatch_unsupported",
             format!(
-                "this project is a member of the Hatch workspace at {} (environment {:?}), which installs {name} from this project's dependencies without expanding {{root:uri}}, so a vendored reference would break that workspace's environments; use hosted or agent mode{}",
+                "this project is a member of the Hatch workspace at {} (environment {:?}), which reads this project's dependencies and optional dependencies, {name} among them, without expanding {{root:uri}}, so a vendored reference would break that workspace's environments; use hosted or agent mode{}",
                 consumer.root.display(),
                 consumer.env,
                 if vendored {
@@ -554,10 +554,10 @@ mod tests {
         }
     }
 
-    /// #505: `load` and `preflight` refuse a member whose `[project]`
-    /// dependency (or a selected feature's) a Hatch workspace in an
-    /// ancestor pyproject.toml or hatch.toml installs raw, before writing;
-    /// the member's own environment dependencies stay vendorable.
+    /// #505: `load` and `preflight` refuse, before writing, a `[project]`
+    /// dependency or optional dependency of a member that a Hatch workspace
+    /// in an ancestor pyproject.toml or hatch.toml lists, since Hatch reads
+    /// those raw.
     #[tokio::test]
     async fn member_consumed_by_a_hatch_workspace_is_refused() {
         let member =
@@ -569,7 +569,7 @@ mod tests {
             (
                 format!("{root}[tool.hatch.envs.default.workspace]\nmembers = [\"libs/*\"]\n"),
                 None,
-                &["six"][..],
+                &["six", "one"][..],
             ),
             (
                 format!(
@@ -582,7 +582,7 @@ mod tests {
             (
                 root.to_string(),
                 Some("[envs.default.workspace]\nmembers = [\"libs/lib1\"]\n"),
-                &["six"][..],
+                &["six", "one"][..],
             ),
         ] {
             let temp = tempfile::tempdir().unwrap();
