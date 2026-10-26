@@ -867,7 +867,10 @@ pub(super) fn revert_recorded_block(
         if !ours(&block.lines) {
             warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
-                format!("{noun} `{key}` was re-resolved since vendoring; left alone"),
+                format!(
+                    "{noun} `{}` was re-resolved since vendoring; left alone",
+                    block.key
+                ),
             ));
             return false;
         }
@@ -878,8 +881,9 @@ pub(super) fn revert_recorded_block(
             warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
-                    "{noun} `{key}` has no recorded pre-vendor original; left as-is \
-                     (re-run `yarn install` to re-resolve it from the registry)"
+                    "{noun} `{}` has no recorded pre-vendor original; left as-is \
+                     (re-run `yarn install` to re-resolve it from the registry)",
+                    block.key
                 ),
             ));
             return false;
@@ -893,11 +897,11 @@ pub(super) fn revert_recorded_block(
     true
 }
 
-/// The live block a re-keyed `key` now lives in (#692): of the blocks whose
-/// key shares a pattern with `key`, the one still resolving through our
-/// artifact, else the only one there is (which the caller's ownership gate
-/// then reports as drift). `None` when there is no such block, or several
-/// and none of them unambiguously ours.
+/// The live block a re-keyed `key` now lives in (#692): the one block whose
+/// key shares a pattern with `key` and that still resolves through our
+/// artifact. A re-keyed block resolved elsewhere is not followed: like a
+/// removed one, it no longer needs the artifact, and once nothing in the
+/// lock does the revert can finish.
 fn rekeyed_block<'b>(
     blocks: &'b [LockBlock],
     key: &str,
@@ -905,13 +909,11 @@ fn rekeyed_block<'b>(
     ours: impl Fn(&[String]) -> bool,
 ) -> Option<&'b LockBlock> {
     let recorded = key_patterns(key);
-    let sharing: Vec<&LockBlock> = blocks
+    let mut owned = blocks
         .iter()
-        .filter(|b| key_patterns(&b.key).iter().any(|p| recorded.contains(p)))
-        .collect();
-    let owned: Vec<&LockBlock> = sharing.iter().copied().filter(|b| ours(&b.lines)).collect();
-    match (owned.as_slice(), sharing.as_slice()) {
-        ([one], _) | ([], [one]) => Some(one),
+        .filter(|b| ours(&b.lines) && key_patterns(&b.key).iter().any(|p| recorded.contains(p)));
+    match (owned.next(), owned.next()) {
+        (Some(one), None) => Some(one),
         _ => None,
     }
 }
@@ -2619,7 +2621,9 @@ left-pad@^1.3.0:
     }
 
     /// #692 ownership gate: a merged block that a third party re-resolved
-    /// away from our artifact is drift, not ours, and stays untouched.
+    /// away from our artifact is not ours and stays untouched. Like a
+    /// removed block, it no longer needs the artifact, so the revert
+    /// finishes instead of keeping it (and the ledger entry) forever.
     #[tokio::test]
     async fn issue_692_merged_block_resolved_elsewhere_is_left_alone() {
         let fx = fixture_with_lock(Y2_BEFORE).await;
@@ -2640,10 +2644,13 @@ left-pad@^1.3.0:
 
         let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
         assert_eq!(fx.lock_text().await, merged, "their block is untouched");
         assert!(
-            fx.tgz_path().exists(),
-            "a block we can't account for keeps the artifact"
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact, so it is removed"
         );
     }
 
