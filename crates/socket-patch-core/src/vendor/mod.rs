@@ -111,6 +111,7 @@ pub mod vlt_bundled;
 pub mod vlt_lock;
 pub(crate) mod vlt_lock_text;
 pub(crate) mod yarn_berry_lock;
+pub(crate) mod yarn_classic_bundled;
 pub(crate) mod yarn_classic_lock;
 pub(crate) mod yarn_copies;
 #[cfg(test)]
