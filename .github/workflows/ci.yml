@@ -1218,8 +1218,13 @@ jobs:
           # matrix, 2.9.8 and macOS/Windows included, is
           # composer-compatibility.yml.
           # Both capstones share one leg per composer line: the setup is
-          # identical and the run step loops over `suite`.
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2'}
+          # identical and the run step loops over `suite`. The PR-tier leg
+          # also carries the newest-uv redirect and .NET 10 capstones (rows
+          # further down describe them): each suite runs in seconds, their
+          # toolchains (PHP, uv, .NET) don't overlap, and one runner instead
+          # of three saves ~0.6 job-min of fixed setup per suite per run
+          # (#1732).
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build e2e_redirect_uv_build e2e_nuget_dotnet_build, composer: '2', uv: '0.12.17', dotnet: '10'}
           # Real-bundler gem capstones, one leg per bundler era. Boundaries:
           # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
           # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
@@ -1347,33 +1352,37 @@ jobs:
           # the oldest and newest line + the 0.5.x boundary (0.5.4 still
           # re-resolves a transitive override / rejects a repointed
           # constraint under --locked; 0.5.5 keeps both). The other 0.N
-          # lines and 0.5.3/0.5.6 are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
+          # lines and 0.5.3/0.5.6 are in e2e-full. The redirect capstone
+          # rides the composer leg above.
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
           # The Poetry / PDM / Hatch / Pipenv / pip / deno manifest-less VEX
           # capstones share ONE test binary (`e2e_vex_build`, a module per
           # tool — one optimized link in test-release instead of six), so
           # each leg's `test_filter` names its tool's module and keeps
-          # `--ignored`.
+          # `--ignored`. A `test_filter` may hold several `;`-separated
+          # filters: the run step runs the binary once per filter, and each
+          # one must run a test. The PR tier runs Poetry, PDM, Hatch and deno
+          # in one leg and Pipenv with pip in another (same uv + Pythons
+          # setup), since each tool's tests take seconds and a leg of its
+          # own spent ~80% of its time on runner start and setup (#1732).
           # Real-Poetry hosted + vendored capstones (#[ignore]-gated,
           # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
           # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.0 (first lock 2.1 writer),
           # current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
+          # Real deno negative capstone (no hosted/vendored wiring exists for
+          # deno; VEX must attest nothing), one leg per major.
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored; pdm:: --ignored; hatch:: --ignored; deno:: --ignored', poetry: '2.4.3', pdm: '2.29.2', hatch: '1.18.1', deno: '2.9.7'}
           # Real PDM / Hatch capstones (wiremock Socket API that also serves
           # the hosted wheel; PyPI for the tool bootstrap + six).
           # PDM: lock 2 (1.4), refused 3.1 (1.15) and 4.2 (2.7), 4.3 (2.8),
           # the hishel<1 bootstrap window (2.25) and current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
           # Hatch: 1.0 (hatch.toml env vendoring refused, needs >= 1.2),
           # 1.2, the virtualenv<21 window (1.9, 1.14) and current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
           # Real Pipenv / pip capstones (mock patch server; the tools are
           # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
           # space-separated releases the suite loops over. The middle
           # Pipenv releases are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2026.8.0'}
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 23 24 25 26'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored; pip:: --ignored', pipenv: '2026.8.0', pip: '22 23 24 25 26'}
           # Real-Maven hosted + vendored capstones, one leg per Maven line:
           # 3.6 (pre http-blocker), 3.8 (resolver 1.6: no trusted checksums),
           # 3.9 (trusted checksums), 4.0 rc. Hosted also runs both sides of
@@ -1409,11 +1418,8 @@ jobs:
           # Mill, scala-cli and macOS / Windows are sbt-compatibility.yml.
           # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
           # major (the suite pins the major through a sandbox global.json):
-          # the oldest and newest here, 7-9 on ubuntu in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '10'}
-          # Real deno negative capstone (no hosted/vendored wiring exists for
-          # deno; VEX must attest nothing), one leg per major.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '2.9.7'}
+          # the newest rides the composer leg above, 7-9 on ubuntu in
+          # e2e-full.
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
@@ -1830,35 +1836,46 @@ jobs:
           E2E_ALLOW_EMPTY: ${{ matrix.allow_empty }}
         shell: bash
         # Runs from the package root with CARGO_MANIFEST_DIR set, as
-        # `cargo test` would. `suite` may name several binaries; an
-        # `allow_empty` row skips the ones whose test file has not landed.
-        # Every suite a leg runs must run at least one test (per suite, so
-        # one suite's tests never hide another's empty filter): a renamed
-        # module, a dropped `#[ignore]` under the default `--ignored`
-        # selector or a stale `test_filter` would otherwise pass as 0/0.
+        # `cargo test` would. `suite` may name several binaries and
+        # `test_filter` several `;`-separated filters: every suite runs once
+        # per filter, each in its own log group. An `allow_empty` row skips
+        # the suites whose test file has not landed.
+        # Every suite x filter a leg runs must run at least one test (so one
+        # run's tests never hide another's empty filter): a renamed module, a
+        # dropped `#[ignore]` under the default `--ignored` selector or a
+        # stale `test_filter` would otherwise pass as 0/0.
         run: |
           set -uo pipefail
           exe=''
           if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
           cd crates/socket-patch-cli
           export CARGO_MANIFEST_DIR="$PWD"
+          IFS=';' read -ra filters <<< "$E2E_TEST_FILTER"
           status=0
+          n=0
           for suite in $E2E_SUITE; do
             if [ "$E2E_ALLOW_EMPTY" = true ] && [ ! -f "tests/$suite.rs" ] && [ ! -f "tests/$suite/main.rs" ]; then
               echo "::notice::$suite has not landed yet; skipped (allow_empty)"
               continue
             fi
-            log="../../target/e2e-$suite.log"
-            # shellcheck disable=SC2086 # the filter is several libtest arguments
-            if ! "../../target/e2e-bin/$suite$exe" $E2E_TEST_FILTER 2>&1 | tee "$log"; then
-              status=1
-              continue
-            fi
-            passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
-            if [ "${passed:-0}" = 0 ]; then
-              echo "::error::$suite ran no test in this leg (filter: $E2E_TEST_FILTER). Fix the row's suite or test_filter so it selects the tests it is meant to run."
-              status=1
-            fi
+            for filter in "${filters[@]}"; do
+              n=$((n + 1))
+              log="../../target/e2e-$suite-$n.log"
+              echo "::group::$suite $filter"
+              # shellcheck disable=SC2086 # the filter is several libtest arguments
+              if ! "../../target/e2e-bin/$suite$exe" $filter 2>&1 | tee "$log"; then
+                echo "::endgroup::"
+                echo "::error::$suite failed (filter: $filter)."
+                status=1
+                continue
+              fi
+              echo "::endgroup::"
+              passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
+              if [ "${passed:-0}" = 0 ]; then
+                echo "::error::$suite ran no test in this leg (filter: $filter). Fix the row's suite or test_filter so it selects the tests it is meant to run."
+                status=1
+              fi
+            done
           done
           exit "$status"
 

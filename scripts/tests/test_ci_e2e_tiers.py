@@ -34,6 +34,12 @@ def rows(job):
     return rows_mod.job_rows(JOBS, job)
 
 
+def runs(row):
+    """The (suite, os, filter) runs the e2e run step makes of a row."""
+    return {(suite, row["os"], " ".join(f.split()))
+            for suite in row["suite"].split() for f in row.get("test_filter", "").split(";")}
+
+
 def job_text(job):
     return "\n".join(JOBS[job])
 
@@ -50,10 +56,12 @@ class Tiers(unittest.TestCase):
                                         f"no test target {suite}")
 
     def test_full_rows_only_add_releases_to_pr_suites(self):
-        pr = {(r["suite"], r["os"], r.get("test_filter", "")) for r in rows("e2e")}
+        # A row may bundle several suites and `;`-separated filters; compare
+        # the (suite, os, filter) runs the run step expands them into.
+        pr = {cell for r in rows("e2e") for cell in runs(r)}
         for row in rows("e2e-full"):
             with self.subTest(row=row):
-                self.assertIn((row["suite"], row["os"], row.get("test_filter", "")), pr)
+                self.assertLessEqual(runs(row), pr)
         pr_rows = [tuple(sorted(r.items())) for r in rows("e2e")]
         full_rows = [tuple(sorted(r.items())) for r in rows("e2e-full")]
         self.assertFalse(set(pr_rows) & set(full_rows), "a row in both tiers runs twice")
@@ -343,7 +351,7 @@ class PdmCapstone(unittest.TestCase):
         self.assertEqual(len(excluded), len(ci))
         for row in rows("e2e"):
             if "pdm" in row:
-                self.assertEqual(row.get("test_filter"), "pdm:: --ignored")
+                self.assertIn("pdm:: --ignored", [f.strip() for f in row.get("test_filter", "").split(";")])
         self.assertFalse(any("pdm" in r for r in rows("e2e-full")),
                          "a pdm row off the PR tier would leave its cell unrun on PRs")
         versions = re.search(r"pdm: \[([^\]]*)\]", "\n".join(self.job)).group(1)
