@@ -780,9 +780,9 @@ async fn restore_berry(
                 format!(
                     "{name}@{version}: a `patch:` entry from `yarn patch` still wraps the \
                      hosted tarball in {rel}, and restoring the registry entry under it would \
-                     leave a lock `yarn install --immutable` rejects — remove the `patch:` \
-                     resolution from {pkg_rel}, run `yarn install`, roll back, then re-run \
-                     `yarn patch` on the registry version"
+                     leave a lock `yarn install --immutable` rejects — put the registry range \
+                     back in place of the `patch:` descriptor in {pkg_rel}, run `yarn install`, \
+                     roll back, then re-run `yarn patch` on the registry version"
                 ),
             );
             continue;

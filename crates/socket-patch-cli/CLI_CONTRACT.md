@@ -194,7 +194,7 @@ A missing referenced diff does not remove that protection.
   `rollback`, `remove` and `vendor --revert` refuse that package before
   writing (hosted: a refused pin, exit 1; vendored:
   `vendor_lock_still_wired_revert_blocked`, dry runs included) and ask for the
-  `patch:` resolution to be dropped first.
+  `patch:` descriptor to be replaced by the registry range first.
 
 Detection covers root and declared npm workspace manifests, ancestor workspace
 settings, and the following evidence:

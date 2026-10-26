@@ -849,9 +849,9 @@ pub async fn revert_yarn_berry_opts(
         let detail = format!(
             "refusing to revert {uuid_dir_rel}: a `patch:` entry from `yarn patch` in {wired} \
              still wraps the vendored tarball, and restoring the registry entry under it would \
-             leave a lock `yarn install --immutable` rejects — remove the `patch:` resolution \
-             from {PACKAGE_JSON}, run `yarn install`, re-run `vendor --revert`, then re-run \
-             `yarn patch` on the registry version"
+             leave a lock `yarn install --immutable` rejects — put the registry range back in \
+             place of the `patch:` descriptor in {PACKAGE_JSON}, run `yarn install`, re-run \
+             `vendor --revert`, then re-run `yarn patch` on the registry version"
         );
         return RevertOutcome {
             success: false,
@@ -3987,7 +3987,7 @@ __metadata:
     }
 
     /// #962: the user ran `yarn patch` / `yarn patch-commit -s` over the
-    /// vendored package, so a `patch:` lock entry and `resolutions` value
+    /// vendored package, so a `patch:` lock entry and dependency descriptor
     /// wrap the vendored tarball. Restoring the recorded entry would leave
     /// that wrapper naming a descriptor no entry resolves: every
     /// `yarn install --immutable` rejects the lock (YN0028). The revert must
@@ -4017,7 +4017,8 @@ __metadata:
         tokio::fs::write(fx.lock_path(), &lock).await.unwrap();
         let pkg_text = tokio::fs::read_to_string(fx.pkg_path()).await.unwrap();
         let mut pkg: Value = serde_json::from_str(&pkg_text).unwrap();
-        pkg["resolutions"][format!("left-pad@{resolution}")] = Value::String(wrapped);
+        // yarn 4.18 `patch-commit -s` rewrites the dependency itself.
+        pkg["dependencies"]["left-pad"] = Value::String(wrapped);
         let pkg_text = serde_json::to_string_pretty(&pkg).unwrap() + "\n";
         tokio::fs::write(fx.pkg_path(), &pkg_text).await.unwrap();
 

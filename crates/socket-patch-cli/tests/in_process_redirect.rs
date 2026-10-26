@@ -1172,33 +1172,39 @@ async fn yarn_berry_rollback_refuses_a_pin_wrapped_by_a_user_yarn_patch() {
         );
         assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
 
-        // What `yarn patch-commit -s` writes over the hosted pin: a
-        // `resolutions` entry routing the tarball descriptor to a `patch:`
-        // descriptor (the inner one with yarn's `%3A` escapes), the lock
-        // entry it resolves to, and the workspace dependency through it.
+        // What yarn 4.18 `yarn patch-commit -s` writes over the hosted pin:
+        // the dependency becomes a `patch:` descriptor wrapping the tarball
+        // URL (with yarn's `%3A` escapes), locked by a `patch:` entry next to
+        // the hosted one, which stays (the `resolutions` selector is kept).
         let wrapped = format!(
-            "patch:{NAME}@{}#~/.yarn/patches/{NAME}-http-7f4bf328bd.patch",
+            "patch:{NAME}@{}#~/.yarn/patches/{NAME}-http-735c2bb24a.patch",
             hosted_url.replace(':', "%3A")
         );
         let pkg_path = tmp.path().join("package.json");
         let mut pkg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
-        pkg["resolutions"][format!("{NAME}@{hosted_url}")] = serde_json::json!(wrapped);
+        pkg["dependencies"][NAME] = serde_json::json!(wrapped);
         std::fs::write(
             &pkg_path,
             serde_json::to_string_pretty(&pkg).unwrap() + "\n",
         )
         .unwrap();
         let lock_path = tmp.path().join("yarn.lock");
-        let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
-            &format!("    {NAME}: \"npm:^{VERSION}\"\n"),
-            &format!("    {NAME}: \"{wrapped}\"\n"),
-        ) + &format!(
-            "\n\"{NAME}@{wrapped}\":\n  version: {VERSION}\n  \
-                 resolution: \"{NAME}@{wrapped}::version={VERSION}&hash=0d6d28\"\n  \
-                 checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+        let pinned = std::fs::read_to_string(&lock_path).unwrap();
+        let patched_entry = format!(
+            "\"{NAME}@{wrapped}\":\n  version: {VERSION}\n  \
+             resolution: \"{NAME}@{wrapped}::version={VERSION}&hash=e516cc\"\n  \
+             checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n\n",
             "4".repeat(128)
         );
+        let workspace = "\"consumer@workspace:.\":";
+        assert!(pinned.contains(workspace), "{pinned}");
+        let lock = pinned
+            .replace(
+                &format!("    {NAME}: \"npm:^{VERSION}\"\n"),
+                &format!("    {NAME}: \"{wrapped}\"\n"),
+            )
+            .replace(workspace, &format!("{patched_entry}{workspace}"));
         std::fs::write(&lock_path, &lock).unwrap();
         let pkg_before = std::fs::read_to_string(&pkg_path).unwrap();
 
