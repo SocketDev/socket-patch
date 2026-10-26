@@ -2629,7 +2629,8 @@ jobs:
   #     The kill switch gates the STEPS, never the job.
   #   * NO `needs:` — an upstream failure would skip this job, same wedge.
   #   * NO matrix and NO rename — the check name must stay `hosted-e2e`.
-  #   * NO `continue-on-error` — a bypass must be visible, not invisible.
+  #   * NO `continue-on-error` on the job or its e2e steps — a bypass must be
+  #     visible, not invisible. Only the capped `Cache cargo` restore has it.
   # The job ALWAYS runs and ALWAYS reaches success or failure.
   #
   # ESCAPE HATCH — when production is down and this is blocking merges:
