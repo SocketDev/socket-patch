@@ -747,11 +747,7 @@ async fn restore_berry(
             continue;
         };
         let url_pin = reference.starts_with("https://") || reference.starts_with("http://");
-        let archive = if url_pin {
-            reference
-        } else if let Some((_, binding)) = reference.split_once("::__archiveUrl=") {
-            binding.split('&').next().unwrap_or(binding)
-        } else {
+        let Some(archive) = berry_hosted_archive(reference) else {
             continue;
         };
         let Some(uuid) = ctx.hosted_uuid(archive) else {
@@ -781,8 +777,9 @@ async fn restore_berry(
                     "{name}@{version}: a `patch:` entry from `yarn patch` still wraps the \
                      hosted tarball in {rel}, and restoring the registry entry under it would \
                      leave a lock `yarn install --immutable` rejects — put the registry range \
-                     back in place of the `patch:` descriptor in {pkg_rel}, run `yarn install`, \
-                     roll back, then re-run `yarn patch` on the registry version"
+                     back in place of the `patch:` descriptor in the package.json that declares \
+                     it, run `yarn install`, roll back, then re-run `yarn patch` on the registry \
+                     version"
                 ),
             );
             continue;
@@ -1062,21 +1059,28 @@ async fn restore_berry(
     view.write(rel, doc.render(&moved));
 }
 
-/// The hosted patch uuids a yarn `patch:` descriptor in `text` (a berry
-/// lock or a root `package.json`) wraps: a tarball-URL pin, or the
-/// `npm:…::__archiveUrl=` binding of a lock pinned before 5.0.
-fn yarn_patch_wrapped_uuids(text: &str, ctx: &Ctx<'_>) -> Vec<String> {
-    use crate::formats::yarn::patterns::{patch_wrapped_descriptors, split_pattern};
+/// The tarball URL a berry hosted pin's locator reference names: the
+/// tarball-URL locator itself, or the percent-encoded `::__archiveUrl=`
+/// binding of an `npm:` locator pinned by releases up to 5.0 (#404).
+fn berry_hosted_archive(reference: &str) -> Option<&str> {
+    if reference.starts_with("https://") || reference.starts_with("http://") {
+        Some(reference)
+    } else {
+        let (_, binding) = reference.split_once("::__archiveUrl=")?;
+        Some(binding.split('&').next().unwrap_or(binding))
+    }
+}
 
-    patch_wrapped_descriptors(text)
+/// The hosted patch uuids a user `patch:` reference in `text` (a berry
+/// lock or a root `package.json`) wraps (#962).
+fn yarn_patch_wrapped_uuids(text: &str, ctx: &Ctx<'_>) -> Vec<String> {
+    use crate::formats::yarn::patterns::{split_pattern, user_patch_sources};
+
+    user_patch_sources(text)
         .iter()
-        .filter_map(|inner| {
-            let (_, reference) = split_pattern(inner)?;
-            let url = match reference.split_once("::__archiveUrl=") {
-                Some((_, binding)) => binding.split('&').next().unwrap_or(binding),
-                None => reference,
-            };
-            ctx.hosted_uuid(url)
+        .filter_map(|source| {
+            let (_, reference) = split_pattern(source)?;
+            ctx.hosted_uuid(berry_hosted_archive(reference)?)
         })
         .collect()
 }

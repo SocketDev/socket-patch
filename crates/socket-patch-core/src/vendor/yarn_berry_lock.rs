@@ -850,8 +850,9 @@ pub async fn revert_yarn_berry_opts(
             "refusing to revert {uuid_dir_rel}: a `patch:` entry from `yarn patch` in {wired} \
              still wraps the vendored tarball, and restoring the registry entry under it would \
              leave a lock `yarn install --immutable` rejects — put the registry range back in \
-             place of the `patch:` descriptor in {PACKAGE_JSON}, run `yarn install`, re-run \
-             `vendor --revert`, then re-run `yarn patch` on the registry version"
+             place of the `patch:` descriptor in the {PACKAGE_JSON} that declares it, run \
+             `yarn install`, re-run `vendor --revert`, then re-run `yarn patch` on the \
+             registry version"
         );
         return RevertOutcome {
             success: false,
@@ -1125,7 +1126,7 @@ pub async fn revert_yarn_berry_opts(
 // ───────────────────────────── revert internals ─────────────────────────────
 
 /// The first wired file (yarn.lock, then package.json) in which a user
-/// `patch:` descriptor wraps the vendored artifact of `uuid` (#962). An
+/// `patch:` reference wraps the vendored artifact of `uuid` (#962). An
 /// unreadable or missing file wraps nothing here: the wired revert's own
 /// reads report it.
 async fn user_patch_wrapping(project_root: &Path, uuid: &str) -> Option<&'static str> {
@@ -1134,9 +1135,9 @@ async fn user_patch_wrapping(project_root: &Path, uuid: &str) -> Option<&'static
         let Ok(text) = read_regular_to_string(&project_root.join(wired)).await else {
             continue;
         };
-        if crate::formats::yarn::patterns::patch_wrapped_descriptors(&text)
+        if crate::formats::yarn::patterns::user_patch_sources(&text)
             .iter()
-            .any(|inner| inner.to_ascii_lowercase().contains(&needle))
+            .any(|source| source.to_ascii_lowercase().contains(&needle))
         {
             return Some(wired);
         }
