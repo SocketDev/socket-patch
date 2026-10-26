@@ -117,7 +117,14 @@ jobs:
         # shared-key by profile + runner image (not job or package-manager
         # version). rust-cache also hashes the toolchain, Cargo manifests
         # and Rust environment. Check/coverage/release keep separate caches.
+        # A cache restore is an optimisation, so cap it and carry on cold.
+        # Healthy restores take under 30 s. On 2026-10-26 one hung for 14+
+        # min and held merge-queue head #1719 (and 12 entries behind it)
+        # until it was cancelled; uncapped it would have run to the 40-min
+        # job timeout. Later `Cache cargo` steps carry the same two keys.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -150,6 +157,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -393,6 +402,8 @@ jobs:
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -569,6 +580,8 @@ jobs:
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -633,6 +646,8 @@ jobs:
         # The shards share one cache key and shard 1 alone writes it.
         # rust-cache keeps only dependencies, which every shard builds.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
 
@@ -1055,6 +1070,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: e2e-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1121,6 +1138,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: check-windows-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2281,6 +2300,8 @@ jobs:
         run: scripts/rustup-retry.sh toolchain install
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2326,6 +2347,8 @@ jobs:
         run: scripts/rustup-retry.sh toolchain install
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2561,6 +2584,8 @@ jobs:
           docker pull rust:1.56-slim
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2669,6 +2694,8 @@ jobs:
       - name: Cache cargo
         if: steps.gate.outputs.run == 'true'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
