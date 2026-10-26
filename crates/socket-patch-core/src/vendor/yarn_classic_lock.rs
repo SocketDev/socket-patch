@@ -690,6 +690,7 @@ pub async fn revert_yarn_classic_opts(
                 KIND_LOCK_BLOCK,
                 "lock block",
                 |lines| classic_field(lines, "resolved"),
+                Some(split_key_patterns),
                 &mut outcome.warnings,
             );
         }
@@ -777,6 +778,15 @@ pub async fn revert_yarn_classic_opts(
 /// wiring `kind` they own, the noun their warnings use (`lock block` vs
 /// `lock entry`), and the field carrying the vendor path — `vendor_field`
 /// reads it (classic `resolved` / berry `resolution`).
+///
+/// `key_patterns` (classic only) splits a key line into its patterns. With
+/// it, a recorded key that is gone is looked for in a live block sharing
+/// one of its patterns (#692): yarn classic re-keys a block when it dedupes
+/// another range into it (`left-pad@^1.1.0, left-pad@^1.3.0:`) or drops one,
+/// keeping its `resolved`, so the block is still the one we wired. The
+/// restore then keeps the live key line. Berry passes `None`: its revert
+/// re-keys entries itself and reads the old key as already converged.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn revert_recorded_block(
     text: &mut String,
     rec: &WiringRecord,
@@ -784,6 +794,7 @@ pub(super) fn revert_recorded_block(
     expected_kind: &str,
     noun: &str,
     vendor_field: fn(&[String]) -> Option<&str>,
+    key_patterns: Option<fn(&str) -> Vec<String>>,
     warnings: &mut Vec<VendorWarning>,
 ) -> bool {
     let Some(key) = rec.key.as_deref() else {
@@ -805,9 +816,15 @@ pub(super) fn revert_recorded_block(
     // The recorded pre-vendor block (key line first), used both for the
     // restore and for the ALREADY-CONVERGED checks below.
     let orig_lines = rec.original.as_ref().and_then(json_to_lines);
+    let ours = |lines: &[String]| {
+        vendor_field(lines)
+            .and_then(parse_vendor_path)
+            .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid)
+    };
     let edit = {
         let blocks = scan_blocks(text);
-        let Some(block) = blocks.iter().find(|b| b.key == key) else {
+        let rekeyed = || rekeyed_block(&blocks, key, key_patterns?, ours);
+        let Some(block) = blocks.iter().find(|b| b.key == key).or_else(rekeyed) else {
             // ALREADY CONVERGED: an earlier partial revert restored this
             // record, and the restore rekeyed the block (berry's `file:`
             // locator key reverts to the pre-vendor descriptor), so the
@@ -828,6 +845,14 @@ pub(super) fn revert_recorded_block(
             ));
             return false;
         };
+        // The restore keeps the live key line: the recorded one when the
+        // key is unchanged, the re-keyed one (#692) otherwise.
+        let orig_lines = orig_lines.map(|mut orig| {
+            if let (Some(first), Some(live)) = (orig.first_mut(), block.lines.first()) {
+                first.clone_from(live);
+            }
+            orig
+        });
         // ALREADY CONVERGED: the live block equals the recorded pre-vendor
         // original — an earlier partial revert (or the user, by hand)
         // already restored it in place. Not drift.
@@ -837,10 +862,7 @@ pub(super) fn revert_recorded_block(
         // Ownership gate: the live block's vendor field must still point
         // into OUR uuid dir — anything else means a third party re-resolved
         // it.
-        let ours = vendor_field(&block.lines)
-            .and_then(parse_vendor_path)
-            .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
-        if !ours {
+        if !ours(&block.lines) {
             warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!("{noun} `{key}` was re-resolved since vendoring; left alone"),
@@ -867,6 +889,29 @@ pub(super) fn revert_recorded_block(
     };
     *text = edit;
     true
+}
+
+/// The live block a re-keyed `key` now lives in (#692): of the blocks whose
+/// key shares a pattern with `key`, the one still resolving through our
+/// artifact, else the only one there is (which the caller's ownership gate
+/// then reports as drift). `None` when there is no such block, or several
+/// and none of them unambiguously ours.
+fn rekeyed_block<'b>(
+    blocks: &'b [LockBlock],
+    key: &str,
+    key_patterns: fn(&str) -> Vec<String>,
+    ours: impl Fn(&[String]) -> bool,
+) -> Option<&'b LockBlock> {
+    let recorded = key_patterns(key);
+    let sharing: Vec<&LockBlock> = blocks
+        .iter()
+        .filter(|b| key_patterns(&b.key).iter().any(|p| recorded.contains(p)))
+        .collect();
+    let owned: Vec<&LockBlock> = sharing.iter().copied().filter(|b| ours(&b.lines)).collect();
+    match (owned.as_slice(), sharing.as_slice()) {
+        ([one], _) | ([], [one]) => Some(one),
+        _ => None,
+    }
 }
 
 // ─────────────────────────── block classification ───────────────────────────
@@ -2467,6 +2512,139 @@ left-pad@^1.3.0:
         );
     }
 
+    /// `text` with the block keyed `key` re-keyed to `merged`, as yarn
+    /// classic writes it after deduping another range into that block.
+    fn merge_key(text: &str, key: &str, merged: &str) -> String {
+        let out = text.replacen(&format!("\n{key}:\n"), &format!("\n{merged}:\n"), 1);
+        assert_ne!(out, text, "the key `{key}` must be in the lock");
+        out
+    }
+
+    /// #692: after vendoring, yarn dedupes a second range resolving to the
+    /// same version into the wired block and rewrites its key line to
+    /// `left-pad@^1.1.0, left-pad@^1.3.0:`, keeping our `resolved`. The
+    /// block is still ours: revert must restore the pre-vendor resolution
+    /// under the merged key and remove the artifact, instead of reporting
+    /// the block as gone and keeping the lock wired forever.
+    #[tokio::test]
+    async fn issue_692_revert_restores_a_block_yarn_merged_after_vendoring() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let merged_key = "left-pad@^1.1.0, left-pad@^1.3.0";
+        let merged = merge_key(&fx.lock_text().await, "left-pad@^1.3.0", merged_key);
+        tokio::fs::write(fx.lock_path(), &merged).await.unwrap();
+
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact);
+        assert_eq!(
+            fx.lock_text().await,
+            merge_key(Y2_BEFORE, "left-pad@^1.3.0", merged_key),
+            "pre-vendor resolution restored under the merged key"
+        );
+        assert!(
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "nothing resolves through the artifact any more, so it is removed"
+        );
+
+        // A repeat revert (rollback re-run) is a quiet no-op.
+        let again = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(again.success, "{:?}", again.error);
+        assert!(!again.drift_skipped(), "{:?}", again.warnings);
+    }
+
+    /// #692, the CRLF lock and the shrunk key: yarn drops one range of a
+    /// merged block after vendoring (`left-pad@^1.3.0, left-pad@~1.3.0` →
+    /// `left-pad@^1.3.0`). The block still resolves through our artifact,
+    /// so the revert restores it under its live key, in the lock's own line
+    /// endings.
+    #[tokio::test]
+    async fn issue_692_revert_restores_a_block_whose_key_lost_a_range() {
+        let before = Y5_BEFORE.replace('\n', "\r\n");
+        let fx = fixture_with_lock(&before).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let shrunk = fx.lock_text().await.replacen(
+            "\r\nleft-pad@^1.3.0, left-pad@~1.3.0:\r\n",
+            "\r\nleft-pad@^1.3.0:\r\n",
+            1,
+        );
+        tokio::fs::write(fx.lock_path(), &shrunk).await.unwrap();
+
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            fx.lock_text().await,
+            before.replacen(
+                "\r\nleft-pad@^1.3.0, left-pad@~1.3.0:\r\n",
+                "\r\nleft-pad@^1.3.0:\r\n",
+                1
+            ),
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// #692: re-vendoring a merged block is in sync (nothing to rewrite),
+    /// and the ledger it keeps still reverts afterwards.
+    #[tokio::test]
+    async fn issue_692_revendor_after_merge_then_revert_converges() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let merged_key = "left-pad@^1.1.0, left-pad@^1.3.0";
+        let merged = merge_key(&fx.lock_text().await, "left-pad@^1.3.0", merged_key);
+        tokio::fs::write(fx.lock_path(), &merged).await.unwrap();
+
+        let (_, again, _) = expect_done(fx.vendor(false).await);
+        assert!(again.is_none(), "a merged, still-wired block is in sync");
+        assert_eq!(fx.lock_text().await, merged, "re-vendor writes nothing");
+
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            fx.lock_text().await,
+            merge_key(Y2_BEFORE, "left-pad@^1.3.0", merged_key)
+        );
+    }
+
+    /// #692 ownership gate: a merged block that a third party re-resolved
+    /// away from our artifact is drift, not ours, and stays untouched.
+    #[tokio::test]
+    async fn issue_692_merged_block_resolved_elsewhere_is_left_alone() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let (sha1, _) = fx.packed_hashes().await;
+        let ours =
+            format!("  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\"");
+        let theirs = "  resolved \"https://example.com/their-fork.tgz#0000000000000000000000000000000000000000\"";
+        let wired = fx.lock_text().await;
+        assert!(wired.contains(&ours));
+        let merged = merge_key(
+            &wired.replacen(&ours, theirs, 1),
+            "left-pad@^1.3.0",
+            "left-pad@^1.1.0, left-pad@^1.3.0",
+        );
+        tokio::fs::write(fx.lock_path(), &merged).await.unwrap();
+
+        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.lock_text().await, merged, "their block is untouched");
+        assert!(
+            fx.tgz_path().exists(),
+            "a block we can't account for keeps the artifact"
+        );
+    }
+
     /// #665 guard: the recorded block vanished, but another (hand-copied or
     /// re-keyed) block still resolves through the artifact. Deleting it
     /// would break that install, so the artifact is kept, as for drift.
@@ -3061,6 +3239,7 @@ left-pad@^1.3.0:
                 KIND_LOCK_BLOCK,
                 "lock block",
                 |lines| classic_field(lines, "resolved"),
+                Some(split_key_patterns),
                 &mut warnings,
             );
             (changed, text, warnings)
