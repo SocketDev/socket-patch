@@ -4494,3 +4494,78 @@ async fn deno_npm_cache_find_by_purls_resolves_encoded_capital_name() {
         .unwrap();
     assert_eq!(found_paths(&found, &purl), vec![pkg]);
 }
+
+/// #444 (Bugbot): Deno maps a registry URL with a path
+/// (`https://host/api/npm/`, as Artifactory, CodeArtifact and GitLab
+/// serve) to nested dirs, `$DENO_DIR/npm/<host>/api/npm/<name>/<version>/`
+/// (checked against Deno 2.9.7). A `--global-prefix` naming that nested
+/// registry dir is still read in Deno's layout.
+#[tokio::test]
+#[serial_test::parallel]
+async fn deno_npm_cache_nested_registry_prefix_crawls_and_resolves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp
+        .path()
+        .join("npm")
+        .join("registry.example.com")
+        .join("api")
+        .join("npm");
+    let pkg = stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: false,
+        global_prefix: Some(registry.clone()),
+    };
+    let purls: Vec<String> = NpmCrawler
+        .crawl_all(&opts)
+        .await
+        .into_iter()
+        .map(|p| p.purl)
+        .collect();
+    assert_eq!(purls, vec!["pkg:npm/is-odd@3.0.1"]);
+    let purl = "pkg:npm/is-odd@3.0.1".to_string();
+    let found = NpmCrawler
+        .find_by_purls(&registry, std::slice::from_ref(&purl))
+        .await
+        .unwrap();
+    assert_eq!(found_paths(&found, &purl), vec![pkg]);
+}
+
+/// #444 (Bugbot): `-g` finds a nested registry dir under `$DENO_DIR/npm`
+/// beside a plain one.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_mode_includes_nested_deno_npm_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deno_dir = tmp.path().join("deno");
+    let plain = deno_dir.join("npm").join("registry.npmjs.org");
+    let nested = deno_dir.join("npm").join("4873").join("api").join("npm");
+    stage_deno_npm_pkg(&plain, "is-odd", "3.0.1", "3.0.1").await;
+    stage_deno_npm_pkg(&nested, "is-number", "6.0.0", "6.0.0").await;
+
+    struct DenoDirGuard(Option<std::ffi::OsString>);
+    impl Drop for DenoDirGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("DENO_DIR", v),
+                None => std::env::remove_var("DENO_DIR"),
+            }
+        }
+    }
+    let _guard = DenoDirGuard(std::env::var_os("DENO_DIR"));
+    std::env::set_var("DENO_DIR", &deno_dir);
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+    };
+    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    assert!(roots.contains(&plain), "{roots:?}");
+    assert!(roots.contains(&nested), "{roots:?}");
+    assert!(
+        !roots
+            .iter()
+            .any(|r| r.ends_with("4873") || r.ends_with("api")),
+        "intermediate dirs are not roots: {roots:?}"
+    );
+}

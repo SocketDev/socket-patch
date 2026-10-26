@@ -1866,35 +1866,62 @@ fn list_dir_sync(path: &Path) -> Listing {
     }
 }
 
-/// The registry dirs of Deno's npm cache, `$DENO_DIR/npm/<registry-host>`
-/// (#444). `deno install -g` tools load their npm dependencies from there,
-/// in Deno's own layout (see [`is_deno_npm_cache_root`]), so these are
-/// global roots beside the npm, pnpm, yarn and bun `node_modules`.
-/// `jsr.io` is skipped: it is the Deno crawler's JSR root, not an npm
-/// registry. Sorted, for a stable scan order.
+/// How many levels below `$DENO_DIR/npm` a registry dir may sit. Deno
+/// maps a registry URL to `<host>[_<port>]` plus one dir per path segment,
+/// so `https://host/api/npm/` lands three levels down; this leaves room
+/// for longer paths without walking the cache's package dirs.
+const DENO_NPM_REGISTRY_MAX_DEPTH: usize = 8;
+
+/// The registry dirs of Deno's npm cache (#444): every dir under
+/// `$DENO_DIR/npm` that holds Deno's packuments
+/// ([`holds_deno_packument`]), `<host>` for a registry at a host's root
+/// (`registry.npmjs.org`) and `<host>/<path...>` for one served below a
+/// path (`https://host/api/npm/` → `<host>/api/npm`, as Artifactory,
+/// CodeArtifact and GitLab registries are). `deno install -g` tools load
+/// their npm dependencies from there, in Deno's own layout (see
+/// [`is_deno_npm_cache_root`]), so these are global roots beside the npm,
+/// pnpm, yarn and bun `node_modules`. A registry dir is not descended
+/// into (its children are packages), and `jsr.io` is skipped: it is the
+/// Deno crawler's JSR root, not an npm registry. Sorted, for a stable
+/// scan order.
 fn deno_npm_cache_roots() -> Vec<PathBuf> {
     let Some(npm) = super::deno_crawler::deno_dir().map(|dir| dir.join("npm")) else {
         return Vec::new();
     };
-    let mut roots: Vec<PathBuf> = list_dir_sync(&npm)
-        .entries
+    let mut roots = Vec::new();
+    let mut level: Vec<PathBuf> = sorted_subdirs_sync(&npm)
         .into_iter()
-        .filter(|entry| !entry.name_str.starts_with('.') && entry.name_str != "jsr.io")
-        .map(|entry| npm.join(entry.name))
+        .filter(|name| name != "jsr.io")
+        .map(|name| npm.join(name))
         .collect();
+    for _ in 0..DENO_NPM_REGISTRY_MAX_DEPTH {
+        let mut next = Vec::new();
+        for dir in level {
+            if holds_deno_packument(&dir) {
+                roots.push(dir);
+            } else {
+                next.extend(sorted_subdirs_sync(&dir).into_iter().map(|n| dir.join(n)));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
     roots.sort();
     roots
 }
 
 /// Whether `root` is a registry dir of Deno's npm cache
-/// (`$DENO_DIR/npm/registry.npmjs.org`) rather than a `node_modules` tree:
-/// a dir directly under one named `npm`, other than `node_modules` and
-/// Deno's `jsr.io` root, that holds Deno's cached packument
-/// (`<name>/registry.json`) for at least one package. A `node_modules`
-/// tree never has that file, so a project root that merely sits under a
-/// dir named `npm` keeps its usual walk. Deno lays a package out at
-/// `<name>/<version>/` (scoped: `@scope/name/<version>/`), and each further
-/// copy it makes for a different peer-dependency resolution at
+/// (`$DENO_DIR/npm/registry.npmjs.org`, or a nested
+/// `$DENO_DIR/npm/<host>/<path...>` for a registry served below a path)
+/// rather than a `node_modules` tree: a dir below one named `npm`, other
+/// than a `node_modules` and Deno's `jsr.io` root, that holds Deno's
+/// cached packument (`<name>/registry.json`) for at least one package. A
+/// `node_modules` tree never has that file, so a project root that merely
+/// sits under a dir named `npm` keeps its usual walk. Deno lays a package
+/// out at `<name>/<version>/` (scoped: `@scope/name/<version>/`), and each
+/// further copy it makes for a different peer-dependency resolution at
 /// `<version>_<n>/`. A relative `--global-prefix` is judged by its
 /// absolute spelling.
 pub(super) fn is_deno_npm_cache_root(root: &Path) -> bool {
@@ -1903,9 +1930,9 @@ pub(super) fn is_deno_npm_cache_root(root: &Path) -> bool {
         .file_name()
         .is_some_and(|name| name != "node_modules" && name != "jsr.io")
         && root
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|parent| parent == "npm");
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.file_name().is_some_and(|name| name == "npm"));
     named && holds_deno_packument(&root)
 }
 
