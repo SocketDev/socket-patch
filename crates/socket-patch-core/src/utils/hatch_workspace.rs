@@ -55,8 +55,13 @@ pub fn raw_consumer(member: &Path, member_pyproject: &str, name: &str) -> Option
     let lexical = absolute(member)?;
     let member = std::fs::canonicalize(&lexical).unwrap_or_else(|_| lexical.clone());
     let name = canonicalize_pypi_name(name);
+    let own = project
+        .get("name")
+        .and_then(Item::as_str)
+        .map(canonicalize_pypi_name)
+        .unwrap_or_default();
     roots(&member, &lexical).into_iter().find_map(|root| {
-        workspace_features(&root, &member)
+        workspace_features(&root, &member, &own)
             .into_iter()
             .find(|(_, features)| consumed(project, features).contains(&name))
             .map(|(env, _)| RawConsumer { root, env })
@@ -148,9 +153,11 @@ fn member_entry(table: &dyn TableLike) -> Option<(String, Vec<String>)> {
 
 /// For each environment of the project at `root` whose workspace lists
 /// `member`: the environment name and the member's selected features
-/// (normalized). Members are a string array, an array of inline tables or
+/// (normalized): those the entry selects, plus every extra of `own` (the
+/// member's canonical name) the workspace's requirement strings name.
+/// Members are a string array, an array of inline tables or
 /// an array of tables (`[[...workspace.members]]`).
-fn workspace_features(root: &Path, member: &Path) -> Vec<(String, Vec<String>)> {
+fn workspace_features(root: &Path, member: &Path, own: &str) -> Vec<(String, Vec<String>)> {
     let external = parse(root, HATCH_FILES[1]);
     let project = parse(root, HATCH_FILES[0]);
     let (_, envs) = environments(project.as_ref(), external.as_ref());
@@ -178,13 +185,74 @@ fn workspace_features(root: &Path, member: &Path) -> Vec<(String, Vec<String>)> 
                 .collect(),
             _ => continue,
         };
-        for (path, features) in entries {
-            if lists(root, &path, &exclude, member) {
-                found.push((env.to_string(), features));
+        let listed: Vec<(Vec<PathBuf>, Vec<String>)> = entries
+            .into_iter()
+            .map(|(path, features)| (members_of(root, &path, &exclude), features))
+            .collect();
+        let real = |path: &PathBuf| std::fs::canonicalize(path).ok();
+        for (members, features) in &listed {
+            if !members
+                .iter()
+                .any(|path| real(path).as_deref() == Some(member))
+            {
+                continue;
             }
+            // `all_dependencies_complex` expands every member's raw extras
+            // that any of the environment's requirement strings name as
+            // `<member>[extra]`: the root's own and its environments',
+            // and the other members' (#505 review).
+            let mut features = features.clone();
+            let mut texts: Vec<DocumentMut> = project.iter().chain(&external).cloned().collect();
+            texts.extend(
+                listed
+                    .iter()
+                    .flat_map(|(paths, _)| paths)
+                    .filter(|path| real(path).as_deref() != Some(member))
+                    .filter_map(|path| parse(path, HATCH_FILES[0])),
+            );
+            for document in &texts {
+                features.extend(referenced_extras(document.as_item(), own));
+            }
+            found.push((env.to_string(), features));
         }
     }
     found
+}
+
+/// The normalized extras of `own` that any requirement string anywhere in
+/// `item` names as `own[extra]`.
+fn referenced_extras(item: &Item, own: &str) -> Vec<String> {
+    fn walk(value: &Value, own: &str, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => {
+                let spec = text.value();
+                if canonicalize_pypi_name(pep508_name(spec)) == own {
+                    out.extend(extras(spec));
+                }
+            }
+            Value::Array(array) => array.iter().for_each(|value| walk(value, own, out)),
+            Value::InlineTable(table) => table.iter().for_each(|(_, value)| walk(value, own, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    match item {
+        Item::Value(value) => walk(value, own, &mut out),
+        Item::Table(table) => {
+            for (_, item) in table.iter() {
+                out.extend(referenced_extras(item, own));
+            }
+        }
+        Item::ArrayOfTables(tables) => {
+            for table in tables.iter() {
+                for (_, item) in table.iter() {
+                    out.extend(referenced_extras(item, own));
+                }
+            }
+        }
+        Item::None => {}
+    }
+    out
 }
 
 /// A member spec with the context fields Hatch formats in it (`{root}`,
@@ -198,21 +266,20 @@ fn expand(root: &Path, spec: &str) -> Option<String> {
     (!spec.contains('{')).then_some(spec)
 }
 
-/// Whether the member spec `spec` of the workspace at `root` lists
-/// `member` (a canonical path), as Hatch's `find_members` resolves it: the
+/// The members (directories, as reached) the member spec `spec` of the
+/// workspace at `root` lists, as Hatch's `find_members` resolves it: the
 /// spec is joined to the root and normalized, and the part below the root
 /// and the spec's shared prefix is matched one directory level at a time
 /// (a component with `*`, `?` or `[` as an fnmatch pattern Python searches
 /// for, so it may match a suffix of the directory name; symlinked
-/// directories are followed). A found directory whose real path is
-/// `member` lists it unless an `exclude` pattern matches its path relative
-/// to that prefix or its absolute path.
-fn lists(root: &Path, spec: &str, exclude: &[&str], member: &Path) -> bool {
+/// directories are followed), less any an `exclude` pattern matches by
+/// its path relative to that prefix or its absolute path.
+fn members_of(root: &Path, spec: &str, exclude: &[&str]) -> Vec<PathBuf> {
     let Some(spec) = expand(root, spec).filter(|spec| !spec.is_empty()) else {
-        return false;
+        return Vec::new();
     };
     let Some(target) = absolute(&root.join(spec)) else {
-        return false;
+        return Vec::new();
     };
     let prefix: PathBuf = root
         .components()
@@ -221,7 +288,7 @@ fn lists(root: &Path, spec: &str, exclude: &[&str], member: &Path) -> bool {
         .map(|(a, _)| a)
         .collect();
     let Ok(pattern) = target.strip_prefix(&prefix) else {
-        return false;
+        return Vec::new();
     };
     let mut found = vec![prefix.clone()];
     for component in pattern.iter().map(|c| c.to_string_lossy().into_owned()) {
@@ -254,10 +321,7 @@ fn lists(root: &Path, spec: &str, exclude: &[&str], member: &Path) -> bool {
             text.to_owned()
         }
     };
-    found.iter().any(|path| {
-        if std::fs::canonicalize(path).ok().as_deref() != Some(member) {
-            return false;
-        }
+    found.retain(|path| {
         let relative = path
             .strip_prefix(&prefix)
             .map(|rel| rel.to_string_lossy().into_owned())
@@ -269,7 +333,8 @@ fn lists(root: &Path, spec: &str, exclude: &[&str], member: &Path) -> bool {
                 .iter()
                 .any(|text| fnmatch(&pattern, &normcase(text)))
         })
-    })
+    });
+    found
 }
 
 enum Token {
@@ -550,6 +615,48 @@ mod tests {
         assert_eq!(consumer(&dir, MEMBER, "six").as_deref(), Some("default"));
         // Hatch looks the normalized `spaced-out` up as a raw key.
         let (_temp, dir) = layout(&with("[\"Spaced_Out\"]"), None, "libs/lib1");
+        assert_eq!(consumer(&dir, MEMBER, "certifi"), None);
+    }
+
+    /// #505 review: an extra of the member that the workspace's own
+    /// requirement strings name (`lib1[sec]` in an environment, the root
+    /// project or another member) is installed raw too, transitively.
+    #[test]
+    fn extras_named_across_the_workspace_are_consumed() {
+        let members = "[\"libs/*\"]";
+        let env = format!(
+            "{ROOT}[tool.hatch.envs.default]\ndependencies = [\"lib1[sec]\"]\n\
+             [tool.hatch.envs.default.workspace]\nmembers = {members}\n"
+        );
+        let (_temp, dir) = layout(&env, None, "libs/lib1");
+        assert_eq!(
+            consumer(&dir, MEMBER, "urllib3").as_deref(),
+            Some("default")
+        );
+        assert_eq!(consumer(&dir, MEMBER, "idna"), None);
+        let root = ROOT.replace("version", "dependencies = [\"lib1[all]\"]\nversion");
+        let (_temp, dir) = layout(
+            &format!("{root}[tool.hatch.envs.default.workspace]\nmembers = {members}\n"),
+            None,
+            "libs/lib1",
+        );
+        assert_eq!(
+            consumer(&dir, MEMBER, "urllib3").as_deref(),
+            Some("default")
+        );
+        assert_eq!(consumer(&dir, MEMBER, "idna").as_deref(), Some("default"));
+        let (temp, dir) = layout(&workspace(members), None, "libs/lib1");
+        let sibling = temp.path().join("ws/libs/lib2");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(
+            sibling.join("pyproject.toml"),
+            "[project]\nname = \"lib2\"\nversion = \"1\"\ndependencies = [\"LIB1[Sec]\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            consumer(&dir, MEMBER, "urllib3").as_deref(),
+            Some("default")
+        );
         assert_eq!(consumer(&dir, MEMBER, "certifi"), None);
     }
 

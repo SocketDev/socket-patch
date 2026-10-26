@@ -38,10 +38,12 @@ environment plugin, source table or conditional override is refused before
 writing. Use agent mode (`scan --mode agent` + `socket-patch apply` in CI) for these shapes. Hosted PEP 735 groups are
 supported; vendored groups are refused because Hatch does not expand
 `{root:uri}` within dependency groups. Vendoring a member of a Hatch 1.16+
-workspace is refused the same way when a workspace environment declared in
-an ancestor `pyproject.toml` or `hatch.toml` (up to the checkout root)
-installs the package from the member's static `[project]` dependencies or
-the optional dependencies of the member's `features`: Hatch reads those
+workspace is refused the same way when a workspace environment, declared
+in a `pyproject.toml` or `hatch.toml` of an ancestor or of another project
+in the same checkout (a root may list a sibling through `../`), installs
+the package from the member's static `[project]` dependencies, from the
+optional dependencies of the member's `features`, or from an extra the
+workspace names as `<member>[extra]`: Hatch reads those
 strings raw, so the workspace environments would get an unexpanded
 `{root:uri}` (#505). Unknown direct sources require an
 explicit revert before patching. A hosted scan re-pins socket-patch's own
