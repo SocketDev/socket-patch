@@ -845,11 +845,13 @@ pub(super) fn revert_recorded_block(
             ));
             return false;
         };
-        // The restore keeps the live key line: the recorded one when the
-        // key is unchanged, the re-keyed one (#692) otherwise.
+        // A block yarn re-keyed (#692) is restored under its live key line,
+        // so the ranges merged into it since vendoring stay locked.
         let orig_lines = orig_lines.map(|mut orig| {
-            if let (Some(first), Some(live)) = (orig.first_mut(), block.lines.first()) {
-                first.clone_from(live);
+            if block.key != key {
+                if let (Some(first), Some(live)) = (orig.first_mut(), block.lines.first()) {
+                    first.clone_from(live);
+                }
             }
             orig
         });
