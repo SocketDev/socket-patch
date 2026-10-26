@@ -187,7 +187,14 @@ A missing referenced diff does not remove that protection.
   reversal (`rollback`, `remove`, `vendor --revert`) keep their existing behavior.
   `repair` may restore Socket-owned artifacts; any re-vendoring uses the same
   consent gate. Existing Socket pins are not automatically unwound when a user
-  adds a patch: inspect them and explicitly roll back if necessary.
+  adds a patch: inspect them and explicitly roll back if necessary. One
+  exception: a Yarn Berry hosted pin or vendored tarball that a user `patch:`
+  descriptor wraps (`yarn patch` run over the Socket pin) cannot be unwound
+  under it, since the wrapper would name a descriptor no lock entry resolves.
+  `rollback`, `remove` and `vendor --revert` refuse that package before
+  writing (hosted: a refused pin, exit 1; vendored:
+  `vendor_lock_still_wired_revert_blocked`, dry runs included) and ask for the
+  `patch:` resolution to be dropped first.
 
 Detection covers root and declared npm workspace manifests, ancestor workspace
 settings, and the following evidence:
