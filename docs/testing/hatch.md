@@ -35,7 +35,9 @@ A `pylock.toml` in a Hatch project without locked environments (`uv export`,
 
 A range, transitive-only declaration, dynamic dependency metadata, custom
 environment plugin, source table or conditional override is refused before
-writing. Use agent mode (`scan --mode agent` + `socket-patch apply` in CI) for these shapes. Hosted PEP 735 groups are
+writing. So is a project-table pin of a package with a url, path, git or
+workspace entry in `[tool.uv.sources]` when an environment uses the uv
+installer: uv applies that source over the hosted reference (#673). Use agent mode (`scan --mode agent` + `socket-patch apply` in CI) for these shapes. Hosted PEP 735 groups are
 supported; vendored groups are refused because Hatch does not expand
 `{root:uri}` within dependency groups. Unknown direct sources require an
 explicit revert before patching. A hosted scan re-pins socket-patch's own
