@@ -117,7 +117,16 @@ jobs:
         # shared-key by profile + runner image (not job or package-manager
         # version). rust-cache also hashes the toolchain, Cargo manifests
         # and Rust environment. Check/coverage/release keep separate caches.
+        # A cache restore is an optimisation, so cap it and carry on cold.
+        # Healthy restores take under 30 s on every runner OS. On 2026-10-26
+        # one hung for 14+ min in yarn-classic-matrix and held merge-queue
+        # head #1719 (and 12 entries behind it) until it was cancelled;
+        # uncapped it runs to the job's own timeout. Every cache restore in
+        # this file carries the same two keys (enforced by
+        # scripts/tests/test_merge_queue_fail_fast.py).
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -150,6 +159,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -393,6 +404,8 @@ jobs:
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -431,6 +444,9 @@ jobs:
         id: vexctl-cache
         if: needs.release-readiness.outputs.reuse != 'true' && runner.os == 'macOS'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        # Capped like `Cache cargo`: a miss only means compiling vexctl.
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/vexctl-bin
           key: vexctl-${{ env.VEXCTL_VERSION }}-go${{ steps.go.outputs.go-version }}-${{ runner.os }}-${{ runner.arch }}
@@ -504,6 +520,7 @@ jobs:
           && runner.os == 'macOS'
           && github.ref == 'refs/heads/main'
           && steps.vexctl-cache.outputs.cache-hit != 'true'
+          && steps.vexctl-cache.outcome == 'success'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/vexctl-bin
@@ -569,6 +586,8 @@ jobs:
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -633,6 +652,8 @@ jobs:
         # The shards share one cache key and shard 1 alone writes it.
         # rust-cache keeps only dependencies, which every shard builds.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
 
@@ -1055,6 +1076,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: e2e-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1121,6 +1144,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: check-windows-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2281,6 +2306,8 @@ jobs:
         run: scripts/rustup-retry.sh toolchain install
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2326,6 +2353,8 @@ jobs:
         run: scripts/rustup-retry.sh toolchain install
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2561,6 +2590,8 @@ jobs:
           docker pull rust:1.56-slim
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2598,7 +2629,8 @@ jobs:
   #     The kill switch gates the STEPS, never the job.
   #   * NO `needs:` — an upstream failure would skip this job, same wedge.
   #   * NO matrix and NO rename — the check name must stay `hosted-e2e`.
-  #   * NO `continue-on-error` — a bypass must be visible, not invisible.
+  #   * NO `continue-on-error` on the job or its e2e steps — a bypass must be
+  #     visible, not invisible. Only the capped `Cache cargo` restore has it.
   # The job ALWAYS runs and ALWAYS reaches success or failure.
   #
   # ESCAPE HATCH — when production is down and this is blocking merges:
@@ -2669,6 +2701,8 @@ jobs:
       - name: Cache cargo
         if: steps.gate.outputs.run == 'true'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
