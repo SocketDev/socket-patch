@@ -995,6 +995,67 @@ async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
     );
 }
 
+/// #1105: a project hosted at patch A whose venv was then synced from the
+/// hosted lock (`uv sync`, `poetry install`, `uv pip install -r`), so six
+/// holds A's patched bytes, moves to vendored at the superseding patch B.
+/// The installed copy matches neither the pristine release nor B's
+/// output; it used to be dropped as `package_not_installed` (exit 1, the
+/// project left hosted on A) while `scan --mode vendored --dry-run`
+/// previewed success. The takeover must restore the upstream entry and
+/// vendor B.
+#[tokio::test]
+async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
+    let lanes: [(&str, StageFn); 3] = [
+        ("uv", stage_uv_with_sibling),
+        ("poetry", stage_poetry),
+        ("requirements", stage_requirements),
+    ];
+    for (lane, stage) in lanes {
+        let (_tmp, root) = project();
+        let files = stage(&root);
+        let server = MockServer::start().await;
+        let hosted_url = mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "{lane}: hosted scan at A: {env:#}");
+        assert!(
+            files.iter().any(|f| std::fs::read_to_string(root.join(f))
+                .unwrap()
+                .contains(&hosted_url)),
+            "{lane}: hosted mode pins A: {env:#}"
+        );
+
+        let venv = root.join("../hosted-venv");
+        venv_installed_from_patch_a(&venv);
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        prebuilt_common::mount_project(&server, &root).await;
+        mount_pypi_json(&server).await;
+        let uri = server.uri();
+        let pypi = format!("{uri}/pypi");
+        let extra = [
+            ("VIRTUAL_ENV", venv.to_str().unwrap()),
+            ("SOCKET_PYPI_JSON_API", pypi.as_str()),
+        ];
+        let args = ["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+
+        let (code, env) = run_cli(&root, &args, &extra);
+        assert_eq!(code, 0, "{lane}: takeover onto B: {env:#}");
+        assert!(
+            !env.to_string().contains("package_not_installed"),
+            "{lane}: the installed copy is not reported missing: {env:#}"
+        );
+        let wired: String = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        assert!(
+            wired.contains(&format!(".socket/vendor/pypi/{UUID_B}/"))
+                && !wired.contains(&hosted_url)
+                && !wired.contains(UUID),
+            "{lane}: wired to vendored B, hosted A gone:\n{wired}"
+        );
+    }
+}
+
 const UV_LOCK: &str = r#"version = 1
 revision = 2
 requires-python = ">=3.9"

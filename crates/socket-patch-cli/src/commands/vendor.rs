@@ -2537,15 +2537,25 @@ impl StagedSource {
 /// neither the pristine release nor this patch's output. The re-vendor
 /// then takes the pristine artifact from the lock / registry / service, as
 /// a lock-only checkout does, instead of reporting it not installed.
+///
+/// A PyPI install under a live hosted pin (`hosted_pinned`) is the same
+/// story after a hosted scan (#1105): `uv sync` / `poetry install` from
+/// the hosted lock installs a hosted patch's bytes, whichever generation
+/// the pin names now. The pin names no release variant, so it only answers
+/// for a sole candidate; gems keep their installed dir, which the gem
+/// backend reads to refuse a platform gem.
 fn superseded_install(
     ledger: &VendorState,
     candidate: &str,
     record: &PatchRecord,
     sole_candidate: bool,
+    hosted_pinned: bool,
 ) -> bool {
     lookup_entry_kv(&ledger.entries, candidate).is_some_and(|(key, entry)| {
         entry.uuid != record.uuid && (sole_candidate || key == candidate)
-    })
+    }) || (sole_candidate
+        && hosted_pinned
+        && matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Pypi)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2605,8 +2615,13 @@ async fn plan_service_downloads(
                         if !variant_matches_installed(Some(
                             &verify_file_patch(dir, file, info).await.status,
                         )) {
-                            if !superseded_install(ledger, candidate, record, candidates.len() == 1)
-                            {
+                            if !superseded_install(
+                                ledger,
+                                candidate,
+                                record,
+                                candidates.len() == 1,
+                                takeover_blocked(candidate),
+                            ) {
                                 continue;
                             }
                             source_path = &uninstalled;
@@ -3093,8 +3108,13 @@ pub(crate) async fn vendor_records_reusing(
                                 .await
                                 .status,
                         )) {
-                            if !superseded_install(&state, candidate, record, candidates.len() == 1)
-                            {
+                            if !superseded_install(
+                                &state,
+                                candidate,
+                                record,
+                                candidates.len() == 1,
+                                hosted_pin_of(candidate).is_some(),
+                            ) {
                                 continue;
                             }
                             candidate_source = PackageSource::Installed(&uninstalled);
@@ -4907,6 +4927,28 @@ mod plan_gate_tests {
             license: String::new(),
             tier: String::new(),
         }
+    }
+
+    /// #1105: a live hosted pin marks a PyPI install superseded (a hosted
+    /// sync installed a hosted patch's bytes), so the takeover vendors the
+    /// record instead of reporting it not installed. The pin names no
+    /// variant, so only a sole candidate counts, and gems keep their
+    /// installed dir for the platform-gem refusal.
+    #[test]
+    fn hosted_pin_marks_a_pypi_install_superseded() {
+        let ledger = VendorState::default();
+        let pypi = "pkg:pypi/six@1.16.0";
+        let b = record(UUID_B);
+        assert!(superseded_install(&ledger, pypi, &b, true, true));
+        assert!(!superseded_install(&ledger, pypi, &b, false, true));
+        assert!(!superseded_install(&ledger, pypi, &b, true, false));
+        assert!(!superseded_install(
+            &ledger,
+            "pkg:gem/nokogiri@1.16.0",
+            &b,
+            true,
+            true
+        ));
     }
 
     /// The download plan runs every record through its backend's own gate:
