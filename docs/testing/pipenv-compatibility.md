@@ -98,6 +98,18 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   Pipenv 3, `--deploy` with 9, `pipenv sync` with 2018, `pipenv verify` with
   2020, `pipenv requirements` with 2022 (it exports the hosted URL / vendored
   path). Pipenv 0.x has no `WORKON_HOME` placement to discover.
+- **Vendored wheels export without a hash.** `pipenv requirements --hash`
+  on Pipenv 2023.7.9 and later writes no `--hash` for a `file` / `path`
+  entry, so the vendored wheel is the one unhashed line while the registry
+  entries keep theirs; pip then switches to `--require-hashes` and refuses
+  the whole `pip install -r` (#981). 2023.7.1–2023.7.4 export a `file`
+  entry as a bare `<name>==` (Pipenv's own bug, any `file` reference);
+  2022.12–2023.6 export `file:///<abs> --hash=…` and install. No lock
+  shape avoids it (a `#sha256=` fragment on the relative path breaks
+  `pipenv sync`), so the vendored run warns
+  `pypi_pipenv_hash_export_unsupported` whenever another lock entry
+  carries hashes. Export without `--hash`, or use hosted mode: its
+  `<url>#sha256=<hex>` reference exports a hash pip accepts.
 - **Out-of-tree venv naming** is unchanged from Pipenv 7 through 2026:
   `sanitize(<project dir name>)[:42]-<8 chars of urlsafe-base64(sha256(<abs
   Pipfile path>))>`, plus `-<PIPENV_PYTHON>` when that variable is set (the

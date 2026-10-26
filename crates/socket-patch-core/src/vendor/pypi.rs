@@ -1307,6 +1307,10 @@ async fn pypi_prelude<'p>(
             };
             if target == PipenvTarget::Fresh {
                 warnings.extend(project.warnings.iter().cloned());
+                warnings.extend(super::pypi_pipenv::hash_export_warning(
+                    &project,
+                    &canon_name,
+                ));
             }
             // Both a fresh vendor and a re-run over an already-wired lock
             // keep warning while the venv still holds the upstream release.
@@ -7257,6 +7261,51 @@ wheels = [
             read_json(&fx.root, "Pipfile.lock").await,
             serde_json::from_str::<serde_json::Value>(PIPENV_REGISTRY_LOCK).unwrap()
         );
+    }
+
+    /// #981: a lock with another hashed registry entry exports through
+    /// `pipenv requirements --hash` with hashes on every line but the
+    /// vendored wheel's, which pip's hash-checking mode refuses. The vendor
+    /// run warns; a lock that pins only the target exports no hash and
+    /// does not.
+    #[tokio::test]
+    async fn pipenv_vendor_warns_the_hash_export_gap() {
+        let fx = pipenv_e2e_fixture().await;
+        let VendorOutcome::Done { warnings, .. } = pipenv_vendor(&fx, &fx.record).await else {
+            panic!("vendor did not complete");
+        };
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code != "pypi_pipenv_hash_export_unsupported"),
+            "{warnings:?}"
+        );
+
+        let fx = pipenv_e2e_fixture().await;
+        let lock = PIPENV_REGISTRY_LOCK.replace(
+            r#""develop": {}"#,
+            r#""develop": {
+        "idna": {
+            "hashes": ["sha256:bbb"],
+            "index": "pypi",
+            "version": "==3.7"
+        }
+    }"#,
+        );
+        touch(&fx.root, "Pipfile.lock", &lock).await;
+        let VendorOutcome::Done { warnings, .. } = pipenv_vendor(&fx, &fx.record).await else {
+            panic!("vendor did not complete");
+        };
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "pypi_pipenv_hash_export_unsupported"),
+            "{warnings:?}"
+        );
+        let lock = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(lock.contains(UUID), "Pipfile.lock not wired:\n{lock}");
     }
 
     const SIBLING_EXPORT: &str = "-i https://pypi.org/simple\nsix==1.16.0\n";
