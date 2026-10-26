@@ -653,6 +653,7 @@ fn prepare_metadata_completion(
             let project: DocumentMut = project
                 .parse()
                 .map_err(|error| format!("invalid pyproject.toml: {error}"))?;
+            refuse_dynamic_root_requirement(document, &project, &name)?;
             let overridden = project
                 .get("tool")
                 .and_then(Item::as_table_like)
@@ -718,6 +719,72 @@ fn prepare_metadata_completion(
     }))
 }
 
+/// Refuse when `project` declares PEP 621 `dynamic` dependencies (or
+/// optional-dependencies) and the lock's root package lists `name` in
+/// `requires-dist` (#639). That entry came from the build backend, not from
+/// pyproject.toml, so upstream restore has no declaration to derive its
+/// specifier from, and rollback, remove and a vendored takeover could never
+/// undo the repointed entry. `requires-dev` comes from PEP 735 groups,
+/// which can't be dynamic, and a transitive package (absent from
+/// `requires-dist`) is wired through an override that unwinds cleanly.
+fn refuse_dynamic_root_requirement(
+    document: &DocumentMut,
+    project: &DocumentMut,
+    name: &str,
+) -> Result<(), String> {
+    let dynamic: Vec<&str> = project
+        .get("project")
+        .and_then(|p| p.get("dynamic"))
+        .and_then(Item::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|field| ["dependencies", "optional-dependencies"].contains(field))
+        .collect();
+    if dynamic.is_empty() {
+        return Ok(());
+    }
+    let required = document
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .into_iter()
+        .flatten()
+        .filter(|package| is_root_package(package))
+        .filter_map(|package| package.get("metadata"))
+        .filter_map(|metadata| metadata.get("requires-dist"))
+        .filter_map(Item::as_array)
+        .flatten()
+        .filter_map(Value::as_inline_table)
+        .filter_map(|requirement| requirement.get("name").and_then(Value::as_str))
+        .any(|value| canonicalize_pypi_name(value) == name);
+    if !required {
+        return Ok(());
+    }
+    let fields = dynamic
+        .iter()
+        .map(|field| format!("\"{field}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "pyproject.toml declares dynamic = [{fields}], so the build backend supplies the \
+         project's {name} requirement; hosted mode does not redirect it, since rollback \
+         could not restore that requirement in the lock"
+    ))
+}
+
+/// Whether `package` is the lock's root project (`source = { virtual = "." }`
+/// or `{ editable = "." }`).
+fn is_root_package(package: &Table) -> bool {
+    package
+        .get("source")
+        .and_then(Item::as_table_like)
+        .is_some_and(|source| {
+            ["virtual", "editable"]
+                .into_iter()
+                .any(|key| source.get(key).and_then(Item::as_str) == Some("."))
+        })
+}
+
 fn finish_metadata_completion(
     document: &mut DocumentMut,
     completion: MetadataCompletion,
@@ -735,15 +802,7 @@ fn finish_metadata_completion(
             .and_then(Item::as_array_of_tables_mut)
             .expect("package collection checked");
         for package in packages.iter_mut() {
-            let root = package
-                .get("source")
-                .and_then(Item::as_table_like)
-                .is_some_and(|source| {
-                    ["virtual", "editable"]
-                        .into_iter()
-                        .any(|key| source.get(key).and_then(Item::as_str) == Some("."))
-                });
-            if root {
+            if is_root_package(package) {
                 if let Some(metadata) = package
                     .get_mut("metadata")
                     .and_then(Item::as_table_like_mut)

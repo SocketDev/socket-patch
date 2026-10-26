@@ -28211,3 +28211,143 @@ mod uv_old_release_advisories {
         );
     }
 }
+
+/// #639: a PEP 621 `dynamic = ["dependencies"]` project gets its dependency
+/// list from the build backend, so pyproject.toml declares nothing uv's
+/// root `requires-dist` can be restored from. Hosted mode must refuse to
+/// repoint such an entry rather than write wiring that rollback, remove
+/// and the vendored takeover can never undo.
+#[cfg(test)]
+mod uv_dynamic_dependencies {
+    use super::*;
+
+    const URL: &str = "https://patch.test/six-1.16.0-py2.py3-none-any.whl";
+    const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+    const ISODATE: &str = "[[package]]\nname = \"isodate\"\nversion = \"0.6.1\"\nsource = { registry = \"https://pypi.org/simple\" }\ndependencies = [{ name = \"six\" }]\nwheels = [{ url = \"https://files.pythonhosted.org/packages/isodate-0.6.1-py2.py3-none-any.whl\", hash = \"sha256:0751eece944162659049d35f4f549ed815792b38793f07cf73381c1c87cbed96\" }]\n";
+
+    fn six() -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: "six".into(),
+            namespace: None,
+            version: "1.16.0".into(),
+            token: String::new(),
+            patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact_url: URL.into(),
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some("c".repeat(64)),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The issue's setuptools project: `dynamic` names `dynamic_fields`,
+    /// and the backend reads the list from requirements.in.
+    fn project(dynamic_fields: &str) -> String {
+        format!(
+            "[project]\nname = \"app\"\nversion = \"1.0.0\"\nrequires-python = \">=3.8\"\ndynamic = [{dynamic_fields}]\n\n[build-system]\nrequires = [\"setuptools>=61\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools.dynamic]\ndependencies = {{ file = [\"requirements.in\"] }}\n"
+        )
+    }
+
+    fn lock(app_deps: &str, requires: &str, packages: &[&str]) -> String {
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.8\"\n\n[[package]]\nname = \"app\"\nversion = \"1.0.0\"\nsource = {{ editable = \".\" }}\ndependencies = [{app_deps}]\n\n[package.metadata]\nrequires-dist = [{requires}]\n\n{}",
+            packages.join("\n")
+        )
+    }
+
+    fn files(pyproject: String, uv_lock: String) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("pyproject.toml".to_string(), pyproject),
+            ("uv.lock".to_string(), uv_lock),
+        ])
+    }
+
+    /// The backend-supplied `six==1.16.0` is refused for every newline
+    /// style, for a dynamic optional-dependencies extra, and when a static
+    /// dependency group also names six (restore matches `requires-dist`
+    /// only against `[project]` declarations): nothing is written, and the
+    /// warning names the dynamic declaration.
+    #[test]
+    fn backend_declared_dependency_is_refused_before_writing() {
+        let six_dist = "{ name = \"six\", specifier = \"==1.16.0\" }";
+        let cases = [
+            (project("\"dependencies\""), six_dist),
+            (
+                project("\"optional-dependencies\""),
+                "{ name = \"six\", marker = \"extra == 'compat'\", specifier = \"==1.16.0\" }",
+            ),
+            (
+                project("\"dependencies\"") + "\n[dependency-groups]\ntest = [\"six\"]\n",
+                six_dist,
+            ),
+        ];
+        for (pyproject, requires) in cases {
+            let dynamic = &pyproject;
+            for newline in ["\n", "\r\n"] {
+                let input = files(
+                    pyproject.replace('\n', newline),
+                    lock("{ name = \"six\" }", requires, &[SIX]).replace('\n', newline),
+                );
+                let result = rewrite_registry_redirect(&input, &[six()]);
+                assert!(
+                    result.files.is_empty(),
+                    "{dynamic}: wrote {:?}",
+                    result.files.keys()
+                );
+                assert!(
+                    result.refused_python_lock_uuids.contains(&six().patch_uuid)
+                        && !result
+                            .confirmed_python_lock_uuids
+                            .contains(&six().patch_uuid),
+                    "{dynamic}: {:?}",
+                    result.warnings
+                );
+                let warning = result
+                    .warnings
+                    .iter()
+                    .find(|w| w.code == "redirect_uv_metadata_unsupported")
+                    .unwrap_or_else(|| panic!("{dynamic}: {:?}", result.warnings));
+                assert!(
+                    warning.detail.contains("six") && warning.detail.contains("dynamic"),
+                    "{}",
+                    warning.detail
+                );
+            }
+        }
+    }
+
+    /// A package the backend's list only pulls in transitively is not in
+    /// the root `requires-dist`, so its override wiring stays restorable
+    /// and the dynamic project is still hosted-patched.
+    #[test]
+    fn transitive_dependency_of_a_dynamic_project_is_still_wired() {
+        let input = files(
+            project("\"dependencies\""),
+            lock(
+                "{ name = \"isodate\" }",
+                "{ name = \"isodate\", specifier = \"==0.6.1\" }",
+                &[ISODATE, SIX],
+            ),
+        );
+        let result = rewrite_registry_redirect(&input, &[six()]);
+        assert!(
+            result
+                .confirmed_python_lock_uuids
+                .contains(&six().patch_uuid),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            result.files["pyproject.toml"].contains("override-dependencies"),
+            "{}",
+            result.files["pyproject.toml"]
+        );
+        assert!(
+            result.files["uv.lock"].contains(URL),
+            "{}",
+            result.files["uv.lock"]
+        );
+    }
+}
