@@ -4247,7 +4247,7 @@ mod tests {
             )),
         )
         .await;
-        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        let detail = expect_refused(outcome, "vendor_prebuilt_pending");
         assert!(detail.contains("still building"), "{detail}");
         assert!(!root.join(".socket/vendor").exists(), "no vendor debris");
         assert!(!root.join(".cargo").exists(), "nothing wired");
@@ -4286,7 +4286,7 @@ mod tests {
             )),
         )
         .await;
-        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        let detail = expect_refused(outcome, "vendor_prebuilt_unavailable");
         assert!(
             detail.contains("prebuilt crate unavailable: not_found"),
             "{detail}"

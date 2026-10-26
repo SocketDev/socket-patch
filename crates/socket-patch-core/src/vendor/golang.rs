@@ -2290,7 +2290,7 @@ mod tests {
             Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
         )
         .await;
-        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        let detail = expect_refused(outcome, "vendor_prebuilt_pending");
         assert!(detail.contains("still building"), "{detail}");
         assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
         assert_eq!(
@@ -2324,7 +2324,7 @@ mod tests {
             Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
         )
         .await;
-        let detail = expect_refused(outcome, "vendor_prebuilt_required");
+        let detail = expect_refused(outcome, "vendor_prebuilt_unavailable");
         assert!(
             detail.contains("prebuilt module zip unavailable: not_found"),
             "{detail}"
