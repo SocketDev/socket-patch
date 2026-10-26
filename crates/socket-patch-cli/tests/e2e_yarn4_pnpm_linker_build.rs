@@ -1131,3 +1131,175 @@ fn yarn4_pnpm_linker_agent_apply_patches_bundled_copy_inside_store_package() {
         "rollback restores the bundled copy"
     );
 }
+
+/// #859: `pnpmStoreFolder` moves the pnpm linker's store out of
+/// `node_modules`. Agent-mode `apply` must still patch the copy Node loads
+/// and `rollback` restore it, whether the store sits in a hidden folder
+/// (`.cache/.store`, which the workspace walk skips), a plain one
+/// (`store`, whose entries' links were refused as first-party source), or
+/// is set through the environment (`YARN_NODE_LINKER` /
+/// `YARN_PNPM_STORE_FOLDER`, where even a direct dependency was refused).
+#[test]
+fn yarn4_pnpm_linker_agent_apply_patches_relocated_store_copies() {
+    if !has_corepack_pm(yarn_berry()) {
+        skip!(
+            "SKIP e2e_yarn4_pnpm_linker_build (agent relocated store): `corepack {}` unavailable",
+            yarn_berry()
+        );
+        return;
+    }
+
+    // `pnpmStoreFolder` arrived in yarn 4.8.0; older releases refuse it as
+    // an unrecognized setting, so there is nothing to relocate.
+    let minor = yarn_berry()
+        .trim_start_matches("yarn@")
+        .split('.')
+        .nth(1)
+        .and_then(|m| m.parse::<u32>().ok());
+    if minor.is_some_and(|m| m < 8) {
+        println!(
+            "SKIP e2e_yarn4_pnpm_linker_build (agent relocated store): {} predates \
+             pnpmStoreFolder (4.8.0)",
+            yarn_berry()
+        );
+        return;
+    }
+
+    let env_store: &[(&str, &str)] = &[
+        ("YARN_NODE_LINKER", "pnpm"),
+        ("YARN_PNPM_STORE_FOLDER", ".cache/.store"),
+    ];
+    // (cell, yarnrc, environment, store folder, patched package)
+    let cells: [(&str, String, &[(&str, &str)], &str, &str); 4] = [
+        (
+            "hidden",
+            format!("{YARNRC_PNPM}pnpmStoreFolder: .cache/.store\n"),
+            &[],
+            ".cache/.store",
+            "is-number-npm-6.0.0-",
+        ),
+        (
+            "plain",
+            format!("{YARNRC_PNPM}pnpmStoreFolder: store\n"),
+            &[],
+            "store",
+            "is-number-npm-6.0.0-",
+        ),
+        (
+            "env transitive",
+            "enableGlobalCache: false\n".to_string(),
+            env_store,
+            ".cache/.store",
+            "is-number-npm-6.0.0-",
+        ),
+        (
+            "env direct",
+            "enableGlobalCache: false\n".to_string(),
+            env_store,
+            ".cache/.store",
+            "is-odd-npm-3.0.1-",
+        ),
+    ];
+    for (cell, yarnrc, env, folder, slug) in cells {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            r#"{"name":"yarn4-pnpm-linker-relocated","version":"0.0.0","private":true,"dependencies":{"is-odd":"3.0.1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(proj.join(".yarnrc.yml"), &yarnrc).unwrap();
+        let global = tmp.path().join("yarn-global");
+        let mut yarn_env = vec![("YARN_GLOBAL_FOLDER", global.to_str().unwrap())];
+        yarn_env.extend_from_slice(env);
+        let install = corepack(&proj, yarn_berry(), &["install"], &yarn_env);
+        if !install.status.success() {
+            skip!(
+                "SKIP e2e_yarn4_pnpm_linker_build (agent relocated store, {cell}): fixture \
+                 `yarn install` failed (registry unreachable?):\n{}",
+                yarn_berry_common::yarn_output(&install)
+            );
+            return;
+        }
+
+        // The layout under test: no `.store` in `node_modules`, the
+        // package's only physical copy in the relocated store.
+        let nm = proj.join("node_modules");
+        assert!(
+            !nm.join(".store").exists(),
+            "({cell}) the store must be relocated"
+        );
+        let entry = std::fs::read_dir(proj.join(folder))
+            .unwrap_or_else(|e| panic!("({cell}) relocated store {folder}: {e}"))
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(slug))
+            })
+            .unwrap_or_else(|| panic!("({cell}) {folder} must hold a {slug} entry"));
+        let (name, version) = if slug.starts_with("is-odd") {
+            ("is-odd", "3.0.1")
+        } else {
+            ("is-number", "6.0.0")
+        };
+        let purl = format!("pkg:npm/{name}@{version}");
+        let index = entry.join("package").join("index.js");
+        let orig = std::fs::read(&index).expect("store copy of index.js");
+        assert!(!orig.starts_with(MARKER.as_bytes()));
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        stage_patch(&proj, &purl, &orig, &patched);
+        std::fs::write(proj.join(".socket/blobs").join(git_sha256(&orig)), &orig).unwrap();
+
+        let socket = |command: &str| {
+            let mut cmd = hermetic::binary_command();
+            cmd.current_dir(&proj);
+            hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Yarn]);
+            let args = [
+                command,
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ];
+            let _fixture = prebuilt_common::prepare_command(&mut cmd, &proj, &args, &[]);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("failed to run socket-patch binary");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "({cell}) {command} failed.\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+                panic!("({cell}) {command} --json output is not JSON: {e}\n{stdout}")
+            })
+        };
+
+        let applied = socket("apply");
+        assert_eq!(applied["status"], "success", "({cell}) {applied}");
+        assert_eq!(applied["summary"]["applied"], 1, "({cell}) {applied}");
+        assert_eq!(std::fs::read(&index).unwrap(), patched, "({cell}) patched");
+
+        // RUNTIME PROOF: the code the project loads carries the patch.
+        let resolve = format!(
+            "process.stdout.write(require('fs').readFileSync(require.resolve('{name}', \
+             {{paths: [require('path').dirname(require.resolve('is-odd'))]}})))"
+        );
+        let out = corepack(&proj, yarn_berry(), &["node", "-e", &resolve], env);
+        assert!(
+            out.status.success(),
+            "({cell}) `yarn node` failed:\n{}",
+            yarn_berry_common::yarn_output(&out)
+        );
+        assert_eq!(out.stdout, patched, "({cell}) the loaded {name} is patched");
+
+        let rolled_back = socket("rollback");
+        assert_eq!(rolled_back["status"], "success", "({cell}) {rolled_back}");
+        assert_eq!(std::fs::read(&index).unwrap(), orig, "({cell}) restored");
+    }
+}

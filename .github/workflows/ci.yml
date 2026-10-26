@@ -39,9 +39,13 @@ permissions:
 # queued push but the newest during a merge burst, and most main commits never
 # got a verdict. Merge-group refs (gh-readonly-queue/...) are unique per queue
 # entry already. The nightly keeps its own group so it never queues behind (or
-# cancels) a push.
+# cancels) a push. Draft PR runs get their own group too: a push followed at
+# once by `gh pr ready` can deliver the push's `synchronize` (payload still
+# draft) after `ready_for_review`. In a shared group that late draft run
+# cancelled the real run, skipped every job, and left ci-ok green on a head
+# nothing had tested.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event.pull_request.draft && '-draft' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Linux jobs run on Depot's runners (depot-ubuntu-*-4: 4 vCPU, like GitHub's
@@ -588,7 +592,17 @@ jobs:
     # numbers are report-only so contributors get visibility without flaky
     # CI when coverage shifts naturally with test edits. A failing TEST
     # fails the job: this is the Linux leg of `test`.
+    #
+    # Two shards (scripts/ci-test-shard.py, as `test` and `test-release`):
+    # the instrumented build takes ~110 s and running the tests ~220 s, so
+    # one leg was the queue's critical path (~6 min). Each shard compiles
+    # and runs only its targets and uploads its own LCOV; coverage-merge
+    # unions them. `ci-ok` waits for every shard.
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     timeout-minutes: 35
     permissions:
       contents: read
@@ -616,12 +630,14 @@ jobs:
       - name: Cache cargo
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
+        # The shards share one cache key and shard 1 alone writes it.
+        # rust-cache keeps only dependencies, which every shard builds.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
 
       - name: Warm the coverage cache after merge-queue validation
-        if: needs.release-readiness.outputs.reuse == 'true'
+        if: needs.release-readiness.outputs.reuse == 'true' && matrix.shard == 1
         run: |
           cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
           source "$RUNNER_TEMP/coverage-env.sh"
@@ -672,6 +688,9 @@ jobs:
         env:
           SOCKET_PATCH_GO_E2E_REQUIRED: '1'
           SOCKET_PATCH_GO_E2E_VERSION: '1.24'
+          CI_TEST_COVERAGE: '1'
+          TEST_SHARD: ${{ matrix.shard }}
+          TEST_SHARD_COUNT: ${{ strategy.job-total }}
         #
         # The test output is also teed to a file so that a failing test's
         # panic becomes an annotation (scripts/ci-test-failures.py): in a
@@ -680,27 +699,29 @@ jobs:
         # can't be diagnosed once the re-run has passed.
         run: |
           set -o pipefail
-          cargo llvm-cov --workspace --no-fail-fast \
-            --no-report 2>&1 | tee "$RUNNER_TEMP/coverage-tests.log" || {
+          python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" \
+            2>&1 | tee "$RUNNER_TEMP/coverage-tests.log" || {
             status=$?
             python3 scripts/ci-test-failures.py "$RUNNER_TEMP/coverage-tests.log" || true
             exit "$status"
           }
           set +o pipefail
-          cargo llvm-cov report --lcov --output-path coverage-host.lcov
-          python3 scripts/ci-lcov-summary.py coverage-host.lcov | tee coverage-summary.txt
+          cargo llvm-cov report --lcov --output-path "coverage-host-$TEST_SHARD.lcov"
+          python3 scripts/ci-lcov-summary.py "coverage-host-$TEST_SHARD.lcov" | tee coverage-summary.txt
 
       - name: Publish coverage summary to job summary
         if: needs.release-readiness.outputs.reuse != 'true'
         # Render the per-file LCOV line/function/branch totals as a fenced
         # block in the GitHub Actions job summary so reviewers don't
         # need to crack open the artifact for a quick look.
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
         run: |
           {
-            echo "## Host coverage summary"
+            echo "## Host coverage summary (shard $TEST_SHARD)"
             echo ""
-            echo "(In-process tests only. See coverage-merge for the"
-            echo "full picture including docker-e2e binary coverage.)"
+            echo "(This shard's in-process tests only. See coverage-merge"
+            echo "for the full picture including docker-e2e binary coverage.)"
             echo ""
             echo '```'
             cat coverage-summary.txt
@@ -711,8 +732,8 @@ jobs:
         if: needs.release-readiness.outputs.reuse != 'true'
         uses: ./.github/actions/upload-artifact
         with:
-          name: coverage-host
-          path: coverage-host.lcov
+          name: coverage-host-${{ matrix.shard }}
+          path: coverage-host-${{ matrix.shard }}.lcov
           if-no-files-found: error
           retention-days: 30
 
@@ -1336,9 +1357,9 @@ jobs:
           # Lines that run both capstones run them in one leg (one Maven
           # install; the run step loops over `suite`).
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          # Real-Gradle capstones, PR tier: one leg per Gradle line x {agent +
-          # hosted, vendor + multi-project} on ubuntu, each on its line's LTS
-          # JDK. Every other OS x line x mode cell (and the JDK-ceiling,
+          # Real-Gradle capstones, PR tier: legs per Gradle line x {agent,
+          # hosted (three shards), vendor + multi-project} on ubuntu, each on
+          # its line's LTS JDK. Every other OS x line x mode cell (and the JDK-ceiling,
           # configuration-cache, Isolated Projects and real-Central rows) runs
           # in gradle-compatibility.yml. `suite` lists every binary the leg
           # runs (space-separated); the libtest filters select by the prefix
@@ -1349,11 +1370,14 @@ jobs:
           # selected test needs it (gradle_vendor_395's mixed root).
           # The hosted suite (~43 real-Gradle builds, ~31 min serially) is
           # split into three legs per line so it stops being the merge-queue
-          # critical path: the agent suites plus `gradle_hosted_[345]`, the
-          # `gradle_hosted_[b-p]` names, and a catch-all that `--skip`s
-          # exactly those words, so a new test always lands in some leg
-          # (test_ci_gradle_prefixes.py keeps the skip list in sync).
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          # critical path: `gradle_hosted_[345]`, the `gradle_hosted_[b-p]`
+          # names, and a catch-all that `--skip`s exactly those words, so a
+          # new test always lands in some leg (test_ci_gradle_prefixes.py
+          # keeps the skip list in sync). The agent suites get a leg of their
+          # own: sharing one with `gradle_hosted_[345]`, that leg took 4.3-6.2
+          # min and often outlasted the `coverage` job, setting `ci-ok`.
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           # Real-sbt hosted (socket-patch.sbt) + vendored
           # (socket-patch-vendor.sbt) capstones on the current 1.x line. The
           # other sbt lines, JDK 21, the agent cells beyond coverage-docker's,
@@ -1483,11 +1507,10 @@ jobs:
         if: matrix.pipenv != '' || matrix.pip != ''
         uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
         with:
-          # Pin uv: it is the PEP 751 oracle the pylock tests install with,
-          # and uv 0.13.2 started refusing Pipenv's `environments = []`
-          # pylock ("target environment is not supported by the lockfile").
-          # Bump deliberately, after checking the Pipenv pylock legs pass.
-          version: "0.13.1"
+          # Exact pin (scripts/check-tool-pins.py). uv 0.13.2+ refuses the
+          # `environments = []` pylock Pipenv writes; the pylock test checks
+          # that refusal matches Pipenv's own pylock, so keep this current.
+          version: "0.13.5"
 
       - name: Install the Pythons the Pipenv / pip legs run on
         if: matrix.pipenv != '' || matrix.pip != ''
@@ -1953,15 +1976,18 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '4.0.0-rc-7', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}

@@ -89,6 +89,19 @@ const VEX_VULNS: &[(&str, &[&str])] = &[("GHSA-vend-pypi-real", &["CVE-2024-8888
 /// API: the staged patch's `six.py` afterHash + advisory), `original`
 /// being the registry requirements the revert step restores.
 fn manifestless_vex(fresh: &Path, what: &str, patched: &[u8], original: &[u8]) {
+    manifestless_vex_reverting(fresh, what, patched, &|p: &Path| {
+        std::fs::write(p.join("requirements.txt"), original).unwrap()
+    });
+}
+
+/// [`manifestless_vex`] for a wiring that `revert` un-does (the vendor line
+/// may sit in a `-r` include rather than the root file).
+fn manifestless_vex_reverting(
+    fresh: &Path,
+    what: &str,
+    patched: &[u8],
+    revert: &(dyn Fn(&Path) + Sync),
+) {
     let view =
         vex_e2e_common::patch_view(UUID, PURL, &[("six.py", &git_sha256(patched))], VEX_VULNS);
     vex_pipenv_pip_steps::run_manifestless_steps(&vex_pipenv_pip_steps::Steps {
@@ -101,7 +114,7 @@ fn manifestless_vex(fresh: &Path, what: &str, patched: &[u8], original: &[u8]) {
         records: vex_pipenv_pip_steps::Records::Mock(vec![(UUID.to_string(), view)]),
         patch_server_url: None,
         product: "pkg:pypi/app@0.1.0",
-        revert: &|p: &Path| std::fs::write(p.join("requirements.txt"), original).unwrap(),
+        revert,
         envs: Vec::new(),
         on_step: None,
         expect_verified: true,
@@ -1870,6 +1883,118 @@ fn pip_vendored_requirements_evaluate_environment_markers() {
         assert_eq!(
             std::fs::read_to_string(project.join("requirements.txt")).unwrap(),
             original
+        );
+    }
+}
+
+/// #1104: the #928 marker split with its branches in different files of
+/// the `-r` tree (a layered `base.txt` plus a root file). pip merges the
+/// tree into one requirement set, so vendoring must rewrite the 1.16.0
+/// branch where it lives, leave the other version's branch alone in either
+/// layout, install the patched wheel from a fresh `--no-index` checkout,
+/// and revert byte-identically. Before the fix the file holding only the
+/// other branch made vendored refuse with a false
+/// `pypi_requirement_not_pinned`.
+#[test]
+#[serial_test::serial]
+fn pip_vendored_requirements_marker_split_across_includes() {
+    let python =
+        find_python().expect("Python is required for the pip cross-file marker-split regression");
+    let target = "six==1.16.0 ; python_full_version >= '3'\n";
+    // Never matches the running interpreter.
+    let other = "six==1.17.0 ; python_full_version < '3'\n";
+    for (label, root_pin, include_pin) in [("root", target, other), ("include", other, target)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_tool_ok(
+            &tool(Path::new(python), &project, &["-m", "venv", ".venv"], &[]),
+            "create source venv",
+        );
+        let venv = project.join(".venv");
+        assert_tool_ok(
+            &tool(
+                &venv.join("bin/pip"),
+                &project,
+                &["install", "--disable-pip-version-check", "six==1.16.0"],
+                &[],
+            ),
+            "install upstream six",
+        );
+        let patched = stage_patch(&project, &site_packages(&venv).join("six.py"));
+        let root_original = format!("-r base.txt\n{root_pin}");
+        let base_original = include_pin.to_string();
+        std::fs::write(project.join("requirements.txt"), &root_original).unwrap();
+        std::fs::write(project.join("base.txt"), &base_original).unwrap();
+
+        let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &project);
+        assert_eq!(code, 0, "[{label}] vendor failed: {stdout}\n{stderr}");
+        assert_vendored_applied(&parse_envelope(&stdout));
+        let (wired, untouched, untouched_original) = if label == "root" {
+            ("requirements.txt", "base.txt", &base_original)
+        } else {
+            ("base.txt", "requirements.txt", &root_original)
+        };
+        assert_eq!(
+            &std::fs::read_to_string(project.join(untouched)).unwrap(),
+            untouched_original,
+            "[{label}] the other branch's file must stay untouched"
+        );
+        let wired_now = std::fs::read_to_string(project.join(wired)).unwrap();
+        let vendor_line = wired_now.lines().last().unwrap();
+        assert!(
+            vendor_line.starts_with("./.socket/vendor/pypi/")
+                && vendor_line.contains(" ; python_full_version >= '3'  # socket-patch vendor:"),
+            "[{label}] the 1.16.0 branch becomes a marker-carrying vendor line: {vendor_line}"
+        );
+
+        let fresh = project.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        for file in ["requirements.txt", "base.txt"] {
+            std::fs::copy(project.join(file), fresh.join(file)).unwrap();
+        }
+        copy_dir_recursive(&project.join(".socket"), &fresh.join(".socket"));
+        assert_tool_ok(
+            &tool(Path::new(python), &fresh, &["-m", "venv", ".venv"], &[]),
+            "create fresh venv",
+        );
+        let fresh_venv = fresh.join(".venv");
+        assert_tool_ok(
+            &tool(
+                &fresh_venv.join("bin/pip"),
+                &fresh,
+                &[
+                    "install",
+                    "--disable-pip-version-check",
+                    "--no-index",
+                    "-r",
+                    "requirements.txt",
+                ],
+                &[],
+            ),
+            "install vendored cross-file marker-split requirements",
+        );
+        assert_eq!(python_oracle(&fresh_venv, &fresh), "1", "[{label}]");
+        manifestless_vex_reverting(
+            &fresh,
+            &format!("pip vendored cross-file marker split {label}"),
+            &patched,
+            &|p: &Path| {
+                std::fs::write(p.join("requirements.txt"), &root_original).unwrap();
+                std::fs::write(p.join("base.txt"), &base_original).unwrap();
+            },
+        );
+
+        let (code, stdout, stderr) =
+            run_socket(&project, &["vendor", "--revert", "--offline", "--json"]);
+        assert_eq!(code, 0, "[{label}] revert failed: {stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(project.join("requirements.txt")).unwrap(),
+            root_original
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("base.txt")).unwrap(),
+            base_original
         );
     }
 }

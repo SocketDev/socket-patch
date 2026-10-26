@@ -1376,11 +1376,12 @@ pub(crate) async fn run_locked(
                 .map(|(code, detail)| RunWarning { code, detail })
                 .collect();
             run_warnings.extend(user_patch_warnings.iter().cloned());
-            run_warnings.extend(results.iter().filter_map(|r| {
-                let note = r.error.as_deref().filter(|_| r.success)?;
-                note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)
-                    .then(|| RunWarning {
-                        code: "ownership_not_restored".to_string(),
+            run_warnings.extend(results.iter().flat_map(|r| {
+                let note = r.error.as_deref().filter(|_| r.success).unwrap_or_default();
+                socket_patch_core::patch::apply::advisory_warning_codes(note)
+                    .into_iter()
+                    .map(move |code| RunWarning {
+                        code: code.to_string(),
                         detail: format!("{}: {note}", normalize_purl(&r.package_key)),
                     })
             }));
@@ -1408,6 +1409,22 @@ pub(crate) async fn run_locked(
                     .map(|(code, detail)| RunWarning { code, detail }),
                 );
                 run_warnings.extend(cache_warnings.iter().cloned());
+            }
+            // A global Go apply patches the module cache in place: a tool
+            // already built from it with `go install` keeps the unpatched
+            // code until it is rebuilt (#422). Read-only, so a dry run
+            // over an already-patched cache says so too. An embedded
+            // `--vex` checks again and says so itself.
+            if args.common.is_global() {
+                let (patched, dirs) = patched_go_modules(&results);
+                let (warnings, _) =
+                    socket_patch_core::utils::go_installed_tools::audit(patched, dirs).await;
+                let warnings: Vec<RunWarning> = warnings
+                    .into_iter()
+                    .map(|(code, detail)| RunWarning { code, detail })
+                    .collect();
+                run_warnings.extend(warnings.iter().cloned());
+                cache_warnings.extend(warnings);
             }
 
             // Run-level advisories + best-effort fallback-home skips on the
@@ -2842,6 +2859,44 @@ async fn apply_patches_inner(
         targeted: target_manifest_purls.len(),
         show_summary: true,
     })
+}
+
+/// The Go modules a (global, in-place) apply left patched in the module
+/// cache, and their cache copies, for the installed-tool check (#422).
+/// Already-patched copies count too: a tool built before an earlier run
+/// is just as stale. A dry run reports what the real run would.
+fn patched_go_modules(
+    results: &[ApplyResult],
+) -> (
+    Vec<socket_patch_core::utils::go_installed_tools::PatchedModule>,
+    Vec<PathBuf>,
+) {
+    use socket_patch_core::utils::go_installed_tools::PatchedModule;
+    let mut patched = Vec::new();
+    let mut dirs = Vec::new();
+    for r in results {
+        if !r.success || r.package_path == VENDOR_OWNED_MARKER {
+            continue;
+        }
+        let dir = PathBuf::from(&r.package_path);
+        // Files this run writes (or, dry, would write) are patched now; an
+        // already-patched copy is dated by its files on disk.
+        let writes = !r.files_patched.is_empty()
+            || r.files_verified
+                .iter()
+                .any(|f| f.status == VerifyStatus::Ready);
+        let module = if writes {
+            PatchedModule::written_now(&r.package_key)
+        } else {
+            let files = r.files_verified.iter().map(|f| f.file.as_str());
+            PatchedModule::of_copy(&r.package_key, &dir, files)
+        };
+        if let Some(module) = module {
+            patched.push(module);
+            dirs.push(dir);
+        }
+    }
+    (patched, dirs)
 }
 
 /// One Maven base purl for [`apply_maven_base`].

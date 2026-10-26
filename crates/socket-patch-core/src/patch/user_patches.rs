@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde_json::Value;
 
 use crate::formats::text::strip_bom;
@@ -107,8 +109,9 @@ impl UserPatchIndex {
             if let Some(text) = index.read(&yarn_lock, "npm").await {
                 // Only Berry has patch: locators. Every Berry lock carries
                 // builtin compat patches, so scan the resolution lines rather
-                // than parse what can be a very large lockfile.
-                for line in text.lines() {
+                // than parse what can be a very large lockfile, and visit
+                // only the few lines that can hold one.
+                for line in lines_containing(&text, "@patch:") {
                     let Some(value) = line.trim_start().strip_prefix("resolution:") else {
                         continue;
                     };
@@ -514,10 +517,12 @@ impl UserPatchIndex {
 
     async fn patch_package(&mut self, dir: &Path, value: &Value) {
         self.patch_directory(&dir.join("patches"), false).await;
-        let flag = regex::Regex::new(r#"--patch-dir(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))"#)
-            .unwrap();
+        // Compiled once, and only for a project whose scripts run patch-package.
+        static FLAG: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"--patch-dir(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))"#).unwrap()
+        });
         // `cd` as a command, not the tail of a word like `abcd`.
-        let cd = regex::Regex::new(r"(?:^|[\s;&|(])cd\s").unwrap();
+        static CD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[\s;&|(])cd\s").unwrap());
         if let Some(scripts) = value["scripts"].as_object() {
             for script in scripts
                 .values()
@@ -526,17 +531,17 @@ impl UserPatchIndex {
             {
                 // A `cd` after patch-package (`patch-package && cd ios && pod
                 // install`) can't move the directory it already read.
-                let moved = cd
+                let moved = CD
                     .find(script)
                     .is_some_and(|cd| cd.start() < script.rfind("patch-package").unwrap_or(0));
-                if moved || (script.contains("--patch-dir") && !flag.is_match(script)) {
+                if moved || (script.contains("--patch-dir") && !FLAG.is_match(script)) {
                     self.unknown(
                         "npm",
                         &dir.join("package.json"),
                         "cannot resolve patch-package directory without executing the script",
                     );
                 }
-                for captures in flag.captures_iter(script) {
+                for captures in FLAG.captures_iter(script) {
                     let path = captures.iter().skip(1).flatten().next().unwrap().as_str();
                     if path.contains(['$', '`']) || moved {
                         self.unknown(
@@ -724,6 +729,27 @@ fn locator_target(locator: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// The lines of `text` that contain `needle`, each once, as `str::lines`
+/// spells them (a `\r` before a `\n` is dropped, a final bare one kept). Searching for the
+/// needle skips the rest of the text instead of splitting every line.
+/// `needle` must be non-empty and on one line, so each match moves on.
+fn lines_containing<'a>(text: &'a str, needle: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    debug_assert!(!needle.is_empty() && !needle.contains('\n'));
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        let at = from + text.get(from..)?.find(needle)?;
+        let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+        let Some(end) = text[at..].find('\n').map(|i| at + i) else {
+            // Past the end: the next call finds nothing.
+            from = text.len() + 1;
+            return Some(&text[start..]);
+        };
+        from = end + 1;
+        let line = &text[start..end];
+        Some(line.strip_suffix('\r').unwrap_or(line))
+    })
+}
+
 fn lock_options() -> serde_saphyr::Options {
     // Lockfiles of large monorepos exceed the default 250k-node budget, and a
     // parse failure would protect every npm package.
@@ -736,10 +762,14 @@ fn lock_options() -> serde_saphyr::Options {
     options
 }
 
+/// An npm `name@selector` key split at the first `@` past a scope, as Bun
+/// and pnpm split it: the selector may hold an `@` of its own, such as the
+/// hosted URL or vendored path Bun 1.4 keys a patch by after a rewire
+/// (`@s/p@.socket/vendor/npm/<uuid>/@s/p-1.0.0.tgz`, #1019).
 fn split_selector(key: &str) -> (&str, Option<&str>) {
-    match key.rsplit_once('@') {
-        Some((name, version)) if !name.is_empty() => (name, Some(version)),
-        _ => (key, None),
+    match crate::vendor::bun_lock_text::split_name_spec(key) {
+        Some((name, selector)) => (name, Some(selector)),
+        None => (key, None),
     }
 }
 
@@ -751,6 +781,27 @@ mod tests {
         let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// #1019: after a rewire, Bun 1.4 keys a later `bun patch` by the
+    /// package's resolution. A hosted URL or vendored path can hold an `@`
+    /// of its own, so the key splits at the first `@` past a scope, as Bun
+    /// splits it.
+    #[tokio::test]
+    async fn bun_resolution_keys_protect_scoped_and_unscoped_packages() {
+        for (key, purl) in [
+            ("plainpkg@https://patch.socket.dev/patch/npm/plainpkg/1.0.0/tok/u1/plainpkg-1.0.0.tgz", "pkg:npm/plainpkg@1.0.0"),
+            ("plainpkg@.socket/vendor/npm/u1/plainpkg-1.0.0.tgz", "pkg:npm/plainpkg@1.0.0"),
+            ("@s/p@https://patch.socket.dev/patch/npm/@s/p/1.0.0/tok/u1/p-1.0.0.tgz", "pkg:npm/%40s/p@1.0.0"),
+            ("@s/p@.socket/vendor/npm/u1/@s/p-1.0.0.tgz", "pkg:npm/%40s/p@1.0.0"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let manifest = format!(r#"{{"patchedDependencies":{{"{key}":"patches/x.patch"}}}}"#);
+            write(tmp.path(), "package.json", &manifest);
+            let index = UserPatchIndex::discover(tmp.path()).await;
+            assert!(!index.conflicts(purl).is_empty(), "{key}: {index:?}");
+            assert!(index.conflicts("pkg:npm/other@1.0.0").is_empty(), "{key}");
+        }
     }
 
     #[tokio::test]
@@ -834,6 +885,48 @@ mod tests {
         assert!(!index.conflicts("pkg:npm/wrapped@1.0.0").is_empty());
         assert!(index.conflicts("pkg:npm/alias@1.2.0").is_empty());
         assert!(index.conflicts("pkg:npm/@s/pkg@1.3.0").is_empty());
+    }
+
+    #[test]
+    fn lines_containing_matches_a_filtered_lines_walk() {
+        for text in [
+            "",
+            "@patch:",
+            "a\nb@patch:c\n",
+            "x@patch:y@patch:z\r\nno\r\n  q@patch:\r\n",
+            "\n\n@patch:\n\n",
+            "a@patch:\nb@patch:",
+            "@patch:@patch:\r",
+            "lone\rcarriage@patch:\r\rx\n",
+            "\u{e9}@patch:\u{e9}\n\u{e9}",
+        ] {
+            let slow: Vec<&str> = text.lines().filter(|l| l.contains("@patch:")).collect();
+            let fast: Vec<&str> = lines_containing(text, "@patch:").collect();
+            assert_eq!(fast, slow, "{text:?}");
+        }
+        // The documented contract, independent of the toolchain's `lines`.
+        let got: Vec<&str> = lines_containing("a@patch:\r\nb@patch:\r", "@patch:").collect();
+        assert_eq!(got, ["a@patch:", "b@patch:\r"]);
+    }
+
+    #[tokio::test]
+    async fn yarn_lock_patches_are_found_among_many_unpatched_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lock = String::from("__metadata:\r\n  version: 8\r\n");
+        for i in 0..200 {
+            lock.push_str(&format!(
+                "\"dep-{i}@npm:1.0.0\":\r\n  version: 1.0.0\r\n  resolution: \"dep-{i}@npm:1.0.0\"\r\n"
+            ));
+        }
+        lock.push_str("\"first@patch:first@npm%3A1.0.0#./a.patch\":\r\n  resolution: \"first@patch:first@npm%3A1.0.0#./a.patch::version=1.0.0&hash=a\"\r\n");
+        lock.push_str("\"ts@patch:ts@npm%3A5.0.0#optional!builtin<compat/typescript>\":\r\n  resolution: \"ts@patch:ts@npm%3A5.0.0#optional!builtin<compat/typescript>::version=5.0.0&hash=b\"\r\n");
+        lock.push_str("\"last@patch:last@npm%3A2.0.0#./b.patch\":\n  resolution: \"last@patch:last@npm%3A2.0.0#./b.patch::version=2.0.0&hash=c\"");
+        write(tmp.path(), "yarn.lock", &lock);
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(!index.conflicts("pkg:npm/first@1.0.0").is_empty());
+        assert!(!index.conflicts("pkg:npm/last@2.0.0").is_empty());
+        assert!(index.conflicts("pkg:npm/ts@5.0.0").is_empty());
+        assert!(index.conflicts("pkg:npm/dep-7@1.0.0").is_empty());
     }
 
     #[tokio::test]

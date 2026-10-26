@@ -76,6 +76,7 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
         // rebuilt registry record is not byte-exact for every lock.
         bun_lockb: false,
     };
+    let live_before = socket_patch_core::vendor::bun_lock::live_user_patch_keys(&common.cwd).await;
     let outcome = restore_upstream(&common.cwd, pins, &opts).await;
     for pin in &outcome.pins {
         match &pin.status {
@@ -130,6 +131,17 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
                 "redirect_bun_reinstall_required".to_string(),
                 bun_lock::reinstall_advisory(&stale),
             ));
+        }
+        // A `bun patch` keyed by a hosted URL the restore took out of the
+        // lock stops applying (#1019).
+        if !common.dry_run {
+            let live_after = bun_lock::live_user_patch_keys(&common.cwd).await;
+            for key in live_before.difference(&live_after) {
+                out.warnings.push((
+                    "redirect_bun_patched_dependency_dropped".to_string(),
+                    bun_lock::dropped_patch_detail(key),
+                ));
+            }
         }
     }
     // PDM, uv and Pipenv keep a same-version install through a plain sync

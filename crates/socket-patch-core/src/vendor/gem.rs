@@ -185,7 +185,8 @@ pub async fn gem_manifest_refusal(project_root: &Path) -> Option<(&'static str, 
 /// The per-gem twin of [`gem_manifest_refusal`] for the hosted→vendored
 /// takeover: the backend's Gemfile declaration gate ([`plan_gemfile_edit`]
 /// and [`refuse_append_of_direct_dependency`], refused as
-/// `gemfile_declaration_not_editable`) for `purl`. Evaluated on the files
+/// `gemfile_declaration_not_editable`, with [`gemspec_merge_refusal`]) for
+/// `purl`. Evaluated on the files
 /// as the takeover's restore of `pin` will leave them: a dry-run
 /// [`restore_upstream`] supplies the restored `Gemfile` / `Gemfile.lock`
 /// text, so the hosted `source … do` block socket-patch itself wrote is
@@ -235,6 +236,11 @@ pub async fn gem_vendor_target_preflight(
     };
     plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
         .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
+        .and_then(|plan| {
+            let after = apply_gemfile_plan(&gemfile_text, &plan);
+            gemspec_merge_refusal(project_root, &after, &lock_text, &name, &version)
+                .map_or(Ok(()), Err)
+        })
         .err()
         .map(|detail| ("gemfile_declaration_not_editable", detail))
 }
@@ -485,6 +491,20 @@ fn gem_edits(
             )))
         }
     };
+    // ── gemspec development dependency (#985) ────────────────────────────
+    let project_root = prelude.gemfile_path.parent().unwrap_or(Path::new("."));
+    if let Some(detail) = gemspec_merge_refusal(
+        project_root,
+        &apply_gemfile_plan(&prelude.gemfile_text, &plan),
+        &prelude.lock_text,
+        name,
+        version,
+    ) {
+        return Err(Box::new(refused(
+            "gemfile_declaration_not_editable",
+            detail,
+        )));
+    }
     // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
     // A lock-shape failure therefore costs no download / copy / patch and no
     // Gemfile write.
@@ -1653,6 +1673,69 @@ fn lock_record_lines(edit: &LockEdit) -> (Vec<String>, Vec<String>) {
     let mut new = edit.path_section.clone();
     new.push(edit.new_dep_line.clone());
     (original, new)
+}
+
+/// Why vendored mode must not wire `name`@`version` into the Gemfile as
+/// `plan` leaves it (`gemfile_after`), if it must not (#985). Bundler 2.7+
+/// folds a `gemspec` development dependency on the gem into a `gem` line
+/// that follows the directive. For a path gem bundler then rejects even
+/// the lock it writes itself under frozen/deployment mode ("rack from
+/// `<path>` to `<path>`", verified on 2.7.2 and 4.0.18), so no lock this
+/// backend could write keeps vendored mode's frozen-install promise.
+/// Declared before the directive, the gem keeps its own requirement and
+/// installs frozen: the refusal names that remedy.
+fn gemspec_merge_refusal(
+    project_root: &Path,
+    gemfile_after: &str,
+    lock: &str,
+    name: &str,
+    version: &str,
+) -> Option<String> {
+    match crate::formats::gem::gemspec::locked_exact_requirement(
+        gemfile_after,
+        lock,
+        name,
+        version,
+        &mut |dir| gemspec_listing(project_root, dir),
+    ) {
+        Ok(requirement) if requirement == format!("= {version}") => None,
+        Ok(requirement) => Some(format!(
+            "the gemspec the Gemfile's `gemspec` directive loads declares a development \
+             dependency on `{name}`, so bundler 2.7+ locks the vendored gem as `{name} \
+             ({requirement})!` and then rejects that lock under frozen/deployment mode (a \
+             bundler limitation for path gems); move the `gem \"{name}\"` declaration above \
+             `gemspec` in the Gemfile (bundler then keeps its own requirement), or use hosted \
+             mode"
+        )),
+        Err(why) => Some(format!(
+            "cannot tell whether bundler 2.7+ merges a gemspec development dependency on \
+             `{name}` into the vendored requirement ({why}), so a frozen install of the \
+             vendored pair is not guaranteed; use hosted mode"
+        )),
+    }
+}
+
+/// The `*.gemspec` files of the root-relative directory `dir` under
+/// `project_root`, for [`crate::formats::gem::gemspec::locked_exact_requirement`].
+fn gemspec_listing(project_root: &Path, dir: &str) -> crate::formats::gem::gemspec::GemspecListing {
+    let path = project_root.join(dir);
+    let entries = std::fs::read_dir(&path).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Some(file) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !crate::formats::gem::gemspec::is_gemspec_file(&file)
+            || entry.file_type().is_ok_and(|t| t.is_dir())
+        {
+            continue;
+        }
+        let text = crate::utils::fs::read_regular_to_string_sync(&path.join(&file)).ok();
+        out.push((file, text));
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Produce the pair-edited lock text (see the module doc for the canonical
@@ -3088,6 +3171,91 @@ mod tests {
                 .unwrap(),
             GEMFILE_DIRECT
         );
+    }
+
+    /// #985: on bundler 2.7+ a `gemspec` development dependency on the gem
+    /// merges into a vendored `gem` line after the directive, and bundler
+    /// then rejects even its own lock for the path gem under frozen mode, so
+    /// vendoring refuses before any write and names the remedy. A `gem`
+    /// line before the directive, or bundler < 2.7, keeps the exact pin
+    /// and vendors.
+    #[tokio::test]
+    async fn gemspec_dev_dependency_merge_refuses_before_any_write() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngemspec\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\"\n";
+        let lock = LOCK_DIRECT
+            .replace(
+                "  puma\n  rack (~> 3.1)\n",
+                "  mylib!\n  puma\n  rack (~> 3.1, >= 3)\n",
+            )
+            .replace("2.5.22", "2.7.2");
+        let spec = "Gem::Specification.new do |s|\n  s.name = \"mylib\"\n  \
+                    s.add_development_dependency \"rack\", \">= 3\"\nend\n";
+        let refusal = |outcome: &VendorOutcome| match outcome {
+            VendorOutcome::Refused { code, detail } => Some((*code, detail.clone())),
+            _ => None,
+        };
+
+        for extra in [None, Some("other.gemspec")] {
+            let (_tmp, root, installed, blobs, record) = fixture(gemfile, &lock).await;
+            tokio::fs::write(root.join("mylib.gemspec"), spec)
+                .await
+                .unwrap();
+            if let Some(extra) = extra {
+                // Two gemspecs, no `name:`: what bundler loads is unknown.
+                tokio::fs::write(root.join(extra), spec).await.unwrap();
+            }
+            let outcome = run_vendor(&root, &blobs, &installed, &record, false).await;
+            let (code, detail) = refusal(&outcome).unwrap_or_else(|| panic!("{outcome:?}"));
+            assert_eq!(code, "gemfile_declaration_not_editable");
+            let want = if extra.is_some() {
+                "cannot tell"
+            } else {
+                "above `gemspec`"
+            };
+            assert!(detail.contains(want), "{detail}");
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                lock
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile
+            );
+        }
+
+        // The remedy: declared before the directive, the exact pin vendors.
+        let before = "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\"\n\ngemspec\n";
+        let (_tmp, root, installed, blobs, record) = fixture(
+            before,
+            &lock.replace("rack (~> 3.1, >= 3)", "rack (~> 3.1)"),
+        )
+        .await;
+        tokio::fs::write(root.join("mylib.gemspec"), spec)
+            .await
+            .unwrap();
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        assert!(wired.contains("\n  rack (= 3.2.6)!\n"), "{wired}");
+
+        // Bundler < 2.7 never merges.
+        let (_tmp, root, installed, blobs, record) =
+            fixture(gemfile, &lock.replace("2.7.2", "2.6.9")).await;
+        tokio::fs::write(root.join("mylib.gemspec"), spec)
+            .await
+            .unwrap();
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        assert!(wired.contains("\n  rack (= 3.2.6)!\n"), "{wired}");
     }
 
     #[tokio::test]
@@ -6697,7 +6865,7 @@ mod tests {
 
         let (code, detail) =
             unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_pending");
         assert!(detail.contains("still building"), "{detail}");
         assert!(!root.join(".socket").exists());
         assert_eq!(
@@ -6734,7 +6902,7 @@ mod tests {
 
         let (code, detail) =
             unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_unavailable");
         assert!(detail.contains("unavailable"), "{detail}");
         assert!(!root.join(".socket").exists());
     }

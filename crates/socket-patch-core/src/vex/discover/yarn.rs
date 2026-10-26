@@ -157,6 +157,51 @@ async fn extract_classic(ctx: &DiscoverCtx<'_>, entries: Vec<YarnEntry>, out: &m
         }
     }
     record_copies(ctx, copies, out).await;
+    record_bundled_copies(ctx, &entries, out).await;
+}
+
+/// Record each copy yarn 1 unpacked from a parent's `bundleDependencies`
+/// as an unpatched copy beside the parent's lock entry (#758). yarn.lock
+/// has no block for it and doesn't say the parent bundles anything, so no
+/// Socket wiring of the same `name@version` reaches it, and only the
+/// installed tree shows it
+/// ([`crate::vendor::yarn_classic_bundled::bundled_copies`]).
+async fn record_bundled_copies(ctx: &DiscoverCtx<'_>, entries: &[YarnEntry], out: &mut Discovery) {
+    // Only a Socket wiring in this lock can be contested by a bundled copy
+    // (the walk reads around the view, so it is not paid for nothing).
+    if !out
+        .refs
+        .iter()
+        .any(|r| r.source_file == std::path::Path::new(YARN_LOCK))
+    {
+        return;
+    }
+    // The bundle is an installed tree: only a disk has one.
+    let Some(root) = ctx.disk_root() else {
+        return;
+    };
+    for (purl, copy) in crate::vendor::yarn_classic_bundled::bundled_copies(root).await {
+        let parent_key = entries
+            .iter()
+            .find(|e| {
+                e.live
+                    && classic_key_real_name(&e.patterns) == Some(copy.parent_name.as_str())
+                    && classic_field(&e.block.lines, "version")
+                        == Some(copy.parent_version.as_str())
+            })
+            .map(|e| e.block.key.clone())
+            .unwrap_or_else(|| format!("{}@{}", copy.parent_name, copy.parent_version));
+        out.bundled_copy(
+            YARN_LOCK,
+            Some(purl),
+            &parent_key,
+            &format!(
+                "bundles its own copy at {:?}, unpacked from the package's tarball with no \
+                 {YARN_LOCK} block, which no Socket wiring reaches",
+                copy.location
+            ),
+        );
+    }
 }
 
 /// The copy a classic `file:` / url block installs, to be read for the
@@ -2915,5 +2960,147 @@ mod tests {
             .expect("discovery must not block on a FIFO");
         assert!(out.refs.is_empty());
         assert_eq!(diag_codes(&out), vec![DIAG_LOCKFILE_UNREADABLE]);
+    }
+
+    /// REGRESSION (#758): yarn classic unpacks a `bundledDependencies`
+    /// copy from its parent's tarball into `<parent>/node_modules/<name>`
+    /// and yarn.lock records nothing about it, so no hosted or vendored
+    /// wiring of the same `name@version` reaches it. An installed bundled
+    /// copy (named directly, through `bundleDependencies: true`, or as a
+    /// dependency of a bundled package) contests a hosted and a vendored
+    /// ref alike. A bundled copy of another version, and a nested copy
+    /// yarn placed there from the lock (its parent bundles nothing), contest
+    /// nothing.
+    #[tokio::test]
+    async fn classic_installed_bundled_copy_contests_the_ref() {
+        const PURL: &str = "pkg:npm/left-pad@1.3.0";
+        let lp = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wired = [
+            (
+                classic_block(
+                    "left-pad@^1.3.0",
+                    "1.3.0",
+                    &format!("{lp}#{SHA1}"),
+                    Some(SRI),
+                ),
+                UUID_A,
+                WiringMode::Hosted,
+            ),
+            (
+                classic_block(
+                    "left-pad@^1.3.0",
+                    "1.3.0",
+                    &format!("file:./.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz#{SHA1}"),
+                    Some(SRI),
+                ),
+                UUID_B,
+                WiringMode::Vendored,
+            ),
+        ];
+        let parent_block = classic_block(
+            "\"@bh/bund@^1.0.0\"",
+            "1.0.0",
+            &format!("https://registry.yarnpkg.com/@bh/bund/-/bund-1.0.0.tgz#{SHA1}"),
+            Some(SRI),
+        );
+        // (what, parent package.json, copy dir under the parent, version, contested)
+        let cases = [
+            (
+                "named",
+                r#"{"name":"@bh/bund","version":"1.0.0","dependencies":{"left-pad":"1.3.0"},"bundledDependencies":["left-pad"]}"#,
+                "node_modules/left-pad",
+                "1.3.0",
+                true,
+            ),
+            (
+                "bundleDependencies: true",
+                r#"{"name":"@bh/bund","version":"1.0.0","dependencies":{"left-pad":"1.3.0"},"bundleDependencies":true}"#,
+                "node_modules/left-pad",
+                "1.3.0",
+                true,
+            ),
+            (
+                "dependency of a bundled package",
+                r#"{"name":"@bh/bund","version":"1.0.0","dependencies":{"wrap":"1.0.0"},"bundleDependencies":["wrap"]}"#,
+                "node_modules/left-pad",
+                "1.3.0",
+                true,
+            ),
+            (
+                "nested under a bundled package",
+                r#"{"name":"@bh/bund","version":"1.0.0","dependencies":{"wrap":"1.0.0"},"bundleDependencies":["wrap"]}"#,
+                "node_modules/wrap/node_modules/left-pad",
+                "1.3.0",
+                true,
+            ),
+            (
+                "another version",
+                r#"{"name":"@bh/bund","version":"1.0.0","dependencies":{"left-pad":"1.2.0"},"bundledDependencies":["left-pad"]}"#,
+                "node_modules/left-pad",
+                "1.2.0",
+                false,
+            ),
+            (
+                "not bundled",
+                r#"{"name":"@bh/bund","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
+                "node_modules/left-pad",
+                "1.3.0",
+                false,
+            ),
+        ];
+        for (wired_block, uuid, mode) in &wired {
+            for (what, parent_manifest, copy, version, contested) in cases {
+                let p = Project::new();
+                p.write(
+                    "yarn.lock",
+                    classic(&[parent_block.clone(), wired_block.clone()]),
+                );
+                p.write(
+                    "node_modules/left-pad/package.json",
+                    r#"{"name":"left-pad","version":"1.3.0"}"#,
+                );
+                let parent = "node_modules/@bh/bund";
+                p.write(&format!("{parent}/package.json"), parent_manifest);
+                p.write(
+                    &format!("{parent}/node_modules/wrap/package.json"),
+                    r#"{"name":"wrap","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
+                );
+                p.write(
+                    &format!("{parent}/{copy}/package.json"),
+                    format!(r#"{{"name":"left-pad","version":"{version}"}}"#),
+                );
+                let out = run(&p).await;
+                if contested {
+                    assert_refs(&out, &[]);
+                    let detail = out
+                        .diagnostics
+                        .iter()
+                        .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                        .map(|d| d.detail.as_str())
+                        .unwrap_or_else(|| panic!("{what} {mode:?}: {:?}", out.diagnostics));
+                    assert!(
+                        detail.contains(&format!("{parent}/{copy}"))
+                            && detail.contains("@bh/bund@^1.0.0")
+                            && detail.contains("bundles its own copy"),
+                        "{what}: the diagnostic names the copy and its parent: {detail}"
+                    );
+                    // Still a pin the lock records (#1195).
+                    let shadowed: Vec<_> = out.shadowed.iter().map(|r| r.uuid.as_str()).collect();
+                    assert_eq!(shadowed, [*uuid], "{what} {mode:?}");
+                    assert!(
+                        out.unpatched_copies.iter().any(|c| c.purl == PURL),
+                        "{what}: {:?}",
+                        out.unpatched_copies
+                    );
+                } else {
+                    assert_refs(&out, &[(PURL, uuid, *mode)]);
+                    assert!(
+                        out.diagnostics.is_empty(),
+                        "{what} {mode:?}: {:?}",
+                        out.diagnostics
+                    );
+                }
+            }
+        }
     }
 }

@@ -42,9 +42,9 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
     decode_json_string, default_trust_detail, has_workspace_packages, is_bundled_entry,
-    is_user_tarball_entry, lock_version, loses_default_trust, packages_bounds, parse_entry_line,
-    patched_dependency_detail, patched_dependency_key, patched_dependency_keys, split_name_spec,
-    BunEntry,
+    is_user_tarball_entry, live_resolution_keys, lock_version, loses_default_trust,
+    packages_bounds, parse_entry_line, patched_dependency_detail, patched_dependency_key,
+    patched_dependency_keys, split_name_spec, BunEntry,
 };
 
 use super::common::refused;
@@ -206,10 +206,9 @@ pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, 
         }
         Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
     };
-    let entries = BunTextLock::parse(&text)
-        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?
-        .entries;
-    check_workspace_compatibility(&text, &entries)
+    let lock = BunTextLock::parse_shared(&text)
+        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?;
+    check_workspace_compatibility(&text, &lock.entries)
 }
 
 /// Whether `bun.lock` already wires EVERY packages entry resolving the npm
@@ -281,13 +280,12 @@ pub async fn wired_instances_all_ours(
         }
         Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
     };
-    let entries = BunTextLock::parse(&text)
-        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?
-        .entries;
+    let lock = BunTextLock::parse_shared(&text)
+        .map_err(|e| ("vendor_lockfile_version_unsupported", e.detail()))?;
     let target_spec = format!("{name}@{version}");
     let target_leaf = tgz_rel_leaf(&name, &version);
     let mut matched = 0usize;
-    for entry in &entries {
+    for entry in &lock.entries {
         match classify_rewritable(entry, &target_spec, &name, &target_leaf) {
             Some(TupleShape::Ours { .. }) => matched += 1,
             Some(TupleShape::Registry) => return Ok(false),
@@ -377,7 +375,7 @@ impl NpmLockBackend for BunTextBackend {
         let project = read_project(project_root).await?;
 
         // ── 3. Pre-flight: at least one rewritable instance ──────────────
-        let (target_spec, target_leaf) = preflight_package(&project, name, version)?;
+        let (target_spec, target_leaf) = preflight_package(&project, coords)?;
         for key in bundled_matches(&project.entries, &target_spec, name, &target_leaf) {
             // LOUD: this copy ships inside its PARENT's tarball, which we do
             // not repack — it stays the unpatched bytes after vendor (#469).
@@ -670,14 +668,17 @@ pub(super) fn default_trust_warning(
 }
 
 /// Refuse to vendor a package the project patches itself with `bun patch`
-/// (#367): Bun applies that patch only to the registry `name@version`, so
-/// a local tarball tuple would silently drop it from every install.
+/// (#367): Bun applies that patch only to the resolution it is keyed on
+/// (the registry `name@version`, or a hosted or older vendored tarball,
+/// #1019), so the tuple for `coords` would silently drop it from every
+/// install.
 pub(super) fn refuse_user_patched(
     user_patched: &[String],
-    name: &str,
-    version: &str,
+    coords: &NpmCoords,
 ) -> Result<(), Box<VendorOutcome>> {
-    match patched_dependency_key(user_patched, name, version) {
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
+    let target = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
+    match patched_dependency_key(user_patched, name, version, &target) {
         Some(key) => Err(Box::new(refused(
             "vendor_lock_entry_unsupported",
             patched_dependency_detail(key, name, version),
@@ -733,10 +734,10 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BunProject, Box<
 /// asks the service, so the download plan evaluates it ahead of the loop.
 pub(super) fn preflight_package(
     project: &BunProject,
-    name: &str,
-    version: &str,
+    coords: &NpmCoords,
 ) -> Result<(String, String), Box<VendorOutcome>> {
-    refuse_user_patched(&project.user_patched, name, version)?;
+    refuse_user_patched(&project.user_patched, coords)?;
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let target_spec = format!("{name}@{version}");
     let target_leaf = tgz_rel_leaf(name, version);
     let has_match = project
@@ -826,7 +827,7 @@ pub(crate) async fn preflight_packages(
             .map_err(|o| refusal_code(&o)),
         packages,
         |project, coords| {
-            preflight_package(project, &coords.name, &coords.version)
+            preflight_package(project, coords)
                 .map(drop)
                 .map_err(|o| refusal_code(&o))
         },
@@ -858,6 +859,7 @@ pub(crate) async fn revert_bun_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
+    let live_before = live_user_patch_keys(project_root).await;
     let mut outcome = revert_bun_wiring(entry, project_root, opts).await;
     // Only a revert that put a lock entry back can leave Bun keeping a
     // copy: with the lock missing nothing was restored, and with the entry
@@ -876,7 +878,66 @@ pub(crate) async fn revert_bun_opts(
             ));
         }
     }
+    if outcome.success && !restored_nothing {
+        let live_after = live_user_patch_keys(project_root).await;
+        for key in live_before.difference(&live_after) {
+            outcome.warnings.push(VendorWarning::new(
+                PATCHED_DEPENDENCY_DROPPED,
+                dropped_patch_detail(key),
+            ));
+        }
+    }
     outcome
+}
+
+/// A wet revert took out of the lock the vendored tarball a project's own
+/// `bun patch` is keyed by (#1019): Bun stops applying that patch, without
+/// failing. The hosted unwind warns the same way as
+/// `redirect_bun_patched_dependency_dropped`.
+pub const PATCHED_DEPENDENCY_DROPPED: &str = "vendor_bun_patched_dependency_dropped";
+
+/// The detail for a [`live_user_patch_keys`] key an unwind took out of the
+/// lock, shared by the hosted and vendored warnings.
+pub fn dropped_patch_detail(key: &str) -> String {
+    super::bun_lock_text::dropped_patch_detail(key)
+}
+
+/// The project's `bun patch` keys that name a hosted or vendored tarball
+/// the lock resolves to right now (#1019; see [`live_resolution_keys`]),
+/// from the root `package.json` and the text lock's mirror, matched against
+/// the text `bun.lock`, or else `bun.lockb`. An unwind compares the set
+/// before and after it writes: a key that left it is a patch Bun drops.
+/// Empty, with no further read, when the project declares no such key.
+pub async fn live_user_patch_keys(project_root: &Path) -> std::collections::BTreeSet<String> {
+    let manifest = read_manifest(project_root).await;
+    let lock = read_regular_to_string(&project_root.join(BUN_LOCK))
+        .await
+        .ok();
+    let keys = patched_dependency_keys(manifest.as_deref(), lock.as_deref());
+    if !keys.iter().any(|k| k.contains('/')) {
+        return Default::default();
+    }
+    if let Some(lock) = lock {
+        let Ok(parsed) = BunTextLock::parse(&lock) else {
+            return Default::default();
+        };
+        let specs: Vec<String> = parsed
+            .entries
+            .iter()
+            .filter_map(|e| e.elems.first().and_then(|s| decode_json_string(s)))
+            .collect();
+        return live_resolution_keys(&keys, specs.iter().map(String::as_str));
+    }
+    let Ok(bytes) = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb")).await
+    else {
+        return Default::default();
+    };
+    let specs: Vec<String> = super::bun_lockb::BunLockb::parse_packages(&bytes)
+        .unwrap_or_default()
+        .iter()
+        .map(|p| format!("{}@{}", p.name, p.resolution))
+        .collect();
+    live_resolution_keys(&keys, specs.iter().map(String::as_str))
 }
 
 /// A revert (or hosted unwind) left an installed copy Bun may keep: its
@@ -2525,6 +2586,73 @@ mod tests {
         .unwrap();
         let (result, _, _) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
+    }
+
+    /// REGRESSION (#1019): after a hosted or vendored rewire, Bun 1.4 keys a
+    /// `bun patch` by the tarball the package resolves to. Vendoring onto a
+    /// new uuid (a takeover, or a superseding re-run) would orphan that key
+    /// just as it would a registry one, so it refuses the same way.
+    #[tokio::test]
+    async fn user_bun_patch_keyed_by_resolution_refuses_before_any_write() {
+        let registry_line = r#""left-pad": ["left-pad@1.3.0", "", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],"#;
+        let with_key = |key: &str| {
+            let mut manifest: Value = serde_json::from_str(BN3_PKG).unwrap();
+            manifest["patchedDependencies"] = serde_json::json!({ key: "patches/x.patch" });
+            serde_json::to_string_pretty(&manifest).unwrap()
+        };
+        for resolution in [
+            "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/old/left-pad-1.3.0.tgz",
+            ".socket/vendor/npm/00000000-0000-4000-8000-000000000000/left-pad-1.3.0.tgz",
+        ] {
+            let key = format!("left-pad@{resolution}");
+            let lock = BN3_BEFORE_LOCK.replace(
+                registry_line,
+                &format!(r#""left-pad": ["{key}", {{}}, "sha512-OLD=="],"#),
+            );
+            assert_ne!(lock, BN3_BEFORE_LOCK, "the fixture line must be replaced");
+            let fx = fixture_with(&lock, "node_modules/left-pad").await;
+            tokio::fs::write(fx.root().join("package.json"), with_key(&key))
+                .await
+                .unwrap();
+            let (planned, looped) = preflight_then_vendor(&fx).await;
+            assert_eq!(planned, Err("vendor_lock_entry_unsupported"), "{key}");
+            assert_eq!(looped, Err("vendor_lock_entry_unsupported"), "{key}");
+            let detail = expect_refused(fx.vendor(true).await, "vendor_lock_entry_unsupported");
+            assert!(
+                detail.contains(&key) && detail.contains("resolves to"),
+                "{detail}"
+            );
+            assert_eq!(fx.read_lock().await, lock, "refusal writes nothing");
+            assert!(!fx.root().join(".socket/vendor").exists());
+
+            // Over a registry lock too: a takeover checks after reverting
+            // the wiring the key names, so it fails closed.
+            let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+            tokio::fs::write(fx.root().join("package.json"), with_key(&key))
+                .await
+                .unwrap();
+            expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
+        }
+
+        // The key for this run's own tarball (an in-sync re-run) moves
+        // nothing, so it vendors; reverting that wiring then warns that the
+        // patch stops applying, and still reverts.
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let key = format!("left-pad@{}", fx.rel_tgz());
+        tokio::fs::write(fx.root().join("package.json"), with_key(&key))
+            .await
+            .unwrap();
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let outcome = revert_bun(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let dropped = outcome
+            .warnings
+            .iter()
+            .find(|w| w.code == PATCHED_DEPENDENCY_DROPPED)
+            .unwrap_or_else(|| panic!("{:?}", outcome.warnings));
+        assert!(dropped.detail.contains(&key), "{}", dropped.detail);
+        assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "lock byte-restored");
     }
 
     /// REGRESSION (#367), `bun.lockb`: the binary lock has no text mirror,

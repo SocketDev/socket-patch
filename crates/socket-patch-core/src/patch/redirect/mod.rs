@@ -1255,6 +1255,7 @@ fn rewrite_npm_lock(
                 &user_patched,
                 &fname,
                 &dep.version,
+                &dep.artifact_url,
             ) {
                 format!("package.json `patchedDependencies` has `{key}`")
             } else if let Some((_, _, lockfile, key)) = lock_patched
@@ -1331,6 +1332,26 @@ pub fn npm_shrinkwrap_only_detail(packages: &[String], how: &str) -> String {
          {PACKAGE_LOCK}, so npm >= 12 installs stay UNPATCHED (npm <= 11 installs from the \
          shrinkwrap and is patched); rename the lock to {PACKAGE_LOCK} (or commit a copy \
          under that name) and re-run",
+        packages.join(", ")
+    )
+}
+
+/// The project's Deno lock. `deno install` installs a `package.json`
+/// project's npm dependencies from it and never reads an npm-family lock.
+pub const DENO_LOCK: &str = "deno.lock";
+
+/// The shared detail of the hosted (`redirect_npm_deno_lock`) and vendored
+/// (`vendor_npm_deno_lock`) warnings (#406): `packages` (`name@version`)
+/// are wired in the npm-family lock, but `deno.lock` also locks them, so
+/// installs Deno runs keep the registry copy.
+pub fn npm_deno_lock_detail(packages: &[String], how: &str) -> String {
+    format!(
+        "{} {how} in the project's npm-family lock, but {DENO_LOCK} locks the same \
+         version and `deno install` installs this project's npm dependencies from \
+         {DENO_LOCK}, never from that lock — so installs run by Deno stay UNPATCHED, and \
+         `vex` leaves the package out (installs the other package manager runs from its \
+         lock are unaffected); to patch what Deno installs, run `deno install` and then \
+         `socket-patch scan --mode agent`",
         packages.join(", ")
     )
 }
@@ -5501,15 +5522,15 @@ fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) ->
 // deviations). Byte-for-byte twin of the TS `rewriteBun`.
 fn parse_bun_hosted_lock(
     content: &str,
-) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {
+) -> Result<std::sync::Arc<crate::formats::bun::BunTextLock>, RewriteWarning> {
     use crate::vendor::bun_lock_text::{has_workspace_packages, lock_version};
 
     // The shared gate's `Err` text IS the detail: hosted and vendored refuse
     // an unsupported head with one message (and one remedy per arm — a
     // future version means "update socket-patch", a missing integer means
     // "re-lock"), so the two modes cannot drift apart.
-    let (lines, entries) = match crate::formats::bun::BunTextLock::parse(content) {
-        Ok(lock) => (lock.lines, lock.entries),
+    let lock = match crate::formats::bun::BunTextLock::parse_shared(content) {
+        Ok(lock) => lock,
         Err(crate::formats::bun::BunTextError::Version(detail)) => {
             return Err(RewriteWarning {
                 code: "redirect_bun_lock_unsupported".into(),
@@ -5543,7 +5564,7 @@ fn parse_bun_hosted_lock(
     // workspaces is kept at 0 by an in-place install on 1.2.0, 1.2.23 and
     // 1.3.0 and bumped to 1 by 1.3.9 and every later release; that case is
     // accepted here either way.)
-    if lock_version(content) == Some(0) && has_workspace_packages(&entries) {
+    if lock_version(content) == Some(0) && has_workspace_packages(&lock.entries) {
         return Err(RewriteWarning {
             code: "redirect_bun_workspace_unsupported".into(),
             detail: "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen \
@@ -5556,7 +5577,7 @@ fn parse_bun_hosted_lock(
         });
     }
 
-    Ok((lines, entries))
+    Ok(lock)
 }
 
 /// The warning for a package the bun rewriters pinned to its hosted URL that
@@ -5572,10 +5593,11 @@ pub(crate) fn bun_default_trust_warning(name: &str, version: &str) -> RewriteWar
     }
 }
 
-/// Leave `dep` on its registry resolution when the project's own
+/// Leave `dep` on its current resolution when the project's own
 /// `patchedDependencies` patches it (#367): Bun applies that patch only to
-/// the registry `name@version`, so a hosted pin would silently drop it from
-/// every install. Warns, keeps the in-run VEX from assuming the uuid
+/// the resolution it is keyed on (the registry `name@version`, or an older
+/// hosted or vendored tarball, #1019), so a pin to `dep`'s URL would
+/// silently drop it from every install. Warns, keeps the in-run VEX from assuming the uuid
 /// patched, and keeps any other lock from confirming it. `true` when `dep`
 /// was skipped.
 pub(crate) fn skip_bun_user_patched(
@@ -5585,7 +5607,8 @@ pub(crate) fn skip_bun_user_patched(
     result: &mut RewriteResult,
 ) -> bool {
     use crate::vendor::bun_lock_text::{patched_dependency_detail, patched_dependency_key};
-    let Some(key) = patched_dependency_key(user_patched, name, &dep.version) else {
+    let Some(key) = patched_dependency_key(user_patched, name, &dep.version, &dep.artifact_url)
+    else {
         return false;
     };
     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
@@ -5627,13 +5650,16 @@ fn rewrite_bun_lock(
     let Some(content) = files.get("bun.lock") else {
         return;
     };
-    let (mut lines, entries) = match parse_bun_hosted_lock(content) {
-        Ok(parsed) => parsed,
+    let lock = match parse_bun_hosted_lock(content) {
+        Ok(lock) => lock,
         Err(warning) => {
             result.warnings.push(warning);
             return;
         }
     };
+    let entries = &lock.entries;
+    // The shared parse is never edited: the first splice copies its lines.
+    let mut lines = std::borrow::Cow::Borrowed(lock.lines.as_slice());
 
     let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
         files.get("package.json").map(String::as_str),
@@ -5788,7 +5814,7 @@ fn rewrite_bun_lock(
             if rebuilt == original {
                 continue;
             }
-            lines[entry.line_idx] = rebuilt.clone();
+            lines.to_mut()[entry.line_idx] = rebuilt.clone();
             result.edits.push(FileEdit {
                 path: "bun.lock".into(),
                 kind: "redirect_bun_lock_package".into(),
@@ -5830,7 +5856,7 @@ fn rewrite_bun_lock(
     // holds a pin is touched, and the manifests are the engine's advisory
     // `<dir>/package.json` reads.
     if pinned_any {
-        let heals = crate::vendor::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
+        let heals = crate::vendor::bun_lock_text::heal_workspace_literals(lines.to_mut(), |dir| {
             let rel = if dir.is_empty() {
                 "package.json".to_string()
             } else {
@@ -7794,12 +7820,48 @@ fn rewrite_gem(
             // lock bundler < 2.2 wrote is proven frozen-installable after
             // that refresh (e2e_redirect_gem_build); a later bundler keeping
             // a merged lock keeps the caveat.
+            // Bundler 2.7+ folds a `gemspec` development dependency on the
+            // gem into its Gemfile requirement, so the lock must pin the
+            // union or every frozen install rejects the pair (#985). When
+            // that cannot be read, the plain exact pin still installs
+            // unfrozen; say so.
+            let requirement = gemfile
+                .as_deref()
+                .map(|gf| {
+                    crate::formats::gem::gemspec::locked_exact_requirement(
+                        gf,
+                        lk,
+                        &dep.name,
+                        &dep.version,
+                        &mut |dir| crate::formats::gem::gemspec::candidate_listing(files, dir),
+                    )
+                })
+                .unwrap_or_else(|| Ok(format!("= {}", dep.version)))
+                .unwrap_or_else(|why| {
+                    if checksums_era {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_gemspec_dependency_unreadable".into(),
+                            detail: format!(
+                                "{lock_name} pins {name} (= {version})!, but bundler 2.7+ merges \
+                                 a gemspec development dependency on {name} into that \
+                                 requirement and {why}; if the gemspec declares one, \
+                                 frozen/deployment installs reject the pair — run `bundle \
+                                 install` (unfrozen) once to record bundler's requirement in \
+                                 {lock_name}",
+                                name = dep.name,
+                                version = dep.version,
+                            ),
+                        });
+                    }
+                    format!("= {}", dep.version)
+                });
             let converged = checksums_era
                 && converge_gem_lock_source(
                     lk,
                     dep,
                     &ov.index_url,
                     lock_name,
+                    &requirement,
                     &mut lock_changed,
                     result,
                 );
@@ -13920,6 +13982,81 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
+    /// REGRESSION (#1019): a `bun patch` made after a hosted rewire is keyed
+    /// by the hosted URL the package resolves to (Bun 1.4). A re-run that
+    /// picks up a superseding patch would move the entry to a new URL and
+    /// orphan that key, silently dropping the user's patch, so the entry
+    /// keeps its current URL and the run says why. Scoped packages too,
+    /// whose URL holds an `@` of its own.
+    #[test]
+    fn bun_lock_patch_keyed_by_hosted_url_survives_superseding_rerun() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        for (key, name, namespace, old_url) in [
+            (
+                "left-pad",
+                "left-pad",
+                None,
+                "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/old/left-pad-1.3.0.tgz",
+            ),
+            (
+                "@s/left-pad",
+                "left-pad",
+                Some("@s"),
+                "https://patch.socket.dev/patch/npm/@s/left-pad/1.3.0/tok/old/left-pad-1.3.0.tgz",
+            ),
+        ] {
+            let new_url = old_url.replace("/old/", "/new/");
+            let mut ovr = npm_override(name, "1.3.0", &new_url, &sha512);
+            ovr.namespace = namespace.map(String::from);
+            let entry = format!("\"{key}\": [\"{key}@{old_url}\", {{}}, \"{sha512}\"],");
+            let manifest = format!(
+                r#"{{"name":"app","dependencies":{{"{key}":"1.3.0"}},"patchedDependencies":{{"{key}@{old_url}":"patches/x.patch"}}}}"#
+            );
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(&entry, 1));
+            files.insert("package.json".to_string(), manifest);
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.edits.is_empty(), "{key}: {:?}", r.edits);
+            assert!(
+                r.files
+                    .get("bun.lock")
+                    .is_none_or(|out| !out.contains(&new_url)),
+                "{key}: the entry keeps its current URL"
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_patched_dependency_skipped"],
+                "{key}: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.warnings[0]
+                    .detail
+                    .contains(&format!("resolves to {old_url}")),
+                "{}",
+                r.warnings[0].detail
+            );
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+            // An in-sync re-run (the keyed URL is the pin's own) moves
+            // nothing, so it neither skips nor warns.
+            let in_sync = npm_override(name, "1.3.0", old_url, &sha512);
+            let mut in_sync = DepOverride {
+                namespace: namespace.map(String::from),
+                ..in_sync
+            };
+            in_sync.patch_uuid = ovr.patch_uuid.clone();
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&in_sync), &mut r);
+            assert!(r.warnings.is_empty(), "{key}: {:?}", r.warnings);
+            assert!(
+                !r.bundled_skipped_uuids.contains(&in_sync.patch_uuid),
+                "{key}"
+            );
+        }
+    }
+
     /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
     /// (better-sqlite3, esbuild, sharp, simple-git-hooks, …) applies only to
     /// packages resolved from the npm registry, so a default-trusted package
@@ -17838,6 +17975,82 @@ mod tests {
             ))),
             "pre-edit CHECKSUMS line captured for revert"
         );
+    }
+
+    /// #985: on bundler 2.7+ a `gemspec` development dependency on the gem
+    /// merges into the redirected `gem` line that follows the directive, so
+    /// the DEPENDENCIES pin carries the union (`>= 0, = 7.0.0`) bundler
+    /// writes; a bare `(= 7.0.0)!` fails every frozen install. Bundler
+    /// 2.6, a `gem` line before the directive, and an unreadable gemspec
+    /// keep the exact pin (the last one with a warning).
+    #[test]
+    fn gem_pin_carries_the_gemspec_dev_dependency_bundler_merges() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngemspec\n\ngroup :development do\n  \
+                       gem \"rails\"\nend\n";
+        let gemspec = "Gem::Specification.new do |s|\n  s.name = \"mylib\"\n  \
+                       s.add_development_dependency \"rails\", \">= 6\"\nend\n";
+        let listing = serde_json::json!({ "": { "mylib.gemspec": gemspec } }).to_string();
+        let lock = |bundler: &str| {
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64)))
+                .replace("rails (= 7.0.0)", "rails (>= 6)")
+                .replace("2.6.2", bundler)
+        };
+        let pin = |files: &BTreeMap<String, String>| {
+            let r = rewrite_registry_redirect(files, &[gem_override("rails", "7.0.0")]);
+            let lock = r.files.get("Gemfile.lock").expect("lock rewritten").clone();
+            let pin = lock
+                .lines()
+                .skip_while(|l| *l != "DEPENDENCIES")
+                .nth(1)
+                .unwrap()
+                .to_string();
+            (
+                pin,
+                warning_codes(&r)
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut files = BTreeMap::new();
+        files.insert("Gemfile".to_string(), gemfile.to_string());
+        files.insert("Gemfile.lock".to_string(), lock("2.7.2"));
+        files.insert(
+            crate::formats::gem::gemspec::GEMSPECS_KEY.to_string(),
+            listing.clone(),
+        );
+        let (merged, warnings) = pin(&files);
+        assert_eq!(merged, "  rails (>= 6, = 7.0.0)!");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Bundler 4 merges too.
+        files.insert("Gemfile.lock".to_string(), lock("4.0.22"));
+        assert_eq!(pin(&files).0, "  rails (>= 6, = 7.0.0)!");
+        // Re-running over the converged pair changes nothing.
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let mut again = files.clone();
+        again.extend(r.files.clone());
+        let r2 = rewrite_registry_redirect(&again, &[gem_override("rails", "7.0.0")]);
+        assert!(r2.edits.is_empty(), "{:?}", r2.edits);
+
+        // Bundler 2.6 never merges.
+        files.insert("Gemfile.lock".to_string(), lock("2.6.9"));
+        assert_eq!(pin(&files).0, "  rails (= 7.0.0)!");
+        // A `gem` line before the directive keeps its own requirement.
+        files.insert("Gemfile.lock".to_string(), lock("2.7.2"));
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\"\ngemspec\n".to_string(),
+        );
+        assert_eq!(pin(&files).0, "  rails (= 7.0.0)!");
+        // The gemspec cannot be read: the exact pin, and a warning.
+        files.insert("Gemfile".to_string(), gemfile.to_string());
+        files.insert(
+            crate::formats::gem::gemspec::GEMSPECS_KEY.to_string(),
+            serde_json::json!({ "": { "mylib.gemspec": null } }).to_string(),
+        );
+        let (exact, warnings) = pin(&files);
+        assert_eq!(exact, "  rails (= 7.0.0)!");
+        assert_eq!(warnings, ["redirect_gem_gemspec_dependency_unreadable"]);
     }
 
     /// CHECKSUMS-era locks (bundler >= 4 writes the section by default) must
@@ -27084,6 +27297,32 @@ mod hatch_tests {
         assert!(result.confirmed_hatch_uuids.is_empty());
     }
 
+    /// #673: Hatch's uv installer applies `[tool.uv.sources]` over the
+    /// hosted reference, so the dep stays unconfirmed (nothing written)
+    /// instead of reporting a redirect that installs the unpatched copy.
+    #[test]
+    fn hatch_uv_source_leaves_the_dep_unconfirmed() {
+        let files: BTreeMap<String, String> = [(
+            "pyproject.toml".to_string(),
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"urllib3==1.26.18\"]\n\n[tool.hatch.envs.default]\ninstaller = \"uv\"\n\n[tool.uv.sources]\nurllib3 = { url = \"https://files.test/urllib3-1.26.18-py2.py3-none-any.whl\" }\n".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        assert!(result.hatch_uuids.contains("test-uuid"));
+        assert!(result.confirmed_hatch_uuids.is_empty());
+        assert!(!result.files.contains_key("pyproject.toml"));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_hatch_unsupported"
+                    && w.detail.contains("[tool.uv.sources]")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
     #[test]
     fn hatch_confirmation_ignores_inactive_sources_and_comments() {
         let dep = patch();
@@ -28127,6 +28366,146 @@ mod uv_old_release_advisories {
             vec!["redirect_uv_override_requires_uv_0_5_6"],
             "{:?}",
             result.warnings
+        );
+    }
+}
+
+/// #639: a PEP 621 `dynamic = ["dependencies"]` project gets its dependency
+/// list from the build backend, so pyproject.toml declares nothing uv's
+/// root `requires-dist` can be restored from. Hosted mode must refuse to
+/// repoint such an entry rather than write wiring that rollback, remove
+/// and the vendored takeover can never undo.
+#[cfg(test)]
+mod uv_dynamic_dependencies {
+    use super::*;
+
+    const URL: &str = "https://patch.test/six-1.16.0-py2.py3-none-any.whl";
+    const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+    const ISODATE: &str = "[[package]]\nname = \"isodate\"\nversion = \"0.6.1\"\nsource = { registry = \"https://pypi.org/simple\" }\ndependencies = [{ name = \"six\" }]\nwheels = [{ url = \"https://files.pythonhosted.org/packages/isodate-0.6.1-py2.py3-none-any.whl\", hash = \"sha256:0751eece944162659049d35f4f549ed815792b38793f07cf73381c1c87cbed96\" }]\n";
+
+    fn six() -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: "six".into(),
+            namespace: None,
+            version: "1.16.0".into(),
+            token: String::new(),
+            patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact_url: URL.into(),
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some("c".repeat(64)),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The issue's setuptools project: `dynamic` names `dynamic_fields`,
+    /// and the backend reads the list from requirements.in.
+    fn project(dynamic_fields: &str) -> String {
+        format!(
+            "[project]\nname = \"app\"\nversion = \"1.0.0\"\nrequires-python = \">=3.8\"\ndynamic = [{dynamic_fields}]\n\n[build-system]\nrequires = [\"setuptools>=61\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools.dynamic]\ndependencies = {{ file = [\"requirements.in\"] }}\n"
+        )
+    }
+
+    fn lock(app_deps: &str, requires: &str, packages: &[&str]) -> String {
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.8\"\n\n[[package]]\nname = \"app\"\nversion = \"1.0.0\"\nsource = {{ editable = \".\" }}\ndependencies = [{app_deps}]\n\n[package.metadata]\nrequires-dist = [{requires}]\n\n{}",
+            packages.join("\n")
+        )
+    }
+
+    fn files(pyproject: String, uv_lock: String) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("pyproject.toml".to_string(), pyproject),
+            ("uv.lock".to_string(), uv_lock),
+        ])
+    }
+
+    /// The backend-supplied `six==1.16.0` is refused for every newline
+    /// style, for a dynamic optional-dependencies extra, and when a static
+    /// dependency group also names six (restore matches `requires-dist`
+    /// only against `[project]` declarations): nothing is written, and the
+    /// warning names the dynamic declaration.
+    #[test]
+    fn backend_declared_dependency_is_refused_before_writing() {
+        let six_dist = "{ name = \"six\", specifier = \"==1.16.0\" }";
+        let cases = [
+            (project("\"dependencies\""), six_dist),
+            (
+                project("\"optional-dependencies\""),
+                "{ name = \"six\", marker = \"extra == 'compat'\", specifier = \"==1.16.0\" }",
+            ),
+            (
+                project("\"dependencies\"") + "\n[dependency-groups]\ntest = [\"six\"]\n",
+                six_dist,
+            ),
+        ];
+        for (pyproject, requires) in cases {
+            let dynamic = &pyproject;
+            for newline in ["\n", "\r\n"] {
+                let input = files(
+                    pyproject.replace('\n', newline),
+                    lock("{ name = \"six\" }", requires, &[SIX]).replace('\n', newline),
+                );
+                let result = rewrite_registry_redirect(&input, &[six()]);
+                assert!(
+                    result.files.is_empty(),
+                    "{dynamic}: wrote {:?}",
+                    result.files.keys()
+                );
+                assert!(
+                    result.refused_python_lock_uuids.contains(&six().patch_uuid)
+                        && !result
+                            .confirmed_python_lock_uuids
+                            .contains(&six().patch_uuid),
+                    "{dynamic}: {:?}",
+                    result.warnings
+                );
+                let warning = result
+                    .warnings
+                    .iter()
+                    .find(|w| w.code == "redirect_uv_metadata_unsupported")
+                    .unwrap_or_else(|| panic!("{dynamic}: {:?}", result.warnings));
+                assert!(
+                    warning.detail.contains("six") && warning.detail.contains("dynamic"),
+                    "{}",
+                    warning.detail
+                );
+            }
+        }
+    }
+
+    /// A package the backend's list only pulls in transitively is not in
+    /// the root `requires-dist`, so its override wiring stays restorable
+    /// and the dynamic project is still hosted-patched.
+    #[test]
+    fn transitive_dependency_of_a_dynamic_project_is_still_wired() {
+        let input = files(
+            project("\"dependencies\""),
+            lock(
+                "{ name = \"isodate\" }",
+                "{ name = \"isodate\", specifier = \"==0.6.1\" }",
+                &[ISODATE, SIX],
+            ),
+        );
+        let result = rewrite_registry_redirect(&input, &[six()]);
+        assert!(
+            result
+                .confirmed_python_lock_uuids
+                .contains(&six().patch_uuid),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            result.files["pyproject.toml"].contains("override-dependencies"),
+            "{}",
+            result.files["pyproject.toml"]
+        );
+        assert!(
+            result.files["uv.lock"].contains(URL),
+            "{}",
+            result.files["uv.lock"]
         );
     }
 }

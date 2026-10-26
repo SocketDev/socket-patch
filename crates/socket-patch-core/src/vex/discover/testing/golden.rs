@@ -254,13 +254,18 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     file,
                     key,
                     how,
+                    remedy,
                 } = c;
-                json!({
+                let mut copy = json!({
                     "purl": purl,
                     "file": path_str(file),
                     "key": key,
                     "how": normalize(how, &roots),
-                })
+                });
+                if let Some(remedy) = remedy {
+                    copy["remedy"] = json!(remedy);
+                }
+                copy
             })
             .collect::<Vec<_>>()
             .into();
@@ -295,13 +300,18 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     file,
                     key,
                     how,
+                    remedy,
                 } = c;
-                json!({
+                let mut copy = json!({
                     "purl": purl,
                     "file": path_str(file),
                     "key": key,
                     "how": normalize(how, &roots),
-                })
+                });
+                if let Some(remedy) = remedy {
+                    copy["remedy"] = json!(remedy);
+                }
+                copy
             })
             .collect::<Vec<_>>()
             .into();

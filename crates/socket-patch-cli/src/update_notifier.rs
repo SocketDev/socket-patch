@@ -240,7 +240,10 @@ async fn refresh_latest(debug: bool) -> Option<semver::Version> {
 /// its managed-install refusal.
 fn upgrade_command() -> &'static str {
     match core_update::resolve_install_path() {
-        Ok(p) => upgrade_hint_for(detect_channel(&p, &ChannelEnv::from_env()), &p),
+        Ok(p) => {
+            let env = ChannelEnv::from_env();
+            upgrade_hint_for(detect_channel(&p, &env), &p, &env)
+        }
         Err(_) => upgrade_hint(InstallChannel::Standalone),
     }
 }

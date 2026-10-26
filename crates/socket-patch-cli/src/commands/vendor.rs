@@ -117,14 +117,15 @@ pub struct VendorArgs {
 fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
         // An older vendored patch kept in force (see [`keep_older_vendored_patch`]).
-        || matches!(code, vendor::VENDOR_PREBUILT_PENDING | vendor::VENDOR_PREBUILT_UNAVAILABLE)
+        || vendor::is_unserved(code)
         || socket_patch_core::vendor::jvm::sbt_gate::SKIP_CODES.contains(&code)
 }
 
-/// #954: the patch service has no artifact for `uuid` yet (still building)
-/// or at all (`build_failed`, `not_found`, …) — the backend's failed `Done`
-/// carries [`vendor::VENDOR_PREBUILT_PENDING`] /
-/// [`vendor::VENDOR_PREBUILT_UNAVAILABLE`] — while the ledger already holds
+/// #954, #1235: the patch service has no artifact for `uuid` yet (still
+/// building) or at all (`build_failed`, `not_found`, …) — the backend's
+/// refusal carries [`vendor::VENDOR_PREBUILT_PENDING`] /
+/// [`vendor::VENDOR_PREBUILT_UNAVAILABLE`] as its code (an npm-family failed
+/// `Done` as a warning) — while the ledger already holds
 /// `purl` vendored at another patch. The backend touched nothing, so that
 /// older vendoring is still in force: like hosted mode, which keeps its pin
 /// and skips the upgrade, the package is a benign skip under the unserved
@@ -133,8 +134,9 @@ fn refusal_is_benign(code: &str) -> bool {
 /// (the [`Discovery::vendor_entry_live`] verdict `vendor --check` and `vex`
 /// use) is in force: once a relock dropped its `.socket/vendor/` reference
 /// the package is patched in neither mode, so the unserved upgrade stays a
-/// failure. Any other outcome passes through, a failure minus the unserved
-/// marker (its error already says it).
+/// failure. Any other outcome passes through: an unserved refusal as the
+/// `vendor_prebuilt_required` failure it always was, a failed `Done` minus
+/// the unserved marker (its error already says it).
 ///
 /// [`Discovery::vendor_entry_live`]: socket_patch_core::vex::discover::Discovery::vendor_entry_live
 async fn keep_older_vendored_patch(
@@ -144,49 +146,57 @@ async fn keep_older_vendored_patch(
     uuid: &str,
     common: &GlobalArgs,
 ) -> Option<VendorOutcome> {
-    let Some(VendorOutcome::Done {
-        result,
-        entry,
-        mut warnings,
-    }) = outcome
-    else {
-        return outcome;
-    };
-    if !result.success {
-        if let Some(i) = warnings.iter().position(|w| {
-            matches!(
-                w.code,
-                vendor::VENDOR_PREBUILT_PENDING | vendor::VENDOR_PREBUILT_UNAVAILABLE
-            )
-        }) {
-            let unserved = warnings.remove(i);
-            if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
-                let root = common.project_root();
-                if !crate::commands::discover_wiring(common, &root)
-                    .await
-                    .vendor_entry_live(&root, kept)
-                    .await
-                {
-                    return Some(VendorOutcome::Done {
-                        result,
-                        entry,
-                        warnings,
-                    });
-                }
-                return Some(VendorOutcome::Refused {
-                    code: unserved.code,
-                    detail: format!(
-                        "kept the vendored patch {}: {} for patch {uuid}",
-                        kept.uuid, unserved.detail
-                    ),
+    let (code, detail, failed_done) = match outcome {
+        Some(VendorOutcome::Refused { code, detail }) if vendor::is_unserved(code) => {
+            (code, detail, None)
+        }
+        Some(VendorOutcome::Done {
+            result,
+            entry,
+            mut warnings,
+        }) if !result.success => {
+            let Some(i) = warnings.iter().position(|w| vendor::is_unserved(w.code)) else {
+                return Some(VendorOutcome::Done {
+                    result,
+                    entry,
+                    warnings,
                 });
-            }
+            };
+            let unserved = warnings.remove(i);
+            (
+                unserved.code,
+                unserved.detail,
+                Some((result, entry, warnings)),
+            )
+        }
+        other => return other,
+    };
+    if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
+        let root = common.project_root();
+        if crate::commands::discover_wiring(common, &root)
+            .await
+            .vendor_entry_live(&root, kept)
+            .await
+        {
+            return Some(VendorOutcome::Refused {
+                code,
+                detail: format!(
+                    "kept the vendored patch {}: {detail} for patch {uuid}",
+                    kept.uuid
+                ),
+            });
         }
     }
-    Some(VendorOutcome::Done {
-        result,
-        entry,
-        warnings,
+    Some(match failed_done {
+        Some((result, entry, warnings)) => VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        },
+        None => VendorOutcome::Refused {
+            code: vendor::VENDOR_PREBUILT_REQUIRED,
+            detail,
+        },
     })
 }
 
@@ -299,6 +309,10 @@ async fn takeover_dry_refusal(
     .await;
     drop(probe);
     match outcome {
+        // A takeover has no older vendored patch to keep in force.
+        Some(VendorOutcome::Refused { code, detail }) if vendor::is_unserved(code) => {
+            Some((vendor::VENDOR_PREBUILT_REQUIRED, detail))
+        }
         Some(VendorOutcome::Refused { code, detail }) if !refusal_is_benign(code) => {
             Some((code, detail))
         }
@@ -2544,15 +2558,25 @@ impl StagedSource {
 /// neither the pristine release nor this patch's output. The re-vendor
 /// then takes the pristine artifact from the lock / registry / service, as
 /// a lock-only checkout does, instead of reporting it not installed.
+///
+/// A PyPI install under a live hosted pin (`hosted_pinned`) is the same
+/// story after a hosted scan (#1105): `uv sync` / `poetry install` from
+/// the hosted lock installs a hosted patch's bytes, whichever generation
+/// the pin names now. The pin names no release variant, so it only answers
+/// for a sole candidate; gems keep their installed dir, which the gem
+/// backend reads to refuse a platform gem.
 fn superseded_install(
     ledger: &VendorState,
     candidate: &str,
     record: &PatchRecord,
     sole_candidate: bool,
+    hosted_pinned: bool,
 ) -> bool {
     lookup_entry_kv(&ledger.entries, candidate).is_some_and(|(key, entry)| {
         entry.uuid != record.uuid && (sole_candidate || key == candidate)
-    })
+    }) || (sole_candidate
+        && hosted_pinned
+        && matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Pypi)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2612,8 +2636,13 @@ async fn plan_service_downloads(
                         if !variant_matches_installed(Some(
                             &verify_file_patch(dir, file, info).await.status,
                         )) {
-                            if !superseded_install(ledger, candidate, record, candidates.len() == 1)
-                            {
+                            if !superseded_install(
+                                ledger,
+                                candidate,
+                                record,
+                                candidates.len() == 1,
+                                takeover_blocked(candidate),
+                            ) {
                                 continue;
                             }
                             source_path = &uninstalled;
@@ -3100,8 +3129,13 @@ pub(crate) async fn vendor_records_reusing(
                                 .await
                                 .status,
                         )) {
-                            if !superseded_install(&state, candidate, record, candidates.len() == 1)
-                            {
+                            if !superseded_install(
+                                &state,
+                                candidate,
+                                record,
+                                candidates.len() == 1,
+                                hosted_pin_of(candidate).is_some(),
+                            ) {
                                 continue;
                             }
                             candidate_source = PackageSource::Installed(&uninstalled);
@@ -4914,6 +4948,28 @@ mod plan_gate_tests {
             license: String::new(),
             tier: String::new(),
         }
+    }
+
+    /// #1105: a live hosted pin marks a PyPI install superseded (a hosted
+    /// sync installed a hosted patch's bytes), so the takeover vendors the
+    /// record instead of reporting it not installed. The pin names no
+    /// variant, so only a sole candidate counts, and gems keep their
+    /// installed dir for the platform-gem refusal.
+    #[test]
+    fn hosted_pin_marks_a_pypi_install_superseded() {
+        let ledger = VendorState::default();
+        let pypi = "pkg:pypi/six@1.16.0";
+        let b = record(UUID_B);
+        assert!(superseded_install(&ledger, pypi, &b, true, true));
+        assert!(!superseded_install(&ledger, pypi, &b, false, true));
+        assert!(!superseded_install(&ledger, pypi, &b, true, false));
+        assert!(!superseded_install(
+            &ledger,
+            "pkg:gem/nokogiri@1.16.0",
+            &b,
+            true,
+            true
+        ));
     }
 
     /// The download plan runs every record through its backend's own gate:

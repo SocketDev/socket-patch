@@ -84,7 +84,7 @@ pub(crate) fn code_of(tail: &str) -> Option<&str> {
 /// Split `code` at its top-level commas (outside strings and brackets).
 /// Each piece keeps its byte offset into `code`. `None` on unbalanced
 /// brackets.
-fn split_args(code: &str) -> Option<Vec<(usize, &str)>> {
+pub(crate) fn split_args(code: &str) -> Option<Vec<(usize, &str)>> {
     let mut out = Vec::new();
     let mut quote: Option<char> = None;
     let mut escaped = false;

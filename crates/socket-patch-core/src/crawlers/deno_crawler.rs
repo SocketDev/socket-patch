@@ -40,7 +40,7 @@
 //! scope: same content-addressed-by-hash storage as JSR, plus no
 //! upstream PURL convention.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -60,8 +60,9 @@ impl DenoCrawler {
 
     /// Get the JSR cache root paths to scan.
     ///
-    /// With `--global-prefix`, returns the prefix directly; otherwise
-    /// resolves `$DENO_DIR/npm/jsr.io/`.
+    /// With `--global-prefix`, returns the prefix directly (nothing for a
+    /// registry dir of Deno's npm cache, which holds npm packages);
+    /// otherwise resolves `$DENO_DIR/npm/jsr.io/`.
     ///
     /// In local mode, only returns paths when the cwd looks like a
     /// Deno project (`deno.json`, `deno.jsonc`, or `deno.lock`
@@ -71,6 +72,13 @@ impl DenoCrawler {
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         if let Some(ref custom) = options.global_prefix {
+            // Deno's npm cache (`$DENO_DIR/npm/registry.npmjs.org`) holds
+            // npm packages, which the npm crawler reads there; walked as a
+            // JSR root, its `@scope/name/<version>` dirs would read as
+            // bogus `pkg:jsr/` purls.
+            if super::npm_crawler::is_deno_npm_cache_root(custom) {
+                return Ok(Vec::new());
+            }
             return Ok(vec![custom.clone()]);
         }
         if !options.global && !is_deno_project(&options.cwd).await {
@@ -219,6 +227,38 @@ pub(crate) fn lock_section<'a>(lock: &'a Value, section: &str) -> Option<&'a Map
         .and_then(Value::as_object)
 }
 
+/// The `(name, version)` of every package in a parsed `deno.lock`'s npm
+/// section ([`lock_section`]), in key order. A key is `name@version` or
+/// `@scope/name@version`, either with Deno's peer suffix
+/// (`name@1.0.0_peer@2.0.0`), which is dropped; a key of no such shape is
+/// skipped. Shared by VEX discovery (`vex::discover::deno`) and the hosted
+/// and vendored npm writers' `deno.lock` warnings (#406).
+pub(crate) fn lock_npm_packages(lock: &Value) -> Vec<(&str, &str)> {
+    lock_section(lock, "npm")
+        .map(|m| m.keys().filter_map(|key| npm_key(key)).collect())
+        .unwrap_or_default()
+}
+
+/// [`lock_npm_packages`] of a `deno.lock` text, as `name@version` strings.
+/// Advisory: text that is not JSON locks nothing. Like VEX discovery, a
+/// lock without a `version` is still read, so the warnings name exactly
+/// the pins `vex` omits.
+pub(crate) fn lock_text_npm_packages(text: &str) -> BTreeSet<String> {
+    let Ok(lock) = serde_json::from_str::<Value>(crate::formats::text::strip_bom(text)) else {
+        return BTreeSet::new();
+    };
+    lock_npm_packages(&lock)
+        .into_iter()
+        .map(|(name, version)| format!("{name}@{version}"))
+        .collect()
+}
+
+fn npm_key(key: &str) -> Option<(&str, &str)> {
+    let at = key.get(1..)?.find('@')? + 1;
+    let version = key[at + 1..].split('_').next()?;
+    (!version.is_empty()).then_some((&key[..at], version))
+}
+
 /// Walk `<root>/@<scope>/<name>/<version>/` and emit a
 /// `CrawledPackage` per (scope, name, version) tuple found.
 async fn scan_jsr_cache(root: &Path, seen: &mut HashSet<String>, out: &mut Vec<CrawledPackage>) {
@@ -304,7 +344,7 @@ async fn is_deno_project(cwd: &Path) -> bool {
 /// * Linux/other Unix: `$XDG_CACHE_HOME/deno`, else `$HOME/.cache/deno`.
 /// * Windows: `%LOCALAPPDATA%\deno` (falling back to `~\.cache\deno`
 ///   if LOCALAPPDATA isn't set).
-fn deno_dir() -> Option<PathBuf> {
+pub(super) fn deno_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("DENO_DIR") {
         if !d.is_empty() {
             return Some(PathBuf::from(d));
@@ -388,6 +428,41 @@ mod tests {
     async fn deno_crawler_default_and_new_construct_cleanly() {
         let _a = DenoCrawler::default();
         let _b = DenoCrawler::new();
+    }
+
+    /// A `--global-prefix` naming Deno's npm cache registry dir is the npm
+    /// crawler's (#444): its scoped `@types/node/20.0.0` must not also
+    /// surface as `pkg:jsr/@types/node@20.0.0`. A JSR tree under a dir
+    /// named `npm` (no `registry.json`) is still walked.
+    #[tokio::test]
+    async fn crawl_all_skips_deno_npm_cache_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = tmp.path().join("npm").join("registry.npmjs.org");
+        stage(&registry, "@types", "node", "20.0.0").await;
+        tokio::fs::write(registry.join("@types/node/registry.json"), b"{}")
+            .await
+            .unwrap();
+        let opts = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: true,
+            global_prefix: Some(registry),
+        };
+        assert!(DenoCrawler.crawl_all(&opts).await.is_empty());
+
+        let mirror = tmp.path().join("npm").join("jsr-mirror");
+        stage(&mirror, "@std", "path", "1.0.8").await;
+        let opts = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: true,
+            global_prefix: Some(mirror),
+        };
+        let purls: Vec<String> = DenoCrawler
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
+        assert_eq!(purls, vec!["pkg:jsr/@std/path@1.0.8"]);
     }
 
     #[tokio::test]

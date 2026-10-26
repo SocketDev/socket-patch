@@ -433,6 +433,162 @@ async fn requirements_sole_pin_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, &["requirements.txt"]).await;
 }
 
+/// #740: a sibling requirements file that reads the root requirements.txt
+/// as `-c` constraints breaks on pip 20.3.x / 21.0.x once the root pin is a
+/// link ("Links are not allowed as constraints"). Both writers still
+/// rewrite the pin, but now name every such reader in a warning: hosted
+/// `redirect_requirements_constraints_link`, vendored (dry run and wet)
+/// `vendor_requirements_constraints_link`. A line that names the file as
+/// `-r` (or `-r` after `-c`, which pip follows instead) is not a reader,
+/// and a project with no reader gets no warning.
+#[tokio::test]
+async fn requirements_read_as_constraints_warn_in_both_modes() {
+    fn stage(root: &Path, readers: bool) {
+        std::fs::write(root.join("requirements.txt"), "six==1.16.0\n").unwrap();
+        std::fs::write(root.join("include.txt"), "-r requirements.txt\n").unwrap();
+        std::fs::write(
+            root.join("both.txt"),
+            "-c requirements.txt -r requirements.txt\n",
+        )
+        .unwrap();
+        if readers {
+            std::fs::write(
+                root.join("requirements-dev.txt"),
+                "-c requirements.txt\nidna==3.7\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("requirements")).unwrap();
+            std::fs::write(
+                root.join("requirements/test.txt"),
+                "--constraint=../requirements.txt  # pins\n",
+            )
+            .unwrap();
+        }
+    }
+    fn reported(env: &Value, code: &str) -> Vec<String> {
+        let mut readers: Vec<String> = Vec::new();
+        let mut walk = vec![env];
+        while let Some(v) = walk.pop() {
+            match v {
+                Value::Object(map) => {
+                    if ["code", "errorCode"]
+                        .iter()
+                        .any(|key| map.get(*key).and_then(Value::as_str) == Some(code))
+                    {
+                        let text = v.to_string();
+                        for reader in [
+                            "requirements-dev.txt",
+                            "requirements/test.txt",
+                            "both.txt",
+                            "include.txt",
+                        ] {
+                            if text.contains(&format!("{reader} reads requirements.txt")) {
+                                readers.push(reader.to_string());
+                            }
+                        }
+                        assert!(
+                            text.contains("Links are not allowed as constraints"),
+                            "{text}"
+                        );
+                    }
+                    walk.extend(map.values());
+                }
+                Value::Array(items) => walk.extend(items),
+                _ => {}
+            }
+        }
+        readers.sort();
+        readers
+    }
+    let expected = vec![
+        "requirements-dev.txt".to_string(),
+        "requirements/test.txt".to_string(),
+    ];
+    for readers in [true, false] {
+        let want = if readers {
+            expected.clone()
+        } else {
+            Vec::new()
+        };
+
+        let (_tmp, root) = project();
+        stage(&root, readers);
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            hosted_pinned(&env),
+            1,
+            "the pin is still redirected: {env:#}"
+        );
+        assert_eq!(
+            reported(&env, "redirect_requirements_constraints_link"),
+            want,
+            "{env:#}"
+        );
+        // A re-run rewrites nothing; the URL pin still breaks the readers.
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            reported(&env, "redirect_requirements_constraints_link"),
+            want,
+            "re-run: {env:#}"
+        );
+
+        let (_tmp, root) = project();
+        stage(&root, readers);
+        stage_manifest(&root);
+        let (code, env) = run_cli(&root, &["vendor", "--dry-run"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            reported(&env, "vendor_requirements_constraints_link"),
+            want,
+            "dry run: {env:#}"
+        );
+        assert!(
+            !readers || env.to_string().contains("would pin six==1.16.0"),
+            "{env:#}"
+        );
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert!(std::fs::read_to_string(root.join("requirements.txt"))
+            .unwrap()
+            .contains(&format!(".socket/vendor/pypi/{UUID}/")));
+        assert_eq!(
+            reported(&env, "vendor_requirements_constraints_link"),
+            want,
+            "{env:#}"
+        );
+        assert!(
+            !readers || env.to_string().contains("now pins six==1.16.0"),
+            "{env:#}"
+        );
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            reported(&env, "vendor_requirements_constraints_link"),
+            want,
+            "in-sync re-run: {env:#}"
+        );
+        // An in-sync run that rebuilds a missing wheel keeps the wiring too.
+        std::fs::remove_dir_all(root.join(format!(".socket/vendor/pypi/{UUID}"))).unwrap();
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert!(
+            env["events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|e| e["action"] == "rebuilt")),
+            "{env:#}"
+        );
+        assert_eq!(
+            reported(&env, "vendor_requirements_constraints_link"),
+            want,
+            "in-sync rebuild: {env:#}"
+        );
+    }
+}
+
 /// #410: a requirements.txt in which every requirement is the hosted pin
 /// (a lone `six==1.16.0`, or one beside `-e .`) can be unwound again.
 /// Hosted `rollback`, `remove` and the hosted → vendored takeover restore
@@ -837,6 +993,67 @@ async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
         original,
         "revert restores the registry lock"
     );
+}
+
+/// #1105: a project hosted at patch A whose venv was then synced from the
+/// hosted lock (`uv sync`, `poetry install`, `uv pip install -r`), so six
+/// holds A's patched bytes, moves to vendored at the superseding patch B.
+/// The installed copy matches neither the pristine release nor B's
+/// output; it used to be dropped as `package_not_installed` (exit 1, the
+/// project left hosted on A) while `scan --mode vendored --dry-run`
+/// previewed success. The takeover must restore the upstream entry and
+/// vendor B.
+#[tokio::test]
+async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
+    let lanes: [(&str, StageFn); 3] = [
+        ("uv", stage_uv_with_sibling),
+        ("poetry", stage_poetry),
+        ("requirements", stage_requirements),
+    ];
+    for (lane, stage) in lanes {
+        let (_tmp, root) = project();
+        let files = stage(&root);
+        let server = MockServer::start().await;
+        let hosted_url = mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "{lane}: hosted scan at A: {env:#}");
+        assert!(
+            files.iter().any(|f| std::fs::read_to_string(root.join(f))
+                .unwrap()
+                .contains(&hosted_url)),
+            "{lane}: hosted mode pins A: {env:#}"
+        );
+
+        let venv = root.join("../hosted-venv");
+        venv_installed_from_patch_a(&venv);
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        prebuilt_common::mount_project(&server, &root).await;
+        mount_pypi_json(&server).await;
+        let uri = server.uri();
+        let pypi = format!("{uri}/pypi");
+        let extra = [
+            ("VIRTUAL_ENV", venv.to_str().unwrap()),
+            ("SOCKET_PYPI_JSON_API", pypi.as_str()),
+        ];
+        let args = ["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+
+        let (code, env) = run_cli(&root, &args, &extra);
+        assert_eq!(code, 0, "{lane}: takeover onto B: {env:#}");
+        assert!(
+            !env.to_string().contains("package_not_installed"),
+            "{lane}: the installed copy is not reported missing: {env:#}"
+        );
+        let wired: String = files
+            .iter()
+            .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+            .collect();
+        assert!(
+            wired.contains(&format!(".socket/vendor/pypi/{UUID_B}/"))
+                && !wired.contains(&hosted_url)
+                && !wired.contains(UUID),
+            "{lane}: wired to vendored B, hosted A gone:\n{wired}"
+        );
+    }
 }
 
 const UV_LOCK: &str = r#"version = 1

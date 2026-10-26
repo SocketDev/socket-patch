@@ -889,6 +889,9 @@ async fn generate_vex(
             warnings,
         )
         .await;
+        if common.is_global() {
+            withhold_stale_go_tools(&mut outcome, manifest, &copies, common, warnings).await;
+        }
         outcome
     };
 
@@ -1059,7 +1062,19 @@ async fn generate_vex(
             ),
         }
     };
+    // PDM < 2.11 keeps an installed release on `pdm sync` (#641): a
+    // package its pdm.lock wires gets the remedy that resyncs it.
+    let pdm_lock = if outcome.vendored_out_of_sync.is_empty() || common.is_global() {
+        None
+    } else {
+        socket_patch_core::vendor::pypi_pdm::stale_install_lock(&common.cwd).await
+    };
     for purl in &outcome.vendored_out_of_sync {
+        let pdm_note = pdm_lock
+            .as_ref()
+            .and_then(|lock| socket_patch_core::vendor::pypi_pdm::stale_install_note(lock, purl))
+            .map(|note| format!(" {note}"))
+            .unwrap_or_default();
         note_warning(
             warnings,
             common,
@@ -1068,7 +1083,7 @@ async fn generate_vex(
                 "{purl}: the installed tree does not match its vendored artifact; the \
                  attestation is based on the committed .socket/vendor artifact (the lockfile \
                  consumes it), but the live tree carries different bytes — re-run your \
-                 package manager's install to resync it.{hatch_note}"
+                 package manager's install to resync it.{hatch_note}{pdm_note}"
             ),
         );
     }
@@ -1401,6 +1416,56 @@ async fn withhold_unpatched_jvm_copies(
             ),
         );
     }
+}
+
+/// A global Go patch rewrites the module cache in place, so a tool built
+/// from it with `go install` before the patch still runs the unpatched code
+/// however intact the cache copy is (#422): never attest it while such a
+/// tool remains. `go` missing from `PATH` (nothing can be checked) is said,
+/// not withheld.
+async fn withhold_stale_go_tools(
+    outcome: &mut VerifyOutcome,
+    manifest: &PatchManifest,
+    copies: &HashMap<String, Vec<PathBuf>>,
+    common: &GlobalArgs,
+    warnings: &mut Vec<RunWarning>,
+) {
+    use socket_patch_core::utils::go_installed_tools::{audit, PatchedModule};
+    use socket_patch_core::utils::purl::parse_golang_purl;
+    let mut patched = Vec::new();
+    let mut dirs = Vec::new();
+    for purl in &outcome.applied {
+        let (Some(record), Some(paths)) = (manifest.patches.get(purl), copies.get(purl)) else {
+            continue;
+        };
+        for dir in paths {
+            // An attested copy's patched files are there to date it.
+            let files = record.files.keys().map(String::as_str);
+            if let Some(module) = PatchedModule::of_copy(purl, dir, files) {
+                patched.push(module);
+                dirs.push(dir.clone());
+            }
+        }
+    }
+    let (notes, stale) = audit(patched, dirs).await;
+    for (code, detail) in notes {
+        note_warning(warnings, common, &code, detail);
+    }
+    let stale: HashSet<(String, String)> =
+        stale.into_iter().map(|t| (t.module, t.version)).collect();
+    let (withheld, kept): (Vec<String>, Vec<String>) = std::mem::take(&mut outcome.applied)
+        .into_iter()
+        .partition(|purl| {
+            parse_golang_purl(purl)
+                .is_some_and(|(m, v)| stale.contains(&(m.into_owned(), v.into_owned())))
+        });
+    outcome.applied = kept;
+    outcome
+        .failed
+        .extend(withheld.into_iter().map(|purl| FailedPatch {
+            purl,
+            reason: GO_INSTALLED_TOOL_STALE.to_string(),
+        }));
 }
 
 /// Record a run-level advisory the way `update`/`vendor` do: stderr
@@ -1782,6 +1847,10 @@ fn join_and(items: &[&str]) -> String {
 /// overrides, ignores or rejects (#393, #458, #531).
 const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
 
+/// Omission tag for a global Go patch while a tool built from the unpatched
+/// module with `go install` remains (#422).
+const GO_INSTALLED_TOOL_STALE: &str = socket_patch_core::utils::go_installed_tools::STALE_WARNING;
+
 /// Omission tag for a Go patch whose version-pinned replace names a version
 /// the build list does not select (#391, #392, #509).
 const GO_VERSION_NOT_SELECTED: &str = "go_version_not_selected";
@@ -1944,6 +2013,10 @@ fn omission_phrase(reason: &str) -> &'static str {
         GO_WORKSPACE_OVERRIDE => {
             "the go.work in effect overrides, ignores or conflicts with its go.mod replace, \
              so the build does not link the patched module"
+        }
+        GO_INSTALLED_TOOL_STALE => {
+            "a tool installed with `go install` was built from the unpatched module and keeps \
+             running it until it is rebuilt"
         }
         GO_VERSION_NOT_SELECTED => {
             "go.mod and go.sum show the build selects another version of the module, so its \
@@ -2135,6 +2208,7 @@ mod tests {
             WIRING_CONFLICT,
             GO_WORKSPACE_OVERRIDE,
             GO_VERSION_NOT_SELECTED,
+            GO_INSTALLED_TOOL_STALE,
         ] {
             assert_ne!(
                 omission_phrase(tag),
