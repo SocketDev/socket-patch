@@ -426,7 +426,8 @@ async fn registry_lock_scope(
 }
 
 /// The `(name, version)` of every registry-sourced `[[package]]` in
-/// `<cwd>/Cargo.lock` (`LockedPackage::is_from_registry`), in lock order.
+/// `<cwd>/Cargo.lock` (`LockedPackage::is_from_registry`) that no
+/// `[replace]` swaps out, in lock order.
 /// `None` when there is no readable lock or it is not TOML: the crawl then
 /// keeps walking the whole cache.
 async fn lock_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
@@ -437,7 +438,9 @@ async fn lock_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
     Some(
         lock.packages()
             .iter()
-            .filter(|p| p.is_from_registry())
+            // A `[replace]`d entry keeps its registry `source`, but cargo
+            // builds the replacement it names, never this registry copy.
+            .filter(|p| p.is_from_registry() && p.replace.is_none())
             .map(|p| (p.name.clone(), p.version.clone()))
             .collect(),
     )
@@ -1231,6 +1234,48 @@ version = "fake"
                 .unwrap();
             roots.sort();
             assert_eq!(roots, vec![other, crates_io]);
+        }
+
+        /// #506: a `[replace]`d entry keeps its registry `source` in the
+        /// lock, but cargo builds the replacement its `replace` key names,
+        /// so the registry copy is out of scope for the crawl and for
+        /// `locked_registry_crates`.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn replaced_registry_entry_is_out_of_scope() {
+            let home = tempfile::tempdir().unwrap();
+            let (crates_io, _) = cache(home.path());
+            stage(&crates_io, "cfg-if", "1.0.4");
+            let _g = CargoHome::set(home.path());
+
+            let project = tempfile::tempdir().unwrap();
+            write(
+                &project.path().join("Cargo.toml"),
+                "[package]\nname = \"member\"\n",
+            );
+            let git = "git+https://example.com/cfg-if#abc";
+            write(
+                &project.path().join("Cargo.lock"),
+                &format!(
+                    "{}\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+                     source = \"{CRATES_IO}\"\nreplace = \"cfg-if 1.0.4 ({git})\"\n\n\
+                     [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{git}\"\n",
+                    lock(&[
+                        ("member", "0.1.0", None),
+                        ("serde", "1.0.200", Some(CRATES_IO))
+                    ]),
+                ),
+            );
+
+            let options = local(project.path());
+            let pkgs = CargoCrawler::new().crawl_all(&options).await;
+            assert_eq!(purls(&pkgs), ["pkg:cargo/serde@1.0.200"]);
+            let locked = CargoCrawler::new()
+                .locked_registry_crates(&options)
+                .await
+                .expect("a locked project's registry scope");
+            assert!(locked.contains_purl("pkg:cargo/serde@1.0.200"));
+            assert!(!locked.contains_purl("pkg:cargo/cfg-if@1.0.4"));
         }
 
         /// A cached dir whose manifest names another crate or version, or

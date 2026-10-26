@@ -12,6 +12,7 @@ pub const PURL: &str = "pkg:cargo/cfg-if@1.0.4";
 pub const BEFORE: &[u8] = b"pub fn upstream() -> u32 { 1 }\n";
 pub const AFTER: &[u8] = b"pub fn upstream() -> u32 { 1 }\npub fn socket_patched() {}\n";
 pub const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+pub const GIT_SOURCE: &str = "git+file:///srv/git/cfg-if#0123456789abcdef0123456789abcdef01234567";
 
 /// Where cargo builds `cfg-if` from in the project.
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +27,9 @@ pub enum Shape {
     GitDependency,
     /// `cfg-if = { path = "local/cfg-if" }`, no `[patch]` at all.
     PathDependency,
+    /// `[replace] "cfg-if:1.0.4" = { git = "file:///…" }`: the lock keeps
+    /// the crates.io entry and names the git copy in its `replace` key.
+    Replace,
 }
 
 /// A crates.io copy of `cfg-if-1.0.4` in `<cargo_home>/registry/src`,
@@ -61,6 +65,8 @@ pub fn write_project(root: &Path, shape: Shape) {
             std::fs::create_dir_all(root.join(".cargo")).unwrap();
             std::fs::write(root.join(".cargo/config.toml"), patch).unwrap();
         }
+        Shape::Replace => manifest
+            .push_str("\n[replace]\n\"cfg-if:1.0.4\" = { git = \"file:///srv/git/cfg-if\" }\n"),
         Shape::Registry | Shape::GitDependency | Shape::PathDependency => {}
     }
     if matches!(
@@ -84,9 +90,14 @@ pub fn write_project(root: &Path, shape: Shape) {
              \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"\n"
         ),
         Shape::ManifestPatch | Shape::ConfigPatch | Shape::PathDependency => String::new(),
-        Shape::GitDependency => "source = \"git+file:///srv/git/cfg-if#\
-             0123456789abcdef0123456789abcdef01234567\"\n"
-            .to_string(),
+        Shape::GitDependency => format!("source = \"{GIT_SOURCE}\"\n"),
+        // What cargo writes for a `[replace]`d crate: the original entry
+        // keeps its registry `source` and names the replacement, which is
+        // locked as a package of its own.
+        Shape::Replace => format!(
+            "source = \"{CRATES_IO}\"\nreplace = \"cfg-if 1.0.4 ({GIT_SOURCE})\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{GIT_SOURCE}\"\n"
+        ),
     };
     std::fs::write(
         root.join("Cargo.lock"),

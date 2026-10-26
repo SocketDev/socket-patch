@@ -90,6 +90,7 @@ fn crate_overridden_away_from_the_registry_is_not_patched() {
         Shape::ConfigPatch,
         Shape::GitDependency,
         Shape::PathDependency,
+        Shape::Replace,
     ] {
         let (code, v, lib) = apply(shape, &[]);
         assert_eq!(
@@ -99,8 +100,9 @@ fn crate_overridden_away_from_the_registry_is_not_patched() {
         let ev = event(&v, shape);
         assert_eq!(ev["action"], "skipped", "{shape:?}: {v}");
         match shape {
-            // The user's own `[patch]` entry: the consent gate's calm skip.
-            Shape::ManifestPatch | Shape::ConfigPatch => {
+            // The user's own `[patch]` or `[replace]` entry: the consent
+            // gate's calm skip.
+            Shape::ManifestPatch | Shape::ConfigPatch | Shape::Replace => {
                 assert_eq!(code, 0, "{shape:?}: {v}");
                 assert_eq!(ev["errorCode"], "user_patch_conflict", "{shape:?}: {ev}");
             }
@@ -123,7 +125,7 @@ fn crate_overridden_away_from_the_registry_is_not_patched() {
 /// cargo builds, so it stays untouched and the run does not succeed.
 #[test]
 fn allowed_patch_conflict_still_leaves_the_unused_registry_copy() {
-    for shape in [Shape::ManifestPatch, Shape::ConfigPatch] {
+    for shape in [Shape::ManifestPatch, Shape::ConfigPatch, Shape::Replace] {
         let (code, v, lib) = apply(shape, &["--allow-patch-conflicts"]);
         assert_eq!(lib, BEFORE, "{shape:?}: {v}");
         assert_eq!(code, 1, "{shape:?}: must not report success: {v}");

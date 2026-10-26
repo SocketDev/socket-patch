@@ -1934,7 +1934,8 @@ fn verify_mode_attests_registry_sourced_cargo_crate() {
 }
 
 /// #506: when `Cargo.lock` resolves the crate to a `[patch.crates-io]`
-/// path (in `Cargo.toml` or `.cargo/config.toml`), a git or a path source, cargo
+/// path (in `Cargo.toml` or `.cargo/config.toml`), a git or a path source,
+/// or a `[replace]` entry (a registry entry whose `replace` names the copy), cargo
 /// never builds the registry copy, so its patched bytes attest nothing.
 #[test]
 fn verify_mode_does_not_attest_cargo_crate_overridden_away_from_registry() {
@@ -1944,6 +1945,7 @@ fn verify_mode_does_not_attest_cargo_crate_overridden_away_from_registry() {
         Shape::ConfigPatch,
         Shape::GitDependency,
         Shape::PathDependency,
+        Shape::Replace,
     ] {
         let (ok, stdout, stderr) = vex_over_patched_registry_copy(shape);
         assert!(
