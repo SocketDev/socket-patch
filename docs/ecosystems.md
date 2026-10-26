@@ -110,7 +110,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   (`redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only`), and `vex`
   omits those patches (`vex_npm_shrinkwrap_only`) while `list`, `rollback` and
   `remove` still manage them; rename the lock to package-lock.json (or commit
-  a copy under that name) and re-run. npm 12 defaults `allow-remote=none` and refuses the
+  a copy under that name) and re-run. A Deno project's `deno install` reads
+  only `deno.lock`, never an npm-family lock, so a hosted or vendored npm pin
+  of a `name@version` that `deno.lock` also locks warns
+  (`redirect_npm_deno_lock` / `vendor_npm_deno_lock`) and `vex` omits it
+  (`vex_deno_lock_copy`); patch Deno installs with `--mode agent` after
+  `deno install`. npm 12 defaults `allow-remote=none` and refuses the
   redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
   `allow-remote=all`, so the hosted run writes it (new file, or one appended
   line; once `rollback` / `remove` / the vendored takeover has restored the last
@@ -504,7 +509,10 @@ moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
 `node_modules/.vlt`, Bun's isolated-linker store `node_modules/.bun`,
 Deno's isolated `nodeModulesDir` store `node_modules/.deno`, and
 `node_modules/.store`, written by npm's `install-strategy=linked` and by
-Yarn 4's pnpm linker (where each entry's `package/` dir is the copy).
+Yarn 4's pnpm linker (where each entry's `package/` dir is the copy), or
+the folder a Yarn `pnpmStoreFolder` setting moved that store to (from the
+nearest `.yarnrc.yml` that sets it, the home `.yarnrc.yml`, or
+`YARN_PNPM_STORE_FOLDER`, while the active linker is `pnpm`).
 pnpm 7–12 keep the entry of a removed or upgraded-away package for a
 while after `pnpm remove` or an upgrade (pnpm 7–11 for up to 7 days, pnpm
 12 until `pnpm prune`). Scans skip such an entry when the current
@@ -548,8 +556,10 @@ vendored and the local source is skipped with `vendor_workspace_member_skipped`)
 Links into a store inside a `node_modules` tree, including a workspace member's link
 into the root `node_modules/.pnpm`, are patched as usual. So are links into
 Yarn's pnpm-linker store relocated outside `node_modules`, but only for an
-active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with
-`pnpmStoreFolder` in the nearest `.yarnrc.yml`), only to the
+active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with a
+`pnpmStoreFolder`, each read from the environment, the nearest
+`.yarnrc.yml` that sets it, or the home `.yarnrc.yml`, as Yarn reads
+them), only to the
 `<store>/<entry>/package` directory of a package Yarn installs as a copy
 (`npm:`, peer-instantiated `virtual:`, a `file:` tarball, `patch:`, a URL or
 git; never `workspace:`, `portal:` or `link:`), and only when that store
@@ -1414,6 +1424,27 @@ lines, so `go mod tidy -diff` stays clean after a patch update.
 
 This requires a free, publicly retrievable patch reference carrying a `goproxy`
 override. CLI support does not imply a patch is published for a particular module.
+
+### Global mode: tools built with `go install`
+
+With `--global` / `--global-prefix` there is no project to redirect, so `apply`
+patches the module cache copy (`$GOMODCACHE/<module>@<version>/`) in place. That
+changes what the next build compiles, and nothing else: a tool installed earlier
+with `go install pkg@version` is a static binary that keeps running the unpatched
+code. After a global apply, socket-patch reads the build info of the binaries in
+`$GOBIN` (else `bin/` of each `GOPATH` entry, default `~/go/bin`, plus
+`<root>/bin` for a cache at `<root>/pkg/mod`) with `go version -m`, and warns
+`go_installed_tool_stale` for each one built from a patched module before it was
+patched, with the command that rebuilds it:
+
+```sh
+go install example.com/tool@v1.0.0   # rebuilds from the patched cache
+```
+
+`vex -g` omits the patch with the same code while such a tool remains. A binary
+copied out of those directories can't be found; rebuild it the same way. While
+the cache copy stays patched, `go mod verify` reports `dir has been modified`
+for it until `rollback -g`.
 
 ### Files go derives from go.mod
 

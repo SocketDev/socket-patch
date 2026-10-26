@@ -31,6 +31,7 @@ use crate::vex_e2e_common;
 use crate::vex_pipenv_pip_real;
 
 use std::path::{Path, PathBuf};
+use std::process::Output;
 
 use serde_json::Value;
 use vex_pipenv_pip_real::*;
@@ -450,32 +451,15 @@ fn pylock_flow(pipenv: &Pipenv, root: &Path) {
     assert!(ok, "{what}: the fresh install must carry the PATCHED six");
 
     // #1368: a PEP 751 installer reading the wired pylock gets the PATCHED
-    // six too, from the committed wheel.
+    // six too, from the committed wheel. pip must install it. uv must too,
+    // unless it refuses Pipenv's own untouched pylock the same way: uv
+    // 0.13.2+ reads the `environments = []` Pipenv writes as "no supported
+    // environment", which is upstream's call, not the wiring's.
     let pep751 = root.join("pylock").join("pep751");
-    copy_tree(&proj, &pep751, &[".venv"]);
-    make_venv(
-        &pipenv.uv,
-        python.to_str().unwrap(),
-        &pep751.join(".venv"),
-        &[],
-    )
-    .unwrap_or_else(|e| panic!("{what}: pylock venv: {e}"));
-    let py = venv_bin(&pep751.join(".venv"), "python");
-    let out = tool(
-        &pipenv.uv,
-        &pep751,
-        &[
-            "pip",
-            "install",
-            "--python",
-            py.to_str().unwrap(),
-            "-r",
-            "pylock.toml",
-        ],
-        &[],
-    );
-    assert_ok(&out, &format!("{what}: `uv pip install -r pylock.toml`"));
-    let (_, bytes, is_patched) = six_oracle(&py, &pep751)
+    let python = python.to_str().unwrap();
+    let (out, py) = pylock_install(&pipenv.uv, python, &proj, &pep751.join("pip"), true);
+    assert_ok(&out, &format!("{what}: `pip install -r pylock.toml`"));
+    let (_, bytes, is_patched) = six_oracle(&py, &pep751.join("pip"))
         .unwrap_or_else(|| panic!("{what}: six not importable from the pylock install"));
     let ok = is_patched && bytes == patched;
     record(
@@ -486,6 +470,92 @@ fn pylock_flow(pipenv: &Pipenv, root: &Path) {
         if ok { "pass" } else { "FAIL" },
     );
     assert!(ok, "{what}: the pylock install must carry the PATCHED six");
+
+    let (out, py) = pylock_install(&pipenv.uv, python, &proj, &pep751.join("uv"), false);
+    let verdict = if out.status.success() {
+        let (_, bytes, is_patched) = six_oracle(&py, &pep751.join("uv"))
+            .unwrap_or_else(|| panic!("{what}: six not importable from the uv pylock install"));
+        assert!(
+            is_patched && bytes == patched,
+            "{what}: the uv pylock install must carry the PATCHED six"
+        );
+        "pass"
+    } else {
+        let pristine_dir = pep751.join("uv-pristine");
+        copy_tree(&proj, &pristine_dir, &[".venv"]);
+        std::fs::write(pristine_dir.join("pylock.toml"), &pristine_pylock).unwrap();
+        let (pristine_out, _) = pylock_install(
+            &pipenv.uv,
+            python,
+            &pristine_dir,
+            &pep751.join("uv-p"),
+            false,
+        );
+        let wired_err = error_lines(&out);
+        assert!(
+            !pristine_out.status.success()
+                && !wired_err.is_empty()
+                && wired_err == error_lines(&pristine_out),
+            "{what}: uv refuses the wired pylock but not Pipenv's own: {}\n--- pristine\n{}",
+            out_text(&out),
+            out_text(&pristine_out)
+        );
+        "upstream-refused"
+    };
+    record(
+        "pipenv",
+        v,
+        "use_pylock/vendored",
+        "pylock-uv-install",
+        verdict,
+    );
+}
+
+/// Installs `src`'s `pylock.toml` into a fresh venv in a copy of `src` at
+/// `dir`, with pip (`-r pylock.toml` needs pip 26.1+; pinned exactly like
+/// every other oracle here) or uv. Returns the installer's output and the
+/// venv's python.
+fn pylock_install(
+    uv: &Path,
+    python: &str,
+    src: &Path,
+    dir: &Path,
+    with_pip: bool,
+) -> (Output, PathBuf) {
+    copy_tree(src, dir, &[".venv"]);
+    let venv = dir.join(".venv");
+    let pins: &[&str] = if with_pip { &["pip==26.2.2"] } else { &[] };
+    make_venv(uv, python, &venv, pins).unwrap_or_else(|e| panic!("pylock venv: {e}"));
+    let py = venv_bin(&venv, "python");
+    let out = if with_pip {
+        tool(
+            &py,
+            dir,
+            &["-m", "pip", "install", "-r", "pylock.toml"],
+            &[],
+        )
+    } else {
+        let args = [
+            "pip",
+            "install",
+            "--python",
+            py.to_str().unwrap(),
+            "-r",
+            "pylock.toml",
+        ];
+        tool(uv, dir, &args, &[])
+    };
+    (out, py)
+}
+
+/// The `error:` lines of an installer's stderr: what it refused, without
+/// the paths it printed around it.
+fn error_lines(out: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.starts_with("error:"))
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]

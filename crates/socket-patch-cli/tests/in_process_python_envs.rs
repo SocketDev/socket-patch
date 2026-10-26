@@ -662,6 +662,31 @@ async fn pipenv_explicit_not_in_project_still_scans_dot_venv() {
     }
 }
 
+/// #842: only Pipenv 2026.2+ reads the Pipfile's `[pipenv] venv_in_project
+/// = true`; older Pipenv keeps the venv in WORKON_HOME. With no `./.venv`,
+/// scan must still find that venv instead of skipping the installed
+/// package as "not installed".
+#[tokio::test]
+#[serial]
+async fn pipenv_pipfile_in_project_without_dot_venv_scans_workon_venv() {
+    let (_tmp, project, workon) = pipenv_project();
+    std::fs::write(
+        project.join("Pipfile"),
+        "[packages]\npipenv-pkg = \"*\"\n\n[pipenv]\nvenv_in_project = true\n",
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+    let env: Vec<(&str, &Path)> = vec![
+        ("WORKON_HOME", &workon),
+        ("PIPENV_CUSTOM_VENV_NAME", Path::new("proj-env")),
+    ];
+    let code = scan_with_pipenv_env(default_args(&project, server.uri()), &env).await;
+    assert_eq!(code, 0);
+    let bodies = batch_bodies(&server).await;
+    assert_discovered(&bodies, "pkg:pypi/pipenv-pkg@1.0.0");
+}
+
 /// #546: Pipenv loads the project's `.env` before it picks the venv, so a
 /// `PIPENV_CUSTOM_VENV_NAME` or `WORKON_HOME` there decides which venv is
 /// scanned (and `PIPENV_DONT_LOAD_ENV` turns that off).

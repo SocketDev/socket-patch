@@ -39,9 +39,13 @@ permissions:
 # queued push but the newest during a merge burst, and most main commits never
 # got a verdict. Merge-group refs (gh-readonly-queue/...) are unique per queue
 # entry already. The nightly keeps its own group so it never queues behind (or
-# cancels) a push.
+# cancels) a push. Draft PR runs get their own group too: a push followed at
+# once by `gh pr ready` can deliver the push's `synchronize` (payload still
+# draft) after `ready_for_review`. In a shared group that late draft run
+# cancelled the real run, skipped every job, and left ci-ok green on a head
+# nothing had tested.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event.pull_request.draft && '-draft' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Linux jobs run on Depot's runners (depot-ubuntu-*-4: 4 vCPU, like GitHub's
@@ -1503,11 +1507,10 @@ jobs:
         if: matrix.pipenv != '' || matrix.pip != ''
         uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
         with:
-          # Pin uv: it is the PEP 751 oracle the pylock tests install with,
-          # and uv 0.13.2 started refusing Pipenv's `environments = []`
-          # pylock ("target environment is not supported by the lockfile").
-          # Bump deliberately, after checking the Pipenv pylock legs pass.
-          version: "0.13.1"
+          # Exact pin (scripts/check-tool-pins.py). uv 0.13.2+ refuses the
+          # `environments = []` pylock Pipenv writes; the pylock test checks
+          # that refusal matches Pipenv's own pylock, so keep this current.
+          version: "0.13.5"
 
       - name: Install the Pythons the Pipenv / pip legs run on
         if: matrix.pipenv != '' || matrix.pip != ''

@@ -28,6 +28,7 @@ use crate::constants::npm_family::{
     RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::formats::cargo::source_replacement::CratesIoSource;
+use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
     effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
     NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
@@ -1765,6 +1766,8 @@ pub async fn rewrite(
         )
         .await;
         if vetoed.is_empty() {
+            let constraints = constraints_link_warnings(view, &done, &kept).await;
+            done.rewrite.warnings.extend(constraints);
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
             done.rewrite.warnings.extend(copy_left);
@@ -1775,6 +1778,48 @@ pub async fn rewrite(
         kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
         unattributed.extend(vetoed);
     }
+}
+
+/// A `redirect_requirements_constraints_link` warning for each sibling
+/// requirements file that reads the root requirements.txt as `-c`
+/// constraints while a hosted pin there is a URL (#740), which pip 20.3
+/// and 21.0 refuse in a constraints file. Said on every run that confirms
+/// such a pin, not only the one that writes it: the hazard lasts as long
+/// as the pin does.
+async fn constraints_link_warnings(
+    view: &ProjectView<'_>,
+    done: &Rewritten,
+    kept: &[Candidate],
+) -> Vec<RewriteWarning> {
+    let confirmed = &done.rewrite.confirmed_requirements_uuids;
+    let mut pinned: Vec<&str> = kept
+        .iter()
+        .filter(|c| confirmed.contains(&c.dep.patch_uuid))
+        .map(|c| c.dep.name.as_str())
+        .collect();
+    pinned.sort_unstable();
+    pinned.dedup();
+    if pinned.is_empty() {
+        return Vec::new();
+    }
+    crate::vendor::pypi_requirements::constraint_readers_in(*view, &[PYPI_REQUIREMENTS.to_string()])
+        .await
+        .into_iter()
+        .map(|found| {
+            warning(
+                "redirect_requirements_constraints_link",
+                format!(
+                "{} reads {} as a constraints file (`-c`), and the hosted pin of {} in {} is a \
+                 URL; {}",
+                found.reader,
+                found.target,
+                pinned.join(", "),
+                found.target,
+                crate::vendor::pypi_requirements::CONSTRAINT_LINK_REMEDY
+            ),
+            )
+        })
+        .collect()
 }
 
 /// Lockfile discovery over the project as `done` would leave it, read as
@@ -2335,6 +2380,7 @@ async fn rewrite_once(
         .cloned()
         .collect();
     let confirmed = confirm(&files, &rewrite, candidates, binary_bun, withheld_from_vlt);
+    npm_warnings.extend(npm_deno_lock(view, &overrides, &confirmed));
     Rewritten {
         files,
         symlinked_reads,
@@ -2970,6 +3016,44 @@ fn npm_allow_remote(
         }
     }
     (npm_warnings, npmrc_config_write)
+}
+
+/// #406: `deno install` installs a `package.json` project's npm
+/// dependencies from `deno.lock` and never reads an npm-family lock, so a
+/// redirected npm package that `deno.lock` also locks at the same version
+/// keeps installing the registry copy wherever Deno installs. Said once,
+/// naming every such package; the redirect still stands for npm / pnpm /
+/// yarn / bun installs. Advisory read: no readable `deno.lock`, nothing.
+fn npm_deno_lock(
+    view: &ProjectView<'_>,
+    overrides: &[DepOverride],
+    confirmed: &[(String, String)],
+) -> Option<RewriteWarning> {
+    use crate::patch::redirect::{full_name, npm_deno_lock_detail, DENO_LOCK};
+    let npm: Vec<&DepOverride> = overrides
+        .iter()
+        .filter(|o| o.ecosystem == "npm")
+        .filter(|o| confirmed.iter().any(|(_, uuid)| *uuid == o.patch_uuid))
+        .collect();
+    if npm.is_empty() {
+        return None;
+    }
+    let text = read_advisory_text(view, DENO_LOCK)?;
+    let locked = crate::crawlers::deno_crawler::lock_text_npm_packages(&text);
+    let mut packages: Vec<String> = npm
+        .into_iter()
+        .map(|o| format!("{}@{}", full_name(o), o.version))
+        .filter(|key| locked.contains(key))
+        .collect();
+    packages.sort();
+    packages.dedup();
+    if packages.is_empty() {
+        return None;
+    }
+    Some(warning(
+        "redirect_npm_deno_lock",
+        npm_deno_lock_detail(&packages, "redirected"),
+    ))
 }
 
 /// A dep counts as REDIRECTED only if its hosted-artifact URL (or its
@@ -4109,6 +4193,82 @@ mod tests {
         std::fs::write(tmp.path().join("package.json"), OVERRIDING_MANIFEST).unwrap();
         let (_, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
         assert!(redirected(&done), "{:?}", done.rewrite.warnings);
+    }
+
+    /// REGRESSION (#406): `deno install` installs a `package.json`
+    /// project's npm deps from `deno.lock` and never reads
+    /// package-lock.json, so a redirect of a `name@version` that deno.lock
+    /// also locks is SAID (`redirect_npm_deno_lock`), once, while the
+    /// redirect still stands for npm. Another version in deno.lock, an
+    /// unparseable one, or none says nothing.
+    #[tokio::test]
+    async fn issue_406_a_deno_lock_of_the_redirected_version_is_said() {
+        const LOCK: &str = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "left-pad": "1.3.0" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let deno_lock = |key: &str| {
+            format!(r#"{{"version":"5","npm":{{"{key}":{{"integrity":"sha512-X=="}}}}}}"#)
+        };
+        let said = |done: &Rewritten| {
+            let lock = done.rewrite.files.get("package-lock.json");
+            assert!(
+                lock.is_some_and(|l| l.contains(&left_pad_url())),
+                "{:?}",
+                done.rewrite.warnings
+            );
+            let found: Vec<&RewriteWarning> = done
+                .npm_warnings
+                .iter()
+                .filter(|w| w.code == "redirect_npm_deno_lock")
+                .collect();
+            assert!(found.len() <= 1, "{found:?}");
+            found.first().map(|w| w.detail.clone())
+        };
+        let cases = [
+            (Some(deno_lock("left-pad@1.3.0")), true),
+            // Deno's peer suffix still names the same version.
+            (Some(deno_lock("left-pad@1.3.0_react@18.2.0")), true),
+            (Some(deno_lock("left-pad@1.2.0")), false),
+            (Some("not json".to_string()), false),
+            (None, false),
+        ];
+        for (deno, expect) in cases {
+            // In memory.
+            let mut p = MemoryProject::new();
+            p.insert_text("package-lock.json", LOCK);
+            if let Some(text) = &deno {
+                p.insert_text("deno.lock", text.as_str());
+            }
+            let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+            let detail = said(&done);
+            assert_eq!(detail.is_some(), expect, "{deno:?}: {detail:?}");
+            if let Some(detail) = detail {
+                assert!(detail.starts_with("left-pad@1.3.0 redirected"), "{detail}");
+                assert!(detail.contains("deno install"), "{detail}");
+                assert!(detail.contains("--mode agent"), "{detail}");
+            }
+            // On disk.
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("package-lock.json"), LOCK).unwrap();
+            if let Some(text) = &deno {
+                std::fs::write(tmp.path().join("deno.lock"), text).unwrap();
+            }
+            let (_, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
+            assert_eq!(said(&done).is_some(), expect, "disk {deno:?}");
+            // deno.lock is never written.
+            assert!(!done.rewrite.files.contains_key("deno.lock"));
+        }
     }
 
     const LEFT_PAD_V9_LOCK: &str = "lockfileVersion: '9.0'
