@@ -116,22 +116,63 @@ pub async fn load_pdm_project(root: &Path) -> Result<PdmProject, (&'static str, 
 
 /// The remedy for an env that still holds the upstream `name` after its
 /// pdm.lock was wired (#641), or `None` when the PDM release that writes
-/// `lock_version` reinstalls it on its own. PDM before 2.11 (lock_version
-/// `2` / `4.3` / `4.4`) keeps a release already installed at the same
-/// version; 2.x has `pdm sync --reinstall`, while PDM 1.x (lock_version `2`)
-/// has no such flag, so the installed copy has to go first.
+/// `lock_version` reinstalls it on its own
+/// ([`crate::utils::pdm_lock::keeps_installed_release`]). PDM 2.x has
+/// `pdm sync --reinstall`; the releases that write lock_version `2` (before
+/// 2.0) have no such flag, so the installed copy has to go first.
 pub fn stale_install_remedy(lock_version: &str, name: &str) -> Option<String> {
-    match lock_version {
-        "2" => Some(format!(
-            "PDM 1.x has no `pdm sync --reinstall`: remove the installed `{name}` from that \
-             environment (its package files and `.dist-info`, or recreate the environment or \
-             `__pypackages__`), then `pdm sync`"
-        )),
-        "4.3" | "4.4" => Some(
-            "Run `pdm sync --reinstall` (or recreate the environment, then `pdm sync`)".to_string(),
-        ),
-        _ => None,
+    if !crate::utils::pdm_lock::keeps_installed_release(lock_version) {
+        return None;
     }
+    Some(if lock_version == "2" {
+        format!(
+            "PDM before 2.0 has no `pdm sync --reinstall`: remove the installed `{name}` from \
+             the environment PDM installs into (its package files and `.dist-info`, or \
+             recreate the environment or `__pypackages__`), then `pdm sync`"
+        )
+    } else {
+        "Run `pdm sync --reinstall` (or recreate the environment, then `pdm sync`)".to_string()
+    })
+}
+
+/// The governing pdm.lock of `root` when its PDM keeps an installed release
+/// ([`stale_install_remedy`]), for [`stale_install_note`]. Loaded once per
+/// `vex` run; `None` when another tool lock drives installs, the lock is
+/// unreadable, or its PDM reinstalls.
+pub async fn stale_install_lock(root: &Path) -> Option<PdmProject> {
+    if !crate::formats::governing_locks::pypi_tool_lock_governs(LOCK_FILE, |lock| {
+        root.join(lock).is_file()
+    }) {
+        return None;
+    }
+    let project = load_pdm_project(root).await.ok()?;
+    crate::utils::pdm_lock::keeps_installed_release(&project.lock_version).then_some(project)
+}
+
+/// The addendum to `vex`'s `vendored_tree_out_of_sync` hint for `purl`
+/// (#641): re-running `pdm sync` does not resync a tree PDM < 2.11 keeps,
+/// so name the remedy that does. `None` unless `p` wires `purl`'s package
+/// to a vendored artifact, so a package another flavor wired gets none.
+pub fn stale_install_note(p: &PdmProject, purl: &str) -> Option<String> {
+    let base = crate::utils::purl::strip_purl_qualifiers(purl);
+    let (name, _) = crate::utils::purl::parse_pypi_purl(base)?;
+    let wired = lock_units_named(&p.lock, &canonicalize_pypi_name(&name))
+        .into_iter()
+        .any(|unit| {
+            unit.get("path")
+                .and_then(Item::as_str)
+                .and_then(parse_vendor_path)
+                .is_some_and(|parts| parts.eco == "pypi")
+        });
+    if !wired {
+        return None;
+    }
+    let remedy = stale_install_remedy(&p.lock_version, &name)?;
+    Some(format!(
+        "pdm.lock (lock_version {}) was written by PDM < 2.11, which keeps an \
+         already-installed release on `pdm sync`. {remedy}.",
+        p.lock_version
+    ))
 }
 
 /// `"direct"` iff the package is declared in the pyproject — PEP 621
@@ -517,6 +558,60 @@ pub async fn revert_pdm(entry: &VendorEntry, root: &Path, dry_run: bool) -> Reve
 mod tests {
     use super::*;
     use crate::vendor::state::VendorArtifact;
+
+    /// #641: `vex`'s out-of-sync hint names the PDM remedy for a package a
+    /// PDM < 2.11 pdm.lock wires to a vendored artifact, and nothing for a
+    /// registry entry, a 2.11+ lock, or a pdm.lock another lock shadows.
+    #[tokio::test]
+    async fn stale_install_note_follows_the_lock_and_its_wiring() {
+        let lock = |version: &str, source: &str| {
+            format!(
+                "[metadata]\ngroups = [\"default\"]\nlock_version = \"{version}\"\n\
+                 content_hash = \"sha256:00\"\n\n[[package]]\nname = \"Six\"\n\
+                 version = \"1.16.0\"\n{source}"
+            )
+        };
+        let wired = "path = \".socket/vendor/pypi/0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a/six-1.16.0-py2.py3-none-any.whl\"\n";
+        let purl = "pkg:pypi/six@1.16.0?artifact_id=x";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(stale_install_lock(root).await.is_none(), "no pdm.lock");
+
+        let note = |root: std::path::PathBuf, purl: &'static str| async move {
+            stale_install_lock(&root)
+                .await
+                .and_then(|p| stale_install_note(&p, purl))
+        };
+        std::fs::write(root.join(LOCK_FILE), lock("4.4", wired)).unwrap();
+        let text = note(root.to_path_buf(), purl).await.expect("4.4 wired");
+        assert!(
+            text.contains("lock_version 4.4") && text.contains("`pdm sync --reinstall`"),
+            "{text}"
+        );
+        assert!(note(root.to_path_buf(), "pkg:pypi/other@1.0.0")
+            .await
+            .is_none());
+
+        std::fs::write(root.join(LOCK_FILE), lock("2", wired)).unwrap();
+        let text = note(root.to_path_buf(), purl).await.expect("2 wired");
+        assert!(
+            text.contains("no `pdm sync --reinstall`") && text.contains("`six`"),
+            "{text}"
+        );
+
+        // A registry entry is not ours to advise on.
+        std::fs::write(root.join(LOCK_FILE), lock("4.4", "")).unwrap();
+        assert!(note(root.to_path_buf(), purl).await.is_none());
+
+        // PDM 2.11+ reinstalls.
+        std::fs::write(root.join(LOCK_FILE), lock("4.5.0", wired)).unwrap();
+        assert!(note(root.to_path_buf(), purl).await.is_none());
+
+        // A uv.lock beside it drives installs instead.
+        std::fs::write(root.join(LOCK_FILE), lock("4.4", wired)).unwrap();
+        std::fs::write(root.join("uv.lock"), "version = 1\n").unwrap();
+        assert!(note(root.to_path_buf(), purl).await.is_none());
+    }
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     const REL_WHEEL: &str =

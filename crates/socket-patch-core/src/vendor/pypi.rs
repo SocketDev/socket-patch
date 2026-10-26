@@ -925,21 +925,39 @@ async fn pdm_stale_install_warning(
     if stale_dirs.is_empty() {
         return None;
     }
-    let listed = stale_dirs
-        .iter()
-        .map(|d| d.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(VendorWarning::new(
-        "pypi_pdm_stale_install",
-        format!(
-            "{purl}: the UNPATCHED upstream release is still installed in {listed}. pdm.lock \
-             (lock_version {lock_version}) was written by PDM < 2.11, which does not replace an \
-             already-installed package at the same version (`pdm sync` and `pdm install` keep \
-             those bytes), so the wired pdm.lock only protects fresh installs. {remedy}. Then \
-             `socket-patch vex` re-verifies the installed files."
-        ),
-    ))
+    let join = |dirs: &[&std::path::PathBuf]| {
+        dirs.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // A base interpreter's copy a `--system-site-packages` venv inherits is
+    // not PDM's to reinstall (#409, #1450): name it apart.
+    let inherited = crate::crawlers::python_crawler::inherited_base_site_dirs(&sites).await;
+    let (base, own): (Vec<_>, Vec<_>) = stale_dirs.iter().partition(|d| inherited.contains(*d));
+    let mut detail = format!(
+        "{purl}: the UNPATCHED upstream release is still installed in {}.",
+        join(&stale_dirs.iter().collect::<Vec<_>>())
+    );
+    if !own.is_empty() {
+        detail.push_str(&format!(
+            " pdm.lock (lock_version {lock_version}) was written by PDM < 2.11, which does not \
+             replace an already-installed package at the same version (`pdm sync` and `pdm \
+             install` keep those bytes), so the wired pdm.lock only protects fresh installs. \
+             For {}: {remedy}.",
+            join(&own)
+        ));
+    }
+    if !base.is_empty() {
+        detail.push_str(&format!(
+            " {} belongs to the base interpreter the environment inherits \
+             (`--system-site-packages`), which PDM does not manage: uninstall `{name}` there, or \
+             recreate the environment without system site packages, then `pdm sync`.",
+            join(&base)
+        ));
+    }
+    detail.push_str(" Then `socket-patch vex` re-verifies the installed files.");
+    Some(VendorWarning::new("pypi_pdm_stale_install", detail))
 }
 
 /// The `sites` that hold the package of `purl` with positive evidence of
@@ -1205,24 +1223,13 @@ async fn pypi_prelude<'p>(
                 Ok(p) => p,
                 Err((code, detail)) => return Err(refused(code, detail)),
             };
-            let target =
-                super::pypi_pdm::check_target_guards(&project, &canon_name, version, &record.uuid);
-            // Both a fresh vendor and a re-run over an already-wired lock
-            // keep warning while PDM < 2.11 would keep the upstream release
-            // (#641). A refusal probes nothing.
-            if target.is_ok() {
-                warnings.extend(
-                    pdm_stale_install_warning(
-                        project_root,
-                        purl,
-                        record,
-                        installed_sites,
-                        &project.lock_version,
-                    )
-                    .await,
-                );
-            }
-            match target {
+            let lock_version = project.lock_version.clone();
+            let plan = match super::pypi_pdm::check_target_guards(
+                &project,
+                &canon_name,
+                version,
+                &record.uuid,
+            ) {
                 Ok(PdmTarget::InSync) => {
                     wired_pin = splice_lock_wired_pin(&project.lock_text, &uuid_dir_rel);
                     WiringPlan::InSync
@@ -1235,7 +1242,21 @@ async fn pypi_prelude<'p>(
                     supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
                         .await?
                 }
-            }
+            };
+            // A fresh vendor, a superseding re-wire and a re-run over an
+            // already-wired lock all keep warning while PDM < 2.11 would
+            // keep the upstream release (#641). A refusal returned above.
+            warnings.extend(
+                pdm_stale_install_warning(
+                    project_root,
+                    purl,
+                    record,
+                    installed_sites,
+                    &lock_version,
+                )
+                .await,
+            );
+            plan
         }
         PypiFlavor::Pipenv => {
             let project = match super::pypi_pipenv::load_pipenv_project(project_root).await {

@@ -1059,12 +1059,19 @@ async fn generate_vex(
             ),
         }
     };
+    // PDM < 2.11 keeps an installed release on `pdm sync` (#641): a
+    // package its pdm.lock wires gets the remedy that resyncs it.
+    let pdm_lock = if outcome.vendored_out_of_sync.is_empty() || common.is_global() {
+        None
+    } else {
+        socket_patch_core::vendor::pypi_pdm::stale_install_lock(&common.cwd).await
+    };
     for purl in &outcome.vendored_out_of_sync {
-        let pdm_note = if common.is_global() {
-            String::new()
-        } else {
-            pdm_out_of_sync_note(&common.cwd, purl).await
-        };
+        let pdm_note = pdm_lock
+            .as_ref()
+            .and_then(|lock| socket_patch_core::vendor::pypi_pdm::stale_install_note(lock, purl))
+            .map(|note| format!(" {note}"))
+            .unwrap_or_default();
         note_warning(
             warnings,
             common,
@@ -2007,84 +2014,12 @@ fn emit_envelope_success(summary: &VexWriteSummary, dry_run: bool) {
     println!("{}", env.to_pretty_json());
 }
 
-/// The PDM addendum to a pypi `vendored_tree_out_of_sync` hint (#641): PDM
-/// before 2.11 (lock_version `2` / `4.3` / `4.4`) keeps a release already
-/// installed at the same version, so re-running `pdm sync` does not resync
-/// the tree. Names the remedy that does; empty when pdm.lock does not
-/// govern `cwd` or was written by a PDM that reinstalls.
-async fn pdm_out_of_sync_note(cwd: &Path, purl: &str) -> String {
-    use socket_patch_core::vendor::pypi_pdm::{load_pdm_project, stale_install_remedy};
-    let Some(name) = purl
-        .strip_prefix("pkg:pypi/")
-        .and_then(|rest| rest.split(['@', '?']).next())
-        .filter(|name| !name.is_empty())
-    else {
-        return String::new();
-    };
-    if !socket_patch_core::formats::governing_locks::pypi_tool_lock_governs("pdm.lock", |lock| {
-        cwd.join(lock).is_file()
-    }) {
-        return String::new();
-    }
-    let Ok(project) = load_pdm_project(cwd).await else {
-        return String::new();
-    };
-    match stale_install_remedy(&project.lock_version, name) {
-        Some(remedy) => format!(
-            " pdm.lock (lock_version {}) was written by PDM < 2.11, which keeps an \
-             already-installed release on `pdm sync`. {remedy}.",
-            project.lock_version
-        ),
-        None => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Lightweight tests at the args/wiring layer. End-to-end behavior
     //! lives in `tests/e2e_vex*.rs`.
     use super::*;
     use clap::Parser;
-
-    /// #641: the out-of-sync hint names the PDM remedy that resyncs the
-    /// tree for a pdm.lock PDM < 2.11 wrote, and stays generic otherwise.
-    #[tokio::test]
-    async fn pdm_out_of_sync_note_follows_the_lock_version() {
-        let lock = |version: &str| {
-            format!(
-                "[metadata]\ngroups = [\"default\"]\nlock_version = \"{version}\"\n\
-                 content_hash = \"sha256:00\"\n\n[[package]]\nname = \"six\"\n\
-                 version = \"1.16.0\"\n"
-            )
-        };
-        let purl = "pkg:pypi/six@1.16.0";
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path();
-        assert_eq!(pdm_out_of_sync_note(cwd, purl).await, "", "no pdm.lock");
-
-        std::fs::write(cwd.join("pdm.lock"), lock("4.4")).unwrap();
-        let note = pdm_out_of_sync_note(cwd, purl).await;
-        assert!(
-            note.contains("lock_version 4.4") && note.contains("`pdm sync --reinstall`"),
-            "{note}"
-        );
-        assert_eq!(pdm_out_of_sync_note(cwd, "pkg:npm/six@1.16.0").await, "");
-
-        std::fs::write(cwd.join("pdm.lock"), lock("2")).unwrap();
-        let note = pdm_out_of_sync_note(cwd, purl).await;
-        assert!(
-            note.contains("no `pdm sync --reinstall`") && note.contains("`six`"),
-            "{note}"
-        );
-
-        std::fs::write(cwd.join("pdm.lock"), lock("4.5.0")).unwrap();
-        assert_eq!(pdm_out_of_sync_note(cwd, purl).await, "", "PDM 2.11+");
-
-        // A uv.lock beside it drives installs instead.
-        std::fs::write(cwd.join("pdm.lock"), lock("4.4")).unwrap();
-        std::fs::write(cwd.join("uv.lock"), "version = 1\n").unwrap();
-        assert_eq!(pdm_out_of_sync_note(cwd, purl).await, "", "uv governs");
-    }
 
     /// The go-patches synthesis guards its copy-dir keys with core's
     /// `are_safe_redirect_coords`; pin the accept/reject set from the CLI
