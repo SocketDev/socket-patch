@@ -1463,6 +1463,14 @@ async fn pypi_prelude<'p>(
             .await);
         }
         if artifact_present || dry_run {
+            // The wiring stays a link in place: keep naming its `-c`
+            // readers on every run (#740).
+            if let Ok(prior) = reuse::prior_entry(project_root, "pypi", record, None).await {
+                warnings.extend(
+                    constraint_link_warnings(project_root, &prior.wiring, &canon_name, version)
+                        .await,
+                );
+            }
             return Err(done(
                 already_patched_result(base, Path::new(""), &record.files),
                 None,
@@ -1679,6 +1687,7 @@ async fn wire_in_sync_sibling(
         return done(result, None, warnings);
     };
     if dry_run {
+        let mut targets = requirements_record_files(&entry.wiring);
         if export_pending {
             warnings.push(VendorWarning::new(
                 "pypi_requirements_sibling_wired",
@@ -1688,7 +1697,21 @@ async fn wire_in_sync_sibling(
                     crate::formats::governing_locks::PYPI_REQUIREMENTS
                 ),
             ));
+            targets.extend(
+                super::pypi_requirements::planned_files(
+                    project_root,
+                    canon_name,
+                    version,
+                    &entry.artifact.path,
+                )
+                .await,
+            );
+            targets.sort();
+            targets.dedup();
         }
+        warnings.extend(
+            constraint_reader_warnings(project_root, &targets, canon_name, version, true).await,
+        );
         if !pylocks.is_empty() {
             warnings.push(pylock_dry_run_notice(&pylocks, canon_name, version));
         }
@@ -1768,6 +1791,10 @@ async fn wire_in_sync_sibling(
             }
         }
     }
+    // Every requirements file the entry wires, this run's or earlier: the
+    // link pins stay in place, so their `-c` readers are named each run.
+    warnings
+        .extend(constraint_link_warnings(project_root, &entry.wiring, canon_name, version).await);
     done(result, Some(entry), warnings)
 }
 
@@ -1983,6 +2010,12 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                 return done(result, None, warnings);
             }
         }
+        let targets =
+            planned_requirements_targets(project_root, &plan, &canon_name, version, &rel_wheel)
+                .await;
+        warnings.extend(
+            constraint_reader_warnings(project_root, &targets, &canon_name, version, true).await,
+        );
         return done(result, None, warnings);
     }
     let Some(artifact) = artifact else {
@@ -2089,6 +2122,11 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                 warnings,
             )
             .await;
+        }
+        if let Ok(prior) = reuse::prior_entry(project_root, "pypi", record, None).await {
+            warnings.extend(
+                constraint_link_warnings(project_root, &prior.wiring, &canon_name, version).await,
+            );
         }
         return done(result, None, warnings);
     }
@@ -2375,7 +2413,97 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         MetaSlot::Pipenv(m) => entry.pipenv = Some(m),
         MetaSlot::None => {}
     }
+    warnings
+        .extend(constraint_link_warnings(project_root, &entry.wiring, &canon_name, version).await);
     done(result, Some(entry), warnings)
+}
+
+/// A `vendor_requirements_constraints_link` warning for each sibling file
+/// that reads a requirements file `wiring` wrote a vendor line into as `-c`
+/// constraints (#740): the wheel path is a link, which pip 20.3.x and
+/// 21.0.x refuse there.
+async fn constraint_link_warnings(
+    project_root: &Path,
+    wiring: &[super::state::WiringRecord],
+    canon_name: &str,
+    version: &str,
+) -> Vec<VendorWarning> {
+    let targets = requirements_record_files(wiring);
+    constraint_reader_warnings(project_root, &targets, canon_name, version, false).await
+}
+
+/// The requirements files `wiring` holds vendor lines in.
+fn requirements_record_files(wiring: &[super::state::WiringRecord]) -> Vec<String> {
+    let mut files: Vec<String> = wiring
+        .iter()
+        .filter(|r| r.kind == super::pypi_requirements::RECORD_KIND)
+        .map(|r| r.file.clone())
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The requirements files the wet run of `plan` writes vendor lines into,
+/// for the dry run's [`constraint_reader_warnings`]: a fresh requirements
+/// wiring's (directly, or as the exported sibling of a uv / Pipenv lock)
+/// as the planner would write it, and a re-wire's as the superseded entry
+/// recorded them.
+async fn planned_requirements_targets(
+    project_root: &Path,
+    plan: &WiringPlan,
+    canon_name: &str,
+    version: &str,
+    rel_wheel: &str,
+) -> Vec<String> {
+    let fresh =
+        || super::pypi_requirements::planned_files(project_root, canon_name, version, rel_wheel);
+    let mut targets = match plan {
+        WiringPlan::Requirements | WiringPlan::Uv(_, true) => fresh().await,
+        WiringPlan::Pipenv(_, superseded, true, _) => {
+            let mut files = fresh().await;
+            if let Some(prev) = superseded {
+                files.extend(requirements_record_files(&prev.wiring));
+            }
+            files
+        }
+        WiringPlan::RequirementsRewire(prev) => requirements_record_files(&prev.wiring),
+        WiringPlan::Supersede(superseded) => requirements_record_files(&superseded.prev.wiring),
+        _ => Vec::new(),
+    };
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// [`constraint_link_warnings`] for the requirements files `targets`;
+/// `planned` words it for a dry run.
+async fn constraint_reader_warnings(
+    project_root: &Path,
+    targets: &[String],
+    canon_name: &str,
+    version: &str,
+    planned: bool,
+) -> Vec<VendorWarning> {
+    let view = super::lock_inventory::ProjectView::Disk(project_root);
+    let pins = if planned { "would pin" } else { "now pins" };
+    super::pypi_requirements::constraint_readers_in(view, targets)
+        .await
+        .into_iter()
+        .map(|found| {
+            VendorWarning::new(
+                "vendor_requirements_constraints_link",
+                format!(
+                    "{} reads {} as a constraints file (`-c`), and {} {pins} \
+                     {canon_name}=={version} to a vendored wheel path; {}",
+                    found.reader,
+                    found.target,
+                    found.target,
+                    super::pypi_requirements::CONSTRAINT_LINK_REMEDY
+                ),
+            )
+        })
+        .collect()
 }
 
 /// The flavor-guard refusals that name socket-patch's own wiring at another

@@ -28,6 +28,7 @@ use crate::constants::npm_family::{
     RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::formats::cargo::source_replacement::CratesIoSource;
+use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
     effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
     NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
@@ -1765,6 +1766,8 @@ pub async fn rewrite(
         )
         .await;
         if vetoed.is_empty() {
+            let constraints = constraints_link_warnings(view, &done, &kept).await;
+            done.rewrite.warnings.extend(constraints);
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
             done.rewrite.warnings.extend(copy_left);
@@ -1775,6 +1778,48 @@ pub async fn rewrite(
         kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
         unattributed.extend(vetoed);
     }
+}
+
+/// A `redirect_requirements_constraints_link` warning for each sibling
+/// requirements file that reads the root requirements.txt as `-c`
+/// constraints while a hosted pin there is a URL (#740), which pip 20.3
+/// and 21.0 refuse in a constraints file. Said on every run that confirms
+/// such a pin, not only the one that writes it: the hazard lasts as long
+/// as the pin does.
+async fn constraints_link_warnings(
+    view: &ProjectView<'_>,
+    done: &Rewritten,
+    kept: &[Candidate],
+) -> Vec<RewriteWarning> {
+    let confirmed = &done.rewrite.confirmed_requirements_uuids;
+    let mut pinned: Vec<&str> = kept
+        .iter()
+        .filter(|c| confirmed.contains(&c.dep.patch_uuid))
+        .map(|c| c.dep.name.as_str())
+        .collect();
+    pinned.sort_unstable();
+    pinned.dedup();
+    if pinned.is_empty() {
+        return Vec::new();
+    }
+    crate::vendor::pypi_requirements::constraint_readers_in(*view, &[PYPI_REQUIREMENTS.to_string()])
+        .await
+        .into_iter()
+        .map(|found| {
+            warning(
+                "redirect_requirements_constraints_link",
+                format!(
+                "{} reads {} as a constraints file (`-c`), and the hosted pin of {} in {} is a \
+                 URL; {}",
+                found.reader,
+                found.target,
+                pinned.join(", "),
+                found.target,
+                crate::vendor::pypi_requirements::CONSTRAINT_LINK_REMEDY
+            ),
+            )
+        })
+        .collect()
 }
 
 /// Lockfile discovery over the project as `done` would leave it, read as
