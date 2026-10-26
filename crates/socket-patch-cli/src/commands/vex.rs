@@ -1062,7 +1062,19 @@ async fn generate_vex(
             ),
         }
     };
+    // PDM < 2.11 keeps an installed release on `pdm sync` (#641): a
+    // package its pdm.lock wires gets the remedy that resyncs it.
+    let pdm_lock = if outcome.vendored_out_of_sync.is_empty() || common.is_global() {
+        None
+    } else {
+        socket_patch_core::vendor::pypi_pdm::stale_install_lock(&common.cwd).await
+    };
     for purl in &outcome.vendored_out_of_sync {
+        let pdm_note = pdm_lock
+            .as_ref()
+            .and_then(|lock| socket_patch_core::vendor::pypi_pdm::stale_install_note(lock, purl))
+            .map(|note| format!(" {note}"))
+            .unwrap_or_default();
         note_warning(
             warnings,
             common,
@@ -1071,7 +1083,7 @@ async fn generate_vex(
                 "{purl}: the installed tree does not match its vendored artifact; the \
                  attestation is based on the committed .socket/vendor artifact (the lockfile \
                  consumes it), but the live tree carries different bytes — re-run your \
-                 package manager's install to resync it.{hatch_note}"
+                 package manager's install to resync it.{hatch_note}{pdm_note}"
             ),
         );
     }

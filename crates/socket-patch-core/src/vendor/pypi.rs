@@ -901,6 +901,65 @@ async fn hatch_stale_install_warning(
         .collect()
 }
 
+/// The PDM twin of [`pipenv_stale_install_warning`] (#641): PDM before
+/// 2.11 (lock_version `2` / `4.3` / `4.4`) does not replace a release that
+/// is already installed at the same version, so `pdm sync` / `pdm install`
+/// keep the upstream bytes in the env PDM installs into (its venv, or PEP
+/// 582 `__pypackages__`). Each such env that still holds them is named with
+/// the remedy that release line supports. A 2.11+ lock reinstalls: silent.
+async fn pdm_stale_install_warning(
+    project_root: &Path,
+    purl: &str,
+    record: &PatchRecord,
+    listings: &InstalledSiteListings,
+    lock_version: &str,
+) -> Option<VendorWarning> {
+    let name = parse_pypi_purl(strip_purl_qualifiers(purl))
+        .map_or_else(|| purl.to_string(), |(name, _)| name.to_string());
+    let remedy = super::pypi_pdm::stale_install_remedy(lock_version, &name)?;
+    // The env PDM resolves for the project (`.pdm-python`, an activated or
+    // in-project venv, else `__pypackages__`); Hatch's envs are not PDM's.
+    let sites =
+        crate::crawlers::python_crawler::non_hatch_local_venv_site_packages(project_root).await;
+    let stale_dirs = stale_install_sites(&sites, purl, record, listings).await;
+    if stale_dirs.is_empty() {
+        return None;
+    }
+    let join = |dirs: &[&std::path::PathBuf]| {
+        dirs.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // A base interpreter's copy a `--system-site-packages` venv inherits is
+    // not PDM's to reinstall (#409, #1450): name it apart.
+    let inherited = crate::crawlers::python_crawler::inherited_base_site_dirs(&sites).await;
+    let (base, own): (Vec<_>, Vec<_>) = stale_dirs.iter().partition(|d| inherited.contains(*d));
+    let mut detail = format!(
+        "{purl}: the UNPATCHED upstream release is still installed in {}.",
+        join(&stale_dirs.iter().collect::<Vec<_>>())
+    );
+    if !own.is_empty() {
+        detail.push_str(&format!(
+            " pdm.lock (lock_version {lock_version}) was written by PDM < 2.11, which does not \
+             replace an already-installed package at the same version (`pdm sync` and `pdm \
+             install` keep those bytes), so the wired pdm.lock only protects fresh installs. \
+             For {}: {remedy}.",
+            join(&own)
+        ));
+    }
+    if !base.is_empty() {
+        detail.push_str(&format!(
+            " {} belongs to the base interpreter the environment inherits \
+             (`--system-site-packages`), which PDM does not manage: uninstall `{name}` there, or \
+             recreate the environment without system site packages, then `pdm sync`.",
+            join(&base)
+        ));
+    }
+    detail.push_str(" Then `socket-patch vex` re-verifies the installed files.");
+    Some(VendorWarning::new("pypi_pdm_stale_install", detail))
+}
+
 /// The `sites` that hold the package of `purl` with positive evidence of
 /// unpatched bytes (a readable file at the upstream or another hash), and no
 /// copy that verifies as patched.
@@ -1164,8 +1223,13 @@ async fn pypi_prelude<'p>(
                 Ok(p) => p,
                 Err((code, detail)) => return Err(refused(code, detail)),
             };
-            match super::pypi_pdm::check_target_guards(&project, &canon_name, version, &record.uuid)
-            {
+            let lock_version = project.lock_version.clone();
+            let plan = match super::pypi_pdm::check_target_guards(
+                &project,
+                &canon_name,
+                version,
+                &record.uuid,
+            ) {
                 Ok(PdmTarget::InSync) => {
                     wired_pin = splice_lock_wired_pin(&project.lock_text, &uuid_dir_rel);
                     WiringPlan::InSync
@@ -1178,7 +1242,21 @@ async fn pypi_prelude<'p>(
                     supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
                         .await?
                 }
-            }
+            };
+            // A fresh vendor, a superseding re-wire and a re-run over an
+            // already-wired lock all keep warning while PDM < 2.11 would
+            // keep the upstream release (#641). A refusal returned above.
+            warnings.extend(
+                pdm_stale_install_warning(
+                    project_root,
+                    purl,
+                    record,
+                    installed_sites,
+                    &lock_version,
+                )
+                .await,
+            );
+            plan
         }
         PypiFlavor::Pipenv => {
             let project = match super::pypi_pipenv::load_pipenv_project(project_root).await {
@@ -8985,6 +9063,188 @@ wheels = [
             panic!("re-run must be Done");
         };
         assert!(stale(&warnings).is_empty(), "{warnings:?}");
+    }
+
+    /// The [`PDM_LOCK_REGISTRY`] project written by another PDM release.
+    fn pdm_lock_at(lock_version: &str) -> String {
+        let lock = PDM_LOCK_REGISTRY.replace(
+            "lock_version = \"4.5.0\"",
+            &format!("lock_version = \"{lock_version}\""),
+        );
+        assert!(lock.contains(&format!("lock_version = \"{lock_version}\"")));
+        lock
+    }
+
+    /// The `pypi_pdm_stale_install` details among `warnings`.
+    fn pdm_stale(warnings: &[VendorWarning]) -> Vec<String> {
+        warnings
+            .iter()
+            .filter(|w| w.code == "pypi_pdm_stale_install")
+            .map(|w| w.detail.clone())
+            .collect()
+    }
+
+    /// #641: PDM before 2.11 (lock_version 4.3 / 4.4) keeps a release that
+    /// is already installed at the same version, so `pdm sync` after a
+    /// vendor leaves the upstream bytes live. Vendoring over such an env —
+    /// fresh and re-run in sync — must name it with `pdm sync --reinstall`.
+    /// A 2.11+ lock (4.4.1, 4.5.0) reinstalls and a patched env is silent.
+    #[tokio::test]
+    async fn pdm_vendor_warns_about_a_stale_install_before_pdm_2_11() {
+        for (lock_version, warns) in [
+            ("4.3", true),
+            ("4.4", true),
+            ("4.4.1", false),
+            ("4.5.0", false),
+        ] {
+            let fx = e2e_fixture().await;
+            if cfg!(windows) {
+                // The venv probe reads `.venv\Lib\site-packages` on Windows.
+                let sp = fx.root.join(".venv").join("Lib").join("site-packages");
+                let di = sp.join("six-1.16.0.dist-info");
+                std::fs::create_dir_all(&di).unwrap();
+                std::fs::copy(fx.site_packages.join("six.py"), sp.join("six.py")).unwrap();
+                for leaf in ["METADATA", "WHEEL", "RECORD"] {
+                    std::fs::copy(
+                        fx.site_packages.join("six-1.16.0.dist-info").join(leaf),
+                        di.join(leaf),
+                    )
+                    .unwrap();
+                }
+            }
+            swap_to_lock_flavor(&fx, &[("pdm.lock", &pdm_lock_at(lock_version))]).await;
+
+            let VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } = vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+            else {
+                panic!("{lock_version}: vendor must be Done");
+            };
+            assert!(result.success, "{lock_version}: {:?}", result.error);
+            crate::vendor::test_support::persist(&fx.root, "pkg:pypi/six@1.16.0", entry.unwrap())
+                .await;
+            let details = pdm_stale(&warnings);
+            if !warns {
+                assert!(details.is_empty(), "{lock_version}: {warnings:?}");
+                continue;
+            }
+            assert_eq!(details.len(), 1, "{lock_version}: {warnings:?}");
+            assert!(
+                details[0].contains("pkg:pypi/six@1.16.0")
+                    && details[0].contains("site-packages")
+                    && details[0].contains(&format!("lock_version {lock_version}"))
+                    && details[0].contains("`pdm sync --reinstall`"),
+                "{lock_version}: {}",
+                details[0]
+            );
+
+            // The in-sync re-run keeps warning while the env is stale.
+            let VendorOutcome::Done { warnings, .. } =
+                vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+            else {
+                panic!("{lock_version}: re-run must be Done");
+            };
+            assert_eq!(
+                pdm_stale(&warnings).len(),
+                1,
+                "{lock_version}: {warnings:?}"
+            );
+
+            // Once the env holds the patched bytes there is nothing to say.
+            for sp in [
+                fx.site_packages.clone(),
+                fx.root.join(".venv").join("Lib").join("site-packages"),
+            ] {
+                if sp.is_dir() {
+                    touch(&sp, "six.py", std::str::from_utf8(PATCHED).unwrap()).await;
+                }
+            }
+            let VendorOutcome::Done { warnings, .. } =
+                vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+            else {
+                panic!("{lock_version}: re-run must be Done");
+            };
+            assert!(
+                pdm_stale(&warnings).is_empty(),
+                "{lock_version}: {warnings:?}"
+            );
+        }
+    }
+
+    /// #641: a PDM 1.x project (lock_version 2) installing into PEP 582
+    /// `__pypackages__` keeps the upstream release too, and PDM 1.x has no
+    /// `pdm sync --reinstall`: the remedy removes the installed copy first.
+    #[tokio::test]
+    async fn pdm_1x_vendor_warns_about_a_stale_pep582_install() {
+        const PDM_LOCK_V2: &str = r#"[[package]]
+name = "six"
+sections = ["default"]
+version = "1.16.0"
+requires_python = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
+summary = "Python 2 and 3 compatibility utilities"
+
+[metadata]
+lock_version = "2"
+content_hash = "sha256:d49d286986c5de41ec9879b6d710389b0be11cd096d883c069123b489ac6e6ea"
+
+[metadata.files]
+"six 1.16.0" = [
+    {file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"},
+    {file = "six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926"},
+]
+"#;
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(
+            &fx,
+            &[
+                ("pdm.lock", PDM_LOCK_V2),
+                (
+                    "pyproject.toml",
+                    "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.pdm]\n",
+                ),
+            ],
+        )
+        .await;
+        // No venv: PDM installs into `__pypackages__/<X.Y>/lib`.
+        let lib = fx.root.join("__pypackages__").join("3.8").join("lib");
+        tokio::fs::create_dir_all(lib.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::rename(&fx.site_packages, &lib).await.unwrap();
+        tokio::fs::remove_dir_all(fx.root.join(".venv"))
+            .await
+            .unwrap();
+
+        let VendorOutcome::Done {
+            result, warnings, ..
+        } = crate::vendor::test_support::vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &lib,
+            &fx.root,
+            &fx.record,
+            &PatchSources::blobs_only(&fx.blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let details = pdm_stale(&warnings);
+        assert_eq!(details.len(), 1, "{warnings:?}");
+        assert!(
+            details[0].contains("__pypackages__")
+                && details[0].contains("lock_version 2")
+                && details[0].contains("no `pdm sync --reinstall`")
+                && details[0].contains("then `pdm sync`"),
+            "{}",
+            details[0]
+        );
     }
 
     /// One full vendor → revert cycle through `vendor_pypi` for a lock-splice
