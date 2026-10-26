@@ -727,6 +727,14 @@ async fn restore_berry(
     let mut hits: Vec<Hit> = Vec::new();
     // What the lock still declares, read once for the URL-keyed hits.
     let mut declared: Option<BTreeSet<String>> = None;
+    // Hosted pins a user `yarn patch` wraps (#962): restoring the base
+    // entry would leave the `patch:` descriptor naming a URL no entry
+    // resolves, which every `yarn install --immutable` rejects (YN0028).
+    let wrapped: BTreeSet<String> = [Some(raw), pkg_text.as_deref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|text| yarn_patch_wrapped_uuids(text, ctx))
+        .collect();
     for (i, block) in blocks.iter().enumerate() {
         let lines = stanza_lines(block);
         let Some(resolution) = berry_field(&lines, "resolution").map(str::to_string) else {
@@ -766,6 +774,19 @@ async fn restore_berry(
             );
             continue;
         };
+        if wrapped.contains(&uuid) {
+            result.refuse(
+                &uuid,
+                format!(
+                    "{name}@{version}: a `patch:` entry from `yarn patch` still wraps the \
+                     hosted tarball in {rel}, and restoring the registry entry under it would \
+                     leave a lock `yarn install --immutable` rejects — remove the `patch:` \
+                     resolution from {pkg_rel}, run `yarn install`, roll back, then re-run \
+                     `yarn patch` on the registry version"
+                ),
+            );
+            continue;
+        }
         // An entry keyed by the tarball descriptor itself takes back the
         // descriptors its `resolutions` selectors route to that URL.
         let keyed_by_url = matches!(
@@ -1039,6 +1060,33 @@ async fn restore_berry(
     }
     doc.stanzas = blocks;
     view.write(rel, doc.render(&moved));
+}
+
+/// The hosted patch uuids a yarn `patch:` descriptor in `text` (a berry
+/// lock or a root `package.json`) wraps. `yarn patch-commit` escapes the
+/// inner descriptor (`patch:<name>@http%3A//host/…#<patch path>`); a lock
+/// pinned before 5.0 has the wrapped `npm:…::__archiveUrl=` binding instead.
+fn yarn_patch_wrapped_uuids(text: &str, ctx: &Ctx<'_>) -> Vec<String> {
+    use crate::formats::yarn::patterns::split_pattern;
+    use crate::utils::purl::percent_decode_purl_component;
+
+    text.match_indices("patch:")
+        .filter_map(|(at, tag)| {
+            let rest = &text[at + tag.len()..];
+            let end = rest
+                .find(|c: char| {
+                    matches!(c, '#' | '"' | '\'' | ',' | '\n' | '\r') || c.is_whitespace()
+                })
+                .unwrap_or(rest.len());
+            let inner = percent_decode_purl_component(&rest[..end]).into_owned();
+            let (_, reference) = split_pattern(&inner)?;
+            let url = match reference.split_once("::__archiveUrl=") {
+                Some((_, binding)) => binding.split('&').next().unwrap_or(binding),
+                None => reference,
+            };
+            ctx.hosted_uuid(url)
+        })
+        .collect()
 }
 
 /// Retire the leftover hosted `resolutions` selectors of a yarn berry root

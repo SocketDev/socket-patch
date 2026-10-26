@@ -1139,6 +1139,97 @@ async fn yarn_berry_catalog_dependency_is_pinned_and_rolled_back() {
     );
 }
 
+/// #962: the user ran `yarn patch` / `yarn patch-commit -s` over a hosted
+/// pin, so a `patch:` lock entry and a `resolutions` descriptor wrap the
+/// hosted tarball URL. Restoring the base entry to its `npm:` descriptor
+/// would leave that wrapper naming a URL no entry resolves any more: every
+/// `yarn install --immutable` then fails (YN0028), and a plain install
+/// re-pins the Socket tarball. `rollback` and `remove` must refuse the pin
+/// and write nothing.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_rollback_refuses_a_pin_wrapped_by_a_user_yarn_patch() {
+    for command in ["rollback", "remove"] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+        mock_reference_with_berry_url(&server, &hosted_url).await;
+        mock_view(&server).await;
+        let tarball = upstream_tarball();
+        mock_npm_registry(
+            &server,
+            &vlt_hosted_common::sha512_sri(&tarball),
+            Some(tarball),
+        )
+        .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_berry_project(tmp.path());
+        let env = run_redirect_subprocess_with(
+            tmp.path(),
+            &server.uri(),
+            &["--patch-server-url", &server.uri()],
+        );
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
+
+        // What `yarn patch-commit -s` writes over the hosted pin: a
+        // `resolutions` entry routing the tarball descriptor to a `patch:`
+        // descriptor (the inner one with yarn's `%3A` escapes), the lock
+        // entry it resolves to, and the workspace dependency through it.
+        let wrapped = format!(
+            "patch:{NAME}@{}#~/.yarn/patches/{NAME}-http-7f4bf328bd.patch",
+            hosted_url.replace(':', "%3A")
+        );
+        let pkg_path = tmp.path().join("package.json");
+        let mut pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+        pkg["resolutions"][format!("{NAME}@{hosted_url}")] = serde_json::json!(wrapped);
+        std::fs::write(
+            &pkg_path,
+            serde_json::to_string_pretty(&pkg).unwrap() + "\n",
+        )
+        .unwrap();
+        let lock_path = tmp.path().join("yarn.lock");
+        let lock = std::fs::read_to_string(&lock_path).unwrap().replace(
+            &format!("    {NAME}: \"npm:^{VERSION}\"\n"),
+            &format!("    {NAME}: \"{wrapped}\"\n"),
+        ) + &format!(
+            "\n\"{NAME}@{wrapped}\":\n  version: {VERSION}\n  \
+                 resolution: \"{NAME}@{wrapped}::version={VERSION}&hash=0d6d28\"\n  \
+                 checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+            "4".repeat(128)
+        );
+        std::fs::write(&lock_path, &lock).unwrap();
+        let pkg_before = std::fs::read_to_string(&pkg_path).unwrap();
+
+        let (code, env) = hosted_unwind_json(tmp.path(), &server, &server.uri(), &[command, PURL]);
+        assert_eq!(
+            code,
+            Some(1),
+            "{command} must refuse the wrapped pin: {env:#}"
+        );
+        assert_eq!(
+            rollback_json::hosted_reverted(&env),
+            serde_json::json!([]),
+            "{command}: {env:#}"
+        );
+        assert!(
+            env.to_string().contains("yarn patch"),
+            "{command}: the refusal names the user's `yarn patch`: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            lock,
+            "{command} leaves yarn.lock untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pkg_path).unwrap(),
+            pkg_before,
+            "{command} leaves package.json untouched"
+        );
+    }
+}
+
 /// #404 upgrade path: a lock pinned by an earlier release carries the old
 /// `npm:<v>::__archiveUrl=<url>` resolution, which makes yarn's npm fetcher
 /// send registry auth to the patch host. `rollback` must still recognize and
