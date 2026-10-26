@@ -41,3 +41,4 @@ pub(crate) mod uv_workspace;
 pub(crate) mod workspace_globs;
 
 pub mod hatch;
+pub mod hatch_workspace;
