@@ -1275,6 +1275,15 @@ crate. `apply` therefore treats a crate that `Cargo.lock` resolves but that is n
 unpacked as not installed, not as a calm lockfile-only skip: a run where no targeted
 patch matched exits 1 and names `cargo fetch` as the remedy.
 
+Agent mode patches only crates that `Cargo.lock` takes from a registry. When the lock
+takes a crate from a path, a git repository, a `[patch]` entry or a `[replace]` entry
+(a registry entry whose `replace` key names the copy cargo builds), cargo never builds
+the registry cache's copy, even if another project left one there. So `apply` doesn't
+patch that copy, and `vex` doesn't attest it (#506). A user-authored `[patch]` or
+`[replace]` entry is reported as `user_patch_conflict`, unless `--allow-patch-conflicts`
+lets apply try it. That case, a git dependency and a `path` dependency are reported as
+`package_not_installed`. A run where no targeted patch matched exits 1.
+
 ## Cargo: vendored wiring in Cargo.toml
 
 Vendored mode (v5+) wires a patched crate with a `[patch.crates-io]` path

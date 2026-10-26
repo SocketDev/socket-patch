@@ -63,6 +63,30 @@ impl CargoCrawler {
         }
     }
 
+    /// The crates a local Cargo project's build takes from the shared
+    /// registry cache: one per registry-sourced `Cargo.lock` entry
+    /// ([`lock_scope`]), the crates [`Self::crawl_all`] looks up there.
+    /// `None` when the cache is not scoped to a lock (a global run, a
+    /// `cargo vendor` directory source, no readable `Cargo.lock`).
+    ///
+    /// [`Self::find_by_purls`] matches a registry dir by name and version
+    /// alone, so it also finds a copy another project left behind of a
+    /// crate this lock takes from a path, git or `[patch]` source. Cargo
+    /// never builds that copy: callers that patch or attest the build's
+    /// copy keep only these crates (#506).
+    pub async fn locked_registry_crates(
+        &self,
+        options: &CrawlerOptions,
+    ) -> Option<LockedRegistryCrates> {
+        let project_registry = source_roots(options).await.1;
+        Some(LockedRegistryCrates(
+            registry_lock_scope(options, project_registry)
+                .await?
+                .into_iter()
+                .collect(),
+        ))
+    }
+
     /// Crawl all discovered crate source directories and return every
     /// package found.
     ///
@@ -84,11 +108,7 @@ impl CargoCrawler {
         if src_paths.is_empty() {
             return Vec::new();
         }
-        let scope = if project_registry {
-            lock_scope(&options.cwd).await
-        } else {
-            None
-        };
+        let scope = registry_lock_scope(options, project_registry).await;
 
         run_blocking(move || {
             let mut packages = Vec::new();
@@ -261,6 +281,21 @@ impl CargoCrawler {
     }
 }
 
+/// The registry-sourced `(name, version)`s of a project's `Cargo.lock`
+/// ([`CargoCrawler::locked_registry_crates`]).
+#[derive(Debug, Clone, Default)]
+pub struct LockedRegistryCrates(HashSet<(String, String)>);
+
+impl LockedRegistryCrates {
+    /// Whether the lock takes `purl`'s `name@version` from a registry.
+    /// A purl that is not a Cargo one never is.
+    pub fn contains_purl(&self, purl: &str) -> bool {
+        crate::utils::purl::parse_cargo_purl(purl).is_some_and(|(name, version)| {
+            self.0.contains(&(name.into_owned(), version.into_owned()))
+        })
+    }
+}
+
 /// [`CargoCrawler::get_crate_source_paths`], and whether those roots are
 /// the shared registry cache of a local Cargo project (the roots
 /// [`lock_scope`] narrows).
@@ -374,8 +409,25 @@ async fn crates_io_source(cwd: &Path) -> CratesIoSource {
     run_blocking(move || resolve_for(&cwd, cargo_home.as_deref())).await
 }
 
+/// The registry crates `options`' build takes from the shared registry
+/// cache when its roots are that cache for a local project
+/// (`project_registry`, from [`source_roots`]): the one scope
+/// [`CargoCrawler::crawl_all`] walks and
+/// [`CargoCrawler::locked_registry_crates`] reports.
+async fn registry_lock_scope(
+    options: &CrawlerOptions,
+    project_registry: bool,
+) -> Option<Vec<(String, String)>> {
+    if project_registry {
+        lock_scope(&options.cwd).await
+    } else {
+        None
+    }
+}
+
 /// The `(name, version)` of every registry-sourced `[[package]]` in
-/// `<cwd>/Cargo.lock` (`LockedPackage::is_from_registry`), in lock order.
+/// `<cwd>/Cargo.lock` (`LockedPackage::is_from_registry`) that no
+/// `[replace]` swaps out, in lock order.
 /// `None` when there is no readable lock or it is not TOML: the crawl then
 /// keeps walking the whole cache.
 async fn lock_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
@@ -386,7 +438,9 @@ async fn lock_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
     Some(
         lock.packages()
             .iter()
-            .filter(|p| p.is_from_registry())
+            // A `[replace]`d entry keeps its registry `source`, but cargo
+            // builds the replacement it names, never this registry copy.
+            .filter(|p| p.is_from_registry() && p.replace.is_none())
             .map(|p| (p.name.clone(), p.version.clone()))
             .collect(),
     )
@@ -1180,6 +1234,48 @@ version = "fake"
                 .unwrap();
             roots.sort();
             assert_eq!(roots, vec![other, crates_io]);
+        }
+
+        /// #506: a `[replace]`d entry keeps its registry `source` in the
+        /// lock, but cargo builds the replacement its `replace` key names,
+        /// so the registry copy is out of scope for the crawl and for
+        /// `locked_registry_crates`.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn replaced_registry_entry_is_out_of_scope() {
+            let home = tempfile::tempdir().unwrap();
+            let (crates_io, _) = cache(home.path());
+            stage(&crates_io, "cfg-if", "1.0.4");
+            let _g = CargoHome::set(home.path());
+
+            let project = tempfile::tempdir().unwrap();
+            write(
+                &project.path().join("Cargo.toml"),
+                "[package]\nname = \"member\"\n",
+            );
+            let git = "git+https://example.com/cfg-if#abc";
+            write(
+                &project.path().join("Cargo.lock"),
+                &format!(
+                    "{}\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+                     source = \"{CRATES_IO}\"\nreplace = \"cfg-if 1.0.4 ({git})\"\n\n\
+                     [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{git}\"\n",
+                    lock(&[
+                        ("member", "0.1.0", None),
+                        ("serde", "1.0.200", Some(CRATES_IO))
+                    ]),
+                ),
+            );
+
+            let options = local(project.path());
+            let pkgs = CargoCrawler::new().crawl_all(&options).await;
+            assert_eq!(purls(&pkgs), ["pkg:cargo/serde@1.0.200"]);
+            let locked = CargoCrawler::new()
+                .locked_registry_crates(&options)
+                .await
+                .expect("a locked project's registry scope");
+            assert!(locked.contains_purl("pkg:cargo/serde@1.0.200"));
+            assert!(!locked.contains_purl("pkg:cargo/cfg-if@1.0.4"));
         }
 
         /// A cached dir whose manifest names another crate or version, or
