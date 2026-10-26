@@ -36,8 +36,10 @@ def rows(job):
 
 def runs(row):
     """The (suite, os, filter) runs the e2e run step makes of a row."""
-    return {(suite, row["os"], " ".join(f.split()))
-            for suite in row["suite"].split() for f in row.get("test_filter", "").split(";")}
+    # Blank segments are skipped, as the run step skips them; a row with
+    # no filter at all runs the job default.
+    filters = [" ".join(f.split()) for f in row.get("test_filter", "").split(";") if f.strip()] or [""]
+    return {(suite, row["os"], f) for suite in row["suite"].split() for f in filters}
 
 
 def job_text(job):
@@ -351,7 +353,7 @@ class PdmCapstone(unittest.TestCase):
         self.assertEqual(len(excluded), len(ci))
         for row in rows("e2e"):
             if "pdm" in row:
-                self.assertIn("pdm:: --ignored", [f.strip() for f in row.get("test_filter", "").split(";")])
+                self.assertIn(("e2e_vex_build", row["os"], "pdm:: --ignored"), runs(row))
         self.assertFalse(any("pdm" in r for r in rows("e2e-full")),
                          "a pdm row off the PR tier would leave its cell unrun on PRs")
         versions = re.search(r"pdm: \[([^\]]*)\]", "\n".join(self.job)).group(1)

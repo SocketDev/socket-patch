@@ -1219,11 +1219,14 @@ jobs:
           # composer-compatibility.yml.
           # Both capstones share one leg per composer line: the setup is
           # identical and the run step loops over `suite`. The PR-tier leg
-          # also carries the newest-uv redirect and .NET 10 capstones (rows
-          # further down describe them): each suite runs in seconds, their
-          # toolchains (PHP, uv, .NET) don't overlap, and one runner instead
-          # of three saves ~0.6 job-min of fixed setup per suite per run
-          # (#1732).
+          # also carries the newest-uv redirect capstone (described with the
+          # uv rows below) and the .NET 10 one: each suite runs in seconds,
+          # their toolchains (PHP, uv, .NET) don't overlap, and one runner
+          # instead of three saves ~0.6 job-min of fixed setup per suite per
+          # run (#1732).
+          # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
+          # major (the suite pins the major through a sandbox global.json):
+          # the newest here, 7-9 on ubuntu in e2e-full.
           - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build e2e_redirect_uv_build e2e_nuget_dotnet_build, composer: '2', uv: '0.12.17', dotnet: '10'}
           # Real-bundler gem capstones, one leg per bundler era. Boundaries:
           # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
@@ -1369,15 +1372,16 @@ jobs:
           # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
           # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.0 (first lock 2.1 writer),
           # current.
-          # Real deno negative capstone (no hosted/vendored wiring exists for
-          # deno; VEX must attest nothing), one leg per major.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored; pdm:: --ignored; hatch:: --ignored; deno:: --ignored', poetry: '2.4.3', pdm: '2.29.2', hatch: '1.18.1', deno: '2.9.7'}
           # Real PDM / Hatch capstones (wiremock Socket API that also serves
           # the hosted wheel; PyPI for the tool bootstrap + six).
           # PDM: lock 2 (1.4), refused 3.1 (1.15) and 4.2 (2.7), 4.3 (2.8),
           # the hishel<1 bootstrap window (2.25) and current.
           # Hatch: 1.0 (hatch.toml env vendoring refused, needs >= 1.2),
           # 1.2, the virtualenv<21 window (1.9, 1.14) and current.
+          # Real deno negative capstone (no hosted/vendored wiring exists for
+          # deno; VEX must attest nothing): the current major here, older
+          # majors in e2e-extended.
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored; pdm:: --ignored; hatch:: --ignored; deno:: --ignored', poetry: '2.4.3', pdm: '2.29.2', hatch: '1.18.1', deno: '2.9.7'}
           # Real Pipenv / pip capstones (mock patch server; the tools are
           # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
           # space-separated releases the suite loops over. The middle
@@ -1416,10 +1420,6 @@ jobs:
           # (socket-patch-vendor.sbt) capstones on the current 1.x line. The
           # other sbt lines, JDK 21, the agent cells beyond coverage-docker's,
           # Mill, scala-cli and macOS / Windows are sbt-compatibility.yml.
-          # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
-          # major (the suite pins the major through a sandbox global.json):
-          # the newest rides the composer leg above, 7-9 on ubuntu in
-          # e2e-full.
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
@@ -1510,10 +1510,11 @@ jobs:
           scripts/pip-install-retry.sh --upgrade pip "uv==$UV_TEST_VERSION"
           uv --version
 
-      - name: Install uv (PDM / Hatch legs)
-        if: matrix.pdm != '' || matrix.hatch != ''
-        # The suites bootstrap the pinned PDM / Hatch into their own venv
-        # with uv; this uv is tooling, not the release under test.
+      - name: Install uv (Poetry / PDM / Hatch legs)
+        if: matrix.poetry != '' || matrix.pdm != '' || matrix.hatch != ''
+        # The Poetry step below and the PDM / Hatch suites bootstrap the
+        # pinned tool into their own venv with uv; this uv is tooling, not
+        # the release under test.
         shell: bash
         run: scripts/pip-install-retry.sh uv==0.11.19
 
@@ -1527,7 +1528,6 @@ jobs:
         env:
           POETRY_TEST_VERSION: ${{ matrix.poetry }}
         run: |
-          scripts/pip-install-retry.sh uv==0.11.19
           case "$POETRY_TEST_VERSION" in 1.0.*|1.1.*) py=3.8.20 ;; *) py=3.12 ;; esac
           uv venv "$RUNNER_TEMP/poetry" --python "$py"
           extra=""; [ "$POETRY_TEST_VERSION" = "1.2.2" ] && extra="cleo==1.0.0a5"
@@ -1859,6 +1859,9 @@ jobs:
               continue
             fi
             for filter in "${filters[@]}"; do
+              # An empty segment (`a;;b`) would run the binary with no
+              # arguments: the non-ignored tests instead of the row's.
+              [ -n "${filter// /}" ] || continue
               n=$((n + 1))
               log="../../target/e2e-$suite-$n.log"
               echo "::group::$suite $filter"
