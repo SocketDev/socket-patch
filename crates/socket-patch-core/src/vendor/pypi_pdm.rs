@@ -114,6 +114,26 @@ pub async fn load_pdm_project(root: &Path) -> Result<PdmProject, (&'static str, 
     })
 }
 
+/// The remedy for an env that still holds the upstream `name` after its
+/// pdm.lock was wired (#641), or `None` when the PDM release that writes
+/// `lock_version` reinstalls it on its own. PDM before 2.11 (lock_version
+/// `2` / `4.3` / `4.4`) keeps a release already installed at the same
+/// version; 2.x has `pdm sync --reinstall`, while PDM 1.x (lock_version `2`)
+/// has no such flag, so the installed copy has to go first.
+pub fn stale_install_remedy(lock_version: &str, name: &str) -> Option<String> {
+    match lock_version {
+        "2" => Some(format!(
+            "PDM 1.x has no `pdm sync --reinstall`: remove the installed `{name}` from that \
+             environment (its package files and `.dist-info`, or recreate the environment or \
+             `__pypackages__`), then `pdm sync`"
+        )),
+        "4.3" | "4.4" => Some(
+            "Run `pdm sync --reinstall` (or recreate the environment, then `pdm sync`)".to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// `"direct"` iff the package is declared in the pyproject — PEP 621
 /// `[project] dependencies` / `optional-dependencies`,
 /// `[tool.pdm.dev-dependencies]` groups, or PEP 735 `[dependency-groups]` —

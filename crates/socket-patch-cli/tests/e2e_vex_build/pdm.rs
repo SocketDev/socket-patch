@@ -417,6 +417,14 @@ fn flow(mode: Mode) {
     .unwrap();
     assert_attested(&doc, PURL, mode.uuid(), mode.marker(), VULNS);
     std::fs::remove_file(&vex_out).unwrap();
+    // The vendored scan ran over a venv that already holds upstream six.
+    let stale_warnings: Vec<String> = env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["errorCode"] == "pypi_pdm_stale_install")
+        .map(|e| e.to_string())
+        .collect();
     let wired_lock = std::fs::read_to_string(project.join("pdm.lock")).unwrap();
     assert!(
         !project
@@ -533,6 +541,76 @@ fn flow(mode: Mode) {
     matrix.run(&fresh, project, &|dir: &Path| {
         std::fs::write(dir.join("pdm.lock"), &pristine_lock).unwrap();
     });
+
+    if mode == Mode::Vendored {
+        stale_install_flow(&pdm, tmp.path(), &locked, &wired_lock, &stale_warnings);
+    }
+}
+
+/// #641: PDM before 2.11 (lock_version 2 / 4.3 / 4.4) keeps the upstream six
+/// the project venv already held when the vendored scan wired pdm.lock, so
+/// the scan must warn `pypi_pdm_stale_install`, and the remedy it names must
+/// install the patched wheel. A 2.11+ lock reinstalls on `pdm sync`: silent.
+fn stale_install_flow(
+    pdm: &Pdm,
+    case: &Path,
+    locked: &Locked,
+    wired_lock: &str,
+    stale_warnings: &[String],
+) {
+    let what = format!("pdm {} lock {} stale install", pdm.version, locked.lock_version);
+    let project = &locked.project;
+    let keeps = matches!(locked.lock_version.as_str(), "2" | "4.3" | "4.4");
+    if !keeps {
+        assert!(stale_warnings.is_empty(), "{what}: {stale_warnings:?}");
+        return;
+    }
+    assert_eq!(stale_warnings.len(), 1, "{what}: {stale_warnings:?}");
+    let python = venv_bin(&project.join(".venv"), "python");
+    let (_, _, marked) = six_oracle(&python, project).unwrap();
+    assert!(!marked, "{what}: the scan never touches the installed files");
+    assert_eq!(
+        std::fs::read_to_string(project.join("pdm.lock")).unwrap(),
+        wired_lock,
+        "{what}: the project keeps the wired lock"
+    );
+
+    // The next `pdm sync` keeps the upstream bytes, as the warning says.
+    let envs = pdm.case_env(&case.join("stale-case"), project);
+    let out = pdm.sync(project, &envs);
+    let (_, _, marked) = six_oracle(&python, project).unwrap();
+    assert!(!marked, "{what}: PDM < 2.11 keeps six: {}", out_text(&out));
+
+    // The named remedy installs the patched wheel.
+    let out = if locked.lock_version == "2" {
+        assert!(
+            stale_warnings[0].contains("no `pdm sync --reinstall`"),
+            "{what}: {}",
+            stale_warnings[0]
+        );
+        let (module, _, _) = six_oracle(&python, project).unwrap();
+        let site = module.parent().unwrap();
+        std::fs::remove_file(&module).unwrap();
+        std::fs::remove_dir_all(site.join("six-1.16.0.dist-info")).unwrap();
+        pdm.sync(project, &envs)
+    } else {
+        assert!(
+            stale_warnings[0].contains("`pdm sync --reinstall`"),
+            "{what}: {}",
+            stale_warnings[0]
+        );
+        pdm.run(project, &envs, &["sync", "--reinstall", "--no-self"])
+    };
+    let (_, _, marked) = six_oracle(&python, project)
+        .unwrap_or_else(|| panic!("{what}: six missing after the remedy: {}", out_text(&out)));
+    assert!(marked, "{what}: the remedy installs the patch: {}", out_text(&out));
+    record(
+        "pdm",
+        &pdm.version,
+        &format!("lock {}/vendored", locked.lock_version),
+        "stale-install-warned",
+        "pass",
+    );
 }
 
 #[test]
