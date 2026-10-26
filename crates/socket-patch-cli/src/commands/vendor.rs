@@ -1011,11 +1011,17 @@ pub async fn run(args: VendorArgs) -> i32 {
     if !args.revert {
         let inventory = crate::commands::hosted_inventory(&args.common, &args.common.cwd).await;
         // Contested hosted wiring: the patch set cannot be read off the
-        // lockfiles, and a "nothing to vendor" answer would hide it.
-        if let Some(refusal) = inventory.contested_refusal() {
-            return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
-        }
+        // lockfiles, and a "nothing to vendor" answer would hide it. With
+        // a manifest and no in-scope pins, the manifest is the patch set,
+        // so the legacy manifest arm below runs instead.
+        let refusal = inventory.contested_refusal();
         let pins = hosted_pins_in_scope(&args.common, inventory.pins);
+        if let Some(refusal) = refusal {
+            let has_manifest = tokio::fs::metadata(&manifest_path).await.is_ok();
+            if !has_manifest || !pins.is_empty() {
+                return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
+            }
+        }
         if !pins.is_empty() {
             // Eject needs every patch record from the API: an offline
             // run (or dry run) refuses before any request.
