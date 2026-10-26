@@ -1507,11 +1507,10 @@ jobs:
         if: matrix.pipenv != '' || matrix.pip != ''
         uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
         with:
-          # Pin uv: it is the PEP 751 oracle the pylock tests install with,
-          # and uv 0.13.2 started refusing Pipenv's `environments = []`
-          # pylock ("target environment is not supported by the lockfile").
-          # Bump deliberately, after checking the Pipenv pylock legs pass.
-          version: "0.13.1"
+          # Exact pin (scripts/check-tool-pins.py). uv 0.13.2+ refuses the
+          # `environments = []` pylock Pipenv writes; the pylock test checks
+          # that refusal matches Pipenv's own pylock, so keep this current.
+          version: "0.13.5"
 
       - name: Install the Pythons the Pipenv / pip legs run on
         if: matrix.pipenv != '' || matrix.pip != ''
