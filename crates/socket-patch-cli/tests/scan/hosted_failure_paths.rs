@@ -1652,6 +1652,76 @@ async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
     assert_eq!(doc["vex"]["statements"], 1, "{doc:#}");
 }
 
+/// REGRESSION (#406): `deno install` installs a `package.json` project's
+/// npm dependencies from `deno.lock` and never reads package-lock.json. A
+/// project with both is still redirected (npm installs from the lock), but
+/// the run warns `redirect_npm_deno_lock`, on the idempotent re-run too,
+/// leaves deno.lock alone, and the in-run `--vex` attests nothing for it
+/// (`vex_deno_lock_copy`). A deno.lock of another version says nothing.
+#[tokio::test]
+async fn deno_lock_of_the_redirected_version_warns_and_vex_omits_it() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+    let args = [
+        "--vex",
+        "out.vex.json",
+        "--vex-product",
+        "pkg:npm/consumer@0.0.0",
+        "--patch-server-url",
+        "http://patch.test",
+    ];
+    let deno_lock = |version: &str| {
+        format!(r#"{{"version":"5","npm":{{"{NAME}@{version}":{{"integrity":"sha512-X=="}}}}}}"#)
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+    let same = deno_lock("1.0.0");
+    std::fs::write(tmp.path().join("deno.lock"), &same).unwrap();
+    for run in ["first run", "re-run"] {
+        let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &args, &[]);
+        assert_eq!(hosted_pins(&doc).len(), 1, "{run}: {doc:#}");
+        let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+        assert!(lock.contains(HOSTED_URL), "{run}: {lock}");
+        let detail = warning_detail(&doc, "redirect_npm_deno_lock");
+        for needle in [
+            "covgap-hosted@1.0.0",
+            "deno.lock",
+            "deno install",
+            "--mode agent",
+        ] {
+            assert!(detail.contains(needle), "{run}: {needle}: {detail}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("deno.lock")).unwrap(),
+            same,
+            "{run}: deno.lock is never written"
+        );
+        // The in-run VEX omits it, so the requested VEX fails the run.
+        assert_eq!(code, 1, "{run}: {doc:#}");
+        assert_eq!(doc["error"]["code"], "no_applicable_patches", "{doc:#}");
+        assert!(
+            codes_in(&doc["warnings"]).contains(&"vex_deno_lock_copy".to_string()),
+            "{run}: {doc:#}"
+        );
+        assert!(!tmp.path().join("out.vex.json").exists());
+    }
+
+    // Another version in deno.lock: no warning, and the VEX attests.
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+    std::fs::write(tmp.path().join("deno.lock"), deno_lock("0.9.0")).unwrap();
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &args, &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(
+        !codes_in(&doc["warnings"]).contains(&"redirect_npm_deno_lock".to_string()),
+        "{doc:#}"
+    );
+    assert_eq!(doc["vex"]["statements"], 1, "{doc:#}");
+}
+
 // ───────────────── yarn classic berry-migration advisory ─────────────────
 
 /// #907: a hosted pin in a classic yarn.lock is dropped by the next yarn 2+

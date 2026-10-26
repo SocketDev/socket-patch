@@ -111,6 +111,7 @@ pub mod vlt_bundled;
 pub mod vlt_lock;
 pub(crate) mod vlt_lock_text;
 pub(crate) mod yarn_berry_lock;
+pub(crate) mod yarn_classic_bundled;
 pub(crate) mod yarn_classic_lock;
 pub(crate) mod yarn_copies;
 #[cfg(test)]
@@ -679,17 +680,28 @@ fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String
     out
 }
 
-/// Warning code on a failed npm-family [`VendorOutcome::Done`]: the patch
-/// service is still building the patch's prebuilt artifact. With
+/// The patch service is still building the patch's prebuilt artifact: the
+/// code of a backend's [`VendorOutcome::Refused`], or a warning on an
+/// npm-family failed [`VendorOutcome::Done`]. With
 /// [`VENDOR_PREBUILT_UNAVAILABLE`], it tells the vendor loop the patch is not
 /// served (yet), not broken: a package already vendored at an older patch
-/// keeps it and is reported as skipped (#954), the way hosted mode keeps
-/// its pin.
+/// keeps it and is reported as skipped (#954, #1235), the way hosted mode
+/// keeps its pin. With nothing to keep, the vendor loop reports the refusal
+/// as `vendor_prebuilt_required`.
 pub const VENDOR_PREBUILT_PENDING: &str = "vendor_prebuilt_pending";
-/// Warning code on a failed npm-family [`VendorOutcome::Done`]: the patch
-/// service has no artifact for the patch (`build_failed`, `not_found`,
-/// `withdrawn`, …). See [`VENDOR_PREBUILT_PENDING`].
+/// The patch service has no artifact for the patch (`build_failed`,
+/// `not_found`, `withdrawn`, …). See [`VENDOR_PREBUILT_PENDING`].
 pub const VENDOR_PREBUILT_UNAVAILABLE: &str = "vendor_prebuilt_unavailable";
+/// The refusal when the patch service has no prebuilt artifact a backend
+/// may vendor, and what an unserved refusal is reported as when there is
+/// no older vendored patch to keep.
+pub const VENDOR_PREBUILT_REQUIRED: &str = "vendor_prebuilt_required";
+
+/// Whether `code` marks a patch the service does not serve (yet):
+/// [`VENDOR_PREBUILT_PENDING`] or [`VENDOR_PREBUILT_UNAVAILABLE`].
+pub fn is_unserved(code: &str) -> bool {
+    matches!(code, VENDOR_PREBUILT_PENDING | VENDOR_PREBUILT_UNAVAILABLE)
+}
 
 /// The result of one backend `vendor_*` call.
 //

@@ -19,6 +19,7 @@
 //! readers that must refuse such a lock.
 
 pub(crate) mod gemfile;
+pub(crate) mod gemspec;
 pub(crate) mod hosted;
 pub(crate) mod manifest;
 pub(crate) mod mirror;

@@ -907,6 +907,7 @@ pub async fn revert_yarn_berry_opts(
                         KIND_LOCK_ENTRY,
                         "lock entry",
                         |lines| berry_field(lines, "resolution"),
+                        None,
                         &mut outcome.warnings,
                     );
                 }

@@ -4891,7 +4891,7 @@ mod tests {
         )
         .await;
         let (code, detail) = unwrap_refused(outcome);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_unavailable");
         assert!(detail.contains("unavailable"), "{detail}");
         assert!(
             !root.join(".socket").exists(),

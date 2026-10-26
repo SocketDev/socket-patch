@@ -64,7 +64,9 @@ pub(super) fn rewrite(
                 // warning: warn proactively once per lock, mirroring poetry's
                 // `redirect_poetry_stale_install_risk`.
                 if !stale_warned
-                    && matches!(lock_ver.as_deref(), Some("2") | Some("4.3") | Some("4.4"))
+                    && lock_ver
+                        .as_deref()
+                        .is_some_and(crate::utils::pdm_lock::keeps_installed_release)
                 {
                     stale_warned = true;
                     result.warnings.push(RewriteWarning {

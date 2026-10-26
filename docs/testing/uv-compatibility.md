@@ -164,6 +164,17 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   (`redirect_workspace_lockfile_elsewhere` hosted,
   `pypi_uv_workspace_unsupported` vendored) instead of rewriting a
   Hatch-configured member as a lockless Hatch project (#1138).
+- A project with PEP 621 `dynamic = ["dependencies"]` (or
+  `"optional-dependencies"`) gets its requirement list from the build
+  backend, so `pyproject.toml` declares nothing the lock root's
+  `requires-dist` entry could be restored from. Vendored mode refuses
+  `dynamic = ["dependencies"]` outright (`pypi_uv_dynamic_dependencies`).
+  Hosted mode refuses, before any write, a package the lock root's
+  `requires-dist` lists in such a project
+  (`redirect_uv_metadata_unsupported`), since rollback and remove could
+  never restore that entry (#639). A package the project only pulls in
+  transitively is still wired through `override-dependencies`, which
+  rollback and remove undo.
 - A script lock requires its paired script and a valid PEP 723 metadata block.
   Missing metadata or an incompatible existing source is reported before either
   file is rewritten.

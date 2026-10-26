@@ -982,3 +982,150 @@ fn go_work_member_replaces_must_not_conflict() {
 
     chmod_writable(tmp.path());
 }
+
+// ── global mode: tools already built with `go install` (#422) ──
+
+const TOOL: &str = "example.com/tool";
+const TOOL_PURL: &str = "pkg:golang/example.com/tool@v1.0.0";
+
+/// Run the `go install`ed tool and return its trimmed output.
+fn run_tool(gobin: &Path) -> String {
+    let out = Command::new(gobin.join("tool")).output().expect("run tool");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `go install example.com/tool@v1.0.0` into `gobin`, from the file proxy.
+fn install_tool(tmp: &Path, modcache: &str, proxy_url: &str, gobin: &Path) {
+    let mut env = go_env(modcache, proxy_url);
+    // `go install pkg@version` refuses `-mod=mod`.
+    env.retain(|(k, _)| *k != "GOFLAGS");
+    env.push(("GOBIN", gobin.to_str().unwrap()));
+    let out = go(tmp, &["install", &format!("{TOOL}@{UVER}")], &env);
+    assert!(
+        out.status.success(),
+        "go install: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `vex -g --json` over `dir` for the installed tool's product.
+fn global_vex(dir: &Path, modcache: &Path, gobin: &Path) -> vex_e2e_common::VexOutcome {
+    let r = VexRun {
+        offline: true,
+        product: Some(TOOL_PURL.into()),
+        extra_args: vec!["--global".into()],
+        ..VexRun::default()
+    }
+    .env("GOMODCACHE", modcache)
+    .env("GOBIN", gobin)
+    .env("GOFLAGS", "");
+    run_vex(&vex_e2e_common::binary(), dir, &r)
+}
+
+/// #422: a global apply patches the module cache in place, which a tool
+/// already built from it with `go install` never sees. apply names the
+/// tool and its `go install` remedy, and `vex -g` refuses to attest until
+/// the tool is rebuilt — after which it runs the patched code and attests.
+#[test]
+fn global_apply_flags_tools_built_from_the_unpatched_module() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(global-go-install)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (_consumer, modcache, proxy_url) = stage(tmp.path());
+    let mc = modcache.to_str().unwrap();
+    publish(
+        tmp.path(),
+        TOOL,
+        UVER,
+        &[
+            (
+                "go.mod",
+                &format!("module {TOOL}\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+            ),
+            (
+                "main.go",
+                &format!(
+                    "package main\n\nimport (\n\t\"fmt\"\n\t\"{UMOD}\"\n)\n\nfunc main() {{ fmt.Println(\"TOOL:\", upstream.Greeting()) }}\n"
+                ),
+            ),
+        ],
+    );
+    let gobin = tmp.path().join("gobin");
+    install_tool(tmp.path(), mc, &proxy_url, &gobin);
+    assert_eq!(run_tool(&gobin), "TOOL: PRISTINE");
+
+    // Outside any Go project: the manifest is the only project state.
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    write_patch(&outside);
+    let apply_with = |extra: &[&str]| {
+        let mut args = vec![
+            "apply",
+            "--global",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--json",
+            "--cwd",
+            outside.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let (code, stdout, stderr) = common::run_with_env(
+            &outside,
+            &args,
+            &[("GOMODCACHE", mc), ("GOBIN", gobin.to_str().unwrap())],
+        );
+        assert_eq!(code, 0, "apply -g: {stdout}\n{stderr}");
+        let env = common::envelope::parse_json_envelope(&stdout);
+        let stale: Vec<String> = env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["code"] == "go_installed_tool_stale")
+            .map(|w| w["detail"].as_str().unwrap().to_string())
+            .collect();
+        stale
+    };
+    let apply = || apply_with(&[]);
+    // The preview names the tool the real run will leave stale.
+    let preview = apply_with(&["--dry-run"]);
+    let lib = modcache.join(format!("{UMOD}@{UVER}")).join("lib.go");
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), PRISTINE_LIB);
+    let stale = apply();
+    assert_eq!(preview, stale);
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), PATCHED_LIB);
+    // The cache is patched; the installed binary is not.
+    assert_eq!(run_tool(&gobin), "TOOL: PRISTINE");
+    assert_eq!(stale.len(), 1, "{stale:?}");
+    assert!(
+        stale[0].contains(&format!("go install {TOOL}@{UVER}"))
+            && stale[0].contains(&format!("{UMOD}@{UVER}")),
+        "{stale:?}"
+    );
+    // A re-run over the already-patched cache still names the tool, a
+    // dry run included (the check is read-only).
+    assert_eq!(apply(), stale);
+    assert_eq!(apply_with(&["--dry-run"]), stale);
+
+    let out = global_vex(&outside, &modcache, &gobin);
+    assert_absent(out.doc.as_ref(), UPURL);
+    vex_e2e_common::assert_not_attested(&out.envelope, UPURL, "go_installed_tool_stale");
+    assert!(
+        warnings_of(&out.stdout).contains(&"go_installed_tool_stale".to_string()),
+        "{out}"
+    );
+
+    // The remedy the warning names rebuilds the tool from the patched cache.
+    install_tool(tmp.path(), mc, &proxy_url, &gobin);
+    assert_eq!(run_tool(&gobin), "TOOL: PATCHED");
+    let out = global_vex(&outside, &modcache, &gobin);
+    assert!(
+        !warnings_of(&out.stdout).contains(&"go_installed_tool_stale".to_string()),
+        "{out}"
+    );
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), UPURL, UUID, Marker::Applied, &[(GHSA, &[CVE])]);
+
+    chmod_writable(&modcache);
+}

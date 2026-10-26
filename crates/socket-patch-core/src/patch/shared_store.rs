@@ -323,53 +323,31 @@ fn linked_source_of(pkg_path: &Path, real: PathBuf) -> Option<SharedStore> {
 /// workspace carrying `pnpmStoreFolder: packages`) can never admit a
 /// workspace member:
 ///
-/// * the project is a Yarn project: a `yarn.lock` at or above it;
-/// * the active linker is pnpm: the nearest `.yarnrc.yml` at or above the
-///   project that sets `nodeLinker` sets it to `pnpm`;
-/// * `<store>` is the `pnpmStoreFolder` of the nearest `.yarnrc.yml` that
-///   sets it, resolved against that file's directory as Yarn does, and does
-///   not contain the project (`pnpmStoreFolder: .`);
+/// * the project is a Yarn project: the nearest folder at or above
+///   `node_modules` holding a `yarn.lock`. A link found inside a store
+///   entry's own `node_modules` (a transitive dependency) is judged
+///   against that project, not against the store entry (#859);
+/// * the active linker is pnpm and `<store>` is its `pnpmStoreFolder`, as
+///   yarn resolves both: the environment, then the nearest rc file at or
+///   above the project, then the home rc file
+///   ([`crate::crawlers::pkg_managers::active_yarn_pnpm_store`]); `<store>`
+///   does not contain the project (`pnpmStoreFolder: .`);
 /// * `real` is exactly `<store>/<entry>/package`, where `<entry>` is Yarn's
 ///   slug of a registry locator ([`is_yarn_copy_slug`]): the layout
 ///   Yarn gives a hard (installed) package, never a workspace.
 fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
-    let Some(project) = node_modules.parent() else {
-        return false;
-    };
-    if !project
+    let Some(project) = node_modules
         .ancestors()
-        .any(|dir| dir.join("yarn.lock").is_file())
-    {
-        return false;
-    }
-    let rcs: Vec<(&Path, String)> = project
-        .ancestors()
-        .filter_map(|dir| {
-            let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(".yarnrc.yml"));
-            rc.ok().map(|rc| (dir, rc))
-        })
-        .collect();
-    // Yarn expands `${…}` with the project's injected dotenv files applied
-    // (#1611).
-    let env = crate::crawlers::pkg_managers::YarnEnv::for_project(project);
-    let nearest = |key: &str| {
-        rcs.iter().find_map(|(dir, rc)| {
-            // The value yarn uses (`${…}` expanded, #1100); one it cannot
-            // expand admits nothing.
-            crate::formats::yarn::rc::setting(rc, key, &|name| env.var(name))
-                .map(|setting| (*dir, setting.value.unwrap_or_default()))
-        })
-    };
-    if nearest("nodeLinker").is_none_or(|(_, linker)| linker != "pnpm") {
-        return false;
-    }
-    let Some((rc_dir, value)) = nearest("pnpmStoreFolder").filter(|(_, v)| !v.is_empty()) else {
+        .skip(1)
+        .find(|dir| dir.join("yarn.lock").is_file())
+    else {
         return false;
     };
-    let (Ok(store), Ok(project)) = (
-        std::fs::canonicalize(rc_dir.join(value)),
-        std::fs::canonicalize(project),
-    ) else {
+    let Some(store) = crate::crawlers::pkg_managers::active_yarn_pnpm_store(project) else {
+        return false;
+    };
+    let (Ok(store), Ok(project)) = (std::fs::canonicalize(store), std::fs::canonicalize(project))
+    else {
         return false;
     };
     if project.starts_with(&store) {
@@ -920,6 +898,53 @@ mod tests {
             is_linked_source(nm.join("left-pad")).await,
             "store contains project"
         );
+    }
+
+    /// #859: a transitive dependency of a relocated Yarn pnpm store is a
+    /// link inside a store entry's own `node_modules`
+    /// (`<store>/is-odd-…/node_modules/is-number`) to a sibling entry's
+    /// `package` dir. It is judged against the project holding the
+    /// `yarn.lock`, not the store entry, so it is not first-party source.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relocated_yarn_pnpm_store_transitive_link_is_not_refused() {
+        use std::os::unix::fs::symlink;
+        for folder in ["store", ".cache/.store"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(root.join("yarn.lock"), "").unwrap();
+            std::fs::write(
+                root.join(".yarnrc.yml"),
+                format!("nodeLinker: pnpm\npnpmStoreFolder: {folder}\n"),
+            )
+            .unwrap();
+            let store = root.join(folder);
+            let number = store.join("is-number-npm-6.0.0-0123456789").join("package");
+            std::fs::create_dir_all(&number).unwrap();
+            let odd_nm = store
+                .join("is-odd-npm-3.0.1-0123456789")
+                .join("node_modules");
+            std::fs::create_dir_all(&odd_nm).unwrap();
+            symlink(&number, odd_nm.join("is-number")).unwrap();
+            assert_eq!(
+                shared_store_of(&odd_nm.join("is-number")).await,
+                None,
+                "{folder}"
+            );
+            // Not without an active pnpm linker.
+            std::fs::write(
+                root.join(".yarnrc.yml"),
+                format!("pnpmStoreFolder: {folder}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                shared_store_of(&odd_nm.join("is-number"))
+                    .await
+                    .map(|s| s.kind),
+                Some(SharedStoreKind::LinkedSource),
+                "{folder}: PnP linker"
+            );
+        }
     }
 
     /// The review reproduction: an npm workspace whose stray `.yarnrc.yml`

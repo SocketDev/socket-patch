@@ -48,6 +48,14 @@ patched build installed, because the restored lock pins the same version: `pdm
 sync` and `pdm install` report nothing to do. The unwind warns
 `vendor_pypi_reinstall_required` / `redirect_pypi_reinstall_required` and names
 `pdm sync --reinstall` (#477).
+The forward direction has the same gap before PDM 2.11 (lock_version `2`,
+`4.3`, `4.4`): an env that already holds the upstream release keeps it on
+`pdm sync`. Hosted mode warns `redirect_pdm_stale_install_risk`. Vendored mode
+probes the env PDM installs into (its venv, or PEP 582 `__pypackages__`) and
+warns `pypi_pdm_stale_install` with `pdm sync --reinstall`, or on PDM 1.x
+(lock_version `2`, no `--reinstall`) with removing the installed copy before
+`pdm sync`. `vex` names the same remedy in its `vendored_tree_out_of_sync`
+hint (#641).
 Refused before any write: a `[[package]]` locked at several versions (a marker
 fork), a user-authored `url`/`path`/VCS/`editable` source, an unsupported
 `lock_version` or `strategy`, hash-less `files`, malformed hashes, and a wheel
@@ -95,7 +103,7 @@ Measured details:
   activated or in-project venv is used, with `__pypackages__` as the last
   resort. `PDM_IGNORE_SAVED_PYTHON` and `PDM_IGNORE_ACTIVE_VENV` are
   honored, parsed as PDM parses booleans. Agent mode patches the env found,
-  and the hosted stale-install warning and `vex` check it. Global mode (`-g`)
+  and the hosted and vendored stale-install warnings and `vex` check it. Global mode (`-g`)
   reads `global_project.path`, `venv.location` and `python.install_root` from
   the user and site configs alike.
 - **Implicit macOS site settings require a recognized PDM launcher.** The

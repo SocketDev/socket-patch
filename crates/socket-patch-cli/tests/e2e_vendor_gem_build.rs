@@ -1940,3 +1940,169 @@ fn gem_vendor_drops_positional_constraints() {
         );
     }
 }
+
+/// The gem library a #985 project builds: its gemspec declares rack as a
+/// development dependency. Writes `Gemfile` (the given body), the gemspec
+/// and its lib, then installs unfrozen.
+fn gemspec_library(proj: &Path, gemfile: &str) {
+    std::fs::write(proj.join("Gemfile"), gemfile).unwrap();
+    std::fs::create_dir_all(proj.join("lib")).unwrap();
+    std::fs::write(proj.join("lib/mylib.rb"), "module Mylib; end\n").unwrap();
+    std::fs::write(
+        proj.join("mylib.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"mylib\"\n  s.version = \"0.1.0\"\n  \
+         s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.files = [\"lib/mylib.rb\"]\n  \
+         s.add_development_dependency \"rack\", \">= 3\"\nend\n",
+    )
+    .unwrap();
+    let relock = bundle(proj, &["install"], false);
+    assert!(
+        relock.status.success(),
+        "the gem library installs before vendor (test premise):\n{}",
+        String::from_utf8_lossy(&relock.stderr)
+    );
+}
+
+/// #985: a gem library whose Gemfile's `gemspec` directive declares rack as
+/// a development dependency, and whose Gemfile declares rack AFTER the
+/// directive. Bundler 2.7+ merges the two requirements, and for a path gem
+/// it then rejects even the lock it writes itself under frozen mode, so
+/// vendoring refuses before any write (before the fix it wrote a pair whose
+/// frozen install exited 16) and names the remedy. With the `gem` line moved
+/// above `gemspec`, the vendored pair installs frozen and reverts cleanly.
+/// Bundler < 2.7 never merges and vendors either order.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_gemspec_dev_dependency_refuses_or_installs_frozen() {
+    let Some((_tmp, proj, bundler, purl)) = staged_rack_project("gemspec dev dependency") else {
+        return;
+    };
+    let after = "source \"https://rubygems.org\"\n\ngemspec\n\ngem \"rack\", \"~> 3.1\"\n";
+    let before = "source \"https://rubygems.org\"\n\ngem \"rack\", \"~> 3.1\"\n\ngemspec\n";
+    let vendor = |proj: &Path| {
+        run_socket(
+            proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        )
+    };
+
+    if bundler.at_least(2, 7) {
+        gemspec_library(&proj, after);
+        let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+        let (code, stdout, stderr) = vendor(&proj);
+        assert_ne!(
+            code, 0,
+            "vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(env["summary"]["applied"], 0, "nothing vendored: {env}");
+        let event = env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["purl"] == purl)
+            .unwrap_or_else(|| panic!("an event for {purl}: {env}"));
+        assert_eq!(
+            event["errorCode"], "gemfile_declaration_not_editable",
+            "event: {event}"
+        );
+        assert!(
+            event["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("above `gemspec`")),
+            "the refusal names the remedy: {event}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            after
+        );
+        assert_eq!(
+            std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+            lock_before
+        );
+        assert!(
+            !proj.join(".socket/vendor/gem").exists(),
+            "no vendored copy is written"
+        );
+    }
+
+    // The remedy (and, on bundler < 2.7, either order): vendored, frozen.
+    let gemfile = if bundler.at_least(2, 7) {
+        before
+    } else {
+        after
+    };
+    gemspec_library(&proj, gemfile);
+    let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+    let (code, stdout, stderr) = vendor(&proj);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let wired = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+    let version = purl.rsplit('@').next().unwrap();
+    assert!(
+        wired.contains(&format!("  rack (= {version})!\n")),
+        "exact pin:\n{wired}"
+    );
+    let install = bundle(&proj, &["install"], true);
+    assert!(
+        install.status.success(),
+        "frozen install of the vendored pair failed:\n{wired}\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap(),
+        wired,
+        "the frozen install keeps the lock byte-identical"
+    );
+    let probe = bundle(
+        &proj,
+        &[
+            "exec",
+            "ruby",
+            "-e",
+            "print Gem.loaded_specs.fetch(\"rack\").full_gem_path",
+        ],
+        true,
+    );
+    let loaded = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe.status.success() && loaded.contains(".socket/vendor/gem/"),
+        "rack must load from the vendored path ({purl}), got {loaded:?}:\n{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+        gemfile,
+        "revert restores the Gemfile byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+        lock_before,
+        "revert restores Gemfile.lock byte-identical"
+    );
+}
