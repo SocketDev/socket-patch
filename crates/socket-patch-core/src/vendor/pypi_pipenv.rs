@@ -156,12 +156,22 @@ pub(super) async fn load_pipenv_project(
 /// mode, which then refuses the whole install over the vendored wheel. No
 /// lock shape avoids it (a `#sha256=` fragment on the relative path breaks
 /// `pipenv sync`), so warn whenever an entry other than `canon_name`'s
-/// would export a hash. Hosted mode exports `<url>#sha256=<hex>`, which pip
-/// accepts as the hash.
-pub(super) fn hash_export_warning(p: &PipenvProject, canon_name: &str) -> Option<VendorWarning> {
-    let hashed_registry_entry = category_names(&p.lock).iter().any(|section| {
-        p.lock[section].as_object().is_some_and(|entries| {
-            entries.iter().any(|(key, entry)| {
+/// would export a hash, unless `installer` is a release before 2023 (2022
+/// exports `file:///<abs> --hash=…`; earlier ones have no `requirements`).
+/// Hosted mode exports `<url>#sha256=<hex>`, which pip accepts as the hash.
+pub(super) fn hash_export_warning(
+    p: &PipenvProject,
+    canon_name: &str,
+    installer: Option<u32>,
+) -> Option<VendorWarning> {
+    if installer.is_some_and(|major| major < 2023) {
+        return None;
+    }
+    let hashed = category_names(&p.lock).into_iter().find_map(|section| {
+        let entries = p.lock[&section].as_object()?;
+        entries
+            .iter()
+            .find(|(key, entry)| {
                 canonicalize_pypi_name(key) != canon_name
                     && entry
                         .get("hashes")
@@ -170,20 +180,19 @@ pub(super) fn hash_export_warning(p: &PipenvProject, canon_name: &str) -> Option
                     && entry.get("file").is_none()
                     && NON_REGISTRY_KEYS.iter().all(|k| entry.get(*k).is_none())
             })
-        })
-    });
-    hashed_registry_entry.then(|| {
-        VendorWarning::new(
-            "pypi_pipenv_hash_export_unsupported",
-            format!(
-                "`pipenv requirements --hash` (Pipenv 2023.7.9 and later) exports the vendored \
-                 wheel without a hash while the other {LOCK_FILE} entries keep theirs, so \
-                 `pip install -r` of that export refuses the whole install (\"Hashes are \
-                 required in --require-hashes mode\"); export without `--hash`, or use \
-                 `--mode hosted`, whose reference exports with a hash pip accepts"
-            ),
-        )
-    })
+            .map(|(key, _)| format!("{section}.{key}"))
+    })?;
+    Some(VendorWarning::new(
+        "pypi_pipenv_hash_export_unsupported",
+        format!(
+            "`pipenv requirements --hash` (Pipenv 2023.7.9 and later) exports the vendored \
+             {canon_name} wheel without a hash while hashed {LOCK_FILE} entries (such as \
+             {hashed}) keep theirs, so `pip install -r` of an export holding both refuses \
+             the whole install (\"Hashes are required in --require-hashes mode\"); export \
+             without `--hash`, or use `--mode hosted`, whose reference exports with a hash \
+             pip accepts"
+        ),
+    ))
 }
 
 /// Target-specific guards (also re-run by the wire step right before
@@ -1311,7 +1320,7 @@ mod tests {
     async fn hash_export_warning_when_other_entries_are_hashed() {
         let tmp = write_lock(LOCK_TRANSITIVE_REGISTRY).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let w = hash_export_warning(&p, "six").expect("python-dateutil is hashed");
+        let w = hash_export_warning(&p, "six", None).expect("python-dateutil is hashed");
         assert_eq!(w.code, "pypi_pipenv_hash_export_unsupported");
         assert!(
             w.detail.contains("pipenv requirements --hash"),
@@ -1319,6 +1328,11 @@ mod tests {
             w.detail
         );
         assert!(w.detail.contains("--mode hosted"), "{}", w.detail);
+        assert!(w.detail.contains("vendored six wheel"), "{}", w.detail);
+        assert!(w.detail.contains("default.python-dateutil"), "{}", w.detail);
+        // A 2023+ installer warns; 2022 exports the wheel with its hash.
+        assert!(hash_export_warning(&p, "six", Some(2026)).is_some());
+        assert!(hash_export_warning(&p, "six", Some(2022)).is_none());
 
         // A hashed entry in another category counts too: `--dev` and
         // `--categories` exports carry it.
@@ -1336,7 +1350,7 @@ mod tests {
         );
         let tmp = write_lock(&develop).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        assert!(hash_export_warning(&p, "six").is_some());
+        assert!(hash_export_warning(&p, "six", None).is_some());
     }
 
     /// With no other hashed registry entry, the export has no `--hash`
@@ -1346,13 +1360,13 @@ mod tests {
     async fn hash_export_warning_absent_without_other_hashed_entries() {
         let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        assert!(hash_export_warning(&p, "six").is_none());
+        assert!(hash_export_warning(&p, "six", None).is_none());
 
         // python-dateutil's only sibling is six's vendored `file` entry,
         // which the export writes without a hash.
         let tmp = write_lock(LOCK_TRANSITIVE_VENDORED).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        assert!(hash_export_warning(&p, "python-dateutil").is_none());
+        assert!(hash_export_warning(&p, "python-dateutil", None).is_none());
     }
 
     /// Our serializer reproduces pipenv's own

@@ -1307,11 +1307,14 @@ async fn pypi_prelude<'p>(
             };
             if target == PipenvTarget::Fresh {
                 warnings.extend(project.warnings.iter().cloned());
-                warnings.extend(super::pypi_pipenv::hash_export_warning(
-                    &project,
-                    &canon_name,
-                ));
             }
+            // Like the stale install below, the export gap (#981) outlives
+            // the run that wired the lock: an in-sync re-run warns too.
+            warnings.extend(super::pypi_pipenv::hash_export_warning(
+                &project,
+                &canon_name,
+                installer,
+            ));
             // Both a fresh vendor and a re-run over an already-wired lock
             // keep warning while the venv still holds the upstream release.
             if let Some(stale) = pipenv_stale_install_warning(
@@ -7266,23 +7269,57 @@ wheels = [
     /// #981: a lock with another hashed registry entry exports through
     /// `pipenv requirements --hash` with hashes on every line but the
     /// vendored wheel's, which pip's hash-checking mode refuses. The vendor
-    /// run warns; a lock that pins only the target exports no hash and
-    /// does not.
+    /// run warns, and so does an in-sync re-run; a lock that pins only the
+    /// target exports no hash and does not, nor does a Pipenv 2022 project,
+    /// whose export keeps the wheel's hash.
     #[tokio::test]
     async fn pipenv_vendor_warns_the_hash_export_gap() {
-        let fx = pipenv_e2e_fixture().await;
-        let VendorOutcome::Done { warnings, .. } = pipenv_vendor(&fx, &fx.record).await else {
-            panic!("vendor did not complete");
-        };
-        assert!(
+        async fn vendor_with(fx: &E2eFixture, major: u32) -> Vec<VendorWarning> {
+            const PURL: &str = "pkg:pypi/six@1.16.0";
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let service = crate::vendor::test_support::service_fixture::Fixture::new(
+                PURL,
+                fx.site_packages.as_path().into(),
+                &fx.record,
+                &sources,
+            )
+            .await;
+            let outcome = vendor_pypi_with_pipenv_version(
+                PURL,
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&service.cfg),
+                &tokio::sync::OnceCell::new_with(Some(Some(major))),
+                &InstalledSiteListings::default(),
+            )
+            .await;
+            let VendorOutcome::Done {
+                warnings, entry, ..
+            } = outcome
+            else {
+                panic!("vendor did not complete: {outcome:?}");
+            };
+            if let Some(entry) = entry {
+                save_ledger_entry(&fx.root, &entry).await;
+            }
+            warnings
+        }
+        let warns = |warnings: &[VendorWarning]| {
             warnings
                 .iter()
-                .all(|w| w.code != "pypi_pipenv_hash_export_unsupported"),
-            "{warnings:?}"
-        );
+                .any(|w| w.code == "pypi_pipenv_hash_export_unsupported")
+        };
 
         let fx = pipenv_e2e_fixture().await;
-        let lock = PIPENV_REGISTRY_LOCK.replace(
+        let warnings = vendor_with(&fx, 2026).await;
+        assert!(!warns(&warnings), "{warnings:?}");
+
+        let hashed_develop = PIPENV_REGISTRY_LOCK.replace(
             r#""develop": {}"#,
             r#""develop": {
         "idna": {
@@ -7292,20 +7329,22 @@ wheels = [
         }
     }"#,
         );
-        touch(&fx.root, "Pipfile.lock", &lock).await;
-        let VendorOutcome::Done { warnings, .. } = pipenv_vendor(&fx, &fx.record).await else {
-            panic!("vendor did not complete");
-        };
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.code == "pypi_pipenv_hash_export_unsupported"),
-            "{warnings:?}"
-        );
+        let fx = pipenv_e2e_fixture().await;
+        touch(&fx.root, "Pipfile.lock", &hashed_develop).await;
+        let warnings = vendor_with(&fx, 2026).await;
+        assert!(warns(&warnings), "{warnings:?}");
         let lock = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
             .await
             .unwrap();
         assert!(lock.contains(UUID), "Pipfile.lock not wired:\n{lock}");
+        // The in-sync re-run keeps warning: the export gap is still there.
+        let warnings = vendor_with(&fx, 2026).await;
+        assert!(warns(&warnings), "{warnings:?}");
+
+        let fx = pipenv_e2e_fixture().await;
+        touch(&fx.root, "Pipfile.lock", &hashed_develop).await;
+        let warnings = vendor_with(&fx, 2022).await;
+        assert!(!warns(&warnings), "{warnings:?}");
     }
 
     const SIBLING_EXPORT: &str = "-i https://pypi.org/simple\nsix==1.16.0\n";

@@ -108,7 +108,8 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   shape avoids it (a `#sha256=` fragment on the relative path breaks
   `pipenv sync`), so the vendored run warns
   `pypi_pipenv_hash_export_unsupported` whenever another lock entry
-  carries hashes. Export without `--hash`, or use hosted mode: its
+  carries hashes (re-runs included; not when the probed Pipenv is 2022 or
+  older). Export without `--hash`, or use hosted mode: its
   `<url>#sha256=<hex>` reference exports a hash pip accepts.
 - **Out-of-tree venv naming** is unchanged from Pipenv 7 through 2026:
   `sanitize(<project dir name>)[:42]-<8 chars of urlsafe-base64(sha256(<abs
