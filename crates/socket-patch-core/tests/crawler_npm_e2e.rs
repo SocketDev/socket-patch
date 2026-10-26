@@ -4644,3 +4644,37 @@ async fn global_mode_finds_registry_nested_under_another() {
     let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
     assert_eq!(deno_roots, vec![&host, &nested], "{roots:?}");
 }
+
+/// #444 (Bugbot): a host-root package named like the first segment of a
+/// path registry on the same host (`<host>/api/<version>/` beside
+/// `<host>/api/npm/<pkg>/`) does not hide that registry from `-g`.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_mode_finds_path_registry_behind_same_named_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deno_dir = tmp.path().join("deno");
+    let host = deno_dir.join("npm").join("registry.example.com");
+    let nested = host.join("api").join("npm");
+    stage_deno_npm_pkg(&host, "api", "1.0.0", "1.0.0").await;
+    stage_deno_npm_pkg(&nested, "is-number", "6.0.0", "6.0.0").await;
+
+    struct DenoDirGuard(Option<std::ffi::OsString>);
+    impl Drop for DenoDirGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("DENO_DIR", v),
+                None => std::env::remove_var("DENO_DIR"),
+            }
+        }
+    }
+    let _guard = DenoDirGuard(std::env::var_os("DENO_DIR"));
+    std::env::set_var("DENO_DIR", &deno_dir);
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+    };
+    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
+    assert_eq!(deno_roots, vec![&host, &nested], "{roots:?}");
+}

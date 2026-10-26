@@ -1881,7 +1881,8 @@ const DENO_NPM_REGISTRY_MAX_DEPTH: usize = 8;
 /// their npm dependencies from there, in Deno's own layout (see
 /// [`is_deno_npm_cache_root`]), so these are global roots beside the npm,
 /// pnpm, yarn and bun `node_modules`. Below a registry dir only the
-/// children that are not its packages are walked, and `jsr.io` is skipped: it is the
+/// non-version subdirs of its children are walked (a nested registry
+/// can sit there, not a package's copy), and `jsr.io` is skipped: it is the
 /// Deno crawler's JSR root, not an npm registry. Sorted, for a stable
 /// scan order.
 fn deno_npm_cache_roots() -> Vec<PathBuf> {
@@ -1899,17 +1900,21 @@ fn deno_npm_cache_roots() -> Vec<PathBuf> {
         for dir in level {
             let children = sorted_subdirs_sync(&dir);
             if holds_deno_packages(&dir) {
-                // A registry dir's children are its packages, but the same
-                // host can also serve a registry below a path
-                // (`<host>/<pkg>/` beside `<host>/api/npm/<pkg>/`): keep
-                // walking the children that are neither.
-                next.extend(
-                    children
-                        .into_iter()
-                        .filter(|name| !name.starts_with('@'))
-                        .map(|name| dir.join(name))
-                        .filter(|child| !is_deno_package_dir(child)),
-                );
+                // A registry dir's children are its packages, and a Deno
+                // package dir holds only version dirs (named from a
+                // digit). The same host can also serve a registry below a
+                // path (`<host>/api/npm/<pkg>/` beside `<host>/<pkg>/`),
+                // even under a dir that is also a package (`<host>/api/`):
+                // keep walking every non-version subdir of a child.
+                for child in children.into_iter().filter(|name| !name.starts_with('@')) {
+                    let child = dir.join(child);
+                    next.extend(
+                        sorted_subdirs_sync(&child)
+                            .into_iter()
+                            .filter(|name| !name.starts_with(|c: char| c.is_ascii_digit()))
+                            .map(|name| child.join(name)),
+                    );
+                }
                 roots.push(dir);
             } else {
                 next.extend(children.into_iter().map(|name| dir.join(name)));
