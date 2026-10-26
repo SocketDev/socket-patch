@@ -433,6 +433,132 @@ async fn requirements_sole_pin_vendored_to_hosted() {
     assert_vendored_to_hosted(&root, &["requirements.txt"]).await;
 }
 
+/// #740: a sibling requirements file that reads the root requirements.txt
+/// as `-c` constraints breaks on pip 20.3.x / 21.0.x once the root pin is a
+/// link ("Links are not allowed as constraints"). Both writers still
+/// rewrite the pin, but now name every such reader in a warning: hosted
+/// `redirect_requirements_constraints_link`, vendored (dry run and wet)
+/// `vendor_requirements_constraints_link`. A line that names the file as
+/// `-r` (or `-r` after `-c`, which pip follows instead) is not a reader,
+/// and a project with no reader gets no warning.
+#[tokio::test]
+async fn requirements_read_as_constraints_warn_in_both_modes() {
+    fn stage(root: &Path, readers: bool) {
+        std::fs::write(root.join("requirements.txt"), "six==1.16.0\n").unwrap();
+        std::fs::write(root.join("include.txt"), "-r requirements.txt\n").unwrap();
+        std::fs::write(
+            root.join("both.txt"),
+            "-c requirements.txt -r requirements.txt\n",
+        )
+        .unwrap();
+        if readers {
+            std::fs::write(
+                root.join("requirements-dev.txt"),
+                "-c requirements.txt\nidna==3.7\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("requirements")).unwrap();
+            std::fs::write(
+                root.join("requirements/test.txt"),
+                "--constraint=../requirements.txt  # pins\n",
+            )
+            .unwrap();
+        }
+    }
+    fn reported(env: &Value, code: &str) -> Vec<String> {
+        let mut readers: Vec<String> = Vec::new();
+        let mut walk = vec![env];
+        while let Some(v) = walk.pop() {
+            match v {
+                Value::Object(map) => {
+                    if ["code", "errorCode"]
+                        .iter()
+                        .any(|key| map.get(*key).and_then(Value::as_str) == Some(code))
+                    {
+                        let text = v.to_string();
+                        for reader in [
+                            "requirements-dev.txt",
+                            "requirements/test.txt",
+                            "both.txt",
+                            "include.txt",
+                        ] {
+                            if text.contains(&format!("{reader} reads requirements.txt")) {
+                                readers.push(reader.to_string());
+                            }
+                        }
+                        assert!(
+                            text.contains("Links are not allowed as constraints"),
+                            "{text}"
+                        );
+                    }
+                    walk.extend(map.values());
+                }
+                Value::Array(items) => walk.extend(items),
+                _ => {}
+            }
+        }
+        readers.sort();
+        readers
+    }
+    let expected = vec![
+        "requirements-dev.txt".to_string(),
+        "requirements/test.txt".to_string(),
+    ];
+    for readers in [true, false] {
+        let want = if readers {
+            expected.clone()
+        } else {
+            Vec::new()
+        };
+
+        let (_tmp, root) = project();
+        stage(&root, readers);
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            hosted_pinned(&env),
+            1,
+            "the pin is still redirected: {env:#}"
+        );
+        assert_eq!(
+            reported(&env, "redirect_requirements_constraints_link"),
+            want,
+            "{env:#}"
+        );
+
+        let (_tmp, root) = project();
+        stage(&root, readers);
+        stage_manifest(&root);
+        let (code, env) = run_cli(&root, &["vendor", "--dry-run"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(
+            reported(&env, "vendor_requirements_constraints_link"),
+            want,
+            "dry run: {env:#}"
+        );
+        assert!(
+            !readers || env.to_string().contains("would pin six==1.16.0"),
+            "{env:#}"
+        );
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 0, "{env:#}");
+        assert!(std::fs::read_to_string(root.join("requirements.txt"))
+            .unwrap()
+            .contains(&format!(".socket/vendor/pypi/{UUID}/")));
+        assert_eq!(
+            reported(&env, "vendor_requirements_constraints_link"),
+            want,
+            "{env:#}"
+        );
+        assert!(
+            !readers || env.to_string().contains("now pins six==1.16.0"),
+            "{env:#}"
+        );
+    }
+}
+
 /// #410: a requirements.txt in which every requirement is the hosted pin
 /// (a lone `six==1.16.0`, or one beside `-e .`) can be unwound again.
 /// Hosted `rollback`, `remove` and the hosted → vendored takeover restore

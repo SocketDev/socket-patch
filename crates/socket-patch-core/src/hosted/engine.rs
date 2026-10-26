@@ -28,6 +28,7 @@ use crate::constants::npm_family::{
     RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::formats::cargo::source_replacement::CratesIoSource;
+use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
     effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
     NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
@@ -2218,6 +2219,34 @@ async fn rewrite_once(
             w.code != "redirect_pnpm_no_lockfile" && w.code != "redirect_npm_no_lockfile"
         });
         rewrite.warnings.push(warning);
+    }
+    // A rewritten root requirements.txt pins by link, which pip 20.3 and
+    // 21.0 refuse in a constraints file: name each file reading it as one.
+    if rewrite.files.contains_key(PYPI_REQUIREMENTS) {
+        let pinned: Vec<&str> = rewrite
+            .edits
+            .iter()
+            .filter(|e| e.path == PYPI_REQUIREMENTS)
+            .filter_map(|e| e.key.as_deref())
+            .collect();
+        let readers = crate::vendor::pypi_requirements::constraint_readers_in(
+            *view,
+            &[PYPI_REQUIREMENTS.to_string()],
+        )
+        .await;
+        for found in readers {
+            rewrite.warnings.push(warning(
+                "redirect_requirements_constraints_link",
+                format!(
+                    "{} reads {} as a constraints file (`-c`), and {} now pins {} by URL; {}",
+                    found.reader,
+                    found.target,
+                    found.target,
+                    pinned.join(", "),
+                    crate::vendor::pypi_requirements::CONSTRAINT_LINK_REMEDY
+                ),
+            ));
+        }
     }
     if let Some(content) = binary_content {
         rewrite
