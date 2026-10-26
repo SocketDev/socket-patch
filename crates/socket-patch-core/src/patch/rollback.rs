@@ -482,8 +482,9 @@ impl crate::patch::store_copies::CopyFold for RollbackResult {
 /// is back to its pre-apply shape. In site-packages a leftover empty
 /// directory still imports as a PEP 420 namespace package (#838).
 ///
-/// For a `.py` file, its now-stale bytecode in the sibling `__pycache__/`
-/// (`<stem>.<tag>[.opt-N].pyc`) goes first. Then each parent directory is
+/// The caller removes a `.py` file's now-stale bytecode first (see
+/// `remove_stale_bytecode`), so an emptied `__pycache__/` is pruned here
+/// like any other directory. Each parent directory is
 /// removed while it is empty, deepest first, stopping at `pkg_path`
 /// (never removed) or at the first directory that still holds anything.
 /// Apply records no list of the directories it created, so "empty once
@@ -497,11 +498,7 @@ impl crate::patch::store_copies::CopyFold for RollbackResult {
 /// Best effort: the file delete already committed the rollback, so a
 /// directory that can't be removed is left in place rather than failing it.
 async fn prune_emptied_parents(pkg_path: &Path, filepath: &Path) {
-    // The bytecode goes whatever the pruning below decides: a stale
-    // `.pyc` of a deleted module must not outlive it.
     if filepath.extension().is_some_and(|ext| ext == "py") {
-        use crate::patch::apply::{remove_stale_bytecode, StaleBytecode};
-        remove_stale_bytecode(filepath, StaleBytecode::All).await;
         remove_dir_if_empty(&filepath.with_file_name("__pycache__")).await;
     }
     let Some(rel) = filepath
@@ -670,6 +667,16 @@ async fn rollback_package_patch_at(
                 result.error = Some(format!("Failed to delete {}: {}", file_name, e));
                 return result;
             }
+            // The bytecode goes whatever the pruning decides: a stale `.pyc`
+            // of a deleted module must not outlive it, and a failed delete is
+            // reported like a restore's (`stale_bytecode_not_removed`).
+            warnings.extend(
+                crate::patch::apply::remove_stale_bytecode(
+                    &filepath,
+                    crate::patch::apply::StaleBytecode::All,
+                )
+                .await,
+            );
             prune_emptied_parents(pkg_path, &filepath).await;
             result.files_rolled_back.push(file_name.clone());
             continue;
