@@ -171,6 +171,9 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
 #[derive(Debug, Clone)]
 pub(crate) struct YarnEnv {
     pub node_linker: Option<String>,
+    /// `YARN_PNPM_STORE_FOLDER`, which moves the pnpm linker's store the
+    /// way an rc file's `pnpmStoreFolder` does (#859).
+    pub pnpm_store_folder: Option<String>,
     pub rc_filename: String,
     pub home: Option<PathBuf>,
     /// The variables `${NAME}` references read; `None` reads this
@@ -199,6 +202,7 @@ impl YarnEnv {
             // environment (each one overwrites the setting) but the first
             // `yarn_rc_filename` (`getRcFilename` returns on a match).
             node_linker: yarn_env_key(std::env::vars_os(), "YARN_NODE_LINKER", true),
+            pnpm_store_folder: yarn_env_key(std::env::vars_os(), "YARN_PNPM_STORE_FOLDER", true),
             rc_filename: yarn_env_key(std::env::vars_os(), "YARN_RC_FILENAME", false)
                 .unwrap_or_else(|| ".yarnrc.yml".to_string()),
             home: crate::utils::fs::home_dir(),
@@ -262,6 +266,7 @@ impl YarnEnv {
     pub(crate) fn repository_only() -> Self {
         Self {
             node_linker: None,
+            pnpm_store_folder: None,
             rc_filename: ".yarnrc.yml".to_string(),
             home: None,
             vars: Some(Default::default()),
@@ -364,6 +369,52 @@ pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<
             rc_node_linker(&rc, env)
         })
         .or_else(|| env.home_node_linker())
+}
+
+/// The folder yarn berry's pnpm linker keeps its store in for the project
+/// at `project_root` (#859), as yarn resolves `pnpmStoreFolder`:
+/// `YARN_PNPM_STORE_FOLDER` when set (relative to the project, where yarn
+/// runs), else the nearest rc file at or above the project that sets it
+/// (relative to that file's folder), else the home folder's rc file
+/// (relative to the home folder), else the default
+/// `<project>/node_modules/.store`. `None` when the value cannot be
+/// expanded or expands to nothing: yarn refuses to run on it, so no store
+/// is admitted. The path is lexical; callers canonicalize it.
+pub(crate) fn yarn_pnpm_store_folder_in(project_root: &Path, env: &YarnEnv) -> Option<PathBuf> {
+    let expand = |raw: &str| {
+        crate::formats::yarn::rc::expand_env(raw, &mut |name| Ok(env.var(name)))
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    let start = std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    if let Some(raw) = &env.pnpm_store_folder {
+        return Some(start.join(expand(raw)?));
+    }
+    let from_rc = |dir: &Path| {
+        let rc = crate::utils::fs::read_regular_to_string_sync(&dir.join(&env.rc_filename)).ok()?;
+        // An empty value is still the nearest setting: it admits nothing.
+        crate::formats::yarn::rc::raw_setting(&rc, "pnpmStoreFolder")
+            .map(|raw| expand(&raw).map(|value| dir.join(value)))
+    };
+    let found = start
+        .ancestors()
+        .find_map(from_rc)
+        .or_else(|| env.home.as_deref().and_then(from_rc));
+    match found {
+        Some(store) => store,
+        None => Some(start.join("node_modules").join(".store")),
+    }
+}
+
+/// The store of an active yarn berry pnpm-linker install of the project at
+/// `project_root` ([`yarn_pnpm_store_folder_in`]), or `None` when the
+/// linker yarn resolves there ([`yarn_node_linker_in`]) is not `pnpm`.
+pub(crate) fn active_yarn_pnpm_store(project_root: &Path) -> Option<PathBuf> {
+    let env = YarnEnv::for_project(project_root);
+    if yarn_node_linker_in(project_root, &env).as_deref() != Some("pnpm") {
+        return None;
+    }
+    yarn_pnpm_store_folder_in(project_root, &env)
 }
 
 /// The linker that decides whether a PnP loader is live: yarn 1 has no
@@ -775,10 +826,51 @@ mod tests {
         );
     }
 
+    /// #859: `pnpmStoreFolder` resolves the way yarn resolves it: the
+    /// environment against the project, else the nearest rc file that sets
+    /// it against that file's folder, else the home rc file against the
+    /// home folder, else `node_modules/.store`; an unexpandable value
+    /// admits no store.
+    #[test]
+    fn yarn_pnpm_store_folder_resolution() {
+        let d = tempfile::tempdir().unwrap();
+        let (root, home) = (d.path().join("repo"), d.path().join("home"));
+        let member = root.join("packages").join("a");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let mut env = bare_env(None);
+        let store = |env: &YarnEnv| yarn_pnpm_store_folder_in(&member, env);
+
+        assert_eq!(
+            store(&env),
+            Some(member.join("node_modules").join(".store"))
+        );
+        env.home = Some(home.clone());
+        std::fs::write(home.join(".yarnrc.yml"), "pnpmStoreFolder: s\n").unwrap();
+        assert_eq!(store(&env), Some(home.join("s")), "home rc");
+        std::fs::write(root.join(".yarnrc.yml"), "pnpmStoreFolder: .cache/.store\n").unwrap();
+        assert_eq!(store(&env), Some(root.join(".cache/.store")), "ancestor rc");
+        std::fs::write(member.join(".yarnrc.yml"), "nodeLinker: pnpm\n").unwrap();
+        assert_eq!(
+            store(&env),
+            Some(root.join(".cache/.store")),
+            "nearest that sets it"
+        );
+        std::fs::write(member.join(".yarnrc.yml"), "pnpmStoreFolder: \"${S:-x}\"\n").unwrap();
+        assert_eq!(store(&env), Some(member.join("x")), "fallback");
+        std::fs::write(member.join(".yarnrc.yml"), "pnpmStoreFolder: \"${S}\"\n").unwrap();
+        assert_eq!(store(&env), None, "unset variable");
+        std::fs::write(member.join(".yarnrc.yml"), "pnpmStoreFolder: ''\n").unwrap();
+        assert_eq!(store(&env), None, "empty nearest setting");
+        env.pnpm_store_folder = Some("from-env".into());
+        assert_eq!(store(&env), Some(member.join("from-env")), "environment");
+    }
+
     /// A [`YarnEnv`] with no home folder and the default rc file name.
     fn bare_env(node_linker: Option<&str>) -> YarnEnv {
         YarnEnv {
             node_linker: node_linker.map(str::to_string),
+            pnpm_store_folder: None,
             rc_filename: ".yarnrc.yml".into(),
             home: None,
             vars: Some(Default::default()),
