@@ -1866,6 +1866,180 @@ fn list_dir_sync(path: &Path) -> Listing {
     }
 }
 
+/// How many levels below `$DENO_DIR/npm` a registry dir may sit. Deno
+/// maps a registry URL to `<host>[_<port>]` plus one dir per path segment,
+/// so `https://host/api/npm/` lands three levels down; this leaves room
+/// for longer paths without walking the cache's package dirs.
+const DENO_NPM_REGISTRY_MAX_DEPTH: usize = 8;
+
+/// The registry dirs of Deno's npm cache (#444): every dir under
+/// `$DENO_DIR/npm` that holds packages in Deno's layout
+/// ([`holds_deno_packages`]), `<host>` for a registry at a host's root
+/// (`registry.npmjs.org`) and `<host>/<path...>` for one served below a
+/// path (`https://host/api/npm/` → `<host>/api/npm`, as Artifactory,
+/// CodeArtifact and GitLab registries are). `deno install -g` tools load
+/// their npm dependencies from there, in Deno's own layout (see
+/// [`is_deno_npm_cache_root`]), so these are global roots beside the npm,
+/// pnpm, yarn and bun `node_modules`. Below a registry dir only the
+/// non-version subdirs of its children are walked (a nested registry
+/// can sit there, not a package's copy), and `jsr.io` is skipped: it is the
+/// Deno crawler's JSR root, not an npm registry. Sorted, for a stable
+/// scan order.
+fn deno_npm_cache_roots() -> Vec<PathBuf> {
+    let Some(npm) = super::deno_crawler::deno_dir().map(|dir| dir.join("npm")) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    let mut level: Vec<PathBuf> = sorted_subdirs_sync(&npm)
+        .into_iter()
+        .filter(|name| name != "jsr.io")
+        .map(|name| npm.join(name))
+        .collect();
+    for _ in 0..DENO_NPM_REGISTRY_MAX_DEPTH {
+        let mut next = Vec::new();
+        for dir in level {
+            let children = sorted_subdirs_sync(&dir);
+            if holds_deno_packages(&dir) {
+                // A registry dir's children are mostly its packages, but the
+                // same host can also serve a registry below a path
+                // (`<host>/npm/<pkg>/` or `<host>/api/npm/<pkg>/` beside
+                // `<host>/<pkg>/`). A child that is not a package is walked
+                // like any other dir; one that is (a package named like
+                // the path's first segment, `<host>/api/`) holds only
+                // version dirs (named from a digit) of its own, so its
+                // other subdirs are walked.
+                for child in children.into_iter().filter(|name| !name.starts_with('@')) {
+                    let child = dir.join(child);
+                    if is_deno_package_dir(&child) {
+                        next.extend(
+                            sorted_subdirs_sync(&child)
+                                .into_iter()
+                                .filter(|name| !name.starts_with(|c: char| c.is_ascii_digit()))
+                                .map(|name| child.join(name)),
+                        );
+                    } else {
+                        next.push(child);
+                    }
+                }
+                roots.push(dir);
+            } else {
+                next.extend(children.into_iter().map(|name| dir.join(name)));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    roots.sort();
+    roots
+}
+
+/// Whether `root` is a registry dir of Deno's npm cache
+/// (`$DENO_DIR/npm/registry.npmjs.org`, or a nested
+/// `$DENO_DIR/npm/<host>/<path...>` for a registry served below a path)
+/// rather than a `node_modules` tree: a dir below one named `npm`, other
+/// than a `node_modules` and Deno's `jsr.io` root, with at least one
+/// package dir in Deno's layout ([`is_deno_package_dir`]). A
+/// `node_modules` package dir has its own `package.json`, so a project
+/// root that merely sits under a dir named `npm` keeps its usual walk. Deno lays a package
+/// out at `<name>/<version>/` (scoped: `@scope/name/<version>/`), and each
+/// further copy it makes for a different peer-dependency resolution at
+/// `<version>_<n>/`. A relative `--global-prefix` is judged by its
+/// absolute spelling.
+pub(super) fn is_deno_npm_cache_root(root: &Path) -> bool {
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let named = root
+        .file_name()
+        .is_some_and(|name| name != "node_modules" && name != "jsr.io")
+        && root
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.file_name().is_some_and(|name| name == "npm"));
+    named && holds_deno_packages(&root)
+}
+
+/// Whether some package dir of `root` (`<name>` or `@scope/<name>`) is laid
+/// out the way Deno's npm cache lays one out ([`is_deno_package_dir`]),
+/// stopping at the first that is.
+fn holds_deno_packages(root: &Path) -> bool {
+    sorted_subdirs_sync(root).into_iter().any(|name| {
+        let dir = root.join(&name);
+        if name.starts_with('@') {
+            sorted_subdirs_sync(&dir)
+                .into_iter()
+                .any(|child| is_deno_package_dir(&dir.join(child)))
+        } else {
+            is_deno_package_dir(&dir)
+        }
+    })
+}
+
+/// Whether `dir` is a package dir of Deno's npm cache: it has no
+/// `package.json` of its own (a `node_modules` package dir always does)
+/// and holds Deno's cached packument (`registry.json`) or a version dir
+/// (a name starting with a digit) with a `package.json`. Deno skips the
+/// packument when a `deno.lock` already pins the tarball, so the version
+/// dirs alone must count.
+fn is_deno_package_dir(dir: &Path) -> bool {
+    if dir.join("package.json").exists() {
+        return false;
+    }
+    dir.join("registry.json").is_file()
+        || sorted_subdirs_sync(dir).into_iter().any(|version| {
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && dir.join(version).join("package.json").is_file()
+        })
+}
+
+/// The copy index of the Deno npm cache dir `dir_name` when it holds
+/// `version`: 0 for `<version>`, `n` for `<version>_<n>`, `None` for a dir
+/// of any other version.
+fn deno_npm_copy_index(dir_name: &str, version: &str) -> Option<u64> {
+    let rest = dir_name.strip_prefix(version)?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let digits = rest.strip_prefix('_')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The non-hidden subdirectories of `dir`, sorted by name.
+fn sorted_subdirs_sync(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = list_dir_sync(dir)
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            !entry.name_str.starts_with('.') && entry.file_type.is_some_and(|t| t.is_dir())
+        })
+        .map(|entry| entry.name_str)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every package dir (`<name>` or `@scope/<name>`) of the Deno npm cache
+/// registry dir `root`.
+fn deno_npm_cache_package_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for name in sorted_subdirs_sync(root) {
+        if name.starts_with('@') {
+            let scope = root.join(&name);
+            dirs.extend(
+                sorted_subdirs_sync(&scope)
+                    .into_iter()
+                    .map(|n| scope.join(n)),
+            );
+        } else {
+            dirs.push(root.join(name));
+        }
+    }
+    dirs
+}
+
 /// The `node_modules` roots a global prefix stands for. pnpm 11+ gives
 /// every `pnpm add -g` its own install, `$PNPM_HOME/global/v11/<hash>/`,
 /// each with its own `node_modules` (and its own `.pnpm` on pnpm 12, or
@@ -2427,6 +2601,11 @@ impl NpmCrawler {
             })
             .collect();
         let gathered: Vec<Vec<ScanEvent>> = par_map(roots, |(nm_path, store)| {
+            // A Deno npm cache root (#444) has its own layout and no
+            // relocated store (it is not a `node_modules`).
+            if is_deno_npm_cache_root(nm_path) {
+                return Self::gather_deno_npm_cache(nm_path);
+            }
             let mut events = Self::gather_node_modules(nm_path, None, false);
             if let Some(store) = store {
                 let entries = Self::list_npm_store_entries_sync(&store, true);
@@ -2502,6 +2681,11 @@ impl NpmCrawler {
                 purl: purl.clone(),
                 dir_key,
             });
+        }
+
+        if is_deno_npm_cache_root(node_modules_path) {
+            let root = node_modules_path.to_path_buf();
+            return Ok(run_walk(move || Self::resolve_deno_npm_cache(&root, pending)).await);
         }
 
         // Both passes run as one walk-pool task: each visited dir is
@@ -3075,6 +3259,12 @@ impl NpmCrawler {
             }
         }
 
+        // Deno's npm cache, last: a copy another manager's global root
+        // also holds keeps being reported there.
+        for root in deno_npm_cache_roots() {
+            add(root);
+        }
+
         paths
     }
 
@@ -3086,6 +3276,9 @@ impl NpmCrawler {
     fn node_modules_paths_sync(options: &CrawlerOptions) -> Vec<PathBuf> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
+                if is_deno_npm_cache_root(custom) {
+                    return vec![custom.clone()];
+                }
                 return pnpm_isolated_global_install_roots(custom);
             }
             return NpmCrawler.get_global_node_modules_paths();
@@ -3523,6 +3716,104 @@ impl NpmCrawler {
             decoded: entry.advertised,
             events: Self::gather_node_modules(&entry.node_modules, entry.listing, true),
         })
+    }
+
+    /// Gather every package in the Deno npm cache registry dir `root`
+    /// (`<name>/<version>/`, see [`is_deno_npm_cache_root`]), each
+    /// identified by its own package.json like any other package. A
+    /// `<version>_<n>` peer-dependency copy is read only when no
+    /// `<version>` dir sits beside it: the scan keeps one copy per purl,
+    /// and that one comes first.
+    fn gather_deno_npm_cache(root: &Path) -> Vec<ScanEvent> {
+        par_map(deno_npm_cache_package_dirs(root), |pkg_dir| {
+            let dirs = sorted_subdirs_sync(&pkg_dir);
+            let is_extra_copy = |dir: &String| {
+                dir.rsplit_once('_').is_some_and(|(base, n)| {
+                    !n.is_empty()
+                        && n.bytes().all(|b| b.is_ascii_digit())
+                        && dirs.binary_search_by(|d| d.as_str().cmp(base)).is_ok()
+                })
+            };
+            dirs.iter()
+                .filter(|dir| !is_extra_copy(dir))
+                .map(|dir| {
+                    let path = pkg_dir.join(dir);
+                    ScanEvent::Package {
+                        identity: read_package_json_sync(&path.join("package.json")),
+                        path,
+                        entry_key: None,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// [`Self::find_by_purls`] over the Deno npm cache registry dir `root`:
+    /// every copy of each target, `<dir_key>/<version>` first, then its
+    /// `<version>_<n>` peer-dependency copies in index order, each kept
+    /// only when its package.json names the target and recorded once.
+    /// Deno stores a name with capitals under an encoded `_<...>` dir at
+    /// the registry root, so a target with one that the direct lookup
+    /// misses is matched by package.json identity against those dirs only.
+    fn resolve_deno_npm_cache(
+        root: &Path,
+        targets: Vec<Target>,
+    ) -> HashMap<String, Vec<CrawledPackage>> {
+        let is_target = |path: &Path, target: &Target| {
+            read_package_json_sync(&path.join("package.json"))
+                .is_some_and(|(name, version)| name == target.dir_key && version == target.version)
+        };
+        let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
+        let mut record = |path: PathBuf, target: &Target| {
+            let copies = result.entry(target.purl.clone()).or_default();
+            if !copies.iter().any(|c| c.path == path) {
+                copies.push(CrawledPackage {
+                    name: target.name.clone(),
+                    version: target.version.clone(),
+                    namespace: target.namespace.clone(),
+                    purl: target.purl.clone(),
+                    path,
+                });
+            }
+        };
+        let mut unmatched = Vec::new();
+        for target in targets {
+            let pkg_dir = root.join(&target.dir_key);
+            let mut copies: Vec<(u64, String)> = sorted_subdirs_sync(&pkg_dir)
+                .into_iter()
+                .filter_map(|dir| Some((deno_npm_copy_index(&dir, &target.version)?, dir)))
+                .collect();
+            copies.sort();
+            let mut found = false;
+            for (_, dir) in copies {
+                let path = pkg_dir.join(dir);
+                if is_target(&path, &target) {
+                    record(path, &target);
+                    found = true;
+                }
+            }
+            if !found && target.dir_key.bytes().any(|b| b.is_ascii_uppercase()) {
+                unmatched.push(target);
+            }
+        }
+        if !unmatched.is_empty() {
+            for encoded in sorted_subdirs_sync(root)
+                .into_iter()
+                .filter(|name| name.starts_with('_'))
+            {
+                let pkg_dir = root.join(encoded);
+                for dir in sorted_subdirs_sync(&pkg_dir) {
+                    let path = pkg_dir.join(dir);
+                    for target in unmatched.iter().filter(|t| is_target(&path, t)) {
+                        record(path.clone(), target);
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Replay gathered [`ScanEvent`]s in order against `seen`, exactly as
