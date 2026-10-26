@@ -558,7 +558,10 @@ fn stale_install_flow(
     wired_lock: &str,
     stale_warnings: &[String],
 ) {
-    let what = format!("pdm {} lock {} stale install", pdm.version, locked.lock_version);
+    let what = format!(
+        "pdm {} lock {} stale install",
+        pdm.version, locked.lock_version
+    );
     let project = &locked.project;
     let keeps = matches!(locked.lock_version.as_str(), "2" | "4.3" | "4.4");
     if !keeps {
@@ -568,7 +571,10 @@ fn stale_install_flow(
     assert_eq!(stale_warnings.len(), 1, "{what}: {stale_warnings:?}");
     let python = venv_bin(&project.join(".venv"), "python");
     let (_, _, marked) = six_oracle(&python, project).unwrap();
-    assert!(!marked, "{what}: the scan never touches the installed files");
+    assert!(
+        !marked,
+        "{what}: the scan never touches the installed files"
+    );
     assert_eq!(
         std::fs::read_to_string(project.join("pdm.lock")).unwrap(),
         wired_lock,
@@ -603,7 +609,11 @@ fn stale_install_flow(
     };
     let (_, _, marked) = six_oracle(&python, project)
         .unwrap_or_else(|| panic!("{what}: six missing after the remedy: {}", out_text(&out)));
-    assert!(marked, "{what}: the remedy installs the patch: {}", out_text(&out));
+    assert!(
+        marked,
+        "{what}: the remedy installs the patch: {}",
+        out_text(&out)
+    );
     record(
         "pdm",
         &pdm.version,

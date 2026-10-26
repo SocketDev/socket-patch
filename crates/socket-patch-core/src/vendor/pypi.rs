@@ -919,8 +919,8 @@ async fn pdm_stale_install_warning(
     let remedy = super::pypi_pdm::stale_install_remedy(lock_version, &name)?;
     // The env PDM resolves for the project (`.pdm-python`, an activated or
     // in-project venv, else `__pypackages__`); Hatch's envs are not PDM's.
-    let sites = crate::crawlers::python_crawler::non_hatch_local_venv_site_packages(project_root)
-        .await;
+    let sites =
+        crate::crawlers::python_crawler::non_hatch_local_venv_site_packages(project_root).await;
     let stale_dirs = stale_install_sites(&sites, purl, record, listings).await;
     if stale_dirs.is_empty() {
         return None;
@@ -9125,7 +9125,11 @@ wheels = [
             else {
                 panic!("{lock_version}: re-run must be Done");
             };
-            assert_eq!(pdm_stale(&warnings).len(), 1, "{lock_version}: {warnings:?}");
+            assert_eq!(
+                pdm_stale(&warnings).len(),
+                1,
+                "{lock_version}: {warnings:?}"
+            );
 
             // Once the env holds the patched bytes there is nothing to say.
             for sp in [
@@ -9141,7 +9145,10 @@ wheels = [
             else {
                 panic!("{lock_version}: re-run must be Done");
             };
-            assert!(pdm_stale(&warnings).is_empty(), "{lock_version}: {warnings:?}");
+            assert!(
+                pdm_stale(&warnings).is_empty(),
+                "{lock_version}: {warnings:?}"
+            );
         }
     }
 
