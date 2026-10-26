@@ -791,6 +791,7 @@ pub async fn read_candidate_files(
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
+        read_gemspecs(view, unreadable, &mut out).await;
     }
     // A Gradle build: every script, catalog and lock file its script graph
     // reaches, for the hosted Gradle planner.
@@ -1172,6 +1173,64 @@ async fn keep_bundler_loaded_gem_files(
         code: "redirect_gem_twin_manifest_ambiguous".into(),
         detail,
     }));
+}
+
+/// The gemspecs the Gemfile's `gemspec` directives load: bundler 2.7+
+/// folds their development dependencies into the requirement the lock
+/// pins (#985). Advisory: never rewritten, carried in the
+/// [`GEMSPECS_KEY`](crate::formats::gem::gemspec::GEMSPECS_KEY) entry. A
+/// directive the rewriter cannot read is left for it to report.
+async fn read_gemspecs(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    use crate::formats::gem::gemspec::{gemspec_directives, is_gemspec_file, GEMSPECS_KEY};
+    let Some(gemfile) = ["gems.rb", "Gemfile"]
+        .iter()
+        .find_map(|rel| out.files.get(*rel))
+    else {
+        return;
+    };
+    let dirs: BTreeSet<String> = gemspec_directives(gemfile)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.dir)
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+    let mut listing = serde_json::Map::new();
+    for dir in dirs {
+        let entries = match view.list_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                listing.insert(dir, serde_json::Value::String(e.to_string()));
+                continue;
+            }
+        };
+        let mut specs = serde_json::Map::new();
+        for entry in entries
+            .into_iter()
+            .filter(|e| !e.is_dir && is_gemspec_file(&e.name))
+        {
+            let rel = if dir.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{dir}/{}", entry.name)
+            };
+            let text = read_advisory(view, unreadable, &rel).await;
+            specs.insert(
+                entry.name,
+                text.map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+        listing.insert(dir, serde_json::Value::Object(specs));
+    }
+    out.files.insert(
+        GEMSPECS_KEY.to_string(),
+        serde_json::Value::Object(listing).to_string(),
+    );
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
