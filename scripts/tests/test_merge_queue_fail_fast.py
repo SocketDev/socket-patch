@@ -115,7 +115,9 @@ class CiWorkflowContract(unittest.TestCase):
     def test_no_job_tolerates_failure(self):
         # A job-level continue-on-error would let ci-ok pass despite a failed
         # job, and this script would then cancel a run that could still land.
-        self.assertIsNone(re.search(r"^\s*continue-on-error:", self.text, re.M))
+        # Step-level ones (8+ spaces, e.g. the capped `Cache cargo` restores)
+        # leave the job's conclusion to its other steps, so they are fine.
+        self.assertIsNone(re.search(r"^    continue-on-error:", self.text, re.M))
 
     def test_gate_runs_on_a_cancelled_run(self):
         gate = self.text[self.text.index("\n  ci-ok:"):]
