@@ -1125,16 +1125,25 @@ fn pipenv_uses_virtual_env(var: &impl Fn(&str) -> Option<String>) -> bool {
     var("PIPENV_ACTIVE").is_none() && !ignore
 }
 
+/// The in-project choice `PIPENV_VENV_IN_PROJECT` (or
+/// `PIPENV_NO_VENV_IN_PROJECT`) makes, which every Pipenv reads. A
+/// non-boolean, non-empty variable counts as "yes".
+fn pipenv_env_venv_in_project(var: &impl Fn(&str) -> Option<String>) -> Option<bool> {
+    match pipenv_env_setting(var, "VENV_IN_PROJECT") {
+        Some(Ok(flag)) => Some(flag),
+        Some(Err(text)) if !text.is_empty() => Some(true),
+        _ => None,
+    }
+}
+
 /// An explicit in-project choice for the Pipenv project at `cwd`, if any:
 /// `PIPENV_VENV_IN_PROJECT` (or `PIPENV_NO_VENV_IN_PROJECT`) first, then
 /// Pipenv 2026.2+'s Pipfile `[pipenv] venv_in_project`. A non-boolean,
 /// non-empty variable counts as "yes", as `setting or <auto-detect>` did
 /// through Pipenv 2026.1.
 fn pipenv_venv_in_project(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> Option<bool> {
-    match pipenv_env_setting(var, "VENV_IN_PROJECT") {
-        Some(Ok(flag)) => return Some(flag),
-        Some(Err(text)) if !text.is_empty() => return Some(true),
-        _ => {}
+    if let Some(flag) = pipenv_env_venv_in_project(var) {
+        return Some(flag);
     }
     // Non-blocking, regular-files-only read: a FIFO `Pipfile` (a lock alone
     // marks the project) must not wedge discovery.
@@ -1156,7 +1165,10 @@ fn pipenv_venv_in_project(cwd: &Path, var: &impl Fn(&str) -> Option<String>) -> 
 /// - No `./.venv` directory: Pipenv's own placement (a `.venv` file pointer
 ///   or `$WORKON_HOME/<name>-<hash>`, see
 ///   [`find_pipenv_virtualenv_site_packages`]). An explicit "in project"
-///   with no `./.venv` means Pipenv has no venv yet, so nothing.
+///   from the environment with no `./.venv` means Pipenv has no venv yet,
+///   so nothing. From the Pipfile key alone it means that only on Pipenv
+///   2026.2+; older ones ignore the key, so Pipenv's own placement is
+///   still returned (#842).
 /// - A `./.venv` directory and an explicit "in project": `./.venv` only.
 /// - A `./.venv` directory and an explicit "not in project": Pipenv
 ///   2023.11.14+ ignores `./.venv` and uses WORKON_HOME, but 2018.11
@@ -1624,7 +1636,13 @@ async fn pipenv_settings_site_packages(
     let in_project = pipenv_venv_in_project(cwd, var);
     let dot_venv = cwd.join(".venv");
     if !dot_venv.is_dir() {
-        if in_project == Some(true) && !dot_venv.exists() {
+        // Only the environment variable is read by every Pipenv: the
+        // Pipfile key alone leaves 2018.11 through 2026.1 on WORKON_HOME
+        // (#842).
+        if in_project == Some(true)
+            && !dot_venv.exists()
+            && pipenv_env_venv_in_project(var) == Some(true)
+        {
             return Vec::new();
         }
         return find_pipenv_virtualenv_site_packages_with(cwd, var).await;
@@ -5559,6 +5577,42 @@ mod tests {
                 find_local_venv_site_packages_with(&project, &var).await,
                 vec![dot],
                 "{}={:?} beats the Pipfile and uses ./.venv only",
+                env.0,
+                env.1
+            );
+        }
+    }
+
+    /// #842: only Pipenv 2026.2+ reads the Pipfile's `[pipenv]
+    /// venv_in_project = true`. With no `./.venv`, 2018.11 through 2026.1
+    /// keep the venv in WORKON_HOME, so that venv is still found. The
+    /// environment variable is read by every Pipenv: with it, no `./.venv`
+    /// still means Pipenv has no venv yet.
+    #[tokio::test]
+    async fn pipenv_pipfile_in_project_without_dot_venv_finds_workon_venv() {
+        let (_tmp, project, site, var) = pipenv_project_with_workon_venv(&[]);
+        std::fs::write(
+            project.join("Pipfile"),
+            "[packages]\nsix = \"==1.16.0\"\n\n[pipenv]\nvenv_in_project = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            find_local_venv_site_packages_with(&project, &var).await,
+            vec![site],
+            "Pipenv <= 2026.1 ignores the Pipfile key and uses WORKON_HOME"
+        );
+
+        for env in [
+            ("PIPENV_VENV_IN_PROJECT", "1"),
+            ("PIPENV_NO_VENV_IN_PROJECT", "0"),
+        ] {
+            let (_tmp, project, _site, var) =
+                pipenv_project_with_workon_venv(&[(env.0, env.1.to_string())]);
+            assert!(
+                find_local_venv_site_packages_with(&project, &var)
+                    .await
+                    .is_empty(),
+                "{}={:?}: every Pipenv reads it, so no ./.venv means no venv",
                 env.0,
                 env.1
             );
