@@ -1034,10 +1034,11 @@ worse, lets a warm cache silently serve unpatched bytes):
   left. It works without a manifest: with no manifest and no ledger it is a clean exit-0 no-op.
 * Re-running `vendor` is idempotent (byte-stable lockfiles, deterministic artifacts →
   `already_vendored` skips). Manifest-tracked entries whose patches were dropped from the manifest
-  are auto-reverted at the start of the next `vendor` run (`vendor_reconciled` events); `detached`
-  entries have no manifest record and are exempt. Standalone `vendor` (no flags) is fed
-  by `.socket/manifest.json` — or, with no manifest, by the lockfiles' hosted pins (the eject
-  above); with neither it is a clean exit-0 no-op whose human line names
+  are auto-reverted at the start of the next manifest-driven `vendor` run (`vendor_reconciled`
+  events); `detached` entries have no manifest record and are exempt. Standalone `vendor` (no
+  flags) is fed by the lockfiles' hosted pins whenever one is in scope (the eject above, which
+  ignores `.socket/manifest.json` and runs no reconcile) — otherwise by `.socket/manifest.json`;
+  with neither it is a clean exit-0 no-op whose human line names
   the missing manifest — `No manifest found, nothing to vendor.`, or, when the vendor ledger holds
   entries, `No manifest to vendor from; N vendored entr(y is|ies are) tracked in the ledger —
   `socket-patch repair` verifies (it|them).` — and it never re-vendors from the ledger. This no-op
