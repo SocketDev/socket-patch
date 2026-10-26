@@ -118,10 +118,12 @@ jobs:
         # version). rust-cache also hashes the toolchain, Cargo manifests
         # and Rust environment. Check/coverage/release keep separate caches.
         # A cache restore is an optimisation, so cap it and carry on cold.
-        # Healthy restores take under 30 s. On 2026-10-26 one hung for 14+
-        # min and held merge-queue head #1719 (and 12 entries behind it)
-        # until it was cancelled; uncapped it would have run to the 40-min
-        # job timeout. Later `Cache cargo` steps carry the same two keys.
+        # Healthy restores take under 30 s on every runner OS. On 2026-10-26
+        # one hung for 14+ min in yarn-classic-matrix and held merge-queue
+        # head #1719 (and 12 entries behind it) until it was cancelled;
+        # uncapped it runs to the job's own timeout. Every cache restore in
+        # this file carries the same two keys (enforced by
+        # scripts/tests/test_merge_queue_fail_fast.py).
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         timeout-minutes: 5
         continue-on-error: true
@@ -442,6 +444,9 @@ jobs:
         id: vexctl-cache
         if: needs.release-readiness.outputs.reuse != 'true' && runner.os == 'macOS'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        # Capped like `Cache cargo`: a miss only means compiling vexctl.
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/vexctl-bin
           key: vexctl-${{ env.VEXCTL_VERSION }}-go${{ steps.go.outputs.go-version }}-${{ runner.os }}-${{ runner.arch }}
@@ -515,6 +520,7 @@ jobs:
           && runner.os == 'macOS'
           && github.ref == 'refs/heads/main'
           && steps.vexctl-cache.outputs.cache-hit != 'true'
+          && steps.vexctl-cache.outcome == 'success'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/vexctl-bin
