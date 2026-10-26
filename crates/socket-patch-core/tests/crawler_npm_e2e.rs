@@ -4609,3 +4609,38 @@ async fn deno_npm_cache_without_packument_is_still_found() {
         vec![deps.join("rxjs")]
     );
 }
+
+/// #444 (Bugbot): one host can hold a registry at its root and another
+/// below a path (`npm/<host>/<pkg>/` beside `npm/<host>/api/npm/<pkg>/`);
+/// `-g` finds both, without taking a package dir as a nested registry.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_mode_finds_registry_nested_under_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deno_dir = tmp.path().join("deno");
+    let host = deno_dir.join("npm").join("registry.example.com");
+    let nested = host.join("api").join("npm");
+    stage_deno_npm_pkg(&host, "is-odd", "3.0.1", "3.0.1").await;
+    stage_deno_npm_pkg(&host, "@types/node", "20.0.0", "20.0.0").await;
+    stage_deno_npm_pkg(&nested, "is-number", "6.0.0", "6.0.0").await;
+
+    struct DenoDirGuard(Option<std::ffi::OsString>);
+    impl Drop for DenoDirGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("DENO_DIR", v),
+                None => std::env::remove_var("DENO_DIR"),
+            }
+        }
+    }
+    let _guard = DenoDirGuard(std::env::var_os("DENO_DIR"));
+    std::env::set_var("DENO_DIR", &deno_dir);
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+    };
+    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
+    assert_eq!(deno_roots, vec![&host, &nested], "{roots:?}");
+}

@@ -1880,8 +1880,8 @@ const DENO_NPM_REGISTRY_MAX_DEPTH: usize = 8;
 /// CodeArtifact and GitLab registries are). `deno install -g` tools load
 /// their npm dependencies from there, in Deno's own layout (see
 /// [`is_deno_npm_cache_root`]), so these are global roots beside the npm,
-/// pnpm, yarn and bun `node_modules`. A registry dir is not descended
-/// into (its children are packages), and `jsr.io` is skipped: it is the
+/// pnpm, yarn and bun `node_modules`. Below a registry dir only the
+/// children that are not its packages are walked, and `jsr.io` is skipped: it is the
 /// Deno crawler's JSR root, not an npm registry. Sorted, for a stable
 /// scan order.
 fn deno_npm_cache_roots() -> Vec<PathBuf> {
@@ -1897,10 +1897,22 @@ fn deno_npm_cache_roots() -> Vec<PathBuf> {
     for _ in 0..DENO_NPM_REGISTRY_MAX_DEPTH {
         let mut next = Vec::new();
         for dir in level {
+            let children = sorted_subdirs_sync(&dir);
             if holds_deno_packages(&dir) {
+                // A registry dir's children are its packages, but the same
+                // host can also serve a registry below a path
+                // (`<host>/<pkg>/` beside `<host>/api/npm/<pkg>/`): keep
+                // walking the children that are neither.
+                next.extend(
+                    children
+                        .into_iter()
+                        .filter(|name| !name.starts_with('@'))
+                        .map(|name| dir.join(name))
+                        .filter(|child| !is_deno_package_dir(child)),
+                );
                 roots.push(dir);
             } else {
-                next.extend(sorted_subdirs_sync(&dir).into_iter().map(|n| dir.join(n)));
+                next.extend(children.into_iter().map(|name| dir.join(name)));
             }
         }
         if next.is_empty() {
