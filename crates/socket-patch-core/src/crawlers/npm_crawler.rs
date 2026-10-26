@@ -1900,20 +1900,26 @@ fn deno_npm_cache_roots() -> Vec<PathBuf> {
         for dir in level {
             let children = sorted_subdirs_sync(&dir);
             if holds_deno_packages(&dir) {
-                // A registry dir's children are its packages, and a Deno
-                // package dir holds only version dirs (named from a
-                // digit). The same host can also serve a registry below a
-                // path (`<host>/api/npm/<pkg>/` beside `<host>/<pkg>/`),
-                // even under a dir that is also a package (`<host>/api/`):
-                // keep walking every non-version subdir of a child.
+                // A registry dir's children are mostly its packages, but the
+                // same host can also serve a registry below a path
+                // (`<host>/npm/<pkg>/` or `<host>/api/npm/<pkg>/` beside
+                // `<host>/<pkg>/`). A child that is not a package is walked
+                // like any other dir; one that is (a package named like
+                // the path's first segment, `<host>/api/`) holds only
+                // version dirs (named from a digit) of its own, so its
+                // other subdirs are walked.
                 for child in children.into_iter().filter(|name| !name.starts_with('@')) {
                     let child = dir.join(child);
-                    next.extend(
-                        sorted_subdirs_sync(&child)
-                            .into_iter()
-                            .filter(|name| !name.starts_with(|c: char| c.is_ascii_digit()))
-                            .map(|name| child.join(name)),
-                    );
+                    if is_deno_package_dir(&child) {
+                        next.extend(
+                            sorted_subdirs_sync(&child)
+                                .into_iter()
+                                .filter(|name| !name.starts_with(|c: char| c.is_ascii_digit()))
+                                .map(|name| child.join(name)),
+                        );
+                    } else {
+                        next.push(child);
+                    }
                 }
                 roots.push(dir);
             } else {
