@@ -1510,11 +1510,11 @@ jobs:
           scripts/pip-install-retry.sh --upgrade pip "uv==$UV_TEST_VERSION"
           uv --version
 
-      - name: Install uv (Poetry / PDM / Hatch legs)
-        if: matrix.poetry != '' || matrix.pdm != '' || matrix.hatch != ''
-        # The Poetry step below and the PDM / Hatch suites bootstrap the
-        # pinned tool into their own venv with uv; this uv is tooling, not
-        # the release under test.
+      - name: Install uv (PDM / Hatch legs)
+        if: (matrix.pdm != '' || matrix.hatch != '') && matrix.poetry == ''
+        # The suites bootstrap the pinned PDM / Hatch into their own venv
+        # with uv; this uv is tooling, not the release under test. A leg that
+        # also runs Poetry gets the same uv from 'Install pinned Poetry'.
         shell: bash
         run: scripts/pip-install-retry.sh uv==0.11.19
 
@@ -1528,6 +1528,7 @@ jobs:
         env:
           POETRY_TEST_VERSION: ${{ matrix.poetry }}
         run: |
+          scripts/pip-install-retry.sh uv==0.11.19
           case "$POETRY_TEST_VERSION" in 1.0.*|1.1.*) py=3.8.20 ;; *) py=3.12 ;; esac
           uv venv "$RUNNER_TEMP/poetry" --python "$py"
           extra=""; [ "$POETRY_TEST_VERSION" = "1.2.2" ] && extra="cleo==1.0.0a5"
@@ -1859,9 +1860,14 @@ jobs:
               continue
             fi
             for filter in "${filters[@]}"; do
-              # An empty segment (`a;;b`) would run the binary with no
-              # arguments: the non-ignored tests instead of the row's.
-              [ -n "${filter// /}" ] || continue
+              # A blank `;` segment would run the binary with no arguments
+              # (every non-ignored test), which the empty-run check below
+              # can't tell from a real selection.
+              if [ -z "${filter// /}" ]; then
+                echo "::error::$suite has an empty test_filter segment ($E2E_TEST_FILTER). Drop the stray ';'."
+                status=1
+                continue
+              fi
               n=$((n + 1))
               log="../../target/e2e-$suite-$n.log"
               echo "::group::$suite $filter"

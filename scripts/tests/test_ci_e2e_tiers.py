@@ -36,8 +36,8 @@ def rows(job):
 
 def runs(row):
     """The (suite, os, filter) runs the e2e run step makes of a row."""
-    # Blank segments are skipped, as the run step skips them; a row with
-    # no filter at all runs the job default.
+    # A blank segment runs nothing (the run step fails the leg on one); a
+    # row with no filter at all runs the job default.
     filters = [" ".join(f.split()) for f in row.get("test_filter", "").split(";") if f.strip()] or [""]
     return {(suite, row["os"], f) for suite in row["suite"].split() for f in filters}
 
