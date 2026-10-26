@@ -1063,23 +1063,15 @@ async fn restore_berry(
 }
 
 /// The hosted patch uuids a yarn `patch:` descriptor in `text` (a berry
-/// lock or a root `package.json`) wraps. `yarn patch-commit` escapes the
-/// inner descriptor (`patch:<name>@http%3A//host/…#<patch path>`); a lock
-/// pinned before 5.0 has the wrapped `npm:…::__archiveUrl=` binding instead.
+/// lock or a root `package.json`) wraps: a tarball-URL pin, or the
+/// `npm:…::__archiveUrl=` binding of a lock pinned before 5.0.
 fn yarn_patch_wrapped_uuids(text: &str, ctx: &Ctx<'_>) -> Vec<String> {
-    use crate::formats::yarn::patterns::split_pattern;
-    use crate::utils::purl::percent_decode_purl_component;
+    use crate::formats::yarn::patterns::{patch_wrapped_descriptors, split_pattern};
 
-    text.match_indices("patch:")
-        .filter_map(|(at, tag)| {
-            let rest = &text[at + tag.len()..];
-            let end = rest
-                .find(|c: char| {
-                    matches!(c, '#' | '"' | '\'' | ',' | '\n' | '\r') || c.is_whitespace()
-                })
-                .unwrap_or(rest.len());
-            let inner = percent_decode_purl_component(&rest[..end]).into_owned();
-            let (_, reference) = split_pattern(&inner)?;
+    patch_wrapped_descriptors(text)
+        .iter()
+        .filter_map(|inner| {
+            let (_, reference) = split_pattern(inner)?;
             let url = match reference.split_once("::__archiveUrl=") {
                 Some((_, binding)) => binding.split('&').next().unwrap_or(binding),
                 None => reference,

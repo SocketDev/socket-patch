@@ -841,6 +841,28 @@ pub async fn revert_yarn_berry_opts(
             }
         }
     }
+    // A user `yarn patch` over the vendored tarball (#962): restoring the
+    // recorded entry under its `patch:` wrapper leaves a lock every
+    // `yarn install --immutable` rejects, so refuse before either file is
+    // written (and before the dry-run return, so a preview agrees).
+    if let Some(wired) = user_patch_wrapping(project_root, &entry.uuid).await {
+        let detail = format!(
+            "refusing to revert {uuid_dir_rel}: a `patch:` entry from `yarn patch` in {wired} \
+             still wraps the vendored tarball, and restoring the registry entry under it would \
+             leave a lock `yarn install --immutable` rejects — remove the `patch:` resolution \
+             from {PACKAGE_JSON}, run `yarn install`, re-run `vendor --revert`, then re-run \
+             `yarn patch` on the registry version"
+        );
+        return RevertOutcome {
+            success: false,
+            warnings: vec![VendorWarning::new(
+                "vendor_lock_still_wired_revert_blocked",
+                detail.clone(),
+            )],
+            error: Some(detail),
+            kept_artifact: false,
+        };
+    }
     if dry_run {
         return RevertOutcome::ok();
     }
@@ -1101,6 +1123,26 @@ pub async fn revert_yarn_berry_opts(
 }
 
 // ───────────────────────────── revert internals ─────────────────────────────
+
+/// The first wired file (yarn.lock, then package.json) in which a user
+/// `patch:` descriptor wraps the vendored artifact of `uuid` (#962). An
+/// unreadable or missing file wraps nothing here: the wired revert's own
+/// reads report it.
+async fn user_patch_wrapping(project_root: &Path, uuid: &str) -> Option<&'static str> {
+    let needle = uuid.to_ascii_lowercase();
+    for wired in [YARN_LOCK, PACKAGE_JSON] {
+        let Ok(text) = read_regular_to_string(&project_root.join(wired)).await else {
+            continue;
+        };
+        if crate::formats::yarn::patterns::patch_wrapped_descriptors(&text)
+            .iter()
+            .any(|inner| inner.to_ascii_lowercase().contains(&needle))
+        {
+            return Some(wired);
+        }
+    }
+    None
+}
 
 /// Put back an entry vendoring pruned (see [`KIND_LOCK_ENTRY_PRUNED`]):
 /// the rewritten shared entry returns to its original lines, a removed one
@@ -3942,6 +3984,70 @@ __metadata:
             fx.tgz_path().exists(),
             "the artifact must survive the refusal"
         );
+    }
+
+    /// #962: the user ran `yarn patch` / `yarn patch-commit -s` over the
+    /// vendored package, so a `patch:` lock entry and `resolutions` value
+    /// wrap the vendored tarball. Restoring the recorded entry would leave
+    /// that wrapper naming a descriptor no entry resolves: every
+    /// `yarn install --immutable` rejects the lock (YN0028). The revert must
+    /// refuse BEFORE writing either file, on a dry run too.
+    #[tokio::test]
+    async fn revert_refuses_before_writing_when_a_user_yarn_patch_wraps_the_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let resolution = text
+            .lines()
+            .find_map(|l| l.strip_prefix("  resolution: \"left-pad@"))
+            .and_then(|r| r.strip_suffix('"'))
+            .expect("the vendored lock must carry our resolution line")
+            .to_string();
+        let wrapped = format!(
+            "patch:left-pad@{}#~/.yarn/patches/left-pad-file-0d6d28.patch",
+            resolution.replace(':', "%3A")
+        );
+        let lock = format!(
+            "{text}\n\"left-pad@{wrapped}\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@{wrapped}::version=1.3.0&hash=0d6d28\"\n  \
+             languageName: node\n  linkType: hard\n"
+        );
+        tokio::fs::write(fx.lock_path(), &lock).await.unwrap();
+        let pkg_text = tokio::fs::read_to_string(fx.pkg_path()).await.unwrap();
+        let mut pkg: Value = serde_json::from_str(&pkg_text).unwrap();
+        pkg["resolutions"][format!("left-pad@{resolution}")] = Value::String(wrapped);
+        let pkg_text = serde_json::to_string_pretty(&pkg).unwrap() + "\n";
+        tokio::fs::write(fx.pkg_path(), &pkg_text).await.unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert_yarn_berry(&entry, fx.root(), dry_run).await;
+            assert!(
+                !outcome.success,
+                "dry_run={dry_run}: must refuse under a user `yarn patch`: {:?}",
+                outcome.warnings
+            );
+            assert!(
+                outcome.warnings.iter().any(|w| {
+                    w.code == "vendor_lock_still_wired_revert_blocked"
+                        && w.detail.contains("yarn patch")
+                }),
+                "dry_run={dry_run}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+                lock,
+                "dry_run={dry_run}: yarn.lock untouched"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
+                pkg_text,
+                "dry_run={dry_run}: package.json untouched"
+            );
+            assert!(fx.tgz_path().exists(), "the artifact must survive");
+        }
     }
 
     /// The user re-keys our resolutions entry (`"left-pad"` →

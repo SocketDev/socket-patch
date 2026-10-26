@@ -114,6 +114,31 @@ pub(crate) fn classic_key_real_name(patterns: &[String]) -> Option<&str> {
     names.all(|n| n == Some(first)).then_some(first)
 }
 
+/// The descriptors every berry `patch:` protocol wraps in `text` (a lock or
+/// a `package.json`), percent-decoded once: `patch:left-pad@http%3A//h/x.tgz
+/// #~/.yarn/patches/x.patch` wraps `left-pad@http://h/x.tgz`. The patch
+/// path after `#` and any `::version=…` binding are dropped.
+pub(crate) fn patch_wrapped_descriptors(text: &str) -> Vec<String> {
+    text.match_indices("patch:")
+        // The protocol opens a range (`name@patch:`) or a quoted value,
+        // never the middle of a word: `x.patch::version=…` is no wrapper.
+        .filter(|&(at, _)| {
+            text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| matches!(c, '@' | '"' | '\'') || c.is_whitespace())
+        })
+        .map(|(at, tag)| {
+            let rest = &text[at + tag.len()..];
+            let end = rest
+                .find(|c: char| matches!(c, '#' | '"' | '\'' | ',') || c.is_whitespace())
+                .unwrap_or(rest.len());
+            crate::utils::purl::percent_decode_purl_component(&rest[..end]).into_owned()
+        })
+        .filter(|inner| !inner.is_empty())
+        .collect()
+}
+
 /// A classic `resolved` value split at its first `#`: the url before it,
 /// and the fragment as a lowercase sha1 when it is 40 hex digits (either
 /// case) — the legacy tarball verifier yarn v1 enforces when no
@@ -194,6 +219,22 @@ pub(crate) fn berry_npm_alias_target(range: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #962: the descriptor a `patch:` wraps, as `yarn patch-commit`
+    /// spells it in a lock key, a `resolution:` and a `package.json` value.
+    #[test]
+    fn patch_wrapped_descriptors_decode_what_yarn_patch_wraps() {
+        let lock = "\"left-pad@patch:left-pad@http%3A//h%3A1/x.tgz#~/.yarn/patches/a.patch\":\n  \
+                    resolution: \"left-pad@patch:left-pad@npm%3A1.3.0#~/.yarn/patches/a.patch\
+                    ::version=1.3.0&hash=0d6d28\"\n";
+        assert_eq!(
+            patch_wrapped_descriptors(lock),
+            vec!["left-pad@http://h:1/x.tgz", "left-pad@npm:1.3.0"]
+        );
+        let pkg = r#"{ "resolutions": { "a@npm:1": "patch:a@file%3A./v/a.tgz#./p.patch" } }"#;
+        assert_eq!(patch_wrapped_descriptors(pkg), vec!["a@file:./v/a.tgz"]);
+        assert!(patch_wrapped_descriptors("\"left-pad@npm:1.3.0\":\n").is_empty());
+    }
 
     /// #1271: the classic grammar keeps an empty range (`left-pad@` from
     /// `"left-pad": ""`); the strict berry grammar still rejects it.
