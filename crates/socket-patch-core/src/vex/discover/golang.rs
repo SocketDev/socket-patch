@@ -8,7 +8,7 @@
 //!
 //! | owner | what our tools write | ref |
 //! |---|---|---|
-//! | [`ReplaceOwner::Hosted`] (`scan --mode hosted`, `rewrite_golang`) | `replace M v => patch.socket.dev/gopatch/<uuid> <sver>` + go.sum `patch.socket.dev/gopatch/<uuid> <sver> h1:…` and `…<sver>/go.mod h1:…` | hosted, `integrity_required = true` |
+//! | [`ReplaceOwner::Hosted`] (`scan --mode hosted`, `rewrite_golang`) | `replace M v => patch.socket.dev/gopatch/<uuid> <sver>` + go.sum `patch.socket.dev/gopatch/<uuid> <sver> h1:…` and `…<sver>/go.mod h1:…` (`go mod tidy` may prune the first) | hosted, `integrity_required` iff the zip line is present |
 //! | [`ReplaceOwner::Vendor`] (`vendor`, `vendor_go_module`) | `replace M v => ./.socket/vendor/golang/<uuid>/M@v` | vendored |
 //! | [`ReplaceOwner::GoPatches`] (`apply`'s redirect) | `replace M v => ./.socket/go-patches/M@v` | none — no uuid; the CLI's `synthesize_go_patches` verifies those |
 //!
@@ -32,13 +32,20 @@
 //!   `--patch-server-url` deployment does not change Go module paths, so
 //!   the origin allowlist does not apply here.
 //! * **Pin.** The hosted rewriter refuses to write the replace without BOTH
-//!   go.sum lines, so `integrity_required = true`; the ref's
-//!   `locked_integrity` is the zip line's `h1:` dirhash
-//!   ([`LockIntegrity::GoH1`]) and is set only when the sum file carries
-//!   exactly one well-formed zip hash AND the `/go.mod` line for the Socket
-//!   module+version (anything else is not what the rewriter wrote — and a
-//!   conflicting pair is a go `SECURITY ERROR`). NB for the CLI's
-//!   installed-tree basis: under a hosted replace the module cache's
+//!   go.sum lines, but `go mod tidy` then drops the zip line whenever no
+//!   package of the replaced module is loaded (a transitive module only MVS
+//!   reads keeps just its `/go.mod` line), and the build stays green. So
+//!   the pin is the `/go.mod` line for the Socket module+version: exactly
+//!   one well-formed hash for it, plus at most one well-formed zip hash.
+//!   With the zip line, `integrity_required = true` and `locked_integrity`
+//!   is its `h1:` dirhash ([`LockIntegrity::GoH1`]). Without it (the tidy
+//!   state) `integrity_required = false`: the module path carries the patch
+//!   uuid and go compiles none of its packages, so the pinned replace alone
+//!   is the attestation basis. Anything else — no `/go.mod` line, two
+//!   different hashes for one line (a go `SECURITY ERROR`), a malformed
+//!   line for the Socket module+version (go rejects the whole go.sum) — is
+//!   not a pin: `integrity_required = true`, no `locked_integrity`.
+//!   NB for the CLI's installed-tree basis: under a hosted replace the module cache's
 //!   `M@v` (if any, e.g. from before the redirect) is pristine BY
 //!   CONSTRUCTION — the build consumes `patch.socket.dev/gopatch/<uuid>@<sver>`.
 //! * **Vendored identity** comes from [`vendor_ref`] over the replace PATH
@@ -200,10 +207,12 @@ async fn extract_file(
                     }
                     sums = Some(pins);
                 }
-                let integrity = sums
-                    .as_ref()
-                    .and_then(|s| s.pin(rhs, rhs_version))
-                    .map(LockIntegrity::GoH1);
+                let (integrity, integrity_required) =
+                    match sums.as_ref().map(|s| s.pin(rhs, rhs_version)) {
+                        Some(SumPin::Zip(h1)) => (Some(LockIntegrity::GoH1(h1)), true),
+                        Some(SumPin::GoModOnly) => (None, false),
+                        Some(SumPin::Unpinned) | None => (None, true),
+                    };
                 let url = format!("{rhs}@{rhs_version}");
                 out.push(PatchedRef::hosted(
                     purl,
@@ -211,7 +220,7 @@ async fn extract_file(
                     file,
                     Some(url.as_str()),
                     integrity,
-                    true,
+                    integrity_required,
                 ));
             }
             Some(ReplaceOwner::Vendor) => {
@@ -349,22 +358,47 @@ fn replaced_purl(
 struct SumPins {
     /// Zip-line `h1:` hashes.
     zip: HashMap<(String, String), BTreeSet<String>>,
-    /// `(module, version)`s with a `/go.mod` line.
-    gomod: HashSet<(String, String)>,
+    /// `/go.mod`-line `h1:` hashes.
+    gomod: HashMap<(String, String), BTreeSet<String>>,
+    /// Keys with a line go cannot parse (wrong token count, malformed hash).
+    malformed: HashSet<(String, String)>,
+}
+
+/// What the sum files pin for one Socket `module@version`.
+#[derive(Debug, PartialEq, Eq)]
+enum SumPin {
+    /// Both lines: the zip line's `h1:`.
+    Zip(String),
+    /// Only the `/go.mod` line (`go mod tidy` pruned the zip line).
+    GoModOnly,
+    Unpinned,
 }
 
 impl SumPins {
     fn add(&mut self, text: &str) {
+        // `go_sum_lines` skips a line too short to carry a hash.
+        for line in text.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if let [module, version] = tokens[..] {
+                if module.starts_with(HOSTED_GO_MODULE_PREFIX) {
+                    let version = version.strip_suffix("/go.mod").unwrap_or(version);
+                    self.malformed
+                        .insert((module.to_string(), version.to_string()));
+                }
+            }
+        }
         for line in go_sum_lines(text) {
-            if line.extra_tokens
-                || !line.module.starts_with(HOSTED_GO_MODULE_PREFIX)
-                || !is_h1_dirhash(line.hash)
-            {
+            if !line.module.starts_with(HOSTED_GO_MODULE_PREFIX) {
                 continue;
             }
             let key = (line.module.to_string(), line.version.to_string());
-            if line.go_mod {
-                self.gomod.insert(key);
+            if line.extra_tokens || !is_h1_dirhash(line.hash) {
+                self.malformed.insert(key);
+            } else if line.go_mod {
+                self.gomod
+                    .entry(key)
+                    .or_default()
+                    .insert(line.hash.to_string());
             } else {
                 self.zip
                     .entry(key)
@@ -374,14 +408,21 @@ impl SumPins {
         }
     }
 
-    /// The zip `h1:` of `module@version` iff the rewriter's full pin is
-    /// present: one unambiguous zip hash plus the `/go.mod` line.
-    fn pin(&self, module: &str, version: &str) -> Option<String> {
+    /// The pin of `module@version`: one unambiguous `/go.mod` hash, and at
+    /// most one zip hash.
+    fn pin(&self, module: &str, version: &str) -> SumPin {
         let key = (module.to_string(), version.to_string());
-        let hashes = self.zip.get(&key)?;
-        (hashes.len() == 1 && self.gomod.contains(&key))
-            .then(|| hashes.iter().next().cloned())
-            .flatten()
+        let one = |hashes: Option<&BTreeSet<String>>| match hashes {
+            Some(h) if h.len() == 1 => h.iter().next().cloned(),
+            _ => None,
+        };
+        if self.malformed.contains(&key) || one(self.gomod.get(&key)).is_none() {
+            return SumPin::Unpinned;
+        }
+        match self.zip.get(&key) {
+            None => SumPin::GoModOnly,
+            some => one(some).map_or(SumPin::Unpinned, SumPin::Zip),
+        }
     }
 }
 
@@ -518,30 +559,73 @@ mod tests {
             let out = run(&p).await;
             assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
             assert_eq!(out.refs[0].locked_integrity, None, "{go_sum:?}");
+            assert!(!out.refs[0].lockfile_basis_ok(), "{go_sum:?}");
+        }
+    }
+
+    /// `go mod tidy` keeps only the `/go.mod` line of a replaced module whose
+    /// packages nothing imports, and the build stays green: that line alone
+    /// is the pin, with nothing to lock the (never fetched) zip to.
+    #[tokio::test]
+    async fn tidy_pruned_zip_line_leaves_a_go_mod_line_pin() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n");
+        for (file, sum_file) in [("go.mod", "go.sum"), ("go.work", "go.work.sum")] {
+            let p = Project::new();
+            if file == "go.mod" {
+                p.write("go.mod", &go_mod);
+            } else {
+                p.write("go.mod", BASE_GO_MOD).write(
+                    "go.work",
+                    format!("go 1.21\n\nuse .\n\nreplace {MODULE} {VERSION} => {m} {sver}\n"),
+                );
+            }
+            p.write(sum_file, format!("{m} {sver}/go.mod {MOD_H1}\n"));
+            let out = run(&p).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            let r = &out.refs[0];
+            assert_eq!(r.locked_integrity, None, "{file}");
+            assert!(!r.integrity_required, "{file}");
+            assert!(r.lockfile_basis_ok(), "{file}");
+            assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         }
     }
 
     #[tokio::test]
-    async fn hosted_pin_requires_both_go_sum_lines_and_one_hash() {
+    async fn hosted_pin_requires_the_go_mod_line_and_one_hash_per_line() {
         let m = gopatch(UUID_A);
         let go_mod =
             format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} v1.4.2-socketpatch.1\n");
         for go_sum in [
             // No go.sum at all.
             None,
-            // Zip line only / go.mod line only.
+            // Zip line only.
             Some(format!("{m} v1.4.2-socketpatch.1 {ZIP_H1}\n")),
-            Some(format!("{m} v1.4.2-socketpatch.1/go.mod {MOD_H1}\n")),
             // Conflicting zip hashes (a union-merged go.sum).
             Some(format!(
                 "{}{m} v1.4.2-socketpatch.1 {MOD_H1}\n",
                 go_sum_for(UUID_A, "v1.4.2-socketpatch.1")
             )),
-            // Pinned at another socket version.
+            // Conflicting `/go.mod` hashes, with and without the zip line.
+            Some(format!(
+                "{}{m} v1.4.2-socketpatch.1/go.mod {ZIP_H1}\n",
+                go_sum_for(UUID_A, "v1.4.2-socketpatch.1")
+            )),
+            Some(format!(
+                "{m} v1.4.2-socketpatch.1/go.mod {MOD_H1}\n{m} v1.4.2-socketpatch.1/go.mod {ZIP_H1}\n"
+            )),
+            // Pinned at another socket version (both lines, or the tidy
+            // `/go.mod` line).
             Some(go_sum_for(UUID_A, "v1.4.2-socketpatch.9")),
-            // Malformed hash.
+            Some(format!("{m} v1.4.2-socketpatch.9/go.mod {MOD_H1}\n")),
+            // Malformed hash, on either line.
             Some(format!(
                 "{m} v1.4.2-socketpatch.1 h1:short\n{m} v1.4.2-socketpatch.1/go.mod {MOD_H1}\n"
+            )),
+            Some(format!(
+                "{}{m} v1.4.2-socketpatch.1/go.mod h1:short\n",
+                go_sum_for(UUID_A, "v1.4.2-socketpatch.1")
             )),
         ] {
             let p = Project::new();
