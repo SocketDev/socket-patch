@@ -410,6 +410,7 @@ pub async fn vendor_go_module<'a>(
     let marker = VendorMarker::new("golang", &base_purl, record, vendored_at);
     write_marker_or_warn(&project_root.join(&base_rel), &marker, &mut warnings).await;
 
+    let host = super::go_workspace::replace_host(project_root, module).await;
     let entry = VendorEntry {
         took_over_go_patches: takeover,
         ..VendorEntry::new(
@@ -425,7 +426,7 @@ pub async fn vendor_go_module<'a>(
                 file_inventory,
             },
             vec![WiringRecord {
-                file: "go.mod".to_string(),
+                file: host.file_name().to_string(),
                 kind: "go_replace".to_string(),
                 // Rewritten whenever ANY socket-owned directive pre-existed (a
                 // go-patches or hosted takeover, or a re-vendor refreshing an
@@ -1428,6 +1429,45 @@ mod tests {
         // The uuid dir is gone, and the empty eco level pruned with it.
         assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
         assert!(!root.join(".socket/vendor/golang").exists());
+    }
+
+    /// A go.work root with no module of its own: the module both members
+    /// require is vendored once, its replace in go.work (relative to the
+    /// root, where the copy lives), recorded as go.work wiring; a re-run is
+    /// in sync; revert restores go.work byte for byte.
+    #[tokio::test]
+    async fn test_go_work_root_vendors_into_go_work() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::remove_file(root.join("go.mod")).await.unwrap();
+        let work = "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n";
+        std::fs::write(root.join("go.work"), work).unwrap();
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(root.join(m)).unwrap();
+            std::fs::write(
+                root.join(m).join("go.mod"),
+                format!("module example.com/{m}\n\ngo 1.21\n\nrequire {MODULE} v1.4.2\n"),
+            )
+            .unwrap();
+        }
+        let (result, entry, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(entry.wiring[0].file, "go.work");
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.work")).unwrap(),
+            format!("{work}\nreplace {MODULE} v1.4.2 => ./{}\n", copy_rel())
+        );
+        assert!(!root.join("go.mod").exists());
+        let (_, again, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(again.is_none(), "an in-sync re-run records nothing");
+
+        let out = revert_go_vendor(&entry, root, false).await;
+        assert!(out.success, "{:?}", out.error);
+        assert_eq!(std::fs::read_to_string(root.join("go.work")).unwrap(), work);
+        assert!(!root.join(".socket/vendor").exists());
     }
 
     #[tokio::test]

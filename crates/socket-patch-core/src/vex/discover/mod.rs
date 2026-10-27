@@ -4362,7 +4362,7 @@ mod tests {
                 "cargo",
                 &[".cargo/config", ".cargo/config.toml", "Cargo.toml"],
             ),
-            ("golang", &["go.mod"]),
+            ("golang", &["go.mod", "go.work"]),
             ("gem", &["Gemfile.lock"]),
             ("composer", &["composer.lock"]),
             (

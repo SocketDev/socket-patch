@@ -488,8 +488,7 @@ async fn read_advisory(
 /// rewriter under [`crate::patch::redirect::GO_WORKSPACE_KEY`]. On disk it is
 /// the one go resolves (`GOWORK`, else a go.work at or above the root, with
 /// members anywhere); in memory a root `go.work` and its in-root members.
-/// Beside a go.work root without a go.mod, each in-root member's go.mod and
-/// go.sum are read as rewrite targets.
+/// A root go.work and go.work.sum are candidate files the rewriter writes.
 async fn read_go_workspace(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
@@ -563,12 +562,6 @@ async fn read_go_workspace(
         return;
     }
     let hosted = crate::patch::redirect::HostedGoWorkspace { root, loaded };
-    if !out.files.contains_key("go.mod") {
-        for dir in hosted.member_dirs() {
-            out.read(view, unreadable, &format!("{dir}/go.mod")).await;
-            out.read(view, unreadable, &format!("{dir}/go.sum")).await;
-        }
-    }
     if let Ok(json) = serde_json::to_string(&hosted) {
         out.files
             .insert(crate::patch::redirect::GO_WORKSPACE_KEY.to_string(), json);
@@ -728,9 +721,8 @@ pub async fn read_candidate_files(
         }
     }
 
-    // Go: the workspace in effect decides which version a replace must pin
-    // and whether it takes effect at all, and a go.work root with no module
-    // of its own has its in-root members' go.mod files rewritten.
+    // Go: the workspace in effect decides which version a replace must pin,
+    // whether it takes effect at all, and whether it belongs in go.work.
     if candidates.iter().any(|c| c.dep.ecosystem == "golang") {
         read_go_workspace(view, unreadable, &mut out).await;
     }

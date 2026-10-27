@@ -23,6 +23,14 @@
 //!   version-less one) applies to the whole workspace, and two members
 //!   replacing one `module@version` with different targets make go link
 //!   one of them or refuse to build, depending on the `use` order.
+//! * **Where a Socket replace goes** ([`GoWorkspace::replace_host`]): run
+//!   at the directory holding go.work, a module the workspace shares (the
+//!   root has no module of its own, another member lists it, or go.work
+//!   already holds our replace of it) is replaced once in go.work, as `go
+//!   work edit -replace` would, since member replaces of one directory
+//!   resolve to different paths and conflict; otherwise the project's
+//!   go.mod holds it ([`GoWorkspace::work_conflict`] and
+//!   [`GoWorkspace::conflict`] gate each).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -33,7 +41,7 @@ use crate::utils::fs::read_regular_to_string;
 
 use super::go_build_list::Selection;
 use super::go_mod_edit::{self, ReplaceEntry};
-use super::go_sum_edit::go_semver_cmp;
+use super::go_sum_edit::{go_semver_cmp, go_sum_lines};
 
 /// Which `go.work` go uses for a project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,19 +197,53 @@ async fn load_file(work_file: PathBuf) -> Loaded {
     })
 }
 
-/// Why the `go.work` in effect keeps a member `go.mod` replace from taking
-/// effect. Paths are as displayed to the user.
+/// The file that holds a project's Socket `replace` of a module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceHost {
+    /// The project's own `go.mod`.
+    GoMod,
+    /// The `go.work` at the project root: one replace for every member.
+    GoWork,
+}
+
+impl ReplaceHost {
+    /// The root-relative file name.
+    pub fn file_name(self) -> &'static str {
+        match self {
+            ReplaceHost::GoMod => "go.mod",
+            ReplaceHost::GoWork => "go.work",
+        }
+    }
+}
+
+/// Why the `go.work` in effect keeps a Socket replace from taking effect.
+/// Paths are as displayed to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceConflict {
     /// `go.work` replaces this version of the module (or every version)
     /// itself (`target`), which overrides every member's replace of it.
     WorkReplace { work_file: String, target: String },
+    /// socket-patch already replaces the module in `go.work` (`target`),
+    /// from the workspace root (`work_dir`).
+    WorkHosted {
+        work_file: String,
+        work_dir: String,
+        target: String,
+    },
+    /// A replace in `go.work` would override `member`'s own replace of the
+    /// module (`target`) for the whole workspace.
+    MemberOverridden {
+        work_file: String,
+        member: String,
+        target: String,
+    },
     /// `go.work` doesn't `use` the project, so go ignores its go.mod.
     NotAMember { work_file: String },
     /// Another `use` member (`member`) replaces the same `module@version`
     /// with a different `target`; go refuses to build the workspace.
     MemberConflict {
         work_file: String,
+        work_dir: String,
         member: String,
         target: String,
     },
@@ -210,6 +252,7 @@ pub enum WorkspaceConflict {
     /// depending on the `use` order.
     MemberWildcard {
         work_file: String,
+        work_dir: String,
         member: String,
         target: String,
     },
@@ -232,7 +275,25 @@ impl WorkspaceConflict {
                 "has no effect: {work_file} replaces {module} {version} with {target}, and \
                  a go.work replace of a version (or of every version) overrides every \
                  module's, so the build links {target} instead of the patched copy; remove \
-                 that replace from {work_file}, or move the socket-patch replace there"
+                 that replace from {work_file} and re-run"
+            ),
+            WorkspaceConflict::WorkHosted {
+                work_file,
+                work_dir,
+                target,
+            } => format!(
+                "has no effect: socket-patch already replaces {module} {version} for the \
+                 whole workspace in {work_file} (with {target}), which overrides every \
+                 module's replace; run socket-patch in {work_dir} to change it"
+            ),
+            WorkspaceConflict::MemberOverridden {
+                work_file,
+                member,
+                target,
+            } => format!(
+                "would override {member}/go.mod, which replaces {module} {version} with \
+                 {target}: a {work_file} replace applies to every module of the workspace; \
+                 remove that replace from {member}/go.mod and re-run"
             ),
             WorkspaceConflict::NotAMember { work_file } => format!(
                 "has no effect: {work_file} does not `use` this module, so workspace builds \
@@ -241,24 +302,27 @@ impl WorkspaceConflict {
             ),
             WorkspaceConflict::MemberConflict {
                 work_file,
+                work_dir,
                 member,
                 target,
             } => format!(
                 "conflicts with {member}/go.mod, which replaces {module} {version} with \
                  {target}: go refuses to build the {work_file} workspace (\"conflicting \
-                 replacements\"); keep one replace for the whole workspace, in {work_file} \
-                 or in one member's go.mod"
+                 replacements\"); run socket-patch in {work_dir}, which replaces it once \
+                 in {work_file} for every member"
             ),
             WorkspaceConflict::MemberWildcard {
                 work_file,
+                work_dir,
                 member,
                 target,
             } => format!(
                 "has no reliable effect: {member}/go.mod replaces every version of {module} \
                  with {target}, so in the {work_file} workspace go either links {target} \
                  instead of the patched copy or refuses to build (\"conflicting \
-                 replacements\"), depending on the `use` order; remove that replace, or keep \
-                 one replace for the whole workspace in {work_file}"
+                 replacements\"), depending on the `use` order; remove that replace, or run \
+                 socket-patch in {work_dir}, which replaces it once in {work_file} for every \
+                 member"
             ),
             WorkspaceConflict::MainModule { work_file, member } => format!(
                 "has no effect: {member} is a module of the {work_file} workspace, so go \
@@ -266,14 +330,28 @@ impl WorkspaceConflict {
                  the source in {member}, or drop it from the `use` list of {work_file}"
             ),
             WorkspaceConflict::NoModule { work_file, members } => format!(
-                "has nowhere to go: this directory holds {work_file} but no go.mod of its \
-                 own; run socket-patch in the workspace member that requires {module} \
-                 ({members})"
+                "has nowhere to go: this directory is in the {work_file} workspace but holds \
+                 neither go.work nor a go.mod of its own; run socket-patch in the workspace \
+                 root or in a member ({members})"
             ),
             WorkspaceConflict::Invalid { reason } => {
                 format!("cannot take effect: {reason}; fix the workspace setting and re-run")
             }
         }
+    }
+}
+
+impl Member {
+    /// Whether this member's go.mod requires `module`, or its go.sum holds
+    /// a zip line of it (what a pre-1.17 member builds).
+    pub fn lists(&self, module: &str) -> bool {
+        self.go_mod
+            .as_deref()
+            .is_some_and(|m| go_mod_edit::parse_required_versions(m).contains_key(module))
+            || self
+                .go_sum
+                .as_deref()
+                .is_some_and(|s| go_sum_lines(s).any(|l| l.zip_version_of(module).is_some()))
     }
 }
 
@@ -442,6 +520,85 @@ impl GoWorkspace {
         [work, members]
     }
 
+    /// Whether go.work sits in `root`.
+    pub fn rooted_at(&self, root: &Path) -> bool {
+        same_dir_key(self.work_dir()) == same_dir_key(root)
+    }
+
+    /// Which file holds the Socket replace of `module` for the project at
+    /// `root` (`root_has_go_mod`: it is a module itself): go.work when it
+    /// sits in `root` and the root has no module, go.work already holds a
+    /// Socket replace of `module`, or another member lists `module`.
+    pub fn replace_host(&self, root: &Path, root_has_go_mod: bool, module: &str) -> ReplaceHost {
+        if !self.rooted_at(root) {
+            return ReplaceHost::GoMod;
+        }
+        let own = same_dir_key(root);
+        let shared = !root_has_go_mod
+            || self
+                .replaces()
+                .iter()
+                .any(|e| e.module == module && e.socket_owned())
+            || self
+                .members
+                .iter()
+                .any(|m| same_dir_key(&m.dir) != own && m.lists(module));
+        if shared {
+            ReplaceHost::GoWork
+        } else {
+            ReplaceHost::GoMod
+        }
+    }
+
+    /// Whether the replace `ours` of `module@version`, written into this
+    /// go.work, would not do what it says: go.work already replaces that
+    /// version (or every version) with something else, or a member
+    /// replaces it with something the go.work replace would silently
+    /// override. Socket replaces elsewhere are ours to override.
+    pub fn work_conflict(
+        &self,
+        project_root: &Path,
+        module: &str,
+        version: &str,
+        ours: &ReplaceEntry,
+    ) -> Option<WorkspaceConflict> {
+        let display = display_path(project_root, &self.work_file);
+        let our_target = lexical_target(self.work_dir(), ours);
+        let applies = |e: &ReplaceEntry| {
+            e.module == module
+                && !e.socket_owned()
+                && e.version.as_deref().is_none_or(|v| v == version)
+        };
+        if let Some(w) = self
+            .replaces()
+            .into_iter()
+            .find(|w| applies(w) && lexical_target(self.work_dir(), w) != our_target)
+        {
+            return Some(WorkspaceConflict::WorkReplace {
+                work_file: display,
+                target: target_display(&w),
+            });
+        }
+        for member in &self.members {
+            let replaces = member
+                .go_mod
+                .as_deref()
+                .map(go_mod_edit::parse_replace_entries)
+                .unwrap_or_default();
+            if let Some(other) = replaces
+                .iter()
+                .find(|e| applies(e) && lexical_target(&member.dir, e) != our_target)
+            {
+                return Some(WorkspaceConflict::MemberOverridden {
+                    work_file: display,
+                    member: display_path(project_root, &member.dir),
+                    target: target_display(other),
+                });
+            }
+        }
+        None
+    }
+
     /// Whether this workspace keeps the replace `ours` of `module@version`
     /// in the go.mod at `project_root` from taking effect (`None`: it
     /// works).
@@ -475,9 +632,17 @@ impl GoWorkspace {
             });
         if let Some(w) = effective {
             return (lexical_target(self.work_dir(), w) != our_target).then(|| {
-                WorkspaceConflict::WorkReplace {
-                    work_file: display,
-                    target: target_display(w),
+                if w.socket_owned() {
+                    WorkspaceConflict::WorkHosted {
+                        work_dir: display_path(project_root, self.work_dir()),
+                        work_file: display,
+                        target: target_display(w),
+                    }
+                } else {
+                    WorkspaceConflict::WorkReplace {
+                        work_file: display,
+                        target: target_display(w),
+                    }
                 }
             });
         }
@@ -520,19 +685,22 @@ impl GoWorkspace {
             else {
                 continue;
             };
-            let (work_file, member, target) = (
+            let (work_file, work_dir, member, target) = (
                 display,
+                display_path(project_root, self.work_dir()),
                 display_path(project_root, &member.dir),
                 target_display(other),
             );
             return Some(match exact {
                 Some(_) => WorkspaceConflict::MemberConflict {
                     work_file,
+                    work_dir,
                     member,
                     target,
                 },
                 None => WorkspaceConflict::MemberWildcard {
                     work_file,
+                    work_dir,
                     member,
                     target,
                 },
@@ -550,6 +718,33 @@ impl Loaded {
             Loaded::None => None,
             Loaded::Workspace(ws) => Some(ws.selection(module, version)),
             Loaded::Invalid(_) => Some(Selection::Unknown),
+        }
+    }
+
+    /// [`GoWorkspace::replace_host`]; go.mod outside a workspace.
+    pub fn replace_host(&self, root: &Path, root_has_go_mod: bool, module: &str) -> ReplaceHost {
+        match self {
+            Loaded::Workspace(ws) => ws.replace_host(root, root_has_go_mod, module),
+            Loaded::None | Loaded::Invalid(_) => ReplaceHost::GoMod,
+        }
+    }
+
+    /// Whether a Socket replace `ours` of `module@version` in `host` would
+    /// not take effect: [`GoWorkspace::work_conflict`] for go.work,
+    /// [`GoWorkspace::conflict`] for go.mod.
+    pub fn host_conflict(
+        &self,
+        host: ReplaceHost,
+        project_root: &Path,
+        module: &str,
+        version: &str,
+        ours: &ReplaceEntry,
+    ) -> Option<WorkspaceConflict> {
+        match (self, host) {
+            (Loaded::Workspace(ws), ReplaceHost::GoWork) => {
+                ws.work_conflict(project_root, module, version, ours)
+            }
+            _ => self.conflict(project_root, module, version, ours),
         }
     }
 
@@ -637,6 +832,32 @@ async fn read_dep_go_mod(
         }
     }
     None
+}
+
+/// Where the Socket replace of `module` goes for the project at
+/// `project_root` ([`GoWorkspace::replace_host`] of the workspace in
+/// effect).
+pub async fn replace_host(project_root: &Path, module: &str) -> ReplaceHost {
+    load(project_root).await.replace_host(
+        project_root,
+        project_root.join("go.mod").is_file(),
+        module,
+    )
+}
+
+/// The `go.work` in effect when it sits in `project_root`: the one whose
+/// replaces are the project's own.
+pub fn root_work_file(project_root: &Path) -> Option<PathBuf> {
+    match resolve(project_root) {
+        GoWork::File(file)
+            if file
+                .parent()
+                .is_some_and(|dir| same_dir_key(dir) == same_dir_key(project_root)) =>
+        {
+            Some(file)
+        }
+        _ => None,
+    }
 }
 
 /// The directories whose go.mod a Go command run at `root` operates on:
@@ -1145,6 +1366,128 @@ mod tests {
         let off = load_with(tmp.path(), Some("off")).await;
         assert_eq!(off, Loaded::None);
         assert_eq!(off.selection(DEP, "v1.0.0"), None);
+    }
+
+    /// Run at the go.work root, a module the workspace shares is replaced
+    /// in go.work: the root has no module, another member lists it, or
+    /// go.work already holds our replace of it. A member run, or a module
+    /// only the root lists, keeps go.mod.
+    #[tokio::test]
+    async fn a_shared_module_is_replaced_in_go_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        async fn replace_host(dir: &Path, module: &str) -> ReplaceHost {
+            load_with(dir, None)
+                .await
+                .replace_host(dir, dir.join("go.mod").is_file(), module)
+        }
+        write(root, "go.work", "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n");
+        member(root, "a", "1.21", &require("v1.0.0"));
+        member(root, "b", "1.21", "");
+        assert_eq!(replace_host(root, DEP).await, ReplaceHost::GoWork);
+        assert_eq!(replace_host(&root.join("a"), DEP).await, ReplaceHost::GoMod);
+
+        write(root, "go.work", "go 1.22\n\nuse (\n\t.\n\t./a\n\t./b\n)\n");
+        write(
+            root,
+            "go.mod",
+            &format!("module example.com/root\n{}", require("v1.0.0")),
+        );
+        assert_eq!(
+            replace_host(root, DEP).await,
+            ReplaceHost::GoWork,
+            "a lists it"
+        );
+        member(root, "a", "1.21", "");
+        assert_eq!(
+            replace_host(root, DEP).await,
+            ReplaceHost::GoMod,
+            "root only"
+        );
+        // A pre-1.17 member's go.sum zip line is what it builds.
+        write(root, "b/go.sum", &format!("{DEP} v1.0.0 h1:x=\n"));
+        assert_eq!(replace_host(root, DEP).await, ReplaceHost::GoWork);
+        std::fs::remove_file(root.join("b/go.sum")).unwrap();
+        // Sticky: our go.work replace stays where it is.
+        write(
+            root,
+            "go.work",
+            &format!(
+                "go 1.22\n\nuse (\n\t.\n\t./a\n\t./b\n)\n\nreplace {DEP} v1.0.0 => \
+                 ./.socket/go-patches/{DEP}@v1.0.0\n"
+            ),
+        );
+        assert_eq!(replace_host(root, DEP).await, ReplaceHost::GoWork);
+        assert_eq!(
+            load_with(root, Some("off"))
+                .await
+                .replace_host(root, true, DEP),
+            ReplaceHost::GoMod
+        );
+    }
+
+    /// A go.work replace overrides every member's: a user replace of the
+    /// version (or of every version) in go.work or in a member refuses it;
+    /// one of another version, or a Socket one, does not.
+    #[tokio::test]
+    async fn work_conflict_protects_user_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ours = replace(&format!(
+            "{DEP} v1.0.0 => ./.socket/vendor/golang/u/{DEP}@v1.0.0"
+        ));
+        let uses = "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n";
+        member(root, "a", "1.21", &require("v1.0.0"));
+        member(root, "b", "1.21", &require("v1.0.0"));
+        let conflict = |ws: &GoWorkspace| ws.work_conflict(root, DEP, "v1.0.0", &ours);
+
+        write(root, "go.work", uses);
+        assert_eq!(conflict(&workspace(root).await), None);
+        for extra in [
+            format!("replace {DEP} v1.3.0 => ./fork"),
+            format!("replace {DEP} v1.0.0 => ./.socket/go-patches/{DEP}@v1.0.0"),
+            format!("replace {DEP} v1.0.0 => ./.socket/vendor/golang/u/{DEP}@v1.0.0"),
+        ] {
+            write(root, "go.work", &format!("{uses}\n{extra}\n"));
+            assert_eq!(conflict(&workspace(root).await), None, "{extra}");
+        }
+        for extra in [
+            format!("replace {DEP} v1.0.0 => ./fork"),
+            format!("replace {DEP} => ./fork"),
+        ] {
+            write(root, "go.work", &format!("{uses}\n{extra}\n"));
+            assert!(
+                matches!(
+                    conflict(&workspace(root).await),
+                    Some(WorkspaceConflict::WorkReplace { .. })
+                ),
+                "{extra}"
+            );
+        }
+        write(root, "go.work", uses);
+        member(
+            root,
+            "b",
+            "1.21",
+            &format!("{}\nreplace {DEP} => ../fork\n", require("v1.0.0")),
+        );
+        match conflict(&workspace(root).await) {
+            Some(c @ WorkspaceConflict::MemberOverridden { .. }) => {
+                assert!(c.consequence(DEP, "v1.0.0").contains("b/go.mod"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // The same directory through b is the same replacement.
+        member(
+            root,
+            "b",
+            "1.21",
+            &format!(
+                "{}\nreplace {DEP} v1.0.0 => ../.socket/vendor/golang/u/{DEP}@v1.0.0\n",
+                require("v1.0.0")
+            ),
+        );
+        assert_eq!(conflict(&workspace(root).await), None);
     }
 
     /// A go.work root without a go.mod of its own operates on its in-root

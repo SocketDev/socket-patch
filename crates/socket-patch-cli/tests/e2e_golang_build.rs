@@ -874,7 +874,8 @@ fn go_work_replace_overrides_the_socket_replace() {
 }
 
 /// #458: a go.work that doesn't `use` the project makes every workspace
-/// build ignore the project's go.mod, replace included.
+/// build ignore the project's go.mod, replace included. Run beside that
+/// go.work, apply replaces the module its member builds in go.work itself.
 #[test]
 fn go_work_without_the_project_ignores_its_replace() {
     if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(go-work-not-member)") {
@@ -895,9 +896,18 @@ fn go_work_without_the_project_ignores_its_replace() {
 
     write_patch(&consumer);
     let (code, so, se) = apply_json(&consumer, &modcache);
-    assert_ne!(code, 0, "apply must refuse an ignored replace:\n{so}\n{se}");
-    assert!(so.contains("does not `use` this module"), "{so}");
+    assert_eq!(code, 0, "apply replaces it in go.work:\n{so}\n{se}");
     assert!(replace_lines(&consumer.join("go.mod")).is_empty());
+    assert_eq!(
+        replace_lines(&consumer.join("go.work")),
+        [format!(
+            "replace {UMOD} {UVER} => ./.socket/go-patches/{UMOD}@{UVER}"
+        )]
+    );
+    assert!(go_out(&svc, &env).contains("OUT: PATCHED"));
+    let (code, so, se) = check(&consumer, &modcache);
+    assert_eq!(code, 0, "{so}\n{se}");
+    std::fs::write(consumer.join("go.work"), go_work).unwrap();
 
     // Applied before the go.work existed.
     std::fs::remove_file(consumer.join("go.work")).unwrap();

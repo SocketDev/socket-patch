@@ -1,5 +1,7 @@
-//! Read / write `<project_root>/go.mod` for the project-local Go
-//! `replace`-redirect backend.
+//! Read / write `<project_root>/go.mod` (and, for a module a workspace
+//! shares, the `go.work` at the project root:
+//! [`go_workspace::replace_host`](crate::vendor::go_workspace::replace_host))
+//! for the project-local Go `replace`-redirect backend.
 //!
 //! `go.mod` is **not** TOML, so there is no `toml_edit` to lean on. This is a
 //! small, line/block-aware editor that
@@ -144,13 +146,19 @@ impl ReplaceEntry {
 
 // ── public async API ─────────────────────────────────────────────────────────
 
-/// Read all `replace` directives. Read-only; a missing/unreadable `go.mod`
-/// yields an empty vec (callers treat that as "no managed entries").
+/// Read the project's `replace` directives: those of the `go.work` in
+/// effect when it sits at the project root (first: go reads them first),
+/// then `go.mod`'s. Read-only; a missing/unreadable file yields none
+/// (callers treat that as "no managed entries").
 pub async fn read_replace_entries(project_root: &Path) -> Vec<ReplaceEntry> {
-    match read_regular_to_string(&go_mod_path(project_root)).await {
-        Ok(content) => parse_replace_entries(&content),
-        Err(_) => Vec::new(),
+    let mut entries = Vec::new();
+    let work = crate::vendor::go_workspace::root_work_file(project_root);
+    for path in work.into_iter().chain([go_mod_path(project_root)]) {
+        if let Ok(content) = read_regular_to_string(&path).await {
+            entries.extend(parse_replace_entries(&content));
+        }
     }
+    entries
 }
 
 /// Resolved versions from the `require` directives, keyed by module path. Used
@@ -166,13 +174,17 @@ pub async fn read_required_versions(project_root: &Path) -> Option<HashMap<Strin
 
 /// Upsert a socket-owned `replace <module> <version> => ./<base_rel>/<module>@<version>`,
 /// where `base_rel` is the project-relative copy base (e.g. [`GO_PATCHES_DIR`],
-/// or `<GO_VENDOR_DIR>/<uuid>` for vendor). Idempotent. An existing
-/// socket-owned line for `module` — of EITHER owner — is rewritten in place
-/// (the cross-owner case is `vendor` taking over an `apply` redirect). Returns
-/// whether the file changed. Errors (without writing) if `go.mod` is absent,
-/// or if a *user-authored* `replace` already pins the same `module`+`version`
-/// (a duplicate would make `go.mod` invalid), or if the `go.work` in effect
-/// would override, ignore or reject the replace
+/// or `<GO_VENDOR_DIR>/<uuid>` for vendor), into the file
+/// [`go_workspace::replace_host`](crate::vendor::go_workspace::replace_host)
+/// names: `go.mod`, or for a module the workspace rooted here shares, its
+/// `go.work` (the same target text: it is relative to the project root
+/// either way). Idempotent. An existing socket-owned line for `module` — of
+/// EITHER owner — is rewritten in place (the cross-owner case is `vendor`
+/// taking over an `apply` redirect). Returns whether the file changed.
+/// Errors (without writing) if the file is absent, or if a *user-authored*
+/// `replace` already pins the same `module`+`version` (a duplicate would
+/// make the file invalid), or if the `go.work` in effect would override,
+/// ignore or reject the replace
 /// ([`go_consumer_sync::replace_refusal`](crate::vendor::go_consumer_sync::replace_refusal):
 /// the build would link something other than the patched copy).
 pub async fn ensure_replace_entry(
@@ -188,16 +200,18 @@ pub async fn ensure_replace_entry(
     {
         return Err(refusal);
     }
-    edit_go_mod(project_root, dry_run, |c| {
+    let host = crate::vendor::go_workspace::replace_host(project_root, module).await;
+    edit_file(&project_root.join(host.file_name()), dry_run, |c| {
         upsert_replace_entry(c, module, version, base_rel)
     })
     .await
 }
 
 /// Remove the `replace` directive(s) for `module` owned by `owner` (pruning an
-/// emptied `replace ( … )` block). A user-authored entry, the OTHER owner's
-/// entry, or an absent entry is a no-op — so `apply`'s reconcile can never
-/// drop a vendored module's directive and vice versa. Returns whether the file
+/// emptied `replace ( … )` block) from `go.mod` and the `go.work` at the
+/// project root. A user-authored entry, the OTHER owner's entry, or an
+/// absent entry is a no-op — so `apply`'s reconcile can never drop a
+/// vendored module's directive and vice versa. Returns whether a file
 /// changed.
 pub async fn drop_replace_entry(
     project_root: &Path,
@@ -205,10 +219,19 @@ pub async fn drop_replace_entry(
     owner: ReplaceOwner,
     dry_run: bool,
 ) -> Result<bool, String> {
-    edit_go_mod(project_root, dry_run, |c| {
-        remove_replace_entry(c, module, owner)
-    })
-    .await
+    let work = project_root.join("go.work");
+    let go_mod = go_mod_path(project_root);
+    let has_work = work.is_file();
+    let mut changed = false;
+    if has_work {
+        changed |= edit_file(&work, dry_run, |c| remove_replace_entry(c, module, owner)).await?;
+    }
+    // A go.work root has no go.mod of its own; without go.work one is
+    // required, so its absence is the error.
+    if !has_work || go_mod.exists() {
+        changed |= edit_file(&go_mod, dry_run, |c| remove_replace_entry(c, module, owner)).await?;
+    }
+    Ok(changed)
 }
 
 // ── file resolution + read/write ──────────────────────────────────────────────
@@ -217,16 +240,16 @@ fn go_mod_path(project_root: &Path) -> PathBuf {
     project_root.join("go.mod")
 }
 
-/// Apply a pure transform to `go.mod`, writing only if it changed and
-/// `!dry_run`. Unlike `.cargo/config.toml`, a `go.mod` is **required** to exist
-/// (it defines the module): a missing file is an error, not an empty start.
-async fn edit_go_mod(
-    project_root: &Path,
+/// Apply a pure transform to `go.mod` (or `go.work`), writing only if it
+/// changed and `!dry_run`. Unlike `.cargo/config.toml`, the file is
+/// **required** to exist (it defines the module or workspace): a missing
+/// file is an error, not an empty start.
+async fn edit_file(
+    path: &Path,
     dry_run: bool,
     transform: impl FnOnce(&str) -> Result<Option<String>, String>,
 ) -> Result<bool, String> {
-    let path = go_mod_path(project_root);
-    let content = read_regular_to_string(&path)
+    let content = read_regular_to_string(path)
         .await
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     match transform(&content)? {
@@ -237,7 +260,7 @@ async fn edit_go_mod(
                 // comments live alongside our socket `replace`) — a torn write
                 // would corrupt a manifest that no longer builds, and the swap
                 // must keep the file's permission bits.
-                crate::utils::fs::atomic_write_bytes_preserving_mode(&path, new.as_bytes())
+                crate::utils::fs::atomic_write_bytes_preserving_mode(path, new.as_bytes())
                     .await
                     .map_err(|e| format!("write {}: {e}", path.display()))?;
             }
@@ -1750,6 +1773,80 @@ replace (
                 .await
                 .unwrap()
         );
+    }
+
+    /// Run at a go.work root, a shared module's replace goes into go.work
+    /// (a go.mod-less root, or a module another member lists), is read
+    /// back from it, and drops out of it byte for byte; a module only the
+    /// root lists stays in go.mod.
+    #[tokio::test]
+    async fn test_shared_module_replace_lives_in_go_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let work = "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n";
+        std::fs::write(root.join("go.work"), work).unwrap();
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(root.join(m)).unwrap();
+            std::fs::write(
+                root.join(m).join("go.mod"),
+                format!("module example.com/{m}\n\ngo 1.21\n\nrequire example.com/m v1.0.0\n"),
+            )
+            .unwrap();
+        }
+        assert!(
+            ensure_replace_entry(root, "example.com/m", "v1.0.0", GO_PATCHES_DIR, false)
+                .await
+                .unwrap()
+        );
+        let line = "replace example.com/m v1.0.0 => ./.socket/go-patches/example.com/m@v1.0.0";
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.work")).unwrap(),
+            format!("{work}\n{line}\n")
+        );
+        assert!(!root.join("go.mod").exists());
+        let entries = read_replace_entries(root).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].owner, Some(ReplaceOwner::GoPatches));
+        assert!(
+            !ensure_replace_entry(root, "example.com/m", "v1.0.0", GO_PATCHES_DIR, false)
+                .await
+                .unwrap(),
+            "idempotent"
+        );
+        assert!(
+            drop_replace_entry(root, "example.com/m", ReplaceOwner::GoPatches, false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(root.join("go.work")).unwrap(), work);
+
+        // Beside a root module: shared with a member → go.work; the root's
+        // alone → go.mod.
+        let work = "go 1.22\n\nuse (\n\t.\n\t./a\n)\n";
+        std::fs::write(root.join("go.work"), work).unwrap();
+        let go_mod = "module example.com/root\n\ngo 1.21\n\nrequire example.com/m v1.0.0\n";
+        std::fs::write(root.join("go.mod"), go_mod).unwrap();
+        ensure_replace_entry(root, "example.com/m", "v1.0.0", GO_PATCHES_DIR, false)
+            .await
+            .unwrap();
+        assert!(std::fs::read_to_string(root.join("go.work"))
+            .unwrap()
+            .contains(line));
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.mod")).unwrap(),
+            go_mod
+        );
+        drop_replace_entry(root, "example.com/m", ReplaceOwner::GoPatches, false)
+            .await
+            .unwrap();
+        std::fs::write(root.join("a/go.mod"), "module example.com/a\n").unwrap();
+        ensure_replace_entry(root, "example.com/m", "v1.0.0", GO_PATCHES_DIR, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("go.work")).unwrap(), work);
+        assert!(std::fs::read_to_string(root.join("go.mod"))
+            .unwrap()
+            .contains(line));
     }
 
     #[tokio::test]

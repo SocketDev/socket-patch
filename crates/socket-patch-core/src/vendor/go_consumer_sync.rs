@@ -183,14 +183,70 @@ pub async fn audit(
     pristine_go_mods: &HashMap<String, PathBuf>,
 ) -> Vec<GoSyncIssue> {
     let mut issues: Vec<GoSyncIssue> = Vec::new();
+    let mut found = Vec::new();
     for root in go_workspace::module_roots(project_root).await {
-        for issue in audit_module(&root, pristine_go_mods).await {
-            if !issues.contains(&issue) {
-                issues.push(issue);
-            }
+        found.extend(audit_module(&root, pristine_go_mods).await);
+    }
+    found.extend(audit_work(project_root).await);
+    for issue in found {
+        if !issues.contains(&issue) {
+            issues.push(issue);
         }
     }
     issues
+}
+
+/// The Socket replaces in the `go.work` at the project root: `go work
+/// vendor` must record them in the workspace's `vendor/modules.txt`.
+async fn audit_work(project_root: &Path) -> Vec<GoSyncIssue> {
+    let Some(work) = go_workspace::root_work_file(project_root) else {
+        return Vec::new();
+    };
+    let Ok(text) = read_regular_to_string(&work).await else {
+        return Vec::new();
+    };
+    let replaces: Vec<ReplaceEntry> = go_mod_edit::parse_replace_entries(&text)
+        .into_iter()
+        .filter(ReplaceEntry::socket_owned)
+        .collect();
+    if replaces.is_empty() {
+        return Vec::new();
+    }
+    let (path, command) = modules_txt_location(project_root);
+    let Ok(modules_txt) = read_regular_to_string(&path).await else {
+        return Vec::new();
+    };
+    let recorded = recorded_replacements(&modules_txt);
+    replaces
+        .into_iter()
+        .filter(|e| !recorded.iter().any(|r| same_replacement(e, r, true)))
+        .map(|e| GoSyncIssue::VendorModulesTxt {
+            module: e.module,
+            modules_txt: display_rel(project_root, &path),
+            command,
+            stale: false,
+        })
+        .collect()
+}
+
+/// The `# module version => target` replacements a `modules.txt` records.
+fn recorded_replacements(modules_txt: &str) -> Vec<ReplaceEntry> {
+    modules_txt
+        .lines()
+        .filter_map(|line| line.strip_prefix("# "))
+        .filter(|body| body.contains("=>"))
+        .filter_map(go_mod_edit::parse_replace_body)
+        .collect()
+}
+
+/// `path` relative to `project_root` when inside it, else as is.
+fn display_rel(project_root: &Path, path: &Path) -> String {
+    let base = std::env::current_dir()
+        .unwrap_or_default()
+        .join(project_root);
+    path.strip_prefix(&base)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.display().to_string())
 }
 
 async fn audit_module(
@@ -296,8 +352,9 @@ pub async fn workspace_conflict(
 }
 
 /// Why `apply` / `vendor` must not write `replace module version =>
-/// ./<base_rel>/module@version` into the project's go.mod, if the `go.work`
-/// in effect would override, ignore or reject it: the refusal message.
+/// ./<base_rel>/module@version` into the project's go.mod (or the go.work
+/// at its root, [`go_workspace::replace_host`]), if the `go.work` in effect
+/// would override, ignore or reject it: the refusal message.
 pub async fn replace_refusal(
     project_root: &Path,
     module: &str,
@@ -306,9 +363,12 @@ pub async fn replace_refusal(
 ) -> Option<String> {
     let target = go_mod_edit::replace_target_path(base_rel, module, version);
     let ours = go_mod_edit::parse_replace_body(&format!("{module} {version} => {target}"))?;
-    let conflict = workspace_conflict(project_root, module, version, &ours).await?;
+    let ws = go_workspace::load(project_root).await;
+    let host = ws.replace_host(project_root, project_root.join("go.mod").is_file(), module);
+    let conflict = ws.host_conflict(host, project_root, module, version, &ours)?;
     Some(format!(
-        "refusing to write `replace {module} {version} => {target}` to go.mod: it {}",
+        "refusing to write `replace {module} {version} => {target}` to {}: it {}",
+        host.file_name(),
         conflict.consequence(module, version)
     ))
 }
@@ -345,20 +405,8 @@ async fn vendor_modules_txt_issues(
         return Vec::new();
     };
     let workspace = command == "go work vendor";
-    let display = {
-        let base = std::env::current_dir()
-            .unwrap_or_default()
-            .join(project_root);
-        path.strip_prefix(&base)
-            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| path.display().to_string())
-    };
-    let recorded: Vec<ReplaceEntry> = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("# "))
-        .filter(|body| body.contains("=>"))
-        .filter_map(go_mod_edit::parse_replace_body)
-        .collect();
+    let display = display_rel(project_root, &path);
+    let recorded = recorded_replacements(&text);
 
     // In a workspace, a `go.work` replace of the same module overrides the
     // member's, and a recorded replacement may come from any member.

@@ -248,8 +248,8 @@ pub async fn apply_go_redirect<'a>(
             Vec::new(),
             false,
             Some(format!(
-                "go.mod holds a hosted-mode replace for {module} (written by `scan --mode \
-                 hosted`); refusing to overwrite it — revert the hosted redirect first \
+                "the project holds a hosted-mode replace for {module} (written by `scan \
+                 --mode hosted`); refusing to overwrite it — revert the hosted redirect first \
                  (restore go.mod/go.sum from version control, or drop the replace and run \
                  `go mod tidy`), then re-run apply"
             )),
@@ -887,6 +887,58 @@ mod tests {
             "go.mod untouched"
         );
         assert!(!root.join(GO_PATCHES_DIR).exists(), "no copy created");
+    }
+
+    /// A go.work root with no module of its own: apply copies the module
+    /// both members require once and replaces it in go.work; `--check`
+    /// sees it there; removal restores go.work byte for byte.
+    #[tokio::test]
+    async fn test_apply_at_a_go_work_root_writes_go_work() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        tokio::fs::remove_file(root.join("go.mod")).await.unwrap();
+        let work = "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n";
+        std::fs::write(root.join("go.work"), work).unwrap();
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(root.join(m)).unwrap();
+            std::fs::write(
+                root.join(m).join("go.mod"),
+                format!("module example.com/{m}\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+            )
+            .unwrap();
+        }
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        let line = format!(
+            "replace {MODULE} {VERSION} => {}",
+            replace_target_path(GO_PATCHES_DIR, MODULE, VERSION)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.work")).unwrap(),
+            format!("{work}\n{line}\n")
+        );
+        let desired: HashSet<String> = [PURL.to_string()].into();
+        verify_go_redirect_state(root, &manifest_with(&files), &desired)
+            .await
+            .unwrap();
+        remove_go_redirect(PURL, root, GO_PATCHES_DIR, ReplaceOwner::GoPatches, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("go.work")).unwrap(), work);
+        assert!(!root.join("go.mod").exists());
     }
 
     #[tokio::test]

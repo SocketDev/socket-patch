@@ -9,7 +9,9 @@
 //! sum lines live where go verifies them: beside a go.mod its go.sum, and
 //! in workspace mode `go.work.sum` (go writes there itself) and the
 //! members' go.sum files. The upstream pair goes back into each sum file
-//! that held the socket pair, else beside the directive.
+//! that held the socket pair, else beside the directive, unless a sum file
+//! still holds it (a go.work pin never prunes it); a go.work.sum left empty
+//! was created for the pin and is removed.
 //!
 //! A directive the hosted run took over from the user (a pre-existing
 //! `replace` it superseded) is not recorded anywhere, so the restore always
@@ -23,7 +25,7 @@ use crate::vendor::go_mod_edit::{
     hosted_module_uuid, normalize_for_read, parse_replace_entries, parse_use_dirs,
     remove_replace_entry, ReplaceOwner,
 };
-use crate::vendor::go_sum_edit::{reinsert_lines, remove_module_prefix_lines};
+use crate::vendor::go_sum_edit::{go_sum_lines, reinsert_lines, remove_module_prefix_lines};
 use crate::vendor::go_workspace::in_root_dir;
 
 const GO_WORK: &str = "go.work";
@@ -177,6 +179,17 @@ pub(crate) async fn restore(
                 held.push(sum.clone());
             }
         }
+        // A go.work pin leaves the original's pair where it was (the
+        // members' go.sum keep it for module-mode builds): nothing to put
+        // back.
+        let kept_upstream = candidates.iter().any(|sum| {
+            matches!(sum_texts.get(sum), Some(Some(text)) if go_sum_lines(text)
+                .any(|l| l.zip_version_of(&hit.module) == Some(hit.version.as_str())))
+        });
+        if kept_upstream {
+            result.handled.insert(hit.uuid.clone());
+            continue;
+        }
         let targets = if held.is_empty() {
             let own = candidates[0].clone();
             let existing = candidates
@@ -205,7 +218,13 @@ pub(crate) async fn restore(
         let Some(text) = text else {
             continue;
         };
-        if view.read(&file).await.ok().flatten().as_deref() != Some(text.as_str()) {
+        if view.read(&file).await.ok().flatten().as_deref() == Some(text.as_str()) {
+            continue;
+        }
+        // The hosted run created go.work.sum for the pin alone.
+        if file == GO_WORK_SUM && text.is_empty() {
+            view.remove(&file);
+        } else {
             view.write(&file, text);
         }
     }

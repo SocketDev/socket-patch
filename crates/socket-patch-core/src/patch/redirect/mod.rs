@@ -9129,26 +9129,6 @@ pub struct HostedGoWorkspace {
     pub loaded: crate::vendor::go_workspace::Loaded,
 }
 
-impl HostedGoWorkspace {
-    /// The root-relative dirs of the in-root members, when go.work sits
-    /// at the root.
-    pub(crate) fn member_dirs(&self) -> Vec<String> {
-        match &self.loaded {
-            crate::vendor::go_workspace::Loaded::Workspace(ws)
-                if crate::vendor::go_workspace::same_dir_key(ws.work_dir())
-                    == crate::vendor::go_workspace::same_dir_key(&self.root) =>
-            {
-                ws.members_within(&self.root)
-                    .into_iter()
-                    .map(|(dir, _)| dir)
-                    .filter(|dir| !dir.is_empty())
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
-    }
-}
-
 fn rewrite_golang(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -9167,36 +9147,26 @@ fn rewrite_golang(
     let workspace: Option<HostedGoWorkspace> = files
         .get(GO_WORKSPACE_KEY)
         .and_then(|text| serde_json::from_str(text).ok());
-    // The replace directive lives in a MAIN module's go.mod: the root's, or
-    // (a go.work root with no module of its own) the in-root members'.
-    let dirs: Vec<String> = if files.contains_key("go.mod") {
-        vec![String::new()]
-    } else {
-        workspace
-            .as_ref()
-            .map(|ws| {
-                ws.member_dirs()
-                    .into_iter()
-                    .filter(|dir| files.contains_key(&format!("{dir}/go.mod")))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    if dirs.is_empty() {
+    let has_go_mod = files.contains_key("go.mod");
+    // A go.work at the root (and read as a candidate) takes the replace of
+    // a module the workspace shares; a go.work root has no go.mod at all.
+    let root_work = workspace.as_ref().and_then(|ws| match &ws.loaded {
+        crate::vendor::go_workspace::Loaded::Workspace(w)
+            if w.rooted_at(&ws.root) && files.contains_key("go.work") =>
+        {
+            Some(w)
+        }
+        _ => None,
+    });
+    if !has_go_mod && root_work.is_none() {
         result.warnings.push(RewriteWarning {
             code: "redirect_golang_no_go_mod".into(),
             detail: "no go.mod present; golang redirect skipped".into(),
         });
         return;
     }
-    let shared = dirs.len() > 1;
-    let mut targets: Vec<GoTarget> = dirs
-        .into_iter()
-        .map(|dir| GoTarget {
-            shared,
-            ..GoTarget::new(files, dir)
-        })
-        .collect();
+    let mut mod_target = has_go_mod.then(|| GoTarget::new(files, "go.mod", "go.sum", true));
+    let mut work_target = root_work.map(|_| GoTarget::new(files, "go.work", "go.work.sum", false));
 
     for dep in &golang {
         let fname = full_name(dep);
@@ -9277,9 +9247,13 @@ fn rewrite_golang(
             });
             continue;
         }
+        let host = match (&workspace, root_work) {
+            (Some(ws), Some(w)) => w.replace_host(&ws.root, has_go_mod, &fname),
+            _ => crate::vendor::go_workspace::ReplaceHost::GoMod,
+        };
         // The go.work in effect may override or reject the replace, or
         // select another version through another member: one answer for
-        // the whole workspace, checked before any go.mod is written.
+        // the whole workspace, checked before anything is written.
         let selection = workspace
             .as_ref()
             .and_then(|ws| ws.loaded.selection(&fname, &dep.version));
@@ -9292,96 +9266,60 @@ fn rewrite_golang(
                 rhs_version: Some(rhs_version.clone()),
                 owner: Some(go_mod_edit::ReplaceOwner::Hosted),
             };
-            let conflict = targets.iter().find_map(|t| {
+            if let Some(conflict) =
                 ws.loaded
-                    .conflict(&ws.root.join(&t.dir), &fname, &dep.version, &ours)
-            });
-            if let Some(conflict) = conflict {
+                    .host_conflict(host, &ws.root, &fname, &dep.version, &ours)
+            {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_golang_workspace_conflict".into(),
                     detail: format!(
                         "{fname}@{}: refusing to write `replace {fname} {} => {rhs_module} \
-                         {rhs_version}`: it {}; nothing redirected",
+                         {rhs_version}` to {}: it {}; nothing redirected",
                         dep.version,
                         dep.version,
+                        host.file_name(),
                         conflict.consequence(&fname, &dep.version)
                     ),
                 });
                 continue;
             }
         }
-        // Beside other members, the replace goes into each member whose own
-        // go.mod or go.sum lists the module (any member's applies to the
-        // whole workspace; identical hosted targets never conflict).
-        let chosen: Vec<usize> = if targets.len() == 1 {
-            vec![0]
-        } else {
-            (0..targets.len())
-                .filter(|&i| targets[i].lists(&fname, &dep.version))
-                .collect()
+        let target = match host {
+            crate::vendor::go_workspace::ReplaceHost::GoMod => mod_target.as_mut(),
+            crate::vendor::go_workspace::ReplaceHost::GoWork => work_target.as_mut(),
         };
-        if chosen.is_empty() {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_golang_not_in_module_graph".into(),
-                detail: format!(
-                    "{fname}@{}: no workspace member's go.mod or go.sum lists this module — \
-                     it is not in this workspace's build graph; nothing redirected",
-                    dep.version
-                ),
-            });
+        let Some(target) = target else {
             continue;
-        }
-        // Any member's replace applies to the whole workspace, so one
-        // member refusing leaves the others' pins half-applied: undo them.
-        let edits_before = result.edits.len();
-        let mut written: Vec<(usize, GoTarget)> = Vec::new();
-        let mut refused = false;
-        for &i in &chosen {
-            let before = (chosen.len() > 1).then(|| targets[i].clone());
-            if rewrite_golang_target(
-                &mut targets[i],
-                dep,
-                &fname,
-                rhs_module,
-                rhs_version,
-                zip_h1,
-                gomod_h1,
-                selection.clone(),
-                result,
-            ) {
-                written.extend(before.map(|b| (i, b)));
-            } else {
-                refused = true;
-            }
-        }
-        if !refused {
+        };
+        if rewrite_golang_target(
+            target,
+            dep,
+            &fname,
+            rhs_module,
+            rhs_version,
+            zip_h1,
+            gomod_h1,
+            selection,
+            result,
+        ) {
             result.confirmed_golang_uuids.insert(dep.patch_uuid.clone());
-            continue;
         }
-        let mut undone: Vec<String> = Vec::new();
-        for (i, before) in written {
-            undone.extend([before.key("go.mod"), before.key("go.sum")]);
-            targets[i] = before;
-        }
-        let mut index = 0;
-        result.edits.retain(|e| {
-            index += 1;
-            index <= edits_before || !undone.contains(&e.path)
-        });
     }
 
-    for target in targets {
+    for target in mod_target.into_iter().chain(work_target) {
         target.finish(result);
     }
 }
 
-/// One go.mod / go.sum pair the golang rewriter edits: the root's, or a
-/// workspace member's (`dir`, root-relative).
-#[derive(Clone)]
+/// One replace file and the sum file go verifies its pin against: the
+/// root go.mod and go.sum, or the root go.work and go.work.sum.
 struct GoTarget {
-    dir: String,
-    /// One of several workspace members edited for the same deps.
-    shared: bool,
+    mod_file: &'static str,
+    sum_file: &'static str,
+    /// Whether the replaced original's sum lines are pruned: `go mod tidy`
+    /// drops them from a go.mod's go.sum, while the members' go.sum files
+    /// keep them for a module-mode build (go.work.sum is never tidied).
+    prunes_original: bool,
     go_mod: String,
     go_sum: crate::vendor::go_sum_edit::GoSumEditor,
     mod_changed: bool,
@@ -9389,20 +9327,22 @@ struct GoTarget {
 }
 
 impl GoTarget {
-    fn new(files: &BTreeMap<String, String>, dir: String) -> Self {
-        let key = |file: &str| match dir.as_str() {
-            "" => file.to_string(),
-            dir => format!("{dir}/{file}"),
-        };
-        let go_mod = files.get(&key("go.mod")).cloned().unwrap_or_default();
-        // An absent go.sum starts empty: the fully-replaced original needs
+    fn new(
+        files: &BTreeMap<String, String>,
+        mod_file: &'static str,
+        sum_file: &'static str,
+        prunes_original: bool,
+    ) -> Self {
+        let go_mod = files.get(mod_file).cloned().unwrap_or_default();
+        // An absent sum file starts empty: the fully-replaced original needs
         // no lines of its own, so the two socket lines alone are a pin.
         let go_sum = crate::vendor::go_sum_edit::GoSumEditor::new(
-            files.get(&key("go.sum")).cloned().unwrap_or_default(),
+            files.get(sum_file).cloned().unwrap_or_default(),
         );
         GoTarget {
-            dir,
-            shared: false,
+            mod_file,
+            sum_file,
+            prunes_original,
             go_mod,
             go_sum,
             mod_changed: false,
@@ -9410,44 +9350,15 @@ impl GoTarget {
         }
     }
 
-    fn key(&self, file: &str) -> String {
-        match self.dir.as_str() {
-            "" => file.to_string(),
-            dir => format!("{dir}/{file}"),
-        }
-    }
-
-    /// Whether this member's go.mod requires or replaces `module`, or its
-    /// go.sum holds `module@version`'s zip line.
-    fn lists(&self, module: &str, version: &str) -> bool {
-        use crate::vendor::go_mod_edit;
-        go_mod_edit::parse_required_versions(&self.go_mod).contains_key(module)
-            || go_mod_edit::parse_replace_entries(&self.go_mod)
-                .iter()
-                .any(|e| e.module == module && e.socket_owned())
-            || self
-                .go_sum
-                .zip_versions(module)
-                .iter()
-                .any(|v| v == version)
-    }
-
     fn finish(self, result: &mut RewriteResult) {
-        let (mod_key, sum_key) = (self.key("go.mod"), self.key("go.sum"));
         if self.mod_changed {
-            result.files.insert(mod_key, self.go_mod);
+            result.files.insert(self.mod_file.to_string(), self.go_mod);
         }
         if self.sum_changed {
-            result.files.insert(sum_key, self.go_sum.into_string());
+            result
+                .files
+                .insert(self.sum_file.to_string(), self.go_sum.into_string());
         }
-    }
-}
-
-/// A warning shared by every workspace member the golang rewriter edits
-/// (`shared`) is reported once.
-fn push_once(result: &mut RewriteResult, warning: RewriteWarning, shared: bool) {
-    if !shared || !result.warnings.contains(&warning) {
-        result.warnings.push(warning);
     }
 }
 
@@ -9468,10 +9379,10 @@ fn rewrite_golang_target(
 ) -> bool {
     use crate::vendor::go_build_list;
     use crate::vendor::go_mod_edit;
-    let mod_key = target.key("go.mod");
-    let sum_key = target.key("go.sum");
-    let shared = target.shared;
+    let mod_key = target.mod_file.to_string();
+    let sum_key = target.sum_file.to_string();
     let GoTarget {
+        prunes_original,
         go_mod,
         go_sum,
         mod_changed,
@@ -9531,18 +9442,14 @@ fn rewrite_golang_target(
         } else {
             "go.sum shows the build selects"
         };
-        push_once(
-            result,
-            RewriteWarning {
-                code: "redirect_golang_version_mismatch".into(),
-                detail: format!(
-                    "{fname}: {basis} {selected} but the patch targets {} — \
+        result.warnings.push(RewriteWarning {
+            code: "redirect_golang_version_mismatch".into(),
+            detail: format!(
+                "{fname}: {basis} {selected} but the patch targets {} — \
                  a version-pinned replace would be silently ignored",
-                    dep.version
-                ),
-            },
-            shared,
-        );
+                dep.version
+            ),
+        });
         let stale_hosted = prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
         if let Some(stale) = stale_hosted {
             if let Ok(Some(new)) =
@@ -9582,28 +9489,24 @@ fn rewrite_golang_target(
         // outside this project's graph (local discovery crawls the whole
         // module cache). Its replace would be inert, and confirming it
         // would attest a patch no build links.
-        push_once(
-            result,
-            RewriteWarning {
-                code: "redirect_golang_not_in_module_graph".into(),
-                detail: if in_workspace && selection == go_build_list::Selection::Unknown {
-                    format!(
-                        "{fname}@{}: nothing shows the go.work workspace building this \
-                         version — a go.mod its module graph needs is not in the module \
-                         cache (`go mod download` fetches it); nothing redirected",
-                        dep.version
-                    )
-                } else {
-                    format!(
-                        "{fname}@{}: neither go.mod's require nor a go.sum zip line shows \
-                         the build selecting this version — it is not in this project's \
-                         build graph; nothing redirected",
-                        dep.version
-                    )
-                },
+        result.warnings.push(RewriteWarning {
+            code: "redirect_golang_not_in_module_graph".into(),
+            detail: if in_workspace && selection == go_build_list::Selection::Unknown {
+                format!(
+                    "{fname}@{}: nothing shows the go.work workspace building this version \
+                     — a go.mod its module graph needs is not in the module cache (`go mod \
+                     download` fetches it); nothing redirected",
+                    dep.version
+                )
+            } else {
+                format!(
+                    "{fname}@{}: neither go.mod's require nor a go.sum zip line shows the \
+                     build selecting this version — it is not in this project's build \
+                     graph; nothing redirected",
+                    dep.version
+                )
             },
-            shared,
-        );
+        });
         return false;
     }
 
@@ -9697,7 +9600,12 @@ fn rewrite_golang_target(
     // prunes exactly these — writing the tidy-stable state up front keeps
     // the first day-2 tidy a byte-level no-op. The removed lines ride in
     // `original` so the ledger can restore them on revert.
-    if let Some(removed) = go_sum.remove_exact_module_version_lines(fname, &dep.version) {
+    let removed = if *prunes_original {
+        go_sum.remove_exact_module_version_lines(fname, &dep.version)
+    } else {
+        None
+    };
+    if let Some(removed) = removed {
         *sum_changed = true;
         result.edits.push(FileEdit {
             path: sum_key.clone(),
@@ -23437,6 +23345,22 @@ packages:
         )
     }
 
+    /// [`go_workspace_key`] plus the root go.work itself as a candidate
+    /// file, as the engine reads it when go.work sits at the root.
+    fn with_root_go_work(
+        files: &mut BTreeMap<String, String>,
+        work_extra: &str,
+        members: &[(&str, &str)],
+    ) {
+        let (k, v) = go_workspace_key(work_extra, members);
+        let uses: String = members.iter().map(|(d, _)| format!("\t{d}\n")).collect();
+        files.insert(k, v);
+        files.insert(
+            "go.work".to_string(),
+            format!("go 1.21\n\nuse (\n{uses})\n{work_extra}"),
+        );
+    }
+
     fn go_member(require: &str, extra: &str) -> String {
         format!("module example.com/m\n\ngo 1.21\n\nrequire github.com/foo/bar {require}\n{extra}")
     }
@@ -23509,10 +23433,12 @@ packages:
         assert!(out.confirmed_golang_uuids.contains(GO_UUID));
     }
 
-    /// A go.work root without a go.mod: each member listing the module gets
-    /// the pin in its own go.mod and go.sum; one that doesn't is left alone.
+    /// A module the workspace shares is pinned once in the root go.work,
+    /// its sum lines in go.work.sum, the members' go.mod and go.sum left
+    /// alone (they keep the upstream pair for a module-mode build); a
+    /// re-run is a no-op; one member's own replace refuses it.
     #[test]
-    fn golang_go_work_root_pins_the_members_that_list_the_module() {
+    fn golang_shared_module_is_pinned_in_go_work() {
         let ovr = golang_override();
         let a = go_member("v1.4.2", "");
         let c = "module example.com/c\n\ngo 1.21\n";
@@ -23524,84 +23450,78 @@ packages:
         ] {
             files.insert(key.to_string(), text.to_string());
         }
-        let (k, v) = go_workspace_key("", &[("a", &a), ("b", &a), ("c", c)]);
-        files.insert(k, v);
+        with_root_go_work(&mut files, "", &[("a", &a), ("b", &a), ("c", c)]);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
         assert_eq!(
             out.files.keys().collect::<Vec<_>>(),
-            ["a/go.mod", "a/go.sum", "b/go.mod", "b/go.sum"]
+            ["go.work", "go.work.sum"]
+        );
+        let line = format!(
+            "replace github.com/foo/bar v1.4.2 => {} v1.4.2-socketpatch.1",
+            golang_socket_module()
+        );
+        assert!(out.files["go.work"].ends_with(&format!(")\n\n{line}\n")));
+        assert_eq!(
+            out.files["go.work.sum"],
+            format!(
+                "{m} v1.4.2-socketpatch.1 {GO_ZIP_H1}\n{m} v1.4.2-socketpatch.1/go.mod {GO_GOMOD_H1}\n",
+                m = golang_socket_module()
+            )
         );
         assert!(out.confirmed_golang_uuids.contains(GO_UUID));
         assert!(out
             .edits
             .iter()
-            .any(|e| e.path == "b/go.mod" && e.kind == "redirect_golang_replace"));
+            .any(|e| e.path == "go.work" && e.kind == "redirect_golang_replace"));
+        assert!(!out
+            .edits
+            .iter()
+            .any(|e| e.kind == "redirect_golang_gosum_prune"));
+
+        let mut again = files.clone();
+        again.extend(out.files.clone());
+        let second = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
+        assert!(second.files.is_empty() && second.edits.is_empty());
+        assert!(second.confirmed_golang_uuids.contains(GO_UUID));
+
+        // Beside a root module, another member listing it shares it too;
+        // a module only the root lists stays in the root go.mod.
+        let mut files = golang_files();
+        let root = files["go.mod"].clone();
+        with_root_go_work(&mut files, "", &[(".", &root), ("b", &a)]);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert_eq!(
+            out.files.keys().collect::<Vec<_>>(),
+            ["go.work", "go.work.sum"]
+        );
+        let mut files = golang_files();
+        with_root_go_work(&mut files, "", &[(".", &root), ("b", c)]);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert_eq!(out.files.keys().collect::<Vec<_>>(), ["go.mod", "go.sum"]);
+
+        // A member's own replace would be overridden for every member.
+        let mut files = BTreeMap::new();
+        let b = go_member("v1.4.2", "replace github.com/foo/bar v1.4.2 => ../fork\n");
+        files.insert("a/go.mod".to_string(), a.clone());
+        files.insert("b/go.mod".to_string(), b.clone());
+        with_root_go_work(&mut files, "", &[("a", &a), ("b", &b)]);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
+        assert!(out.warnings[0].detail.contains("would override b/go.mod"));
 
         // Without the workspace there is no go.mod to pin.
-        files.remove(GO_WORKSPACE_KEY);
+        let mut files = BTreeMap::new();
+        files.insert("a/go.mod".to_string(), a.clone());
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert_eq!(out.warnings[0].code, "redirect_golang_no_go_mod");
     }
 
-    /// At a go.work root the pin goes into several members; one member
-    /// refusing (here: a member not yet pinned while an unread member
-    /// leaves the selection unknown) undoes the others' writes (here:
-    /// restoring a pinned member's tidy-pruned zip line).
-    #[test]
-    fn golang_go_work_root_member_refusal_writes_no_member() {
-        use crate::vendor::go_workspace::{GoWorkspace, Loaded, Member};
-        let ovr = golang_override();
-        let a = go_member("v1.4.2", "");
-        let sm = golang_socket_module();
-        let b = go_member(
-            "v1.4.2",
-            &format!("\nreplace github.com/foo/bar v1.4.2 => {sm} v1.4.2-socketpatch.1\n"),
-        );
-        let b_sum = format!("{sm} v1.4.2-socketpatch.1/go.mod {GO_GOMOD_H1}\n");
-        let mut files = BTreeMap::new();
-        files.insert("a/go.mod".to_string(), a.clone());
-        files.insert("b/go.mod".to_string(), b.clone());
-        files.insert("b/go.sum".to_string(), b_sum);
-        let member = |dir: &str, go_mod: Option<&String>| Member {
-            dir: dir.into(),
-            go_mod: go_mod.cloned(),
-            go_sum: None,
-        };
-        let hosted = HostedGoWorkspace {
-            root: std::path::PathBuf::new(),
-            loaded: Loaded::Workspace(GoWorkspace {
-                work_file: "go.work".into(),
-                work: "go 1.21\n\nuse (\n\ta\n\tb\n\t../out\n)\n".into(),
-                work_sum: None,
-                members: vec![
-                    member("a", Some(&a)),
-                    member("b", Some(&b)),
-                    member("../out", None),
-                ],
-                graph: None,
-            }),
-        };
-        files.insert(
-            GO_WORKSPACE_KEY.to_string(),
-            serde_json::to_string(&hosted).unwrap(),
-        );
-        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
-        assert!(out.files.is_empty(), "{:?}", out.files);
-        assert!(out.edits.is_empty(), "{:?}", out.edits);
-        assert!(out.confirmed_golang_uuids.is_empty());
-        assert_eq!(
-            out.warnings
-                .iter()
-                .map(|w| w.code.as_str())
-                .collect::<Vec<_>>(),
-            ["redirect_golang_not_in_module_graph"]
-        );
-    }
-
-    /// A go.work root whose other member replaces every version of the
-    /// module elsewhere: go would link that target or refuse to build, so
-    /// no member gets the pin.
+    /// A go.work root whose member replaces every version of the module
+    /// elsewhere: the go.work pin would silently override it, so nothing
+    /// is written.
     #[test]
     fn golang_go_work_root_member_wildcard_replace_refuses() {
         let ovr = golang_override();
@@ -23610,14 +23530,17 @@ packages:
         let mut files = BTreeMap::new();
         files.insert("a/go.mod".to_string(), a.clone());
         files.insert("b/go.mod".to_string(), b.clone());
-        let (k, v) = go_workspace_key("", &[("a", &a), ("b", &b)]);
-        files.insert(k, v);
+        with_root_go_work(&mut files, "", &[("a", &a), ("b", &b)]);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.files.is_empty(), "{:?}", out.files);
         assert!(out.confirmed_golang_uuids.is_empty());
         assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
         assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
-        assert!(out.warnings[0].detail.contains("every version"));
+        assert!(
+            out.warnings[0].detail.contains("b/go.mod"),
+            "{:?}",
+            out.warnings
+        );
     }
 
     /// Only `patch.socket.dev/gopatch/<canonical uuid>` is a hosted module;
