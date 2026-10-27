@@ -484,6 +484,93 @@ async fn read_advisory(
     }
 }
 
+/// The Go workspace in effect for the project, handed to the golang
+/// rewriter under [`crate::patch::redirect::GO_WORKSPACE_KEY`]. On disk it is
+/// the one go resolves (`GOWORK`, else a go.work at or above the root, with
+/// members anywhere); in memory a root `go.work` and its in-root members.
+/// Beside a go.work root without a go.mod, each in-root member's go.mod and
+/// go.sum are read as rewrite targets.
+async fn read_go_workspace(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
+    let (root, loaded) = match view {
+        ProjectView::Memory(_) => {
+            let Some(work) = read_advisory(view, unreadable, "go.work").await else {
+                return;
+            };
+            let work = crate::vendor::go_mod_edit::normalize_for_read(&work);
+            if crate::vendor::go_mod_edit::block_structure_error(&work).is_some() {
+                return;
+            }
+            let mut members = Vec::new();
+            for raw in crate::vendor::go_mod_edit::parse_use_dirs(&work) {
+                let Some(dir) = go_workspace::in_root_dir(&raw) else {
+                    members.push(Member {
+                        dir: raw.into(),
+                        go_mod: None,
+                        go_sum: None,
+                    });
+                    continue;
+                };
+                let at = |file: &str| match dir.as_str() {
+                    "" => file.to_string(),
+                    dir => format!("{dir}/{file}"),
+                };
+                members.push(Member {
+                    go_mod: read_advisory(view, unreadable, &at("go.mod"))
+                        .await
+                        .map(|t| crate::vendor::go_mod_edit::normalize_for_read(&t)),
+                    go_sum: read_advisory(view, unreadable, &at("go.sum")).await,
+                    dir: dir.into(),
+                });
+            }
+            let work_sum = read_advisory(view, unreadable, "go.work.sum").await;
+            let ws = GoWorkspace {
+                work_file: "go.work".into(),
+                work,
+                work_sum,
+                members,
+            };
+            (std::path::PathBuf::new(), Loaded::Workspace(ws))
+        }
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let Some(root) = view.disk_root_reading(std::iter::empty::<&std::path::Path>()) else {
+                return;
+            };
+            let root = root.to_path_buf();
+            let loaded = go_workspace::load(&root).await;
+            let mut touched: Vec<std::path::PathBuf> =
+                root.ancestors().map(|dir| dir.join("go.work")).collect();
+            if let Loaded::Workspace(ws) = &loaded {
+                touched.push(ws.work_dir().join("go.work.sum"));
+                for member in &ws.members {
+                    touched.push(member.dir.join("go.mod"));
+                    touched.push(member.dir.join("go.sum"));
+                }
+            }
+            view.disk_root_reading(&touched);
+            (root, loaded)
+        }
+    };
+    if loaded == Loaded::None {
+        return;
+    }
+    let hosted = crate::patch::redirect::HostedGoWorkspace { root, loaded };
+    if !out.files.contains_key("go.mod") {
+        for dir in hosted.member_dirs() {
+            out.read(view, unreadable, &format!("{dir}/go.mod")).await;
+            out.read(view, unreadable, &format!("{dir}/go.sum")).await;
+        }
+    }
+    if let Ok(json) = serde_json::to_string(&hosted) {
+        out.files
+            .insert(crate::patch::redirect::GO_WORKSPACE_KEY.to_string(), json);
+    }
+}
+
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
 /// `Cargo.toml`), the Python locks and their scripts, the Rush locks, and
@@ -635,6 +722,13 @@ pub async fn read_candidate_files(
         for rel in crate::utils::cargo_workspace::member_manifests_in(view) {
             out.read(view, unreadable, &rel).await;
         }
+    }
+
+    // Go: the workspace in effect decides which version a replace must pin
+    // and whether it takes effect at all, and a go.work root with no module
+    // of its own has its in-root members' go.mod files rewritten.
+    if candidates.iter().any(|c| c.dep.ecosystem == "golang") {
+        read_go_workspace(view, unreadable, &mut out).await;
     }
 
     // NuGet merges the user config and every parent directory's config
