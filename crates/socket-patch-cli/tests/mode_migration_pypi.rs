@@ -1030,14 +1030,15 @@ async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
 
 /// #1105: a project hosted at patch A whose venv was then synced from the
 /// hosted lock (`uv sync`, `poetry install`, `uv pip install -r`), so six
-/// holds A's patched bytes, moves to vendored at the superseding patch B.
-/// The installed copy matches neither the pristine release nor B's
-/// output; it used to be dropped as `package_not_installed` (exit 1, the
-/// project left hosted on A) while `scan --mode vendored --dry-run`
-/// previewed success. The takeover must restore the upstream entry and
-/// vendor B.
+/// holds A's patched bytes, while the agent manifest already names the
+/// superseding patch B. Plain `vendor` used to drop the package as
+/// `package_not_installed` (exit 1, the project left hosted on A). It now
+/// ejects the hosted pin: A's record comes from the API, never the
+/// manifest or the venv, and the project ends up vendored at A.
+/// (`scan --mode vendored` is how to move to B; the superseded-install
+/// rule it relies on is covered by `hosted_pin_marks_a_pypi_install_superseded`.)
 #[tokio::test]
-async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
+async fn hosted_to_vendored_ejects_the_hosted_pin_over_a_hosted_venv() {
     let lanes: [(&str, StageFn); 3] = [
         ("uv", stage_uv_with_sibling),
         ("poetry", stage_poetry),
@@ -1059,8 +1060,12 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
 
         let venv = root.join("../hosted-venv");
         venv_installed_from_patch_a(&venv);
-        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        // Serve A's prebuilt artifact and record, then point the manifest
+        // at B: the eject must not read it.
+        stage_manifest(&root);
         prebuilt_common::mount_project(&server, &root).await;
+        mount_patch_view(&server).await;
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
         mount_pypi_json(&server).await;
         let uri = server.uri();
         let pypi = format!("{uri}/pypi");
@@ -1068,10 +1073,11 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
             ("VIRTUAL_ENV", venv.to_str().unwrap()),
             ("SOCKET_PYPI_JSON_API", pypi.as_str()),
         ];
-        let args = ["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+        let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+        args.extend(api_args(&uri));
 
         let (code, env) = run_cli(&root, &args, &extra);
-        assert_eq!(code, 0, "{lane}: takeover onto B: {env:#}");
+        assert_eq!(code, 0, "{lane}: eject of hosted A: {env:#}");
         assert!(
             !env.to_string().contains("package_not_installed"),
             "{lane}: the installed copy is not reported missing: {env:#}"
@@ -1081,10 +1087,10 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
             .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
             .collect();
         assert!(
-            wired.contains(&format!(".socket/vendor/pypi/{UUID_B}/"))
+            wired.contains(&format!(".socket/vendor/pypi/{UUID}/"))
                 && !wired.contains(&hosted_url)
-                && !wired.contains(UUID),
-            "{lane}: wired to vendored B, hosted A gone:\n{wired}"
+                && !wired.contains(UUID_B),
+            "{lane}: wired to vendored A, hosted A gone, manifest B unread:\n{wired}"
         );
     }
 }
