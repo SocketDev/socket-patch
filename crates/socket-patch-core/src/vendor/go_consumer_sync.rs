@@ -280,13 +280,6 @@ fn modules_txt_location(project_root: &Path) -> (PathBuf, &'static str) {
     )
 }
 
-/// Whether the go command builds `project_root` in workspace mode (a
-/// `go.work` from `GOWORK` or at or above the project), so its build list
-/// spans every member's requirements, not only the project go.mod's.
-pub(crate) fn workspace_in_effect(project_root: &Path) -> bool {
-    workspace_file(project_root).is_some()
-}
-
 /// The `go.work` go would use for `project_root`: `GOWORK` (resolved as go
 /// resolves it: the environment, else the `go env -w` file) when it names a
 /// file (`off` disables workspaces), else the nearest `go.work` at or above
