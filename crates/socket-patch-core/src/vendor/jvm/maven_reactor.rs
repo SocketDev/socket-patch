@@ -1829,13 +1829,33 @@ fn has_fallback_repository(doc: &Doc) -> bool {
     })
 }
 
-/// `-Dk=v` tokens of a `maven.config`.
+/// The user properties a `maven.config` defines, as Maven reads them:
+/// `#` lines are comments (Maven 3.9+; older Maven rejects them), and a
+/// property is `-Dk=v`, `--define=k=v`, or `-D` / `--define` followed by a
+/// separate `k=v` token, on the same line or the next. `-Dk` sets `k=true`;
+/// a later definition wins.
 fn cli_properties(config: &str) -> BTreeMap<String, String> {
-    config
-        .split_whitespace()
-        .filter_map(|t| t.strip_prefix("-D")?.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+    let mut tokens = config
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .flat_map(str::split_whitespace);
+    let mut props = BTreeMap::new();
+    while let Some(token) = tokens.next() {
+        let def = match token {
+            "-D" | "--define" => tokens.next(),
+            _ => token
+                .strip_prefix("--define=")
+                .or_else(|| token.strip_prefix("-D")),
+        };
+        let Some((k, v)) = def.map(|d| d.split_once('=').unwrap_or((d, "true"))) else {
+            continue;
+        };
+        if !k.is_empty() {
+            props.insert(k.to_string(), v.to_string());
+        }
+    }
+    props
 }
 
 // ── pom edits ───────────────────────────────────────────────────
@@ -3701,6 +3721,85 @@ mod tests {
         let (plan, after) = vendor(&files);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         assert_eq!(text(&after, "a/pom.xml"), a.replace("${ct.version}", SV));
+    }
+
+    /// A module at `${ct.version}` whose pom says 1.10.0 (the patch base),
+    /// vendored with `config` as `.mvn/maven.config`.
+    fn vendor_with_maven_config(config: &str) -> (JvmPlan, Fs, String) {
+        let root = ROOT.replace(
+            "  <modules>",
+            "  <properties>\n    <ct.version>1.10.0</ct.version>\n  </properties>\n  <modules>",
+        );
+        let a = module("a", &dep("${ct.version}"));
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", "")),
+            (".mvn/maven.config", config),
+        ]);
+        let (plan, after) = vendor(&files);
+        (plan, after, a)
+    }
+
+    // #535: Maven applies `--define=k=v`, `-D k=v` and `-D` / `k=v` on
+    // separate lines, so the override must beat the pom's 1.10.0.
+    #[test]
+    fn maven_config_long_and_split_define_spellings_win() {
+        for config in [
+            "--define=ct.version=1.11.0\n",
+            "-D ct.version=1.11.0\n",
+            "-D\nct.version=1.11.0\n",
+            "--define\nct.version=1.11.0\n",
+            "-B\r\n--define=ct.version=1.11.0\r\n",
+        ] {
+            let (plan, after, a) = vendor_with_maven_config(config);
+            assert_eq!(
+                reasons(&plan),
+                ["conflicting_literal_version"],
+                "{config:?}"
+            );
+            assert_eq!(text(&after, "a/pom.xml"), a, "{config:?}");
+        }
+    }
+
+    // #550: since Maven 3.9 a `#` line is a comment and defines nothing.
+    #[test]
+    fn maven_config_comment_lines_define_nothing() {
+        for config in [
+            "# -Dct.version=1.11.0\n",
+            "#   -Dct.version=1.11.0   old pin\n",
+            "  # --define=ct.version=1.11.0\n",
+            "# just a note\n-B\n",
+        ] {
+            let (plan, after, a) = vendor_with_maven_config(config);
+            assert!(plan.warnings.is_empty(), "{config:?}: {:?}", plan.warnings);
+            assert_eq!(
+                text(&after, "a/pom.xml"),
+                a.replace("${ct.version}", SV),
+                "{config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn maven_config_user_properties_parse_like_maven() {
+        let props = cli_properties(
+            "# -Dgone=1\n-Da=1\n--define=b=2\n-D c=3\n-D\nd=4\n--define e=5\n-Dflag\n  -Da=6  \n",
+        );
+        let want = [
+            ("a", "6"),
+            ("b", "2"),
+            ("c", "3"),
+            ("d", "4"),
+            ("e", "5"),
+            ("flag", "true"),
+        ];
+        assert_eq!(
+            props,
+            want.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        );
     }
 
     #[test]
