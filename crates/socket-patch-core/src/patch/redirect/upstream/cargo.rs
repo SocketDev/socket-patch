@@ -326,9 +326,18 @@ fn lock_names_index(text: &str, uuid: &str) -> bool {
 
 static SHORTHAND_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(
-        r#"^(\s*[^=\s][^=]*?\s*=\s*)\{ version = ("[^"]+"|'[^']+'), registry = "(socket-patch-[0-9a-fA-F-]{36})" \}(.*)$"#,
+        r#"^(\s*[^=\s][^=]*?\s*=\s*)\{ version = ("[^"]+"), registry = "(socket-patch-[0-9a-fA-F-]{36})" \}(.*)$"#,
     )
     .expect("static shorthand regex is valid")
+});
+
+/// The rewriter's pin of a literal-string version (#757), written
+/// registry-first so it is never a user's own `{ version = '…' }` table.
+static LITERAL_SHORTHAND_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(
+        r#"^(\s*[^=\s][^=]*?\s*=\s*)\{ registry = "(socket-patch-[0-9a-fA-F-]{36})", version = ('[^']+') \}(.*)$"#,
+    )
+    .expect("static literal shorthand regex is valid")
 });
 
 /// Whether `body` (a line without its comment) is a dotted-key pin,
@@ -364,6 +373,11 @@ fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
     if let Some(c) = SHORTHAND_RE.captures(line) {
         if &c[3] == reg {
             return Some(Some(format!("{}{}{}", &c[1], &c[2], &c[4])));
+        }
+    }
+    if let Some(c) = LITERAL_SHORTHAND_RE.captures(line) {
+        if &c[2] == reg {
+            return Some(Some(format!("{}{}{}", &c[1], &c[3], &c[4])));
         }
     }
     let open = line.find('{')?;
@@ -618,12 +632,17 @@ mod tests {
                 Some("# explicit".to_string()),
             ),
             (
-                format!("serde = {{ version = '1.0.190', registry = \"{REG}\" }} # why\r"),
+                format!("serde = {{ registry = \"{REG}\", version = '1.0.190' }} # why\r"),
                 Some("serde = '1.0.190' # why\r".to_string()),
             ),
             (
-                format!("'serde' = {{ version = '^1.0', registry = \"{REG}\" }}"),
+                format!("'serde' = {{ registry = \"{REG}\", version = '^1.0' }}"),
                 Some("'serde' = '^1.0'".to_string()),
+            ),
+            // A user's own one-line literal table keeps its table.
+            (
+                format!("serde = {{ version = '1.0.190', registry = \"{REG}\" }}"),
+                Some("serde = { version = '1.0.190' }".to_string()),
             ),
         ] {
             assert_eq!(unpin_line(&pinned, REG), Some(original), "{pinned:?}");
@@ -648,7 +667,7 @@ mod tests {
         let pinned = format!(
             "{head}cfg-if.version = \"1.0.4\" # why\ncfg-if.registry = \"socket-patch-{B}\"\n\
              cfg-if.features = [\n  \"core\",\n]\n\
-             log = {{ version = '0.4.20', registry = \"socket-patch-{B}\" }}\n"
+             log = {{ registry = \"socket-patch-{B}\", version = '0.4.20' }}\n"
         );
         for (crlf, bom) in [(false, false), (true, false), (false, true), (true, true)] {
             let shape = |s: &str| {

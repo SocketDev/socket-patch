@@ -2827,7 +2827,8 @@ fn is_repinnable_registry_name(value: &str) -> bool {
 /// The `socket-patch-<uuid>` registry name pinning `crate_name` in this
 /// manifest, in EVERY declaration shape [`plan_cargo_toml`] writes: a
 /// `[…dependencies.<key>]` header table (whose pin is a standalone
-/// `registry = …` line), an inline table, a quoted key, and a rename
+/// `registry = …` line), an inline table, dotted keys (`<key>.registry`,
+/// read at the end of their table, #757), a quoted key, and a rename
 /// (`package = "<crate>"` under any key). Readers that probe for a LIVE
 /// hosted redirect use this rather than a single-line regex, which saw only
 /// the inline spelling and read the other three as "not redirected".
@@ -2945,7 +2946,9 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
 }
 
 /// Every Socket registry pin a manifest carries, as `(crate, registry)` in
-/// file order — [`cargo_socket_registry_pin`] for all crates at once. That
+/// scan order (file order, except that a table's dotted-key pins come at
+/// the end of that table) — [`cargo_socket_registry_pin`] for all crates
+/// at once. That
 /// scan's per-crate test is always "the declaration's owning crate (its
 /// `package` rename, else its key) equals the crate asked about", and
 /// everything else it computes is independent of the crate asked about, so
@@ -4031,8 +4034,16 @@ fn plan_cargo_toml(
                 }
                 CargoReqMatch::Ours => {}
             }
+            // A literal version is pinned registry-first, a spelling the
+            // one-line inline rewrite never writes, so restore can tell it
+            // from a user's own `{ version = '…' }` table.
+            let fields = if quoted.starts_with('\'') {
+                format!("registry = \"{reg}\", version = {quoted}")
+            } else {
+                format!("version = {quoted}, registry = \"{reg}\"")
+            };
             let new_text = format!(
-                "{}{{ version = {quoted}, registry = \"{reg}\" }}{}",
+                "{}{{ {fields} }}{}",
                 m.get(1)
                     .expect("line_re always captures group 1 (key prefix)")
                     .as_str(),
@@ -4072,8 +4083,10 @@ fn plan_cargo_toml(
             continue;
         }
         let package = cargo_dotted_value(&fields, "package");
-        let is_ours = match &package {
-            Some((_, package)) => package.as_deref() == Some(crate_name),
+        // An unreadable rename falls back to the key, as the table form
+        // and the pin readers do.
+        let is_ours = match package.as_ref().and_then(|(_, package)| package.as_deref()) {
+            Some(package) => package == crate_name,
             None => key == crate_name,
         };
         if !is_ours {
@@ -4128,11 +4141,14 @@ fn plan_cargo_toml(
                     new_text,
                 }));
             }
-            Some((_, value)) => {
+            Some((_, Some(value))) => {
                 pending.push(Pending::Refuse(format!(
-                    "pinned to another registry (\"{}\")",
-                    value.unwrap_or_default()
+                    "pinned to another registry (\"{value}\")"
                 )));
+                continue;
+            }
+            Some((_, None)) => {
+                pending.push(Pending::Refuse(unreadable_dotted()));
                 continue;
             }
             None => {
@@ -24349,6 +24365,8 @@ packages:
             "serde.version = \"1.0.190\"\nserde.path = \"../serde\"\n",
             "serde.git = \"https://example.com/serde\"\nserde.version = \"1.0.190\"\n",
             "serde.version = \"1.0.190\"\nserde.registry = \"corp-mirror\"\n",
+            // A dotted registry that is not a one-line string.
+            "serde.version = \"1.0.190\"\nserde.registry = \"\"\"\ncorp\"\"\"\n",
             // A dotted version that is not a one-line string.
             "serde.version = \"\"\"\n1.0.190\"\"\"\n",
             // Multi-line literal and non-string values.
@@ -24389,15 +24407,15 @@ packages:
         for (entry, want) in [
             (
                 "serde = '1.0.190'\n",
-                format!("serde = {{ version = '1.0.190', registry = \"{reg}\" }}\n"),
+                format!("serde = {{ registry = \"{reg}\", version = '1.0.190' }}\n"),
             ),
             (
                 "serde = '1.0.190' # why\n",
-                format!("serde = {{ version = '1.0.190', registry = \"{reg}\" }} # why\n"),
+                format!("serde = {{ registry = \"{reg}\", version = '1.0.190' }} # why\n"),
             ),
             (
                 "'serde' = '^1.0'\n",
-                format!("'serde' = {{ version = '^1.0', registry = \"{reg}\" }}\n"),
+                format!("'serde' = {{ registry = \"{reg}\", version = '^1.0' }}\n"),
             ),
         ] {
             for crlf in [false, true] {
@@ -24561,6 +24579,42 @@ packages:
             r.files
         );
         assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// #757: a dotted rename whose `package` value can't be read falls back
+    /// to the key, as the table form does, so the crate's declarations in
+    /// every dependency kind are pinned together, never partially.
+    #[test]
+    fn cargo_dotted_unreadable_package_falls_back_to_the_key() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n\n[dev-dependencies]\n\
+                        serde.package = \"\"\"\nserde\"\"\"\nserde.version = \"1.0.190\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        let doc: toml_edit::DocumentMut = toml.parse().expect("still valid TOML");
+        for kind in ["dependencies", "dev-dependencies"] {
+            assert_eq!(
+                doc[kind]["serde"]["registry"].as_str(),
+                Some(cargo_reg().as_str()),
+                "{kind}: {toml}"
+            );
+        }
+        let r = rewrite_registry_redirect(
+            &cargo_files(&format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde.version = \"1.0.190\"\nserde.registry = \"\"\"\ncorp\"\"\"\n"
+            )),
+            &[cargo_sparse_override()],
+        );
+        assert!(r.files.is_empty());
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.detail.contains("dotted keys this rewriter does not edit")),
+            "an unreadable registry is not named as another registry: {:?}",
+            r.warnings
+        );
     }
 
     /// #757: a rescan that picks a newer patch moves an earlier dotted pin
