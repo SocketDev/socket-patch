@@ -1816,6 +1816,159 @@ fn run_two_document_capstone(
     assert!(!proj.join(".socket/vendor").exists());
 }
 
+/// #935, the vendored half: workspace member `a` installs the registry
+/// release while member `b` installs a `file:` directory copy of the same
+/// `name@version`. The override vendoring writes reaches only the registry
+/// edge, so pnpm keeps installing `b`'s copy from the user's bytes. The run
+/// still vendors `a`'s copy, and now names `b`'s with
+/// `vendor_copy_unpatched` instead of reporting a clean success. The fresh
+/// frozen install proves what the warning says.
+#[test]
+fn pnpm_vendor_names_a_file_copy_of_the_vendored_release() {
+    let pm = PNPM_PRIMARY;
+    if !has_corepack_pm(pm) {
+        println!("SKIP: `corepack {pm}` unavailable");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let write = |rel: &str, text: &str| {
+        let path = proj.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "package.json",
+        "{\n  \"name\": \"root\",\n  \"version\": \"1.0.0\",\n  \"private\": true\n}\n",
+    );
+    write("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+    write(
+        "packages/a/package.json",
+        &format!(r#"{{"name":"a","version":"1.0.0","dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#),
+    );
+    write(
+        "packages/b/package.json",
+        &format!(
+            r#"{{"name":"b","version":"1.0.0","dependencies":{{"{DEP}":"file:../../forks/{DEP}"}}}}"#
+        ),
+    );
+    write(
+        &format!("forks/{DEP}/package.json"),
+        &format!(r#"{{"name":"{DEP}","version":"{DEP_VERSION}","main":"index.js"}}"#),
+    );
+    write(
+        &format!("forks/{DEP}/index.js"),
+        "module.exports = 'fork';\n",
+    );
+
+    let store = tmp.path().join("pnpm-store");
+    let install = corepack(
+        &proj,
+        pm,
+        &["install", "--store-dir", store.to_str().unwrap()],
+    );
+    if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "required {pm} fixture install failed: {install:?}"
+        );
+        println!("SKIP ({pm}): fixture `pnpm install` failed: {install:?}");
+        return;
+    }
+    let lock_path = proj.join("pnpm-lock.yaml");
+    let copy_key = format!("{DEP}@file:forks/{DEP}");
+    assert!(
+        std::fs::read_to_string(&lock_path)
+            .unwrap()
+            .contains(&format!("  {copy_key}:\n")),
+        "the fixture locks the file: copy"
+    );
+
+    let orig = std::fs::read(
+        proj.join("packages/a/node_modules")
+            .join(DEP)
+            .join("index.js"),
+    )
+    .expect("member a's registry copy is installed");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "vendor failed ({pm}):\n{stdout}\n{stderr}");
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let copies: Vec<&serde_json::Value> = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["errorCode"] == "vendor_copy_unpatched")
+        .collect();
+    assert_eq!(copies.len(), 1, "exactly one event names the copy: {env}");
+    let detail = copies[0].to_string();
+    assert!(
+        detail.contains(&format!("`{copy_key}`")) && detail.contains("UNPATCHED"),
+        "the warning names the copy's lock entry: {detail}"
+    );
+
+    // Fresh checkout, empty store, frozen: a gets the vendored bytes, b
+    // keeps the fork, exactly as the warning says.
+    let fresh = tmp.path().join("fresh");
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    copy_dir_recursive(&proj.join("forks"), &fresh.join("forks"));
+    for file in [
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "packages/a/package.json",
+        "packages/b/package.json",
+    ] {
+        std::fs::create_dir_all(fresh.join(file).parent().unwrap()).unwrap();
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    let fresh_store = tmp.path().join("fresh-store");
+    let ci = corepack(
+        &fresh,
+        pm,
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--store-dir",
+            fresh_store.to_str().unwrap(),
+        ],
+    );
+    assert!(ci.status.success(), "fresh frozen install ({pm}): {ci:?}");
+    let landed = |member: &str| {
+        std::fs::read(
+            fresh
+                .join("packages")
+                .join(member)
+                .join("node_modules")
+                .join(DEP)
+                .join("index.js"),
+        )
+        .unwrap()
+    };
+    assert!(
+        landed("a").starts_with(MARKER.as_bytes()),
+        "a installs the vendored bytes"
+    );
+    assert_eq!(
+        landed("b"),
+        b"module.exports = 'fork';\n",
+        "b keeps the fork"
+    );
+}
+
 // ── gated real-pnpm legacy lifecycle legs ─────────────────────────────
 
 #[test]

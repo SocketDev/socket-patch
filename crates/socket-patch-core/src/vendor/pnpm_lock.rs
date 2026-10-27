@@ -97,6 +97,11 @@ pub(crate) const VENDOR_PNPM_LOCK_MULTI_DOCUMENT: &str = "vendor_pnpm_lock_multi
 /// whose own copy (the lock's env document) vendoring leaves unpatched.
 pub(crate) const VENDOR_CONFIG_DEPENDENCY_UNPATCHED: &str = "vendor_config_dependency_unpatched";
 
+/// Warning code: the registry entry was wired, but the lock also installs the same
+/// `name@version` from a `file:` directory or tarball, which the override
+/// never reaches (#935).
+pub(crate) const VENDOR_COPY_UNPATCHED: &str = "vendor_copy_unpatched";
+
 /// The root-only workspace member list written into a freshly created
 /// `pnpm-workspace.yaml`. pnpm 9 refuses a workspace file whose `packages`
 /// field is missing or empty; `.` (the root, already the sole importer) is a
@@ -239,6 +244,38 @@ impl NpmLockBackend for PnpmBackend {
                      `--mode hosted` to patch both"
                 ),
             ));
+        }
+        // A `file:` directory or tarball copy of the same release elsewhere
+        // in the lock: the override reaches only the registry edge, so pnpm
+        // keeps installing that copy from the user's bytes (#935). Named,
+        // not refused: the registry copy is still patched. Most locks name
+        // no `file:` source outside the vendor dir, so skip the parse.
+        let lines = project.lock.lines();
+        if lines
+            .iter()
+            .any(|l| l.contains("file:") && !l.contains(".socket/vendor/"))
+        {
+            let text = lines.join("\n");
+            let copies = crate::vex::discover::npm::pnpm_lock_file_copies(
+                project_root,
+                PNPM_LOCK,
+                &text,
+                name,
+                version,
+            )
+            .await;
+            for copy in copies {
+                warnings.push(VendorWarning::new(
+                    VENDOR_COPY_UNPATCHED,
+                    format!(
+                        "{PNPM_LOCK} entry `{}` {}; the override vendoring writes for \
+                         {name}@{version} reaches only the registry entry, so that copy stays \
+                         UNPATCHED and `vex` attests nothing for the package. Depend on the \
+                         registry release instead of that copy to patch it",
+                        copy.key, copy.how
+                    ),
+                ));
+            }
         }
         Ok(PnpmPlan {
             project,
@@ -5801,6 +5838,147 @@ snapshots:
 
   left-pad@1.3.0: {}
 ";
+
+    /// A workspace whose member `a` installs `left-pad@1.3.0` from the
+    /// registry while member `b` installs a `file:` copy of the same release
+    /// (`copy_key` names its packages entry, `copy_entry` the entry's body).
+    fn file_copy_lock(copy_key: &str, copy_entry: &str) -> String {
+        let copy_version = copy_key.split_once('@').map_or("", |(_, v)| v);
+        format!(
+            "lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {{}}
+
+  packages/a:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+
+  packages/b:
+    dependencies:
+      left-pad:
+        specifier: file:../../{path}
+        version: {copy_version}
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {{integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}}
+    deprecated: use String.prototype.padStart()
+
+  {copy_key}:
+{copy_entry}
+
+snapshots:
+
+  left-pad@1.3.0: {{}}
+
+  {copy_key}: {{}}
+",
+            path = copy_version.trim_start_matches("file:"),
+        )
+    }
+
+    /// #935: vendoring writes an override pnpm applies to the registry edge
+    /// only, so a `file:` directory or tarball copy of the same
+    /// `name@version` elsewhere in the lock keeps installing the user's
+    /// unpatched bytes. The run still wires the registry entry, but names
+    /// that copy (`vendor_copy_unpatched`) instead of reporting a clean
+    /// success. A `file:` copy of another version, or one whose package
+    /// can't be read, is not named.
+    #[tokio::test]
+    async fn file_copy_of_the_vendored_release_is_named() {
+        let directory = "    resolution: {directory: forks/left-pad, type: directory}";
+        let tarball = "    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==, tarball: file:forks/left-pad-1.3.0.tgz}\n    version: 1.3.0";
+        let tarball_old = "    resolution: {integrity: sha512-OQadpCyFCT/VLniZQgym8d3/ofIJtuZyw2ibsVeIUOexKgW/osn8+mMFJbwGMPeDC4GnLzD8q115WPCDx4YRWg==, tarball: file:forks/left-pad-1.2.0.tgz}\n    version: 1.2.0";
+        // (case, packages key, entry, the copy's package.json, named?)
+        let cases = [
+            (
+                "directory",
+                "left-pad@file:forks/left-pad",
+                directory,
+                Some(r#"{"name":"left-pad","version":"1.3.0"}"#),
+                true,
+            ),
+            (
+                "tarball",
+                "left-pad@file:forks/left-pad-1.3.0.tgz",
+                tarball,
+                None,
+                true,
+            ),
+            (
+                "directory of another version",
+                "left-pad@file:forks/left-pad",
+                directory,
+                Some(r#"{"name":"left-pad","version":"1.2.0"}"#),
+                false,
+            ),
+            (
+                "unreadable directory",
+                "left-pad@file:forks/left-pad",
+                directory,
+                None,
+                false,
+            ),
+            (
+                "tarball of another version",
+                "left-pad@file:forks/left-pad-1.2.0.tgz",
+                tarball_old,
+                None,
+                false,
+            ),
+        ];
+        for (case, key, entry, manifest, named) in cases {
+            let lock = file_copy_lock(key, entry);
+            let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+            tokio::fs::write(
+                fx.root().join(PNPM_WORKSPACE),
+                "packages:\n  - packages/*\n",
+            )
+            .await
+            .unwrap();
+            if let Some(manifest) = manifest {
+                let dir = fx.root().join("forks/left-pad");
+                tokio::fs::create_dir_all(&dir).await.unwrap();
+                tokio::fs::write(dir.join(PACKAGE_JSON), manifest)
+                    .await
+                    .unwrap();
+            }
+            for dry_run in [true, false] {
+                let (result, _, warnings) = expect_done(fx.vendor(dry_run).await);
+                assert!(result.success, "{case}: {:?}", result.error);
+                let copies: Vec<&VendorWarning> = warnings
+                    .iter()
+                    .filter(|w| w.code == VENDOR_COPY_UNPATCHED)
+                    .collect();
+                if named {
+                    assert_eq!(copies.len(), 1, "{case} dry_run={dry_run}: {warnings:?}");
+                    assert!(
+                        copies[0].detail.contains(key)
+                            && copies[0].detail.contains("left-pad@1.3.0")
+                            && copies[0].detail.contains("UNPATCHED"),
+                        "{case}: {}",
+                        copies[0].detail
+                    );
+                } else {
+                    assert!(copies.is_empty(), "{case} dry_run={dry_run}: {warnings:?}");
+                }
+            }
+            // The copy's entry is never rewired.
+            assert!(
+                fx.read(PNPM_LOCK).await.contains(&format!("  {key}:\n")),
+                "{case}"
+            );
+        }
+    }
 
     /// pnpm's two-document layout: `---`, the env document, `---`, the
     /// project lock.

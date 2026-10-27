@@ -174,6 +174,14 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   matching package instance is rewritten; an unsupported instance prevents
   confirming that dependency across the lockfile set. Rollback preserves the
   original resolution fragments.
+  A `file:` directory or tarball dependency on the same `name@version` (a
+  workspace member depending on `file:../../forks/left-pad` beside another
+  member's registry `left-pad@1.3.0`) keeps installing the user's own bytes:
+  no pin or `overrides` entry reaches it. The registry entry is still wired,
+  and the scan names the copy (`redirect_copy_unpatched` in hosted mode,
+  `vendor_copy_unpatched` in vendored mode); `vex` attests nothing for the
+  package while the copy is in the lock. A directory's version is read from
+  its `package.json` (#935).
   A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
   in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
   run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is
