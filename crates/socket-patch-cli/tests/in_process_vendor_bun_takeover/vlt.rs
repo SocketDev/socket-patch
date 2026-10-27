@@ -72,6 +72,16 @@ fn seed_manifest(root: &Path) {
 /// Discovery, grant, the artifact, and a view carrying the blob (the
 /// vendored download phase stages it from `blobContent`).
 async fn mock_api(server: &MockServer) {
+    mock_view(server).await;
+    hosted::mock_discovery(server).await;
+    hosted::mock_reference(server).await;
+    hosted::mock_artifact(server).await;
+    mock_registry(server).await;
+}
+
+/// The patch record's view, carrying the blob: what an eject fetches for
+/// the hosted pin's UUID.
+async fn mock_view(server: &MockServer) {
     let mut view = hosted::view_body();
     view["files"]["package/index.js"]["blobContent"] =
         json!(base64::engine::general_purpose::STANDARD.encode(PATCHED));
@@ -80,10 +90,6 @@ async fn mock_api(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(view))
         .mount(server)
         .await;
-    hosted::mock_discovery(server).await;
-    hosted::mock_reference(server).await;
-    hosted::mock_artifact(server).await;
-    mock_registry(server).await;
 }
 
 /// The npm registry's version document the v5 upstream restore reads for
@@ -314,13 +320,13 @@ async fn vlt_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
     seed_manifest(root);
     assert_no_redirect_ledger(root);
 
+    // A hosted pin is in scope: `vendor` previews the eject of the
+    // lockfile's pin; the manifest is neither its input nor rewritten.
+    let manifest = hosted::read(root, ".socket/manifest.json");
     let (code, env, stderr) = vendor_online(root, &server, &["--dry-run"]);
     assert_eq!(code, 0, "{env:#}\n{stderr}");
     let codes = all_codes(&env);
-    assert!(
-        codes.contains(&"vendor_would_revert_redirect".to_string()),
-        "{env:#}"
-    );
+    assert!(codes.contains(&"eject_planned".to_string()), "{env:#}");
     assert!(
         !codes.contains(&"vendor_lock_entry_not_found".to_string()),
         "the hosted node is registry-shaped: {env:#}"
@@ -334,11 +340,13 @@ async fn vlt_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
 
     let (code, env, stderr) = vendor_online(root, &server, &[]);
     assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
     assert!(
-        all_codes(&env).contains(&"vendor_takeover_reverted_redirect".to_string()),
+        all_codes(&env).contains(&"redirect_vlt_reinstall_required".to_string()),
         "{env:#}"
     );
     assert_vendored_from_registry(root);
+    assert_eq!(hosted::read(root, ".socket/manifest.json"), manifest);
     revert_lands_on_registry(root);
 }
 
@@ -524,6 +532,8 @@ async fn vlt_failed_vendor_after_the_takeover_revert_keeps_the_hosted_pin() {
     )
     .await;
     hosted::mock_artifact(&service).await;
+    // The eject fetches the hosted pin's record from this API.
+    mock_view(&service).await;
     let cwd = root.to_str().unwrap().to_string();
     let uri = service.uri();
     let argv = [

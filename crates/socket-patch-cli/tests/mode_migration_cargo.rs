@@ -48,6 +48,7 @@ mod prebuilt_common;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
@@ -296,6 +297,10 @@ async fn mount_hosted_mocks(
     )
     .await;
     let cksum = sha256_hex(crate_bytes);
+    let sri512 = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(crate_bytes))
+    );
     // Production-shaped index path: manifest-less VEX reads the hosted
     // uuid out of the lock's `source` (with `--patch-server-url`).
     let index_rel = format!("/patch-registry/cargo/{TOKEN}/{UUID_H}/index");
@@ -342,10 +347,12 @@ async fn mount_hosted_mocks(
                     "status": "granted",
                     "url": hosted_url,
                     "purl": purl,
+                    // sha512 too: a plain `vendor` eject downloads this
+                    // same prebuilt artifact into `.socket/vendor/`.
                     "artifacts": [{
                         "kind": "tarball",
                         "url": hosted_url,
-                        "integrity": { "sha256": cksum }
+                        "integrity": { "sha256": cksum, "sha512": sri512 }
                     }],
                     "registryOverride": {
                         "kind": "cargo-sparse",
@@ -401,6 +408,17 @@ async fn mount_hosted_mocks(
         .respond_with(ResponseTemplate::new(200).set_body_raw(index_line, "text/plain"))
         .mount(server)
         .await;
+    // The granted artifact itself (what a `vendor` eject downloads).
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/patch/cargo/{DEP}/{version}/{TOKEN}/{UUID_H}/{DEP}-{version}.crate"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(crate_bytes.to_vec(), "application/octet-stream"),
+        )
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/dl/{DEP}/{version}/download")))
         .respond_with(
@@ -437,7 +455,10 @@ async fn mount_crates_index(server: &MockServer, version: &str, pristine_lock: &
 }
 
 /// Plain `vendor --json` ONLINE over a hosted pin on `server`'s origin
-/// (`--patch-server-url`), the crates index mirrored at `index`.
+/// (`--patch-server-url`, which is also the artifact service), the crates
+/// index mirrored at `index`. With a hosted pin in scope, `vendor` EJECTS
+/// that pin and ignores the manifest, so the patch record comes from
+/// `server`'s API (`patches/view/UUID_H`).
 fn vendor_over_hosted(
     proj: &Path,
     cargo_home: &Path,
@@ -451,12 +472,45 @@ fn vendor_over_hosted(
             "--json",
             "--patch-server-url",
             server.uri().as_str(),
+            "--api-url",
+            server.uri().as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
             "--cwd",
             proj.to_str().unwrap(),
         ],
         cargo_home,
         &[("SOCKET_CRATES_INDEX", index)],
     )
+}
+
+/// The decided contract of a plain `vendor` over a hosted pin while
+/// `.socket/manifest.json` also names a patch (UUID_V) for the same purl:
+/// only the hosted lockfile pin (UUID_H) is vendored; the manifest is
+/// neither used to select patches nor rewritten. Vendoring the manifest's
+/// patches instead takes a full `scan --mode vendored`.
+fn assert_ejected_hosted_pin_only(proj: &Path, envelope: &serde_json::Value, manifest: &str) {
+    assert_eq!(envelope["status"], "success", "{envelope:#}");
+    assert_eq!(envelope["summary"]["applied"], 1, "{envelope:#}");
+    assert!(
+        proj.join(format!(".socket/vendor/cargo/{UUID_H}")).is_dir(),
+        "the hosted pin's patch is vendored: {envelope:#}"
+    );
+    assert!(
+        !proj.join(format!(".socket/vendor/cargo/{UUID_V}")).exists(),
+        "the manifest-only patch must not be vendored while a hosted pin is in scope"
+    );
+    assert!(
+        !envelope.to_string().contains(UUID_V),
+        "the manifest-only patch is not part of the eject: {envelope:#}"
+    );
+    assert_eq!(
+        read(proj, ".socket/manifest.json"),
+        manifest,
+        "the eject never rewrites the manifest"
+    );
 }
 
 /// Manifest-less VEX over a post-takeover fresh checkout: `wired` (uuid +
@@ -957,19 +1011,19 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         "hosted mode writes no ledger"
     );
 
-    // B: plain `vendor` over the hosted state — the takeover.
+    // B: plain `vendor` over the hosted state. A manifest naming a
+    // DIFFERENT patch (UUID_V) for the same purl is staged too: with a
+    // hosted pin in scope, `vendor` ejects exactly the lockfile's hosted
+    // patch (UUID_H) and ignores the manifest (vendoring the manifest's
+    // patches takes a full `scan --mode vendored`).
     let index =
         mount_crates_index(&server, &version, &String::from_utf8_lossy(&lock_pristine)).await;
     stage_patch(&proj, &purl, &orig, &patched);
+    let manifest = read(&proj, ".socket/manifest.json");
     let (code, stdout, stderr) = vendor_over_hosted(&proj, &cargo_home, &server, &index);
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
-    assert_eq!(envelope["summary"]["applied"], 1, "{stdout}");
-    // C7: the PLAIN vendor command surfaces the takeover (pre-fix: silent).
-    assert!(
-        stdout.contains("vendor_takeover_reverted_redirect"),
-        "takeover advisory missing from the plain vendor envelope: {stdout}"
-    );
+    assert_ejected_hosted_pin_only(&proj, &envelope, &manifest);
 
     // The project is FULLY vendored: the hosted Cargo.toml pin and the
     // registries block are gone, [patch.crates-io] + detached lock are in,
@@ -982,7 +1036,7 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
     );
     assert!(
         toml.contains("[patch.crates-io]")
-            && toml.contains(&format!(".socket/vendor/cargo/{UUID_V}/")),
+            && toml.contains(&format!(".socket/vendor/cargo/{UUID_H}/")),
         "the vendored wiring lives in Cargo.toml: {toml}"
     );
     let config = read(&proj, ".cargo/config.toml");
@@ -1001,10 +1055,11 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         !lock_block.contains("source ="),
         "vendored lock entry is detached: {lock_block}"
     );
-    assert_lock_version(&proj, &tagged(&version, UUID_V), "hosted -> vendored");
+    assert_lock_version(&proj, &tagged(&version, UUID_H), "hosted -> vendored");
 
     // C: the vendored contract — fresh checkout, EMPTY home, offline locked
-    // build (pre-fix: "no matching package named cfg-if found").
+    // build (pre-fix: "no matching package named cfg-if found"). The
+    // ejected hosted patch attests; the manifest-only one never does.
     let (fresh, home) = fresh_checkout(&proj, tmp.path(), "c");
     assert_build_ok(
         "cargo build --locked --offline (vendored fresh checkout)",
@@ -1015,8 +1070,8 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         home: home.clone(),
         purl: purl.clone(),
         patched: patched.clone(),
-        wired: (UUID_V, Marker::Vendored),
-        displaced: UUID_H,
+        wired: (UUID_H, Marker::Vendored),
+        displaced: UUID_V,
         server_uri: server.uri(),
     }
     .run()
@@ -1115,11 +1170,15 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
     assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
 
     // A again: vendor back (restoring the hosted pin's crates.io entry
-    // first).
+    // first). The hosted pin is in scope, so plain `vendor` ejects the
+    // lockfile's hosted patch (UUID_H); the manifest's UUID_V is ignored.
     let index =
         mount_crates_index(&server, &version, &String::from_utf8_lossy(&lock_pristine)).await;
+    let manifest = read(&proj, ".socket/manifest.json");
     let (code, stdout, stderr) = vendor_over_hosted(&proj, &cargo_home, &server, &index);
     assert_eq!(code, 0, "re-vendor failed: {stdout}\n{stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
+    assert_ejected_hosted_pin_only(&proj, &envelope, &manifest);
 
     // The vendored ledger's lock originals are the PRISTINE crates.io values
     // — the only offline-recoverable home of the registry checksum.
@@ -1138,8 +1197,9 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
     );
 
     // The vendored contract still holds after the round trip, and the lock
-    // names the vendored patch again (tagged), not the hosted one.
-    assert_lock_version(&proj, &tagged(&version, UUID_V), "A -> B -> A");
+    // names the ejected hosted patch, now vendored (tagged), not the
+    // manifest's original vendored one.
+    assert_lock_version(&proj, &tagged(&version, UUID_H), "A -> B -> A");
     let (fresh, home) = fresh_checkout(&proj, tmp.path(), "aba");
     assert_build_ok(
         "cargo build --locked --offline (A->B->A fresh checkout)",
@@ -1150,8 +1210,8 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
         home: home.clone(),
         purl: purl.clone(),
         patched: patched.clone(),
-        wired: (UUID_V, Marker::Vendored),
-        displaced: UUID_H,
+        wired: (UUID_H, Marker::Vendored),
+        displaced: UUID_V,
         server_uri: server.uri(),
     }
     .run()
@@ -1185,8 +1245,9 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
 }
 
 // ── FAIL CLOSED: vendoring over an unrestorable hosted pin refuses ─────────
-// When the hosted pin's crates.io entry cannot be re-resolved (here:
-// `--offline`), the vendor run must refuse the purl with an actionable error
+// When the hosted pin cannot be ejected (`--offline`: no patch record; online
+// with an index that cannot re-resolve the crates.io entry), the vendor run
+// must refuse the purl with an actionable error
 // instead of creating the mixed unbuildable state and reporting success. The
 // cargo backend's `hosted_redirect_live` guard backstops a half-reverted
 // project whose lock is back on crates.io but whose manifest still pins.
@@ -1246,11 +1307,30 @@ async fn vendor_over_unrestorable_hosted_pin_is_refused() {
         ],
         &cargo_home,
     );
+    // With a hosted pin in scope, plain `vendor` ejects that pin (the staged
+    // manifest is ignored), and an offline eject cannot fetch its record:
+    // refused up front, before any restore.
     assert_eq!(code, 1, "must fail closed: {stdout}\n{stderr}");
     assert!(
-        stdout.contains("redirect_revert_failed")
-            && stdout.contains("cannot vendor over the live hosted pin")
-            && stdout.contains("git checkout --"),
+        stdout.contains("offline_eject_unavailable") && stdout.contains("without --offline"),
+        "actionable offline refusal missing: {stdout}"
+    );
+    assert_eq!(read(&proj, "Cargo.toml"), toml_before);
+    assert_eq!(read(&proj, "Cargo.lock"), lock_before);
+
+    // Online, but the crates.io entry cannot be re-resolved (the index has
+    // no row for the crate): the eject's upstream restore refuses the pin
+    // with the checkout remedy instead of creating the mixed unbuildable
+    // state.
+    let (code, stdout, stderr) = vendor_over_hosted(
+        &proj,
+        &cargo_home,
+        &server,
+        &format!("{}/no-such-index", server.uri()),
+    );
+    assert_eq!(code, 1, "must fail closed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains("redirect_revert_failed") && stdout.contains("git checkout --"),
         "actionable refusal (with the checkout remedy) missing: {stdout}"
     );
     // Nothing was half-applied: the hosted wiring is untouched and no

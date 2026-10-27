@@ -464,11 +464,9 @@ fn human_corrupt_pre_v5_redirect_ledger_vendors_normally() {
     );
 }
 
-/// Human unrestorable-hosted-pin surface: an offline run over a hosted pin
-/// prints the `Cannot vendor …: cannot restore the upstream entry` line and
-/// counts the refusal.
+/// Human offline-hosted surface: an early refusal names the offline gate.
 #[test]
-fn human_unrestorable_hosted_pin_prints_cannot_restore() {
+fn human_offline_hosted_pin_reports_eject_refusal() {
     let fx = npm_fixture();
     let hosted_lock = pin_hosted(&fx);
 
@@ -476,13 +474,12 @@ fn human_unrestorable_hosted_pin_prints_cannot_restore() {
         human_vendor(&fx, &["--offline", "--patch-server-url", HOSTED_ORIGIN]);
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stderr.contains("Cannot vendor pkg:npm/left-pad@1.3.0:")
-            && stderr.contains("cannot restore the upstream entry"),
-        "the human takeover-refusal line: {stderr}"
+        stderr.contains("offline_eject_unavailable") && stderr.contains("re-run without --offline"),
+        "the human eject-refusal line: {stderr}"
     );
     assert!(
-        stdout.contains("Vendored 0 packages; 1 failed."),
-        "the fail-closed refusal is counted: {stdout}"
+        !stdout.contains("Vendored"),
+        "an early refusal never starts vendoring: {stdout}"
     );
     assert_eq!(fx.lock_bytes(), hosted_lock, "lock untouched");
 }

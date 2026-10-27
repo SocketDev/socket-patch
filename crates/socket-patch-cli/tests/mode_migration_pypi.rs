@@ -233,6 +233,34 @@ async fn mount_hosted_api_serving(
     hosted_url
 }
 
+/// The patch API's record of `UUID` (the one [`stage_manifest`] stages):
+/// plain `vendor` over a hosted pin ejects it, fetching the pinned UUID's
+/// record from the API rather than reading the agent manifest.
+async fn mount_patch_view(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "six.py": {
+                "beforeHash": compute_git_sha256_from_bytes(ORIG),
+                "afterHash": compute_git_sha256_from_bytes(PATCHED),
+            }},
+            "vulnerabilities": {},
+            "description": "pypi mode takeover fixture",
+            "license": "MIT",
+            "tier": "free"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The flags pointing a `vendor` eject's record fetch at `uri`.
+fn api_args(uri: &str) -> [&str; 6] {
+    ["--api-url", uri, "--org", ORG, "--api-token", "fake-token"]
+}
+
 /// Stage the manifest and vendor the project; `files` carry the wiring.
 fn vendor_project(root: &Path, files: &[&str]) {
     stage_manifest(root);
@@ -614,12 +642,17 @@ async fn assert_all_hosted_requirements_unwind(pristine: &str) {
 
         if unwind[0] == "vendor" {
             stage_manifest(&root);
-            // `--patch-server-url` (which names the hosted origin to take
-            // over) also moves the vendored download onto this server.
+            // `--patch-server-url` (which names the hosted origin) also
+            // moves the vendored download onto this server; the eject
+            // fetches the pinned record from its API.
             prebuilt_common::mount_project(&server, &root).await;
+            mount_patch_view(&server).await;
         }
         let mut args = unwind.clone();
         args.extend(["--patch-server-url", uri.as_str()]);
+        if unwind[0] == "vendor" {
+            args.extend(api_args(&uri));
+        }
         let (code, env) = run_cli(&root, &args, &[]);
         assert_eq!(code, 0, "{unwind:?} over {pristine:?}: {env:#}");
         let after = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
@@ -627,7 +660,7 @@ async fn assert_all_hosted_requirements_unwind(pristine: &str) {
             assert!(
                 after.contains(&format!(".socket/vendor/pypi/{UUID}/"))
                     && !after.contains(&hosted_url),
-                "the takeover leaves the project vendored:\n{after}"
+                "the eject leaves the project vendored:\n{after}"
             );
         } else {
             assert_eq!(after, pristine, "{unwind:?} restores the pristine file");
@@ -997,14 +1030,15 @@ async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
 
 /// #1105: a project hosted at patch A whose venv was then synced from the
 /// hosted lock (`uv sync`, `poetry install`, `uv pip install -r`), so six
-/// holds A's patched bytes, moves to vendored at the superseding patch B.
-/// The installed copy matches neither the pristine release nor B's
-/// output; it used to be dropped as `package_not_installed` (exit 1, the
-/// project left hosted on A) while `scan --mode vendored --dry-run`
-/// previewed success. The takeover must restore the upstream entry and
-/// vendor B.
+/// holds A's patched bytes, while the agent manifest already names the
+/// superseding patch B. Plain `vendor` used to drop the package as
+/// `package_not_installed` (exit 1, the project left hosted on A). It now
+/// ejects the hosted pin: A's record comes from the API, never the
+/// manifest or the venv, and the project ends up vendored at A.
+/// (`scan --mode vendored` is how to move to B; the superseded-install
+/// rule it relies on is covered by `hosted_pin_marks_a_pypi_install_superseded`.)
 #[tokio::test]
-async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
+async fn hosted_to_vendored_ejects_the_hosted_pin_over_a_hosted_venv() {
     let lanes: [(&str, StageFn); 3] = [
         ("uv", stage_uv_with_sibling),
         ("poetry", stage_poetry),
@@ -1026,8 +1060,12 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
 
         let venv = root.join("../hosted-venv");
         venv_installed_from_patch_a(&venv);
-        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        // Serve A's prebuilt artifact and record, then point the manifest
+        // at B: the eject must not read it.
+        stage_manifest(&root);
         prebuilt_common::mount_project(&server, &root).await;
+        mount_patch_view(&server).await;
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
         mount_pypi_json(&server).await;
         let uri = server.uri();
         let pypi = format!("{uri}/pypi");
@@ -1035,10 +1073,11 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
             ("VIRTUAL_ENV", venv.to_str().unwrap()),
             ("SOCKET_PYPI_JSON_API", pypi.as_str()),
         ];
-        let args = ["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+        let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+        args.extend(api_args(&uri));
 
         let (code, env) = run_cli(&root, &args, &extra);
-        assert_eq!(code, 0, "{lane}: takeover onto B: {env:#}");
+        assert_eq!(code, 0, "{lane}: eject of hosted A: {env:#}");
         assert!(
             !env.to_string().contains("package_not_installed"),
             "{lane}: the installed copy is not reported missing: {env:#}"
@@ -1048,10 +1087,10 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
             .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
             .collect();
         assert!(
-            wired.contains(&format!(".socket/vendor/pypi/{UUID_B}/"))
+            wired.contains(&format!(".socket/vendor/pypi/{UUID}/"))
                 && !wired.contains(&hosted_url)
-                && !wired.contains(UUID),
-            "{lane}: wired to vendored B, hosted A gone:\n{wired}"
+                && !wired.contains(UUID_B),
+            "{lane}: wired to vendored A, hosted A gone, manifest B unread:\n{wired}"
         );
     }
 }
@@ -3117,12 +3156,11 @@ async fn pipenv_hosted_to_vendored_keeps_the_requirements_patched() {
     // which also rehosts the prebuilt download: serve the vendored wheel
     // from the same mock.
     prebuilt_common::mount_project(&server, &root).await;
+    mount_patch_view(&server).await;
     let uri = server.uri();
-    let (code, env) = run_cli(
-        &root,
-        &["vendor", "--patch-server-url", &uri, "--vendor-url", &uri],
-        &[],
-    );
+    let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+    args.extend(api_args(&uri));
+    let (code, env) = run_cli(&root, &args, &[]);
     assert_eq!(code, 0, "vendor takeover: {env:#}");
     let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
     assert!(
@@ -3247,7 +3285,10 @@ async fn pipenv_vendor_wires_the_exported_requirements_too() {
     }
     stage_manifest(&root);
     prebuilt_common::mount_project(&server, &root).await;
-    let (code, env) = run_cli(&root, &["vendor", "--patch-server-url", uri.as_str()], &[]);
+    mount_patch_view(&server).await;
+    let mut args = vec!["vendor", "--patch-server-url", uri.as_str()];
+    args.extend(api_args(&uri));
+    let (code, env) = run_cli(&root, &args, &[]);
     assert_eq!(code, 0, "takeover: {env:#}");
     assert_both_vendored(&root, "takeover");
 }

@@ -207,23 +207,21 @@ fn corrupt_pre_v5_redirect_ledger_is_ignored_by_vendor() {
     );
 }
 
-/// Dry run over a purl the lockfile pins hosted: the run warns
-/// `vendor_would_revert_redirect` (an UNCOUNTED advisory — dry/wet takeover
-/// parity) after resolving the upstream entry exactly like a wet run
-/// would, and writes nothing — no lock edit, no artifact, no ledger.
+/// Dry run over a hosted pin with an agent manifest uses the same eject
+/// preview as a manifest-free checkout, and writes nothing.
 #[tokio::test]
-async fn dry_run_over_hosted_pin_warns_and_writes_nothing() {
+async fn dry_run_over_hosted_pin_previews_eject_and_writes_nothing() {
     let fx = npm_fixture();
     let hosted_lock = pin_hosted(&fx);
     let registry = mock_npm_registry().await;
 
     let (code, env) = vendor_online(&fx, &registry.uri(), &["--dry-run"]);
     assert_eq!(code, 0, "the dry run itself succeeds: {env:#}");
-    let warned = find_event(&env, "skipped", Some("vendor_would_revert_redirect"));
+    let warned = find_event(&env, "applied", Some("eject_planned"));
     assert_eq!(warned["purl"], PURL);
     assert_eq!(
         env["summary"]["skipped"], 0,
-        "the takeover advisory is uncounted: {env:#}"
+        "no package is skipped: {env:#}"
     );
     assert_eq!(
         fx.lock_bytes(),
@@ -242,7 +240,7 @@ async fn dry_run_over_hosted_pin_warns_and_writes_nothing() {
 }
 
 /// The wet twin: vendoring over the hosted pin first restores the upstream
-/// registry entry (`vendor_takeover_reverted_redirect`), then vendors; the
+/// registry entry, then vendors; the
 /// vendor ledger records the UPSTREAM entry as the original, so `vendor
 /// --revert` lands on the registry entry — never back on the hosted URL.
 #[tokio::test]
@@ -254,12 +252,11 @@ async fn vendor_over_hosted_pin_restores_upstream_then_revert_returns_to_registr
     let (code, env) = vendor_online(&fx, &registry.uri(), &[]);
     assert_eq!(code, 0, "{env:#}");
     find_event(&env, "applied", None);
-    let warned = find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
     assert!(
-        warned["reason"]
-            .as_str()
-            .is_some_and(|m| m.contains("package-lock.json")),
-        "the advisory names the restored lockfile: {warned:#}"
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_takeover_reverted_redirect"),
+        "eject restores upstream as its own step: {env:#}"
     );
     let lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
     let entry = &lock["packages"]["node_modules/left-pad"];
@@ -288,10 +285,8 @@ async fn vendor_over_hosted_pin_restores_upstream_then_revert_returns_to_registr
     assert_eq!(entry["integrity"], UPSTREAM_INTEGRITY, "{lock:#}");
 }
 
-/// A hosted pin whose upstream entry cannot be restored (here: `--offline`,
-/// so the registry lookup is impossible) fails the purl CLOSED with
-/// `redirect_revert_failed` naming the checkout remedy — vendoring over a
-/// live hosted pin would record the hosted fragment as the "original".
+/// An offline hosted conversion refuses before fetching records or
+/// restoring upstream, even when an agent manifest is present.
 #[test]
 fn unrestorable_hosted_pin_fails_closed() {
     let fx = npm_fixture();
@@ -302,12 +297,11 @@ fn unrestorable_hosted_pin_fails_closed() {
         &["--offline", "--patch-server-url", HOSTED_ORIGIN],
     );
     assert_eq!(code, 1, "{env:#}");
-    let failed = find_event(&env, "failed", Some("redirect_revert_failed"));
-    assert_eq!(failed["purl"], PURL);
-    let detail = failed["error"].as_str().unwrap_or_default();
+    assert_eq!(env["error"]["code"], "offline_eject_unavailable");
+    let detail = env["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        detail.contains("git checkout") && detail.contains("package-lock.json"),
-        "the refusal names the checkout remedy for the lockfile: {env:#}"
+        detail.contains("offline") && detail.contains("re-run without --offline"),
+        "{env:#}"
     );
     assert_eq!(
         fx.lock_bytes(),

@@ -23,15 +23,15 @@ use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{
-    assert_no_event_code, find_event, hosted_line, line_integrity, lock_line, patch_record, read,
-    run_json, run_json_env, vendor_cli, write_bun_project, HOSTED_URL, LEFT_PAD_REGISTRY_LINE,
-    NAME, PATCHED_INDEX, PATCHED_SHA512, PURL, UUID, VERSION,
+    assert_no_event_code, events, find_event, hosted_line, line_integrity, lock_line, patch_record,
+    read, run_json, run_json_env, vendor_cli, write_bun_project, HOSTED_URL,
+    LEFT_PAD_REGISTRY_LINE, NAME, PATCHED_INDEX, PATCHED_SHA512, PURL, UUID, VERSION,
 };
 
 const SCOPED_NAME: &str = "@corp/widget";
 const SCOPED_VERSION: &str = "2.0.0";
-const SCOPED_PURL: &str = "pkg:npm/@corp/widget@2.0.0";
-const SCOPED_UUID: &str = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
+pub(super) const SCOPED_PURL: &str = "pkg:npm/@corp/widget@2.0.0";
+pub(super) const SCOPED_UUID: &str = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
 const SCOPED_HOSTED_URL: &str = "https://patch.socket.dev/patch/npm/@corp/widget/2.0.0/55555555-5555-4555-8555-555555555555/3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f/widget-2.0.0.tgz";
 const SCOPED_INTEGRITY: &str = "sha512-corpWIDGETcorp0123456789==";
 const SCOPED_PATCHED_SHA512: &str = "sha512-corpPATCHEDcorp0123456789==";
@@ -267,7 +267,15 @@ async fn bun_takeover_then_vendor_revert_keeps_the_bunfig_and_scope_registry_url
     let (code, env) = vendor_cli(root, &[]);
     assert_eq!(code, 0, "vendor over the hosted pins: {env:#}");
     assert_eq!(env["summary"]["applied"], 2, "{env:#}");
-    find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
+    // An eject of both hosted pins: each is restored upstream, then vendored.
+    assert_eq!(
+        events(&env)
+            .iter()
+            .filter(|e| e["action"] == "applied")
+            .count(),
+        2,
+        "{env:#}"
+    );
     assert_no_event_code(&env, "redirect_revert_failed");
     assert_no_registry_fallback(&env);
     let lock = read(root, "bun.lock");
