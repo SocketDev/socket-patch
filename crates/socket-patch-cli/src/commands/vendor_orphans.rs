@@ -106,6 +106,16 @@ pub(crate) fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
         .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
 }
 
+/// How to recover a lockfile reference into `.socket/vendor/` that the
+/// ledger lost. `repair` does not rebuild ledger entries from lockfiles
+/// (v5.0), so the entry must come back from version control (after a git
+/// merge kept one side of state.json, both sides' `entries` merged), or
+/// the lockfile goes back to its pre-vendor version.
+pub(crate) const UNLEDGERED_WIRING_REMEDY: &str =
+    "restore its entry in .socket/vendor/state.json from version control (if a git merge \
+     kept one side of state.json, merge both sides' `entries`), or restore the lockfile \
+     with `git checkout -- <lockfile>`";
+
 /// The advisory for an orphan uuid dir the sweep kept because a project
 /// lockfile still points into it.
 pub(crate) fn orphan_still_wired(unit: &vendor::path::SweptVendorDir) -> VendorWarning {
@@ -113,8 +123,8 @@ pub(crate) fn orphan_still_wired(unit: &vendor::path::SweptVendorDir) -> VendorW
         "vendor_orphan_still_wired",
         format!(
             "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
-             entry owns; the artifacts were kept (run `socket-patch repair` to re-adopt \
-             them into the ledger, then revert again)",
+             entry owns; the artifacts were kept ({UNLEDGERED_WIRING_REMEDY}, then revert \
+             again)",
             unit.eco, unit.uuid
         ),
     )
@@ -202,6 +212,7 @@ mod tests {
         assert!(orphan_in_target(&Target::parse(uuid), &unparsed));
         assert!(!orphan_in_target(&Target::parse("left-pad"), &unparsed));
     }
+
     /// A kept, still-wired orphan points the user at a remedy that works
     /// in v5: `repair` no longer rebuilds ledger entries from lockfiles,
     /// so the advisory names the ledger restore (and the merge case,
