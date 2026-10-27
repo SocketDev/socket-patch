@@ -1364,10 +1364,12 @@ jobs:
           # each leg's `test_filter` names its tool's module and keeps
           # `--ignored`. A `test_filter` may hold several `;`-separated
           # filters: the run step runs the binary once per filter, and each
-          # one must run a test. The PR tier runs Poetry, PDM, Hatch and deno
-          # in one leg and Pipenv with pip in another (same uv + Pythons
-          # setup), since each tool's tests take seconds and a leg of its
-          # own spent ~80% of its time on runner start and setup (#1732).
+          # one must run a test. The PR tier runs Poetry, PDM, Hatch, Pipenv
+          # and deno in one leg, since each tool's tests take seconds and a
+          # leg of its own spent ~80% of its time on runner start and setup
+          # (#1732). pip (~3 min of tests) keeps its own leg so it does not
+          # grow the e2e critical path. In the shared leg PDM / Hatch
+          # bootstrap with the Pipenv leg's uv (it is first on PATH).
           # Real-Poetry hosted + vendored capstones (#[ignore]-gated,
           # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
           # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.0 (first lock 2.1 writer),
@@ -1381,12 +1383,12 @@ jobs:
           # Real deno negative capstone (no hosted/vendored wiring exists for
           # deno; VEX must attest nothing): the current major here, older
           # majors in e2e-extended.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored; pdm:: --ignored; hatch:: --ignored; deno:: --ignored', poetry: '2.4.3', pdm: '2.29.2', hatch: '1.18.1', deno: '2.9.7'}
           # Real Pipenv / pip capstones (mock patch server; the tools are
           # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
           # space-separated releases the suite loops over. The middle
           # Pipenv releases are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored; pip:: --ignored', pipenv: '2026.8.0', pip: '22 23 24 25 26'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored; pdm:: --ignored; hatch:: --ignored; pipenv:: --ignored; deno:: --ignored', poetry: '2.4.3', pdm: '2.29.2', hatch: '1.18.1', pipenv: '2026.8.0', deno: '2.9.7'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 23 24 25 26'}
           # Real-Maven hosted + vendored capstones, one leg per Maven line:
           # 3.6 (pre http-blocker), 3.8 (resolver 1.6: no trusted checksums),
           # 3.9 (trusted checksums), 4.0 rc. Hosted also runs both sides of
