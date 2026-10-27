@@ -132,7 +132,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_classic_vex::output_retrying_dns(&mut cmd)
 }
 
 /// Run the socket-patch binary with a scrubbed environment.
