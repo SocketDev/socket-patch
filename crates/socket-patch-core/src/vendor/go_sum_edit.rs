@@ -304,7 +304,7 @@ impl GoSumEditor {
                     .strip_prefix(module)
                     .is_some_and(|rest| rest.starts_with(char::is_whitespace))
             })
-            .flat_map(go_sum_lines)
+            .filter_map(parse_go_sum_line)
             .filter_map(|l| l.zip_version_of(module).map(str::to_string))
             .collect()
     }
@@ -397,20 +397,24 @@ impl<'a> GoSumLine<'a> {
 /// lines are skipped. Each caller keeps its own token rule
 /// ([`GoSumLine::extra_tokens`]) and hash filter.
 pub(crate) fn go_sum_lines(text: &str) -> impl Iterator<Item = GoSumLine<'_>> {
-    text.lines().filter_map(|line| {
-        let mut tokens = line.split_whitespace();
-        let (module, version, hash) = (tokens.next()?, tokens.next()?, tokens.next()?);
-        let (version, go_mod) = match version.strip_suffix("/go.mod") {
-            Some(version) => (version, true),
-            None => (version, false),
-        };
-        Some(GoSumLine {
-            module,
-            version,
-            go_mod,
-            hash,
-            extra_tokens: tokens.next().is_some(),
-        })
+    text.lines().filter_map(parse_go_sum_line)
+}
+
+/// One line of [`go_sum_lines`], or `None` when it has fewer than three
+/// tokens.
+fn parse_go_sum_line(line: &str) -> Option<GoSumLine<'_>> {
+    let mut tokens = line.split_whitespace();
+    let (module, version, hash) = (tokens.next()?, tokens.next()?, tokens.next()?);
+    let (version, go_mod) = match version.strip_suffix("/go.mod") {
+        Some(version) => (version, true),
+        None => (version, false),
+    };
+    Some(GoSumLine {
+        module,
+        version,
+        go_mod,
+        hash,
+        extra_tokens: tokens.next().is_some(),
     })
 }
 
@@ -859,12 +863,20 @@ mod tests {
         // line (#1424): compare against `go_sum_lines` over odd spacing.
         let content =
             "m v1 h1:a\n m v2 h\n\u{a0}m v3 h\nm\u{a0}v4 h\nmm v5 h\nm v6/go.mod h\nm\tv7\th\n";
-        let editor = GoSumEditor::new(content.to_string());
+        let text = GoSumEditor::new(content.to_string());
+        // An edit leaves the editor holding split lines; ask both forms.
+        let mut lines = GoSumEditor::new(content.to_string());
+        assert!(lines.upsert_module_lines(MOD, VER, ZIP_H1, GOMOD_H1));
         for module in ["m", "mm", "m\u{a0}v4", ""] {
             let reference: Vec<String> = go_sum_lines(content)
                 .filter_map(|l| l.zip_version_of(module).map(str::to_string))
                 .collect();
-            assert_eq!(editor.zip_versions(module), reference, "module {module:?}");
+            assert_eq!(text.zip_versions(module), reference, "module {module:?}");
+            assert_eq!(
+                lines.zip_versions(module),
+                reference,
+                "lines, module {module:?}"
+            );
         }
     }
 }
