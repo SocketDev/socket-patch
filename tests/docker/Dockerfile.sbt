@@ -97,6 +97,11 @@ RUN set -eu \
 # 1.9.9) boot quickly cold and stay out: the scala-cli real-tool test serves
 # the image's Central cache from memory, which more lines would bloat past
 # its 2g container.
+# Each warm `update` gets a 600 s deadline and one retry (normally it takes
+# well under a minute): Ivy has no read timeout, so one stalled resolver
+# connection used to hang the layer until the job's 45-min timeout (#1665).
+# timeout(1) signals its whole process group, so the sbt script's JVM dies
+# with it and leaves no Ivy lock behind for the retry.
 ARG SBT_WARM_VERSIONS="0.13.18 1.2.8 1.13.0 2.0.9"
 # CI's blocking slice uses only two sbt lines; nightly/compat keep all tools.
 ARG SBT_WARM_TOOLS=1
@@ -108,8 +113,15 @@ RUN set -eu \
         'libraryDependencies += "org.apache.commons" % "commons-lang3" % "3.11"' > "$d/build.sbt"; \
       case "$v" in 0.*|1.[0-3].*) jdk=/opt/jdk8;; *) jdk=/opt/jdk17;; esac; \
       case "$v" in 2.*) extra=--server;; *) extra=;; esac; \
-      (cd "$d" && JAVA_HOME="$jdk" PATH="$jdk/bin:$PATH" \
-        sbt -batch -no-colors -Dsbt.server.autostart=false $extra update); \
+      ok=; for attempt in 1 2; do \
+        if (cd "$d" && JAVA_HOME="$jdk" PATH="$jdk/bin:$PATH" \
+          timeout -k 30 600 \
+          sbt -batch -no-colors -Dsbt.server.autostart=false $extra update); then \
+          ok=1; break; \
+        fi; \
+        echo "warm sbt $v update failed or ran past 600 s (attempt $attempt)" >&2; \
+      done; \
+      [ -n "$ok" ]; \
       rm -rf "$d"; \
     done \
  && if [ "$SBT_WARM_TOOLS" = 1 ]; then \
