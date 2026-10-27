@@ -1074,6 +1074,13 @@ async fn cargo_hosted_explicit_crates_io_registry_is_pinned() {
             consumer_manifest("cfg-if = \"1.0.4\"\n"),
         ),
         (
+            "crates-io-wrapped",
+            consumer_manifest(
+                "cfg-if = { version = \"1.0.4\", features = [\n], registry = \"crates-io\" }\n",
+            ),
+            consumer_manifest("cfg-if = { version = \"1.0.4\", features = [\n] }\n"),
+        ),
+        (
             "crates-io-table",
             format!(
                 "{}\n[dependencies.cfg-if]\nversion = \"1.0.4\"\nregistry = \"crates-io\"\n",

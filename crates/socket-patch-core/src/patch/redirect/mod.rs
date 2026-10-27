@@ -3283,6 +3283,55 @@ fn cargo_inline_table<'a>(
     None
 }
 
+/// The line rewrites that move a wrapped inline table (`lines[idx..=end]`)
+/// from an explicit `registry = "crates-io"` to `reg`: the key is dropped
+/// with one adjacent comma, and the pin goes right after the opening `{`,
+/// the spelling upstream restore unpins. `None` when the key is not found
+/// exactly once outside comments.
+fn cargo_wrapped_crates_io_repin(
+    lines: &[&str],
+    idx: usize,
+    end: usize,
+    reg: &str,
+) -> Option<Vec<(usize, String)>> {
+    let code = |line: &str| line.split('#').next().unwrap_or_default().len();
+    let mut hits = (idx..=end).filter_map(|j| {
+        let line = lines[j];
+        let start = if j == idx { line.find('{')? } else { 0 };
+        CARGO_TOML_CRATES_IO_KEY_RE
+            .find(&line[start..code(line)])
+            .map(|m| (j, start + m.start(), start + m.end()))
+    });
+    let (j, from, to) = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    let line = lines[j];
+    let after = &line[to..];
+    let dropped = match after.trim_start().strip_prefix(',') {
+        Some(rest) => format!("{}{}", &line[..from], rest.trim_start()),
+        None => format!("{}{after}", line[..from].trim_end().strip_suffix(',')?),
+    };
+    let opening = if j == idx {
+        dropped.as_str()
+    } else {
+        lines[idx]
+    };
+    let brace = opening.find('{')?;
+    let mut rewrites = vec![(
+        idx,
+        format!(
+            "{} registry = \"{reg}\",{}",
+            &opening[..=brace],
+            &opening[brace + 1..]
+        ),
+    )];
+    if j != idx {
+        rewrites.push((j, dropped));
+    }
+    Some(rewrites)
+}
+
 fn cargo_toml_inline_string(inner: &str, key: &str) -> Option<String> {
     let document = format!("dependency = {{{inner}}}")
         .parse::<toml_edit::DocumentMut>()
@@ -3434,6 +3483,9 @@ static CARGO_TOML_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
 static CARGO_TOML_REGISTRY_VAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:\bregistry|"registry"|'registry')\s*=\s*(?:"[^"]*"|'[^']*')"#)
         .expect("static registry-value regex is valid")
+});
+static CARGO_TOML_CRATES_IO_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"registry\s*=\s*"crates-io""#).expect("static crates-io key regex is valid")
 });
 static CARGO_TOML_REGISTRY_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid")
@@ -3779,20 +3831,35 @@ fn plan_cargo_toml(
                     // Upstream restore unpins only the opening-line spelling
                     // this planner writes, so only an earlier pin in that
                     // spelling is superseded in place.
+                    // An explicit `registry = "crates-io"` (#386) is dropped
+                    // and the pin written in that spelling; restore then
+                    // leaves the declaration without the redundant key, as
+                    // it does for a one-line table.
                     let brace = raw.find('{').unwrap_or_default();
                     let earlier = format!(" registry = \"{value}\",");
-                    if is_socket_patch_registry_name(&value)
+                    let rewrites = if is_repinnable_registry_name(&value)
                         && raw[brace + 1..].starts_with(&earlier)
                     {
-                        let new_text = format!(
-                            "{} registry = \"{reg}\",{}",
-                            &raw[..=brace],
-                            &raw[brace + 1 + earlier.len()..]
-                        );
-                        pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                        Some(vec![(
                             idx,
-                            new_text,
-                        }));
+                            format!(
+                                "{} registry = \"{reg}\",{}",
+                                &raw[..=brace],
+                                &raw[brace + 1 + earlier.len()..]
+                            ),
+                        )])
+                    } else if value == "crates-io" {
+                        cargo_wrapped_crates_io_repin(&lines, idx, end, reg)
+                    } else {
+                        None
+                    };
+                    if let Some(rewrites) = rewrites {
+                        for (idx, new_text) in rewrites {
+                            pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                                idx,
+                                new_text,
+                            }));
+                        }
                         if workspace {
                             ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                         }
@@ -24225,6 +24292,25 @@ packages:
             assert!(
                 toml.contains(&format!("serde = {{ registry = \"{}\", version", cargo_reg())),
                 "[{entry:?}] pinned on the opening line: {toml}"
+            );
+        }
+        // An explicit `registry = "crates-io"` (#386) anywhere in the
+        // wrapped table is dropped and the pin lands on the opening line.
+        for entry in [
+            "serde = { registry = \"crates-io\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+            "serde = { version = \"1.0.190\", registry = \"crates-io\", features = [\n  \"derive\",\n] }\n",
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\",\n], registry = \"crates-io\" }\n",
+        ] {
+            let manifest = format!("{head}{entry}");
+            let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "[{entry:?}] {:?}", r.warnings);
+            let toml = r.files.get("Cargo.toml").expect("rewritten");
+            assert!(
+                toml.ends_with(&format!(
+                    "serde = {{ registry = \"{}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n",
+                    cargo_reg()
+                )),
+                "[{entry:?}] crates-io dropped, pinned on the opening line: {toml}"
             );
         }
         // Already pinned (the planner's own output): nothing to write.
