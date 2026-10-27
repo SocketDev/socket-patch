@@ -1152,6 +1152,61 @@ async fn cargo_hosted_multiline_inline_table_is_pinned() {
     }
 }
 
+/// #757: dotted keys (`cfg-if.version = …`, here with a wrapped features
+/// array after the version line) and a literal-string version
+/// (`cfg-if = '…'`) were refused as spellings the line grammar does not
+/// edit. Each is pinned, builds against the patched copy, and `remove`
+/// restores every byte, for LF and CRLF manifests.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_dotted_and_literal_spellings_are_pinned() {
+    for (tag, dep, crlf) in [
+        (
+            "dotted",
+            "cfg-if.version = \"1.0.4\" # pinned\ncfg-if.features = [\n]\n",
+            false,
+        ),
+        (
+            "dotted-crlf",
+            "cfg-if.version = \"1.0.4\" # pinned\ncfg-if.features = [\n]\n",
+            true,
+        ),
+        (
+            "dotted-renamed",
+            "legacy.package = \"cfg-if\"\nlegacy.version = '1.0.4'\n",
+            false,
+        ),
+        ("literal", "cfg-if = '1.0.4' # pinned\n", false),
+        ("literal-crlf", "cfg-if = '1.0.4' # pinned\n", true),
+    ] {
+        let crate_ref = if tag == "dotted-renamed" {
+            "legacy"
+        } else {
+            "cfg_if"
+        };
+        let shape = Shape {
+            tag,
+            files: vec![
+                ("Cargo.toml", consumer_manifest(dep)),
+                ("src/main.rs", "fn main() {}\n".to_string()),
+            ],
+            patches: vec![CFG_IF_1],
+            oracle: vec![(
+                "src/main.rs",
+                format!("fn main() {{ println!(\"{{}}\", {crate_ref}::socket_patched()); }}\n"),
+            )],
+            crlf,
+            lockless: false,
+            refused: None,
+            prefetch: "",
+            contest: None,
+            restored: vec![],
+        };
+        if run_shape(shape).await.is_none() {
+            return;
+        }
+    }
+}
+
 /// Bug H: a config ending in a blank line comes back byte-for-byte (the
 /// appended block's removal once normalized the trailing newline run). A
 /// config without a final newline comes back with every byte but that
