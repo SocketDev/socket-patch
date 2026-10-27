@@ -103,11 +103,14 @@
 //!    diagnostic) and dedupes. `source_file` is the root-relative name of the
 //!    file the reference was read from.
 //! 8. **Integrity.** Set `locked_integrity` whenever the lock pins the
-//!    artifact bytes. For hosted refs set `integrity_required` iff that
-//!    format's hosted rewriter ALWAYS writes a pin: a pin-less entry is then
-//!    not Socket-written and must not use the not-installed lockfile basis
-//!    (see [`PatchedRef::lockfile_basis_ok`]). Document the per-format
-//!    choice in the extractor. Vendored refs ignore it (the artifact is
+//!    artifact bytes. For hosted refs set `integrity_required` iff a
+//!    pin-less entry in this lock state is not Socket-written: the
+//!    format's hosted rewriter always writes a pin there, and no tool
+//!    legitimately drops it. Such an entry must not use the not-installed
+//!    lockfile basis (see [`PatchedRef::lockfile_basis_ok`]). The choice
+//!    may depend on the lock state (a gem lock without `CHECKSUMS`, a Go
+//!    pin `go mod tidy` pruned to its `/go.mod` line); document it in the
+//!    extractor. Vendored refs ignore it (the artifact is
 //!    hashed).
 //! 9. **Tests** live in the extractor's own file and use the `testing`
 //!    module below (`Project` tempdir builder with fixture copy,
@@ -273,10 +276,11 @@ pub struct PatchedRef {
     /// The content pin the lock records for the wired artifact, if any.
     /// Never `Some(LockIntegrity::None)` (push normalizes it to `None`).
     pub locked_integrity: Option<LockIntegrity>,
-    /// Hosted only: this format's hosted rewriter ALWAYS writes an
-    /// integrity pin, so a missing `locked_integrity` means the entry was
-    /// not Socket-written (hand-edited / degraded) and must not be attested
-    /// from the lockfile alone.
+    /// Hosted only: in this lock state the hosted rewriter always writes an
+    /// integrity pin and no tool legitimately drops it, so a missing
+    /// `locked_integrity` means the entry was not Socket-written
+    /// (hand-edited / degraded) and must not be attested from the lockfile
+    /// alone.
     pub integrity_required: bool,
     /// Hosted only: the Socket URL (artifact, registry index, or source url)
     /// the reference was recovered from, for diagnostics.

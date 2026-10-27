@@ -839,6 +839,44 @@ async fn tidy_pruned_zip_line_still_pins_the_hosted_replace() {
         String::from_utf8_lossy(&build.stderr)
     );
 
+    // Re-running the hosted rewrite leaves the tidy pair alone.
+    let ovr = DepOverride {
+        ecosystem: "golang".into(),
+        name: UMOD.into(),
+        namespace: None,
+        version: UVER.into(),
+        token: String::new(),
+        patch_uuid: UUID.into(),
+        artifact_url: format!("{proxy_url}/{smod}/@v/{SVER}.zip"),
+        registry_override: Some(RegistryOverride {
+            kind: "goproxy".into(),
+            index_url: proxy_url.clone(),
+            identifiers: RegistryOverrideIdentifiers {
+                name: UMOD.into(),
+                version: UVER.into(),
+                go_module_path: Some(smod.clone()),
+                go_module_version: Some(SVER.into()),
+                ..Default::default()
+            },
+        }),
+        integrity: Integrity {
+            dirhash_h1: Some(zip_h1),
+            go_mod_h1: Some(gomod_h1),
+            ..Default::default()
+        },
+    };
+    let files: std::collections::BTreeMap<String, String> = ["go.mod", "go.sum"]
+        .into_iter()
+        .map(|name| {
+            let text = std::fs::read_to_string(consumer.join(name)).unwrap();
+            (name.to_string(), text)
+        })
+        .collect();
+    let rerun = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+    assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+    assert!(rerun.files.is_empty(), "{:?}", rerun.files);
+    assert!(rerun.confirmed_golang_uuids.contains(UUID));
+
     let discovery = socket_patch_core::vex::discover::discover_patched_refs(&consumer).await;
     let purl = format!("pkg:golang/{UMOD}@{UVER}");
     let refs: Vec<_> = discovery.refs.iter().filter(|r| r.purl == purl).collect();

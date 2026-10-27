@@ -41,10 +41,18 @@
 //!   is its `h1:` dirhash ([`LockIntegrity::GoH1`]). Without it (the tidy
 //!   state) `integrity_required = false`: the module path carries the patch
 //!   uuid and go compiles none of its packages, so the pinned replace alone
-//!   is the attestation basis. Anything else — no `/go.mod` line, two
-//!   different hashes for one line (a go `SECURITY ERROR`), a malformed
-//!   line for the Socket module+version (go rejects the whole go.sum) — is
-//!   not a pin: `integrity_required = true`, no `locked_integrity`.
+//!   is the attestation basis — but MVS also keeps the `/go.mod` line of a
+//!   version it reads and does not select, so a `/go.mod`-only pin whose
+//!   version go.sum shows is not selected ([`go_build_list::select`]) is
+//!   inert: diagnosed, no ref. Anything else — no `/go.mod` line, two
+//!   different hashes for one line, a non-dirhash `h1:` (both a go
+//!   `SECURITY ERROR`), a line of other than three tokens anywhere in a
+//!   sum file (go rejects the whole file) — is not a pin:
+//!   `integrity_required = true`, no `locked_integrity`. Hashes of other
+//!   algorithms are ignored, as go ignores them. The sum files are the
+//!   root `go.sum` and, with a `go.work`, `go.work.sum` and each in-root
+//!   `use` member's `go.sum` (go verifies against all of them, so a
+//!   member's go.sum may hold the zip line).
 //!   NB for the CLI's installed-tree basis: under a hosted replace the module cache's
 //!   `M@v` (if any, e.g. from before the redirect) is pristine BY
 //!   CONSTRUCTION — the build consumes `patch.socket.dev/gopatch/<uuid>@<sver>`.
@@ -73,10 +81,11 @@
 //!   `replace` grammar and paths relative to the (root) workspace dir; its
 //!   refs are emitted with `source_file = "go.work"`, versions checked
 //!   against the ROOT `go.mod`'s `require` (the only one discovery reads),
-//!   and hosted pins looked up in `go.work.sum`, then `go.sum`. go.work
+//!   and hosted pins looked up in the sum files above. go.work
 //!   replaces override go.mod replaces in Go, but rule 10 leaves
 //!   cross-file precedence to the CLI's `wiring_conflict` gate. Nested
-//!   workspace members' go.mod files are not read (root-only, rule 1).
+//!   workspace members' go.mod files are not read (root-only, rule 1);
+//!   only their go.sum pins are.
 //! * **Hand-edit tolerance**: a UTF-8 BOM, CRLF line ends, tab-separated
 //!   tokens, `replace(` without a space, `// comments`, and Go string
 //!   literals (`"github.com/foo/bar"`, `` `…` ``) around escape- and
@@ -93,7 +102,9 @@ use super::{
     golang_purl, vendor_ref, vendored_leaf_purl, DiscoverCtx, Discovery, PatchedRef,
     DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
+use crate::patch::apply::is_safe_relative_subpath;
 use crate::patch::path_safety::is_safe_single_segment;
+use crate::vendor::go_build_list;
 use crate::vendor::go_mod_edit::{
     self, block_structure_error, hosted_module_uuid, normalize_for_read, ReplaceEntry,
     ReplaceOwner, HOSTED_GO_MODULE_PREFIX,
@@ -111,21 +122,48 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         Some(text) => parse_go_file(GO_MOD, &text, out),
         None => None,
     };
-    // `require` of the root module: the version the build selects (as far
-    // as a root-only reader can tell).
     let required: HashMap<String, String> = go_mod
         .as_deref()
         .map(go_mod_edit::parse_required_versions)
         .unwrap_or_default();
 
-    if let Some(text) = go_mod.as_deref() {
-        extract_file(ctx, out, GO_MOD, text, &required, &[GO_SUM]).await;
+    let go_work = match ctx.read_text(GO_WORK, out).await {
+        Some(text) => parse_go_file(GO_WORK, &text, out),
+        None => None,
+    };
+    let files: Vec<(&str, Vec<ReplaceEntry>)> = [(GO_MOD, &go_mod), (GO_WORK, &go_work)]
+        .into_iter()
+        .filter_map(|(file, text)| {
+            Some((file, go_mod_edit::parse_replace_entries(text.as_deref()?)))
+        })
+        .collect();
+    let any_hosted = files
+        .iter()
+        .flat_map(|(_, entries)| entries)
+        .any(|e| e.owner == Some(ReplaceOwner::Hosted));
+    let sums = if any_hosted {
+        SumPins::read(ctx, out, go_work.as_deref()).await
+    } else {
+        SumPins::default()
+    };
+    let graph = Graph {
+        pruned: go_mod
+            .as_deref()
+            .is_some_and(go_mod_edit::prunes_module_graph),
+        required,
+    };
+    for (file, entries) in &files {
+        extract_file(out, file, entries, &graph, &sums);
     }
-    if let Some(text) = ctx.read_text(GO_WORK, out).await {
-        if let Some(text) = parse_go_file(GO_WORK, &text, out) {
-            extract_file(ctx, out, GO_WORK, &text, &required, &[GO_WORK_SUM, GO_SUM]).await;
-        }
-    }
+}
+
+/// The root module's build-list evidence.
+struct Graph {
+    /// go >= 1.17: `require` lists every module that provides a package.
+    pruned: bool,
+    /// `require` of the root module: the version the build selects (as far
+    /// as a root-only reader can tell).
+    required: HashMap<String, String>,
 }
 
 /// Normalize a go.mod-grammar file (BOM, simple string literals) and check
@@ -145,24 +183,21 @@ fn parse_go_file(file: &str, text: &str, out: &mut Discovery) -> Option<String> 
 }
 
 /// Emit the refs of one parsed file's Socket-owned `replace` directives.
-async fn extract_file(
-    ctx: &DiscoverCtx<'_>,
+fn extract_file(
     out: &mut Discovery,
     file: &str,
-    text: &str,
-    required: &HashMap<String, String>,
-    sum_files: &[&str],
+    entries: &[ReplaceEntry],
+    graph: &Graph,
+    sums: &SumPins,
 ) {
-    let entries = go_mod_edit::parse_replace_entries(text);
+    let required = &graph.required;
     // Versioned directives of ANY owner: they shadow a version-less replace
     // of the same module at that version.
     let versioned: HashSet<(&str, &str)> = entries
         .iter()
         .filter_map(|e| Some((e.module.as_str(), e.version.as_deref()?)))
         .collect();
-    let mut sums: Option<SumPins> = None;
-
-    for entry in &entries {
+    for entry in entries {
         match entry.owner {
             Some(ReplaceOwner::Hosted) => {
                 let Some(rhs) = entry.rhs_module.as_deref() else {
@@ -198,21 +233,33 @@ async fn extract_file(
                 let Some(purl) = replaced_purl(entry, required, &versioned, file, out) else {
                     continue;
                 };
-                if sums.is_none() {
-                    let mut pins = SumPins::default();
-                    for sum in sum_files {
-                        if let Some(sum_text) = ctx.read_text(sum, out).await {
-                            pins.add(&sum_text);
+                let (integrity, integrity_required) = match sums.pin(rhs, rhs_version) {
+                    SumPin::Zip(h1) => (Some(LockIntegrity::GoH1(h1)), true),
+                    SumPin::GoModOnly => {
+                        // MVS reads (and go.sum keeps the `/go.mod` line of)
+                        // versions it does not select; only a zip line shows
+                        // the replaced version is the one built.
+                        let req = required.get(&entry.module).map(String::as_str);
+                        // `replaced_purl` resolved one of the two.
+                        let version = entry.version.as_deref().or(req).unwrap_or_default();
+                        let zips = sums.zip_versions(&entry.module);
+                        let selected = go_build_list::select(graph.pruned, req, &zips, version);
+                        if let Some(other) = selected.other_version() {
+                            out.diag(
+                                DIAG_REF_INVALID,
+                                file,
+                                format!(
+                                    "{file}: replace {} {version} is inert: go.sum shows the \
+                                     build selects {other}, so it uses the unpatched module",
+                                    entry.module
+                                ),
+                            );
+                            continue;
                         }
+                        (None, false)
                     }
-                    sums = Some(pins);
-                }
-                let (integrity, integrity_required) =
-                    match sums.as_ref().map(|s| s.pin(rhs, rhs_version)) {
-                        Some(SumPin::Zip(h1)) => (Some(LockIntegrity::GoH1(h1)), true),
-                        Some(SumPin::GoModOnly) => (None, false),
-                        Some(SumPin::Unpinned) | None => (None, true),
-                    };
+                    SumPin::Unpinned => (None, true),
+                };
                 let url = format!("{rhs}@{rhs_version}");
                 out.push(PatchedRef::hosted(
                     purl,
@@ -353,15 +400,21 @@ fn replaced_purl(
     purl
 }
 
-/// go.sum pins of Socket hosted modules, keyed `(module, version)`.
+/// go.sum pins of Socket hosted modules, keyed `(module, version)`, from
+/// every sum file go verifies against.
 #[derive(Default)]
 struct SumPins {
     /// Zip-line `h1:` hashes.
     zip: HashMap<(String, String), BTreeSet<String>>,
     /// `/go.mod`-line `h1:` hashes.
     gomod: HashMap<(String, String), BTreeSet<String>>,
-    /// Keys with a line go cannot parse (wrong token count, malformed hash).
+    /// Keys with an `h1:` hash that is not a dirhash: go fails the
+    /// comparison with a `SECURITY ERROR`.
     malformed: HashSet<(String, String)>,
+    /// A sum file has a line go cannot parse, so every build fails.
+    unparseable: bool,
+    /// Every module's zip-line versions (the build-list evidence).
+    zip_versions: HashMap<String, Vec<String>>,
 }
 
 /// What the sum files pin for one Socket `module@version`.
@@ -375,24 +428,52 @@ enum SumPin {
 }
 
 impl SumPins {
-    fn add(&mut self, text: &str) {
-        // `go_sum_lines` skips a line too short to carry a hash.
-        for line in text.lines() {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if let [module, version] = tokens[..] {
-                if module.starts_with(HOSTED_GO_MODULE_PREFIX) {
-                    let version = version.strip_suffix("/go.mod").unwrap_or(version);
-                    self.malformed
-                        .insert((module.to_string(), version.to_string()));
+    /// The root `go.sum`; in workspace mode also `go.work.sum` and each
+    /// in-root `use` member's `go.sum`, which go verifies against too.
+    async fn read(ctx: &DiscoverCtx<'_>, out: &mut Discovery, go_work: Option<&str>) -> Self {
+        let mut files = vec![GO_SUM.to_string()];
+        if let Some(work) = go_work {
+            files.push(GO_WORK_SUM.to_string());
+            for dir in go_mod_edit::parse_use_dirs(work) {
+                if let Some(rel) = member_go_sum(&dir) {
+                    if !files.contains(&rel) {
+                        files.push(rel);
+                    }
                 }
             }
         }
+        let mut pins = SumPins::default();
+        for file in &files {
+            if let Some(text) = ctx.read_text(file, out).await {
+                pins.add(&text);
+            }
+        }
+        pins
+    }
+
+    fn add(&mut self, text: &str) {
+        // go rejects a whole go.sum with any non-blank line of other than
+        // three tokens (only `go mod tidy` skips it).
+        if text
+            .lines()
+            .any(|l| !matches!(l.split_whitespace().count(), 0 | 3))
+        {
+            self.unparseable = true;
+            return;
+        }
         for line in go_sum_lines(text) {
-            if !line.module.starts_with(HOSTED_GO_MODULE_PREFIX) {
+            if !line.go_mod {
+                self.zip_versions
+                    .entry(line.module.to_string())
+                    .or_default()
+                    .push(line.version.to_string());
+            }
+            // go ignores hashes of algorithms it does not know.
+            if !line.module.starts_with(HOSTED_GO_MODULE_PREFIX) || !line.hash.starts_with("h1:") {
                 continue;
             }
             let key = (line.module.to_string(), line.version.to_string());
-            if line.extra_tokens || !is_h1_dirhash(line.hash) {
+            if !is_h1_dirhash(line.hash) {
                 self.malformed.insert(key);
             } else if line.go_mod {
                 self.gomod
@@ -416,7 +497,8 @@ impl SumPins {
             Some(h) if h.len() == 1 => h.iter().next().cloned(),
             _ => None,
         };
-        if self.malformed.contains(&key) || one(self.gomod.get(&key)).is_none() {
+        if self.unparseable || self.malformed.contains(&key) || one(self.gomod.get(&key)).is_none()
+        {
             return SumPin::Unpinned;
         }
         match self.zip.get(&key) {
@@ -424,6 +506,30 @@ impl SumPins {
             some => one(some).map_or(SumPin::Unpinned, SumPin::Zip),
         }
     }
+
+    fn zip_versions(&self, module: &str) -> Vec<&str> {
+        self.zip_versions
+            .get(module)
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Root-relative `go.sum` of a `go.work` `use` member; `None` for the root
+/// itself (already read) and for a member outside the root.
+fn member_go_sum(dir: &str) -> Option<String> {
+    let dir = dir.replace('\\', "/");
+    if !is_safe_relative_subpath(&dir) {
+        return None;
+    }
+    let segments: Vec<&str> = dir
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+    Some(format!("{}/{GO_SUM}", segments.join("/")))
 }
 
 #[cfg(test)]
@@ -734,6 +840,113 @@ mod tests {
         let r = &out.refs[0];
         assert_eq!(r.source_file, std::path::PathBuf::from("go.work"));
         assert!(r.lockfile_basis_ok());
+    }
+
+    /// In workspace mode go verifies against every member's go.sum, so the
+    /// zip line may live there; a member outside the root is not read.
+    #[tokio::test]
+    async fn workspace_member_go_sum_holds_the_zip_line() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n");
+        for (use_dir, member_sum, pinned) in [
+            ("./svc", "svc/go.sum", true),
+            ("svc/", "svc/go.sum", true),
+            ("../svc", "../svc/go.sum", false),
+        ] {
+            let p = Project::new();
+            p.write("go.mod", &go_mod)
+                .write(
+                    "go.work",
+                    format!("go 1.21\n\nuse (\n\t.\n\t{use_dir}\n)\n"),
+                )
+                .write("go.sum", format!("{m} {sver}/go.mod {MOD_H1}\n"));
+            if pinned {
+                p.write(member_sum, format!("{m} {sver} {ZIP_H1}\n"));
+            }
+            let out = run(&p).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            let r = &out.refs[0];
+            if pinned {
+                assert_eq!(
+                    r.locked_integrity,
+                    Some(LockIntegrity::GoH1(ZIP_H1.to_string())),
+                    "{use_dir}"
+                );
+                assert!(r.integrity_required);
+            } else {
+                assert_eq!(r.locked_integrity, None, "{use_dir}");
+            }
+            assert!(r.lockfile_basis_ok(), "{use_dir}");
+        }
+    }
+
+    /// In a go < 1.17 graph MVS keeps the `/go.mod` line of a version it only
+    /// reads: a `/go.mod`-only pin whose version go.sum shows is not the one
+    /// selected is inert.
+    #[tokio::test]
+    async fn go_mod_line_only_pin_of_an_unselected_version_is_inert() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!(
+            "module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n\
+             replace {MODULE} {VERSION} => {m} {sver}\n"
+        );
+        let pin = format!("{m} {sver}/go.mod {MOD_H1}\n");
+        for (extra, inert) in [
+            (
+                format!("{MODULE} v1.5.0 {ZIP_H1}\n{MODULE} v1.5.0/go.mod {MOD_H1}\n"),
+                true,
+            ),
+            (format!("{MODULE} v1.5.0/go.mod {MOD_H1}\n"), false),
+            (format!("{MODULE} v1.4.1 {ZIP_H1}\n"), true),
+            (String::new(), false),
+        ] {
+            let p = Project::new();
+            p.write("go.mod", &go_mod)
+                .write("go.sum", format!("{extra}{pin}"));
+            let out = run(&p).await;
+            if inert {
+                assert_refs(&out, &[]);
+                assert_eq!(out.diagnostics.len(), 1, "{extra}");
+                assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+                assert!(out.diagnostics[0].detail.contains("is inert"));
+            } else {
+                assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+                assert!(out.refs[0].lockfile_basis_ok(), "{extra}");
+            }
+        }
+        // With the zip line the socket module is loaded, so it is selected.
+        let p = Project::new();
+        p.write("go.mod", &go_mod).write(
+            "go.sum",
+            format!("{MODULE} v1.5.0 {ZIP_H1}\n{}", go_sum_for(UUID_A, sver)),
+        );
+        assert_refs(&run(&p).await, &[(PURL, UUID_A, WiringMode::Hosted)]);
+    }
+
+    /// go rejects a whole go.sum over one line of the wrong token count, and
+    /// ignores hashes of algorithms it does not know.
+    #[tokio::test]
+    async fn sum_file_parse_rules_follow_go() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n");
+        let pair = go_sum_for(UUID_A, sver);
+        for (go_sum, pinned) in [
+            (format!("a.com/x v1.0.0 h1:x= extra\n{pair}"), false),
+            (format!("a.com/x v1.0.0\n{pair}"), false),
+            (format!("\n  \n{pair}"), true),
+            (format!("{pair}{m} {sver} h2:whatever\n"), true),
+            (format!("{pair}{m} {sver}/go.mod h1:short\n"), false),
+        ] {
+            let p = Project::new();
+            p.write("go.mod", &go_mod).write("go.sum", &go_sum);
+            let out = run(&p).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.refs[0].lockfile_basis_ok(), pinned, "{go_sum:?}");
+            assert_eq!(out.refs[0].locked_integrity.is_some(), pinned, "{go_sum:?}");
+        }
     }
 
     #[tokio::test]
