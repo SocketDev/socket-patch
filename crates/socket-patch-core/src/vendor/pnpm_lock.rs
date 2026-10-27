@@ -248,13 +248,15 @@ impl NpmLockBackend for PnpmBackend {
         // A `file:` directory or tarball copy of the same release elsewhere
         // in the lock: the override reaches only the registry edge, so pnpm
         // keeps installing that copy from the user's bytes (#935). Named,
-        // not refused: the registry copy is still patched. Most locks name
-        // no `file:` source outside the vendor dir, so skip the parse.
+        // not refused: the registry copy is still patched. The lock is only
+        // re-parsed when it may hold such a copy: a v9 key names the
+        // package (`name@file:…`), a legacy `file:` key does not.
         let lines = project.lock.lines();
-        if lines
-            .iter()
-            .any(|l| l.contains("file:") && !l.contains(".socket/vendor/"))
-        {
+        let v9_key = format!("{name}@file:");
+        if lines.iter().any(|l| match self.dialect {
+            PnpmDialect::V9 => l.contains(&v9_key) && !l.contains(".socket/vendor/"),
+            PnpmDialect::Legacy => l.contains("file:") && !l.contains(".socket/vendor/"),
+        }) {
             let text = lines.join("\n");
             let copies = crate::vex::discover::npm::pnpm_lock_file_copies(
                 project_root,

@@ -943,7 +943,12 @@ pub(crate) async fn pnpm_lock_file_copies(
                 false
             }
         };
-        copies.extend(pnpm_file_copy(package, directory));
+        // Only a copy that may be `name@version` is worth reading: the key
+        // or entry names most of them.
+        copies.extend(pnpm_file_copy(package, directory).filter(|copy| {
+            copy.name.as_deref().is_none_or(|n| n == name)
+                && copy.version.as_deref().is_none_or(|v| v == version)
+        }));
     }
     let mut scratch = Discovery::default();
     record_pnpm_file_copies(&ctx, file, copies, &mut scratch).await;
