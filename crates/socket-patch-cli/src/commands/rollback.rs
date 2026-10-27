@@ -914,7 +914,13 @@ async fn unledgered_vendor_wiring(
         crate::commands::vendored_backend::repair::unledgered_vendor_references(ledger_root, state)
             .await
             .into_iter()
-            .filter(|(eco, _, _)| crate::commands::vendor::ecosystem_in_scope(common, eco))
+            // An entry that carries the uuid under another ecosystem (an
+            // unknown backend, a hand edit) still owns it: its own revert
+            // reports what is wrong with it.
+            .filter(|(eco, uuid, _)| {
+                crate::commands::vendor::ecosystem_in_scope(common, eco)
+                    && !state.entries.values().any(|e| e.uuid == *uuid)
+            })
             .map(|(eco, uuid, _)| format!(".socket/vendor/{eco}/{uuid}/"))
             .collect();
     if dirs.is_empty() {
