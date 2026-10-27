@@ -612,9 +612,9 @@ pub(crate) async fn selection_refusal(
              module; nothing written (get a patch for {selected}, or require {version})"
         )),
         Selection::NotInGraph => Some(format!(
-            "{module} {version} is not in this project's build graph (go.mod does not \
-             require it and go.sum has no zip line for it): its replace would be ignored; \
-             nothing written"
+            "{module} {version} is not in this project's build graph (no go.mod of the \
+             build requires it and no go.sum has a zip line for it): its replace would be \
+             ignored; nothing written"
         )),
         Selection::Selected | Selection::Unknown => None,
     }

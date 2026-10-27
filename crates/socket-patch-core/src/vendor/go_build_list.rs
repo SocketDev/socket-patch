@@ -8,7 +8,8 @@
 //! instead of keeping its own go.mod/go.sum heuristic (#391, #392, #509).
 //!
 //! The answer comes from the project's `go.mod` and `go.sum` only (no
-//! toolchain, no network), so it works on a fresh clone in CI:
+//! toolchain, no network), so it works on a fresh clone in CI; in workspace
+//! mode from every `use` member's (see [`super::go_workspace`]):
 //!
 //! * **go ≥ 1.17** (pruned graph): `require` lists the selected version of
 //!   every module that provides a package to the build, so it is
@@ -105,27 +106,29 @@ pub fn select(pruned: bool, required: Option<&str>, zips: &[&str], version: &str
     }
 }
 
-/// [`selection`] for a project directory: reads `<project_root>/go.mod` and
-/// `go.sum` (`None` when there is no readable go.mod). In workspace mode the
-/// build list also takes other members' requirements, so a module absent
-/// from this go.mod may still be built: [`Selection::NotInGraph`] becomes
-/// [`Selection::Unknown`] there.
+/// [`selection`] for a project directory. In workspace mode the build
+/// list spans every `use` member's requirements, so the answer is the
+/// workspace's ([`super::go_workspace::GoWorkspace::selection`]), unknown
+/// when go refuses the workspace. Otherwise it reads `<project_root>/go.mod`
+/// and `go.sum` (`None` when there is no readable go.mod).
 pub async fn project_selection(
     project_root: &Path,
     module: &str,
     version: &str,
 ) -> Option<Selection> {
+    if let Some(sel) = super::go_workspace::load(project_root)
+        .await
+        .selection(module, version)
+    {
+        return Some(sel);
+    }
     let go_mod = read_regular_to_string(&project_root.join("go.mod"))
         .await
         .ok()?;
     let go_sum = read_regular_to_string(&project_root.join("go.sum"))
         .await
         .ok();
-    let sel = selection(&go_mod, go_sum.as_deref(), module, version);
-    if sel == Selection::NotInGraph && super::go_consumer_sync::workspace_in_effect(project_root) {
-        return Some(Selection::Unknown);
-    }
-    Some(sel)
+    Some(selection(&go_mod, go_sum.as_deref(), module, version))
 }
 
 #[cfg(test)]

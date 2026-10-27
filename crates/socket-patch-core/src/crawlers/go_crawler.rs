@@ -312,25 +312,13 @@ fn go_sum_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
     Some(scope)
 }
 
-/// Whether the go command would build `cwd` in workspace mode: `GOWORK`
-/// names a file, or (`GOWORK` unset or empty) a `go.work` exists in `cwd`
-/// or an ancestor. `GOWORK=off` disables workspaces. `GOWORK` resolves
-/// from the environment, then the `go env -w` file.
+/// Whether the go command would build `cwd` in workspace mode (or refuses
+/// to build it over an invalid `GOWORK`), resolved as go resolves it.
 fn workspace_in_effect(cwd: &Path) -> bool {
-    match crate::utils::go_env::go_env("GOWORK") {
-        Some(v) if v == "off" => false,
-        Some(_) => true,
-        None => go_work_at_or_above(cwd, &std::env::current_dir().unwrap_or_default()),
-    }
-}
-
-/// Whether a `go.work` exists in `cwd` or an ancestor, a relative `cwd`
-/// taken against `base` first: the CLI's default `cwd` is `.`, whose
-/// lexical ancestors stop at itself, so a parent `go.work` would be missed.
-fn go_work_at_or_above(cwd: &Path, base: &Path) -> bool {
-    base.join(cwd)
-        .ancestors()
-        .any(|dir| std::fs::symlink_metadata(dir.join("go.work")).is_ok())
+    !matches!(
+        crate::vendor::go_workspace::resolve(cwd),
+        crate::vendor::go_workspace::GoWork::None
+    )
 }
 
 /// Look up each `recorded` module in cache root `cache_path` instead of
@@ -1393,8 +1381,9 @@ mod tests {
         }
 
         /// A workspace's build list spans other modules' go.sum files and
-        /// go.work.sum, so a go.work in cwd or an ancestor, or a GOWORK
-        /// file, keeps the walk; GOWORK=off scopes again.
+        /// go.work.sum, so a go.work in cwd or an ancestor (GOWORK unset or
+        /// `auto`), or a GOWORK file, keeps the walk; GOWORK=off scopes
+        /// again.
         #[tokio::test]
         #[serial_test::serial]
         async fn a_workspace_keeps_the_walk_unless_gowork_is_off() {
@@ -1408,6 +1397,11 @@ mod tests {
                 "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
             ]);
             assert_eq!(f.crawl().await, scoped);
+            {
+                // `auto` searches like unset: no go.work, no workspace.
+                let _auto = EnvGuard::set("GOWORK", "auto");
+                assert_eq!(f.crawl().await, scoped);
+            }
 
             // go.work in an ancestor of cwd.
             let parent_work = f.project.parent().unwrap().join("go.work");
@@ -1422,29 +1416,15 @@ mod tests {
             // go.work in cwd.
             write(&f.project.join("go.work"), "go 1.22\nuse .\n");
             assert_eq!(f.crawl().await, walked);
+            {
+                let _auto = EnvGuard::set("GOWORK", "auto");
+                assert_eq!(f.crawl().await, walked);
+            }
             std::fs::remove_file(f.project.join("go.work")).unwrap();
 
             // GOWORK naming a file elsewhere.
             let _gowork = EnvGuard::set("GOWORK", "/elsewhere/go.work");
             assert_eq!(f.crawl().await, walked);
-        }
-
-        /// A relative `cwd` (the CLI passes `.`) still finds a parent
-        /// go.work, resolved against the process's directory.
-        #[test]
-        fn a_relative_cwd_still_sees_a_parent_workspace() {
-            let tmp = tempfile::tempdir().unwrap();
-            let project = tmp.path().join("ws").join("project");
-            mkdir(&project);
-            assert!(!go_work_at_or_above(Path::new("."), &project));
-            write(&tmp.path().join("ws").join("go.work"), "go 1.22\n");
-            assert!(go_work_at_or_above(Path::new("."), &project));
-            assert!(go_work_at_or_above(
-                Path::new("project"),
-                &tmp.path().join("ws")
-            ));
-            // An absolute cwd ignores the base.
-            assert!(go_work_at_or_above(&project, Path::new("/elsewhere")));
         }
 
         /// go.sum is project content joined onto the cache root: traversal

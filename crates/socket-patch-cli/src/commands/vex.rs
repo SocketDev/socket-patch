@@ -991,8 +991,13 @@ async fn generate_vex(
         use socket_patch_core::utils::purl::build_golang_purl;
         use socket_patch_core::utils::purl_key::PurlKey;
         use socket_patch_core::vendor::go_build_list::{project_selection, Selection};
-        for entry in socket_patch_core::vendor::go_mod_edit::read_replace_entries(&common.cwd).await
-        {
+        let mut entries = Vec::new();
+        for root in socket_patch_core::vendor::go_workspace::module_roots(&common.cwd).await {
+            for entry in socket_patch_core::vendor::go_mod_edit::read_replace_entries(&root).await {
+                entries.push((root.clone(), entry));
+            }
+        }
+        for (root, entry) in entries {
             let Some(version) = entry.version.as_deref().filter(|_| entry.socket_owned()) else {
                 continue;
             };
@@ -1001,7 +1006,7 @@ async fn generate_vex(
                 continue;
             }
             let Some(Selection::Other(selected)) =
-                project_selection(&common.cwd, &entry.module, version).await
+                project_selection(&root, &entry.module, version).await
             else {
                 continue;
             };
