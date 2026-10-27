@@ -114,6 +114,84 @@ pub(crate) fn classic_key_real_name(patterns: &[String]) -> Option<&str> {
     names.all(|n| n == Some(first)).then_some(first)
 }
 
+/// What a berry `patch:` reference wraps, every layer peeled.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PatchLayers {
+    /// The innermost source, percent-decoded (`left-pad@npm:1.3.0`,
+    /// `left-pad@http://host/x.tgz`).
+    pub source: String,
+    /// Some layer applies a patch outside yarn's builtin compatibility
+    /// namespace (`yarn patch`, or a plugin's own builtin).
+    pub user_patch: bool,
+}
+
+/// Peel a berry `patch:` reference (`patch:…` or `name@patch:…`) layer by
+/// layer: a compatibility patch can wrap a user patch, or vice versa, and
+/// both still belong to the original package. `Ok(None)` when `spec` is no
+/// patch reference; `Err` names a reference too odd to read.
+pub(crate) fn patch_layers(spec: &str) -> Result<Option<PatchLayers>, &'static str> {
+    use crate::utils::purl::percent_decode_purl_component;
+
+    if !spec.starts_with("patch:") && !spec.contains("@patch:") {
+        return Ok(None);
+    }
+    let mut source = spec.to_owned();
+    let mut user_patch = false;
+    for _ in 0..16 {
+        let Some(inner) = source
+            .strip_prefix("patch:")
+            .or_else(|| source.split_once("@patch:").map(|(_, rest)| rest))
+        else {
+            return Ok(Some(PatchLayers { source, user_patch }));
+        };
+        let Some((original, patches)) = inner.split_once('#') else {
+            return Err("unrecognized patch: reference");
+        };
+        // Only Yarn's compatibility namespace is exempt. Plugins can
+        // supply their own builtin patches through getBuiltinPatch.
+        let patches = percent_decode_purl_component(patches);
+        user_patch |= !patches
+            .split("::")
+            .next()
+            .unwrap_or(&patches)
+            .split('&')
+            .all(|p| {
+                let p = p.rsplit('!').next().unwrap_or(p).trim_start_matches('~');
+                p.starts_with("builtin<compat/") && p.ends_with('>')
+            });
+        source = percent_decode_purl_component(original).into_owned();
+    }
+    Err("patch locator nesting exceeds inspection limit")
+}
+
+/// The sources every user `patch:` reference in `text` (a berry lock or a
+/// `package.json`) wraps, innermost layer first decoded
+/// ([`patch_layers`]): `patch:left-pad@http%3A//h/x.tgz#~/.yarn/patches/
+/// x.patch` wraps `left-pad@http://h/x.tgz`. Yarn's builtin compatibility
+/// wrappers are not the user's and are left out.
+pub(crate) fn user_patch_sources(text: &str) -> Vec<String> {
+    text.match_indices("patch:")
+        // The protocol opens a value (`"patch:`) or a range (`name@patch:`),
+        // never the middle of a word: `x.patch::version=…` is no reference.
+        .filter(|&(at, _)| {
+            text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| matches!(c, '@' | '"' | '\'') || c.is_whitespace())
+        })
+        .filter_map(|(at, _)| {
+            let rest = &text[at..];
+            let end = rest
+                .find(|c: char| matches!(c, '"' | '\'' | ',') || c.is_whitespace())
+                .unwrap_or(rest.len());
+            match patch_layers(&rest[..end]) {
+                Ok(Some(layers)) if layers.user_patch => Some(layers.source),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// A classic `resolved` value split at its first `#`: the url before it,
 /// and the fragment as a lowercase sha1 when it is 40 hex digits (either
 /// case) — the legacy tarball verifier yarn v1 enforces when no
@@ -194,6 +272,34 @@ pub(crate) fn berry_npm_alias_target(range: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #962: the source a user `patch:` wraps, as `yarn patch-commit`
+    /// spells it in a lock key, a `resolution:` and a `package.json` value;
+    /// builtin compatibility wrappers are not the user's.
+    #[test]
+    fn user_patch_sources_peel_what_yarn_patch_wraps() {
+        let lock = "\"left-pad@patch:left-pad@http%3A//h%3A1/x.tgz#~/.yarn/patches/a.patch\":\n  \
+                    resolution: \"left-pad@patch:left-pad@npm%3A1.3.0#~/.yarn/patches/a.patch\
+                    ::version=1.3.0&hash=0d6d28\"\n";
+        assert_eq!(
+            user_patch_sources(lock),
+            vec!["left-pad@http://h:1/x.tgz", "left-pad@npm:1.3.0"]
+        );
+        let pkg = r#"{ "dependencies": { "a": "patch:a@file%3A./v/a.tgz#./p.patch" } }"#;
+        assert_eq!(user_patch_sources(pkg), vec!["a@file:./v/a.tgz"]);
+        // A user patch over yarn's own compat wrapper: both layers peeled.
+        let nested = "\"typescript@patch:typescript@patch%3Atypescript@http%253A//h/t.tgz\
+                      %23optional!builtin%3Ccompat/typescript%3E#~/.yarn/patches/t.patch\":";
+        assert_eq!(
+            user_patch_sources(nested),
+            vec!["typescript@http://h/t.tgz"]
+        );
+        // The compat wrapper alone is not a user patch.
+        let builtin =
+            "\"resolve@patch:resolve@http%3A//h/r.tgz#optional!builtin<compat/resolve>\":";
+        assert!(user_patch_sources(builtin).is_empty());
+        assert!(user_patch_sources("\"left-pad@npm:1.3.0\":\n").is_empty());
+    }
 
     /// #1271: the classic grammar keeps an empty range (`left-pad@` from
     /// `"left-pad": ""`); the strict berry grammar still rejects it.
