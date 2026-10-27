@@ -4711,3 +4711,77 @@ async fn global_mode_finds_one_segment_registry_under_root_registry() {
     let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
     assert_eq!(deno_roots, vec![&host, &nested], "{roots:?}");
 }
+
+/// #444: a `--global-prefix` naming `$DENO_DIR` or `$DENO_DIR/npm` (a parent
+/// of Deno's npm cache registry dirs) expands to every registry dir below
+/// it, the same ones `-g` finds, so the scan sees the packages
+/// `deno install -g` tools load instead of nothing. Deno's `jsr.io` root
+/// stays out: it is not an npm registry.
+#[tokio::test]
+#[serial_test::parallel]
+async fn deno_dir_and_npm_dir_prefixes_expand_to_registry_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deno_dir = tmp.path().join("deno");
+    let npm = deno_dir.join("npm");
+    let public = npm.join("registry.npmjs.org");
+    let nested = npm.join("registry.example.com").join("api").join("npm");
+    let odd = stage_deno_npm_pkg(&public, "is-odd", "3.0.1", "3.0.1").await;
+    let pad = stage_deno_npm_pkg(&nested, "left-pad", "1.3.0", "1.3.0").await;
+    stage_deno_npm_pkg(&npm.join("jsr.io"), "@std/path", "1.0.0", "1.0.0").await;
+    tokio::fs::create_dir_all(deno_dir.join("remote"))
+        .await
+        .unwrap();
+
+    for prefix in [&deno_dir, &npm] {
+        let opts = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(prefix.clone()),
+        };
+        let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+        assert_eq!(roots, vec![nested.clone(), public.clone()], "{prefix:?}");
+
+        let mut crawled: Vec<(String, PathBuf)> = NpmCrawler
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .map(|p| (p.purl, p.path))
+            .collect();
+        crawled.sort();
+        assert_eq!(
+            crawled,
+            vec![
+                ("pkg:npm/is-odd@3.0.1".to_string(), odd.clone()),
+                ("pkg:npm/left-pad@1.3.0".to_string(), pad.clone()),
+            ],
+            "{prefix:?}"
+        );
+    }
+}
+
+/// #444: a prefix that has an `npm` child but no Deno cache under it (a
+/// global `node_modules` holding the npm CLI itself, or a custom prefix)
+/// keeps the `node_modules` walk it always had.
+#[tokio::test]
+#[serial_test::parallel]
+async fn prefix_with_npm_package_child_keeps_node_modules_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = tmp.path().join("lib");
+    stage_npm_pkg(&prefix, "npm", "10.9.0").await;
+    stage_npm_pkg(&prefix, "left-pad", "1.3.0").await;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: false,
+        global_prefix: Some(prefix.clone()),
+    };
+    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    assert_eq!(roots, vec![prefix.clone()]);
+    let mut purls: Vec<String> = NpmCrawler
+        .crawl_all(&opts)
+        .await
+        .into_iter()
+        .map(|p| p.purl)
+        .collect();
+    purls.sort();
+    assert_eq!(purls, vec!["pkg:npm/left-pad@1.3.0", "pkg:npm/npm@10.9.0"]);
+}

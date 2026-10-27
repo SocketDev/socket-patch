@@ -398,6 +398,22 @@ impl GlobalArgs {
                     what,
                 ));
             }
+            // A Deno tool's per-tool `node_modules` that Deno never loads
+            // (#444): patching it reported `applied` (and VEX
+            // `not_affected`) while the tool kept running the copy in
+            // Deno's npm cache.
+            if socket_patch_core::crawlers::deno_crawler::is_unloaded_deno_tool_node_modules(prefix)
+            {
+                return Err(not_dir(
+                    "--global-prefix",
+                    "SOCKET_GLOBAL_PREFIX",
+                    prefix,
+                    "is a Deno tool's node_modules that Deno does not load \
+                     (its deno.json sets no nodeModulesDir); the tool runs its npm \
+                     packages from Deno's npm cache, so use -g, or --global-prefix \
+                     naming $DENO_DIR or $DENO_DIR/npm",
+                ));
+            }
         }
         if self.manifest_path != DEFAULT_PATCH_MANIFEST_PATH {
             let manifest = self.resolved_manifest_path();
