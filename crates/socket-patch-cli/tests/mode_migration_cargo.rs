@@ -1423,12 +1423,8 @@ async fn takeover_over_unrewritable_spelling_keeps_vendored() {
     for (tag, spelling) in [
         ("dotted", format!("{DEP}.version = \"1.0\"\n")),
         ("literal", format!("{DEP} = '1.0'\n")),
-        // An inline table spread over lines (#757). `registry = "crates-io"`
-        // was this case until #386 made hosted mode pin it.
-        (
-            "multi-line-inline",
-            format!("{DEP} = {{ version = \"1.0\", features = [\n] }}\n"),
-        ),
+        // `registry = "crates-io"` (#386) and an inline table whose array
+        // wraps lines (#757) were cases here until hosted mode pinned them.
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path()) else {

@@ -556,7 +556,7 @@ pub async fn revert_composer_opts(
                 "vendor_lock_entry_drifted",
                 format!(
                     "composer.lock entry for {} no longer points into .socket/vendor/composer/; left alone",
-                    w.key.as_deref().unwrap_or("<unknown>")
+                    w.key_label()
                 ),
             )),
             Err(e) => {
@@ -3000,7 +3000,7 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_pending");
         assert!(detail.contains("still building"), "{detail}");
         assert!(!root.join(".socket").exists(), "nothing written");
         assert_eq!(
@@ -3053,7 +3053,7 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_unavailable");
         assert!(detail.contains("unavailable"), "{detail}");
         assert!(!root.join(".socket").exists(), "nothing written");
     }

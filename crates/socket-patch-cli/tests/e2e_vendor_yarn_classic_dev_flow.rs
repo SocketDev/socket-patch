@@ -132,7 +132,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_classic_vex::output_retrying_dns(&mut cmd)
 }
 
 /// Run the socket-patch binary with a scrubbed environment.
@@ -816,4 +816,168 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
         "the completed revert returns the project to pristine registry bytes"
     );
     eprintln!("FULL RECOVERY OK");
+}
+
+/// #692: a workspace member adds a second range of the vendored package
+/// after vendoring, so yarn dedupes it into the wired block and re-keys it
+/// (`left-pad@^1.1.0, left-pad@^1.3.0:`) while keeping our `resolved`.
+/// `rollback` must still restore the registry resolution, under the merged
+/// key, and drop the vendored artifact; it used to report the block as gone
+/// and exit 1 on every run with the lock still wired.
+#[test]
+fn yarn_classic_rollback_after_member_add_merges_the_vendored_key() {
+    const LEG: &str = "yarn_classic_rollback_after_member_add_merges_the_vendored_key";
+    if !yarn_ready(LEG) {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    for member in ["a", "b"] {
+        std::fs::create_dir_all(proj.join(member)).unwrap();
+    }
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"yarn-classic-692","private":true,"workspaces":["a","b"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("a/package.json"),
+        format!(r#"{{"name":"a","version":"1.0.0","dependencies":{{"{DEP}":"^1.1.0"}}}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("b/package.json"),
+        r#"{"name":"b","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let cache = tmp.path().join("yarn-cache");
+    let yarn_env = [("YARN_CACHE_FOLDER", cache.to_str().unwrap())];
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &yarn_env,
+    );
+    if !install.status.success() {
+        yarn_classic_vex::skip(
+            LEG,
+            &format!(
+                "fixture `yarn install` failed (registry unreachable?):\n{}",
+                String::from_utf8_lossy(&install.stderr)
+            ),
+        );
+        return;
+    }
+
+    let installed_index = proj.join("node_modules").join(DEP).join("index.js");
+    let orig = std::fs::read(&installed_index).expect("installed index.js");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+    let lock_path = proj.join("yarn.lock");
+    let lock_pristine = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock_pristine.contains(&format!("\n{DEP}@^1.1.0:\n")),
+        "fixture lock keys the block by the one range:\n{lock_pristine}"
+    );
+
+    let cwd = proj.to_str().unwrap();
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    assert!(proj.join(&tgz_rel).is_file(), "vendored tarball missing");
+
+    // Install the vendored tarball, which also puts it in the yarn cache: a
+    // member's `yarn add` resolves the lock's `file:./` path from the member
+    // directory and only finds the tarball there (#691).
+    let frozen = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--frozen-lockfile", "--no-progress"],
+        &yarn_env,
+    );
+    assert!(
+        frozen.status.success(),
+        "frozen install of the vendored lock failed.\nstderr:\n{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert_eq!(std::fs::read(&installed_index).unwrap(), patched);
+
+    // Member `b` asks for a second range that resolves to the same version:
+    // yarn merges it into the vendored block.
+    let add = corepack(
+        &proj.join("b"),
+        &yarn_classic(),
+        &[
+            "add",
+            &format!("{DEP}@^1.3.0"),
+            "--no-progress",
+            "--prefer-offline",
+        ],
+        &yarn_env,
+    );
+    assert!(
+        add.status.success(),
+        "member `yarn add` failed.\nstderr:\n{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let merged_key = format!("{DEP}@^1.1.0, {DEP}@^1.3.0:");
+    let lock_merged = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        lock_merged.contains(&format!("\n{merged_key}\n")),
+        "yarn must merge the second range into the vendored block:\n{lock_merged}"
+    );
+    assert!(
+        lock_block(&lock_merged, DEP).contains(&format!("file:./{tgz_rel}#")),
+        "the merged block must still resolve through the vendored tarball:\n{lock_merged}"
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["rollback", "--json", "--yes", "--offline", "--cwd", cwd],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback of the merged block must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let lock_after = std::fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(
+        lock_block(&lock_after, DEP),
+        lock_block(&lock_pristine, DEP).replacen(&format!("{DEP}@^1.1.0:"), &merged_key, 1),
+        "the registry resolution is restored under the merged key"
+    );
+    assert!(
+        !lock_after.contains(".socket/vendor/"),
+        "nothing may stay wired to the vendored tarball:\n{lock_after}"
+    );
+    assert!(
+        !proj.join(&tgz_rel).exists(),
+        "the vendored tarball is removed once nothing resolves through it"
+    );
+
+    // The restored lock installs the registry bytes, frozen.
+    std::fs::remove_dir_all(proj.join("node_modules")).unwrap();
+    let frozen = corepack(
+        &proj,
+        &yarn_classic(),
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--no-progress",
+            "--prefer-offline",
+        ],
+        &yarn_env,
+    );
+    assert!(
+        frozen.status.success(),
+        "frozen install of the restored lock failed.\nstderr:\n{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert_eq!(std::fs::read(&installed_index).unwrap(), orig);
 }

@@ -589,7 +589,8 @@ fn root_workspace_gate(blocks: &[LockBlock]) -> Result<String, Box<VendorOutcome
 /// exact version being vendored is TAKEN OVER (its value is rewritten to
 /// our spec — the pin already forced this exact version, so semantics are
 /// preserved — and recorded as the wiring `original` so revert restores
-/// it): `Ok(Some(version))`. Anything else same-name still refuses.
+/// it): `Ok(Some(version))`. Anything else overriding the same package,
+/// parent-scoped selectors included, still refuses.
 fn resolutions_gate(
     pkg_obj: &serde_json::Map<String, Value>,
     name: &str,
@@ -604,17 +605,20 @@ fn resolutions_gate(
             )));
         };
         for (selector, value) in res_obj {
-            let sel_name = split_pattern(selector)
-                .map(|(n, _)| n)
-                .unwrap_or(selector.as_str());
-            if sel_name != name {
+            // The package the selector overrides, through any parent scope
+            // (`pkg-a/left-pad`, `**/left-pad`): yarn applies those before
+            // our bare pin, so they conflict just like a bare entry (#783).
+            if crate::formats::yarn::patterns::resolution_selector_target(selector) != Some(name) {
                 continue;
             }
             // Our own (possibly stale-uuid) entry is fine to overwrite; a
-            // user-authored override is never clobbered silently.
-            let ours = value
-                .as_str()
-                .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
+            // user-authored override is never clobbered silently. Vendoring
+            // only ever writes the bare `name` key, so a parent-scoped
+            // selector pointing into .socket/vendor is not ours.
+            let ours = selector == name
+                && value
+                    .as_str()
+                    .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
             if ours {
                 continue;
             }
@@ -626,9 +630,9 @@ fn resolutions_gate(
                 "vendor_override_conflict",
                 format!(
                     "{PACKAGE_JSON} already has a resolutions entry for `{selector}` \
-                     ({value}); vendor will not overwrite a user-authored override (an \
-                     exact-version pin `\"{name}\": \"{version}\"` is taken over \
-                     automatically)"
+                     ({value}); vendor will not overwrite a user-authored override (only \
+                     a bare exact-version pin `\"{name}\": \"{version}\"` is taken over \
+                     automatically; parent-scoped selectors always refuse)"
                 ),
             )));
         }
@@ -837,6 +841,29 @@ pub async fn revert_yarn_berry_opts(
             }
         }
     }
+    // A user `yarn patch` over the vendored tarball (#962): restoring the
+    // recorded entry under its `patch:` wrapper leaves a lock every
+    // `yarn install --immutable` rejects, so refuse before either file is
+    // written (and before the dry-run return, so a preview agrees).
+    if let Some(wired) = user_patch_wrapping(project_root, &entry.uuid).await {
+        let detail = format!(
+            "refusing to revert {uuid_dir_rel}: a `patch:` entry from `yarn patch` in {wired} \
+             still wraps the vendored tarball, and restoring the registry entry under it would \
+             leave a lock `yarn install --immutable` rejects — put the registry range back in \
+             place of the `patch:` descriptor in the {PACKAGE_JSON} that declares it, run \
+             `yarn install`, re-run `vendor --revert`, then re-run `yarn patch` on the \
+             registry version"
+        );
+        return RevertOutcome {
+            success: false,
+            warnings: vec![VendorWarning::new(
+                "vendor_lock_still_wired_revert_blocked",
+                detail.clone(),
+            )],
+            error: Some(detail),
+            kept_artifact: false,
+        };
+    }
     if dry_run {
         return RevertOutcome::ok();
     }
@@ -903,6 +930,7 @@ pub async fn revert_yarn_berry_opts(
                         KIND_LOCK_ENTRY,
                         "lock entry",
                         |lines| berry_field(lines, "resolution"),
+                        None,
                         &mut outcome.warnings,
                     );
                 }
@@ -1096,6 +1124,26 @@ pub async fn revert_yarn_berry_opts(
 }
 
 // ───────────────────────────── revert internals ─────────────────────────────
+
+/// The first wired file (yarn.lock, then package.json) in which a user
+/// `patch:` reference wraps the vendored artifact of `uuid` (#962). An
+/// unreadable or missing file wraps nothing here: the wired revert's own
+/// reads report it.
+async fn user_patch_wrapping(project_root: &Path, uuid: &str) -> Option<&'static str> {
+    let needle = uuid.to_ascii_lowercase();
+    for wired in [YARN_LOCK, PACKAGE_JSON] {
+        let Ok(text) = read_regular_to_string(&project_root.join(wired)).await else {
+            continue;
+        };
+        if crate::formats::yarn::patterns::user_patch_sources(&text)
+            .iter()
+            .any(|source| source.to_ascii_lowercase().contains(&needle))
+        {
+            return Some(wired);
+        }
+    }
+    None
+}
 
 /// Put back an entry vendoring pruned (see [`KIND_LOCK_ENTRY_PRUNED`]):
 /// the rewritten shared entry returns to its original lines, a removed one
@@ -2300,6 +2348,56 @@ __metadata:
         assert!(detail.contains("left-pad"), "{detail}");
         assert!(!fx.root().join(".socket/vendor").exists());
         assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
+    }
+
+    /// #783: a parent-scoped or glob selector that overrides the target
+    /// (`pkg-a/left-pad`, `pkg-a/left-pad@^1.3.0`, `<root>/left-pad`,
+    /// `@scope/parent/left-pad`, `**/left-pad`) is a user-authored override
+    /// too. Yarn applies it before our bare pin, so vendoring beside it
+    /// leaves a lock `--immutable` rejects: refuse and write nothing. A
+    /// selector naming the target only as a PARENT overrides another
+    /// package and still vendors.
+    #[tokio::test]
+    async fn parent_scoped_resolutions_selector_is_refused() {
+        for selector in [
+            "pkg-a/left-pad",
+            "pkg-a/left-pad@^1.3.0",
+            "vendor-spike/left-pad",
+            "@scope/parent/left-pad",
+            "**/left-pad",
+        ] {
+            let pkg = B3_BEFORE_PKG.replace(
+                "  }\n}",
+                &format!("  }},\n  \"resolutions\": {{\n    \"{selector}\": \"1.3.0\"\n  }}\n}}"),
+            );
+            assert_ne!(pkg, B3_BEFORE_PKG, "the fixture edit must hit");
+            let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+            assert!(detail.contains(selector), "{selector}: {detail}");
+            fx.assert_untouched().await;
+        }
+
+        // Vendoring only writes the bare key, so a parent-scoped selector
+        // pointing into .socket/vendor (hand-copied, or another uuid) is
+        // not ours to overwrite: it still refuses.
+        let pkg = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            &format!(
+                "  }},\n  \"resolutions\": {{\n    \"pkg-a/left-pad\": \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"\n  }}\n}}"
+            ),
+        );
+        let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+        expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        fx.assert_untouched().await;
+
+        let pkg = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            "  },\n  \"resolutions\": {\n    \"left-pad/is-odd\": \"1.0.0\"\n  }\n}",
+        );
+        let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
     }
 
     /// A user-authored BARE-name pin to the exact version being vendored is
@@ -3887,6 +3985,71 @@ __metadata:
             fx.tgz_path().exists(),
             "the artifact must survive the refusal"
         );
+    }
+
+    /// #962: the user ran `yarn patch` / `yarn patch-commit -s` over the
+    /// vendored package, so a `patch:` lock entry and dependency descriptor
+    /// wrap the vendored tarball. Restoring the recorded entry would leave
+    /// that wrapper naming a descriptor no entry resolves: every
+    /// `yarn install --immutable` rejects the lock (YN0028). The revert must
+    /// refuse BEFORE writing either file, on a dry run too.
+    #[tokio::test]
+    async fn revert_refuses_before_writing_when_a_user_yarn_patch_wraps_the_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let text = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let resolution = text
+            .lines()
+            .find_map(|l| l.strip_prefix("  resolution: \"left-pad@"))
+            .and_then(|r| r.strip_suffix('"'))
+            .expect("the vendored lock must carry our resolution line")
+            .to_string();
+        let wrapped = format!(
+            "patch:left-pad@{}#~/.yarn/patches/left-pad-file-0d6d28.patch",
+            resolution.replace(':', "%3A")
+        );
+        let lock = format!(
+            "{text}\n\"left-pad@{wrapped}\":\n  version: 1.3.0\n  \
+             resolution: \"left-pad@{wrapped}::version=1.3.0&hash=0d6d28\"\n  \
+             languageName: node\n  linkType: hard\n"
+        );
+        tokio::fs::write(fx.lock_path(), &lock).await.unwrap();
+        let pkg_text = tokio::fs::read_to_string(fx.pkg_path()).await.unwrap();
+        let mut pkg: Value = serde_json::from_str(&pkg_text).unwrap();
+        // yarn 4.18 `patch-commit -s` rewrites the dependency itself.
+        pkg["dependencies"]["left-pad"] = Value::String(wrapped);
+        let pkg_text = serde_json::to_string_pretty(&pkg).unwrap() + "\n";
+        tokio::fs::write(fx.pkg_path(), &pkg_text).await.unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert_yarn_berry(&entry, fx.root(), dry_run).await;
+            assert!(
+                !outcome.success,
+                "dry_run={dry_run}: must refuse under a user `yarn patch`: {:?}",
+                outcome.warnings
+            );
+            assert!(
+                outcome.warnings.iter().any(|w| {
+                    w.code == "vendor_lock_still_wired_revert_blocked"
+                        && w.detail.contains("yarn patch")
+                }),
+                "dry_run={dry_run}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+                lock,
+                "dry_run={dry_run}: yarn.lock untouched"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
+                pkg_text,
+                "dry_run={dry_run}: package.json untouched"
+            );
+            assert!(fx.tgz_path().exists(), "the artifact must survive");
+        }
     }
 
     /// The user re-keys our resolutions entry (`"left-pad"` →

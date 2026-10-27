@@ -9,9 +9,12 @@
 //! refuses) stays in `poetry_lock` / `pdm_lock`; everything around it lives
 //! here, once.
 
+use std::sync::Arc;
+
 use toml_edit::Table;
 
 use crate::utils::line_endings::majority_terminator;
+use crate::vendor::parse_memo::ParseMemo;
 
 #[cfg(test)]
 thread_local! {
@@ -33,6 +36,54 @@ pub(crate) fn tick(counter: &'static std::thread::LocalKey<std::cell::Cell<usize
     counter.with(|count| count.set(count.get() + 1));
 }
 
+/// The read-only parses of the `poetry.lock` / `pdm.lock` texts this run
+/// last read or wrote (see `vendor::parse_memo`). A hosted scan reads one
+/// lock from four places (the lock inventory, VEX discovery before and
+/// after the rewrite, the redirect's own probe) and the rewrite renders it
+/// once more; each whole-lock parse is ~10% of the scan on a 400-package
+/// lock (#1473, #1624), so those readers go through here and a hosted scan
+/// parses each of the two texts once. Two slots: the lock as read and as
+/// rewritten; a miss (another lock read in between) costs only the parse
+/// it would have cost without the memo. Intermediate texts of the
+/// one-dep-at-a-time rewrite stay out of it, as nobody reads them again.
+#[cfg(not(test))]
+static LOCK_DOCS: ParseMemo<toml_edit::Document<String>, 2> = ParseMemo::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Per thread under test, so one test's lock never satisfies another's
+    /// parse and the [`PARSES`] counts stay exact.
+    static LOCK_DOCS: ParseMemo<toml_edit::Document<String>, 2> = const { ParseMemo::new() };
+}
+
+fn with_lock_docs<R>(f: impl FnOnce(&ParseMemo<toml_edit::Document<String>, 2>) -> R) -> R {
+    #[cfg(not(test))]
+    return f(&LOCK_DOCS);
+    #[cfg(test)]
+    return LOCK_DOCS.with(f);
+}
+
+/// The read-only parse of a `poetry.lock` / `pdm.lock` `text`, shared with
+/// every other reader of the same bytes this run. A parse error is not
+/// cached, so each caller gets the error a fresh parse raises.
+pub(crate) fn parse_lock(
+    text: &str,
+) -> Result<Arc<toml_edit::Document<String>>, toml_edit::TomlError> {
+    with_lock_docs(|memo| {
+        memo.parse(text.as_bytes(), || {
+            #[cfg(test)]
+            tick(&PARSES);
+            toml_edit::Document::parse(text.to_owned())
+        })
+    })
+}
+
+/// Hand the parse of a lock text this run produced to the next reader of
+/// those bytes (VEX discovery reads the written lock back).
+fn share_lock(doc: toml_edit::Document<String>) -> Arc<toml_edit::Document<String>> {
+    with_lock_docs(|memo| memo.store(doc.raw().as_bytes().to_vec(), doc))
+}
+
 /// Takes `name`'s fragments of `text` from its (spanned) parse.
 pub(crate) type FragmentsIn =
     fn(&toml_edit::Document<String>, &str, &str) -> Result<Vec<String>, String>;
@@ -44,9 +95,11 @@ pub(crate) type FragmentsIn =
 /// fragments) when the splice reproduced that output byte for byte.
 /// `DocumentMut`'s own parser is exactly `Document::parse(..).into_mut()`, so
 /// every result is the fresh parse's.
+/// Backed by [`parse_lock`], so a text another reader already parsed costs
+/// nothing here either.
 #[derive(Default)]
 pub struct LockParse {
-    doc: Option<toml_edit::Document<String>>,
+    doc: Option<Arc<toml_edit::Document<String>>>,
 }
 
 impl LockParse {
@@ -54,29 +107,40 @@ impl LockParse {
     pub fn parsed(&mut self, text: &str) -> Result<&Table, toml_edit::TomlError> {
         if self.doc.as_ref().is_none_or(|doc| doc.raw() != text) {
             self.doc = None;
-            self.doc = Some(toml_edit::Document::parse(text.to_owned())?);
+            self.doc = Some(parse_lock(text)?);
         }
         Ok(self.doc.as_ref().expect("parsed just above").as_table())
     }
 
-    /// The held parse of `text` (taken out), or a fresh one; `what` names the
-    /// lock in the parse error.
+    /// The held parse of `text` (taken out), a copy of the shared one, or a
+    /// fresh private parse; `what` names the lock in the parse error. A
+    /// parse someone else still holds is copied, which costs a fraction of
+    /// parsing it again; a text nobody parsed yet is parsed without sharing
+    /// it, as the caller is about to mutate it into the next text.
     pub(crate) fn take(
         &mut self,
         text: &str,
         what: &str,
     ) -> Result<toml_edit::Document<String>, String> {
-        match self.doc.take() {
-            Some(doc) if doc.raw() == text => Ok(doc),
-            _ => toml_edit::Document::parse(text.to_owned())
-                .map_err(|e| format!("invalid {what} lock: {e}")),
-        }
+        let doc = match self.doc.take() {
+            Some(doc) if doc.raw() == text => doc,
+            _ => match with_lock_docs(|memo| memo.get(text.as_bytes())) {
+                Some(shared) => shared,
+                None => {
+                    #[cfg(test)]
+                    tick(&PARSES);
+                    return toml_edit::Document::parse(text.to_owned())
+                        .map_err(|e| format!("invalid {what} lock: {e}"));
+                }
+            },
+        };
+        Ok(Arc::try_unwrap(doc).unwrap_or_else(|shared| (*shared).clone()))
     }
 
     /// Hand back a parse of the text it was taken for, unchanged (a refusal
     /// before any mutation).
     pub(crate) fn restore(&mut self, doc: toml_edit::Document<String>) {
-        self.doc = Some(doc);
+        self.doc = Some(Arc::new(doc));
     }
 }
 
@@ -370,10 +434,8 @@ pub(crate) fn rewrite_batch<P>(
     if text.contains("\r\n") && text.replace("\r\n", "").contains('\n') {
         return None;
     }
-    #[cfg(test)]
-    tick(&PARSES);
-    let original = toml_edit::Document::parse(text.to_owned()).ok()?;
-    let mut lock = original.clone().into_mut();
+    let original = parse_lock(text).ok()?;
+    let mut lock = (*original).clone().into_mut();
     let mut steps = Vec::with_capacity(names.len());
     let mut rewritten: Vec<(usize, Vec<String>)> = Vec::new();
     let mut packages = std::collections::BTreeSet::new();
@@ -476,6 +538,9 @@ pub(crate) fn rewrite_batch<P>(
         .flat_map(|(_, edits)| edits.iter().map(|(_, new)| new.as_str()))
         .collect();
     sole_occurrences(&result, &news)?;
+    // `result` is the rendering `after_doc` parsed: whoever reads the
+    // written lock back reads this parse.
+    share_lock(after_doc);
     for (index, edits) in edits_of {
         if !edits.is_empty() {
             steps[index] = LockStep::Rewritten(edits);

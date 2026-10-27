@@ -39,9 +39,13 @@ permissions:
 # queued push but the newest during a merge burst, and most main commits never
 # got a verdict. Merge-group refs (gh-readonly-queue/...) are unique per queue
 # entry already. The nightly keeps its own group so it never queues behind (or
-# cancels) a push.
+# cancels) a push. Draft PR runs get their own group too: a push followed at
+# once by `gh pr ready` can deliver the push's `synchronize` (payload still
+# draft) after `ready_for_review`. In a shared group that late draft run
+# cancelled the real run, skipped every job, and left ci-ok green on a head
+# nothing had tested.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event.pull_request.draft && '-draft' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Linux jobs run on Depot's runners (depot-ubuntu-*-4: 4 vCPU, like GitHub's
@@ -68,61 +72,32 @@ concurrency:
 # bypass.
 # MERGE-QUEUE REUSE: a push to main whose exact SHA already passed this
 # workflow in the merge queue (scripts/ci-reuse-merge-group.py, run by
-# clippy) only compiles, to refresh the main-only caches, and skips the
-# test steps and test-only jobs the queue already ran. hosted-e2e still
-# runs. The full tier (e2e-full, yarn-berry-full, cargo-vex-matrix-full)
+# release-readiness) only compiles, to refresh the main-only caches, and
+# skips the test steps and test-only jobs the queue already ran. hosted-e2e
+# still runs. The full tier (e2e-full, yarn-berry-full, cargo-vex-matrix-full)
 # never runs on push unless CI_SCOPE is `full`; it is nightly and on
 # dispatch. API errors, missing evidence and direct pushes run everything
 # else.
 # MERGE-MAIN REUSE: a pull_request push that only merged the base branch,
 # with the PR's own diff unchanged and the previous head green
-# (scripts/ci-reuse-pr-head.py, run by clippy), runs only clippy, the cheap
-# preflight jobs, test-release and hosted-e2e. The merge queue re-tests the
-# PR on the latest main before it lands; PRs into other branches and the
-# release/v5-prerelease PR never reuse.
+# (scripts/ci-reuse-pr-head.py, run by release-readiness), runs only
+# clippy, the cheap preflight jobs, test-release and hosted-e2e. The merge
+# queue re-tests the PR on the latest main before it lands; PRs into other
+# branches and the release/v5-prerelease PR never reuse.
 jobs:
   # Required independently of ci-ok so the merge queue sees a compile/lint
-  # failure immediately. Expensive jobs also depend on this preflight.
+  # failure immediately. Every expensive job except coverage and e2e-build
+  # (#1681, see release-readiness) also waits for it, the e2e and cargo-vex
+  # legs through their own `needs`.
   clippy:
     if: github.event.pull_request.draft != true
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     timeout-minutes: 20
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      reuse: ${{ steps.merge-queue.outputs.reuse }}
-      pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-
-      # Main remains the cache writer. Skip duplicate test execution only
-      # when this workflow passed in the merge queue on the identical SHA.
-      - name: Check merge-queue validation
-        id: merge-queue
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci-reuse-merge-group.py
-
-      # A PR push that only merged the base branch, with the PR's own diff
-      # unchanged and the previous head green, skips the test jobs: the
-      # merge queue re-tests every entry on the latest main anyway (#1373).
-      # This job and hosted-e2e still run. Only PRs into main (the only
-      # queue), and never the v5 integration PR, whose full tier the queue
-      # does not run.
-      - name: Check for an unchanged PR diff
-        id: pr-head
-        if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref != 'release/v5-prerelease'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_BASE_REF: ${{ github.base_ref }}
-          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-        run: python3 scripts/ci-reuse-pr-head.py
 
       - name: Install Rust
         # rustup is pre-installed on GitHub-hosted runners. `toolchain
@@ -142,7 +117,16 @@ jobs:
         # shared-key by profile + runner image (not job or package-manager
         # version). rust-cache also hashes the toolchain, Cargo manifests
         # and Rust environment. Check/coverage/release keep separate caches.
+        # A cache restore is an optimisation, so cap it and carry on cold.
+        # Healthy restores take under 30 s on every runner OS. On 2026-10-26
+        # one hung for 14+ min in yarn-classic-matrix and held merge-queue
+        # head #1719 (and 12 entries behind it) until it was cancelled;
+        # uncapped it runs to the job's own timeout. Every cache restore in
+        # this file carries the same two keys (enforced by
+        # scripts/tests/test_merge_queue_fail_fast.py).
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -153,13 +137,15 @@ jobs:
         # Clippy above checks the shipped targets. This catches errors in
         # cfg(test), integration tests and feature-gated targets without
         # linking hundreds of executables or waiting for the E2E fan-out.
+        # coverage and e2e-build start alongside it (#1681); the legs that
+        # consume e2e-build's binaries still wait for it.
         run: cargo check --locked --workspace --all-targets --all-features
 
   # The napi addon is only ever loaded by Node, so cargo's own tests never
   # exercise its JS loader or the engine/provider boundary.
   node-addon:
-    if: (github.event.pull_request.draft != true) && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    if: (github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: [release-readiness, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
     steps:
@@ -173,6 +159,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -188,7 +176,7 @@ jobs:
         run: node crates/socket-patch-node/npm/scripts/build-addon.mjs
 
       - name: Smoke-test addon
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         run: node --test crates/socket-patch-node/npm/test/smoke.mjs
 
   # Check the standalone installer, release scripts, and native installer
@@ -285,14 +273,56 @@ jobs:
   #   - any other PR that bumps the workspace version: the full gate —
   #     CHANGELOG has a dated, non-empty section for the new version and the
   #     tag doesn't already exist.
+  #
+  # This ~10 s job also owns the two reuse checks (`reuse`, `pr_unchanged`)
+  # every gated job reads. They used to live in clippy, so coverage and
+  # e2e-build, the two critical-path chains, sat ~1.4 min waiting for
+  # clippy only to read outputs set in its first second. Both now start
+  # off this job instead; clippy failed in none of 256 PR runs in 7 days,
+  # and merge-queue fail-fast still cancels the queue run on a red clippy
+  # (#1681). A failed release lint now also skips them, as a red clippy
+  # does the rest; ci-ok fails either way. Kept here rather than in a new
+  # job so a run starts no extra runner.
   release-readiness:
     if: github.event.pull_request.draft != true
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.merge-queue.outputs.reuse }}
+      pr_unchanged: ${{ steps.pr-head.outputs.unchanged }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      # Main remains the cache writer. Skip duplicate test execution only
+      # when this workflow passed in the merge queue on the identical SHA.
+      - name: Check merge-queue validation
+        id: merge-queue
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-reuse-merge-group.py
+
+      # A PR push that only merged the base branch, with the PR's own diff
+      # unchanged and the previous head green, skips the test jobs: the
+      # merge queue re-tests every entry on the latest main anyway (#1373).
+      # clippy, this job and hosted-e2e still run. Only PRs into main (the only
+      # queue), and never the v5 integration PR, whose full tier the queue
+      # does not run.
+      - name: Check for an unchanged PR diff
+        id: pr-head
+        if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref != 'release/v5-prerelease'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: python3 scripts/ci-reuse-pr-head.py
 
       - name: Lint release readiness
         env:
@@ -328,8 +358,8 @@ jobs:
           bash scripts/release-lint.sh --sync-only
 
   test:
-    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: [release-readiness, clippy]
     # No ubuntu-latest leg: `coverage` runs this same `cargo test
     # --workspace` (debug, default features, plus Go and vexctl) on ubuntu,
     # instrumented, and fails on any test failure. A plain ubuntu leg ran
@@ -349,7 +379,7 @@ jobs:
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
           # One compile-only cache writer per OS is enough for an already
           # tested SHA.
-          - shard: ${{ needs.clippy.outputs.reuse == 'true' && 2 || 0 }}
+          - shard: ${{ needs.release-readiness.outputs.reuse == 'true' && 2 || 0 }}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 50
     env:
@@ -374,6 +404,8 @@ jobs:
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -382,11 +414,11 @@ jobs:
         run: cargo build --workspace
 
       - name: Warm the test cache after merge-queue validation
-        if: needs.clippy.outputs.reuse == 'true'
+        if: needs.release-readiness.outputs.reuse == 'true'
         run: cargo test --locked --workspace --no-run
 
       - name: Install Go (for vexctl)
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         id: go
         # The `vex` subcommand emits OpenVEX documents; tests/e2e_vex.rs
         # validates the output with vexctl when it's on PATH. vexctl is
@@ -410,14 +442,17 @@ jobs:
         # version, the Go toolchain and the runner, so it is cached under
         # exactly those. Saved from main only, like the cargo cache.
         id: vexctl-cache
-        if: needs.clippy.outputs.reuse != 'true' && runner.os == 'macOS'
+        if: needs.release-readiness.outputs.reuse != 'true' && runner.os == 'macOS'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        # Capped like `Cache cargo`: a miss only means compiling vexctl.
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           path: ${{ runner.temp }}/vexctl-bin
           key: vexctl-${{ env.VEXCTL_VERSION }}-go${{ steps.go.outputs.go-version }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install vexctl
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         # Linux / Windows: the v0.3.0 release binary, checked against the
         # sha256 pinned here (from the release's vexctl_checksums.txt).
         # Compiling it took ~80s on ubuntu and ~180s on windows, the
@@ -481,17 +516,18 @@ jobs:
 
       - name: Save vexctl (macOS)
         if: >-
-          needs.clippy.outputs.reuse != 'true'
+          needs.release-readiness.outputs.reuse != 'true'
           && runner.os == 'macOS'
           && github.ref == 'refs/heads/main'
           && steps.vexctl-cache.outputs.cache-hit != 'true'
+          && steps.vexctl-cache.outcome == 'success'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/vexctl-bin
           key: ${{ steps.vexctl-cache.outputs.cache-primary-key }}
 
       - name: Run tests
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         # Default features only: `--all-features` would also RUN the
         # docker-e2e suites, which soft-skip as "ok" here (no images, and
         # macOS/Windows have no Docker) — fake greens hiding a broken
@@ -550,6 +586,8 @@ jobs:
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -565,15 +603,25 @@ jobs:
         run: python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" --locked --profile ci-release
 
   coverage:
-    if: (github.event.pull_request.draft != true) && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    if: (github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: release-readiness
     # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
     # Reports as a markdown table in the job summary and uploads the raw
     # lcov.info file as a workflow artifact. No threshold gating — the
     # numbers are report-only so contributors get visibility without flaky
     # CI when coverage shifts naturally with test edits. A failing TEST
     # fails the job: this is the Linux leg of `test`.
+    #
+    # Two shards (scripts/ci-test-shard.py, as `test` and `test-release`):
+    # the instrumented build takes ~110 s and running the tests ~220 s, so
+    # one leg was the queue's critical path (~6 min). Each shard compiles
+    # and runs only its targets and uploads its own LCOV; coverage-merge
+    # unions them. `ci-ok` waits for every shard.
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     timeout-minutes: 35
     permissions:
       contents: read
@@ -601,19 +649,23 @@ jobs:
       - name: Cache cargo
         # Swatinem/rust-cache, main-only saves: see the first `Cache cargo`
         # step in this file.
+        # The shards share one cache key and shard 1 alone writes it.
+        # rust-cache keeps only dependencies, which every shard builds.
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
 
       - name: Warm the coverage cache after merge-queue validation
-        if: needs.clippy.outputs.reuse == 'true'
+        if: needs.release-readiness.outputs.reuse == 'true' && matrix.shard == 1
         run: |
           cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
           source "$RUNNER_TEMP/coverage-env.sh"
           cargo test --locked --workspace --no-run
 
       - name: Install Go (for vexctl and the real-go suites)
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         # This job is the Linux leg of `test` (see there): same Go pin.
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
@@ -621,7 +673,7 @@ jobs:
           cache: false
 
       - name: Install vexctl
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         # The v0.3.0 Linux release binary, as in `test`'s vexctl step.
         env:
           VEXCTL_VERSION: v0.3.0
@@ -638,7 +690,7 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: Run tests with coverage
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         # Two-step pattern: `--no-report` runs instrumented tests and
         # collects raw profiles, then one `report` exports LCOV. The
         # summary is derived from that file (scripts/ci-lcov-summary.py)
@@ -657,6 +709,9 @@ jobs:
         env:
           SOCKET_PATCH_GO_E2E_REQUIRED: '1'
           SOCKET_PATCH_GO_E2E_VERSION: '1.24'
+          CI_TEST_COVERAGE: '1'
+          TEST_SHARD: ${{ matrix.shard }}
+          TEST_SHARD_COUNT: ${{ strategy.job-total }}
         #
         # The test output is also teed to a file so that a failing test's
         # panic becomes an annotation (scripts/ci-test-failures.py): in a
@@ -665,27 +720,29 @@ jobs:
         # can't be diagnosed once the re-run has passed.
         run: |
           set -o pipefail
-          cargo llvm-cov --workspace --no-fail-fast \
-            --no-report 2>&1 | tee "$RUNNER_TEMP/coverage-tests.log" || {
+          python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" \
+            2>&1 | tee "$RUNNER_TEMP/coverage-tests.log" || {
             status=$?
             python3 scripts/ci-test-failures.py "$RUNNER_TEMP/coverage-tests.log" || true
             exit "$status"
           }
           set +o pipefail
-          cargo llvm-cov report --lcov --output-path coverage-host.lcov
-          python3 scripts/ci-lcov-summary.py coverage-host.lcov | tee coverage-summary.txt
+          cargo llvm-cov report --lcov --output-path "coverage-host-$TEST_SHARD.lcov"
+          python3 scripts/ci-lcov-summary.py "coverage-host-$TEST_SHARD.lcov" | tee coverage-summary.txt
 
       - name: Publish coverage summary to job summary
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         # Render the per-file LCOV line/function/branch totals as a fenced
         # block in the GitHub Actions job summary so reviewers don't
         # need to crack open the artifact for a quick look.
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
         run: |
           {
-            echo "## Host coverage summary"
+            echo "## Host coverage summary (shard $TEST_SHARD)"
             echo ""
-            echo "(In-process tests only. See coverage-merge for the"
-            echo "full picture including docker-e2e binary coverage.)"
+            echo "(This shard's in-process tests only. See coverage-merge"
+            echo "for the full picture including docker-e2e binary coverage.)"
             echo ""
             echo '```'
             cat coverage-summary.txt
@@ -693,19 +750,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload host LCOV artifact
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         uses: ./.github/actions/upload-artifact
         with:
-          name: coverage-host
-          path: coverage-host.lcov
+          name: coverage-host-${{ matrix.shard }}
+          path: coverage-host-${{ matrix.shard }}.lcov
           if-no-files-found: error
           retention-days: 30
 
   # Dockerfile.base compiles the full-LTO release binary inside Docker, with
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
-    if: ((github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')) && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    if: ((github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: [release-readiness, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 30
     permissions:
@@ -994,10 +1051,10 @@ jobs:
   # test binaries directly from the same checkout path, so `CARGO_BIN_EXE_*`
   # and `CARGO_MANIFEST_DIR` resolve as they did under `cargo test`.
   e2e-build:
-    if: (github.event.pull_request.draft != true) && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    if: (github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: release-readiness
     outputs:
-      reuse: ${{ needs.clippy.outputs.reuse }}
+      reuse: ${{ needs.release-readiness.outputs.reuse }}
     strategy:
       fail-fast: false
       matrix:
@@ -1019,6 +1076,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: e2e-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1032,14 +1091,14 @@ jobs:
       - name: Bundle the binaries the legs run
         # A reused push runs no leg, except e2e-full and cargo-vex-matrix-full
         # on ubuntu when CI_SCOPE is `full`.
-        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
+        if: needs.release-readiness.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         shell: bash
         env:
           BUNDLE_OS: ${{ matrix.os }}
         run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/e2e-bin
 
       - name: Compress the e2e binaries
-        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
+        if: needs.release-readiness.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         # Compress the bundle as one stream so identical Rust code across
         # test binaries shares a dictionary. Zstd is on every runner image.
         # The 128 MiB window cuts the Linux artifact from ~200 MB to ~94 MB;
@@ -1050,7 +1109,7 @@ jobs:
           tar -C target/e2e-bin -cf - . | zstd -q -f -10 --long=27 -o target/e2e-bin.tar.zst
 
       - uses: ./.github/actions/upload-artifact
-        if: needs.clippy.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
+        if: needs.release-readiness.outputs.reuse != 'true' || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')
         with:
           name: e2e-bin-${{ matrix.os }}
           path: target/e2e-bin.tar.zst
@@ -1085,6 +1144,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: check-windows-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1097,10 +1158,10 @@ jobs:
     # Builds the Windows test binaries for e2e-windows and
     # cargo-vex-matrix-windows. The lean merge queue runs
     # windows-compile-check instead.
-    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: [release-readiness, clippy]
     outputs:
-      reuse: ${{ needs.clippy.outputs.reuse }}
+      reuse: ${{ needs.release-readiness.outputs.reuse }}
     strategy:
       fail-fast: false
       matrix:
@@ -1112,9 +1173,9 @@ jobs:
 
   e2e-build-macos:
     if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    needs: clippy
+    needs: [release-readiness, clippy]
     outputs:
-      reuse: ${{ needs.clippy.outputs.reuse }}
+      reuse: ${{ needs.release-readiness.outputs.reuse }}
     strategy:
       fail-fast: false
       matrix:
@@ -1127,7 +1188,9 @@ jobs:
   e2e:
     if: needs.e2e-build.outputs.reuse != 'true'
     # These jobs consume e2e-build's binaries and can run alongside unit tests.
-    needs: [e2e-build]
+    # e2e-build no longer waits for clippy (#1681), so wait for it here: a
+    # red clippy still skips the fan-out.
+    needs: [e2e-build, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -1155,8 +1218,16 @@ jobs:
           # matrix, 2.9.8 and macOS/Windows included, is
           # composer-compatibility.yml.
           # Both capstones share one leg per composer line: the setup is
-          # identical and the run step loops over `suite`.
-          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '2'}
+          # identical and the run step loops over `suite`. The PR-tier leg
+          # also carries the newest-uv redirect capstone (described with the
+          # uv rows below) and the .NET 10 one: each suite runs in seconds,
+          # their toolchains (PHP, uv, .NET) don't overlap, and one runner
+          # instead of three saves ~0.6 job-min of fixed setup per suite per
+          # run (#1732).
+          # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
+          # major (the suite pins the major through a sandbox global.json):
+          # the newest here, 7-9 on ubuntu in e2e-full.
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build e2e_redirect_uv_build e2e_nuget_dotnet_build, composer: '2', uv: '0.12.17', dotnet: '10'}
           # Real-bundler gem capstones, one leg per bundler era. Boundaries:
           # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
           # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
@@ -1284,32 +1355,39 @@ jobs:
           # the oldest and newest line + the 0.5.x boundary (0.5.4 still
           # re-resolves a transitive override / rejects a repointed
           # constraint under --locked; 0.5.5 keeps both). The other 0.N
-          # lines and 0.5.3/0.5.6 are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
+          # lines and 0.5.3/0.5.6 are in e2e-full. The redirect capstone
+          # rides the composer leg above.
           - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
           # The Poetry / PDM / Hatch / Pipenv / pip / deno manifest-less VEX
           # capstones share ONE test binary (`e2e_vex_build`, a module per
           # tool — one optimized link in test-release instead of six), so
           # each leg's `test_filter` names its tool's module and keeps
-          # `--ignored`.
+          # `--ignored`. A `test_filter` may hold several `;`-separated
+          # filters: the run step runs the binary once per filter, and each
+          # one must run a test. The PR tier runs Poetry, PDM, Hatch, Pipenv
+          # and deno in one leg, since each tool's tests take seconds and a
+          # leg of its own spent ~80% of its time on runner start and setup
+          # (#1732). pip (~3 min of tests) keeps its own leg so it does not
+          # grow the e2e critical path. In the shared leg PDM / Hatch
+          # bootstrap with the Pipenv leg's uv (it is first on PATH).
           # Real-Poetry hosted + vendored capstones (#[ignore]-gated,
           # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
           # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.0 (first lock 2.1 writer),
           # current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
           # Real PDM / Hatch capstones (wiremock Socket API that also serves
           # the hosted wheel; PyPI for the tool bootstrap + six).
           # PDM: lock 2 (1.4), refused 3.1 (1.15) and 4.2 (2.7), 4.3 (2.8),
           # the hishel<1 bootstrap window (2.25) and current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
           # Hatch: 1.0 (hatch.toml env vendoring refused, needs >= 1.2),
           # 1.2, the virtualenv<21 window (1.9, 1.14) and current.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
+          # Real deno negative capstone (no hosted/vendored wiring exists for
+          # deno; VEX must attest nothing): the current major here, older
+          # majors in e2e-extended.
           # Real Pipenv / pip capstones (mock patch server; the tools are
           # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
           # space-separated releases the suite loops over. The middle
           # Pipenv releases are in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2026.8.0'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored; pdm:: --ignored; hatch:: --ignored; pipenv:: --ignored; deno:: --ignored', poetry: '2.4.3', pdm: '2.29.2', hatch: '1.18.1', pipenv: '2026.8.0', deno: '2.9.7'}
           - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 23 24 25 26'}
           # Real-Maven hosted + vendored capstones, one leg per Maven line:
           # 3.6 (pre http-blocker), 3.8 (resolver 1.6: no trusted checksums),
@@ -1319,9 +1397,9 @@ jobs:
           # Lines that run both capstones run them in one leg (one Maven
           # install; the run step loops over `suite`).
           - {os: ubuntu-latest, suite: e2e_redirect_maven_build e2e_vendor_maven_build, jvm_tool: maven, maven: '3.9.16'}
-          # Real-Gradle capstones, PR tier: one leg per Gradle line x {agent +
-          # hosted, vendor + multi-project} on ubuntu, each on its line's LTS
-          # JDK. Every other OS x line x mode cell (and the JDK-ceiling,
+          # Real-Gradle capstones, PR tier: legs per Gradle line x {agent,
+          # hosted (three shards), vendor + multi-project} on ubuntu, each on
+          # its line's LTS JDK. Every other OS x line x mode cell (and the JDK-ceiling,
           # configuration-cache, Isolated Projects and real-Central rows) runs
           # in gradle-compatibility.yml. `suite` lists every binary the leg
           # runs (space-separated); the libtest filters select by the prefix
@@ -1332,22 +1410,18 @@ jobs:
           # selected test needs it (gradle_vendor_395's mixed root).
           # The hosted suite (~43 real-Gradle builds, ~31 min serially) is
           # split into three legs per line so it stops being the merge-queue
-          # critical path: the agent suites plus `gradle_hosted_[345]`, the
-          # `gradle_hosted_[b-p]` names, and a catch-all that `--skip`s
-          # exactly those words, so a new test always lands in some leg
-          # (test_ci_gradle_prefixes.py keeps the skip list in sync).
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          # critical path: `gradle_hosted_[345]`, the `gradle_hosted_[b-p]`
+          # names, and a catch-all that `--skip`s exactly those words, so a
+          # new test always lands in some leg (test_ci_gradle_prefixes.py
+          # keeps the skip list in sync). The agent suites get a leg of their
+          # own: sharing one with `gradle_hosted_[345]`, that leg took 4.3-6.2
+          # min and often outlasted the `coverage` job, setting `ci-ok`.
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_agent_'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '9.8.0', java: '21', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           # Real-sbt hosted (socket-patch.sbt) + vendored
           # (socket-patch-vendor.sbt) capstones on the current 1.x line. The
           # other sbt lines, JDK 21, the agent cells beyond coverage-docker's,
           # Mill, scala-cli and macOS / Windows are sbt-compatibility.yml.
-          # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
-          # major (the suite pins the major through a sandbox global.json):
-          # the oldest and newest here, 7-9 on ubuntu in e2e-full.
-          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '10'}
-          # Real deno negative capstone (no hosted/vendored wiring exists for
-          # deno; VEX must attest nothing), one leg per major.
-          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '2.9.7'}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
@@ -1439,9 +1513,10 @@ jobs:
           uv --version
 
       - name: Install uv (PDM / Hatch legs)
-        if: matrix.pdm != '' || matrix.hatch != ''
+        if: (matrix.pdm != '' || matrix.hatch != '') && matrix.poetry == ''
         # The suites bootstrap the pinned PDM / Hatch into their own venv
-        # with uv; this uv is tooling, not the release under test.
+        # with uv; this uv is tooling, not the release under test. A leg that
+        # also runs Poetry gets the same uv from 'Install pinned Poetry'.
         shell: bash
         run: scripts/pip-install-retry.sh uv==0.11.19
 
@@ -1466,11 +1541,10 @@ jobs:
         if: matrix.pipenv != '' || matrix.pip != ''
         uses: astral-sh/setup-uv@eb1897b8dc4b5d5bfe39a428a8f2304605e0983c # v7.0.0
         with:
-          # Pin uv: it is the PEP 751 oracle the pylock tests install with,
-          # and uv 0.13.2 started refusing Pipenv's `environments = []`
-          # pylock ("target environment is not supported by the lockfile").
-          # Bump deliberately, after checking the Pipenv pylock legs pass.
-          version: "0.13.1"
+          # Exact pin (scripts/check-tool-pins.py). uv 0.13.2+ refuses the
+          # `environments = []` pylock Pipenv writes; the pylock test checks
+          # that refusal matches Pipenv's own pylock, so keep this current.
+          version: "0.13.5"
 
       - name: Install the Pythons the Pipenv / pip legs run on
         if: matrix.pipenv != '' || matrix.pip != ''
@@ -1765,35 +1839,54 @@ jobs:
           E2E_ALLOW_EMPTY: ${{ matrix.allow_empty }}
         shell: bash
         # Runs from the package root with CARGO_MANIFEST_DIR set, as
-        # `cargo test` would. `suite` may name several binaries; an
-        # `allow_empty` row skips the ones whose test file has not landed.
-        # Every suite a leg runs must run at least one test (per suite, so
-        # one suite's tests never hide another's empty filter): a renamed
-        # module, a dropped `#[ignore]` under the default `--ignored`
-        # selector or a stale `test_filter` would otherwise pass as 0/0.
+        # `cargo test` would. `suite` may name several binaries and
+        # `test_filter` several `;`-separated filters: every suite runs once
+        # per filter, each in its own log group. An `allow_empty` row skips
+        # the suites whose test file has not landed.
+        # Every suite x filter a leg runs must run at least one test (so one
+        # run's tests never hide another's empty filter): a renamed module, a
+        # dropped `#[ignore]` under the default `--ignored` selector or a
+        # stale `test_filter` would otherwise pass as 0/0.
         run: |
           set -uo pipefail
           exe=''
           if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
           cd crates/socket-patch-cli
           export CARGO_MANIFEST_DIR="$PWD"
+          IFS=';' read -ra filters <<< "$E2E_TEST_FILTER"
           status=0
+          n=0
           for suite in $E2E_SUITE; do
             if [ "$E2E_ALLOW_EMPTY" = true ] && [ ! -f "tests/$suite.rs" ] && [ ! -f "tests/$suite/main.rs" ]; then
               echo "::notice::$suite has not landed yet; skipped (allow_empty)"
               continue
             fi
-            log="../../target/e2e-$suite.log"
-            # shellcheck disable=SC2086 # the filter is several libtest arguments
-            if ! "../../target/e2e-bin/$suite$exe" $E2E_TEST_FILTER 2>&1 | tee "$log"; then
-              status=1
-              continue
-            fi
-            passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
-            if [ "${passed:-0}" = 0 ]; then
-              echo "::error::$suite ran no test in this leg (filter: $E2E_TEST_FILTER). Fix the row's suite or test_filter so it selects the tests it is meant to run."
-              status=1
-            fi
+            for filter in "${filters[@]}"; do
+              # A blank `;` segment would run the binary with no arguments
+              # (every non-ignored test), which the empty-run check below
+              # can't tell from a real selection.
+              if [ -z "${filter// /}" ]; then
+                echo "::error::$suite has an empty test_filter segment ($E2E_TEST_FILTER). Drop the stray ';'."
+                status=1
+                continue
+              fi
+              n=$((n + 1))
+              log="../../target/e2e-$suite-$n.log"
+              echo "::group::$suite $filter"
+              # shellcheck disable=SC2086 # the filter is several libtest arguments
+              if ! "../../target/e2e-bin/$suite$exe" $filter 2>&1 | tee "$log"; then
+                echo "::endgroup::"
+                echo "::error::$suite failed (filter: $filter)."
+                status=1
+                continue
+              fi
+              echo "::endgroup::"
+              passed=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' "$log" | head -n 1)
+              if [ "${passed:-0}" = 0 ]; then
+                echo "::error::$suite ran no test in this leg (filter: $filter). Fix the row's suite or test_filter so it selects the tests it is meant to run."
+                status=1
+              fi
+            done
           done
           exit "$status"
 
@@ -1847,7 +1940,7 @@ jobs:
   # LEAN SCOPE note at the top of `jobs:`.
   e2e-extended:
     if: needs.e2e-build.outputs.reuse != 'true' && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    needs: [e2e-build]
+    needs: [e2e-build, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -1936,15 +2029,18 @@ jobs:
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.2', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '3.9.16', test_filter: '--ignored maven_reactor'}
           - {os: ubuntu-latest, suite: e2e_vendor_jvm_build, jvm_tool: maven, maven: '4.0.0-rc-7', test_filter: '--ignored maven_reactor'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_agent_'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '6.9.4', java: '11', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_agent_'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '7.6.6', java: '17', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
-          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_ gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
+          - {os: ubuntu-latest, suite: 'e2e_gradle_discovery_build e2e_gradle_agent_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_agent_'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_3 gradle_hosted_4 gradle_hosted_5'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_b gradle_hosted_c gradle_hosted_d gradle_hosted_e gradle_hosted_f gradle_hosted_l gradle_hosted_m gradle_hosted_n gradle_hosted_o gradle_hosted_p'}
           - {os: ubuntu-latest, suite: e2e_redirect_gradle_build, jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_hosted_ --skip gradle_hosted_3 --skip gradle_hosted_4 --skip gradle_hosted_5 --skip gradle_hosted_b --skip gradle_hosted_c --skip gradle_hosted_d --skip gradle_hosted_e --skip gradle_hosted_f --skip gradle_hosted_l --skip gradle_hosted_m --skip gradle_hosted_n --skip gradle_hosted_o --skip gradle_hosted_p'}
           - {os: ubuntu-latest, suite: 'e2e_vendor_gradle_build e2e_vendor_jvm_build', jvm_tool: gradle, gradle: '8.14.3', java: '21', test_filter: '--ignored gradle_vendor_ gradle_multi_project'}
@@ -2067,7 +2163,7 @@ jobs:
     # Nightly, on dispatch (release-qa) and on v5 landings only, like
     # e2e-docker; CI_SCOPE=full also runs it on pushes to main.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease'
-    needs: [e2e-build]
+    needs: [e2e-build, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -2216,9 +2312,9 @@ jobs:
     # queue's critical path.
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
-    # Only wait for the clippy preflight.
-    if: (github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true') && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    # Only wait for the clippy and release-readiness preflights.
+    if: (github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: [release-readiness, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 40
     strategy:
@@ -2238,6 +2334,8 @@ jobs:
         run: scripts/rustup-retry.sh toolchain install
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2260,9 +2358,9 @@ jobs:
     # queue's critical path.
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
-    # Only wait for the clippy preflight.
-    if: (github.event.pull_request.draft != true && needs.clippy.outputs.reuse != 'true') && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    # Only wait for the clippy and release-readiness preflights.
+    if: (github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: [release-readiness, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -2283,6 +2381,8 @@ jobs:
         run: scripts/rustup-retry.sh toolchain install
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -2302,9 +2402,9 @@ jobs:
   # nightly, not on every PR push, so PRs stop queueing on the small
   # macOS runner pool.
   yarn-berry-e2e-macos:
-    if: (github.event_name != 'pull_request' && needs.clippy.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: (github.event_name != 'pull_request' && needs.release-readiness.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
-    needs: clippy
+    needs: [release-readiness, clippy]
     strategy:
       fail-fast: false
       matrix:
@@ -2345,7 +2445,7 @@ jobs:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     # e2e-build only (its binaries; only the matching OS build is needed);
     # see yarn-classic-matrix on test/coverage.
-    needs: [e2e-build]
+    needs: [e2e-build, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -2461,7 +2561,7 @@ jobs:
     name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
     # Same gate as e2e-full.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease'
-    needs: [e2e-build]
+    needs: [e2e-build, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 40
     # What .cargo/config.toml's [env] gives processes cargo launches; these
@@ -2499,9 +2599,9 @@ jobs:
     # queue's critical path.
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
-    # Only wait for the clippy preflight.
-    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.clippy.outputs.pr_unchanged != 'true'
-    needs: clippy
+    # Only wait for the clippy and release-readiness preflights.
+    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    needs: [release-readiness, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
     steps:
@@ -2512,20 +2612,22 @@ jobs:
       - name: Install Rust
         run: scripts/rustup-retry.sh toolchain install
       - name: Pull the old cargos under test
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         run: |
           docker pull rust:1.41-slim
           docker pull rust:1.56-slim
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Warm the shared Linux dev cache after merge-queue validation
-        if: needs.clippy.outputs.reuse == 'true'
+        if: needs.release-readiness.outputs.reuse == 'true'
         run: cargo test --locked -p socket-patch-cli --test e2e_vendor_cargo_build --no-run
       - name: Vendored manifest [patch] on old cargo
-        if: needs.clippy.outputs.reuse != 'true'
+        if: needs.release-readiness.outputs.reuse != 'true'
         shell: bash
         env:
           SOCKET_PATCH_CARGO_E2E_REQUIRED: '1'
@@ -2555,7 +2657,8 @@ jobs:
   #     The kill switch gates the STEPS, never the job.
   #   * NO `needs:` — an upstream failure would skip this job, same wedge.
   #   * NO matrix and NO rename — the check name must stay `hosted-e2e`.
-  #   * NO `continue-on-error` — a bypass must be visible, not invisible.
+  #   * NO `continue-on-error` on the job or its e2e steps — a bypass must be
+  #     visible, not invisible. Only the capped `Cache cargo` restore has it.
   # The job ALWAYS runs and ALWAYS reaches success or failure.
   #
   # ESCAPE HATCH — when production is down and this is blocking merges:
@@ -2626,6 +2729,8 @@ jobs:
       - name: Cache cargo
         if: steps.gate.outputs.run == 'true'
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           shared-key: dev-ubuntu-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}

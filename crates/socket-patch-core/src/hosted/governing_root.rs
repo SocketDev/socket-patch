@@ -3286,6 +3286,10 @@ mod tests {
             ),
         ] {
             let tmp = tempfile::tempdir().unwrap();
+            // The refusal names the canonical root; on Windows the temp dir
+            // can be an 8.3 short path (`RUNNER~1`) that canonicalizes to a
+            // different string.
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
             write(tmp.path(), "package.json", r#"{"private":true}"#);
             if let Some(text) = vlt_json {
                 write(tmp.path(), VLT_JSON, text);
@@ -3306,11 +3310,7 @@ mod tests {
             let stray = member_stray_lock(&project)
                 .await
                 .unwrap_or_else(|| panic!("{case}: the lock is stray"));
-            assert_eq!(
-                stray.root,
-                std::fs::canonicalize(tmp.path()).unwrap(),
-                "{case}"
-            );
+            assert_eq!(stray.root, base, "{case}");
             assert_eq!(stray.root_kind, "vlt project root", "{case}");
             assert_eq!(stray.ignored, vec![VLT_LOCK], "{case}");
             let refused = refusal(&ProjectView::Disk(&project), &[candidate("npm")], true)
@@ -3320,7 +3320,7 @@ mod tests {
             assert!(
                 refused
                     .message
-                    .contains(&tmp.path().join(VLT_LOCK).display().to_string())
+                    .contains(&base.join(VLT_LOCK).display().to_string())
                     && refused.message.contains(VLT_JSON)
                     && refused.message.contains("nothing was written"),
                 "{case}: {}",

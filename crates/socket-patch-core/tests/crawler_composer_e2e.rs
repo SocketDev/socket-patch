@@ -1669,3 +1669,394 @@ async fn get_vendor_paths_global_xdg_config_home_outranks_stale_dot_composer() {
         "Composer 2 picks $XDG_CONFIG_HOME/composer over ~/.composer"
     );
 }
+
+// ── Composer 1 + composer/installers (no install-path) ─────────
+
+const TOOL_PURL: &str = "pkg:composer/acme/tool@1.0.0";
+
+/// A Composer 1 project shaped like the one `composer-1.10.28.phar
+/// install` leaves behind for #463: installed.json is a bare array with
+/// no `install-path`, composer/installers sits in `vendor/`, and the
+/// relocated package exists only where the installer put it.
+async fn composer1_project(root: &Path, root_extra: &str, tool_entry: &str) {
+    let composer_dir = root.join("vendor").join("composer");
+    tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+    tokio::fs::create_dir_all(root.join("vendor").join("composer").join("installers"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        composer_dir.join("installed.json"),
+        format!(
+            r#"[
+              {{"name":"composer/installers","version":"v1.12.0","type":"composer-plugin"}},
+              {tool_entry}
+            ]"#
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        root.join("composer.json"),
+        format!(r#"{{"require":{{"acme/tool":"1.0.0"}},"extra":{root_extra}}}"#),
+    )
+    .await
+    .unwrap();
+}
+
+const WP_TOOL: &str = r#"{"name":"acme/tool","version":"1.0.0","type":"wordpress-plugin"}"#;
+
+async fn tool_paths(root: &Path) -> (Vec<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let crawler = ComposerCrawler;
+    let crawled = crawler
+        .crawl_all(&options_at(root))
+        .await
+        .into_iter()
+        .filter(|p| p.purl == TOOL_PURL)
+        .map(|p| p.path)
+        .collect();
+    let found = crawler
+        .find_by_purls(&root.join("vendor"), &[TOOL_PURL.to_string()])
+        .await
+        .unwrap()
+        .remove(TOOL_PURL)
+        .map(|p| p.path);
+    (crawled, found)
+}
+
+/// #463: the exact repro — `installer-paths` maps `type:wordpress-plugin`
+/// to `wp-content/plugins/{$name}/`. Composer 1 records no install-path,
+/// so scan skipped the plugin as "not installed" and vex attested from the
+/// lock pin. Both crawl_all (scan, vex) and find_by_purls (apply) must
+/// find it where composer/installers put it.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_installer_paths_type_rule_finds_relocated_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    composer1_project(
+        root,
+        r#"{"installer-paths":{"wp-content/plugins/{$name}/":["type:wordpress-plugin"]}}"#,
+        WP_TOOL,
+    )
+    .await;
+    let plugin = root.join("wp-content").join("plugins").join("tool");
+    tokio::fs::create_dir_all(&plugin).await.unwrap();
+    assert!(!root.join("vendor").join("acme").join("tool").exists());
+
+    let (crawled, found) = tool_paths(root).await;
+    assert_eq!(crawled, vec![plugin.clone()]);
+    assert_eq!(found, Some(plugin));
+}
+
+/// composer/installers matches `installer-paths` rules by exact package
+/// name, `type:` and `vendor:`, takes the FIRST path (in file order) with
+/// a matching rule, and substitutes `{$vendor}`/`{$name}`/`{$type}`, with
+/// the package's own `extra.installer-name` replacing `{$name}`.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_installer_paths_rules_and_placeholders() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        // Exact name rule.
+        (
+            r#"{"installer-paths":{"web/app/{$vendor}-{$name}/":["acme/tool"]}}"#,
+            WP_TOOL,
+            &["web", "app", "acme-tool"],
+        ),
+        // vendor: rule, {$type} is the full package type.
+        (
+            r#"{"installer-paths":{"ext/{$type}/{$name}/":["vendor:acme"]}}"#,
+            WP_TOOL,
+            &["ext", "wordpress-plugin", "tool"],
+        ),
+        // First matching path wins; a non-matching earlier path is skipped.
+        (
+            r#"{"installer-paths":{
+                "nope/{$name}/":["type:drupal-module"],
+                "first/{$name}/":["vendor:acme"],
+                "second/{$name}/":["type:wordpress-plugin"]}}"#,
+            WP_TOOL,
+            &["first", "tool"],
+        ),
+        // A bare string instead of an array is one rule.
+        (
+            r#"{"installer-paths":{"one/{$name}/":"acme/tool"}}"#,
+            WP_TOOL,
+            &["one", "tool"],
+        ),
+        // installer-name overrides {$name}.
+        (
+            r#"{"installer-paths":{"wp-content/plugins/{$name}/":["type:wordpress-plugin"]}}"#,
+            r#"{"name":"acme/tool","version":"1.0.0","type":"wordpress-plugin",
+                "extra":{"installer-name":"renamed"}}"#,
+            &["wp-content", "plugins", "renamed"],
+        ),
+    ];
+    for (extra, entry, segments) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        composer1_project(root, extra, entry).await;
+        let dir = segments.iter().fold(root.to_path_buf(), |p, s| p.join(s));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let (crawled, found) = tool_paths(root).await;
+        assert_eq!(crawled, vec![dir.clone()], "{extra}");
+        assert_eq!(found, Some(dir), "{extra}");
+    }
+}
+
+/// Without `installer-paths`, composer/installers uses its built-in
+/// location for the type (`wp-content/plugins/{$name}/` for a WordPress
+/// plugin, `modules/{$name}/` for a Drupal module, ...).
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_installers_default_locations() {
+    let cases: &[(&str, &[&str])] = &[
+        ("wordpress-plugin", &["wp-content", "plugins", "tool"]),
+        ("wordpress-theme", &["wp-content", "themes", "tool"]),
+        ("wordpress-muplugin", &["wp-content", "mu-plugins", "tool"]),
+        ("drupal-module", &["modules", "tool"]),
+        ("drupal-theme", &["themes", "tool"]),
+        ("drupal-custom-module", &["modules", "custom", "tool"]),
+    ];
+    for (package_type, segments) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        composer1_project(
+            root,
+            "{}",
+            &format!(r#"{{"name":"acme/tool","version":"1.0.0","type":"{package_type}"}}"#),
+        )
+        .await;
+        let dir = segments.iter().fold(root.to_path_buf(), |p, s| p.join(s));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let (crawled, found) = tool_paths(root).await;
+        assert_eq!(crawled, vec![dir.clone()], "{package_type}");
+        assert_eq!(found, Some(dir), "{package_type}");
+    }
+}
+
+/// When composer/installers placed the package, its directory is the live
+/// copy even if a stale `vendor/<ns>/<name>` is lying around; patching the
+/// stale one would leave the plugin the site loads unpatched.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_installer_path_preferred_over_stale_vendor_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    composer1_project(root, "{}", WP_TOOL).await;
+    let plugin = root.join("wp-content").join("plugins").join("tool");
+    tokio::fs::create_dir_all(&plugin).await.unwrap();
+    tokio::fs::create_dir_all(root.join("vendor").join("acme").join("tool"))
+        .await
+        .unwrap();
+
+    let (crawled, found) = tool_paths(root).await;
+    assert_eq!(crawled, vec![plugin.clone()]);
+    assert_eq!(found, Some(plugin));
+}
+
+/// Controls: only composer/installers relocates packages, and only types
+/// it handles. Without it installed, or for a plain `library`, the
+/// conventional `vendor/<ns>/<name>` stays the only location, even when a
+/// directory exists where an installer would have put it.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_no_installers_or_library_type_stays_in_vendor() {
+    // composer/installers not installed.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let composer_dir = root.join("vendor").join("composer");
+    tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+    tokio::fs::write(composer_dir.join("installed.json"), format!("[{WP_TOOL}]"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        root.join("composer.json"),
+        r#"{"extra":{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}}"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir_all(root.join("wp-content").join("plugins").join("tool"))
+        .await
+        .unwrap();
+    assert_eq!(tool_paths(root).await, (vec![], None));
+    let vendored = root.join("vendor").join("acme").join("tool");
+    tokio::fs::create_dir_all(&vendored).await.unwrap();
+    assert_eq!(
+        tool_paths(root).await,
+        (vec![vendored.clone()], Some(vendored))
+    );
+
+    // A library is never relocated, even by a name rule.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    composer1_project(
+        root,
+        r#"{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+        r#"{"name":"acme/tool","version":"1.0.0","type":"library"}"#,
+    )
+    .await;
+    tokio::fs::create_dir_all(root.join("wp-content").join("plugins").join("tool"))
+        .await
+        .unwrap();
+    assert_eq!(tool_paths(root).await, (vec![], None));
+}
+
+/// installed.json and composer.json are untrusted input and the resolved
+/// directory is a patch WRITE target: an installer path (or an
+/// installer-name) that leaves the project is dropped, like an escaping
+/// install-path, even though the target exists.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_installer_path_escaping_project_is_rejected() {
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"{"installer-paths":{"../evil/{$name}/":["acme/tool"]}}"#,
+            WP_TOOL,
+        ),
+        (
+            r#"{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            r#"{"name":"acme/tool","version":"1.0.0","type":"wordpress-plugin",
+                "extra":{"installer-name":"../../../evil/tool"}}"#,
+        ),
+    ];
+    for (extra, entry) in cases {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("proj");
+        composer1_project(&root, extra, entry).await;
+        tokio::fs::create_dir_all(outer.path().join("evil").join("tool"))
+            .await
+            .unwrap();
+        assert_eq!(tool_paths(&root).await, (vec![], None), "{extra} {entry}");
+    }
+}
+
+/// composer/installers leaves a package in `vendor/` when it does not
+/// handle the type (`wordpress-core`, a `drupal-multisite` that is not
+/// DrupalInstaller's `drupal-drupal-multisite`), when the framework
+/// rewrites `{$name}` (`cakephp-plugin` is installed camel-cased, so the
+/// raw name would point at the wrong directory), and when the root
+/// `extra.installer-disable` switches the framework off. A directory where
+/// a rule would otherwise point must not be taken for the package.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_unrelocated_types_and_disabled_installers_stay_in_vendor() {
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-core",
+        ),
+        (
+            r#"{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "cakephp-plugin",
+        ),
+        (
+            r#"{"installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "drupal-multisite",
+        ),
+        (
+            r#"{"installer-disable":true,
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":["cakephp","wordpress"],
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":"all",
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":"*",
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":["cakephp",true],
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+        (
+            r#"{"installer-disable":["*"],
+                "installer-paths":{"wp-content/plugins/{$name}/":["acme/tool"]}}"#,
+            "wordpress-plugin",
+        ),
+    ];
+    for (extra, package_type) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        composer1_project(
+            root,
+            extra,
+            &format!(r#"{{"name":"acme/tool","version":"1.0.0","type":"{package_type}"}}"#),
+        )
+        .await;
+        tokio::fs::create_dir_all(root.join("wp-content").join("plugins").join("tool"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("sites").join("tool"))
+            .await
+            .unwrap();
+        let vendored = root.join("vendor").join("acme").join("tool");
+        tokio::fs::create_dir_all(&vendored).await.unwrap();
+        assert_eq!(
+            tool_paths(root).await,
+            (vec![vendored.clone()], Some(vendored)),
+            "{package_type} {extra}"
+        );
+    }
+
+    // Framework names match case-sensitively, as composer/installers'
+    // `key_exists` does: `WordPress` does not switch off `wordpress`.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    composer1_project(root, r#"{"installer-disable":["WordPress"]}"#, WP_TOOL).await;
+    let plugin = root.join("wp-content").join("plugins").join("tool");
+    tokio::fs::create_dir_all(&plugin).await.unwrap();
+    tokio::fs::create_dir_all(root.join("vendor").join("acme").join("tool"))
+        .await
+        .unwrap();
+    assert_eq!(tool_paths(root).await, (vec![plugin.clone()], Some(plugin)));
+
+    // DrupalInstaller's real multisite type is relocated to sites/{$name}.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    composer1_project(
+        root,
+        "{}",
+        r#"{"name":"acme/tool","version":"1.0.0","type":"drupal-drupal-multisite"}"#,
+    )
+    .await;
+    let site = root.join("sites").join("tool");
+    tokio::fs::create_dir_all(&site).await.unwrap();
+    assert_eq!(tool_paths(root).await, (vec![site.clone()], Some(site)));
+}
+
+/// An installer-name is a directory name. One that is a path (`..`,
+/// `a/b`) could aim the patch at another directory inside the project,
+/// such as the project root itself, so it is refused.
+#[tokio::test]
+#[serial_test::parallel]
+async fn composer1_installer_name_must_be_one_segment() {
+    for installer_name in ["..", ".", "../../vendor/acme", "a/b"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        composer1_project(
+            &root,
+            "{}",
+            &format!(
+                r#"{{"name":"acme/tool","version":"1.0.0","type":"wordpress-plugin",
+                    "extra":{{"installer-name":"{installer_name}"}}}}"#
+            ),
+        )
+        .await;
+        tokio::fs::create_dir_all(root.join("wp-content").join("plugins").join("a").join("b"))
+            .await
+            .unwrap();
+        assert_eq!(tool_paths(&root).await, (vec![], None), "{installer_name}");
+    }
+}

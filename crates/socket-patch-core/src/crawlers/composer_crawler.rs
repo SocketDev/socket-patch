@@ -17,7 +17,7 @@ mod oracle;
 /// vendor directories.
 pub struct ComposerCrawler;
 
-/// A single package entry distilled from installed.json. Only the three
+/// A single package entry distilled from installed.json. Only the
 /// fields the crawler needs are retained; everything else (source,
 /// dist, autoload, ...) is ignored.
 struct ComposerPackageEntry {
@@ -29,6 +29,201 @@ struct ComposerPackageEntry {
     /// composer/installers target). `None` for Composer 1 entries and any
     /// entry that omits it.
     install_path: Option<String>,
+    /// The package `type` (`library`, `wordpress-plugin`, ...), which
+    /// decides whether composer/installers relocates it.
+    package_type: Option<String>,
+    /// The package's own `extra.installer-name`, which composer/installers
+    /// uses in place of the package name for `{$name}`.
+    installer_name: Option<String>,
+}
+
+/// How composer/installers lays out a project, for entries whose
+/// installed.json record has no `install-path` (Composer 1). Composer 2
+/// records the directory composer/installers chose; Composer 1 does not,
+/// so it has to be worked out again from the same inputs the plugin used.
+#[derive(Default)]
+struct InstallerLayout {
+    /// composer/installers is installed. Without it Composer puts every
+    /// package under `vendor/`, whatever its type or `installer-paths`.
+    active: bool,
+    /// Frameworks the root `extra.installer-disable` switches off (`all`
+    /// for every one); their packages stay in `vendor/`.
+    disabled: Vec<String>,
+    /// The root composer.json `extra.installer-paths`, in file order:
+    /// (path template, rules such as `acme/tool`, `type:x`, `vendor:y`).
+    paths: Vec<(String, Vec<String>)>,
+}
+
+/// composer/installers' built-in locations, keyed by the package type
+/// they apply to (`<framework>-<location key>`), for the frameworks whose
+/// installers leave `{$name}` as is. A type missing here stays in
+/// `vendor/`: the plugin does not handle it (`library`, `wordpress-core`,
+/// ...), or handles it under a framework that rewrites `{$name}`
+/// (CakePHP camel-cases it, MediaWiki, October, ...), whose directory
+/// cannot be worked out from the name alone.
+const INSTALLER_DEFAULT_LOCATIONS: &[(&str, &str)] = &[
+    ("wordpress-plugin", "wp-content/plugins/{$name}/"),
+    ("wordpress-theme", "wp-content/themes/{$name}/"),
+    ("wordpress-muplugin", "wp-content/mu-plugins/{$name}/"),
+    ("wordpress-dropin", "wp-content/{$name}/"),
+    ("drupal-core", "core/"),
+    ("drupal-module", "modules/{$name}/"),
+    ("drupal-theme", "themes/{$name}/"),
+    ("drupal-library", "libraries/{$name}/"),
+    ("drupal-profile", "profiles/{$name}/"),
+    (
+        "drupal-database-driver",
+        "drivers/lib/Drupal/Driver/Database/{$name}/",
+    ),
+    ("drupal-drush", "drush/{$name}/"),
+    ("drupal-custom-theme", "themes/custom/{$name}/"),
+    ("drupal-custom-module", "modules/custom/{$name}/"),
+    ("drupal-custom-profile", "profiles/custom/{$name}/"),
+    // DrupalInstaller's location key is `drupal-multisite`.
+    ("drupal-drupal-multisite", "sites/{$name}/"),
+    ("drupal-console", "console/{$name}/"),
+    ("drupal-console-language", "console/language/{$name}/"),
+    ("drupal-config", "config/sync/"),
+];
+
+impl InstallerLayout {
+    /// Read the layout for one vendor tree: whether composer/installers is
+    /// among its installed packages and not switched off by the root
+    /// `extra.installer-disable`, and the project's `installer-paths`.
+    /// composer.json is read only when some entry lacks an `install-path`;
+    /// a Composer 2 tree never needs the layout.
+    async fn load(project_root: &Path, entries: &[ComposerPackageEntry]) -> Self {
+        let installed = entries
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case("composer/installers"));
+        if !installed || entries.iter().all(|e| e.install_path.is_some()) {
+            return Self::default();
+        }
+        let root = crate::utils::fs::read_regular_to_string(&project_root.join("composer.json"))
+            .await
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+        let extra = root.as_ref().and_then(|r| r.get("extra"));
+        Self {
+            active: true,
+            disabled: extra
+                .and_then(|e| e.get("installer-disable"))
+                .map(parse_installer_disable)
+                .unwrap_or_default(),
+            paths: extra
+                .and_then(|e| e.get("installer-paths"))
+                .map(parse_installer_paths)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Where composer/installers put `entry`, mirroring its
+    /// `BaseInstaller::getInstallPath`: the first `installer-paths` entry
+    /// with a rule naming the package, its `type:` or its `vendor:`, else
+    /// the framework's built-in location. `None` when the plugin would not
+    /// relocate the package, or the path leaves `project_root`.
+    fn locate(&self, project_root: &Path, entry: &ComposerPackageEntry) -> Option<PathBuf> {
+        if !self.active {
+            return None;
+        }
+        let package_type = entry.package_type.as_deref()?;
+        let (_, default) = INSTALLER_DEFAULT_LOCATIONS
+            .iter()
+            .find(|(t, _)| *t == package_type)?;
+        let (framework, _) = package_type.split_once('-')?;
+        if self.disabled.iter().any(|d| d == "all" || d == framework) {
+            return None;
+        }
+        let (vendor, name) = entry.name.split_once('/')?;
+        let template = self
+            .paths
+            .iter()
+            .find(|(_, rules)| {
+                rules.iter().any(|rule| {
+                    *rule == entry.name
+                        || rule.strip_prefix("type:") == Some(package_type)
+                        || rule.strip_prefix("vendor:") == Some(vendor)
+                })
+            })
+            .map_or(*default, |(path, _)| path.as_str());
+        // installed.json is untrusted: an installer-name is a directory
+        // name, never a path that could aim the patch at another directory.
+        let name = match entry.installer_name.as_deref() {
+            Some(n) if path_safety::is_safe_single_segment(n) => n,
+            Some(_) => return None,
+            None => name,
+        };
+        let rendered = render_installer_path(template, name, vendor, package_type)?;
+        contain_in_project(project_root, &project_root.join(rendered))
+            .filter(|dir| dir.as_path() != project_root)
+    }
+}
+
+/// The root `extra.installer-disable`, as composer/installers'
+/// `removeDisabledInstallers` reads it: a scalar is a one-item list, and
+/// a list holding `true`, `"all"` or `"*"` switches every framework off
+/// (`array_intersect` compares the string forms, so `true` is `"1"`).
+/// Otherwise each string names a framework, matched case-sensitively.
+fn parse_installer_disable(value: &serde_json::Value) -> Vec<String> {
+    let items = match value {
+        serde_json::Value::Array(list) => list.as_slice(),
+        scalar => std::slice::from_ref(scalar),
+    };
+    let names: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            serde_json::Value::Bool(true) => Some("1".to_string()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::String(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    if names
+        .iter()
+        .any(|n| matches!(n.as_str(), "1" | "all" | "*"))
+    {
+        vec!["all".to_string()]
+    } else {
+        names
+    }
+}
+
+/// The root composer.json `extra.installer-paths` map, in file order. A
+/// path's value is a list of rules or a single rule string.
+fn parse_installer_paths(value: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    let Some(map) = value.as_object() else {
+        return Vec::new();
+    };
+    map.iter()
+        .map(|(path, rules)| {
+            let rules = match rules {
+                serde_json::Value::String(rule) => vec![rule.clone()],
+                serde_json::Value::Array(list) => list
+                    .iter()
+                    .filter_map(|r| r.as_str().map(str::to_string))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (path.clone(), rules)
+        })
+        .collect()
+}
+
+/// Substitute composer/installers' `{$name}`, `{$vendor}` and `{$type}`
+/// placeholders. `None` for a NUL or any other placeholder, which the
+/// plugin would render as an empty string; guessing that layout could
+/// point the patch at the wrong directory.
+fn render_installer_path(
+    template: &str,
+    name: &str,
+    vendor: &str,
+    package_type: &str,
+) -> Option<String> {
+    let rendered = template
+        .replace("{$name}", name)
+        .replace("{$vendor}", vendor)
+        .replace("{$type}", package_type);
+    (!rendered.contains("{$") && !rendered.contains('\0')).then_some(rendered)
 }
 
 impl ComposerCrawler {
@@ -100,18 +295,17 @@ impl ComposerCrawler {
         for vendor_path in &vendor_paths {
             let project_root = resolve_project_root(vendor_path).await;
             let entries = read_installed_json(vendor_path).await;
-            // Resolve every entry's directory first (pure path logic), then
-            // stat them all in one blocking-pool task instead of one hop
-            // each; the loop below consumes the answers in entry order.
-            let resolved: Vec<Option<PathBuf>> = entries
+            let installers = InstallerLayout::load(&project_root, &entries).await;
+            // Resolve every entry's candidate directories first (pure path
+            // logic), then stat them all in one blocking-pool task instead
+            // of one hop each; the loop below consumes the answers in entry
+            // order.
+            let candidates: Vec<Vec<PathBuf>> = entries
                 .iter()
-                .map(|entry| {
-                    entry.name.split_once('/')?;
-                    resolve_package_dir(vendor_path, &project_root, entry)
-                })
+                .map(|entry| resolve_package_dir(vendor_path, &project_root, &installers, entry))
                 .collect();
-            let on_disk = dirs_exist(resolved.clone()).await;
-            for ((entry, pkg_path), on_disk) in entries.into_iter().zip(resolved).zip(on_disk) {
+            let resolved = first_existing_dirs(candidates).await;
+            for (entry, pkg_path) in entries.into_iter().zip(resolved) {
                 if let Some((namespace, name)) = entry.name.split_once('/') {
                     // Skip packages that installed.json lists but that are
                     // not actually on disk (stale metadata, a metapackage).
@@ -120,9 +314,6 @@ impl ComposerCrawler {
                     let Some(pkg_path) = pkg_path else {
                         continue;
                     };
-                    if !on_disk {
-                        continue;
-                    }
 
                     // Composer's installed.json stores the *pretty*
                     // version (often `v6.4.1`); PURLs use the bare numeric
@@ -176,17 +367,18 @@ impl ComposerCrawler {
         // entry so the real on-disk path can be reconstructed even on
         // case-sensitive filesystems.
         let entries = read_installed_json(vendor_path).await;
+        let project_root = resolve_project_root(vendor_path).await;
+        let installers = InstallerLayout::load(&project_root, &entries).await;
         let installed: HashMap<String, ComposerPackageEntry> = entries
             .into_iter()
             .map(|e| (e.name.to_ascii_lowercase(), e))
             .collect();
-        let project_root = resolve_project_root(vendor_path).await;
 
         // Resolve each PURL's directory first (pure lookups), then stat
         // them all in one blocking-pool task instead of one hop each.
         // (namespace, name, version), as the purl parser handed them back.
         type Coords<'a> = (Cow<'a, str>, Cow<'a, str>, Cow<'a, str>);
-        let mut matches: Vec<(&String, Coords<'_>, PathBuf)> = Vec::new();
+        let mut matches: Vec<(&String, Coords<'_>, Vec<PathBuf>)> = Vec::new();
         for purl in purls {
             if let Some(((namespace_part, name_part), version_part)) =
                 crate::utils::purl::parse_composer_purl(purl)
@@ -210,25 +402,27 @@ impl ComposerCrawler {
                 }
 
                 // Resolve the on-disk directory from installed.json's own
-                // record — its `install-path` when present, else the
-                // conventional layout under the original (case-preserved)
-                // casing Composer wrote to disk; the canonical (lowercase)
-                // PURL name would miss it on a case-sensitive filesystem.
-                let Some(pkg_dir) = resolve_package_dir(vendor_path, &project_root, entry) else {
-                    continue;
-                };
+                // record — its `install-path` when present, else where
+                // composer/installers or the conventional layout put it,
+                // under the original (case-preserved) casing Composer wrote
+                // to disk; the canonical (lowercase) PURL name would miss it
+                // on a case-sensitive filesystem.
+                let candidates =
+                    resolve_package_dir(vendor_path, &project_root, &installers, entry);
 
-                matches.push((purl, (namespace_part, name_part, version_part), pkg_dir));
+                matches.push((purl, (namespace_part, name_part, version_part), candidates));
             }
         }
 
-        let on_disk = dirs_exist(matches.iter().map(|m| Some(m.2.clone())).collect()).await;
-        for ((purl, (namespace, name, version), pkg_dir), on_disk) in
-            matches.into_iter().zip(on_disk)
-        {
-            if !on_disk {
+        let (matches, candidates): (Vec<_>, Vec<_>) = matches
+            .into_iter()
+            .map(|(purl, coords, candidates)| ((purl, coords), candidates))
+            .unzip();
+        let resolved = first_existing_dirs(candidates).await;
+        for ((purl, (namespace, name, version)), pkg_dir) in matches.into_iter().zip(resolved) {
+            let Some(pkg_dir) = pkg_dir else {
                 continue;
-            }
+            };
 
             result.insert(
                 purl.clone(),
@@ -754,8 +948,15 @@ fn resolve_install_path(
     // `join` substitutes an absolute `install-path` (Composer writes one
     // for some path repositories) for the base; the containment check
     // below is what keeps it in bounds either way.
-    let joined = vendor_path.join("composer").join(install_path);
-    let resolved = normalize_lexically(&joined)?;
+    contain_in_project(
+        project_root,
+        &vendor_path.join("composer").join(install_path),
+    )
+}
+
+/// `joined`, normalized, when it stays inside `project_root`; else `None`.
+fn contain_in_project(project_root: &Path, joined: &Path) -> Option<PathBuf> {
+    let resolved = normalize_lexically(joined)?;
     // A RELATIVE vendor path (the CLI default is `--cwd .`) yields a
     // relative project root that can normalize to the EMPTY path — and
     // `starts_with("")` holds for EVERY path, absolute ones included, so
@@ -782,25 +983,58 @@ fn is_anchored(path: &Path) -> bool {
     )
 }
 
-/// The on-disk directory of an installed.json entry.
+/// The directories an installed.json entry may live in, most likely
+/// first; the package is at the first that exists.
 ///
 /// `install-path` is authoritative when recorded: Composer 2 writes it for
 /// every package, and for composer/installers targets (WordPress plugins,
 /// Drupal modules, `extra.installer-paths`) it is the ONLY record of where
 /// the package really lives. Entries without one (Composer 1, hand-written
-/// metadata) keep the conventional `vendor/<namespace>/<name>` layout.
+/// metadata) are where composer/installers put them, when it handles them
+/// ([`InstallerLayout::locate`]), else the conventional
+/// `vendor/<namespace>/<name>` layout. The installer's directory comes
+/// first: it is the copy the application loads, and a `vendor/` copy
+/// beside it is a leftover.
 fn resolve_package_dir(
     vendor_path: &Path,
     project_root: &Path,
+    installers: &InstallerLayout,
     entry: &ComposerPackageEntry,
-) -> Option<PathBuf> {
+) -> Vec<PathBuf> {
     match entry.install_path.as_deref() {
-        Some(install_path) => resolve_install_path(vendor_path, project_root, install_path),
+        Some(install_path) => resolve_install_path(vendor_path, project_root, install_path)
+            .into_iter()
+            .collect(),
         None => {
-            let (namespace, name) = entry.name.split_once('/')?;
-            Some(vendor_path.join(namespace).join(name))
+            let Some((namespace, name)) = entry.name.split_once('/') else {
+                return Vec::new();
+            };
+            let conventional = vendor_path.join(namespace).join(name);
+            match installers.locate(project_root, entry) {
+                Some(relocated) => vec![relocated, conventional],
+                None => vec![conventional],
+            }
         }
     }
+}
+
+/// The first directory of each candidate list that exists, stating every
+/// candidate in one blocking-pool task ([`dirs_exist`]).
+async fn first_existing_dirs(candidates: Vec<Vec<PathBuf>>) -> Vec<Option<PathBuf>> {
+    let flat: Vec<Option<PathBuf>> = candidates.iter().flatten().cloned().map(Some).collect();
+    let mut on_disk = dirs_exist(flat).await.into_iter();
+    candidates
+        .into_iter()
+        .map(|list| {
+            let mut found = None;
+            for dir in list {
+                if on_disk.next() == Some(true) && found.is_none() {
+                    found = Some(dir);
+                }
+            }
+            found
+        })
+        .collect()
 }
 
 /// Whether an installed.json package name is safe to join onto the
@@ -874,10 +1108,22 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
                 .and_then(|p| p.as_str())
                 .filter(|p| !p.is_empty())
                 .map(str::to_string);
+            let package_type = entry
+                .get("type")
+                .and_then(|t| t.as_str())
+                .map(str::to_string);
+            let installer_name = entry
+                .get("extra")
+                .and_then(|e| e.get("installer-name"))
+                .and_then(|n| n.as_str())
+                .filter(|n| !n.is_empty())
+                .map(str::to_string);
             Some(ComposerPackageEntry {
                 name: name.to_string(),
                 version: version.to_string(),
                 install_path,
+                package_type,
+                installer_name,
             })
         })
         .collect()

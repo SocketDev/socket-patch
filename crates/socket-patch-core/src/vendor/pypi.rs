@@ -901,6 +901,65 @@ async fn hatch_stale_install_warning(
         .collect()
 }
 
+/// The PDM twin of [`pipenv_stale_install_warning`] (#641): PDM before
+/// 2.11 (lock_version `2` / `4.3` / `4.4`) does not replace a release that
+/// is already installed at the same version, so `pdm sync` / `pdm install`
+/// keep the upstream bytes in the env PDM installs into (its venv, or PEP
+/// 582 `__pypackages__`). Each such env that still holds them is named with
+/// the remedy that release line supports. A 2.11+ lock reinstalls: silent.
+async fn pdm_stale_install_warning(
+    project_root: &Path,
+    purl: &str,
+    record: &PatchRecord,
+    listings: &InstalledSiteListings,
+    lock_version: &str,
+) -> Option<VendorWarning> {
+    let name = parse_pypi_purl(strip_purl_qualifiers(purl))
+        .map_or_else(|| purl.to_string(), |(name, _)| name.to_string());
+    let remedy = super::pypi_pdm::stale_install_remedy(lock_version, &name)?;
+    // The env PDM resolves for the project (`.pdm-python`, an activated or
+    // in-project venv, else `__pypackages__`); Hatch's envs are not PDM's.
+    let sites =
+        crate::crawlers::python_crawler::non_hatch_local_venv_site_packages(project_root).await;
+    let stale_dirs = stale_install_sites(&sites, purl, record, listings).await;
+    if stale_dirs.is_empty() {
+        return None;
+    }
+    let join = |dirs: &[&std::path::PathBuf]| {
+        dirs.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // A base interpreter's copy a `--system-site-packages` venv inherits is
+    // not PDM's to reinstall (#409, #1450): name it apart.
+    let inherited = crate::crawlers::python_crawler::inherited_base_site_dirs(&sites).await;
+    let (base, own): (Vec<_>, Vec<_>) = stale_dirs.iter().partition(|d| inherited.contains(*d));
+    let mut detail = format!(
+        "{purl}: the UNPATCHED upstream release is still installed in {}.",
+        join(&stale_dirs.iter().collect::<Vec<_>>())
+    );
+    if !own.is_empty() {
+        detail.push_str(&format!(
+            " pdm.lock (lock_version {lock_version}) was written by PDM < 2.11, which does not \
+             replace an already-installed package at the same version (`pdm sync` and `pdm \
+             install` keep those bytes), so the wired pdm.lock only protects fresh installs. \
+             For {}: {remedy}.",
+            join(&own)
+        ));
+    }
+    if !base.is_empty() {
+        detail.push_str(&format!(
+            " {} belongs to the base interpreter the environment inherits \
+             (`--system-site-packages`), which PDM does not manage: uninstall `{name}` there, or \
+             recreate the environment without system site packages, then `pdm sync`.",
+            join(&base)
+        ));
+    }
+    detail.push_str(" Then `socket-patch vex` re-verifies the installed files.");
+    Some(VendorWarning::new("pypi_pdm_stale_install", detail))
+}
+
 /// The `sites` that hold the package of `purl` with positive evidence of
 /// unpatched bytes (a readable file at the upstream or another hash), and no
 /// copy that verifies as patched.
@@ -1164,8 +1223,13 @@ async fn pypi_prelude<'p>(
                 Ok(p) => p,
                 Err((code, detail)) => return Err(refused(code, detail)),
             };
-            match super::pypi_pdm::check_target_guards(&project, &canon_name, version, &record.uuid)
-            {
+            let lock_version = project.lock_version.clone();
+            let plan = match super::pypi_pdm::check_target_guards(
+                &project,
+                &canon_name,
+                version,
+                &record.uuid,
+            ) {
                 Ok(PdmTarget::InSync) => {
                     wired_pin = splice_lock_wired_pin(&project.lock_text, &uuid_dir_rel);
                     WiringPlan::InSync
@@ -1178,7 +1242,21 @@ async fn pypi_prelude<'p>(
                     supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
                         .await?
                 }
-            }
+            };
+            // A fresh vendor, a superseding re-wire and a re-run over an
+            // already-wired lock all keep warning while PDM < 2.11 would
+            // keep the upstream release (#641). A refusal returned above.
+            warnings.extend(
+                pdm_stale_install_warning(
+                    project_root,
+                    purl,
+                    record,
+                    installed_sites,
+                    &lock_version,
+                )
+                .await,
+            );
+            plan
         }
         PypiFlavor::Pipenv => {
             let project = match super::pypi_pipenv::load_pipenv_project(project_root).await {
@@ -1230,6 +1308,13 @@ async fn pypi_prelude<'p>(
             if target == PipenvTarget::Fresh {
                 warnings.extend(project.warnings.iter().cloned());
             }
+            // Like the stale install below, the export gap (#981) outlives
+            // the run that wired the lock: an in-sync re-run warns too.
+            warnings.extend(super::pypi_pipenv::hash_export_warning(
+                &project,
+                &canon_name,
+                installer,
+            ));
             // Both a fresh vendor and a re-run over an already-wired lock
             // keep warning while the venv still holds the upstream release.
             if let Some(stale) = pipenv_stale_install_warning(
@@ -1385,6 +1470,14 @@ async fn pypi_prelude<'p>(
             .await);
         }
         if artifact_present || dry_run {
+            // The wiring stays a link in place: keep naming its `-c`
+            // readers on every run (#740).
+            if let Ok(prior) = reuse::prior_entry(project_root, "pypi", record, None).await {
+                warnings.extend(
+                    constraint_link_warnings(project_root, &prior.wiring, &canon_name, version)
+                        .await,
+                );
+            }
             return Err(done(
                 already_patched_result(base, Path::new(""), &record.files),
                 None,
@@ -1601,6 +1694,7 @@ async fn wire_in_sync_sibling(
         return done(result, None, warnings);
     };
     if dry_run {
+        let mut targets = requirements_record_files(&entry.wiring);
         if export_pending {
             warnings.push(VendorWarning::new(
                 "pypi_requirements_sibling_wired",
@@ -1610,7 +1704,21 @@ async fn wire_in_sync_sibling(
                     crate::formats::governing_locks::PYPI_REQUIREMENTS
                 ),
             ));
+            targets.extend(
+                super::pypi_requirements::planned_files(
+                    project_root,
+                    canon_name,
+                    version,
+                    &entry.artifact.path,
+                )
+                .await,
+            );
+            targets.sort();
+            targets.dedup();
         }
+        warnings.extend(
+            constraint_reader_warnings(project_root, &targets, canon_name, version, true).await,
+        );
         if !pylocks.is_empty() {
             warnings.push(pylock_dry_run_notice(&pylocks, canon_name, version));
         }
@@ -1690,6 +1798,10 @@ async fn wire_in_sync_sibling(
             }
         }
     }
+    // Every requirements file the entry wires, this run's or earlier: the
+    // link pins stay in place, so their `-c` readers are named each run.
+    warnings
+        .extend(constraint_link_warnings(project_root, &entry.wiring, canon_name, version).await);
     done(result, Some(entry), warnings)
 }
 
@@ -1905,6 +2017,12 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                 return done(result, None, warnings);
             }
         }
+        let targets =
+            planned_requirements_targets(project_root, &plan, &canon_name, version, &rel_wheel)
+                .await;
+        warnings.extend(
+            constraint_reader_warnings(project_root, &targets, &canon_name, version, true).await,
+        );
         return done(result, None, warnings);
     }
     let Some(artifact) = artifact else {
@@ -2011,6 +2129,11 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                 warnings,
             )
             .await;
+        }
+        if let Ok(prior) = reuse::prior_entry(project_root, "pypi", record, None).await {
+            warnings.extend(
+                constraint_link_warnings(project_root, &prior.wiring, &canon_name, version).await,
+            );
         }
         return done(result, None, warnings);
     }
@@ -2297,7 +2420,97 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         MetaSlot::Pipenv(m) => entry.pipenv = Some(m),
         MetaSlot::None => {}
     }
+    warnings
+        .extend(constraint_link_warnings(project_root, &entry.wiring, &canon_name, version).await);
     done(result, Some(entry), warnings)
+}
+
+/// A `vendor_requirements_constraints_link` warning for each sibling file
+/// that reads a requirements file `wiring` wrote a vendor line into as `-c`
+/// constraints (#740): the wheel path is a link, which pip 20.3.x and
+/// 21.0.x refuse there.
+async fn constraint_link_warnings(
+    project_root: &Path,
+    wiring: &[super::state::WiringRecord],
+    canon_name: &str,
+    version: &str,
+) -> Vec<VendorWarning> {
+    let targets = requirements_record_files(wiring);
+    constraint_reader_warnings(project_root, &targets, canon_name, version, false).await
+}
+
+/// The requirements files `wiring` holds vendor lines in.
+fn requirements_record_files(wiring: &[super::state::WiringRecord]) -> Vec<String> {
+    let mut files: Vec<String> = wiring
+        .iter()
+        .filter(|r| r.kind == super::pypi_requirements::RECORD_KIND)
+        .map(|r| r.file.clone())
+        .collect();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// The requirements files the wet run of `plan` writes vendor lines into,
+/// for the dry run's [`constraint_reader_warnings`]: a fresh requirements
+/// wiring's (directly, or as the exported sibling of a uv / Pipenv lock)
+/// as the planner would write it, and a re-wire's as the superseded entry
+/// recorded them.
+async fn planned_requirements_targets(
+    project_root: &Path,
+    plan: &WiringPlan,
+    canon_name: &str,
+    version: &str,
+    rel_wheel: &str,
+) -> Vec<String> {
+    let fresh =
+        || super::pypi_requirements::planned_files(project_root, canon_name, version, rel_wheel);
+    let mut targets = match plan {
+        WiringPlan::Requirements | WiringPlan::Uv(_, true) => fresh().await,
+        WiringPlan::Pipenv(_, superseded, true, _) => {
+            let mut files = fresh().await;
+            if let Some(prev) = superseded {
+                files.extend(requirements_record_files(&prev.wiring));
+            }
+            files
+        }
+        WiringPlan::RequirementsRewire(prev) => requirements_record_files(&prev.wiring),
+        WiringPlan::Supersede(superseded) => requirements_record_files(&superseded.prev.wiring),
+        _ => Vec::new(),
+    };
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// [`constraint_link_warnings`] for the requirements files `targets`;
+/// `planned` words it for a dry run.
+async fn constraint_reader_warnings(
+    project_root: &Path,
+    targets: &[String],
+    canon_name: &str,
+    version: &str,
+    planned: bool,
+) -> Vec<VendorWarning> {
+    let view = super::lock_inventory::ProjectView::Disk(project_root);
+    let pins = if planned { "would pin" } else { "now pins" };
+    super::pypi_requirements::constraint_readers_in(view, targets)
+        .await
+        .into_iter()
+        .map(|found| {
+            VendorWarning::new(
+                "vendor_requirements_constraints_link",
+                format!(
+                    "{} reads {} as a constraints file (`-c`), and {} {pins} \
+                     {canon_name}=={version} to a vendored wheel path; {}",
+                    found.reader,
+                    found.target,
+                    found.target,
+                    super::pypi_requirements::CONSTRAINT_LINK_REMEDY
+                ),
+            )
+        })
+        .collect()
 }
 
 /// The flavor-guard refusals that name socket-patch's own wiring at another
@@ -3332,8 +3545,7 @@ pub async fn revert_pypi_opts(
             .filter(|f| !KNOWN_PYPI_FLAVORS.contains(f))
         {
             return RevertOutcome::failed(format!(
-                "unknown pypi vendor flavor {:?}; cannot revert",
-                Some(flavor)
+                "unknown pypi vendor flavor {flavor:?}; cannot revert"
             ));
         }
         let uuid_dir_rel = vendor_uuid_dir_rel("pypi", &entry.uuid)
@@ -3360,9 +3572,12 @@ pub async fn revert_pypi_opts(
         match flavor {
             Some(flavor) => revert_by_record_kind(entry, project_root, flavor, dry_run).await,
             None => {
-                let other = entry.flavor.as_deref();
+                let other = entry
+                    .flavor
+                    .as_deref()
+                    .map_or_else(|| "<none>".to_string(), |f| format!("{f:?}"));
                 return RevertOutcome::failed(format!(
-                    "unknown pypi vendor flavor {other:?}; cannot revert"
+                    "unknown pypi vendor flavor {other}; cannot revert"
                 ));
             }
         }
@@ -6858,7 +7073,7 @@ wheels = [
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("unknown pypi vendor flavor")),
+                .is_some_and(|e| e.contains("unknown pypi vendor flavor \"frobnicate\";")),
             "{outcome:?}"
         );
         let mut wired = revert_entry("uv", &rel_wheel, Vec::new());
@@ -6877,7 +7092,7 @@ wheels = [
             outcome
                 .error
                 .as_deref()
-                .is_some_and(|e| e.contains("unknown pypi vendor flavor")),
+                .is_some_and(|e| e.contains("unknown pypi vendor flavor \"frobnicate\";")),
             "{outcome:?}"
         );
     }
@@ -7049,6 +7264,87 @@ wheels = [
             read_json(&fx.root, "Pipfile.lock").await,
             serde_json::from_str::<serde_json::Value>(PIPENV_REGISTRY_LOCK).unwrap()
         );
+    }
+
+    /// #981: a lock with another hashed registry entry exports through
+    /// `pipenv requirements --hash` with hashes on every line but the
+    /// vendored wheel's, which pip's hash-checking mode refuses. The vendor
+    /// run warns, and so does an in-sync re-run; a lock that pins only the
+    /// target exports no hash and does not, nor does a Pipenv 2022 project,
+    /// whose export keeps the wheel's hash.
+    #[tokio::test]
+    async fn pipenv_vendor_warns_the_hash_export_gap() {
+        async fn vendor_with(fx: &E2eFixture, major: u32) -> Vec<VendorWarning> {
+            const PURL: &str = "pkg:pypi/six@1.16.0";
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let service = crate::vendor::test_support::service_fixture::Fixture::new(
+                PURL,
+                fx.site_packages.as_path().into(),
+                &fx.record,
+                &sources,
+            )
+            .await;
+            let outcome = vendor_pypi_with_pipenv_version(
+                PURL,
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&service.cfg),
+                &tokio::sync::OnceCell::new_with(Some(Some(major))),
+                &InstalledSiteListings::default(),
+            )
+            .await;
+            let VendorOutcome::Done {
+                warnings, entry, ..
+            } = outcome
+            else {
+                panic!("vendor did not complete: {outcome:?}");
+            };
+            if let Some(entry) = entry {
+                save_ledger_entry(&fx.root, &entry).await;
+            }
+            warnings
+        }
+        let warns = |warnings: &[VendorWarning]| {
+            warnings
+                .iter()
+                .any(|w| w.code == "pypi_pipenv_hash_export_unsupported")
+        };
+
+        let fx = pipenv_e2e_fixture().await;
+        let warnings = vendor_with(&fx, 2026).await;
+        assert!(!warns(&warnings), "{warnings:?}");
+
+        let hashed_develop = PIPENV_REGISTRY_LOCK.replace(
+            r#""develop": {}"#,
+            r#""develop": {
+        "idna": {
+            "hashes": ["sha256:bbb"],
+            "index": "pypi",
+            "version": "==3.7"
+        }
+    }"#,
+        );
+        let fx = pipenv_e2e_fixture().await;
+        touch(&fx.root, "Pipfile.lock", &hashed_develop).await;
+        let warnings = vendor_with(&fx, 2026).await;
+        assert!(warns(&warnings), "{warnings:?}");
+        let lock = tokio::fs::read_to_string(fx.root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        assert!(lock.contains(UUID), "Pipfile.lock not wired:\n{lock}");
+        // The in-sync re-run keeps warning: the export gap is still there.
+        let warnings = vendor_with(&fx, 2026).await;
+        assert!(warns(&warnings), "{warnings:?}");
+
+        let fx = pipenv_e2e_fixture().await;
+        touch(&fx.root, "Pipfile.lock", &hashed_develop).await;
+        let warnings = vendor_with(&fx, 2022).await;
+        assert!(!warns(&warnings), "{warnings:?}");
     }
 
     const SIBLING_EXPORT: &str = "-i https://pypi.org/simple\nsix==1.16.0\n";
@@ -8985,6 +9281,188 @@ wheels = [
         assert!(stale(&warnings).is_empty(), "{warnings:?}");
     }
 
+    /// The [`PDM_LOCK_REGISTRY`] project written by another PDM release.
+    fn pdm_lock_at(lock_version: &str) -> String {
+        let lock = PDM_LOCK_REGISTRY.replace(
+            "lock_version = \"4.5.0\"",
+            &format!("lock_version = \"{lock_version}\""),
+        );
+        assert!(lock.contains(&format!("lock_version = \"{lock_version}\"")));
+        lock
+    }
+
+    /// The `pypi_pdm_stale_install` details among `warnings`.
+    fn pdm_stale(warnings: &[VendorWarning]) -> Vec<String> {
+        warnings
+            .iter()
+            .filter(|w| w.code == "pypi_pdm_stale_install")
+            .map(|w| w.detail.clone())
+            .collect()
+    }
+
+    /// #641: PDM before 2.11 (lock_version 4.3 / 4.4) keeps a release that
+    /// is already installed at the same version, so `pdm sync` after a
+    /// vendor leaves the upstream bytes live. Vendoring over such an env —
+    /// fresh and re-run in sync — must name it with `pdm sync --reinstall`.
+    /// A 2.11+ lock (4.4.1, 4.5.0) reinstalls and a patched env is silent.
+    #[tokio::test]
+    async fn pdm_vendor_warns_about_a_stale_install_before_pdm_2_11() {
+        for (lock_version, warns) in [
+            ("4.3", true),
+            ("4.4", true),
+            ("4.4.1", false),
+            ("4.5.0", false),
+        ] {
+            let fx = e2e_fixture().await;
+            if cfg!(windows) {
+                // The venv probe reads `.venv\Lib\site-packages` on Windows.
+                let sp = fx.root.join(".venv").join("Lib").join("site-packages");
+                let di = sp.join("six-1.16.0.dist-info");
+                std::fs::create_dir_all(&di).unwrap();
+                std::fs::copy(fx.site_packages.join("six.py"), sp.join("six.py")).unwrap();
+                for leaf in ["METADATA", "WHEEL", "RECORD"] {
+                    std::fs::copy(
+                        fx.site_packages.join("six-1.16.0.dist-info").join(leaf),
+                        di.join(leaf),
+                    )
+                    .unwrap();
+                }
+            }
+            swap_to_lock_flavor(&fx, &[("pdm.lock", &pdm_lock_at(lock_version))]).await;
+
+            let VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } = vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+            else {
+                panic!("{lock_version}: vendor must be Done");
+            };
+            assert!(result.success, "{lock_version}: {:?}", result.error);
+            crate::vendor::test_support::persist(&fx.root, "pkg:pypi/six@1.16.0", entry.unwrap())
+                .await;
+            let details = pdm_stale(&warnings);
+            if !warns {
+                assert!(details.is_empty(), "{lock_version}: {warnings:?}");
+                continue;
+            }
+            assert_eq!(details.len(), 1, "{lock_version}: {warnings:?}");
+            assert!(
+                details[0].contains("pkg:pypi/six@1.16.0")
+                    && details[0].contains("site-packages")
+                    && details[0].contains(&format!("lock_version {lock_version}"))
+                    && details[0].contains("`pdm sync --reinstall`"),
+                "{lock_version}: {}",
+                details[0]
+            );
+
+            // The in-sync re-run keeps warning while the env is stale.
+            let VendorOutcome::Done { warnings, .. } =
+                vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+            else {
+                panic!("{lock_version}: re-run must be Done");
+            };
+            assert_eq!(
+                pdm_stale(&warnings).len(),
+                1,
+                "{lock_version}: {warnings:?}"
+            );
+
+            // Once the env holds the patched bytes there is nothing to say.
+            for sp in [
+                fx.site_packages.clone(),
+                fx.root.join(".venv").join("Lib").join("site-packages"),
+            ] {
+                if sp.is_dir() {
+                    touch(&sp, "six.py", std::str::from_utf8(PATCHED).unwrap()).await;
+                }
+            }
+            let VendorOutcome::Done { warnings, .. } =
+                vendor_six(&fx, &PatchSources::blobs_only(&fx.blobs), None).await
+            else {
+                panic!("{lock_version}: re-run must be Done");
+            };
+            assert!(
+                pdm_stale(&warnings).is_empty(),
+                "{lock_version}: {warnings:?}"
+            );
+        }
+    }
+
+    /// #641: a PDM 1.x project (lock_version 2) installing into PEP 582
+    /// `__pypackages__` keeps the upstream release too, and PDM 1.x has no
+    /// `pdm sync --reinstall`: the remedy removes the installed copy first.
+    #[tokio::test]
+    async fn pdm_1x_vendor_warns_about_a_stale_pep582_install() {
+        const PDM_LOCK_V2: &str = r#"[[package]]
+name = "six"
+sections = ["default"]
+version = "1.16.0"
+requires_python = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
+summary = "Python 2 and 3 compatibility utilities"
+
+[metadata]
+lock_version = "2"
+content_hash = "sha256:d49d286986c5de41ec9879b6d710389b0be11cd096d883c069123b489ac6e6ea"
+
+[metadata.files]
+"six 1.16.0" = [
+    {file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"},
+    {file = "six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926"},
+]
+"#;
+        let fx = e2e_fixture().await;
+        swap_to_lock_flavor(
+            &fx,
+            &[
+                ("pdm.lock", PDM_LOCK_V2),
+                (
+                    "pyproject.toml",
+                    "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n[tool.pdm]\n",
+                ),
+            ],
+        )
+        .await;
+        // No venv: PDM installs into `__pypackages__/<X.Y>/lib`.
+        let lib = fx.root.join("__pypackages__").join("3.8").join("lib");
+        tokio::fs::create_dir_all(lib.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::rename(&fx.site_packages, &lib).await.unwrap();
+        tokio::fs::remove_dir_all(fx.root.join(".venv"))
+            .await
+            .unwrap();
+
+        let VendorOutcome::Done {
+            result, warnings, ..
+        } = crate::vendor::test_support::vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &lib,
+            &fx.root,
+            &fx.record,
+            &PatchSources::blobs_only(&fx.blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        let details = pdm_stale(&warnings);
+        assert_eq!(details.len(), 1, "{warnings:?}");
+        assert!(
+            details[0].contains("__pypackages__")
+                && details[0].contains("lock_version 2")
+                && details[0].contains("no `pdm sync --reinstall`")
+                && details[0].contains("then `pdm sync`"),
+            "{}",
+            details[0]
+        );
+    }
+
     /// One full vendor → revert cycle through `vendor_pypi` for a lock-splice
     /// flavor: plan arm, wire arm, `entry.flavor` tag (PypiFlavor::as_str),
     /// the matching MetaSlot, and the byte-identical lock restore.
@@ -10592,7 +11070,7 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         let VendorOutcome::Refused { code, detail } = outcome else {
             panic!("expected Refused, got {outcome:?}");
         };
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_pending");
         assert!(detail.contains("still building"), "{detail}");
         assert!(!fx.root.join(".socket").exists());
         assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
@@ -10642,7 +11120,7 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         let VendorOutcome::Refused { code, detail } = outcome else {
             panic!("expected Refused, got {outcome:?}");
         };
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_unavailable");
         assert!(detail.contains("unavailable: not_found"), "{detail}");
         assert!(!fx.root.join(".socket").exists());
     }

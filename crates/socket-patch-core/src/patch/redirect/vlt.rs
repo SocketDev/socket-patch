@@ -8,7 +8,7 @@
 //! commas and re-lays flags and trailing slots on later saves, so the
 //! revert ([`revert_vlt_slots`]) works slot by slot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value};
 
@@ -55,10 +55,76 @@ fn lock_unsupported(detail: &str) -> RewriteWarning {
     }
 }
 
-/// A lock that passed the lock-level parse, with its nodes section located.
+/// A lock that passed the lock-level parse, with its nodes section located
+/// and its node ids split once.
 pub(super) struct HostedLock {
     parsed: ParsedLock,
     nodes: Option<SectionSpan>,
+    index: NodeIndex,
+}
+
+/// A node whose id splits.
+struct IndexedNode {
+    id: String,
+    dep_id: DepId,
+}
+
+/// The lock's nodes with their ids split once per scan rather than once per
+/// override (#1570). Positions point into `nodes`, which keeps the lock's
+/// key order; a node whose id does not split is left out, as it matches no
+/// override.
+#[derive(Default)]
+struct NodeIndex {
+    nodes: Vec<IndexedNode>,
+    /// Registry nodes by `(name, version)`, from any registry segment.
+    registry: HashMap<(String, String), Vec<usize>>,
+    /// Git, file and remote nodes by slot [1].
+    non_registry: HashMap<String, Vec<usize>>,
+}
+
+impl NodeIndex {
+    fn new(nodes: Option<&Map<String, Value>>) -> Self {
+        let mut index = NodeIndex::default();
+        for (id, tuple) in nodes.into_iter().flatten() {
+            let Some(dep_id) = split_dep_id(id) else {
+                continue;
+            };
+            let at = index.nodes.len();
+            match dep_id.kind {
+                DepIdKind::Registry => {
+                    if let Some((name, version)) = dep_id.registry_identity() {
+                        let key = (name.to_string(), version.to_string());
+                        index.registry.entry(key).or_default().push(at);
+                    }
+                }
+                DepIdKind::Git | DepIdKind::File | DepIdKind::Remote => {
+                    if let Some(slot1) = tuple.get(1).and_then(Value::as_str) {
+                        let entry = index.non_registry.entry(slot1.to_string());
+                        entry.or_default().push(at);
+                    }
+                }
+                DepIdKind::Workspace => {}
+            }
+            index.nodes.push(IndexedNode {
+                id: id.clone(),
+                dep_id,
+            });
+        }
+        index
+    }
+
+    fn at<'a>(&'a self, map: Option<&'a Vec<usize>>) -> impl Iterator<Item = &'a IndexedNode> {
+        map.into_iter().flatten().map(|&i| &self.nodes[i])
+    }
+
+    fn registry(&self, name: &str, version: &str) -> impl Iterator<Item = &IndexedNode> {
+        self.at(self.registry.get(&(name.to_string(), version.to_string())))
+    }
+
+    /// The git, file and remote nodes whose slot [1] is `name`.
+    fn non_registry(&self, name: &str) -> impl Iterator<Item = &IndexedNode> {
+        self.at(self.non_registry.get(name))
+    }
 }
 
 pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning> {
@@ -87,57 +153,55 @@ pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning
             "nodes section is not in vlt's canonical layout",
         ));
     }
-    Ok(HostedLock { parsed, nodes })
-}
-
-/// Is `id` a registry node of `name@version`, and is its segment the
-/// default registry? `None` for any other node.
-fn registry_instance(
-    id: &str,
-    name: &str,
-    version: &str,
-    options: Option<&Map<String, Value>>,
-) -> Option<bool> {
-    let dep_id = split_dep_id(id)?;
-    (dep_id.registry_identity()? == (name, version))
-        .then(|| is_default_registry(&dep_id.first, options))
+    let index = NodeIndex::new(parsed.nodes());
+    Ok(HostedLock {
+        parsed,
+        nodes,
+        index,
+    })
 }
 
 /// The default-registry and the foreign registry node ids of
 /// `name@version`, in the lock's key order.
 fn partition_instances<'a>(
-    nodes: &'a Map<String, Value>,
+    lock: &'a HostedLock,
     name: &str,
     version: &str,
-    options: Option<&Map<String, Value>>,
 ) -> (Vec<&'a str>, Vec<&'a str>) {
+    let options = lock.parsed.options();
     let mut defaults = Vec::new();
     let mut foreign = Vec::new();
-    for id in nodes.keys() {
-        match registry_instance(id, name, version, options) {
-            Some(true) => defaults.push(id.as_str()),
-            Some(false) => foreign.push(id.as_str()),
-            None => {}
+    for node in lock.index.registry(name, version) {
+        if is_default_registry(&node.dep_id.first, options) {
+            defaults.push(node.id.as_str());
+        } else {
+            foreign.push(node.id.as_str());
         }
     }
     (defaults, foreign)
 }
 
+/// The git, remote and local-directory node ids that also install
+/// `name@version`, in the lock's key order.
+fn outside_instances<'a>(lock: &'a HostedLock, name: &str, version: &str) -> Vec<&'a str> {
+    // `non_registry(name)` holds only nodes whose slot [1] is `name`.
+    lock.index
+        .non_registry(name)
+        .filter(|node| installs_outside_registry(&node.dep_id, name, name, version))
+        .map(|node| node.id.as_str())
+        .collect()
+}
+
 /// The default-registry node ids of `dep` in a lock that passed the
 /// lock-level parse.
 pub(super) fn default_instances<'a>(lock: &'a HostedLock, dep: &DepOverride) -> Vec<&'a str> {
-    let Some(nodes) = lock.parsed.nodes() else {
-        return Vec::new();
-    };
-    partition_instances(nodes, &full_name(dep), &dep.version, lock.parsed.options()).0
+    partition_instances(lock, &full_name(dep), &dep.version).0
 }
 
 /// Does `dep` have a node of socket-patch's vendored vlt shape in a
 /// lock that passed the lock-level parse?
 pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> bool {
-    lock.parsed
-        .nodes()
-        .is_some_and(|nodes| has_vendored_node(nodes, &full_name(dep), &dep.version))
+    has_vendored_node(lock, &full_name(dep), &dep.version)
 }
 
 /// The lock-level warnings that say vlt may discard the lock's pins:
@@ -231,15 +295,10 @@ fn lock_level_warnings(
     files: &BTreeMap<String, String>,
     bun_lockb_present: bool,
 ) -> Vec<RewriteWarning> {
-    let ids: Vec<DepId> = lock
-        .parsed
-        .nodes()
-        .map(|nodes| nodes.keys().filter_map(|id| split_dep_id(id)).collect())
-        .unwrap_or_default();
     let mut warnings: Vec<RewriteWarning> = discarding_lock_codes(
         lock.parsed.version,
         lock.parsed.options(),
-        ids.iter(),
+        lock.index.nodes.iter().map(|node| &node.dep_id),
         files.get(VLT_CONFIG).map(String::as_str),
     )
     .into_iter()
@@ -267,14 +326,10 @@ fn npm_purl(name: &str, version: &str) -> String {
 }
 
 /// A `file` node of socket-patch's vendored vlt shape for `name@version`.
-fn has_vendored_node(nodes: &Map<String, Value>, name: &str, version: &str) -> bool {
-    nodes.iter().any(|(id, tuple)| {
-        let slot1 = tuple.get(1).and_then(Value::as_str);
-        split_dep_id(id).is_some_and(|dep_id| {
-            dep_id.kind == DepIdKind::File
-                && slot1 == Some(name)
-                && parse_vendored_path(&dep_id.first, name).is_some_and(|p| p.version == version)
-        })
+fn has_vendored_node(lock: &HostedLock, name: &str, version: &str) -> bool {
+    lock.index.non_registry(name).any(|node| {
+        node.dep_id.kind == DepIdKind::File
+            && parse_vendored_path(&node.dep_id.first, name).is_some_and(|p| p.version == version)
     })
 }
 
@@ -310,23 +365,131 @@ fn instance_line(
 }
 
 /// The residual gate: re-parsed, every instance carries the patched slots.
-pub(super) fn every_instance_pinned(
-    text: &str,
-    ids: &[&str],
-    sha512: &str,
-    url: &str,
-) -> Option<()> {
-    let json: Value = serde_json::from_str(text).ok()?;
-    let nodes = json.get("nodes")?.as_object()?;
-    ids.iter()
-        .all(|id| {
-            let tuple = nodes.get(*id).and_then(Value::as_array);
-            tuple.is_some_and(|t| {
-                t.get(2).and_then(Value::as_str) == Some(sha512)
-                    && t.get(3).and_then(Value::as_str) == Some(url)
-            })
+/// `text` must be a lock [`parse_hosted_lock`] read, with only node lines
+/// re-rendered (see [`parse_nodes_of`]).
+fn every_instance_pinned(text: &str, ids: &[&str], sha512: &str, url: &str) -> bool {
+    parse_nodes_of(text, ids).is_some_and(|nodes| instances_pinned(&nodes, ids, sha512, url))
+}
+
+/// The nodes of `ids` in `text`'s `nodes` object, as `serde_json::Value`
+/// would read them (the last `nodes` and the last duplicate key win).
+/// The whole document is still parsed, so broken JSON anywhere is refused,
+/// but every other value is skipped instead of built: the gate runs once
+/// per override, and building a 1500-node lock each time was most of a
+/// hosted vlt scan (#1570). Skipping does not range-check numbers or pair
+/// `\u` surrogates; the text it reads is a lock `sniff_lock` already read
+/// whole, with only node lines re-rendered. `None` when `text` is not a
+/// JSON object or its `nodes` is not an object.
+fn parse_nodes_of(text: &str, ids: &[&str]) -> Option<Map<String, Value>> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+    use std::fmt;
+
+    struct Lock<'a>(&'a [&'a str]);
+    struct Nodes<'a>(&'a [&'a str]);
+
+    impl<'de> Visitor<'de> for Lock<'_> {
+        type Value = Option<Map<String, Value>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut nodes = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "nodes" {
+                    nodes = map.next_value_seed(Nodes(self.0))?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(nodes)
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for Nodes<'_> {
+        type Value = Option<Map<String, Value>>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for Nodes<'_> {
+        type Value = Option<Map<String, Value>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("any JSON value")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut nodes = Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if self.0.contains(&key.as_str()) {
+                    nodes.insert(key, map.next_value::<Value>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(Some(nodes))
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(text);
+    let nodes = serde::Deserializer::deserialize_map(&mut de, Lock(ids)).ok()?;
+    de.end().ok()?;
+    nodes
+}
+
+/// Does every node of `ids` carry the patched sha512 and URL?
+fn instances_pinned(nodes: &Map<String, Value>, ids: &[&str], sha512: &str, url: &str) -> bool {
+    ids.iter().all(|id| {
+        let tuple = nodes.get(*id).and_then(Value::as_array);
+        tuple.is_some_and(|t| {
+            t.get(2).and_then(Value::as_str) == Some(sha512)
+                && t.get(3).and_then(Value::as_str) == Some(url)
         })
-        .then_some(())
+    })
+}
+
+/// Did an earlier run pin every one of `ids`? Reads the lock as parsed,
+/// not its text again.
+pub(super) fn already_pinned(lock: &HostedLock, ids: &[&str], sha512: &str, url: &str) -> bool {
+    lock.parsed
+        .nodes()
+        .is_some_and(|nodes| instances_pinned(nodes, ids, sha512, url))
 }
 
 struct Splice {
@@ -356,31 +519,20 @@ fn rewrite_dep(
 ) -> bool {
     let name = full_name(dep);
     let version = dep.version.as_str();
-    let options = lock.parsed.options();
-    let empty = Map::new();
-    let nodes = lock.parsed.nodes().unwrap_or(&empty);
 
-    let (defaults, foreign) = partition_instances(nodes, &name, version, options);
+    let (defaults, foreign) = partition_instances(lock, &name, version);
     if !foreign.is_empty() {
         result.vlt_foreign_uuids.insert(dep.patch_uuid.clone());
         result.warnings.push(RewriteWarning {
             code: "redirect_vlt_custom_registry_skipped".into(),
             detail: format!(
-                "hosted mode only redirects packages from vlt's default registry; {} left \
-                 unchanged (use --mode vendored or agent mode)",
+                "hosted mode only redirects packages from vlt's default registry; \
+                 {name}@{version} at {} left unchanged (use agent mode)",
                 foreign.join(", ")
             ),
         });
     }
-    let outside: Vec<&str> = nodes
-        .iter()
-        .filter(|(id, tuple)| {
-            let slot1 = tuple.get(1).and_then(Value::as_str).unwrap_or_default();
-            split_dep_id(id)
-                .is_some_and(|dep_id| installs_outside_registry(&dep_id, slot1, &name, version))
-        })
-        .map(|(id, _)| id.as_str())
-        .collect();
+    let outside = outside_instances(lock, &name, version);
     if !outside.is_empty() {
         result.vlt_foreign_uuids.insert(dep.patch_uuid.clone());
         result.warnings.push(RewriteWarning {
@@ -404,7 +556,7 @@ fn rewrite_dep(
         return false;
     };
     if defaults.is_empty() {
-        let warning = if has_vendored_node(nodes, &name, version) {
+        let warning = if has_vendored_node(lock, &name, version) {
             RewriteWarning {
                 code: "redirect_vlt_entry_vendored".into(),
                 detail: format!(
@@ -412,6 +564,11 @@ fn rewrite_dep(
                      a ledger that owns it, or `socket-patch vendor --revert`"
                 ),
             }
+        } else if !foreign.is_empty() || !outside.is_empty() {
+            // The skip warning above already names the package and the
+            // remedy; `vlt install` can't add a default-registry node for
+            // it (#1601).
+            return false;
         } else {
             RewriteWarning {
                 code: "redirect_vlt_entry_not_found".into(),
@@ -476,7 +633,7 @@ fn rewrite_dep(
         candidate[splice.line].clone_from(&splice.text);
     }
     let ids: Vec<&str> = located.iter().map(|(_, id)| *id).collect();
-    if every_instance_pinned(&candidate.join("\n"), &ids, sha512, &dep.artifact_url).is_none() {
+    if !every_instance_pinned(&candidate.join("\n"), &ids, sha512, &dep.artifact_url) {
         unsupported_key(result, dep, ids[0]);
         return false;
     }
@@ -724,6 +881,141 @@ mod tests {
         assert!(result.confirmed_vlt_uuids.contains("uuid-left-pad"));
     }
 
+    /// The index answers every per-override question exactly as a scan
+    /// of every node does: same ids, same key order, same eras.
+    #[test]
+    fn the_node_index_matches_a_scan_of_every_node() {
+        let uuid = "123e4567-e89b-12d3-a456-426614174000";
+        let lock = format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{\"registries\": {{\"corp\": \"https://corp.example/\"}}}},\n  \"nodes\": {{\n{}\n  }}\n}}\n",
+            [
+                format!("\"~corp~left-pad@1.3.0\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                format!("\"{ID}~peer.1\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                format!("\"·npm·left-pad@1.3.0\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                format!("\"~npm~ms@2.1.3\": [0,\"ms\",\"{REG_SHA}\"]"),
+                format!("\"{ID}\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                format!("\"~npm~left-pad@1.2.0\": [0,\"left-pad\",\"{REG_SHA}\"]"),
+                "\"git~github:a+b~abc\": [0,\"left-pad\"]".into(),
+                "\"remote~https_c++x.example+left-pad-1.3.0.tgz\": [0,\"left-pad\"]".into(),
+                "\"remote~https_c++x.example+left-pad-1.2.0.tgz\": [0,\"left-pad\"]".into(),
+                "\"file~packages+lp\": [0,\"left-pad\"]".into(),
+                "\"file~packages+other\": [0,\"ms\"]".into(),
+                format!("\"file~.socket+vendor+npm+{uuid}+left-pad-1.3.0+node__modules+left-pad\": [0,\"left-pad\"]"),
+                format!("\"file~.socket+vendor+npm+{uuid}+ms-2.1.3+node__modules+ms\": [0,\"ms\"]"),
+                "\"workspace~left-pad\": [0,\"left-pad\"]".into(),
+                "\"not-a-dep-id\": [0,\"left-pad\"]".into(),
+            ]
+            .map(|line| format!("    {line}"))
+            .join(",\n")
+        );
+        let hosted = parse_hosted_lock(&lock).unwrap();
+        let nodes = hosted.parsed.nodes().unwrap();
+        let options = hosted.parsed.options();
+        let scan = |name: &str, version: &str| {
+            let mut defaults = Vec::new();
+            let mut foreign = Vec::new();
+            let mut outside = Vec::new();
+            let mut vendored = false;
+            for (id, tuple) in nodes {
+                let Some(dep_id) = split_dep_id(id) else {
+                    continue;
+                };
+                let slot1 = tuple.get(1).and_then(Value::as_str).unwrap_or_default();
+                if dep_id.registry_identity() == Some((name, version)) {
+                    if is_default_registry(&dep_id.first, options) {
+                        defaults.push(id.as_str());
+                    } else {
+                        foreign.push(id.as_str());
+                    }
+                }
+                if installs_outside_registry(&dep_id, slot1, name, version) {
+                    outside.push(id.as_str());
+                }
+                vendored |= dep_id.kind == DepIdKind::File
+                    && slot1 == name
+                    && parse_vendored_path(&dep_id.first, name)
+                        .is_some_and(|p| p.version == version);
+            }
+            (defaults, foreign, outside, vendored)
+        };
+        let indexed = |name: &str, version: &str| {
+            let (defaults, foreign) = partition_instances(&hosted, name, version);
+            let outside = outside_instances(&hosted, name, version);
+            (
+                defaults,
+                foreign,
+                outside,
+                has_vendored_node(&hosted, name, version),
+            )
+        };
+        for (name, version) in [
+            ("left-pad", "1.3.0"),
+            ("left-pad", "1.2.0"),
+            ("ms", "2.1.3"),
+            ("absent", "1.0.0"),
+        ] {
+            assert_eq!(
+                indexed(name, version),
+                scan(name, version),
+                "{name}@{version}"
+            );
+        }
+        let (defaults, foreign, outside, vendored) = indexed("left-pad", "1.3.0");
+        assert_eq!(
+            defaults,
+            [format!("{ID}~peer.1").as_str(), "·npm·left-pad@1.3.0", ID]
+        );
+        assert_eq!(foreign, ["~corp~left-pad@1.3.0"]);
+        assert_eq!(outside.len(), 3, "{outside:?}");
+        assert!(vendored);
+        assert_eq!(hosted.index.nodes.len(), nodes.len() - 1);
+    }
+
+    /// The gate's skipping parse reads exactly the nodes a full
+    /// `serde_json::Value` parse would, and refuses what it refuses.
+    #[test]
+    fn the_gate_parse_matches_a_full_value_parse() {
+        let ids = ["a", "b"];
+        let full = |text: &str| -> Option<Map<String, Value>> {
+            let json: Value = serde_json::from_str(text).ok()?;
+            let nodes = json.get("nodes")?.as_object()?;
+            Some(
+                nodes
+                    .iter()
+                    .filter(|(id, _)| ids.contains(&id.as_str()))
+                    .map(|(id, tuple)| (id.clone(), tuple.clone()))
+                    .collect(),
+            )
+        };
+        for text in [
+            r#"{"nodes": {"a": [0, "a", "s", "u"], "c": [0, "c"], "b": 1}}"#,
+            r#"{"lockfileVersion": 1, "options": {"x": [1.5, -2, null, true, {"y": "z"}]}, "nodes": {"a": [0, "a"]}, "edges": {"e": "f"}}"#,
+            r#"{"nodes": {"a": [0, "old"]}, "nodes": {"a": [0, "new"]}}"#,
+            r#"{"nodes": {"a": [0, "first"], "a": [0, "last"]}}"#,
+            r#"{"nodes": {"a": [0, "a"]}, "nodes": []}"#,
+            r#"{"nodes": [], "nodes": {"b": [0, "b"]}}"#,
+            r#"{"nodes": {"a": [0, "a"]}}"#,
+            r#"{"nodes": "x"}"#,
+            r#"{"nodes": null}"#,
+            r#"{"nodes": 7}"#,
+            r#"{"nodes": -7.5}"#,
+            r#"{"nodes": false}"#,
+            r#"{"other": {}}"#,
+            r#"{}"#,
+            "  {\"nodes\": {}}\r\n",
+            r#"{"nodes": {"a": [0, "a"]}, "edges": {"e": }}"#,
+            r#"{"nodes": {"a": [0, "a"]}} trailing"#,
+            r#"{"nodes": {"a": [0, "a"],}}"#,
+            r#"{"nodes": {"a": [0, "a"]}, "x": "\q"}"#,
+            r#"{"nodes": {"a": [0, "a"]}"#,
+            r#"[{"nodes": {}}]"#,
+            r#""nodes""#,
+            "",
+        ] {
+            assert_eq!(parse_nodes_of(text, &ids), full(text), "{text}");
+        }
+    }
+
     #[test]
     fn residual_gate_refuses_when_the_parsed_node_is_not_the_spliced_line() {
         let entry = format!("    \"{ID}\": [0,\"left-pad\",\"{REG_SHA}\"]");
@@ -800,6 +1092,88 @@ mod tests {
         let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         assert!(result.vlt_foreign_uuids.is_empty());
+    }
+
+    /// #1601: a package that resolves only from a named alias or a
+    /// scoped registry is skipped with one warning whose remedy is
+    /// agent mode. Vendored mode refuses such an instance too, and a
+    /// fresh `vlt install` can't move it to the default registry, so
+    /// neither may be suggested.
+    #[test]
+    fn a_foreign_only_package_points_to_agent_mode_alone() {
+        let scoped = |name: &str| {
+            let mut d = dep(name, "1.3.0", Some(SHA));
+            d.namespace = Some("@sc".into());
+            d
+        };
+        let cases = [
+            (
+                "\"~acme~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-A==\"]".to_string(),
+                dep("left-pad", "1.3.0", Some(SHA)),
+                "~acme~left-pad@1.3.0",
+            ),
+            (
+                "\"~http_c++127.0.0.1_c18557+~@sc+sp@1.3.0\": [0,\"@sc/sp\",\"sha512-S==\"]"
+                    .to_string(),
+                scoped("sp"),
+                "~http_c++127.0.0.1_c18557+~@sc+sp@1.3.0",
+            ),
+        ];
+        for (node, dep, id) in cases {
+            let lock = lock_with(&[&node]);
+            let result = rewrite(&lock, std::slice::from_ref(&dep));
+            assert_eq!(
+                codes(&result),
+                ["redirect_vlt_custom_registry_skipped"],
+                "{id}"
+            );
+            let detail = &result.warnings[0].detail;
+            assert!(detail.contains(id), "{detail}");
+            assert!(detail.ends_with("(use agent mode)"), "{detail}");
+            assert!(!detail.contains("vendored"), "{detail}");
+            assert!(result.vlt_foreign_uuids.contains(&dep.patch_uuid), "{id}");
+            assert!(result.edits.is_empty(), "{id}");
+        }
+
+        // A lock whose only nodes install the package from git or a
+        // remote tarball gets the same single agent-mode warning.
+        let remote = "\"remote~https_c++registry.npmjs.org+left-pad+-+left-pad-1.3.0.tgz\": \
+                      [0,\"left-pad\",\"sha512-r\"]";
+        let result = rewrite(
+            &lock_with(&[remote]),
+            &[dep("left-pad", "1.3.0", Some(SHA))],
+        );
+        assert_eq!(codes(&result), ["redirect_vlt_custom_registry_skipped"]);
+        assert!(result.warnings[0].detail.ends_with("(use agent mode)"));
+
+        // A vendored node beside a foreign one keeps its own remedy.
+        let vendored = "\"file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+\
+                        left-pad-1.3.0+node__modules+left-pad\": [0,\"left-pad\",null,\
+                        \".socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0/\
+                        node_modules/left-pad\"]";
+        let lock = lock_with(&[
+            "\"~acme~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-A==\"]",
+            vendored,
+        ]);
+        let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
+        assert_eq!(
+            codes(&result),
+            [
+                "redirect_vlt_custom_registry_skipped",
+                "redirect_vlt_entry_vendored"
+            ]
+        );
+
+        // Beside a default-registry instance the foreign one is still
+        // named, with the same agent-only remedy.
+        let lock = lock_with(&[
+            "\"~acme~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-A==\"]",
+            &registry_entry(),
+        ]);
+        let result = rewrite(&lock, &[dep("left-pad", "1.3.0", Some(SHA))]);
+        assert_eq!(codes(&result), ["redirect_vlt_custom_registry_skipped"]);
+        assert!(result.warnings[0].detail.ends_with("(use agent mode)"));
+        assert_eq!(result.edits.len(), 1);
     }
 
     #[test]

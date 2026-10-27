@@ -15,6 +15,10 @@ use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
 
 fn detail(outcome: VendorOutcome) -> String {
     match outcome {
+        // A restore has no older patch to keep: unserved is the plain miss.
+        VendorOutcome::Refused { code, detail } if super::is_unserved(code) => {
+            format!("{}: {detail}", super::VENDOR_PREBUILT_REQUIRED)
+        }
         VendorOutcome::Refused { code, detail } => format!("{code}: {detail}"),
         VendorOutcome::Done { result, .. } => result
             .error

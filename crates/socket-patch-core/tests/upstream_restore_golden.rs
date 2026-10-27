@@ -1291,8 +1291,22 @@ async fn pypi_refusal(
     deps: &[DepOverride],
     opts: &RestoreOptions,
 ) -> (String, BTreeMap<String, String>, BTreeMap<String, String>) {
-    let rewritten = hosted(input, deps, None);
+    pypi_refusal_after(input, deps, opts, |_| {}).await
+}
+
+/// [`pypi_refusal`] of a tree `edit` changes after the hosted rewrite,
+/// before the restore: since #1603 the rewrite itself refuses a pylock
+/// under a `--no-binary` filter naming the package, but a lock wired
+/// before then, or filtered after, still comes back to the restore.
+async fn pypi_refusal_after(
+    input: &BTreeMap<String, String>,
+    deps: &[DepOverride],
+    opts: &RestoreOptions,
+    edit: impl FnOnce(&mut BTreeMap<String, String>),
+) -> (String, BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut rewritten = hosted(input, deps, None);
     assert_ne!(&rewritten, input, "the hosted rewrite changed nothing");
+    edit(&mut rewritten);
     let (after, statuses) = restore_tree(&rewritten, opts).await;
     let refusals: Vec<String> = statuses
         .iter()
@@ -2247,9 +2261,25 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         // Exempting another package leaves the global cutoff on urllib3.
         " --exclude-newer 2024-01-01 --exclude-newer-package idna=false",
     ] {
-        let input = tree(&[("pylock.toml", with_flags(flags))]);
-        let (why, rewritten, after) =
-            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        let (why, rewritten, after) = if flags.contains("--no-binary") {
+            // The hosted rewrite refuses these (#1603): wire the lock, then
+            // filter it.
+            let input = tree(&[("pylock.toml", uv_pylock(false))]);
+            let filter = |tree: &mut BTreeMap<String, String>| {
+                let lock = tree.get_mut("pylock.toml").unwrap();
+                *lock = lock.replace(
+                    header,
+                    &format!(
+                        "#    uv pip compile --format pylock.toml req.in{flags} -o pylock.toml\n"
+                    ),
+                );
+                assert!(lock.contains(flags), "{lock}");
+            };
+            pypi_refusal_after(&input, &[urllib3_dep()], &RestoreOptions::default(), filter).await
+        } else {
+            let input = tree(&[("pylock.toml", with_flags(flags))]);
+            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await
+        };
         assert_eq!(
             after, rewritten,
             "{flags}: a refused pin leaves the lock hosted"
@@ -2289,9 +2319,18 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
             "[project]\nname = \"p\"\nversion = \"0\"\n\n[tool.uv.pip]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
         ),
     ] {
-        let input = tree(&[("pylock.toml", plain.clone()), (rel, settings.to_string())]);
-        let (why, _, after) =
-            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        let (why, _, after) = if settings.contains("no-binary") {
+            // The hosted rewrite refuses this (#1603): wire the lock, then
+            // add the setting.
+            let input = tree(&[("pylock.toml", plain.clone())]);
+            let filter = |tree: &mut BTreeMap<String, String>| {
+                tree.insert(rel.to_string(), settings.to_string());
+            };
+            pypi_refusal_after(&input, &[urllib3_dep()], &RestoreOptions::default(), filter).await
+        } else {
+            let input = tree(&[("pylock.toml", plain.clone()), (rel, settings.to_string())]);
+            pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await
+        };
         assert!(after["pylock.toml"].contains("patch.socket.dev"), "{rel}");
         assert!(why.contains(rel), "{rel}: {why}");
     }

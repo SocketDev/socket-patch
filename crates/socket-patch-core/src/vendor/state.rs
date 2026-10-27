@@ -151,6 +151,29 @@ pub struct WiringRecord {
     pub new: Option<serde_json::Value>,
 }
 
+impl WiringRecord {
+    /// The key as user-facing warning text: verbatim, or `<unknown>` for a
+    /// record without one (an older or hand-written ledger). SECURITY: the
+    /// key comes from the committed, tamper-able state.json, so control
+    /// characters are escaped rather than written to the terminal.
+    pub fn key_label(&self) -> std::borrow::Cow<'_, str> {
+        match self.key.as_deref() {
+            None | Some("") => "<unknown>".into(),
+            Some(key) => terminal_safe(key),
+        }
+    }
+}
+
+/// `s` with control characters escaped, for warning text built from
+/// values read out of the committed, tamper-able state.json.
+pub fn terminal_safe(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().any(char::is_control) {
+        s.escape_debug().to_string().into()
+    } else {
+        s.into()
+    }
+}
+
 /// Original Cargo.lock fields removed by the path-dep surgery; not
 /// recomputable offline (the checksum is the sha256 of the registry `.crate`
 /// tarball, not of the extracted tree).
@@ -1076,6 +1099,29 @@ mod tests {
     use super::*;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    /// Warnings name the ledger key as recorded, never in debug form
+    /// (`Some("default:six")`, #1608).
+    #[test]
+    fn key_label_is_plain_text() {
+        let mut rec = WiringRecord {
+            file: "Pipfile.lock".into(),
+            kind: "pipenv_lock_entry".into(),
+            action: WiringAction::Rewritten,
+            key: Some("default:six".into()),
+            original: None,
+            new: None,
+        };
+        assert_eq!(rec.key_label(), "default:six");
+        rec.key = None;
+        assert_eq!(rec.key_label(), "<unknown>");
+        rec.key = Some(String::new());
+        assert_eq!(rec.key_label(), "<unknown>");
+        rec.key = Some("default:six\x1b[2K\nforged".into());
+        assert_eq!(rec.key_label(), "default:six\\u{1b}[2K\\nforged");
+        assert_eq!(terminal_safe("six"), "six");
+        assert_eq!(terminal_safe("six\x1b[2K"), "six\\u{1b}[2K");
+    }
 
     fn sample_entry() -> VendorEntry {
         VendorEntry::new(

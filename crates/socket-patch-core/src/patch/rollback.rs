@@ -482,8 +482,9 @@ impl crate::patch::store_copies::CopyFold for RollbackResult {
 /// is back to its pre-apply shape. In site-packages a leftover empty
 /// directory still imports as a PEP 420 namespace package (#838).
 ///
-/// For a `.py` file, its now-stale bytecode in the sibling `__pycache__/`
-/// (`<stem>.<tag>[.opt-N].pyc`) goes first. Then each parent directory is
+/// The caller removes a `.py` file's now-stale bytecode first (see
+/// `remove_stale_bytecode`), so an emptied `__pycache__/` is pruned here
+/// like any other directory. Each parent directory is
 /// removed while it is empty, deepest first, stopping at `pkg_path`
 /// (never removed) or at the first directory that still holds anything.
 /// Apply records no list of the directories it created, so "empty once
@@ -497,6 +498,9 @@ impl crate::patch::store_copies::CopyFold for RollbackResult {
 /// Best effort: the file delete already committed the rollback, so a
 /// directory that can't be removed is left in place rather than failing it.
 async fn prune_emptied_parents(pkg_path: &Path, filepath: &Path) {
+    if filepath.extension().is_some_and(|ext| ext == "py") {
+        remove_dir_if_empty(&filepath.with_file_name("__pycache__")).await;
+    }
     let Some(rel) = filepath
         .parent()
         .and_then(|parent| parent.strip_prefix(pkg_path).ok())
@@ -515,52 +519,11 @@ async fn prune_emptied_parents(pkg_path: &Path, filepath: &Path) {
             _ => return,
         }
     }
-    if filepath.extension().is_some_and(|ext| ext == "py") {
-        if let Some(stem) = filepath.file_stem().and_then(|s| s.to_str()) {
-            let cache = filepath.with_file_name("__pycache__");
-            remove_stale_bytecode(&cache, stem).await;
-            remove_dir_if_empty(&cache).await;
-        }
-    }
     for dir in chain.iter().rev() {
         if !remove_dir_if_empty(dir).await {
             return;
         }
     }
-}
-
-/// Delete the regular `<stem>.*.pyc` files in `cache`: bytecode compiled
-/// from a module the rollback just removed.
-async fn remove_stale_bytecode(cache: &Path, stem: &str) {
-    match tokio::fs::symlink_metadata(cache).await {
-        Ok(meta) if meta.is_dir() => {}
-        _ => return,
-    }
-    let Ok(mut entries) = tokio::fs::read_dir(cache).await else {
-        return;
-    };
-    let prefix = format!("{stem}.");
-    let mut stale = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with(&prefix)
-            && name.ends_with(".pyc")
-            && entry.file_type().await.is_ok_and(|t| t.is_file())
-        {
-            stale.push(entry.path());
-        }
-    }
-    if stale.is_empty() {
-        return;
-    }
-    let guard = crate::patch::apply::DirWriteGuard::acquire(Some(cache)).await;
-    for path in stale {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-    guard.restore().await;
 }
 
 /// Remove `dir` if it is a real (non-symlink) empty directory. Returns
@@ -704,6 +667,16 @@ async fn rollback_package_patch_at(
                 result.error = Some(format!("Failed to delete {}: {}", file_name, e));
                 return result;
             }
+            // The bytecode goes whatever the pruning decides: a stale `.pyc`
+            // of a deleted module must not outlive it, and a failed delete is
+            // reported like a restore's (`stale_bytecode_not_removed`).
+            warnings.extend(
+                crate::patch::apply::remove_stale_bytecode(
+                    &filepath,
+                    crate::patch::apply::StaleBytecode::All,
+                )
+                .await,
+            );
             prune_emptied_parents(pkg_path, &filepath).await;
             result.files_rolled_back.push(file_name.clone());
             continue;
@@ -3076,5 +3049,57 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read(member.join("index.js")).unwrap(), patched);
+    }
+
+    /// #819: rolling a modified `.py` file back to its original bytes
+    /// removes the bytecode compiled from the patched source, or a
+    /// same-size patch rolled back in the same second keeps running.
+    #[tokio::test]
+    async fn test_rollback_modified_py_removes_stale_bytecode() {
+        let site = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let original = b"AUTHOR = 'original'\n";
+        let patched = b"AUTHOR = 'patchedX'\n";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        tokio::fs::write(blobs.path().join(&before_hash), original)
+            .await
+            .unwrap();
+        let cache = site.path().join("pkg/__pycache__");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(site.path().join("pkg/mod.py"), patched)
+            .await
+            .unwrap();
+        tokio::fs::write(cache.join("mod.cpython-311.pyc"), b"pyc")
+            .await
+            .unwrap();
+        tokio::fs::write(cache.join("other.cpython-311.pyc"), b"pyc")
+            .await
+            .unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "pkg/mod.py".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash,
+            },
+        );
+
+        let result = rollback_package_patch(
+            "pkg:pypi/pkg@1.0.0",
+            site.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            std::fs::read(site.path().join("pkg/mod.py")).unwrap(),
+            original
+        );
+        assert!(!cache.join("mod.cpython-311.pyc").exists());
+        assert!(cache.join("other.cpython-311.pyc").exists());
     }
 }

@@ -1139,6 +1139,103 @@ async fn yarn_berry_catalog_dependency_is_pinned_and_rolled_back() {
     );
 }
 
+/// #962: the user ran `yarn patch` / `yarn patch-commit -s` over a hosted
+/// pin, so a `patch:` lock entry and a `resolutions` descriptor wrap the
+/// hosted tarball URL. Restoring the base entry to its `npm:` descriptor
+/// would leave that wrapper naming a URL no entry resolves any more: every
+/// `yarn install --immutable` then fails (YN0028), and a plain install
+/// re-pins the Socket tarball. `rollback` and `remove` must refuse the pin
+/// and write nothing.
+#[tokio::test]
+#[serial]
+async fn yarn_berry_rollback_refuses_a_pin_wrapped_by_a_user_yarn_patch() {
+    for command in ["rollback", "remove"] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+        mock_reference_with_berry_url(&server, &hosted_url).await;
+        mock_view(&server).await;
+        let tarball = upstream_tarball();
+        mock_npm_registry(
+            &server,
+            &vlt_hosted_common::sha512_sri(&tarball),
+            Some(tarball),
+        )
+        .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_berry_project(tmp.path());
+        let env = run_redirect_subprocess_with(
+            tmp.path(),
+            &server.uri(),
+            &["--patch-server-url", &server.uri()],
+        );
+        assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
+
+        // What yarn 4.18 `yarn patch-commit -s` writes over the hosted pin:
+        // the dependency becomes a `patch:` descriptor wrapping the tarball
+        // URL (with yarn's `%3A` escapes), locked by a `patch:` entry next to
+        // the hosted one, which stays (the `resolutions` selector is kept).
+        let wrapped = format!(
+            "patch:{NAME}@{}#~/.yarn/patches/{NAME}-http-735c2bb24a.patch",
+            hosted_url.replace(':', "%3A")
+        );
+        let pkg_path = tmp.path().join("package.json");
+        let mut pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pkg_path).unwrap()).unwrap();
+        pkg["dependencies"][NAME] = serde_json::json!(wrapped);
+        std::fs::write(
+            &pkg_path,
+            serde_json::to_string_pretty(&pkg).unwrap() + "\n",
+        )
+        .unwrap();
+        let lock_path = tmp.path().join("yarn.lock");
+        let pinned = std::fs::read_to_string(&lock_path).unwrap();
+        let patched_entry = format!(
+            "\"{NAME}@{wrapped}\":\n  version: {VERSION}\n  \
+             resolution: \"{NAME}@{wrapped}::version={VERSION}&hash=e516cc\"\n  \
+             checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n\n",
+            "4".repeat(128)
+        );
+        let workspace = "\"consumer@workspace:.\":";
+        assert!(pinned.contains(workspace), "{pinned}");
+        let lock = pinned
+            .replace(
+                &format!("    {NAME}: \"npm:^{VERSION}\"\n"),
+                &format!("    {NAME}: \"{wrapped}\"\n"),
+            )
+            .replace(workspace, &format!("{patched_entry}{workspace}"));
+        std::fs::write(&lock_path, &lock).unwrap();
+        let pkg_before = std::fs::read_to_string(&pkg_path).unwrap();
+
+        let (code, env) = hosted_unwind_json(tmp.path(), &server, &server.uri(), &[command, PURL]);
+        assert_eq!(
+            code,
+            Some(1),
+            "{command} must refuse the wrapped pin: {env:#}"
+        );
+        assert_eq!(
+            rollback_json::hosted_reverted(&env),
+            serde_json::json!([]),
+            "{command}: {env:#}"
+        );
+        assert!(
+            env.to_string().contains("yarn patch"),
+            "{command}: the refusal names the user's `yarn patch`: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            lock,
+            "{command} leaves yarn.lock untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pkg_path).unwrap(),
+            pkg_before,
+            "{command} leaves package.json untouched"
+        );
+    }
+}
+
 /// #404 upgrade path: a lock pinned by an earlier release carries the old
 /// `npm:<v>::__archiveUrl=<url>` resolution, which makes yarn's npm fetcher
 /// send registry auth to the patch host. `rollback` must still recognize and
@@ -6186,6 +6283,103 @@ async fn pnpm_rollback_reads_the_scope_registry_for_a_scoped_name() {
         );
         let restored = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
         assert_eq!(restored, pristine, "advertised {advertised}");
+    }
+}
+
+/// A v9 pnpm lock resolving `SCOPED_NAME@VERSION` with `resolution` next
+/// to a bare npmjs `left-pad@1.3.0`, whose bare entry shows
+/// `lockfileIncludeTarballUrl` off.
+fn scoped_and_npmjs_pnpm_lock(resolution: &str) -> String {
+    format!(
+        "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      \
+         '{SCOPED_NAME}':\n        specifier: {VERSION}\n        version: {VERSION}\n      \
+         left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\n\
+         packages:\n\n  '{SCOPED_NAME}@{VERSION}':\n    resolution: {resolution}\n\n  \
+         left-pad@1.3.0:\n    resolution: {{integrity: sha512-LEFTPADleftpad==}}\n\n\
+         snapshots:\n\n  '{SCOPED_NAME}@{VERSION}': {{}}\n\n  left-pad@1.3.0: {{}}\n"
+    )
+}
+
+/// #1619: pnpm 12.0–12.12 compare a scoped package's tarball with the
+/// conventional URL under the default registry, not the scope's, so they
+/// record `tarball:` for every package from a scoped registry even with
+/// `lockfileIncludeTarballUrl` off. Rollback and remove of the scoped pin
+/// must give it back, while pnpm 11 and 12.13+ (pnpm#16866) keep it bare.
+/// The pnpm comes from `.modules.yaml` or package.json's `packageManager`,
+/// and the scope registry from `.npmrc` or pnpm-workspace.yaml.
+#[tokio::test]
+#[serial]
+async fn pnpm_12_restore_keeps_the_scoped_registry_tarball() {
+    let server = MockServer::start().await;
+    let scope_registry = format!("{}/scoped/", server.uri());
+    let conventional = format!("{scope_registry}{SCOPED_NAME}/-/scoped-pkg-{VERSION}.tgz");
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/scoped/@socktest%2[fF]scoped-pkg/{VERSION}$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": SCOPED_NAME,
+            "version": VERSION,
+            "dist": { "tarball": conventional, "integrity": "sha512-UPSTREAMupstream==" },
+        })))
+        .mount(&server)
+        .await;
+    let recorded = scoped_and_npmjs_pnpm_lock(&format!(
+        "{{integrity: sha512-UPSTREAMupstream==, tarball: {conventional}}}"
+    ));
+    let bare = scoped_and_npmjs_pnpm_lock("{integrity: sha512-UPSTREAMupstream==}");
+    let pinned = scoped_and_npmjs_pnpm_lock(&format!(
+        "{{integrity: {PATCHED_SHA512}, tarball: {SCOPED_HOSTED_URL}}}"
+    ));
+    let npmrc = format!("@socktest:registry={scope_registry}\n");
+    let workspace = format!("packages:\n  - '.'\nregistries:\n  '@socktest': {scope_registry}\n");
+    // (pnpm, read from .modules.yaml rather than package.json, scope
+    // registry in pnpm-workspace.yaml rather than .npmrc, pristine lock)
+    for (pnpm, modules, in_workspace, pristine) in [
+        ("12.12.1", true, false, &recorded),
+        ("12.12.1", true, true, &recorded),
+        ("12.0.0", false, false, &recorded),
+        ("12.11.2", false, true, &recorded),
+        ("12.13.0", true, false, &bare),
+        ("12.14.0", false, true, &bare),
+        ("11.28.6", true, false, &bare),
+    ] {
+        for command in ["rollback", "remove"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let package_manager = if modules {
+                std::fs::create_dir_all(tmp.path().join("node_modules")).unwrap();
+                write_pnpm_modules_json(tmp.path(), pnpm);
+                String::new()
+            } else {
+                format!(r#", "packageManager": "pnpm@{pnpm}""#)
+            };
+            std::fs::write(
+                tmp.path().join("package.json"),
+                format!(
+                    r#"{{ "name": "consumer", "version": "0.0.0"{package_manager}, "dependencies": {{ "{SCOPED_NAME}": "{VERSION}", "left-pad": "1.3.0" }} }}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(tmp.path().join("pnpm-lock.yaml"), &pinned).unwrap();
+            if in_workspace {
+                std::fs::write(tmp.path().join("pnpm-workspace.yaml"), &workspace).unwrap();
+            } else {
+                std::fs::write(tmp.path().join(".npmrc"), &npmrc).unwrap();
+            }
+
+            let args: &[&str] = if command == "rollback" {
+                &["rollback"]
+            } else {
+                &["remove", "pkg:npm/%40socktest/scoped-pkg@1.0.0"]
+            };
+            let (code, env) = hosted_unwind_json(tmp.path(), &server, "http://patch.test", args);
+            assert_eq!(code, Some(0), "pnpm {pnpm} {command}: {env:#}");
+            let restored = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+            assert_eq!(
+                &restored, pristine,
+                "pnpm {pnpm} {command} (modules {modules}, workspace {in_workspace})"
+            );
+        }
     }
 }
 

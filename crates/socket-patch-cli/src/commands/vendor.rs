@@ -51,6 +51,10 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::lock_cli::acquire_or_emit;
+use crate::commands::vendor_orphans::{
+    orphan_label, orphan_removal_failed, orphan_removed_event, orphan_still_wired,
+    sweep_orphan_vendor_dirs,
+};
 use crate::commands::vendored_backend::{
     ApplyRequest, KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
@@ -114,14 +118,15 @@ pub struct VendorArgs {
 fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
         // An older vendored patch kept in force (see [`keep_older_vendored_patch`]).
-        || matches!(code, vendor::VENDOR_PREBUILT_PENDING | vendor::VENDOR_PREBUILT_UNAVAILABLE)
+        || vendor::is_unserved(code)
         || socket_patch_core::vendor::jvm::sbt_gate::SKIP_CODES.contains(&code)
 }
 
-/// #954: the patch service has no artifact for `uuid` yet (still building)
-/// or at all (`build_failed`, `not_found`, …) — the backend's failed `Done`
-/// carries [`vendor::VENDOR_PREBUILT_PENDING`] /
-/// [`vendor::VENDOR_PREBUILT_UNAVAILABLE`] — while the ledger already holds
+/// #954, #1235: the patch service has no artifact for `uuid` yet (still
+/// building) or at all (`build_failed`, `not_found`, …) — the backend's
+/// refusal carries [`vendor::VENDOR_PREBUILT_PENDING`] /
+/// [`vendor::VENDOR_PREBUILT_UNAVAILABLE`] as its code (an npm-family failed
+/// `Done` as a warning) — while the ledger already holds
 /// `purl` vendored at another patch. The backend touched nothing, so that
 /// older vendoring is still in force: like hosted mode, which keeps its pin
 /// and skips the upgrade, the package is a benign skip under the unserved
@@ -130,8 +135,9 @@ fn refusal_is_benign(code: &str) -> bool {
 /// (the [`Discovery::vendor_entry_live`] verdict `vendor --check` and `vex`
 /// use) is in force: once a relock dropped its `.socket/vendor/` reference
 /// the package is patched in neither mode, so the unserved upgrade stays a
-/// failure. Any other outcome passes through, a failure minus the unserved
-/// marker (its error already says it).
+/// failure. Any other outcome passes through: an unserved refusal as the
+/// `vendor_prebuilt_required` failure it always was, a failed `Done` minus
+/// the unserved marker (its error already says it).
 ///
 /// [`Discovery::vendor_entry_live`]: socket_patch_core::vex::discover::Discovery::vendor_entry_live
 async fn keep_older_vendored_patch(
@@ -141,49 +147,57 @@ async fn keep_older_vendored_patch(
     uuid: &str,
     common: &GlobalArgs,
 ) -> Option<VendorOutcome> {
-    let Some(VendorOutcome::Done {
-        result,
-        entry,
-        mut warnings,
-    }) = outcome
-    else {
-        return outcome;
-    };
-    if !result.success {
-        if let Some(i) = warnings.iter().position(|w| {
-            matches!(
-                w.code,
-                vendor::VENDOR_PREBUILT_PENDING | vendor::VENDOR_PREBUILT_UNAVAILABLE
-            )
-        }) {
-            let unserved = warnings.remove(i);
-            if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
-                let root = common.project_root();
-                if !crate::commands::discover_wiring(common, &root)
-                    .await
-                    .vendor_entry_live(&root, kept)
-                    .await
-                {
-                    return Some(VendorOutcome::Done {
-                        result,
-                        entry,
-                        warnings,
-                    });
-                }
-                return Some(VendorOutcome::Refused {
-                    code: unserved.code,
-                    detail: format!(
-                        "kept the vendored patch {}: {} for patch {uuid}",
-                        kept.uuid, unserved.detail
-                    ),
+    let (code, detail, failed_done) = match outcome {
+        Some(VendorOutcome::Refused { code, detail }) if vendor::is_unserved(code) => {
+            (code, detail, None)
+        }
+        Some(VendorOutcome::Done {
+            result,
+            entry,
+            mut warnings,
+        }) if !result.success => {
+            let Some(i) = warnings.iter().position(|w| vendor::is_unserved(w.code)) else {
+                return Some(VendorOutcome::Done {
+                    result,
+                    entry,
+                    warnings,
                 });
-            }
+            };
+            let unserved = warnings.remove(i);
+            (
+                unserved.code,
+                unserved.detail,
+                Some((result, entry, warnings)),
+            )
+        }
+        other => return other,
+    };
+    if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
+        let root = common.project_root();
+        if crate::commands::discover_wiring(common, &root)
+            .await
+            .vendor_entry_live(&root, kept)
+            .await
+        {
+            return Some(VendorOutcome::Refused {
+                code,
+                detail: format!(
+                    "kept the vendored patch {}: {detail} for patch {uuid}",
+                    kept.uuid
+                ),
+            });
         }
     }
-    Some(VendorOutcome::Done {
-        result,
-        entry,
-        warnings,
+    Some(match failed_done {
+        Some((result, entry, warnings)) => VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        },
+        None => VendorOutcome::Refused {
+            code: vendor::VENDOR_PREBUILT_REQUIRED,
+            detail,
+        },
     })
 }
 
@@ -296,6 +310,10 @@ async fn takeover_dry_refusal(
     .await;
     drop(probe);
     match outcome {
+        // A takeover has no older vendored patch to keep in force.
+        Some(VendorOutcome::Refused { code, detail }) if vendor::is_unserved(code) => {
+            Some((vendor::VENDOR_PREBUILT_REQUIRED, detail))
+        }
         Some(VendorOutcome::Refused { code, detail }) if !refusal_is_benign(code) => {
             Some((code, detail))
         }
@@ -514,75 +532,6 @@ async fn unwired_check_failure(
         "wiring missing: no lockfile or config references {dir} any more, so a fresh install \
          gets the unpatched package; re-run `socket-patch vendor` to rewire it"
     )
-}
-
-/// What the orphan sweep did with the uuid dirs no ledger entry owns.
-#[derive(Default)]
-struct OrphanSweep {
-    /// Un-ledgered AND unreferenced — deleted (unless `dry_run`).
-    removed: Vec<vendor::path::SweptVendorDir>,
-    /// Un-ledgered but a project lockfile still points into them — kept.
-    still_wired: Vec<vendor::path::SweptVendorDir>,
-}
-
-/// Uuid dirs under `.socket/vendor/<eco>/` with no owning `(eco, uuid)`
-/// ledger entry (a hand-edited state file, or artifacts left by an
-/// interrupted run). Unparseable dirs are never returned (and never
-/// deleted). Returns the orphans so callers can emit events / counts.
-///
-/// A missing ledger entry does NOT prove missing wiring: lockfiles can
-/// still point into `.socket/vendor/` after a deleted state.json or a
-/// partial commit. Deleting such a dir would break the next install, so
-/// every candidate is checked against the wiring-bearing files first — the
-/// same lockfile scan `repair` reports `vendor_ledger_missing` from — and a
-/// referenced dir is kept for the caller to warn about.
-async fn sweep_orphan_vendor_dirs(cwd: &Path, state: &VendorState, dry_run: bool) -> OrphanSweep {
-    let recorded_units: HashSet<(&str, &str)> = state
-        .entries
-        .values()
-        .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
-        .collect();
-    let candidates: Vec<vendor::path::SweptVendorDir> = vendor::path::sweep_vendor_dirs(cwd)
-        .await
-        .into_iter()
-        .filter(|unit| !recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())))
-        .collect();
-    let mut out = OrphanSweep::default();
-    if candidates.is_empty() {
-        return out;
-    }
-    let wired: HashSet<(String, String)> =
-        crate::commands::vendored_backend::repair::scan_vendor_references(cwd)
-            .await
-            .into_iter()
-            .map(|(eco, uuid, _path)| (eco, uuid))
-            .collect();
-    // Each removal also prunes the `<eco>/` and `vendor/` levels it
-    // emptied (never `.socket/` — the lock guard owns that level): the
-    // sweep runs AFTER the per-entry reverts and their ledger saves, so it
-    // is the last thing that can leave a fully reverted project with empty
-    // `.socket/vendor/<eco>/` husks.
-    let stop_dir = cwd.join(SOCKET_DIR);
-    for unit in candidates {
-        if wired.contains(&(unit.eco.clone(), unit.uuid.clone())) {
-            out.still_wired.push(unit);
-            continue;
-        }
-        if !dry_run {
-            let _ = remove_tree_and_prune(&unit.dir, &stop_dir).await;
-        }
-        out.removed.push(unit);
-    }
-    out
-}
-
-/// How an orphan uuid dir is named in events: the PURL recovered from its
-/// leaf when the layout is recognizable, else `<eco>/<uuid>`.
-fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
-    unit.purls
-        .first()
-        .cloned()
-        .unwrap_or_else(|| format!("{}/{}", unit.eco, unit.uuid))
 }
 
 /// Does `eco` fall inside this run's `--ecosystems` scope? A vendor-ledger
@@ -1389,13 +1338,10 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references =
+        crate::commands::vendored_backend::repair::unledgered_vendor_references(root, &state).await;
     for (eco, uuid, rel) in references {
-        let ledgered = state
-            .entries
-            .values()
-            .any(|entry| entry.uuid == uuid && entry.ecosystem == eco);
-        if ledgered || unledgered_uuids.contains(uuid.as_str()) {
+        if unledgered_uuids.contains(uuid.as_str()) {
             continue;
         }
         // No ledger entry means no purl to name: like repair, the event
@@ -2675,15 +2621,25 @@ impl StagedSource {
 /// neither the pristine release nor this patch's output. The re-vendor
 /// then takes the pristine artifact from the lock / registry / service, as
 /// a lock-only checkout does, instead of reporting it not installed.
+///
+/// A PyPI install under a live hosted pin (`hosted_pinned`) is the same
+/// story after a hosted scan (#1105): `uv sync` / `poetry install` from
+/// the hosted lock installs a hosted patch's bytes, whichever generation
+/// the pin names now. The pin names no release variant, so it only answers
+/// for a sole candidate; gems keep their installed dir, which the gem
+/// backend reads to refuse a platform gem.
 fn superseded_install(
     ledger: &VendorState,
     candidate: &str,
     record: &PatchRecord,
     sole_candidate: bool,
+    hosted_pinned: bool,
 ) -> bool {
     lookup_entry_kv(&ledger.entries, candidate).is_some_and(|(key, entry)| {
         entry.uuid != record.uuid && (sole_candidate || key == candidate)
-    })
+    }) || (sole_candidate
+        && hosted_pinned
+        && matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Pypi)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2743,8 +2699,13 @@ async fn plan_service_downloads(
                         if !variant_matches_installed(Some(
                             &verify_file_patch(dir, file, info).await.status,
                         )) {
-                            if !superseded_install(ledger, candidate, record, candidates.len() == 1)
-                            {
+                            if !superseded_install(
+                                ledger,
+                                candidate,
+                                record,
+                                candidates.len() == 1,
+                                takeover_blocked(candidate),
+                            ) {
                                 continue;
                             }
                             source_path = &uninstalled;
@@ -3241,8 +3202,13 @@ pub(crate) async fn vendor_records_reusing(
                                 .await
                                 .status,
                         )) {
-                            if !superseded_install(&state, candidate, record, candidates.len() == 1)
-                            {
+                            if !superseded_install(
+                                &state,
+                                candidate,
+                                record,
+                                candidates.len() == 1,
+                                hosted_pin_of(candidate).is_some(),
+                            ) {
                                 continue;
                             }
                             candidate_source = PackageSource::Installed(&uninstalled);
@@ -4613,27 +4579,18 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // points at (their wiring outlived the ledger).
     let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, common.dry_run).await;
     for unit in &sweep.still_wired {
-        let label = orphan_label(unit);
+        record_warning(env, &orphan_label(unit), &orphan_still_wired(unit), common);
+    }
+    for (unit, e) in &sweep.failed {
         record_warning(
             env,
-            &label,
-            &VendorWarning::new(
-                "vendor_orphan_still_wired",
-                format!(
-                    "a project lockfile still points at .socket/vendor/{}/{}, which no ledger \
-                     entry owns; the artifacts were kept (run `socket-patch repair` to re-adopt \
-                     them into the ledger, then revert again)",
-                    unit.eco, unit.uuid
-                ),
-            ),
+            &orphan_label(unit),
+            &orphan_removal_failed(unit, e),
             common,
         );
     }
     for unit in &sweep.removed {
-        env.record(
-            PatchEvent::new(PatchAction::Removed, orphan_label(unit))
-                .with_reason("vendor_orphan_removed", "vendored dir had no ledger entry"),
-        );
+        env.record(orphan_removed_event(unit));
     }
 
     if env.events.is_empty() {
@@ -4707,6 +4664,8 @@ pub(crate) struct VendorGcSummary {
     /// Post-revert rewrites that failed: `("vendor_state_write_failed" |
     /// "manifest_write_failed", <detail>)`. The reverts themselves already
     /// happened on disk; the stale record is what the caller must report.
+    /// Also `("cleanup_failed", <detail>)` per orphan dir (c) could not
+    /// delete.
     pub write_failures: Vec<(&'static str, String)>,
     /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
     /// `vendor_bun_reinstall_required` (#764) and vlt's
@@ -4962,10 +4921,13 @@ pub(crate) async fn run_vendor_gc(
 
     // (c) orphan uuid dirs, against the post-removal ledger. Dirs a lockfile
     // still points at are kept, so they are not counted as reclaimed.
-    out.orphan_dirs = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run)
-        .await
-        .removed
-        .len();
+    // One that could not be deleted is a `cleanup_failed` warning.
+    let sweep = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run).await;
+    out.orphan_dirs = sweep.removed.len();
+    for (unit, e) in &sweep.failed {
+        let warning = orphan_removal_failed(unit, e);
+        out.write_failures.push((warning.code, warning.detail));
+    }
     out
 }
 
@@ -5059,6 +5021,28 @@ mod plan_gate_tests {
             license: String::new(),
             tier: String::new(),
         }
+    }
+
+    /// #1105: a live hosted pin marks a PyPI install superseded (a hosted
+    /// sync installed a hosted patch's bytes), so the takeover vendors the
+    /// record instead of reporting it not installed. The pin names no
+    /// variant, so only a sole candidate counts, and gems keep their
+    /// installed dir for the platform-gem refusal.
+    #[test]
+    fn hosted_pin_marks_a_pypi_install_superseded() {
+        let ledger = VendorState::default();
+        let pypi = "pkg:pypi/six@1.16.0";
+        let b = record(UUID_B);
+        assert!(superseded_install(&ledger, pypi, &b, true, true));
+        assert!(!superseded_install(&ledger, pypi, &b, false, true));
+        assert!(!superseded_install(&ledger, pypi, &b, true, false));
+        assert!(!superseded_install(
+            &ledger,
+            "pkg:gem/nokogiri@1.16.0",
+            &b,
+            true,
+            true
+        ));
     }
 
     /// The download plan runs every record through its backend's own gate:

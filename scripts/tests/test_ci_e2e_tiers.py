@@ -34,6 +34,14 @@ def rows(job):
     return rows_mod.job_rows(JOBS, job)
 
 
+def runs(row):
+    """The (suite, os, filter) runs the e2e run step makes of a row."""
+    # A blank segment runs nothing (the run step fails the leg on one); a
+    # row with no filter at all runs the job default.
+    filters = [" ".join(f.split()) for f in row.get("test_filter", "").split(";") if f.strip()] or [""]
+    return {(suite, row["os"], f) for suite in row["suite"].split() for f in filters}
+
+
 def job_text(job):
     return "\n".join(JOBS[job])
 
@@ -50,10 +58,12 @@ class Tiers(unittest.TestCase):
                                         f"no test target {suite}")
 
     def test_full_rows_only_add_releases_to_pr_suites(self):
-        pr = {(r["suite"], r["os"], r.get("test_filter", "")) for r in rows("e2e")}
+        # A row may bundle several suites and `;`-separated filters; compare
+        # the (suite, os, filter) runs the run step expands them into.
+        pr = {cell for r in rows("e2e") for cell in runs(r)}
         for row in rows("e2e-full"):
             with self.subTest(row=row):
-                self.assertIn((row["suite"], row["os"], row.get("test_filter", "")), pr)
+                self.assertLessEqual(runs(row), pr)
         pr_rows = [tuple(sorted(r.items())) for r in rows("e2e")]
         full_rows = [tuple(sorted(r.items())) for r in rows("e2e-full")]
         self.assertFalse(set(pr_rows) & set(full_rows), "a row in both tiers runs twice")
@@ -128,9 +138,9 @@ GRADLE_LINES = {"6.9.4": "11", "7.6.6": "17", "8.14.3": "21", "9.8.0": "21"}
 # HostedShards checks every hosted test runs in exactly one of them).
 HOSTED_SHARD_1 = ["gradle_hosted_3", "gradle_hosted_4", "gradle_hosted_5"]
 HOSTED_SHARD_2 = ["gradle_hosted_" + c for c in "bcdeflmnop"]
-AGENT_HOSTED = (
-    ("e2e_gradle_discovery_build e2e_gradle_agent_build e2e_redirect_gradle_build",
-     " ".join(["--ignored", "gradle_agent_", *HOSTED_SHARD_1])),
+AGENT_AND_HOSTED_SHARDS = (
+    ("e2e_gradle_discovery_build e2e_gradle_agent_build", "--ignored gradle_agent_"),
+    ("e2e_redirect_gradle_build", " ".join(["--ignored", *HOSTED_SHARD_1])),
     ("e2e_redirect_gradle_build", " ".join(["--ignored", *HOSTED_SHARD_2])),
     ("e2e_redirect_gradle_build",
      " ".join(["--ignored", "gradle_hosted_"] + [w for p in HOSTED_SHARD_1 + HOSTED_SHARD_2 for w in ("--skip", p)])),
@@ -171,7 +181,7 @@ class GradleRows(unittest.TestCase):
         gradle = [r for r in rows("e2e") if r.get("jvm_tool") == "gradle"]
         want = []
         for line, java in GRADLE_LINES.items():
-            for suite, test_filter in (*AGENT_HOSTED, VENDOR):
+            for suite, test_filter in (*AGENT_AND_HOSTED_SHARDS, VENDOR):
                 row = {"os": "ubuntu-latest", "suite": suite, "jvm_tool": "gradle", "gradle": line,
                        "java": java, "test_filter": test_filter}
                 # The allowance lasts only while a suite of the row is unlanded.
@@ -180,7 +190,7 @@ class GradleRows(unittest.TestCase):
                 want.append(row)
         want.append({"os": "windows-latest", "suite": "e2e_vendor_jvm_build", "jvm_tool": "gradle",
                      "gradle": "8.14.3", "java": "17", "test_filter": "--ignored gradle_multi_project"})
-        self.assertEqual(len(gradle), 17)
+        self.assertEqual(len(gradle), 21)
         self.assertEqual(sorted(map(str, gradle)), sorted(map(str, want)))
         self.assertFalse([r for r in rows("e2e-full") if "gradle" in r or "jvm_tool" in r])
 
@@ -227,7 +237,8 @@ class GradleRows(unittest.TestCase):
         gradle = [r for r in rows("e2e") if r.get("jvm_tool") == "gradle"]
         self.assertEqual(sum(needs_maven(r) for r in gradle), 5, "the vendor legs + the windows multi-project leg")
         for row in gradle:
-            self.assertEqual(needs_maven(row), "gradle_hosted_" not in row["test_filter"], row)
+            vendor = {"e2e_vendor_gradle_build", "e2e_vendor_jvm_build"} & set(row["suite"].split())
+            self.assertEqual(needs_maven(row), bool(vendor), row)
 
     def test_compat_grid_expands_to_36_cells_plus_extras(self):
         compat = rows_mod.jobs(GRADLE_COMPAT.read_text(encoding="utf-8"))
@@ -342,7 +353,7 @@ class PdmCapstone(unittest.TestCase):
         self.assertEqual(len(excluded), len(ci))
         for row in rows("e2e"):
             if "pdm" in row:
-                self.assertEqual(row.get("test_filter"), "pdm:: --ignored")
+                self.assertIn(("e2e_vex_build", row["os"], "pdm:: --ignored"), runs(row))
         self.assertFalse(any("pdm" in r for r in rows("e2e-full")),
                          "a pdm row off the PR tier would leave its cell unrun on PRs")
         versions = re.search(r"pdm: \[([^\]]*)\]", "\n".join(self.job)).group(1)

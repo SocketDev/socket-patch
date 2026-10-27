@@ -35,7 +35,7 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::vex_e2e_common::{
     assert_absent, assert_attested, assert_not_attested, binary, run_vex, statements_for,
@@ -112,36 +112,75 @@ pub fn skip(suite: &str, why: &str) {
 /// probed from a neutral temp dir (an ancestor `packageManager` field would
 /// make corepack refuse) with the suites' cache isolation applied by
 /// `isolate`. On `false` the caller returns after [`skip`].
+///
+/// A failed fetch is retried (after 2 s, then 5 s) before it counts as
+/// unavailable: one DNS blip on a CI host otherwise fails the leg under
+/// [`REQUIRED_ENV`]`=1` and evicts its merge-queue entry (#1671).
 pub fn require_yarn_classic(suite: &str, isolate: impl Fn(&mut Command)) -> bool {
     let spec = yarn_classic();
     let want = yarn_classic_version();
     let probe = tempfile::tempdir().expect("tempdir");
-    let mut cmd = Command::new("corepack");
-    cmd.args([spec.as_str(), "--version"])
-        .current_dir(probe.path())
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    isolate(&mut cmd);
-    let got = cmd
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    match got {
-        Some(v) if v == want => true,
-        Some(v) => {
+    let mut last_err = String::new();
+    for (attempt, backoff) in [0, 2, 5].into_iter().enumerate() {
+        std::thread::sleep(std::time::Duration::from_secs(backoff));
+        let mut cmd = Command::new("corepack");
+        cmd.args([spec.as_str(), "--version"])
+            .current_dir(probe.path())
+            .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+        isolate(&mut cmd);
+        let out = match cmd.output() {
+            Ok(out) => out,
+            Err(e) => {
+                // corepack itself is missing: retrying cannot help.
+                last_err = format!("cannot run corepack: {e}");
+                break;
+            }
+        };
+        if out.status.success() {
+            let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if got == want {
+                return true;
+            }
             // A wrong release is never a skip: the leg would silently test
             // another yarn.
-            panic!("{suite}: `corepack {spec} --version` reported {v:?}, expected {want}");
+            panic!("{suite}: `corepack {spec} --version` reported {got:?}, expected {want}");
         }
-        None => {
-            skip(
-                suite,
-                &format!("`corepack {spec}` unavailable (corepack absent or not fetchable)"),
-            );
-            false
-        }
+        last_err = format!(
+            "attempt {} exited {}: {}",
+            attempt + 1,
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        eprintln!("{suite}: `corepack {spec} --version` failed, {last_err}");
     }
+    skip(
+        suite,
+        &format!("`corepack {spec}` unavailable (corepack absent or not fetchable; {last_err})"),
+    );
+    false
+}
+
+/// Run `cmd` (a suite's `corepack <pm> ...` invocation), re-running it after 2 s
+/// and then 5 s while it dies on a transient DNS failure (`EAI_AGAIN`).
+///
+/// yarn 1 re-queues a registry request on `ENOTFOUND`, `ECONNRESET` and
+/// `ETIMEDOUT` (`RequestManager.isPossibleOfflineError` in 1.22.22) but not
+/// on `EAI_AGAIN`, so one resolver blip on a CI host fails the install
+/// outright, and under [`REQUIRED_ENV`]`=1` the whole leg with it (#1734's
+/// CI, 2026-10-26: `getaddrinfo EAI_AGAIN registry.yarnpkg.com`). A failed
+/// lookup writes nothing, so the re-run starts from the same tree. Any
+/// other failure returns on the first attempt.
+pub fn output_retrying_dns(cmd: &mut Command) -> std::process::Output {
+    let mut out = cmd.output().expect("failed to run corepack");
+    for backoff in [2, 5] {
+        if out.status.success() || !String::from_utf8_lossy(&out.stderr).contains("EAI_AGAIN") {
+            break;
+        }
+        eprintln!("yarn hit a transient DNS failure (EAI_AGAIN); retrying in {backoff} s");
+        std::thread::sleep(std::time::Duration::from_secs(backoff));
+        out = cmd.output().expect("failed to run corepack");
+    }
+    out
 }
 
 // ── manifest-less VEX ─────────────────────────────────────────────────

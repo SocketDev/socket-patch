@@ -112,7 +112,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_classic_vex::output_retrying_dns(&mut cmd)
 }
 
 /// Run the socket-patch binary with a scrubbed environment.
@@ -1280,4 +1280,161 @@ fn yarn_classic_rollback_keeps_a_shared_vendor_store_intact() {
             "B installs the patched bytes"
         );
     }
+}
+
+/// #991: two branches vendor different packages, and the merge keeps one
+/// side of the conflicting `.socket/vendor/state.json`. `yarn.lock` merges
+/// cleanly, so it still wires the other side's package to its committed
+/// tarball with no ledger entry. `rollback` used to revert the ledgered
+/// package, exit 0, delete the ledger and leave the other package wired,
+/// so every later run asked for a ledger no commit had. It now refuses
+/// before writing anything, and once the two sides' entries are merged it
+/// unwinds both byte-exact.
+#[test]
+fn yarn_classic_rollback_refuses_a_lock_reference_the_ledger_lost() {
+    if !require_yarn_classic("e2e_vendor_yarn_classic_build", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    const OTHER: &str = "is-number";
+    const OTHER_VERSION: &str = "7.0.0";
+    const OTHER_UUID: &str = "2b3c4d5e-6f7a-4b2c-9d3e-123456789abc";
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("app");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"app","version":"1.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}","{OTHER}":"{OTHER_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "fixture `yarn install` failed (registry unreachable?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let base_lock = std::fs::read(proj.join("yarn.lock")).unwrap();
+
+    // One patch per package, each with its own uuid (one per branch).
+    let socket = proj.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let mut patches = serde_json::Map::new();
+    for (name, version, uuid) in [(DEP, DEP_VERSION, UUID), (OTHER, OTHER_VERSION, OTHER_UUID)] {
+        let orig = std::fs::read(proj.join("node_modules").join(name).join("index.js")).unwrap();
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        std::fs::write(socket.join("blobs").join(git_sha256(&patched)), &patched).unwrap();
+        patches.insert(
+            format!("pkg:npm/{name}@{version}"),
+            serde_json::json!({
+                "uuid": uuid,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": git_sha256(&orig),
+                    "afterHash": git_sha256(&patched),
+                }},
+                "vulnerabilities": {},
+                "description": "merge-resolution marker patch",
+                "license": "MIT",
+                "tier": "free",
+            }),
+        );
+    }
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .unwrap();
+    let cwd = proj.to_str().unwrap().to_string();
+    let (code, stdout, stderr) =
+        run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", &cwd]);
+    assert_eq!(code, 0, "vendor:\n{stdout}\n{stderr}");
+
+    // The merge kept "our" side: the ledger and manifest lose the other
+    // branch's package, while the lock still wires it.
+    let other_purl = format!("pkg:npm/{OTHER}@{OTHER_VERSION}");
+    let state_path = proj.join(".socket/vendor/state.json");
+    let full_state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(
+        full_state["entries"][&other_purl].is_object(),
+        "sanity: both packages vendored: {full_state:#}"
+    );
+    let mut ours = full_state.clone();
+    ours["entries"].as_object_mut().unwrap().remove(&other_purl);
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&ours).unwrap()).unwrap();
+    let manifest_path = socket.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["patches"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&other_purl);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let merged_lock = std::fs::read(proj.join("yarn.lock")).unwrap();
+    let merged_state = std::fs::read(&state_path).unwrap();
+    let other_tgz = proj.join(format!(
+        ".socket/vendor/npm/{OTHER_UUID}/{OTHER}-{OTHER_VERSION}.tgz"
+    ));
+    assert!(other_tgz.is_file(), "sanity: the other side's tarball");
+
+    // Both the dry run and the real run refuse, naming the lost entry,
+    // and write nothing.
+    for dry in [true, false] {
+        let mut args = vec!["rollback", "--json", "--yes", "--offline", "--cwd", &cwd];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (code, stdout, stderr) = run_socket(&proj, &args);
+        assert_eq!(
+            code, 1,
+            "rollback (dry={dry}) must refuse:\n{stdout}\n{stderr}"
+        );
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(env["error"]["code"], "vendor_ledger_missing", "{env:#}");
+        let msg = env["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains(&format!(".socket/vendor/npm/{OTHER_UUID}")),
+            "names the unledgered dir: {msg}"
+        );
+        assert!(msg.contains("entries"), "names the merge remedy: {msg}");
+        assert_eq!(std::fs::read(proj.join("yarn.lock")).unwrap(), merged_lock);
+        assert_eq!(std::fs::read(&state_path).unwrap(), merged_state);
+        assert!(other_tgz.is_file());
+        assert!(proj
+            .join(format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz"))
+            .is_file());
+    }
+
+    // The remedy: merge both sides' entries. The rollback then unwinds
+    // both packages back to the pre-vendor lock.
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&full_state).unwrap()).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["rollback", "--json", "--yes", "--offline", "--cwd", &cwd],
+    );
+    assert_eq!(code, 0, "rollback after the merge fix:\n{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read(proj.join("yarn.lock")).unwrap(),
+        base_lock,
+        "both packages unwound byte-exact"
+    );
+    assert!(
+        !proj.join(".socket/vendor").exists(),
+        "no vendor state left"
+    );
 }

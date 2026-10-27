@@ -7,7 +7,8 @@ use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::python_lock::{
-    is_python_lock_name, python_lock_paths, rewrite_python_lock, script_of_lock, ArtifactSource,
+    is_pep751_lock_name, is_python_lock_name, python_lock_paths, rewrite_python_lock,
+    script_of_lock, ArtifactSource,
 };
 use crate::utils::python_script::{
     find_ancestor_uv_config, refuse_uv_script_no_binary, refuse_uv_script_no_sources,
@@ -15,7 +16,9 @@ use crate::utils::python_script::{
     UvConfig,
 };
 
-use crate::patch::redirect::upstream::{respell_lock_specifier, LockRequirementArray};
+use crate::patch::redirect::upstream::{
+    pylock_no_binary, respell_lock_specifier, root_uv_settings, LockRequirementArray,
+};
 
 use super::common::{record, refuse_symlinked};
 use super::parse_memo::ParseMemo;
@@ -167,24 +170,49 @@ pub(super) async fn load_python_locks(
 ) -> Result<PythonLocks, Failure> {
     let paths =
         python_lock_paths(root).map_err(|error| ("pypi_lock_read_failed", error.to_string()))?;
-    load_listed_locks(root, paths, name, version, uuid).await
+    load_listed_locks(root, paths, name, version, uuid, true).await
 }
 
-/// [`load_python_locks`] over `paths` only.
+/// The project's pyproject.toml and uv.toml, and the uv settings file
+/// above the root that uv applies when the root holds none (#1501), read
+/// into `cache` on the first call.
+async fn project_config_of<'a>(
+    root: &Path,
+    cache: &'a mut Option<(Option<String>, Option<String>, Option<UvConfig>)>,
+) -> &'a (Option<String>, Option<String>, Option<UvConfig>) {
+    if cache.is_none() {
+        let pyproject = read_regular_to_string(&root.join("pyproject.toml"))
+            .await
+            .ok();
+        let uv_toml = super::pypi_uv::read_uv_toml(root).await;
+        let ancestor = (!root_governs_script(pyproject.as_deref(), uv_toml.as_deref()))
+            .then(|| find_ancestor_uv_config(root))
+            .flatten();
+        *cache = Some((pyproject, uv_toml, ancestor));
+    }
+    cache.as_ref().expect("filled above")
+}
+
+/// [`load_python_locks`] over `paths` only. `uv_pip`: uv installs the
+/// PEP 751 locks among them (Pipenv, which reads no uv setting, installs
+/// the ones [`wire_pipenv_pylocks`] wires).
 async fn load_listed_locks(
     root: &Path,
     paths: Vec<String>,
     name: &str,
     version: &str,
     uuid: &str,
+    uv_pip: bool,
 ) -> Result<PythonLocks, Failure> {
     let directory = format!(".socket/vendor/pypi/{uuid}/");
     let placeholder = format!("{directory}{name}-{version}-py3-none-any.whl");
     let mut files = Vec::new();
     let mut in_sync = true;
     let mut pin = None;
-    // The project's pyproject.toml and uv.toml, read once on the first
-    // script lock for the no-sources check (#564).
+    // The project's pyproject.toml and uv.toml, and the uv settings file
+    // above the root when the root holds none, read once on the first
+    // script lock for the no-sources check (#564) or PEP 751 lock for the
+    // no-binary check (#1603).
     let mut project_config: Option<(Option<String>, Option<String>, Option<UvConfig>)> = None;
     for path in paths.into_iter().filter(|path| path != "uv.lock") {
         let text = read_file(&root.join(&path)).await?;
@@ -228,6 +256,18 @@ async fn load_listed_locks(
         } else {
             in_sync = false;
         }
+        if uv_pip && is_pep751_lock_name(&path) {
+            let (pyproject, uv_toml, ancestor) = project_config_of(root, &mut project_config).await;
+            let settings: Vec<_> =
+                root_uv_settings(uv_toml.as_deref(), pyproject.as_deref(), ancestor.as_ref())
+                    .into_iter()
+                    .collect();
+            // The vendored artifact is a wheel, which uv refuses to install
+            // under no-binary (#1603).
+            if let Some(why) = pylock_no_binary(&text, name, &settings) {
+                return Err(("pypi_uv_no_binary", format!("{path}: {why}")));
+            }
+        }
         let script = if let Some(script_name) = script_of_lock(&path) {
             if document
                 .get("package")
@@ -248,21 +288,7 @@ async fn load_listed_locks(
                 return Err(("pypi_script_multiple_versions", format!("{path} resolves multiple versions of {name}; a script source override cannot select only {version}")));
             }
             let script = read_file(&root.join(script_name)).await?;
-            let (pyproject, uv_toml, ancestor) = match &project_config {
-                Some(config) => config,
-                None => {
-                    let pyproject = read_regular_to_string(&root.join("pyproject.toml"))
-                        .await
-                        .ok();
-                    let uv_toml = super::pypi_uv::read_uv_toml(root).await;
-                    // uv applies a parent's settings to the script when
-                    // the root holds none (#1501).
-                    let ancestor = (!root_governs_script(pyproject.as_deref(), uv_toml.as_deref()))
-                        .then(|| find_ancestor_uv_config(root))
-                        .flatten();
-                    project_config.insert((pyproject, uv_toml, ancestor))
-                }
-            };
+            let (pyproject, uv_toml, ancestor) = project_config_of(root, &mut project_config).await;
             refuse_uv_script_no_sources(
                 name,
                 &script,
@@ -422,7 +448,7 @@ pub(super) async fn wire_pipenv_pylocks(
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    let project = load_listed_locks(root, paths, name, version, uuid).await?;
+    let project = load_listed_locks(root, paths, name, version, uuid, false).await?;
     wire_python_locks(&project, root, name, version, wheel, sha).await
 }
 
@@ -1702,6 +1728,140 @@ mod tests {
                 script
             );
         }
+    }
+
+    /// #1603: a PEP 751 lock is installed with `uv pip`, which installs a
+    /// package only from an sdist under a `uv pip compile --no-binary` flag
+    /// naming it (or `:all:`) or a uv `no-binary` setting covering it, so
+    /// the vendored wheel is refused before any write.
+    #[tokio::test]
+    async fn pylock_no_binary_refuses_before_writing() {
+        let pylock = |flags: &str| {
+            format!(
+                "# This file was autogenerated by uv via the following command:\n\
+                 #    uv pip compile req.in{flags} --format pylock.toml -o pylock.toml\n\
+                 lock-version = \"1.0\"\ncreated-by = \"uv\"\nrequires-python = \">=3.8\"\n\n\
+                 [[packages]]\nname = \"two\"\nversion = \"2\"\n\
+                 sdist = {{ url = \"https://files.pythonhosted.org/packages/aa/two-2.tar.gz\", \
+                 size = 10, hashes = {{ sha256 = \"{}\" }} }}\n",
+                "a".repeat(64)
+            )
+        };
+        let load = |lock: String, config: Option<(&'static str, &'static str)>| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            tokio::fs::write(root.join("pylock.toml"), &lock)
+                .await
+                .unwrap();
+            if let Some((file, text)) = config {
+                tokio::fs::write(root.join(file), text).await.unwrap();
+            }
+            let loaded =
+                load_python_locks(root, "two", "2", "11111111-1111-4111-8111-111111111111").await;
+            let after = tokio::fs::read_to_string(root.join("pylock.toml"))
+                .await
+                .unwrap();
+            assert_eq!(after, lock, "nothing is written");
+            loaded.map(|_| ())
+        };
+        let pyproject = |uv: &'static str| -> &'static str {
+            Box::leak(format!("[project]\nname = \"p\"\nversion = \"0\"\n{uv}").into_boxed_str())
+        };
+        for (flags, config) in [
+            (" --no-binary two", None),
+            (" --no-binary=Two", None),
+            (" --no-binary six,two", None),
+            (" --no-binary :all:", None),
+            ("", Some(("uv.toml", "[pip]\nno-binary = [\"two\"]\n"))),
+            ("", Some(("uv.toml", "no-binary = true\n"))),
+            ("", Some(("uv.toml", "no-binary-package = [\"Two\"]\n"))),
+            (
+                "",
+                Some((
+                    "pyproject.toml",
+                    pyproject("[tool.uv.pip]\nno-binary = [\":all:\"]\n"),
+                )),
+            ),
+            (
+                "",
+                Some((
+                    "pyproject.toml",
+                    pyproject("[tool.uv]\nno-binary-package = [\"two\"]\n"),
+                )),
+            ),
+            // `uv pip sync` reads the settings `uv pip compile --no-config`
+            // passed over.
+            (" --no-config", Some(("uv.toml", "no-binary = true\n"))),
+        ] {
+            let Err(error) = load(pylock(flags), config).await else {
+                panic!("{flags:?} with {config:?} must refuse");
+            };
+            assert_eq!(error.0, "pypi_uv_no_binary", "{}", error.1);
+            assert!(error.1.starts_with("pylock.toml: "), "{}", error.1);
+            assert!(error.1.contains("only from an sdist"), "{}", error.1);
+        }
+        // Another package's flag or setting, no-build, a list turned off by
+        // no-binary = false and `:none:` after `:all:` leave the wheel
+        // installable.
+        for (flags, config) in [
+            ("", None),
+            (" --no-binary six", None),
+            (" --no-build", None),
+            ("", Some(("uv.toml", "[pip]\nno-binary = [\"six\"]\n"))),
+            (
+                "",
+                Some((
+                    "uv.toml",
+                    "no-binary = false\nno-binary-package = [\"two\"]\n",
+                )),
+            ),
+            (" --no-binary :all: --no-binary :none:", None),
+        ] {
+            if let Err(error) = load(pylock(flags), config).await {
+                panic!("{flags:?} with {config:?} must load: {error:?}");
+            }
+        }
+        // uv takes the settings from above a root that sets none, and the
+        // root's own settings stop that lookup.
+        for (root_config, refused) in [(None, true), (Some("offline = false\n"), false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("proj");
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            tokio::fs::write(temp.path().join("uv.toml"), "no-binary = true\n")
+                .await
+                .unwrap();
+            if let Some(text) = root_config {
+                tokio::fs::write(root.join("uv.toml"), text).await.unwrap();
+            }
+            tokio::fs::write(root.join("pylock.toml"), pylock(""))
+                .await
+                .unwrap();
+            let loaded =
+                load_python_locks(&root, "two", "2", "11111111-1111-4111-8111-111111111111").await;
+            match loaded {
+                Err(error) if refused => {
+                    assert_eq!(error.0, "pypi_uv_no_binary", "{}", error.1);
+                    assert!(error.1.contains("../uv.toml"), "{}", error.1);
+                }
+                Ok(_) if !refused => {}
+                other => panic!("{root_config:?}: {:?}", other.err()),
+            }
+        }
+        // Pipenv installs the pylocks it reads, and reads no uv setting.
+        let temp = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp.path().join("pylock.toml"), pylock(" --no-binary two"))
+            .await
+            .unwrap();
+        let loaded = load_listed_locks(
+            temp.path(),
+            vec!["pylock.toml".to_string()],
+            "two",
+            "2",
+            "11111111-1111-4111-8111-111111111111",
+            false,
+        )
+        .await;
+        assert!(loaded.is_ok(), "{:?}", loaded.err());
     }
 
     /// #1501: a script scanned from a subdirectory takes the parent

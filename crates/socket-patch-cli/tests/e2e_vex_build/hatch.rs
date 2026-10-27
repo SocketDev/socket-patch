@@ -740,3 +740,88 @@ fn hatch_existing_env_hosted() {
 fn hatch_existing_env_vendored() {
     existing_env_flow(Mode::Vendored);
 }
+
+/// #505: a vendored scan run from a member of a Hatch 1.16+ workspace whose
+/// root environment installs the member's `[project]` dependencies (read
+/// raw, so `{root:uri}` would reach pip unexpanded) is refused with
+/// `pypi_hatch_unsupported` and writes nothing; the workspace root's real
+/// `hatch env create` still succeeds afterwards.
+#[test]
+#[ignore = "real Hatch + PyPI; run with --ignored (CI: SOCKET_PATCH_HATCH_E2E_REQUIRED=1)"]
+fn hatch_workspace_member_vendored_is_refused() {
+    let Some(hatch) = hatch() else { return };
+    let version = hatch.version.clone();
+    if vtuple(&version) < (1, 16) {
+        eprintln!("SKIP: Hatch {version} has no workspaces");
+        return;
+    }
+    let what = format!("hatch {version} workspace-member/vendored");
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let member = ws.join("libs/lib1");
+    std::fs::create_dir_all(ws.join("src/app")).unwrap();
+    std::fs::create_dir_all(member.join("src/lib1")).unwrap();
+    std::fs::write(ws.join("src/app/__init__.py"), "").unwrap();
+    std::fs::write(member.join("src/lib1/__init__.py"), "").unwrap();
+    let root_pyproject = format!(
+        "{BUILD}[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = []\n\n\
+         [tool.hatch.build.targets.wheel]\npackages = [\"src/app\"]\n\n\
+         [tool.hatch.envs.default.workspace]\nmembers = [\"libs/*\"]\n"
+    );
+    let member_pyproject = format!(
+        "{BUILD}[project]\nname = \"lib1\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\n\
+         [tool.hatch.build.targets.wheel]\npackages = [\"src/lib1\"]\n"
+    );
+    std::fs::write(ws.join("pyproject.toml"), &root_pyproject).unwrap();
+    std::fs::write(member.join("pyproject.toml"), &member_pyproject).unwrap();
+
+    let pristine_venv = member.join(".venv");
+    if let Err(e) = make_venv(&hatch.uv, &hatch.python(), &pristine_venv, &["six==1.16.0"]) {
+        skip_or_fail(REQUIRED, &format!("{what}: six==1.16.0 from PyPI: {e}"));
+        return;
+    }
+    let (_, pristine, _) =
+        six_oracle(&venv_bin(&pristine_venv, "python"), &member).expect("pristine six");
+    let patched = [pristine.as_slice(), PATCH_SUFFIX].concat();
+    let api = RealApi::start(Mode::Vendored.uuid(), &pristine, &patched);
+    let scan_envs = vec![("PATH".to_string(), hatch.bin_path())];
+    let (code, env, stderr) =
+        socket_scan(&member, &api, &scan_mode_args(Mode::Vendored), &scan_envs);
+    assert_ne!(code, Some(0), "{what}: must refuse: {env}\n{stderr}");
+    let events: Vec<&serde_json::Value> = env["events"].as_array().into_iter().flatten().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["errorCode"] == "pypi_hatch_unsupported"
+                && e.to_string().contains("Hatch workspace")),
+        "{what}: {env}\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(member.join("pyproject.toml")).unwrap(),
+        member_pyproject,
+        "{what}: member pyproject must be untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("pyproject.toml")).unwrap(),
+        root_pyproject,
+        "{what}: root pyproject must be untouched"
+    );
+    let _ = std::fs::remove_dir_all(&pristine_venv);
+
+    // The workspace root env still syncs from the untouched member.
+    let case = tmp.path().join("case");
+    let envs = hatch.case_env(&case);
+    let out = hatch.run(&ws, &envs, &["env", "create"]);
+    assert!(
+        out.status.success(),
+        "{what}: root `hatch env create`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    record(
+        "hatch",
+        &version,
+        "workspace-member/vendored",
+        "refused",
+        "pass",
+    );
+}

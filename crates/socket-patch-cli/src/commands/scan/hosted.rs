@@ -619,6 +619,9 @@ pub(super) async fn run_redirect(
     stage: &mut super::rollout::Stage,
     // Scan's pre-redirect lockfile discovery (see `rollout::Gate::prior`).
     prior: Option<super::rollout::Prior<'_>>,
+    // The withdrawn-pin sweep's reference answers (see
+    // `rollout::Gate::references`).
+    references: Option<super::withdrawn::KnownReferences>,
     // `--prune` / `--sync`, gated by the policy exactly as the human arm
     // gates it (`patches.enabled: false` writes nothing, the GC included):
     // only feeds the `redirect_prune_ignored` warning.
@@ -685,7 +688,11 @@ pub(super) async fn run_redirect(
         &pairs,
         scan_result,
         npm_prior,
-        Some(super::rollout::Gate::new(stage, rows).with_prior(prior)),
+        Some(
+            super::rollout::Gate::new(stage, rows)
+                .with_prior(prior)
+                .with_references(references),
+        ),
         "scan",
     )
     .await
@@ -869,12 +876,33 @@ async fn run_redirect_selected_untracked(
 
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|(_, uuid)| uuid.clone()).collect();
-        status.set(format!(
-            "Resolving hosted artifacts for {}...",
-            crate::ui::plural(uuids.len(), "patch", "patches")
-        ));
-        let fetched = api_client.fetch_registry_references(&uuids).await;
-        status.finish();
+        // A rescan selects the uuids its lockfiles pin, which the
+        // withdrawn-pin sweep just asked about: ask only about the uuids it
+        // has no settled answer for.
+        let known = rollout.as_mut().and_then(|gate| gate.references.take());
+        let to_fetch = match &known {
+            Some(known) => known.unknown(&uuids),
+            None => uuids.clone(),
+        };
+        let fetched = if to_fetch.is_empty() {
+            Ok(std::collections::HashMap::new())
+        } else {
+            status.set(format!(
+                "Resolving hosted artifacts for {}...",
+                crate::ui::plural(to_fetch.len(), "patch", "patches")
+            ));
+            let fetched = api_client.fetch_registry_references(&to_fetch).await;
+            status.finish();
+            fetched
+        };
+        // `build_candidates` looks up only the selected uuids, so the
+        // sweep's answers for pins outside the selection are inert.
+        let fetched = fetched.map(|mut fetched| {
+            if let Some(known) = known {
+                fetched.extend(known.into_answers());
+            }
+            fetched
+        });
         let references = match fetched {
             Ok(r) => r,
             // A capped run whose every row is NEW: the failure affects only
@@ -1236,18 +1264,25 @@ async fn run_redirect_selected_untracked(
     // the lock block's sub-maps, every new descriptor locked (#591). The
     // tarball is checked against the grant's sha512; one that cannot be
     // fetched, verified or read drops its patch.
+    // The yarn 1 config layers outside the project (env, user, global and
+    // ancestor rc files), and the mirror a yarn run in a workspace member
+    // would use (#1115), located the way yarn 1 does: a mirror set in any
+    // of them refuses the classic rewrite like a project one. Resolved
+    // once: the member search walks the workspace tree.
+    let yarn_classic_outer_once = std::sync::OnceLock::new();
+    let yarn_classic_outer = || {
+        yarn_classic_outer_once
+            .get_or_init(|| resolve_outer_yarn_mirror_for_process(&common.cwd))
+            .clone()
+    };
     let classic_targets: Vec<(String, String, DepOverride)> =
-        engine::yarn_classic_artifact_targets(
-            &candidates,
-            &read.files,
-            &resolve_outer_yarn_mirror_for_process(&common.cwd),
-        )
-        .into_iter()
-        .filter_map(|dep| {
-            let sha512 = dep.integrity.sha512.clone()?;
-            Some((dep.artifact_url.clone(), sha512, dep.clone()))
-        })
-        .collect();
+        engine::yarn_classic_artifact_targets(&candidates, &read.files, &yarn_classic_outer())
+            .into_iter()
+            .filter_map(|dep| {
+                let sha512 = dep.integrity.sha512.clone()?;
+                Some((dep.artifact_url.clone(), sha512, dep.clone()))
+            })
+            .collect();
     for (url, sha512, dep) in classic_targets {
         status.set(format!("Fetching hosted tarball for {}...", dep.name));
         match socket_patch_core::hosted::npm_manifest::fetch_hosted_classic_artifact(
@@ -1319,10 +1354,6 @@ async fn run_redirect_selected_untracked(
         .and_then(|gate| gate.prior)
         .filter(|_| !takeover.is_staged())
         .and_then(|prior| prior.still_current());
-    // The yarn 1 config layers outside the project (env, user, global and
-    // ancestor rc files), located the way yarn 1 does: a mirror set in any
-    // of them refuses the classic rewrite like a project one.
-    let yarn_classic_outer = || resolve_outer_yarn_mirror_for_process(&common.cwd);
     // The cargo configs cargo reads for a build here (the project's, every
     // parent directory's and `$CARGO_HOME`'s): a directory source or local
     // registry in any of them refuses the cargo rewrite like a project one.

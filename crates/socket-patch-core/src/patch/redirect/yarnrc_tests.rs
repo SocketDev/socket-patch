@@ -292,3 +292,321 @@ fn outer_env_layers() {
     let h = Host::new().var("YARN_YARN_OFFLINE_MIRROR_PRUNING", "true");
     assert_eq!(h.mirror(), None);
 }
+
+impl Host {
+    fn member(&self, members: &[&str]) -> Option<(String, String)> {
+        let env = NpmConfigEnv::from_parts(
+            self.vars.clone(),
+            Some(PathBuf::from("/opt/node/bin/node")),
+            false,
+        );
+        let members: Vec<PathBuf> = members.iter().map(PathBuf::from).collect();
+        mirror_of(resolve_member_yarn_mirror(
+            &env,
+            self.root_user,
+            &members,
+            |p| self.files.get(p).cloned(),
+        ))
+        .map(|(p, origin)| {
+            let origin = origin.replace('\\', "/");
+            let (file, member) = origin
+                .split_once(", as read by yarn run in the workspace member ")
+                .expect("the origin names the member");
+            assert!(members.contains(&PathBuf::from(member)), "{origin}");
+            (p, file.to_string())
+        })
+    }
+}
+
+/// #1115: yarn 1 run in a workspace member reads the member's own
+/// `.yarnrc` / `.npmrc` as the project files, which the root's layers
+/// never read.
+#[test]
+fn member_layers_read_the_members_own_rc_files() {
+    let some = |p: &str, o: &str| Some((p.to_string(), o.to_string()));
+    let members = ["/w/root/packages/a", "/w/root/packages/b"];
+    // A member `.yarnrc` (the issue's repro) and a member `.npmrc` (its
+    // follow-up comment) each set the mirror.
+    let h = Host::new().file("/w/root/packages/b/.yarnrc", "yarn-offline-mirror \"/m\"\n");
+    assert_eq!(h.member(&members), some("/m", "/w/root/packages/b/.yarnrc"));
+    let h = Host::new().file(
+        "/w/root/packages/a/.npmrc",
+        "yarn-offline-mirror=./mirror\n",
+    );
+    assert_eq!(
+        h.member(&members),
+        some("./mirror", "/w/root/packages/a/.npmrc")
+    );
+    // A member run reads the root's rc only as an ancestor's, below the
+    // user rc: a root `false` does not hide a user mirror there.
+    let h = Host::new()
+        .file("/w/root/.yarnrc", "yarn-offline-mirror false\n")
+        .file("/home/u/.yarnrc", "yarn-offline-mirror /u\n");
+    assert_eq!(h.member(&members), some("/u", "/home/u/.yarnrc"));
+    // A member's own `false` turns off what it would inherit.
+    let h = Host::new()
+        .file("/w/root/.yarnrc", "yarn-offline-mirror /r\n")
+        .file("/w/root/packages/a/.yarnrc", "yarn-offline-mirror false\n");
+    assert_eq!(
+        h.member(&members[..1]),
+        None,
+        "a member that turns the mirror off uses none"
+    );
+    // No member rc, no other layer: no mirror; no members: none.
+    assert_eq!(Host::new().member(&members), None);
+    let h = Host::new().file("/w/root/packages/a/.yarnrc", "yarn-offline-mirror /m\n");
+    assert_eq!(h.member(&[]), None);
+}
+
+/// #1115: the members are the root `package.json` `workspaces` matches
+/// that hold a `package.json`, only for a classic `yarn.lock`.
+#[test]
+fn yarn_classic_workspace_members_follow_the_root_globs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let write = |rel: &str, text: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    write("yarn.lock", "# yarn lockfile v1\n\n");
+    write(
+        "package.json",
+        r#"{"private":true,"workspaces":{"packages":["packages/*","tools/x"]}}"#,
+    );
+    write("packages/a/package.json", "{}");
+    write("packages/b/README", "not a package");
+    write("packages/a/node_modules/dep/package.json", "{}");
+    write("tools/x/package.json", "{}");
+    write("tools/y/package.json", "{}");
+    write("node_modules/packages/z/package.json", "{}");
+    assert_eq!(
+        yarn_classic_workspace_members(root),
+        vec![root.join("packages/a"), root.join("tools/x")]
+    );
+    // A literal pattern is searched as deep as it goes.
+    write(
+        "package.json",
+        r#"{"private":true,"workspaces":["a/b/c/d/e/f/g/h/i"]}"#,
+    );
+    write("a/b/c/d/e/f/g/h/i/package.json", "{}");
+    assert_eq!(
+        yarn_classic_workspace_members(root),
+        vec![root.join("a/b/c/d/e/f/g/h/i")]
+    );
+    // A member reached through a directory link counts, as yarn's globber
+    // follows it.
+    #[cfg(unix)]
+    {
+        write(
+            "package.json",
+            r#"{"private":true,"workspaces":["linked/*"]}"#,
+        );
+        write("shared/s/package.json", "{}");
+        std::fs::create_dir_all(root.join("linked")).unwrap();
+        std::os::unix::fs::symlink(root.join("shared/s"), root.join("linked/s")).unwrap();
+        assert_eq!(
+            yarn_classic_workspace_members(root),
+            vec![root.join("linked/s")]
+        );
+    }
+    // `**` searches deeper.
+    write(
+        "package.json",
+        r#"{"private":true,"workspaces":["apps/**"]}"#,
+    );
+    write("apps/web/site/package.json", "{}");
+    assert_eq!(
+        yarn_classic_workspace_members(root),
+        vec![root.join("apps/web/site")]
+    );
+    // A berry lock, or no workspaces: none.
+    write("yarn.lock", "__metadata:\n  version: 8\n");
+    assert!(yarn_classic_workspace_members(root).is_empty());
+    write("yarn.lock", "# yarn lockfile v1\n\n");
+    write("package.json", r#"{"private":true}"#);
+    assert!(yarn_classic_workspace_members(root).is_empty());
+}
+
+impl Host {
+    /// [`configured_yarn_global_folders`] for yarn run in `cwd`.
+    fn global_folders(&self, cwd: &str) -> Vec<PathBuf> {
+        let env = NpmConfigEnv::from_parts(
+            self.vars.clone(),
+            Some(PathBuf::from("/opt/node/bin/node")),
+            false,
+        );
+        configured_yarn_global_folders(&env, self.root_user, Path::new(cwd), |p| {
+            self.files.get(p).cloned()
+        })
+    }
+}
+
+fn paths(list: &[&str]) -> Vec<PathBuf> {
+    list.iter().map(PathBuf::from).collect()
+}
+
+/// #1629: every layer yarn 1 reads `global-folder` from names a global
+/// folder. Each expectation matches `yarn global dir` on yarn 1.22.22.
+#[test]
+fn global_folder_layers_match_yarn() {
+    // Env, any prefix spelling yarn's `mergeEnv` accepts.
+    for var in [
+        "YARN_GLOBAL_FOLDER",
+        "yarn_global_folder",
+        "npm_config_global_folder",
+    ] {
+        assert_eq!(
+            Host::new().var(var, "/opt/yg").global_folders("/w"),
+            paths(&["/opt/yg"]),
+            "{var}"
+        );
+    }
+    // The project's own rc, the user's, the global prefix's and an
+    // ancestor's.
+    for (file, text) in [
+        ("/w/.yarnrc", "global-folder \"/opt/yg\"\n"),
+        ("/home/u/.yarnrc", "global-folder /opt/yg\n"),
+        ("/home/u/.yarnrc", "\"global-folder\": '/opt/yg'\n"),
+        ("/opt/node/etc/yarnrc", "global-folder /opt/yg\n"),
+        ("/w/.npmrc", "global-folder=/opt/yg\n"),
+        ("/home/u/.npmrc", "global-folder = \"/opt/yg\"\n"),
+        ("/opt/node/etc/npmrc", "global-folder=/opt/yg\n"),
+    ] {
+        assert_eq!(
+            Host::new().file(file, text).global_folders("/w"),
+            paths(&["/opt/yg"]),
+            "{file}: {text:?}"
+        );
+    }
+    assert_eq!(
+        Host::new()
+            .file("/w/.yarnrc", "global-folder /opt/yg\n")
+            .global_folders("/w/sub"),
+        paths(&["/opt/yg"]),
+        "an ancestor's .yarnrc"
+    );
+    // Every layer counts, env first.
+    assert_eq!(
+        Host::new()
+            .var("YARN_GLOBAL_FOLDER", "/opt/a")
+            .var("npm_config_global_folder", "/opt/b")
+            .file("/home/u/.yarnrc", "global-folder /opt/c\n")
+            .file("/home/u/.npmrc", "global-folder=/opt/d\n")
+            .global_folders("/w"),
+        paths(&["/opt/a", "/opt/b", "/opt/c", "/opt/d"])
+    );
+    // Unset, empty, commented out or under an `.npmrc` section: nothing.
+    for host in [
+        Host::new(),
+        Host::new().var("YARN_GLOBAL_FOLDER", ""),
+        Host::new().file("/home/u/.yarnrc", "# global-folder /opt/yg\n"),
+        Host::new().file("/home/u/.yarnrc", "global-folder \"\"\n"),
+        Host::new().file("/home/u/.npmrc", "[x]\nglobal-folder=/opt/yg\n"),
+        Host::new().file("/home/u/.yarnrc", "global-folders /opt/yg\n"),
+    ] {
+        assert_eq!(host.global_folders("/w"), Vec::<PathBuf>::new());
+    }
+}
+
+/// #1629: yarn resolves a `.yarnrc` `global-folder` against that file's
+/// folder (no `~` expansion), and an env or `.npmrc` value through
+/// `resolveWithHome`: `~/` is yarn's user home (`/usr/local/share` for
+/// root), anything else is taken against the cwd.
+#[test]
+fn global_folder_paths_resolve_like_yarn() {
+    let home = Host::new().file("/home/u/.yarnrc", "global-folder gf\n");
+    assert_eq!(home.global_folders("/w"), paths(&["/home/u/gf"]));
+    let tilde = Host::new().file("/home/u/.yarnrc", "global-folder \"~/gf\"\n");
+    assert_eq!(tilde.global_folders("/w"), paths(&["/home/u/~/gf"]));
+    let ancestor = Host::new().file("/w/.yarnrc", "global-folder ../gf\n");
+    assert_eq!(ancestor.global_folders("/w/sub"), paths(&["/w/../gf"]));
+
+    for host in [
+        Host::new().var("YARN_GLOBAL_FOLDER", "gf"),
+        Host::new().file("/home/u/.npmrc", "global-folder=gf\n"),
+    ] {
+        assert_eq!(host.global_folders("/w"), paths(&["/w/gf"]));
+    }
+    for host in [
+        Host::new().var("YARN_GLOBAL_FOLDER", "~/gf"),
+        Host::new().file("/home/u/.npmrc", "global-folder=~/gf\n"),
+    ] {
+        assert_eq!(host.global_folders("/w"), paths(&["/home/u/gf"]));
+        assert_eq!(
+            host.root().global_folders("/w"),
+            paths(&["/usr/local/share/gf"]),
+            "root's userHome"
+        );
+    }
+}
+
+/// #1629: `global-folder` values decode as yarn 1.22.22 decodes them
+/// (each expectation checked with `yarn global dir`).
+#[test]
+fn global_folder_values_read_like_yarn() {
+    let yarnrc = |text: &str| {
+        Host::new()
+            .file("/home/u/.yarnrc", text)
+            .global_folders("/w")
+    };
+    // A default `--global-folder` flag.
+    assert_eq!(yarnrc("--global-folder \"/opt/rc\"\n"), paths(&["/opt/rc"]));
+    assert_eq!(yarnrc("--global-folder /opt/rc\n"), paths(&["/opt/rc"]));
+    // A trailing comment is its own token.
+    assert_eq!(
+        yarnrc("global-folder /opt/yg # moved\n"),
+        paths(&["/opt/yg"])
+    );
+    // A double-quoted value is JSON.
+    assert_eq!(
+        yarnrc("global-folder \"/opt/a\\\\b\"\n"),
+        paths(&["/opt/a\\b"])
+    );
+    // yarn's YAML fallback reads a single-quoted value.
+    assert_eq!(
+        yarnrc("\"global-folder\": '/opt/yg'\n"),
+        paths(&["/opt/yg"])
+    );
+    // `~` can't start a bare word: yarn ignores the line.
+    assert_eq!(yarnrc("global-folder ~/yg\n"), Vec::<PathBuf>::new());
+
+    let npmrc = |host: Host, text: &str| host.file("/home/u/.npmrc", text).global_folders("/w");
+    // `${NAME}` expands; an unset name makes yarn drop its config.
+    assert_eq!(
+        npmrc(Host::new(), "global-folder=${HOME}/x\n"),
+        paths(&["/home/u/x"])
+    );
+    assert_eq!(
+        npmrc(Host::new().var("YG", "/opt/yg"), "global-folder=${YG}\n"),
+        paths(&["/opt/yg"])
+    );
+    assert_eq!(
+        npmrc(Host::new(), "global-folder=${NOPE}/x\n"),
+        Vec::<PathBuf>::new()
+    );
+    // An escaped expression stays verbatim (`ini` reads `\\` as `\`
+    // first). On Windows the leading `\` makes it root-relative: it keeps
+    // the cwd's drive and replaces the rest, as `path.resolve` does
+    // (`/w` has no drive, so nothing of it is kept).
+    let escaped = if cfg!(windows) {
+        "\\${HOME}/x"
+    } else {
+        "/w/\\${HOME}/x"
+    };
+    for text in [
+        "global-folder=\\${HOME}/x\n",
+        "global-folder=\\\\${HOME}/x\n",
+    ] {
+        assert_eq!(npmrc(Host::new(), text), paths(&[escaped]), "{text:?}");
+    }
+    // `ini` ends an unquoted value at a comment and unquotes a quoted one.
+    assert_eq!(
+        npmrc(Host::new(), "global-folder=/opt/n ; moved\n"),
+        paths(&["/opt/n"])
+    );
+    assert_eq!(
+        npmrc(Host::new(), "global-folder=\"/opt/nq\"\n"),
+        paths(&["/opt/nq"])
+    );
+}

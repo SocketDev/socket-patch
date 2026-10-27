@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one shard of ci.yml's `test` or `test-release` job:
+"""Run one shard of ci.yml's `test`, `test-release` or `coverage` job:
 `cargo test --workspace` split over `COUNT` runners. Each runner compiles
 and executes only its assigned integration targets, shortening both the
 debug and release-mode jobs without changing their compilation profiles.
@@ -14,7 +14,12 @@ Windows debug CI sets CI_TEST_TIMINGS to the checked-in runtime sample.
 Those shards balance measured test time plus linking work, with shard 1's
 unit tests reserved up front. Other runners retain the count-based split.
 
-Extra arguments after `SHARD COUNT` go to every `cargo test` invocation.
+CI_TEST_COVERAGE=1 runs the shard under cargo-llvm-cov for ci.yml's
+`coverage` job: `cargo llvm-cov --no-report` in place of `cargo test`, and
+no doctests, which cargo-llvm-cov leaves out without `--doctests`. A later
+`cargo llvm-cov report` exports the shard's profiles.
+
+Extra arguments after `SHARD COUNT` go to every `cargo` invocation.
 Each invocation runs with `--no-fail-fast`; the exit status is non-zero if
 any of them failed.
 
@@ -68,16 +73,18 @@ def partition(names, count, timings=None):
     return shards
 
 
-def invocations(shard, count, names, extra=(), timings=None):
+def invocations(shard, count, names, extra=(), timings=None, coverage=False):
     """The `cargo test` argument lists shard `shard` (1-based) runs."""
     if not 1 <= shard <= count:
         raise ValueError(f"shard {shard} not in 1..{count}")
-    base = ["cargo", "test", "--workspace", "--no-fail-fast", *extra]
+    runner = ["llvm-cov", "--no-report"] if coverage else ["test"]
+    base = ["cargo", *runner, "--workspace", "--no-fail-fast", *extra]
     mine = partition(names, count, timings)[shard - 1]
     runs = []
     if shard == 1:
         runs.append(base + ["--lib", "--bins"] + [a for n in mine for a in ("--test", n)])
-        runs.append(base + ["--doc"])
+        if not coverage:
+            runs.append(base + ["--doc"])
     elif mine:
         runs.append(base + [a for n in mine for a in ("--test", n)])
     return runs
@@ -94,10 +101,11 @@ def main(argv):
     names = integration_targets(metadata)
     timing_path = os.environ.get("CI_TEST_TIMINGS")
     timings = json.loads(Path(timing_path).read_text(encoding="utf-8")) if timing_path else None
+    coverage = os.environ.get("CI_TEST_COVERAGE") == "1"
     print(f"ci-test-shard: shard {shard}/{count}: "
           f"{len(partition(names, count, timings)[shard - 1])} of {len(names)} integration targets", flush=True)
     status = 0
-    for args in invocations(shard, count, names, argv[2:], timings):
+    for args in invocations(shard, count, names, argv[2:], timings, coverage):
         print("+ " + " ".join(args), flush=True)
         if subprocess.run(args).returncode != 0:
             status = 1

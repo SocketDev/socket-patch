@@ -1519,6 +1519,55 @@ fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
+/// The store of Yarn's pnpm linker for the project `nm` belongs to, when
+/// `pnpmStoreFolder` moved it out of `node_modules/.store` (#859):
+/// `.cache/.store`, `store`, set in an rc file, the home rc file or
+/// `YARN_PNPM_STORE_FOLDER`. Yarn then keeps every package there, at
+/// `<store>/<slug>/package`, and the `node_modules` dirs hold only links
+/// to the direct dependencies: the store is the only home of the
+/// transitive ones, which a walk of `nm` alone never reaches (or a hidden
+/// name hides from the workspace walk). Its entries have the
+/// `node_modules/.store` shape, so the same enumeration applies
+/// ([`NpmCrawler::list_npm_store_entries_sync`]).
+///
+/// The project is the nearest folder at or above `nm`'s parent holding a
+/// `yarn.lock` (a workspace member's `node_modules` uses the root's
+/// store), and its active linker must be pnpm. Like a relocated pnpm
+/// virtual store ([`relocated_pnpm_virtual_store_sync`]), only a store
+/// strictly inside the project, reached through real directories, counts:
+/// one elsewhere (a home rc's folder) may be shared with other projects,
+/// and patching it would patch them too. `None` for the default location,
+/// which the walks find by name. The path keeps the project's spelling.
+fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
+    if nm.file_name() != Some(OsStr::new("node_modules")) || !is_dir_sync(nm) {
+        return None;
+    }
+    let project = nm
+        .parent()?
+        .ancestors()
+        .find(|dir| dir.join("yarn.lock").is_file())?;
+    let store = super::pkg_managers::active_yarn_pnpm_store(project)?;
+    let (Ok(real_store), Ok(real_project)) =
+        (std::fs::canonicalize(store), std::fs::canonicalize(project))
+    else {
+        return None;
+    };
+    let below = path_below(&real_project, &real_store)?;
+    if below == Path::new("node_modules").join(NPM_LINKED_STORE_NAME)
+        || std::fs::canonicalize(nm.join(NPM_LINKED_STORE_NAME)).is_ok_and(|d| d == real_store)
+    {
+        return None;
+    }
+    let mut dir = project.to_path_buf();
+    for component in below.components() {
+        dir.push(component);
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
 /// The entries of pnpm's global virtual store (`enableGlobalVirtualStore`)
 /// that the importer holding `nm` actually loads (#362).
 ///
@@ -1698,6 +1747,16 @@ struct StoreEntry {
 }
 
 impl StoreEntry {
+    /// The entries of a store enumeration, keeping what each advertises.
+    fn from_dirs(dirs: Vec<StoreEntryDir>) -> Vec<StoreEntry> {
+        dirs.into_iter()
+            .map(|e| StoreEntry {
+                advertised: e.advertised,
+                node_modules: e.node_modules,
+            })
+            .collect()
+    }
+
     fn pnpm(entries: Vec<(String, PathBuf)>) -> Vec<StoreEntry> {
         entries
             .into_iter()
@@ -1805,6 +1864,220 @@ fn list_dir_sync(path: &Path) -> Listing {
         Some((entries, complete)) => Listing::from_entries(entries, complete),
         None => Listing::default(),
     }
+}
+
+/// How many levels below `$DENO_DIR/npm` a registry dir may sit. Deno
+/// maps a registry URL to `<host>[_<port>]` plus one dir per path segment,
+/// so `https://host/api/npm/` lands three levels down; this leaves room
+/// for longer paths without walking the cache's package dirs.
+const DENO_NPM_REGISTRY_MAX_DEPTH: usize = 8;
+
+/// The registry dirs of Deno's npm cache (#444): every dir under
+/// `$DENO_DIR/npm` that holds packages in Deno's layout
+/// ([`holds_deno_packages`]), `<host>` for a registry at a host's root
+/// (`registry.npmjs.org`) and `<host>/<path...>` for one served below a
+/// path (`https://host/api/npm/` → `<host>/api/npm`, as Artifactory,
+/// CodeArtifact and GitLab registries are). `deno install -g` tools load
+/// their npm dependencies from there, in Deno's own layout (see
+/// [`is_deno_npm_cache_root`]), so these are global roots beside the npm,
+/// pnpm, yarn and bun `node_modules`. Below a registry dir only the
+/// non-version subdirs of its children are walked (a nested registry
+/// can sit there, not a package's copy), and `jsr.io` is skipped: it is the
+/// Deno crawler's JSR root, not an npm registry. Sorted, for a stable
+/// scan order.
+fn deno_npm_cache_roots() -> Vec<PathBuf> {
+    match super::deno_crawler::deno_dir() {
+        Some(dir) => deno_npm_registry_dirs(&dir.join("npm")),
+        None => Vec::new(),
+    }
+}
+
+/// The registry dirs a `--global-prefix` naming a parent of Deno's npm
+/// cache stands for (#444): `$DENO_DIR` (its `npm` child) or
+/// `$DENO_DIR/npm` itself, walked the way [`deno_npm_cache_roots`] walks
+/// the `-g` one. Empty for anything else: a `node_modules`, a dir that is
+/// itself a package (an `npm` with a `package.json` is the npm CLI, not
+/// Deno's cache), an `npm` holding a `node_modules` (npm's own global
+/// prefix on Windows, `%APPDATA%\npm`), or one with no registry dir below
+/// it, so every other prefix keeps its `node_modules` walk.
+fn deno_cache_parent_registry_dirs(prefix: &Path) -> Vec<PathBuf> {
+    let prefix = std::path::absolute(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+    let prefix = prefix.as_path();
+    let is_cache_npm_dir = |dir: &Path| {
+        dir.file_name().is_some_and(|name| name == "npm")
+            && dir.is_dir()
+            && !dir.join("package.json").exists()
+            && !dir.join("node_modules").exists()
+    };
+    if prefix
+        .file_name()
+        .is_some_and(|name| name == "node_modules")
+        || prefix.join("package.json").exists()
+    {
+        return Vec::new();
+    }
+    let npm = if is_cache_npm_dir(prefix) {
+        prefix.to_path_buf()
+    } else if is_cache_npm_dir(&prefix.join("npm")) {
+        prefix.join("npm")
+    } else {
+        return Vec::new();
+    };
+    deno_npm_registry_dirs(&npm)
+}
+
+/// Every registry dir below `npm`, a Deno npm cache dir
+/// (`$DENO_DIR/npm`); see [`deno_npm_cache_roots`].
+fn deno_npm_registry_dirs(npm: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut level: Vec<PathBuf> = sorted_subdirs_sync(npm)
+        .into_iter()
+        .filter(|name| name != "jsr.io")
+        .map(|name| npm.join(name))
+        .collect();
+    for _ in 0..DENO_NPM_REGISTRY_MAX_DEPTH {
+        let mut next = Vec::new();
+        for dir in level {
+            let children = sorted_subdirs_sync(&dir);
+            if holds_deno_packages(&dir) {
+                // A registry dir's children are mostly its packages, but the
+                // same host can also serve a registry below a path
+                // (`<host>/npm/<pkg>/` or `<host>/api/npm/<pkg>/` beside
+                // `<host>/<pkg>/`). A child that is not a package is walked
+                // like any other dir; one that is (a package named like
+                // the path's first segment, `<host>/api/`) holds only
+                // version dirs (named from a digit) of its own, so its
+                // other subdirs are walked.
+                for child in children.into_iter().filter(|name| !name.starts_with('@')) {
+                    let child = dir.join(child);
+                    if is_deno_package_dir(&child) {
+                        next.extend(
+                            sorted_subdirs_sync(&child)
+                                .into_iter()
+                                .filter(|name| !name.starts_with(|c: char| c.is_ascii_digit()))
+                                .map(|name| child.join(name)),
+                        );
+                    } else {
+                        next.push(child);
+                    }
+                }
+                roots.push(dir);
+            } else {
+                next.extend(children.into_iter().map(|name| dir.join(name)));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    roots.sort();
+    roots
+}
+
+/// Whether `root` is a registry dir of Deno's npm cache
+/// (`$DENO_DIR/npm/registry.npmjs.org`, or a nested
+/// `$DENO_DIR/npm/<host>/<path...>` for a registry served below a path)
+/// rather than a `node_modules` tree: a dir below one named `npm`, other
+/// than a `node_modules` and Deno's `jsr.io` root, with at least one
+/// package dir in Deno's layout ([`is_deno_package_dir`]). A
+/// `node_modules` package dir has its own `package.json`, so a project
+/// root that merely sits under a dir named `npm` keeps its usual walk. Deno lays a package
+/// out at `<name>/<version>/` (scoped: `@scope/name/<version>/`), and each
+/// further copy it makes for a different peer-dependency resolution at
+/// `<version>_<n>/`. A relative `--global-prefix` is judged by its
+/// absolute spelling.
+pub(super) fn is_deno_npm_cache_root(root: &Path) -> bool {
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let named = root
+        .file_name()
+        .is_some_and(|name| name != "node_modules" && name != "jsr.io")
+        && root
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.file_name().is_some_and(|name| name == "npm"));
+    named && holds_deno_packages(&root)
+}
+
+/// Whether some package dir of `root` (`<name>` or `@scope/<name>`) is laid
+/// out the way Deno's npm cache lays one out ([`is_deno_package_dir`]),
+/// stopping at the first that is.
+fn holds_deno_packages(root: &Path) -> bool {
+    sorted_subdirs_sync(root).into_iter().any(|name| {
+        let dir = root.join(&name);
+        if name.starts_with('@') {
+            sorted_subdirs_sync(&dir)
+                .into_iter()
+                .any(|child| is_deno_package_dir(&dir.join(child)))
+        } else {
+            is_deno_package_dir(&dir)
+        }
+    })
+}
+
+/// Whether `dir` is a package dir of Deno's npm cache: it has no
+/// `package.json` of its own (a `node_modules` package dir always does)
+/// and holds Deno's cached packument (`registry.json`) or a version dir
+/// (a name starting with a digit) with a `package.json`. Deno skips the
+/// packument when a `deno.lock` already pins the tarball, so the version
+/// dirs alone must count.
+fn is_deno_package_dir(dir: &Path) -> bool {
+    if dir.join("package.json").exists() {
+        return false;
+    }
+    dir.join("registry.json").is_file()
+        || sorted_subdirs_sync(dir).into_iter().any(|version| {
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && dir.join(version).join("package.json").is_file()
+        })
+}
+
+/// The copy index of the Deno npm cache dir `dir_name` when it holds
+/// `version`: 0 for `<version>`, `n` for `<version>_<n>`, `None` for a dir
+/// of any other version.
+fn deno_npm_copy_index(dir_name: &str, version: &str) -> Option<u64> {
+    let rest = dir_name.strip_prefix(version)?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let digits = rest.strip_prefix('_')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The non-hidden subdirectories of `dir`, sorted by name.
+fn sorted_subdirs_sync(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = list_dir_sync(dir)
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            !entry.name_str.starts_with('.') && entry.file_type.is_some_and(|t| t.is_dir())
+        })
+        .map(|entry| entry.name_str)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every package dir (`<name>` or `@scope/<name>`) of the Deno npm cache
+/// registry dir `root`.
+fn deno_npm_cache_package_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for name in sorted_subdirs_sync(root) {
+        if name.starts_with('@') {
+            let scope = root.join(&name);
+            dirs.extend(
+                sorted_subdirs_sync(&scope)
+                    .into_iter()
+                    .map(|n| scope.join(n)),
+            );
+        } else {
+            dirs.push(root.join(name));
+        }
+    }
+    dirs
 }
 
 /// The `node_modules` roots a global prefix stands for. pnpm 11+ gives
@@ -2355,8 +2628,30 @@ impl NpmCrawler {
 
     fn crawl_all_sync(options: &CrawlerOptions) -> (Vec<CrawledPackage>, Vec<PathBuf>) {
         let nm_paths = Self::node_modules_paths_sync(options);
-        let gathered: Vec<Vec<ScanEvent>> = par_map(&nm_paths, |nm_path| {
-            Self::gather_node_modules(nm_path, None, false)
+        // Yarn's relocated pnpm-linker store (#859), walked once, from the
+        // first root of its project, after that root's own entries like
+        // the stores found by name.
+        let mut seen_stores = HashSet::new();
+        let roots: Vec<(&PathBuf, Option<PathBuf>)> = nm_paths
+            .iter()
+            .map(|nm| {
+                let store = relocated_yarn_pnpm_store_sync(nm)
+                    .filter(|store| seen_stores.insert(store.clone()));
+                (nm, store)
+            })
+            .collect();
+        let gathered: Vec<Vec<ScanEvent>> = par_map(roots, |(nm_path, store)| {
+            // A Deno npm cache root (#444) has its own layout and no
+            // relocated store (it is not a `node_modules`).
+            if is_deno_npm_cache_root(nm_path) {
+                return Self::gather_deno_npm_cache(nm_path);
+            }
+            let mut events = Self::gather_node_modules(nm_path, None, false);
+            if let Some(store) = store {
+                let entries = Self::list_npm_store_entries_sync(&store, true);
+                events.extend(Self::gather_store_entries(entries));
+            }
+            events
         });
 
         let mut packages = Vec::new();
@@ -2426,6 +2721,11 @@ impl NpmCrawler {
                 purl: purl.clone(),
                 dir_key,
             });
+        }
+
+        if is_deno_npm_cache_root(node_modules_path) {
+            let root = node_modules_path.to_path_buf();
+            return Ok(run_walk(move || Self::resolve_deno_npm_cache(&root, pending)).await);
         }
 
         // Both passes run as one walk-pool task: each visited dir is
@@ -2508,6 +2808,13 @@ impl NpmCrawler {
         // `node_modules`.
         let mut level: Vec<(PathBuf, bool)> = vec![(node_modules_path.to_path_buf(), false)];
         let mut visited = HashSet::new();
+        // The root's relocated Yarn pnpm-linker store (#859), contributed
+        // by the root's visit like a store found there by name.
+        let mut yarn_store = relocated_yarn_pnpm_store_sync(node_modules_path).map(|store| {
+            NestedNodeModules::StoreEntries(StoreEntry::from_dirs(
+                Self::list_npm_store_entries_sync(&store, false),
+            ))
+        });
         while !level.is_empty() {
             // A bundled node_modules may link back to an ancestor (or to
             // another already-visited tree). Keep the first/root-first
@@ -2518,9 +2825,14 @@ impl NpmCrawler {
                 let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
                 visited.insert((canonical, *store_entry))
             });
-            let visits: Vec<ResolverVisit> = par_map(level, |(nm_path, store_entry)| {
+            let mut visits: Vec<ResolverVisit> = par_map(level, |(nm_path, store_entry)| {
                 Self::visit_resolver_dir(nm_path, store_entry, &pending)
             });
+            if let Some(store) = yarn_store.take() {
+                if let Some(root) = visits.first_mut() {
+                    root.nested.push(store);
+                }
+            }
             let mut next_level: Vec<(PathBuf, bool)> = Vec::new();
             for visit in visits {
                 for (index, pkg_path) in visit.matched {
@@ -2789,13 +3101,9 @@ impl NpmCrawler {
                 return Vec::new();
             }
             let store = nm_path.join(&entry.name);
-            let entries = Self::list_pnpm_shaped_store_entries_sync(&store, layout, false, false)
-                .into_iter()
-                .map(|e| StoreEntry {
-                    advertised: e.advertised,
-                    node_modules: e.node_modules,
-                })
-                .collect();
+            let entries = StoreEntry::from_dirs(Self::list_pnpm_shaped_store_entries_sync(
+                &store, layout, false, false,
+            ));
             return vec![NestedNodeModules::StoreEntries(entries)];
         }
         // vlt's store has the same transitive-only-home property: every
@@ -2814,13 +3122,10 @@ impl NpmCrawler {
             if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
                 return Vec::new();
             }
-            let entries = Self::list_npm_store_entries_sync(&nm_path.join(&entry.name), false)
-                .into_iter()
-                .map(|e| StoreEntry {
-                    advertised: e.advertised,
-                    node_modules: e.node_modules,
-                })
-                .collect();
+            let entries = StoreEntry::from_dirs(Self::list_npm_store_entries_sync(
+                &nm_path.join(&entry.name),
+                false,
+            ));
             return vec![NestedNodeModules::StoreEntries(entries)];
         }
         // A pnpm virtual store relocated by `virtualStoreDir`, found
@@ -2835,13 +3140,7 @@ impl NpmCrawler {
                 let entries = reachable_pnpm_global_virtual_store_entries_sync(nm_path);
                 return vec![NestedNodeModules::StoreEntries(entries)];
             };
-            let entries = Self::list_pnpm_store_entries_sync(&store, false)
-                .into_iter()
-                .map(|e| StoreEntry {
-                    advertised: e.advertised,
-                    node_modules: e.node_modules,
-                })
-                .collect();
+            let entries = StoreEntry::from_dirs(Self::list_pnpm_store_entries_sync(&store, false));
             return vec![NestedNodeModules::StoreEntries(entries)];
         }
         // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
@@ -3000,6 +3299,12 @@ impl NpmCrawler {
             }
         }
 
+        // Deno's npm cache, last: a copy another manager's global root
+        // also holds keeps being reported there.
+        for root in deno_npm_cache_roots() {
+            add(root);
+        }
+
         paths
     }
 
@@ -3011,6 +3316,13 @@ impl NpmCrawler {
     fn node_modules_paths_sync(options: &CrawlerOptions) -> Vec<PathBuf> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
+                if is_deno_npm_cache_root(custom) {
+                    return vec![custom.clone()];
+                }
+                let registries = deno_cache_parent_registry_dirs(custom);
+                if !registries.is_empty() {
+                    return registries;
+                }
                 return pnpm_isolated_global_install_roots(custom);
             }
             return NpmCrawler.get_global_node_modules_paths();
@@ -3037,7 +3349,23 @@ impl NpmCrawler {
         let members = skipped_workspace_member_roots(start_path, &results);
         results.extend(members);
 
-        merge_configured_install_roots(results, configured_install_roots(start_path))
+        let mut results =
+            merge_configured_install_roots(results, configured_install_roots(start_path));
+        // A Yarn pnpm-linker store relocated into the project (#859) is
+        // walked as a store from its project's `node_modules`; the
+        // `node_modules` of its entries are not importers of their own.
+        let stores: Vec<PathBuf> = results
+            .iter()
+            .filter_map(|nm| relocated_yarn_pnpm_store_sync(nm))
+            .filter_map(|store| std::fs::canonicalize(store).ok())
+            .collect();
+        if !stores.is_empty() {
+            results.retain(|nm| {
+                let real = std::fs::canonicalize(nm).unwrap_or_else(|_| nm.clone());
+                !stores.iter().any(|store| real.starts_with(store))
+            });
+        }
+        results
     }
 
     /// Find `node_modules` in subdirectories (for monorepos / workspaces),
@@ -3432,6 +3760,104 @@ impl NpmCrawler {
             decoded: entry.advertised,
             events: Self::gather_node_modules(&entry.node_modules, entry.listing, true),
         })
+    }
+
+    /// Gather every package in the Deno npm cache registry dir `root`
+    /// (`<name>/<version>/`, see [`is_deno_npm_cache_root`]), each
+    /// identified by its own package.json like any other package. A
+    /// `<version>_<n>` peer-dependency copy is read only when no
+    /// `<version>` dir sits beside it: the scan keeps one copy per purl,
+    /// and that one comes first.
+    fn gather_deno_npm_cache(root: &Path) -> Vec<ScanEvent> {
+        par_map(deno_npm_cache_package_dirs(root), |pkg_dir| {
+            let dirs = sorted_subdirs_sync(&pkg_dir);
+            let is_extra_copy = |dir: &String| {
+                dir.rsplit_once('_').is_some_and(|(base, n)| {
+                    !n.is_empty()
+                        && n.bytes().all(|b| b.is_ascii_digit())
+                        && dirs.binary_search_by(|d| d.as_str().cmp(base)).is_ok()
+                })
+            };
+            dirs.iter()
+                .filter(|dir| !is_extra_copy(dir))
+                .map(|dir| {
+                    let path = pkg_dir.join(dir);
+                    ScanEvent::Package {
+                        identity: read_package_json_sync(&path.join("package.json")),
+                        path,
+                        entry_key: None,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// [`Self::find_by_purls`] over the Deno npm cache registry dir `root`:
+    /// every copy of each target, `<dir_key>/<version>` first, then its
+    /// `<version>_<n>` peer-dependency copies in index order, each kept
+    /// only when its package.json names the target and recorded once.
+    /// Deno stores a name with capitals under an encoded `_<...>` dir at
+    /// the registry root, so a target with one that the direct lookup
+    /// misses is matched by package.json identity against those dirs only.
+    fn resolve_deno_npm_cache(
+        root: &Path,
+        targets: Vec<Target>,
+    ) -> HashMap<String, Vec<CrawledPackage>> {
+        let is_target = |path: &Path, target: &Target| {
+            read_package_json_sync(&path.join("package.json"))
+                .is_some_and(|(name, version)| name == target.dir_key && version == target.version)
+        };
+        let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
+        let mut record = |path: PathBuf, target: &Target| {
+            let copies = result.entry(target.purl.clone()).or_default();
+            if !copies.iter().any(|c| c.path == path) {
+                copies.push(CrawledPackage {
+                    name: target.name.clone(),
+                    version: target.version.clone(),
+                    namespace: target.namespace.clone(),
+                    purl: target.purl.clone(),
+                    path,
+                });
+            }
+        };
+        let mut unmatched = Vec::new();
+        for target in targets {
+            let pkg_dir = root.join(&target.dir_key);
+            let mut copies: Vec<(u64, String)> = sorted_subdirs_sync(&pkg_dir)
+                .into_iter()
+                .filter_map(|dir| Some((deno_npm_copy_index(&dir, &target.version)?, dir)))
+                .collect();
+            copies.sort();
+            let mut found = false;
+            for (_, dir) in copies {
+                let path = pkg_dir.join(dir);
+                if is_target(&path, &target) {
+                    record(path, &target);
+                    found = true;
+                }
+            }
+            if !found && target.dir_key.bytes().any(|b| b.is_ascii_uppercase()) {
+                unmatched.push(target);
+            }
+        }
+        if !unmatched.is_empty() {
+            for encoded in sorted_subdirs_sync(root)
+                .into_iter()
+                .filter(|name| name.starts_with('_'))
+            {
+                let pkg_dir = root.join(encoded);
+                for dir in sorted_subdirs_sync(&pkg_dir) {
+                    let path = pkg_dir.join(dir);
+                    for target in unmatched.iter().filter(|t| is_target(&path, t)) {
+                        record(path.clone(), target);
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Replay gathered [`ScanEvent`]s in order against `seen`, exactly as
@@ -4061,6 +4487,35 @@ async fn find_store_peer_variant_copies_reusing(
     for store in relocated {
         if seen_stores.insert(store.clone()) {
             stores.push((StoreLayout::Pnpm, store));
+        }
+    }
+    // Yarn's pnpm-linker store relocated by `pnpmStoreFolder` (#859): the
+    // project's `node_modules` names no such store, its settings do. Only
+    // a store holding the primary itself counts, as above.
+    if let Some(canonical) = canonical_pkg.clone() {
+        let mut projects: Vec<PathBuf> = Vec::new();
+        for start in chains.into_iter().flatten() {
+            for dir in start.ancestors().skip(1) {
+                let nm = dir.join("node_modules");
+                if !projects.contains(&nm) {
+                    projects.push(nm);
+                }
+            }
+        }
+        let yarn_stores = run_walk(move || {
+            projects
+                .iter()
+                .filter_map(|nm| relocated_yarn_pnpm_store_sync(nm))
+                .filter(|store| {
+                    std::fs::canonicalize(store).is_ok_and(|real| canonical.starts_with(real))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        for store in yarn_stores {
+            if seen_stores.insert(store.clone()) {
+                stores.push((StoreLayout::NpmLinked, store));
+            }
         }
     }
     if stores.is_empty() {
@@ -7400,6 +7855,90 @@ mod tests {
             find_store_peer_variant_copies(&nm.join("is-odd")).await,
             Vec::<PathBuf>::new()
         );
+    }
+
+    /// #859: `pnpmStoreFolder` moves Yarn 4's pnpm-linker store out of
+    /// `node_modules`, to a hidden folder (`.cache/.store`, which the
+    /// workspace walk skips) or a plain one (`store`, whose entries'
+    /// `node_modules` the walk would otherwise take for importers). Either
+    /// way the transitive copies live only there: scan, the resolver and
+    /// the peer fan-out must find each at its `package` dir, once.
+    #[tokio::test]
+    async fn test_yarn4_pnpm_linker_relocated_store_transitive_packages_are_found() {
+        for folder in [".cache/.store", "store"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().join("proj").components().collect();
+            std::fs::create_dir_all(&root).unwrap();
+            let nm = root.join("node_modules");
+            let store = root.join(folder);
+            std::fs::write(root.join("yarn.lock"), "").unwrap();
+            std::fs::write(
+                root.join(".yarnrc.yml"),
+                format!("nodeLinker: pnpm\npnpmStoreFolder: {folder}\n"),
+            )
+            .unwrap();
+
+            let odd_entry = store.join("is-odd-npm-3.0.1-3e1a2b4c5d");
+            write_pkg(&odd_entry.join("package"), "is-odd", "3.0.1");
+            link_own_package(&odd_entry, "is-odd");
+            let number_entry = store.join("is-number-npm-6.0.0-9f8e7d6c5b");
+            let number = number_entry.join("package");
+            write_pkg(&number, "is-number", "6.0.0");
+            link_own_package(&number_entry, "is-number");
+            let twin_entry = store.join("is-number-npm-6.0.0-0a1b2c3d4e");
+            let number_twin = twin_entry.join("package");
+            write_pkg(&number_twin, "is-number", "6.0.0");
+            link_own_package(&twin_entry, "is-number");
+            link_dir(&number, &odd_entry.join("node_modules/is-number"));
+            std::fs::create_dir_all(&nm).unwrap();
+            link_dir(&odd_entry.join("package"), &nm.join("is-odd"));
+
+            assert_store_copies_found(
+                &root,
+                &["pkg:npm/is-number@6.0.0", "pkg:npm/is-odd@3.0.1"],
+                &[
+                    (
+                        "pkg:npm/is-number@6.0.0",
+                        vec![number.clone(), number_twin.clone()],
+                    ),
+                    ("pkg:npm/is-odd@3.0.1", vec![nm.join("is-odd")]),
+                ],
+                &number,
+                vec![number_twin.clone()],
+            )
+            .await;
+
+            // A workspace member's `node_modules` uses the root's store.
+            let member_nm = root.join("packages").join("a").join("node_modules");
+            std::fs::create_dir_all(&member_nm).unwrap();
+            assert_eq!(
+                relocated_yarn_pnpm_store_sync(&member_nm),
+                Some(store.clone()),
+                "{folder}: member"
+            );
+            // A store outside the project may be shared: never walked.
+            std::fs::write(
+                root.join(".yarnrc.yml"),
+                "nodeLinker: pnpm\npnpmStoreFolder: ../shared\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("../shared")).unwrap();
+            assert!(
+                relocated_yarn_pnpm_store_sync(&nm).is_none(),
+                "{folder}: outside the project"
+            );
+
+            // An inactive linker leaves the folder alone.
+            std::fs::write(
+                root.join(".yarnrc.yml"),
+                format!("nodeLinker: node-modules\npnpmStoreFolder: {folder}\n"),
+            )
+            .unwrap();
+            assert!(
+                relocated_yarn_pnpm_store_sync(&nm).is_none(),
+                "{folder}: node-modules linker"
+            );
+        }
     }
 
     /// #496 review: a Yarn 4 store entry's `package` dir carries the

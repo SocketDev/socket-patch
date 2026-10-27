@@ -1454,6 +1454,34 @@ async fn scan_redirect_vlt_foreign_instance_vex_not_attested() {
     assert!(!attested, "{doc:#}");
 }
 
+/// #1601: a package vlt resolves only from a named registry is left
+/// alone with one warning that points to agent mode, the only mode that
+/// can patch it (vendored refuses it, and `vlt install` can't move it to
+/// the default registry).
+#[tokio::test]
+async fn scan_redirect_vlt_foreign_only_instance_points_to_agent_mode() {
+    let server = MockServer::start().await;
+    mock_all(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_vlt_project(tmp.path(), Era::V1);
+    let lock = lock_with(Era::V1, &[registry_node("~custom~left-pad@1.3.0")]);
+    std::fs::write(tmp.path().join("vlt-lock.json"), &lock).unwrap();
+
+    let (_, doc, attested) = scan_with_vex(tmp.path(), &server, &[]);
+
+    assert_eq!(
+        warning_codes(&doc),
+        ["redirect_vlt_custom_registry_skipped"],
+        "{doc:#}"
+    );
+    let detail = doc["warnings"][0]["detail"].as_str().unwrap_or_default();
+    assert!(detail.ends_with("(use agent mode)"), "{doc:#}");
+    assert!(!detail.contains("vendored"), "{doc:#}");
+    assert_eq!(redirected(&doc), 0, "{doc:#}");
+    assert!(!attested, "{doc:#}");
+    assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
+}
+
 #[tokio::test]
 async fn scan_redirect_vlt_old_lockfile_vex_not_attested() {
     let server = MockServer::start().await;

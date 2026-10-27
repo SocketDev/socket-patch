@@ -63,7 +63,10 @@ use crate::formats::cargo::source_replacement::{crates_io_source, ConfigLayer, C
 use crate::formats::cargo::CargoLock;
 use crate::formats::composer::hosted::rewrite_composer_lock;
 use crate::formats::gem::gemfile;
-use crate::formats::gem::hosted::{checksum_entry_span, converge_gem_lock_source};
+use crate::formats::gem::hosted::{
+    bundled_before_2_2, checksum_entry_span, converge_gem_lock_source,
+    refresh_merged_gem_lock_remote,
+};
 use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
@@ -1252,6 +1255,7 @@ fn rewrite_npm_lock(
                 &user_patched,
                 &fname,
                 &dep.version,
+                &dep.artifact_url,
             ) {
                 format!("package.json `patchedDependencies` has `{key}`")
             } else if let Some((_, _, lockfile, key)) = lock_patched
@@ -1328,6 +1332,26 @@ pub fn npm_shrinkwrap_only_detail(packages: &[String], how: &str) -> String {
          {PACKAGE_LOCK}, so npm >= 12 installs stay UNPATCHED (npm <= 11 installs from the \
          shrinkwrap and is patched); rename the lock to {PACKAGE_LOCK} (or commit a copy \
          under that name) and re-run",
+        packages.join(", ")
+    )
+}
+
+/// The project's Deno lock. `deno install` installs a `package.json`
+/// project's npm dependencies from it and never reads an npm-family lock.
+pub const DENO_LOCK: &str = "deno.lock";
+
+/// The shared detail of the hosted (`redirect_npm_deno_lock`) and vendored
+/// (`vendor_npm_deno_lock`) warnings (#406): `packages` (`name@version`)
+/// are wired in the npm-family lock, but `deno.lock` also locks them, so
+/// installs Deno runs keep the registry copy.
+pub fn npm_deno_lock_detail(packages: &[String], how: &str) -> String {
+    format!(
+        "{} {how} in the project's npm-family lock, but {DENO_LOCK} locks the same \
+         version and `deno install` installs this project's npm dependencies from \
+         {DENO_LOCK}, never from that lock — so installs run by Deno stay UNPATCHED, and \
+         `vex` leaves the package out (installs the other package manager runs from its \
+         lock are unaffected); to patch what Deno installs, run `deno install` and then \
+         `socket-patch scan --mode agent`",
         packages.join(", ")
     )
 }
@@ -2815,7 +2839,12 @@ fn is_repinnable_registry_name(value: &str) -> bool {
 pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Option<String> {
     let lines: Vec<&str> = content.split('\n').collect();
     let mut section = CargoTomlSection::Other;
+    // Past the last line of a multi-line inline table (#757).
+    let mut skip_until = 0;
     for (idx, raw) in lines.iter().enumerate() {
+        if idx < skip_until {
+            continue;
+        }
         let trimmed = raw.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -2891,10 +2920,11 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
         if !value.starts_with('{') {
             continue;
         }
-        let Some(close) = value.find('}') else {
+        let Some((end, inner)) = cargo_inline_table(&lines, idx, value) else {
             continue;
         };
-        let inner = &value[1..close];
+        skip_until = end + 1;
+        let inner = inner.as_ref();
         let is_ours = match cargo_toml_inline_string(inner, "package") {
             Some(package) => package == crate_name,
             None => key == crate_name,
@@ -2923,7 +2953,12 @@ impl CargoRegistryPins {
         let lines: Vec<&str> = content.split('\n').collect();
         let mut pins = Vec::new();
         let mut section = CargoTomlSection::Other;
+        // Past the last line of a multi-line inline table (#757).
+        let mut skip_until = 0;
         for (idx, raw) in lines.iter().enumerate() {
+            if idx < skip_until {
+                continue;
+            }
             let trimmed = raw.trim_start();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
@@ -2989,10 +3024,11 @@ impl CargoRegistryPins {
             if !value.starts_with('{') {
                 continue;
             }
-            let Some(close) = value.find('}') else {
+            let Some((end, inner)) = cargo_inline_table(&lines, idx, value) else {
                 continue;
             };
-            let inner = &value[1..close];
+            skip_until = end + 1;
+            let inner = inner.as_ref();
             if let Some(reg) = cargo_toml_inline_string(inner, "registry")
                 .filter(|registry| is_socket_patch_registry_name(registry))
             {
@@ -3133,6 +3169,167 @@ fn cargo_toml_string(value: &str) -> Option<String> {
         .parse::<toml_edit::DocumentMut>()
         .ok()?;
     document.get("value")?.as_str().map(str::to_string)
+}
+
+/// The inline table that opens at `value` (the rest of `lines[idx]` from
+/// its `{`): the index of the line holding its closing `}` and the text
+/// between the braces. A table that closes on its own line borrows that
+/// text. One whose array value wraps onto later lines (#757) joins its
+/// lines with `\n` (a CRLF line keeps its `\r`) and leaves out comments,
+/// so a key named only in a comment is not read as one. TOML 1.0 lets an
+/// inline table break a line only inside a value (an array or a
+/// multi-line string), so a break directly inside the braces, a
+/// mismatched bracket or an unterminated string is `None`. Braces and
+/// brackets inside strings and comments do not count.
+fn cargo_inline_table<'a>(
+    lines: &[&str],
+    idx: usize,
+    value: &'a str,
+) -> Option<(usize, Cow<'a, str>)> {
+    #[derive(PartialEq)]
+    enum Str {
+        No,
+        Basic,
+        Literal,
+        MultiBasic,
+        MultiLiteral,
+    }
+    // A multi-line string closes on its first run of three or more quotes;
+    // up to two of them belong to the content (`"""a""""`).
+    let closing_run = |rest: &[u8], quote: u8| -> Option<usize> {
+        let n = rest.iter().take_while(|&&c| c == quote).count();
+        (n >= 3).then_some(n.min(5))
+    };
+    let mut state = Str::No;
+    let mut stack: Vec<u8> = Vec::new();
+    let mut inner = String::new();
+    for (line_idx, &line) in lines.iter().enumerate().skip(idx) {
+        let line = if line_idx == idx { value } else { line };
+        let b = line.as_bytes();
+        let start = usize::from(line_idx == idx);
+        if line_idx == idx {
+            stack.push(b'{');
+        }
+        let mut end = b.len();
+        let mut i = start;
+        while i < b.len() {
+            let rest = &b[i..];
+            match state {
+                Str::No => match b[i] {
+                    b'#' => {
+                        end = i;
+                        break;
+                    }
+                    b'"' if rest.starts_with(b"\"\"\"") => {
+                        state = Str::MultiBasic;
+                        i += 2;
+                    }
+                    b'"' => state = Str::Basic,
+                    b'\'' if rest.starts_with(b"'''") => {
+                        state = Str::MultiLiteral;
+                        i += 2;
+                    }
+                    b'\'' => state = Str::Literal,
+                    open @ (b'[' | b'{') => stack.push(open),
+                    b']' => {
+                        if stack.pop() != Some(b'[') {
+                            return None;
+                        }
+                    }
+                    b'}' => {
+                        if stack.pop() != Some(b'{') {
+                            return None;
+                        }
+                        if stack.is_empty() {
+                            if line_idx == idx {
+                                return Some((idx, Cow::Borrowed(&value[1..i])));
+                            }
+                            inner.push_str(&line[..i]);
+                            return Some((line_idx, Cow::Owned(inner)));
+                        }
+                    }
+                    _ => {}
+                },
+                Str::Basic | Str::MultiBasic if b[i] == b'\\' => i += 1,
+                Str::Basic if b[i] == b'"' => state = Str::No,
+                Str::Literal if b[i] == b'\'' => state = Str::No,
+                Str::MultiBasic if b[i] == b'"' => {
+                    if let Some(n) = closing_run(rest, b'"') {
+                        state = Str::No;
+                        i += n - 1;
+                    }
+                }
+                Str::MultiLiteral if b[i] == b'\'' => {
+                    if let Some(n) = closing_run(rest, b'\'') {
+                        state = Str::No;
+                        i += n - 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let in_value = match state {
+            Str::No => stack.last() == Some(&b'['),
+            Str::Basic | Str::Literal => false,
+            Str::MultiBasic | Str::MultiLiteral => true,
+        };
+        if !in_value {
+            return None;
+        }
+        inner.push_str(&line[start..end]);
+        inner.push('\n');
+    }
+    None
+}
+
+/// The line rewrites that move a wrapped inline table (`lines[idx..=end]`)
+/// from an explicit `registry = "crates-io"` to `reg`: the key is dropped
+/// with one adjacent comma, and the pin goes right after the opening `{`,
+/// the spelling upstream restore unpins. `None` when the key is not found
+/// exactly once outside comments.
+fn cargo_wrapped_crates_io_repin(
+    lines: &[&str],
+    idx: usize,
+    end: usize,
+    reg: &str,
+) -> Option<Vec<(usize, String)>> {
+    let code = |line: &str| line.split('#').next().unwrap_or_default().len();
+    let mut hits = (idx..=end).filter_map(|j| {
+        let line = lines[j];
+        let start = if j == idx { line.find('{')? } else { 0 };
+        CARGO_TOML_CRATES_IO_KEY_RE
+            .find(&line[start..code(line)])
+            .map(|m| (j, start + m.start(), start + m.end()))
+    });
+    let (j, from, to) = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    let line = lines[j];
+    let after = &line[to..];
+    let dropped = match after.trim_start().strip_prefix(',') {
+        Some(rest) => format!("{}{}", &line[..from], rest.trim_start()),
+        None => format!("{}{after}", line[..from].trim_end().strip_suffix(',')?),
+    };
+    let opening = if j == idx {
+        dropped.as_str()
+    } else {
+        lines[idx]
+    };
+    let brace = opening.find('{')?;
+    let mut rewrites = vec![(
+        idx,
+        format!(
+            "{} registry = \"{reg}\",{}",
+            &opening[..=brace],
+            &opening[brace + 1..]
+        ),
+    )];
+    if j != idx {
+        rewrites.push((j, dropped));
+    }
+    Some(rewrites)
 }
 
 fn cargo_toml_inline_string(inner: &str, key: &str) -> Option<String> {
@@ -3287,6 +3484,10 @@ static CARGO_TOML_REGISTRY_VAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:\bregistry|"registry"|'registry')\s*=\s*(?:"[^"]*"|'[^']*')"#)
         .expect("static registry-value regex is valid")
 });
+static CARGO_TOML_CRATES_IO_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:\bregistry|"registry"|'registry')\s*=\s*(?:"crates-io"|'crates-io')"#)
+        .expect("static crates-io key regex is valid")
+});
 static CARGO_TOML_REGISTRY_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid")
 });
@@ -3415,7 +3616,12 @@ fn plan_cargo_toml(
     let mut excluded: Vec<String> = Vec::new();
 
     let mut section = CargoTomlSection::Other;
+    // Past the last line of a multi-line inline table (#757).
+    let mut skip_until = 0;
     for (idx, raw) in lines.iter().enumerate() {
+        if idx < skip_until {
+            continue;
+        }
         let trimmed = raw.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -3569,7 +3775,9 @@ fn plan_cargo_toml(
             // Inline table. Rename-aware: `package = "<other>"` under our key
             // means this entry is NOT the patched crate; `package =
             // "<crate>"` under any key means it IS.
-            let Some(close) = value.find('}') else {
+            // A table whose array value wraps (#757) is classified by its
+            // whole text and pinned on its opening line.
+            let Some((end, inner)) = cargo_inline_table(&lines, idx, value) else {
                 if key == crate_name {
                     pending.push(Pending::Refuse(
                         "inline table does not close on its line".to_string(),
@@ -3577,7 +3785,9 @@ fn plan_cargo_toml(
                 }
                 continue;
             };
-            let inner = &value[1..close];
+            skip_until = end + 1;
+            let multi_line = end > idx;
+            let inner = inner.as_ref();
             if workspace_key_re.is_match(inner) {
                 pending.push(Pending::NeedsWorkspacePin(key.clone()));
                 continue;
@@ -3618,6 +3828,47 @@ fn plan_cargo_toml(
                     if workspace {
                         ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                     }
+                } else if multi_line {
+                    // Upstream restore unpins only the opening-line spelling
+                    // this planner writes, so only an earlier pin in that
+                    // spelling is superseded in place.
+                    // An explicit `registry = "crates-io"` (#386) is dropped
+                    // and the pin written in that spelling; restore then
+                    // leaves the declaration without the redundant key, as
+                    // it does for a one-line table.
+                    let brace = raw.find('{').unwrap_or_default();
+                    let earlier = format!(" registry = \"{value}\",");
+                    let rewrites = if is_repinnable_registry_name(&value)
+                        && raw[brace + 1..].starts_with(&earlier)
+                    {
+                        Some(vec![(
+                            idx,
+                            format!(
+                                "{} registry = \"{reg}\",{}",
+                                &raw[..=brace],
+                                &raw[brace + 1 + earlier.len()..]
+                            ),
+                        )])
+                    } else if value == "crates-io" {
+                        cargo_wrapped_crates_io_repin(&lines, idx, end, reg)
+                    } else {
+                        None
+                    };
+                    if let Some(rewrites) = rewrites {
+                        for (idx, new_text) in rewrites {
+                            pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                                idx,
+                                new_text,
+                            }));
+                        }
+                        if workspace {
+                            ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
+                        }
+                    } else {
+                        pending.push(Pending::Refuse(format!(
+                            "a multi-line inline table already names a registry (\"{value}\")"
+                        )));
+                    }
                 } else if is_repinnable_registry_name(&value) {
                     let new_text = registry_val_re
                         .replace(raw, format!("registry = \"{reg}\"").as_str())
@@ -3636,6 +3887,22 @@ fn plan_cargo_toml(
                 }
             } else if registry_key_re.is_match(inner) || registry_index_re.is_match(inner) {
                 pending.push(Pending::Refuse("pinned to another registry".to_string()));
+            } else if multi_line {
+                // The pin goes right after the opening `{`, so restore can
+                // drop exactly the text inserted here.
+                let brace = raw.find('{').unwrap_or_default();
+                let new_text = format!(
+                    "{} registry = \"{reg}\",{}",
+                    &raw[..=brace],
+                    &raw[brace + 1..]
+                );
+                pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                    idx,
+                    new_text,
+                }));
+                if workspace {
+                    ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
+                }
             } else {
                 // Rebuild the line: everything through `{`, the trimmed
                 // inner, the registry pin, then `}` + any trailing bytes
@@ -3931,13 +4198,15 @@ pub const YARNRC_REL: &str = ".yarnrc";
 /// The `yarn-offline-mirror` directory yarn 1 uses for the project, if
 /// any: the project's `.yarnrc` / `.npmrc` texts layered with the config
 /// yarn reads outside the project (`outer`, see [`yarnrc`]). `false` in
-/// either registry, or an empty value, means no mirror.
+/// either registry, or an empty value, means no mirror. A mirror that
+/// only an install run from a workspace member uses
+/// ([`yarnrc::OuterYarnMirror::member`]) counts too (#1115).
 pub fn yarn_classic_offline_mirror(
     yarnrc: Option<&str>,
     npmrc: Option<&str>,
     outer: &yarnrc::OuterYarnMirror,
 ) -> Option<yarnrc::MirrorSetting> {
-    yarnrc::effective_mirror(yarnrc, npmrc, outer)
+    yarnrc::effective_mirror(yarnrc, npmrc, outer).or_else(|| outer.member.clone())
 }
 
 /// The project-level refusal of the yarn classic hosted rewriter: a
@@ -5496,15 +5765,15 @@ fn berry_catalog_selectors(yarnrc: Option<&str>, name: &str, ranges: &[&str]) ->
 // deviations). Byte-for-byte twin of the TS `rewriteBun`.
 fn parse_bun_hosted_lock(
     content: &str,
-) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {
+) -> Result<std::sync::Arc<crate::formats::bun::BunTextLock>, RewriteWarning> {
     use crate::vendor::bun_lock_text::{has_workspace_packages, lock_version};
 
     // The shared gate's `Err` text IS the detail: hosted and vendored refuse
     // an unsupported head with one message (and one remedy per arm — a
     // future version means "update socket-patch", a missing integer means
     // "re-lock"), so the two modes cannot drift apart.
-    let (lines, entries) = match crate::formats::bun::BunTextLock::parse(content) {
-        Ok(lock) => (lock.lines, lock.entries),
+    let lock = match crate::formats::bun::BunTextLock::parse_shared(content) {
+        Ok(lock) => lock,
         Err(crate::formats::bun::BunTextError::Version(detail)) => {
             return Err(RewriteWarning {
                 code: "redirect_bun_lock_unsupported".into(),
@@ -5538,7 +5807,7 @@ fn parse_bun_hosted_lock(
     // workspaces is kept at 0 by an in-place install on 1.2.0, 1.2.23 and
     // 1.3.0 and bumped to 1 by 1.3.9 and every later release; that case is
     // accepted here either way.)
-    if lock_version(content) == Some(0) && has_workspace_packages(&entries) {
+    if lock_version(content) == Some(0) && has_workspace_packages(&lock.entries) {
         return Err(RewriteWarning {
             code: "redirect_bun_workspace_unsupported".into(),
             detail: "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen \
@@ -5551,7 +5820,7 @@ fn parse_bun_hosted_lock(
         });
     }
 
-    Ok((lines, entries))
+    Ok(lock)
 }
 
 /// The warning for a package the bun rewriters pinned to its hosted URL that
@@ -5567,10 +5836,11 @@ pub(crate) fn bun_default_trust_warning(name: &str, version: &str) -> RewriteWar
     }
 }
 
-/// Leave `dep` on its registry resolution when the project's own
+/// Leave `dep` on its current resolution when the project's own
 /// `patchedDependencies` patches it (#367): Bun applies that patch only to
-/// the registry `name@version`, so a hosted pin would silently drop it from
-/// every install. Warns, keeps the in-run VEX from assuming the uuid
+/// the resolution it is keyed on (the registry `name@version`, or an older
+/// hosted or vendored tarball, #1019), so a pin to `dep`'s URL would
+/// silently drop it from every install. Warns, keeps the in-run VEX from assuming the uuid
 /// patched, and keeps any other lock from confirming it. `true` when `dep`
 /// was skipped.
 pub(crate) fn skip_bun_user_patched(
@@ -5580,7 +5850,8 @@ pub(crate) fn skip_bun_user_patched(
     result: &mut RewriteResult,
 ) -> bool {
     use crate::vendor::bun_lock_text::{patched_dependency_detail, patched_dependency_key};
-    let Some(key) = patched_dependency_key(user_patched, name, &dep.version) else {
+    let Some(key) = patched_dependency_key(user_patched, name, &dep.version, &dep.artifact_url)
+    else {
         return false;
     };
     result.bundled_skipped_uuids.insert(dep.patch_uuid.clone());
@@ -5622,13 +5893,16 @@ fn rewrite_bun_lock(
     let Some(content) = files.get("bun.lock") else {
         return;
     };
-    let (mut lines, entries) = match parse_bun_hosted_lock(content) {
-        Ok(parsed) => parsed,
+    let lock = match parse_bun_hosted_lock(content) {
+        Ok(lock) => lock,
         Err(warning) => {
             result.warnings.push(warning);
             return;
         }
     };
+    let entries = &lock.entries;
+    // The shared parse is never edited: the first splice copies its lines.
+    let mut lines = std::borrow::Cow::Borrowed(lock.lines.as_slice());
 
     let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
         files.get("package.json").map(String::as_str),
@@ -5783,7 +6057,7 @@ fn rewrite_bun_lock(
             if rebuilt == original {
                 continue;
             }
-            lines[entry.line_idx] = rebuilt.clone();
+            lines.to_mut()[entry.line_idx] = rebuilt.clone();
             result.edits.push(FileEdit {
                 path: "bun.lock".into(),
                 kind: "redirect_bun_lock_package".into(),
@@ -5825,7 +6099,7 @@ fn rewrite_bun_lock(
     // holds a pin is touched, and the manifests are the engine's advisory
     // `<dir>/package.json` reads.
     if pinned_any {
-        let heals = crate::vendor::bun_lock_text::heal_workspace_literals(&mut lines, |dir| {
+        let heals = crate::vendor::bun_lock_text::heal_workspace_literals(lines.to_mut(), |dir| {
             let rel = if dir.is_empty() {
                 "package.json".to_string()
             } else {
@@ -6187,8 +6461,8 @@ fn rewrite_uv_lock(
     result: &mut RewriteResult,
 ) {
     use crate::utils::python_lock::{
-        is_python_lock_name, paired_metadata_rel, pipenv_reads_pylock, ArtifactSource,
-        PythonLockSession,
+        is_pep751_lock_name, is_python_lock_name, paired_metadata_rel, pipenv_reads_pylock,
+        ArtifactSource, PythonLockSession,
     };
 
     let locks: Vec<(&String, &String)> = files
@@ -6212,13 +6486,42 @@ fn rewrite_uv_lock(
             }),
         }
     }
+    // A PEP 751 lock is installed with `uv pip`, which reads uv's settings
+    // (#1603).
+    let pip_settings = locks
+        .iter()
+        .any(|(path, _)| is_pep751_lock_name(path))
+        .then(|| pylock_uv_settings(files));
     for (path, original) in locks {
         let mut content = original.clone();
         let mut session = PythonLockSession::new(original);
         let pipenv_reads = pipenv_reads_pylock(path, |rel| files.contains_key(rel));
+        // Pipenv installs the pylocks it reads, and reads no uv setting.
+        let uv_pip_settings = pip_settings
+            .as_ref()
+            .filter(|_| is_pep751_lock_name(path) && !pipenv_reads);
         for &(dep, sha256) in &usable {
             let artifact = ArtifactSource::Url(&dep.artifact_url);
-            let plan = match session.plan(&content, &dep.name, &dep.version, artifact) {
+            let planned = session.plan(&content, &dep.name, &dep.version, artifact);
+            // Every patched artifact is a wheel, which uv refuses to
+            // install under no-binary (#1603).
+            let no_binary = match (&planned, uv_pip_settings) {
+                (Ok(Some(_)), Some(settings)) => {
+                    upstream::pylock_no_binary(original, &dep.name, settings)
+                }
+                _ => None,
+            };
+            if let Some(why) = no_binary {
+                result
+                    .refused_python_lock_uuids
+                    .insert(dep.patch_uuid.clone());
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_uv_lock_unsupported".into(),
+                    detail: format!("{path}: {why}"),
+                });
+                continue;
+            }
+            let plan = match planned {
                 Ok(Some(_)) if pipenv_reads => {
                     result
                         .refused_python_lock_uuids
@@ -6513,6 +6816,30 @@ const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<c
 ///
 /// [`find_ancestor_uv_config`]: crate::utils::python_script::find_ancestor_uv_config
 pub const UV_ANCESTOR_CONFIG_KEY: &str = "<socket-patch:uv-ancestor-config>";
+
+/// The uv settings `uv pip` reads for a PEP 751 lock in the root
+/// ([`upstream::root_uv_settings`]), with the settings file above the root
+/// the engine hands over under [`UV_ANCESTOR_CONFIG_KEY`]. A user- or
+/// system-level `uv.toml` belongs to the machine that installs, which the
+/// scan cannot see.
+fn pylock_uv_settings(files: &BTreeMap<String, String>) -> Vec<(String, toml_edit::Table)> {
+    let ancestor = files.get(UV_ANCESTOR_CONFIG_KEY).and_then(|value| {
+        let (rel, text) = value.split_once('\n')?;
+        Some(crate::utils::python_script::UvConfig {
+            rel: rel.to_string(),
+            text: text.to_string(),
+        })
+    });
+    upstream::root_uv_settings(
+        files
+            .get(crate::utils::python_script::UV_TOML)
+            .map(String::as_str),
+        files.get("pyproject.toml").map(String::as_str),
+        ancestor.as_ref(),
+    )
+    .into_iter()
+    .collect()
+}
 
 /// The synthetic candidate key carrying the locks the engine found every
 /// project under the root restoring into (#353, #514), one per line:
@@ -7392,6 +7719,10 @@ fn rewrite_gem(
         // Whether THIS dep's Gemfile source redirect is in place (just
         // written or already present) — the lock pin below is gated on it.
         let mut source_placed = false;
+        // The URL of the Socket `source … do` block an earlier run left for
+        // THIS dep (before any in-place refresh below): the remote a merged
+        // lock section attributes to it (#1688).
+        let mut prior_block_url: Option<String> = None;
         if let Some(gf) = gemfile.as_mut() {
             // Looser "declared at all?" probe: matches every `gem` call that
             // names the gem anywhere in its arguments, in any form. It gates
@@ -7451,6 +7782,7 @@ fn rewrite_gem(
                 let url = m
                     .get(1)
                     .expect("block_re always captures group 1 (index URL)");
+                prior_block_url = Some(url.as_str().to_string());
                 if url.as_str() == ov.index_url {
                     source_placed = true;
                 } else {
@@ -7722,16 +8054,74 @@ fn rewrite_gem(
             // "mismatched checksums"; frozen: exit 16). A pre-CHECKSUMS lock
             // has no sha to converge around, so it keeps the
             // mixed-but-installable state + the frozen-install caveat.
-            if !checksums_era
-                || !converge_gem_lock_source(
+            //
+            // A lock an earlier redirect converged into a merged
+            // multi-remote section (bundler ≤ 2.1, or a lock that started
+            // there) instead has its Socket remote follow this dep's Gemfile
+            // block to the new URL, or discovery reads the pair as naming
+            // two patches and every scan skips the new one (#1688). Only a
+            // lock bundler < 2.2 wrote is proven frozen-installable after
+            // that refresh (e2e_redirect_gem_build); a later bundler keeping
+            // a merged lock keeps the caveat.
+            // Bundler 2.7+ folds a `gemspec` development dependency on the
+            // gem into its Gemfile requirement, so the lock must pin the
+            // union or every frozen install rejects the pair (#985). When
+            // that cannot be read, the plain exact pin still installs
+            // unfrozen; say so.
+            let requirement = gemfile
+                .as_deref()
+                .map(|gf| {
+                    crate::formats::gem::gemspec::locked_exact_requirement(
+                        gf,
+                        lk,
+                        &dep.name,
+                        &dep.version,
+                        &mut |dir| crate::formats::gem::gemspec::candidate_listing(files, dir),
+                    )
+                })
+                .unwrap_or_else(|| Ok(format!("= {}", dep.version)))
+                .unwrap_or_else(|why| {
+                    if checksums_era {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_gem_gemspec_dependency_unreadable".into(),
+                            detail: format!(
+                                "{lock_name} pins {name} (= {version})!, but bundler 2.7+ merges \
+                                 a gemspec development dependency on {name} into that \
+                                 requirement and {why}; if the gemspec declares one, \
+                                 frozen/deployment installs reject the pair — run `bundle \
+                                 install` (unfrozen) once to record bundler's requirement in \
+                                 {lock_name}",
+                                name = dep.name,
+                                version = dep.version,
+                            ),
+                        });
+                    }
+                    format!("= {}", dep.version)
+                });
+            let converged = checksums_era
+                && converge_gem_lock_source(
                     lk,
                     dep,
                     &ov.index_url,
                     lock_name,
+                    &requirement,
                     &mut lock_changed,
                     result,
-                )
-            {
+                );
+            let merged_refreshed = !converged
+                && prior_block_url.as_deref().is_some_and(|prior| {
+                    refresh_merged_gem_lock_remote(
+                        lk,
+                        dep,
+                        prior,
+                        &ov.index_url,
+                        lock_name,
+                        &mut lock_changed,
+                        result,
+                    )
+                });
+            let frozen_installable = converged || (merged_refreshed && bundled_before_2_2(lk));
+            if !frozen_installable {
                 mixed_state = true;
             }
         }
@@ -7741,7 +8131,8 @@ fn rewrite_gem(
     // section still records the upstream source, so `bundle install` with
     // `frozen`/`--deployment` set rejects the Gemfile's new source block.
     // Mirror of the CLI's pnpm trust-lockfile warning. A converged pair (the
-    // CHECKSUMS-era path) is frozen-installable as written — no caveat.
+    // CHECKSUMS-era path, or a bundler < 2.2 merged section refreshed in
+    // place) is frozen-installable as written — no caveat.
     if (gemfile_changed || lock_changed) && mixed_state {
         result.warnings.push(RewriteWarning {
             code: "redirect_gem_frozen_install".into(),
@@ -12315,9 +12706,16 @@ mod tests {
             OuterYarnMirror {
                 yarn: env("YARN_YARN_OFFLINE_MIRROR"),
                 npm: env("YARN_YARN_OFFLINE_MIRROR"),
+                ..Default::default()
             },
             OuterYarnMirror {
                 npm: env("npm_config_yarn_offline_mirror"),
+                ..Default::default()
+            },
+            // #1115: a mirror only an install run from a workspace member
+            // uses.
+            OuterYarnMirror {
+                member: Some(setting("/w/root/packages/a/.yarnrc")),
                 ..Default::default()
             },
         ];
@@ -12371,6 +12769,15 @@ mod tests {
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.files["yarn.lock"].contains("left-pad-1.3.0.tgz"));
+        // ...but not a member's mirror (#1115): an install run from that
+        // member never reads the root's `.yarnrc` as its project file.
+        assert!(preflight_yarn_classic_hosted(
+            &files["yarn.lock"],
+            files.get(YARNRC_REL).map(String::as_str),
+            None,
+            refusing.last().unwrap(),
+        )
+        .is_err());
         // The full chain drives it too.
         let mut r = rewrite_registry_redirect_withholding_vlt(
             &BTreeMap::from([("yarn.lock".to_string(), classic_lock_two_entries())]),
@@ -13818,6 +14225,81 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
+    /// REGRESSION (#1019): a `bun patch` made after a hosted rewire is keyed
+    /// by the hosted URL the package resolves to (Bun 1.4). A re-run that
+    /// picks up a superseding patch would move the entry to a new URL and
+    /// orphan that key, silently dropping the user's patch, so the entry
+    /// keeps its current URL and the run says why. Scoped packages too,
+    /// whose URL holds an `@` of its own.
+    #[test]
+    fn bun_lock_patch_keyed_by_hosted_url_survives_superseding_rerun() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        for (key, name, namespace, old_url) in [
+            (
+                "left-pad",
+                "left-pad",
+                None,
+                "https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/old/left-pad-1.3.0.tgz",
+            ),
+            (
+                "@s/left-pad",
+                "left-pad",
+                Some("@s"),
+                "https://patch.socket.dev/patch/npm/@s/left-pad/1.3.0/tok/old/left-pad-1.3.0.tgz",
+            ),
+        ] {
+            let new_url = old_url.replace("/old/", "/new/");
+            let mut ovr = npm_override(name, "1.3.0", &new_url, &sha512);
+            ovr.namespace = namespace.map(String::from);
+            let entry = format!("\"{key}\": [\"{key}@{old_url}\", {{}}, \"{sha512}\"],");
+            let manifest = format!(
+                r#"{{"name":"app","dependencies":{{"{key}":"1.3.0"}},"patchedDependencies":{{"{key}@{old_url}":"patches/x.patch"}}}}"#
+            );
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(&entry, 1));
+            files.insert("package.json".to_string(), manifest);
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.edits.is_empty(), "{key}: {:?}", r.edits);
+            assert!(
+                r.files
+                    .get("bun.lock")
+                    .is_none_or(|out| !out.contains(&new_url)),
+                "{key}: the entry keeps its current URL"
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_bun_patched_dependency_skipped"],
+                "{key}: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.warnings[0]
+                    .detail
+                    .contains(&format!("resolves to {old_url}")),
+                "{}",
+                r.warnings[0].detail
+            );
+            assert!(r.bundled_skipped_uuids.contains(&ovr.patch_uuid));
+
+            // An in-sync re-run (the keyed URL is the pin's own) moves
+            // nothing, so it neither skips nor warns.
+            let in_sync = npm_override(name, "1.3.0", old_url, &sha512);
+            let mut in_sync = DepOverride {
+                namespace: namespace.map(String::from),
+                ..in_sync
+            };
+            in_sync.patch_uuid = ovr.patch_uuid.clone();
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&in_sync), &mut r);
+            assert!(r.warnings.is_empty(), "{key}: {:?}", r.warnings);
+            assert!(
+                !r.bundled_skipped_uuids.contains(&in_sync.patch_uuid),
+                "{key}"
+            );
+        }
+    }
+
     /// REGRESSION (#371): from Bun 1.3.5 on, Bun's default trusted list
     /// (better-sqlite3, esbuild, sharp, simple-git-hooks, …) applies only to
     /// packages resolved from the npm registry, so a default-trusted package
@@ -14351,6 +14833,14 @@ mod tests {
             (
                 "renamed inline table",
                 "[dependencies]\nlegacy = { package = \"serde\", version = \"1.0.190\" }\n",
+            ),
+            (
+                "multi-line inline table (#757)",
+                "[dependencies]\nserde = { version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+            ),
+            (
+                "renamed multi-line inline table (#757)",
+                "[dependencies]\nlegacy = { package = \"serde\", features = [\n  \"derive\",\n], version = \"1.0.190\" }\n",
             ),
             (
                 "table form",
@@ -15080,6 +15570,28 @@ mod tests {
             .iter()
             .any(|w| w.code == "redirect_cargo_toml_dep_not_found"));
         assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// #757: an earlier hosted pin on a multi-line inline table moves to the
+    /// new registry in place, in the spelling restore unpins.
+    #[test]
+    fn cargo_supersede_replaces_previous_multiline_pin() {
+        const OLD_UUID: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+        let old_reg = format!("socket-patch-{OLD_UUID}");
+        let manifest = format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde = {{ registry = \"{old_reg}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n"
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("manifest re-pinned");
+        assert!(
+            toml.ends_with(&format!(
+                "serde = {{ registry = \"{}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
     }
 
     /// A re-scan that selects a NEWER patch uuid over an existing redirect
@@ -17736,6 +18248,82 @@ mod tests {
             ))),
             "pre-edit CHECKSUMS line captured for revert"
         );
+    }
+
+    /// #985: on bundler 2.7+ a `gemspec` development dependency on the gem
+    /// merges into the redirected `gem` line that follows the directive, so
+    /// the DEPENDENCIES pin carries the union (`>= 0, = 7.0.0`) bundler
+    /// writes; a bare `(= 7.0.0)!` fails every frozen install. Bundler
+    /// 2.6, a `gem` line before the directive, and an unreadable gemspec
+    /// keep the exact pin (the last one with a warning).
+    #[test]
+    fn gem_pin_carries_the_gemspec_dev_dependency_bundler_merges() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngemspec\n\ngroup :development do\n  \
+                       gem \"rails\"\nend\n";
+        let gemspec = "Gem::Specification.new do |s|\n  s.name = \"mylib\"\n  \
+                       s.add_development_dependency \"rails\", \">= 6\"\nend\n";
+        let listing = serde_json::json!({ "": { "mylib.gemspec": gemspec } }).to_string();
+        let lock = |bundler: &str| {
+            gem_lock(&format!("  rails (7.0.0) sha256={}", "2".repeat(64)))
+                .replace("rails (= 7.0.0)", "rails (>= 6)")
+                .replace("2.6.2", bundler)
+        };
+        let pin = |files: &BTreeMap<String, String>| {
+            let r = rewrite_registry_redirect(files, &[gem_override("rails", "7.0.0")]);
+            let lock = r.files.get("Gemfile.lock").expect("lock rewritten").clone();
+            let pin = lock
+                .lines()
+                .skip_while(|l| *l != "DEPENDENCIES")
+                .nth(1)
+                .unwrap()
+                .to_string();
+            (
+                pin,
+                warning_codes(&r)
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut files = BTreeMap::new();
+        files.insert("Gemfile".to_string(), gemfile.to_string());
+        files.insert("Gemfile.lock".to_string(), lock("2.7.2"));
+        files.insert(
+            crate::formats::gem::gemspec::GEMSPECS_KEY.to_string(),
+            listing.clone(),
+        );
+        let (merged, warnings) = pin(&files);
+        assert_eq!(merged, "  rails (>= 6, = 7.0.0)!");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Bundler 4 merges too.
+        files.insert("Gemfile.lock".to_string(), lock("4.0.22"));
+        assert_eq!(pin(&files).0, "  rails (>= 6, = 7.0.0)!");
+        // Re-running over the converged pair changes nothing.
+        let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+        let mut again = files.clone();
+        again.extend(r.files.clone());
+        let r2 = rewrite_registry_redirect(&again, &[gem_override("rails", "7.0.0")]);
+        assert!(r2.edits.is_empty(), "{:?}", r2.edits);
+
+        // Bundler 2.6 never merges.
+        files.insert("Gemfile.lock".to_string(), lock("2.6.9"));
+        assert_eq!(pin(&files).0, "  rails (= 7.0.0)!");
+        // A `gem` line before the directive keeps its own requirement.
+        files.insert("Gemfile.lock".to_string(), lock("2.7.2"));
+        files.insert(
+            "Gemfile".to_string(),
+            "source \"https://rubygems.org\"\n\ngem \"rails\"\ngemspec\n".to_string(),
+        );
+        assert_eq!(pin(&files).0, "  rails (= 7.0.0)!");
+        // The gemspec cannot be read: the exact pin, and a warning.
+        files.insert("Gemfile".to_string(), gemfile.to_string());
+        files.insert(
+            crate::formats::gem::gemspec::GEMSPECS_KEY.to_string(),
+            serde_json::json!({ "": { "mylib.gemspec": null } }).to_string(),
+        );
+        let (exact, warnings) = pin(&files);
+        assert_eq!(exact, "  rails (= 7.0.0)!");
+        assert_eq!(warnings, ["redirect_gem_gemspec_dependency_unreadable"]);
     }
 
     /// CHECKSUMS-era locks (bundler >= 4 writes the section by default) must
@@ -23607,6 +24195,141 @@ packages:
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
+    /// #757: an inline table whose array value wraps lines (rustfmt's style
+    /// for a long feature list) is valid TOML 1.0 and is pinned on its
+    /// opening line, for LF and CRLF manifests, a comment inside the array,
+    /// and a rename.
+    #[test]
+    fn cargo_multiline_inline_table_is_pinned_on_its_opening_line() {
+        let reg = cargo_reg();
+        for (entry, want) in [
+            (
+                "serde = { version = \"1.0.190\", features = [\n    \"derive\",\n] }\n",
+                format!(
+                    "serde = {{ registry = \"{reg}\", version = \"1.0.190\", features = [\n    \"derive\",\n] }}\n"
+                ),
+            ),
+            (
+                "serde = { version = \"1.0.190\", features = [ # wrapped\n  \"derive\", # derive\n  \"rc\",\n], default-features = false } # tail\n",
+                format!(
+                    "serde = {{ registry = \"{reg}\", version = \"1.0.190\", features = [ # wrapped\n  \"derive\", # derive\n  \"rc\",\n], default-features = false }} # tail\n"
+                ),
+            ),
+            (
+                "legacy = { package = \"serde\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+                format!(
+                    "legacy = {{ registry = \"{reg}\", package = \"serde\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n"
+                ),
+            ),
+        ] {
+            for crlf in [false, true] {
+                let eol = |s: &str| if crlf { s.replace('\n', "\r\n") } else { s.to_string() };
+                let manifest = eol(&format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n{entry}"
+                ));
+                let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+                assert!(r.warnings.is_empty(), "[{entry:?} crlf={crlf}] {:?}", r.warnings);
+                let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+                assert!(
+                    toml.ends_with(&eol(&want)),
+                    "[{entry:?} crlf={crlf}] pinned on the opening line: {toml}"
+                );
+                let doc: toml_edit::DocumentMut = toml.parse().expect("still valid TOML");
+                let dep = doc["dependencies"].as_table().unwrap().iter().next().unwrap().1;
+                assert_eq!(dep["registry"].as_str(), Some(reg.as_str()));
+                assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+            }
+        }
+    }
+
+    /// #757: a multi-line inline table is classified by its whole text, so a
+    /// `workspace = true`, `path` or other-registry key on a later line is
+    /// seen, and another crate's wrapped table is not mistaken for this one.
+    #[test]
+    fn cargo_multiline_inline_table_is_classified_by_its_whole_text() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n";
+        // Path dependency: the path key sits after the wrapped array.
+        let path = format!(
+            "{head}serde = {{ version = \"1.0.190\", features = [\n  \"derive\",\n], path = \"../serde\" }}\n"
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&path), &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "path dep must write nothing: {:?}",
+            r.files
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        // Another crate's multi-line table, renamed away from serde, is
+        // skipped and the real serde line is pinned.
+        let other = format!(
+            "{head}serde = {{ package = \"serde_json\", version = \"1\", features = [\n  \"std\",\n] }}\n\
+             real = {{ package = \"serde\", version = \"1.0.190\" }}\n"
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&other), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("rewritten");
+        assert!(
+            toml.contains("serde = { package = \"serde_json\", version = \"1\", features = [\n"),
+            "the renamed-away table is untouched: {toml}"
+        );
+        assert!(toml.contains(&format!(
+            "real = {{ package = \"serde\", version = \"1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        )));
+        // Keys and braces named only in comments are not the table's.
+        for entry in [
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\", # path = \"../x\"\n] }\n",
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\", # workspace = true\n] }\n",
+            "serde = { version = \"1.0.190\", features = [ # {x}\n  \"derive\",\n] }\n",
+            "serde = { version = \"1.0.190\", features = [\"a}\", \"\"\"q\"\"\"\"\", \n  \"derive\",\n] }\n",
+        ] {
+            let manifest = format!("{head}{entry}");
+            let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "[{entry:?}] {:?}", r.warnings);
+            let toml = r.files.get("Cargo.toml").expect("rewritten");
+            assert!(
+                toml.contains(&format!("serde = {{ registry = \"{}\", version", cargo_reg())),
+                "[{entry:?}] pinned on the opening line: {toml}"
+            );
+        }
+        // An explicit `registry = "crates-io"` (#386) anywhere in the
+        // wrapped table is dropped and the pin lands on the opening line.
+        for entry in [
+            "serde = { registry = \"crates-io\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+            "serde = { version = \"1.0.190\", registry = \"crates-io\", features = [\n  \"derive\",\n] }\n",
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\",\n], registry = \"crates-io\" }\n",
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\",\n], registry = 'crates-io' }\n",
+            "serde = { \"registry\" = \"crates-io\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+        ] {
+            let manifest = format!("{head}{entry}");
+            let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "[{entry:?}] {:?}", r.warnings);
+            let toml = r.files.get("Cargo.toml").expect("rewritten");
+            assert!(
+                toml.ends_with(&format!(
+                    "serde = {{ registry = \"{}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n",
+                    cargo_reg()
+                )),
+                "[{entry:?}] crates-io dropped, pinned on the opening line: {toml}"
+            );
+        }
+        // Already pinned (the planner's own output): nothing to write.
+        let pinned = format!(
+            "{head}serde = {{ registry = \"{}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n",
+            cargo_reg()
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&pinned), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(
+            r.files.get("Cargo.toml").is_none_or(|t| t == &pinned),
+            "an already-pinned manifest is left as is: {:?}",
+            r.files.get("Cargo.toml")
+        );
+    }
+
     /// Cargo.lock blocks missing their `checksum` (a `[patch]`-resolved or
     /// git-sourced entry) or missing BOTH `source` and `checksum` are rebuilt
     /// with the lines inserted in canonical order, and the neighbor blocks
@@ -26236,6 +26959,194 @@ mod python_lock_warning_tests {
             "{codes:?}"
         );
     }
+
+    /// #1603: a PEP 751 lock is installed with `uv pip`, which installs a
+    /// package only from an sdist under a `uv pip compile --no-binary` flag
+    /// naming it (or `:all:`) or a `no-binary` setting covering it in the
+    /// root's settings. The patched wheel is refused before writing.
+    #[test]
+    fn pylock_no_binary_refuses_a_wheel_uv_would_not_install() {
+        let dep = DepOverride {
+            ecosystem: "pypi".into(),
+            name: "six".into(),
+            namespace: None,
+            version: "1.16.0".into(),
+            token: "11111111-1111-4111-8111-111111111111".into(),
+            patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
+            artifact_url: "https://patch.socket.dev/six-1.16.0-py2.py3-none-any.whl".into(),
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some("b".repeat(64)),
+                ..Integrity::default()
+            },
+        };
+        let pylock = |flags: &str| {
+            format!(
+                "# This file was autogenerated by uv via the following command:\n\
+                 #    uv pip compile req.in{flags} --format pylock.toml -o pylock.toml\n\
+                 lock-version = \"1.0\"\ncreated-by = \"uv\"\nrequires-python = \">=3.8\"\n\n\
+                 [[packages]]\nname = \"six\"\nversion = \"1.16.0\"\n\
+                 sdist = {{ url = \"https://files.pythonhosted.org/packages/71/six-1.16.0.tar.gz\", \
+                 size = 34041, hashes = {{ sha256 = \"{}\" }} }}\n",
+                "a".repeat(64)
+            )
+        };
+        let run = |flags: &str, extra: &[(&str, &str)]| {
+            let mut files = BTreeMap::from([("pylock.toml".to_string(), pylock(flags))]);
+            for (rel, text) in extra {
+                files.insert(rel.to_string(), text.to_string());
+            }
+            rewrite_registry_redirect(&files, std::slice::from_ref(&dep))
+        };
+        let refusals: &[(&str, &[(&str, &str)])] = &[
+            (" --no-binary six", &[]),
+            (" --no-binary=Six", &[]),
+            (" --no-binary idna,six", &[]),
+            (" --no-binary :all:", &[]),
+            ("", &[("uv.toml", "[pip]\nno-binary = [\"six\"]\n")]),
+            ("", &[("uv.toml", "no-binary = true\n")]),
+            ("", &[("uv.toml", "no-binary-package = [\"six\"]\n")]),
+            // The top level and [pip] add up (uv 0.11).
+            (
+                "",
+                &[(
+                    "uv.toml",
+                    "no-binary-package = [\"six\"]\n[pip]\nno-binary = [\"idna\"]\n",
+                )],
+            ),
+            (
+                "",
+                &[(
+                    "pyproject.toml",
+                    "[project]\nname = \"p\"\nversion = \"0\"\n[tool.uv.pip]\nno-binary = [\"six\"]\n",
+                )],
+            ),
+            // uv takes the settings from above a root that sets none.
+            (
+                "",
+                &[(UV_ANCESTOR_CONFIG_KEY, "../uv.toml\n[pip]\nno-binary = [\"six\"]\n")],
+            ),
+            (
+                "",
+                &[(
+                    UV_ANCESTOR_CONFIG_KEY,
+                    "../pyproject.toml\n[tool.uv]\nno-binary-package = [\"six\"]\n",
+                )],
+            ),
+            // `:none:` clears only the values before it.
+            (" --no-binary :none: --no-binary six", &[]),
+            ("", &[("uv.toml", "[pip]\nno-binary = [\":none:\", \"six\"]\n")]),
+            // `uv pip sync` reads the settings `uv pip compile --no-config`
+            // passed over.
+            (" --no-config", &[("uv.toml", "no-binary = true\n")]),
+        ];
+        for (flags, extra) in refusals {
+            let result = run(flags, extra);
+            assert!(
+                result.files.is_empty(),
+                "{flags:?} {extra:?}: {:?}",
+                result.files
+            );
+            assert!(
+                result.refused_python_lock_uuids.contains(&dep.patch_uuid),
+                "{flags:?} {extra:?}"
+            );
+            let warning = result
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_uv_lock_unsupported")
+                .unwrap_or_else(|| panic!("{flags:?} {extra:?}: {:?}", result.warnings));
+            assert!(
+                warning.detail.starts_with("pylock.toml: "),
+                "{}",
+                warning.detail
+            );
+            assert!(
+                warning.detail.contains("installs six only from an sdist"),
+                "{}",
+                warning.detail
+            );
+        }
+        // Another package's flag or setting, no-build, a list turned off by
+        // no-binary = false, `:none:` after `:all:`, and a uv.toml replacing
+        // pyproject's settings leave the wheel installable.
+        let wired: &[(&str, &[(&str, &str)])] = &[
+            ("", &[]),
+            (" --no-binary idna", &[]),
+            (" --no-build", &[]),
+            ("", &[("uv.toml", "[pip]\nno-binary = [\"idna\"]\n")]),
+            (
+                "",
+                &[(
+                    "uv.toml",
+                    "no-binary = false\nno-binary-package = [\"six\"]\n",
+                )],
+            ),
+            (
+                "",
+                &[
+                    ("uv.toml", "offline = false\n"),
+                    (
+                        "pyproject.toml",
+                        "[project]\nname = \"p\"\nversion = \"0\"\n[tool.uv]\nno-binary = true\n",
+                    ),
+                ],
+            ),
+            (" --no-binary :all: --no-binary :none:", &[]),
+            (
+                "",
+                &[("uv.toml", "[pip]\nno-binary = [\":all:\", \":none:\"]\n")],
+            ),
+            // The root's own settings stop the lookup above it.
+            (
+                "",
+                &[
+                    ("uv.toml", "offline = false\n"),
+                    (UV_ANCESTOR_CONFIG_KEY, "../uv.toml\nno-binary = true\n"),
+                ],
+            ),
+        ];
+        for (flags, extra) in wired {
+            let result = run(flags, extra);
+            assert!(
+                result.files.contains_key("pylock.toml"),
+                "{flags:?} {extra:?}: {:?}",
+                result.warnings
+            );
+            assert!(
+                result.confirmed_python_lock_uuids.contains(&dep.patch_uuid),
+                "{flags:?} {extra:?}"
+            );
+        }
+        // Pipenv installs a pylock beside a Pipfile and reads no uv
+        // setting: its own refusal is the one that applies.
+        let result = run(
+            " --no-binary six",
+            &[("Pipfile", "[packages]\nsix = \"==1.16.0\"\n")],
+        );
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            ["redirect_pipenv_pylock_unsupported"],
+            "{:?}",
+            result.warnings
+        );
+        // Another installer's lock reads no uv setting.
+        let mut files = BTreeMap::from([(
+            "pylock.toml".to_string(),
+            pylock(" --no-binary six").replace("created-by = \"uv\"", "created-by = \"pdm\""),
+        )]);
+        files.insert("uv.toml".into(), "no-binary = true\n".into());
+        let result = rewrite_registry_redirect(&files, std::slice::from_ref(&dep));
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.detail.contains("only from an sdist")),
+            "{:?}",
+            result.warnings
+        );
+    }
 }
 
 /// Which metadata file `plan_python_metadata` pairs a native Python lock
@@ -26792,6 +27703,32 @@ mod hatch_tests {
         let result = rewrite_registry_redirect(&files, &[patch()]);
         assert!(!result.files.contains_key("pyproject.toml"));
         assert!(result.confirmed_hatch_uuids.is_empty());
+    }
+
+    /// #673: Hatch's uv installer applies `[tool.uv.sources]` over the
+    /// hosted reference, so the dep stays unconfirmed (nothing written)
+    /// instead of reporting a redirect that installs the unpatched copy.
+    #[test]
+    fn hatch_uv_source_leaves_the_dep_unconfirmed() {
+        let files: BTreeMap<String, String> = [(
+            "pyproject.toml".to_string(),
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"urllib3==1.26.18\"]\n\n[tool.hatch.envs.default]\ninstaller = \"uv\"\n\n[tool.uv.sources]\nurllib3 = { url = \"https://files.test/urllib3-1.26.18-py2.py3-none-any.whl\" }\n".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        assert!(result.hatch_uuids.contains("test-uuid"));
+        assert!(result.confirmed_hatch_uuids.is_empty());
+        assert!(!result.files.contains_key("pyproject.toml"));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_hatch_unsupported"
+                    && w.detail.contains("[tool.uv.sources]")),
+            "{:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -27837,6 +28774,146 @@ mod uv_old_release_advisories {
             vec!["redirect_uv_override_requires_uv_0_5_6"],
             "{:?}",
             result.warnings
+        );
+    }
+}
+
+/// #639: a PEP 621 `dynamic = ["dependencies"]` project gets its dependency
+/// list from the build backend, so pyproject.toml declares nothing uv's
+/// root `requires-dist` can be restored from. Hosted mode must refuse to
+/// repoint such an entry rather than write wiring that rollback, remove
+/// and the vendored takeover can never undo.
+#[cfg(test)]
+mod uv_dynamic_dependencies {
+    use super::*;
+
+    const URL: &str = "https://patch.test/six-1.16.0-py2.py3-none-any.whl";
+    const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+    const ISODATE: &str = "[[package]]\nname = \"isodate\"\nversion = \"0.6.1\"\nsource = { registry = \"https://pypi.org/simple\" }\ndependencies = [{ name = \"six\" }]\nwheels = [{ url = \"https://files.pythonhosted.org/packages/isodate-0.6.1-py2.py3-none-any.whl\", hash = \"sha256:0751eece944162659049d35f4f549ed815792b38793f07cf73381c1c87cbed96\" }]\n";
+
+    fn six() -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: "six".into(),
+            namespace: None,
+            version: "1.16.0".into(),
+            token: String::new(),
+            patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact_url: URL.into(),
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some("c".repeat(64)),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The issue's setuptools project: `dynamic` names `dynamic_fields`,
+    /// and the backend reads the list from requirements.in.
+    fn project(dynamic_fields: &str) -> String {
+        format!(
+            "[project]\nname = \"app\"\nversion = \"1.0.0\"\nrequires-python = \">=3.8\"\ndynamic = [{dynamic_fields}]\n\n[build-system]\nrequires = [\"setuptools>=61\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[tool.setuptools.dynamic]\ndependencies = {{ file = [\"requirements.in\"] }}\n"
+        )
+    }
+
+    fn lock(app_deps: &str, requires: &str, packages: &[&str]) -> String {
+        format!(
+            "version = 1\nrevision = 3\nrequires-python = \">=3.8\"\n\n[[package]]\nname = \"app\"\nversion = \"1.0.0\"\nsource = {{ editable = \".\" }}\ndependencies = [{app_deps}]\n\n[package.metadata]\nrequires-dist = [{requires}]\n\n{}",
+            packages.join("\n")
+        )
+    }
+
+    fn files(pyproject: String, uv_lock: String) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("pyproject.toml".to_string(), pyproject),
+            ("uv.lock".to_string(), uv_lock),
+        ])
+    }
+
+    /// The backend-supplied `six==1.16.0` is refused for every newline
+    /// style, for a dynamic optional-dependencies extra, and when a static
+    /// dependency group also names six (restore matches `requires-dist`
+    /// only against `[project]` declarations): nothing is written, and the
+    /// warning names the dynamic declaration.
+    #[test]
+    fn backend_declared_dependency_is_refused_before_writing() {
+        let six_dist = "{ name = \"six\", specifier = \"==1.16.0\" }";
+        let cases = [
+            (project("\"dependencies\""), six_dist),
+            (
+                project("\"optional-dependencies\""),
+                "{ name = \"six\", marker = \"extra == 'compat'\", specifier = \"==1.16.0\" }",
+            ),
+            (
+                project("\"dependencies\"") + "\n[dependency-groups]\ntest = [\"six\"]\n",
+                six_dist,
+            ),
+        ];
+        for (pyproject, requires) in cases {
+            let dynamic = &pyproject;
+            for newline in ["\n", "\r\n"] {
+                let input = files(
+                    pyproject.replace('\n', newline),
+                    lock("{ name = \"six\" }", requires, &[SIX]).replace('\n', newline),
+                );
+                let result = rewrite_registry_redirect(&input, &[six()]);
+                assert!(
+                    result.files.is_empty(),
+                    "{dynamic}: wrote {:?}",
+                    result.files.keys()
+                );
+                assert!(
+                    result.refused_python_lock_uuids.contains(&six().patch_uuid)
+                        && !result
+                            .confirmed_python_lock_uuids
+                            .contains(&six().patch_uuid),
+                    "{dynamic}: {:?}",
+                    result.warnings
+                );
+                let warning = result
+                    .warnings
+                    .iter()
+                    .find(|w| w.code == "redirect_uv_metadata_unsupported")
+                    .unwrap_or_else(|| panic!("{dynamic}: {:?}", result.warnings));
+                assert!(
+                    warning.detail.contains("six") && warning.detail.contains("dynamic"),
+                    "{}",
+                    warning.detail
+                );
+            }
+        }
+    }
+
+    /// A package the backend's list only pulls in transitively is not in
+    /// the root `requires-dist`, so its override wiring stays restorable
+    /// and the dynamic project is still hosted-patched.
+    #[test]
+    fn transitive_dependency_of_a_dynamic_project_is_still_wired() {
+        let input = files(
+            project("\"dependencies\""),
+            lock(
+                "{ name = \"isodate\" }",
+                "{ name = \"isodate\", specifier = \"==0.6.1\" }",
+                &[ISODATE, SIX],
+            ),
+        );
+        let result = rewrite_registry_redirect(&input, &[six()]);
+        assert!(
+            result
+                .confirmed_python_lock_uuids
+                .contains(&six().patch_uuid),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            result.files["pyproject.toml"].contains("override-dependencies"),
+            "{}",
+            result.files["pyproject.toml"]
+        );
+        assert!(
+            result.files["uv.lock"].contains(URL),
+            "{}",
+            result.files["uv.lock"]
         );
     }
 }

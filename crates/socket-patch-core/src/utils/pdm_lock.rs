@@ -23,6 +23,14 @@ pub fn lock_version(lock: &Table) -> Result<&str, String> {
     }
 }
 
+/// Whether the PDM release that writes `lock_version` keeps a release
+/// already installed at the same version on `pdm sync` / `pdm install`:
+/// PDM before 2.11 (lock_version `2` / `4.3` / `4.4`; measured on 1.4.5,
+/// 2.8.2, 2.9.3 and 2.10.4, while 2.11+ reinstall).
+pub fn keeps_installed_release(lock_version: &str) -> bool {
+    matches!(lock_version, "2" | "4.3" | "4.4")
+}
+
 pub fn validate_strategy(lock: &Table) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let Some(metadata) = lock.get("metadata") else {

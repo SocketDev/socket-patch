@@ -2077,6 +2077,14 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             "drifted fragment + unknown kind: {:?}",
             outcome.warnings
         );
+        // The ledger key reads as recorded, never as `Some("…")` (#1608).
+        assert!(
+            outcome.warnings.iter().any(|w| w
+                .detail
+                .contains("poetry.lock fragment for six changed since vendoring")),
+            "{:?}",
+            outcome.warnings
+        );
         assert_eq!(
             read_lock(tmp.path()).await,
             drifted,

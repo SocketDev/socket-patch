@@ -65,6 +65,10 @@ pub(crate) struct LockedPackage {
     /// The `dependencies` references as spelled (`"name"`, `"name
     /// version"`, `"name version (source)"`; see [`parse_ref`]).
     pub(crate) dependencies: Vec<String>,
+    /// The `replace` package id (`"name version (source)"`) cargo writes on
+    /// an entry a `[replace]` override swaps out: the entry keeps its own
+    /// `source`, but cargo builds the named replacement instead.
+    pub(crate) replace: Option<String>,
 }
 
 impl LockedPackage {
@@ -141,6 +145,7 @@ fn read_packages(root: &Table, spanned: bool) -> Vec<(LockedPackage, Option<Pack
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let replace = t.get("replace").and_then(Item::as_str).map(str::to_string);
                     let spans = if spanned { package_spans(t) } else { None };
                     Some((
                         LockedPackage {
@@ -149,6 +154,7 @@ fn read_packages(root: &Table, spanned: bool) -> Vec<(LockedPackage, Option<Pack
                             source,
                             checksum,
                             dependencies,
+                            replace,
                         },
                         spans,
                     ))

@@ -26,6 +26,8 @@
     ],
     "redirect_vlt_custom_registry_skipped": [
       "scan_redirect_vlt_foreign_instance_vex_not_attested",
+      "scan_redirect_vlt_foreign_only_instance_points_to_agent_mode",
+      "a_foreign_only_package_points_to_agent_mode_alone",
       "vlt_pinned_matrix_hosted_named_alias_untouched",
       "vlt_pinned_matrix_hosted_scoped_registry_untouched",
       "vlt_pinned_matrix_hosted_jsr_untouched",

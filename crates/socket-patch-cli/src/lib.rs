@@ -158,9 +158,14 @@ impl Commands {
     /// that does not exist yet stays legal for them.
     pub fn validate_paths(&self) -> Result<(), String> {
         match self {
-            Commands::SelfUpdate(_) | Commands::HostedBundle(_) => Ok(()),
-            Commands::Get(_) | Commands::Scan(_) => self.global_args().validate_paths(true),
-            other => other.global_args().validate_paths(false),
+            Commands::SelfUpdate(_) | Commands::HostedBundle(_) => return Ok(()),
+            Commands::Get(_) | Commands::Scan(_) => self.global_args().validate_paths(true)?,
+            other => other.global_args().validate_paths(false)?,
+        }
+        match self {
+            Commands::Rollback(_) | Commands::Remove(_) | Commands::Repair(_) => Ok(()),
+            Commands::Vendor(args) if args.revert => Ok(()),
+            other => other.global_args().refuse_unloaded_deno_prefix(),
         }
     }
 }

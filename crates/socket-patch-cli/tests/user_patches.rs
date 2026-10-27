@@ -16,6 +16,12 @@ fn write(root: &Path, path: &str, bytes: impl AsRef<[u8]>) {
     std::fs::write(path, bytes).unwrap();
 }
 
+/// Reasons name discovered paths with the platform separator, and JSON
+/// output escapes Windows' `\` as `\\`; compare with `/` throughout.
+fn slashed(text: &str) -> String {
+    text.replace("\\\\", "/").replace('\\', "/")
+}
+
 fn fixture() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "package.json", "{}");
@@ -87,7 +93,8 @@ fn apply_skips_and_vendor_refuses_declared_patches_despite_matching_hashes_or_ge
                     .unwrap_or_else(|| panic!("missing skipped event: {value}"));
                 assert_eq!(skip["errorCode"], "user_patch_conflict");
                 assert_eq!(skip["uuid"], UUID);
-                assert!(skip["reason"].as_str().unwrap().contains(file));
+                let reason = skip["reason"].as_str().unwrap();
+                assert!(slashed(reason).contains(file), "{reason}");
                 assert_eq!(value["summary"]["applied"], 0);
                 assert_eq!(value["summary"]["skipped"], 1);
                 let warning = value["warnings"]
@@ -222,7 +229,10 @@ fn environment_and_read_only_checks_do_not_grant_or_require_consent() {
     assert!(!stdout.contains("user_patch_conflict"), "{stdout}");
     // The drift names the project patch, and the remedy names the consent
     // that clears it: a plain `apply` leaves the package untouched.
-    assert!(stdout.contains("patches/example+1.0.0.patch"), "{stdout}");
+    assert!(
+        slashed(&stdout).contains("patches/example+1.0.0.patch"),
+        "{stdout}"
+    );
     let (code, _, stderr) = run_with_env(tmp.path(), &["apply", "--offline", "--check"], &[]);
     assert_eq!(code, 1, "{stderr}");
     assert!(

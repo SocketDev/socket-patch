@@ -8,11 +8,12 @@
 //! counts, the wet "Rolled back packages:" / "(already original)" report,
 //! the not-installed warning block, `--verbose` per-file details, the
 //! `--preserve-state` closing message, the empty-manifest announce, the
-//! boundary `Error:` lines, the vendored revert / unwire / preview lines,
-//! the drift-keep notice, the hosted restore / preview / refusal lines,
-//! the pre-v5 ledger retire lines, the Bun and vlt reinstall advisories,
-//! the manifest-write failure line (macOS) and the interactive confirm
-//! decline (PTY).
+//! no-manifest, unknown-identifier and boundary `Error:` lines, the
+//! offline and online missing-blob remedies, the vendored revert / unwire /
+//! preview lines, the drift-keep notice, the hosted restore / preview /
+//! refusal lines, the pre-v5 ledger retire lines, the Bun and vlt
+//! reinstall advisories, the manifest-write failure line (macOS) and the
+//! interactive confirm decline (PTY).
 
 use serde_json::{json, Value};
 
@@ -406,6 +407,122 @@ fn blobs_path_as_file_prints_human_error() {
     assert!(
         stderr.contains("Error:"),
         "the human boundary error must print on stderr; stderr=\n{stderr}"
+    );
+}
+
+/// No manifest: the human `Error:` line names it, exit 1. The `--json`
+/// twin pins `manifest_not_found` in `rollback_invariants.rs`.
+#[test]
+fn no_manifest_prints_human_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline"]);
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("Error: Manifest not found"),
+        "stderr=\n{stderr}"
+    );
+}
+
+/// An identifier that matches no manifest entry: the human `Error:` line
+/// names it, exit 1. The `--json` twin pins `patch_not_found` in
+/// `rollback_invariants.rs`.
+#[test]
+fn unknown_identifier_prints_human_error() {
+    let tmp = missing_blob_fixture();
+    let (code, stdout, stderr) = run(
+        tmp.path(),
+        &["rollback", "--offline", "pkg:npm/does-not-exist@9.9.9"],
+    );
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("No patch found matching identifier: pkg:npm/does-not-exist@9.9.9"),
+        "stderr=\n{stderr}"
+    );
+}
+
+/// Purl of the missing-blob fixture below.
+const MISSING_BLOB_PURL: &str = "pkg:npm/__rollback_test__@1.0.0";
+
+/// A project with one installed package whose before-blob is not on disk
+/// (the drifted bytes match neither manifest hash, so the blob is genuinely
+/// needed). Same shape as `rollback_invariants.rs`'s `--json` twins.
+fn missing_blob_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_socket_manifest(
+        tmp.path(),
+        &[manifest_entry(
+            MISSING_BLOB_PURL,
+            "33333333-3333-4333-8333-333333333333",
+            &"0".repeat(64),
+            &"1".repeat(64),
+        )],
+    );
+    install_npm_pkg(
+        tmp.path(),
+        "node_modules",
+        "__rollback_test__",
+        "1.0.0",
+        b"installed-but-drifted\n",
+    );
+    tmp
+}
+
+/// The offline missing-blob bail: stderr explains the gate and the re-run
+/// remedy, and the stdout summary names the failed package with the same
+/// remedy. Neither points at `repair`, which cannot fetch originals (#893).
+/// The `--json` twin pins `missing_blob` in `rollback_invariants.rs`.
+#[test]
+fn offline_missing_blob_prints_gate_and_remedy() {
+    let tmp = missing_blob_fixture();
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline"]);
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("missing and --offline is set"),
+        "stderr must explain the offline gate; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Re-run without --offline"),
+        "stderr must carry the re-run remedy; stderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Failed to roll back:")
+            && stdout.contains(MISSING_BLOB_PURL)
+            && stdout.contains("Re-run without --offline"),
+        "the human summary must name the failed package and the remedy; stdout=\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("repair") && !stderr.contains("repair"),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+}
+
+/// Online twin: the blob download fails (unroutable localhost port), and
+/// the stdout summary names the package with the "patch API is reachable"
+/// remedy, never `repair` (#893).
+#[test]
+fn undownloadable_blob_prints_reachable_remedy() {
+    let tmp = missing_blob_fixture();
+    let (code, stdout, stderr) = run(
+        tmp.path(),
+        &[
+            "rollback",
+            "--api-url",
+            "http://127.0.0.1:1/",
+            "--proxy-url",
+            "http://127.0.0.1:1/",
+        ],
+    );
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stdout.contains("Failed to roll back:")
+            && stdout.contains(MISSING_BLOB_PURL)
+            && stdout.contains("once the patch API is reachable"),
+        "the human summary must name the failed package and the remedy; stdout=\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("repair") && !stderr.contains("repair"),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
     );
 }
 

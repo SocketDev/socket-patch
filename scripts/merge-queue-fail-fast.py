@@ -7,7 +7,7 @@ the entry, and every entry built on top of it, in the queue for the
 ~45 minutes the Gradle e2e legs take, burning macOS and Windows runners
 on a run that could no longer pass.
 
-No CI job sets `continue-on-error`, so one failed or timed-out job means
+No CI job sets a job-level `continue-on-error`, so one failed or timed-out job means
 `ci-ok` will fail. Cancelling the run then changes only *when* it fails:
 `ci-ok` is `if: always()`, so it still runs on the cancelled run, sees the
 failed and cancelled `needs`, and reports failure within seconds, and the

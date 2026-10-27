@@ -42,6 +42,7 @@ pub(super) async fn load(
     let files = read_files(root).await?;
     require_pip_installer()?;
     require_expandable_root(root)?;
+    require_no_raw_workspace(root, &files, name).await?;
     let prefix = format!("{{root:uri}}/.socket/vendor/pypi/{uuid}/");
     let state = super::state::load_state_shared(root)
         .await
@@ -117,6 +118,7 @@ pub(super) async fn preflight(root: &Path, name: &str) -> Result<(), Failure> {
     let files = read_files(root).await?;
     require_pip_installer()?;
     require_expandable_root(root)?;
+    require_no_raw_workspace(root, &files, name).await?;
     hatch::require_pip_installer(&files).map_err(|error| ("pypi_hatch_unsupported", error))?;
     if hatch::has_environment_dependency(&files, name) {
         require_environment_context_support(root).await?;
@@ -132,6 +134,42 @@ fn require_expandable_root(root: &Path) -> Result<(), Failure> {
             "pypi_hatch_unsupported",
             format!(
                 "the project path contains {c:?}, which Hatch's {{root:uri}} does not escape, so vendored references would not install from this checkout; move the checkout to a path without it, or use hosted or agent mode"
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuse `name` in this project's `[project]` dependencies or optional
+/// dependencies when a Hatch workspace lists the project (#505): Hatch
+/// reads a member's static dependencies raw, so the workspace root's
+/// environments would get an unexpanded `{root:uri}` and fail every sync.
+async fn require_no_raw_workspace(
+    root: &Path,
+    files: &BTreeMap<String, String>,
+    name: &str,
+) -> Result<(), Failure> {
+    let Some(pyproject) = files.get(hatch::HATCH_FILES[0]).cloned() else {
+        return Ok(());
+    };
+    let vendored = pyproject.contains("{root:uri}/.socket/vendor/");
+    let (member, owned) = (root.to_path_buf(), name.to_owned());
+    let consumer = crate::utils::fs::run_blocking(move || {
+        crate::utils::hatch_workspace::raw_consumer(&member, &pyproject, &owned)
+    })
+    .await;
+    match consumer {
+        Some(consumer) => Err((
+            "pypi_hatch_unsupported",
+            format!(
+                "this project is a member of the Hatch workspace at {} (environment {:?}), which reads this project's dependencies and optional dependencies, {name} among them, without expanding {{root:uri}}, so a vendored reference would break that workspace's environments; use hosted or agent mode{}",
+                consumer.root.display(),
+                consumer.env,
+                if vendored {
+                    " (undo references an earlier run vendored here with `socket-patch vendor --revert`)"
+                } else {
+                    ""
+                },
             ),
         )),
         None => Ok(()),
@@ -513,6 +551,71 @@ mod tests {
                 .unwrap();
             assert!(load(&root, "one", "1", UUID).await.is_ok(), "{name}");
             assert!(preflight(&root, "one").await.is_ok(), "{name}");
+        }
+    }
+
+    /// #505: `load` and `preflight` refuse, before writing, a `[project]`
+    /// dependency or optional dependency of a member that a Hatch workspace
+    /// in an ancestor pyproject.toml or hatch.toml lists, since Hatch reads
+    /// those raw.
+    #[tokio::test]
+    async fn member_consumed_by_a_hatch_workspace_is_refused() {
+        let member =
+            "[project]\nname = \"lib1\"\nversion = \"0.1.0\"\ndependencies = [\"six==1.16.0\"]\n\
+                      [project.optional-dependencies]\nsec = [\"one==1\"]\n\
+                      [tool.hatch.envs.default]\ndependencies = [\"two==2\"]\n";
+        let root = "[project]\nname = \"app\"\nversion = \"0.1.0\"\n";
+        for (pyproject, hatch, refused) in [
+            (
+                format!("{root}[tool.hatch.envs.default.workspace]\nmembers = [\"libs/*\"]\n"),
+                None,
+                &["six", "one"][..],
+            ),
+            (
+                format!(
+                    "{root}[tool.hatch.envs.default.workspace]\n\
+                     members = [{{ path = \"libs/lib1\", features = [\"sec\"] }}]\n"
+                ),
+                None,
+                &["six", "one"][..],
+            ),
+            (
+                root.to_string(),
+                Some("[envs.default.workspace]\nmembers = [\"libs/lib1\"]\n"),
+                &["six", "one"][..],
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join(".git")).unwrap();
+            std::fs::write(temp.path().join("pyproject.toml"), &pyproject).unwrap();
+            if let Some(hatch) = hatch {
+                std::fs::write(temp.path().join("hatch.toml"), hatch).unwrap();
+            }
+            let dir = temp.path().join("libs/lib1");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("pyproject.toml"), member).unwrap();
+            for name in ["six", "one"] {
+                let load = load(&dir, name, "1", UUID).await.map(|_| ());
+                let preflight = preflight(&dir, name).await;
+                if refused.contains(&name) {
+                    let Err((code, detail)) = load else {
+                        panic!("{pyproject}: {name} must be refused");
+                    };
+                    assert_eq!(code, "pypi_hatch_unsupported");
+                    assert!(
+                        detail.contains("Hatch workspace") && detail.contains("{root:uri}"),
+                        "{detail}"
+                    );
+                    assert_eq!(preflight.map_err(|(code, _)| code), Err(code));
+                } else {
+                    assert!(load.is_ok(), "{pyproject}: {name}: {load:?}");
+                    assert!(preflight.is_ok(), "{pyproject}: {name}");
+                }
+            }
+            assert_eq!(
+                std::fs::read_to_string(dir.join("pyproject.toml")).unwrap(),
+                member
+            );
         }
     }
 

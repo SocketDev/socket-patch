@@ -23,11 +23,17 @@
 //! entitlement looks like. A `forbidden`, `pending_build` or `build_failed`
 //! answer keeps the pin too. If the reference lookup fails (the patch API
 //! is down, say), every pin is kept and the run warns.
+//!
+//! The settled answers are kept ([`WithdrawnSweep::take_references`]): on
+//! a rescan the redirect selects the same uuids the lockfiles pin, and asks
+//! the endpoint only about the ones the sweep has no answer for (#1606,
+//! #1607).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use socket_patch_core::api::client::ApiClient;
+use socket_patch_core::api::types::PackageVendorResult;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::utils::purl_key::PurlKey;
 
@@ -60,9 +66,53 @@ pub(super) struct WithdrawnSweep {
     events: Vec<PatchEvent>,
     /// `(code, detail)` run-level warnings.
     warnings: Vec<(String, String)>,
+    /// The reference endpoint's answers, when the lookup succeeded.
+    references: Option<KnownReferences>,
+}
+
+/// Reference answers the sweep already has, for the redirect to reuse.
+/// Only settled answers are kept: a `pending_build` (or any status this
+/// build does not know) may have changed by the time the redirect runs, and
+/// a uuid the response left out (a 404 chunk answers nothing) is asked
+/// again rather than read as `not_found`.
+#[derive(Debug, Default)]
+pub(crate) struct KnownReferences(HashMap<String, PackageVendorResult>);
+
+impl KnownReferences {
+    /// The settled answers in `results` for the uuids in `asked` (an
+    /// answer the request did not ask for is not trusted).
+    fn settled(asked: &[String], mut results: HashMap<String, PackageVendorResult>) -> Self {
+        results.retain(|uuid, r| {
+            asked.contains(uuid)
+                && matches!(
+                    r.status.as_str(),
+                    "granted" | "reused" | "withdrawn" | "not_found" | "forbidden"
+                )
+        });
+        KnownReferences(results)
+    }
+
+    /// The uuids in `uuids` with no known answer.
+    pub(crate) fn unknown(&self, uuids: &[String]) -> Vec<String> {
+        uuids
+            .iter()
+            .filter(|uuid| !self.0.contains_key(*uuid))
+            .cloned()
+            .collect()
+    }
+
+    /// The known answers, keyed by uuid as the reference fetch returns them.
+    pub(crate) fn into_answers(self) -> HashMap<String, PackageVendorResult> {
+        self.0
+    }
 }
 
 impl WithdrawnSweep {
+    /// The reference answers the sweep fetched, for the redirect to reuse.
+    pub(super) fn take_references(&mut self) -> Option<KnownReferences> {
+        self.references.take()
+    }
+
     /// Fold the outcome into the scan envelope.
     pub(super) fn record_into(self, env: &mut Envelope) {
         for event in self.events {
@@ -140,6 +190,7 @@ pub(super) async fn sweep(
             is_gone(status).then(|| (pin.clone(), status.clone()))
         })
         .collect();
+    out.references = Some(KnownReferences::settled(&uuids, references));
     if gone.is_empty() {
         return out;
     }
@@ -270,5 +321,30 @@ mod tests {
         let pins = vec![pin("pkg:npm/b@2.0.0", "u2")];
         assert!(pins_in_scope(&pins, ["pkg:npm/b@2.0.1"]).is_empty());
         assert!(pins_in_scope(&pins, Vec::<String>::new()).is_empty());
+    }
+
+    #[test]
+    fn only_settled_answers_are_known() {
+        let answer = |status: &str| -> PackageVendorResult {
+            serde_json::from_value(serde_json::json!({ "status": status })).unwrap()
+        };
+        // `left-out`: the response did not answer it (a 404 chunk, say).
+        let uuids = ["granted", "withdrawn", "building", "failed", "left-out"].map(String::from);
+        let known = KnownReferences::settled(
+            &uuids,
+            HashMap::from([
+                ("granted".to_string(), answer("granted")),
+                ("withdrawn".to_string(), answer("withdrawn")),
+                ("building".to_string(), answer("pending_build")),
+                ("failed".to_string(), answer("build_failed")),
+                // Not asked for: dropped.
+                ("unasked".to_string(), answer("granted")),
+            ]),
+        );
+        assert_eq!(known.unknown(&uuids), ["building", "failed", "left-out"]);
+        assert_eq!(known.unknown(&["unasked".to_string()]), ["unasked"]);
+        let mut answers: Vec<_> = known.into_answers().into_keys().collect();
+        answers.sort();
+        assert_eq!(answers, ["granted", "withdrawn"]);
     }
 }

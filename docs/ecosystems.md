@@ -15,7 +15,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
 | npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
-| PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
+| PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; Pipenv 2023.7.9+ exports the vendored wheel without a hash, so `pipenv requirements --hash` output fails pip's hash-checking mode — `pypi_pipenv_hash_export_unsupported`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); needs cargo 1.68+ (sparse registries) — a project whose `rust-version` or `rust-toolchain[.toml]` declares an older cargo is refused (`redirect_cargo_old_cargo`), use `--mode vendored`; direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; a crate the user overrides with `[patch]` (path, git or another registry) is refused too, the override is left alone; a `cargo vendor` or `cargo local-registry` project (crates.io replaced by an on-disk source in the project's, a parent directory's or `$CARGO_HOME`'s `.cargo/config*`) is refused, use agent mode; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
 | RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
@@ -110,7 +110,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   (`redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only`), and `vex`
   omits those patches (`vex_npm_shrinkwrap_only`) while `list`, `rollback` and
   `remove` still manage them; rename the lock to package-lock.json (or commit
-  a copy under that name) and re-run. npm 12 defaults `allow-remote=none` and refuses the
+  a copy under that name) and re-run. A Deno project's `deno install` reads
+  only `deno.lock`, never an npm-family lock, so a hosted or vendored npm pin
+  of a `name@version` that `deno.lock` also locks warns
+  (`redirect_npm_deno_lock` / `vendor_npm_deno_lock`) and `vex` omits it
+  (`vex_deno_lock_copy`); patch Deno installs with `--mode agent` after
+  `deno install`. npm 12 defaults `allow-remote=none` and refuses the
   redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
   `allow-remote=all`, so the hosted run writes it (new file, or one appended
   line; once `rollback` / `remove` / the vendored takeover has restored the last
@@ -169,6 +174,14 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   matching package instance is rewritten; an unsupported instance prevents
   confirming that dependency across the lockfile set. Rollback preserves the
   original resolution fragments.
+  A `file:` directory or tarball dependency on the same `name@version` (a
+  workspace member depending on `file:../../forks/left-pad` beside another
+  member's registry `left-pad@1.3.0`) keeps installing the user's own bytes:
+  no pin or `overrides` entry reaches it. The registry entry is still wired,
+  and the scan names the copy (`redirect_copy_unpatched` in hosted mode,
+  `vendor_copy_unpatched` in vendored mode); `vex` attests nothing for the
+  package while the copy is in the lock. A directory's version is read from
+  its `package.json` (#935).
   A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
   in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
   run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is
@@ -217,6 +230,23 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   upgrading to pnpm >=11. When no pin says which pnpm runs, the file is
   created, and pnpm 9.0–10.4 then need `pnpm add -w <pkg>`. Vendored mode
   follows the same rule for its `overrides:` mirror.
+  **Vendored build approvals (#1597):** pnpm 10.34.2+ and 11.5.3+ match
+  `allowBuilds` / `onlyBuiltDependencies` against the id a package installs
+  as, and a vendored package installs as `name@file:.socket/vendor/npm/…`.
+  A decision keyed by the name (`sp-build`, `sp-build@1.0.0`) would stop
+  applying: pnpm 10 skips the approved script, pnpm 11 and 12 fail every
+  install with `ERR_PNPM_IGNORED_BUILDS`. Vendoring adds the same decision
+  under the vendored key next to the user's entry (`pnpm-workspace.yaml`, or
+  `package.json#pnpm` for pnpm 10), replaces a key an older patch left, and
+  revert removes it. The key is written only when the project's pnpm pins
+  (`packageManager`, `devEngines`, `engines.pnpm`, or the pnpm that last
+  installed `node_modules`) say 10.34.2+ (within 10.x), 11.5.3+ (within 11.x) or
+  12+: pnpm 10.20–10.34.1 and 11.0–11.5.2 refuse such a key (`ERR_PNPM_INVALID_VERSION_UNION`) and still match the name, so
+  nothing is needed there. Without a usable pin, or for a decision the
+  rewriter can't extend (a flow-style value such as
+  `onlyBuiltDependencies: [pkg]`, a non-boolean `allowBuilds` value), the
+  setting is left alone with the `vendor_pnpm_build_approval_lost` warning
+  naming the key to add. Re-run the scan after upgrading pnpm past 10.34.1 or 11.5.2.
   **Reinstall after redirecting:** a successful warm-cache install can retain
   upstream bytes. Use a clean install tree and an empty store; `--force` is not
   a reliable substitute. Run `socket-patch vex` after installation to verify
@@ -248,7 +278,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `<prefix>/etc/yarnrc` / `npmrc`, every ancestor directory's, and the
   `YARN_*` / `npm_config_*` environment variables. A file saved with a UTF-8
   BOM counts too, and `false` in a higher-precedence layer turns the mirror
-  off. Yarn looks mirror tarballs up by
+  off. In a workspace, a mirror that yarn 1 run in a member directory
+  would use is refused the same way, since installs run there read the
+  root's lock. Such a run reads the member's own `.yarnrc` / `.npmrc` as
+  the project files and the root's only as an ancestor's, below the user
+  and global ones, so a root `false` does not turn off a user mirror for
+  it; set `false` in the member too. Yarn looks mirror tarballs up by
   file name, and the hosted tarball has the same name as the upstream one
   already in the mirror, so installs would get the unpatched bytes and fail
   the integrity check. Use `--mode vendored` there; it works with a mirror.
@@ -386,6 +421,14 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   records no package name in the lock and is not detected. When every entry of the package is such a copy (git, `file:` directory,
   non-registry tarball or `link:`), vendoring refuses with `vendor_lock_entry_not_rewritable` naming them,
   since `yarn install` can't help.
+- **yarn classic bundled copies** — yarn 1 unpacks a package's `bundleDependencies`
+  from its tarball into the package's own `node_modules` and `yarn.lock` records
+  nothing about them (#758), so no pin or vendored wiring reaches such a copy. When
+  `yarn.lock` holds a Socket wiring, the installed `node_modules` is read for them:
+  hosted scans name a bundled copy of the patched `name@version` with
+  `redirect_copy_unpatched`, vendored scans with `vendor_bundled_instance_skipped`, and
+  `vex` attests nothing for the package while the copy is installed. A lock-only `vex`
+  (no `node_modules`) can't see the copy.
 - **bun** — text `bun.lock` lockfileVersion 0, 1 or 2: 0 is the `--save-text-lockfile`
   opt-in lock of Bun 1.1.39–1.1.45, 1 the 1.2–1.3 default, 2 the 1.4+ default; all three
   emit one `packages` grammar, so registry entries rewrite identically. Any other or
@@ -482,7 +525,10 @@ moved it to, as recorded in `node_modules/.modules.yaml`), vlt's
 `node_modules/.vlt`, Bun's isolated-linker store `node_modules/.bun`,
 Deno's isolated `nodeModulesDir` store `node_modules/.deno`, and
 `node_modules/.store`, written by npm's `install-strategy=linked` and by
-Yarn 4's pnpm linker (where each entry's `package/` dir is the copy).
+Yarn 4's pnpm linker (where each entry's `package/` dir is the copy), or
+the folder a Yarn `pnpmStoreFolder` setting moved that store to (from the
+nearest `.yarnrc.yml` that sets it, the home `.yarnrc.yml`, or
+`YARN_PNPM_STORE_FOLDER`, while the active linker is `pnpm`).
 pnpm 7–12 keep the entry of a removed or upgraded-away package for a
 while after `pnpm remove` or an upgrade (pnpm 7–11 for up to 7 days, pnpm
 12 until `pnpm prune`). Scans skip such an entry when the current
@@ -526,8 +572,10 @@ vendored and the local source is skipped with `vendor_workspace_member_skipped`)
 Links into a store inside a `node_modules` tree, including a workspace member's link
 into the root `node_modules/.pnpm`, are patched as usual. So are links into
 Yarn's pnpm-linker store relocated outside `node_modules`, but only for an
-active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with
-`pnpmStoreFolder` in the nearest `.yarnrc.yml`), only to the
+active Yarn pnpm install (a `yarn.lock`, and `nodeLinker: pnpm` with a
+`pnpmStoreFolder`, each read from the environment, the nearest
+`.yarnrc.yml` that sets it, or the home `.yarnrc.yml`, as Yarn reads
+them), only to the
 `<store>/<entry>/package` directory of a package Yarn installs as a copy
 (`npm:`, peer-instantiated `virtual:`, a `file:` tarball, `patch:`, a URL or
 git; never `workspace:`, `portal:` or `link:`), and only when that store
@@ -1235,6 +1283,15 @@ crate. `apply` therefore treats a crate that `Cargo.lock` resolves but that is n
 unpacked as not installed, not as a calm lockfile-only skip: a run where no targeted
 patch matched exits 1 and names `cargo fetch` as the remedy.
 
+Agent mode patches only crates that `Cargo.lock` takes from a registry. When the lock
+takes a crate from a path, a git repository, a `[patch]` entry or a `[replace]` entry
+(a registry entry whose `replace` key names the copy cargo builds), cargo never builds
+the registry cache's copy, even if another project left one there. So `apply` doesn't
+patch that copy, and `vex` doesn't attest it (#506). A user-authored `[patch]` or
+`[replace]` entry is reported as `user_patch_conflict`, unless `--allow-patch-conflicts`
+lets apply try it. That case, a git dependency and a `path` dependency are reported as
+`package_not_installed`. A run where no targeted patch matched exits 1.
+
 ## Cargo: vendored wiring in Cargo.toml
 
 Vendored mode (v5+) wires a patched crate with a `[patch.crates-io]` path
@@ -1392,6 +1449,27 @@ lines, so `go mod tidy -diff` stays clean after a patch update.
 
 This requires a free, publicly retrievable patch reference carrying a `goproxy`
 override. CLI support does not imply a patch is published for a particular module.
+
+### Global mode: tools built with `go install`
+
+With `--global` / `--global-prefix` there is no project to redirect, so `apply`
+patches the module cache copy (`$GOMODCACHE/<module>@<version>/`) in place. That
+changes what the next build compiles, and nothing else: a tool installed earlier
+with `go install pkg@version` is a static binary that keeps running the unpatched
+code. After a global apply, socket-patch reads the build info of the binaries in
+`$GOBIN` (else `bin/` of each `GOPATH` entry, default `~/go/bin`, plus
+`<root>/bin` for a cache at `<root>/pkg/mod`) with `go version -m`, and warns
+`go_installed_tool_stale` for each one built from a patched module before it was
+patched, with the command that rebuilds it:
+
+```sh
+go install example.com/tool@v1.0.0   # rebuilds from the patched cache
+```
+
+`vex -g` omits the patch with the same code while such a tool remains. A binary
+copied out of those directories can't be found; rebuild it the same way. While
+the cache copy stays patched, `go mod verify` reports `dir has been modified`
+for it until `rollback -g`.
 
 ### Files go derives from go.mod
 

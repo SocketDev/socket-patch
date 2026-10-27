@@ -35,7 +35,10 @@ use super::common::refuse_symlinked;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
-/// Classification of the target package within the requirements tree.
+/// Classification of the target package within one requirements file read
+/// as the whole requirement set ([`find_pin`], the tests' view of
+/// [`scan_pins`]).
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum PinSearch {
     /// A clean `name==version` pin (no extras). `line_start` / `line_count`
@@ -64,18 +67,66 @@ enum PinSearch {
 /// marker to carry over, and whether the pin carried `--hash` options.
 type PinSpan = (usize, usize, Option<String>, bool);
 
-/// Scan one file for the target package: every clean exact
-/// `canon_name==version` pin, plus whether any occurrence carries extras or
-/// names the package ambiguously.
+/// What one file says about the target package ([`scan_pins`]).
+struct PinScan {
+    /// Every clean exact `canon_name==version` pin.
+    exact: Vec<PinSpan>,
+    /// Some occurrence carries extras.
+    extras: bool,
+    /// Some occurrence names the package ambiguously on its own.
+    range: bool,
+    /// Some occurrence exactly pins a DIFFERENT version on its own
+    /// environment-marker branch; whether that is ambiguous depends on the
+    /// target pins of the whole requirement set ([`marker_split_ok`]).
+    other_branches: bool,
+}
+
+/// Whether the other version's marker branches (if any) in a requirement
+/// set are harmless given its target pins: every target pin must carry a
+/// marker too, and there must be one. That is the shape `uv pip compile --universal` writes when
+/// a package resolves differently per Python (#928), and pip installs
+/// exactly one branch. Only the target branches are rewritten; the other
+/// branch is left alone, as hosted requirements and vendored pylock already
+/// do. Without markers on both sides pip could see both pins at once, so it
+/// stays a refusal.
 ///
-/// An exact pin of a DIFFERENT version is not ambiguous when it sits on its
-/// own environment-marker branch and every target pin does too: that is
-/// the shape `uv pip compile --universal` writes when a package resolves
-/// differently per Python (#928), and pip installs exactly one branch.
-/// Only the target branches are rewritten; the other branch is left alone,
-/// as hosted requirements and vendored pylock already do. Without markers
-/// on both sides pip could see both pins at once, so it stays a refusal.
-fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, bool, bool) {
+/// pip merges the root file and its `-r` includes into one requirement set,
+/// so [`plan_requirements`] asks this once over every file's scan: the two
+/// branches may sit in different files (#1104).
+fn marker_split_ok(scans: &[PinScan]) -> bool {
+    let mut exact = scans.iter().flat_map(|s| s.exact.iter()).peekable();
+    !scans.iter().any(|s| s.other_branches)
+        || (exact.peek().is_some() && exact.all(|(_, _, marker, _)| marker.is_some()))
+}
+
+/// Why one file's pins refuse the vendor, in fail-closed precedence: any
+/// extras occurrence wins over any ambiguous occurrence wins over the other
+/// version's marker branch when the requirement set's target pins do not
+/// all carry a marker (`split_ok` from [`marker_split_ok`]).
+#[derive(Debug, PartialEq, Eq)]
+enum PinRefusal {
+    Extras,
+    NotPinned,
+    UnmarkedSplit,
+}
+
+fn pin_refusal(scan: &PinScan, split_ok: bool) -> Option<PinRefusal> {
+    if scan.extras {
+        Some(PinRefusal::Extras)
+    } else if scan.range {
+        Some(PinRefusal::NotPinned)
+    } else if scan.other_branches && !split_ok {
+        Some(PinRefusal::UnmarkedSplit)
+    } else {
+        None
+    }
+}
+
+/// Scan one file for the target package: every clean exact
+/// `canon_name==version` pin, plus whether any occurrence carries extras,
+/// names the package ambiguously, or pins another version on its own
+/// marker branch ([`marker_split_ok`]).
+fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
     let mut exact: Vec<PinSpan> = Vec::new();
     let mut found_extras = false;
     let mut found_range = false;
@@ -128,10 +179,12 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, b
             found_range = true;
         }
     }
-    if other_branches && (exact.is_empty() || exact.iter().any(|(_, _, m, _)| m.is_none())) {
-        found_range = true;
+    PinScan {
+        exact,
+        extras: found_extras,
+        range: found_range,
+        other_branches,
     }
-    (exact, found_extras, found_range)
 }
 
 /// Whether one requirements file's content names the package at all (any
@@ -143,19 +196,21 @@ pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
     })
 }
 
-/// Find the target pin in one file's content. Precedence is fail-closed:
-/// any extras occurrence wins over any non-pin occurrence wins over a clean
-/// exact pin — a file that names the package ambiguously is never rewritten
-/// (a marker-split other version is not ambiguous; see [`scan_pins`]).
+/// Find the target pin in one file's content, read as the whole
+/// requirement set, through the same [`pin_refusal`] precedence
+/// [`plan_requirements`] applies: a file that names the package ambiguously
+/// is never rewritten (a marker-split other version is not ambiguous; see
+/// [`marker_split_ok`]).
+#[cfg(test)]
 fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
-    let (exact, found_extras, found_range) = scan_pins(content, canon_name, version);
-    if found_extras {
-        return PinSearch::Extras;
+    let scan = scan_pins(content, canon_name, version);
+    let split_ok = marker_split_ok(std::slice::from_ref(&scan));
+    match pin_refusal(&scan, split_ok) {
+        Some(PinRefusal::Extras) => return PinSearch::Extras,
+        Some(PinRefusal::NotPinned | PinRefusal::UnmarkedSplit) => return PinSearch::Range,
+        None => {}
     }
-    if found_range {
-        return PinSearch::Range;
-    }
-    match exact.into_iter().next() {
+    match scan.exact.into_iter().next() {
         Some((line_start, line_count, marker, hashed)) => PinSearch::Exact {
             line_start,
             line_count,
@@ -589,8 +644,8 @@ fn drift_warning(file: &str, rec: &WiringRecord) -> VendorWarning {
     VendorWarning::new(
         "vendor_revert_line_drifted",
         format!(
-            "{file}: the vendor line for {:?} changed since vendoring; left untouched",
-            rec.key
+            "{file}: the vendor line for {} changed since vendoring; left untouched",
+            rec.key_label()
         ),
     )
 }
@@ -709,9 +764,18 @@ async fn plan_requirements(
     let mut planned: Vec<PlannedFile> = Vec::new();
     let mut rewrote_any = false;
 
-    for file in &files {
-        match find_pin(&file.content, canon_name, version) {
-            PinSearch::Extras => {
+    let scans: Vec<PinScan> = files
+        .iter()
+        .map(|f| scan_pins(&f.content, canon_name, version))
+        .collect();
+    // pip reads the root and its includes as one requirement set, so the
+    // other version's marker branch may sit in a different file than the
+    // target's (#1104): decide that over the whole tree.
+    let split_ok = marker_split_ok(&scans);
+
+    for (file, scan) in files.iter().zip(scans) {
+        match pin_refusal(&scan, split_ok) {
+            Some(PinRefusal::Extras) => {
                 return Err((
                     "pypi_extras_unsupported",
                     format!(
@@ -722,7 +786,7 @@ async fn plan_requirements(
                     ),
                 ));
             }
-            PinSearch::Range => {
+            Some(PinRefusal::NotPinned) => {
                 return Err((
                     "pypi_requirement_not_pinned",
                     format!(
@@ -732,8 +796,23 @@ async fn plan_requirements(
                     ),
                 ));
             }
-            PinSearch::Absent => continue,
-            PinSearch::Exact { .. } => {}
+            Some(PinRefusal::UnmarkedSplit) => {
+                return Err((
+                    "pypi_requirement_not_pinned",
+                    format!(
+                        "{}: pins another {canon_name} version on an environment-marker \
+                         branch, but not every =={version} pin in the requirements tree sits \
+                         on a marker branch of its own (or there is none), so pip may install \
+                         either version; pin =={version} on its own marker branch or use agent \
+                         mode (`scan --mode agent` + `socket-patch apply`) instead",
+                        file.rel
+                    ),
+                ));
+            }
+            None => {}
+        }
+        if scan.exact.is_empty() {
+            continue;
         }
         if !file.editable {
             // SECURITY/scope: an include outside the project root cannot be
@@ -752,10 +831,7 @@ async fn plan_requirements(
 
         // Rewrite EVERY exact-pin occurrence in this file, bottom-up so the
         // recorded spans (against the original content) stay valid.
-        let (spans, _, _) = scan_pins(&file.content, canon_name, version);
-        if spans.is_empty() {
-            continue;
-        }
+        let spans = scan.exact;
         let original_lines = split_lines(&file.content);
         let mut lines = original_lines.clone();
         let mut records = Vec::new();
@@ -1042,6 +1118,22 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
     Ok(out)
 }
 
+/// The requirements files a fresh wiring of `canon_name==version` would
+/// write (the dry run's view of [`wire_requirements`]). Empty when the
+/// planner refuses: the wet run reports that refusal instead.
+pub(super) async fn planned_files(
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+    rel_wheel: &str,
+) -> Vec<String> {
+    let placeholder = "0".repeat(64);
+    plan_requirements(root, canon_name, version, rel_wheel, &placeholder)
+        .await
+        .map(|plan| plan.into_iter().map(|file| file.rel).collect())
+        .unwrap_or_default()
+}
+
 /// Every requirements file the vendor planner may have written a pin into:
 /// the root `requirements.txt` plus each IN-ROOT `-r`/`--requirement`
 /// include it reaches (same walk as the planner, so a vendored pin hosted in
@@ -1140,31 +1232,176 @@ async fn walk_requirements_tree<E>(
 /// (`requirements/../x.txt` → `x.txt`; an escape keeps its `../`). The one
 /// include grammar behind the planner's walk and the lock inventory's.
 pub(crate) fn requirements_includes(rel: &str, content: &str) -> Vec<String> {
-    let include_dir = match rel.rfind('/') {
-        Some(i) => &rel[..i],
-        None => "",
-    };
-    logical_lines(content)
-        .iter()
-        .filter_map(|ll| include_target(&ll.text))
-        .map(|target| {
-            let joined = if include_dir.is_empty() {
-                target
-            } else {
-                format!("{include_dir}/{target}")
-            };
-            crate::utils::relpath::normalize_rel_keeping_escapes(&joined)
+    nested_files(rel, content)
+        .into_iter()
+        .filter_map(|nested| match nested {
+            NestedFile::Requirements(target) => Some(target),
+            NestedFile::Constraints(_) => None,
         })
         .collect()
 }
+
+/// The `-c`/`--constraint` targets of the requirements file `rel`,
+/// resolved as [`requirements_includes`] resolves `-r`.
+fn requirements_constraints(rel: &str, content: &str) -> Vec<String> {
+    nested_files(rel, content)
+        .into_iter()
+        .filter_map(|nested| match nested {
+            NestedFile::Constraints(target) => Some(target),
+            NestedFile::Requirements(_) => None,
+        })
+        .collect()
+}
+
+/// The nested files of the requirements file `rel` with `content`, in file
+/// order, each resolved against `rel`'s directory and lexically normalized.
+fn nested_files(rel: &str, content: &str) -> Vec<NestedFile> {
+    let dir = match rel.rfind('/') {
+        Some(i) => &rel[..i],
+        None => "",
+    };
+    let resolve = |target: String| {
+        let joined = if dir.is_empty() {
+            target
+        } else {
+            format!("{dir}/{target}")
+        };
+        crate::utils::relpath::normalize_rel_keeping_escapes(&joined)
+    };
+    logical_lines(content)
+        .iter()
+        .filter_map(|ll| nested_file(&ll.text))
+        .map(|nested| match nested {
+            NestedFile::Requirements(target) => NestedFile::Requirements(resolve(target)),
+            NestedFile::Constraints(target) => NestedFile::Constraints(resolve(target)),
+        })
+        .collect()
+}
+
+/// A sibling requirements file that pip reads `target` from as constraints
+/// (`-c target`), found by [`constraint_readers_in`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConstraintReader {
+    /// Root-relative path of the file with the `-c` line.
+    pub reader: String,
+    /// Root-relative path of the constraints file it names.
+    pub target: String,
+}
+
+/// Whether `name` looks like a pip requirements file: `*.txt`, or a
+/// pip-tools `*.in` input.
+fn requirements_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".txt") || lower.ends_with(".in")
+}
+
+/// Top-level directories never searched for constraint readers: installed
+/// packages and build output, not the project's own requirements.
+const NOT_READER_DIRS: &[&str] = &[
+    "node_modules",
+    "site-packages",
+    "venv",
+    "env",
+    "target",
+    "build",
+    "dist",
+    "__pycache__",
+];
+
+/// Every requirements file beside `targets` that names one of them as a
+/// `-c` / `--constraint` file (#740). The writers turn a pin in a target
+/// into a link (a hosted `@ <url>` or a vendored wheel path), which pip
+/// 20.3.x and 21.0.x refuse in a constraints file ("Links are not allowed
+/// as constraints"), so each reader found is an install that breaks there.
+///
+/// Read: each `*.txt` / `*.in` file in the project root and in a root
+/// directory whose name mentions `requirement` (`requirements/`), and each
+/// one named like requirements (`requirements.txt`, `dev.in`) in the other
+/// top-level directories (`docs/requirements.txt`, the Read the Docs
+/// layout). Hidden directories and [`NOT_READER_DIRS`] are skipped, and a
+/// file whose bytes never hold `-c` is not parsed. A file that cannot be
+/// read or decoded is skipped (this only warns). A constraints file named
+/// only on the pip command line (`pip install -c requirements.txt`) is not
+/// visible here.
+pub(crate) async fn constraint_readers_in(
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+    targets: &[String],
+) -> Vec<ConstraintReader> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    let mut dirs: Vec<(String, bool)> = Vec::new();
+    for entry in view.list_dir("").await.unwrap_or_default() {
+        let lower = entry.name.to_ascii_lowercase();
+        if !entry.is_dir {
+            if requirements_file_name(&entry.name) {
+                candidates.push(entry.name);
+            }
+        } else if !entry.name.starts_with('.') && !NOT_READER_DIRS.contains(&lower.as_str()) {
+            dirs.push((entry.name, lower.contains("requirement")));
+        }
+    }
+    for (dir, every_file) in dirs {
+        for entry in view.list_dir(&dir).await.unwrap_or_default() {
+            let lower = entry.name.to_ascii_lowercase();
+            if !entry.is_dir
+                && requirements_file_name(&entry.name)
+                && (every_file || lower.contains("requirement") || lower.ends_with(".in"))
+            {
+                candidates.push(format!("{dir}/{}", entry.name));
+            }
+        }
+    }
+    candidates.sort();
+    let mut readers = Vec::new();
+    for rel in candidates {
+        let Ok(bytes) = view.read_bytes(&rel).await else {
+            continue;
+        };
+        // Every `-c` / `--constraint` spelling holds the bytes `-c`; a
+        // file without them (UTF-16 aside) is never parsed.
+        let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+        if !utf16 && !bytes.windows(2).any(|w| w == b"-c") {
+            continue;
+        }
+        let Ok(content) = decode_requirements(bytes) else {
+            continue;
+        };
+        for target in requirements_constraints(&rel, &content) {
+            if target != rel && targets.contains(&target) {
+                let reader = ConstraintReader {
+                    reader: rel.clone(),
+                    target,
+                };
+                if !readers.contains(&reader) {
+                    readers.push(reader);
+                }
+            }
+        }
+    }
+    readers
+}
+
+/// The remedy both writers name for a [`ConstraintReader`].
+pub(crate) const CONSTRAINT_LINK_REMEDY: &str =
+    "pip 20.3.x and 21.0.x refuse a link in a constraints file (\"Links are not allowed as \
+     constraints\"), so installing with that file fails on those pips; use pip 21.1 or later \
+     (or pip 20.2), or stop reading this file with `-c`";
 
 /// The `-r`/`--requirement` include target of a logical line, if any,
 /// read the way pip's `req_file.py` reads it: comment stripped, `${NAME}`
 /// expanded from the environment, then the options `shlex`-split, so
 /// `-r "dev reqs.txt"`, `-r dev\\ reqs.txt`, `--requirement="dev.txt"` and
 /// `-r ${REQDIR}/dev.txt` name the file pip opens (#994).
+#[cfg(test)]
 fn include_target(text: &str) -> Option<String> {
     include_target_with(text, |name| std::env::var(name).ok())
+}
+
+/// [`nested_file_with`] over the process environment.
+fn nested_file(text: &str) -> Option<NestedFile> {
+    nested_file_with(text, |name| std::env::var(name).ok())
 }
 
 /// The long options pip's requirements-file parser knows that take a
@@ -1217,7 +1454,28 @@ fn resolve_long_option(name: &str) -> Option<&'static str> {
 /// requirement, never an include; otherwise the first `-r` value is the
 /// file pip follows (`opts.requirements[0]`). An option's value is
 /// consumed even when it looks like `-r`, as optparse does.
+#[cfg(test)]
 fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    match nested_file_with(text, env)? {
+        NestedFile::Requirements(target) => Some(target),
+        NestedFile::Constraints(_) => None,
+    }
+}
+
+/// The file an options line makes pip open next, and how pip reads it.
+#[derive(Debug, PartialEq, Eq)]
+enum NestedFile {
+    /// `-r` / `--requirement`: read as requirements.
+    Requirements(String),
+    /// `-c` / `--constraint`: read as constraints.
+    Constraints(String),
+}
+
+/// The nested file of a logical line, read with [`include_target_with`]'s
+/// option grammar. pip's `handle_option_line` follows ONE file per line:
+/// the first `-r` value when the line has one, else the first `-c` value,
+/// so `-c c.txt -r dev.txt` follows only `dev.txt`.
+fn nested_file_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Option<NestedFile> {
     let code = expand_env_vars(strip_comment(text), env);
     // pip's break_args_options: a leading word without `-` is a
     // requirement, whose per-requirement options never recurse.
@@ -1228,6 +1486,7 @@ fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Opti
     // is no file to follow.
     let mut words = shlex_split(&code)?.into_iter();
     let mut target: Option<String> = None;
+    let mut constraint: Option<String> = None;
     while let Some(word) = words.next() {
         if word == "--" {
             break;
@@ -1255,6 +1514,7 @@ fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Opti
             match option {
                 "--editable" => return None,
                 "--requirement" if target.is_none() => target = value,
+                "--constraint" if constraint.is_none() => constraint = value,
                 _ => {}
             }
         } else if let Some(short) = word.strip_prefix('-') {
@@ -1276,13 +1536,19 @@ fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Opti
             match flag {
                 'e' => return None,
                 'r' if target.is_none() => target = value,
+                'c' if constraint.is_none() => constraint = value,
                 _ => {}
             }
         }
         // A bare word among the options is an optparse positional that
         // pip ignores.
     }
-    target.filter(|t| !t.is_empty())
+    match target {
+        Some(target) => (!target.is_empty()).then_some(NestedFile::Requirements(target)),
+        None => constraint
+            .filter(|c| !c.is_empty())
+            .map(NestedFile::Constraints),
+    }
 }
 
 // The logical-line lexer lives in `utils::requirements` (shared with the
@@ -1292,6 +1558,125 @@ fn include_target_with(text: &str, env: impl Fn(&str) -> Option<String>) -> Opti
 mod tests {
     use super::*;
     use crate::vendor::state::VendorArtifact;
+
+    /// #740: an options line names one nested file, the first `-r` when it
+    /// has one, else the first `-c`, in every spelling pip's optparse takes.
+    #[test]
+    fn nested_file_reads_constraints_like_pip() {
+        let env = |_: &str| None;
+        let constraint = |t: &str| Some(NestedFile::Constraints(t.to_string()));
+        for (line, want) in [
+            ("-c requirements.txt", constraint("requirements.txt")),
+            ("-crequirements.txt", constraint("requirements.txt")),
+            (
+                "--constraint requirements.txt",
+                constraint("requirements.txt"),
+            ),
+            (
+                "--constraint=requirements.txt",
+                constraint("requirements.txt"),
+            ),
+            // Only `--requirement=` reads past an empty attached value.
+            (
+                "--constraint= -r dev.txt",
+                Some(NestedFile::Requirements("dev.txt".into())),
+            ),
+            (
+                "--constr requirements.txt  # pins",
+                constraint("requirements.txt"),
+            ),
+            ("-c a.txt -c b.txt", constraint("a.txt")),
+            (
+                "-c a.txt -r b.txt",
+                Some(NestedFile::Requirements("b.txt".into())),
+            ),
+            ("-r b.txt", Some(NestedFile::Requirements("b.txt".into()))),
+            ("six==1.16.0", None),
+            ("-e . -c requirements.txt", None),
+            ("--constraint=", None),
+            ("# -c requirements.txt", None),
+        ] {
+            assert_eq!(nested_file_with(line, env), want, "{line:?}");
+        }
+    }
+
+    /// #740: the readers of a constraints file are the root and
+    /// `requirements*/` files, and the requirements-named files of other
+    /// top-level directories, whose `-c` resolves to it against the
+    /// reader's own directory. `-r` lines, other targets, the file itself,
+    /// deeper, hidden and dependency directories are not.
+    #[tokio::test]
+    async fn constraint_readers_resolve_against_the_reading_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in [
+            "requirements",
+            "Requirements-CI",
+            "docs",
+            "requirements/nested",
+            "node_modules/pkg",
+            ".tox",
+        ] {
+            tokio::fs::create_dir_all(root.join(dir)).await.unwrap();
+        }
+        for (rel, content) in [
+            ("requirements.txt", "six==1.16.0\n-c requirements.txt\n"),
+            ("requirements-dev.txt", "-c requirements.txt\nidna==3.7\n"),
+            ("dev.in", "-c ./requirements.txt\n"),
+            ("include.txt", "-r requirements.txt\n"),
+            ("other.txt", "-c constraints.txt\n"),
+            (
+                "requirements/test.txt",
+                "--constraint ../requirements.txt\n",
+            ),
+            ("requirements/base.txt", "-c requirements.txt\n"),
+            ("Requirements-CI/ci.txt", "-c ../requirements/base.txt\n"),
+            (
+                "requirements/nested/deep.txt",
+                "-c ../../requirements.txt\n",
+            ),
+            ("docs/requirements.txt", "-c ../requirements.txt\n"),
+            ("docs/notes.txt", "-c ../requirements.txt\n"),
+            ("node_modules/requirements.txt", "-c ../requirements.txt\n"),
+            (".tox/requirements.txt", "-c ../requirements.txt\n"),
+            ("setup.cfg", "-c requirements.txt\n"),
+        ] {
+            tokio::fs::write(root.join(rel), content).await.unwrap();
+        }
+        let view = crate::vendor::lock_inventory::ProjectView::Disk(root);
+        let readers = |found: Vec<ConstraintReader>| {
+            found
+                .into_iter()
+                .map(|r| format!("{} -> {}", r.reader, r.target))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            readers(constraint_readers_in(view, &["requirements.txt".into()]).await),
+            vec![
+                "dev.in -> requirements.txt",
+                "docs/requirements.txt -> requirements.txt",
+                "requirements-dev.txt -> requirements.txt",
+                "requirements/test.txt -> requirements.txt",
+            ]
+        );
+        assert_eq!(
+            readers(
+                constraint_readers_in(
+                    view,
+                    &["requirements.txt".into(), "requirements/base.txt".into()]
+                )
+                .await
+            ),
+            vec![
+                "Requirements-CI/ci.txt -> requirements/base.txt",
+                "dev.in -> requirements.txt",
+                "docs/requirements.txt -> requirements.txt",
+                "requirements-dev.txt -> requirements.txt",
+                "requirements/test.txt -> requirements.txt",
+            ]
+        );
+        assert!(constraint_readers_in(view, &[]).await.is_empty());
+    }
 
     /// #1120: [`requirements_include_names`] decodes each file as pip does,
     /// so the includes of a UTF-16 root file (a Windows PowerShell 5.1
@@ -2036,6 +2421,115 @@ mod tests {
         );
     }
 
+    /// #1104: pip merges the root and its `-r` includes into one
+    /// requirement set, so a marker split is a split across the whole tree,
+    /// not per file. Either way round, the vendored version's branch is
+    /// rewritten where it lives (marker kept), the other branch is left
+    /// alone, and revert is byte-identical.
+    #[tokio::test]
+    async fn marker_split_across_an_include_rewrites_only_the_vendored_branch() {
+        let target = "six==1.16.0 ; python_version < \"3.12\"\n";
+        let other = "six==1.17.0 ; python_version >= \"3.12\"\n";
+        let rewritten = format!(
+            "./{REL_WHEEL} ; python_version < \"3.12\"  # socket-patch vendor: six==1.16.0\n"
+        );
+        // (root body after `-r base.txt`, base.txt) and the expected rewrites.
+        let layouts = [
+            (target, format!("idna==3.7\n{other}"), true),
+            (other, format!("idna==3.7\n{target}"), false),
+        ];
+        for (root_pin, base, target_in_root) in layouts {
+            let root_original = format!("-r base.txt\n{root_pin}");
+            let tmp = write_root(&root_original).await;
+            tokio::fs::write(tmp.path().join("base.txt"), &base)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    preflight_requirements(tmp.path(), "six", "1.16.0", "u").await,
+                    Ok(RequirementsTarget::Fresh)
+                ),
+                "target in root: {target_in_root}"
+            );
+            assert!(sibling_pin_wirable(tmp.path(), "six", "1.16.0").await);
+            let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, "")
+                .await
+                .unwrap();
+            assert_eq!(wiring.len(), 1);
+            assert_eq!(wiring[0].action, WiringAction::Rewritten);
+            let base_now = tokio::fs::read_to_string(tmp.path().join("base.txt"))
+                .await
+                .unwrap();
+            if target_in_root {
+                assert_eq!(
+                    read_root(tmp.path()).await,
+                    format!("-r base.txt\n{rewritten}")
+                );
+                assert_eq!(base_now, base);
+            } else {
+                assert_eq!(read_root(tmp.path()).await, root_original);
+                assert_eq!(base_now, format!("idna==3.7\n{rewritten}"));
+            }
+
+            let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert_eq!(read_root(tmp.path()).await, root_original);
+            assert_eq!(
+                tokio::fs::read_to_string(tmp.path().join("base.txt"))
+                    .await
+                    .unwrap(),
+                base
+            );
+        }
+    }
+
+    /// #1104's guard rails: across the tree, the other version's branch is
+    /// only tolerated when every target pin carries a marker too. An
+    /// unmarked target pin, or no target pin at all, means pip could pick
+    /// the other version, so the vendor still refuses (naming the file
+    /// that pins the other version) and writes nothing.
+    #[tokio::test]
+    async fn marker_split_across_an_include_still_refuses_an_unmarked_or_missing_target() {
+        let other = "six==1.17.0 ; python_version >= \"3.12\"\n";
+        let cases = [
+            // An unmarked target pin in the root next to a marked other
+            // branch in the include.
+            ("-r base.txt\nsix==1.16.0\n", other.to_string(), "base.txt"),
+            // The unmarked target in the include, the other branch in the root.
+            (
+                &*format!("-r base.txt\n{other}"),
+                "six==1.16.0\n".to_string(),
+                "requirements.txt",
+            ),
+            // Only the other version's branch anywhere in the tree.
+            ("-r base.txt\nidna==3.7\n", other.to_string(), "base.txt"),
+        ];
+        for (root, base, named) in cases {
+            let tmp = write_root(root).await;
+            tokio::fs::write(tmp.path().join("base.txt"), &base)
+                .await
+                .unwrap();
+            let err = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, "pypi_requirement_not_pinned", "{root:?} / {base:?}");
+            assert!(
+                err.1
+                    .starts_with(&format!("{named}: pins another six version"))
+                    && err.1.contains("pin ==1.16.0 on its own marker branch"),
+                "{}",
+                err.1
+            );
+            assert_eq!(read_root(tmp.path()).await, root);
+            assert_eq!(
+                tokio::fs::read_to_string(tmp.path().join("base.txt"))
+                    .await
+                    .unwrap(),
+                base
+            );
+        }
+    }
+
     #[tokio::test]
     async fn absent_package_appends_managed_transitive_line() {
         let tmp = write_root("python-dateutil==2.8.2\n").await;
@@ -2354,6 +2848,14 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.code == "vendor_revert_line_drifted"));
+        // The ledger key reads as recorded, never as `Some("…")` (#1608).
+        assert!(
+            outcome.warnings.iter().any(|w| w.detail.contains(
+                "requirements.txt: the vendor line for requirements.txt:1 changed since vendoring"
+            )),
+            "{:?}",
+            outcome.warnings
+        );
         // A drifted edit (still referencing the uuid dir) also raises the
         // residual-reference warning.
         assert!(outcome

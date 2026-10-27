@@ -1006,3 +1006,61 @@ fn rollback_dispatch_branch_deno() {
     };
     assert_rollback_restored(root, "deno", &fixture);
 }
+
+/// #444: a package `deno install -g` tools load lives in Deno's npm cache,
+/// `$DENO_DIR/npm/registry.npmjs.org/<name>/<version>/`. Both `--global`
+/// (which now discovers that cache from `DENO_DIR`) and a `--global-prefix`
+/// naming the registry dir must reach it; before the fix each reported the
+/// package not installed.
+fn deno_npm_cache_fixture(
+    root: &Path,
+    scope_args: impl FnOnce(&Path) -> Vec<String>,
+) -> RollbackFixture {
+    let deno_dir = root.join("deno-dir");
+    let registry = deno_dir.join("npm").join("registry.npmjs.org");
+    let pkg = registry.join("__deno_global_dispatch__").join("1.0.0");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"__deno_global_dispatch__","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    // Deno caches the package's packument beside its version dirs.
+    std::fs::write(pkg.parent().unwrap().join("registry.json"), "{}").unwrap();
+    let verify_file = pkg.join("index.js");
+    std::fs::write(&verify_file, PATCHED).unwrap();
+    let purl = "pkg:npm/__deno_global_dispatch__@1.0.0";
+    write_rollback_manifest(root, purl, "package/index.js");
+    RollbackFixture {
+        purl: purl.to_string(),
+        verify_file,
+        envs: vec![(
+            "DENO_DIR".to_string(),
+            deno_dir.to_str().unwrap().to_string(),
+        )],
+        scope_args: scope_args(&registry),
+    }
+}
+
+#[test]
+fn rollback_dispatch_deno_npm_cache_global() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_root_package_json(root);
+    let fixture = deno_npm_cache_fixture(root, |_| vec!["--global".to_string()]);
+    assert_rollback_restored(root, "npm", &fixture);
+}
+
+#[test]
+fn rollback_dispatch_deno_npm_cache_global_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_root_package_json(root);
+    let fixture = deno_npm_cache_fixture(root, |registry| {
+        vec![
+            "--global-prefix".to_string(),
+            registry.to_str().unwrap().to_string(),
+        ]
+    });
+    assert_rollback_restored(root, "npm", &fixture);
+}

@@ -110,7 +110,7 @@ pub(crate) fn as_question(text: &str) -> String {
 
 /// The default (destructive) rollback's confirmation prompt, naming only
 /// the legs that have work.
-fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize) -> String {
+fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize, orphans: usize) -> String {
     let mut clauses: Vec<String> = Vec::new();
     if manifest > 0 {
         clauses.push(format!(
@@ -137,6 +137,12 @@ fn rollback_prompt(manifest: usize, vendored: usize, hosted: usize) -> String {
         clauses.push(format!(
             "restore {} to the upstream registry",
             plural(hosted, "hosted package", "hosted packages")
+        ));
+    }
+    if orphans > 0 {
+        clauses.push(format!(
+            "delete {} with no ledger record",
+            plural(orphans, "orphaned vendored dir", "orphaned vendored dirs")
         ));
     }
     as_question(&join_clauses(&clauses))
@@ -281,6 +287,83 @@ fn handled_in_place(results: &[RollbackResult]) -> HashSet<&str> {
         .filter(|r| r.success && (!r.files_rolled_back.is_empty() || !r.files_verified.is_empty()))
         .map(|r| strip_purl_qualifiers(&r.package_key))
         .collect()
+}
+
+/// The manifest records no scope (#450), so this run's view of a record
+/// says nothing about the copy the patch may also have been applied to in
+/// the other scope: a project apply rolled back with `-g` (or a `-g` apply
+/// rolled back from the project) finds an untouched copy, or none, here
+/// while the patched one sits in the other scope. Of `purls` (the records
+/// about to leave the manifest), those with a copy in the other scope (the
+/// project at `--cwd` for a global run, the default global install
+/// otherwise) whose files still hold the patch's afterHash content, with
+/// that copy's path. Their records must stay.
+async fn patched_in_other_scope(
+    purls: &[String],
+    manifest: &PatchManifest,
+    common: &GlobalArgs,
+    socket_dir: &Path,
+    this_scope: &HashSet<&str>,
+) -> Vec<(String, PathBuf)> {
+    if purls.is_empty() {
+        return Vec::new();
+    }
+    let partitioned = partition_purls(purls, common.ecosystems.as_deref());
+    let other = CrawlerOptions {
+        global: !common.is_global(),
+        global_prefix: None,
+        ..common.crawler_options()
+    };
+    let found = find_all_packages_for_rollback(&partitioned, &other, true).await;
+    let blobs = socket_dir.join("blobs");
+    let mut patched = Vec::new();
+    for purl in purls {
+        let (Some(record), Some(paths)) = (manifest.patches.get(purl), found.get(purl)) else {
+            continue;
+        };
+        'copies: for path in paths {
+            // Both scopes can resolve to one tree (a `--cwd` inside the
+            // global root): this run already verified that copy.
+            if this_scope.contains(path.to_string_lossy().as_ref()) {
+                continue;
+            }
+            for (file, info) in &record.files {
+                let v = verify_file_rollback(path, file, info, &blobs).await;
+                // A file that is there but cannot be hashed may still hold
+                // the patched bytes: keep the record rather than strand it.
+                let unverifiable = v.current_hash.is_none()
+                    && v.status != VerifyRollbackStatus::AlreadyOriginal
+                    && !v.is_absent();
+                if unverifiable || v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
+                    patched.push((purl.clone(), path.clone()));
+                    break 'copies;
+                }
+            }
+        }
+    }
+    patched
+}
+
+/// `rollback`'s pointer at the scope that still holds a patched copy: a
+/// rollback of just that purl, naming `--cwd` when the run used one (the record lives in that
+/// project's manifest).
+fn patched_in_other_scope_warning(purl: &str, path: &Path, common: &GlobalArgs) -> String {
+    let (scope, mut command) = if common.is_global() {
+        ("the project", format!("socket-patch rollback {purl}"))
+    } else {
+        (
+            "the global install",
+            format!("socket-patch rollback {purl} -g"),
+        )
+    };
+    if common.cwd != Path::new(".") {
+        command.push_str(&format!(" --cwd {}", common.cwd.display()));
+    }
+    format!(
+        "{purl}: its copy in {scope} ({}) is still patched or could not be \
+         verified, so its manifest record was kept; run `{command}` to restore it",
+        path.display()
+    )
 }
 
 /// The wet run's per-package blocks: what was rolled back (naming each
@@ -819,6 +902,40 @@ fn error_envelope(dry_run: bool, err: EnvelopeError) -> Envelope {
     env
 }
 
+/// The `vendor_ledger_missing` refusal for lockfile references into
+/// `.socket/vendor/<eco>/<uuid>/` (in the `--ecosystems` scope) that no
+/// entry of `state` owns, or `None` when every reference is ledgered.
+async fn unledgered_vendor_wiring(
+    common: &crate::args::GlobalArgs,
+    ledger_root: &Path,
+    state: &VendorState,
+) -> Option<String> {
+    let mut dirs: Vec<String> =
+        crate::commands::vendored_backend::repair::unledgered_vendor_references(ledger_root, state)
+            .await
+            .into_iter()
+            // An entry that carries the uuid under another ecosystem (an
+            // unknown backend, a hand edit) still owns it: its own revert
+            // reports what is wrong with it.
+            .filter(|(eco, uuid, _)| {
+                crate::commands::vendor::ecosystem_in_scope(common, eco)
+                    && !state.entries.values().any(|e| e.uuid == *uuid)
+            })
+            .map(|(eco, uuid, _)| format!(".socket/vendor/{eco}/{uuid}/"))
+            .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    dirs.sort();
+    Some(format!(
+        "lockfiles reference {}, which the vendor ledger (.socket/vendor/state.json) has no \
+         entry for, so rollback cannot unwind them; {} and roll back, or return the \
+         lockfiles to their pre-vendor versions",
+        dirs.join(", "),
+        crate::commands::vendor_orphans::UNLEDGERED_WIRING_REMEDY,
+    ))
+}
+
 /// Report a top-level rollback error: the error envelope on `--json`
 /// (message verbatim), an `Error:` stderr line otherwise. Errors print even
 /// under --silent ("errors only", never "nothing").
@@ -852,6 +969,9 @@ struct VendoredLegOutcome {
     /// could not be saved.
     failed: Vec<(String, &'static str, String)>,
     warnings: Vec<(String, String)>,
+    /// `removed` / `vendor_orphan_removed` events for the orphan uuid
+    /// dirs (no ledger entry) swept, also on dry-run.
+    orphans_removed: Vec<PatchEvent>,
 }
 
 /// Unwire the in-scope vendored entries. `preserve` keeps artifacts and
@@ -1062,6 +1182,11 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
                 .with_details(vendored(serde_json::json!({}))),
             vendor_uuid(key),
         ));
+    }
+    // Swept orphan dirs are `removed` on a dry run too (as in
+    // `vendor --revert`): `verified` would read as a vendored restore.
+    for event in &leg.orphans_removed {
+        env.record(event.clone().with_details(vendored(serde_json::json!({}))));
     }
 
     // ── hosted leg ──
@@ -1498,6 +1623,28 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     let scoped = !identifiers.is_empty() || !path_scope.is_empty();
 
+    // A lockfile still wired into a `.socket/vendor/` dir that the present
+    // ledger does not own (a merge kept one side of state.json, #991) is a
+    // patch this run cannot unwind: the pre-vendor originals lived in the
+    // lost entry. An unscoped run promises to unwind everything, so it
+    // refuses before writing, like the ledger-missing case above, instead
+    // of reverting the rest and deleting the ledger around the wiring.
+    if !scoped && project_state {
+        if let Ok(state) = &vendor_state_result {
+            if let Some(detail) = unledgered_vendor_wiring(&args.common, &ledger_root, state).await
+            {
+                track_patch_rollback_failed(&detail, &telemetry).await;
+                emit_rollback_error(
+                    args.common.json,
+                    args.common.dry_run,
+                    "vendor_ledger_missing",
+                    &detail,
+                );
+                return 1;
+            }
+        }
+    }
+
     // Identifier matching runs across ALL THREE stores; an identifier
     // matching nothing anywhere is the familiar exit-1 error.
     let mut manifest_scope: HashSet<String> = HashSet::new();
@@ -1721,10 +1868,44 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .join(",")
         );
     }
+    // Uuid dirs under `.socket/vendor/` that no ledger entry owns (the
+    // losing side of a git merge of two vendor runs, an interrupted run)
+    // are local state too: a run with work sweeps the ones in its scope
+    // after the vendored leg, as `vendor --revert` does (#1610). Path-glob
+    // targets name installed copies, never an orphan.
+    let sweep_orphans = has_work && project_state && !args.preserve_state && !ledger_unreadable;
+    let orphan_in_scope = |unit: &socket_patch_core::vendor::path::SweptVendorDir| {
+        crate::commands::vendor::ecosystem_in_scope(&args.common, &unit.eco)
+            && (!scoped
+                || identifiers
+                    .iter()
+                    .any(|id| crate::commands::vendor_orphans::orphan_in_target(id, unit)))
+    };
     if has_work && !args.common.dry_run && !args.preserve_state {
+        // The orphans the sweep would delete, for the prompt: the reverts
+        // only shrink the ledger, so the pre-run ledger finds the same set.
+        let orphans = match &vendor_state_result {
+            Ok(state) if sweep_orphans => {
+                crate::commands::vendor_orphans::sweep_orphan_vendor_dirs_where(
+                    &ledger_root,
+                    state,
+                    true,
+                    &orphan_in_scope,
+                )
+                .await
+                .removed
+                .len()
+            }
+            _ => 0,
+        };
         // Compose only the clauses that apply, so a hosted-only run never
         // claims manifest entries it does not have.
-        let prompt = rollback_prompt(manifest_scope.len(), vendor_scope.len(), hosted_scope.len());
+        let prompt = rollback_prompt(
+            manifest_scope.len(),
+            vendor_scope.len(),
+            hosted_scope.len(),
+            orphans,
+        );
         if !crate::ui::confirm(&prompt, true, &args.common) {
             if !args.common.json && !args.common.silent {
                 println!("{}", crate::ui::CANCELLED);
@@ -1773,6 +1954,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // `--preserve-state` keeps artifacts and entries. Skipped
             // fail-closed when the ledger is unreadable.
             let mut vendored_leg = VendoredLegOutcome::default();
+            let mut reverted_state: Option<VendorState> = None;
             if !vendor_corrupt && !vendor_scope.is_empty() {
                 let mut vs = vendor_state_result
                     .as_ref()
@@ -1783,6 +1965,42 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 keys.sort();
                 vendored_leg =
                     run_vendored_leg(&args.common, &keys, &mut vs, args.preserve_state).await;
+                reverted_state = Some(vs);
+            }
+
+            // ── orphan vendored dirs (see `sweep_orphans`) ───────────────
+            // A wired orphan is kept with a warning: deleting it would
+            // break the next install.
+            let ledger_now = reverted_state
+                .as_ref()
+                .or(vendor_state_result.as_ref().ok());
+            if let Some(state) = ledger_now.filter(|_| sweep_orphans && !aborted) {
+                let sweep = crate::commands::vendor_orphans::sweep_orphan_vendor_dirs_where(
+                    &ledger_root,
+                    state,
+                    args.common.dry_run,
+                    &orphan_in_scope,
+                )
+                .await;
+                for unit in &sweep.still_wired {
+                    let warning = crate::commands::vendor_orphans::orphan_still_wired(unit);
+                    run_warnings.push((warning.code.to_string(), warning.detail));
+                }
+                for (unit, e) in &sweep.failed {
+                    let warning = crate::commands::vendor_orphans::orphan_removal_failed(unit, e);
+                    run_warnings.push((warning.code.to_string(), warning.detail));
+                }
+                if !args.common.json && !args.common.silent {
+                    crate::commands::vendor_orphans::print_orphan_sweep(
+                        args.common.dry_run,
+                        &sweep,
+                    );
+                }
+                vendored_leg.orphans_removed = sweep
+                    .removed
+                    .iter()
+                    .map(crate::commands::vendor_orphans::orphan_removed_event)
+                    .collect();
             }
 
             // ── hosted leg ───────────────────────────────────────────────
@@ -1876,6 +2094,39 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .cloned()
                 .collect();
             removable.sort();
+            // Records restored (or found original, or not installed) here
+            // whose copy in the other scope is still patched stay, with
+            // their whole variant group (#450).
+            let elsewhere = if cleanup_allowed {
+                let probe: Vec<String> = removable
+                    .iter()
+                    .filter(|purl| {
+                        (succeeded_purls.contains(*purl) || not_installed.contains(purl))
+                            && !vendored_excluded.contains(purl)
+                            && !purl_keys_cover(&vendored_keys, purl)
+                    })
+                    .cloned()
+                    .collect();
+                let this_scope: HashSet<&str> =
+                    results.iter().map(|r| r.package_path.as_str()).collect();
+                patched_in_other_scope(&probe, &manifest, &args.common, &socket_dir, &this_scope)
+                    .await
+            } else {
+                Vec::new()
+            };
+            if !elsewhere.is_empty() {
+                let kept_bases: HashSet<&str> = elsewhere
+                    .iter()
+                    .map(|(purl, _)| strip_purl_qualifiers(purl))
+                    .collect();
+                removable.retain(|purl| !kept_bases.contains(strip_purl_qualifiers(purl)));
+                for (purl, path) in &elsewhere {
+                    run_warnings.push((
+                        "patched_in_other_scope".into(),
+                        patched_in_other_scope_warning(purl, path, &args.common),
+                    ));
+                }
+            }
 
             // The manifest is rewritten only when an entry actually leaves
             // it; an emptied manifest stays on disk as `{"patches": {}}`
@@ -2007,17 +2258,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .iter()
                 .chain(hosted_leg.warnings.iter())
                 .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
-            // A restored package whose ownership could not be put back
-            // (the engine reports it on `error` with `success: true`) is
-            // restored but worth a note, here and in the envelope.
+            // A restored package whose ownership could not be put back, or
+            // whose stale bytecode could not be removed (the engine reports
+            // it on `error` with `success: true`), is restored but worth a
+            // note, here and in the envelope.
             for r in results.iter().filter(|r| r.success) {
                 if let Some(note) = &r.error {
-                    let warning = (
-                        "ownership_not_restored".to_string(),
-                        format!("{}: {note}", r.package_key),
-                    );
-                    human_warnings.push(warning.clone());
-                    run_warnings.push(warning);
+                    let codes = socket_patch_core::patch::apply::advisory_warning_codes(note);
+                    let codes = if codes.is_empty() {
+                        vec!["ownership_not_restored"]
+                    } else {
+                        codes
+                    };
+                    let detail = format!("{}: {note}", r.package_key);
+                    // One human line per note, one envelope entry per code.
+                    human_warnings.push((codes[0].to_string(), detail.clone()));
+                    run_warnings.extend(codes.iter().map(|c| (c.to_string(), detail.clone())));
                 }
             }
 
@@ -5546,30 +5802,35 @@ mod tests {
     #[test]
     fn rollback_prompt_singular_plural_and_clauses() {
         assert_eq!(
-            rollback_prompt(1, 0, 0),
+            rollback_prompt(1, 0, 0, 0),
             "Roll back 1 patch and remove it from the local manifest?"
         );
         assert_eq!(
-            rollback_prompt(2, 0, 0),
+            rollback_prompt(2, 0, 0, 0),
             "Roll back 2 patches and remove them from the local manifest?"
         );
         // Never "..., and restore" after an inner "and".
         assert_eq!(
-            rollback_prompt(1, 0, 1),
+            rollback_prompt(1, 0, 1, 0),
             "Roll back 1 patch, remove it from the local manifest, and restore 1 hosted \
              package to the upstream registry?"
         );
         assert_eq!(
-            rollback_prompt(0, 0, 3),
+            rollback_prompt(0, 0, 3, 0),
             "Restore 3 hosted packages to the upstream registry?"
         );
         assert_eq!(
-            rollback_prompt(0, 1, 0),
+            rollback_prompt(0, 1, 0, 0),
             "Delete 1 vendored artifact and its ledger record?"
         );
         assert_eq!(
-            rollback_prompt(0, 2, 0),
+            rollback_prompt(0, 2, 0, 0),
             "Delete 2 vendored artifacts and their ledger records?"
+        );
+        assert_eq!(
+            rollback_prompt(0, 1, 0, 1),
+            "Delete 1 vendored artifact and its ledger record and delete 1 orphaned \
+             vendored dir with no ledger record?"
         );
     }
 
@@ -5960,6 +6221,7 @@ mod tests {
                 "boom".to_string(),
             )],
             warnings: Vec::new(),
+            orphans_removed: Vec::new(),
         };
         let hosted = HostedLegOutcome {
             reverted: vec!["pkg:npm/h@1.0.0".to_string()],

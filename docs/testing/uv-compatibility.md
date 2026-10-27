@@ -164,6 +164,17 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   (`redirect_workspace_lockfile_elsewhere` hosted,
   `pypi_uv_workspace_unsupported` vendored) instead of rewriting a
   Hatch-configured member as a lockless Hatch project (#1138).
+- A project with PEP 621 `dynamic = ["dependencies"]` (or
+  `"optional-dependencies"`) gets its requirement list from the build
+  backend, so `pyproject.toml` declares nothing the lock root's
+  `requires-dist` entry could be restored from. Vendored mode refuses
+  `dynamic = ["dependencies"]` outright (`pypi_uv_dynamic_dependencies`).
+  Hosted mode refuses, before any write, a package the lock root's
+  `requires-dist` lists in such a project
+  (`redirect_uv_metadata_unsupported`), since rollback and remove could
+  never restore that entry (#639). A package the project only pulls in
+  transitively is still wired through `override-dependencies`, which
+  rollback and remove undo.
 - A script lock requires its paired script and a valid PEP 723 metadata block.
   Missing metadata or an incompatible existing source is reported before either
   file is rewritten.
@@ -216,9 +227,16 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   parent's settings for a script whose root sets none). `no-build*` allows
   wheels and is not refused. `UV_NO_BINARY`, `UV_NO_BINARY_PACKAGE`, the
   matching flags and a user-level `uv.toml` belong to the machine that
-  installs, which the scan cannot see. A `uv pip compile --no-binary` pylock.toml
-  records nothing of the setting in its own data; its hosted lane is
-  tracked in #1603.
+  installs, which the scan cannot see. A PEP 751 lock uv wrote is
+  installed with `uv pip`, which reads the same settings plus `[pip]
+  no-binary` (the two add up), and `uv pip compile --no-binary six`
+  records six with only its sdist: both modes refuse the lock before any
+  write when the `uv pip compile` command line in its header passes
+  `--no-binary` naming the package or `:all:`, or the root's `uv.toml` /
+  `[tool.uv]` covers it (vendored `pypi_uv_no_binary`, hosted
+  `redirect_uv_lock_unsupported`, #1603). The settings count even when
+  the header shows `--no-config`: that flag only kept them from the
+  compile, and `uv pip sync` reads them.
 - Native projects and scripts resolving multiple versions of the same package
   are refused when a global uv source would replace another version. Supporting
   those cases requires marker-specific source mappings. Standalone PEP 751

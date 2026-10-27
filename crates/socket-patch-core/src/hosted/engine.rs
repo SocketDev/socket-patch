@@ -28,6 +28,7 @@ use crate::constants::npm_family::{
     RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
 };
 use crate::formats::cargo::source_replacement::CratesIoSource;
+use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
     effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
     NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
@@ -709,16 +710,22 @@ pub async fn read_candidate_files(
         .files
         .keys()
         .any(|path| path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path));
-    if uv_lane {
+    // A PEP 751 lock is installed with `uv pip`, which refuses the patched
+    // wheel under the `no-binary` settings of the root's `uv.toml` (#1603).
+    let pylock_lane = out
+        .files
+        .keys()
+        .any(|path| crate::utils::python_lock::is_pep751_lock_name(path));
+    if uv_lane || pylock_lane {
         let rel = crate::utils::python_script::UV_TOML;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
             out.files.insert(rel.to_string(), text);
         }
     }
-    // A PEP 723 script (#1501) or a project (#1545) also takes uv's
-    // settings from above the root when the root holds none; only a disk
-    // view has an above.
-    if uv_lane
+    // A PEP 723 script (#1501), a project (#1545) or `uv pip` installing a
+    // PEP 751 lock (#1603) also takes uv's settings from above the root
+    // when the root holds none; only a disk view has an above.
+    if (uv_lane || pylock_lane)
         && !crate::utils::python_script::root_governs_script(
             out.files.get("pyproject.toml").map(String::as_str),
             out.files
@@ -784,6 +791,7 @@ pub async fn read_candidate_files(
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "gem") {
         keep_bundler_loaded_gem_files(view, candidates, &mut out).await;
+        read_gemspecs(view, unreadable, &mut out).await;
     }
     // A Gradle build: every script, catalog and lock file its script graph
     // reaches, for the hosted Gradle planner.
@@ -1165,6 +1173,64 @@ async fn keep_bundler_loaded_gem_files(
         code: "redirect_gem_twin_manifest_ambiguous".into(),
         detail,
     }));
+}
+
+/// The gemspecs the Gemfile's `gemspec` directives load: bundler 2.7+
+/// folds their development dependencies into the requirement the lock
+/// pins (#985). Advisory: never rewritten, carried in the
+/// [`GEMSPECS_KEY`](crate::formats::gem::gemspec::GEMSPECS_KEY) entry. A
+/// directive the rewriter cannot read is left for it to report.
+async fn read_gemspecs(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    use crate::formats::gem::gemspec::{gemspec_directives, is_gemspec_file, GEMSPECS_KEY};
+    let Some(gemfile) = ["gems.rb", "Gemfile"]
+        .iter()
+        .find_map(|rel| out.files.get(*rel))
+    else {
+        return;
+    };
+    let dirs: BTreeSet<String> = gemspec_directives(gemfile)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.dir)
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+    let mut listing = serde_json::Map::new();
+    for dir in dirs {
+        let entries = match view.list_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                listing.insert(dir, serde_json::Value::String(e.to_string()));
+                continue;
+            }
+        };
+        let mut specs = serde_json::Map::new();
+        for entry in entries
+            .into_iter()
+            .filter(|e| !e.is_dir && is_gemspec_file(&e.name))
+        {
+            let rel = if dir.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{dir}/{}", entry.name)
+            };
+            let text = read_advisory(view, unreadable, &rel).await;
+            specs.insert(
+                entry.name,
+                text.map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+        listing.insert(dir, serde_json::Value::Object(specs));
+    }
+    out.files.insert(
+        GEMSPECS_KEY.to_string(),
+        serde_json::Value::Object(listing).to_string(),
+    );
 }
 
 /// The pypi wheels whose metadata a native lock rewrite needs, in
@@ -1759,6 +1825,8 @@ pub async fn rewrite(
         )
         .await;
         if vetoed.is_empty() {
+            let constraints = constraints_link_warnings(view, &done, &kept).await;
+            done.rewrite.warnings.extend(constraints);
             done.unattributed = unattributed;
             done.rewrite.warnings.extend(lockless);
             done.rewrite.warnings.extend(copy_left);
@@ -1769,6 +1837,48 @@ pub async fn rewrite(
         kept.retain(|c| !vetoed.iter().any(|skip| skip.uuid == c.dep.patch_uuid));
         unattributed.extend(vetoed);
     }
+}
+
+/// A `redirect_requirements_constraints_link` warning for each sibling
+/// requirements file that reads the root requirements.txt as `-c`
+/// constraints while a hosted pin there is a URL (#740), which pip 20.3
+/// and 21.0 refuse in a constraints file. Said on every run that confirms
+/// such a pin, not only the one that writes it: the hazard lasts as long
+/// as the pin does.
+async fn constraints_link_warnings(
+    view: &ProjectView<'_>,
+    done: &Rewritten,
+    kept: &[Candidate],
+) -> Vec<RewriteWarning> {
+    let confirmed = &done.rewrite.confirmed_requirements_uuids;
+    let mut pinned: Vec<&str> = kept
+        .iter()
+        .filter(|c| confirmed.contains(&c.dep.patch_uuid))
+        .map(|c| c.dep.name.as_str())
+        .collect();
+    pinned.sort_unstable();
+    pinned.dedup();
+    if pinned.is_empty() {
+        return Vec::new();
+    }
+    crate::vendor::pypi_requirements::constraint_readers_in(*view, &[PYPI_REQUIREMENTS.to_string()])
+        .await
+        .into_iter()
+        .map(|found| {
+            warning(
+                "redirect_requirements_constraints_link",
+                format!(
+                "{} reads {} as a constraints file (`-c`), and the hosted pin of {} in {} is a \
+                 URL; {}",
+                found.reader,
+                found.target,
+                pinned.join(", "),
+                found.target,
+                crate::vendor::pypi_requirements::CONSTRAINT_LINK_REMEDY
+            ),
+            )
+        })
+        .collect()
 }
 
 /// Lockfile discovery over the project as `done` would leave it, read as
@@ -1924,7 +2034,7 @@ async fn unattributed_pins(
     // [`Discovery::shadowed`]: crate::vex::discover::Discovery::shadowed
     let mut copy_left: Vec<RewriteWarning> = Vec::new();
     let mut copy_shadowed: BTreeSet<String> = BTreeSet::new();
-    let mut named: BTreeSet<(&std::path::Path, &str)> = BTreeSet::new();
+    let mut named: BTreeSet<(&std::path::Path, &str, &str)> = BTreeSet::new();
     for r in &discovery.shadowed {
         if r.mode != crate::vex::discover::WiringMode::Hosted
             || !done.confirmed.iter().any(|(_, uuid)| *uuid == r.uuid)
@@ -1941,7 +2051,7 @@ async fn unattributed_pins(
         }) {
             copy_shadowed.insert(r.uuid.clone());
             if yarn_rewriter_named(&done.rewrite.warnings, &c.file, &c.key)
-                || !named.insert((c.file.as_path(), c.key.as_str()))
+                || !named.insert((c.file.as_path(), c.key.as_str(), c.how.as_str()))
             {
                 continue;
             }
@@ -1949,14 +2059,16 @@ async fn unattributed_pins(
                 REDIRECT_COPY_UNPATCHED,
                 format!(
                     "{}: {} is pinned to patch {}, but lock entry `{}` {}; that copy stays \
-                     UNPATCHED, so `vex` attests nothing for {}. Depend on the registry \
-                     release instead of that copy to patch it",
+                     UNPATCHED, so `vex` attests nothing for {}. {}",
                     c.file.display(),
                     r.purl,
                     r.uuid,
                     c.key,
                     c.how,
-                    r.purl
+                    r.purl,
+                    c.remedy.as_deref().unwrap_or(
+                        "Depend on the registry release instead of that copy to patch it"
+                    ),
                 ),
             ));
         }
@@ -2329,6 +2441,7 @@ async fn rewrite_once(
         .cloned()
         .collect();
     let confirmed = confirm(&files, &rewrite, candidates, binary_bun, withheld_from_vlt);
+    npm_warnings.extend(npm_deno_lock(view, &overrides, &confirmed));
     Rewritten {
         files,
         symlinked_reads,
@@ -2964,6 +3077,44 @@ fn npm_allow_remote(
         }
     }
     (npm_warnings, npmrc_config_write)
+}
+
+/// #406: `deno install` installs a `package.json` project's npm
+/// dependencies from `deno.lock` and never reads an npm-family lock, so a
+/// redirected npm package that `deno.lock` also locks at the same version
+/// keeps installing the registry copy wherever Deno installs. Said once,
+/// naming every such package; the redirect still stands for npm / pnpm /
+/// yarn / bun installs. Advisory read: no readable `deno.lock`, nothing.
+fn npm_deno_lock(
+    view: &ProjectView<'_>,
+    overrides: &[DepOverride],
+    confirmed: &[(String, String)],
+) -> Option<RewriteWarning> {
+    use crate::patch::redirect::{full_name, npm_deno_lock_detail, DENO_LOCK};
+    let npm: Vec<&DepOverride> = overrides
+        .iter()
+        .filter(|o| o.ecosystem == "npm")
+        .filter(|o| confirmed.iter().any(|(_, uuid)| *uuid == o.patch_uuid))
+        .collect();
+    if npm.is_empty() {
+        return None;
+    }
+    let text = read_advisory_text(view, DENO_LOCK)?;
+    let locked = crate::crawlers::deno_crawler::lock_text_npm_packages(&text);
+    let mut packages: Vec<String> = npm
+        .into_iter()
+        .map(|o| format!("{}@{}", full_name(o), o.version))
+        .filter(|key| locked.contains(key))
+        .collect();
+    packages.sort();
+    packages.dedup();
+    if packages.is_empty() {
+        return None;
+    }
+    Some(warning(
+        "redirect_npm_deno_lock",
+        npm_deno_lock_detail(&packages, "redirected"),
+    ))
 }
 
 /// A dep counts as REDIRECTED only if its hosted-artifact URL (or its
@@ -4103,6 +4254,82 @@ mod tests {
         std::fs::write(tmp.path().join("package.json"), OVERRIDING_MANIFEST).unwrap();
         let (_, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
         assert!(redirected(&done), "{:?}", done.rewrite.warnings);
+    }
+
+    /// REGRESSION (#406): `deno install` installs a `package.json`
+    /// project's npm deps from `deno.lock` and never reads
+    /// package-lock.json, so a redirect of a `name@version` that deno.lock
+    /// also locks is SAID (`redirect_npm_deno_lock`), once, while the
+    /// redirect still stands for npm. Another version in deno.lock, an
+    /// unparseable one, or none says nothing.
+    #[tokio::test]
+    async fn issue_406_a_deno_lock_of_the_redirected_version_is_said() {
+        const LOCK: &str = r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "app", "dependencies": { "left-pad": "1.3.0" } },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let deno_lock = |key: &str| {
+            format!(r#"{{"version":"5","npm":{{"{key}":{{"integrity":"sha512-X=="}}}}}}"#)
+        };
+        let said = |done: &Rewritten| {
+            let lock = done.rewrite.files.get("package-lock.json");
+            assert!(
+                lock.is_some_and(|l| l.contains(&left_pad_url())),
+                "{:?}",
+                done.rewrite.warnings
+            );
+            let found: Vec<&RewriteWarning> = done
+                .npm_warnings
+                .iter()
+                .filter(|w| w.code == "redirect_npm_deno_lock")
+                .collect();
+            assert!(found.len() <= 1, "{found:?}");
+            found.first().map(|w| w.detail.clone())
+        };
+        let cases = [
+            (Some(deno_lock("left-pad@1.3.0")), true),
+            // Deno's peer suffix still names the same version.
+            (Some(deno_lock("left-pad@1.3.0_react@18.2.0")), true),
+            (Some(deno_lock("left-pad@1.2.0")), false),
+            (Some("not json".to_string()), false),
+            (None, false),
+        ];
+        for (deno, expect) in cases {
+            // In memory.
+            let mut p = MemoryProject::new();
+            p.insert_text("package-lock.json", LOCK);
+            if let Some(text) = &deno {
+                p.insert_text("deno.lock", text.as_str());
+            }
+            let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+            let detail = said(&done);
+            assert_eq!(detail.is_some(), expect, "{deno:?}: {detail:?}");
+            if let Some(detail) = detail {
+                assert!(detail.starts_with("left-pad@1.3.0 redirected"), "{detail}");
+                assert!(detail.contains("deno install"), "{detail}");
+                assert!(detail.contains("--mode agent"), "{detail}");
+            }
+            // On disk.
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("package-lock.json"), LOCK).unwrap();
+            if let Some(text) = &deno {
+                std::fs::write(tmp.path().join("deno.lock"), text).unwrap();
+            }
+            let (_, done) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
+            assert_eq!(said(&done).is_some(), expect, "disk {deno:?}");
+            // deno.lock is never written.
+            assert!(!done.rewrite.files.contains_key("deno.lock"));
+        }
     }
 
     const LEFT_PAD_V9_LOCK: &str = "lockfileVersion: '9.0'
@@ -5437,6 +5664,116 @@ snapshots:
                 codes.contains(&"redirect_gem_twin_manifest_ambiguous"),
                 "{codes:?}"
             );
+        }
+    }
+
+    /// #1688: bundler ≤ 2.1 writes ONE merged `GEM` section listing every
+    /// remote, so after an earlier redirect + `bundle install` the lock's
+    /// Socket remote names the earlier patch. A superseding patch (or a
+    /// rotated grant) moves the Gemfile's `source … do` block to the new
+    /// URL; the lock's remote must move with it, or discovery reads the
+    /// pair as naming two patches and the run skips the new one as
+    /// `redirect_unattributable` on every scan.
+    #[tokio::test]
+    async fn merged_section_supersede_moves_the_lock_remote_with_the_gemfile() {
+        const OLD_UUID: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+        const OLD_TOKEN: &str = "22222222-2222-4222-8222-222222222222";
+        let new_url =
+            format!("https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/");
+        for (label, old_url) in [
+            (
+                "superseding patch",
+                format!("https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{OLD_UUID}/"),
+            ),
+            (
+                "rotated grant",
+                format!("https://patch.test/patch-registry/gem/{OLD_TOKEN}/{FIXTURE_UUID}/"),
+            ),
+        ] {
+            for eol in ["\n", "\r\n"] {
+                let gemfile = format!(
+                    "source \"https://rubygems.org\"\n\nsource \"{old_url}\" do\n  gem \"rails\", \"7.0.0\"\nend\n"
+                )
+                .replace('\n', eol);
+                let lock = format!(
+                    "GEM\n  remote: https://rubygems.org/\n  remote: {old_url}\n  specs:\n    \
+                     rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\n\
+                     BUNDLED WITH\n   2.1.4\n"
+                )
+                .replace('\n', eol);
+                let mut p = MemoryProject::new();
+                p.insert_text("Gemfile", gemfile.as_str());
+                p.insert_text("Gemfile.lock", lock.as_str());
+                let outer = OuterAllowRemote::default;
+                let options = RewriteOptions {
+                    dry_run: false,
+                    targets_pipenv_lock: false,
+                    pipenv_major: None,
+                    pipenv_unknown_detail: String::new(),
+                    trust_lockfile_config: true,
+                    npm_allow_remote_config: true,
+                    npm_outer: &outer,
+                    yarn_classic_outer: &OuterYarnMirror::default,
+                    cargo_outer: &no_cargo_outer,
+                    pnpm_env: &no_env,
+                    blocking: false,
+                    takeover_uuids: Default::default(),
+                    patch_server_origins: vec!["https://patch.test".to_string()],
+                    prior_discovery: None,
+                };
+                let mut candidate = gem_candidate();
+                if let Some(ov) = candidate.dep.registry_override.as_mut() {
+                    ov.index_url = new_url.clone();
+                }
+                let candidates = vec![candidate];
+                let view = ProjectView::Memory(&p);
+                let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
+                let done = rewrite(
+                    &view,
+                    read,
+                    &candidates,
+                    BTreeMap::new(),
+                    &BTreeSet::new(),
+                    options,
+                )
+                .await;
+                let ctx = format!("{label} ({eol:?})");
+                assert!(
+                    done.unattributed.is_empty(),
+                    "{ctx}: {:?}",
+                    done.unattributed
+                );
+                assert_eq!(
+                    done.confirmed,
+                    vec![("pkg:gem/rails@7.0.0".to_string(), FIXTURE_UUID.to_string())],
+                    "{ctx}: {:?}",
+                    done.rewrite.warnings
+                );
+                assert_eq!(
+                    done.rewrite.files.get("Gemfile").map(String::as_str),
+                    Some(gemfile.replace(&old_url, &new_url).as_str()),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    done.rewrite.files.get("Gemfile.lock").map(String::as_str),
+                    Some(lock.replace(&old_url, &new_url).as_str()),
+                    "{ctx}: the merged section's Socket remote moves in place"
+                );
+                assert!(
+                    done.rewrite.edits.iter().any(|e| {
+                        e.path == "Gemfile.lock"
+                            && e.kind == "redirect_gemfile_lock_source_url"
+                            && e.original == Some(serde_json::Value::String(old_url.clone()))
+                    }),
+                    "{ctx}: {:?}",
+                    done.rewrite.edits
+                );
+                assert!(
+                    !warning_codes(&done).contains(&"redirect_gem_frozen_install"),
+                    "{ctx}: the refreshed pair stays converged: {:?}",
+                    done.rewrite.warnings
+                );
+            }
         }
     }
 

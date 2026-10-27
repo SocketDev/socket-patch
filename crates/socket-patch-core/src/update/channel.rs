@@ -13,7 +13,9 @@
 //! a snapshot of the relevant environment, so the heuristics are
 //! table-testable across platforms without touching process state.
 
+use crate::formats::yarn::berry_gates::{YARNRC, YARN_LOCK};
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 /// How the currently-running binary appears to have been installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,14 @@ pub struct ChannelEnv {
     pub xdg_cache_home: Option<PathBuf>,
     pub home: Option<PathBuf>,
     pub local_app_data: Option<PathBuf>,
+    /// The canonicalized folders yarn 1's `global-folder` config names
+    /// (`YARN_GLOBAL_FOLDER`, `~/.yarnrc`, ...): a `yarn global add`
+    /// moved there looks like a small yarn project on disk (#1629). Read
+    /// through [`ChannelEnv::yarn_global_folders`]; tests set it directly.
+    pub yarn_global_folders: OnceLock<Vec<PathBuf>>,
+    /// Whether [`ChannelEnv::yarn_global_folders`] reads yarn's config
+    /// from this process when it is first asked (set by `from_env`).
+    read_yarn_config: bool,
 }
 
 impl ChannelEnv {
@@ -61,7 +71,24 @@ impl ChannelEnv {
             xdg_cache_home: path_var("XDG_CACHE_HOME"),
             home: crate::utils::fs::home_dir(),
             local_app_data: path_var("LOCALAPPDATA"),
+            yarn_global_folders: OnceLock::new(),
+            read_yarn_config: true,
         }
+    }
+
+    /// [`ChannelEnv::yarn_global_folders`], reading yarn's config on first
+    /// use: only a yarn-owned `node_modules` install needs it, so the
+    /// other channels never walk the rc files.
+    pub fn yarn_global_folders(&self) -> &[PathBuf] {
+        self.yarn_global_folders.get_or_init(|| {
+            if !self.read_yarn_config {
+                return Vec::new();
+            }
+            crate::patch::redirect::yarnrc::configured_yarn_global_folders_for_process()
+                .into_iter()
+                .filter_map(|dir| std::fs::canonicalize(dir).ok())
+                .collect()
+        })
     }
 }
 
@@ -126,7 +153,7 @@ pub fn upgrade_hint(channel: InstallChannel) -> &'static str {
 /// ([`node_manager`]):
 ///
 /// - npm: a global install (`<prefix>/lib/node_modules`,
-///   `%APPDATA%\npm\node_modules`, a yarn `global` store, a Windows
+///   `%APPDATA%\npm\node_modules`, a Windows
 ///   version-manager dir such as nvm-windows'
 ///   `%APPDATA%\nvm\v20.11.0\node_modules`) takes `npm update -g`; a
 ///   project dependency (`<project>/node_modules`) takes `npm install …`,
@@ -147,13 +174,29 @@ pub fn upgrade_hint(channel: InstallChannel) -> &'static str {
 ///   refreshed by running bunx with `@latest`. npm's commands fail here the
 ///   same way they do for pnpm, and `npm install` breaks the next
 ///   `bun install --frozen-lockfile`.
-pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'static str {
+/// - yarn: `yarn global add …@latest` for its global folder (`npm update
+///   -g` never looks there); in a project, `yarn up …@latest` on yarn 2+
+///   (it updates every workspace that declares the dependency) and `yarn
+///   add …@latest` on yarn 1. A yarn 1 workspace root refuses a bare `yarn
+///   add`: `yarn upgrade … --latest` there updates the root's own
+///   declaration, and `yarn upgrade-interactive --latest` is the one
+///   command that reaches a member's. `npm install` in a yarn project
+///   writes a stray `package-lock.json` beside `yarn.lock`.
+///
+/// A folder `env` names as yarn's configured global folder
+/// ([`ChannelEnv::yarn_global_folders`]) is yarn's global folder whatever
+/// it is called.
+pub fn upgrade_hint_for(
+    channel: InstallChannel,
+    canonical_exe: &Path,
+    env: &ChannelEnv,
+) -> &'static str {
     if channel != InstallChannel::Npm {
         return upgrade_hint(channel);
     }
     let global = is_global_npm_install(canonical_exe);
     let holder = outermost_node_modules_holder(canonical_exe);
-    match node_manager(canonical_exe) {
+    match node_manager(canonical_exe, env) {
         NodeManager::Pnpm if global => "pnpm add -g @socketsecurity/socket-patch@latest",
         NodeManager::Pnpm
             if holder.is_some_and(|dir| {
@@ -167,6 +210,22 @@ pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'stat
         NodeManager::Bun if global => "bun add -g @socketsecurity/socket-patch@latest",
         NodeManager::Bun => "bun add @socketsecurity/socket-patch@latest",
         NodeManager::Bunx => "bunx @socketsecurity/socket-patch@latest …",
+        NodeManager::Yarn
+            if is_yarn_global_store(canonical_exe, env)
+                || is_prefix_global_install(canonical_exe) =>
+        {
+            "yarn global add @socketsecurity/socket-patch@latest"
+        }
+        NodeManager::Yarn => match holder.map(read_package_json) {
+            _ if holder.is_some_and(is_yarn_berry_project) => {
+                "yarn up @socketsecurity/socket-patch@latest"
+            }
+            Some(Some(pkg)) if declares_workspaces(&pkg) && declares_socket_patch(&pkg) => {
+                "yarn upgrade @socketsecurity/socket-patch --latest"
+            }
+            Some(Some(pkg)) if declares_workspaces(&pkg) => "yarn upgrade-interactive --latest",
+            _ => "yarn add @socketsecurity/socket-patch@latest",
+        },
         _ if global => upgrade_hint(channel),
         NodeManager::Vlx => "vlx -y -- @socketsecurity/socket-patch@latest …",
         NodeManager::Vlt => "vlt install @socketsecurity/socket-patch@latest",
@@ -177,14 +236,19 @@ pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'stat
 /// Short human label for refusal messages ("managed by pnpm"): the
 /// [`channel_label`], naming the npm-family manager for a `node_modules`
 /// install.
-pub fn channel_label_for(channel: InstallChannel, canonical_exe: &Path) -> &'static str {
+pub fn channel_label_for(
+    channel: InstallChannel,
+    canonical_exe: &Path,
+    env: &ChannelEnv,
+) -> &'static str {
     if channel != InstallChannel::Npm {
         return channel_label(channel);
     }
-    match node_manager(canonical_exe) {
+    match node_manager(canonical_exe, env) {
         NodeManager::Npm => "npm",
         NodeManager::Pnpm => "pnpm",
         NodeManager::Bun | NodeManager::Bunx => "bun",
+        NodeManager::Yarn => "yarn",
         NodeManager::Vlt | NodeManager::Vlx => "vlt",
     }
 }
@@ -196,6 +260,7 @@ enum NodeManager {
     Pnpm,
     Bun,
     Bunx,
+    Yarn,
     Vlt,
     Vlx,
 }
@@ -208,9 +273,12 @@ enum NodeManager {
 /// beside the outermost `node_modules` (`node-linker=hoisted`). Bun by
 /// its `install/global` store, a `.bun` isolated-linker store inside
 /// `node_modules`, or a `bun.lock` / `bun.lockb` beside the outermost
-/// `node_modules`; bunx by its cache dir's name. Anything else is npm,
-/// which also covers yarn (no dedicated hint yet).
-fn node_manager(path: &Path) -> NodeManager {
+/// `node_modules`; bunx by its cache dir's name. Yarn by its global folder
+/// ([`is_yarn_global_store`]) or a `yarn.lock` beside the outermost
+/// `node_modules`, after pnpm's and Bun's and only when no npm lock sits
+/// there too (a project mid-migration keeps npm's hint). Anything else is
+/// npm.
+fn node_manager(path: &Path, env: &ChannelEnv) -> NodeManager {
     let holder = outermost_node_modules_holder(path);
     // bunx's cache is told by its dir name alone, whether or not the dir
     // still holds a package.json.
@@ -242,7 +310,104 @@ fn node_manager(path: &Path) -> NodeManager {
     {
         return NodeManager::Bun;
     }
+    if (holder_has(YARN_LOCK)
+        && !crate::constants::npm_family::NPM_LOCKS
+            .iter()
+            .any(|lock| holder_has(lock)))
+        || is_yarn_global_store(path, env)
+    {
+        return NodeManager::Yarn;
+    }
     NodeManager::Npm
+}
+
+/// Yarn's global folder (`yarn global dir`): the `global` dir that holds
+/// the first `node_modules`, below a `yarn` home (`~/.config/yarn/global`,
+/// `/usr/local/share/.config/yarn/global` as root) or `Yarn\Data` on
+/// Windows, or holding yarn's own `yarn.lock` (a `global-folder` set
+/// elsewhere). A project that merely sits under some `global` dir is not.
+/// Any folder yarn's config names as its global folder is, whatever its
+/// name (#1629).
+fn is_yarn_global_store(path: &Path, env: &ChannelEnv) -> bool {
+    is_default_yarn_global_store(path)
+        || outermost_node_modules_holder(path)
+            .is_some_and(|dir| env.yarn_global_folders().iter().any(|g| g == dir))
+}
+
+/// [`is_yarn_global_store`] by the folder's name alone.
+fn is_default_yarn_global_store(path: &Path) -> bool {
+    let names = normal_components(path);
+    let Some(first_nm) = names.iter().position(|n| *n == "node_modules") else {
+        return false;
+    };
+    let is = |i: Option<usize>, name: &str| {
+        i.and_then(|i| names[i].to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    };
+    let at = |back: usize| first_nm.checked_sub(back);
+    if !is(at(1), "global") {
+        return false;
+    }
+    is(at(2), "yarn")
+        || (is(at(2), "data") && is(at(3), "yarn"))
+        || outermost_node_modules_holder(path).is_some_and(|dir| dir.join(YARN_LOCK).is_file())
+}
+
+/// A yarn 2+ project: `.yarnrc.yml` (which yarn 1 never reads), a berry
+/// `yarn.lock`, or a `packageManager` pin to yarn 2 or later.
+fn is_yarn_berry_project(dir: &Path) -> bool {
+    dir.join(YARNRC).is_file()
+        || yarn_lock_head(dir).is_some_and(|head| crate::formats::yarn::is_berry_lock(&head))
+        || read_package_json(dir).is_some_and(|pkg| {
+            pkg.get("packageManager")
+                .and_then(|pm| pm.as_str())
+                .and_then(|pm| pm.strip_prefix("yarn@"))
+                .and_then(|version| version.split('.').next())
+                .and_then(|major| major.parse::<u32>().ok())
+                .is_some_and(|major| major >= 2)
+        })
+}
+
+/// The start of `dir`'s `yarn.lock`: both grammars announce themselves in
+/// the first lines (berry's `__metadata:` block, yarn 1's header comment),
+/// and this runs on the update notifier's path, so a large lock is not
+/// read whole.
+fn yarn_lock_head(dir: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let (file, _) = crate::utils::fs::open_regular_file_sync(&dir.join(YARN_LOCK)).ok()?;
+    let mut head = Vec::new();
+    file.take(4096).read_to_end(&mut head).ok()?;
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// The parsed `package.json` in `dir`, if it reads as JSON.
+fn read_package_json(dir: &Path) -> Option<serde_json::Value> {
+    let text = crate::utils::fs::read_regular_to_string_sync(&dir.join("package.json")).ok()?;
+    serde_json::from_str(crate::formats::text::strip_bom(&text)).ok()
+}
+
+/// Whether a `package.json` declares workspaces: a non-empty array, or the
+/// `{ "packages": [...] }` form with a non-empty `packages`.
+fn declares_workspaces(pkg: &serde_json::Value) -> bool {
+    let globs = match pkg.get("workspaces") {
+        Some(serde_json::Value::Object(obj)) => obj.get("packages"),
+        other => other,
+    };
+    globs
+        .and_then(|g| g.as_array())
+        .is_some_and(|g| !g.is_empty())
+}
+
+/// Whether a `package.json` itself declares socket-patch in any dependency
+/// section.
+fn declares_socket_patch(pkg: &serde_json::Value) -> bool {
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .iter()
+        .any(|section| {
+            pkg.get(section)
+                .and_then(|deps| deps.get("@socketsecurity/socket-patch"))
+                .is_some()
+        })
 }
 
 /// Bun's global store, `$BUN_INSTALL/install/global/node_modules`
@@ -309,11 +474,7 @@ fn is_pnpm_global_store(path: &Path) -> bool {
 /// vlx installs each package into its own project dir whose generated
 /// `package.json` is named `vlx`.
 fn is_vlx_cache_dir(dir: &Path) -> bool {
-    crate::utils::fs::read_regular_to_string_sync(&dir.join("package.json"))
-        .ok()
-        .and_then(|text| {
-            serde_json::from_str::<serde_json::Value>(crate::formats::text::strip_bom(&text)).ok()
-        })
+    read_package_json(dir)
         .is_some_and(|pkg| pkg.get("name").and_then(|n| n.as_str()) == Some("vlx"))
 }
 
@@ -328,24 +489,33 @@ fn outermost_node_modules_holder(path: &Path) -> Option<&Path> {
 }
 
 /// Whether the outermost `node_modules` of `path` belongs to a global
-/// install. The well-known global layouts (directly under `lib` on a Unix
-/// prefix or `npm` on Windows, or anywhere below a yarn/pnpm `global`
-/// store) decide without touching the disk. Otherwise the directory that
-/// holds the outermost `node_modules` decides: a project has a
-/// `package.json` there, while a global prefix without a `lib/` level
-/// (nvm-windows `…\nvm\v20.11.0`, fnm `…\installation`, Volta's image
-/// dirs) does not. Defaulting to global when unsure is the safer miss:
-/// `npm install …` run from an arbitrary cwd would scaffold a stray
-/// `node_modules`/`package.json` there and leave the real copy stale.
+/// install: a prefix layout ([`is_prefix_global_install`]) or anywhere
+/// below a `global` store (yarn's, pnpm's). Defaulting to global when
+/// unsure is the safer miss: `npm install …` run from an arbitrary cwd
+/// would scaffold a stray `node_modules`/`package.json` there and leave
+/// the real copy stale.
 fn is_global_npm_install(path: &Path) -> bool {
     let names = normal_components(path);
     let Some(first_nm) = names.iter().position(|n| *n == "node_modules") else {
         return false;
     };
+    names[..first_nm].iter().any(|n| *n == "global") || is_prefix_global_install(path)
+}
+
+/// A global prefix: the first `node_modules` sits directly under `lib` on
+/// a Unix prefix (including Volta's package images, whose `lib/` also
+/// holds yarn's package.json and yarn.lock after a `yarn global add`) or
+/// `npm` on Windows, which decides without touching the disk. Otherwise
+/// the directory that holds the outermost `node_modules` decides: a
+/// project has a `package.json` there, while a prefix without a `lib/`
+/// level (nvm-windows `…\nvm\v20.11.0`, fnm `…\installation`) does not.
+fn is_prefix_global_install(path: &Path) -> bool {
+    let names = normal_components(path);
+    let Some(first_nm) = names.iter().position(|n| *n == "node_modules") else {
+        return false;
+    };
     let parent = first_nm.checked_sub(1).map(|i| names[i]);
-    if matches!(parent, Some(p) if p == "lib" || p == "npm")
-        || names[..first_nm].iter().any(|n| *n == "global")
-    {
+    if matches!(parent, Some(p) if p == "lib" || p == "npm") {
         return true;
     }
     match outermost_node_modules_holder(path) {
@@ -401,6 +571,16 @@ fn launcher_cache_roots(env: &ChannelEnv) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`upgrade_hint_for`] with no yarn `global-folder` configured.
+    fn hint(channel: InstallChannel, exe: &Path) -> &'static str {
+        upgrade_hint_for(channel, exe, &ChannelEnv::default())
+    }
+
+    /// [`channel_label_for`] with no yarn `global-folder` configured.
+    fn label(channel: InstallChannel, exe: &Path) -> &'static str {
+        channel_label_for(channel, exe, &ChannelEnv::default())
+    }
 
     fn env_with_home(home: &str) -> ChannelEnv {
         ChannelEnv {
@@ -681,11 +861,10 @@ mod tests {
         let global = [
             "/usr/local/lib/node_modules/@socketsecurity/socket-patch/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
             "/home/u/.nvm/versions/node/v20.1.0/lib/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
-            "/home/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
         ];
         for p in global {
             assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, Path::new(p)),
+                hint(InstallChannel::Npm, Path::new(p)),
                 "npm update -g @socketsecurity/socket-patch",
                 "{p}"
             );
@@ -702,7 +881,7 @@ mod tests {
         for rel in local {
             let p = project.path().join(rel);
             assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, &p),
+                hint(InstallChannel::Npm, &p),
                 "npm install @socketsecurity/socket-patch@latest",
                 "{}",
                 p.display()
@@ -720,7 +899,7 @@ mod tests {
                 .join(prefix)
                 .join("node_modules/@socketsecurity/socket-patch-win32-x64/bin/socket-patch.exe");
             assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, &p),
+                hint(InstallChannel::Npm, &p),
                 "npm update -g @socketsecurity/socket-patch",
                 "{}",
                 p.display()
@@ -728,7 +907,7 @@ mod tests {
         }
         // Other channels are path-independent.
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Pypi, Path::new("/work/app/node_modules/x")),
+            hint(InstallChannel::Pypi, Path::new("/work/app/node_modules/x")),
             upgrade_hint(InstallChannel::Pypi)
         );
     }
@@ -748,13 +927,13 @@ mod tests {
         std::fs::write(project.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
         let exe = project.path().join(bin);
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &exe),
+            hint(InstallChannel::Npm, &exe),
             "npm install @socketsecurity/socket-patch@latest",
             "no vlt-lock.json: an npm project"
         );
         std::fs::write(project.path().join("vlt-lock.json"), "{}").unwrap();
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &exe),
+            hint(InstallChannel::Npm, &exe),
             "vlt install @socketsecurity/socket-patch@latest"
         );
         // A lock in a nested dir between the holder and the binary is not
@@ -764,7 +943,7 @@ mod tests {
         std::fs::create_dir_all(nested.path().join("node_modules/.vlt")).unwrap();
         std::fs::write(nested.path().join("node_modules/.vlt/vlt-lock.json"), "{}").unwrap();
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &nested.path().join(bin)),
+            hint(InstallChannel::Npm, &nested.path().join(bin)),
             "npm install @socketsecurity/socket-patch@latest"
         );
 
@@ -780,19 +959,19 @@ mod tests {
         .unwrap();
         std::fs::write(vlx.join("vlt-lock.json"), "{}").unwrap();
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &vlx.join(bin)),
+            hint(InstallChannel::Npm, &vlx.join(bin)),
             "vlx -y -- @socketsecurity/socket-patch@latest …"
         );
         // A project merely named like vlx's dir but with another name is a
         // vlt project, not the vlx cache.
         std::fs::write(vlx.join("package.json"), r#"{"name":"vlxx"}"#).unwrap();
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &vlx.join(bin)),
+            hint(InstallChannel::Npm, &vlx.join(bin)),
             "vlt install @socketsecurity/socket-patch@latest"
         );
         // Global installs keep the global hint whatever vlt files exist.
         assert_eq!(
-            upgrade_hint_for(
+            hint(
                 InstallChannel::Npm,
                 Path::new(
                     "/usr/local/lib/node_modules/@socketsecurity/socket-patch/bin/socket-patch"
@@ -821,22 +1000,22 @@ mod tests {
         for p in global {
             let p = Path::new(p);
             assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, p),
+                hint(InstallChannel::Npm, p),
                 "pnpm add -g @socketsecurity/socket-patch@latest",
                 "{}",
                 p.display()
             );
-            assert_eq!(channel_label_for(InstallChannel::Npm, p), "pnpm");
+            assert_eq!(label(InstallChannel::Npm, p), "pnpm");
         }
         // Yarn's global store is not pnpm's.
         let yarn = Path::new(
             "/home/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
         );
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, yarn),
-            "npm update -g @socketsecurity/socket-patch"
+            hint(InstallChannel::Npm, yarn),
+            "yarn global add @socketsecurity/socket-patch@latest"
         );
-        assert_eq!(channel_label_for(InstallChannel::Npm, yarn), "npm");
+        assert_eq!(label(InstallChannel::Npm, yarn), "yarn");
     }
 
     #[test]
@@ -850,22 +1029,22 @@ mod tests {
         std::fs::write(project.path().join("package.json"), "{}").unwrap();
         let p = project.path().join(isolated);
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &p),
+            hint(InstallChannel::Npm, &p),
             "pnpm add @socketsecurity/socket-patch@latest"
         );
-        assert_eq!(channel_label_for(InstallChannel::Npm, &p), "pnpm");
+        assert_eq!(label(InstallChannel::Npm, &p), "pnpm");
         // `node-linker=hoisted` has no `.pnpm`: pnpm-lock.yaml decides.
         let p = project.path().join(hoisted);
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &p),
+            hint(InstallChannel::Npm, &p),
             "npm install @socketsecurity/socket-patch@latest"
         );
         std::fs::write(project.path().join("pnpm-lock.yaml"), "").unwrap();
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &p),
+            hint(InstallChannel::Npm, &p),
             "pnpm add @socketsecurity/socket-patch@latest"
         );
-        assert_eq!(channel_label_for(InstallChannel::Npm, &p), "pnpm");
+        assert_eq!(label(InstallChannel::Npm, &p), "pnpm");
 
         // A workspace root refuses a bare `pnpm add` (ERR_PNPM_ADDING_TO_ROOT)
         // and the dependency may be declared by any member, so update it
@@ -875,7 +1054,7 @@ mod tests {
         std::fs::write(ws.path().join("pnpm-workspace.yaml"), "packages: [a]\n").unwrap();
         let p = ws.path().join(isolated);
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &p),
+            hint(InstallChannel::Npm, &p),
             "pnpm update --recursive --latest @socketsecurity/socket-patch"
         );
     }
@@ -896,25 +1075,30 @@ mod tests {
         for p in global {
             let p = Path::new(p);
             assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, p),
+                hint(InstallChannel::Npm, p),
                 "bun add -g @socketsecurity/socket-patch@latest",
                 "{}",
                 p.display()
             );
-            assert_eq!(channel_label_for(InstallChannel::Npm, p), "bun");
+            assert_eq!(label(InstallChannel::Npm, p), "bun");
         }
         // Neither npm's `lib` prefix nor yarn's global store is Bun's.
-        for p in [
+        let npm = Path::new(
             "/usr/local/lib/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+        );
+        assert_eq!(
+            hint(InstallChannel::Npm, npm),
+            "npm update -g @socketsecurity/socket-patch"
+        );
+        assert_eq!(label(InstallChannel::Npm, npm), "npm");
+        let yarn = Path::new(
             "/home/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
-        ] {
-            let p = Path::new(p);
-            assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, p),
-                "npm update -g @socketsecurity/socket-patch"
-            );
-            assert_eq!(channel_label_for(InstallChannel::Npm, p), "npm");
-        }
+        );
+        assert_eq!(
+            hint(InstallChannel::Npm, yarn),
+            "yarn global add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(label(InstallChannel::Npm, yarn), "yarn");
     }
 
     #[test]
@@ -927,22 +1111,22 @@ mod tests {
         std::fs::write(project.path().join("package.json"), "{}").unwrap();
         let p = project.path().join(isolated);
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &p),
+            hint(InstallChannel::Npm, &p),
             "bun add @socketsecurity/socket-patch@latest"
         );
-        assert_eq!(channel_label_for(InstallChannel::Npm, &p), "bun");
+        assert_eq!(label(InstallChannel::Npm, &p), "bun");
         // The `.bun` store is Bun's even beside a pnpm lock left over from
         // a migration.
         std::fs::write(project.path().join("pnpm-lock.yaml"), "").unwrap();
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &p),
+            hint(InstallChannel::Npm, &p),
             "bun add @socketsecurity/socket-patch@latest"
         );
         std::fs::remove_file(project.path().join("pnpm-lock.yaml")).unwrap();
         // The hoisted linker: the text or binary lockfile decides.
         let p = project.path().join(hoisted);
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &p),
+            hint(InstallChannel::Npm, &p),
             "npm install @socketsecurity/socket-patch@latest"
         );
         for lock in ["bun.lock", "bun.lockb"] {
@@ -951,11 +1135,11 @@ mod tests {
             std::fs::write(project.path().join(lock), "").unwrap();
             let p = project.path().join(hoisted);
             assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, &p),
+                hint(InstallChannel::Npm, &p),
                 "bun add @socketsecurity/socket-patch@latest",
                 "{lock}"
             );
-            assert_eq!(channel_label_for(InstallChannel::Npm, &p), "bun");
+            assert_eq!(label(InstallChannel::Npm, &p), "bun");
         }
         // A lock in a nested dir between the holder and the binary is not
         // the holder's.
@@ -964,7 +1148,7 @@ mod tests {
         std::fs::create_dir_all(nested.path().join("node_modules/x")).unwrap();
         std::fs::write(nested.path().join("node_modules/x/bun.lock"), "").unwrap();
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &nested.path().join(hoisted)),
+            hint(InstallChannel::Npm, &nested.path().join(hoisted)),
             "npm install @socketsecurity/socket-patch@latest"
         );
     }
@@ -987,11 +1171,11 @@ mod tests {
             std::fs::write(holder.join("bun.lock"), "").unwrap();
             let p = holder.join(bin);
             assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, &p),
+                hint(InstallChannel::Npm, &p),
                 "bunx @socketsecurity/socket-patch@latest …",
                 "{dir}"
             );
-            assert_eq!(channel_label_for(InstallChannel::Npm, &p), "bun");
+            assert_eq!(label(InstallChannel::Npm, &p), "bun");
         }
         // A cache dir without its package.json (which would otherwise read
         // as a global prefix) is still bunx's.
@@ -1001,7 +1185,7 @@ mod tests {
         std::fs::create_dir_all(&holder).unwrap();
         std::fs::write(holder.join("bun.lockb"), "").unwrap();
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, &holder.join(bin)),
+            hint(InstallChannel::Npm, &holder.join(bin)),
             "bunx @socketsecurity/socket-patch@latest …"
         );
         // A Bun project merely named like the cache, or nested below one
@@ -1017,11 +1201,300 @@ mod tests {
             std::fs::write(holder.join("package.json"), "{}").unwrap();
             std::fs::write(holder.join("bun.lock"), "").unwrap();
             assert_eq!(
-                upgrade_hint_for(InstallChannel::Npm, &holder.join(bin)),
+                hint(InstallChannel::Npm, &holder.join(bin)),
                 "bun add @socketsecurity/socket-patch@latest",
                 "{dir}"
             );
         }
+    }
+
+    /// #1629: a yarn install upgrades through yarn. `npm update -g` never
+    /// looks in yarn's global folder (it prints "up to date" and leaves the
+    /// yarn copy stale), and `npm install` in a yarn project writes a stray
+    /// package-lock.json beside yarn.lock.
+    #[test]
+    fn yarn_global_installs_get_yarn_global_add() {
+        let global = [
+            // `yarn global dir` on Linux and macOS.
+            "/home/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch",
+            "/Users/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
+            // ... as root.
+            "/usr/local/share/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch",
+            // ... on Windows (`%LOCALAPPDATA%\Yarn\Data\global`).
+            "/c/Users/u/AppData/Local/Yarn/Data/global/node_modules/@socketsecurity/socket-patch-win32-x64/socket-patch.exe",
+        ];
+        for p in global {
+            let p = Path::new(p);
+            assert_eq!(
+                hint(InstallChannel::Npm, p),
+                "yarn global add @socketsecurity/socket-patch@latest",
+                "{}",
+                p.display()
+            );
+            assert_eq!(label(InstallChannel::Npm, p), "yarn");
+        }
+        // A global folder elsewhere (`--global-folder` / `global-folder`)
+        // that is still named `global`: its yarn.lock names the owner.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("tools/global");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        let p = store.join("node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch");
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "npm update -g @socketsecurity/socket-patch",
+            "no yarn.lock: not yarn's"
+        );
+        std::fs::write(store.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "yarn global add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(label(InstallChannel::Npm, &p), "yarn");
+        // Volta runs `yarn global add` with its global folder set to the
+        // package image's `lib/`, so yarn's package.json and yarn.lock sit
+        // beside a prefix-style `lib/node_modules`. That is still a global
+        // install: `yarn add` from the user's cwd would edit their project
+        // and leave the Volta copy stale.
+        let image = tmp
+            .path()
+            .join(".volta/tools/image/packages/@socketsecurity/socket-patch/lib");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        std::fs::write(image.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        let p = image.join(
+            "node_modules/@socketsecurity/socket-patch/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch",
+        );
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "yarn global add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(label(InstallChannel::Npm, &p), "yarn");
+        // A `global` dir with no yarn home above it and no yarn.lock stays
+        // an npm global.
+        assert_eq!(
+            hint(
+                InstallChannel::Npm,
+                Path::new("/opt/global/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch"),
+            ),
+            "npm update -g @socketsecurity/socket-patch"
+        );
+    }
+
+    /// #1629: a global folder moved by yarn's `global-folder` config to a
+    /// dir not named `global` reads like a small yarn project on disk; the
+    /// config names it, so it upgrades with `yarn global add` (`yarn add`
+    /// from the user's cwd would edit some project instead).
+    #[test]
+    fn yarn_configured_global_folder_gets_yarn_global_add() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("tools/yarn-g");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        std::fs::write(folder.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        let bin = "node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch";
+        let p = folder.join(bin);
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "yarn add @socketsecurity/socket-patch@latest"
+        );
+
+        let env = ChannelEnv {
+            yarn_global_folders: OnceLock::from(vec![folder.clone()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p, &env),
+            "yarn global add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(channel_label_for(InstallChannel::Npm, &p, &env), "yarn");
+        // A nested copy under the folder's package still belongs to it.
+        let nested = folder.join(
+            "node_modules/@socketsecurity/socket-patch/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch",
+        );
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &nested, &env),
+            "yarn global add @socketsecurity/socket-patch@latest"
+        );
+        // Even before yarn wrote its yarn.lock there.
+        std::fs::remove_file(folder.join("yarn.lock")).unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &p, &env),
+            "yarn global add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(channel_label_for(InstallChannel::Npm, &p, &env), "yarn");
+        // A project elsewhere is still a project.
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("package.json"), "{}").unwrap();
+        std::fs::write(project.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &project.join(bin), &env),
+            "yarn add @socketsecurity/socket-patch@latest"
+        );
+        // Only the configured folder itself counts, not a project below it.
+        let below = folder.join("sub");
+        std::fs::create_dir_all(&below).unwrap();
+        std::fs::write(below.join("package.json"), "{}").unwrap();
+        std::fs::write(below.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, &below.join(bin), &env),
+            "yarn add @socketsecurity/socket-patch@latest"
+        );
+    }
+
+    #[test]
+    fn yarn_project_installs_get_yarn_add() {
+        let bin = "node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch";
+
+        // Yarn 1: yarn.lock beside the outermost node_modules.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let p = project.path().join(bin);
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "npm install @socketsecurity/socket-patch@latest"
+        );
+        std::fs::write(project.path().join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "yarn add @socketsecurity/socket-patch@latest"
+        );
+        assert_eq!(label(InstallChannel::Npm, &p), "yarn");
+
+        // A yarn 1 workspace root refuses a bare `yarn add` without -W,
+        // and `yarn upgrade` there never touches a member's declaration;
+        // `upgrade-interactive` lists every workspace's dependencies.
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "yarn upgrade-interactive --latest"
+        );
+        // ... including the object form of `workspaces`.
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"private":true,"workspaces":{"packages":["a"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "yarn upgrade-interactive --latest"
+        );
+        // When the root declares socket-patch itself, `yarn upgrade` updates
+        // that declaration in place (and keeps its section).
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"private":true,"workspaces":["a"],"devDependencies":{"@socketsecurity/socket-patch":"^4.0.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hint(InstallChannel::Npm, &p),
+            "yarn upgrade @socketsecurity/socket-patch --latest"
+        );
+        // An empty `workspaces` (or one with only `nohoist`) is no workspace
+        // root.
+        for manifest in [
+            r#"{"workspaces":[]}"#,
+            r#"{"workspaces":{"nohoist":["**/x"]}}"#,
+        ] {
+            std::fs::write(project.path().join("package.json"), manifest).unwrap();
+            assert_eq!(
+                hint(InstallChannel::Npm, &p),
+                "yarn add @socketsecurity/socket-patch@latest",
+                "{manifest}"
+            );
+        }
+        // An npm lock beside yarn.lock (a project mid-migration) keeps
+        // npm's hint, as before.
+        for lock in ["package-lock.json", "npm-shrinkwrap.json"] {
+            std::fs::write(project.path().join(lock), "{}").unwrap();
+            assert_eq!(
+                hint(InstallChannel::Npm, &p),
+                "npm install @socketsecurity/socket-patch@latest",
+                "{lock}"
+            );
+            assert_eq!(label(InstallChannel::Npm, &p), "npm");
+            std::fs::remove_file(project.path().join(lock)).unwrap();
+        }
+        // A yarn project that sits below some `global` dir is still a
+        // project, not yarn's global folder.
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("global/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        std::fs::write(app.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        assert_eq!(
+            hint(InstallChannel::Npm, &app.join(bin)),
+            "yarn add @socketsecurity/socket-patch@latest"
+        );
+
+        // Yarn 2+ (node-modules linker): `yarn up` upgrades every
+        // workspace that declares the dependency, and works outside one.
+        for berry_marker in ["lock", "yarnrc", "packageManager"] {
+            let berry = tempfile::tempdir().unwrap();
+            std::fs::write(berry.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+            if berry_marker == "packageManager" {
+                std::fs::write(berry.path().join("yarn.lock"), "").unwrap();
+                std::fs::write(
+                    berry.path().join("package.json"),
+                    r#"{"name":"app","packageManager":"yarn@4.5.0+sha512.abc"}"#,
+                )
+                .unwrap();
+            } else if berry_marker == "lock" {
+                std::fs::write(
+                    berry.path().join("yarn.lock"),
+                    "__metadata:\n  version: 8\n  cacheKey: 10c0\n",
+                )
+                .unwrap();
+            } else {
+                std::fs::write(berry.path().join("yarn.lock"), "").unwrap();
+                std::fs::write(
+                    berry.path().join(".yarnrc.yml"),
+                    "nodeLinker: node-modules\n",
+                )
+                .unwrap();
+            }
+            let p = berry.path().join(bin);
+            assert_eq!(
+                hint(InstallChannel::Npm, &p),
+                "yarn up @socketsecurity/socket-patch@latest",
+                "{berry_marker}"
+            );
+            assert_eq!(label(InstallChannel::Npm, &p), "yarn");
+        }
+
+        // pnpm's and Bun's lockfiles outrank a leftover yarn.lock, and so
+        // does a store component in the path.
+        for lock in ["pnpm-lock.yaml", "bun.lock"] {
+            let mixed = tempfile::tempdir().unwrap();
+            std::fs::write(mixed.path().join("package.json"), "{}").unwrap();
+            std::fs::write(mixed.path().join("yarn.lock"), "").unwrap();
+            std::fs::write(mixed.path().join(lock), "").unwrap();
+            assert_ne!(
+                label(InstallChannel::Npm, &mixed.path().join(bin)),
+                "yarn",
+                "{lock}"
+            );
+        }
+        let pnpm_store = project.path().join(
+            "node_modules/.pnpm/@socketsecurity+socket-patch-linux-x64-gnu@4.0.0/node_modules/@socketsecurity/socket-patch-linux-x64-gnu/socket-patch",
+        );
+        assert_eq!(label(InstallChannel::Npm, &pnpm_store), "pnpm");
+
+        // A yarn.lock in a nested dir between the holder and the binary is
+        // not the holder's.
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::write(nested.path().join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(nested.path().join("node_modules/x")).unwrap();
+        std::fs::write(nested.path().join("node_modules/x/yarn.lock"), "").unwrap();
+        assert_eq!(
+            hint(InstallChannel::Npm, &nested.path().join(bin)),
+            "npm install @socketsecurity/socket-patch@latest"
+        );
     }
 
     #[test]
@@ -1031,12 +1504,12 @@ mod tests {
         let bin = project
             .path()
             .join("node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch");
-        assert_eq!(channel_label_for(InstallChannel::Npm, &bin), "npm");
+        assert_eq!(label(InstallChannel::Npm, &bin), "npm");
         std::fs::write(project.path().join("vlt-lock.json"), "{}").unwrap();
-        assert_eq!(channel_label_for(InstallChannel::Npm, &bin), "vlt");
+        assert_eq!(label(InstallChannel::Npm, &bin), "vlt");
         // Non-npm channels keep their path-independent label.
         assert_eq!(
-            channel_label_for(InstallChannel::Homebrew, &bin),
+            label(InstallChannel::Homebrew, &bin),
             channel_label(InstallChannel::Homebrew)
         );
     }
@@ -1048,7 +1521,7 @@ mod tests {
             r"C:\Users\u\AppData\Roaming\npm\node_modules\@socketsecurity\socket-patch-win32-x64\bin\socket-patch.exe",
         );
         assert_eq!(
-            upgrade_hint_for(InstallChannel::Npm, p),
+            hint(InstallChannel::Npm, p),
             "npm update -g @socketsecurity/socket-patch"
         );
     }

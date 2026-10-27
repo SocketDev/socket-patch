@@ -515,7 +515,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         if let Ok(state) = vendor_state_result {
             let ledger_matches = vendor_entries_matching(&state, None, &target);
             if !ledger_matches.is_empty() {
-                return remove_ledger_only(&args, ledger_matches, state, &telemetry).await;
+                return remove_ledger_only(&args, &target, ledger_matches, state, &telemetry).await;
             }
         }
 
@@ -916,6 +916,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
             return 1;
         }
     }
+    sweep_target_orphans(&args, &vendor_state, &target, &mut vendor_leg).await;
+    printed_progress |= loud && vendor_leg.printed;
 
     if loud {
         if printed_progress {
@@ -1117,6 +1119,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         use crate::commands::vendored_backend::tag_event_mode;
         use crate::commands::{HOSTED_MODE_LABEL, VENDORED_MODE_LABEL};
         let mut vendor_reverted = vendor_leg.reverted;
+        vendor_reverted.extend(vendor_leg.orphans);
         tag_event_mode(&mut vendor_reverted, VENDORED_MODE_LABEL);
         env.events.extend(vendor_reverted);
         // Hosted unwinds likewise bypass `record` — summary.removed stays
@@ -1257,6 +1260,10 @@ struct RemoveVendorLeg {
     kept: Vec<String>,
     /// Why each [`Self::kept`] entry was kept (same order).
     kept_causes: Vec<KeepCause>,
+    /// `Removed`/`vendor_orphan_removed` events (dry runs too, as in
+    /// `vendor --revert`): uuid dirs of the reverted packages that no
+    /// ledger entry owns, swept after the reverts (#1610).
+    orphans: Vec<PatchEvent>,
     /// Entries actually reverted and dropped from the ledger (wet runs).
     reverted_count: usize,
     /// Entries unwired with their artifact and ledger entry kept
@@ -1410,6 +1417,60 @@ async fn revert_vendored_matches(
         }
     }
     Ok(leg)
+}
+
+/// Sweep the uuid dirs under `.socket/vendor/` that no ledger entry owns
+/// and `target` names (a git merge of two vendor runs keeps both sides'
+/// dirs, #1610), as `vendor --revert` does: into `leg.orphans`, with a
+/// `skipped` advisory for each one a lockfile still points into (kept) or
+/// that could not be deleted. Runs only after a vendored revert, past the
+/// remove's last abort point. `--preserve-state` keeps local state,
+/// orphans included.
+async fn sweep_target_orphans(
+    args: &RemoveArgs,
+    state: &VendorState,
+    target: &Target,
+    leg: &mut RemoveVendorLeg,
+) {
+    use crate::commands::vendor_orphans::{
+        orphan_in_target, orphan_label, orphan_removal_failed, orphan_removed_event,
+        orphan_still_wired, print_orphan_sweep, sweep_orphan_vendor_dirs_where,
+    };
+    if args.preserve_state || leg.reverted.is_empty() {
+        return;
+    }
+    let sweep = sweep_orphan_vendor_dirs_where(
+        &args.common.project_root(),
+        state,
+        args.common.dry_run,
+        |unit| orphan_in_target(target, unit),
+    )
+    .await;
+    let loud = !args.common.json && !args.common.silent;
+    let warnings = sweep
+        .still_wired
+        .iter()
+        .map(|unit| (unit, orphan_still_wired(unit)))
+        .chain(
+            sweep
+                .failed
+                .iter()
+                .map(|(unit, e)| (unit, orphan_removal_failed(unit, e))),
+        );
+    for (unit, warning) in warnings {
+        if loud {
+            eprintln!("Warning: {}", warning.detail);
+        }
+        leg.skipped.push(
+            PatchEvent::new(PatchAction::Skipped, orphan_label(unit))
+                .with_reason(warning.code, warning.detail),
+        );
+    }
+    if loud && !sweep.removed.is_empty() {
+        print_orphan_sweep(args.common.dry_run, &sweep);
+        leg.printed = true;
+    }
+    leg.orphans = sweep.removed.iter().map(orphan_removed_event).collect();
 }
 
 /// Why a hosted unwind stopped: a pin the upstream restore refused (or a
@@ -1591,6 +1652,7 @@ async fn remove_hosted_only(
 /// patch can only mean reverting its vendoring.
 async fn remove_ledger_only(
     args: &RemoveArgs,
+    target: &Target,
     matches: Vec<(String, VendorEntry)>,
     mut state: VendorState,
     telemetry: &TelemetryAuth,
@@ -1657,10 +1719,11 @@ async fn remove_ledger_only(
     }
 
     let keys: Vec<String> = matches.iter().map(|(k, _)| k.clone()).collect();
-    let leg = match revert_vendored_matches(args, &keys, &mut state, telemetry, false).await {
+    let mut leg = match revert_vendored_matches(args, &keys, &mut state, telemetry, false).await {
         Ok(leg) => leg,
         Err(code) => return code,
     };
+    sweep_target_orphans(args, &state, target, &mut leg).await;
 
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
@@ -1675,6 +1738,14 @@ async fn remove_ledger_only(
     for ev in events {
         env.record(ev);
     }
+    // Swept orphan dirs bypass `record`: `summary.removed` counts the
+    // reverted entries, not the dirs no entry owned.
+    let mut orphans = leg.orphans;
+    crate::commands::vendored_backend::tag_event_mode(
+        &mut orphans,
+        crate::commands::VENDORED_MODE_LABEL,
+    );
+    env.events.extend(orphans);
     if !leg.kept.is_empty() {
         // Any drift-kept entry means part of the requested removal did
         // NOT happen: partialFailure (exit 1). When EVERY match kept, the
