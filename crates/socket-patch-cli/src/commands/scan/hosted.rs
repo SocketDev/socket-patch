@@ -1867,12 +1867,13 @@ async fn run_redirect_selected_untracked(
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
     engine_warnings.extend(done.npm_warnings.iter().cloned());
     // A hosted Go `replace` breaks a committed vendor/ directory until
-    // `go mod vendor` re-records it in vendor/modules.txt (#343).
+    // `go mod vendor` (`go work vendor`) re-records it in
+    // vendor/modules.txt (#343).
     if !common.dry_run
         && done
             .rewritten
             .iter()
-            .any(|f| f == "go.mod" || f.ends_with("/go.mod"))
+            .any(|f| f == "go.mod" || f == "go.work" || f.ends_with("/go.mod"))
     {
         for (code, detail) in socket_patch_core::vendor::go_consumer_sync::audit_warnings(
             &common.cwd,
