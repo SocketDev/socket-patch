@@ -109,12 +109,13 @@ pub(crate) fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
 /// How to recover a lockfile reference into `.socket/vendor/` that the
 /// ledger lost. `repair` does not rebuild ledger entries from lockfiles
 /// (v5.0), so the entry must come back from version control (after a git
-/// merge kept one side of state.json, both sides' `entries` merged), or
-/// the lockfile goes back to its pre-vendor version.
+/// merge kept one side of state.json, both sides' `entries` merged). It
+/// names no lockfile restore: the advisory below follows a revert that
+/// already rewrote the lockfile, and checking it out again would re-wire
+/// what that revert removed.
 pub(crate) const UNLEDGERED_WIRING_REMEDY: &str =
     "restore the missing entries in .socket/vendor/state.json from version control (if a \
-     git merge kept one side of state.json, merge both sides' `entries`), or restore the \
-     lockfile with `git checkout -- <lockfile>`";
+     git merge kept one side of state.json, merge both sides' `entries`)";
 
 /// The advisory for an orphan uuid dir the sweep kept because a project
 /// lockfile still points into it.
@@ -234,6 +235,8 @@ mod tests {
         );
         assert!(!detail.contains("socket-patch repair"), "{detail}");
         assert!(detail.contains("entries"), "{detail}");
-        assert!(detail.contains("git checkout -- <lockfile>"), "{detail}");
+        // The advisory follows a revert that rewrote the lockfile:
+        // checking the lockfile out again would re-wire what it removed.
+        assert!(!detail.contains("git checkout"), "{detail}");
     }
 }

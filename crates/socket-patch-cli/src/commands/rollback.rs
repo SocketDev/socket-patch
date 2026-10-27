@@ -929,7 +929,8 @@ async fn unledgered_vendor_wiring(
     dirs.sort();
     Some(format!(
         "lockfiles reference {}, which the vendor ledger (.socket/vendor/state.json) has no \
-         entry for, so rollback cannot unwind them; {}, then roll back",
+         entry for, so rollback cannot unwind them; {} and roll back, or return the \
+         lockfiles to their pre-vendor versions",
         dirs.join(", "),
         crate::commands::vendor_orphans::UNLEDGERED_WIRING_REMEDY,
     ))
