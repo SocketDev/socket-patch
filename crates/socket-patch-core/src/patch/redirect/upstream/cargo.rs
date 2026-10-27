@@ -355,6 +355,16 @@ fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
         }
     }
     let open = line.find('{')?;
+    // The opening line of a multi-line inline table, which the rewriter
+    // pins right after its `{` (#757).
+    let opening_pin = format!(" registry = \"{reg}\",");
+    if !line[open..].contains('}') && line[open + 1..].starts_with(&opening_pin) {
+        return Some(Some(format!(
+            "{}{}",
+            &line[..=open],
+            &line[open + 1 + opening_pin.len()..]
+        )));
+    }
     let close = open + line[open..].find('}')?;
     let inner = &line[open + 1..close];
     let pin_re = Regex::new(&format!(
@@ -506,6 +516,74 @@ mod tests {
                 "serde = { version = \"1\", features = [\"derive\"] } # hi".to_string()
             ))
         );
+    }
+
+    /// #757: the rewriter pins a multi-line inline table on its opening
+    /// line; restore drops exactly the text it inserted.
+    #[test]
+    fn multiline_inline_table_opening_line_loses_only_the_pin() {
+        for (pinned, original) in [
+            (
+                format!("serde = {{ registry = \"{REG}\", version = \"1\", features = ["),
+                "serde = { version = \"1\", features = [",
+            ),
+            (
+                format!("serde = {{ registry = \"{REG}\", features = [ # wrapped\r"),
+                "serde = { features = [ # wrapped\r",
+            ),
+        ] {
+            assert_eq!(unpin_line(&pinned, REG), Some(Some(original.to_string())));
+        }
+    }
+
+    /// #757 end to end: restoring a hosted pin on a multi-line inline
+    /// table returns the manifest byte-exact, for LF, CRLF and a BOM.
+    #[tokio::test]
+    async fn restore_unpins_a_multiline_inline_table_byte_exact() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n";
+        let original = format!(
+            "{head}cfg-if = {{ version = \"1.0.4\", features = [\n  \"core\", # why\n] }}\nlog = \"0.4\"\n"
+        );
+        let pinned = format!(
+            "{head}cfg-if = {{ registry = \"socket-patch-{B}\", version = \"1.0.4\", features = [\n  \"core\", # why\n] }}\nlog = \"0.4\"\n"
+        );
+        for (crlf, bom) in [(false, false), (true, false), (false, true), (true, true)] {
+            let shape = |s: &str| {
+                let s = if crlf {
+                    s.replace('\n', "\r\n")
+                } else {
+                    s.to_string()
+                };
+                if bom {
+                    format!("\u{feff}{s}")
+                } else {
+                    s
+                }
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("Cargo.toml"), shape(&pinned)).unwrap();
+            let pins = [super::super::HostedPin {
+                purl: "pkg:cargo/cfg-if@1.0.4".into(),
+                uuid: B.into(),
+                files: vec!["Cargo.toml".into()],
+            }];
+            let opts = super::super::RestoreOptions {
+                offline: true,
+                ..Default::default()
+            };
+            let outcome = super::super::restore_upstream(tmp.path(), &pins, &opts).await;
+            assert_eq!(
+                outcome.restored().count(),
+                1,
+                "crlf={crlf} bom={bom}: {:?}",
+                outcome.pins
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+                shape(&original),
+                "crlf={crlf} bom={bom}"
+            );
+        }
     }
 
     #[test]
