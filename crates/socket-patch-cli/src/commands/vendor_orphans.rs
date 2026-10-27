@@ -202,4 +202,27 @@ mod tests {
         assert!(orphan_in_target(&Target::parse(uuid), &unparsed));
         assert!(!orphan_in_target(&Target::parse("left-pad"), &unparsed));
     }
+    /// A kept, still-wired orphan points the user at a remedy that works
+    /// in v5: `repair` no longer rebuilds ledger entries from lockfiles,
+    /// so the advisory names the ledger restore (and the merge case,
+    /// #991) or the lockfile restore instead.
+    #[test]
+    fn orphan_still_wired_names_a_working_remedy() {
+        let unit = vendor::path::SweptVendorDir {
+            eco: "npm".into(),
+            uuid: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".into(),
+            dir: PathBuf::from("/x"),
+            purls: vec![],
+        };
+        let warning = orphan_still_wired(&unit);
+        assert_eq!(warning.code, "vendor_orphan_still_wired");
+        let detail = &warning.detail;
+        assert!(
+            detail.contains(".socket/vendor/npm/aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"),
+            "{detail}"
+        );
+        assert!(!detail.contains("socket-patch repair"), "{detail}");
+        assert!(detail.contains("entries"), "{detail}");
+        assert!(detail.contains("git checkout -- <lockfile>"), "{detail}");
+    }
 }

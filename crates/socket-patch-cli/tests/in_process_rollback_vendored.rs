@@ -977,10 +977,13 @@ async fn unscoped_rollback_sweeps_orphan_vendor_dirs() {
     );
 }
 
-/// An orphan a lockfile still points at is kept and named with
-/// `vendor_orphan_still_wired`: deleting it would break the next install.
+/// An orphan a lockfile still points at is a package the ledger lost
+/// (the losing side of a merge of `.socket/vendor/state.json`, #991): an
+/// unscoped rollback cannot unwind it, so it refuses with
+/// `vendor_ledger_missing` before writing anything. It used to revert the
+/// rest, exit 0 and delete the ledger, leaving the package wired.
 #[tokio::test]
-async fn unscoped_rollback_keeps_a_still_wired_orphan() {
+async fn unscoped_rollback_refuses_a_still_wired_orphan() {
     let fx = vendored_fixture_with_orphans().await;
     // Wire `right-pad` to its orphan dir behind the ledger's back.
     let mut lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
@@ -989,19 +992,45 @@ async fn unscoped_rollback_keeps_a_still_wired_orphan() {
         "resolved": format!("file:.socket/vendor/npm/{OTHER_ORPHAN_UUID}/right-pad-1.0.0.tgz"),
     });
     std::fs::write(fx.lock_path(), serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+    let lock_before = fx.lock_bytes();
+    let state_before = std::fs::read(fx.state_path()).unwrap();
+    let manifest_before = std::fs::read(fx.manifest_path()).unwrap();
 
-    let (code, env) = rollback_cli(fx.root(), &[]);
-    assert_eq!(code, 0, "rollback exits 0: {env:#}");
-    rollback_json::assert_rollback_envelope(&env);
-    assert_eq!(orphans_removed(&env), vec![PURL.to_string()], "{env:#}");
-    assert!(
-        rollback_json::warning_codes(&env).contains(&"vendor_orphan_still_wired".to_string()),
-        "the kept orphan is named: {env:#}"
-    );
-    assert!(
-        !orphan_dir(&fx, ORPHAN_UUID).exists(),
-        "unwired orphan swept"
-    );
+    for extra in [&["--dry-run"][..], &[][..], &["--preserve-state"][..]] {
+        let (code, env) = rollback_cli(fx.root(), extra);
+        assert_eq!(code, 1, "rollback {extra:?} refuses: {env:#}");
+        assert_eq!(env["status"], "error", "{env:#}");
+        assert_eq!(env["error"]["code"], "vendor_ledger_missing", "{env:#}");
+        let msg = env["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains(&format!(".socket/vendor/npm/{OTHER_ORPHAN_UUID}")),
+            "names the unledgered dir: {msg}"
+        );
+        assert!(
+            !msg.contains("socket-patch repair"),
+            "repair does not rebuild ledger entries (v5): {msg}"
+        );
+        assert!(
+            env["events"].as_array().is_some_and(Vec::is_empty),
+            "{env:#}"
+        );
+        assert_eq!(fx.lock_bytes(), lock_before, "lock untouched");
+        assert_eq!(
+            std::fs::read(fx.state_path()).unwrap(),
+            state_before,
+            "ledger kept"
+        );
+        assert_eq!(std::fs::read(fx.manifest_path()).unwrap(), manifest_before);
+        assert!(fx.tgz_path().is_file(), "the ledgered artifact stays");
+        assert!(orphan_dir(&fx, ORPHAN_UUID).is_dir());
+        assert!(orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir());
+    }
+
+    // A scoped rollback of the ledgered package does not own the other
+    // wiring: it reverts its target as before.
+    let (code, env) = rollback_cli(fx.root(), &[PURL]);
+    assert_eq!(code, 0, "rollback <purl> exits 0: {env:#}");
+    assert!(!fx.tgz_path().exists(), "the target is reverted");
     assert!(
         orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir(),
         "a wired orphan is never deleted"
