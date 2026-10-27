@@ -1426,6 +1426,195 @@ fn socket_raw(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, Strin
     )
 }
 
+// ── go work vendor, GOWORK elsewhere, member runs ─────────────────────
+
+/// `go work vendor` (Go 1.22+) at `root`; its success.
+fn work_vendor(tmp: &Path, root: &Path, proxy: &str) -> Output {
+    let m = Machine::new(tmp, &format!("work-vendor-{}", unique()));
+    go(root, &m, &["work", "vendor"], &day2(proxy))
+}
+
+/// A committed workspace `vendor/` directory: after vendor or hosted mode
+/// replaces the shared module in go.work, the run warns that
+/// `vendor/modules.txt` does not record it and the `-mod=vendor` build
+/// fails as go says; `go work vendor` records it and the members build the
+/// patched module from `vendor/` fully offline; `vendor --check` is clean
+/// again.
+#[test]
+fn go_work_vendor_records_the_go_work_replace() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || golang_e2e_matrix::go_minor() < 22
+    {
+        return;
+    }
+    for mode in ["vendored", "hosted"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = ChmodGuard(tmp.path().to_path_buf());
+        let w = stage_members(tmp.path(), UVER, UVER);
+        let out = work_vendor(tmp.path(), &w.root, &w.proxy);
+        assert!(
+            out.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let offline_vendor = [
+            ("GOPROXY", "off"),
+            ("GOSUMDB", "off"),
+            ("GOFLAGS", "-mod=vendor"),
+        ];
+        let (out, err) = run_member(tmp.path(), &w.root, "a", "off", &offline_vendor);
+        assert!(out.contains("A: PRISTINE"), "{mode} baseline: {out}\n{err}");
+
+        let m = Machine::new(tmp.path(), "run");
+        let env = if mode == "vendored" {
+            download(&w.root, &m, &w.proxy);
+            write_local_patch(&w.root, VENDOR_UUID);
+            let cwd = w.root.to_str().unwrap();
+            let (code, env, stderr) = socket(
+                &w.root,
+                &["vendor", "--json", "--offline", "--cwd", cwd],
+                &m.modcache,
+            );
+            assert_eq!(code, 0, "{env}\n{stderr}");
+            env
+        } else {
+            let (code, env, stderr) = w.api.get(&w.root, &m.modcache, &[]);
+            assert_eq!(code, 0, "{env}\n{stderr}");
+            env
+        };
+        assert!(
+            warning_codes(&env).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
+            "{mode}: the run names `go work vendor`: {env}"
+        );
+        let (out, err) = run_member(tmp.path(), &w.root, "a", "off", &offline_vendor);
+        assert!(
+            !out.contains("PATCHED") && err.contains("inconsistent vendoring"),
+            "{mode}: {out}\n{err}"
+        );
+
+        let out = work_vendor(tmp.path(), &w.root, &w.proxy);
+        assert!(
+            out.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let modules_txt = read(&w.root.join("vendor/modules.txt"));
+        assert!(
+            modules_txt
+                .lines()
+                .any(|l| l.starts_with(&format!("# {UMOD} {UVER} => "))),
+            "{mode}: {modules_txt}"
+        );
+        for dir in ["a", "b"] {
+            let (out, err) = run_member(tmp.path(), &w.root, dir, "off", &offline_vendor);
+            assert!(
+                out.contains(&format!("{}: PATCHED", dir.to_uppercase())),
+                "{mode} {dir}: {out}\n{err}"
+            );
+        }
+        if mode == "vendored" {
+            let cwd = w.root.to_str().unwrap();
+            let (code, env, stderr) = socket(
+                &w.root,
+                &["vendor", "--check", "--json", "--cwd", cwd],
+                &m.modcache,
+            );
+            assert_eq!(code, 0, "vendor --check: {env}\n{stderr}");
+        }
+    }
+}
+
+/// Where the run happens decides where the replace goes. From a member
+/// (go.work above it) `vendor` writes the member's go.mod, and a second
+/// member is refused with the way out: run at the workspace root. From the
+/// root the shared module is replaced once in go.work, over the member's
+/// own Socket replace, and both members build it. `GOWORK` naming the same
+/// file by absolute path is the same workspace; one naming a go.work
+/// elsewhere leaves the root with no module and no go.work of its own, so
+/// the run refuses and writes nothing.
+#[test]
+fn run_location_and_gowork_decide_the_replace_file() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, UVER);
+    let m = Machine::new(tmp.path(), "vendor");
+    download(&w.root, &m, &w.proxy);
+    let (a, b) = (w.root.join("a"), w.root.join("b"));
+    write_local_patch(&a, VENDOR_UUID);
+    write_local_patch(&b, VENDOR_UUID);
+    write_local_patch(&w.root, VENDOR_UUID);
+    let vendor = |cwd: &Path, env: &[(&str, &str)]| {
+        socket_env(
+            cwd,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                cwd.to_str().unwrap(),
+            ],
+            &m.modcache,
+            env,
+        )
+    };
+
+    let (code, env, stderr) = vendor(&a, &[]);
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    let art = format!(".socket/vendor/golang/{VENDOR_UUID}/{UMOD}@{UVER}");
+    assert!(
+        read(&a.join("go.mod")).contains(&format!("replace {UMOD} {UVER} => ./{art}")),
+        "a member run writes its own go.mod"
+    );
+    let b_mod = read(&b.join("go.mod"));
+    let (code, env, _) = vendor(&b, &[]);
+    assert_ne!(code, 0, "{env}");
+    let text = env.to_string();
+    assert!(
+        text.contains("conflicting replacements") && text.contains("run socket-patch in"),
+        "{env}"
+    );
+    assert_eq!(read(&b.join("go.mod")), b_mod, "nothing written in b");
+
+    let work_before = read(&w.root.join("go.work"));
+    let elsewhere = tmp.path().join("other");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(
+        elsewhere.join("go.work"),
+        format!(
+            "go 1.18\n\nuse (\n\t{}\n\t{}\n)\n",
+            a.display(),
+            b.display()
+        ),
+    )
+    .unwrap();
+    let gowork = elsewhere.join("go.work");
+    let (code, env, _) = vendor(&w.root, &[("GOWORK", gowork.to_str().unwrap())]);
+    assert_ne!(code, 0, "{env}");
+    assert!(env.to_string().contains("has nowhere to go"), "{env}");
+    assert_eq!(read(&w.root.join("go.work")), work_before);
+
+    let own = w.root.join("go.work");
+    let (code, env, stderr) = vendor(&w.root, &[("GOWORK", own.to_str().unwrap())]);
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(
+        read(&w.root.join("go.work")),
+        format!("{work_before}\nreplace {UMOD} {UVER} => ./{art}\n")
+    );
+    let offline = [("GOPROXY", "off"), ("GOSUMDB", "off")];
+    for dir in ["a", "b"] {
+        let (out, err) = run_member(tmp.path(), &w.root, dir, "off", &offline);
+        assert!(
+            out.contains(&format!("{}: PATCHED", dir.to_uppercase())),
+            "{dir}: {out}\n{err}"
+        );
+    }
+}
+
 /// go keeps no member's go.mod tidy in workspace mode: `b` requires `x`,
 /// which requires `UMOD` v1.1.0, so the workspace builds v1.1.0 although
 /// every member requires v1.0.0, and only x's go.mod shows it. Until the
