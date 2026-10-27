@@ -1042,3 +1042,125 @@ async fn workspace_member_selecting_another_version_never_attests() {
         }
     }
 }
+
+/// A go.work member's dependency requires a higher version of the patched
+/// module than any member's go.mod names. go builds that version without
+/// asking for a go.mod update and writes its sums to `go.work.sum` itself,
+/// so the `/go.mod`-only pin is never the attestation basis, and once the
+/// higher zip line is recorded the replace is diagnosed inert.
+// #[serial]: see the capstone's note — env mutation vs env iteration.
+#[tokio::test]
+#[serial_test::serial]
+async fn workspace_transitive_raise_never_attests() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_hosted_build") {
+        return;
+    }
+    const NEXT: &str = "v1.1.0";
+    const MID: &str = "example.com/mid";
+    let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
+    let proxy_url = format!("file://{}", tmp.path().join("proxy").display());
+    let smod = socket_module();
+    let upstream_gomod = format!("module {UMOD}\n\ngo 1.21\n");
+    publish(tmp.path(), UMOD, UVER, &upstream_gomod, PRISTINE_LIB);
+    publish(
+        tmp.path(),
+        UMOD,
+        NEXT,
+        &upstream_gomod,
+        "package upstream\n\nfunc Greeting() string { return \"PRISTINE-NEXT\" }\n",
+    );
+    publish(tmp.path(), &smod, SVER, &upstream_gomod, PATCHED_LIB);
+    publish(
+        tmp.path(),
+        MID,
+        "v1.0.0",
+        &format!("module {MID}\n\ngo 1.21\n\nrequire {UMOD} {NEXT}\n"),
+        "package mid\n\nfunc Hello() string { return \"hi\" }\n",
+    );
+    let (_, gomod_h1) = harvest_sums(tmp.path(), &proxy_url, &smod, SVER);
+
+    let app = tmp.path().join("app");
+    let svc = app.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    std::fs::write(
+        app.join("go.mod"),
+        format!("module example.com/app\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("main.go"),
+        format!(
+            "package main\n\nimport \"{UMOD}\"\n\nfunc main() {{ println(upstream.Greeting()) }}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        svc.join("go.mod"),
+        format!("module example.com/svc\n\ngo 1.21\n\nrequire {MID} v1.0.0\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        svc.join("svc.go"),
+        format!("package svc\n\nimport \"{MID}\"\n\nvar X = mid.Hello()\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("go.work"),
+        format!("go 1.21\n\nuse (\n\t.\n\t./svc\n)\n\nreplace {UMOD} {UVER} => {smod} {SVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("go.work.sum"),
+        format!("{smod} {SVER}/go.mod {gomod_h1}\n"),
+    )
+    .unwrap();
+
+    let purl = format!("pkg:golang/{UMOD}@{UVER}");
+    let discovery = socket_patch_core::vex::discover::discover_patched_refs(&app).await;
+    let refs: Vec<_> = discovery.refs.iter().filter(|r| r.purl == purl).collect();
+    assert_eq!(refs.len(), 1, "{:?}", discovery.refs);
+    assert!(!refs[0].lockfile_basis_ok(), "{:?}", refs[0]);
+    assert!(
+        discovery.diagnostics.is_empty(),
+        "{:?}",
+        discovery.diagnostics
+    );
+
+    // A fresh checkout has no sums for the dependencies; skip the checksum
+    // database for this file:// proxy so go records them as it would.
+    let mut env = day2_env(&proxy_url);
+    env.retain(|(k, _)| *k != "GONOSUMDB");
+    env.push(("GONOSUMDB", "example.com".to_string()));
+    let machine = Machine::new(tmp.path(), "machine");
+    let run = go(&app, &machine, &["run", "."], &as_pairs(&env));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("PRISTINE-NEXT"), "{stderr}");
+    let list = go(&app, &machine, &["list", "-m", UMOD], &as_pairs(&env));
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout).trim(),
+        format!("{UMOD} {NEXT}"),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let work_sum = std::fs::read_to_string(app.join("go.work.sum")).unwrap();
+    assert!(
+        work_sum.contains(&format!("{UMOD} {NEXT} h1:")),
+        "{work_sum}"
+    );
+
+    let discovery = socket_patch_core::vex::discover::discover_patched_refs(&app).await;
+    assert!(
+        !discovery.refs.iter().any(|r| r.purl == purl),
+        "{:?}",
+        discovery.refs
+    );
+    assert!(
+        discovery.diagnostics.iter().any(|d| d
+            .detail
+            .contains(&format!("is inert: the build selects {NEXT}"))),
+        "{:?}",
+        discovery.diagnostics
+    );
+}

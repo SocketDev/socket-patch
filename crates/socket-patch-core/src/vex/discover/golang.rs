@@ -43,12 +43,14 @@
 //!   uuid and go compiles none of its packages, so the pinned replace alone
 //!   is the attestation basis — but MVS also keeps the `/go.mod` line of a
 //!   version it reads and does not select, so a `/go.mod`-only pin whose
-//!   version the main modules' `require`s or go.sum show is not selected
-//!   ([`go_build_list::select`]) is inert: diagnosed, no ref. With a
-//!   `go.work` the build list is the union of every `use` member's
-//!   requirements, so the pin attests only when each member's go.mod is
-//!   in the root and read and they show the replaced version is the one
-//!   selected; otherwise `integrity_required = true`. Anything else — no `/go.mod` line, two
+//!   version go.mod's `require` or go.sum show is not selected
+//!   ([`go_build_list::select`]) is inert: diagnosed, no ref. A `go.work`
+//!   build keeps no member's go.mod tidy and adds missing sums to
+//!   `go.work.sum` itself, so a dependency's requirement can raise the
+//!   version past everything discovery reads: there a `/go.mod`-only pin
+//!   is never the basis (`integrity_required = true`), and a higher
+//!   version in a member's `require` or a sum file's zip line makes it
+//!   inert. Anything else — no `/go.mod` line, two
 //!   different hashes for one line, a non-dirhash `h1:` (both a go
 //!   `SECURITY ERROR`), a line of other than three tokens anywhere in a
 //!   sum file (go rejects the whole file) — is not a pin:
@@ -91,7 +93,7 @@
 //!   replaces override go.mod replaces in Go, but rule 10 leaves
 //!   cross-file precedence to the CLI's `wiring_conflict` gate. In-root
 //!   workspace members' go.mod files are read only for their `require`s
-//!   (the `/go.mod`-only pin's selection) and their go.sum for pins; their
+//!   (a `/go.mod`-only pin's inert check) and their go.sum for pins; their
 //!   replaces are not (root-only, rule 1).
 //! * **Hand-edit tolerance**: a UTF-8 BOM, CRLF line ends, tab-separated
 //!   tokens, `replace(` without a space, `// comments`, and Go string
@@ -103,6 +105,7 @@
 //! * `vendor/modules.txt` (`go mod vendor`) only mirrors go.mod's replaces
 //!   and is not read.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::{
@@ -185,8 +188,9 @@ struct Graph {
     /// `require` of the root module: the version the build selects (as far
     /// as a root-only reader can tell).
     required: HashMap<String, String>,
-    /// The main modules: the root module, or every `go.work` `use` member.
-    /// `None` when a member is outside the root or unreadable.
+    /// The main modules: the root module, or every readable in-root
+    /// `go.work` `use` member. `None` when a member is outside the root or
+    /// unreadable.
     mains: Option<Vec<MainModule>>,
     /// A `go.work` is in effect.
     workspace: bool,
@@ -208,21 +212,28 @@ impl MainModule {
 }
 
 impl Graph {
-    /// [`go_build_list::select`] over every main module: a workspace builds
-    /// the union of its members' requirements.
+    /// [`go_build_list::select`] over the main modules. A workspace never
+    /// proves [`Selection::Selected`]: go builds it from the full module
+    /// graph without requiring any member's go.mod to be tidy, and fills in
+    /// `go.work.sum` itself, so a dependency's own requirement can raise the
+    /// module past every `require` and sum line discovery reads. Only a
+    /// higher version in that evidence proves the replace inert.
     fn select(&self, module: &str, version: &str, zips: &[&str]) -> Selection {
-        let Some(mains) = &self.mains else {
-            return Selection::Unknown;
-        };
-        let pruned = mains.iter().all(|m| m.pruned);
+        let mains = self.mains.as_deref().unwrap_or_default();
         let required = mains
             .iter()
             .filter_map(|m| m.required.get(module).map(String::as_str))
             .max_by(|a, b| go_semver_cmp(a, b));
-        match go_build_list::select(pruned, required, zips, version) {
-            Selection::NotInGraph if self.workspace => Selection::Unknown,
-            selected => selected,
+        if !self.workspace {
+            let pruned = mains.iter().all(|m| m.pruned);
+            return go_build_list::select(pruned, required, zips, version);
         }
+        required
+            .into_iter()
+            .chain(zips.iter().copied())
+            .filter(|v| go_semver_cmp(v, version) == Ordering::Greater)
+            .max_by(|a, b| go_semver_cmp(a, b))
+            .map_or(Selection::Unknown, |v| Selection::Other(v.to_string()))
     }
 }
 
@@ -355,9 +366,7 @@ fn extract_file(
                             );
                             continue;
                         }
-                        // A workspace member out of reach may require
-                        // another version: only a proven selection attests.
-                        (None, graph.workspace && selected != Selection::Selected)
+                        (None, graph.workspace)
                     }
                     SumPin::Unpinned => (None, true),
                 };
@@ -769,7 +778,8 @@ mod tests {
 
     /// `go mod tidy` keeps only the `/go.mod` line of a replaced module whose
     /// packages nothing imports, and the build stays green: that line alone
-    /// is the pin, with nothing to lock the (never fetched) zip to.
+    /// is the pin, with nothing to lock the (never fetched) zip to. Not in a
+    /// workspace, whose selection go.mod cannot show.
     #[tokio::test]
     async fn tidy_pruned_zip_line_leaves_a_go_mod_line_pin() {
         let m = gopatch(UUID_A);
@@ -789,9 +799,10 @@ mod tests {
             let out = run(&p).await;
             assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
             let r = &out.refs[0];
+            let attests = file == "go.mod";
             assert_eq!(r.locked_integrity, None, "{file}");
-            assert!(!r.integrity_required, "{file}");
-            assert!(r.lockfile_basis_ok(), "{file}");
+            assert_eq!(r.integrity_required, !attests, "{file}");
+            assert_eq!(r.lockfile_basis_ok(), attests, "{file}");
             assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         }
     }
@@ -982,84 +993,124 @@ mod tests {
         }
     }
 
-    /// A workspace builds the union of its members' requirements: a
-    /// `/go.mod`-only pin attests only when every member is read and none
-    /// selects another version.
+    /// A workspace builds the union of its members' requirements, and a
+    /// member's dependency can raise the module past every `require` while
+    /// go writes the missing sums to `go.work.sum` itself: a `/go.mod`-only
+    /// pin there is never the basis, and a higher `require` or zip line
+    /// makes it inert.
     #[tokio::test]
-    async fn workspace_go_mod_only_pin_needs_every_member_to_select_it() {
+    async fn workspace_go_mod_only_pin_is_never_the_basis() {
         let m = gopatch(UUID_A);
         let sver = "v1.4.2-socketpatch.1";
         let svc = |go: &str, require: &str| format!("module example.com/svc\n\ngo {go}\n{require}");
         let req = |v: &str| format!("\nrequire {MODULE} {v}\n");
         let zip = |v: &str| format!("{MODULE} {v} {ZIP_H1}\n{MODULE} {v}/go.mod {MOD_H1}\n");
-        enum Want {
-            Attested,
-            Unproven,
-            Inert,
-        }
-        for (name, uses, svc_mod, svc_sum, want) in [
+        let mid = "\nrequire example.com/mid v1.0.0\n";
+        for (name, uses, svc_mod, svc_sum, work_sum, inert) in [
             (
                 "member requires it too",
                 ". ./svc",
                 Some(svc("1.21", &req(VERSION))),
                 None,
-                Want::Attested,
+                None,
+                false,
             ),
             (
                 "member does not require it",
                 ". ./svc",
                 Some(svc("1.21", "")),
                 None,
-                Want::Attested,
-            ),
-            (
-                "member requires a higher version",
-                ". ./svc",
-                Some(svc("1.21", &req("v1.5.0"))),
-                Some(zip("v1.5.0")),
-                Want::Inert,
+                None,
+                false,
             ),
             (
                 "member requires a lower version",
                 ". ./svc",
                 Some(svc("1.21", &req("v1.4.1"))),
                 None,
-                Want::Attested,
+                None,
+                false,
+            ),
+            (
+                "member's dependency, sums not yet written",
+                ". ./svc",
+                Some(svc("1.21", mid)),
+                None,
+                None,
+                false,
+            ),
+            (
+                "member's dependency, go.work.sum written",
+                ". ./svc",
+                Some(svc("1.21", mid)),
+                None,
+                Some(zip("v1.5.0")),
+                true,
+            ),
+            (
+                "member's dependency, member go.sum",
+                ". ./svc",
+                Some(svc("1.21", mid)),
+                Some(zip("v1.5.0")),
+                None,
+                true,
+            ),
+            (
+                "member requires a higher version",
+                ". ./svc",
+                Some(svc("1.21", &req("v1.5.0"))),
+                Some(zip("v1.5.0")),
+                None,
+                true,
             ),
             (
                 "go 1.16 member builds a higher zip",
                 ". ./svc",
                 Some(svc("1.16", &req("v1.4.1"))),
                 Some(zip("v1.5.0")),
-                Want::Inert,
+                None,
+                true,
             ),
             (
-                "member go.mod missing",
+                "only a higher /go.mod line",
                 ". ./svc",
+                Some(svc("1.21", mid)),
                 None,
-                None,
-                Want::Unproven,
+                Some(format!("{MODULE} v1.5.0/go.mod {MOD_H1}\n")),
+                false,
             ),
+            ("member go.mod missing", ". ./svc", None, None, None, false),
             (
                 "member outside the root",
                 ". ../svc",
                 None,
                 None,
-                Want::Unproven,
+                None,
+                false,
+            ),
+            (
+                "member outside the root, higher zip",
+                ". ../svc",
+                None,
+                None,
+                Some(zip("v1.5.0")),
+                true,
             ),
             (
                 "root not a member",
                 "./svc",
                 Some(svc("1.21", &req(VERSION))),
                 None,
-                Want::Attested,
+                None,
+                false,
             ),
             (
                 "root not a member, nothing requires it",
                 "./svc",
                 Some(svc("1.21", "")),
                 None,
-                Want::Unproven,
+                None,
+                false,
             ),
         ] {
             let p = Project::new();
@@ -1071,7 +1122,13 @@ mod tests {
                         uses.replace(' ', "\n")
                     ),
                 )
-                .write("go.work.sum", format!("{m} {sver}/go.mod {MOD_H1}\n"));
+                .write(
+                    "go.work.sum",
+                    format!(
+                        "{m} {sver}/go.mod {MOD_H1}\n{}",
+                        work_sum.unwrap_or_default()
+                    ),
+                );
             if let Some(text) = &svc_mod {
                 p.write("svc/go.mod", text);
             }
@@ -1079,19 +1136,20 @@ mod tests {
                 p.write("svc/go.sum", text);
             }
             let out = run(&p).await;
-            match want {
-                Want::Inert => {
-                    assert_refs(&out, &[]);
-                    assert_eq!(out.diagnostics.len(), 1, "{name}");
-                    assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID, "{name}");
-                    assert!(out.diagnostics[0].detail.contains("is inert"), "{name}");
-                }
-                Want::Attested | Want::Unproven => {
-                    assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
-                    let ok = matches!(want, Want::Attested);
-                    assert_eq!(out.refs[0].lockfile_basis_ok(), ok, "{name}");
-                    assert_eq!(out.refs[0].locked_integrity, None, "{name}");
-                }
+            if inert {
+                assert_refs(&out, &[]);
+                assert_eq!(out.diagnostics.len(), 1, "{name}");
+                assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID, "{name}");
+                assert!(
+                    out.diagnostics[0].detail.contains("selects v1.5.0"),
+                    "{name}"
+                );
+            } else {
+                assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+                assert!(out.refs[0].integrity_required, "{name}");
+                assert!(!out.refs[0].lockfile_basis_ok(), "{name}");
+                assert_eq!(out.refs[0].locked_integrity, None, "{name}");
+                assert!(out.diagnostics.is_empty(), "{name}: {:?}", out.diagnostics);
             }
         }
     }
