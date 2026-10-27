@@ -47,7 +47,7 @@ use serde_json::{Map, Value};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{home_dir, is_dir};
+use crate::utils::fs::{home_dir, is_dir, read_regular_to_string_sync};
 
 /// Deno (JSR) ecosystem crawler.
 pub struct DenoCrawler;
@@ -368,7 +368,7 @@ pub fn is_unloaded_deno_tool_node_modules(path: &Path) -> bool {
     else {
         return false;
     };
-    let Some(config) = std::fs::read_to_string(&config)
+    let Some(config) = read_regular_to_string_sync(&config)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
     else {
