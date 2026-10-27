@@ -1026,8 +1026,8 @@ async fn unscoped_rollback_refuses_a_still_wired_orphan() {
         assert!(orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir());
     }
 
-    // A scoped rollback of the ledgered package does not own the other
-    // wiring: it reverts its target as before.
+    // A scoped rollback does not own the other package's wiring: it
+    // reverts its target as before.
     let (code, env) = rollback_cli(fx.root(), &[PURL]);
     assert_eq!(code, 0, "rollback <purl> exits 0: {env:#}");
     assert!(!fx.tgz_path().exists(), "the target is reverted");
@@ -1035,6 +1035,41 @@ async fn unscoped_rollback_refuses_a_still_wired_orphan() {
         orphan_dir(&fx, OTHER_ORPHAN_UUID).is_dir(),
         "a wired orphan is never deleted"
     );
+}
+
+/// A scoped rollback whose target's own orphan dir a lockfile still points
+/// at keeps that dir and names it with `vendor_orphan_still_wired`, with a
+/// remedy that works in v5 (not `repair`).
+#[tokio::test]
+async fn scoped_rollback_keeps_a_still_wired_orphan_of_its_target() {
+    let fx = vendored_fixture_with_orphans().await;
+    // A nested copy of the target wired to the target's orphan dir.
+    let mut lock: Value = serde_json::from_slice(&fx.lock_bytes()).unwrap();
+    lock["packages"]["node_modules/other/node_modules/left-pad"] = json!({
+        "version": "1.3.0",
+        "resolved": format!("file:.socket/vendor/npm/{ORPHAN_UUID}/left-pad-1.3.0.tgz"),
+    });
+    std::fs::write(fx.lock_path(), serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+
+    let (code, env) = rollback_cli(fx.root(), &[PURL]);
+    assert_eq!(code, 0, "rollback <purl> exits 0: {env:#}");
+    rollback_json::assert_rollback_envelope(&env);
+    let warnings = env["warnings"].as_array().cloned().unwrap_or_default();
+    let still_wired = warnings
+        .iter()
+        .find(|w| w["code"] == "vendor_orphan_still_wired")
+        .unwrap_or_else(|| panic!("the kept orphan is named: {env:#}"));
+    let detail = still_wired["message"]
+        .as_str()
+        .or_else(|| still_wired["detail"].as_str())
+        .unwrap_or_default();
+    assert!(detail.contains(ORPHAN_UUID), "{env:#}");
+    assert!(!detail.contains("socket-patch repair"), "{env:#}");
+    assert!(
+        orphan_dir(&fx, ORPHAN_UUID).is_dir(),
+        "a wired orphan is never deleted"
+    );
+    assert!(!fx.tgz_path().exists(), "the target is reverted");
 }
 
 /// A scoped rollback sweeps only the orphans of the package it targets.

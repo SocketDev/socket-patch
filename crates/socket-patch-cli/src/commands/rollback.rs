@@ -902,9 +902,6 @@ fn error_envelope(dry_run: bool, err: EnvelopeError) -> Envelope {
     env
 }
 
-/// Report a top-level rollback error: the error envelope on `--json`
-/// (message verbatim), an `Error:` stderr line otherwise. Errors print even
-/// under --silent ("errors only", never "nothing").
 /// The `vendor_ledger_missing` refusal for lockfile references into
 /// `.socket/vendor/<eco>/<uuid>/` (in the `--ecosystems` scope) that no
 /// entry of `state` owns, or `None` when every reference is ledgered.
@@ -914,32 +911,27 @@ async fn unledgered_vendor_wiring(
     state: &VendorState,
 ) -> Option<String> {
     let mut dirs: Vec<String> =
-        crate::commands::vendored_backend::repair::scan_vendor_references(ledger_root)
+        crate::commands::vendored_backend::repair::unledgered_vendor_references(ledger_root, state)
             .await
             .into_iter()
-            .filter(|(eco, uuid, _)| {
-                crate::commands::vendor::ecosystem_in_scope(common, eco)
-                    && !state
-                        .entries
-                        .values()
-                        .any(|e| e.ecosystem == *eco && e.uuid == *uuid)
-            })
+            .filter(|(eco, _, _)| crate::commands::vendor::ecosystem_in_scope(common, eco))
             .map(|(eco, uuid, _)| format!(".socket/vendor/{eco}/{uuid}/"))
             .collect();
     if dirs.is_empty() {
         return None;
     }
     dirs.sort();
-    dirs.dedup();
     Some(format!(
         "lockfiles reference {}, which the vendor ledger (.socket/vendor/state.json) has no \
-         entry for, so rollback cannot unwind {}; {}, then roll back",
+         entry for, so rollback cannot unwind them; {}, then roll back",
         dirs.join(", "),
-        if dirs.len() == 1 { "it" } else { "them" },
         crate::commands::vendor_orphans::UNLEDGERED_WIRING_REMEDY,
     ))
 }
 
+/// Report a top-level rollback error: the error envelope on `--json`
+/// (message verbatim), an `Error:` stderr line otherwise. Errors print even
+/// under --silent ("errors only", never "nothing").
 fn emit_rollback_error(json: bool, dry_run: bool, code: &str, msg: &str) {
     if json {
         println!(
@@ -1634,6 +1626,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         if let Ok(state) = &vendor_state_result {
             if let Some(detail) = unledgered_vendor_wiring(&args.common, &ledger_root, state).await
             {
+                track_patch_rollback_failed(&detail, &telemetry).await;
                 emit_rollback_error(
                     args.common.json,
                     args.common.dry_run,

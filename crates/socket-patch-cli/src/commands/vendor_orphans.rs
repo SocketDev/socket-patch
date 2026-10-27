@@ -112,9 +112,9 @@ pub(crate) fn orphan_label(unit: &vendor::path::SweptVendorDir) -> String {
 /// merge kept one side of state.json, both sides' `entries` merged), or
 /// the lockfile goes back to its pre-vendor version.
 pub(crate) const UNLEDGERED_WIRING_REMEDY: &str =
-    "restore its entry in .socket/vendor/state.json from version control (if a git merge \
-     kept one side of state.json, merge both sides' `entries`), or restore the lockfile \
-     with `git checkout -- <lockfile>`";
+    "restore the missing entries in .socket/vendor/state.json from version control (if a \
+     git merge kept one side of state.json, merge both sides' `entries`), or restore the \
+     lockfile with `git checkout -- <lockfile>`";
 
 /// The advisory for an orphan uuid dir the sweep kept because a project
 /// lockfile still points into it.
