@@ -294,10 +294,26 @@ fn move_replace_to_go_work(root: &Path, sums_of: Option<&str>) -> String {
 
 /// Run socket-patch (hermetic `SOCKET_*` environment) in `cwd`.
 fn socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, serde_json::Value, String) {
+    socket_env(cwd, args, modcache, &[])
+}
+
+/// [`socket`] with `env` on top (`GOWORK` is unset unless `env` sets it).
+fn socket_env(
+    cwd: &Path,
+    args: &[&str],
+    modcache: &Path,
+    env: &[(&str, &str)],
+) -> (i32, serde_json::Value, String) {
     let mut cmd = hermetic::command(&binary());
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv]);
     cmd.current_dir(cwd);
-    cmd.env("GOMODCACHE", modcache).env("GOFLAGS", "");
+    cmd.env("GOMODCACHE", modcache)
+        .env("GOFLAGS", "")
+        .env("GOENV", "off")
+        .env_remove("GOWORK");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let _fixture = prebuilt_common::prepare_command(
         &mut cmd,
         cwd,
@@ -553,6 +569,62 @@ impl GrantApi {
         });
         GrantApi { server, _rt: rt }
     }
+
+    /// Serve Go's checksum database lookup of `UMOD@UVER` (what a hosted
+    /// rollback reads through `SOCKET_GOSUMDB_URL`): the upstream pair.
+    fn mount_sumdb(&self, zip_h1: &str, mod_h1: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let body = format!(
+            "1\n{UMOD} {UVER} {zip_h1}\n{UMOD} {UVER}/go.mod {mod_h1}\n\ngo.sum database tree\n1\nAAAA\n"
+        );
+        self._rt.block_on(
+            Mock::given(method("GET"))
+                .and(path(format!("/lookup/{UMOD}@{UVER}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&self.server),
+        );
+    }
+
+    /// `get HOSTED_UUID --mode hosted` in `cwd`, with `env` on top.
+    fn get(
+        &self,
+        cwd: &Path,
+        modcache: &Path,
+        env: &[(&str, &str)],
+    ) -> (i32, serde_json::Value, String) {
+        self.get_with(cwd, modcache, env, &[])
+    }
+
+    /// [`GrantApi::get`] with `extra` arguments.
+    fn get_with(
+        &self,
+        cwd: &Path,
+        modcache: &Path,
+        env: &[(&str, &str)],
+        extra: &[&str],
+    ) -> (i32, serde_json::Value, String) {
+        let uri = self.server.uri();
+        let cwd_arg = cwd.to_str().unwrap();
+        let mut args = vec![
+            "get",
+            HOSTED_UUID,
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            cwd_arg,
+            "--api-url",
+            &uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ];
+        args.extend_from_slice(extra);
+        socket_env(cwd, &args, modcache, env)
+    }
 }
 
 /// `get <uuid> --mode hosted` in a workspace root: the root go.mod/go.sum
@@ -645,4 +717,436 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
         label: "hosted/go.work-replace",
         ..base
     });
+}
+
+// ── go.work model: members, selection, precedence, GOWORK ─────────────
+
+/// A `go.work` workspace of two modules `a` and `b` (no root module unless
+/// a test adds one), each importing `UMOD`, with the socket module and
+/// `UMOD` `v1.0.0` / `v1.1.0` on the file proxy.
+struct Members {
+    root: PathBuf,
+    proxy: String,
+    smod: String,
+    /// The socket module's go.sum pair.
+    pin: (String, String),
+    /// `UMOD` `v1.0.0`'s go.sum pair.
+    upstream: (String, String),
+    api: GrantApi,
+}
+
+const NEXT: &str = "v1.1.0";
+const NEXT_LIB: &str = "package upstream\n\nfunc Greeting() string { return \"PRISTINE-NEXT\" }\n";
+
+fn stage_members(tmp: &Path, a_ver: &str, b_ver: &str) -> Members {
+    let proxy = format!("file://{}", tmp.join("proxy").display());
+    let smod = format!("patch.socket.dev/gopatch/{HOSTED_UUID}");
+    publish(tmp, UMOD, UVER, PRISTINE_LIB);
+    publish(tmp, UMOD, NEXT, NEXT_LIB);
+    publish(tmp, &smod, SVER, PATCHED_LIB);
+    let pin = harvest(tmp, &proxy, &smod, SVER);
+    let upstream = harvest(tmp, &proxy, UMOD, UVER);
+    let next = harvest(tmp, &proxy, UMOD, NEXT);
+    let root = tmp.join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("go.work"), "go 1.18\n\nuse (\n\t./a\n\t./b\n)\n").unwrap();
+    for (dir, ver) in [("a", a_ver), ("b", b_ver)] {
+        let sums = if ver == UVER { &upstream } else { &next };
+        let member = root.join(dir);
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("go.mod"),
+            format!("module example.com/{dir}\n\ngo 1.18\n\nrequire {UMOD} {ver}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("go.sum"),
+            format!("{UMOD} {ver} {}\n{UMOD} {ver}/go.mod {}\n", sums.0, sums.1),
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("main.go"),
+            format!(
+                "package main\n\nimport (\n\t\"fmt\"\n\t\"{UMOD}\"\n)\n\n\
+                 func main() {{ fmt.Println(\"{}:\", upstream.Greeting()) }}\n",
+                dir.to_uppercase()
+            ),
+        )
+        .unwrap();
+    }
+    let api = GrantApi::start(&proxy, &smod, &pin.0, &pin.1);
+    Members {
+        root,
+        proxy,
+        smod,
+        pin,
+        upstream,
+        api,
+    }
+}
+
+/// `go run ./<dir>` from `cwd` on a fresh machine; its stdout and stderr.
+fn run_member(
+    tmp: &Path,
+    cwd: &Path,
+    dir: &str,
+    proxy: &str,
+    extra: &[(&str, &str)],
+) -> (String, String) {
+    let m = Machine::new(tmp, &format!("run-{}", unique()));
+    let mut env = day2(proxy);
+    env.extend_from_slice(extra);
+    let out = go(cwd, &m, &["run", &format!("./{dir}")], &env);
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn unique() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+fn warning_codes(env: &serde_json::Value) -> Vec<String> {
+    env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["code"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// The most common layout: a go.work root with no go.mod of its own.
+/// `get --mode hosted` from the root pins each member that requires the
+/// module; both members build the patched copy in workspace mode and alone
+/// (`GOWORK=off`); discovery from the root attests both pins; `rollback`
+/// from the root puts every go.mod and go.sum back byte for byte, and the
+/// members build upstream again.
+#[test]
+fn go_work_root_without_go_mod_hosted_pins_members_and_rolls_back() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, UVER);
+    let pristine: Vec<(String, String)> = ["a/go.mod", "a/go.sum", "b/go.mod", "b/go.sum"]
+        .iter()
+        .map(|rel| (rel.to_string(), read(&w.root.join(rel))))
+        .collect();
+    let (out, _) = run_member(tmp.path(), &w.root, "a", &w.proxy, &[]);
+    assert!(out.contains("A: PRISTINE"), "baseline: {out}");
+
+    let m = Machine::new(tmp.path(), "get");
+    let (code, env, stderr) = w.api.get(&w.root, &m.modcache, &[]);
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    assert_eq!(
+        env["redirect"]["rewrittenFiles"],
+        serde_json::json!(["a/go.mod", "a/go.sum", "b/go.mod", "b/go.sum"]),
+        "{env}"
+    );
+    let replace = format!("replace {UMOD} {UVER} => {} {SVER}", w.smod);
+    for dir in ["a", "b"] {
+        let go_mod = read(&w.root.join(dir).join("go.mod"));
+        assert!(
+            go_mod.lines().any(|l| l.trim() == replace),
+            "{dir}:\n{go_mod}"
+        );
+        let go_sum = read(&w.root.join(dir).join("go.sum"));
+        assert!(
+            go_sum.contains(&format!("{} {SVER} {}\n", w.smod, w.pin.0)),
+            "{dir}:\n{go_sum}"
+        );
+        assert!(
+            !go_sum.contains(&format!("{UMOD} {UVER} ")),
+            "{dir}:\n{go_sum}"
+        );
+    }
+    assert!(!w.root.join("go.mod").exists(), "no root go.mod is created");
+    for dir in ["a", "b"] {
+        let (out, err) = run_member(tmp.path(), &w.root, dir, &w.proxy, &[]);
+        assert!(
+            out.contains(&format!("{}: PATCHED", dir.to_uppercase())),
+            "{dir}: {out}\n{err}"
+        );
+        let (out, err) = run_member(
+            tmp.path(),
+            &w.root.join(dir),
+            ".",
+            &w.proxy,
+            &[("GOWORK", "off")],
+        );
+        assert!(out.contains("PATCHED"), "{dir} alone: {out}\n{err}");
+    }
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let discovery = rt.block_on(socket_patch_core::vex::discover::discover_patched_refs(
+        &w.root,
+    ));
+    let mut sources: Vec<String> = discovery
+        .refs
+        .iter()
+        .filter(|r| r.purl == UPURL && r.uuid == HOSTED_UUID && r.lockfile_basis_ok())
+        .map(|r| r.source_file.to_string_lossy().into_owned())
+        .collect();
+    sources.sort();
+    assert_eq!(sources, ["a/go.mod", "b/go.mod"], "{:?}", discovery);
+
+    w.api.mount_sumdb(&w.upstream.0, &w.upstream.1);
+    let uri = w.api.server.uri();
+    let (code, env, stderr) = socket_env(
+        &w.root,
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--cwd",
+            w.root.to_str().unwrap(),
+        ],
+        &m.modcache,
+        &[("SOCKET_GOSUMDB_URL", uri.as_str())],
+    );
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    for (rel, text) in &pristine {
+        assert_eq!(&read(&w.root.join(rel)), text, "{rel} after rollback");
+    }
+    let (out, err) = run_member(tmp.path(), &w.root, "b", &w.proxy, &[]);
+    assert!(out.contains("B: PRISTINE"), "after rollback: {out}\n{err}");
+}
+
+/// A hosted pin moved into go.work, its sum lines in go.work.sum (where go
+/// itself writes them in workspace mode): `rollback` drops the go.work
+/// replace and the socket lines, puts the upstream pair back into
+/// go.work.sum, and the workspace builds upstream on a fresh machine.
+#[test]
+fn go_work_pin_and_go_work_sum_roll_back() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, UVER);
+    for dir in ["a", "b"] {
+        let sum = w.root.join(dir).join("go.sum");
+        std::fs::write(&sum, "").unwrap();
+    }
+    let work = read(&w.root.join("go.work"));
+    std::fs::write(
+        w.root.join("go.work"),
+        format!("{work}\nreplace {UMOD} {UVER} => {} {SVER}\n", w.smod),
+    )
+    .unwrap();
+    std::fs::write(
+        w.root.join("go.work.sum"),
+        format!(
+            "{s} {SVER} {}\n{s} {SVER}/go.mod {}\n",
+            w.pin.0,
+            w.pin.1,
+            s = w.smod
+        ),
+    )
+    .unwrap();
+    for dir in ["a", "b"] {
+        let (out, err) = run_member(tmp.path(), &w.root, dir, &w.proxy, &[]);
+        assert!(out.contains("PATCHED"), "{dir}: {out}\n{err}");
+    }
+
+    let m = Machine::new(tmp.path(), "rollback");
+    w.api.mount_sumdb(&w.upstream.0, &w.upstream.1);
+    let uri = w.api.server.uri();
+    let (code, env, stderr) = socket_env(
+        &w.root,
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--cwd",
+            w.root.to_str().unwrap(),
+        ],
+        &m.modcache,
+        &[("SOCKET_GOSUMDB_URL", uri.as_str())],
+    );
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(read(&w.root.join("go.work")), work);
+    let work_sum = read(&w.root.join("go.work.sum"));
+    assert!(!work_sum.contains("patch.socket.dev"), "{work_sum}");
+    assert_eq!(
+        work_sum,
+        format!(
+            "{UMOD} {UVER} {}\n{UMOD} {UVER}/go.mod {}\n",
+            w.upstream.0, w.upstream.1
+        )
+    );
+    for dir in ["a", "b"] {
+        let (out, err) = run_member(tmp.path(), &w.root, dir, &w.proxy, &[]);
+        assert!(out.contains("PRISTINE"), "{dir}: {out}\n{err}");
+    }
+}
+
+/// Another member requiring a higher version raises the workspace build
+/// above the patched one: hosted mode in `a` refuses (go builds v1.1.0)
+/// whether `GOWORK` is unset or `auto`, refuses a relative `GOWORK` as go
+/// does, and with `GOWORK=off` (module mode, where `a` builds v1.0.0)
+/// pins it, and `a` alone builds the patched copy.
+#[test]
+fn cross_member_version_raise_and_gowork_modes() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, NEXT);
+    let a = w.root.join("a");
+    let m = Machine::new(tmp.path(), "list");
+    let list = go(&a, &m, &["list", "-m", UMOD], &day2(&w.proxy));
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout).trim(),
+        format!("{UMOD} {NEXT}"),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let go_mod = read(&a.join("go.mod"));
+
+    for gowork in [None, Some("auto")] {
+        let env: Vec<(&str, &str)> = gowork.map(|v| ("GOWORK", v)).into_iter().collect();
+        let (code, out, stderr) = w.api.get(&a, &m.modcache, &env);
+        assert_eq!(out["summary"]["applied"], 0, "{gowork:?}: {out}\n{stderr}");
+        assert!(
+            warning_codes(&out).contains(&"redirect_golang_version_mismatch".to_string()),
+            "{gowork:?}: {out}"
+        );
+        assert_ne!(code, -1);
+        assert_eq!(read(&a.join("go.mod")), go_mod, "{gowork:?}");
+    }
+    let (_, out, _) = w.api.get(&a, &m.modcache, &[("GOWORK", "go.work")]);
+    assert_eq!(out["summary"]["applied"], 0, "{out}");
+    assert!(
+        warning_codes(&out).contains(&"redirect_golang_workspace_conflict".to_string()),
+        "{out}"
+    );
+    assert_eq!(read(&a.join("go.mod")), go_mod);
+
+    let (code, out, stderr) = w.api.get(&a, &m.modcache, &[("GOWORK", "off")]);
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    assert_eq!(out["summary"]["applied"], 1, "{out}");
+    let (stdout, err) = run_member(tmp.path(), &a, ".", &w.proxy, &[("GOWORK", "off")]);
+    assert!(stdout.contains("A: PATCHED"), "{stdout}\n{err}");
+    // The workspace still builds v1.1.0: the replace pinned to v1.0.0 is
+    // inert there, and `vex` from `a` must not attest it.
+    let (stdout, err) = run_member(tmp.path(), &w.root, "a", &w.proxy, &[]);
+    assert!(stdout.contains("PRISTINE-NEXT"), "{stdout}\n{err}");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let sel = rt.block_on(socket_patch_core::vendor::go_build_list::project_selection(
+        &a, UMOD, UVER,
+    ));
+    assert_eq!(
+        sel,
+        Some(socket_patch_core::vendor::go_build_list::Selection::Other(
+            NEXT.to_string()
+        ))
+    );
+}
+
+/// The hosted writer consults the go.work in effect before writing: a
+/// go.work replace of this module (or a member replacing the same version
+/// elsewhere) keeps the pin from taking effect, so nothing is written and
+/// the patch is not reported redirected; a go.work replace of ANOTHER
+/// version leaves the member replace in force (Go 1.26 precedence), so
+/// hosted pins it and the member builds patched.
+#[test]
+fn hosted_gate_follows_go_work_precedence() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, UVER);
+    let fork = w.root.join("fork");
+    std::fs::create_dir_all(&fork).unwrap();
+    std::fs::write(fork.join("go.mod"), format!("module {UMOD}\n\ngo 1.18\n")).unwrap();
+    std::fs::write(
+        fork.join("lib.go"),
+        "package upstream\n\nfunc Greeting() string { return \"FORK\" }\n",
+    )
+    .unwrap();
+    let b = w.root.join("b");
+    let work = read(&w.root.join("go.work"));
+    let a_mod = read(&w.root.join("a/go.mod"));
+    let b_mod = read(&b.join("go.mod"));
+    let m = Machine::new(tmp.path(), "gate");
+
+    for (label, work_extra, a_extra) in [
+        (
+            "go.work replaces this version",
+            format!("\nreplace {UMOD} {UVER} => ./fork\n"),
+            "",
+        ),
+        (
+            "go.work replaces every version",
+            format!("\nreplace {UMOD} => ./fork\n"),
+            "",
+        ),
+        (
+            "member a replaces it elsewhere",
+            String::new(),
+            "\nreplace example.com/upstream v1.0.0 => ../fork\n",
+        ),
+    ] {
+        std::fs::write(w.root.join("go.work"), format!("{work}{work_extra}")).unwrap();
+        std::fs::write(w.root.join("a/go.mod"), format!("{a_mod}{a_extra}")).unwrap();
+        // The user's own replace is protected unless the conflict is
+        // accepted; accepted, the go.work gate still refuses the pin.
+        let (_, out, _) = w.api.get(&b, &m.modcache, &[]);
+        assert_eq!(
+            out["error"]["code"], "user_patch_conflict",
+            "{label}: {out}"
+        );
+        let (_, out, stderr) = w
+            .api
+            .get_with(&b, &m.modcache, &[], &["--allow-patch-conflicts"]);
+        assert_eq!(out["summary"]["applied"], 0, "{label}: {out}\n{stderr}");
+        assert!(
+            warning_codes(&out).contains(&"redirect_golang_workspace_conflict".to_string()),
+            "{label}: {out}"
+        );
+        assert_eq!(read(&b.join("go.mod")), b_mod, "{label}: nothing written");
+        let (stdout, err) = run_member(tmp.path(), &w.root, "b", &w.proxy, &[]);
+        assert!(
+            stdout.contains("B: FORK"),
+            "{label}: workspace still builds: {stdout}\n{err}"
+        );
+    }
+
+    std::fs::write(w.root.join("a/go.mod"), &a_mod).unwrap();
+    std::fs::write(
+        w.root.join("go.work"),
+        format!("{work}\nreplace {UMOD} v0.9.0 => ./fork\n"),
+    )
+    .unwrap();
+    let (code, out, stderr) = w
+        .api
+        .get_with(&b, &m.modcache, &[], &["--allow-patch-conflicts"]);
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    assert_eq!(out["summary"]["applied"], 1, "{out}");
+    assert!(
+        !warning_codes(&out).contains(&"go_workspace_replace_ineffective".to_string()),
+        "{out}"
+    );
+    let (stdout, err) = run_member(tmp.path(), &w.root, "b", &w.proxy, &[]);
+    assert!(stdout.contains("B: PATCHED"), "{stdout}\n{err}");
 }
