@@ -9410,16 +9410,11 @@ fn rewrite_golang(
                 }
             }
         }
-        // A re-run over a project `go mod tidy` left with only the `/go.mod`
-        // line (no package of the module is loaded) is already pinned:
-        // re-adding the zip line would only churn the next tidy.
-        let tidied = prior.is_some_and(|e| {
-            e.owner == Some(go_mod_edit::ReplaceOwner::Hosted)
-                && e.version.as_deref() == Some(dep.version.as_str())
-                && e.rhs_module.as_deref() == Some(rhs_module.as_str())
-                && e.rhs_version.as_deref() == Some(rhs_version.as_str())
-        }) && go_sum.holds_only_go_mod_line(rhs_module, rhs_version, gomod_h1);
-        if !tidied && go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
+        // Always both lines, even over the `/go.mod` line alone that `go mod
+        // tidy` leaves while no package of the module is loaded: the
+        // rewriter cannot see imports, and without the zip line a later
+        // import fails `missing go.sum entry` with nothing else to restore it.
+        if go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
             sum_changed = true;
             result.edits.push(FileEdit {
                 path: "go.sum".into(),
@@ -23121,9 +23116,9 @@ packages:
     }
 
     /// `go mod tidy` drops the socket module's zip line when no package of it
-    /// is loaded; a re-run leaves that pair alone and still confirms.
+    /// is loaded; a re-run restores it, so a later import still builds.
     #[test]
-    fn golang_rerun_keeps_a_tidy_pruned_pair() {
+    fn golang_rerun_restores_a_tidy_pruned_zip_line() {
         let files = golang_files();
         let ovr = golang_override();
         let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
@@ -23136,17 +23131,11 @@ packages:
         assert_ne!(tidied, first.files["go.sum"]);
         let mut again = files.clone();
         again.extend(first.files.clone());
-        again.insert("go.sum".to_string(), tidied.clone());
+        again.insert("go.sum".to_string(), tidied);
         let second = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
-        assert!(second.files.is_empty(), "{:?}", second.files);
+        assert_eq!(second.files.keys().collect::<Vec<_>>(), ["go.sum"]);
+        assert_eq!(second.files["go.sum"], first.files["go.sum"]);
         assert!(second.confirmed_golang_uuids.contains(GO_UUID));
-
-        // A `/go.mod` line with another hash is not the pin: rewritten.
-        let mod_h1 = ovr.integrity.go_mod_h1.clone().unwrap();
-        let wrong = tidied.replace(&mod_h1, "h1:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=");
-        again.insert("go.sum".to_string(), wrong);
-        let third = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
-        assert_eq!(third.files["go.sum"], first.files["go.sum"]);
     }
 
     /// Only `patch.socket.dev/gopatch/<canonical uuid>` is a hosted module;

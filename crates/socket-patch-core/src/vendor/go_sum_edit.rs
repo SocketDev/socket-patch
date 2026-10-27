@@ -223,22 +223,6 @@ impl GoSumEditor {
             .chain(lines.into_iter().flatten())
     }
 
-    /// True when the only line for `module@version` is exactly its wanted
-    /// `/go.mod` line: what `go mod tidy` leaves of the pair when no package
-    /// of the module is loaded.
-    pub(crate) fn holds_only_go_mod_line(
-        &self,
-        module: &str,
-        version: &str,
-        gomod_h1: &str,
-    ) -> bool {
-        let want = format!("{module} {version}/go.mod {gomod_h1}");
-        let mut key_lines = self
-            .current_lines()
-            .filter(|l| is_version_line(l, module, version));
-        key_lines.next() == Some(want.as_str()) && key_lines.next().is_none()
-    }
-
     /// Upsert the two `go.sum` lines for `module@version`. Any existing lines
     /// for exactly that module+version (either suffix form) are replaced;
     /// everything else — including stale lines for the *replaced* original
@@ -466,20 +450,6 @@ mod tests {
         let mut editor = GoSumEditor::new(content.to_string());
         let removed = editor.remove_exact_module_version_lines(module, version)?;
         Some((editor.into_string(), removed))
-    }
-
-    #[test]
-    fn only_the_exact_go_mod_line_is_the_tidy_pair() {
-        let gomod = format!("{MOD} {VER}/go.mod {GOMOD_H1}\n");
-        let holds = |text: &str| {
-            GoSumEditor::new(text.to_string()).holds_only_go_mod_line(MOD, VER, GOMOD_H1)
-        };
-        assert!(holds(&gomod));
-        assert!(holds(&format!("a.com/x v1.0.0 h1:x=\n{gomod}")));
-        assert!(!holds(""));
-        assert!(!holds(&format!("{MOD} {VER} {ZIP_H1}\n{gomod}")));
-        assert!(!holds(&format!("{MOD} {VER}/go.mod {ZIP_H1}\n")));
-        assert!(!holds(&format!("{gomod}{gomod}")));
     }
 
     #[test]

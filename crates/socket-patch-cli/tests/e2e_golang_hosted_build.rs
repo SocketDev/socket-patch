@@ -762,11 +762,13 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
 /// requirement and nothing imports its packages: `go mod tidy` prunes the
 /// socket module's zip line from the committed pair, the build stays green
 /// on a fresh machine (the zip is never fetched), and discovery still reads
-/// the `/go.mod` line as the hosted pin.
+/// the `/go.mod` line as the hosted pin. Once the project imports the
+/// module that state no longer builds, and re-running the hosted rewrite
+/// restores the zip line so it builds the patched module again.
 // #[serial]: see the capstone's note — env mutation vs env iteration.
 #[tokio::test]
 #[serial_test::serial]
-async fn tidy_pruned_zip_line_still_pins_the_hosted_replace() {
+async fn tidy_pruned_zip_line_pins_and_a_rerun_restores_it() {
     if !golang_e2e_matrix::toolchain_ready("e2e_golang_hosted_build") {
         return;
     }
@@ -839,7 +841,41 @@ async fn tidy_pruned_zip_line_still_pins_the_hosted_replace() {
         String::from_utf8_lossy(&build.stderr)
     );
 
-    // Re-running the hosted rewrite leaves the tidy pair alone.
+    let discovery = socket_patch_core::vex::discover::discover_patched_refs(&consumer).await;
+    let purl = format!("pkg:golang/{UMOD}@{UVER}");
+    let refs: Vec<_> = discovery.refs.iter().filter(|r| r.purl == purl).collect();
+    assert_eq!(refs.len(), 1, "{:?}", discovery.refs);
+    assert_eq!(refs[0].uuid, UUID);
+    assert!(refs[0].lockfile_basis_ok(), "{:?}", refs[0]);
+    assert!(
+        discovery.diagnostics.is_empty(),
+        "{:?}",
+        discovery.diagnostics
+    );
+
+    // The project starts importing the patched module (and requires it, as
+    // go 1.16 wants for a directly imported module): the tidy state no
+    // longer builds.
+    let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    std::fs::write(
+        consumer.join("go.mod"),
+        format!("{go_mod}\nrequire {UMOD} {UVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("main.go"),
+        format!(
+            "package main\n\nimport (\n\t\"{MID}\"\n\t\"{UMOD}\"\n)\n\n\
+             func main() {{ println(mid.Hello(), upstream.Greeting()) }}\n"
+        ),
+    )
+    .unwrap();
+    let m3 = Machine::new(tmp.path(), "machine3");
+    let broken = go(&consumer, &m3, &["build", "./..."], &as_pairs(&env));
+    let stderr = String::from_utf8_lossy(&broken.stderr);
+    assert!(!broken.status.success(), "{stderr}");
+    assert!(stderr.contains("missing go.sum entry"), "{stderr}");
+
     let ovr = DepOverride {
         ecosystem: "golang".into(),
         name: UMOD.into(),
@@ -860,8 +896,8 @@ async fn tidy_pruned_zip_line_still_pins_the_hosted_replace() {
             },
         }),
         integrity: Integrity {
-            dirhash_h1: Some(zip_h1),
-            go_mod_h1: Some(gomod_h1),
+            dirhash_h1: Some(zip_h1.clone()),
+            go_mod_h1: Some(gomod_h1.clone()),
             ..Default::default()
         },
     };
@@ -874,20 +910,28 @@ async fn tidy_pruned_zip_line_still_pins_the_hosted_replace() {
         .collect();
     let rerun = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
     assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
-    assert!(rerun.files.is_empty(), "{:?}", rerun.files);
     assert!(rerun.confirmed_golang_uuids.contains(UUID));
-
-    let discovery = socket_patch_core::vex::discover::discover_patched_refs(&consumer).await;
-    let purl = format!("pkg:golang/{UMOD}@{UVER}");
-    let refs: Vec<_> = discovery.refs.iter().filter(|r| r.purl == purl).collect();
-    assert_eq!(refs.len(), 1, "{:?}", discovery.refs);
-    assert_eq!(refs[0].uuid, UUID);
-    assert!(refs[0].lockfile_basis_ok(), "{:?}", refs[0]);
-    assert!(
-        discovery.diagnostics.is_empty(),
+    assert_eq!(
+        rerun.files.keys().collect::<Vec<_>>(),
+        ["go.sum"],
         "{:?}",
-        discovery.diagnostics
+        rerun.files
     );
+    let restored = &rerun.files["go.sum"];
+    assert!(
+        restored.contains(&format!("{smod} {SVER} {zip_h1}\n")),
+        "{restored}"
+    );
+    std::fs::write(consumer.join("go.sum"), restored).unwrap();
+
+    let m4 = Machine::new(tmp.path(), "machine4");
+    let run = go(&consumer, &m4, &["run", "."], &as_pairs(&env));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success(),
+        "fresh-machine run after re-run failed: {stderr}"
+    );
+    assert!(stderr.contains("hi PATCHED"), "{stderr}");
 }
 
 /// A go.work whose other `use` member requires a higher version of the

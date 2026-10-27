@@ -1443,6 +1443,9 @@ replacement. Go uses committed `go.sum` entries without consulting the checksum
 database for those entries, so a fresh checkout needs no per-machine checksum
 exemption. A mismatched checksum still fails the build. The rewriter removes the
 replaced version's original sum lines to keep the result stable under `go mod tidy`.
+When no package of the patched module is imported, `go mod tidy` drops the zip-hash
+line and the build still works; re-running `scan --mode hosted` writes it back, so a
+later import of the module builds without a `missing go.sum entry` error.
 A re-pin to a newer patch (a superseding patch uuid, or the same patch republished
 at a new `-socketpatch.<n>` version) also removes the previous Socket module's sum
 lines, so `go mod tidy -diff` stays clean after a patch update.
