@@ -902,6 +902,40 @@ fn error_envelope(dry_run: bool, err: EnvelopeError) -> Envelope {
     env
 }
 
+/// The `vendor_ledger_missing` refusal for lockfile references into
+/// `.socket/vendor/<eco>/<uuid>/` (in the `--ecosystems` scope) that no
+/// entry of `state` owns, or `None` when every reference is ledgered.
+async fn unledgered_vendor_wiring(
+    common: &crate::args::GlobalArgs,
+    ledger_root: &Path,
+    state: &VendorState,
+) -> Option<String> {
+    let mut dirs: Vec<String> =
+        crate::commands::vendored_backend::repair::unledgered_vendor_references(ledger_root, state)
+            .await
+            .into_iter()
+            // An entry that carries the uuid under another ecosystem (an
+            // unknown backend, a hand edit) still owns it: its own revert
+            // reports what is wrong with it.
+            .filter(|(eco, uuid, _)| {
+                crate::commands::vendor::ecosystem_in_scope(common, eco)
+                    && !state.entries.values().any(|e| e.uuid == *uuid)
+            })
+            .map(|(eco, uuid, _)| format!(".socket/vendor/{eco}/{uuid}/"))
+            .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    dirs.sort();
+    Some(format!(
+        "lockfiles reference {}, which the vendor ledger (.socket/vendor/state.json) has no \
+         entry for, so rollback cannot unwind them; {} and roll back, or return the \
+         lockfiles to their pre-vendor versions",
+        dirs.join(", "),
+        crate::commands::vendor_orphans::UNLEDGERED_WIRING_REMEDY,
+    ))
+}
+
 /// Report a top-level rollback error: the error envelope on `--json`
 /// (message verbatim), an `Error:` stderr line otherwise. Errors print even
 /// under --silent ("errors only", never "nothing").
@@ -1588,6 +1622,28 @@ pub async fn run(args: RollbackArgs) -> i32 {
     };
 
     let scoped = !identifiers.is_empty() || !path_scope.is_empty();
+
+    // A lockfile still wired into a `.socket/vendor/` dir that the present
+    // ledger does not own (a merge kept one side of state.json, #991) is a
+    // patch this run cannot unwind: the pre-vendor originals lived in the
+    // lost entry. An unscoped run promises to unwind everything, so it
+    // refuses before writing, like the ledger-missing case above, instead
+    // of reverting the rest and deleting the ledger around the wiring.
+    if !scoped && project_state {
+        if let Ok(state) = &vendor_state_result {
+            if let Some(detail) = unledgered_vendor_wiring(&args.common, &ledger_root, state).await
+            {
+                track_patch_rollback_failed(&detail, &telemetry).await;
+                emit_rollback_error(
+                    args.common.json,
+                    args.common.dry_run,
+                    "vendor_ledger_missing",
+                    &detail,
+                );
+                return 1;
+            }
+        }
+    }
 
     // Identifier matching runs across ALL THREE stores; an identifier
     // matching nothing anywhere is the familiar exit-1 error.
