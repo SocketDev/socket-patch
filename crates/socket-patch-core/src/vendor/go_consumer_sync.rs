@@ -305,6 +305,21 @@ fn workspace_file(project_root: &Path) -> Option<PathBuf> {
         .find(|file| file.is_file())
 }
 
+/// The `use` member directories of the `go.work` in effect for
+/// `project_root` (joined to go.work's directory), or `None` when no
+/// workspace is in effect or its go.work can't be read.
+pub(crate) async fn workspace_member_dirs(project_root: &Path) -> Option<Vec<PathBuf>> {
+    let work_file = workspace_file(project_root)?;
+    let text = read_regular_to_string(&work_file).await.ok()?;
+    let work_dir = work_file.parent().unwrap_or(Path::new(""));
+    Some(
+        go_mod_edit::parse_use_dirs(&go_mod_edit::normalize_for_read(&text))
+            .into_iter()
+            .map(|dir| work_dir.join(dir))
+            .collect(),
+    )
+}
+
 /// The `go.work` in effect, read once: its own replaces and each `use`
 /// member's go.mod replaces.
 struct Workspace {
