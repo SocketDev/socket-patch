@@ -889,3 +889,112 @@ async fn tidy_pruned_zip_line_still_pins_the_hosted_replace() {
         discovery.diagnostics
     );
 }
+
+/// A go.work whose other `use` member requires a higher version of the
+/// patched module: go builds that version, so `go.work.sum` keeps only the
+/// socket module's `/go.mod` line and the replace is inert. Discovery must
+/// not attest it, neither when that member is in the project root (its
+/// `require` shows the build selects the higher version) nor when it is
+/// outside it (its `require` cannot be read).
+// #[serial]: see the capstone's note — env mutation vs env iteration.
+#[tokio::test]
+#[serial_test::serial]
+async fn workspace_member_selecting_another_version_never_attests() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_hosted_build") {
+        return;
+    }
+    const NEXT: &str = "v1.1.0";
+    let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
+    let proxy_url = format!("file://{}", tmp.path().join("proxy").display());
+    let smod = socket_module();
+    let upstream_gomod = format!("module {UMOD}\n\ngo 1.21\n");
+    publish(tmp.path(), UMOD, UVER, &upstream_gomod, PRISTINE_LIB);
+    publish(
+        tmp.path(),
+        UMOD,
+        NEXT,
+        &upstream_gomod,
+        "package upstream\n\nfunc Greeting() string { return \"PRISTINE-NEXT\" }\n",
+    );
+    publish(tmp.path(), &smod, SVER, &upstream_gomod, PATCHED_LIB);
+    let (_, gomod_h1) = harvest_sums(tmp.path(), &proxy_url, &smod, SVER);
+    let (next_zip_h1, next_gomod_h1) = harvest_sums(tmp.path(), &proxy_url, UMOD, NEXT);
+    let next_pair = format!("{UMOD} {NEXT} {next_zip_h1}\n{UMOD} {NEXT}/go.mod {next_gomod_h1}\n");
+    let env = day2_env(&proxy_url);
+    let purl = format!("pkg:golang/{UMOD}@{UVER}");
+
+    for (name, svc_rel) in [("in-root", "svc"), ("out-of-root", "../svc")] {
+        let app = tmp.path().join(name).join("app");
+        let svc = app.join(svc_rel);
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::write(
+            app.join("go.mod"),
+            format!("module example.com/app\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+        )
+        .unwrap();
+        std::fs::write(app.join("go.sum"), &next_pair).unwrap();
+        std::fs::write(
+            app.join("main.go"),
+            format!(
+                "package main\n\nimport \"{UMOD}\"\n\nfunc main() {{ println(upstream.Greeting()) }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("go.mod"),
+            format!("module example.com/svc\n\ngo 1.21\n\nrequire {UMOD} {NEXT}\n"),
+        )
+        .unwrap();
+        std::fs::write(svc.join("go.sum"), &next_pair).unwrap();
+        std::fs::write(
+            svc.join("svc.go"),
+            format!("package svc\n\nimport \"{UMOD}\"\n\nvar X = upstream.Greeting()\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("go.work"),
+            format!(
+                "go 1.21\n\nuse (\n\t.\n\t./{svc_rel}\n)\n\n\
+                 replace {UMOD} {UVER} => {smod} {SVER}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("go.work.sum"),
+            format!("{smod} {SVER}/go.mod {gomod_h1}\n"),
+        )
+        .unwrap();
+
+        let machine = Machine::new(tmp.path(), &format!("{name}-machine"));
+        let run = go(&app, &machine, &["run", "."], &as_pairs(&env));
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains("PRISTINE-NEXT"), "{name}: {stderr}");
+        let list = go(&app, &machine, &["list", "-m", UMOD], &as_pairs(&env));
+        assert_eq!(
+            String::from_utf8_lossy(&list.stdout).trim(),
+            format!("{UMOD} {NEXT}"),
+            "{name}: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+
+        let discovery = socket_patch_core::vex::discover::discover_patched_refs(&app).await;
+        let attested: Vec<_> = discovery
+            .refs
+            .iter()
+            .filter(|r| r.purl == purl && r.lockfile_basis_ok())
+            .collect();
+        assert!(attested.is_empty(), "{name}: {attested:?}");
+        if name == "in-root" {
+            assert!(
+                discovery
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.detail.contains("is inert")),
+                "{name}: {:?}",
+                discovery.diagnostics
+            );
+        }
+    }
+}
