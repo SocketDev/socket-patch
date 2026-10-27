@@ -204,6 +204,11 @@ def pins_for(version):
         # ModuleNotFoundError before locking.
         if (2, 21) <= v < (2, 26, 1):
             pins.append("hishel<1")
+        # 2.x declares an unbounded `unearth`; 0.19 (2026-10-27) moved to
+        # httpx2 and breaks PDM's PyPI client ("PDMPyPIClient is not an
+        # instance or subtype of type (Client)" on `pdm lock`, seen on
+        # 2.29.2). `<0.19` resolves the 0.18 line 2.x ran with before.
+        pins.append("unearth<0.19")
     return pins
 
 
