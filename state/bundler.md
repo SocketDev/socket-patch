@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-17 (run 48), main `7d3086f`, latest release v5.0.1 (npm; no git tags). Newest Bundler tested: 4.1.0.beta2; newest stable 4.0.23 (full gem suites pass, run 45).
+Last updated: 2026-10-27 (run 49), main `4654b7c`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta2 (no newer release). Gem redirect and vendor suites pass on 4.0.23 at `4654b7c` (run 49). Ruby 3.1.6 is now in the sandbox (`/opt/rbenv/versions/3.1.6/bin`), so Bundler 1.17.3 runs.
 
 ## Coverage matrix
 
@@ -438,6 +438,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
 | Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
 
+### Run 49 (main `4654b7c`, v5.0.1; Linux; scratch tests in `e2e_redirect_gem_build.rs`, real `bundle install` / `bundle exec`)
+
+| Cell | 1.17.3 (Ruby 3.1.6) | 2.1.4 | 2.5.22 | 4.0.18 | 4.0.23 |
+| --- | --- | --- | --- | --- | --- |
+| Hosted: 2 gems redirected (merged section, 2 Socket remotes): in-sync re-scan / supersede / `vex` | **fail #1749** | **fail #1749** | pass | — | pass |
+| Hosted: one gem, supersede (#1688 fix) | — | pass | — | — | — |
+| Hosted #985: gemspec dev dep with multi requirement (`">= 0.5", "< 2"`), CHECKSUMS → frozen install | — | — | — | pass (`(>= 0.5, = 1.0.0, < 2)!`) | — |
+| Hosted #985: merged pin → `rollback` / `remove` → frozen install | — | — | — | pass | — |
+| Hosted: gem only a gemspec dev dep (no `gem` line) | — | — | — | refused `redirect_gem_declaration_not_visible` (documented) | — |
+| Full redirect + vendor gem suites | — | — | — | — | pass (33 + 9) |
+
 ### Run 48 (main `7d3086f`, v5.0.1; Linux Ruby 3.3.6; scratch copies of `e2e_redirect_gem_build.rs` with sha512 + `gem-stub-gemspec` grants, real `bundle install` / `bundle exec`)
 
 | Cell | 4.0.18 | 2.5.22 |
@@ -471,11 +482,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #985 / #1109 (`agent:needs-human`), #1594, #1626 and #1235 when fixes merge.
-2. #1594 CHECKSUMS arm against real rubygems.org (needs an upstream the takeover can re-derive a checksum for; the mock upstream is refused).
-3. Vendored superseding patch that changes the gem's runtime deps (the PATH `specs:` must follow the new stub gemspec).
-4. Windows / macOS probe (Actions didn't trigger in run 38; leftover probe branches can't be deleted from the sandbox): #952 with `BUNDLE_GEMFILE=gemfiles\alt.gemfile`, #1092 `x64-mingw-ucrt` / `arm64-darwin` pairs, the #1260 stale-cache warning.
-5. Re-run the three gem suites on 4.1.0 final when it ships.
+1. Re-run #1749 and #1109 (`agent:needs-human`) when fixes merge. #985, #1235, #1594, #1626 and #1688 are fixed; they were spot-checked in run 49 (#985 merged pins, #1688 single-gem supersede).
+2. #1749 follow-up: a lock that started merged on 2.1, then converged under Bundler 2.2+ / 4.x (does the upgraded lock stay merged and hit #1749?).
+3. The full gem suites on Bundler 1.17.3 / Ruby 3.1.6 (now possible in the sandbox), plus `e2e_redirect_gem_stale_install` (its tests aren't `#[ignore]`d, so run it without `--ignored`).
+4. Vendored superseding patch that changes the gem's runtime deps (the PATH `specs:` must follow the new stub gemspec).
+5. Windows / macOS probe backlog (#952, #1092, #1260). Re-run the gem suites on 4.1.0 final when it ships.
 
 ## Known non-bugs
 
@@ -607,3 +618,7 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - A hosted→vendored takeover in the #1626 unconverged-supersede window fails closed with `gemfile_declaration_not_editable` and writes nothing (run 48).
 - Vendored gem rewrites of a CRLF Gemfile write the new line with LF (mixed endings). Bundler accepts it and the unwind is byte-exact, so it's cosmetic, like the hosted case (run 48).
 - Successful vendored gem fixtures in `e2e_redirect_gem_build.rs`: the `.gem` lives at `<stage>/<uuid>/<name>-src/<name>-<v>.gem` (not `<stage>/<uuid>/`), the stub is `gem spec <that .gem> --ruby`, and the grant needs a `tarball` with `sha512` SRI plus a `gem-stub-gemspec` artifact. Reset the fixture to `pristine_gemfile` / `pristine_lock` and delete `.socket` to start from an unpatched project (run 48).
+- A Gemfile that gets the vulnerable gem only through a `gemspec` development dependency (no `gem` line) is refused with `redirect_gem_declaration_not_visible`, which names the gemspec case. That's a documented refusal (run 49).
+- The #1646 user-patch consent gate has no gem evidence (CLI_CONTRACT.md's detection table lists no Bundler mechanism). That's documented scope (run 49).
+- Bundler 2.5 / 2.6 never merge a gemspec dev dep into a later Gemfile `gem` line (they only merge dev + dev). 2.7 is the right boundary for `bundler_merges_dev_dependencies` (checked in the 2.5.23 / 2.6.9 / 2.7.0 `dsl.rb`, run 49).
+- Manifestless `vex` in the redirect harness needs `--api-url`, `--org`, `--api-token` and `--patch-server-url <mock>`, or every Bundler version reads `manifest_not_found` (run 49).
