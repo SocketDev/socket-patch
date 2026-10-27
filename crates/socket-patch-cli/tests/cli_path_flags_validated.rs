@@ -261,7 +261,7 @@ fn deno_tool_node_modules_deno_never_loads_is_a_usage_error() {
     ] {
         let root = tempfile::tempdir().unwrap();
         let decoy = stage_deno_tool_dir(root.path(), deno_json, false);
-        for command in COMMANDS {
+        for command in COMMANDS.iter().filter(|c| !restores(c)) {
             let (code, stdout, stderr) = run(
                 tmp.path(),
                 command,
@@ -279,6 +279,37 @@ fn deno_tool_node_modules_deno_never_loads_is_a_usage_error() {
             );
             assert!(stdout.is_empty(), "{command:?}: {stdout}");
         }
+    }
+}
+
+/// The commands that restore what an earlier run patched; they still
+/// accept a Deno per-tool tree, so a decoy patched by an earlier release
+/// can be reverted.
+fn restores(command: &[&str]) -> bool {
+    matches!(
+        command.first(),
+        Some(&"rollback") | Some(&"remove") | Some(&"repair")
+    ) || command.contains(&"--revert")
+}
+
+/// #444: `rollback`, `remove`, `vendor --revert` and `repair` still
+/// accept the decoy tree, so files an earlier release patched there can
+/// be restored.
+#[test]
+fn deno_tool_node_modules_decoy_stays_restorable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let decoy = stage_deno_tool_dir(root.path(), r#"{"imports":{}}"#, false);
+    for command in COMMANDS.iter().filter(|c| restores(c)) {
+        let (code, stdout, stderr) = run(
+            tmp.path(),
+            command,
+            &["--global-prefix", decoy.to_str().unwrap()],
+        );
+        assert!(
+            !stderr.contains("Deno does not load"),
+            "{command:?} (exit {code}) must not refuse the decoy\nstdout={stdout}\nstderr={stderr}"
+        );
     }
 }
 

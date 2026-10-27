@@ -1897,13 +1897,17 @@ fn deno_npm_cache_roots() -> Vec<PathBuf> {
 /// `$DENO_DIR/npm` itself, walked the way [`deno_npm_cache_roots`] walks
 /// the `-g` one. Empty for anything else: a `node_modules`, a dir that is
 /// itself a package (an `npm` with a `package.json` is the npm CLI, not
-/// Deno's cache), or one with no registry dir below it, so every other
-/// prefix keeps its `node_modules` walk.
+/// Deno's cache), an `npm` holding a `node_modules` (npm's own global
+/// prefix on Windows, `%APPDATA%\npm`), or one with no registry dir below
+/// it, so every other prefix keeps its `node_modules` walk.
 fn deno_cache_parent_registry_dirs(prefix: &Path) -> Vec<PathBuf> {
+    let prefix = std::path::absolute(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+    let prefix = prefix.as_path();
     let is_cache_npm_dir = |dir: &Path| {
         dir.file_name().is_some_and(|name| name == "npm")
             && dir.is_dir()
             && !dir.join("package.json").exists()
+            && !dir.join("node_modules").exists()
     };
     if prefix
         .file_name()

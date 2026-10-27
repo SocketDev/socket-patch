@@ -398,22 +398,6 @@ impl GlobalArgs {
                     what,
                 ));
             }
-            // A Deno tool's per-tool `node_modules` that Deno never loads
-            // (#444): patching it reported `applied` (and VEX
-            // `not_affected`) while the tool kept running the copy in
-            // Deno's npm cache.
-            if socket_patch_core::crawlers::deno_crawler::is_unloaded_deno_tool_node_modules(prefix)
-            {
-                return Err(not_dir(
-                    "--global-prefix",
-                    "SOCKET_GLOBAL_PREFIX",
-                    prefix,
-                    "is a Deno tool's node_modules that Deno does not load \
-                     (its deno.json sets no nodeModulesDir); the tool runs its npm \
-                     packages from Deno's npm cache, so use -g, or --global-prefix \
-                     naming $DENO_DIR or $DENO_DIR/npm",
-                ));
-            }
         }
         if self.manifest_path != DEFAULT_PATCH_MANIFEST_PATH {
             let manifest = self.resolved_manifest_path();
@@ -450,6 +434,33 @@ impl GlobalArgs {
             }
         }
         Ok(())
+    }
+
+    /// Refuse a `--global-prefix` naming a Deno tool's per-tool
+    /// `node_modules` that Deno never loads (#444): patching it reported
+    /// `applied` (and VEX `not_affected`) while the tool kept running the
+    /// copy in Deno's npm cache. Only commands that patch, find or attest
+    /// call this; the ones that restore (`rollback`, `remove`,
+    /// `vendor --revert`, `repair`) still reach a tree an earlier release
+    /// patched.
+    pub fn refuse_unloaded_deno_prefix(&self) -> Result<(), String> {
+        match &self.global_prefix {
+            Some(prefix)
+                if socket_patch_core::crawlers::deno_crawler::is_unloaded_deno_tool_node_modules(
+                    prefix,
+                ) =>
+            {
+                Err(format!(
+                    "--global-prefix (or SOCKET_GLOBAL_PREFIX) `{}` is inside a Deno tool's \
+                     node_modules that Deno does not load (the tool's Deno config leaves \
+                     nodeModulesDir unset or \"none\"); the tool runs its npm packages from \
+                     Deno's npm cache, so use -g, or --global-prefix naming $DENO_DIR or \
+                     $DENO_DIR/npm",
+                    prefix.display()
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The crawler options this run's `--cwd` / `--global` /

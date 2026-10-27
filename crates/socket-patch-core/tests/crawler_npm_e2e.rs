@@ -4785,3 +4785,60 @@ async fn prefix_with_npm_package_child_keeps_node_modules_walk() {
     purls.sort();
     assert_eq!(purls, vec!["pkg:npm/left-pad@1.3.0", "pkg:npm/npm@10.9.0"]);
 }
+
+/// #444 review: npm's own global prefix on Windows is `%APPDATA%\npm`, a
+/// dir named `npm` holding a `node_modules`. It, and its parent, keep the
+/// plain walk instead of being read as Deno's npm cache, even when a
+/// package's nested dir looks like a Deno package dir.
+#[tokio::test]
+#[serial_test::parallel]
+async fn npm_global_prefix_named_npm_is_not_deno_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let npm = tmp.path().join("AppData").join("npm");
+    let node_modules = npm.join("node_modules");
+    stage_npm_pkg(&node_modules, "electron-builder", "24.0.0").await;
+    stage_npm_pkg(
+        &node_modules.join("electron-builder").join("node_modules"),
+        "7zip-bin",
+        "5.2.0",
+    )
+    .await;
+    for prefix in [npm.clone(), tmp.path().join("AppData")] {
+        let opts = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(prefix.clone()),
+        };
+        let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+        assert_eq!(roots, vec![prefix.clone()], "{prefix:?}");
+    }
+}
+
+/// #444 review: a relative spelling of `$DENO_DIR/npm` (`.` from inside
+/// it) expands like the absolute one.
+#[tokio::test]
+#[serial_test::serial]
+async fn relative_deno_npm_dir_prefix_expands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let npm = tmp.path().join("deno").join("npm");
+    let registry = npm.join("registry.npmjs.org");
+    stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
+
+    /// Restores the working directory however the test ends.
+    struct CwdGuard(PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _guard = CwdGuard(std::env::current_dir().unwrap());
+    std::env::set_current_dir(&npm).unwrap();
+    let opts = CrawlerOptions {
+        cwd: npm.clone(),
+        global: false,
+        global_prefix: Some(PathBuf::from(".")),
+    };
+    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    assert!(roots[0].ends_with("registry.npmjs.org"), "{roots:?}");
+}

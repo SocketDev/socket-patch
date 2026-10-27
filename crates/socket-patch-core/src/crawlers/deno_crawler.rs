@@ -332,24 +332,32 @@ async fn is_deno_project(cwd: &Path) -> bool {
     false
 }
 
-/// Whether `path` is the per-tool `node_modules` Deno (>= 2.7) writes
-/// beside a `deno install -g` tool, `<install-root>/bin/.<tool>/node_modules`,
-/// that the tool never loads (#444). A tool installed from a local or JSR
-/// entrypoint gets a `deno.json` there with no `nodeModulesDir`, and no
-/// `package.json`, so Deno resolves its npm packages from `$DENO_DIR/npm`
-/// and the tree is a decoy: patching it leaves the code the tool runs
-/// unpatched. An `npm:` entrypoint tool's `deno.json` sets
-/// `"nodeModulesDir": "manual"` (with a `package.json`), and Deno does
-/// load that tree. A config that is not plain JSON is not judged.
+/// Whether `path` is, or is inside, the per-tool `node_modules` Deno
+/// (>= 2.7) writes beside a `deno install -g` tool,
+/// `<install-root>/bin/.<tool>/node_modules`, that the tool never loads
+/// (#444). A tool installed from a local or JSR entrypoint gets a
+/// `deno.json` there with no `nodeModulesDir` and no `package.json`, so
+/// Deno resolves its npm packages from `$DENO_DIR/npm` and the tree is a
+/// decoy: patching it leaves the code the tool runs unpatched. An `npm:`
+/// entrypoint tool's `deno.json` sets `"nodeModulesDir": "manual"` (with a
+/// `package.json`), and Deno does load that tree. Symlinks are resolved
+/// first, so a link to the decoy is judged as the decoy.
 pub fn is_unloaded_deno_tool_node_modules(path: &Path) -> bool {
-    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let Some(tool) = path
-        .file_name()
-        .filter(|name| *name == "node_modules")
-        .and(path.parent())
-    else {
-        return false;
-    };
+    let path = std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    path.ancestors().any(|dir| {
+        dir.file_name().is_some_and(|name| name == "node_modules")
+            && dir.parent().is_some_and(tool_dir_skips_node_modules)
+    })
+}
+
+/// Whether `tool` is a Deno per-tool dir (`bin/.<tool>`) whose config
+/// tells Deno not to use its `node_modules`, the way Deno decides it: an
+/// explicit `nodeModulesDir` wins (`"none"` or `false` skip it), and when
+/// unset, Deno uses it only beside a `package.json`. The config is read as
+/// JSONC, as Deno reads it; one that does not parse is not judged.
+fn tool_dir_skips_node_modules(tool: &Path) -> bool {
     let hidden_tool_dir = tool
         .file_name()
         .and_then(|name| name.to_str())
@@ -358,7 +366,7 @@ pub fn is_unloaded_deno_tool_node_modules(path: &Path) -> bool {
         .parent()
         .and_then(Path::file_name)
         .is_some_and(|name| name == "bin");
-    if !hidden_tool_dir || !under_bin || tool.join("package.json").exists() {
+    if !hidden_tool_dir || !under_bin {
         return false;
     }
     let Some(config) = ["deno.json", "deno.jsonc"]
@@ -368,15 +376,17 @@ pub fn is_unloaded_deno_tool_node_modules(path: &Path) -> bool {
     else {
         return false;
     };
-    let Some(config) = read_regular_to_string_sync(&config)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-    else {
+    let Some(config) = read_regular_to_string_sync(&config).ok().and_then(|text| {
+        let text =
+            crate::vendor::bun_lock_text::strip_jsonc(crate::formats::text::strip_bom(&text));
+        serde_json::from_str::<Value>(&text).ok()
+    }) else {
         return false;
     };
     match config.get("nodeModulesDir") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => true,
+        Some(Value::Bool(false)) => true,
         Some(Value::String(mode)) => mode == "none",
+        None | Some(Value::Null) => !tool.join("package.json").exists(),
         Some(_) => false,
     }
 }
@@ -1001,6 +1011,32 @@ mod tests {
             false,
         );
         assert!(!is_unloaded_deno_tool_node_modules(&jsonc_comments));
+        let commented = stage(
+            "i/bin/.tool",
+            Some(("deno.jsonc", "\u{feff}// generated\n{\"imports\":{},}")),
+            false,
+        );
+        assert!(is_unloaded_deno_tool_node_modules(&commented));
+        let none_beside_package_json = stage(
+            "j/bin/.tool",
+            Some(("deno.json", r#"{"nodeModulesDir":"none"}"#)),
+            true,
+        );
+        assert!(is_unloaded_deno_tool_node_modules(
+            &none_beside_package_json
+        ));
+        let nested = decoy
+            .join(".deno")
+            .join("is-odd@3.0.1")
+            .join("node_modules");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(is_unloaded_deno_tool_node_modules(&nested));
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("decoy-link");
+            std::os::unix::fs::symlink(&decoy, &link).unwrap();
+            assert!(is_unloaded_deno_tool_node_modules(&link));
+        }
         let not_under_bin = stage("g/lib/.tool", Some(("deno.json", "{}")), false);
         assert!(!is_unloaded_deno_tool_node_modules(&not_under_bin));
         let project = stage("h/bin/tool", Some(("deno.json", "{}")), false);
