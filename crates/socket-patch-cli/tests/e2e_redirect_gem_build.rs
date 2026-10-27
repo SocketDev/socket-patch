@@ -2483,7 +2483,9 @@ async fn gem_hosted_two_gems_rescan_supersede_and_attest() {
         lock.contains(VULN_GEN3) && !lock.contains(VULN_GEN2) && lock.contains(TINY_GEN2),
         "generation 3 lock:\n{lock}"
     );
-    let frozen = bundle_env(&fx.proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    // A cold checkout of the converged pair installs frozen.
+    let fresh = stage_fresh_checkout(&fx, "two-gems-fresh-frozen");
+    let frozen = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
     assert!(
         frozen.status.success(),
         "frozen install of the generation 3 pair:\nstdout:\n{}\nstderr:\n{}",

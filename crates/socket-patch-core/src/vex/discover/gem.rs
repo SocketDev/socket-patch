@@ -97,17 +97,18 @@
 //! sibling manifest (`Gemfile` for `Gemfile.lock`, `gems.rb` for
 //! `gems.locked`) declares it inside a `source` block whose URL is that
 //! remote. With several hosted gems the section lists one Socket remote
-//! per patch, and each remote is attributed on its own. That manifest is read ONLY for this cross-check — i.e. only when
-//! the lock has a merged section, whose own Socket remote already names the
-//! uuid — so a Gemfile-only wiring (lock not merged) stays with the ledger
-//! fallback.
+//! per patch, and each remote is attributed on its own. That manifest is
+//! read ONLY for this cross-check — i.e. only when the lock has a merged
+//! section, whose own Socket remotes already name the uuids — so a
+//! Gemfile-only wiring (lock not merged) stays with the ledger fallback.
 //! The manifest is read as text, not run as Ruby, so the cross-check fails
 //! closed on what text cannot settle: `=begin` … `=end` block comments are
 //! skipped, and a gem the manifest ALSO declares in a block for another
 //! source (dead code, a conditional branch) is not attributed.
 //! The section's other specs (upstream gems) are silent; a Socket remote of
-//! a merged section with no such pinned gem is [`DIAG_REF_UNATTRIBUTABLE`]
-//! (the section's other Socket remotes are still read).
+//! a merged section with no such pinned gem, or whose pinned gems the
+//! section does not lock, is [`DIAG_REF_UNATTRIBUTABLE`] (the section's
+//! other Socket remotes are still read).
 //!
 //! ## Vendored (`vendor::gem` module docs)
 //!
@@ -441,18 +442,34 @@ fn section_refs(
         );
         return;
     }
-    for line in &sec.specs {
-        if let Wiring::Hosted {
+    let only = match wiring {
+        Wiring::Hosted {
             only: Some(only), ..
-        } = wiring
-        {
-            // Merged section: only the gems source-pinned to the Socket
-            // remote are its; the rest came from the other remotes.
-            if !line.parsed.is_some_and(|s| only.contains(s.name)) {
-                continue;
-            }
+        } => Some(only),
+        _ => None,
+    };
+    let mut matched = false;
+    for line in &sec.specs {
+        // Merged section: only the gems source-pinned to the Socket remote
+        // are its; the rest came from the other remotes.
+        if only.is_some_and(|only| !line.parsed.is_some_and(|s| only.contains(s.name))) {
+            continue;
         }
+        matched = true;
         spec_ref(file, lock, owners, line, wiring, out);
+    }
+    if let Some(only) = only.filter(|_| !matched) {
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            file,
+            format!(
+                "{file}: line {}: the gems source-pinned to Socket patch {} ({}) are not \
+                 locked in this merged GEM section",
+                sec.line_no,
+                wiring.uuid(),
+                only.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        );
     }
 }
 
@@ -508,6 +525,18 @@ fn hosted_wirings<'t>(
     let merged = sec.remotes.len() != 1;
     let mut wirings = Vec::new();
     for (remote, uuid) in socket {
+        if !is_patch_registry_index(remote, &uuid) {
+            out.diag(
+                DIAG_REF_INVALID,
+                file,
+                format!(
+                    "{file}: line {}: GEM remote {remote:?} is on the Socket patch server but \
+                     is not a patch-registry/gem/<token>/<uuid>/ index",
+                    sec.line_no
+                ),
+            );
+            continue;
+        }
         let mut only = None;
         if merged {
             // A merged section (module docs): attributable only per gem,
@@ -515,21 +544,17 @@ fn hosted_wirings<'t>(
             // manifest ALSO declares in a block for another source is
             // ambiguous (the reader sees text, not which branch Ruby runs),
             // so it is not attributed to any Socket remote.
-            let pinned: BTreeSet<String> = if is_patch_registry_index(remote, &uuid) {
-                blocks
-                    .iter()
-                    .filter(|(url, name)| {
-                        same_remote(url, remote)
-                            && lock.pinned.contains(name.as_str())
-                            && blocks
-                                .iter()
-                                .all(|(u, n)| n != name || same_remote(u, remote))
-                    })
-                    .map(|(_, name)| name.clone())
-                    .collect()
-            } else {
-                BTreeSet::new()
-            };
+            let pinned: BTreeSet<String> = blocks
+                .iter()
+                .filter(|(url, name)| {
+                    same_remote(url, remote)
+                        && lock.pinned.contains(name.as_str())
+                        && blocks
+                            .iter()
+                            .all(|(u, n)| n != name || same_remote(u, remote))
+                })
+                .map(|(_, name)| name.clone())
+                .collect();
             if pinned.is_empty() {
                 out.diag(
                     DIAG_REF_UNATTRIBUTABLE,
@@ -547,18 +572,6 @@ fn hosted_wirings<'t>(
                 continue;
             }
             only = Some(pinned);
-        }
-        if !is_patch_registry_index(remote, &uuid) {
-            out.diag(
-                DIAG_REF_INVALID,
-                file,
-                format!(
-                    "{file}: line {}: GEM remote {remote:?} is on the Socket patch server but \
-                     is not a patch-registry/gem/<token>/<uuid>/ index",
-                    sec.line_no
-                ),
-            );
-            continue;
         }
         wirings.push(Wiring::Hosted { remote, uuid, only });
     }
@@ -1408,6 +1421,61 @@ mod tests {
         assert_eq!(
             diag_codes(&out),
             vec![DIAG_REF_UNATTRIBUTABLE; 2],
+            "{:?}",
+            out.diagnostics
+        );
+        for uuid in [UUID_A, UUID_B] {
+            assert_eq!(
+                out.diagnostics
+                    .iter()
+                    .filter(|d| d.detail.contains(uuid))
+                    .count(),
+                1,
+                "{uuid}: {:?}",
+                out.diagnostics
+            );
+        }
+
+        // A Socket remote that is not a patch-registry index is an invalid
+        // ref, as in a single-remote section; the other remote still pins.
+        let bad = format!("{}?x=1", index(UUID_B));
+        let p = Project::new();
+        p.write("Gemfile.lock", two_patch_merged_lock(&index(UUID_A), &bad));
+        p.write("Gemfile", block_gemfile(&index(UUID_A)));
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:gem/vuln-gem@1.0.0", UUID_A, WiringMode::Hosted)],
+        );
+        assert_eq!(
+            diag_codes(&out),
+            vec![DIAG_REF_INVALID],
+            "{:?}",
+            out.diagnostics
+        );
+
+        // A gem pinned to a Socket remote but not locked in its merged
+        // section yields no ref, and says so.
+        let lock = two_patch_merged_lock(&index(UUID_A), &index(UUID_B))
+            .replace("    tiny-dep (1.0.0)\n", "")
+            .replace("      tiny-dep\n", "");
+        let p = Project::new();
+        p.write("Gemfile.lock", lock);
+        p.write("Gemfile", two_block_gemfile(&index(UUID_A), &index(UUID_B)));
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:gem/vuln-gem@1.0.0", UUID_A, WiringMode::Hosted)],
+        );
+        assert_eq!(
+            diag_codes(&out),
+            vec![DIAG_REF_UNATTRIBUTABLE],
+            "{:?}",
+            out.diagnostics
+        );
+        assert!(
+            out.diagnostics[0].detail.contains(UUID_B)
+                && out.diagnostics[0].detail.contains("tiny-dep"),
             "{:?}",
             out.diagnostics
         );
