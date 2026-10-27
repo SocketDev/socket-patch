@@ -110,8 +110,8 @@ pub fn select(pruned: bool, required: Option<&str>, zips: &[&str], version: &str
 ///
 /// In workspace mode the build list also takes every `use` member's
 /// requirements, and MVS selects the highest version any of them asks for
-/// (#1751). So another member's higher version is the one built, and a
-/// module absent from this go.mod may still be built:
+/// (#1751). So a version another member proves is weighed with this one's,
+/// and a module absent from this go.mod may still be built:
 /// [`Selection::NotInGraph`] becomes [`Selection::Unknown`] there unless a
 /// member proves the version.
 pub async fn project_selection(
@@ -121,18 +121,17 @@ pub async fn project_selection(
 ) -> Option<Selection> {
     let own = dir_selection(project_root, module, version).await?;
     let Some(members) = super::go_consumer_sync::workspace_member_dirs(project_root).await else {
-        if own == Selection::NotInGraph
-            && super::go_consumer_sync::workspace_in_effect(project_root)
-        {
-            return Some(Selection::Unknown);
-        }
         return Some(own);
     };
     let mut highest = evidence(&own, version);
+    // A member whose files can't tell may build a higher version than the
+    // highest one proven, so then only a proof at or above ours decides.
+    let mut unknown = own == Selection::Unknown;
     for dir in members {
         let Some(member) = dir_selection(&dir, module, version).await else {
             continue;
         };
+        unknown |= member == Selection::Unknown;
         if let Some(v) = evidence(&member, version) {
             if highest
                 .as_deref()
@@ -143,8 +142,10 @@ pub async fn project_selection(
         }
     }
     Some(match highest {
-        Some(h) if go_semver_cmp(&h, version) == Ordering::Greater => Selection::Other(h),
         Some(h) if h == version => Selection::Selected,
+        Some(h) if !unknown || go_semver_cmp(&h, version) == Ordering::Greater => {
+            Selection::Other(h)
+        }
         _ if own == Selection::NotInGraph => Selection::Unknown,
         _ => own,
     })
@@ -310,6 +311,45 @@ mod tests {
         assert_eq!(
             project_selection(&a, UP, "v1.1.0").await,
             Some(Selection::Selected)
+        );
+    }
+
+    /// A version below the patched one counts when it is the highest any
+    /// member proves, unless a member's files can't tell.
+    #[tokio::test]
+    async fn workspace_lower_versions_decide_only_without_unknown_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let (a, b, c) = (ws.join("a"), ws.join("b"), ws.join("c"));
+        module(&a, "a", "v1.0.0");
+        module(&b, "b", "v1.0.5");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(c.join("go.mod"), "module example.com/c\n\ngo 1.21\n").unwrap();
+        std::fs::write(
+            ws.join("go.work"),
+            "go 1.21\n\nuse (\n\t./a\n\t./b\n\t./c\n)\n",
+        )
+        .unwrap();
+        for project in [&a, &c] {
+            assert_eq!(
+                project_selection(project, UP, "v1.1.0").await,
+                Some(Selection::Other("v1.0.5".into()))
+            );
+        }
+        // An old-style member with only a lower bound may build anything.
+        std::fs::write(
+            b.join("go.mod"),
+            format!("module example.com/b\n\ngo 1.16\n\nrequire {UP} v1.0.5\n"),
+        )
+        .unwrap();
+        std::fs::write(b.join("go.sum"), "").unwrap();
+        assert_eq!(
+            project_selection(&c, UP, "v1.1.0").await,
+            Some(Selection::Unknown)
+        );
+        assert_eq!(
+            project_selection(&a, UP, "v1.1.0").await,
+            Some(Selection::Other("v1.0.0".into()))
         );
     }
 

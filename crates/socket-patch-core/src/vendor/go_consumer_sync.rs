@@ -306,18 +306,30 @@ fn workspace_file(project_root: &Path) -> Option<PathBuf> {
 }
 
 /// The `use` member directories of the `go.work` in effect for
-/// `project_root` (joined to go.work's directory), or `None` when no
-/// workspace is in effect or its go.work can't be read.
+/// `project_root`: `None` when no workspace is in effect, empty when its
+/// go.work can't be read.
 pub(crate) async fn workspace_member_dirs(project_root: &Path) -> Option<Vec<PathBuf>> {
     let work_file = workspace_file(project_root)?;
-    let text = read_regular_to_string(&work_file).await.ok()?;
+    Some(match read_work_file(&work_file).await {
+        Some(text) => use_dirs(&work_file, &text),
+        None => Vec::new(),
+    })
+}
+
+/// `work_file`'s text, normalized for parsing.
+async fn read_work_file(work_file: &Path) -> Option<String> {
+    let text = read_regular_to_string(work_file).await.ok()?;
+    Some(go_mod_edit::normalize_for_read(&text))
+}
+
+/// The `use` directories of go.work `text`, joined to `work_file`'s
+/// directory.
+fn use_dirs(work_file: &Path, text: &str) -> Vec<PathBuf> {
     let work_dir = work_file.parent().unwrap_or(Path::new(""));
-    Some(
-        go_mod_edit::parse_use_dirs(&go_mod_edit::normalize_for_read(&text))
-            .into_iter()
-            .map(|dir| work_dir.join(dir))
-            .collect(),
-    )
+    go_mod_edit::parse_use_dirs(text)
+        .into_iter()
+        .map(|dir| work_dir.join(dir))
+        .collect()
 }
 
 /// The `go.work` in effect, read once: its own replaces and each `use`
@@ -337,12 +349,9 @@ struct Member {
 
 async fn load_workspace(project_root: &Path) -> Option<Workspace> {
     let work_file = workspace_file(project_root)?;
-    let text = read_regular_to_string(&work_file).await.ok()?;
-    let text = go_mod_edit::normalize_for_read(&text);
-    let work_dir = work_file.parent().unwrap_or(Path::new("")).to_path_buf();
+    let text = read_work_file(&work_file).await?;
     let mut members = Vec::new();
-    for dir in go_mod_edit::parse_use_dirs(&text) {
-        let dir = work_dir.join(dir);
+    for dir in use_dirs(&work_file, &text) {
         let replaces = match read_regular_to_string(&dir.join("go.mod")).await {
             Ok(go_mod) => {
                 go_mod_edit::parse_replace_entries(&go_mod_edit::normalize_for_read(&go_mod))
