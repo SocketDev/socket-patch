@@ -137,6 +137,12 @@ fn pins_for(v: &str) -> Vec<String> {
         if ((2, 21, 0)..(2, 26, 1)).contains(&t) {
             pins.push("hishel<1");
         }
+        // 2.x declares an unbounded `unearth`, and unearth 0.19 (2026-10-27)
+        // moved to `httpx2`: PDM's PyPI client is no longer the `httpx`
+        // client unearth expects, so `pdm lock` dies with "PDMPyPIClient is
+        // not an instance or subtype of type (Client)" (seen on 2.29.2).
+        // `<0.19` resolves the 0.18 line every 2.x ran with before.
+        pins.push("unearth<0.19");
     }
     let mut out = vec![format!("pdm=={v}")];
     out.extend(pins.into_iter().map(String::from));
