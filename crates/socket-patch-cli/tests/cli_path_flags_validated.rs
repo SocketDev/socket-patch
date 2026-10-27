@@ -218,3 +218,122 @@ fn manifest_creating_commands_accept_a_manifest_path_in_a_new_directory() {
         );
     }
 }
+
+/// Stage the per-tool dir Deno >= 2.7 writes beside a `deno install -g`
+/// tool, `<install-root>/bin/.<tool>/`, with a `node_modules` holding
+/// is-odd, and return that `node_modules`.
+fn stage_deno_tool_dir(root: &Path, deno_json: &str, package_json: bool) -> std::path::PathBuf {
+    let tool = root.join("bin").join(".sptool");
+    let pkg = tool
+        .join("node_modules")
+        .join(".deno")
+        .join("is-odd@3.0.1")
+        .join("node_modules")
+        .join("is-odd");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"is-odd","version":"3.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(tool.join("deno.json"), deno_json).unwrap();
+    std::fs::write(tool.join("deno.lock"), "{}").unwrap();
+    if package_json {
+        std::fs::write(tool.join("package.json"), "{}").unwrap();
+    }
+    std::fs::write(root.join("bin").join("sptool"), "#!/bin/sh\n").unwrap();
+    tool.join("node_modules")
+}
+
+/// #444: Deno writes a per-tool `bin/.<tool>/node_modules` for a tool
+/// installed from a local or JSR entrypoint, but the tool's `deno.json`
+/// sets no `nodeModulesDir`, so Deno loads its npm packages from
+/// `$DENO_DIR/npm` instead. A `--global-prefix` naming that tree used to
+/// report `applied` and a VEX `not_affected` while the tool kept running
+/// the unpatched copy; it is now a usage error pointing at `-g`.
+#[test]
+fn deno_tool_node_modules_deno_never_loads_is_a_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    for deno_json in [
+        r#"{"imports":{}}"#,
+        r#"{"nodeModulesDir":"none"}"#,
+        r#"{"nodeModulesDir":false}"#,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let decoy = stage_deno_tool_dir(root.path(), deno_json, false);
+        for command in COMMANDS.iter().filter(|c| !restores(c)) {
+            let (code, stdout, stderr) = run(
+                tmp.path(),
+                command,
+                &["--global-prefix", decoy.to_str().unwrap()],
+            );
+            assert_eq!(
+                code, 2,
+                "{deno_json} {command:?} must be a usage error\nstdout={stdout}\nstderr={stderr}"
+            );
+            assert!(
+                stderr.contains("--global-prefix")
+                    && stderr.contains("Deno does not load")
+                    && stderr.contains("-g"),
+                "{deno_json} {command:?}: {stderr}"
+            );
+            assert!(stdout.is_empty(), "{command:?}: {stdout}");
+        }
+    }
+}
+
+/// The commands that restore what an earlier run patched; they still
+/// accept a Deno per-tool tree, so a decoy patched by an earlier release
+/// can be reverted.
+fn restores(command: &[&str]) -> bool {
+    matches!(
+        command.first(),
+        Some(&"rollback") | Some(&"remove") | Some(&"repair")
+    ) || command.contains(&"--revert")
+}
+
+/// #444: `rollback`, `remove`, `vendor --revert` and `repair` still
+/// accept the decoy tree, so files an earlier release patched there can
+/// be restored.
+#[test]
+fn deno_tool_node_modules_decoy_stays_restorable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let decoy = stage_deno_tool_dir(root.path(), r#"{"imports":{}}"#, false);
+    for command in COMMANDS.iter().filter(|c| restores(c)) {
+        let (code, stdout, stderr) = run(
+            tmp.path(),
+            command,
+            &["--global-prefix", decoy.to_str().unwrap()],
+        );
+        assert!(
+            !stderr.contains("Deno does not load"),
+            "{command:?} (exit {code}) must not refuse the decoy\nstdout={stdout}\nstderr={stderr}"
+        );
+    }
+}
+
+/// #444: a per-tool `node_modules` Deno does load (an `npm:` entrypoint
+/// tool, whose `deno.json` sets `"nodeModulesDir": "manual"`, or one with
+/// a `package.json`) is still a valid `--global-prefix`.
+#[test]
+fn deno_tool_node_modules_deno_loads_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (deno_json, package_json) in [
+        (r#"{"workspace":[],"nodeModulesDir":"manual"}"#, true),
+        (r#"{"nodeModulesDir":"auto"}"#, false),
+        (r#"{"imports":{}}"#, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let live = stage_deno_tool_dir(root.path(), deno_json, package_json);
+        let (code, stdout, stderr) = run(
+            tmp.path(),
+            &["list"],
+            &["--global-prefix", live.to_str().unwrap()],
+        );
+        assert_ne!(
+            code, 2,
+            "{deno_json}: a live tree is no usage error\nstdout={stdout}\nstderr={stderr}"
+        );
+    }
+}
