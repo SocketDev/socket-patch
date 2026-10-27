@@ -326,13 +326,15 @@ class StampTests(unittest.TestCase):
 
     def test_release_lint_catches_npm_dependency_drift(self):
         pkg = self.root / "npm/socket-patch/package.json"
-        rel._write(pkg, rel._read(pkg).replace('"zod": "3.25.76"', '"zod": "3.25.77"'))
+        # Read the pin instead of hardcoding it, so a zod bump doesn't break this test.
+        pinned = json.loads(rel._read(pkg))["dependencies"]["zod"]
+        rel._write(pkg, rel._read(pkg).replace(f'"zod": "{pinned}"', f'"zod": "{pinned}-drift"'))
         drift = self.lint("--sync-only")
         self.assertNotEqual(drift.returncode, 0, drift.stdout)
         self.assertIn("dependencies", drift.stdout + drift.stderr)
-        self.assertIn("node_modules/zod is 3.25.76", drift.stdout + drift.stderr)
+        self.assertIn(f"node_modules/zod is {pinned}", drift.stdout + drift.stderr)
         self.assertEqual(quiet(rel.main, ["--root", str(self.root), "npm-lock-check"]), 1)
-        rel._write(pkg, rel._read(pkg).replace('"zod": "3.25.77"', '"zod": "3.25.76"'))
+        rel._write(pkg, rel._read(pkg).replace(f'"zod": "{pinned}-drift"', f'"zod": "{pinned}"'))
         lock_path = self.root / "npm/socket-patch/package-lock.json"
         lock = json.loads(rel._read(lock_path))
         del lock["packages"]["node_modules/typescript"]
