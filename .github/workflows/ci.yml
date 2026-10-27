@@ -2881,7 +2881,11 @@ jobs:
     name: ci-ok                 # registered as a required check; do not rename
     if: always()
     needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, windows-compile-check, e2e-build-windows, e2e-build-macos, e2e, e2e-windows, e2e-extended, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
-    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    # GitHub-hosted, not Depot: the check is one 2 s python3 call, and it
+    # runs alone at the end of every run, so a Depot host boot (up to 2.6 min
+    # on 10-27) always lands on the merge's critical path. Hosted Linux
+    # started in 2-3 s at p90 over 10-24..10-27 (#1745).
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check every needed job

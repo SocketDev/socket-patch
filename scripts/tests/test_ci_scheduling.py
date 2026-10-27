@@ -36,6 +36,8 @@ class Scheduling(unittest.TestCase):
         self.assertEqual(dependencies("ci-ok"), set(JOBS) - {"ci-ok"})
         self.assertIn("    if: always()", JOBS["ci-ok"])
         self.assertIn('if v["result"] not in ("success", "skipped")', "\n".join(JOBS["ci-ok"]))
+        # No Depot boot on the critical path for a 2 s check (#1745).
+        self.assertIn("    runs-on: ubuntu-24.04", JOBS["ci-ok"])
         for job in JOBS:
             ancestors(job)  # All dependencies exist and the graph is acyclic.
 
