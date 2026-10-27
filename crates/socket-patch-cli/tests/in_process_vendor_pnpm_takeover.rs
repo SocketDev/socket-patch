@@ -637,7 +637,21 @@ async fn vendor_dry_run_over_hosted_pnpm_catalog_dep_previews_the_refusal() {
     .unwrap();
     let hosted = snapshot(root);
     let vendor = |extra: &[&str]| {
-        let mut args = vec!["vendor", "--json", "--cwd", root.to_str().unwrap()];
+        let uri = server.uri();
+        let mut args = vec![
+            "vendor",
+            "--json",
+            "--cwd",
+            root.to_str().unwrap(),
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
+            "--patch-server-url",
+            &uri,
+        ];
         args.extend_from_slice(extra);
         run_json(root, &server.uri(), &args)
     };
