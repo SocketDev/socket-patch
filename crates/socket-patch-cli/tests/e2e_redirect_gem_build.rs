@@ -2309,6 +2309,189 @@ async fn gem_hosted_superseding_patch_keeps_gem_sections_in_bundler_order() {
     );
 }
 
+/// #1749: two gems hosted at once. On bundler < 2.2 the converged lock
+/// holds ONE merged `GEM` section with a Socket remote per patch; lockfile
+/// discovery gave up on that section, so a re-scan skipped both gems as
+/// `redirect_unattributable` (exit 0), `vex` found no patch, and a
+/// superseding patch never landed. Every bundler must re-scan clean, attest
+/// both gems, and take the superseding patch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler; \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_two_gems_rescan_supersede_and_attest() {
+    let Some(fx) = redirect_scanned_project(
+        "two-hosted-gems",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    const VULN_GEN2: &str = "10000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    const TINY_GEN2: &str = "80000000-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    const VULN_GEN3: &str = "9a9a9a9a-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let stage = fx.tmp.path().join("generation-stage");
+    let vuln = |uuid: &'static str, lib: String| GenerationGem {
+        name: DEP,
+        uuid,
+        deps: vec![format!("{TRANSITIVE}:>= 0")],
+        lib_file: "vuln_gem.rb",
+        orig: orig_lib(),
+        gem: build_gem(
+            &stage.join(uuid),
+            DEP,
+            DEP_VERSION,
+            "vuln_gem.rb",
+            &lib,
+            &[TRANSITIVE],
+        ),
+        patched: lib,
+    };
+    let tiny_patched = TINY_LIB.replace("tiny-ok", "tiny-patched");
+    let tiny_gem = build_gem(
+        &stage.join(TINY_GEN2),
+        TRANSITIVE,
+        "1.0.0",
+        "tiny_dep.rb",
+        &tiny_patched,
+        &[],
+    );
+    let tiny = || GenerationGem {
+        name: TRANSITIVE,
+        uuid: TINY_GEN2,
+        deps: vec![],
+        lib_file: "tiny_dep.rb",
+        orig: TINY_LIB.to_string(),
+        patched: tiny_patched.clone(),
+        gem: tiny_gem.clone(),
+    };
+    let api = fx._server.uri();
+    let gemfile_path = fx.proj.join(fx.gemfile_name);
+    let lock_path = fx.proj.join(fx.lock_name);
+    let scan = |what: &str| {
+        let (code, stdout, stderr) = run_hosted_scan(&fx.proj, &api);
+        assert_eq!(code, 0, "{what}: {stdout}\nstderr:\n{stderr}");
+        assert!(
+            !stdout.contains("redirect_unattributable"),
+            "{what}: a hosted gem was skipped as unattributable:\n{stdout}"
+        );
+        stdout
+    };
+    let converge = |what: &str| {
+        let install = bundle(&fx.proj, &["install"]);
+        assert!(
+            install.status.success(),
+            "{what}: bundle install:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&install.stdout),
+            String::from_utf8_lossy(&install.stderr)
+        );
+        std::fs::read_to_string(&lock_path).unwrap()
+    };
+
+    // Both gems hosted, then the prescribed unfrozen install.
+    mount_patch_generation(&fx._server, 2, &[vuln(VULN_GEN2, patched_lib()), tiny()]).await;
+    scan("generation-2 scan");
+    let lock = converge("generation 2");
+    for uuid in [VULN_GEN2, TINY_GEN2] {
+        assert!(lock.contains(uuid), "generation 2 lock:\n{lock}");
+    }
+    if !fx.bundler.at_least(2, 2) {
+        assert_eq!(
+            lock.lines().filter(|l| *l == "GEM").count(),
+            1,
+            "bundler < 2.2 merges every remote into one GEM section:\n{lock}"
+        );
+    }
+
+    // An in-sync re-scan attributes both gems and changes nothing.
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    scan("in-sync re-scan");
+    assert_eq!(std::fs::read_to_string(&gemfile_path).unwrap(), gemfile);
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock);
+
+    // Manifest-less vex attests both patches from the lock.
+    let doc_path = fx.tmp.path().join("two-gems-vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &fx.proj,
+        &[
+            "vex",
+            "--output",
+            doc_path.to_str().unwrap(),
+            "--product",
+            PRODUCT,
+            "--cwd",
+            fx.proj.to_str().unwrap(),
+            "--patch-server-url",
+            &api,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(code, 0, "vex: {stdout}\nstderr:\n{stderr}");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&doc_path).unwrap()).unwrap();
+    // Both patches fix the same advisory, so they share one statement.
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "{doc}");
+    assert_eq!(stmts[0]["status"], "not_affected", "{doc}");
+    let mut subjects: Vec<&str> = stmts[0]["products"][0]["subcomponents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["@id"].as_str().unwrap())
+        .collect();
+    subjects.sort_unstable();
+    assert_eq!(
+        subjects,
+        [format!("pkg:gem/{TRANSITIVE}@1.0.0").as_str(), PURL],
+        "{doc}"
+    );
+    let impact = stmts[0]["impact_statement"].as_str().unwrap();
+    for uuid in [VULN_GEN2, TINY_GEN2] {
+        assert!(
+            impact.contains(&format!("Socket patch {uuid} (redirected)")),
+            "{doc}"
+        );
+    }
+
+    // A superseding patch for vuln-gem lands; tiny-dep keeps its patch.
+    mount_patch_generation(
+        &fx._server,
+        1,
+        &[
+            vuln(VULN_GEN3, patched_lib().replace("PATCHED", "PATCHED-GEN3")),
+            tiny(),
+        ],
+    )
+    .await;
+    scan("generation-3 scan");
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    assert!(
+        gemfile.contains(VULN_GEN3) && !gemfile.contains(VULN_GEN2) && gemfile.contains(TINY_GEN2),
+        "generation 3 Gemfile:\n{gemfile}"
+    );
+    let lock = converge("generation 3");
+    assert!(
+        lock.contains(VULN_GEN3) && !lock.contains(VULN_GEN2) && lock.contains(TINY_GEN2),
+        "generation 3 lock:\n{lock}"
+    );
+    let frozen = bundle_env(&fx.proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        frozen.status.success(),
+        "frozen install of the generation 3 pair:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&frozen.stdout),
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+}
+
 /// #1626: on a lock with no CHECKSUMS section, a superseding hosted
 /// re-scan moves only the Gemfile's `source … do` block to the new patch;
 /// the lock keeps pinning the old one until a `bundle install`. A
