@@ -358,7 +358,8 @@ fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
     // The opening line of a multi-line inline table, which the rewriter
     // pins right after its `{` (#757).
     let opening_pin = format!(" registry = \"{reg}\",");
-    if !line[open..].contains('}') && line[open + 1..].starts_with(&opening_pin) {
+    let wraps = super::super::cargo_inline_table(&[line], 0, &line[open..]).is_none();
+    if wraps && line[open + 1..].starts_with(&opening_pin) {
         return Some(Some(format!(
             "{}{}",
             &line[..=open],
@@ -530,6 +531,10 @@ mod tests {
             (
                 format!("serde = {{ registry = \"{REG}\", features = [ # wrapped\r"),
                 "serde = { features = [ # wrapped\r",
+            ),
+            (
+                format!("serde = {{ registry = \"{REG}\", features = [ # see {{x}}"),
+                "serde = { features = [ # see {x}",
             ),
         ] {
             assert_eq!(unpin_line(&pinned, REG), Some(Some(original.to_string())));

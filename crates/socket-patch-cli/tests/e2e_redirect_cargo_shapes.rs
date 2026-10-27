@@ -1109,6 +1109,42 @@ async fn cargo_hosted_explicit_crates_io_registry_is_pinned() {
     }
 }
 
+/// #757: an inline table whose array value wraps lines (rustfmt's style for
+/// a long feature list) was refused as "inline table does not close on its
+/// line". It is pinned on its opening line, builds against the patched
+/// copy, and `remove` restores every byte, for LF and CRLF manifests.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_multiline_inline_table_is_pinned() {
+    for (tag, crlf) in [("multiline-inline", false), ("multiline-inline-crlf", true)] {
+        let shape = Shape {
+            tag,
+            files: vec![
+                (
+                    "Cargo.toml",
+                    consumer_manifest(
+                        "cfg-if = { version = \"1.0.4\", features = [ # none needed\n] }\n",
+                    ),
+                ),
+                ("src/main.rs", "fn main() {}\n".to_string()),
+            ],
+            patches: vec![CFG_IF_1],
+            oracle: vec![(
+                "src/main.rs",
+                "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
+            )],
+            crlf,
+            lockless: false,
+            refused: None,
+            prefetch: "",
+            contest: None,
+            restored: vec![],
+        };
+        if run_shape(shape).await.is_none() {
+            return;
+        }
+    }
+}
+
 /// Bug H: a config ending in a blank line comes back byte-for-byte (the
 /// appended block's removal once normalized the trailing newline run). A
 /// config without a final newline comes back with every byte but that
