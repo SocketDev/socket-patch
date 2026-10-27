@@ -121,7 +121,7 @@ RUN set -eu \
         fi; \
         echo "warm sbt $v update failed or ran past 600 s (attempt $attempt)" >&2; \
       done; \
-      [ -n "$ok" ]; \
+      [ -n "$ok" ] || exit 1; \
       rm -rf "$d"; \
     done \
  && if [ "$SBT_WARM_TOOLS" = 1 ]; then \
