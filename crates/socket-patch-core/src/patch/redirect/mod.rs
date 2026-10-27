@@ -3485,7 +3485,8 @@ static CARGO_TOML_REGISTRY_VAL_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static registry-value regex is valid")
 });
 static CARGO_TOML_CRATES_IO_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"registry\s*=\s*"crates-io""#).expect("static crates-io key regex is valid")
+    Regex::new(r#"(?:\bregistry|"registry"|'registry')\s*=\s*(?:"crates-io"|'crates-io')"#)
+        .expect("static crates-io key regex is valid")
 });
 static CARGO_TOML_REGISTRY_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid")
@@ -24300,6 +24301,8 @@ packages:
             "serde = { registry = \"crates-io\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
             "serde = { version = \"1.0.190\", registry = \"crates-io\", features = [\n  \"derive\",\n] }\n",
             "serde = { version = \"1.0.190\", features = [\n  \"derive\",\n], registry = \"crates-io\" }\n",
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\",\n], registry = 'crates-io' }\n",
+            "serde = { \"registry\" = \"crates-io\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
         ] {
             let manifest = format!("{head}{entry}");
             let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
