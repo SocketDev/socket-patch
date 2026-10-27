@@ -36,10 +36,14 @@ class Scheduling(unittest.TestCase):
         self.assertEqual(dependencies("ci-ok"), set(JOBS) - {"ci-ok"})
         self.assertIn("    if: always()", JOBS["ci-ok"])
         self.assertIn('if v["result"] not in ("success", "skipped")', "\n".join(JOBS["ci-ok"]))
-        # No Depot boot on the critical path for a 2 s check (#1745).
-        self.assertIn("    runs-on: ubuntu-24.04", JOBS["ci-ok"])
         for job in JOBS:
             ancestors(job)  # All dependencies exist and the graph is acyclic.
+
+    def test_ci_ok_defaults_to_a_hosted_runner(self):
+        # A 2 s check that runs last must not pay a Depot host boot on the
+        # merge's critical path (#1745); the repo variable is the escape hatch.
+        runs_on = [line for line in JOBS["ci-ok"] if line.startswith("    runs-on:")]
+        self.assertEqual(runs_on, ["    runs-on: ${{ vars.CI_OK_RUNNER || 'ubuntu-latest' }}"])
 
     def test_expensive_jobs_cannot_start_after_a_failed_preflight(self):
         cheap = {"clippy", "lint-ecosystems", "release-readiness", "dispatch-tests", "ci-ok"}
