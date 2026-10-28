@@ -242,6 +242,25 @@ pub async fn apply_go_redirect<'a>(
             .iter()
             .any(|e| e.module == module && e.owner == Some(ReplaceOwner::Hosted))
     {
+        // A shared module's hosted pin lives in the root go.work, which
+        // `go mod tidy` never touches: name the files that hold it.
+        let in_work = match crate::vendor::go_workspace::root_work_file(project_root) {
+            Some(work) => crate::utils::fs::read_regular_to_string(&work)
+                .await
+                .is_ok_and(|text| {
+                    crate::vendor::go_mod_edit::parse_replace_entries(&text)
+                        .iter()
+                        .any(|e| e.module == module && e.owner == Some(ReplaceOwner::Hosted))
+                }),
+            None => false,
+        };
+        let revert = if in_work {
+            "restore go.work/go.work.sum from version control, or drop the replace from \
+             go.work and run `go work sync`"
+        } else {
+            "restore go.mod/go.sum from version control, or drop the replace and run \
+             `go mod tidy`"
+        };
         return synthesized_result(
             purl,
             &copy_dir,
@@ -250,8 +269,7 @@ pub async fn apply_go_redirect<'a>(
             Some(format!(
                 "the project holds a hosted-mode replace for {module} (written by `scan \
                  --mode hosted`); refusing to overwrite it — revert the hosted redirect first \
-                 (restore go.mod/go.sum from version control, or drop the replace and run \
-                 `go mod tidy`), then re-run apply"
+                 ({revert}), then re-run apply"
             )),
         );
     }

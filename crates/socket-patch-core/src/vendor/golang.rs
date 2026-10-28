@@ -402,7 +402,8 @@ pub async fn vendor_go_module<'a>(
             format!(
                 "took over the hosted-mode replace for `{module}` (written by `scan --mode \
                  hosted`); after `vendor --revert`, re-run `scan --mode hosted` or run \
-                 `go mod tidy` to regenerate the original module's go.sum lines"
+                 `go mod tidy` (`go work sync` in a go.work workspace) to regenerate the \
+                 original module's go.sum lines"
             ),
         ));
     }
@@ -728,8 +729,9 @@ pub async fn revert_go_vendor_opts(
             "takeover_not_restored",
             format!(
                 "the hosted-mode replace for `{module}` that vendoring took over was \
-                 not restored; re-run `scan --mode hosted`, or run `go mod tidy` to \
-                 regenerate the original module's go.sum lines"
+                 not restored; re-run `scan --mode hosted`, or run `go mod tidy` (`go \
+                 work sync` in a go.work workspace) to regenerate the original module's \
+                 go.sum lines"
             ),
         ));
     }
