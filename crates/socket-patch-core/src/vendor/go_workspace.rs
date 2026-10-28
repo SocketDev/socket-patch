@@ -105,6 +105,28 @@ pub struct DepGoMod {
     pub requires: Vec<(String, String)>,
 }
 
+/// The level go loads a module's go.mod at (`modPruning`), which decides
+/// whether its requirements' go.mod files are loaded in turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pruning {
+    /// Its requirements load only when its go.mod does not prune.
+    Pruned,
+    /// Its whole transitive graph loads.
+    Unpruned,
+    /// Its requirements always load, at its own go.mod's pruning.
+    Workspace,
+}
+
+impl Pruning {
+    fn of(pruned: bool) -> Self {
+        if pruned {
+            Pruning::Pruned
+        } else {
+            Pruning::Unpruned
+        }
+    }
+}
+
 /// One `use` member of a [`GoWorkspace`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
@@ -408,7 +430,9 @@ impl GoWorkspace {
     /// Read the go.mod of every dependency go loads to build this
     /// workspace's module graph (Go 1.26 `readModGraph`): each member
     /// requirement's, and below a go.mod older than go 1.17 (no graph
-    /// pruning) each of its requirements' in turn. A dependency's go.mod
+    /// pruning) each of its requirements' in turn. A member older than
+    /// go 1.17 does not prune either, so its requirements load their
+    /// whole graph. A dependency's go.mod
     /// comes from its replacement (go.work's, else a member's): a
     /// directory's go.mod, or the replacing version's in the module cache.
     /// A Socket replace keeps the replaced module's requirements, so its
@@ -422,19 +446,28 @@ impl GoWorkspace {
     pub async fn read_graph_from(&mut self, cache: Option<&Path>) {
         let replaces = self.replace_sources();
         let mut graph: BTreeMap<String, Option<DepGoMod>> = BTreeMap::new();
+        // go loads each member at its `workspace` level, which queues the
+        // member's requirements at the member's own pruning.
         let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
-        let mut queue: VecDeque<(String, String, bool)> = self
+        let mut queue: VecDeque<(String, String, Pruning)> = self
             .members
             .iter()
             .filter_map(|m| m.go_mod.as_deref())
-            .flat_map(go_mod_edit::parse_required_versions)
-            .map(|(path, v)| (path, v, false))
+            .flat_map(|text| {
+                let pruning = Pruning::of(go_mod_edit::prunes_module_graph(text));
+                go_mod_edit::parse_required_versions(text)
+                    .into_iter()
+                    .map(move |(path, v)| (path, v, pruning))
+            })
             .collect();
         let mut has_deps: BTreeSet<String> = queue.iter().map(|(p, _, _)| p.clone()).collect();
         let mut raised: BTreeSet<String> = BTreeSet::new();
         loop {
-            while let Some((path, version, unpruned)) = queue.pop_front() {
+            while let Some((path, version, pruning)) = queue.pop_front() {
                 let key = format!("{path}@{version}");
+                // go dedups unpruned loads apart from the other two levels
+                // (`loadingUnpruned` vs `loading`).
+                let unpruned = pruning == Pruning::Unpruned;
                 if version == "none" || !seen.insert((key.clone(), unpruned)) {
                     continue;
                 }
@@ -445,9 +478,14 @@ impl GoWorkspace {
                 let Some(Some(dep)) = graph.get(&key) else {
                     continue;
                 };
-                if unpruned || !dep.pruned {
+                if pruning != Pruning::Pruned || !dep.pruned {
+                    let next = if unpruned {
+                        Pruning::Unpruned
+                    } else {
+                        Pruning::of(dep.pruned)
+                    };
                     for (p, v) in &dep.requires {
-                        queue.push_back((p.clone(), v.clone(), true));
+                        queue.push_back((p.clone(), v.clone(), next));
                     }
                 }
             }
@@ -478,7 +516,7 @@ impl GoWorkspace {
             for (path, v) in needed {
                 raised.insert(format!("{path}@{v}"));
                 has_deps.insert(path.clone());
-                queue.push_back((path, v, false));
+                queue.push_back((path, v, Pruning::Workspace));
             }
             if queue.is_empty() {
                 break;
@@ -1065,6 +1103,90 @@ mod tests {
         assert_eq!(
             graphed(root, cache).await.selection(DEP, "v1.2.3"),
             Selection::Selected
+        );
+    }
+
+    /// A member older than go 1.17 does not prune: go loads the whole
+    /// graph below its requirements, even through pruned dependencies.
+    #[tokio::test]
+    async fn an_unpruned_member_loads_its_whole_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("ws");
+        let cache = &tmp.path().join("cache");
+        write(root, "go.work", "go 1.22\n\nuse ./app\n");
+        cached(
+            cache,
+            "example.com/b",
+            "v1.0.0",
+            "1.21",
+            "\nrequire example.com/c v1.0.0\n",
+        );
+        cached(
+            cache,
+            "example.com/c",
+            "v1.0.0",
+            "1.21",
+            &format!("\nrequire {DEP} v1.5.0\n"),
+        );
+        for v in ["v1.4.2", "v1.5.0"] {
+            cached(cache, DEP, v, "1.21", "");
+        }
+        let requires = format!("\nrequire (\n\texample.com/b v1.0.0\n\t{DEP} v1.4.2\n)\n");
+        member(root, "app", "1.21", &requires);
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.4.2"),
+            Selection::Selected
+        );
+        member(root, "app", "1.16", &requires);
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.4.2"),
+            Selection::Other("v1.5.0".into())
+        );
+    }
+
+    /// go loads a raised version at its workspace level: its own
+    /// requirements' go.mod files load even when it prunes.
+    #[tokio::test]
+    async fn a_raised_version_loads_its_requirements() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("ws");
+        let cache = &tmp.path().join("cache");
+        write(root, "go.work", "go 1.22\n\nuse (\n\t./app\n\t./x\n)\n");
+        member(
+            root,
+            "app",
+            "1.21",
+            &format!("\nrequire (\n\texample.com/a v1.0.0\n\t{DEP} v1.2.3\n)\n"),
+        );
+        member(root, "x", "1.21", "\nrequire example.com/c v1.0.0\n");
+        cached(cache, "example.com/a", "v1.0.0", "1.21", "");
+        cached(
+            cache,
+            "example.com/c",
+            "v1.0.0",
+            "1.21",
+            "\nrequire example.com/a v1.1.0\n",
+        );
+        cached(
+            cache,
+            "example.com/a",
+            "v1.1.0",
+            "1.21",
+            "\nrequire example.com/d v1.0.0\n",
+        );
+        cached(
+            cache,
+            "example.com/d",
+            "v1.0.0",
+            "1.21",
+            &format!("\nrequire {DEP} v1.5.0\n"),
+        );
+        for v in ["v1.2.3", "v1.5.0"] {
+            cached(cache, DEP, v, "1.21", "");
+        }
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.2.3"),
+            Selection::Other("v1.5.0".into())
         );
     }
 
