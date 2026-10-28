@@ -998,6 +998,15 @@ async fn generate_vex(
                 entries.push((root.clone(), entry));
             }
         }
+        // A go.work replace pins the whole workspace, and discovery attests
+        // it like a go.mod one, so it passes the same selection gate.
+        if let socket_patch_core::vendor::go_workspace::Loaded::Workspace(ws) =
+            socket_patch_core::vendor::go_workspace::load(&common.cwd).await
+        {
+            for entry in ws.replaces() {
+                entries.push((common.cwd.clone(), entry));
+            }
+        }
         for (root, entry) in entries {
             let Some(version) = entry.version.as_deref().filter(|_| entry.socket_owned()) else {
                 continue;
