@@ -132,10 +132,16 @@ fn get_hosted_with(
         "fake",
     ];
     args.extend_from_slice(extra);
+    // The go.work in effect is the one above the project (#1753), whatever
+    // GOWORK the machine running the tests sets.
     let (code, stdout, stderr) = run_with_prebuilt(
         consumer,
         &args,
-        &[("GOMODCACHE", modcache.to_str().unwrap())],
+        &[
+            ("GOMODCACHE", modcache.to_str().unwrap()),
+            ("GOWORK", "auto"),
+            ("GOENV", "off"),
+        ],
     );
     assert_eq!(
         code, 0,

@@ -685,7 +685,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
-    go_members: &[crate::vendor::go_build_list::ModuleFiles],
+    go_members: &[crate::vendor::go_build_list::ModuleEvidence],
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -742,7 +742,7 @@ fn rewriter_groups<'a>(
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
     yarn_outer: &'a yarnrc::OuterYarnMirror,
     cargo_outer: &'a CratesIoSource,
-    go_members: &'a [crate::vendor::go_build_list::ModuleFiles],
+    go_members: &'a [crate::vendor::go_build_list::ModuleEvidence],
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -9125,7 +9125,7 @@ fn go_token_safe(s: &str) -> bool {
 fn rewrite_golang(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    go_members: &[crate::vendor::go_build_list::ModuleFiles],
+    go_members: &[crate::vendor::go_build_list::ModuleEvidence],
     result: &mut RewriteResult,
 ) {
     use crate::vendor::go_build_list;
@@ -9284,9 +9284,7 @@ fn rewrite_golang(
         let selection = if go_members.is_empty() {
             own.clone()
         } else {
-            let members = go_members.iter().map(|m| {
-                go_build_list::selection(&m.go_mod, m.go_sum.as_deref(), &fname, &dep.version)
-            });
+            let members = go_members.iter().map(|m| m.selection(&fname, &dep.version));
             go_build_list::workspace_selection(own.clone(), members, &dep.version)
         };
         if let Some(selected) = selection.other_version() {
@@ -9346,14 +9344,16 @@ fn rewrite_golang(
             // outside this project's graph (local discovery crawls the whole
             // module cache). Its replace would be inert, and confirming it
             // would attest a patch no build links.
+            let detail = if go_members.is_empty() {
+                "neither go.mod's require nor a go.sum zip line shows the build selecting \
+                 this version — it is not in this project's build graph"
+            } else {
+                "no go.work workspace member's go.mod require or go.sum zip line shows the \
+                 build selecting this version"
+            };
             result.warnings.push(RewriteWarning {
                 code: "redirect_golang_not_in_module_graph".into(),
-                detail: format!(
-                    "{fname}@{}: neither go.mod's require nor a go.sum zip line shows the \
-                     build selecting this version — it is not in this project's build graph; \
-                     nothing redirected",
-                    dep.version
-                ),
+                detail: format!("{fname}@{}: {detail}; nothing redirected", dep.version),
             });
             continue;
         }
@@ -23018,11 +23018,9 @@ packages:
     }
 
     /// A go.work member that is not the scanned module.
-    fn go_member(require: &str) -> crate::vendor::go_build_list::ModuleFiles {
-        crate::vendor::go_build_list::ModuleFiles {
-            go_mod: format!("module example.com/other\n\ngo 1.21\n\n{require}"),
-            go_sum: None,
-        }
+    fn go_member(require: &str) -> crate::vendor::go_build_list::ModuleEvidence {
+        let go_mod = format!("module example.com/other\n\ngo 1.21\n\n{require}");
+        crate::vendor::go_build_list::ModuleEvidence::from_files(&go_mod, None)
     }
 
     /// #1753: in a go.work workspace the build selects the highest version

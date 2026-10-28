@@ -503,7 +503,7 @@ async fn workspace_issues(project_root: &Path, replaces: &[ReplaceEntry]) -> Vec
 /// exists once folded (`./x/../app` with no `x`, which go's `filepath.Join`
 /// folds) is folded lexically and then resolved, so it still matches a
 /// project under a symlinked dir (macOS `/var` -> `/private/var`).
-fn same_dir_key(dir: &Path) -> PathBuf {
+pub(crate) fn same_dir_key(dir: &Path) -> PathBuf {
     let abs = std::env::current_dir().unwrap_or_default().join(dir);
     std::fs::canonicalize(&abs).unwrap_or_else(|_| {
         let folded = crate::utils::relpath::normalize_lexically_keeping_escapes(&abs);

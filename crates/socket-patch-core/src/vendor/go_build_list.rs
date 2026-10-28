@@ -25,6 +25,7 @@
 //!   the original's go.sum lines, so absence proves nothing.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::utils::fs::read_regular_to_string;
@@ -127,33 +128,66 @@ pub async fn project_selection(
     Some(workspace_selection(own, members, version))
 }
 
-/// The text of one go.work member's `go.mod` and (when present) `go.sum`.
+/// What one go.work member's `go.mod` and `go.sum` prove about the
+/// versions it builds, parsed once for every module asked about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ModuleFiles {
-    pub go_mod: String,
-    pub go_sum: Option<String>,
+pub struct ModuleEvidence {
+    pruned: bool,
+    required: HashMap<String, String>,
+    zips: HashMap<String, Vec<String>>,
 }
 
-/// The files of every other `use` member of the go.work in effect for
+impl ModuleEvidence {
+    pub fn from_files(go_mod: &str, go_sum: Option<&str>) -> Self {
+        let mut zips: HashMap<String, Vec<String>> = HashMap::new();
+        for line in go_sum.into_iter().flat_map(go_sum_lines) {
+            if !line.go_mod {
+                let versions = zips.entry(line.module.to_string()).or_default();
+                versions.push(line.version.to_string());
+            }
+        }
+        Self {
+            pruned: prunes_module_graph(go_mod),
+            required: parse_required_versions(go_mod),
+            zips,
+        }
+    }
+
+    /// [`selection`] for `module@version` from these files.
+    pub fn selection(&self, module: &str, version: &str) -> Selection {
+        let zips: Vec<&str> = self
+            .zips
+            .get(module)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        select(
+            self.pruned,
+            self.required.get(module).map(String::as_str),
+            &zips,
+            version,
+        )
+    }
+}
+
+/// The evidence of every other `use` member of the go.work in effect for
 /// `project_root` (empty outside a workspace), read on the calling thread.
 /// A member whose go.mod can't be read is left out, as
 /// [`project_selection`] skips it.
-pub fn other_workspace_members(project_root: &Path) -> Vec<ModuleFiles> {
+pub fn other_workspace_members(project_root: &Path) -> Vec<ModuleEvidence> {
+    use super::go_consumer_sync::{same_dir_key, workspace_member_dirs_sync};
     use crate::utils::fs::read_regular_to_string_sync;
-    let Some(dirs) = super::go_consumer_sync::workspace_member_dirs_sync(project_root) else {
+    let Some(dirs) = workspace_member_dirs_sync(project_root) else {
         return Vec::new();
     };
-    let base = std::env::current_dir()
-        .unwrap_or_default()
-        .join(project_root);
-    let root = std::fs::canonicalize(&base).unwrap_or(base);
+    let root = same_dir_key(project_root);
     dirs.into_iter()
-        .filter(|dir| std::fs::canonicalize(dir).map_or(true, |dir| dir != root))
+        .filter(|dir| same_dir_key(dir) != root)
         .filter_map(|dir| {
-            Some(ModuleFiles {
-                go_mod: read_regular_to_string_sync(&dir.join("go.mod")).ok()?,
-                go_sum: read_regular_to_string_sync(&dir.join("go.sum")).ok(),
-            })
+            let go_mod = read_regular_to_string_sync(&dir.join("go.mod")).ok()?;
+            let go_sum = read_regular_to_string_sync(&dir.join("go.sum")).ok();
+            Some(ModuleEvidence::from_files(&go_mod, go_sum.as_deref()))
         })
         .collect()
 }
@@ -358,9 +392,9 @@ mod tests {
         );
     }
 
-    /// #1753: the hosted rewriter gets every member but the scanned one,
-    /// with its go.mod and go.sum text; a member without a go.mod is left
-    /// out, and outside a workspace there are none.
+    /// #1753: the hosted rewriter gets every member but the scanned one; a
+    /// member without a go.mod is left out, and outside a workspace there
+    /// are none.
     #[test]
     fn other_workspace_members_reads_every_member_but_this_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -368,7 +402,6 @@ mod tests {
         let (a, b, c) = (ws.join("a"), ws.join("b"), ws.join("c"));
         module(&a, "a", "v1.0.0");
         module(&b, "b", "v1.1.0");
-        std::fs::remove_file(a.join("go.sum")).unwrap();
         std::fs::create_dir_all(&c).unwrap();
         assert!(other_workspace_members(&a).is_empty());
         std::fs::write(
@@ -378,12 +411,13 @@ mod tests {
         .unwrap();
         let members = other_workspace_members(&a);
         assert_eq!(members.len(), 1, "{members:?}");
-        assert!(members[0].go_mod.contains("module example.com/b"));
-        assert!(members[0].go_sum.as_deref().unwrap().contains("v1.1.0"));
+        assert_eq!(
+            members[0].selection(UP, "v1.0.0"),
+            Selection::Other("v1.1.0".into())
+        );
         let members = other_workspace_members(&b);
         assert_eq!(members.len(), 1, "{members:?}");
-        assert!(members[0].go_mod.contains("module example.com/a"));
-        assert_eq!(members[0].go_sum, None);
+        assert_eq!(members[0].selection(UP, "v1.0.0"), Selection::Selected);
     }
 
     /// A version below the patched one counts when it is the highest any

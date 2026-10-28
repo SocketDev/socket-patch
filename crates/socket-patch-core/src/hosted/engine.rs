@@ -42,7 +42,7 @@ use crate::patch::redirect::{
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
 use crate::utils::redact::url_host;
-use crate::vendor::go_build_list::ModuleFiles;
+use crate::vendor::go_build_list::ModuleEvidence;
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
@@ -1551,7 +1551,7 @@ pub struct RewriteOptions<'a> {
     /// resolved only when a golang dep is rewritten: the Go rewriter weighs
     /// their requirements, since the workspace build selects the highest
     /// version any member asks for (#1753).
-    pub go_workspace: &'a (dyn Fn() -> Vec<ModuleFiles> + Send + Sync),
+    pub go_workspace: &'a (dyn Fn() -> Vec<ModuleEvidence> + Send + Sync),
     /// A variable of the environment pnpm installs the project in, by
     /// name: a `pnpm_config_trust_lockfile` there beats the
     /// pnpm-workspace.yaml key the trust auto-config writes (#1514).
