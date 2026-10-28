@@ -1183,17 +1183,33 @@ fn maven_reactor_uncertain_property_version_withholds_vex() {
             );
         write(root, "proj/a/pom.xml", a.as_bytes());
         let env = ok(root, &["vendor"]);
-        assert!(env.to_string().contains(&format!("reason: {reason}")), "{env}");
-        assert_eq!(std::fs::read_to_string(root.join("proj/a/pom.xml")).unwrap(), a);
+        assert!(
+            env.to_string().contains(&format!("reason: {reason}")),
+            "{env}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("proj/a/pom.xml")).unwrap(),
+            a
+        );
         assert!(!wiring_text(root).contains("-socket."), "{reason}: pinned");
         let vex = root.join("vex.json");
         let (_, env) = socket(
             root,
-            &["vex", "-O", vex.to_str().unwrap(), "--product", "pkg:generic/x@1"],
+            &[
+                "vex",
+                "-O",
+                vex.to_str().unwrap(),
+                "--product",
+                "pkg:generic/x@1",
+            ],
         );
         assert_eq!(
             events(&env),
-            [(purl("foo"), "skipped".to_string(), "vendor_unwired".to_string())],
+            [(
+                purl("foo"),
+                "skipped".to_string(),
+                "vendor_unwired".to_string()
+            )],
             "{reason}: {env}"
         );
         assert!(!vex.exists(), "{env}");

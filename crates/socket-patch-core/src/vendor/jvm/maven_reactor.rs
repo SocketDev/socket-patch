@@ -1311,7 +1311,12 @@ struct Pom {
     parent: Option<ParentRef>,
     /// Top-level `<properties>` (profiles excluded).
     props: BTreeMap<String, String>,
+    /// Each profile's id and `<properties>`, in document order.
+    profile_props: Vec<(String, BTreeMap<String, String>)>,
 }
+
+/// A pom and one of its profiles' `<properties>`.
+type Overlay<'a> = (&'a str, &'a BTreeMap<String, String>);
 
 struct ParentRef {
     group: Option<String>,
@@ -1335,12 +1340,26 @@ impl Pom {
             version: doc.child_text(p, "version"),
             relative_path: doc.child(p, "relativePath").map(|r| doc.text_of(r)),
         });
-        let mut props = BTreeMap::new();
-        if let Some(p) = doc.child(project, "properties") {
-            for &c in &doc.nodes[p].children {
-                props.insert(doc.nodes[c].name.clone(), doc.text_of(c));
+        let properties_of = |model: usize| {
+            let mut props = BTreeMap::new();
+            if let Some(p) = doc.child(model, "properties") {
+                for &c in &doc.nodes[p].children {
+                    props.insert(doc.nodes[c].name.clone(), doc.text_of(c));
+                }
             }
-        }
+            props
+        };
+        let props = properties_of(project);
+        let profile_props = doc
+            .child(project, "profiles")
+            .into_iter()
+            .flat_map(|ps| doc.children(ps, "profile"))
+            .map(|p| {
+                let id = doc.child_text(p, "id").unwrap_or_else(|| "default".into());
+                (id, properties_of(p))
+            })
+            .filter(|(_, props)| !props.is_empty())
+            .collect();
         Ok(Pom {
             dir: rel.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
             group: doc.child_text(project, "groupId"),
@@ -1351,6 +1370,7 @@ impl Pom {
                 .unwrap_or_else(|| "jar".to_string()),
             parent,
             props,
+            profile_props,
             doc,
         })
     }
@@ -1516,6 +1536,18 @@ impl Reactor {
     /// Interpolate every `${name}` in `value` in the context of `rel`;
     /// `None` when any name is undefined in the checkout.
     fn interpolate(&self, rel: &str, value: &str, depth: usize) -> Option<String> {
+        self.interpolate_with(rel, value, depth, None)
+    }
+
+    /// [`Self::interpolate`] with `overlay`'s properties (a profile's)
+    /// layered over its pom's own, as when that profile is active.
+    fn interpolate_with(
+        &self,
+        rel: &str,
+        value: &str,
+        depth: usize,
+        overlay: Option<Overlay<'_>>,
+    ) -> Option<String> {
         if depth > MAX_INTERPOLATION_DEPTH {
             return None;
         }
@@ -1525,8 +1557,8 @@ impl Reactor {
             out.push_str(&rest[..at]);
             let after = &rest[at + 2..];
             let close = after.find('}')?;
-            let raw = self.lookup(rel, &after[..close])?;
-            out.push_str(&self.interpolate(rel, &raw, depth + 1)?);
+            let raw = self.lookup_with(rel, &after[..close], overlay)?;
+            out.push_str(&self.interpolate_with(rel, &raw, depth + 1, overlay)?);
             rest = &after[close + 1..];
         }
         out.push_str(rest);
@@ -1537,6 +1569,10 @@ impl Reactor {
     /// model's own version expressions, then `<properties>` up the local
     /// chain.
     fn lookup(&self, rel: &str, name: &str) -> Option<String> {
+        self.lookup_with(rel, name, None)
+    }
+
+    fn lookup_with(&self, rel: &str, name: &str, overlay: Option<Overlay<'_>>) -> Option<String> {
         let pom = &self.poms[rel];
         match name {
             "project.version" | "pom.version" => {
@@ -1553,12 +1589,42 @@ impl Reactor {
         if let Some(v) = self.cli_props.get(name) {
             return Some(v.clone());
         }
-        if let Some(v) = self.chain(rel).find_map(|p| self.poms[p].props.get(name)) {
+        if let Some(v) = self.chain(rel).find_map(|p| {
+            overlay
+                .filter(|(at, _)| *at == p)
+                .and_then(|(_, props)| props.get(name))
+                .or_else(|| self.poms[p].props.get(name))
+        }) {
             return Some(v.clone());
         }
         (name == "version")
             .then(|| pom.effective_version().map(str::to_string))
             .flatten()
+    }
+
+    /// A version `declared` (with `${...}`) reaches in some pom that reads
+    /// it, `rel` or an inheritor, when a profile on that pom's chain is
+    /// active, and that is neither the base nor `sv`: the pom and the
+    /// profile's id, and the version. Profile activation is not evaluated,
+    /// so every profile counts.
+    fn profile_override(
+        &self,
+        rel: &str,
+        declared: &str,
+        base: &str,
+        sv: &str,
+    ) -> Option<(String, String, String)> {
+        std::iter::once(rel)
+            .chain(self.inheritors(rel))
+            .find_map(|reader| {
+                self.chain(reader).find_map(|at| {
+                    self.poms[at].profile_props.iter().find_map(|(id, props)| {
+                        let v = self.interpolate_with(reader, declared, 0, Some((at, props)))?;
+                        (!is_base_like(&v, base) && v != sv)
+                            .then(|| (format!("profile {id} of {at}"), v, reader.to_string()))
+                    })
+                })
+            })
     }
 
     /// Every pom in scope that inherits from `rel` (has it on its chain).
@@ -1643,9 +1709,11 @@ impl Reactor {
                             "property_unresolved",
                             format!(
                                 "{at}: {ga} version {declared} is not defined in the checkout; \
-                                 left as is, probably unpatched"
+                                 left as is, probably unpatched, and {root} is not pinned"
                             ),
                         ));
+                        // The explicit version beats any pin of the root.
+                        unpinned.insert(root);
                         continue;
                     }
                 }
@@ -1665,6 +1733,24 @@ impl Reactor {
                         (!is_base_like(&v, patch.version) && v != sv).then(|| (p.to_string(), v))
                     })
                 });
+                let profiled = || {
+                    declared
+                        .contains("${")
+                        .then(|| self.profile_override(rel, &declared, patch.version, sv))
+                        .flatten()
+                };
+                if let Some((profile, v, p)) = profiled() {
+                    warnings.push(degraded(
+                        "conflicting_literal_version",
+                        format!(
+                            "{at}: {ga} version {declared} resolves to {v} in {p} under \
+                             {profile}, not {}; left as is and {root} is not pinned",
+                            patch.version
+                        ),
+                    ));
+                    unpinned.insert(root);
+                    continue;
+                }
                 if let Some((p, v)) = overridden.flatten() {
                     warnings.push(degraded(
                         "conflicting_literal_version",
@@ -1910,8 +1996,14 @@ fn local_parent_of(
         (Some(a), Some(b)) => a == b,
         _ => true,
     };
-    let matches = want_group.as_deref() == candidate.effective_group()
-        && want_artifact == candidate.artifact
+    // Maven 4 (model 4.1.0) infers omitted parent coordinates from the
+    // pom at the relative path.
+    let matches = want_group
+        .as_deref()
+        .is_none_or(|g| Some(g) == candidate.effective_group())
+        && want_artifact
+            .as_deref()
+            .is_none_or(|a| Some(a) == candidate.artifact.as_deref())
         && versions_agree;
     Ok(matches.then_some(parent_rel))
 }
@@ -5288,11 +5380,7 @@ mod tests {
         );
         let bare = "<dependency><groupId>org.apache.commons</groupId>\
                     <artifactId>commons-text</artifactId></dependency>";
-        let a = with_profile(
-            &module("a", bare),
-            "new",
-            "<ct.version>1.12.0</ct.version>",
-        );
+        let a = with_profile(&module("a", bare), "new", "<ct.version>1.12.0</ct.version>");
         let files = fs(&[
             ("pom.xml", &root),
             ("a/pom.xml", &a),
