@@ -11,7 +11,9 @@
 //!   and below any go.mod older than go 1.17 its whole requirement graph.
 //!   go keeps no member's go.mod tidy in workspace mode, so a dependency's
 //!   requirement can raise a module past every member's `require`, and
-//!   only the dependencies' go.mod files show it. They are read from a
+//!   only the dependencies' go.mod files show it. Like go, it then reads
+//!   the go.mod of each version MVS raises a requirement to, until the
+//!   selection stops changing. They are read from a
 //!   replacement directory or the module cache; until each is there the
 //!   answer is [`Selection::Unknown`] unless a version above the patched
 //!   one already shows. Sum files are no evidence: go only ever appends to
@@ -277,6 +279,37 @@ impl WorkspaceConflict {
     }
 }
 
+/// The highest version of each module that the members' go.mod files or
+/// any go.mod read into `graph` requires: what MVS selects over it.
+fn selected_versions(
+    members: &[Member],
+    graph: &BTreeMap<String, Option<DepGoMod>>,
+) -> BTreeMap<String, String> {
+    let mut selected: BTreeMap<String, String> = BTreeMap::new();
+    let requires = members
+        .iter()
+        .filter_map(|m| m.go_mod.as_deref())
+        .flat_map(go_mod_edit::parse_required_versions)
+        .chain(
+            graph
+                .values()
+                .flatten()
+                .flat_map(|d| d.requires.iter().cloned()),
+        );
+    for (path, v) in requires {
+        if v == "none" {
+            continue;
+        }
+        match selected.get(&path) {
+            Some(cur) if !go_semver_cmp(&v, cur).is_gt() => {}
+            _ => {
+                selected.insert(path, v);
+            }
+        }
+    }
+    selected
+}
+
 impl GoWorkspace {
     /// go.work's own `replace` directives.
     pub fn replaces(&self) -> Vec<ReplaceEntry> {
@@ -397,22 +430,58 @@ impl GoWorkspace {
             .flat_map(go_mod_edit::parse_required_versions)
             .map(|(path, v)| (path, v, false))
             .collect();
-        while let Some((path, version, unpruned)) = queue.pop_front() {
-            let key = format!("{path}@{version}");
-            if version == "none" || !seen.insert((key.clone(), unpruned)) {
-                continue;
-            }
-            if !graph.contains_key(&key) {
-                let dep = read_dep_go_mod(&replaces, cache, &path, &version).await;
-                graph.insert(key.clone(), dep);
-            }
-            let Some(Some(dep)) = graph.get(&key) else {
-                continue;
-            };
-            if unpruned || !dep.pruned {
-                for (p, v) in &dep.requires {
-                    queue.push_back((p.clone(), v.clone(), true));
+        let mut has_deps: BTreeSet<String> = queue.iter().map(|(p, _, _)| p.clone()).collect();
+        let mut raised: BTreeSet<String> = BTreeSet::new();
+        loop {
+            while let Some((path, version, unpruned)) = queue.pop_front() {
+                let key = format!("{path}@{version}");
+                if version == "none" || !seen.insert((key.clone(), unpruned)) {
+                    continue;
                 }
+                if !graph.contains_key(&key) {
+                    let dep = read_dep_go_mod(&replaces, cache, &path, &version).await;
+                    graph.insert(key.clone(), dep);
+                }
+                let Some(Some(dep)) = graph.get(&key) else {
+                    continue;
+                };
+                if unpruned || !dep.pruned {
+                    for (p, v) in &dep.requires {
+                        queue.push_back((p.clone(), v.clone(), true));
+                    }
+                }
+            }
+            // go then loads the go.mod of each root's selected version and
+            // of every version MVS raises a loaded module's requirement to,
+            // until nothing changes (`readModGraph`'s `hasDepsInAll` loop).
+            let selected = selected_versions(&self.members, &graph);
+            let at = |path: &str| selected.get(path).cloned();
+            let mut needed: BTreeSet<(String, String)> = BTreeSet::new();
+            for path in &has_deps {
+                let Some(v) = at(path) else { continue };
+                let key = format!("{path}@{v}");
+                if !raised.contains(&key) {
+                    needed.insert((path.clone(), v));
+                    continue;
+                }
+                let Some(Some(dep)) = graph.get(&key) else {
+                    continue;
+                };
+                for (p, required) in &dep.requires {
+                    let Some(s) = at(p) else { continue };
+                    if go_semver_cmp(&s, required).is_gt() && !raised.contains(&format!("{p}@{s}"))
+                    {
+                        needed.insert((p.clone(), s));
+                    }
+                }
+            }
+            for (path, v) in needed {
+                raised.insert(format!("{path}@{v}"));
+                has_deps.insert(path.clone());
+                queue.push_back((path, v, false));
+            }
+            if queue.is_empty() {
+                break;
             }
         }
         self.graph = Some(graph);
@@ -947,6 +1016,55 @@ mod tests {
         assert_eq!(
             graphed(root, cache).await.selection(DEP, "v1.0.0"),
             Selection::Other("v1.4.0".into())
+        );
+    }
+
+    /// A version MVS raises above every `require` has its own go.mod read
+    /// too, as go reads it in workspace mode, and its requirements can
+    /// raise the patched module in turn.
+    #[tokio::test]
+    async fn a_raised_version_go_mod_raises_the_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("ws");
+        let cache = &tmp.path().join("cache");
+        write(root, "go.work", "go 1.22\n\nuse (\n\t./app\n\t./x\n)\n");
+        member(
+            root,
+            "app",
+            "1.21",
+            &format!("\nrequire (\n\texample.com/a v1.0.0\n\t{DEP} v1.2.3\n)\n"),
+        );
+        member(root, "x", "1.21", "\nrequire example.com/c v1.0.0\n");
+        cached(cache, "example.com/a", "v1.0.0", "1.21", "");
+        cached(
+            cache,
+            "example.com/c",
+            "v1.0.0",
+            "1.21",
+            "\nrequire example.com/a v1.1.0\n",
+        );
+        cached(cache, DEP, "v1.2.3", "1.21", "");
+        // a v1.1.0's go.mod is not in the cache yet: nothing is proven.
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.2.3"),
+            Selection::Unknown
+        );
+        cached(
+            cache,
+            "example.com/a",
+            "v1.1.0",
+            "1.21",
+            &format!("\nrequire {DEP} v1.5.0\n"),
+        );
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.2.3"),
+            Selection::Other("v1.5.0".into())
+        );
+        // A raised version that requires nothing new leaves the pin selected.
+        cached(cache, "example.com/a", "v1.1.0", "1.21", "");
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.2.3"),
+            Selection::Selected
         );
     }
 
