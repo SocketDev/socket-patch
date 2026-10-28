@@ -1494,30 +1494,84 @@ with the command that does, and
 
 ### Go workspaces (go.work)
 
-In workspace mode go reads `replace` directives from `go.work` and from the
-`go.mod` of each module it `use`s. socket-patch writes its `replace` into the
-project's own `go.mod`, so it first checks the `go.work` go would use (`GOWORK`,
-else the nearest `go.work` at or above the project). A project `go.mod` replace
-does nothing, or breaks the build, when:
+Every Go path (`apply`, `vendor`, `scan --mode hosted`, `vex`, `list`,
+`rollback`) reads the workspace the way go does. The `go.work` in effect is
+`GOWORK` when it names an absolute file, none under `GOWORK=off`, and
+otherwise (`GOWORK` unset, empty or `auto`) the nearest `go.work` at or
+above the project. A relative `GOWORK` makes go fail
+(`invalid GOWORK: not an absolute path`), so socket-patch writes nothing for
+it and attests nothing. `vex` reads only the project's own `go.work`: when
+`GOWORK` names any other file, it attests none of the project's Go patches
+and reports each as `patched_ref_invalid`.
 
-- `go.work` replaces the same module itself (any version). A go.work replace
-  overrides every module's, so the build links the go.work target;
+In workspace mode go reads `replace` directives from `go.work` and from the
+`go.mod` of each module it `use`s. socket-patch writes its `replace` into a
+module's own `go.mod` and first checks how the workspace treats it (Go 1.26
+precedence). A member `go.mod` replace does nothing, or breaks the build,
+when:
+
+- `go.work` replaces the same version of the module, or every version
+  (`replace M => …`). go reads that replace before any member's, so the build
+  links the go.work target. A go.work replace of *another* version does not
+  override the member's replace of this one;
 - `go.work` doesn't `use` the project, so workspace builds ignore its `go.mod`;
 - another `use` member already replaces the same `module@version` with a
   different target, so go refuses the workspace ("conflicting replacements").
   A hosted replace names the same Socket module in every member and doesn't
-  conflict.
+  conflict;
+- another `use` member replaces every version of the module
+  (`replace M => …`) with a different target. Depending on the `use` order,
+  go then links that target or refuses the workspace.
 
-`apply` and `vendor` refuse to write such a replace and say which case applies.
-A replace written before the `go.work` changed is reported as
-`go_workspace_replace_ineffective` by `apply`, `vendor` and
-`scan --mode hosted`, fails `apply --check` and `vendor --check`, and `vex`
-leaves the patch out (`go_workspace_override`). To patch the whole workspace,
-apply in one member it uses, or move the Socket `replace` into `go.work`.
+`apply`, `vendor` and `scan --mode hosted` refuse to write such a replace and
+say which case applies (hosted: `redirect_golang_workspace_conflict`, nothing
+written and the patch not reported redirected). A replace written before the
+`go.work` changed is reported as `go_workspace_replace_ineffective` by
+`apply`, `vendor` and `scan --mode hosted`, fails `apply --check` and
+`vendor --check`, and `vex` leaves the patch out (`go_workspace_override`). To
+patch the whole workspace, apply in one member it uses, or move the Socket
+`replace` into `go.work`.
+
+The build list of a workspace is the union of every `use` member's
+requirements, so another member can require a higher version of the patched
+module and make a replace pinned to the lower one inert. go doesn't keep
+member `go.mod` files tidy in workspace mode, so a member's dependency can
+raise the module too, with no member's `require` showing it. socket-patch
+works out which version the workspace selects the way go does: minimal
+version selection over each member's `require`s and the `go.mod` of every
+dependency go loads, read from the dependency's replacement directory or the
+module cache (`$GOMODCACHE/cache/download`). `go.sum` and `go.work.sum` are
+not evidence: go only ever appends to `go.work.sum`, so it keeps the line of
+a version nothing requires any more. When a `go.mod` it needs is missing
+(a fresh clone before `go mod download`, or a member's `go.mod` it can't
+read) and nothing it did read already shows a higher version, the answer is
+unknown: `apply` still writes the replace, but `apply --check` fails, `vex`
+leaves the patch out (`go_version_not_selected`) and hosted mode writes
+nothing (`redirect_golang_not_in_module_graph`) until `go mod download` puts
+the files in the module cache. For the same reason `vex` never attests a
+hosted pin in a workspace from its `/go.mod` go.sum line alone; it needs the
+Socket module's zip line.
+
+A module that is itself a `use` member (a local checkout of a dependency,
+`use ./dep`) is built from that directory and go ignores every `replace` of
+it. `apply`, `vendor` and `scan --mode hosted` refuse to replace it and say
+so; patch the checkout itself instead.
+
+A `go.work` root without a `go.mod` of its own (the usual layout) works from
+the root for `scan --mode hosted`, `vex`, `list` and `rollback`: hosted mode
+writes the pin into the `go.mod` and `go.sum` of each in-root member that lists
+the module (into all of them or none: when one member refuses, the others'
+edits are undone), discovery reads each in-root member's `go.mod`, and `rollback`
+removes the pins and puts the upstream sum lines back. `apply` and `vendor`
+write a project-local copy with a path relative to one module, so from such a
+root they refuse and name the members to run them in. `rollback` also removes
+a hosted pin from `go.work` itself, strips the Socket module's lines from
+`go.work.sum` (where go writes sum lines in workspace mode), and puts the
+upstream pair back in the sum file that held the Socket one.
 
 A `replace` names an exact module version, so it only works while the build
 selects that version. socket-patch reads which version that is from `go.mod`
-and `go.sum`: the `require` line in a go 1.17+ module, or, in an older module
+and `go.sum` (every workspace member's in workspace mode): the `require` line in a go 1.17+ module, or, in an older module
 (whose `require` lists only lower bounds and leaves out transitive modules),
 the highest of the required version and the versions `go.sum` has a module
 zip line for. `apply` and `scan --mode hosted` refuse to write a replace for

@@ -25,9 +25,10 @@
 //! * **The `go.work` in effect** (#393, #458, #531). In workspace mode go
 //!   reads `replace` directives from `go.work` and from the go.mod files of
 //!   the modules it `use`s. A project `go.mod` replace does nothing when
-//!   `go.work` replaces the same module itself, or when `go.work` doesn't
-//!   `use` the project, and it breaks the build ("conflicting replacements")
-//!   when another member replaces the same `module@version` elsewhere.
+//!   `go.work` replaces the same version of the module (or every version)
+//!   itself, or when `go.work` doesn't `use` the project, and it breaks the
+//!   build ("conflicting replacements") when another member replaces the
+//!   same `module@version` elsewhere.
 //!   [`workspace_conflict`] says which; the writers refuse such a replace,
 //!   and [`audit`] reports one already written.
 //!
@@ -42,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 use crate::utils::fs::read_regular_to_string;
 use crate::vendor::go_mod_edit::{self, ReplaceEntry};
+use crate::vendor::go_workspace::{self, lexical_target, same_dir_key, GoWork, Loaded};
 
 /// Warning code for a `vendor/modules.txt` that disagrees with a socket
 /// `replace` in `go.mod`.
@@ -53,23 +55,7 @@ pub const REQUIREMENTS_CODE: &str = "go_requirements_out_of_sync";
 /// overrides, ignores, or makes conflict with another member's.
 pub const WORKSPACE_CODE: &str = "go_workspace_replace_ineffective";
 
-/// Why the `go.work` in effect keeps a project `go.mod` replace from
-/// taking effect. Paths are as displayed to the user.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkspaceConflict {
-    /// `go.work` replaces the module itself (`target`), which overrides
-    /// every member's replace of it.
-    WorkReplace { work_file: String, target: String },
-    /// `go.work` doesn't `use` the project, so go ignores its go.mod.
-    NotAMember { work_file: String },
-    /// Another `use` member (`member`) replaces the same `module@version`
-    /// with a different `target`; go refuses to build the workspace.
-    MemberConflict {
-        work_file: String,
-        member: String,
-        target: String,
-    },
-}
+pub use super::go_workspace::WorkspaceConflict;
 
 /// One way the consumer's derived Go state disagrees with the socket
 /// `replace` directives.
@@ -181,38 +167,9 @@ impl std::fmt::Display for GoSyncIssue {
     }
 }
 
-impl WorkspaceConflict {
-    /// What the conflict does to a go.mod replace of `module@version`, and
-    /// how to fix it (completes "the go.mod `replace` for M V …").
-    pub fn consequence(&self, module: &str, version: &str) -> String {
-        match self {
-            WorkspaceConflict::WorkReplace { work_file, target } => format!(
-                "has no effect: {work_file} replaces {module} with {target}, and a go.work \
-                 replace overrides every module's, so the build links {target} instead of \
-                 the patched copy; remove that replace from {work_file}, or move the \
-                 socket-patch replace there"
-            ),
-            WorkspaceConflict::NotAMember { work_file } => format!(
-                "has no effect: {work_file} does not `use` this module, so workspace builds \
-                 ignore its go.mod and link the unpatched {module}; add this module to \
-                 {work_file} (`go work use .`), or run socket-patch in a module it uses"
-            ),
-            WorkspaceConflict::MemberConflict {
-                work_file,
-                member,
-                target,
-            } => format!(
-                "conflicts with {member}/go.mod, which replaces {module} {version} with \
-                 {target}: go refuses to build the {work_file} workspace (\"conflicting \
-                 replacements\"); keep one replace for the whole workspace, in {work_file} \
-                 or in one member's go.mod"
-            ),
-        }
-    }
-}
-
 /// Every [`GoSyncIssue`] in the project at `project_root` (the directory
-/// holding the consumer `go.mod`). Read-only and offline: reads `go.mod`,
+/// holding the consumer `go.mod`, or a go.work root whose in-root members
+/// hold them). Read-only and offline: reads `go.mod`,
 /// the socket copies it points at, and `vendor/modules.txt`.
 ///
 /// `pristine_go_mods` maps a replaced module to its unpatched `go.mod`
@@ -222,6 +179,21 @@ impl WorkspaceConflict {
 /// requirement the consumer lists at a lower version is, since an upstream
 /// `go.mod` routinely requires modules a pruned consumer graph never lists.
 pub async fn audit(
+    project_root: &Path,
+    pristine_go_mods: &HashMap<String, PathBuf>,
+) -> Vec<GoSyncIssue> {
+    let mut issues: Vec<GoSyncIssue> = Vec::new();
+    for root in go_workspace::module_roots(project_root).await {
+        for issue in audit_module(&root, pristine_go_mods).await {
+            if !issues.contains(&issue) {
+                issues.push(issue);
+            }
+        }
+    }
+    issues
+}
+
+async fn audit_module(
     project_root: &Path,
     pristine_go_mods: &HashMap<String, PathBuf>,
 ) -> Vec<GoSyncIssue> {
@@ -253,12 +225,15 @@ pub async fn audit_warnings(
 /// overrides, ignores or makes conflict. For `vex`, which must not attest
 /// a patch the build does not link.
 pub async fn workspace_audit(project_root: &Path) -> Vec<GoSyncIssue> {
-    match read_regular_to_string(&project_root.join("go.mod")).await {
-        Ok(go_mod) => {
-            workspace_issues(project_root, &go_mod_edit::parse_replace_entries(&go_mod)).await
+    let mut issues = Vec::new();
+    for root in go_workspace::module_roots(project_root).await {
+        if let Ok(go_mod) = read_regular_to_string(&root.join("go.mod")).await {
+            issues.extend(
+                workspace_issues(&root, &go_mod_edit::parse_replace_entries(&go_mod)).await,
+            );
         }
-        Err(_) => Vec::new(),
     }
+    issues
 }
 
 /// Where go looks for the vendor directory's `modules.txt`, and the command
@@ -280,120 +255,26 @@ fn modules_txt_location(project_root: &Path) -> (PathBuf, &'static str) {
     )
 }
 
-/// The `go.work` go would use for `project_root`: `GOWORK` (resolved as go
-/// resolves it: the environment, else the `go env -w` file) when it names a
-/// file (`off` disables workspaces), else the nearest `go.work` at or above
-/// the project.
 fn workspace_file(project_root: &Path) -> Option<PathBuf> {
-    let base = std::env::current_dir()
-        .unwrap_or_default()
-        .join(project_root);
-    match crate::utils::go_env::go_env("GOWORK").as_deref() {
-        Some("off") => return None,
-        Some(v) if v != "auto" => return Some(base.join(v)),
-        _ => {}
+    match go_workspace::resolve(project_root) {
+        GoWork::File(file) => Some(file),
+        _ => None,
     }
-    base.ancestors()
-        .map(|dir| dir.join("go.work"))
-        .find(|file| file.is_file())
-}
-
-/// The `use` member directories of the `go.work` in effect for
-/// `project_root`: `None` when no workspace is in effect, empty when its
-/// go.work can't be read.
-pub(crate) async fn workspace_member_dirs(project_root: &Path) -> Option<Vec<PathBuf>> {
-    let work_file = workspace_file(project_root)?;
-    Some(match read_work_file(&work_file).await {
-        Some(text) => use_dirs(&work_file, &text),
-        None => Vec::new(),
-    })
-}
-
-/// [`workspace_member_dirs`] on the calling thread, for the hosted engine's
-/// synchronous config resolvers.
-pub(crate) fn workspace_member_dirs_sync(project_root: &Path) -> Option<Vec<PathBuf>> {
-    let work_file = workspace_file(project_root)?;
-    Some(
-        match crate::utils::fs::read_regular_to_string_sync(&work_file) {
-            Ok(text) => use_dirs(&work_file, &go_mod_edit::normalize_for_read(&text)),
-            Err(_) => Vec::new(),
-        },
-    )
-}
-
-/// `work_file`'s text, normalized for parsing.
-async fn read_work_file(work_file: &Path) -> Option<String> {
-    let text = read_regular_to_string(work_file).await.ok()?;
-    Some(go_mod_edit::normalize_for_read(&text))
-}
-
-/// The `use` directories of go.work `text`, joined to `work_file`'s
-/// directory.
-fn use_dirs(work_file: &Path, text: &str) -> Vec<PathBuf> {
-    let work_dir = work_file.parent().unwrap_or(Path::new(""));
-    go_mod_edit::parse_use_dirs(text)
-        .into_iter()
-        .map(|dir| work_dir.join(dir))
-        .collect()
-}
-
-/// The `go.work` in effect, read once: its own replaces and each `use`
-/// member's go.mod replaces.
-struct Workspace {
-    work_file: PathBuf,
-    replaces: Vec<ReplaceEntry>,
-    members: Vec<Member>,
-}
-
-struct Member {
-    /// The member directory as go.work spells it, joined to go.work's
-    /// directory (go resolves the member's relative replaces against it).
-    dir: PathBuf,
-    replaces: Vec<ReplaceEntry>,
-    /// Whether the member's go.mod could be read (else `replaces` is empty
-    /// because it is unknown, not because there are none).
-    readable: bool,
-}
-
-async fn load_workspace(project_root: &Path) -> Option<Workspace> {
-    let work_file = workspace_file(project_root)?;
-    let text = read_work_file(&work_file).await?;
-    let mut members = Vec::new();
-    for dir in use_dirs(&work_file, &text) {
-        let (replaces, readable) = match read_regular_to_string(&dir.join("go.mod")).await {
-            Ok(go_mod) => (
-                go_mod_edit::parse_replace_entries(&go_mod_edit::normalize_for_read(&go_mod)),
-                true,
-            ),
-            Err(_) => (Vec::new(), false),
-        };
-        members.push(Member {
-            dir,
-            replaces,
-            readable,
-        });
-    }
-    Some(Workspace {
-        replaces: go_mod_edit::parse_replace_entries(&text),
-        work_file,
-        members,
-    })
 }
 
 /// Whether the `go.work` in effect for `project_root` keeps a project
 /// `go.mod` replace of `module@version` => `ours` (a replace as parsed
 /// from, or about to be written to, that go.mod) from taking effect.
-/// `None` when no workspace is in effect or the replace works. Read-only;
-/// an unreadable `go.work` or member `go.mod` is skipped (go would fail
-/// loudly on it anyway).
+/// `None` when no workspace is in effect or the replace works.
 pub async fn workspace_conflict(
     project_root: &Path,
     module: &str,
     version: &str,
     ours: &ReplaceEntry,
 ) -> Option<WorkspaceConflict> {
-    let ws = load_workspace(project_root).await?;
-    conflict_in(&ws, project_root, module, version, ours)
+    go_workspace::load(project_root)
+        .await
+        .conflict(project_root, module, version, ours)
 }
 
 /// Why `apply` / `vendor` must not write `replace module version =>
@@ -414,75 +295,19 @@ pub async fn replace_refusal(
     ))
 }
 
-fn conflict_in(
-    ws: &Workspace,
-    project_root: &Path,
-    module: &str,
-    version: &str,
-    ours: &ReplaceEntry,
-) -> Option<WorkspaceConflict> {
-    let work_dir = ws.work_file.parent().unwrap_or(Path::new(""));
-    let display = display_path(project_root, &ws.work_file);
-    let project = same_dir_key(project_root);
-    let own = ws.members.iter().find(|m| same_dir_key(&m.dir) == project);
-    let our_target = lexical_target(own.map_or(project_root, |m| &m.dir), ours);
-
-    // go drops every member replace of a module path that go.work replaces
-    // (any version). The build links the patched copy only if go.work's own
-    // replace for this version (else its version-less one) sends it there.
-    let work: Vec<&ReplaceEntry> = ws.replaces.iter().filter(|w| w.module == module).collect();
-    if let Some(first) = work.first() {
-        let effective = work
-            .iter()
-            .find(|w| w.version.as_deref() == Some(version))
-            .or_else(|| work.iter().find(|w| w.version.is_none()));
-        return match effective {
-            Some(w) if lexical_target(work_dir, w) == our_target => None,
-            _ => Some(WorkspaceConflict::WorkReplace {
-                work_file: display,
-                target: target_display(effective.unwrap_or(first)),
-            }),
-        };
-    }
-
-    if own.is_none() {
-        return Some(WorkspaceConflict::NotAMember { work_file: display });
-    }
-    for member in ws
-        .members
-        .iter()
-        .filter(|m| same_dir_key(&m.dir) != project)
-    {
-        if let Some(other) = member.replaces.iter().find(|e| {
-            e.module == module
-                && e.version.as_deref() == Some(version)
-                && lexical_target(&member.dir, e) != our_target
-        }) {
-            return Some(WorkspaceConflict::MemberConflict {
-                work_file: display,
-                member: display_path(project_root, &member.dir),
-                target: target_display(other),
-            });
-        }
-    }
-    None
-}
-
 /// [`workspace_conflict`] for every versioned socket replace in the
 /// project's go.mod, reading the workspace once.
 async fn workspace_issues(project_root: &Path, replaces: &[ReplaceEntry]) -> Vec<GoSyncIssue> {
     if !replaces.iter().any(ReplaceEntry::socket_owned) {
         return Vec::new();
     }
-    let Some(ws) = load_workspace(project_root).await else {
-        return Vec::new();
-    };
+    let ws = go_workspace::load(project_root).await;
     let mut issues = Vec::new();
     for entry in replaces.iter().filter(|e| e.socket_owned()) {
         let Some(version) = entry.version.as_deref() else {
             continue;
         };
-        if let Some(conflict) = conflict_in(&ws, project_root, &entry.module, version, entry) {
+        if let Some(conflict) = ws.conflict(project_root, &entry.module, version, entry) {
             issues.push(GoSyncIssue::Workspace {
                 module: entry.module.clone(),
                 version: version.to_string(),
@@ -491,62 +316,6 @@ async fn workspace_issues(project_root: &Path, replaces: &[ReplaceEntry]) -> Vec
         }
     }
     issues
-}
-
-/// A directory as go matches a module root against the workspace's `use`
-/// list: absolute, with symlinks resolved when it exists. A path that only
-/// exists once folded (`./x/../app` with no `x`, which go's `filepath.Join`
-/// folds) is folded lexically and then resolved, so it still matches a
-/// project under a symlinked dir (macOS `/var` -> `/private/var`).
-pub(crate) fn same_dir_key(dir: &Path) -> PathBuf {
-    let abs = std::env::current_dir().unwrap_or_default().join(dir);
-    std::fs::canonicalize(&abs).unwrap_or_else(|_| {
-        let folded = crate::utils::relpath::normalize_lexically_keeping_escapes(&abs);
-        std::fs::canonicalize(&folded).unwrap_or(folded)
-    })
-}
-
-/// Where a replace sends the module, compared as go compares replacements
-/// (`filepath.Join` of the go.mod's directory and the path: lexical, no
-/// symlink resolution), or its `module version`.
-fn lexical_target(go_mod_dir: &Path, entry: &ReplaceEntry) -> String {
-    match &entry.path {
-        Some(path) => {
-            let abs = std::env::current_dir()
-                .unwrap_or_default()
-                .join(go_mod_dir)
-                .join(path.replace('\\', "/"));
-            crate::utils::relpath::normalize_lexically_keeping_escapes(&abs)
-                .to_string_lossy()
-                .into_owned()
-        }
-        None => target_display(entry),
-    }
-}
-
-fn target_display(entry: &ReplaceEntry) -> String {
-    match (&entry.path, &entry.rhs_module, &entry.rhs_version) {
-        (Some(path), _, _) => path.clone(),
-        (None, Some(m), Some(v)) => format!("{m} {v}"),
-        (None, Some(m), None) => m.clone(),
-        (None, None, _) => "<unknown>".to_string(),
-    }
-}
-
-/// `path` relative to `project_root` when it is inside it (`go.work`,
-/// `tools`), else absolute.
-fn display_path(project_root: &Path, path: &Path) -> String {
-    let base = same_dir_key(project_root);
-    let abs = std::env::current_dir().unwrap_or_default().join(path);
-    let abs = match (abs.parent(), abs.file_name()) {
-        (Some(parent), Some(name)) => same_dir_key(parent).join(name),
-        _ => abs,
-    };
-    match abs.strip_prefix(&base) {
-        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().replace('\\', "/"),
-        Ok(_) => ".".to_string(),
-        Err(_) => abs.display().to_string(),
-    }
 }
 
 async fn vendor_modules_txt_issues(
@@ -579,10 +348,9 @@ async fn vendor_modules_txt_issues(
     // the `go.work` ones, each resolved against its own file's directory
     // and recorded relative to the go.work directory. Outside a workspace
     // `go mod vendor` records the go.mod's replaces verbatim.
-    let ws = if workspace {
-        load_workspace(project_root).await
-    } else {
-        None
+    let ws = match go_workspace::load(project_root).await {
+        Loaded::Workspace(ws) if workspace => Some(ws),
+        _ => None,
     };
     // modules.txt sits in `<go.work or go.mod directory>/vendor/`.
     let work_dir = path.parent().and_then(Path::parent).unwrap_or(project_root);
@@ -592,27 +360,34 @@ async fn vendor_modules_txt_issues(
         .flat_map(|w| &w.members)
         .find(|m| same_dir_key(&m.dir) == project)
         .map_or(project_root, |m| m.dir.as_path());
-    let work_replaces: &[ReplaceEntry] = ws.as_ref().map_or(&[], |w| &w.replaces);
+    let work_replaces: Vec<ReplaceEntry> = ws.as_ref().map_or_else(Vec::new, |w| w.replaces());
+    // Each member's go.mod replaces; a member whose go.mod can't be read is
+    // left out, since its replaces are unknown.
+    let member_replaces: Vec<(&Path, Vec<ReplaceEntry>)> = ws
+        .iter()
+        .flat_map(|w| &w.members)
+        .filter_map(|m| {
+            let go_mod = m.go_mod.as_deref()?;
+            Some((m.dir.as_path(), go_mod_edit::parse_replace_entries(go_mod)))
+        })
+        .collect();
     // Every replace modules.txt may record, with the directory go resolves
     // it against.
     let sources: Vec<(&Path, &ReplaceEntry)> = replaces
         .iter()
         .map(|e| (project_dir, e))
         .chain(
-            ws.iter()
-                .flat_map(|w| &w.members)
-                .flat_map(|m| m.replaces.iter().map(|e| (m.dir.as_path(), e))),
+            member_replaces
+                .iter()
+                .flat_map(|(dir, entries)| entries.iter().map(move |e| (*dir, e))),
         )
         .chain(work_replaces.iter().map(|e| (work_dir, e)))
         .collect();
-    // Members whose socket copies a recorded line may point into; one whose
-    // go.mod can't be read is left out, since its replaces are unknown.
-    let member_dirs: Vec<PathBuf> = ws
+    // Members whose socket copies a recorded line may point into.
+    let member_dirs: Vec<PathBuf> = member_replaces
         .iter()
-        .flat_map(|w| &w.members)
-        .filter(|m| m.readable)
-        .map(|m| {
-            let abs = std::env::current_dir().unwrap_or_default().join(&m.dir);
+        .map(|(dir, _)| {
+            let abs = std::env::current_dir().unwrap_or_default().join(dir);
             crate::utils::relpath::normalize_lexically_keeping_escapes(&abs)
         })
         .collect();
@@ -997,9 +772,10 @@ mod tests {
         issues.iter().map(GoSyncIssue::code).collect()
     }
 
-    /// #393: a user replace of the module in go.work (versioned, version-less,
-    /// or for another version) overrides the member's socket replace. Our own
-    /// replace moved into go.work for this version does not.
+    /// #393: a user replace in go.work of this version of the module (or
+    /// a version-less one) overrides the member's socket replace; one of
+    /// another version does not. Our own replace moved into go.work for
+    /// this version does not either.
     #[tokio::test]
     async fn go_work_replace_of_the_module_makes_the_replace_inert() {
         let dir = tempfile::tempdir().unwrap();
@@ -1009,7 +785,6 @@ mod tests {
         for user in [
             "replace example.com/upstream v1.0.0 => ../fork",
             "replace example.com/upstream => ../fork",
-            "replace example.com/upstream v0.9.0 => ../fork",
             "replace \"example.com/upstream\" => example.com/fork v1.2.3",
         ] {
             write(root, "go.work", &format!("go 1.21\n\nuse .\n\n{user}\n"));
@@ -1027,12 +802,18 @@ mod tests {
             &format!("go 1.21\n\nuse .\n\nreplace example.com/upstream v1.0.0 => ./{COPY}\n"),
         );
         assert_eq!(audit(root, &none).await, vec![]);
-        write(
-            root,
-            "go.work",
-            "go 1.21\n\nuse .\n\nreplace example.com/other => ../o\n",
-        );
-        assert_eq!(audit(root, &none).await, vec![]);
+        // go reads go.work's replace of another version only for that one.
+        for other in [
+            "example.com/other => ../o",
+            "example.com/upstream v0.9.0 => ../fork",
+        ] {
+            write(
+                root,
+                "go.work",
+                &format!("go 1.21\n\nuse .\n\nreplace {other}\n"),
+            );
+            assert_eq!(audit(root, &none).await, vec![], "{other}");
+        }
     }
 
     /// A go.work replace counts as ours only when it sends this version to

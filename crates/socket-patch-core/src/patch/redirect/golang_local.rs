@@ -81,6 +81,13 @@ pub enum Drift {
         patched_version: String,
         required_version: String,
     },
+    /// In a go.work workspace, nothing read shows the build selects the
+    /// patched version: a go.mod its module graph needs is missing, so a
+    /// dependency may raise the module past it.
+    UnprovenSelection {
+        purl: String,
+        patched_version: String,
+    },
 }
 
 impl std::fmt::Display for Drift {
@@ -120,6 +127,16 @@ impl std::fmt::Display for Drift {
                 f,
                 "{purl}: patched version {patched_version} is not the version the build \
                  selects ({required_version}) — go would link the UNPATCHED module"
+            ),
+            Drift::UnprovenSelection {
+                purl,
+                patched_version,
+            } => write!(
+                f,
+                "{purl}: nothing shows the go.work workspace selects the patched version \
+                 {patched_version}: a go.mod its module graph needs is in neither a \
+                 replacement directory nor the module cache (`go mod download` fetches it), \
+                 and go may link the UNPATCHED module"
             ),
         }
     }
@@ -515,17 +532,27 @@ pub async fn verify_go_redirect_state(
         // Selected-version cross-check: if the build list selects a version
         // that is NOT the patched one, the version-pinned `replace` is unused
         // and the build links the unpatched module — a silent-stale hole the
-        // copy/directive checks below can't see. Only a proven other version
-        // is flagged: a module the build doesn't use at all isn't linked.
-        // Project-local and offline: go.mod + go.sum only.
-        if let Some(Selection::Other(selected)) =
-            go_build_list::project_selection(project_root, module, version).await
-        {
-            drifts.push(Drift::ResolvedVersionMismatch {
+        // copy/directive checks below can't see. A proven other version is
+        // flagged, and in a workspace (whose dependencies' go.mod files can
+        // raise the module) a selection nothing read proves; a module the
+        // build doesn't use at all isn't linked. Offline: go.mod and go.sum,
+        // plus in a workspace the module cache's go.mod files.
+        match go_build_list::project_selection(project_root, module, version).await {
+            Some(Selection::Other(selected)) => drifts.push(Drift::ResolvedVersionMismatch {
                 purl: purl.clone(),
                 patched_version: version.to_string(),
                 required_version: selected,
-            });
+            }),
+            Some(Selection::Unknown)
+                if crate::vendor::go_workspace::resolve(project_root)
+                    != crate::vendor::go_workspace::GoWork::None =>
+            {
+                drifts.push(Drift::UnprovenSelection {
+                    purl: purl.clone(),
+                    patched_version: version.to_string(),
+                })
+            }
+            _ => {}
         }
 
         let copy_dir = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
@@ -612,9 +639,9 @@ pub(crate) async fn selection_refusal(
              module; nothing written (get a patch for {selected}, or require {version})"
         )),
         Selection::NotInGraph => Some(format!(
-            "{module} {version} is not in this project's build graph (go.mod does not \
-             require it and go.sum has no zip line for it): its replace would be ignored; \
-             nothing written"
+            "{module} {version} is not in this project's build graph (no go.mod of the \
+             build requires it and no go.sum has a zip line for it): its replace would be \
+             ignored; nothing written"
         )),
         Selection::Selected | Selection::Unknown => None,
     }

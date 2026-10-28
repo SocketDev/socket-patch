@@ -604,7 +604,6 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         &std::collections::BTreeSet::new(),
         &yarnrc::OuterYarnMirror::default(),
         &CratesIoSource::Registry,
-        &[],
     )
 }
 
@@ -685,7 +684,6 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
-    go_members: &[crate::vendor::go_build_list::ModuleEvidence],
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -713,7 +711,6 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         gradle_unreadable,
         yarn_outer,
         cargo_outer,
-        go_members,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -742,7 +739,6 @@ fn rewriter_groups<'a>(
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
     yarn_outer: &'a yarnrc::OuterYarnMirror,
     cargo_outer: &'a CratesIoSource,
-    go_members: &'a [crate::vendor::go_build_list::ModuleEvidence],
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -769,7 +765,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| {
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
-        Box::new(move |result| rewrite_golang(files, overrides, go_members, result)),
+        Box::new(move |result| rewrite_golang(files, overrides, result)),
         Box::new(move |result| {
             sbt::rewrite_sbt(files, overrides, result);
             scala_guidance::warn(files, overrides, result);
@@ -9306,15 +9302,44 @@ fn go_token_safe(s: &str) -> bool {
 // `goproxy` override falls back to the `redirect_golang_unsupported`
 // warning (the paid tier's tokened URLs remain a genuine no-go — see the
 // design doc's paid-tier analysis).
+/// Engine-supplied input: the Go workspace in effect, as
+/// [`HostedGoWorkspace`] JSON.
+pub const GO_WORKSPACE_KEY: &str = "<socket-patch:go-workspace>";
+
+/// The Go workspace the hosted engine found for the project at `root`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostedGoWorkspace {
+    pub root: std::path::PathBuf,
+    pub loaded: crate::vendor::go_workspace::Loaded,
+}
+
+impl HostedGoWorkspace {
+    /// The root-relative dirs of the in-root members, when go.work sits
+    /// at the root.
+    pub(crate) fn member_dirs(&self) -> Vec<String> {
+        match &self.loaded {
+            crate::vendor::go_workspace::Loaded::Workspace(ws)
+                if crate::vendor::go_workspace::same_dir_key(ws.work_dir())
+                    == crate::vendor::go_workspace::same_dir_key(&self.root) =>
+            {
+                ws.members_within(&self.root)
+                    .into_iter()
+                    .map(|(dir, _)| dir)
+                    .filter(|dir| !dir.is_empty())
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 fn rewrite_golang(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
-    go_members: &[crate::vendor::go_build_list::ModuleEvidence],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::go_build_list;
     use crate::vendor::go_mod_edit::{self, HOSTED_GO_MODULE_PREFIX};
-    use crate::vendor::go_sum_edit::{self, GoSumEditor};
+    use crate::vendor::go_sum_edit;
 
     let golang: Vec<&DepOverride> = overrides
         .iter()
@@ -9323,19 +9348,39 @@ fn rewrite_golang(
     if golang.is_empty() {
         return;
     }
-    // The replace directive can only live in the MAIN module's go.mod.
-    let Some(orig_go_mod) = files.get("go.mod") else {
+    let workspace: Option<HostedGoWorkspace> = files
+        .get(GO_WORKSPACE_KEY)
+        .and_then(|text| serde_json::from_str(text).ok());
+    // The replace directive lives in a MAIN module's go.mod: the root's, or
+    // (a go.work root with no module of its own) the in-root members'.
+    let dirs: Vec<String> = if files.contains_key("go.mod") {
+        vec![String::new()]
+    } else {
+        workspace
+            .as_ref()
+            .map(|ws| {
+                ws.member_dirs()
+                    .into_iter()
+                    .filter(|dir| files.contains_key(&format!("{dir}/go.mod")))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if dirs.is_empty() {
         result.warnings.push(RewriteWarning {
             code: "redirect_golang_no_go_mod".into(),
             detail: "no go.mod present; golang redirect skipped".into(),
         });
         return;
-    };
-    let mut go_mod = orig_go_mod.clone();
-    // An absent go.sum starts empty: the fully-replaced original needs no
-    // lines of its own, so the two socket lines alone are a complete pin.
-    let mut go_sum = GoSumEditor::new(files.get("go.sum").cloned().unwrap_or_default());
-    let (mut mod_changed, mut sum_changed) = (false, false);
+    }
+    let shared = dirs.len() > 1;
+    let mut targets: Vec<GoTarget> = dirs
+        .into_iter()
+        .map(|dir| GoTarget {
+            shared,
+            ..GoTarget::new(files, dir)
+        })
+        .collect();
 
     for dep in &golang {
         let fname = full_name(dep);
@@ -9416,243 +9461,441 @@ fn rewrite_golang(
             });
             continue;
         }
-        // One walk of go.mod reads the prior directive, the required version
-        // and the upsert's refresh line / conflict for this dep.
-        let scan = go_mod_edit::scan_hosted_replace(
-            &go_mod,
-            &fname,
-            &dep.version,
-            rhs_module,
-            rhs_version,
-        );
-        // Any pre-existing socket-owned directive for the module (this run is
-        // a refresh, or a takeover of a local/vendored redirect): capture its
-        // text — the ledger's `original` is the only pre-redirect record.
-        let prior = scan.prior.as_ref();
-        let prior_text = prior.map(|e| {
-            let target = e.path.clone().unwrap_or_else(|| match &e.rhs_version {
-                Some(v) => format!("{} {v}", e.rhs_module.as_deref().unwrap_or_default()),
-                None => e.rhs_module.clone().unwrap_or_default(),
-            });
-            let ver = e
-                .version
-                .as_deref()
-                .map(|v| format!(" {v}"))
-                .unwrap_or_default();
-            format!("replace {}{ver} => {target}", e.module)
-        });
-
-        // Stale-pin cross-check: `replace` is keyed on module+version, and a
-        // pin the graph no longer selects is SILENTLY inert (the build links
-        // the unpatched module with zero warning) — refuse to write one, and
-        // reconcile away OUR OWN inert directive if one is already committed:
-        // left in place, its module path keeps confirming the dep as
-        // redirected (ledger + VEX attestation) while go links the unpatched
-        // version.
-        //
-        // Which version the build selects comes from go.mod and go.sum
-        // (`go_build_list`): `require` for a go >= 1.17 graph; for an older
-        // one, the highest of `require` and go.sum's zip lines, since a
-        // `/go.mod`-only line is written for every version MVS reads, not
-        // only the one it selects (#509). In a go.work workspace the other
-        // members' files are weighed too: MVS builds the highest version
-        // any of them asks for (#1753).
-        let zips = go_sum.zip_versions(&fname);
-        let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        let own = go_build_list::select(
-            go_mod_edit::prunes_module_graph(&go_mod),
-            scan.required.as_deref(),
-            &zips,
-            &dep.version,
-        );
-        let selection = if go_members.is_empty() {
-            own.clone()
-        } else {
-            let members = go_members.iter().map(|m| m.selection(&fname, &dep.version));
-            go_build_list::workspace_selection(own.clone(), members, &dep.version)
-        };
-        if let Some(selected) = selection.other_version() {
-            let basis = if own.other_version() != Some(selected) {
-                "another go.work workspace member makes the build select"
-            } else if scan.required.as_deref() == Some(selected) {
-                "go.mod requires"
-            } else {
-                "go.sum shows the build selects"
+        // The go.work in effect may override or reject the replace, or
+        // select another version through another member: one answer for
+        // the whole workspace, checked before any go.mod is written.
+        let selection = workspace
+            .as_ref()
+            .and_then(|ws| ws.loaded.selection(&fname, &dep.version));
+        if let Some(ws) = &workspace {
+            let ours = go_mod_edit::ReplaceEntry {
+                module: fname.clone(),
+                version: Some(dep.version.clone()),
+                path: None,
+                rhs_module: Some(rhs_module.clone()),
+                rhs_version: Some(rhs_version.clone()),
+                owner: Some(go_mod_edit::ReplaceOwner::Hosted),
             };
-            result.warnings.push(RewriteWarning {
-                code: "redirect_golang_version_mismatch".into(),
-                detail: format!(
-                    "{fname}: {basis} {selected} but the patch targets {} — \
-                     a version-pinned replace would be silently ignored",
-                    dep.version
-                ),
+            let conflict = targets.iter().find_map(|t| {
+                ws.loaded
+                    .conflict(&ws.root.join(&t.dir), &fname, &dep.version, &ours)
             });
-            let stale_hosted = prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
-            if let Some(stale) = stale_hosted {
-                if let Ok(Some(new)) = go_mod_edit::remove_replace_entry(
-                    &go_mod,
-                    &fname,
-                    go_mod_edit::ReplaceOwner::Hosted,
-                ) {
-                    go_mod = new;
-                    mod_changed = true;
-                    result.edits.push(FileEdit {
-                        path: "go.mod".into(),
-                        kind: "redirect_golang_stale_replace_removed".into(),
-                        action: "removed".into(),
-                        key: Some(fname.clone()),
-                        original: prior_text.clone().map(Value::String),
-                        new: None,
-                    });
-                }
-                if let Some(stale_rhs) = stale.rhs_module.as_deref() {
-                    if go_sum.remove_module_prefix_lines(stale_rhs) {
-                        sum_changed = true;
-                        result.edits.push(FileEdit {
-                            path: "go.sum".into(),
-                            kind: "redirect_golang_stale_gosum_removed".into(),
-                            action: "removed".into(),
-                            key: Some(stale_rhs.to_string()),
-                            original: None,
-                            new: None,
-                        });
-                    }
-                }
-            }
-            continue;
-        } else if selection != go_build_list::Selection::Selected
-            && prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str()))
-        {
-            // Not selected by go.mod's require, no go.sum zip line at this
-            // version, and not already redirected by us: the module is
-            // outside this project's graph (local discovery crawls the whole
-            // module cache). Its replace would be inert, and confirming it
-            // would attest a patch no build links.
-            let detail = if go_members.is_empty() {
-                "neither go.mod's require nor a go.sum zip line shows the build selecting \
-                 this version — it is not in this project's build graph"
-            } else {
-                "no go.work workspace member's go.mod require or go.sum zip line shows the \
-                 build selecting this version"
-            };
-            result.warnings.push(RewriteWarning {
-                code: "redirect_golang_not_in_module_graph".into(),
-                detail: format!("{fname}@{}: {detail}; nothing redirected", dep.version),
-            });
-            continue;
-        }
-
-        match go_mod_edit::apply_hosted_replace(
-            &mut go_mod,
-            &scan,
-            &fname,
-            &dep.version,
-            rhs_module,
-            rhs_version,
-        ) {
-            Err(e) => {
+            if let Some(conflict) = conflict {
                 result.warnings.push(RewriteWarning {
-                    code: "redirect_golang_replace_conflict".into(),
-                    detail: format!("{fname}@{}: {e}", dep.version),
+                    code: "redirect_golang_workspace_conflict".into(),
+                    detail: format!(
+                        "{fname}@{}: refusing to write `replace {fname} {} => {rhs_module} \
+                         {rhs_version}`: it {}; nothing redirected",
+                        dep.version,
+                        dep.version,
+                        conflict.consequence(&fname, &dep.version)
+                    ),
                 });
                 continue;
             }
-            // Re-run over an already-redirected go.mod: nothing to record.
-            Ok(false) => {}
-            Ok(true) => {
-                mod_changed = true;
-                result.edits.push(FileEdit {
-                    path: "go.mod".into(),
-                    kind: "redirect_golang_replace".into(),
-                    // A takeover/refresh of an existing socket directive must
-                    // keep its text in `original` — the ledger is the only
-                    // pre-redirect record a future revert can restore from.
-                    action: if prior_text.is_some() {
-                        "updated".into()
-                    } else {
-                        "added".into()
-                    },
-                    key: Some(fname.clone()),
-                    original: prior_text.map(Value::String),
-                    new: Some(Value::String(format!(
-                        "replace {fname} {} => {rhs_module} {rhs_version}",
-                        dep.version
-                    ))),
-                });
+        }
+        // Beside other members, the replace goes into each member whose own
+        // go.mod or go.sum lists the module (any member's applies to the
+        // whole workspace; identical hosted targets never conflict).
+        let chosen: Vec<usize> = if targets.len() == 1 {
+            vec![0]
+        } else {
+            (0..targets.len())
+                .filter(|&i| targets[i].lists(&fname, &dep.version))
+                .collect()
+        };
+        if chosen.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_not_in_module_graph".into(),
+                detail: format!(
+                    "{fname}@{}: no workspace member's go.mod or go.sum lists this module — \
+                     it is not in this workspace's build graph; nothing redirected",
+                    dep.version
+                ),
+            });
+            continue;
+        }
+        // Any member's replace applies to the whole workspace, so one
+        // member refusing leaves the others' pins half-applied: undo them.
+        let edits_before = result.edits.len();
+        let mut written: Vec<(usize, GoTarget)> = Vec::new();
+        let mut refused = false;
+        for &i in &chosen {
+            let before = (chosen.len() > 1).then(|| targets[i].clone());
+            if rewrite_golang_target(
+                &mut targets[i],
+                dep,
+                &fname,
+                rhs_module,
+                rhs_version,
+                zip_h1,
+                gomod_h1,
+                selection.clone(),
+                result,
+            ) {
+                written.extend(before.map(|b| (i, b)));
+            } else {
+                refused = true;
             }
         }
-        // A refresh that moved the pin to another generation (a superseding
-        // patch uuid, or the same uuid republished at a new version) owns the
-        // previous target's go.sum pair too: nothing references it any more,
-        // so `go mod tidy` would prune it, and leaving it makes the first
-        // day-2 tidy rewrite go.sum (#682).
-        if let Some((old_module, old_version)) = prior
-            .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted))
-            .and_then(|e| e.rhs_module.as_deref().zip(e.rhs_version.as_deref()))
-            .filter(|&(m, v)| (m, v) != (rhs_module.as_str(), rhs_version.as_str()))
-        {
-            let still_targeted = go_mod_edit::parse_replace_entries(&go_mod).iter().any(|e| {
-                e.rhs_module.as_deref() == Some(old_module)
-                    && e.rhs_version.as_deref() == Some(old_version)
-            });
-            if !still_targeted {
-                if let Some(removed) =
-                    go_sum.remove_exact_module_version_lines(old_module, old_version)
-                {
-                    sum_changed = true;
+        if !refused {
+            result.confirmed_golang_uuids.insert(dep.patch_uuid.clone());
+            continue;
+        }
+        let mut undone: Vec<String> = Vec::new();
+        for (i, before) in written {
+            undone.extend([before.key("go.mod"), before.key("go.sum")]);
+            targets[i] = before;
+        }
+        let mut index = 0;
+        result.edits.retain(|e| {
+            index += 1;
+            index <= edits_before || !undone.contains(&e.path)
+        });
+    }
+
+    for target in targets {
+        target.finish(result);
+    }
+}
+
+/// One go.mod / go.sum pair the golang rewriter edits: the root's, or a
+/// workspace member's (`dir`, root-relative).
+#[derive(Clone)]
+struct GoTarget {
+    dir: String,
+    /// One of several workspace members edited for the same deps.
+    shared: bool,
+    go_mod: String,
+    go_sum: crate::vendor::go_sum_edit::GoSumEditor,
+    mod_changed: bool,
+    sum_changed: bool,
+}
+
+impl GoTarget {
+    fn new(files: &BTreeMap<String, String>, dir: String) -> Self {
+        let key = |file: &str| match dir.as_str() {
+            "" => file.to_string(),
+            dir => format!("{dir}/{file}"),
+        };
+        let go_mod = files.get(&key("go.mod")).cloned().unwrap_or_default();
+        // An absent go.sum starts empty: the fully-replaced original needs
+        // no lines of its own, so the two socket lines alone are a pin.
+        let go_sum = crate::vendor::go_sum_edit::GoSumEditor::new(
+            files.get(&key("go.sum")).cloned().unwrap_or_default(),
+        );
+        GoTarget {
+            dir,
+            shared: false,
+            go_mod,
+            go_sum,
+            mod_changed: false,
+            sum_changed: false,
+        }
+    }
+
+    fn key(&self, file: &str) -> String {
+        match self.dir.as_str() {
+            "" => file.to_string(),
+            dir => format!("{dir}/{file}"),
+        }
+    }
+
+    /// Whether this member's go.mod requires or replaces `module`, or its
+    /// go.sum holds `module@version`'s zip line.
+    fn lists(&self, module: &str, version: &str) -> bool {
+        use crate::vendor::go_mod_edit;
+        go_mod_edit::parse_required_versions(&self.go_mod).contains_key(module)
+            || go_mod_edit::parse_replace_entries(&self.go_mod)
+                .iter()
+                .any(|e| e.module == module && e.socket_owned())
+            || self
+                .go_sum
+                .zip_versions(module)
+                .iter()
+                .any(|v| v == version)
+    }
+
+    fn finish(self, result: &mut RewriteResult) {
+        let (mod_key, sum_key) = (self.key("go.mod"), self.key("go.sum"));
+        if self.mod_changed {
+            result.files.insert(mod_key, self.go_mod);
+        }
+        if self.sum_changed {
+            result.files.insert(sum_key, self.go_sum.into_string());
+        }
+    }
+}
+
+/// A warning shared by every workspace member the golang rewriter edits
+/// (`shared`) is reported once.
+fn push_once(result: &mut RewriteResult, warning: RewriteWarning, shared: bool) {
+    if !shared || !result.warnings.contains(&warning) {
+        result.warnings.push(warning);
+    }
+}
+
+/// Write one dep's hosted replace and go.sum pin into `target`: `false`
+/// when it was refused (warned) instead. `selection` is the workspace's
+/// answer, when a go.work is in effect.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_golang_target(
+    target: &mut GoTarget,
+    dep: &DepOverride,
+    fname: &str,
+    rhs_module: &str,
+    rhs_version: &str,
+    zip_h1: &str,
+    gomod_h1: &str,
+    selection: Option<crate::vendor::go_build_list::Selection>,
+    result: &mut RewriteResult,
+) -> bool {
+    use crate::vendor::go_build_list;
+    use crate::vendor::go_mod_edit;
+    let mod_key = target.key("go.mod");
+    let sum_key = target.key("go.sum");
+    let shared = target.shared;
+    let GoTarget {
+        go_mod,
+        go_sum,
+        mod_changed,
+        sum_changed,
+        ..
+    } = target;
+    let in_workspace = selection.is_some();
+    // One walk of go.mod reads the prior directive, the required version
+    // and the upsert's refresh line / conflict for this dep.
+    let scan =
+        go_mod_edit::scan_hosted_replace(go_mod, fname, &dep.version, rhs_module, rhs_version);
+    // Any pre-existing socket-owned directive for the module (this run is
+    // a refresh, or a takeover of a local/vendored redirect): capture its
+    // text — the ledger's `original` is the only pre-redirect record.
+    let prior = scan.prior.as_ref();
+    let prior_text = prior.map(|e| {
+        let target = e.path.clone().unwrap_or_else(|| match &e.rhs_version {
+            Some(v) => format!("{} {v}", e.rhs_module.as_deref().unwrap_or_default()),
+            None => e.rhs_module.clone().unwrap_or_default(),
+        });
+        let ver = e
+            .version
+            .as_deref()
+            .map(|v| format!(" {v}"))
+            .unwrap_or_default();
+        format!("replace {}{ver} => {target}", e.module)
+    });
+
+    // Stale-pin cross-check: `replace` is keyed on module+version, and a
+    // pin the graph no longer selects is SILENTLY inert (the build links
+    // the unpatched module with zero warning) — refuse to write one, and
+    // reconcile away OUR OWN inert directive if one is already committed:
+    // left in place, its module path keeps confirming the dep as
+    // redirected (ledger + VEX attestation) while go links the unpatched
+    // version.
+    //
+    // Which version the build selects comes from go.mod and go.sum
+    // (`go_build_list`): `require` for a go >= 1.17 graph; for an older
+    // one, the highest of `require` and go.sum's zip lines, since a
+    // `/go.mod`-only line is written for every version MVS reads, not
+    // only the one it selects (#509).
+    let selection = selection.unwrap_or_else(|| {
+        let zips = go_sum.zip_versions(fname);
+        let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
+        go_build_list::select(
+            go_mod_edit::prunes_module_graph(go_mod),
+            scan.required.as_deref(),
+            &zips,
+            &dep.version,
+        )
+    });
+    if let Some(selected) = selection.other_version() {
+        let basis = if in_workspace {
+            "the go.work workspace selects"
+        } else if scan.required.as_deref() == Some(selected) {
+            "go.mod requires"
+        } else {
+            "go.sum shows the build selects"
+        };
+        push_once(
+            result,
+            RewriteWarning {
+                code: "redirect_golang_version_mismatch".into(),
+                detail: format!(
+                    "{fname}: {basis} {selected} but the patch targets {} — \
+                 a version-pinned replace would be silently ignored",
+                    dep.version
+                ),
+            },
+            shared,
+        );
+        let stale_hosted = prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
+        if let Some(stale) = stale_hosted {
+            if let Ok(Some(new)) =
+                go_mod_edit::remove_replace_entry(go_mod, fname, go_mod_edit::ReplaceOwner::Hosted)
+            {
+                *go_mod = new;
+                *mod_changed = true;
+                result.edits.push(FileEdit {
+                    path: mod_key.clone(),
+                    kind: "redirect_golang_stale_replace_removed".into(),
+                    action: "removed".into(),
+                    key: Some(fname.to_string()),
+                    original: prior_text.clone().map(Value::String),
+                    new: None,
+                });
+            }
+            if let Some(stale_rhs) = stale.rhs_module.as_deref() {
+                if go_sum.remove_module_prefix_lines(stale_rhs) {
+                    *sum_changed = true;
                     result.edits.push(FileEdit {
-                        path: "go.sum".into(),
-                        kind: "redirect_golang_superseded_gosum_removed".into(),
+                        path: sum_key.clone(),
+                        kind: "redirect_golang_stale_gosum_removed".into(),
                         action: "removed".into(),
-                        key: Some(format!("{old_module}@{old_version}")),
-                        original: Some(Value::String(removed.join("\n"))),
+                        key: Some(stale_rhs.to_string()),
+                        original: None,
                         new: None,
                     });
                 }
             }
         }
-        // Always both lines, even over the `/go.mod` line alone that `go mod
-        // tidy` leaves while no package of the module is loaded: the
-        // rewriter cannot see imports, and without the zip line a later
-        // import fails `missing go.sum entry` with nothing else to restore it.
-        if go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
-            sum_changed = true;
+        return false;
+    } else if selection != go_build_list::Selection::Selected
+        && (in_workspace && selection == go_build_list::Selection::Unknown
+            || prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str())))
+    {
+        // Not selected by go.mod's require, no go.sum zip line at this
+        // version, and not already redirected by us: the module is
+        // outside this project's graph (local discovery crawls the whole
+        // module cache). Its replace would be inert, and confirming it
+        // would attest a patch no build links. A workspace graph that
+        // could not be read proves nothing either way, so there even our
+        // own pin is no proof the build selects this version.
+        push_once(
+            result,
+            RewriteWarning {
+                code: "redirect_golang_not_in_module_graph".into(),
+                detail: if in_workspace && selection == go_build_list::Selection::Unknown {
+                    format!(
+                        "{fname}@{}: nothing shows the go.work workspace building this \
+                         version — a go.mod its module graph needs is not in the module \
+                         cache (`go mod download` fetches it); nothing redirected",
+                        dep.version
+                    )
+                } else {
+                    format!(
+                        "{fname}@{}: neither go.mod's require nor a go.sum zip line shows \
+                         the build selecting this version — it is not in this project's \
+                         build graph; nothing redirected",
+                        dep.version
+                    )
+                },
+            },
+            shared,
+        );
+        return false;
+    }
+
+    match go_mod_edit::apply_hosted_replace(
+        go_mod,
+        &scan,
+        fname,
+        &dep.version,
+        rhs_module,
+        rhs_version,
+    ) {
+        Err(e) => {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_replace_conflict".into(),
+                detail: format!("{fname}@{}: {e}", dep.version),
+            });
+            return false;
+        }
+        // Re-run over an already-redirected go.mod: nothing to record.
+        Ok(false) => {}
+        Ok(true) => {
+            *mod_changed = true;
             result.edits.push(FileEdit {
-                path: "go.sum".into(),
-                kind: "redirect_golang_gosum".into(),
-                action: "added".into(),
-                key: Some(format!("{rhs_module}@{rhs_version}")),
-                original: None,
+                path: mod_key.clone(),
+                kind: "redirect_golang_replace".into(),
+                // A takeover/refresh of an existing socket directive must
+                // keep its text in `original` — the ledger is the only
+                // pre-redirect record a future revert can restore from.
+                action: if prior_text.is_some() {
+                    "updated".into()
+                } else {
+                    "added".into()
+                },
+                key: Some(fname.to_string()),
+                original: prior_text.map(Value::String),
                 new: Some(Value::String(format!(
-                    "{rhs_module} {rhs_version} {zip_h1}\n{rhs_module} {rhs_version}/go.mod {gomod_h1}"
+                    "replace {fname} {} => {rhs_module} {rhs_version}",
+                    dep.version
                 ))),
             });
         }
-        // Prune the replaced original's lines: with the pinned replace in
-        // force go never fetches or verifies the original, and `go mod tidy`
-        // prunes exactly these — writing the tidy-stable state up front keeps
-        // the first day-2 tidy a byte-level no-op. The removed lines ride in
-        // `original` so the ledger can restore them on revert.
-        if let Some(removed) = go_sum.remove_exact_module_version_lines(&fname, &dep.version) {
-            sum_changed = true;
-            result.edits.push(FileEdit {
-                path: "go.sum".into(),
-                kind: "redirect_golang_gosum_prune".into(),
-                action: "removed".into(),
-                key: Some(format!("{fname}@{}", dep.version)),
-                original: Some(Value::String(removed.join("\n"))),
-                new: None,
-            });
+    }
+    // A refresh that moved the pin to another generation (a superseding
+    // patch uuid, or the same uuid republished at a new version) owns the
+    // previous target's go.sum pair too: nothing references it any more,
+    // so `go mod tidy` would prune it, and leaving it makes the first
+    // day-2 tidy rewrite go.sum (#682).
+    if let Some((old_module, old_version)) = prior
+        .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted))
+        .and_then(|e| e.rhs_module.as_deref().zip(e.rhs_version.as_deref()))
+        .filter(|&(m, v)| (m, v) != (rhs_module, rhs_version))
+    {
+        let still_targeted = go_mod_edit::parse_replace_entries(go_mod).iter().any(|e| {
+            e.rhs_module.as_deref() == Some(old_module)
+                && e.rhs_version.as_deref() == Some(old_version)
+        });
+        if !still_targeted {
+            if let Some(removed) = go_sum.remove_exact_module_version_lines(old_module, old_version)
+            {
+                *sum_changed = true;
+                result.edits.push(FileEdit {
+                    path: sum_key.clone(),
+                    kind: "redirect_golang_superseded_gosum_removed".into(),
+                    action: "removed".into(),
+                    key: Some(format!("{old_module}@{old_version}")),
+                    original: Some(Value::String(removed.join("\n"))),
+                    new: None,
+                });
+            }
         }
-        result.confirmed_golang_uuids.insert(dep.patch_uuid.clone());
     }
-
-    if mod_changed {
-        result.files.insert("go.mod".into(), go_mod);
+    // Always both lines, even over the `/go.mod` line alone that `go mod
+    // tidy` leaves while no package of the module is loaded: the
+    // rewriter cannot see imports, and without the zip line a later
+    // import fails `missing go.sum entry` with nothing else to restore it.
+    if go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
+        *sum_changed = true;
+        result.edits.push(FileEdit {
+            path: sum_key.clone(),
+            kind: "redirect_golang_gosum".into(),
+            action: "added".into(),
+            key: Some(format!("{rhs_module}@{rhs_version}")),
+            original: None,
+            new: Some(Value::String(format!(
+                "{rhs_module} {rhs_version} {zip_h1}\n{rhs_module} {rhs_version}/go.mod {gomod_h1}"
+            ))),
+        });
     }
-    if sum_changed {
-        result.files.insert("go.sum".into(), go_sum.into_string());
+    // Prune the replaced original's lines: with the pinned replace in
+    // force go never fetches or verifies the original, and `go mod tidy`
+    // prunes exactly these — writing the tidy-stable state up front keeps
+    // the first day-2 tidy a byte-level no-op. The removed lines ride in
+    // `original` so the ledger can restore them on revert.
+    if let Some(removed) = go_sum.remove_exact_module_version_lines(fname, &dep.version) {
+        *sum_changed = true;
+        result.edits.push(FileEdit {
+            path: sum_key.clone(),
+            kind: "redirect_golang_gosum_prune".into(),
+            action: "removed".into(),
+            key: Some(format!("{fname}@{}", dep.version)),
+            original: Some(Value::String(removed.join("\n"))),
+            new: None,
+        });
     }
+    true
 }
 
 #[cfg(test)]
@@ -12994,7 +13237,6 @@ mod tests {
             &std::collections::BTreeSet::new(),
             &refusing[3],
             &CratesIoSource::Registry,
-            &[],
         );
         assert!(!r.files.contains_key("yarn.lock"));
         assert!(r
@@ -23239,78 +23481,6 @@ packages:
         assert!(out.warnings[0].detail.contains("v1.5.0"));
     }
 
-    /// A go.work member that is not the scanned module.
-    fn go_member(require: &str) -> crate::vendor::go_build_list::ModuleEvidence {
-        let go_mod = format!("module example.com/other\n\ngo 1.21\n\n{require}");
-        crate::vendor::go_build_list::ModuleEvidence::from_files(&go_mod, None)
-    }
-
-    /// #1753: in a go.work workspace the build selects the highest version
-    /// any member requires, so a pin for this module's v1.4.2 is inert when
-    /// another member requires v1.5.0.
-    #[test]
-    fn golang_workspace_member_requiring_a_higher_version_skips() {
-        let files = golang_files();
-        let ovr = golang_override();
-        let members = [go_member("require github.com/foo/bar v1.5.0\n")];
-        let mut out = RewriteResult::default();
-        rewrite_golang(&files, std::slice::from_ref(&ovr), &members, &mut out);
-        assert!(out.files.is_empty(), "nothing written: {:?}", out.files);
-        assert_eq!(
-            out.warnings
-                .iter()
-                .map(|w| w.code.as_str())
-                .collect::<Vec<_>>(),
-            ["redirect_golang_version_mismatch"]
-        );
-        assert!(
-            out.warnings[0]
-                .detail
-                .contains("another go.work workspace member makes the build select v1.5.0"),
-            "{}",
-            out.warnings[0].detail
-        );
-    }
-
-    /// #1753: a member requiring a lower version, or not requiring the
-    /// module at all, leaves the build on this module's v1.4.2. A member
-    /// that proves the patched version puts a module this go.mod omits in
-    /// the build.
-    #[test]
-    fn golang_workspace_members_that_do_not_outrank_still_redirect() {
-        let ovr = golang_override();
-        for members in [
-            vec![go_member("require github.com/foo/bar v1.4.1\n")],
-            vec![go_member("require example.com/unrelated v1.0.0\n")],
-            vec![go_member("")],
-        ] {
-            let mut out = RewriteResult::default();
-            rewrite_golang(
-                &golang_files(),
-                std::slice::from_ref(&ovr),
-                &members,
-                &mut out,
-            );
-            assert!(out.warnings.is_empty(), "{members:?}: {:?}", out.warnings);
-            assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
-        }
-
-        let mut files = golang_files();
-        files.insert(
-            "go.mod".to_string(),
-            "module example.com/app\n\ngo 1.21\n\nrequire example.com/direct v2.0.0\n".to_string(),
-        );
-        files.insert("go.sum".to_string(), String::new());
-        let mut out = RewriteResult::default();
-        rewrite_golang(&files, std::slice::from_ref(&ovr), &[], &mut out);
-        assert_eq!(out.warnings[0].code, "redirect_golang_not_in_module_graph");
-        let members = [go_member("require github.com/foo/bar v1.4.2\n")];
-        let mut out = RewriteResult::default();
-        rewrite_golang(&files, std::slice::from_ref(&ovr), &members, &mut out);
-        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
-        assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
-    }
-
     /// A module NOT in the main go.mod's require block may still be resolved
     /// (transitively) at the patched version — the cross-check only fires on a
     /// positive mismatch, never on absence.
@@ -23444,6 +23614,276 @@ packages:
         assert_eq!(second.files.keys().collect::<Vec<_>>(), ["go.sum"]);
         assert_eq!(second.files["go.sum"], first.files["go.sum"]);
         assert!(second.confirmed_golang_uuids.contains(GO_UUID));
+    }
+
+    /// The engine's [`GO_WORKSPACE_KEY`] for an in-memory go.work whose
+    /// members are `(dir, go.mod)` pairs (`.` for the root module).
+    fn go_workspace_key(work_extra: &str, members: &[(&str, &str)]) -> (String, String) {
+        use crate::vendor::go_workspace::{GoWorkspace, Loaded, Member};
+        let uses: String = members.iter().map(|(d, _)| format!("\t{d}\n")).collect();
+        let hosted = HostedGoWorkspace {
+            root: std::path::PathBuf::new(),
+            loaded: Loaded::Workspace(GoWorkspace {
+                work_file: "go.work".into(),
+                work: format!("go 1.21\n\nuse (\n{uses})\n{work_extra}"),
+                work_sum: None,
+                members: members
+                    .iter()
+                    .map(|(dir, go_mod)| Member {
+                        dir: (*dir).into(),
+                        go_mod: Some(go_mod.to_string()),
+                        go_sum: None,
+                    })
+                    .collect(),
+                graph: Some(
+                    members
+                        .iter()
+                        .flat_map(|(_, go_mod)| {
+                            crate::vendor::go_mod_edit::parse_required_versions(go_mod)
+                        })
+                        .map(|(path, v)| {
+                            let leaf = crate::vendor::go_workspace::DepGoMod {
+                                pruned: true,
+                                requires: Vec::new(),
+                            };
+                            (format!("{path}@{v}"), Some(leaf))
+                        })
+                        .collect(),
+                ),
+            }),
+        };
+        (
+            GO_WORKSPACE_KEY.to_string(),
+            serde_json::to_string(&hosted).unwrap(),
+        )
+    }
+
+    fn go_member(require: &str, extra: &str) -> String {
+        format!("module example.com/m\n\ngo 1.21\n\nrequire github.com/foo/bar {require}\n{extra}")
+    }
+
+    /// The go.work in effect gates the write: a member replacing the same
+    /// version elsewhere, or go.work replacing it, refuses the pin (nothing
+    /// written, uuid not confirmed); go.work replacing another version
+    /// does not.
+    #[test]
+    fn golang_workspace_conflict_refuses_before_writing() {
+        let files = golang_files();
+        let root = files["go.mod"].clone();
+        let ovr = golang_override();
+        for (work, other) in [
+            ("", "replace github.com/foo/bar v1.4.2 => ../fork\n"),
+            ("", "replace github.com/foo/bar => ../fork\n"),
+            ("\nreplace github.com/foo/bar v1.4.2 => ./fork\n", ""),
+            ("\nreplace github.com/foo/bar => ./fork\n", ""),
+        ] {
+            let mut files = files.clone();
+            let (k, v) =
+                go_workspace_key(work, &[(".", &root), ("b", &go_member("v1.4.2", other))]);
+            files.insert(k, v);
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(out.files.is_empty(), "{work}{other}: {:?}", out.files);
+            assert!(out.confirmed_golang_uuids.is_empty());
+            assert_eq!(
+                out.warnings
+                    .iter()
+                    .map(|w| w.code.as_str())
+                    .collect::<Vec<_>>(),
+                ["redirect_golang_workspace_conflict"],
+                "{work}{other}"
+            );
+        }
+        let mut files = files.clone();
+        let (k, v) = go_workspace_key(
+            "\nreplace github.com/foo/bar v1.0.0 => ./fork\n",
+            &[(".", &root), ("b", &go_member("v1.4.2", ""))],
+        );
+        files.insert(k, v);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.confirmed_golang_uuids.contains(GO_UUID));
+    }
+
+    /// The workspace selects across members: another member raising the
+    /// module refuses the pin; a root that does not require it still pins
+    /// it when a member does (its replace applies to the whole workspace).
+    #[test]
+    fn golang_workspace_selection_spans_members() {
+        let ovr = golang_override();
+        let mut files = golang_files();
+        let root = files["go.mod"].clone();
+        let (k, v) = go_workspace_key("", &[(".", &root), ("b", &go_member("v1.5.0", ""))]);
+        files.insert(k, v);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty());
+        assert_eq!(out.warnings[0].code, "redirect_golang_version_mismatch");
+        assert!(out.warnings[0].detail.contains("workspace selects v1.5.0"));
+
+        let bare = "module example.com/app\n\ngo 1.21\n";
+        let mut files = BTreeMap::new();
+        files.insert("go.mod".to_string(), bare.to_string());
+        let (k, v) = go_workspace_key("", &[(".", bare), ("b", &go_member("v1.4.2", ""))]);
+        files.insert(k, v);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+        assert!(out.confirmed_golang_uuids.contains(GO_UUID));
+    }
+
+    /// A go.work root without a go.mod: each member listing the module gets
+    /// the pin in its own go.mod and go.sum; one that doesn't is left alone.
+    #[test]
+    fn golang_go_work_root_pins_the_members_that_list_the_module() {
+        let ovr = golang_override();
+        let a = go_member("v1.4.2", "");
+        let c = "module example.com/c\n\ngo 1.21\n";
+        let mut files = BTreeMap::new();
+        for (key, text) in [
+            ("a/go.mod", a.as_str()),
+            ("b/go.mod", a.as_str()),
+            ("c/go.mod", c),
+        ] {
+            files.insert(key.to_string(), text.to_string());
+        }
+        let (k, v) = go_workspace_key("", &[("a", &a), ("b", &a), ("c", c)]);
+        files.insert(k, v);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(
+            out.files.keys().collect::<Vec<_>>(),
+            ["a/go.mod", "a/go.sum", "b/go.mod", "b/go.sum"]
+        );
+        assert!(out.confirmed_golang_uuids.contains(GO_UUID));
+        assert!(out
+            .edits
+            .iter()
+            .any(|e| e.path == "b/go.mod" && e.kind == "redirect_golang_replace"));
+
+        // Without the workspace there is no go.mod to pin.
+        files.remove(GO_WORKSPACE_KEY);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert_eq!(out.warnings[0].code, "redirect_golang_no_go_mod");
+    }
+
+    /// At a go.work root the pin goes into several members; one member
+    /// refusing (here: a member not yet pinned while an unread member
+    /// leaves the selection unknown) undoes the others' writes (here:
+    /// restoring a pinned member's tidy-pruned zip line).
+    #[test]
+    fn golang_go_work_root_member_refusal_writes_no_member() {
+        use crate::vendor::go_workspace::{GoWorkspace, Loaded, Member};
+        let ovr = golang_override();
+        let a = go_member("v1.4.2", "");
+        let sm = golang_socket_module();
+        let b = go_member(
+            "v1.4.2",
+            &format!("\nreplace github.com/foo/bar v1.4.2 => {sm} v1.4.2-socketpatch.1\n"),
+        );
+        let b_sum = format!("{sm} v1.4.2-socketpatch.1/go.mod {GO_GOMOD_H1}\n");
+        let mut files = BTreeMap::new();
+        files.insert("a/go.mod".to_string(), a.clone());
+        files.insert("b/go.mod".to_string(), b.clone());
+        files.insert("b/go.sum".to_string(), b_sum);
+        let member = |dir: &str, go_mod: Option<&String>| Member {
+            dir: dir.into(),
+            go_mod: go_mod.cloned(),
+            go_sum: None,
+        };
+        let hosted = HostedGoWorkspace {
+            root: std::path::PathBuf::new(),
+            loaded: Loaded::Workspace(GoWorkspace {
+                work_file: "go.work".into(),
+                work: "go 1.21\n\nuse (\n\ta\n\tb\n\t../out\n)\n".into(),
+                work_sum: None,
+                members: vec![
+                    member("a", Some(&a)),
+                    member("b", Some(&b)),
+                    member("../out", None),
+                ],
+                graph: None,
+            }),
+        };
+        files.insert(
+            GO_WORKSPACE_KEY.to_string(),
+            serde_json::to_string(&hosted).unwrap(),
+        );
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert!(out.edits.is_empty(), "{:?}", out.edits);
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert_eq!(
+            out.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_golang_not_in_module_graph"]
+        );
+    }
+
+    /// A workspace whose graph could not be read (here: an unread member)
+    /// proves nothing about the selected version: even our own pin at the
+    /// patched version is not confirmed on a re-run.
+    #[test]
+    fn golang_unknown_workspace_does_not_confirm_an_existing_pin() {
+        use crate::vendor::go_workspace::{GoWorkspace, Loaded, Member};
+        let ovr = golang_override();
+        let files = golang_files();
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(first.confirmed_golang_uuids.contains(GO_UUID));
+        let mut again = files.clone();
+        again.extend(first.files.clone());
+        let member = |dir: &str, go_mod: Option<String>| Member {
+            dir: dir.into(),
+            go_mod,
+            go_sum: None,
+        };
+        let hosted = HostedGoWorkspace {
+            root: std::path::PathBuf::new(),
+            loaded: Loaded::Workspace(GoWorkspace {
+                work_file: "go.work".into(),
+                work: "go 1.21\n\nuse (\n\t.\n\t../out\n)\n".into(),
+                work_sum: None,
+                members: vec![
+                    member(".", Some(again["go.mod"].clone())),
+                    member("../out", None),
+                ],
+                graph: None,
+            }),
+        };
+        again.insert(
+            GO_WORKSPACE_KEY.to_string(),
+            serde_json::to_string(&hosted).unwrap(),
+        );
+        let out = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.code == "redirect_golang_not_in_module_graph"),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// A go.work root whose other member replaces every version of the
+    /// module elsewhere: go would link that target or refuse to build, so
+    /// no member gets the pin.
+    #[test]
+    fn golang_go_work_root_member_wildcard_replace_refuses() {
+        let ovr = golang_override();
+        let a = go_member("v1.4.2", "");
+        let b = go_member("v1.4.2", "\nreplace github.com/foo/bar => ../fork\n");
+        let mut files = BTreeMap::new();
+        files.insert("a/go.mod".to_string(), a.clone());
+        files.insert("b/go.mod".to_string(), b.clone());
+        let (k, v) = go_workspace_key("", &[("a", &a), ("b", &b)]);
+        files.insert(k, v);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
+        assert!(out.warnings[0].detail.contains("every version"));
     }
 
     /// Only `patch.socket.dev/gopatch/<canonical uuid>` is a hosted module;
