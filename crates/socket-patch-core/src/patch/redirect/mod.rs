@@ -8740,6 +8740,23 @@ fn rewrite_maven_pom(
                 continue;
             }
         }
+        // A declaration whose groupId / artifactId is a property this pom
+        // does not define (a parent's) may be this GA, and then its own
+        // `<version>` beats any pin written here (#683): nothing is pinned.
+        if let Some(shadow) = idx.placeholder_shadow(&group_id, &artifact_id) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_coordinate_unresolved".into(),
+                detail: format!(
+                    "{}:{} <version>{}</version> names a property pom.xml does not define, so it \
+                     may be {group_id}:{artifact_id} and its own version would win over a pin; \
+                     pom.xml was left as it is and the dep is not counted as redirected",
+                    shadow.group.as_deref().unwrap_or_default(),
+                    shadow.artifact.as_deref().unwrap_or_default(),
+                    shadow.version_text.as_deref().unwrap_or_default(),
+                ),
+            });
+            continue;
+        }
         let has_live_repo = idx.has_repository(&repo_id);
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
@@ -10097,6 +10114,120 @@ mod tests {
             "single-module root still rewritten"
         );
         assert!(!warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"));
+    }
+
+    /// A direct declaration whose groupId / artifactId is a property of
+    /// the pom's own `<properties>` is the GA (#683): its literal is
+    /// rewritten, not shadowed by an added `<dependencyManagement>` pin
+    /// Maven would never apply. `<exclusions>` before the coordinates do
+    /// not hide it either.
+    #[test]
+    fn maven_pom_property_coordinates_are_the_direct_declaration() {
+        for (case, props, coords) in [
+            (
+                "property groupId",
+                "<g>org.slf4j</g>",
+                "<groupId>${g}</groupId><artifactId>slf4j-api</artifactId>",
+            ),
+            (
+                "property artifactId",
+                "<a>slf4j-api</a>",
+                "<groupId>org.slf4j</groupId><artifactId>${a}</artifactId>",
+            ),
+            (
+                "interpolated groupId",
+                "<vendor>slf4j</vendor>",
+                "<groupId>org.${vendor}</groupId><artifactId>slf4j-api</artifactId>",
+            ),
+            (
+                "exclusions first",
+                "",
+                "<exclusions><exclusion><groupId>org.example</groupId><artifactId>none</artifactId></exclusion></exclusions><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>",
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                format!(
+                    "<project>\n  <properties>{props}</properties>\n  <dependencies>\n    <dependency>{coords}<version>1.7.36</version></dependency>\n  </dependencies>\n</project>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let out = r.files.get("pom.xml").expect("pom rewritten");
+            assert!(
+                out.contains(&format!("{coords}<version>{MAVEN_SUFFIXED}</version>")),
+                "{case}: the direct literal is pinned: {out}"
+            );
+            assert!(
+                !out.contains("<dependencyManagement>"),
+                "{case}: no shadowed managed pin: {out}"
+            );
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_dep_management_added"),
+                "{case}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// A versioned declaration whose groupId / artifactId is a property
+    /// the pom does not define (a parent's) may be the GA, and its own
+    /// version would then beat any pin (#683): the dep is refused with
+    /// nothing written, not pinned through `<dependencyManagement>`.
+    #[test]
+    fn maven_pom_undefined_coordinate_property_refuses_the_dep() {
+        for coords in [
+            "<groupId>${parent.g}</groupId><artifactId>slf4j-api</artifactId>",
+            "<groupId>org.slf4j</groupId><artifactId>${parent.a}</artifactId>",
+            "<groupId>${g}</groupId><artifactId>${a}</artifactId>",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                format!(
+                    "<project>\n  <dependencies>\n    <dependency>{coords}<version>1.7.36</version></dependency>\n  </dependencies>\n</project>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{coords}: nothing written: {:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_coordinate_unresolved"],
+                "{coords}"
+            );
+        }
+        // A placeholder that cannot be the GA (the other coordinate
+        // differs), or a versionless one (it takes the managed pin), does
+        // not block the pin.
+        for other in [
+            "<groupId>${parent.g}</groupId><artifactId>logback-classic</artifactId><version>1.4.14</version>",
+            "<groupId>${parent.g}</groupId><artifactId>slf4j-api</artifactId>",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                format!(
+                    "<project>\n  <dependencies>\n    <dependency>{other}</dependency>\n  </dependencies>\n</project>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_coordinate_unresolved"),
+                "{other}: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.files
+                    .get("pom.xml")
+                    .is_some_and(|p| p.contains(MAVEN_SUFFIXED)),
+                "{other}: pinned: {:?}",
+                r.warnings
+            );
+        }
     }
 
     /// Fail-closed transitive-only (no matching dependency): a

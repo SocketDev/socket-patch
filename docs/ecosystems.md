@@ -830,6 +830,11 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   `<profiles>` (a literal or a `${property}`) is left as-is and reported
   (`redirect_maven_profile_dependency_unpatched`), because an active profile's version
   beats the pin, and when a profile holds the GA's only declaration nothing is pinned.
+  A `${property}` groupId or artifactId is resolved from the pom's own `<properties>`
+  before matching, so `<groupId>${ct.group}</groupId>` is rewritten like a literal. One
+  the pom does not define (a parent's) may be the patched GA, and then its own version
+  wins: the dep is refused with nothing written (`redirect_maven_coordinate_unresolved`),
+  and `vex` does not attest a pin past such a declaration.
   The grant serves the main jar only: a `<classifier>` variant keeps its version
   (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
   the classifier-less declarations. A `sources` / `javadoc` variant at the patched release

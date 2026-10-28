@@ -65,6 +65,8 @@ pub(crate) struct PomScope {
     pub(crate) masked: String,
     ignored: Vec<Element>,
     profiles: Vec<Element>,
+    /// The root `<properties>` (see [`properties`]).
+    properties: BTreeMap<String, String>,
 }
 
 impl PomScope {
@@ -83,10 +85,12 @@ impl PomScope {
         ]
         .concat();
         let profiles = elements(&masked, "profiles")?;
+        let properties = properties(&masked, &ignored, &profiles)?;
         Ok(PomScope {
             masked,
             ignored,
             profiles,
+            properties,
         })
     }
 
@@ -133,6 +137,9 @@ fn inside(pos: usize, set: &[Element]) -> bool {
 #[derive(Debug)]
 pub(crate) struct ScopedDep {
     pub(crate) element: Element,
+    /// `<groupId>` / `<artifactId>` with every `${prop}` the root
+    /// `<properties>` defines interpolated (see [`interpolate`]); an
+    /// undefined one stays as written, so [`may_name`] can tell it apart.
     pub(crate) group: Option<String>,
     pub(crate) artifact: Option<String>,
     /// Inner-text byte range of the literal `<version>`, when present.
@@ -155,8 +162,9 @@ impl PomScope {
             let version = elements(&body, "version")?.into_iter().next();
             out.push(ScopedDep {
                 element: dep,
-                group: child_text(&body, "groupId")?,
-                artifact: child_text(&body, "artifactId")?,
+                group: child_text(&body, "groupId")?.map(|g| interpolate(&g, &self.properties)),
+                artifact: child_text(&body, "artifactId")?
+                    .map(|a| interpolate(&a, &self.properties)),
                 version_inner: version.map(|v| {
                     (
                         dep.inner_start + v.inner_start,
@@ -182,8 +190,6 @@ pub(crate) fn parse_pom(raw: &str) -> Result<Pom, String> {
     let scope = PomScope::new(raw)?;
     let text = &scope.masked;
     let managed = elements(text, "dependencyManagement")?;
-
-    let properties = properties(text, &scope.ignored, &scope.profiles)?;
     let mut pom = Pom::default();
 
     for repo in scope.elements("repository")? {
@@ -202,7 +208,9 @@ pub(crate) fn parse_pom(raw: &str) -> Result<Pom, String> {
         pom.deps.push(PomDep {
             group,
             artifact,
-            version: dep.version_text.map(|v| resolve_property(&v, &properties)),
+            version: dep
+                .version_text
+                .map(|v| resolve_property(&v, &scope.properties)),
             classifier: dep.classifier,
             managed: inside(dep.element.start, &managed),
             in_profile: dep.in_profile,
@@ -262,6 +270,44 @@ fn resolve_property(version: &str, properties: &BTreeMap<String, String>) -> Str
         .and_then(|name| properties.get(name))
         .cloned()
         .unwrap_or_else(|| version.to_string())
+}
+
+/// `text` with every `${name}` the root `<properties>` defines replaced by
+/// its value (one level, no recursion, as Maven interpolates a coordinate
+/// such as `org.${vendor}`); an undefined or malformed reference is kept as
+/// written.
+fn interpolate(text: &str, properties: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("${") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        match after
+            .find('}')
+            .map(|close| (&after[..close], close))
+            .filter(|(name, _)| is_property_name(name))
+            .and_then(|(name, close)| properties.get(name).map(|v| (v, close)))
+        {
+            Some((value, close)) => {
+                out.push_str(value);
+                rest = &after[close + 1..];
+            }
+            None => {
+                out.push_str("${");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether a dependency's (interpolated) `coordinate` may be `want`: it
+/// is, or it still holds a `${…}` this pom does not define (a parent's or
+/// the build's property), so Maven might resolve it to `want`. A reader
+/// that cannot rule a declaration out must not pin or attest past it.
+pub(crate) fn may_name(coordinate: &str, want: &str) -> bool {
+    coordinate == want || coordinate.contains("${")
 }
 
 fn is_property_name(name: &str) -> bool {

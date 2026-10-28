@@ -104,8 +104,8 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
-    is_maven_coordinate, is_maven_version_text, parse_pom, split_socket_version, Pom, PomDep,
-    PomRepo,
+    is_maven_coordinate, is_maven_version_text, may_name, parse_pom, split_socket_version, Pom,
+    PomDep, PomRepo,
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
 use crate::utils::digest::sha256_hex;
@@ -158,7 +158,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw);
     extract_hosted(ctx, &pom, &gas, &hosted, reactor, out).await;
     if !vendored.is_empty() {
-        extract_vendored(ctx, &gas, &vendored, out).await;
+        extract_vendored(ctx, &pom.deps, &gas, &vendored, out).await;
     }
 }
 
@@ -214,6 +214,14 @@ async fn extract_hosted(
                 DIAG_REF_INVALID,
                 POM,
                 format!("{POM}: {ga:?} is not a usable Maven groupId:artifactId"),
+            );
+            continue;
+        }
+        if let Some(shadow) = placeholder_shadow(&pom.deps, group, artifact) {
+            out.diag(
+                DIAG_REF_INVALID,
+                POM,
+                placeholder_shadow_detail(shadow, &ga),
             );
             continue;
         }
@@ -417,6 +425,7 @@ async fn trusted_checksums(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> BTreeM
 
 async fn extract_vendored(
     ctx: &DiscoverCtx<'_>,
+    deps: &[PomDep],
     gas: &BTreeMap<(String, String), GaVersions>,
     vendored: &BTreeSet<String>,
     out: &mut Discovery,
@@ -490,6 +499,14 @@ async fn extract_vendored(
                      does not match the jar, so Maven (checksumPolicy=fail) rejects the \
                      vendored copy and resolves {purl} from the next repository"
                 ),
+            );
+            continue;
+        }
+        if let Some(shadow) = placeholder_shadow(deps, group, artifact) {
+            out.diag(
+                DIAG_REF_INVALID,
+                POM,
+                placeholder_shadow_detail(shadow, &format!("{group}:{artifact}")),
             );
             continue;
         }
@@ -635,6 +652,32 @@ fn classify_repo(ctx: &DiscoverCtx<'_>, repo: &PomRepo, out: &mut Discovery) -> 
 struct GaVersions {
     direct: BTreeSet<String>,
     managed: BTreeSet<String>,
+}
+
+/// A versioned main-jar declaration Maven always reads whose groupId or
+/// artifactId still holds a `${…}` this pom does not define (a parent's or
+/// the build's property), so it may be `group:artifact` (#683). Its own
+/// `<version>` would then decide what Maven resolves, unseen by
+/// [`group_by_ga`], so the GA's wiring is not attested past it.
+fn placeholder_shadow<'a>(deps: &'a [PomDep], group: &str, artifact: &str) -> Option<&'a PomDep> {
+    deps.iter().find(|d| {
+        !d.in_profile
+            && d.classifier.is_none()
+            && d.version.is_some()
+            && (d.group != group || d.artifact != artifact)
+            && may_name(&d.group, group)
+            && may_name(&d.artifact, artifact)
+    })
+}
+
+fn placeholder_shadow_detail(shadow: &PomDep, ga: &str) -> String {
+    format!(
+        "{POM}: {}:{} <version>{}</version> names a property this pom does not define, so it \
+         may be {ga} and its own version may be what Maven resolves",
+        shadow.group,
+        shadow.artifact,
+        shadow.version.as_deref().unwrap_or_default()
+    )
 }
 
 fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
@@ -1286,6 +1329,82 @@ mod tests {
         );
         let out = run(&p).await;
         assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+    }
+
+    /// A `${property}` groupId / artifactId is read through the pom's own
+    /// `<properties>` (#683): a property-named direct declaration keeping
+    /// the plain version shadows the managed pin (Maven resolves Central's
+    /// jar), and one carrying the suffixed version is the pin.
+    #[tokio::test]
+    async fn property_coordinates_are_the_declared_ga() {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        for (props, g, a) in [
+            ("<g>org.slf4j</g>", "${g}", "slf4j-api"),
+            ("<a>slf4j-api</a>", "org.slf4j", "${a}"),
+        ] {
+            let shadowed = Project::new();
+            shadowed.write(
+                "pom.xml",
+                pom(&format!(
+                    "<properties>{props}</properties>\n\
+                     <dependencyManagement><dependencies>\n{}</dependencies></dependencyManagement>\n\
+                     <dependencies>\n{}</dependencies>\n<repositories>\n{repo}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                    dep(g, a, Some("1.7.36")),
+                )),
+            );
+            let out = run(&shadowed).await;
+            assert_refs(&out, &[]);
+            assert!(
+                diag_codes(&out).contains(&DIAG_REF_INVALID),
+                "{g}:{a}: {:?}",
+                out.diagnostics
+            );
+
+            let pinned = Project::new();
+            pinned.write(
+                "pom.xml",
+                pom(&format!(
+                    "<properties>{props}</properties>\n<dependencies>\n{}</dependencies>\n\
+                     <repositories>\n{repo}</repositories>\n",
+                    dep(g, a, Some(&suffixed(UUID_A))),
+                )),
+            );
+            let out = run(&pinned).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        }
+    }
+
+    /// A versioned declaration whose coordinate is a property this pom
+    /// does not define may be the pinned GA, so the pin is not attested
+    /// past it (#683).
+    #[tokio::test]
+    async fn undefined_coordinate_property_is_not_attested_past() {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            pom(&format!(
+                "<dependencyManagement><dependencies>\n{}</dependencies></dependencyManagement>\n\
+                 <dependencies>\n{}</dependencies>\n<repositories>\n{repo}</repositories>\n",
+                dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                dep("${parent.g}", "slf4j-api", Some("1.7.36")),
+            )),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert!(
+            diag_codes(&out).contains(&DIAG_REF_INVALID),
+            "{:?}",
+            out.diagnostics
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.detail.contains("${parent.g}:slf4j-api")),
+            "{:?}",
+            out.diagnostics
+        );
     }
 
     #[tokio::test]

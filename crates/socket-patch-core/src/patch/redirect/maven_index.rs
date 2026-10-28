@@ -171,6 +171,25 @@ impl PomIndex {
             .collect()
     }
 
+    /// A versioned main-jar declaration outside `<profiles>` that is not
+    /// `group:artifact` as written but may be (see
+    /// [`may_name`](crate::formats::maven::may_name)): a groupId or
+    /// artifactId property this pom does not define.
+    pub(super) fn placeholder_shadow(&self, group: &str, artifact: &str) -> Option<&IndexedDep> {
+        use crate::formats::maven::may_name;
+        self.deps.iter().find(|d| {
+            let (Some(g), Some(a)) = (d.group.as_deref(), d.artifact.as_deref()) else {
+                return false;
+            };
+            !d.in_profile
+                && d.classifier.is_none()
+                && d.version_text.is_some()
+                && (g != group || a != artifact)
+                && may_name(g, group)
+                && may_name(a, artifact)
+        })
+    }
+
     pub(super) fn dep(&self, i: usize) -> &IndexedDep {
         &self.deps[i]
     }

@@ -55,7 +55,25 @@ struct DepMatch {
     version_text: Option<String>,
 }
 
+/// Read through [`PomScope`](crate::formats::maven::PomScope) when the pom
+/// is readable as one, so a `${property}` groupId / artifactId the rewriter
+/// resolved to the GA (#683) is found again; else by the raw block scan.
 fn dep_matches(pom: &str, group: &str, artifact: &str) -> Vec<DepMatch> {
+    let scoped = crate::formats::maven::PomScope::new(pom).and_then(|s| s.dependencies());
+    if let Ok(deps) = scoped {
+        return deps
+            .into_iter()
+            .filter(|d| {
+                d.group.as_deref() == Some(group) && d.artifact.as_deref() == Some(artifact)
+            })
+            .map(|d| DepMatch {
+                start: d.element.start,
+                end: d.element.end,
+                version: d.version_inner,
+                version_text: d.version_text,
+            })
+            .collect();
+    }
     MAVEN_DEPENDENCY_BLOCK_RE
         .find_iter(pom)
         .filter(|m| {
@@ -493,6 +511,55 @@ mod tests {
                 fixture(case, "input", "pom.xml"),
                 "{case}"
             );
+        }
+    }
+
+    /// A pin the rewriter wrote on a `${property}` groupId / artifactId
+    /// declaration (#683) is found and restored: the round trip gives the
+    /// input pom back.
+    #[tokio::test]
+    async fn property_coordinate_pin_round_trips() {
+        let overrides: Vec<crate::patch::redirect::DepOverride> =
+            serde_json::from_str(&fixture("basic", ".", "overrides.json")).unwrap();
+        for (prop, from, to) in [
+            (
+                "<g>org.slf4j</g>",
+                "<groupId>org.slf4j</groupId>",
+                "<groupId>${g}</groupId>",
+            ),
+            (
+                "<a>slf4j-api</a>",
+                "<artifactId>slf4j-api</artifactId>",
+                "<artifactId>${a}</artifactId>",
+            ),
+        ] {
+            let input = fixture("basic", "input", "pom.xml")
+                .replacen(from, to, 1)
+                .replacen(
+                    "  <dependencies>",
+                    &format!("  <properties>{prop}</properties>\n  <dependencies>"),
+                    1,
+                );
+            let files = BTreeMap::from([("pom.xml".to_string(), input.clone())]);
+            let rewritten = crate::patch::redirect::rewrite_registry_redirect(&files, &overrides);
+            let pom = &rewritten.files["pom.xml"];
+            assert!(
+                pom.contains(&format!("<version>{SUFFIXED}</version>"))
+                    && !pom.contains("<dependencyManagement>"),
+                "{to}: {pom}"
+            );
+            let tree: Vec<(&str, String)> = rewritten
+                .files
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            let (outcome, after) = run(&tree).await;
+            assert!(
+                matches!(outcome.pins[0].status, PinStatus::Restored),
+                "{to}: {:?}",
+                outcome.pins[0].status
+            );
+            assert_eq!(after["pom.xml"], input, "{to}");
         }
     }
 
