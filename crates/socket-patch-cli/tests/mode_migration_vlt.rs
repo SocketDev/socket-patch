@@ -1,10 +1,10 @@
 //! Real-vlt mode migrations (suite `migration`, DESIGN §8.3, §4.10).
 //!
-//! Hosted ⇄ vendored takeovers (both drivers), dry-run parity, scoped and
-//! unscoped unwinds, agent-mode interplay (r-tests T21), package-manager
-//! switches (T37) and the vlt upgrade (T19, `SOCKET_PATCH_VLT_E2E_UPGRADE_JS`)
-//! against the REAL vlt under test, every terminal state proven by a fresh
-//! checkout's locked install. Each leg is `vlt_pinned_matrix_migration_<leg>`
+//! Hosted ⇄ vendored migrations (scan takeovers, the `vendor` eject),
+//! dry-run parity, scoped and unscoped unwinds, agent-mode interplay
+//! (r-tests T21), package-manager switches (T37) and the vlt upgrade (T19,
+//! `SOCKET_PATCH_VLT_E2E_UPGRADE_JS`) against the REAL vlt under test,
+//! every terminal state proven by a fresh checkout's locked install. Each leg is `vlt_pinned_matrix_migration_<leg>`
 //! and prints one `VLT-LEG` line.
 
 #[path = "common/rollback_json.rs"]
@@ -305,14 +305,22 @@ async fn vlt_pinned_matrix_migration_hosted_then_vendored() {
     fx.vlt_ok(&fx.proj, &fx.leg.locked_install_args());
     for driver in ["scan", "vendor"] {
         let dir = copy_project(&fx, &fx.proj, &format!("drv-{driver}"));
-        let out = if driver == "scan" {
-            vendored_scan(&fx, &dir, &[])
-        } else {
+        let eject = driver == "vendor";
+        let out = if eject {
             stage_manifest(&dir, &[fx.t()]);
-            vendor_upstream(&fx, &dir, &[])
+            let manifest = std::fs::read(dir.join(".socket/manifest.json")).unwrap();
+            let out = vendor_upstream(&fx, &dir, &[]);
+            assert_eq!(
+                std::fs::read(dir.join(".socket/manifest.json")).unwrap(),
+                manifest,
+                "{driver}: the eject leaves the manifest untouched: {out}"
+            );
+            out
+        } else {
+            vendored_scan(&fx, &dir, &[])
         };
         assert_eq!(out.code, 0, "{driver}: {out}");
-        assert_vendored_over_hosted(driver, &out);
+        assert_vendored_over_hosted(eject, driver, &out);
         assert_pure_vendored(&dir, fx.t());
         assert_fresh(
             &fx,
@@ -332,28 +340,24 @@ async fn vlt_pinned_matrix_migration_hosted_then_vendored() {
     fx.leg.ran();
 }
 
-/// The wet hosted → vendored advisory for `driver`. `scan --mode vendored`
-/// announces its per-purl takeover; plain `vendor` with a hosted pin in
-/// scope runs the eject instead, which announces no takeover but, having
-/// healed the warm vlt store, asks for a `vlt install`.
-fn assert_vendored_over_hosted(driver: &str, out: &SocketOut) {
+/// The wet hosted → vendored advisories. `scan --mode vendored` announces
+/// its per-purl takeover; plain `vendor` with a hosted pin in scope
+/// (`eject`) runs the eject instead, which announces no takeover. Both
+/// heal the warm vlt store and ask for a `vlt install`.
+fn assert_vendored_over_hosted(eject: bool, tag: &str, out: &SocketOut) {
     let doc = out.json();
-    assert!(!has_code(&doc, "redirect_revert_failed"), "{driver}: {out}");
-    if driver == "scan" {
-        assert!(
-            has_code(&doc, "vendor_takeover_reverted_redirect"),
-            "{driver}: {out}"
-        );
-    } else {
-        assert!(
-            !has_code(&doc, "vendor_takeover_reverted_redirect"),
-            "{driver}: the eject is not a takeover: {out}"
-        );
-        assert!(
-            has_code(&doc, "redirect_vlt_reinstall_required"),
-            "{driver}: {out}"
-        );
-    }
+    assert_eq!(
+        has_code(&doc, "vendor_takeover_reverted_redirect"),
+        !eject,
+        "{tag}: only the scan takeover announces a takeover: {out}"
+    );
+    // The eject reports a failed restore as a run error (exit 1); the scan
+    // takeover reports it per event, so check it there.
+    assert!(!has_code(&doc, "redirect_revert_failed"), "{tag}: {out}");
+    assert!(
+        has_code(&doc, "redirect_vlt_reinstall_required"),
+        "{tag}: the warm vlt store is healed: {out}"
+    );
 }
 
 fn vendor_revert_all(dir: &Path) -> SocketOut {
@@ -363,8 +367,8 @@ fn vendor_revert_all(dir: &Path) -> SocketOut {
 // ── 3. dry-run parity ─────────────────────────────────────────────────────
 
 /// Over a live hosted redirect `vendor --dry-run` previews the eject of
-/// the hosted pin (`eject_planned`) and `scan --mode vendored --dry-run` says `would_vendor`; over a live
-/// vendored state `scan --mode hosted --dry-run` previews
+/// the hosted pin (`eject_planned`) and `scan --mode vendored --dry-run`
+/// says `would_vendor`; over a live vendored state `scan --mode hosted --dry-run` previews
 /// `redirect_would_revert_vendored`. No preview writes a byte, and the wet
 /// runs then do what was previewed.
 #[tokio::test(flavor = "multi_thread")]
@@ -382,7 +386,18 @@ async fn vlt_pinned_matrix_migration_dry_run_parity() {
     let out = vendor_upstream(&fx, &fx.proj, &["--dry-run"]);
     assert_eq!(out.code, 0, "{out}");
     let doc = out.json();
-    assert!(has_code(&doc, "eject_planned"), "{out}");
+    let planned: Vec<&Value> = doc["events"]
+        .as_array()
+        .map(|evs| {
+            evs.iter()
+                .filter(|e| e["errorCode"] == "eject_planned")
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        planned.len() == 1 && planned[0]["purl"] == fx.t().purl(),
+        "one eject planned, for the hosted pin only: {out}"
+    );
     assert!(!has_code(&doc, "vendor_would_revert_redirect"), "{out}");
     assert!(!out.stdout.contains("vendor_lock_entry_not_found"), "{out}");
     let out = vendored_scan(&fx, &fx.proj, &["--dry-run"]);
@@ -405,7 +420,7 @@ async fn vlt_pinned_matrix_migration_dry_run_parity() {
     );
     let out = vendor_upstream(&fx, &fx.proj, &[]);
     assert_eq!(out.code, 0, "{out}");
-    assert_vendored_over_hosted("vendor", &out);
+    assert_vendored_over_hosted(true, "vendor", &out);
     assert_pure_vendored(&fx.proj, fx.t());
     let before = project_bytes(&fx.proj);
     let out = hosted_scan(&fx, &fx.proj, &["--dry-run"]);
