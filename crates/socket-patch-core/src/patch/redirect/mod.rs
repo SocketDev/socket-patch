@@ -8743,19 +8743,49 @@ fn rewrite_maven_pom(
         // A declaration whose groupId / artifactId is a property this pom
         // does not define (a parent's) may be this GA, and then its own
         // `<version>` beats any pin written here (#683): nothing is pinned.
-        if let Some(shadow) = idx.placeholder_shadow(&group_id, &artifact_id) {
+        // One inside `<profiles>` beats it only while that profile is
+        // active, and is reported like a literal profile declaration.
+        let shadow_text = |d: &maven_index::IndexedDep| {
+            format!(
+                "{}:{} <version>{}</version>",
+                d.group.as_deref().unwrap_or_default(),
+                d.artifact.as_deref().unwrap_or_default(),
+                d.version_text.as_deref().unwrap_or_default(),
+            )
+        };
+        if let Some(shadow) = idx.placeholder_shadow(&group_id, &artifact_id, false) {
             result.warnings.push(RewriteWarning {
                 code: "redirect_maven_coordinate_unresolved".into(),
                 detail: format!(
-                    "{}:{} <version>{}</version> names a property pom.xml does not define, so it \
-                     may be {group_id}:{artifact_id} and its own version would win over a pin; \
-                     pom.xml was left as it is and the dep is not counted as redirected",
-                    shadow.group.as_deref().unwrap_or_default(),
-                    shadow.artifact.as_deref().unwrap_or_default(),
-                    shadow.version_text.as_deref().unwrap_or_default(),
+                    "{} names a property pom.xml does not define, so it may be \
+                     {group_id}:{artifact_id} and its own version would win over a pin; pom.xml \
+                     was left as it is and the dep is not counted as redirected",
+                    shadow_text(shadow),
                 ),
             });
             continue;
+        }
+        if profile_version.is_none() {
+            if let Some(shadow) = idx.placeholder_shadow(&group_id, &artifact_id, true) {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_profile_dependency_unpatched".into(),
+                    detail: format!(
+                        "{} inside <profiles> names a property pom.xml does not define, so it \
+                         may be {group_id}:{artifact_id}; it is not edited, and while that \
+                         profile is active it may resolve that version, not the patched \
+                         artifact{}",
+                        shadow_text(shadow),
+                        if matches.is_empty() {
+                            " (no declaration outside <profiles>, so nothing is pinned)"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+                if matches.is_empty() {
+                    continue;
+                }
+            }
         }
         let has_live_repo = idx.has_repository(&repo_id);
 
@@ -10207,6 +10237,7 @@ mod tests {
             "<groupId>${parent.g}</groupId><artifactId>logback-classic</artifactId><version>1.4.14</version>",
             "<groupId>${parent.g}</groupId><artifactId>slf4j-api</artifactId>",
             "<groupId>${project.groupId}</groupId><artifactId>${project.artifactId}-core</artifactId><version>${project.version}</version>",
+            "<groupId>${parent.g}</groupId><artifactId>${bom}</artifactId><version>3</version><type>pom</type><scope>import</scope>",
         ] {
             let mut files = BTreeMap::new();
             files.insert(
@@ -10227,6 +10258,44 @@ mod tests {
                     .is_some_and(|p| p.contains(MAVEN_SUFFIXED)),
                 "{other}: pinned: {:?}",
                 r.warnings
+            );
+        }
+    }
+
+    /// A versioned `<profiles>` declaration through an undefined coordinate
+    /// property may be the GA while its profile is active: reported like a
+    /// literal profile declaration (#683), pinned beside a top-level
+    /// literal and skipped when it is the only declaration.
+    #[test]
+    fn maven_pom_undefined_coordinate_property_in_a_profile_is_reported() {
+        let profile = "<profiles><profile><id>p</id><dependencies><dependency>\
+                       <groupId>${parent.g}</groupId><artifactId>slf4j-api</artifactId>\
+                       <version>1.7.36</version></dependency></dependencies></profile></profiles>";
+        for (top, pinned) in [
+            (
+                "<dependencies><dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version></dependency></dependencies>",
+                true,
+            ),
+            ("", false),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                format!("<project>\n  {top}\n  {profile}\n</project>\n"),
+            );
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_profile_dependency_unpatched"),
+                "{pinned}: {:?}",
+                r.warnings
+            );
+            assert_eq!(
+                r.files
+                    .get("pom.xml")
+                    .is_some_and(|p| p.contains(MAVEN_SUFFIXED)),
+                pinned,
+                "{:?}",
+                r.files
             );
         }
     }

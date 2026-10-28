@@ -55,14 +55,19 @@ struct DepMatch {
     version_text: Option<String>,
 }
 
-/// Read through [`PomScope`](crate::formats::maven::PomScope) when the pom
-/// is readable as one, so a `${property}` groupId / artifactId the rewriter
-/// resolved to the GA (#683) is found again; else by the raw block scan.
-fn dep_matches(pom: &str, group: &str, artifact: &str) -> Vec<DepMatch> {
-    let scoped = crate::formats::maven::PomScope::new(pom).and_then(|s| s.dependencies());
-    if let Ok(deps) = scoped {
+/// Read from the pom's [`PomScope`](crate::formats::maven::PomScope)
+/// dependencies when it is readable as one, so a `${property}` groupId /
+/// artifactId the rewriter resolved to the GA (#683) is found again; else
+/// by the raw block scan.
+fn dep_matches(
+    pom: &str,
+    scoped: Option<&[crate::formats::maven::ScopedDep]>,
+    group: &str,
+    artifact: &str,
+) -> Vec<DepMatch> {
+    if let Some(deps) = scoped {
         return deps
-            .into_iter()
+            .iter()
             .filter(|d| {
                 d.group.as_deref() == Some(group) && d.artifact.as_deref() == Some(artifact)
             })
@@ -70,7 +75,7 @@ fn dep_matches(pom: &str, group: &str, artifact: &str) -> Vec<DepMatch> {
                 start: d.element.start,
                 end: d.element.end,
                 version: d.version_inner,
-                version_text: d.version_text,
+                version_text: d.version_text.clone(),
             })
             .collect();
     }
@@ -163,7 +168,8 @@ fn restore_pin(
     let suffixed = format!("{base}-socket.{}", &uuid[..8]);
     let mut text = remove_repository(pom, uuid, ctx)?;
 
-    let matches = dep_matches(&text, group, artifact);
+    let scoped = crate::formats::maven::PomScope::new(&text).and_then(|s| s.dependencies());
+    let matches = dep_matches(&text, scoped.as_deref().ok(), group, artifact);
     if !matches
         .iter()
         .any(|m| m.version_text.as_deref() == Some(suffixed.as_str()))
@@ -172,17 +178,19 @@ fn restore_pin(
             "pom.xml declares no {group}:{artifact} <version>{suffixed}</version>"
         ));
     }
-    // The GA's literal versions where Maven reads them for the main jar:
+    // The GA's suffixed literals where Maven reads them for the main jar:
     // not commented out, outside `<build>` / `<reporting>` / `<profiles>`,
     // no classifier — the same scope the rewriter decides "transitive" by.
+    // A lone one in the authored shape is the rewriter's own entry, even
+    // beside a declaration at the base version: an earlier release added
+    // that entry when it could not read a `${property}` groupId (#683).
     let sections = dm_sections(&text);
     let managed = |pos: usize| sections.iter().any(|(s, e)| pos >= *s && pos < *e);
-    let scoped = crate::formats::maven::PomScope::new(&text).and_then(|s| s.dependencies());
     // In the same scope: a versionless direct declaration with nothing but
     // this pom's own `<dependencyManagement>` to manage it means that entry
     // is the user's (a commented, plugin, profile or classifier sibling is
     // not such a declaration).
-    let (versioned, versionless_direct) = match &scoped {
+    let (pinned, versionless_direct) = match &scoped {
         Ok(deps) => {
             let main = || {
                 deps.iter().filter(|d| {
@@ -193,12 +201,17 @@ fn restore_pin(
                 })
             };
             (
-                main().filter(|d| d.version_inner.is_some()).count(),
+                main()
+                    .filter(|d| d.version_text.as_deref() == Some(suffixed.as_str()))
+                    .count(),
                 main().any(|d| d.version_inner.is_none() && !managed(d.element.start)),
             )
         }
         Err(_) => (
-            matches.iter().filter(|m| m.version.is_some()).count(),
+            matches
+                .iter()
+                .filter(|m| m.version_text.as_deref() == Some(suffixed.as_str()))
+                .count(),
             matches
                 .iter()
                 .any(|m| m.version.is_none() && !managed(m.start)),
@@ -213,7 +226,7 @@ fn restore_pin(
         .iter()
         .filter(|m| m.version_text.as_deref() == Some(suffixed.as_str()))
     {
-        let authored = versioned == 1
+        let authored = pinned == 1
             && !entry_is_users
             && text[m.start..m.end] == authored_dm_block(group, artifact, &suffixed)
             && after_dm_open(&masked, m.start);
@@ -561,6 +574,44 @@ mod tests {
             );
             assert_eq!(after["pom.xml"], input, "{to}");
         }
+    }
+
+    /// A pin an earlier release wrote for a `${property}` groupId (#683):
+    /// it could not read the declaration, so it added a
+    /// `<dependencyManagement>` entry beside the base-version literal. The
+    /// entry is still the rewriter's own and is removed, giving the input
+    /// pom back.
+    #[tokio::test]
+    async fn pre_683_managed_pin_beside_a_property_declaration_is_removed() {
+        let direct = "<dependency>\n      <groupId>ch.qos.logback</groupId>\n      \
+                      <artifactId>logback-classic</artifactId>\n      <version>1.4.14</version>\n    \
+                      </dependency>";
+        let shadowed = "<dependency>\n      <groupId>${g}</groupId>\n      \
+                        <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    \
+                        </dependency>";
+        let with = |pom: String| {
+            assert!(pom.contains(direct));
+            pom.replacen(direct, shadowed, 1).replacen(
+                "  <dependencies>",
+                "  <properties><g>org.slf4j</g></properties>\n  <dependencies>",
+                1,
+            )
+        };
+        let input = with(fixture("transitive-depmgmt", "input", "pom.xml"));
+        let mut tree = vec![(
+            "pom.xml",
+            with(fixture("transitive-depmgmt", "expected", "pom.xml")),
+        )];
+        for rel in [".mvn/maven.config", ".mvn/checksums/checksums.sha256"] {
+            tree.push((rel, fixture("transitive-depmgmt", "expected", rel)));
+        }
+        let (outcome, after) = run(&tree).await;
+        assert!(
+            matches!(outcome.pins[0].status, PinStatus::Restored),
+            "{:?}",
+            outcome.pins[0].status
+        );
+        assert_eq!(after["pom.xml"], input);
     }
 
     /// A versionless sibling Maven does not read for the main jar (in a

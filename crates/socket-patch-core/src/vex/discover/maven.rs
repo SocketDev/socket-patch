@@ -104,7 +104,7 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
-    is_maven_coordinate, is_maven_version_text, may_name, parse_pom, split_socket_version, Pom,
+    is_maven_coordinate, is_maven_version_text, may_shadow, parse_pom, split_socket_version, Pom,
     PomDep, PomRepo,
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
@@ -197,7 +197,8 @@ async fn extract_hosted(
         }
     }
 
-    for ((group, artifact), versions) in gas {
+    for (group, artifact) in gas.keys() {
+        let versions = &ga_versions(&pom.deps, gas, group, artifact);
         let socket_pins: BTreeSet<&str> = versions
             .direct
             .iter()
@@ -214,14 +215,6 @@ async fn extract_hosted(
                 DIAG_REF_INVALID,
                 POM,
                 format!("{POM}: {ga:?} is not a usable Maven groupId:artifactId"),
-            );
-            continue;
-        }
-        if let Some(shadow) = placeholder_shadow(&pom.deps, group, artifact) {
-            out.diag(
-                DIAG_REF_INVALID,
-                POM,
-                placeholder_shadow_detail(shadow, &ga),
             );
             continue;
         }
@@ -502,17 +495,10 @@ async fn extract_vendored(
             );
             continue;
         }
-        if let Some(shadow) = placeholder_shadow(deps, group, artifact) {
-            out.diag(
-                DIAG_REF_INVALID,
-                POM,
-                placeholder_shadow_detail(shadow, &format!("{group}:{artifact}")),
-            );
-            continue;
-        }
         // The vendored repository serves the ORIGINAL GAV; a pom that now
         // pins this GA to another version no longer consumes the artifact.
-        if let Some(versions) = gas.get(&(group.to_string(), artifact.to_string())) {
+        {
+            let versions = ga_versions(deps, gas, group, artifact);
             let effective = if versions.direct.is_empty() {
                 &versions.managed
             } else {
@@ -648,36 +634,46 @@ fn classify_repo(ctx: &DiscoverCtx<'_>, repo: &PomRepo, out: &mut Discovery) -> 
 
 /// Distinct literal versions of one `groupId:artifactId`, split by where
 /// they are declared (profile-scoped declarations excluded).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct GaVersions {
     direct: BTreeSet<String>,
     managed: BTreeSet<String>,
 }
 
-/// A versioned main-jar declaration Maven always reads whose groupId or
-/// artifactId still holds a `${…}` this pom does not define (a parent's or
-/// the build's property), so it may be `group:artifact` (#683). Its own
-/// `<version>` would then decide what Maven resolves, unseen by
-/// [`group_by_ga`], so the GA's wiring is not attested past it.
-fn placeholder_shadow<'a>(deps: &'a [PomDep], group: &str, artifact: &str) -> Option<&'a PomDep> {
-    deps.iter().find(|d| {
-        !d.in_profile
-            && d.classifier.is_none()
-            && d.version.is_some()
-            && (d.group != group || d.artifact != artifact)
-            && may_name(&d.group, group)
-            && may_name(&d.artifact, artifact)
-    })
-}
-
-fn placeholder_shadow_detail(shadow: &PomDep, ga: &str) -> String {
-    format!(
-        "{POM}: {}:{} <version>{}</version> names a property this pom does not define, so it \
-         may be {ga} and its own version may be what Maven resolves",
-        shadow.group,
-        shadow.artifact,
-        shadow.version.as_deref().unwrap_or_default()
-    )
+/// What Maven may resolve for `group:artifact`'s main jar: its own
+/// declarations ([`group_by_ga`]) plus the version of every declaration
+/// Maven always reads whose groupId or artifactId is a property this pom
+/// does not define and may be this GA (#683,
+/// [`may_shadow`](crate::formats::maven::may_shadow)) — its version then
+/// takes part in Maven's precedence, unseen under the literal key.
+fn ga_versions(
+    deps: &[PomDep],
+    gas: &BTreeMap<(String, String), GaVersions>,
+    group: &str,
+    artifact: &str,
+) -> GaVersions {
+    let mut versions = gas
+        .get(&(group.to_string(), artifact.to_string()))
+        .cloned()
+        .unwrap_or_default();
+    for dep in deps.iter().filter(|d| !d.in_profile) {
+        let Some(version) = &dep.version else {
+            continue;
+        };
+        if may_shadow(
+            (&dep.group, &dep.artifact),
+            dep.type_text.as_deref(),
+            dep.classifier.as_deref(),
+            (group, artifact),
+        ) {
+            if dep.managed {
+                versions.managed.insert(version.clone());
+            } else {
+                versions.direct.insert(version.clone());
+            }
+        }
+    }
+    versions
 }
 
 fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
@@ -1401,10 +1397,30 @@ mod tests {
         assert!(
             out.diagnostics
                 .iter()
-                .any(|d| d.detail.contains("${parent.g}:slf4j-api")),
+                .any(|d| d.detail.contains("org.slf4j:slf4j-api") && d.detail.contains("1.7.36")),
             "{:?}",
             out.diagnostics
         );
+
+        // A placeholder that cannot be the GA (a non-jar type, or literal
+        // text around the reference that differs) does not.
+        for other in [
+            "<dependency><groupId>${parent.g}</groupId><artifactId>${bom}</artifactId>\
+             <version>3</version><type>pom</type><scope>import</scope></dependency>",
+            "<dependency><groupId>${parent.g}</groupId><artifactId>${a}-core</artifactId>\
+             <version>3</version></dependency>",
+        ] {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<dependencies>\n{}{other}\n</dependencies>\n<repositories>\n{repo}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                )),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        }
     }
 
     #[tokio::test]
@@ -1662,6 +1678,32 @@ mod tests {
         );
         let out = run(&p).await;
         assert_refs(&out, &[(V_PURL, UUID_A, WiringMode::Vendored)]);
+
+        // #683: a declaration whose groupId is a property this pom does not
+        // define may be the GA. At the vendored version it consumes the
+        // vendored jar; at another version it may not.
+        for (version, attested) in [("1.10.0", true), ("1.11.0", false)] {
+            let p = vendored_project(UUID_A);
+            let text = std::fs::read_to_string(p.root().join("pom.xml")).expect("pom");
+            p.write(
+                "pom.xml",
+                text.replace(
+                    "<groupId>org.apache.commons</groupId>",
+                    "<groupId>${parent.g}</groupId>",
+                )
+                .replace(
+                    "<version>1.10.0</version>",
+                    &format!("<version>{version}</version>"),
+                ),
+            );
+            let out = run(&p).await;
+            if attested {
+                assert_refs(&out, &[(V_PURL, UUID_A, WiringMode::Vendored)]);
+            } else {
+                assert_refs(&out, &[]);
+                assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID], "{version}");
+            }
+        }
     }
 
     /// REGRESSION: the vendored repository is `checksumPolicy=fail`, so the

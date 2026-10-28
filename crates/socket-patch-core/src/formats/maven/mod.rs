@@ -47,6 +47,8 @@ pub(crate) struct PomDep {
     /// The non-empty `<classifier>`: a sibling artifact of the GA (sources,
     /// tests, a native build), managed and resolved apart from the main jar.
     pub(crate) classifier: Option<String>,
+    /// The trimmed `<type>`, when written.
+    pub(crate) type_text: Option<String>,
     /// Inside `<dependencyManagement>`.
     pub(crate) managed: bool,
     pub(crate) in_profile: bool,
@@ -90,8 +92,14 @@ impl PomScope {
         let profiles = elements(&masked, "profiles")?;
         let properties = properties(&masked, &ignored, &profiles)?;
         let mut coordinate_refs = properties.clone();
+        // A `project.*` / `pom.*` reference names the model, whatever a
+        // same-named property says; the deprecated bare form yields to one.
         for (name, value) in model_refs(&masked)? {
-            coordinate_refs.entry(name).or_insert(value);
+            if name.starts_with("project.") || name.starts_with("pom.") {
+                coordinate_refs.insert(name, value);
+            } else {
+                coordinate_refs.entry(name).or_insert(value);
+            }
         }
         Ok(PomScope {
             masked,
@@ -222,6 +230,7 @@ pub(crate) fn parse_pom(raw: &str) -> Result<Pom, String> {
                 .version_text
                 .map(|v| resolve_property(&v, &scope.properties)),
             classifier: dep.classifier,
+            type_text: dep.type_text,
             managed: inside(dep.element.start, &managed),
             in_profile: dep.in_profile,
         });
@@ -282,11 +291,28 @@ fn resolve_property(version: &str, properties: &BTreeMap<String, String>) -> Str
         .unwrap_or_else(|| version.to_string())
 }
 
-/// `text` with every `${name}` the root `<properties>` defines replaced by
-/// its value (one level, no recursion, as Maven interpolates a coordinate
-/// such as `org.${vendor}`); an undefined or malformed reference is kept as
-/// written.
+/// Interpolation rounds before a still-unresolved reference is given up on
+/// (a property defined through another, or a cycle).
+const MAX_INTERPOLATION: usize = 8;
+
+/// `text` with every `${name}` the root `<properties>` or project model
+/// defines replaced by its value, as Maven interpolates a coordinate such as
+/// `org.${vendor}` (a value naming another property is resolved too, up to
+/// [`MAX_INTERPOLATION`] rounds); an undefined or malformed reference is
+/// kept as written.
 fn interpolate(text: &str, properties: &BTreeMap<String, String>) -> String {
+    let mut text = text.to_string();
+    for _ in 0..MAX_INTERPOLATION {
+        let next = interpolate_once(&text, properties);
+        if next == text {
+            break;
+        }
+        text = next;
+    }
+    text
+}
+
+fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find("${") {
@@ -314,9 +340,10 @@ fn interpolate(text: &str, properties: &BTreeMap<String, String>) -> String {
 
 /// The model references a sibling declaration commonly uses
 /// (`${project.groupId}`, `${pom.version}`, the deprecated bare
-/// `${groupId}`), read from the project's own `<groupId>` / `<artifactId>`
-/// / `<version>`; groupId and version fall back to the `<parent>`'s, which
-/// the project inherits when it omits them.
+/// `${groupId}`, `${project.parent.groupId}`), read from the project's own
+/// `<groupId>` / `<artifactId>` / `<version>` and its `<parent>`'s; groupId
+/// and version fall back to the parent's, which the project inherits when
+/// it omits them.
 fn model_refs(masked: &str) -> Result<BTreeMap<String, String>, String> {
     let Some(project) = elements(masked, "project")?.into_iter().next() else {
         return Ok(BTreeMap::new());
@@ -341,15 +368,22 @@ fn model_refs(masked: &str) -> Result<BTreeMap<String, String>, String> {
     ] {
         own = blank_elements(&own, section)?;
     }
+    let usable = |v: Option<String>| v.filter(|v| !v.is_empty() && !v.contains("${"));
     let mut refs = BTreeMap::new();
     for (field, inherited) in [("groupId", true), ("artifactId", false), ("version", true)] {
-        let value = match child_text(&own, field)? {
+        let parent_value = usable(parent_text(field)?);
+        let value = match usable(child_text(&own, field)?) {
             Some(v) => Some(v),
-            None if inherited => parent_text(field)?,
+            None if inherited => parent_value.clone(),
             None => None,
         };
-        if let Some(value) = value.filter(|v| !v.is_empty() && !v.contains("${")) {
+        if let Some(value) = value {
             for prefix in ["project.", "pom.", ""] {
+                refs.insert(format!("{prefix}{field}"), value.clone());
+            }
+        }
+        if let Some(value) = parent_value {
+            for prefix in ["project.parent.", "pom.parent.", "parent."] {
                 refs.insert(format!("{prefix}{field}"), value.clone());
             }
         }
@@ -391,6 +425,25 @@ pub(crate) fn may_name(coordinate: &str, want: &str) -> bool {
         }
     }
     true
+}
+
+/// Whether a declaration Maven always reads (outside `<profiles>` when
+/// `in_profile` is false) whose coordinates are not `group:artifact` as
+/// written may still be that GA's main jar through an undefined coordinate
+/// property (#683): a jar-typed (or untyped), classifier-less declaration
+/// whose coordinates [`may_name`] it. The hosted rewriter and VEX share this
+/// rule, so what one pins the other attests.
+pub(crate) fn may_shadow(
+    (dep_group, dep_artifact): (&str, &str),
+    type_text: Option<&str>,
+    classifier: Option<&str>,
+    (group, artifact): (&str, &str),
+) -> bool {
+    (dep_group != group || dep_artifact != artifact)
+        && classifier.is_none()
+        && type_text.is_none_or(|t| t == "jar")
+        && may_name(dep_group, group)
+        && may_name(dep_artifact, artifact)
 }
 
 fn is_property_name(name: &str) -> bool {
@@ -496,6 +549,36 @@ mod tests {
         assert!(!super::may_name("${a}-core", "slf4j-api"));
         assert!(!super::may_name("x-${a}", "slf4j-api"));
         assert!(!super::may_name("sl${a}api-${b}x", "slf4j-api"));
+
+        // A property defined through another, the parent's coordinates,
+        // and the model winning over a same-named property.
+        let pom = "<project><parent><groupId>org.parent</groupId></parent><groupId>com.acme</groupId>\
+                   <properties><base>org.slf4j</base><g>${base}</g><project.groupId>org.slf4j</project.groupId></properties>\
+                   <dependencies>\
+                   <dependency><groupId>${g}</groupId><artifactId>a</artifactId></dependency>\
+                   <dependency><groupId>${project.parent.groupId}</groupId><artifactId>b</artifactId></dependency>\
+                   <dependency><groupId>${project.groupId}</groupId><artifactId>c</artifactId></dependency>\
+                   </dependencies></project>";
+        let deps = PomScope::new(pom).unwrap().dependencies().unwrap();
+        let groups: Vec<_> = deps.iter().map(|d| d.group.as_deref().unwrap()).collect();
+        assert_eq!(groups, ["org.slf4j", "org.parent", "com.acme"]);
+
+        let ga = ("org.slf4j", "slf4j-api");
+        assert!(super::may_shadow(("${g}", "slf4j-api"), None, None, ga));
+        assert!(super::may_shadow(
+            ("${g}", "slf4j-api"),
+            Some("jar"),
+            None,
+            ga
+        ));
+        assert!(!super::may_shadow(("${g}", "${b}"), Some("pom"), None, ga));
+        assert!(!super::may_shadow(
+            ("${g}", "slf4j-api"),
+            None,
+            Some("tests"),
+            ga
+        ));
+        assert!(!super::may_shadow(ga, None, None, ga));
     }
 
     #[test]
