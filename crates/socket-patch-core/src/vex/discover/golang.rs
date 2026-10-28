@@ -165,7 +165,7 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bo
         .any(|e| e.owner == Some(ReplaceOwner::Hosted));
     let mut graph = Graph {
         required,
-        mains: Some(vec![MainModule::new(go_mod.as_deref().unwrap_or_default())]),
+        mains: vec![MainModule::new(go_mod.as_deref().unwrap_or_default())],
         workspace: go_work.is_some(),
     };
     let mut sums = SumPins::default();
@@ -191,9 +191,8 @@ struct Graph {
     /// as a root-only reader can tell).
     required: HashMap<String, String>,
     /// The main modules: the root module, or every readable in-root
-    /// `go.work` `use` member. `None` when a member is outside the root or
-    /// unreadable.
-    mains: Option<Vec<MainModule>>,
+    /// `go.work` `use` member.
+    mains: Vec<MainModule>,
     /// A `go.work` is in effect.
     workspace: bool,
 }
@@ -221,7 +220,7 @@ impl Graph {
     /// module past every `require` and sum line discovery reads. Only a
     /// higher version in that evidence proves the replace inert.
     fn select(&self, module: &str, version: &str, zips: &[&str]) -> Selection {
-        let mains = self.mains.as_deref().unwrap_or_default();
+        let mains = &self.mains;
         let required = mains
             .iter()
             .filter_map(|m| m.required.get(module).map(String::as_str))
@@ -241,19 +240,20 @@ impl Graph {
 
 /// The `use` members of `go.work` as main modules, and the sum files go
 /// verifies against in workspace mode: `go.work.sum` and each member's
-/// `go.sum` (the root's only when `.` is a member). The main modules are
-/// `None` when a member's go.mod is outside the root or unreadable.
+/// `go.sum` (the root's only when `.` is a member). A member whose go.mod
+/// is outside the root or unreadable adds no main module; the others still
+/// count, since in a workspace their `require`s only ever prove a replace
+/// inert, never selected.
 async fn read_workspace(
     ctx: &DiscoverCtx<'_>,
     out: &mut Discovery,
     go_mod: Option<&str>,
     go_work: &str,
-) -> (Option<Vec<MainModule>>, Vec<String>) {
-    let mut mains = Some(Vec::new());
+) -> (Vec<MainModule>, Vec<String>) {
+    let mut mains = Vec::new();
     let mut files = vec![GO_WORK_SUM.to_string()];
     for dir in go_mod_edit::parse_use_dirs(go_work) {
         let Some(dir) = member_dir(&dir) else {
-            mains = None;
             continue;
         };
         let text = if dir.is_empty() {
@@ -265,10 +265,8 @@ async fn read_workspace(
                 None => None,
             }
         };
-        match (text, mains.as_mut()) {
-            (Some(text), Some(mains)) => mains.push(MainModule::new(&text)),
-            (Some(_), None) => {}
-            (None, _) => mains = None,
+        if let Some(text) = text {
+            mains.push(MainModule::new(&text));
         }
         let sum = member_file(&dir, GO_SUM);
         if !files.contains(&sum) {
@@ -1216,6 +1214,41 @@ mod tests {
                 );
                 assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
             }
+        }
+    }
+
+    /// A member that cannot be read (outside the root, or missing its
+    /// go.mod) does not hide another member's higher require.
+    #[tokio::test]
+    async fn workspace_unreadable_member_keeps_other_members_requires() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        for extra in ["../outside", "./missing"] {
+            let p = Project::new();
+            p.write("go.mod", BASE_GO_MOD)
+                .write(
+                    "go.work",
+                    format!(
+                        "go 1.21\n\nuse (\n\t.\n\t{extra}\n\t./svc\n)\n\nreplace {MODULE} {VERSION} => {m} {sver}\n"
+                    ),
+                )
+                .write(
+                    "go.work.sum",
+                    format!("{m} {sver} {ZIP_H1}\n{m} {sver}/go.mod {MOD_H1}\n"),
+                )
+                .write(
+                    "svc/go.mod",
+                    format!("module example.com/svc\n\ngo 1.21\n\nrequire {MODULE} v1.5.0\n"),
+                );
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.code == DIAG_REF_INVALID && d.detail.contains("selects v1.5.0")),
+                "{extra}: {:?}",
+                out.diagnostics
+            );
         }
     }
 
