@@ -32,11 +32,14 @@ use std::process::{Command, Output};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "common/envelope.rs"]
+mod envelope;
 #[path = "golang_e2e_matrix/mod.rs"]
 mod golang_e2e_matrix;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
+use envelope::warning_codes;
 use golang_e2e_matrix::{manifestless_vex, ManifestlessGo};
 use vex_e2e_common::{binary, git_sha256, hermetic, patch_view, Marker, VexVia};
 
@@ -841,15 +844,6 @@ fn unique() -> usize {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
     N.fetch_add(1, Ordering::Relaxed)
-}
-
-fn warning_codes(env: &serde_json::Value) -> Vec<String> {
-    env["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|w| w["code"].as_str().map(str::to_string))
-        .collect()
 }
 
 fn read(path: &Path) -> String {
