@@ -295,15 +295,23 @@ fn resolve_property(version: &str, properties: &BTreeMap<String, String>) -> Str
 /// (a property defined through another, or a cycle).
 const MAX_INTERPOLATION: usize = 8;
 
+/// Longest text interpolation builds. A real coordinate is far shorter; a
+/// pom whose properties each name the previous one many times would
+/// otherwise grow exponentially with every round ("billion laughs").
+const MAX_INTERPOLATED_LEN: usize = 1024;
+
 /// `text` with every `${name}` the root `<properties>` or project model
 /// defines replaced by its value, as Maven interpolates a coordinate such as
 /// `org.${vendor}` (a value naming another property is resolved too, up to
 /// [`MAX_INTERPOLATION`] rounds); an undefined or malformed reference is
-/// kept as written.
+/// kept as written, and a round that would exceed [`MAX_INTERPOLATED_LEN`]
+/// is not taken, leaving its references unresolved (which fails closed).
 fn interpolate(text: &str, properties: &BTreeMap<String, String>) -> String {
     let mut text = text.to_string();
     for _ in 0..MAX_INTERPOLATION {
-        let next = interpolate_once(&text, properties);
+        let Some(next) = interpolate_once(&text, properties) else {
+            break;
+        };
         if next == text {
             break;
         }
@@ -312,10 +320,15 @@ fn interpolate(text: &str, properties: &BTreeMap<String, String>) -> String {
     text
 }
 
-fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> String {
+/// One round of [`interpolate`], or `None` once the result would exceed
+/// [`MAX_INTERPOLATED_LEN`].
+fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find("${") {
+        if out.len() > MAX_INTERPOLATED_LEN {
+            return None;
+        }
         out.push_str(&rest[..open]);
         let after = &rest[open + 2..];
         match after
@@ -335,7 +348,7 @@ fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> String
         }
     }
     out.push_str(rest);
-    out
+    (out.len() <= MAX_INTERPOLATED_LEN).then_some(out)
 }
 
 /// The model references a sibling declaration commonly uses
@@ -536,6 +549,32 @@ mod tests {
     /// #683: a coordinate property the pom defines, or a project model
     /// reference, is resolved; an undefined one may name only what its
     /// literal text around it allows.
+    #[test]
+    fn exponential_property_expansion_is_capped() {
+        // Each property names the previous one 40 times: uncapped, `${p6}`
+        // would expand to 40^6 bytes.
+        let mut props = String::from("<p0>x</p0>");
+        for i in 1..=6 {
+            props.push_str(&format!(
+                "<p{i}>{}</p{i}>",
+                format!("${{p{}}}", i - 1).repeat(40)
+            ));
+        }
+        let pom = format!(
+            "<project><groupId>${{p6}}</groupId><properties>{props}</properties><dependencies>\
+             <dependency><groupId>${{p6}}</groupId><artifactId>a</artifactId><version>1</version></dependency>\
+             </dependencies></project>"
+        );
+        let deps = PomScope::new(&pom).unwrap().dependencies().unwrap();
+        let group = deps[0].group.as_deref().unwrap();
+        assert!(
+            group.len() <= super::MAX_INTERPOLATED_LEN,
+            "{}",
+            group.len()
+        );
+        assert!(group.contains("${"), "left unresolved, so it fails closed");
+    }
+
     #[test]
     fn coordinate_references() {
         let pom = "<project><parent><groupId>org.parent</groupId><version>9</version></parent>\
