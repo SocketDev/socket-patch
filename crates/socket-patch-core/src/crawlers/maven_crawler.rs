@@ -13,6 +13,8 @@ use crate::utils::fs::is_dir;
 use crate::vendor::jvm::layout::{self, BuildTool};
 
 #[cfg(test)]
+mod local_repo_tests;
+#[cfg(test)]
 mod oracle;
 #[cfg(test)]
 mod scala_cache_tests;
@@ -541,8 +543,8 @@ pub struct JvmEnv {
 }
 
 impl JvmEnv {
-    /// The caches of this process: `$MAVEN_REPO_LOCAL` / `$M2_HOME` /
-    /// `~/.m2`, and [`gradle_cache::home_from_process_env`].
+    /// The caches of this process: the Maven local repository
+    /// ([`m2_repo_path_with`]), and [`gradle_cache::home_from_process_env`].
     pub fn from_process() -> Self {
         Self {
             m2_repo: MavenCrawler::m2_repo_path(),
@@ -554,7 +556,7 @@ impl JvmEnv {
     /// the passwd entry's), which Gradle prefers to `$HOME`.
     pub fn resolve(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Self {
         Self {
-            m2_repo: m2_repo_path_with(env, home_dir),
+            m2_repo: m2_repo_path_with(env, os, home_dir),
             gradle: GradleHome::resolve(env, os, home_dir),
         }
     }
@@ -594,28 +596,122 @@ pub fn is_ro_root(path: &Path) -> bool {
     JvmEnv::from_process().is_ro_root(path)
 }
 
-/// The Maven local repository `env` names: `$MAVEN_REPO_LOCAL`, else
-/// `$M2_HOME/repository`, else `<home>/.m2/repository` with `<home>` =
-/// `$HOME`, `$USERPROFILE` or `home_dir`, the first that is set and rooted
-/// ([`crate::utils::fs::home_from_env`]). A set-but-empty variable counts
-/// as unset (see [`MavenCrawler::m2_repo_path`]). `None` when there is no
-/// usable home: a relative or literal `~` would resolve against the working
-/// directory and treat a `~/.m2` inside the scanned project as the user's
-/// local repository (B66).
-pub fn m2_repo_path_with(env: &dyn Env, home_dir: Option<&Path>) -> Option<PathBuf> {
+/// The Maven local repository `env` names, in Maven's own order (#423):
+///
+/// 1. `$MAVEN_REPO_LOCAL` (socket-patch's override);
+/// 2. `-Dmaven.repo.local` in `$MAVEN_ARGS`, then `$MAVEN_OPTS`;
+/// 3. `<localRepository>` in the user settings
+///    (`<user.home>/.m2/settings.xml`), then in the global settings
+///    (`conf/settings.xml` under `$MAVEN_HOME`, else `$M2_HOME`);
+/// 4. `<user.home>/.m2/repository`.
+///
+/// `M2_HOME` is the Maven install, never a local repository. `user.home`
+/// is `-Duser.home` in `$MAVEN_OPTS`, else the JVM's: on Windows the
+/// profile directory (`$USERPROFILE`, else `$HOME`, else `home_dir`),
+/// elsewhere `$HOME`, `$USERPROFILE` or `home_dir`, the first that is set
+/// and rooted ([`crate::utils::fs::home_from_env`]). A set-but-empty
+/// variable counts as unset (see [`MavenCrawler::m2_repo_path`]). A
+/// relative or unresolvable location (an undefined `${…}`) is skipped: it
+/// would resolve against whatever directory Maven runs in, not ours. `None`
+/// when nothing names a repository and there is no usable home: a relative
+/// or literal `~` would resolve against the working directory and treat a
+/// `~/.m2` inside the scanned project as the user's local repository (B66).
+pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Option<PathBuf> {
+    use crate::gradle::home::system_property;
+    use crate::utils::fs::is_usable_home;
+
     let set = |k: &str| env.var(k).filter(|v| !v.is_empty());
     if let Some(repo_local) = set("MAVEN_REPO_LOCAL") {
         return Some(PathBuf::from(repo_local));
     }
-    if let Some(m2_home) = set("M2_HOME") {
-        return Some(PathBuf::from(m2_home).join("repository"));
+    // Later sources override earlier ones on the JVM: command-line `-D`s
+    // (MAVEN_ARGS) are set over the launcher's MAVEN_OPTS.
+    let property = |name: &str| {
+        ["MAVEN_ARGS", "MAVEN_OPTS"].iter().find_map(|k| {
+            set(k)
+                .and_then(|opts| system_property(&opts, name, os))
+                .filter(|v| !v.is_empty())
+        })
+    };
+    let user_home = property("user.home")
+        .map(PathBuf::from)
+        .filter(|h| is_usable_home(h))
+        .or_else(|| match os {
+            Os::Windows => ["USERPROFILE", "HOME"]
+                .iter()
+                .filter_map(|k| set(k).map(PathBuf::from))
+                .find(|h| is_usable_home(h)),
+            Os::Unix => crate::utils::fs::home_from_env(|k| set(k).map(Into::into)),
+        })
+        .or_else(|| {
+            home_dir
+                .filter(|h| is_usable_home(h))
+                .map(Path::to_path_buf)
+        });
+    if let Some(repo) = property("maven.repo.local")
+        .map(PathBuf::from)
+        .filter(|p| p.has_root())
+    {
+        return Some(repo);
     }
-    let home = crate::utils::fs::home_from_env(|k| set(k).map(Into::into)).or_else(|| {
-        home_dir
-            .filter(|h| crate::utils::fs::is_usable_home(h))
-            .map(Path::to_path_buf)
-    })?;
-    Some(home.join(".m2").join("repository"))
+    let maven_home = set("MAVEN_HOME").or_else(|| set("M2_HOME"));
+    let settings_files = [
+        user_home
+            .as_ref()
+            .map(|h| h.join(".m2").join("settings.xml")),
+        maven_home.map(|m| PathBuf::from(m).join("conf").join("settings.xml")),
+    ];
+    let lookup = |name: &str| match name {
+        "user.home" => user_home.as_ref().map(|h| h.display().to_string()),
+        _ => match name.strip_prefix("env.") {
+            Some(var) => set(var),
+            None => property(name),
+        },
+    };
+    for path in settings_files.into_iter().flatten() {
+        if let Some(repo) = settings_local_repository(&path, &lookup) {
+            return Some(repo);
+        }
+    }
+    Some(user_home?.join(".m2").join("repository"))
+}
+
+/// The `<localRepository>` a Maven `settings.xml` at `path` names, with
+/// `${…}` placeholders resolved through `lookup`. `None` when the file is
+/// missing, unreadable or not well formed where it matters, sets no
+/// `<localRepository>`, or names a relative or unresolvable location.
+fn settings_local_repository(
+    path: &Path,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    use crate::formats::xml;
+
+    let raw = std::fs::read_to_string(path).ok()?;
+    let text = xml::blank_non_markup(&raw).ok()?;
+    let settings = *xml::elements(&text, "settings").ok()?.first()?;
+    let value = xml::children(&text, &settings, "localRepository")
+        .ok()?
+        .first()?
+        .inner(&text)
+        .trim()
+        .to_string();
+    let repo = PathBuf::from(interpolate(&value, lookup)?);
+    repo.has_root().then_some(repo)
+}
+
+/// `text` with every `${name}` replaced by `lookup(name)`; `None` when one
+/// is undefined or unterminated.
+fn interpolate(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let end = rest[at..].find('}')? + at;
+        out.push_str(&lookup(&rest[at + 2..end])?);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// A `--global-prefix` as the cache root it names: a Gradle user home
@@ -1103,7 +1199,7 @@ impl MavenCrawler {
 
     /// Get the Maven local repository path.
     ///
-    /// Checks `$MAVEN_REPO_LOCAL`, `$M2_HOME/repository`, `$HOME/.m2/repository`.
+    /// See [`m2_repo_path_with`] for the order Maven itself uses.
     ///
     /// A set-but-EMPTY variable counts as unset. `std::env::var` yields
     /// `Ok("")` for `export MAVEN_REPO_LOCAL="$M2"` with `$M2` undefined —
@@ -1122,7 +1218,7 @@ impl MavenCrawler {
     /// Same rule as `nuget_home()`, `deno_dir()`, `go_crawler`'s
     /// `get_gomodcache`, and `utils::fs::home_dir`.
     fn m2_repo_path() -> Option<PathBuf> {
-        m2_repo_path_with(&gradle_cache::ProcessEnv, None)
+        m2_repo_path_with(&gradle_cache::ProcessEnv, Os::current(), None)
     }
 
     /// Scan a Maven repository directory and return all valid packages found.
@@ -2414,22 +2510,27 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect()
         };
-        assert_eq!(m2_repo_path_with(&env(&[]), None), None);
-        assert_eq!(m2_repo_path_with(&env(&[("HOME", "")]), None), None);
-        assert_eq!(m2_repo_path_with(&env(&[("HOME", "~")]), None), None);
+        let m2_repo_path_with_unix =
+            |e: &HashMap<String, String>, h| m2_repo_path_with(e, Os::Unix, h);
+        assert_eq!(m2_repo_path_with_unix(&env(&[]), None), None);
+        assert_eq!(m2_repo_path_with_unix(&env(&[("HOME", "")]), None), None);
+        assert_eq!(m2_repo_path_with_unix(&env(&[("HOME", "~")]), None), None);
         assert_eq!(
-            m2_repo_path_with(&env(&[("HOME", "rel/home")]), Some(Path::new("also-rel"))),
+            m2_repo_path_with_unix(&env(&[("HOME", "rel/home")]), Some(Path::new("also-rel"))),
             None
         );
         let abs = std::env::temp_dir();
         let abs_s = abs.to_str().unwrap();
         let want = Some(abs.join(".m2").join("repository"));
         assert_eq!(
-            m2_repo_path_with(&env(&[("HOME", "rel"), ("USERPROFILE", abs_s)]), None),
+            m2_repo_path_with_unix(&env(&[("HOME", "rel"), ("USERPROFILE", abs_s)]), None),
             want
         );
-        assert_eq!(m2_repo_path_with(&env(&[("HOME", "~")]), Some(&abs)), want);
-        assert_eq!(m2_repo_path_with(&env(&[("HOME", abs_s)]), None), want);
+        assert_eq!(
+            m2_repo_path_with_unix(&env(&[("HOME", "~")]), Some(&abs)),
+            want
+        );
+        assert_eq!(m2_repo_path_with_unix(&env(&[("HOME", abs_s)]), None), want);
     }
 
     #[test]
@@ -2442,15 +2543,19 @@ mod tests {
         // Maven patch was skipped — while Maven itself would have used the
         // default local repo. Empty must fall through, exactly as
         // `nuget_home()` treats an empty `NUGET_PACKAGES`.
-        let m2_home = tempfile::tempdir().unwrap();
+        let repo_local = tempfile::tempdir().unwrap();
         let _local = EnvGuard::set("MAVEN_REPO_LOCAL", "");
-        let _m2 = EnvGuard::set("M2_HOME", m2_home.path().to_str().unwrap());
+        let _args = EnvGuard::unset("MAVEN_ARGS");
+        let _opts = EnvGuard::set(
+            "MAVEN_OPTS",
+            &format!("-Dmaven.repo.local={}", repo_local.path().display()),
+        );
 
         let repo = MavenCrawler::m2_repo_path();
         assert_eq!(
             repo,
-            Some(m2_home.path().join("repository")),
-            "empty MAVEN_REPO_LOCAL must fall through to the M2_HOME arm, got {repo:?}"
+            Some(repo_local.path().to_path_buf()),
+            "empty MAVEN_REPO_LOCAL must fall through to -Dmaven.repo.local, got {repo:?}"
         );
     }
 
@@ -2464,6 +2569,9 @@ mod tests {
         // directory inside the user's own project. Same CWD-relative hazard
         // the `utils::fs::home_dir` and `go_crawler` empty-HOME fixes closed.
         let _local = EnvGuard::unset("MAVEN_REPO_LOCAL");
+        let _args = EnvGuard::unset("MAVEN_ARGS");
+        let _opts = EnvGuard::unset("MAVEN_OPTS");
+        let _maven_home = EnvGuard::unset("MAVEN_HOME");
         let _m2 = EnvGuard::set("M2_HOME", "");
 
         let repo = MavenCrawler::m2_repo_path();

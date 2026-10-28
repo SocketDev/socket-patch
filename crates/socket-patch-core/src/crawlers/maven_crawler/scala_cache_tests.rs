@@ -260,6 +260,9 @@ impl Hermetic {
             "LOCALAPPDATA",
             "JAVA_OPTS",
             "M2_HOME",
+            "MAVEN_HOME",
+            "MAVEN_OPTS",
+            "MAVEN_ARGS",
             "GRADLE_OPTS",
             "GRADLE_RO_DEP_CACHE",
         ];
