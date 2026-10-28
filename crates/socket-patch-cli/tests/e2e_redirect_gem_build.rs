@@ -2033,6 +2033,31 @@ struct GenerationGem {
     gem: Vec<u8>,
 }
 
+/// The `sha512-<base64>` SRI string of `bytes`.
+fn sri(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes))
+    )
+}
+
+/// The stub gemspec `gem spec --ruby` derives from a built `.gem`.
+fn stub_gemspec(gem: &[u8]) -> Vec<u8> {
+    let file = tempfile::Builder::new().suffix(".gem").tempfile().unwrap();
+    std::fs::write(file.path(), gem).unwrap();
+    let mut spec = Command::new("gem");
+    spec.args(["spec", file.path().to_str().unwrap(), "--ruby"]);
+    cache_env::isolate(&mut spec);
+    let stub = spec.output().expect("failed to run gem spec");
+    assert!(
+        stub.status.success(),
+        "gem spec --ruby:\n{}",
+        String::from_utf8_lossy(&stub.stderr)
+    );
+    stub.stdout
+}
+
 /// Layer a new patch generation over the fixture's API mocks (wiremock
 /// serves the lowest `priority` first): the batch, by-package, reference and
 /// view routes answer with `gems`, and each uuid gets its own patch-registry
@@ -2116,29 +2141,35 @@ async fn mount_patch_generation(server: &MockServer, priority: u8, gems: &[Gener
         .with_priority(priority)
         .mount(server)
         .await;
-    let results: serde_json::Map<String, serde_json::Value> = gems
-        .iter()
-        .map(|g| {
-            let sha = sha256_hex(&g.gem);
-            let hosted_url = format!(
-                "{}/patch/gem/{}/{DEP_VERSION}/{TOKEN}/{}/{}-{DEP_VERSION}.gem",
-                server.uri(),
-                g.name,
-                g.uuid,
-                g.name
-            );
-            let index_url = format!("{}/patch-registry/gem/{TOKEN}/{}/", server.uri(), g.uuid);
-            (
-                g.uuid.to_string(),
-                serde_json::json!({
-                    "status": "granted",
-                    "url": hosted_url,
-                    "purl": purl(g),
-                    "artifacts": [{
-                        "kind": "tarball",
-                        "url": hosted_url,
-                        "integrity": { "sha256": sha }
-                    }],
+    // The vendored half of each grant: the patched `.gem` and its stub
+    // gemspec, so a hosted → vendored eject can fetch both.
+    let mut results = serde_json::Map::new();
+    for g in gems {
+        let sha = sha256_hex(&g.gem);
+        let hosted_url = format!(
+            "{}/patch/gem/{}/{DEP_VERSION}/{TOKEN}/{}/{}-{DEP_VERSION}.gem",
+            server.uri(),
+            g.name,
+            g.uuid,
+            g.name
+        );
+        let index_url = format!("{}/patch-registry/gem/{TOKEN}/{}/", server.uri(), g.uuid);
+        let stub = stub_gemspec(&g.gem);
+        let base = format!("/artifacts/{}", g.uuid);
+        let gem_url = format!("{}{base}/{}-{DEP_VERSION}.gem", server.uri(), g.name);
+        let stub_url = format!("{}{base}/{}-{DEP_VERSION}.gemspec", server.uri(), g.name);
+        results.insert(
+            g.uuid.to_string(),
+            serde_json::json!({
+                "status": "granted",
+                "url": hosted_url,
+                "purl": purl(g),
+                "artifacts": [
+                    { "kind": "tarball", "url": gem_url,
+                      "integrity": { "sha512": sri(&g.gem), "sha256": sha } },
+                    { "kind": "gem-stub-gemspec", "url": stub_url,
+                      "integrity": { "sha512": sri(&stub) } }
+                ],
                     "registryOverride": {
                         "kind": "rubygems-compact-index",
                         "indexUrl": index_url,
@@ -2148,10 +2179,19 @@ async fn mount_patch_generation(server: &MockServer, priority: u8, gems: &[Gener
                             "gemChecksumSha256": sha,
                         }
                     }
-                }),
-            )
-        })
-        .collect();
+            }),
+        );
+        for (leaf, bytes) in [
+            (format!("{}-{DEP_VERSION}.gem", g.name), g.gem.clone()),
+            (format!("{}-{DEP_VERSION}.gemspec", g.name), stub),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("{base}/{leaf}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(server)
+                .await;
+        }
+    }
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/package")))
         .respond_with(
@@ -2492,6 +2532,85 @@ async fn gem_hosted_two_gems_rescan_supersede_and_attest() {
         String::from_utf8_lossy(&frozen.stdout),
         String::from_utf8_lossy(&frozen.stderr)
     );
+
+    // The hosted → vendored eject (#1648) reads the same wiring: it takes
+    // both gems instead of refusing the merged section as contested.
+    let upstream = format!("{api}/upstream");
+    let eject = |extra: &[&str]| {
+        let mut argv = vec!["vendor", "--json"];
+        argv.extend_from_slice(extra);
+        argv.extend([
+            "--cwd",
+            fx.proj.to_str().unwrap(),
+            "--api-url",
+            &api,
+            "--patch-server-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ]);
+        let (code, stdout, stderr) =
+            run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+        assert_eq!(code, 0, "vendor {extra:?}: {stdout}\nstderr:\n{stderr}");
+        let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        for purl in [PURL.to_string(), format!("pkg:gem/{TRANSITIVE}@1.0.0")] {
+            assert!(
+                env["events"]
+                    .as_array()
+                    .is_some_and(|e| e.iter().any(|e| e["purl"] == purl.as_str())),
+                "vendor {extra:?} takes {purl}: {env}"
+            );
+        }
+    };
+    eject(&["--dry-run"]);
+    assert_eq!(std::fs::read_to_string(&gemfile_path).unwrap(), gemfile);
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock);
+    eject(&["--yes"]);
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    assert!(
+        !gemfile.contains("/patch-registry/") && !lock.contains("/patch-registry/"),
+        "the eject leaves no hosted remote:\n{gemfile}\n{lock}"
+    );
+    // A cold checkout of the vendored pair installs frozen and loads both
+    // patched gems.
+    let fresh = stage_fresh_checkout(&fx, "two-gems-ejected-frozen");
+    let frozen = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        frozen.status.success(),
+        "frozen install of the ejected pair:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&frozen.stdout),
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    let gen3_lib = patched_lib().replace("PATCHED", "PATCHED-GEN3");
+    for (name, lib, want) in [
+        (DEP, "vuln_gem.rb", &gen3_lib),
+        (TRANSITIVE, "tiny_dep.rb", &tiny_patched),
+    ] {
+        let loaded = bundle(
+            &fresh,
+            &[
+                "exec",
+                "ruby",
+                "-e",
+                "print File.read(File.join(Gem.loaded_specs[ARGV[0]].full_gem_path, 'lib', ARGV[1]))",
+                name,
+                lib,
+            ],
+        );
+        assert!(
+            loaded.status.success(),
+            "bundle exec loads {name}:\n{}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&loaded.stdout),
+            *want,
+            "{name} loads its patched bytes"
+        );
+    }
 }
 
 /// #1626: on a lock with no CHECKSUMS section, a superseding hosted
@@ -4150,8 +4269,6 @@ async fn gem_hosted_unwind_names_a_patched_archive_in_vendor_cache() {
 /// hosted registry override. Priority 1, so it answers every later
 /// `patches/package` call in place of the hosted-only grant.
 async fn mount_vendored_grant(fx: &RedirectFixture) {
-    use base64::Engine as _;
-    use sha2::Sha512;
     let server = &fx._server;
     let gem_path = fx
         .tmp
@@ -4160,22 +4277,7 @@ async fn mount_vendored_grant(fx: &RedirectFixture) {
         .join(format!("{DEP}-src"))
         .join(format!("{DEP}-{DEP_VERSION}.gem"));
     let gem = std::fs::read(&gem_path).expect("the patched .gem from build_gem");
-    let mut spec = Command::new("gem");
-    spec.args(["spec", gem_path.to_str().unwrap(), "--ruby"]);
-    cache_env::isolate(&mut spec);
-    let stub = spec.output().expect("failed to run gem spec");
-    assert!(
-        stub.status.success(),
-        "gem spec --ruby:\n{}",
-        String::from_utf8_lossy(&stub.stderr)
-    );
-    let stub = stub.stdout;
-    let sri = |bytes: &[u8]| {
-        format!(
-            "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
-        )
-    };
+    let stub = stub_gemspec(&gem);
     let base = format!("/artifacts/{UUID}");
     let gem_url = format!("{}{base}/{DEP}-{DEP_VERSION}.gem", server.uri());
     let stub_url = format!("{}{base}/{DEP}-{DEP_VERSION}.gemspec", server.uri());
