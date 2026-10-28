@@ -506,7 +506,21 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
     );
 
     // #534: `b`'s `<relativePath>../corp-parent</relativePath>` names a
-    // directory; `vendor --check` reads it as Maven does.
+    // directory; `vex` and `vendor --check` read it as Maven does.
+    let (code, doc, stderr) = socket_in(
+        &proj,
+        &m2,
+        None,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--product",
+            "pkg:maven/com.example/aggregator@1.0.0",
+        ],
+    );
+    assert_eq!(code, Some(0), "vex: {doc}\n{stderr}");
+    assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
     let (code, env, stderr) = socket_in(
         &proj,
         &m2,
