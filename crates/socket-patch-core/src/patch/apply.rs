@@ -4081,7 +4081,9 @@ mod tests {
 
     /// Regression (#1756): a superseding patch replaces an earlier Socket
     /// patch npm installed in its LF-shebang form, as it replaces the
-    /// earlier patch's exact bytes.
+    /// earlier patch's exact bytes. (On Windows npm leaves bins alone, so
+    /// the patch's exact bytes are written.)
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn socket_content_policy_knows_npm_fixed_socket_blob() {
         let files = crlf_bin_files();
