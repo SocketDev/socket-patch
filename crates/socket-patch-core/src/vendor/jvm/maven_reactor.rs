@@ -1881,14 +1881,13 @@ fn local_parent_of(
         parent.artifact.clone(),
         parent.version.clone(),
     );
-    let candidates = [
-        path.clone(),
-        if path.is_empty() {
-            "pom.xml".to_string()
-        } else {
-            format!("{path}/pom.xml")
-        },
-    ];
+    // Like a `<module>`: Maven reads a directory as its `pom.xml`, and `..`
+    // normalizes to the root itself (#534).
+    let candidates = if path.is_empty() {
+        vec!["pom.xml".to_string()]
+    } else {
+        vec![format!("{path}/pom.xml"), path]
+    };
     let Some(parent_rel) = candidates
         .into_iter()
         .find(|c| poms.contains_key(c) || read(c).is_some())
