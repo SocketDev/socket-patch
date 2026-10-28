@@ -1514,12 +1514,13 @@ and `go.sum`: the `require` line in a go 1.17+ module, or, in an older module
 the highest of the required version and the versions `go.sum` has a module
 zip line for. `apply` and `scan --mode hosted` refuse to write a replace for
 any other version. In a workspace the build takes the highest version any
-`use` member selects, so `apply`, `vendor`, `apply --check` and `vex` read
-every member's `go.mod` and `go.sum` too: a member that requires a newer
-version makes a replace pinned to the older one inert. `scan --mode hosted`
-still reads only the module it runs in (#1753). After an upgrade such as `go get M@v1.0.1`, `apply --check`
-fails and `vex` leaves the patch out (`go_version_not_selected`) until you
-get a patch for the new version.
+`use` member selects, so `apply`, `vendor`, `apply --check`, `vex` and
+`scan --mode hosted` read every member's `go.mod` and `go.sum` too: a member
+that requires a newer version makes a replace pinned to the older one inert.
+A hosted rescan removes a pin it wrote once another member outranks it.
+After an upgrade such as `go get M@v1.0.1`, `apply --check` fails and `vex`
+leaves the patch out (`go_version_not_selected`) until you get a patch for the
+new version.
 
 Paid hosted Go references are unsupported: embedding credentials in module paths
 would expose them to module proxies and change module identity. Use vendored mode

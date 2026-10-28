@@ -109,28 +109,72 @@ pub fn select(pruned: bool, required: Option<&str>, zips: &[&str], version: &str
 /// `go.sum` (`None` when there is no readable go.mod).
 ///
 /// In workspace mode the build list also takes every `use` member's
-/// requirements, and MVS selects the highest version any of them asks for
-/// (#1751). So a version another member proves is weighed with this one's,
-/// and a module absent from this go.mod may still be built:
-/// [`Selection::NotInGraph`] becomes [`Selection::Unknown`] there unless a
-/// member proves the version.
+/// requirements, so their go.mod/go.sum are weighed too
+/// ([`workspace_selection`]).
 pub async fn project_selection(
     project_root: &Path,
     module: &str,
     version: &str,
 ) -> Option<Selection> {
     let own = dir_selection(project_root, module, version).await?;
-    let Some(members) = super::go_consumer_sync::workspace_member_dirs(project_root).await else {
+    let Some(dirs) = super::go_consumer_sync::workspace_member_dirs(project_root).await else {
         return Some(own);
     };
+    let mut members = Vec::new();
+    for dir in dirs {
+        members.extend(dir_selection(&dir, module, version).await);
+    }
+    Some(workspace_selection(own, members, version))
+}
+
+/// The text of one go.work member's `go.mod` and (when present) `go.sum`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleFiles {
+    pub go_mod: String,
+    pub go_sum: Option<String>,
+}
+
+/// The files of every other `use` member of the go.work in effect for
+/// `project_root` (empty outside a workspace), read on the calling thread.
+/// A member whose go.mod can't be read is left out, as
+/// [`project_selection`] skips it.
+pub fn other_workspace_members(project_root: &Path) -> Vec<ModuleFiles> {
+    use crate::utils::fs::read_regular_to_string_sync;
+    let Some(dirs) = super::go_consumer_sync::workspace_member_dirs_sync(project_root) else {
+        return Vec::new();
+    };
+    let base = std::env::current_dir()
+        .unwrap_or_default()
+        .join(project_root);
+    let root = std::fs::canonicalize(&base).unwrap_or(base);
+    dirs.into_iter()
+        .filter(|dir| std::fs::canonicalize(dir).map_or(true, |dir| dir != root))
+        .filter_map(|dir| {
+            Some(ModuleFiles {
+                go_mod: read_regular_to_string_sync(&dir.join("go.mod")).ok()?,
+                go_sum: read_regular_to_string_sync(&dir.join("go.sum")).ok(),
+            })
+        })
+        .collect()
+}
+
+/// The selection for the whole workspace, from this module's own
+/// [`Selection`] (`own`) and each other member's.
+///
+/// MVS selects the highest version any member asks for (#1751). So a
+/// version another member proves is weighed with this one's, and a module
+/// absent from this go.mod may still be built: [`Selection::NotInGraph`]
+/// becomes [`Selection::Unknown`] unless a member proves the version.
+pub fn workspace_selection(
+    own: Selection,
+    members: impl IntoIterator<Item = Selection>,
+    version: &str,
+) -> Selection {
     let mut highest = evidence(&own, version);
     // A member whose files can't tell may build a higher version than the
     // highest one proven, so then only a proof at or above ours decides.
     let mut unknown = own == Selection::Unknown;
-    for dir in members {
-        let Some(member) = dir_selection(&dir, module, version).await else {
-            continue;
-        };
+    for member in members {
         unknown |= member == Selection::Unknown;
         if let Some(v) = evidence(&member, version) {
             if highest
@@ -141,14 +185,14 @@ pub async fn project_selection(
             }
         }
     }
-    Some(match highest {
+    match highest {
         Some(h) if h == version => Selection::Selected,
         Some(h) if !unknown || go_semver_cmp(&h, version) == Ordering::Greater => {
             Selection::Other(h)
         }
         _ if own == Selection::NotInGraph => Selection::Unknown,
         _ => own,
-    })
+    }
 }
 
 /// [`selection`] from `<dir>/go.mod` and `go.sum`, ignoring any workspace.
@@ -312,6 +356,34 @@ mod tests {
             project_selection(&a, UP, "v1.1.0").await,
             Some(Selection::Selected)
         );
+    }
+
+    /// #1753: the hosted rewriter gets every member but the scanned one,
+    /// with its go.mod and go.sum text; a member without a go.mod is left
+    /// out, and outside a workspace there are none.
+    #[test]
+    fn other_workspace_members_reads_every_member_but_this_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        let (a, b, c) = (ws.join("a"), ws.join("b"), ws.join("c"));
+        module(&a, "a", "v1.0.0");
+        module(&b, "b", "v1.1.0");
+        std::fs::remove_file(a.join("go.sum")).unwrap();
+        std::fs::create_dir_all(&c).unwrap();
+        assert!(other_workspace_members(&a).is_empty());
+        std::fs::write(
+            ws.join("go.work"),
+            "go 1.21\n\nuse (\n\t./a\n\t./b/\n\t./c\n)\n",
+        )
+        .unwrap();
+        let members = other_workspace_members(&a);
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert!(members[0].go_mod.contains("module example.com/b"));
+        assert!(members[0].go_sum.as_deref().unwrap().contains("v1.1.0"));
+        let members = other_workspace_members(&b);
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert!(members[0].go_mod.contains("module example.com/a"));
+        assert_eq!(members[0].go_sum, None);
     }
 
     /// A version below the patched one counts when it is the highest any

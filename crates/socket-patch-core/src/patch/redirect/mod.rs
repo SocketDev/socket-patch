@@ -604,6 +604,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         &std::collections::BTreeSet::new(),
         &yarnrc::OuterYarnMirror::default(),
         &CratesIoSource::Registry,
+        &[],
     )
 }
 
@@ -684,6 +685,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
+    go_members: &[crate::vendor::go_build_list::ModuleFiles],
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -711,6 +713,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         gradle_unreadable,
         yarn_outer,
         cargo_outer,
+        go_members,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -739,6 +742,7 @@ fn rewriter_groups<'a>(
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
     yarn_outer: &'a yarnrc::OuterYarnMirror,
     cargo_outer: &'a CratesIoSource,
+    go_members: &'a [crate::vendor::go_build_list::ModuleFiles],
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -765,7 +769,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| {
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
-        Box::new(move |result| rewrite_golang(files, overrides, result)),
+        Box::new(move |result| rewrite_golang(files, overrides, go_members, result)),
         Box::new(move |result| {
             sbt::rewrite_sbt(files, overrides, result);
             scala_guidance::warn(files, overrides, result);
@@ -9121,6 +9125,7 @@ fn go_token_safe(s: &str) -> bool {
 fn rewrite_golang(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    go_members: &[crate::vendor::go_build_list::ModuleFiles],
     result: &mut RewriteResult,
 ) {
     use crate::vendor::go_build_list;
@@ -9265,17 +9270,29 @@ fn rewrite_golang(
         // (`go_build_list`): `require` for a go >= 1.17 graph; for an older
         // one, the highest of `require` and go.sum's zip lines, since a
         // `/go.mod`-only line is written for every version MVS reads, not
-        // only the one it selects (#509).
+        // only the one it selects (#509). In a go.work workspace the other
+        // members' files are weighed too: MVS builds the highest version
+        // any of them asks for (#1753).
         let zips = go_sum.zip_versions(&fname);
         let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        let selection = go_build_list::select(
+        let own = go_build_list::select(
             go_mod_edit::prunes_module_graph(&go_mod),
             scan.required.as_deref(),
             &zips,
             &dep.version,
         );
+        let selection = if go_members.is_empty() {
+            own.clone()
+        } else {
+            let members = go_members.iter().map(|m| {
+                go_build_list::selection(&m.go_mod, m.go_sum.as_deref(), &fname, &dep.version)
+            });
+            go_build_list::workspace_selection(own.clone(), members, &dep.version)
+        };
         if let Some(selected) = selection.other_version() {
-            let basis = if scan.required.as_deref() == Some(selected) {
+            let basis = if own.other_version() != Some(selected) {
+                "another go.work workspace member makes the build select"
+            } else if scan.required.as_deref() == Some(selected) {
                 "go.mod requires"
             } else {
                 "go.sum shows the build selects"
@@ -12789,6 +12806,7 @@ mod tests {
             &std::collections::BTreeSet::new(),
             &refusing[3],
             &CratesIoSource::Registry,
+            &[],
         );
         assert!(!r.files.contains_key("yarn.lock"));
         assert!(r
@@ -22997,6 +23015,80 @@ packages:
         assert!(out.files.is_empty());
         assert_eq!(out.warnings[0].code, "redirect_golang_version_mismatch");
         assert!(out.warnings[0].detail.contains("v1.5.0"));
+    }
+
+    /// A go.work member that is not the scanned module.
+    fn go_member(require: &str) -> crate::vendor::go_build_list::ModuleFiles {
+        crate::vendor::go_build_list::ModuleFiles {
+            go_mod: format!("module example.com/other\n\ngo 1.21\n\n{require}"),
+            go_sum: None,
+        }
+    }
+
+    /// #1753: in a go.work workspace the build selects the highest version
+    /// any member requires, so a pin for this module's v1.4.2 is inert when
+    /// another member requires v1.5.0.
+    #[test]
+    fn golang_workspace_member_requiring_a_higher_version_skips() {
+        let files = golang_files();
+        let ovr = golang_override();
+        let members = [go_member("require github.com/foo/bar v1.5.0\n")];
+        let mut out = RewriteResult::default();
+        rewrite_golang(&files, std::slice::from_ref(&ovr), &members, &mut out);
+        assert!(out.files.is_empty(), "nothing written: {:?}", out.files);
+        assert_eq!(
+            out.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_golang_version_mismatch"]
+        );
+        assert!(
+            out.warnings[0]
+                .detail
+                .contains("another go.work workspace member makes the build select v1.5.0"),
+            "{}",
+            out.warnings[0].detail
+        );
+    }
+
+    /// #1753: a member requiring a lower version, or not requiring the
+    /// module at all, leaves the build on this module's v1.4.2. A member
+    /// that proves the patched version puts a module this go.mod omits in
+    /// the build.
+    #[test]
+    fn golang_workspace_members_that_do_not_outrank_still_redirect() {
+        let ovr = golang_override();
+        for members in [
+            vec![go_member("require github.com/foo/bar v1.4.1\n")],
+            vec![go_member("require example.com/unrelated v1.0.0\n")],
+            vec![go_member("")],
+        ] {
+            let mut out = RewriteResult::default();
+            rewrite_golang(
+                &golang_files(),
+                std::slice::from_ref(&ovr),
+                &members,
+                &mut out,
+            );
+            assert!(out.warnings.is_empty(), "{members:?}: {:?}", out.warnings);
+            assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+        }
+
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire example.com/direct v2.0.0\n".to_string(),
+        );
+        files.insert("go.sum".to_string(), String::new());
+        let mut out = RewriteResult::default();
+        rewrite_golang(&files, std::slice::from_ref(&ovr), &[], &mut out);
+        assert_eq!(out.warnings[0].code, "redirect_golang_not_in_module_graph");
+        let members = [go_member("require github.com/foo/bar v1.4.2\n")];
+        let mut out = RewriteResult::default();
+        rewrite_golang(&files, std::slice::from_ref(&ovr), &members, &mut out);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
     }
 
     /// A module NOT in the main go.mod's require block may still be resolved

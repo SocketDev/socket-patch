@@ -309,6 +309,18 @@ pub(crate) async fn workspace_member_dirs(project_root: &Path) -> Option<Vec<Pat
     })
 }
 
+/// [`workspace_member_dirs`] on the calling thread, for the hosted engine's
+/// synchronous config resolvers.
+pub(crate) fn workspace_member_dirs_sync(project_root: &Path) -> Option<Vec<PathBuf>> {
+    let work_file = workspace_file(project_root)?;
+    Some(
+        match crate::utils::fs::read_regular_to_string_sync(&work_file) {
+            Ok(text) => use_dirs(&work_file, &go_mod_edit::normalize_for_read(&text)),
+            Err(_) => Vec::new(),
+        },
+    )
+}
+
 /// `work_file`'s text, normalized for parsing.
 async fn read_work_file(work_file: &Path) -> Option<String> {
     let text = read_regular_to_string(work_file).await.ok()?;
