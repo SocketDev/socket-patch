@@ -350,8 +350,9 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         .filter(|w| w.kind == POM_FRAGMENT_KIND)
         .map(|w| w.file.clone())
         .collect();
-    if let Ok(reactor) = Reactor::discover(read) {
-        files.extend(reactor.scope);
+    let reactor = Reactor::discover(read).ok();
+    if let Some(reactor) = &reactor {
+        files.extend(reactor.scope.iter().cloned());
     }
     let mut before: BTreeMap<String, Option<String>> = files
         .into_iter()
@@ -369,7 +370,7 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
             .filter(|w| w.kind == POM_FRAGMENT_KIND && w.file == *rel)
             .collect();
         *t = cut_pin(rel, t, c, &recs, &mut drifted);
-        *t = restore_versions(rel, t, c, &sv, &recs, &mut drifted);
+        *t = restore_versions(rel, t, c, &sv, &recs, reactor.as_ref(), &mut drifted);
         for w in recs
             .iter()
             .filter(|w| w.key.as_deref() == Some("pin_section"))
@@ -530,13 +531,15 @@ fn cut_pin(
 }
 
 /// `text` with every g:a declaration at `sv` back at its recorded original
-/// (else the base version).
+/// (else the base version). `reactor` interpolates `${...}` coordinates in
+/// `rel`'s context, as the plan matched them.
 fn restore_versions(
     rel: &str,
     text: &str,
     c: &Coords<'_>,
     sv: &str,
     recs: &[&WiringRecord],
+    reactor: Option<&Reactor>,
     drifted: &mut Vec<String>,
 ) -> String {
     if !text.contains(sv) {
@@ -548,8 +551,13 @@ fn restore_versions(
         ));
         return text.to_string();
     };
+    let resolve = |v: &str| {
+        reactor
+            .filter(|r| r.poms.contains_key(rel))
+            .and_then(|r| r.interpolate(rel, v, 0))
+    };
     let mut edits = Vec::new();
-    for (dep, key) in doc.keyed_declarations(c.group_id, c.artifact_id) {
+    for (dep, key) in doc.keyed_declarations(c.group_id, c.artifact_id, &resolve) {
         let Some(version) = doc.child(dep, "version") else {
             continue;
         };
@@ -911,7 +919,7 @@ impl Reactor {
         'modules: for rel in self.scope.iter().filter(|rel| self.local_root(rel) == root) {
             let locally_versioned = self.chain(rel).any(|p| {
                 let doc = &self.poms[p].doc;
-                doc.keyed_declarations(g, a)
+                self.keyed_declarations(p, g, a)
                     .iter()
                     .any(|(dep, _)| doc.child(*dep, "version").is_some())
             });
@@ -1497,6 +1505,14 @@ impl Reactor {
         roots
     }
 
+    /// The g:a declarations of `rel`, with `${...}` coordinates
+    /// interpolated in its context.
+    fn keyed_declarations(&self, rel: &str, g: &str, a: &str) -> Vec<(usize, String)> {
+        self.poms[rel]
+            .doc
+            .keyed_declarations(g, a, &|v| self.interpolate(rel, v, 0))
+    }
+
     /// Interpolate every `${name}` in `value` in the context of `rel`;
     /// `None` when any name is undefined in the checkout.
     fn interpolate(&self, rel: &str, value: &str, depth: usize) -> Option<String> {
@@ -1526,7 +1542,12 @@ impl Reactor {
             "project.version" | "pom.version" => {
                 return pom.effective_version().map(str::to_string);
             }
+            "project.groupId" | "pom.groupId" => {
+                return pom.effective_group().map(str::to_string);
+            }
+            "project.artifactId" | "pom.artifactId" => return pom.artifact.clone(),
             "project.parent.version" => return pom.parent.as_ref()?.version.clone(),
+            "project.parent.groupId" => return pom.parent.as_ref()?.group.clone(),
             _ => {}
         }
         if let Some(v) = self.cli_props.get(name) {
@@ -1564,7 +1585,8 @@ impl Reactor {
     ) {
         let doc = &self.poms[rel].doc;
         let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
-        for (dep, key) in doc.keyed_declarations(patch.group_id, patch.artifact_id) {
+        self.warn_unresolved_coordinates(rel, patch, warnings);
+        for (dep, key) in self.keyed_declarations(rel, patch.group_id, patch.artifact_id) {
             if doc
                 .child_text(dep, "type")
                 .is_some_and(|t| !t.is_empty() && t != "jar")
@@ -1582,8 +1604,30 @@ impl Reactor {
                 ));
                 continue;
             }
-            let top_managed = doc.is_top_level_managed(dep);
             let root = self.local_root(rel);
+            // Maven interpolates after inheritance: a pom that inherits this
+            // declaration may name another artifact through it, which the
+            // literal SV must not reach.
+            if doc.has_property_coordinate(dep) {
+                let other = self.inheritors(rel).find(|p| {
+                    let resolve = |v: &str| self.interpolate(p, v, 0);
+                    doc.coordinate(dep, "groupId", &resolve).as_deref() != Some(patch.group_id)
+                        || doc.coordinate(dep, "artifactId", &resolve).as_deref()
+                            != Some(patch.artifact_id)
+                });
+                if let Some(p) = other {
+                    warnings.push(degraded(
+                        "coordinates_overridden",
+                        format!(
+                            "{at}: {ga} is named through properties that {p} resolves \
+                             differently; left as is and {root} is not pinned"
+                        ),
+                    ));
+                    unpinned.insert(root);
+                    continue;
+                }
+            }
+            let top_managed = doc.is_top_level_managed(dep);
             if top_managed && root == rel {
                 managed_roots.insert(root.clone());
             }
@@ -1661,6 +1705,89 @@ impl Reactor {
             }
         }
     }
+}
+
+impl Reactor {
+    /// Warn for each declaration of `rel` that could be `patch`'s g:a but
+    /// names a `${...}` groupId or artifactId undefined in the checkout:
+    /// it is left as is, probably unpatched.
+    fn warn_unresolved_coordinates(
+        &self,
+        rel: &str,
+        patch: &JvmPatch<'_>,
+        warnings: &mut Vec<JvmWarning>,
+    ) {
+        let doc = &self.poms[rel].doc;
+        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        for dep in doc.declarations() {
+            let (Some(g), Some(a)) = (
+                doc.child_text(dep, "groupId"),
+                doc.child_text(dep, "artifactId"),
+            ) else {
+                continue;
+            };
+            let unresolved: Vec<&str> = [&g, &a]
+                .into_iter()
+                .filter(|c| c.contains("${") && resolve(c).is_none())
+                .map(String::as_str)
+                .collect();
+            let could_be = |raw: &str, want: &str| match resolve(raw) {
+                Some(v) => v == want,
+                None => may_interpolate_to(raw, want),
+            };
+            let other_variant = doc
+                .child_text(dep, "type")
+                .is_some_and(|t| !t.is_empty() && t != "jar")
+                || doc
+                    .child_text(dep, "classifier")
+                    .is_some_and(|c| !c.is_empty());
+            if unresolved.is_empty()
+                || other_variant
+                || !could_be(&g, patch.group_id)
+                || !could_be(&a, patch.artifact_id)
+            {
+                continue;
+            }
+            let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
+            warnings.push(degraded(
+                "property_unresolved",
+                format!(
+                    "{at}: {g}:{a} may be {}:{} but {} is not defined in the checkout; \
+                     left as is, probably unpatched",
+                    patch.group_id,
+                    patch.artifact_id,
+                    unresolved.join(", ")
+                ),
+            ));
+        }
+    }
+}
+
+/// Whether `raw`, with each `${...}` standing for any text, can read
+/// `want`.
+fn may_interpolate_to(raw: &str, want: &str) -> bool {
+    let mut literals = Vec::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find("${") {
+        literals.push(&rest[..at]);
+        let Some(close) = rest[at..].find('}') else {
+            return false;
+        };
+        rest = &rest[at + close + 1..];
+    }
+    let Some((first, tail)) = literals.split_first() else {
+        return raw == want;
+    };
+    let Some(mut left) = want.strip_prefix(first) else {
+        return false;
+    };
+    for middle in tail {
+        let Some(i) = left.find(middle) else {
+            return false;
+        };
+        left = &left[i + middle.len()..];
+    }
+    left.ends_with(rest)
 }
 
 /// The base version, or a suffixed version of it from any patch uuid.
@@ -2487,23 +2614,58 @@ impl Doc {
     }
 
     /// The g:a declarations that are not pins, with their record key
-    /// `version:<g>:<a>:<section>:<ordinal>`.
-    fn keyed_declarations(&self, g: &str, a: &str) -> Vec<(usize, String)> {
+    /// `version:<g>:<a>:<section>:<ordinal>`. `resolve` interpolates a
+    /// `${...}` groupId or artifactId, which Maven does before matching.
+    fn keyed_declarations(
+        &self,
+        g: &str,
+        a: &str,
+        resolve: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<(usize, String)> {
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
         let mut out = Vec::new();
         for dep in self.declarations() {
-            if self.child_text(dep, "groupId").as_deref() != Some(g)
-                || self.child_text(dep, "artifactId").as_deref() != Some(a)
+            if self.coordinate(dep, "groupId", resolve).as_deref() != Some(g)
+                || self.coordinate(dep, "artifactId", resolve).as_deref() != Some(a)
                 || self.pin_at(dep).is_some()
             {
                 continue;
             }
-            let section = self.section_of(dep);
+            // Declarations named through properties count apart, so literal
+            // declarations keep the keys of records written before they
+            // were matched.
+            let mut section = self.section_of(dep);
+            if self.has_property_coordinate(dep) {
+                section.push_str(":$");
+            }
             let ordinal = seen.entry(section.clone()).or_default();
             out.push((dep, format!("version:{g}:{a}:{section}:{ordinal}")));
             *ordinal += 1;
         }
         out
+    }
+
+    /// The `name` child of `dep`, interpolated through `resolve` when it
+    /// holds a `${...}` expression; `None` when that is undefined.
+    fn coordinate(
+        &self,
+        dep: usize,
+        name: &str,
+        resolve: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        let raw = self.child_text(dep, name)?;
+        if raw.contains("${") {
+            resolve(&raw)
+        } else {
+            Some(raw)
+        }
+    }
+
+    /// Whether `dep` names its groupId or artifactId through `${...}`.
+    fn has_property_coordinate(&self, dep: usize) -> bool {
+        ["groupId", "artifactId"]
+            .iter()
+            .any(|n| self.child_text(dep, n).is_some_and(|t| t.contains("${")))
     }
 
     /// `dependencies` / `dependencyManagement`, prefixed with
@@ -4616,6 +4778,154 @@ mod tests {
         let undo = unplan(&read, &patch().coords(), &plan.records);
         let a = undo.changes.iter().find(|(r, _)| r == "a/pom.xml").unwrap();
         assert_eq!(a.1.as_deref(), Some(module("a", cdata).as_bytes()));
+    }
+
+    #[test]
+    fn property_coordinates_are_interpolated_and_restored() {
+        // #655: Maven interpolates groupId/artifactId before matching, so a
+        // `${ct.group}:${ct.artifact}` declaration is the patched artifact.
+        let root = ROOT.replace(
+            "  <modules>",
+            "  <properties>\n    <ct.group>org.apache.commons</ct.group>\n    \
+             <ct.artifact>commons-text</ct.artifact>\n  </properties>\n  <modules>",
+        );
+        let decl = "<dependency><groupId>${ct.group}</groupId>\
+             <artifactId>${ct.artifact}</artifactId><version>1.10.0</version></dependency>";
+        let a = module("a", decl);
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (plan, after) = vendor(&files);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(text(&after, "a/pom.xml"), a.replace("1.10.0", SV));
+        let read = |rel: &str| after.get(rel).cloned();
+        let undo = unplan(&read, &patch().coords(), &plan.records);
+        assert!(undo.drifted.is_empty(), "{:?}", undo.drifted);
+        let a_undo = undo.changes.iter().find(|(r, _)| r == "a/pom.xml").unwrap();
+        assert_eq!(a_undo.1.as_deref(), Some(a.as_bytes()));
+    }
+
+    #[test]
+    fn unresolvable_property_coordinate_warns() {
+        let decl = "<dependency><groupId>${remote.group}</groupId>\
+             <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>";
+        let a = module("a", decl);
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (plan, after) = vendor(&files);
+        assert_eq!(reasons(&plan), ["property_unresolved"]);
+        assert!(
+            plan.warnings[0].detail.contains("${remote.group}"),
+            "{}",
+            plan.warnings[0].detail
+        );
+        assert_eq!(text(&after, "a/pom.xml"), a);
+    }
+
+    #[test]
+    fn property_coordinates_keep_literal_record_keys() {
+        // Records written before #655 keyed the literal declaration as
+        // ordinal 0; a `${...}` declaration ahead of it must not shift that.
+        let deps = format!(
+            "<dependency><groupId>${{ct.group}}</groupId>\
+             <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>{}",
+            dep("1.10.0")
+        );
+        let doc = Doc::parse(module("a", &deps)).unwrap();
+        let resolve = |_: &str| Some("org.apache.commons".to_string());
+        let keys: Vec<String> = doc
+            .keyed_declarations("org.apache.commons", "commons-text", &resolve)
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "version:org.apache.commons:commons-text:dependencies:$:0",
+                "version:org.apache.commons:commons-text:dependencies:0",
+            ]
+        );
+    }
+
+    #[test]
+    fn property_coordinates_another_module_overrides_are_left_alone() {
+        let root = ROOT.replace(
+            "  <modules>",
+            "  <properties>\n    <lib.artifact>commons-text</lib.artifact>\n  </properties>\n  \
+             <dependencyManagement><dependencies><dependency><groupId>org.apache.commons</groupId>\
+             <artifactId>${lib.artifact}</artifactId><version>1.10.0</version></dependency>\
+             </dependencies></dependencyManagement>\n  <modules>",
+        );
+        let b = module("b", "").replace(
+            "  <dependencies>",
+            "  <properties><lib.artifact>commons-lang3</lib.artifact></properties>\n  <dependencies>",
+        );
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &module("a", "")),
+            ("b/pom.xml", &b),
+        ]);
+        let plan = run(&files).expect("plan");
+        assert_eq!(reasons(&plan), ["coordinates_overridden"]);
+        let after = applied(&files, &plan);
+        let out = text(&after, "pom.xml");
+        assert!(!out.contains(SV), "{out}");
+        assert!(
+            out.contains("<artifactId>${lib.artifact}</artifactId><version>1.10.0</version>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn project_group_id_coordinate_resolves() {
+        let root = ROOT.replace(
+            "<groupId>t</groupId>",
+            "<groupId>org.apache.commons</groupId>",
+        );
+        let decl = "<dependency><groupId>${project.groupId}</groupId>\
+             <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>";
+        let a = module("a", decl).replace(
+            "<groupId>t</groupId>",
+            "<groupId>org.apache.commons</groupId>",
+        );
+        let b = module("b", "").replace(
+            "<groupId>t</groupId>",
+            "<groupId>org.apache.commons</groupId>",
+        );
+        let files = fs(&[("pom.xml", &root), ("a/pom.xml", &a), ("b/pom.xml", &b)]);
+        let (plan, after) = vendor(&files);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(text(&after, "a/pom.xml"), a.replace("1.10.0", SV));
+    }
+
+    #[test]
+    fn unresolvable_coordinate_of_another_artifact_does_not_warn() {
+        let decls = "<dependency><groupId>org.apache.commons</groupId>\
+             <artifactId>${remote.x}-lang3</artifactId><version>3.0</version></dependency>\
+             <dependency><groupId>${remote.group}</groupId><artifactId>commons-text</artifactId>\
+             <classifier>sources</classifier><version>1.10.0</version></dependency>";
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", decls)),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (plan, _) = vendor(&files);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn may_interpolate_to_keeps_literal_text() {
+        assert!(may_interpolate_to("${g}", "org.apache.commons"));
+        assert!(may_interpolate_to("org.${x}.commons", "org.apache.commons"));
+        assert!(may_interpolate_to("${a}-${b}", "commons-text"));
+        assert!(!may_interpolate_to("${x}-lang3", "commons-text"));
+        assert!(!may_interpolate_to("com.${x}", "org.apache.commons"));
+        assert!(!may_interpolate_to("${x", "commons-text"));
     }
 
     #[test]
