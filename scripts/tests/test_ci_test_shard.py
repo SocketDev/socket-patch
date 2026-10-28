@@ -96,6 +96,22 @@ class Partition(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         self.assertEqual(run.call_args_list[-1].args[0][:3], ["cargo", "llvm-cov", "--no-report"])
 
+    def test_coverage_shards_default_to_the_timing_sample(self):
+        names = ["e2e_heavy", "e2e_light", "e2e_mid", "unit_only"]
+        metadata = {"workspace_members": ["a"], "packages": [
+            {"id": "a", "targets": [{"name": n, "kind": ["test"]} for n in names]}]}
+        timings = json.loads(shard.DEFAULT_COVERAGE_TIMINGS.read_text())
+        env = {k: v for k, v in shard.os.environ.items() if k != "CI_TEST_TIMINGS"}
+        for coverage, expected in (("1", shard.partition(names, 2, timings)), ("", shard.partition(names, 2))):
+            with self.subTest(coverage=coverage), \
+                    patch.dict(shard.os.environ, {**env, "CI_TEST_COVERAGE": coverage}, clear=True), \
+                    patch.object(shard.subprocess, "run", side_effect=[
+                        subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata)),
+                        subprocess.CompletedProcess([], 0),
+                    ]) as run:
+                self.assertEqual(shard.main(["2", "2"]), 0)
+                self.assertCountEqual(selected([c.args[0] for c in run.call_args_list[1:]]), expected[1])
+
     def test_negative_bad_shard(self):
         with self.assertRaises(ValueError):
             shard.invocations(3, 2, self.NAMES)

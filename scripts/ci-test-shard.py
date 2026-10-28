@@ -12,12 +12,17 @@ the union of the shards is the old single `cargo test --workspace` run.
 
 Windows debug CI sets CI_TEST_TIMINGS to the checked-in runtime sample.
 Those shards balance measured test time plus linking work, with shard 1's
-unit tests reserved up front. Other runners retain the count-based split.
+unit tests reserved up front. The Linux `coverage` shards use the same
+sample by default (see CI_TEST_COVERAGE below). Other runners retain the
+count-based split.
 
 CI_TEST_COVERAGE=1 runs the shard under cargo-llvm-cov for ci.yml's
 `coverage` job: `cargo llvm-cov --no-report` in place of `cargo test`, and
 no doctests, which cargo-llvm-cov leaves out without `--doctests`. A later
-`cargo llvm-cov report` exports the shard's profiles.
+`cargo llvm-cov report` exports the shard's profiles. Unless CI_TEST_TIMINGS
+is set, coverage shards balance on scripts/ci-test-durations.json: the count
+split left shard 2 running ~80 s longer than shard 1 (246 s vs 167 s of
+tests), and it set the end of every CI run.
 
 Extra arguments after `SHARD COUNT` go to every `cargo` invocation.
 Each invocation runs with `--no-fail-fast`; the exit status is non-zero if
@@ -32,6 +37,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+
+DEFAULT_COVERAGE_TIMINGS = Path(__file__).resolve().parent / "ci-test-durations.json"
 
 # Shard 1's share of the integration targets, relative to every other
 # shard's 1.0 (it also carries the unit tests and doctests).
@@ -99,9 +106,9 @@ def main(argv):
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
         check=True, capture_output=True, text=True).stdout)
     names = integration_targets(metadata)
-    timing_path = os.environ.get("CI_TEST_TIMINGS")
-    timings = json.loads(Path(timing_path).read_text(encoding="utf-8")) if timing_path else None
     coverage = os.environ.get("CI_TEST_COVERAGE") == "1"
+    timing_path = os.environ.get("CI_TEST_TIMINGS") or (DEFAULT_COVERAGE_TIMINGS if coverage else None)
+    timings = json.loads(Path(timing_path).read_text(encoding="utf-8")) if timing_path else None
     print(f"ci-test-shard: shard {shard}/{count}: "
           f"{len(partition(names, count, timings)[shard - 1])} of {len(names)} integration targets", flush=True)
     status = 0
