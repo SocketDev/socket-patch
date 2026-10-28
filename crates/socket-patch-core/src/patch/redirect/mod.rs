@@ -9482,13 +9482,16 @@ fn rewrite_golang_target(
         }
         return false;
     } else if selection != go_build_list::Selection::Selected
-        && prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str()))
+        && (in_workspace && selection == go_build_list::Selection::Unknown
+            || prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str())))
     {
         // Not selected by go.mod's require, no go.sum zip line at this
         // version, and not already redirected by us: the module is
         // outside this project's graph (local discovery crawls the whole
         // module cache). Its replace would be inert, and confirming it
-        // would attest a patch no build links.
+        // would attest a patch no build links. A workspace graph that
+        // could not be read proves nothing either way, so there even our
+        // own pin is no proof the build selects this version.
         result.warnings.push(RewriteWarning {
             code: "redirect_golang_not_in_module_graph".into(),
             detail: if in_workspace && selection == go_build_list::Selection::Unknown {
@@ -23517,6 +23520,51 @@ packages:
         files.insert("a/go.mod".to_string(), a.clone());
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert_eq!(out.warnings[0].code, "redirect_golang_no_go_mod");
+    }
+
+    /// A workspace whose graph could not be read (here: an unread member)
+    /// proves nothing about the selected version: even our own pin at the
+    /// patched version is not confirmed on a re-run.
+    #[test]
+    fn golang_unknown_workspace_does_not_confirm_an_existing_pin() {
+        use crate::vendor::go_workspace::{GoWorkspace, Loaded, Member};
+        let ovr = golang_override();
+        let files = golang_files();
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(first.confirmed_golang_uuids.contains(GO_UUID));
+        let mut again = files.clone();
+        again.extend(first.files.clone());
+        let member = |dir: &str, go_mod: Option<String>| Member {
+            dir: dir.into(),
+            go_mod,
+            go_sum: None,
+        };
+        let hosted = HostedGoWorkspace {
+            root: std::path::PathBuf::new(),
+            loaded: Loaded::Workspace(GoWorkspace {
+                work_file: "go.work".into(),
+                work: "go 1.21\n\nuse (\n\t.\n\t../out\n)\n".into(),
+                work_sum: None,
+                members: vec![
+                    member(".", Some(again["go.mod"].clone())),
+                    member("../out", None),
+                ],
+                graph: None,
+            }),
+        };
+        again.insert(
+            GO_WORKSPACE_KEY.to_string(),
+            serde_json::to_string(&hosted).unwrap(),
+        );
+        let out = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.code == "redirect_golang_not_in_module_graph"),
+            "{:?}",
+            out.warnings
+        );
     }
 
     /// A go.work root whose member replaces every version of the module
