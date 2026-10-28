@@ -684,6 +684,10 @@ fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
     let mut pending = vec![root];
     let mut listed = 0usize;
     while let Some(dir) = pending.pop() {
+        // A store a restore named after `dir` was queued.
+        if walk.package_folders.contains(&dir) {
+            continue;
+        }
         listed += 1;
         if listed > SCOPE_DIR_BUDGET {
             walk.libraries = None;
@@ -694,6 +698,9 @@ fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
             walk.libraries = None;
         }
         let (mut is_project, mut has_obj) = (false, false);
+        // Queued only after this directory's own restore is read, so a
+        // store it names (`RestorePackagesPath` = `pkgs`) is never entered.
+        let mut subdirs = Vec::new();
         for entry in &entries {
             let Some(name) = entry.name.to_str() else {
                 continue;
@@ -708,9 +715,8 @@ fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
                 if !name.starts_with('.')
                     && !SCOPE_SKIPPED_DIRS.contains(&name)
                     && !skip.contains(&sub)
-                    && !walk.package_folders.contains(&sub)
                 {
-                    pending.push(sub);
+                    subdirs.push(sub);
                 }
             } else if PROJECT_EXTENSIONS.iter().any(|ext| name.ends_with(ext)) {
                 is_project = true;
@@ -718,26 +724,30 @@ fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
                 walk.packages_config = true;
             }
         }
-        if !(is_project || has_obj) {
-            continue;
-        }
-        let assets = dir.join("obj").join("project.assets.json");
-        let parsed = crate::utils::fs::read_regular_to_string_sync(&assets)
-            .ok()
-            .and_then(|content| parse_project_assets(&content));
-        let libraries = match parsed {
-            Some(assets) => {
-                walk.package_folders.extend(assets.package_folders);
-                assets.libraries
+        if is_project || has_obj {
+            let assets = dir.join("obj").join("project.assets.json");
+            let parsed = crate::utils::fs::read_regular_to_string_sync(&assets)
+                .ok()
+                .and_then(|content| parse_project_assets(&content));
+            let libraries = match parsed {
+                Some(assets) => {
+                    walk.package_folders.extend(assets.package_folders);
+                    assets.libraries
+                }
+                None => None,
+            };
+            if is_project {
+                match (walk.libraries.as_mut(), libraries) {
+                    (Some(all), Some(own)) => all.extend(own),
+                    _ => walk.libraries = None,
+                }
             }
-            None => None,
-        };
-        if is_project {
-            match (walk.libraries.as_mut(), libraries) {
-                (Some(all), Some(own)) => all.extend(own),
-                _ => walk.libraries = None,
-            }
         }
+        pending.extend(
+            subdirs
+                .into_iter()
+                .filter(|sub| !walk.package_folders.contains(sub)),
+        );
     }
     walk
 }
@@ -2589,5 +2599,45 @@ mod tests {
             .unwrap();
         assert!(!paths.contains(&store), "{paths:?}");
         assert_eq!(applied_copy(&proj).await, Some(copy));
+    }
+
+    /// A store the walked directory's own restore names (a solution-root
+    /// `RestorePackagesPath` of `pkgs/`, written with NuGet's trailing
+    /// separator) is not entered: here a project-shaped folder inside it
+    /// would otherwise drop the scope, and a large store would spend the
+    /// directory budget before deeper restores are seen.
+    #[test]
+    fn restore_walk_does_not_enter_a_store_its_restore_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("App.csproj"), "<Project/>").unwrap();
+        let pkgs = root.join("pkgs");
+        std::fs::create_dir_all(pkgs.join("some.tool").join("1.0.0").join("content")).unwrap();
+        std::fs::write(
+            pkgs.join("some.tool")
+                .join("1.0.0")
+                .join("content")
+                .join("Template.csproj"),
+            "<Project/>",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("obj")).unwrap();
+        let key = format!("{}{}", pkgs.display(), std::path::MAIN_SEPARATOR);
+        std::fs::write(
+            root.join("obj").join("project.assets.json"),
+            serde_json::to_string(&serde_json::json!({
+                "libraries": { "Newtonsoft.Json/13.0.3": { "type": "package" } },
+                "packageFolders": { key: {} }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let walk = restore_walk(root, &[]);
+        assert_eq!(walk.package_folders, [pkgs]);
+        assert_eq!(
+            walk.libraries,
+            Some(vec![("Newtonsoft.Json".to_string(), "13.0.3".to_string())])
+        );
     }
 }
