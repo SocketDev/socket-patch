@@ -299,9 +299,7 @@ pub async fn verify_file_patch(
         };
     }
 
-    // Check if matches expected before hash. A `Ready` whose
-    // `current_hash` is not the `beforeHash` is npm's form of it; the apply
-    // engine writes the patched bytes in the same form.
+    // Check if matches expected before hash (or npm's form of it).
     if current_hash != file_info.before_hash
         && source_hash.as_deref() != Some(file_info.before_hash.as_str())
     {
@@ -1250,12 +1248,12 @@ async fn apply_package_patch_at(
 
         // A bin npm installed with an LF shebang gets the patched bytes in
         // that form too (see `npm_bin`).
-        let (patched_content, written_hash) = match npm_fixed_write(
+        let (patched_content, written_hash) = match crate::patch::npm_bin::form_for_write(
             package_key,
             &pkg_path.join(normalized),
-            verify_result,
-            file_info,
+            &file_info.before_hash,
             patched_content,
+            &file_info.after_hash,
         )
         .await
         {
@@ -1341,45 +1339,6 @@ async fn apply_package_patch_at(
     result.error = join_notes(warnings);
     result.success = true;
     result
-}
-
-/// The bytes to write for a patched file, and their hash: the patched
-/// content as is, or npm's `fixBin` form of it (see
-/// [`npm_bin`](crate::patch::npm_bin)) when the file on disk is a bin npm
-/// installed with an LF shebang. That is the case when verify matched
-/// npm's form of the original, and, for an npm package off Windows (where
-/// npm writes cmd-shims and leaves bins alone), when an overwrite with
-/// consent replaces such a file: writing the CRLF shebang back would leave
-/// a bin `env` can't run.
-async fn npm_fixed_write<'a>(
-    package_key: &str,
-    path: &Path,
-    verify: Option<&VerifyResult>,
-    file_info: &PatchFileInfo,
-    patched: Cow<'a, [u8]>,
-) -> Result<(Cow<'a, [u8]>, String), std::io::Error> {
-    use crate::patch::npm_bin;
-    let as_recorded = |patched| Ok((patched, file_info.after_hash.clone()));
-    let raw_before = verify.is_none_or(|v| {
-        v.current_hash.is_none() || v.current_hash.as_deref() == Some(&file_info.before_hash)
-    });
-    if file_info.before_hash.is_empty() || raw_before {
-        return as_recorded(patched);
-    }
-    let Ok(installed) = crate::utils::fs::read_regular_to_bytes(path).await else {
-        return as_recorded(patched);
-    };
-    let npm_installed = npm_bin::has_lf_shebang(&installed)
-        && ((!cfg!(windows) && package_key.starts_with("pkg:npm/"))
-            || npm_bin::source_hash_of(&installed).as_deref()
-                == Some(file_info.before_hash.as_str()));
-    if !npm_installed {
-        return as_recorded(patched);
-    }
-    match npm_bin::fixed_for_write(&patched, &file_info.after_hash)? {
-        Some((fixed, hash)) => Ok((Cow::Owned(fixed), hash)),
-        None => as_recorded(patched),
-    }
 }
 
 /// Whether `hash` (a file's current content hash) names a blob Socket

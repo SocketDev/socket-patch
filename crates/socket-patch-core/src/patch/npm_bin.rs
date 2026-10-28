@@ -59,6 +59,42 @@ pub(crate) fn fixed_for_write(
     Ok(Some((fixed, hash)))
 }
 
+/// The bytes to write over the file at `path` for `content` (recorded as
+/// `expected_hash`), and their hash: `content` in `fixBin`'s form when
+/// the file now on disk is a bin npm installed with an LF shebang, else
+/// `content` as recorded. Writing a CRLF shebang there would leave a bin
+/// `env` can't run.
+///
+/// The file is taken for an npm-installed bin when it has an LF shebang
+/// and either belongs to an npm package (off Windows: npm writes
+/// cmd-shims there and leaves bins alone), or hashes, in npm's original
+/// form, to `installed_source` (the content this write replaces).
+pub(crate) async fn form_for_write<'a>(
+    package_key: &str,
+    path: &Path,
+    installed_source: &str,
+    content: std::borrow::Cow<'a, [u8]>,
+    expected_hash: &str,
+) -> Result<(std::borrow::Cow<'a, [u8]>, String), std::io::Error> {
+    let as_recorded = |content| Ok((content, expected_hash.to_string()));
+    let lf_shebang = read_prefix(path)
+        .await
+        .is_some_and(|prefix| has_lf_shebang(&prefix));
+    let npm_installed = lf_shebang
+        && ((!cfg!(windows)
+            && crate::crawlers::Ecosystem::from_purl(package_key)
+                == Some(crate::crawlers::Ecosystem::Npm))
+            || (!installed_source.is_empty()
+                && source_hash(path).await.as_deref() == Some(installed_source)));
+    if !npm_installed {
+        return as_recorded(content);
+    }
+    match fixed_for_write(&content, expected_hash)? {
+        Some((fixed, hash)) => Ok((std::borrow::Cow::Owned(fixed), hash)),
+        None => as_recorded(content),
+    }
+}
+
 /// The content `fixBin` turned into `bytes`, or `None` when `bytes` is not
 /// something `fixBin` writes (a `#!` first line of at least one byte,
 /// ending in `\n` early enough that its `\r\n` original fit the probe).
@@ -91,13 +127,23 @@ pub(crate) async fn source_hash(path: &Path) -> Option<String> {
 
 /// Blocking twin of [`source_hash`].
 pub(crate) fn source_hash_sync(path: &Path) -> Option<String> {
+    unfix_bin(&read_prefix_sync(path)?)?;
+    let bytes = crate::utils::fs::read_regular_to_bytes_sync(path).ok()?;
+    source_hash_of(&bytes)
+}
+
+/// The first [`PROBE_LEN`] bytes of the regular file at `path`.
+async fn read_prefix(path: &Path) -> Option<Vec<u8>> {
+    let path = path.to_path_buf();
+    crate::utils::fs::run_blocking(move || read_prefix_sync(&path)).await
+}
+
+fn read_prefix_sync(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let (file, _) = crate::utils::fs::open_regular_file_sync(path).ok()?;
     let mut prefix = Vec::with_capacity(PROBE_LEN);
     file.take(PROBE_LEN as u64).read_to_end(&mut prefix).ok()?;
-    unfix_bin(&prefix)?;
-    let bytes = crate::utils::fs::read_regular_to_bytes_sync(path).ok()?;
-    source_hash_of(&bytes)
+    Some(prefix)
 }
 
 /// [`source_hash`] of bytes already read.
