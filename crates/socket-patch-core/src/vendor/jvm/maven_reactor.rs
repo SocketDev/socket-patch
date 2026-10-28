@@ -163,6 +163,7 @@ pub fn plan_with_external(
             &mut warnings,
             &mut unpinned,
             &mut managed_roots,
+            &mut BTreeSet::new(),
         );
     }
 
@@ -458,6 +459,47 @@ pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusa
             .iter()
             .any(|rel| reactor.poms[rel].doc.masked.contains(&sv))
     })
+}
+
+/// [`wired_checked`], and no declaration of `c`'s g:a is left at a version
+/// that may still read the base: a `${...}` the checkout does not define
+/// or that an inheriting pom or a profile moves (#513, #459). Such a
+/// module builds the unpatched jar, so `vex` must not attest.
+pub fn attestable_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusal> {
+    let sv = c.suffixed_version();
+    let reactor = Reactor::discover(read)?;
+    if !reactor
+        .scope
+        .iter()
+        .any(|rel| reactor.poms[rel].doc.masked.contains(&sv))
+    {
+        return Ok(false);
+    }
+    let patch = JvmPatch {
+        group_id: c.group_id,
+        artifact_id: c.artifact_id,
+        version: c.version,
+        uuid: c.uuid,
+        jar: &[],
+        upstream_pom: &[],
+        upstream_module: None,
+        extra_artifacts: &[],
+        patched_members: &[],
+    };
+    let mut uncertain = BTreeSet::new();
+    for rel in &reactor.scope {
+        reactor.rewrite_declarations(
+            rel,
+            &patch,
+            &sv,
+            &mut BTreeMap::new(),
+            &mut Vec::new(),
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut uncertain,
+        );
+    }
+    Ok(uncertain.is_empty())
 }
 
 /// `<!-- socket-patch <uuid>:` — the start of `c`'s pin comment.
@@ -1313,6 +1355,9 @@ struct Pom {
     props: BTreeMap<String, String>,
     /// Each profile's id and `<properties>`, in document order.
     profile_props: Vec<(String, BTreeMap<String, String>)>,
+    /// Model 4.1.0 (Maven 4): omitted parent coordinates are inferred
+    /// from the pom at the relative path.
+    infers_parent: bool,
 }
 
 /// A pom and one of its profiles' `<properties>`.
@@ -1360,7 +1405,10 @@ impl Pom {
             })
             .filter(|(_, props)| !props.is_empty())
             .collect();
+        let infers_parent = doc.child_text(project, "modelVersion").as_deref() == Some("4.1.0")
+            || doc.masked.contains("maven.apache.org/POM/4.1.0");
         Ok(Pom {
+            infers_parent,
             dir: rel.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
             group: doc.child_text(project, "groupId"),
             artifact: doc.child_text(project, "artifactId"),
@@ -1574,12 +1622,20 @@ impl Reactor {
 
     fn lookup_with(&self, rel: &str, name: &str, overlay: Option<Overlay<'_>>) -> Option<String> {
         let pom = &self.poms[rel];
+        // A Maven 4 child may omit its parent's coordinates too: they come
+        // from the inferred local parent.
+        let version = || {
+            self.chain(rel)
+                .find_map(|p| self.poms[p].effective_version())
+                .map(str::to_string)
+        };
         match name {
-            "project.version" | "pom.version" => {
-                return pom.effective_version().map(str::to_string);
-            }
+            "project.version" | "pom.version" => return version(),
             "project.groupId" | "pom.groupId" => {
-                return pom.effective_group().map(str::to_string);
+                return self
+                    .chain(rel)
+                    .find_map(|p| self.poms[p].effective_group())
+                    .map(str::to_string);
             }
             "project.artifactId" | "pom.artifactId" => return pom.artifact.clone(),
             "project.parent.version" => return pom.parent.as_ref()?.version.clone(),
@@ -1597,31 +1653,37 @@ impl Reactor {
         }) {
             return Some(v.clone());
         }
-        (name == "version")
-            .then(|| pom.effective_version().map(str::to_string))
-            .flatten()
+        (name == "version").then(version).flatten()
     }
 
-    /// A version `declared` (with `${...}`) reaches in some pom that reads
-    /// it, `rel` or an inheritor, when a profile on that pom's chain is
-    /// active, and that is neither the base nor `sv`: the pom and the
-    /// profile's id, and the version. Profile activation is not evaluated,
-    /// so every profile counts.
-    fn profile_override(
+    /// A version `declared` (with `${...}`) reaches in a pom that reads
+    /// it, an inheritor of `rel` or `rel` itself with a profile on its
+    /// chain active, that is neither the base nor `sv`: the version and
+    /// where. Profile activation is not evaluated, so every profile counts
+    /// (one at a time).
+    fn version_override(
         &self,
         rel: &str,
         declared: &str,
         base: &str,
         sv: &str,
-    ) -> Option<(String, String, String)> {
+    ) -> Option<(String, String)> {
+        let moved = |v: &str| !is_base_like(v, base) && v != sv;
         std::iter::once(rel)
             .chain(self.inheritors(rel))
             .find_map(|reader| {
-                self.chain(reader).find_map(|at| {
-                    self.poms[at].profile_props.iter().find_map(|(id, props)| {
-                        let v = self.interpolate_with(reader, declared, 0, Some((at, props)))?;
-                        (!is_base_like(&v, base) && v != sv)
-                            .then(|| (format!("profile {id} of {at}"), v, reader.to_string()))
+                let plain = (reader != rel)
+                    .then(|| self.interpolate(reader, declared, 0))
+                    .flatten()
+                    .filter(|v| moved(v))
+                    .map(|v| (v, reader.to_string()));
+                plain.or_else(|| {
+                    self.chain(reader).find_map(|at| {
+                        self.poms[at].profile_props.iter().find_map(|(id, props)| {
+                            let v =
+                                self.interpolate_with(reader, declared, 0, Some((at, props)))?;
+                            moved(&v).then(|| (v, format!("{reader} under profile {id} of {at}")))
+                        })
                     })
                 })
             })
@@ -1636,8 +1698,9 @@ impl Reactor {
     }
 
     /// Rewrite the base declarations of `rel` and record the
-    /// warnings, the local roots not to pin, and the local roots whose own
-    /// top-level management already covers g:a.
+    /// warnings, the local roots not to pin, the local roots whose own
+    /// top-level management already covers g:a, and the declarations left
+    /// at a version that may still read the base (`uncertain`).
     #[allow(clippy::too_many_arguments)]
     fn rewrite_declarations(
         &self,
@@ -1648,10 +1711,11 @@ impl Reactor {
         warnings: &mut Vec<JvmWarning>,
         unpinned: &mut BTreeSet<String>,
         managed_roots: &mut BTreeSet<String>,
+        uncertain: &mut BTreeSet<String>,
     ) {
         let doc = &self.poms[rel].doc;
         let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
-        self.warn_unresolved_coordinates(rel, patch, warnings);
+        self.warn_unresolved_coordinates(rel, patch, warnings, unpinned, uncertain);
         for (dep, key) in self.keyed_declarations(rel, patch.group_id, patch.artifact_id) {
             if doc
                 .child_text(dep, "type")
@@ -1690,6 +1754,7 @@ impl Reactor {
                         ),
                     ));
                     unpinned.insert(root);
+                    uncertain.insert(at);
                     continue;
                 }
             }
@@ -1714,6 +1779,7 @@ impl Reactor {
                         ));
                         // The explicit version beats any pin of the root.
                         unpinned.insert(root);
+                        uncertain.insert(at);
                         continue;
                     }
                 }
@@ -1724,34 +1790,15 @@ impl Reactor {
                 continue;
             }
             if is_base_like(&resolved, patch.version) {
-                // Maven interpolates after inheritance: a pom that inherits
-                // this declaration and overrides the property must keep its
-                // own version, so the literal SV cannot go here.
-                let overridden = declared.contains("${").then(|| {
-                    self.inheritors(rel).find_map(|p| {
-                        let v = self.interpolate(p, &declared, 0)?;
-                        (!is_base_like(&v, patch.version) && v != sv).then(|| (p.to_string(), v))
-                    })
-                });
-                let profiled = || {
-                    declared
-                        .contains("${")
-                        .then(|| self.profile_override(rel, &declared, patch.version, sv))
-                        .flatten()
-                };
-                if let Some((profile, v, p)) = profiled() {
-                    warnings.push(degraded(
-                        "conflicting_literal_version",
-                        format!(
-                            "{at}: {ga} version {declared} resolves to {v} in {p} under \
-                             {profile}, not {}; left as is and {root} is not pinned",
-                            patch.version
-                        ),
-                    ));
-                    unpinned.insert(root);
-                    continue;
-                }
-                if let Some((p, v)) = overridden.flatten() {
+                // Maven interpolates after inheritance and with the active
+                // profiles: a pom that inherits this declaration and
+                // overrides the property, or a profile that does, must keep
+                // its own version, so the literal SV cannot go here.
+                let overridden = declared
+                    .contains("${")
+                    .then(|| self.version_override(rel, &declared, patch.version, sv))
+                    .flatten();
+                if let Some((v, p)) = overridden {
                     warnings.push(degraded(
                         "conflicting_literal_version",
                         format!(
@@ -1761,6 +1808,7 @@ impl Reactor {
                         ),
                     ));
                     unpinned.insert(root);
+                    uncertain.insert(at);
                     continue;
                 }
                 let span = doc.value_span(version);
@@ -1796,12 +1844,15 @@ impl Reactor {
 impl Reactor {
     /// Warn for each declaration of `rel` that could be `patch`'s g:a but
     /// names a `${...}` groupId or artifactId undefined in the checkout:
-    /// it is left as is, probably unpatched.
+    /// it is left as is, probably unpatched. One with its own version
+    /// beats any pin, so its local root is not pinned.
     fn warn_unresolved_coordinates(
         &self,
         rel: &str,
         patch: &JvmPatch<'_>,
         warnings: &mut Vec<JvmWarning>,
+        unpinned: &mut BTreeSet<String>,
+        uncertain: &mut BTreeSet<String>,
     ) {
         let doc = &self.poms[rel].doc;
         let resolve = |v: &str| self.interpolate(rel, v, 0);
@@ -1835,16 +1886,29 @@ impl Reactor {
                 continue;
             }
             let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
+            let versioned = doc
+                .child_text(dep, "version")
+                .is_some_and(|v| !v.is_empty());
+            let root = self.local_root(rel);
+            let unpin = if versioned {
+                format!(", and {root} is not pinned")
+            } else {
+                String::new()
+            };
             warnings.push(degraded(
                 "property_unresolved",
                 format!(
                     "{at}: {g}:{a} may be {}:{} but {} is not defined in the checkout; \
-                     left as is, probably unpatched",
+                     left as is, probably unpatched{unpin}",
                     patch.group_id,
                     patch.artifact_id,
                     unresolved.join(", ")
                 ),
             ));
+            if versioned {
+                unpinned.insert(root);
+                uncertain.insert(at);
+            }
         }
     }
 }
@@ -1998,13 +2062,14 @@ fn local_parent_of(
     };
     // Maven 4 (model 4.1.0) infers omitted parent coordinates from the
     // pom at the relative path.
-    let matches = want_group
-        .as_deref()
-        .is_none_or(|g| Some(g) == candidate.effective_group())
-        && want_artifact
-            .as_deref()
-            .is_none_or(|a| Some(a) == candidate.artifact.as_deref())
-        && versions_agree;
+    let infers = poms[rel].infers_parent;
+    let matches = match want_group.as_deref() {
+        None => infers,
+        Some(g) => Some(g) == candidate.effective_group(),
+    } && match want_artifact.as_deref() {
+        None => infers,
+        Some(a) => Some(a) == candidate.artifact.as_deref(),
+    } && versions_agree;
     Ok(matches.then_some(parent_rel))
 }
 
@@ -5389,6 +5454,106 @@ mod tests {
         let plan = run(&files).unwrap();
         assert_eq!(reasons(&plan), ["conflicting_literal_version"]);
         assert!(unwired(&applied(&files, &plan)));
+    }
+
+    fn attestable(files: &Fs) -> (bool, bool) {
+        let read = |p: &str| files.get(p).cloned();
+        let c = Coords {
+            group_id: "org.apache.commons",
+            artifact_id: "commons-text",
+            version: "1.10.0",
+            uuid: UUID,
+        };
+        (
+            wired_checked(&read, &c).unwrap(),
+            attestable_checked(&read, &c).unwrap(),
+        )
+    }
+
+    /// A sibling rewritten to SV wires the patch, but a module left at an
+    /// uncertain `${...}` still builds the base: not attestable.
+    #[test]
+    fn an_uncertain_module_beside_a_rewritten_one_is_not_attestable() {
+        let profiled = with_profile(
+            &module("a", &dep("${ct.version}")),
+            "new",
+            "<ct.version>1.11.0</ct.version>",
+        );
+        let root = ROOT.replace(
+            "  <modules>",
+            "  <properties><ct.version>1.10.0</ct.version></properties>\n  <modules>",
+        );
+        for (root, a) in [
+            (ROOT.to_string(), module("a", &dep("${remote.prop}"))),
+            (root, profiled),
+        ] {
+            let files = fs(&[
+                ("pom.xml", &root),
+                ("a/pom.xml", &a),
+                ("b/pom.xml", &module("b", &dep("1.10.0"))),
+            ]);
+            let (_, after) = vendor(&files);
+            assert_eq!(text(&after, "b/pom.xml"), module("b", &dep(SV)));
+            assert_eq!(attestable(&after), (true, false), "{a}");
+        }
+        // Without the uncertain module the same reactor attests.
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", "")),
+            ("b/pom.xml", &module("b", &dep("1.10.0"))),
+        ]);
+        let (_, after) = vendor(&files);
+        assert_eq!(attestable(&after), (true, true));
+    }
+
+    /// #513: a possibly-matching declaration named through an undefined
+    /// `${...}` groupId with its own version beats any pin.
+    #[test]
+    fn an_unresolved_coordinate_with_a_version_leaves_the_root_unpinned() {
+        let a = module(
+            "a",
+            "<dependency><groupId>${ext.group}</groupId>\
+             <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>",
+        );
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["property_unresolved"]);
+        assert!(!root_pinned(&plan, &files));
+        assert!(unwired(&applied(&files, &plan)));
+    }
+
+    /// Maven 4 children also inherit the inferred parent's version, and a
+    /// model 4.0.0 pom does not infer a parent.
+    #[test]
+    fn maven_4_parent_inference_is_4_1_only_and_carries_the_version() {
+        let root = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  \
+            <modelVersion>4.1.0</modelVersion>\n  <groupId>org.apache.commons</groupId>\n  \
+            <artifactId>root</artifactId>\n  <version>1.10.0</version>\n  \
+            <packaging>pom</packaging>\n  <subprojects><subproject>a</subproject></subprojects>\n\
+            </project>\n";
+        let a41 = format!(
+            "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  \
+             <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  <artifactId>a</artifactId>\n  \
+             <dependencies>\n    {}\n  </dependencies>\n</project>\n",
+            dep("${project.version}")
+        );
+        let files = fs(&[("pom.xml", root), ("a/pom.xml", &a41)]);
+        let (plan, after) = vendor(&files);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(
+            text(&after, "a/pom.xml"),
+            a41.replace("${project.version}", SV)
+        );
+        let a40 = a41
+            .replace("POM/4.1.0", "POM/4.0.0")
+            .replace(">4.1.0<", ">4.0.0<");
+        let files = fs(&[("pom.xml", root), ("a/pom.xml", &a40)]);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["property_unresolved"]);
     }
 
     /// A profile that sets the base version (or a user property that wins

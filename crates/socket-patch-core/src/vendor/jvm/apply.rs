@@ -830,10 +830,11 @@ pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
     referenced || reader.read_error.borrow().is_some()
 }
 
-/// The liveness proof `vex` needs: every half of the entry is wired, and
-/// a Gradle half's script is intact and re-plans with no refusal and no
+/// The liveness proof `vex` needs: every half of the entry is wired, a
+/// Gradle half's script is intact and re-plans with no refusal and no
 /// degraded warning (a conflicting rule or unchecked build logic added
-/// since vendoring withholds attestation).
+/// since vendoring withholds attestation), and no Maven declaration is
+/// left at a version that may still read the base.
 pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, String> {
     let (g, a, v) = entry_gav(entry)?;
     let c = Coords {
@@ -856,7 +857,7 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
             wired = gradle::wired_checked(&read, &list, &c).map_err(|e| e.detail);
         }
         if maven && wired == Ok(true) {
-            wired = maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail);
+            wired = maven_reactor::attestable_checked(&read, &c).map_err(|e| e.detail);
         }
         wired
     };
