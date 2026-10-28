@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-27 (run 49), main `4654b7c`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta2 (no newer release). Gem redirect and vendor suites pass on 4.0.23 at `4654b7c` (run 49). Ruby 3.1.6 is now in the sandbox (`/opt/rbenv/versions/3.1.6/bin`), so Bundler 1.17.3 runs.
+Last updated: 2026-10-28 (run 50), main `b787454`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta2 (no newer release). Gem redirect and vendor suites pass on 4.0.23 at `4654b7c` (run 49). Ruby 3.1.6 is now in the sandbox (`/opt/rbenv/versions/3.1.6/bin`), so Bundler 1.17.3 runs.
 
 ## Coverage matrix
 
@@ -438,6 +438,16 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
 | Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
 
+### Run 50 (main `b787454`, v5.0.1; Linux Ruby 3.3.6; #1648 plain `vendor` eject, scratch tests in `e2e_redirect_gem_build.rs`, real `bundle install`)
+
+| Cell | 4.0.18 | 2.5.22 |
+| --- | --- | --- |
+| Eject, top-level decl, fresh checkout → frozen install → `vendor --revert` → frozen install | pass | — |
+| Eject with a stale `.socket/manifest.json` (other uuid + manifest-only gem) | pass (manifest ignored, byte-identical) | — |
+| Eject, `gems.rb` twin, dry run and wet run | pass (both `gemfile_not_loaded`) | — |
+| Eject, `group`-block decl: dry run vs wet run parity | **fail #1761** | **fail #1761** |
+| Eject on an unconverged Gemfile-only pin | no-op `noManifest` (documented) | — |
+
 ### Run 49 (main `4654b7c`, v5.0.1; Linux; scratch tests in `e2e_redirect_gem_build.rs`, real `bundle install` / `bundle exec`)
 
 | Cell | 1.17.3 (Ruby 3.1.6) | 2.1.4 | 2.5.22 | 4.0.18 | 4.0.23 |
@@ -482,11 +492,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #1749 and #1109 (`agent:needs-human`) when fixes merge. #985, #1235, #1594, #1626 and #1688 are fixed; they were spot-checked in run 49 (#985 merged pins, #1688 single-gem supersede).
-2. #1749 follow-up: a lock that started merged on 2.1, then converged under Bundler 2.2+ / 4.x (does the upgraded lock stay merged and hit #1749?).
-3. The full gem suites on Bundler 1.17.3 / Ruby 3.1.6 (now possible in the sandbox), plus `e2e_redirect_gem_stale_install` (its tests aren't `#[ignore]`d, so run it without `--ignored`).
-4. Vendored superseding patch that changes the gem's runtime deps (the PATH `specs:` must follow the new stub gemspec).
-5. Windows / macOS probe backlog (#952, #1092, #1260). Re-run the gem suites on 4.1.0 final when it ships.
+1. Re-run #1749 when #1750 merges, and #1109 (`agent:needs-human`) / #1761 when fixed.
+2. Eject (#1648) on a Bundler ≤ 2.1 merged lock with two hosted gems (#1749 interplay), and on a `BUNDLE_GEMFILE` dual boot / `eval_gemfile` direct dep (dry run vs wet run parity).
+3. #1749 follow-up: a lock that started merged on 2.1, then converged under Bundler 2.2+ / 4.x.
+4. The full gem suites on Bundler 1.17.3 / Ruby 3.1.6, plus `e2e_redirect_gem_stale_install` (its tests aren't `#[ignore]`d, so run it without `--ignored`).
+5. Vendored superseding patch that changes the gem's runtime deps; the Windows / macOS probe backlog (#952, #1092, #1260); the gem suites on 4.1.0 final when it ships.
 
 ## Known non-bugs
 
@@ -622,3 +632,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - The #1646 user-patch consent gate has no gem evidence (CLI_CONTRACT.md's detection table lists no Bundler mechanism). That's documented scope (run 49).
 - Bundler 2.5 / 2.6 never merge a gemspec dev dep into a later Gemfile `gem` line (they only merge dev + dev). 2.7 is the right boundary for `bundler_merges_dev_dependencies` (checked in the 2.5.23 / 2.6.9 / 2.7.0 `dsl.rb`, run 49).
 - Manifestless `vex` in the redirect harness needs `--api-url`, `--org`, `--api-token` and `--patch-server-url <mock>`, or every Bundler version reads `manifest_not_found` (run 49).
+- Plain `vendor` on a hosted gem whose lock isn't converged yet (Gemfile-only wiring, before the first unfrozen `bundle install`) finds no hosted pins and exits 0 with `noManifest`. That's documented: Gemfile-only pins aren't references (CLI_CONTRACT "Lockless pins") (run 50).
+- After an eject (#1648), a later plain `vendor` with a `.socket/manifest.json` present falls back to manifest-driven vendoring, because no hosted pins are left. That's the documented legacy fallback (run 50).
