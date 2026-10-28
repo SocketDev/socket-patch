@@ -614,7 +614,14 @@ pub async fn verify_go_redirect_state(
         match socket {
             Some(e)
                 if e.path.as_deref() == Some(expected.as_str())
-                    && e.version.as_deref() == Some(version) => {}
+                    && e.version.as_deref() == Some(version) =>
+            {
+                // A root go.mod that mirrors a go.work host must hold it
+                // too, or a `GOWORK=off` build links the unpatched module.
+                if !replace_in_every_host(project_root, module, version, &expected).await {
+                    drifts.push(Drift::MissingReplace { purl: purl.clone() });
+                }
+            }
             Some(e) => drifts.push(Drift::WrongReplacePath {
                 purl: purl.clone(),
                 expected,
@@ -703,12 +710,27 @@ async fn redirect_in_sync(
         return false;
     }
     let expected = replace_target_path(base_rel, module, version);
-    read_replace_entries(project_root).await.iter().any(|e| {
-        e.module == module
-            && e.socket_owned()
-            && e.path.as_deref() == Some(expected.as_str())
-            && e.version.as_deref() == Some(version)
-    })
+    replace_in_every_host(project_root, module, version, &expected).await
+}
+
+/// True if every file apply writes the replace of `module` into (the
+/// replace host, plus a root `go.mod` that mirrors a `go.work` host) holds
+/// a socket-owned `replace` pinning `version` to `expected`. A mirror
+/// missing from go.mod must not count as in sync: a `GOWORK=off` build
+/// would link the unpatched module.
+async fn replace_in_every_host(
+    project_root: &Path,
+    module: &str,
+    version: &str,
+    expected: &str,
+) -> bool {
+    let files = go_mod_edit::superseded_replace(project_root, module).await;
+    !files.is_empty()
+        && files.iter().all(|(_, e)| {
+            e.as_ref().is_some_and(|e| {
+                e.path.as_deref() == Some(expected) && e.version.as_deref() == Some(version)
+            })
+        })
 }
 
 /// Synthesize Go's minimal `go.mod` (`module <path>`) in the copy iff it has
@@ -957,6 +979,72 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read_to_string(root.join("go.work")).unwrap(), work);
         assert!(!root.join("go.mod").exists());
+    }
+
+    /// A root module that is a go.work member keeps a mirror of the go.work
+    /// replace in its go.mod. A deleted mirror is drift: `--check` reports
+    /// it, and a re-apply (otherwise in sync) writes it back.
+    #[tokio::test]
+    async fn test_missing_root_go_mod_mirror_is_drift_and_reapplied() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let gomod = std::fs::read_to_string(root.join("go.mod")).unwrap();
+        std::fs::write(root.join("go.work"), "go 1.22\n\nuse (\n\t.\n\t./b\n)\n").unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(
+            root.join("b").join("go.mod"),
+            format!("module example.com/b\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+        )
+        .unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+        let apply = || {
+            apply_go_redirect(
+                PURL,
+                MODULE,
+                VERSION,
+                &pristine,
+                root,
+                GO_PATCHES_DIR,
+                &files,
+                &sources,
+                false,
+                MismatchPolicy::Warn,
+            )
+        };
+        let result = apply().await;
+        assert!(result.success, "{:?}", result.error);
+        let line = format!(
+            "replace {MODULE} {VERSION} => {}",
+            replace_target_path(GO_PATCHES_DIR, MODULE, VERSION)
+        );
+        assert!(std::fs::read_to_string(root.join("go.work"))
+            .unwrap()
+            .contains(&line));
+        assert!(std::fs::read_to_string(root.join("go.mod"))
+            .unwrap()
+            .contains(&line));
+        let manifest = manifest_with(&files);
+        let desired: HashSet<String> = [PURL.to_string()].into();
+        verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap();
+
+        std::fs::write(root.join("go.mod"), &gomod).unwrap();
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert!(drifts
+            .iter()
+            .any(|d| matches!(d, Drift::MissingReplace { .. })));
+
+        let result = apply().await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(std::fs::read_to_string(root.join("go.mod"))
+            .unwrap()
+            .contains(&line));
+        verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
