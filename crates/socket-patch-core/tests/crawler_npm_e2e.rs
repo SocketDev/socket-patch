@@ -4712,6 +4712,70 @@ async fn global_mode_finds_one_segment_registry_under_root_registry() {
     assert_eq!(deno_roots, vec![&host, &nested], "{roots:?}");
 }
 
+/// #1784: a one-segment path registry (`https://host/npm/` →
+/// `<host>/npm/<pkg>/`) stays a root when the host-root registry has also
+/// cached a package named like that segment (`<host>/npm/<version>/`),
+/// whether the nested registry's packages are plain or scoped, and the
+/// scan reports each registry's packages once, from its own dir.
+#[tokio::test]
+#[serial_test::serial]
+async fn global_mode_finds_one_segment_registry_behind_same_named_package() {
+    struct DenoDirGuard(Option<std::ffi::OsString>);
+    impl Drop for DenoDirGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("DENO_DIR", v),
+                None => std::env::remove_var("DENO_DIR"),
+            }
+        }
+    }
+    let _guard = DenoDirGuard(std::env::var_os("DENO_DIR"));
+    for nested_pkg in ["foo", "@scope/foo"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let deno_dir = tmp.path().join("deno");
+        let host = deno_dir.join("npm").join("registry.example.com");
+        let nested = host.join("npm");
+        let npm_pkg = stage_deno_npm_pkg(&host, "npm", "10.9.0", "10.9.0").await;
+        let foo = stage_deno_npm_pkg(&nested, nested_pkg, "1.0.0", "1.0.0").await;
+
+        std::env::set_var("DENO_DIR", &deno_dir);
+        let opts = CrawlerOptions {
+            cwd: tmp.path().to_path_buf(),
+            global: true,
+            global_prefix: None,
+        };
+        let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+        let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
+        assert_eq!(deno_roots, vec![&host, &nested], "{nested_pkg}: {roots:?}");
+
+        let mut crawled: Vec<(String, PathBuf)> = NpmCrawler
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .filter(|p| p.path.starts_with(&deno_dir))
+            .map(|p| (p.purl, p.path))
+            .collect();
+        crawled.sort();
+        let foo_purl = format!("pkg:npm/{nested_pkg}@1.0.0");
+        let mut expected = vec![
+            ("pkg:npm/npm@10.9.0".to_string(), npm_pkg.clone()),
+            (foo_purl.clone(), foo.clone()),
+        ];
+        expected.sort();
+        assert_eq!(crawled, expected, "{nested_pkg}");
+
+        let found = NpmCrawler
+            .find_by_purls(&nested, &[foo_purl.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            found_paths(&found, &foo_purl),
+            vec![foo.clone()],
+            "{nested_pkg}"
+        );
+    }
+}
+
 /// #444: a `--global-prefix` naming `$DENO_DIR` or `$DENO_DIR/npm` (a parent
 /// of Deno's npm cache registry dirs) expands to every registry dir below
 /// it, the same ones `-g` finds, so the scan sees the packages
