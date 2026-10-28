@@ -334,7 +334,12 @@ async fn patched_in_other_scope(
                 let unverifiable = v.current_hash.is_none()
                     && v.status != VerifyRollbackStatus::AlreadyOriginal
                     && !v.is_absent();
-                if unverifiable || v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
+                // `Ready` also covers npm's LF-shebang form of a patched
+                // bin, whose hash is not the afterHash.
+                if unverifiable
+                    || v.status == VerifyRollbackStatus::Ready
+                    || v.current_hash.as_deref() == Some(info.after_hash.as_str())
+                {
                     patched.push((purl.clone(), path.clone()));
                     break 'copies;
                 }
