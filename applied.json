@@ -39,7 +39,8 @@
   "20261025T132003Z-janitor.json",
   "20261026T133311Z-janitor.json",
   "20261027T133451Z-janitor.json",
-  "20261028T012021Z-janitor.json"
+  "20261028T012021Z-janitor.json",
+  "20261028T073500Z-janitor.json"
  ],
  "failed": {
   "00000000T000000Z-bridge-test.json": [
