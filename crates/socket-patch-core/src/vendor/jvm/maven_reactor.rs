@@ -1391,7 +1391,7 @@ struct Reactor {
     scope: Vec<String>,
     /// pom → its local parent pom.
     local_parent: BTreeMap<String, String>,
-    /// `-Dk=v` user properties from `.mvn/maven.config`.
+    /// User properties from `.mvn/maven.config` ([`cli_properties`]).
     cli_props: BTreeMap<String, String>,
 }
 
@@ -1829,28 +1829,47 @@ fn has_fallback_repository(doc: &Doc) -> bool {
     })
 }
 
-/// The user properties a `maven.config` defines, as Maven reads them:
-/// `#` lines are comments (Maven 3.9+; older Maven rejects them), and a
-/// property is `-Dk=v`, `--define=k=v`, or `-D` / `--define` followed by a
-/// separate `k=v` token, on the same line or the next. `-Dk` sets `k=true`;
-/// a later definition wins.
+/// The user properties a `maven.config` defines, as Maven 3.9+ reads it:
+/// one argument per line, `#` lines are comments (older Maven rejects
+/// them), and a wholly quoted argument is unquoted. A property is
+/// `-Dk=v`, `-D k=v`, `--define=k=v` or `--define k=v`, or a bare `-D` /
+/// `--define` whose `k=v` is the next line. The value is the rest of the
+/// argument, so `-Dv=1.0 # note` defines `1.0 # note`, as in Maven.
+/// `-Dk` sets `k=true`; a later definition wins.
 fn cli_properties(config: &str) -> BTreeMap<String, String> {
-    let mut tokens = config
+    // Java's `String.trim`: every char up to U+0020, nothing beyond.
+    fn trim(s: &str) -> &str {
+        s.trim_matches(|c: char| c <= ' ')
+    }
+    fn unquote(s: &str) -> &str {
+        s.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .map_or(s, trim)
+    }
+    let mut args = config
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .flat_map(str::split_whitespace);
+        .map(|line| unquote(trim(line)))
+        .filter(|arg| !arg.is_empty() && !arg.starts_with('#'))
+        .peekable();
     let mut props = BTreeMap::new();
-    while let Some(token) = tokens.next() {
-        let def = match token {
-            "-D" | "--define" => tokens.next(),
-            _ => token
-                .strip_prefix("--define=")
-                .or_else(|| token.strip_prefix("-D")),
+    while let Some(arg) = args.next() {
+        let def = match arg.strip_prefix("--define") {
+            Some(rest) => rest
+                .strip_prefix('=')
+                .or_else(|| (rest.is_empty() || rest.starts_with(' ')).then_some(rest)),
+            None => arg.strip_prefix("-D"),
         };
-        let Some((k, v)) = def.map(|d| d.split_once('=').unwrap_or((d, "true"))) else {
+        let Some(def) = def.map(trim) else {
             continue;
         };
+        let def = match def {
+            "" => match args.next_if(|next| !next.starts_with('-')) {
+                Some(next) => next,
+                None => continue,
+            },
+            def => def,
+        };
+        let (k, v) = def.split_once('=').unwrap_or((def, "true"));
         if !k.is_empty() {
             props.insert(k.to_string(), v.to_string());
         }
@@ -3751,6 +3770,9 @@ mod tests {
             "-D\nct.version=1.11.0\n",
             "--define\nct.version=1.11.0\n",
             "-B\r\n--define=ct.version=1.11.0\r\n",
+            "\"-Dct.version=1.11.0\"\n",
+            // Maven 3.9+ reads the whole line as the value.
+            "-Dct.version=1.10.0 # TODO bump\n",
         ] {
             let (plan, after, a) = vendor_with_maven_config(config);
             assert_eq!(
@@ -3784,7 +3806,8 @@ mod tests {
     #[test]
     fn maven_config_user_properties_parse_like_maven() {
         let props = cli_properties(
-            "# -Dgone=1\n-Da=1\n--define=b=2\n-D c=3\n-D\nd=4\n--define e=5\n-Dflag\n  -Da=6  \n",
+            "# -Dgone=1\n-Da=1\n--define=b=2\n-D c=3\n-D\nd=4\n--define e=5\n-Dflag\n  -Da=6  \n\
+             \"-Dq=7\"\n-Dv=1.0 # note\n-D\n-Dw=8\n--defined=x\n-B\n",
         );
         let want = [
             ("a", "6"),
@@ -3793,6 +3816,9 @@ mod tests {
             ("d", "4"),
             ("e", "5"),
             ("flag", "true"),
+            ("q", "7"),
+            ("v", "1.0 # note"),
+            ("w", "8"),
         ];
         assert_eq!(
             props,
