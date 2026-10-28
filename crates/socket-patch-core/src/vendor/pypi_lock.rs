@@ -42,14 +42,14 @@ pub(super) struct PythonLocks {
 }
 
 impl PythonLocks {
-    /// Each file [`wire_python_locks`] may rewrite, with its text as
-    /// loaded: every lock, and a script lock's script.
-    pub(super) fn loaded_files(&self) -> Vec<(String, String)> {
+    /// Each file [`wire_python_locks`] may rewrite: every lock, and a
+    /// script lock's script.
+    pub(super) fn file_names(&self) -> Vec<&str> {
         let mut files = Vec::new();
         for file in &self.files {
-            files.push((file.name.clone(), file.text.clone()));
-            if let (Some(script), Some(name)) = (&file.script, script_of_lock(&file.name)) {
-                files.push((name.to_string(), script.clone()));
+            files.push(file.name.as_str());
+            if file.script.is_some() {
+                files.extend(script_of_lock(&file.name));
             }
         }
         files

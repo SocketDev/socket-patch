@@ -401,8 +401,8 @@ async fn detect_pypi_flavor(
         }
         // #1524: a requirements.txt an earlier run vendored for this
         // package keeps that wiring (and its records stay in the ledger
-        // entry), so don't say it keeps its registry source.
-        let mut vendored = Vec::new();
+        // entry), and one wired with the lock (#1758) is no loser either:
+        // name neither as keeping its registry source.
         let mut unchanged = Vec::new();
         for file in present {
             let wired = match target {
@@ -418,29 +418,17 @@ async fn detect_pypi_flavor(
                 }
                 _ => false,
             };
-            if wired {
-                vendored.push(file);
-            } else {
+            if !wired {
                 unchanged.push(file);
             }
         }
-        let mut clauses = Vec::new();
         if !unchanged.is_empty() {
-            clauses.push(format!(
-                "installs driven by {} retain their existing sources",
-                unchanged.join(", ")
-            ));
-        }
-        if !vendored.is_empty() {
-            clauses.push(format!("{} keeps its vendored wiring", vendored.join(", ")));
-        }
-        if !clauses.is_empty() {
             warnings.push(VendorWarning::new(
                 "pypi_multiple_lockfiles",
                 format!(
-                    "wiring {}; {}",
+                    "wiring {}; installs driven by {} retain their existing sources",
                     additional_locks.join(", "),
-                    clauses.join("; ")
+                    unchanged.join(", ")
                 ),
             ));
         }
@@ -1043,8 +1031,8 @@ struct PypiPrelude<'p> {
     prior: Option<VendorEntry>,
     expected_pin: Option<(String, String)>,
     reused_wheel: Option<AcquiredWheel>,
-    /// An in-sync Pipenv or uv lock whose exported requirements pin still
-    /// needs wiring once the missing wheel is rebuilt (#612, #1368).
+    /// An in-sync Pipenv, uv or Python lock whose requirements pin still
+    /// needs wiring once the missing wheel is rebuilt (#612, #1368, #1758).
     sibling_pending: bool,
 }
 
@@ -1103,9 +1091,9 @@ async fn pypi_prelude<'p>(
     // entry left (a state.json lost in a merge, clobbered, or never
     // committed — the exact window the state `repair` exists for).
     let mut wired_pin: Option<(String, String)> = None;
-    // An in-sync Pipenv or uv lock whose exported requirements pin is not
-    // wired yet (a project vendored before #612 / #1368, or an export made
-    // since).
+    // An in-sync Pipenv, uv or Python lock whose requirements pin is not
+    // wired yet (a project vendored before #612 / #1368 / #1758, or an
+    // export made since).
     let mut sibling_pending = false;
     let mut warnings: Vec<VendorWarning> = flavor_warnings;
     let plan = match flavor {
@@ -1616,9 +1604,21 @@ fn sibling_lock(flavor: PypiFlavor) -> Option<(&'static str, &'static str)> {
         )),
         PypiFlavor::PythonLocks => Some((
             "the Python lockfile",
-            "run `socket-patch vendor --revert` and vendor again",
+            "restore the lockfile's registry entry, e.g. with `pip lock -r requirements.txt`, \
+             and vendor again",
         )),
         PypiFlavor::Poetry | PypiFlavor::Pdm | PypiFlavor::Requirements | PypiFlavor::Hatch => None,
+    }
+}
+
+/// How the sibling notes name the requirements file wired with `flavor`'s
+/// lock: an export of a Pipenv or uv lock, but the file a `pip lock`
+/// pylock was locked from (#1758).
+fn sibling_requirements(flavor: PypiFlavor) -> &'static str {
+    if flavor == PypiFlavor::PythonLocks {
+        "requirements.txt"
+    } else {
+        "exported requirements.txt"
     }
 }
 
@@ -1629,9 +1629,9 @@ fn sibling_dry_run_notice(flavor: PypiFlavor, canon_name: &str, version: &str) -
     VendorWarning::new(
         "pypi_requirements_sibling_wired",
         format!(
-            "would wire the exported {} pin of {canon_name}=={version} to the vendored wheel \
-             together with {lock}",
-            crate::formats::governing_locks::PYPI_REQUIREMENTS
+            "would wire the {} pin of {canon_name}=={version} to the vendored wheel together \
+             with {lock}",
+            sibling_requirements(flavor)
         ),
     )
 }
@@ -1666,8 +1666,8 @@ fn pylock_dry_run_notice(pylocks: &[String], canon_name: &str, version: &str) ->
     )
 }
 
-/// #612 / #1368 for a Pipenv or uv lock already wired to this patch: wire
-/// the exported requirements pin to the same committed wheel and extend
+/// #612 / #1368 / #1758 for a Pipenv, uv or Python lock already wired to
+/// this patch: wire the requirements pin to the same committed wheel and extend
 /// the ledger entry with its records, so the revert restores both files.
 /// `result` is the run's outcome so far (the in-sync skip, or a rebuilt
 /// wheel). Without a ledger entry (whose records the revert replays), or
@@ -1737,9 +1737,9 @@ async fn wire_in_sync_sibling(
             warnings.push(VendorWarning::new(
                 "pypi_requirements_sibling_wired",
                 format!(
-                    "would wire the exported {} pin of {canon_name}=={version} to the vendored \
-                     wheel already wired in {lock}",
-                    crate::formats::governing_locks::PYPI_REQUIREMENTS
+                    "would wire the {} pin of {canon_name}=={version} to the vendored wheel \
+                     already wired in {lock}",
+                    sibling_requirements(flavor)
                 ),
             ));
             targets.extend(
@@ -1820,9 +1820,9 @@ async fn wire_in_sync_sibling(
                 warnings.push(VendorWarning::new(
                     "pypi_requirements_sibling_wired",
                     format!(
-                        "wired the exported {} pin of {canon_name}=={version} to the vendored \
-                         wheel already wired in {lock}",
-                        crate::formats::governing_locks::PYPI_REQUIREMENTS
+                        "wired the {} pin of {canon_name}=={version} to the vendored wheel \
+                         already wired in {lock}",
+                        sibling_requirements(flavor)
                     ),
                 ));
                 // A re-export (`pipenv requirements > requirements.txt`) put
@@ -2280,14 +2280,10 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             }
         }
         WiringPlan::PythonLocks(project, sibling) => {
-            // The locks as `wire_python_locks` checks they still are, to
-            // put back if the requirements pin then refuses.
-            let lock_before: Snapshot = if sibling {
-                project
-                    .loaded_files()
-                    .into_iter()
-                    .map(|(file, text)| (file, Some(text.into_bytes())))
-                    .collect()
+            // The files as they are before the wiring, to put back if the
+            // requirements pin then refuses.
+            let lock_before = if sibling {
+                snapshot_files(project_root, &project.file_names()).await
             } else {
                 Vec::new()
             };
@@ -3295,8 +3291,8 @@ async fn snapshot_files(project_root: &Path, files: &[&str]) -> Snapshot {
     snapshot
 }
 
-/// Wire the exported requirements pin beside a just-wired Pipenv or uv lock
-/// to the same wheel (#612, #1368): a superseded entry's recorded lines are
+/// Wire the requirements pin beside a just-wired Pipenv, uv or Python lock
+/// to the same wheel (#612, #1368, #1758): a superseded entry's recorded lines are
 /// re-wired in place, a registry pin is rewritten fresh. On a refusal the
 /// lock files in `lock_before` are put back, so neither file is left half
 /// wired.
@@ -11738,20 +11734,15 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hashes = {sha256 = "u
         let (result, entry, warnings) =
             crate::vendor::test_support::expect_done(vendor_six(&fx, &sources, None).await);
         assert!(result.success, "{:?}", result.error);
-        // The routing note names requirements.txt as still vendored, not
-        // as a file left on its registry source.
+        // requirements.txt stays vendored: no routing note names it as a
+        // file left on its registry source (#1524), or at all (#1758).
         let routing: Vec<&str> = warnings
             .iter()
             .filter(|w| w.code == "pypi_multiple_lockfiles")
             .map(|w| w.detail.as_str())
             .collect();
         assert!(
-            routing
-                .iter()
-                .any(|d| d.contains("requirements.txt keeps its vendored wiring"))
-                && routing
-                    .iter()
-                    .all(|d| !d.contains("retain their existing sources")),
+            routing.iter().all(|d| !d.contains("requirements.txt")),
             "{routing:?}"
         );
         crate::vendor::test_support::persist(&fx.root, key, entry.expect("entry on success")).await;

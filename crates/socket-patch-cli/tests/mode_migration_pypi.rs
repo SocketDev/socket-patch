@@ -3231,6 +3231,19 @@ async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
     stage_manifest(&root);
     let needle = format!(".socket/vendor/pypi/{UUID}/");
 
+    // The dry run previews the requirements wiring and writes nothing.
+    let (code, env) = run_cli(&root, &["vendor", "--dry-run"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let text = env.to_string();
+    assert!(
+        text.contains("pypi_requirements_sibling_wired")
+            && !text.contains("pypi_multiple_lockfiles"),
+        "{env:#}"
+    );
+    for (file, bytes) in &originals {
+        assert_eq!(&std::fs::read(root.join(file)).unwrap(), bytes, "{file}");
+    }
+
     let (code, env) = run_cli(&root, &["vendor"], &[]);
     assert_eq!(code, 0, "{env:#}");
     for file in files {
@@ -3242,8 +3255,7 @@ async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
         );
     }
     assert!(
-        !env.to_string().contains("UNPATCHED")
-            && !env.to_string().contains("retain their existing sources"),
+        !env.to_string().contains("pypi_multiple_lockfiles"),
         "requirements.txt is wired, not an unpatched loser: {env:#}"
     );
 
@@ -3257,6 +3269,10 @@ async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
         .collect();
     let (code, env) = run_cli(&root, &["vendor"], &[]);
     assert_eq!(code, 0, "{env:#}");
+    assert!(
+        !env.to_string().contains("pypi_multiple_lockfiles"),
+        "a settled re-run names no lockfile: {env:#}"
+    );
     for (file, bytes) in files.iter().zip(&wired) {
         assert_eq!(&std::fs::read(root.join(file)).unwrap(), bytes, "{file}");
     }
@@ -3271,6 +3287,56 @@ async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
         );
     }
     assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+}
+
+/// #1758: a pylock vendored while requirements.txt did not pin six yet
+/// (a project vendored before the fix wired only the pylock). Once the
+/// file pins six==1.16.0, the next `vendor` wires it to the committed
+/// wheel and records it in the ledger entry: `vendor --check` is green
+/// and `vendor --revert` restores both files.
+#[tokio::test]
+async fn pip_lock_rerun_wires_a_requirements_pin_added_later() {
+    let (_tmp, root) = project();
+    stage_pip_lock(&root);
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\n").unwrap();
+    stage_manifest(&root);
+    let needle = format!(".socket/vendor/pypi/{UUID}/");
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+        "idna==3.7\n",
+        "{env:#}"
+    );
+
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        env.to_string().contains("pypi_requirements_sibling_wired"),
+        "{env:#}"
+    );
+    assert!(
+        std::fs::read_to_string(root.join("requirements.txt"))
+            .unwrap()
+            .contains(&needle),
+        "{env:#}"
+    );
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        std::fs::read(root.join("requirements.txt")).unwrap(),
+        b"idna==3.7\nsix==1.16.0\n",
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("pylock.toml")).unwrap(),
+        PIP_LOCK.as_bytes(),
+        "{env:#}"
+    );
 }
 
 /// #1758: hosted mode pins six in both `requirements.txt` and the
