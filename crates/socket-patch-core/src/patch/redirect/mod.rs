@@ -10200,12 +10200,13 @@ mod tests {
                 "{coords}"
             );
         }
-        // A placeholder that cannot be the GA (the other coordinate
-        // differs), or a versionless one (it takes the managed pin), does
-        // not block the pin.
+        // A placeholder that cannot be the GA (the other coordinate, or the
+        // literal text around the reference, differs), or a versionless
+        // one (it takes the managed pin), does not block the pin.
         for other in [
             "<groupId>${parent.g}</groupId><artifactId>logback-classic</artifactId><version>1.4.14</version>",
             "<groupId>${parent.g}</groupId><artifactId>slf4j-api</artifactId>",
+            "<groupId>${project.groupId}</groupId><artifactId>${project.artifactId}-core</artifactId><version>${project.version}</version>",
         ] {
             let mut files = BTreeMap::new();
             files.insert(

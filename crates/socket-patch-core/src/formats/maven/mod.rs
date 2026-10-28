@@ -67,6 +67,9 @@ pub(crate) struct PomScope {
     profiles: Vec<Element>,
     /// The root `<properties>` (see [`properties`]).
     properties: BTreeMap<String, String>,
+    /// [`Self::properties`] plus the `${project.*}` model references a
+    /// coordinate may name (see [`model_refs`]).
+    coordinate_refs: BTreeMap<String, String>,
 }
 
 impl PomScope {
@@ -86,11 +89,16 @@ impl PomScope {
         .concat();
         let profiles = elements(&masked, "profiles")?;
         let properties = properties(&masked, &ignored, &profiles)?;
+        let mut coordinate_refs = properties.clone();
+        for (name, value) in model_refs(&masked)? {
+            coordinate_refs.entry(name).or_insert(value);
+        }
         Ok(PomScope {
             masked,
             ignored,
             profiles,
             properties,
+            coordinate_refs,
         })
     }
 
@@ -138,7 +146,8 @@ fn inside(pos: usize, set: &[Element]) -> bool {
 pub(crate) struct ScopedDep {
     pub(crate) element: Element,
     /// `<groupId>` / `<artifactId>` with every `${prop}` the root
-    /// `<properties>` defines interpolated (see [`interpolate`]); an
+    /// `<properties>` or the project's own coordinates define
+    /// interpolated (see [`interpolate`]); an
     /// undefined one stays as written, so [`may_name`] can tell it apart.
     pub(crate) group: Option<String>,
     pub(crate) artifact: Option<String>,
@@ -162,9 +171,10 @@ impl PomScope {
             let version = elements(&body, "version")?.into_iter().next();
             out.push(ScopedDep {
                 element: dep,
-                group: child_text(&body, "groupId")?.map(|g| interpolate(&g, &self.properties)),
+                group: child_text(&body, "groupId")?
+                    .map(|g| interpolate(&g, &self.coordinate_refs)),
                 artifact: child_text(&body, "artifactId")?
-                    .map(|a| interpolate(&a, &self.properties)),
+                    .map(|a| interpolate(&a, &self.coordinate_refs)),
                 version_inner: version.map(|v| {
                     (
                         dep.inner_start + v.inner_start,
@@ -302,12 +312,85 @@ fn interpolate(text: &str, properties: &BTreeMap<String, String>) -> String {
     out
 }
 
+/// The model references a sibling declaration commonly uses
+/// (`${project.groupId}`, `${pom.version}`, the deprecated bare
+/// `${groupId}`), read from the project's own `<groupId>` / `<artifactId>`
+/// / `<version>`; groupId and version fall back to the `<parent>`'s, which
+/// the project inherits when it omits them.
+fn model_refs(masked: &str) -> Result<BTreeMap<String, String>, String> {
+    let Some(project) = elements(masked, "project")?.into_iter().next() else {
+        return Ok(BTreeMap::new());
+    };
+    let body = project.inner(masked);
+    let parent = elements(body, "parent")?.into_iter().next();
+    let parent_text = |tag: &str| match &parent {
+        Some(p) => child_text(p.inner(body), tag),
+        None => Ok(None),
+    };
+    // The project's own coordinates: what is left once every section that
+    // nests a groupId / artifactId / version of something else is blanked.
+    let mut own = body.to_string();
+    for section in [
+        "build",
+        "reporting",
+        "profiles",
+        "distributionManagement",
+        "dependencyManagement",
+        "parent",
+        "dependencies",
+    ] {
+        own = blank_elements(&own, section)?;
+    }
+    let mut refs = BTreeMap::new();
+    for (field, inherited) in [("groupId", true), ("artifactId", false), ("version", true)] {
+        let value = match child_text(&own, field)? {
+            Some(v) => Some(v),
+            None if inherited => parent_text(field)?,
+            None => None,
+        };
+        if let Some(value) = value.filter(|v| !v.is_empty() && !v.contains("${")) {
+            for prefix in ["project.", "pom.", ""] {
+                refs.insert(format!("{prefix}{field}"), value.clone());
+            }
+        }
+    }
+    Ok(refs)
+}
+
 /// Whether a dependency's (interpolated) `coordinate` may be `want`: it
 /// is, or it still holds a `${…}` this pom does not define (a parent's or
-/// the build's property), so Maven might resolve it to `want`. A reader
-/// that cannot rule a declaration out must not pin or attest past it.
+/// the build's property) and Maven might resolve it to `want` — each such
+/// reference may stand for any text, while the literal text around it must
+/// still match. A reader that cannot rule a declaration out must not pin or
+/// attest past it.
 pub(crate) fn may_name(coordinate: &str, want: &str) -> bool {
-    coordinate == want || coordinate.contains("${")
+    if !coordinate.contains("${") {
+        return coordinate == want;
+    }
+    // The literal pieces between the references (an unterminated `${`
+    // reads as a reference running to the end).
+    let mut pieces = Vec::new();
+    let mut rest = coordinate;
+    while let Some(open) = rest.find("${") {
+        pieces.push(&rest[..open]);
+        rest = match rest[open..].find('}') {
+            Some(close) => &rest[open + close + 1..],
+            None => "",
+        };
+    }
+    pieces.push(rest);
+    let (first, last) = (pieces[0], pieces[pieces.len() - 1]);
+    if want.len() < first.len() + last.len() || !want.starts_with(first) || !want.ends_with(last) {
+        return false;
+    }
+    let mut middle = &want[first.len()..want.len() - last.len()];
+    for piece in &pieces[1..pieces.len() - 1] {
+        match middle.find(piece) {
+            Some(at) => middle = &middle[at + piece.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 fn is_property_name(name: &str) -> bool {
@@ -385,6 +468,34 @@ mod tests {
         assert_eq!(scope.project_close(), pom.rfind("</project>"));
         assert!(PomScope::new("<project><![CDATA[ open</project>").is_err());
         assert!(PomScope::new("<!-- <project></project> -->").is_err());
+    }
+
+    /// #683: a coordinate property the pom defines, or a project model
+    /// reference, is resolved; an undefined one may name only what its
+    /// literal text around it allows.
+    #[test]
+    fn coordinate_references() {
+        let pom = "<project><parent><groupId>org.parent</groupId><version>9</version></parent>\
+                   <artifactId>app</artifactId><properties><v>org.slf4j</v></properties>\
+                   <dependencies>\
+                   <dependency><groupId>${v}</groupId><artifactId>${project.artifactId}-core</artifactId></dependency>\
+                   <dependency><groupId>${project.groupId}</groupId><artifactId>x-${undefined}</artifactId></dependency>\
+                   </dependencies></project>";
+        let deps = PomScope::new(pom).unwrap().dependencies().unwrap();
+        assert_eq!(deps[0].group.as_deref(), Some("org.slf4j"));
+        assert_eq!(deps[0].artifact.as_deref(), Some("app-core"));
+        assert_eq!(deps[1].group.as_deref(), Some("org.parent"));
+        assert_eq!(deps[1].artifact.as_deref(), Some("x-${undefined}"));
+
+        assert!(super::may_name("slf4j-api", "slf4j-api"));
+        assert!(!super::may_name("slf4j-apix", "slf4j-api"));
+        assert!(super::may_name("${a}", "slf4j-api"));
+        assert!(super::may_name("slf4j-${a}", "slf4j-api"));
+        assert!(super::may_name("${a}-${b}", "slf4j-api"));
+        assert!(super::may_name("${a", "slf4j-api"));
+        assert!(!super::may_name("${a}-core", "slf4j-api"));
+        assert!(!super::may_name("x-${a}", "slf4j-api"));
+        assert!(!super::may_name("sl${a}api-${b}x", "slf4j-api"));
     }
 
     #[test]
