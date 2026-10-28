@@ -4043,10 +4043,8 @@ mod tests {
             plan.warnings[0].detail
         );
         assert_eq!(text(&after, "a/pom.xml"), a);
-        assert!(
-            text(&after, "pom.xml").contains("<dependencyManagement>"),
-            "still pinned"
-        );
+        // a's explicit `${remote.prop}` beats any pin (#513).
+        assert!(!text(&after, "pom.xml").contains("<dependencyManagement>"));
     }
 
     #[test]
@@ -5139,6 +5137,203 @@ mod tests {
         let (plan, after) = vendor(&files);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         assert!(text(&after, "pom.xml").contains(&format!("<version>{SV}</version></dependency>")));
+    }
+
+    // ── uncertain property versions (#513, #459) ──
+
+    /// No pom of the reactor names the suffixed version: `vex` sees the
+    /// patch as unwired.
+    fn unwired(files: &Fs) -> bool {
+        files
+            .iter()
+            .filter(|(rel, _)| rel.ends_with(".xml"))
+            .all(|(_, bytes)| !String::from_utf8_lossy(bytes).contains(SV))
+    }
+
+    /// `profile` as a profile of `pom`, placed before its `<dependencies>`
+    /// (or `<modules>`).
+    fn with_profile(pom: &str, id: &str, props: &str) -> String {
+        let profile = format!(
+            "<profiles><profile><id>{id}</id><activation><activeByDefault>true\
+             </activeByDefault></activation><properties>{props}</properties></profile>\
+             </profiles>\n  "
+        );
+        let at = pom
+            .find("<dependencies>")
+            .or_else(|| pom.find("<modules>"))
+            .unwrap();
+        format!("{}{profile}{}", &pom[..at], &pom[at..])
+    }
+
+    /// #513 case 1: a property only an external parent defines keeps the
+    /// module's explicit version over any pin, so the root is not pinned.
+    #[test]
+    fn a_property_from_an_external_parent_leaves_the_root_unpinned() {
+        let parent = "<parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId>\
+            <version>3</version><relativePath/></parent>";
+        let mut files = external_reactor(parent, "");
+        let a = text(&files, "a/pom.xml").replace(
+            "</artifactId></dependency>",
+            "</artifactId><version>${ct.version}</version></dependency>",
+        );
+        files.insert("a/pom.xml".into(), a.clone().into_bytes());
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["property_unresolved"]);
+        let after = applied(&files, &plan);
+        assert_eq!(text(&after, "a/pom.xml"), a);
+        assert!(!root_pinned(&plan, &files));
+        assert!(unwired(&after));
+    }
+
+    /// #513 case 2: Maven 4.1.0 infers an empty `<parent/>` from
+    /// `../pom.xml`, so the root's property resolves and is rewritten.
+    #[test]
+    fn a_maven_4_inferred_parent_is_local() {
+        let root = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  \
+            <modelVersion>4.1.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
+            <artifactId>root</artifactId>\n  <version>1.0.0</version>\n  \
+            <packaging>pom</packaging>\n  <subprojects><subproject>a</subproject></subprojects>\n  \
+            <properties><ct.version>1.10.0</ct.version></properties>\n</project>\n";
+        let a = format!(
+            "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  \
+             <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  <artifactId>a</artifactId>\n  \
+             <dependencies>\n    {}\n  </dependencies>\n</project>\n",
+            dep("${ct.version}")
+        );
+        let files = fs(&[("pom.xml", root), ("a/pom.xml", &a)]);
+        let (plan, after) = vendor(&files);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(text(&after, "a/pom.xml"), a.replace("${ct.version}", SV));
+        assert!(root_pinned(&plan, &files));
+    }
+
+    /// #459: a profile of the declaring module raising the property keeps
+    /// the declaration and leaves the root unpinned.
+    #[test]
+    fn a_profile_overriding_the_version_property_is_left_alone() {
+        let root = ROOT.replace(
+            "  <modules>",
+            "  <properties><ct.version>1.10.0</ct.version></properties>\n  <modules>",
+        );
+        let a = with_profile(
+            &module("a", &dep("${ct.version}")),
+            "modern-jdk",
+            "<ct.version>1.11.0</ct.version>",
+        );
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["conflicting_literal_version"]);
+        assert!(
+            plan.warnings[0].detail.contains("profile modern-jdk"),
+            "{:?}",
+            plan.warnings
+        );
+        let after = applied(&files, &plan);
+        assert_eq!(text(&after, "a/pom.xml"), a);
+        assert!(!root_pinned(&plan, &files));
+        assert!(unwired(&after));
+    }
+
+    /// #459: the same through the parent's profile, and through a profile
+    /// overriding a property the version is built from.
+    #[test]
+    fn a_profile_up_the_chain_or_on_a_nested_property_is_weighed() {
+        let a = module("a", &dep("${ct.version}"));
+        for (props, profile) in [
+            (
+                "<ct.version>1.10.0</ct.version>",
+                "<ct.version>1.11.0</ct.version>",
+            ),
+            (
+                "<ct.minor>10</ct.minor><ct.version>1.${ct.minor}.0</ct.version>",
+                "<ct.minor>11</ct.minor>",
+            ),
+        ] {
+            let root = with_profile(
+                &ROOT.replace(
+                    "  <modules>",
+                    &format!("  <properties>{props}</properties>\n  <modules>"),
+                ),
+                "corp",
+                profile,
+            );
+            let files = fs(&[
+                ("pom.xml", &root),
+                ("a/pom.xml", &a),
+                ("b/pom.xml", &module("b", "")),
+            ]);
+            let plan = run(&files).unwrap();
+            assert_eq!(reasons(&plan), ["conflicting_literal_version"], "{props}");
+            let after = applied(&files, &plan);
+            assert_eq!(text(&after, "a/pom.xml"), a);
+            assert!(unwired(&after), "{props}");
+        }
+    }
+
+    /// #459: a module's profile overriding the property an inherited
+    /// management declaration reads keeps that declaration.
+    #[test]
+    fn an_inheriting_modules_profile_keeps_the_managed_property() {
+        let root = ROOT.replace(
+            "  <build>",
+            "  <properties><ct.version>1.10.0</ct.version></properties>\n  \
+             <dependencyManagement>\n    <dependencies>\n      \
+             <dependency><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId>\
+             <version>${ct.version}</version></dependency>\n    </dependencies>\n  \
+             </dependencyManagement>\n  <build>",
+        );
+        let bare = "<dependency><groupId>org.apache.commons</groupId>\
+                    <artifactId>commons-text</artifactId></dependency>";
+        let a = with_profile(
+            &module("a", bare),
+            "new",
+            "<ct.version>1.12.0</ct.version>",
+        );
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", bare)),
+        ]);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["conflicting_literal_version"]);
+        assert!(unwired(&applied(&files, &plan)));
+    }
+
+    /// A profile that sets the base version (or a user property that wins
+    /// over every profile) changes nothing.
+    #[test]
+    fn a_profile_agreeing_with_the_base_or_beaten_by_maven_config_is_rewritten() {
+        let root = ROOT.replace(
+            "  <modules>",
+            "  <properties><ct.version>1.10.0</ct.version></properties>\n  <modules>",
+        );
+        let agreeing = with_profile(
+            &module("a", &dep("${ct.version}")),
+            "same",
+            "<ct.version>1.10.0</ct.version>",
+        );
+        let raising = with_profile(
+            &module("a", &dep("${ct.version}")),
+            "new",
+            "<ct.version>1.11.0</ct.version>",
+        );
+        for (a, config) in [(&agreeing, None), (&raising, Some("-Dct.version=1.10.0\n"))] {
+            let mut files = fs(&[
+                ("pom.xml", &root),
+                ("a/pom.xml", a),
+                ("b/pom.xml", &module("b", "")),
+            ]);
+            if let Some(config) = config {
+                files.insert(".mvn/maven.config".into(), config.as_bytes().to_vec());
+            }
+            let (plan, after) = vendor(&files);
+            assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+            assert_eq!(text(&after, "a/pom.xml"), a.replace("${ct.version}", SV));
+        }
     }
 
     #[test]

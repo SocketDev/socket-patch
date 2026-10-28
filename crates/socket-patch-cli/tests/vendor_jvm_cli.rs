@@ -1153,6 +1153,53 @@ fn gradle_vendor_533_unpatched_classifier_copy_withholds_vex() {
     assert!(!vex.exists(), "{env}");
 }
 
+/// #513 / #459: a reactor `${prop}` version that can't be pinned with
+/// certainty (undefined in the checkout, or raised by a profile) is left
+/// as is with a warning, and `vex` does not attest the package the build
+/// still takes unpatched.
+#[test]
+fn maven_reactor_uncertain_property_version_withholds_vex() {
+    for (extra, reason) in [
+        ("", "property_unresolved"),
+        (
+            "<properties><foo.version>1.0</foo.version></properties>\
+             <profiles><profile><id>new</id><properties><foo.version>1.1</foo.version>\
+             </properties></profile></profiles>",
+            "conflicting_literal_version",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+        let a = std::fs::read_to_string(root.join("proj/a/pom.xml")).unwrap();
+        let a = a
+            .replace(
+                "<version>1.0</version></dependency>",
+                "<version>${foo.version}</version></dependency>",
+            )
+            .replace(
+                "<artifactId>a</artifactId>",
+                &format!("<artifactId>a</artifactId>{extra}"),
+            );
+        write(root, "proj/a/pom.xml", a.as_bytes());
+        let env = ok(root, &["vendor"]);
+        assert!(env.to_string().contains(&format!("reason: {reason}")), "{env}");
+        assert_eq!(std::fs::read_to_string(root.join("proj/a/pom.xml")).unwrap(), a);
+        assert!(!wiring_text(root).contains("-socket."), "{reason}: pinned");
+        let vex = root.join("vex.json");
+        let (_, env) = socket(
+            root,
+            &["vex", "-O", vex.to_str().unwrap(), "--product", "pkg:generic/x@1"],
+        );
+        assert_eq!(
+            events(&env),
+            [(purl("foo"), "skipped".to_string(), "vendor_unwired".to_string())],
+            "{reason}: {env}"
+        );
+        assert!(!vex.exists(), "{env}");
+    }
+}
+
 /// #429 repair: a deleted owned `.gitattributes` (and nothing else) is
 /// rewritten by `repair` (no download), so the next autocrlf clone keeps the
 /// script and index LF.
