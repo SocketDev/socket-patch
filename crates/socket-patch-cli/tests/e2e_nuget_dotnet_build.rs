@@ -991,6 +991,108 @@ fn nuget_vendored_dotnet_restore_then_manifestless_vex() {
     );
 }
 
+// ── global runs over a vendored project's restore folder (#489) ────────
+
+/// A vendored project's locked restore extracts the patched nupkg into the
+/// global packages folder, so a global agent run that starts in the project
+/// sees the project's own install there. `scan -g --mode agent` must yield
+/// it to the vendor ledger and `rollback -g` must leave it patched: a locked
+/// restore never re-extracts it (the lock and the nupkg's sha512 still
+/// match), so restoring upstream bytes there silently unpatched the build.
+#[test]
+#[ignore = "real .NET SDK + nuget.org: run with --ignored (CI e2e matrix pins each SDK major)"]
+fn nuget_vendored_project_survives_global_agent_scan_and_rollback() {
+    let sb = Sandbox::new();
+    let Some(dn) = Dotnet::probe("vendored-global", &sb) else {
+        return;
+    };
+    let sdk = dn.version.clone();
+    let fixture = sb.dir("fixture");
+    let store_fx = sb.dir("store-fixture");
+    restore_fixture(&dn, &sb, &fixture, &store_fx);
+
+    let pristine = std::fs::read(pkg_dir(&store_fx).join(FILE_KEY)).unwrap();
+    let mut patched = pristine.clone();
+    patched.extend_from_slice(MARKER);
+    let upstream = std::fs::read(pkg_dir(&store_fx).join(NUPKG_NAME)).unwrap();
+    let nupkg = patched_nupkg(&upstream, &patched);
+    let backend = Backend::start(VENDORED_UUID, &pristine, &patched, Some(&nupkg));
+    let uri = backend.uri();
+    let api = ["--api-url", &uri, "--org", ORG, "--api-token", "fake-token"];
+
+    let mut args = vec![
+        "scan",
+        "--mode",
+        "vendored",
+        "--vendor-source",
+        "service",
+        "--json",
+        "--yes",
+    ];
+    args.extend(api);
+    let (code, env, stderr) = socket_patch(&fixture, &store_fx, &args);
+    assert_eq!(
+        code,
+        Some(0),
+        "SDK {sdk} scan --mode vendored: {env:#}\n{stderr}"
+    );
+
+    // The project's machine: a fresh checkout whose locked restore
+    // extracted the patched bytes into its global packages folder.
+    let checkout = sb.dir("checkout");
+    fresh_checkout(&fixture, &checkout);
+    let store = sb.dir("store-checkout");
+    dn.restore_ok(
+        &sb,
+        &checkout,
+        &store,
+        &["--locked-mode"],
+        "vendored restore",
+    );
+    let installed = pkg_dir(&store).join(FILE_KEY);
+    assert_eq!(std::fs::read(&installed).unwrap(), patched, "SDK {sdk}");
+    let ledger = std::fs::read(checkout.join(socket_patch_core::vendor::VENDOR_STATE_REL)).unwrap();
+
+    let mut args = vec!["scan", "-g", "--mode", "agent", "--json", "--yes"];
+    args.extend(api);
+    let (code, env, stderr) = socket_patch(&checkout, &store, &args);
+    assert_eq!(
+        code,
+        Some(0),
+        "SDK {sdk} scan -g --mode agent: {env:#}\n{stderr}"
+    );
+    assert!(
+        env.to_string().contains("vendored_ownership_retained"),
+        "SDK {sdk}: the project's install stays the ledger's: {env:#}"
+    );
+    assert_eq!(env["summary"]["applied"], 0, "SDK {sdk}: {env:#}");
+
+    let mut args = vec!["rollback", "-g", "--json", "--yes"];
+    args.extend(api);
+    let (code, env, stderr) = socket_patch(&checkout, &store, &args);
+    assert_eq!(code, Some(0), "SDK {sdk} rollback -g: {env:#}\n{stderr}");
+    assert_eq!(env["summary"]["rolledBack"], 0, "SDK {sdk}: {env:#}");
+
+    // The project's next locked restore keeps building the patched bytes.
+    dn.restore_ok(
+        &sb,
+        &checkout,
+        &store,
+        &["--locked-mode"],
+        "restore after -g",
+    );
+    assert_eq!(
+        std::fs::read(&installed).unwrap(),
+        patched,
+        "SDK {sdk}: the project's install must stay PATCHED after scan -g + rollback -g"
+    );
+    assert_eq!(
+        std::fs::read(checkout.join(socket_patch_core::vendor::VENDOR_STATE_REL)).unwrap(),
+        ledger,
+        "SDK {sdk}: the vendor ledger is untouched"
+    );
+}
+
 // ── solution layout: member and named locks (#353, #514) ──────────────
 
 /// A solution layout: `nuget.config` at the root, one project under
