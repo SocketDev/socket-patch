@@ -216,6 +216,17 @@ impl ReplaceHost {
             ReplaceHost::GoWork => "go.work",
         }
     }
+
+    /// Whether the root `go.mod` holds the same Socket replace as this
+    /// host: a go.work host whose root is itself a module (so a `use`
+    /// member, see [`GoWorkspace::replace_host`]). The go.work replace
+    /// patches the workspace; the go.mod one keeps a build that doesn't
+    /// read this go.work (`GOWORK=off`, a checkout without it) patched.
+    /// The two never conflict: go skips a member's replace of a path
+    /// go.work replaces.
+    pub fn mirrors_root_go_mod(self, root_has_go_mod: bool) -> bool {
+        self == ReplaceHost::GoWork && root_has_go_mod
+    }
 }
 
 /// Why the `go.work` in effect keeps a Socket replace from taking effect.
@@ -600,7 +611,9 @@ impl GoWorkspace {
     /// `use` member and go.work already holds a Socket replace of `module`
     /// or another member lists `module`. A root module go.work doesn't use
     /// keeps go.mod, whose replace [`GoWorkspace::conflict`] refuses: a
-    /// go.work replace would patch the members, never the project.
+    /// go.work replace would patch the members, never the project. A root
+    /// module's go.mod keeps the replace too
+    /// ([`ReplaceHost::mirrors_root_go_mod`]).
     pub fn replace_host(&self, root: &Path, root_has_go_mod: bool, module: &str) -> ReplaceHost {
         if !self.rooted_at(root) {
             return ReplaceHost::GoMod;

@@ -9299,10 +9299,29 @@ fn rewrite_golang(
             rhs_version,
             zip_h1,
             gomod_h1,
-            selection,
+            selection.clone(),
             result,
         ) {
             result.confirmed_golang_uuids.insert(dep.patch_uuid.clone());
+            // A root module that is a go.work member keeps the replace in
+            // its go.mod too, so a build without this go.work (`GOWORK=off`)
+            // stays patched. go.work's replace takes precedence, so the
+            // two never conflict.
+            if host.mirrors_root_go_mod(has_go_mod) {
+                if let Some(mirror) = mod_target.as_mut() {
+                    rewrite_golang_target(
+                        mirror,
+                        dep,
+                        &fname,
+                        rhs_module,
+                        rhs_version,
+                        zip_h1,
+                        gomod_h1,
+                        selection,
+                        result,
+                    );
+                }
+            }
         }
     }
 
@@ -23488,16 +23507,27 @@ packages:
         assert!(second.files.is_empty() && second.edits.is_empty());
         assert!(second.confirmed_golang_uuids.contains(GO_UUID));
 
-        // Beside a root module, another member listing it shares it too;
-        // a module only the root lists stays in the root go.mod.
+        // Beside a root module, another member listing it shares it too,
+        // and the root go.mod keeps the pin as well (a `GOWORK=off` build
+        // of the root stays patched); a re-run keeps both. A module only
+        // the root lists stays in the root go.mod.
         let mut files = golang_files();
         let root = files["go.mod"].clone();
         with_root_go_work(&mut files, "", &[(".", &root), ("b", &a)]);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
         assert_eq!(
             out.files.keys().collect::<Vec<_>>(),
-            ["go.work", "go.work.sum"]
+            ["go.mod", "go.sum", "go.work", "go.work.sum"]
         );
+        assert!(out.files["go.mod"].contains(&line));
+        assert!(out.files["go.work"].contains(&line));
+        assert!(out.files["go.sum"].contains(&golang_socket_module()));
+        let mut again = files.clone();
+        again.extend(out.files.clone());
+        let second = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
+        assert!(second.files.is_empty() && second.edits.is_empty());
+        assert!(second.confirmed_golang_uuids.contains(GO_UUID));
         let mut files = golang_files();
         with_root_go_work(&mut files, "", &[(".", &root), ("b", c)]);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));

@@ -461,7 +461,17 @@ fn go_work_vendored_members_build_patched_and_attest_without_manifest() {
         "vendor wires the shared module in go.work"
     );
     for (rel, bytes) in &ws.pristine {
-        if *rel != "go.work" {
+        if *rel == "go.mod" {
+            // The root module, a `use` member, keeps the replace too.
+            assert_eq!(
+                std::fs::read_to_string(root.join(rel)).unwrap(),
+                format!(
+                    "{}\nreplace {UMOD} {UVER} => ./{art}\n",
+                    String::from_utf8_lossy(bytes)
+                ),
+                "{rel}"
+            );
+        } else if *rel != "go.work" {
             assert_eq!(&std::fs::read(root.join(rel)).unwrap(), bytes, "{rel}");
         }
     }
@@ -653,8 +663,8 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
     assert_eq!(env["summary"]["applied"], 1, "{env}");
     assert_eq!(
         env["redirect"]["rewrittenFiles"],
-        serde_json::json!(["go.work", "go.work.sum"]),
-        "only the workspace files: {env}"
+        serde_json::json!(["go.mod", "go.sum", "go.work", "go.work.sum"]),
+        "the workspace files and the root module's own: {env}"
     );
     assert_eq!(
         std::fs::read_to_string(root.join("go.work")).unwrap(),
@@ -664,8 +674,16 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
         std::fs::read_to_string(root.join("go.work.sum")).unwrap(),
         format!("{smod} {SVER} {zip_h1}\n{smod} {SVER}/go.mod {mod_h1}\n")
     );
+    // The root module, a `use` member, keeps the pin too, so a
+    // `GOWORK=off` build of it stays patched.
+    assert!(std::fs::read_to_string(root.join("go.mod"))
+        .unwrap()
+        .contains(&format!("replace {UMOD} {UVER} => {smod} {SVER}\n")));
+    assert!(std::fs::read_to_string(root.join("go.sum"))
+        .unwrap()
+        .contains(&format!("{smod} {SVER} {zip_h1}\n")));
     for (rel, bytes) in &ws.pristine {
-        if *rel != "go.work" {
+        if !["go.work", "go.mod", "go.sum"].contains(rel) {
             assert_eq!(&std::fs::read(root.join(rel)).unwrap(), bytes, "{rel}");
         }
     }
@@ -1671,12 +1689,13 @@ fn a_workspace_module_is_never_replaced() {
 
 /// `apply` at a go.work root whose own module alone requires the module
 /// writes the replace into go.mod; once member `a` (added to `use`) shares
-/// it, `vendor` moves it into go.work and deletes the go-patches copy, so
-/// no go.mod replace is left naming it: the workspace builds the vendored
-/// copy, the root alone (`GOWORK=off`) builds upstream, and `vendor
-/// --revert` leaves neither file replacing the module.
+/// it, `vendor` writes it into go.work too, repoints the go.mod replace at
+/// the vendored copy and deletes the go-patches copy: the workspace and the
+/// root alone (`GOWORK=off`) both build the vendored copy, a re-run keeps
+/// both replaces, and `vendor --revert` leaves neither file replacing the
+/// module.
 #[test]
-fn vendor_moves_a_root_go_mod_redirect_into_go_work() {
+fn vendor_keeps_a_root_go_mod_redirect_beside_go_work() {
     if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
         || !golang_e2e_matrix::supports_go_work()
     {
@@ -1737,7 +1756,11 @@ fn vendor_moves_a_root_go_mod_redirect_into_go_work() {
         read(&w.root.join("go.work")),
         format!("{work}\nreplace {UMOD} {UVER} => ./{art}\n")
     );
-    assert_eq!(read(&w.root.join("go.mod")), go_mod);
+    // The root module keeps the replace beside go.work's.
+    assert_eq!(
+        read(&w.root.join("go.mod")),
+        format!("{go_mod}\nreplace {UMOD} {UVER} => ./{art}\n")
+    );
     assert!(!w.root.join(&copy).exists());
     for (dir, tag) in [(".", "ROOT"), ("a", "A")] {
         let (out, err) = run_member(tmp.path(), &w.root, dir, &w.proxy, &[]);
@@ -1747,7 +1770,18 @@ fn vendor_moves_a_root_go_mod_redirect_into_go_work() {
         );
     }
     let (out, err) = run_member(tmp.path(), &w.root, ".", &w.proxy, &[("GOWORK", "off")]);
-    assert!(out.contains("ROOT: PRISTINE"), "root alone: {out}\n{err}");
+    assert!(out.contains("ROOT: PATCHED"), "root alone: {out}\n{err}");
+    // A re-run keeps both replaces.
+    let (code, env, stderr) = vendor(&[]);
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert_eq!(
+        read(&w.root.join("go.mod")),
+        format!("{go_mod}\nreplace {UMOD} {UVER} => ./{art}\n")
+    );
+    assert_eq!(
+        read(&w.root.join("go.work")),
+        format!("{work}\nreplace {UMOD} {UVER} => ./{art}\n")
+    );
 
     let (code, env, stderr) = vendor(&["--revert"]);
     assert_eq!(code, 0, "vendor --revert: {env}\n{stderr}");

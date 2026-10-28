@@ -403,13 +403,22 @@ pub async fn replace_refusal(
     let target = go_mod_edit::replace_target_path(base_rel, module, version);
     let ours = go_mod_edit::parse_replace_body(&format!("{module} {version} => {target}"))?;
     let ws = go_workspace::load(project_root).await;
-    let host = ws.replace_host(project_root, project_root.join("go.mod").is_file(), module);
-    if let Some(refusal) = go_mod_edit::symlink_refusal(&project_root.join(host.file_name())).await
-    {
-        return Some(format!(
-            "refusing to write `replace {module} {version} => {target}` to {}: {refusal}",
-            host.file_name()
-        ));
+    let has_go_mod = project_root.join("go.mod").is_file();
+    let host = ws.replace_host(project_root, has_go_mod, module);
+    // A root go.mod that mirrors a go.work host is written too; go reads
+    // go.work's replace first, so only the host's can conflict.
+    let mirror = host
+        .mirrors_root_go_mod(has_go_mod)
+        .then_some(go_workspace::ReplaceHost::GoMod);
+    for file in std::iter::once(host).chain(mirror) {
+        if let Some(refusal) =
+            go_mod_edit::symlink_refusal(&project_root.join(file.file_name())).await
+        {
+            return Some(format!(
+                "refusing to write `replace {module} {version} => {target}` to {}: {refusal}",
+                file.file_name()
+            ));
+        }
     }
     let conflict = ws.host_conflict(host, project_root, module, version, &ours)?;
     Some(format!(
