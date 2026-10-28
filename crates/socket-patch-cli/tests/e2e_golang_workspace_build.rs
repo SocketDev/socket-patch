@@ -1478,6 +1478,7 @@ fn go_work_vendor_records_the_go_work_replace() {
             assert_eq!(code, 0, "{env}\n{stderr}");
             env
         } else {
+            warm(tmp.path(), &m, &w.proxy, &[(UMOD, UVER)]);
             let (code, env, stderr) = w.api.get(&w.root, &m.modcache, &[]);
             assert_eq!(code, 0, "{env}\n{stderr}");
             env
