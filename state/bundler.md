@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-28 (run 50), main `b787454`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta2 (no newer release). Gem redirect and vendor suites pass on 4.0.23 at `4654b7c` (run 49). Ruby 3.1.6 is now in the sandbox (`/opt/rbenv/versions/3.1.6/bin`), so Bundler 1.17.3 runs.
+Last updated: 2026-10-28 (run 51), main `b787454`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta2 (no newer release). The redirect, vendor and stale-install gem suites pass on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51), and on 4.0.23 at `4654b7c` (run 49). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`.
 
 ## Coverage matrix
 
@@ -10,7 +10,7 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 
 | OS | Ruby | Bundler | Hosted: single-line decl | Hosted: multi-line decl / `if` modifier | Hosted: decl in `group` block | Hosted: platform gem, no CHECKSUMS | Hosted: CHECKSUMS lock | Hosted: stale-install guard | Hosted: `BUNDLE_GEMFILE` in `.bundle/config` | Vendored: `Gemfile` only | Vendored: `gems.rb` + `Gemfile` twin | Vendored: `BUNDLE_GEMFILE` | Vendored: `gems.rb` only | Agent: multi-home `vex` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 3.3.6 | 1.17.x | blocked (1.17 needs Ruby ≤ 3.1) | untested | untested | untested | n/a | untested | untested | untested | untested | untested | untested | untested |
+| Linux | 3.1.6 | 1.17.3 | pass (suites, run 51) | untested | untested | untested | n/a | untested | untested | untested | untested | untested | untested | untested |
 | Linux | 3.3.6 | 2.2–2.4 | untested | fixed #340 (#637) | untested | untested | n/a | untested | fixed #390 (#431) | untested | fixed #341 (#431) | untested | untested | untested |
 | Linux | 3.3.6 | 2.6.9 | pass | untested | untested | untested | pass | untested | untested | untested | untested | untested | untested | untested |
 | Linux | 3.3.6 | 4.0.17 | pass | fixed #340 (#637) | pass | pass (switches to patched ruby gem) | pass | pass | fixed #390 (#431) | pass | fixed #341 (#431) | fixed #390 (#431) | refused (documented) | fixed #420 (#517) |
@@ -438,6 +438,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
 | Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
 
+### Run 51 (main `b787454`, v5.0.1; Linux; #1648 plain `vendor` eject, scratch tests in `e2e_redirect_gem_build.rs`, real `bundle install` / `bundle exec`)
+
+| Cell | 1.17.3 (Ruby 3.1.6) | 2.1.4 (Ruby 3.1.6) | 4.0.18 (Ruby 3.3.6) |
+| --- | --- | --- | --- |
+| Eject, one hosted gem (merged lock on ≤ 2.1) → frozen install | pass | pass | pass (run 50) |
+| Eject → `vendor --revert` ×2 → frozen install | pass (back to upstream, documented) | pass (back to upstream, documented) | pass (run 50) |
+| Eject, two hosted gems: dry run / wet run | refused `hosted_wiring_contested` (#1749, commented) | refused `hosted_wiring_contested` (#1749, commented) | pass (both ejected, frozen install, `bundle exec` loads both patched, `vex` `not_affected`) |
+| Two-gem merged 2.1.4 lock → unfrozen `bundle install` on 2.6.9 | — | lock splits into one section per remote; eject then plans (exit 0) | — |
+| Eject after a dual boot is added (`BUNDLE_GEMFILE: Gemfile.next` in `.bundle/config`, or the env var; `Gemfile.next` evals `Gemfile`) | pass (both refuse `hosted_wiring_contested`, nothing written) | — | pass (same) |
+| Redirect (54) + vendor (44) + stale-install (42) suites | pass | — | — |
+
 ### Run 50 (main `b787454`, v5.0.1; Linux Ruby 3.3.6; #1648 plain `vendor` eject, scratch tests in `e2e_redirect_gem_build.rs`, real `bundle install`)
 
 | Cell | 4.0.18 | 2.5.22 |
@@ -492,11 +503,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #1749 when #1750 merges, and #1109 (`agent:needs-human`) / #1761 when fixed.
-2. Eject (#1648) on a Bundler ≤ 2.1 merged lock with two hosted gems (#1749 interplay), and on a `BUNDLE_GEMFILE` dual boot / `eval_gemfile` direct dep (dry run vs wet run parity).
-3. #1749 follow-up: a lock that started merged on 2.1, then converged under Bundler 2.2+ / 4.x.
-4. The full gem suites on Bundler 1.17.3 / Ruby 3.1.6, plus `e2e_redirect_gem_stale_install` (its tests aren't `#[ignore]`d, so run it without `--ignored`).
-5. Vendored superseding patch that changes the gem's runtime deps; the Windows / macOS probe backlog (#952, #1092, #1260); the gem suites on 4.1.0 final when it ships.
+1. Re-run #1749 when #1750 merges (including the two-gem eject on 2.1.4 / 1.17.3), #1761 when #1762 merges, and #1109 (`agent:needs-human`) when it's fixed.
+2. A merged two-gem lock kept merged under a frozen / deployment install after a Bundler upgrade (does any path keep it merged on 2.2+?).
+3. Vendored superseding patch that changes the gem's runtime deps.
+4. Eject on a CHECKSUMS lock with a platform gem (`-x86_64-linux`) and on a git-sourced sibling gem.
+5. The Windows / macOS probe backlog (#952, #1092, #1260); the gem suites on 4.1.0 final when it ships.
 
 ## Known non-bugs
 
@@ -634,3 +645,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Manifestless `vex` in the redirect harness needs `--api-url`, `--org`, `--api-token` and `--patch-server-url <mock>`, or every Bundler version reads `manifest_not_found` (run 49).
 - Plain `vendor` on a hosted gem whose lock isn't converged yet (Gemfile-only wiring, before the first unfrozen `bundle install`) finds no hosted pins and exits 0 with `noManifest`. That's documented: Gemfile-only pins aren't references (CLI_CONTRACT "Lockless pins") (run 50).
 - After an eject (#1648), a later plain `vendor` with a `.socket/manifest.json` present falls back to manifest-driven vendoring, because no hosted pins are left. That's the documented legacy fallback (run 50).
+- An eject's later `vendor --revert` returns the project to the upstream (unpatched) gem, not to hosted. That's documented in CLI_CONTRACT "Eject a hosted project (v5.0)" (run 51).
+- Adding a `BUNDLE_GEMFILE` dual boot to a hosted project makes `vendor` (dry and wet) refuse `hosted_wiring_contested`, even when `Gemfile.next` evals `Gemfile`. It fails closed and matches the documented #390 dual-boot refusal (run 51).
