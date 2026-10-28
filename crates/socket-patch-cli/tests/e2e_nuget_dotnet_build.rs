@@ -1067,6 +1067,25 @@ fn nuget_vendored_project_survives_global_agent_scan_and_rollback() {
     );
     assert_eq!(env["summary"]["applied"], 0, "SDK {sdk}: {env:#}");
 
+    // A global agent scan from before #489 recorded the project's install
+    // as its own: `rollback -g` must still leave it patched.
+    let record = serde_json::json!({ "patches": { PURL: {
+        "uuid": VENDORED_UUID,
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": { FILE_KEY: {
+            "beforeHash": git_sha256(&pristine),
+            "afterHash": git_sha256(&patched),
+        }},
+        "vulnerabilities": {},
+        "description": "",
+        "license": "MIT",
+        "tier": "free",
+    }}});
+    std::fs::write(
+        checkout.join(".socket/manifest.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
     let mut args = vec!["rollback", "-g", "--json", "--yes"];
     args.extend(api);
     let (code, env, stderr) = socket_patch(&checkout, &store, &args);
