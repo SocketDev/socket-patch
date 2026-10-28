@@ -42,7 +42,6 @@ use crate::patch::redirect::{
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
 use crate::utils::redact::url_host;
-use crate::vendor::go_build_list::ModuleEvidence;
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
@@ -485,6 +484,95 @@ async fn read_advisory(
     }
 }
 
+/// The Go workspace in effect for the project, handed to the golang
+/// rewriter under [`crate::patch::redirect::GO_WORKSPACE_KEY`]. On disk it is
+/// the one go resolves (`GOWORK`, else a go.work at or above the root, with
+/// members anywhere); in memory a root `go.work` and its in-root members.
+/// A root go.work and go.work.sum are candidate files the rewriter writes.
+async fn read_go_workspace(
+    view: &ProjectView<'_>,
+    unreadable: &BTreeSet<String>,
+    out: &mut CandidateFiles,
+) {
+    use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
+    let (root, loaded) = match view {
+        ProjectView::Memory(_) => 'memory: {
+            let Some(work) = read_advisory(view, unreadable, "go.work").await else {
+                return;
+            };
+            let work = crate::vendor::go_mod_edit::normalize_for_read(&work);
+            // As on disk (`go_workspace::load`): a go.work go cannot parse
+            // is a workspace go refuses to build, never module mode.
+            if let Some(problem) = crate::vendor::go_mod_edit::block_structure_error(&work) {
+                break 'memory (
+                    std::path::PathBuf::new(),
+                    Loaded::Invalid(format!("go.work: {problem}, so go refuses to build")),
+                );
+            }
+            let mut members = Vec::new();
+            for raw in crate::vendor::go_mod_edit::parse_use_dirs(&work) {
+                let Some(dir) = go_workspace::in_root_dir(&raw) else {
+                    members.push(Member {
+                        dir: raw.into(),
+                        go_mod: None,
+                        go_sum: None,
+                    });
+                    continue;
+                };
+                let at = |file: &str| match dir.as_str() {
+                    "" => file.to_string(),
+                    dir => format!("{dir}/{file}"),
+                };
+                members.push(Member {
+                    go_mod: read_advisory(view, unreadable, &at("go.mod"))
+                        .await
+                        .map(|t| crate::vendor::go_mod_edit::normalize_for_read(&t)),
+                    go_sum: read_advisory(view, unreadable, &at("go.sum")).await,
+                    dir: dir.into(),
+                });
+            }
+            let work_sum = read_advisory(view, unreadable, "go.work.sum").await;
+            let ws = GoWorkspace {
+                work_file: "go.work".into(),
+                work,
+                work_sum,
+                members,
+                graph: None,
+            };
+            (std::path::PathBuf::new(), Loaded::Workspace(ws))
+        }
+        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
+            let Some(root) = view.disk_root_reading(std::iter::empty::<&std::path::Path>()) else {
+                return;
+            };
+            let root = root.to_path_buf();
+            let mut loaded = go_workspace::load(&root).await;
+            if let Loaded::Workspace(ws) = &mut loaded {
+                ws.read_graph().await;
+            }
+            let mut touched: Vec<std::path::PathBuf> =
+                root.ancestors().map(|dir| dir.join("go.work")).collect();
+            if let Loaded::Workspace(ws) = &loaded {
+                touched.push(ws.work_dir().join("go.work.sum"));
+                for member in &ws.members {
+                    touched.push(member.dir.join("go.mod"));
+                    touched.push(member.dir.join("go.sum"));
+                }
+            }
+            view.disk_root_reading(&touched);
+            (root, loaded)
+        }
+    };
+    if loaded == Loaded::None {
+        return;
+    }
+    let hosted = crate::patch::redirect::HostedGoWorkspace { root, loaded };
+    if let Ok(json) = serde_json::to_string(&hosted) {
+        out.files
+            .insert(crate::patch::redirect::GO_WORKSPACE_KEY.to_string(), json);
+    }
+}
+
 /// Read the project's candidate files: [`REDIRECT_CANDIDATE_FILES`], the
 /// Cargo workspace members (when a cargo candidate meets a root
 /// `Cargo.toml`), the Python locks and their scripts, the Rush locks, and
@@ -636,6 +724,12 @@ pub async fn read_candidate_files(
         for rel in crate::utils::cargo_workspace::member_manifests_in(view) {
             out.read(view, unreadable, &rel).await;
         }
+    }
+
+    // Go: the workspace in effect decides which version a replace must pin,
+    // whether it takes effect at all, and whether it belongs in go.work.
+    if candidates.iter().any(|c| c.dep.ecosystem == "golang") {
+        read_go_workspace(view, unreadable, &mut out).await;
     }
 
     // NuGet merges the user config and every parent directory's config
@@ -1547,11 +1641,6 @@ pub struct RewriteOptions<'a> {
     /// resolved only when a cargo dep is rewritten (the cargo rewriter's
     /// offline-source refusal).
     pub cargo_outer: &'a (dyn Fn() -> CratesIoSource + Send + Sync),
-    /// The other `use` members of the go.work in effect for the project,
-    /// resolved only when a golang dep is rewritten: the Go rewriter weighs
-    /// their requirements, since the workspace build selects the highest
-    /// version any member asks for (#1753).
-    pub go_workspace: &'a (dyn Fn() -> Vec<ModuleEvidence> + Send + Sync),
     /// A variable of the environment pnpm installs the project in, by
     /// name: a `pnpm_config_trust_lockfile` there beats the
     /// pnpm-workspace.yaml key the trust auto-config writes (#1514).
@@ -2278,11 +2367,6 @@ async fn rewrite_once(
     } else {
         CratesIoSource::Registry
     };
-    let go_members = if rewrite_overrides.iter().any(|o| o.ecosystem == "golang") {
-        (options.go_workspace)()
-    } else {
-        Vec::new()
-    };
     let (files, mut rewrite) = if options.blocking {
         // Pure CPU over every lock text (the independent rewriter groups
         // run concurrently inside), so it runs on the blocking pool rather
@@ -2299,7 +2383,6 @@ async fn rewrite_once(
                 &gradle_unreadable,
                 &yarn_outer,
                 &cargo_outer,
-                &go_members,
             );
             (files, rewrite)
         })
@@ -2319,7 +2402,6 @@ async fn rewrite_once(
             &gradle_unreadable,
             &yarn_outer,
             &cargo_outer,
-            &go_members,
         );
         (files, rewrite)
     };
@@ -3517,6 +3599,25 @@ mod tests {
     use super::*;
     use crate::vendor::lock_inventory::MemoryProject;
 
+    /// In memory as on disk, a go.work go cannot parse reaches the
+    /// rewriter as a workspace go refuses, never as module mode.
+    #[tokio::test]
+    async fn memory_malformed_go_work_is_invalid() {
+        use crate::vendor::go_workspace::Loaded;
+        let mut p = MemoryProject::new();
+        p.insert_text("go.mod", "module example.com/app\n\ngo 1.21\n");
+        p.insert_text("go.work", "go 1.21\n\nuse (\n\t.\n");
+        let mut out = CandidateFiles::default();
+        read_go_workspace(&ProjectView::Memory(&p), &BTreeSet::new(), &mut out).await;
+        let hosted: crate::patch::redirect::HostedGoWorkspace =
+            serde_json::from_str(&out.files[crate::patch::redirect::GO_WORKSPACE_KEY]).unwrap();
+        assert!(
+            matches!(hosted.loaded, Loaded::Invalid(_)),
+            "{:?}",
+            hosted.loaded
+        );
+    }
+
     fn no_cargo_outer() -> CratesIoSource {
         CratesIoSource::Registry
     }
@@ -3813,7 +3914,6 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
-            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -3887,7 +3987,6 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
-            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -4203,7 +4302,6 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
-            go_workspace: &Vec::new,
             pnpm_env: env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -4640,7 +4738,6 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
-                go_workspace: &Vec::new,
                 pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
@@ -4746,7 +4843,6 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
-                go_workspace: &Vec::new,
                 pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
@@ -4923,7 +5019,6 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
-            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5265,7 +5360,6 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
-            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5482,7 +5576,6 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
-            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5538,7 +5631,6 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
-            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5737,7 +5829,6 @@ snapshots:
                     npm_outer: &outer,
                     yarn_classic_outer: &OuterYarnMirror::default,
                     cargo_outer: &no_cargo_outer,
-                    go_workspace: &Vec::new,
                     pnpm_env: &no_env,
                     blocking: false,
                     takeover_uuids: Default::default(),
@@ -6147,7 +6238,6 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
-            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),

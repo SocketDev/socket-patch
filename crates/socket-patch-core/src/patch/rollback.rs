@@ -573,6 +573,38 @@ async fn remove_dir_if_empty(dir: &Path) -> bool {
 /// The single-copy rollback engine behind [`rollback_package_patch`]:
 /// verifies and rolls back the package at exactly the one `pkg_path` it is
 /// given.
+/// A bin of an npm package holding the raw original bytes with their CRLF
+/// shebang, which a rollback before #1756 wrote over npm's form, can't be
+/// run by `env`: `Ready`, so the restore writes npm's form of the
+/// original (#1791). Only with the before blob at hand: a finished
+/// rollback never fails for want of one.
+async fn mark_crlf_bin_rewrite(
+    package_key: &str,
+    pkg_path: &Path,
+    file_name: &str,
+    file_info: &PatchFileInfo,
+    blobs_path: &Path,
+    verify: &mut VerifyRollbackResult,
+) {
+    if verify.status == VerifyRollbackStatus::AlreadyOriginal
+        && !file_info.before_hash.is_empty()
+        && verify.current_hash.as_deref() == Some(file_info.before_hash.as_str())
+        && crate::patch::apply::is_valid_blob_hash(&file_info.before_hash)
+        && tokio::fs::symlink_metadata(blobs_path.join(&file_info.before_hash))
+            .await
+            .is_ok_and(|m| m.is_file())
+        && crate::patch::npm_bin::needs_fix(
+            package_key,
+            pkg_path,
+            normalize_file_path(file_name),
+            &file_info.before_hash,
+        )
+        .await
+    {
+        verify.status = VerifyRollbackStatus::Ready;
+    }
+}
+
 async fn rollback_package_patch_at(
     package_key: &str,
     pkg_path: &Path,
@@ -592,7 +624,17 @@ async fn rollback_package_patch_at(
 
     // First, verify all files
     for (file_name, file_info) in files_in_order(files) {
-        let verify_result = verify_file_rollback(pkg_path, file_name, file_info, blobs_path).await;
+        let mut verify_result =
+            verify_file_rollback(pkg_path, file_name, file_info, blobs_path).await;
+        mark_crlf_bin_rewrite(
+            package_key,
+            pkg_path,
+            file_name,
+            file_info,
+            blobs_path,
+            &mut verify_result,
+        )
+        .await;
 
         // If any file has issues (not ready and not already original), we can't proceed
         if verify_result.status != VerifyRollbackStatus::Ready
@@ -772,7 +814,8 @@ async fn rollback_package_patch_at(
         // form, the bytes `npm install` leaves (see `npm_bin`).
         let (original_content, restored_hash) = match crate::patch::npm_bin::form_for_write(
             package_key,
-            &pkg_path.join(normalize_file_path(file_name)),
+            pkg_path,
+            normalize_file_path(file_name),
             &file_info.after_hash,
             std::borrow::Cow::Owned(original_content),
             &file_info.before_hash,
@@ -3192,6 +3235,94 @@ mod tests {
                 .await;
         assert!(again.success, "{again:?}");
         assert!(again.files_rolled_back.is_empty(), "{again:?}");
+    }
+
+    /// Regression (#1791): a bin v5.0.1 patched with the raw CRLF bytes
+    /// rolls back to npm's runnable form of the original, the bytes
+    /// `npm install` wrote, not the CRLF tarball bytes.
+    #[tokio::test]
+    async fn rollback_of_raw_crlf_bin_restores_npm_form() {
+        let before: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(1);\r\n";
+        let after: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(2);\r\n";
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let before_hash = compute_git_sha256_from_bytes(before);
+        tokio::fs::write(blobs.path().join(&before_hash), before)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            pkg.path().join("package.json"),
+            br#"{"name":"x","version":"1.0.0","bin":"cli.js"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(pkg.path().join("cli.js"), after)
+            .await
+            .unwrap();
+        let files = HashMap::from([(
+            "package/cli.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        )]);
+        let res =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            b"#!/usr/bin/env node\nconsole.log(1);\r\n"
+        );
+    }
+
+    /// Regression (#1791): a bin an earlier rollback left with the raw
+    /// CRLF original is rewritten in npm's runnable form when the before
+    /// blob is there, and left alone, as already original, when it isn't.
+    #[tokio::test]
+    async fn rollback_rewrites_raw_crlf_original_bin() {
+        let before: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(1);\r\n";
+        let after: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(2);\r\n";
+        let before_hash = compute_git_sha256_from_bytes(before);
+        let files = HashMap::from([(
+            "package/cli.js".to_string(),
+            PatchFileInfo {
+                before_hash: before_hash.clone(),
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        )]);
+        for with_blob in [true, false] {
+            let pkg = tempfile::tempdir().unwrap();
+            let blobs = tempfile::tempdir().unwrap();
+            if with_blob {
+                tokio::fs::write(blobs.path().join(&before_hash), before)
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(
+                pkg.path().join("package.json"),
+                br#"{"name":"x","version":"1.0.0","bin":"cli.js"}"#,
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(pkg.path().join("cli.js"), before)
+                .await
+                .unwrap();
+            let res =
+                rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                    .await;
+            assert!(res.success, "{with_blob}: {res:?}");
+            let expected: &[u8] = if with_blob {
+                b"#!/usr/bin/env node\nconsole.log(1);\r\n"
+            } else {
+                before
+            };
+            assert_eq!(
+                tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+                expected,
+                "{with_blob}"
+            );
+        }
     }
 
     /// Regression (#1756): a bin the patch added, installed by npm in its

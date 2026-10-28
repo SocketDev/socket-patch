@@ -1153,6 +1153,90 @@ fn gradle_vendor_533_unpatched_classifier_copy_withholds_vex() {
     assert!(!vex.exists(), "{env}");
 }
 
+/// #513 / #459: a reactor `${prop}` version that can't be pinned with
+/// certainty (undefined in the checkout, or raised by a profile) is left
+/// as is with a warning, and `vex` does not attest the package the build
+/// still takes unpatched.
+#[test]
+fn maven_reactor_uncertain_property_version_withholds_vex() {
+    let cases = [
+        ("", "property_unresolved"),
+        (
+            "<properties><foo.version>1.0</foo.version></properties>\
+             <profiles><profile><id>new</id><properties><foo.version>1.1</foo.version>\
+             </properties></profile></profiles>",
+            "conflicting_literal_version",
+        ),
+    ];
+    // With a sibling module at the literal base, that module is rewritten
+    // and the patch is wired, yet `a` still builds the base.
+    for ((extra, reason), sibling) in cases
+        .into_iter()
+        .flat_map(|case| [(case, false), (case, true)])
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+        let pristine = std::fs::read_to_string(root.join("proj/a/pom.xml")).unwrap();
+        let a = pristine
+            .replace(
+                "<version>1.0</version></dependency>",
+                "<version>${foo.version}</version></dependency>",
+            )
+            .replace(
+                "<artifactId>a</artifactId>",
+                &format!("<artifactId>a</artifactId>{extra}"),
+            );
+        write(root, "proj/a/pom.xml", a.as_bytes());
+        if sibling {
+            let agg = std::fs::read_to_string(root.join("proj/pom.xml")).unwrap();
+            let agg = agg.replace(
+                "<module>a</module>",
+                "<module>a</module>\n    <module>b</module>",
+            );
+            write(root, "proj/pom.xml", agg.as_bytes());
+            std::fs::create_dir_all(root.join("proj/b")).unwrap();
+            let b = pristine.replace("<artifactId>a</artifactId>", "<artifactId>b</artifactId>");
+            write(root, "proj/b/pom.xml", b.as_bytes());
+        }
+        let env = ok(root, &["vendor"]);
+        assert!(
+            env.to_string().contains(&format!("reason: {reason}")),
+            "{env}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("proj/a/pom.xml")).unwrap(),
+            a
+        );
+        assert_eq!(
+            wiring_text(root).contains("-socket."),
+            sibling,
+            "{reason}: wired"
+        );
+        let vex = root.join("vex.json");
+        let (_, env) = socket(
+            root,
+            &[
+                "vex",
+                "-O",
+                vex.to_str().unwrap(),
+                "--product",
+                "pkg:generic/x@1",
+            ],
+        );
+        assert_eq!(
+            events(&env),
+            [(
+                purl("foo"),
+                "skipped".to_string(),
+                "vendor_unwired".to_string()
+            )],
+            "{reason} (sibling: {sibling}): {env}"
+        );
+        assert!(!vex.exists(), "{env}");
+    }
+}
+
 /// #429 repair: a deleted owned `.gitattributes` (and nothing else) is
 /// rewritten by `repair` (no download), so the next autocrlf clone keeps the
 /// script and index LF.

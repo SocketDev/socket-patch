@@ -797,3 +797,413 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
             .unwrap_or_else(|e| std::panic::resume_unwind(e))
     });
 }
+
+/// A go 1.16 graph where the patched module is only a transitive
+/// requirement and nothing imports its packages: `go mod tidy` prunes the
+/// socket module's zip line from the committed pair, the build stays green
+/// on a fresh machine (the zip is never fetched), and discovery still reads
+/// the `/go.mod` line as the hosted pin. Once the project imports the
+/// module that state no longer builds, and re-running the hosted rewrite
+/// restores the zip line so it builds the patched module again.
+// #[serial]: see the capstone's note — env mutation vs env iteration.
+#[tokio::test]
+#[serial_test::serial]
+async fn tidy_pruned_zip_line_pins_and_a_rerun_restores_it() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_hosted_build") {
+        return;
+    }
+    const MID: &str = "example.com/mid";
+    let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
+    let proxy_url = format!("file://{}", tmp.path().join("proxy").display());
+    let smod = socket_module();
+    let upstream_gomod = format!("module {UMOD}\n\ngo 1.16\n");
+    publish(tmp.path(), UMOD, UVER, &upstream_gomod, PRISTINE_LIB);
+    publish(tmp.path(), &smod, SVER, &upstream_gomod, PATCHED_LIB);
+    publish(
+        tmp.path(),
+        MID,
+        "v1.0.0",
+        &format!("module {MID}\n\ngo 1.16\n\nrequire {UMOD} {UVER}\n"),
+        "package mid\n\nfunc Hello() string { return \"hi\" }\n",
+    );
+    let (zip_h1, gomod_h1) = harvest_sums(tmp.path(), &proxy_url, &smod, SVER);
+    let (mid_zip_h1, mid_gomod_h1) = harvest_sums(tmp.path(), &proxy_url, MID, "v1.0.0");
+
+    // The hosted rewriter's committed shape: the replace plus BOTH lines.
+    let consumer = tmp.path().join("consumer");
+    std::fs::create_dir_all(&consumer).unwrap();
+    std::fs::write(
+        consumer.join("go.mod"),
+        format!(
+            "module example.com/consumer\n\ngo 1.16\n\nrequire {MID} v1.0.0\n\n\
+             replace {UMOD} {UVER} => {smod} {SVER}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("go.sum"),
+        format!(
+            "{MID} v1.0.0 {mid_zip_h1}\n{MID} v1.0.0/go.mod {mid_gomod_h1}\n\
+             {smod} {SVER} {zip_h1}\n{smod} {SVER}/go.mod {gomod_h1}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("main.go"),
+        format!("package main\n\nimport \"{MID}\"\n\nfunc main() {{ println(mid.Hello()) }}\n"),
+    )
+    .unwrap();
+
+    let env = day2_env(&proxy_url);
+    let m1 = Machine::new(tmp.path(), "machine1");
+    let tidy = go(&consumer, &m1, &["mod", "tidy"], &as_pairs(&env));
+    assert!(
+        tidy.status.success(),
+        "go mod tidy failed: {}",
+        String::from_utf8_lossy(&tidy.stderr)
+    );
+    let go_sum = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+    assert!(
+        go_sum.contains(&format!("{smod} {SVER}/go.mod {gomod_h1}\n")),
+        "{go_sum}"
+    );
+    assert!(
+        !go_sum.contains(&format!("{smod} {SVER} ")),
+        "tidy must prune the zip line: {go_sum}"
+    );
+
+    let m2 = Machine::new(tmp.path(), "machine2");
+    let build = go(&consumer, &m2, &["build", "./..."], &as_pairs(&env));
+    assert!(
+        build.status.success(),
+        "fresh-machine build after tidy failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let discovery = socket_patch_core::vex::discover::discover_patched_refs(&consumer).await;
+    let purl = format!("pkg:golang/{UMOD}@{UVER}");
+    let refs: Vec<_> = discovery.refs.iter().filter(|r| r.purl == purl).collect();
+    assert_eq!(refs.len(), 1, "{:?}", discovery.refs);
+    assert_eq!(refs[0].uuid, UUID);
+    assert!(refs[0].lockfile_basis_ok(), "{:?}", refs[0]);
+    assert!(
+        discovery.diagnostics.is_empty(),
+        "{:?}",
+        discovery.diagnostics
+    );
+
+    // The project starts importing the patched module (and requires it, as
+    // go 1.16 wants for a directly imported module): the tidy state no
+    // longer builds.
+    let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    std::fs::write(
+        consumer.join("go.mod"),
+        format!("{go_mod}\nrequire {UMOD} {UVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("main.go"),
+        format!(
+            "package main\n\nimport (\n\t\"{MID}\"\n\t\"{UMOD}\"\n)\n\n\
+             func main() {{ println(mid.Hello(), upstream.Greeting()) }}\n"
+        ),
+    )
+    .unwrap();
+    let m3 = Machine::new(tmp.path(), "machine3");
+    let broken = go(&consumer, &m3, &["build", "./..."], &as_pairs(&env));
+    let stderr = String::from_utf8_lossy(&broken.stderr);
+    assert!(!broken.status.success(), "{stderr}");
+    assert!(stderr.contains("missing go.sum entry"), "{stderr}");
+
+    let ovr = DepOverride {
+        ecosystem: "golang".into(),
+        name: UMOD.into(),
+        namespace: None,
+        version: UVER.into(),
+        token: String::new(),
+        patch_uuid: UUID.into(),
+        artifact_url: format!("{proxy_url}/{smod}/@v/{SVER}.zip"),
+        registry_override: Some(RegistryOverride {
+            kind: "goproxy".into(),
+            index_url: proxy_url.clone(),
+            identifiers: RegistryOverrideIdentifiers {
+                name: UMOD.into(),
+                version: UVER.into(),
+                go_module_path: Some(smod.clone()),
+                go_module_version: Some(SVER.into()),
+                ..Default::default()
+            },
+        }),
+        integrity: Integrity {
+            dirhash_h1: Some(zip_h1.clone()),
+            go_mod_h1: Some(gomod_h1.clone()),
+            ..Default::default()
+        },
+    };
+    let files: std::collections::BTreeMap<String, String> = ["go.mod", "go.sum"]
+        .into_iter()
+        .map(|name| {
+            let text = std::fs::read_to_string(consumer.join(name)).unwrap();
+            (name.to_string(), text)
+        })
+        .collect();
+    let rerun = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+    assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+    assert!(rerun.confirmed_golang_uuids.contains(UUID));
+    assert_eq!(
+        rerun.files.keys().collect::<Vec<_>>(),
+        ["go.sum"],
+        "{:?}",
+        rerun.files
+    );
+    let restored = &rerun.files["go.sum"];
+    assert!(
+        restored.contains(&format!("{smod} {SVER} {zip_h1}\n")),
+        "{restored}"
+    );
+    std::fs::write(consumer.join("go.sum"), restored).unwrap();
+
+    let m4 = Machine::new(tmp.path(), "machine4");
+    let run = go(&consumer, &m4, &["run", "."], &as_pairs(&env));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success(),
+        "fresh-machine run after re-run failed: {stderr}"
+    );
+    assert!(stderr.contains("hi PATCHED"), "{stderr}");
+}
+
+/// A go.work whose other `use` member requires a higher version of the
+/// patched module: go builds that version, so `go.work.sum` keeps only the
+/// socket module's `/go.mod` line and the replace is inert. Discovery must
+/// not attest it, neither when that member is in the project root (its
+/// `require` shows the build selects the higher version) nor when it is
+/// outside it (its `require` cannot be read).
+// #[serial]: see the capstone's note — env mutation vs env iteration.
+#[tokio::test]
+#[serial_test::serial]
+async fn workspace_member_selecting_another_version_never_attests() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_hosted_build") {
+        return;
+    }
+    const NEXT: &str = "v1.1.0";
+    let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
+    let proxy_url = format!("file://{}", tmp.path().join("proxy").display());
+    let smod = socket_module();
+    let upstream_gomod = format!("module {UMOD}\n\ngo 1.21\n");
+    publish(tmp.path(), UMOD, UVER, &upstream_gomod, PRISTINE_LIB);
+    publish(
+        tmp.path(),
+        UMOD,
+        NEXT,
+        &upstream_gomod,
+        "package upstream\n\nfunc Greeting() string { return \"PRISTINE-NEXT\" }\n",
+    );
+    publish(tmp.path(), &smod, SVER, &upstream_gomod, PATCHED_LIB);
+    let (_, gomod_h1) = harvest_sums(tmp.path(), &proxy_url, &smod, SVER);
+    let (next_zip_h1, next_gomod_h1) = harvest_sums(tmp.path(), &proxy_url, UMOD, NEXT);
+    let next_pair = format!("{UMOD} {NEXT} {next_zip_h1}\n{UMOD} {NEXT}/go.mod {next_gomod_h1}\n");
+    let env = day2_env(&proxy_url);
+    let purl = format!("pkg:golang/{UMOD}@{UVER}");
+
+    for (name, svc_rel) in [("in-root", "svc"), ("out-of-root", "../svc")] {
+        let app = tmp.path().join(name).join("app");
+        let svc = app.join(svc_rel);
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::write(
+            app.join("go.mod"),
+            format!("module example.com/app\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+        )
+        .unwrap();
+        std::fs::write(app.join("go.sum"), &next_pair).unwrap();
+        std::fs::write(
+            app.join("main.go"),
+            format!(
+                "package main\n\nimport \"{UMOD}\"\n\nfunc main() {{ println(upstream.Greeting()) }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("go.mod"),
+            format!("module example.com/svc\n\ngo 1.21\n\nrequire {UMOD} {NEXT}\n"),
+        )
+        .unwrap();
+        std::fs::write(svc.join("go.sum"), &next_pair).unwrap();
+        std::fs::write(
+            svc.join("svc.go"),
+            format!("package svc\n\nimport \"{UMOD}\"\n\nvar X = upstream.Greeting()\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("go.work"),
+            format!(
+                "go 1.21\n\nuse (\n\t.\n\t./{svc_rel}\n)\n\n\
+                 replace {UMOD} {UVER} => {smod} {SVER}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("go.work.sum"),
+            format!("{smod} {SVER}/go.mod {gomod_h1}\n"),
+        )
+        .unwrap();
+
+        let machine = Machine::new(tmp.path(), &format!("{name}-machine"));
+        let run = go(&app, &machine, &["run", "."], &as_pairs(&env));
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains("PRISTINE-NEXT"), "{name}: {stderr}");
+        let list = go(&app, &machine, &["list", "-m", UMOD], &as_pairs(&env));
+        assert_eq!(
+            String::from_utf8_lossy(&list.stdout).trim(),
+            format!("{UMOD} {NEXT}"),
+            "{name}: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+
+        let discovery = socket_patch_core::vex::discover::discover_patched_refs(&app).await;
+        let attested: Vec<_> = discovery
+            .refs
+            .iter()
+            .filter(|r| r.purl == purl && r.lockfile_basis_ok())
+            .collect();
+        assert!(attested.is_empty(), "{name}: {attested:?}");
+        if name == "in-root" {
+            assert!(
+                discovery
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.detail.contains("is inert")),
+                "{name}: {:?}",
+                discovery.diagnostics
+            );
+        }
+    }
+}
+
+/// A go.work member's dependency requires a higher version of the patched
+/// module than any member's go.mod names. go builds that version without
+/// asking for a go.mod update and writes its sums to `go.work.sum` itself,
+/// so the `/go.mod`-only pin is never the attestation basis, and once the
+/// dependency's go.mod is in the module cache the replace is diagnosed
+/// inert.
+// #[serial]: see the capstone's note — env mutation vs env iteration.
+#[tokio::test]
+#[serial_test::serial]
+async fn workspace_transitive_raise_never_attests() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_hosted_build") {
+        return;
+    }
+    const NEXT: &str = "v1.1.0";
+    const MID: &str = "example.com/mid";
+    let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = ChmodGuard(tmp.path().to_path_buf());
+    let proxy_url = format!("file://{}", tmp.path().join("proxy").display());
+    let smod = socket_module();
+    let upstream_gomod = format!("module {UMOD}\n\ngo 1.21\n");
+    publish(tmp.path(), UMOD, UVER, &upstream_gomod, PRISTINE_LIB);
+    publish(
+        tmp.path(),
+        UMOD,
+        NEXT,
+        &upstream_gomod,
+        "package upstream\n\nfunc Greeting() string { return \"PRISTINE-NEXT\" }\n",
+    );
+    publish(tmp.path(), &smod, SVER, &upstream_gomod, PATCHED_LIB);
+    publish(
+        tmp.path(),
+        MID,
+        "v1.0.0",
+        &format!("module {MID}\n\ngo 1.21\n\nrequire {UMOD} {NEXT}\n"),
+        "package mid\n\nfunc Hello() string { return \"hi\" }\n",
+    );
+    let (_, gomod_h1) = harvest_sums(tmp.path(), &proxy_url, &smod, SVER);
+
+    let app = tmp.path().join("app");
+    let svc = app.join("svc");
+    std::fs::create_dir_all(&svc).unwrap();
+    std::fs::write(
+        app.join("go.mod"),
+        format!("module example.com/app\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("main.go"),
+        format!(
+            "package main\n\nimport \"{UMOD}\"\n\nfunc main() {{ println(upstream.Greeting()) }}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        svc.join("go.mod"),
+        format!("module example.com/svc\n\ngo 1.21\n\nrequire {MID} v1.0.0\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        svc.join("svc.go"),
+        format!("package svc\n\nimport \"{MID}\"\n\nvar X = mid.Hello()\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("go.work"),
+        format!("go 1.21\n\nuse (\n\t.\n\t./svc\n)\n\nreplace {UMOD} {UVER} => {smod} {SVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("go.work.sum"),
+        format!("{smod} {SVER}/go.mod {gomod_h1}\n"),
+    )
+    .unwrap();
+
+    let purl = format!("pkg:golang/{UMOD}@{UVER}");
+    let discovery = socket_patch_core::vex::discover::discover_patched_refs(&app).await;
+    let refs: Vec<_> = discovery.refs.iter().filter(|r| r.purl == purl).collect();
+    assert_eq!(refs.len(), 1, "{:?}", discovery.refs);
+    assert!(!refs[0].lockfile_basis_ok(), "{:?}", refs[0]);
+    assert!(
+        discovery.diagnostics.is_empty(),
+        "{:?}",
+        discovery.diagnostics
+    );
+
+    // A fresh checkout has no sums for the dependencies; skip the checksum
+    // database for this file:// proxy so go records them as it would.
+    let mut env = day2_env(&proxy_url);
+    env.retain(|(k, _)| *k != "GONOSUMDB");
+    env.push(("GONOSUMDB", "example.com".to_string()));
+    let machine = Machine::new(tmp.path(), "machine");
+    let run = go(&app, &machine, &["run", "."], &as_pairs(&env));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stderr}");
+    assert!(stderr.contains("PRISTINE-NEXT"), "{stderr}");
+    let list = go(&app, &machine, &["list", "-m", UMOD], &as_pairs(&env));
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout).trim(),
+        format!("{UMOD} {NEXT}"),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let work_sum = std::fs::read_to_string(app.join("go.work.sum")).unwrap();
+    assert!(
+        work_sum.contains(&format!("{UMOD} {NEXT} h1:")),
+        "{work_sum}"
+    );
+
+    std::env::set_var("GOMODCACHE", &machine.modcache);
+    let discovery = socket_patch_core::vex::discover::discover_patched_refs(&app).await;
+    std::env::remove_var("GOMODCACHE");
+    assert!(
+        !discovery.refs.iter().any(|r| r.purl == purl),
+        "{:?}",
+        discovery.refs
+    );
+    assert!(
+        discovery.diagnostics.iter().any(|d| d
+            .detail
+            .contains(&format!("is inert: the build selects {NEXT}"))),
+        "{:?}",
+        discovery.diagnostics
+    );
+}

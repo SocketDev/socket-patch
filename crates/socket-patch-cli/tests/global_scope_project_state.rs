@@ -13,7 +13,9 @@
 //! 3. `rollback -g` and `remove -g` leave a vendored project's wiring,
 //!    artifact and ledger as they were (#445);
 //! 4. `apply -g` and `scan -g --mode agent` patch the global copy of a purl
-//!    the project vendors (#445, the reverse direction);
+//!    the project vendors (#445, the reverse direction), except a NuGet
+//!    project's own install in the global packages folder it restores into,
+//!    which every global run leaves to the project's ledger (#489);
 //! 5. the standalone `vendor` command (plain, `--revert`, `--check`) is a
 //!    usage error under global scope, so it neither vendors into nor
 //!    reverts the project (#498).
@@ -568,6 +570,404 @@ async fn global_agent_scan_patches_a_purl_the_project_vendors() {
         "the global copy must be patched: {v}"
     );
     project.assert_untouched("scan --global-prefix --mode agent");
+}
+
+// ═════════ 4b. a vendored NuGet project's global packages folder (#489) ═════════
+//
+// A PackageReference project restores into the global packages folder, so
+// a global run's copy of a package the project vendors IS the project's
+// installed copy: the restore extracted it from the vendored nupkg, and a
+// locked restore never re-extracts it. The project's ledger still owns it
+// under global scope; a global store the project does not restore into
+// stays the global run's to patch.
+
+const N_UUID: &str = "4f4f6b2c-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+const N_PURL: &str = "pkg:nuget/Newtonsoft.Json@13.0.3";
+const N_PRISTINE: &[u8] = b"The MIT License (MIT)\nCopyright (c) 2007 James Newton-King\n";
+const N_PATCHED: &[u8] =
+    b"The MIT License (MIT)\n// SOCKET-PATCH-MARKER\nCopyright (c) 2007 James Newton-King\n";
+
+fn nupkg(license: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    let files: &[(&str, &[u8])] = &[
+        ("[Content_Types].xml", b"<?xml version=\"1.0\"?><Types/>"),
+        ("_rels/.rels", b"<?xml version=\"1.0\"?><Relationships/>"),
+        (
+            "Newtonsoft.Json.nuspec",
+            b"<?xml version=\"1.0\"?><package><metadata><id>Newtonsoft.Json</id>\
+              <version>13.0.3</version></metadata></package>",
+        ),
+        ("lib/net6.0/Newtonsoft.Json.dll", b"MZ-fake-assembly"),
+        ("LICENSE.md", license),
+    ];
+    for (name, bytes) in files {
+        zw.start_file(*name, opts).unwrap();
+        zw.write_all(bytes).unwrap();
+    }
+    zw.finish().unwrap().into_inner()
+}
+
+/// `Newtonsoft.Json` `13.0.3` extracted in global-packages-folder layout
+/// under `store`, its `LICENSE.md` holding `license`.
+fn write_newtonsoft(store: &Path, license: &[u8]) -> PathBuf {
+    let dir = store.join("newtonsoft.json/13.0.3");
+    std::fs::create_dir_all(dir.join("lib/net6.0")).unwrap();
+    std::fs::write(dir.join("newtonsoft.json.13.0.3.nupkg"), nupkg(N_PRISTINE)).unwrap();
+    std::fs::write(
+        dir.join("newtonsoft.json.nuspec"),
+        "<package><metadata><id>Newtonsoft.Json</id><version>13.0.3</version></metadata></package>",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("lib/net6.0/Newtonsoft.Json.dll"),
+        b"MZ-fake-assembly",
+    )
+    .unwrap();
+    std::fs::write(dir.join("LICENSE.md"), license).unwrap();
+    dir
+}
+
+/// A vendored NuGet project at `<tmp>/project` whose restore uses the
+/// global packages folder `<tmp>/store` (`NUGET_PACKAGES`), after a locked
+/// restore extracted the vendored nupkg there: the store copy is PATCHED.
+struct VendoredNuget {
+    tmp: tempfile::TempDir,
+    ledger: Vec<u8>,
+}
+
+impl VendoredNuget {
+    fn root(&self) -> PathBuf {
+        self.tmp.path().join("project")
+    }
+    fn store(&self) -> PathBuf {
+        self.tmp.path().join("store")
+    }
+    fn license(&self) -> Vec<u8> {
+        std::fs::read(self.store().join("newtonsoft.json/13.0.3/LICENSE.md")).unwrap()
+    }
+    fn env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("SOCKET_PATCH_SERVER_URL", PATCH_HOST.to_string()),
+            ("NUGET_PACKAGES", self.store().to_str().unwrap().to_string()),
+        ]
+    }
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        let env = self.env();
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        common::run_with_env(&self.root(), args, &env)
+    }
+    fn assert_untouched(&self, what: &str) {
+        assert_eq!(
+            self.license(),
+            N_PATCHED,
+            "{what}: the project's installed copy in the global packages folder must stay patched"
+        );
+        assert_eq!(
+            std::fs::read(self.root().join(".socket/vendor/state.json")).unwrap(),
+            self.ledger,
+            "{what}: the vendor ledger must stay byte-identical"
+        );
+    }
+}
+
+fn vendored_nuget() -> VendoredNuget {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("project");
+    let store = tmp.path().join("store");
+    write_newtonsoft(&store, N_PRISTINE);
+    std::fs::create_dir_all(root.join("obj")).unwrap();
+    std::fs::write(
+        root.join("app.csproj"),
+        "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>\
+         <TargetFramework>net8.0</TargetFramework>\
+         <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>\
+         </PropertyGroup><ItemGroup>\
+         <PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" />\
+         </ItemGroup></Project>\n",
+    )
+    .unwrap();
+    let lock = json!({
+        "version": 1,
+        "dependencies": { "net8.0": { "Newtonsoft.Json": {
+            "type": "Direct",
+            "requested": "[13.0.3, )",
+            "resolved": "13.0.3",
+            "contentHash": "ORIGINALcachedhash=="
+        }}}
+    });
+    std::fs::write(
+        root.join("packages.lock.json"),
+        serde_json::to_string_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+    let assets = json!({
+        "version": 3,
+        "libraries": { "Newtonsoft.Json/13.0.3": { "type": "package", "path": "newtonsoft.json/13.0.3" } },
+        "packageFolders": { format!("{}/", store.display()): {} },
+    });
+    std::fs::write(root.join("obj/project.assets.json"), assets.to_string()).unwrap();
+
+    let after_hash = git_sha256(N_PATCHED);
+    let manifest = json!({
+        "patches": {
+            N_PURL: {
+                "uuid": N_UUID,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "LICENSE.md": {
+                    "beforeHash": git_sha256(N_PRISTINE),
+                    "afterHash": after_hash
+                }},
+                "vulnerabilities": {},
+                "description": "synthetic global-scope patch",
+                "license": "MIT",
+                "tier": "free"
+            }
+        }
+    });
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(&after_hash), N_PATCHED).unwrap();
+    std::fs::write(
+        socket.join("blobs").join(git_sha256(N_PRISTINE)),
+        N_PRISTINE,
+    )
+    .unwrap();
+
+    let service = prebuilt_common::Server::project(&root);
+    let (code, stdout, stderr) = common::run_with_env(
+        &root,
+        &["vendor", "--json", "--silent", "--lock-timeout", "5"],
+        &[
+            ("SOCKET_VENDOR_URL", &service.uri),
+            ("NUGET_PACKAGES", store.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "fixture vendor: stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let ledger = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+    assert!(
+        String::from_utf8_lossy(&ledger).contains("pkg:nuget/"),
+        "sanity: the ledger vendors Newtonsoft.Json: {}",
+        String::from_utf8_lossy(&ledger)
+    );
+    // The locked restore extracts the vendored (patched) nupkg into the
+    // global packages folder.
+    std::fs::write(store.join("newtonsoft.json/13.0.3/LICENSE.md"), N_PATCHED).unwrap();
+    VendoredNuget { tmp, ledger }
+}
+
+fn events_with(v: &Value, action: &str) -> Vec<Value> {
+    v["events"]
+        .as_array()
+        .map(|e| {
+            e.iter()
+                .filter(|e| e["action"] == action)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `rollback -g` from a vendored NuGet project leaves the project's
+/// installed copy in the global packages folder patched (#489): restoring
+/// it silently unpatched the project, since a locked restore never
+/// re-extracts it.
+#[test]
+fn global_rollback_keeps_a_vendored_nuget_projects_install() {
+    let project = vendored_nuget();
+    for scope in [
+        vec!["-g"],
+        vec!["--global-prefix", project.store().to_str().unwrap()],
+    ] {
+        let mut args = vec!["rollback", "--json", "--yes", "--offline"];
+        args.extend(scope.iter().copied());
+        let (code, stdout, stderr) = project.run(&args);
+        assert_eq!(code, 0, "{args:?}: stdout={stdout}\nstderr={stderr}");
+        let v = parse(&stdout, &stderr);
+        assert!(events_with(&v, "rolledBack").is_empty(), "{args:?}: {v}");
+        assert!(
+            events_with(&v, "skipped")
+                .iter()
+                .any(|e| e["purl"] == N_PURL && e["errorCode"] == "vendored"),
+            "{args:?}: the kept install is reported: {v}"
+        );
+        project.assert_untouched(&format!("{args:?}"));
+        assert!(
+            serde_json::from_slice::<Value>(
+                &std::fs::read(project.root().join(".socket/manifest.json")).unwrap()
+            )
+            .unwrap()["patches"]
+                .get(N_PURL)
+                .is_some(),
+            "{args:?}: the project's vendored record must stay in the manifest"
+        );
+    }
+}
+
+/// `remove -g <purl>` leaves the project's install patched too (#489).
+#[test]
+fn global_remove_keeps_a_vendored_nuget_projects_install() {
+    let project = vendored_nuget();
+    let (code, stdout, stderr) =
+        project.run(&["remove", N_PURL, "--json", "--yes", "--offline", "-g"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse(&stdout, &stderr);
+    assert!(events_with(&v, "rolledBack").is_empty(), "{v}");
+    assert!(
+        events_with(&v, "skipped")
+            .iter()
+            .any(|e| e["purl"] == N_PURL && e["errorCode"] == "vendored"),
+        "the kept install is reported: {v}"
+    );
+    project.assert_untouched("remove -g");
+}
+
+/// `apply -g` yields the project's install to its ledger (#489) instead of
+/// taking it over as a global agent copy.
+#[test]
+fn global_apply_skips_a_vendored_nuget_projects_install() {
+    let project = vendored_nuget();
+    let (code, stdout, stderr) = project.run(&["apply", "--json", "--offline", "-g"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse(&stdout, &stderr);
+    assert!(events_with(&v, "applied").is_empty(), "{v}");
+    assert!(
+        events_with(&v, "skipped")
+            .iter()
+            .any(|e| e["purl"] == N_PURL && e["errorCode"] == "vendored"),
+        "the project's install is a vendored skip: {v}"
+    );
+    project.assert_untouched("apply -g");
+}
+
+/// `scan -g --mode agent` skips the project's install as
+/// `vendored_ownership_retained` (#489) and records no agent patch for it.
+#[tokio::test]
+async fn global_agent_scan_skips_a_vendored_nuget_projects_install() {
+    let project = vendored_nuget();
+    // v5 vendored mode is manifest-free: nothing but the ledger marks the
+    // copy as the project's.
+    std::fs::write(
+        project.root().join(".socket/manifest.json"),
+        "{\n  \"patches\": {}\n}\n",
+    )
+    .unwrap();
+    let mock = MockServer::start().await;
+    mount_nuget_api(&mock).await;
+    let uri = mock.uri();
+    let (code, stdout, stderr) = project.run(&[
+        "scan",
+        "--json",
+        "--yes",
+        "--mode",
+        "agent",
+        "-g",
+        "--api-url",
+        &uri,
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG,
+    ]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse(&stdout, &stderr);
+    let codes: Vec<&str> = v["warnings"]
+        .as_array()
+        .map(|w| w.iter().filter_map(|w| w["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        codes.contains(&"vendored_ownership_retained"),
+        "the project's ledger owns its install: {v}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.root().join(".socket/manifest.json")).unwrap(),
+        "{\n  \"patches\": {}\n}\n",
+        "no agent record for the project's install: {v}"
+    );
+    project.assert_untouched("scan -g --mode agent");
+}
+
+/// A global store the project does not restore into is still the global
+/// run's (#446): `rollback --global-prefix <other>` restores its copy.
+#[test]
+fn global_rollback_restores_a_store_the_nuget_project_does_not_use() {
+    let project = vendored_nuget();
+    let other = empty_prefix();
+    let copy = write_newtonsoft(other.path(), N_PATCHED);
+    let (code, stdout, stderr) = project.run(&[
+        "rollback",
+        "--json",
+        "--yes",
+        "--offline",
+        "--global-prefix",
+        other.path().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(
+        std::fs::read(copy.join("LICENSE.md")).unwrap(),
+        N_PRISTINE,
+        "the unrelated global copy must be restored: {stdout}"
+    );
+    project.assert_untouched("rollback --global-prefix <other>");
+}
+
+async fn mount_nuget_api(mock: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [{
+                "purl": N_PURL,
+                "patches": [{
+                    "uuid": N_UUID, "purl": N_PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": ["GHSA-newtonsoft-0"],
+                    "severity": "high", "title": "Newtonsoft.Json",
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    let vulns = json!({
+        "GHSA-newtonsoft-0": { "cves": [], "summary": "s", "severity": "high", "description": "d" }
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.*(?i:newtonsoft\\.json)(%40|@)13\\.0\\.3$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "patches": [{
+                "uuid": N_UUID, "purl": N_PURL, "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "Newtonsoft.Json", "license": "MIT", "tier": "free",
+                "vulnerabilities": vulns,
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    use base64::Engine;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{N_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": N_UUID, "purl": N_PURL, "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "LICENSE.md": {
+                "beforeHash": git_sha256(N_PRISTINE),
+                "afterHash": git_sha256(N_PATCHED),
+                "blobContent": base64::engine::general_purpose::STANDARD.encode(N_PATCHED),
+            }},
+            "vulnerabilities": vulns,
+            "description": "Newtonsoft.Json", "license": "MIT", "tier": "free",
+        })))
+        .mount(mock)
+        .await;
 }
 
 // ═══════════════════ 5. the vendor command under global scope ═══════════════════

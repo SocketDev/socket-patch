@@ -2025,13 +2025,11 @@ async fn run_scan(
         .unwrap_or_default();
     // The ledger owns and records the PROJECT's copies only: a global
     // scan's agent leg patches the global copy even when the cwd project
-    // vendors the same purl (see `project_state_in_scope`).
+    // vendors the same purl (see `project_state_in_scope`), unless that
+    // copy is the project's own NuGet install (#489).
     let project_state = crate::commands::project_state_in_scope(&args.common);
-    let vendor_owned_purls: HashSet<PurlKey> = if project_state {
-        vendored_purls.clone()
-    } else {
-        HashSet::new()
-    };
+    let vendor_owned_purls: HashSet<PurlKey> =
+        crate::commands::vendor_owned_keys(&args.common, &vendored_purls).await;
 
     // Read existing manifest once for update detection.
     let existing_manifest = ctx.ledgers().await.manifest;

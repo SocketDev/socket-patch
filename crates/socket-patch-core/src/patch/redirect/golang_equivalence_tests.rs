@@ -16,7 +16,7 @@ fn run(
     overrides: &[DepOverride],
 ) -> RewriteResult {
     let mut got = RewriteResult::default();
-    rewrite_golang(files, overrides, &[], &mut got);
+    rewrite_golang(files, overrides, &mut got);
     g.next(&(files, overrides), &got);
     got
 }

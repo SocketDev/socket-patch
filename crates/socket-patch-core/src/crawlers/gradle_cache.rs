@@ -522,44 +522,7 @@ impl Env for ProcessEnv {
     }
 }
 
-/// The account's home directory from the passwd database
-/// (`getpwuid_r(getuid())->pw_dir`): what the JVM reports as `user.home`
-/// on Linux and macOS, whatever `$HOME` says. `None` on Windows, and when
-/// there is no entry or it names no directory.
-#[cfg(unix)]
-pub fn passwd_home() -> Option<PathBuf> {
-    use std::ffi::CStr;
-    use std::os::unix::ffi::OsStrExt;
-
-    let uid = unsafe { libc::getuid() };
-    let mut buf: Vec<libc::c_char> = vec![0; 4096];
-    // SAFETY: an all-zero `passwd` is a valid out-parameter; it is only
-    // read when `getpwuid_r` reports a result, and its strings point into
-    // `buf`, which outlives every read below.
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    loop {
-        // SAFETY: `buf` is writable for `buf.len()` bytes.
-        let rc =
-            unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
-        if rc == libc::ERANGE && buf.len() < (1 << 20) {
-            buf.resize(buf.len() * 2, 0);
-            continue;
-        }
-        break;
-    }
-    if result.is_null() || pwd.pw_dir.is_null() {
-        return None;
-    }
-    // SAFETY: a non-null `pw_dir` is a NUL-terminated string inside `buf`.
-    let dir = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
-    (!dir.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(dir)))
-}
-
-#[cfg(not(unix))]
-pub fn passwd_home() -> Option<PathBuf> {
-    None
-}
+pub use crate::utils::fs::passwd_home;
 
 /// The Gradle user home this process's Gradle would use
 /// ([`GradleHome::resolve`] over the process environment and, on Unix,

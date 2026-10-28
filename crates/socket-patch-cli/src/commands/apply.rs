@@ -367,18 +367,19 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
 
     // The `apply` scope: `--ecosystems`, minus vendor-owned purls (matched
     // exactly as `apply` matches them; the ledger owns the PROJECT's
-    // copies only, so a global check verifies every in-scope copy).
+    // copies only, so a global check verifies every in-scope copy but the
+    // project's own NuGet install, #489).
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
     let in_scope: HashSet<String> =
         partition_purls(&manifest_purls, args.common.ecosystems.as_deref())
             .into_values()
             .flatten()
             .collect();
-    let vendored = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
-    } else {
-        Default::default()
-    };
+    let vendored = crate::commands::vendor_owned_keys(
+        &args.common,
+        &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
+    )
+    .await;
     let owned_by_apply = |purl: &str| in_scope.contains(purl) && !purl_keys_cover(&vendored, purl);
 
     {
@@ -399,7 +400,8 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                         | GoDrift::StaleCopy { purl, .. }
                         | GoDrift::MissingReplace { purl }
                         | GoDrift::WrongReplacePath { purl, .. }
-                        | GoDrift::ResolvedVersionMismatch { purl, .. } => purl.clone(),
+                        | GoDrift::ResolvedVersionMismatch { purl, .. }
+                        | GoDrift::UnprovenSelection { purl, .. } => purl.clone(),
                         GoDrift::OrphanReplace { module } => module.clone(),
                     };
                     drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));
@@ -663,6 +665,33 @@ async fn verify_installed_tree(
         .failed
         .retain(|f| !(f.reason == "package_not_found" && mismatched_keys.contains(&f.purl)));
     outcome.failed.extend(unmatched);
+
+    // An npm bin holding the patched bytes with a CRLF shebang `env`
+    // can't run (written by a release before #1756) is one `apply`
+    // rewrites, so it is not in sync (#1791).
+    let mut crlf_bins: Vec<String> = Vec::new();
+    for purl in &outcome.applied {
+        let Some(record) = tree.patches.get(purl) else {
+            continue;
+        };
+        'copies: for copy in copies.get(purl).into_iter().flatten() {
+            for (file, info) in &record.files {
+                if socket_patch_core::patch::apply::needs_npm_bin_rewrite(purl, copy, file, info)
+                    .await
+                {
+                    crlf_bins.push(purl.clone());
+                    break 'copies;
+                }
+            }
+        }
+    }
+    outcome.applied.retain(|purl| !crlf_bins.contains(purl));
+    outcome
+        .failed
+        .extend(crlf_bins.into_iter().map(|purl| FailedPatch {
+            purl,
+            reason: "not_applied".to_string(),
+        }));
     outcome
 }
 
@@ -2282,12 +2311,13 @@ async fn apply_patches_inner(
     // unreadable state degrades to "nothing vendored" (fail-open).
     // The ledger owns the PROJECT's copies only: a global apply restores
     // and patches the global copy even when the cwd project vendors the
-    // same purl (see `project_state_in_scope`).
-    let vendored_purls = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
-    } else {
-        Default::default()
-    };
+    // same purl (see `project_state_in_scope`), unless that copy is the
+    // project's own NuGet install (#489).
+    let vendored_purls = crate::commands::vendor_owned_keys(
+        &args.common,
+        &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
+    )
+    .await;
     let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);

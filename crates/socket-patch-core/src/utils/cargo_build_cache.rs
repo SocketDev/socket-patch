@@ -43,14 +43,11 @@ pub struct Invalidation {
 
 /// The project's build directories, reading the process environment.
 pub fn build_dirs(cwd: &Path) -> BuildDirs {
-    build_dirs_with(cwd, &|k| std::env::var(k).ok(), cargo_home().as_deref())
-}
-
-fn cargo_home() -> Option<PathBuf> {
-    match std::env::var("CARGO_HOME") {
-        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
-        _ => crate::utils::fs::home_dir().map(|h| h.join(".cargo")),
-    }
+    build_dirs_with(
+        cwd,
+        &|k| std::env::var(k).ok(),
+        super::cargo_home::cargo_home().as_deref(),
+    )
 }
 
 /// [`build_dirs`] with an injected environment and `CARGO_HOME`.

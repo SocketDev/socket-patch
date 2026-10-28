@@ -285,7 +285,11 @@ jobs:
   # job so a run starts no extra runner.
   release-readiness:
     if: github.event.pull_request.draft != true
-    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    # GitHub-hosted, not Depot: a ~10 s job that gates coverage, e2e-build and
+    # most of the run, so a slow Depot boot here delays every job behind it
+    # (#1795). If hosted Linux backs up, set the repo variable
+    # RELEASE_READINESS_RUNNER (e.g. depot-ubuntu-24.04-4); no merge needed.
+    runs-on: ${{ vars.RELEASE_READINESS_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read

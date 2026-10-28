@@ -69,6 +69,7 @@ pub mod go_mod_edit;
 mod go_native_vendor;
 pub(crate) mod go_sum_backup;
 pub mod go_sum_edit;
+pub mod go_workspace;
 pub mod golang;
 pub mod jvm;
 pub(crate) mod ledger_snapshots;

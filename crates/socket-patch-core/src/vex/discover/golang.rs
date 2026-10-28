@@ -1,5 +1,6 @@
-//! Go modules — root `go.mod` (and `go.work`) `replace` directives, pinned by
-//! `go.sum` (`go.work.sum`).
+//! Go modules — root `go.mod` (and `go.work`; the in-root members' `go.mod`
+//! at a go.work root without one) `replace` directives, pinned by `go.sum`
+//! (`go.work.sum`).
 //!
 //! Both Socket backends wire a Go patch the
 //! same way — a `replace` keyed on the ORIGINAL module + version — and differ
@@ -8,7 +9,7 @@
 //!
 //! | owner | what our tools write | ref |
 //! |---|---|---|
-//! | [`ReplaceOwner::Hosted`] (`scan --mode hosted`, `rewrite_golang`) | `replace M v => patch.socket.dev/gopatch/<uuid> <sver>` + go.sum `patch.socket.dev/gopatch/<uuid> <sver> h1:…` and `…<sver>/go.mod h1:…` | hosted, `integrity_required = true` |
+//! | [`ReplaceOwner::Hosted`] (`scan --mode hosted`, `rewrite_golang`) | `replace M v => patch.socket.dev/gopatch/<uuid> <sver>` + go.sum `patch.socket.dev/gopatch/<uuid> <sver> h1:…` and `…<sver>/go.mod h1:…` (`go mod tidy` may prune the first) | hosted, `integrity_required` iff the zip line is present |
 //! | [`ReplaceOwner::Vendor`] (`vendor`, `vendor_go_module`) | `replace M v => ./.socket/vendor/golang/<uuid>/M@v` | vendored |
 //! | [`ReplaceOwner::GoPatches`] (`apply`'s redirect) | `replace M v => ./.socket/go-patches/M@v` | none — no uuid; the CLI's `synthesize_go_patches` verifies those |
 //!
@@ -32,15 +33,45 @@
 //!   `--patch-server-url` deployment does not change Go module paths, so
 //!   the origin allowlist does not apply here.
 //! * **Pin.** The hosted rewriter refuses to write the replace without BOTH
-//!   go.sum lines, so `integrity_required = true`; the ref's
-//!   `locked_integrity` is the zip line's `h1:` dirhash
-//!   ([`LockIntegrity::GoH1`]) and is set only when the sum file carries
-//!   exactly one well-formed zip hash AND the `/go.mod` line for the Socket
-//!   module+version (anything else is not what the rewriter wrote — and a
-//!   conflicting pair is a go `SECURITY ERROR`). NB for the CLI's
-//!   installed-tree basis: under a hosted replace the module cache's
-//!   `M@v` (if any, e.g. from before the redirect) is pristine BY
-//!   CONSTRUCTION — the build consumes `patch.socket.dev/gopatch/<uuid>@<sver>`.
+//!   go.sum lines, but `go mod tidy` then drops the zip line whenever no
+//!   package of the replaced module is loaded (a transitive module only MVS
+//!   reads keeps just its `/go.mod` line), and the build stays green. So
+//!   the pin is the `/go.mod` line for the Socket module+version: exactly
+//!   one well-formed hash for it, plus at most one well-formed zip hash.
+//!   With the zip line, `integrity_required = true` and `locked_integrity`
+//!   is its `h1:` dirhash ([`LockIntegrity::GoH1`]). Without it (the tidy
+//!   state) `integrity_required = false`: the module path carries the patch
+//!   uuid and go compiles none of its packages, so the pinned replace alone
+//!   is the attestation basis — but MVS also keeps the `/go.mod` line of a
+//!   version it reads and does not select, so a `/go.mod`-only pin whose
+//!   version the main modules' `require`s or go.sum show is not selected
+//!   ([`go_build_list::select`]) is inert: diagnosed, no ref. With a
+//!   `go.work` the build list is MVS over every `use` member's module
+//!   graph ([`GoWorkspace::selection`], with the dependencies' go.mod files
+//!   read from the module cache when the root is on disk): a pin of either
+//!   kind whose replaced version a member's or a dependency's `require`
+//!   raises, or that is itself a `use` member, is inert. Sum files are no
+//!   evidence there (go only appends to `go.work.sum`), and without the
+//!   dependencies' go.mod files nothing read shows a dependency did not
+//!   raise it, so a `/go.mod`-only pin is never the basis
+//!   (`integrity_required = true`); the CLI's selection gate withholds
+//!   what the module graph does not prove. Anything else — no `/go.mod` line, two
+//!   different hashes for one line, a non-dirhash `h1:` (both a go
+//!   `SECURITY ERROR`), a line of other than three tokens anywhere in a
+//!   sum file (go rejects the whole file) — is not a pin:
+//!   `integrity_required = true`, no `locked_integrity`. Hashes of other
+//!   algorithms are ignored, as go ignores them. The sum files are the
+//!   ones go verifies against: the root `go.sum`, or with a `go.work`,
+//!   `go.work.sum` and each in-root `use` member's `go.sum` (the root's
+//!   only when `.` is a member). Under `GOWORK=off` go ignores `go.work`,
+//!   so discovery reads neither it nor its sum files. A `GOWORK` naming
+//!   another file than the root's `go.work`, or a relative one (which go
+//!   rejects), leaves the workspace unreadable here: every Go ref becomes
+//!   a diagnostic.
+//!   NB for the CLI's installed-tree basis: under a hosted replace the
+//!   module cache's `M@v` (if any, e.g. from before the redirect) is
+//!   pristine BY CONSTRUCTION — the build consumes
+//!   `patch.socket.dev/gopatch/<uuid>@<sver>`.
 //! * **Vendored identity** comes from [`vendor_ref`] over the replace PATH
 //!   (root-anchored: a `../…/.socket/vendor/golang/…` or absolute target —
 //!   which `detect_owner` still classifies as `Vendor` — points the build at
@@ -62,14 +93,18 @@
 //!   is unknown ([`DIAG_REF_UNATTRIBUTABLE`]). A versioned replace for the
 //!   same `M@<required>` in the same file takes precedence in Go, so the
 //!   version-less one is then inert too.
-//! * **`go.work`** (hand-written — no Socket tool writes it) uses the same
-//!   `replace` grammar and paths relative to the (root) workspace dir; its
-//!   refs are emitted with `source_file = "go.work"`, versions checked
-//!   against the ROOT `go.mod`'s `require` (the only one discovery reads),
-//!   and hosted pins looked up in `go.work.sum`, then `go.sum`. go.work
-//!   replaces override go.mod replaces in Go, but rule 10 leaves
-//!   cross-file precedence to the CLI's `wiring_conflict` gate. Nested
-//!   workspace members' go.mod files are not read (root-only, rule 1).
+//! * **`go.work`** (where every mode replaces a module the workspace
+//!   shares) uses the same `replace` grammar and paths relative to the
+//!   (root) workspace dir; its
+//!   refs are emitted with `source_file = "go.work"`, and hosted pins looked
+//!   up in the sum files above. Versions are checked against the root
+//!   `go.mod`'s `require` in module mode, and in workspace mode against the
+//!   highest version any read member requires. go.work replaces override
+//!   go.mod replaces in Go, but rule 10 leaves cross-file precedence to the
+//!   CLI's `wiring_conflict` gate. In-root members' go.mod files are read
+//!   for their `require`s and their go.sum for pins; their replaces only
+//!   when the root has no go.mod of its own (a go.work root), each emitted
+//!   with its own `source_file` (`<member>/go.mod`).
 //! * **Hand-edit tolerance**: a UTF-8 BOM, CRLF line ends, tab-separated
 //!   tokens, `replace(` without a space, `// comments`, and Go string
 //!   literals (`"github.com/foo/bar"`, `` `…` ``) around escape- and
@@ -81,17 +116,21 @@
 //!   and is not read.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use super::{
     golang_purl, vendor_ref, vendored_leaf_purl, DiscoverCtx, Discovery, PatchedRef,
     DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::patch::path_safety::is_safe_single_segment;
+use crate::utils::go_env::go_env;
+use crate::vendor::go_build_list::{self, Selection};
 use crate::vendor::go_mod_edit::{
     self, block_structure_error, hosted_module_uuid, normalize_for_read, ReplaceEntry,
     ReplaceOwner, HOSTED_GO_MODULE_PREFIX,
 };
-use crate::vendor::go_sum_edit::{go_sum_lines, is_h1_dirhash};
+use crate::vendor::go_sum_edit::{go_semver_cmp, go_sum_lines, is_h1_dirhash};
+use crate::vendor::go_workspace::{self, in_root_dir, same_dir_key, GoWork, GoWorkspace, Member};
 use crate::vendor::lock_inventory::LockIntegrity;
 
 const GO_MOD: &str = "go.mod";
@@ -100,24 +139,254 @@ const GO_WORK: &str = "go.work";
 const GO_WORK_SUM: &str = "go.work.sum";
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
+    extract_gowork(ctx, out, go_env("GOWORK").as_deref()).await;
+}
+
+/// [`extract`] for an explicit `GOWORK` value.
+async fn extract_gowork(ctx: &DiscoverCtx<'_>, out: &mut Discovery, gowork: Option<&str>) {
+    match gowork {
+        Some("off") => extract_with(ctx, out, false).await,
+        None | Some("") | Some("auto") => extract_with(ctx, out, true).await,
+        Some(gowork) => match unread_workspace(ctx, gowork) {
+            None => extract_with(ctx, out, true).await,
+            Some(why) => withhold(ctx, out, &why).await,
+        },
+    }
+}
+
+/// Why the `go.work` an explicit `GOWORK` names is not the root's, which
+/// is the only one discovery reads (`None`: it is).
+fn unread_workspace(ctx: &DiscoverCtx<'_>, gowork: &str) -> Option<String> {
+    let root = ctx.disk_root();
+    let why = match go_workspace::resolve_with(root.unwrap_or(Path::new("")), Some(gowork)) {
+        GoWork::Invalid(why) => why,
+        GoWork::File(file) => {
+            let own = root.map(|r| r.join(GO_WORK)).filter(|own| own.is_file());
+            if own.is_some_and(|own| same_dir_key(&own) == same_dir_key(&file)) {
+                return None;
+            }
+            format!(
+                "GOWORK={gowork} names a workspace other than this directory's {GO_WORK}, \
+                 which discovery cannot read"
+            )
+        }
+        GoWork::None => return None,
+    };
+    Some(why)
+}
+
+/// Discovery under a workspace it cannot read: what it would find reported
+/// as unattested, never as refs.
+async fn withhold(ctx: &DiscoverCtx<'_>, out: &mut Discovery, why: &str) {
+    let mut found = Discovery::default();
+    extract_with(ctx, &mut found, true).await;
+    out.diagnostics.append(&mut found.diagnostics);
+    for r in found.refs {
+        let file = r.source_file.to_string_lossy().into_owned();
+        out.diag(
+            DIAG_REF_INVALID,
+            &file,
+            format!("{file}: the replace of {} is not attested: {why}", r.purl),
+        );
+    }
+}
+
+/// [`extract`], with `workspaces` false under `GOWORK=off`: go then ignores
+/// `go.work`, its replaces and its sum files.
+async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bool) {
     let go_mod = match ctx.read_text(GO_MOD, out).await {
         Some(text) => parse_go_file(GO_MOD, &text, out),
         None => None,
     };
-    // `require` of the root module: the version the build selects (as far
-    // as a root-only reader can tell).
-    let required: HashMap<String, String> = go_mod
-        .as_deref()
-        .map(go_mod_edit::parse_required_versions)
-        .unwrap_or_default();
+    let go_work = if workspaces {
+        ctx.read_text(GO_WORK, out).await
+    } else {
+        None
+    };
+    let go_work = go_work.and_then(|text| parse_go_file(GO_WORK, &text, out));
+    let workspace = match go_work.as_deref() {
+        Some(work) => Some(read_workspace(ctx, out, go_mod.as_deref(), work).await),
+        None => None,
+    };
 
-    if let Some(text) = go_mod.as_deref() {
-        extract_file(ctx, out, GO_MOD, text, &required, &[GO_SUM]).await;
-    }
-    if let Some(text) = ctx.read_text(GO_WORK, out).await {
-        if let Some(text) = parse_go_file(GO_WORK, &text, out) {
-            extract_file(ctx, out, GO_WORK, &text, &required, &[GO_WORK_SUM, GO_SUM]).await;
+    // The go.mod files whose replaces apply: the root's, or (a go.work root
+    // with no module of its own) each in-root member's.
+    let mut files: Vec<(String, Vec<ReplaceEntry>)> = Vec::new();
+    match (&go_mod, &workspace) {
+        (Some(text), _) => {
+            files.push((GO_MOD.to_string(), go_mod_edit::parse_replace_entries(text)))
         }
+        (None, Some(ws)) => {
+            for (dir, member) in &ws.in_root {
+                if let Some(text) = ws.model.members[*member].go_mod.as_deref() {
+                    files.push((
+                        member_file(dir, GO_MOD),
+                        go_mod_edit::parse_replace_entries(text),
+                    ));
+                }
+            }
+        }
+        (None, None) => {}
+    }
+    if let Some(text) = &go_work {
+        files.push((
+            GO_WORK.to_string(),
+            go_mod_edit::parse_replace_entries(text),
+        ));
+    }
+    let any_hosted = files
+        .iter()
+        .flat_map(|(_, entries)| entries)
+        .any(|e| e.owner == Some(ReplaceOwner::Hosted));
+    let graph = Graph::new(go_mod.as_deref(), workspace.as_ref().map(|ws| &ws.model));
+    let mut sums = SumPins::default();
+    if any_hosted {
+        let sum_files = match &workspace {
+            Some(ws) => ws.sum_files.clone(),
+            None => vec![GO_SUM.to_string()],
+        };
+        sums = SumPins::read(ctx, out, &sum_files).await;
+    }
+    for (file, entries) in &files {
+        extract_file(out, file, entries, &graph, &sums);
+    }
+}
+
+/// The build list's evidence: the root module's go.mod, or the workspace.
+struct Graph<'a> {
+    /// The versions the build requires: the root go.mod's `require`s, or in
+    /// workspace mode the highest each read member requires.
+    required: HashMap<String, String>,
+    root: Option<&'a str>,
+    workspace: Option<&'a GoWorkspace>,
+}
+
+impl<'a> Graph<'a> {
+    fn new(go_mod: Option<&'a str>, workspace: Option<&'a GoWorkspace>) -> Self {
+        let required = match workspace {
+            Some(ws) => {
+                let mut max: HashMap<String, String> = HashMap::new();
+                for text in ws.members.iter().filter_map(|m| m.go_mod.as_deref()) {
+                    for (module, v) in go_mod_edit::parse_required_versions(text) {
+                        match max.get(&module) {
+                            Some(cur) if go_semver_cmp(cur, &v).is_ge() => {}
+                            _ => {
+                                max.insert(module, v);
+                            }
+                        }
+                    }
+                }
+                max
+            }
+            None => go_mod
+                .map(go_mod_edit::parse_required_versions)
+                .unwrap_or_default(),
+        };
+        Graph {
+            required,
+            root: go_mod,
+            workspace,
+        }
+    }
+
+    /// Which version the build selects against the patched `version`
+    /// ([`go_build_list::select`] over the root go.mod and the root go.sum's
+    /// zip lines, or [`GoWorkspace::selection`]).
+    fn select(&self, module: &str, version: &str, zips: &[&str]) -> Selection {
+        match self.workspace {
+            Some(ws) => ws.selection(module, version),
+            None => {
+                let root = self.root.unwrap_or_default();
+                go_build_list::select(
+                    go_mod_edit::prunes_module_graph(root),
+                    self.required.get(module).map(String::as_str),
+                    zips,
+                    version,
+                )
+            }
+        }
+    }
+
+    /// Whether the workspace module graph proves the build selects exactly
+    /// `module@version`.
+    fn selects(&self, module: &str, version: &str) -> bool {
+        self.workspace
+            .is_some_and(|ws| ws.selection(module, version) == Selection::Selected)
+    }
+}
+
+/// The `go.work` in effect, as discovery reads it.
+struct Workspace {
+    /// Members outside the root, or whose go.mod is unreadable, carry no
+    /// go.mod, which leaves every selection unknown.
+    model: GoWorkspace,
+    /// `(root-relative dir, index into model.members)` of in-root members.
+    in_root: Vec<(String, usize)>,
+    /// The sum files go verifies against in workspace mode: `go.work.sum`
+    /// and each member's `go.sum` (the root's only when `.` is a member).
+    sum_files: Vec<String>,
+}
+
+async fn read_workspace(
+    ctx: &DiscoverCtx<'_>,
+    out: &mut Discovery,
+    go_mod: Option<&str>,
+    go_work: &str,
+) -> Workspace {
+    let mut members = Vec::new();
+    let mut in_root = Vec::new();
+    let mut sum_files = vec![GO_WORK_SUM.to_string()];
+    for raw in go_mod_edit::parse_use_dirs(go_work) {
+        let Some(dir) = in_root_dir(&raw) else {
+            members.push(Member {
+                dir: raw.into(),
+                go_mod: None,
+                go_sum: None,
+            });
+            continue;
+        };
+        let text = if dir.is_empty() {
+            go_mod.map(str::to_string)
+        } else {
+            let rel = member_file(&dir, GO_MOD);
+            match ctx.read_text(&rel, out).await {
+                Some(text) => parse_go_file(&rel, &text, out),
+                None => None,
+            }
+        };
+        let sum = member_file(&dir, GO_SUM);
+        let go_sum = ctx.read_text(&sum, out).await;
+        if !sum_files.contains(&sum) {
+            sum_files.push(sum);
+        }
+        in_root.push((dir.clone(), members.len()));
+        members.push(Member {
+            dir: dir.into(),
+            go_mod: text,
+            go_sum,
+        });
+    }
+    let work_sum = ctx.read_text(GO_WORK_SUM, out).await;
+    let mut model = GoWorkspace {
+        work_file: GO_WORK.into(),
+        work: go_work.to_string(),
+        work_sum,
+        members,
+        graph: None,
+    };
+    if let Some(root) = ctx.disk_root() {
+        let mut on_disk = model.clone();
+        on_disk.work_file = root.join(GO_WORK);
+        for member in &mut on_disk.members {
+            member.dir = root.join(&member.dir);
+        }
+        on_disk.read_graph().await;
+        model.graph = on_disk.graph;
+    }
+    Workspace {
+        model,
+        in_root,
+        sum_files,
     }
 }
 
@@ -138,24 +407,21 @@ fn parse_go_file(file: &str, text: &str, out: &mut Discovery) -> Option<String> 
 }
 
 /// Emit the refs of one parsed file's Socket-owned `replace` directives.
-async fn extract_file(
-    ctx: &DiscoverCtx<'_>,
+fn extract_file(
     out: &mut Discovery,
     file: &str,
-    text: &str,
-    required: &HashMap<String, String>,
-    sum_files: &[&str],
+    entries: &[ReplaceEntry],
+    graph: &Graph<'_>,
+    sums: &SumPins,
 ) {
-    let entries = go_mod_edit::parse_replace_entries(text);
+    let required = &graph.required;
     // Versioned directives of ANY owner: they shadow a version-less replace
     // of the same module at that version.
     let versioned: HashSet<(&str, &str)> = entries
         .iter()
         .filter_map(|e| Some((e.module.as_str(), e.version.as_deref()?)))
         .collect();
-    let mut sums: Option<SumPins> = None;
-
-    for entry in &entries {
+    for entry in entries {
         match entry.owner {
             Some(ReplaceOwner::Hosted) => {
                 let Some(rhs) = entry.rhs_module.as_deref() else {
@@ -188,22 +454,40 @@ async fn extract_file(
                     );
                     continue;
                 };
-                let Some(purl) = replaced_purl(entry, required, &versioned, file, out) else {
+                let Some(purl) = replaced_purl(entry, graph, &versioned, file, out) else {
                     continue;
                 };
-                if sums.is_none() {
-                    let mut pins = SumPins::default();
-                    for sum in sum_files {
-                        if let Some(sum_text) = ctx.read_text(sum, out).await {
-                            pins.add(&sum_text);
-                        }
-                    }
-                    sums = Some(pins);
+                // `replaced_purl` resolved the version from one of the two.
+                let req = required.get(&entry.module).map(String::as_str);
+                let version = entry.version.as_deref().or(req).unwrap_or_default();
+                let zips = sums.zip_versions(&entry.module);
+                let selected = graph.select(&entry.module, version, &zips);
+                let pin = sums.pin(rhs, rhs_version);
+                // Outside a workspace the socket module's zip line shows it
+                // is the one built; in one, another member may raise the
+                // module above the replaced version all the same.
+                let proven = matches!(pin, SumPin::Zip(_)) && graph.workspace.is_none();
+                if let Some(other) = selected.other_version().filter(|_| !proven) {
+                    out.diag(
+                        DIAG_REF_INVALID,
+                        file,
+                        format!(
+                            "{file}: replace {} {version} is inert: the build selects \
+                             {other}, so it uses the unpatched module",
+                            entry.module
+                        ),
+                    );
+                    continue;
                 }
-                let integrity = sums
-                    .as_ref()
-                    .and_then(|s| s.pin(rhs, rhs_version))
-                    .map(LockIntegrity::GoH1);
+                let (integrity, integrity_required) = match pin {
+                    SumPin::Zip(h1) => (Some(LockIntegrity::GoH1(h1)), true),
+                    // MVS reads (and go.sum keeps the `/go.mod` line of)
+                    // versions it does not select, and a workspace build
+                    // keeps no member's `require` tidy: there nothing read
+                    // here proves the replaced version is the one built.
+                    SumPin::GoModOnly => (None, graph.workspace.is_some()),
+                    SumPin::Unpinned => (None, true),
+                };
                 let url = format!("{rhs}@{rhs_version}");
                 out.push(PatchedRef::hosted(
                     purl,
@@ -211,14 +495,20 @@ async fn extract_file(
                     file,
                     Some(url.as_str()),
                     integrity,
-                    true,
+                    integrity_required,
                 ));
             }
             Some(ReplaceOwner::Vendor) => {
                 let Some(path) = entry.path.as_deref() else {
                     continue;
                 };
-                let Some(vref) = vendor_ref(path).filter(|v| v.eco == "golang") else {
+                // A member go.mod's path is relative to the member, never
+                // the project-root vendor tree.
+                let anchored = match file.rsplit_once('/') {
+                    Some((dir, _)) => format!("./{dir}/{}", path.trim_start_matches("./")),
+                    None => path.to_string(),
+                };
+                let Some(vref) = vendor_ref(&anchored).filter(|v| v.eco == "golang") else {
                     out.diag(
                         DIAG_REF_INVALID,
                         file,
@@ -230,7 +520,7 @@ async fn extract_file(
                     );
                     continue;
                 };
-                let Some(purl) = replaced_purl(entry, required, &versioned, file, out) else {
+                let Some(purl) = replaced_purl(entry, graph, &versioned, file, out) else {
                     continue;
                 };
                 if vendored_leaf_purl("golang", &vref.leaf).as_deref() != Some(purl.as_str()) {
@@ -289,20 +579,27 @@ fn is_foreign_socket_target(entry: &ReplaceEntry) -> bool {
 /// when the directive is inert or its version is unknowable.
 fn replaced_purl(
     entry: &ReplaceEntry,
-    required: &HashMap<String, String>,
+    graph: &Graph<'_>,
     versioned: &HashSet<(&str, &str)>,
     file: &str,
     out: &mut Discovery,
 ) -> Option<String> {
     let module = entry.module.as_str();
-    let req = required.get(module).map(String::as_str);
+    let req = graph.required.get(module).map(String::as_str);
+    let basis = if graph.workspace.is_some() {
+        "the workspace requires"
+    } else {
+        "go.mod requires"
+    };
     let version = match (entry.version.as_deref(), req) {
-        (Some(v), Some(r)) if v != r => {
+        // In a workspace a dependency can raise the module above every
+        // member's `require`; a pin of the version the graph selects is live.
+        (Some(v), Some(r)) if v != r && !graph.selects(module, v) => {
             out.diag(
                 DIAG_REF_INVALID,
                 file,
                 format!(
-                    "{file}: replace {module} {v} is inert: go.mod requires {module} {r}, \
+                    "{file}: replace {module} {v} is inert: {basis} {module} {r}, \
                      so the build uses the unpatched module"
                 ),
             );
@@ -344,27 +641,76 @@ fn replaced_purl(
     purl
 }
 
-/// go.sum pins of Socket hosted modules, keyed `(module, version)`.
+/// go.sum pins of Socket hosted modules, keyed `(module, version)`, from
+/// every sum file go verifies against.
 #[derive(Default)]
 struct SumPins {
     /// Zip-line `h1:` hashes.
     zip: HashMap<(String, String), BTreeSet<String>>,
-    /// `(module, version)`s with a `/go.mod` line.
-    gomod: HashSet<(String, String)>,
+    /// `/go.mod`-line `h1:` hashes.
+    gomod: HashMap<(String, String), BTreeSet<String>>,
+    /// Keys with an `h1:` hash that is not a dirhash: go fails the
+    /// comparison with a `SECURITY ERROR`.
+    malformed: HashSet<(String, String)>,
+    /// A sum file has a line go cannot parse, so every build fails.
+    unparseable: bool,
+    /// Every module's zip-line versions (the build-list evidence).
+    zip_versions: HashMap<String, Vec<String>>,
+}
+
+/// What the sum files pin for one Socket `module@version`.
+#[derive(Debug, PartialEq, Eq)]
+enum SumPin {
+    /// Both lines: the zip line's `h1:`.
+    Zip(String),
+    /// Only the `/go.mod` line (`go mod tidy` pruned the zip line).
+    GoModOnly,
+    Unpinned,
 }
 
 impl SumPins {
-    fn add(&mut self, text: &str) {
+    async fn read(ctx: &DiscoverCtx<'_>, out: &mut Discovery, files: &[String]) -> Self {
+        let mut pins = SumPins::default();
+        for file in files {
+            if let Some(text) = ctx.read_text(file, out).await {
+                pins.add(&text, file != GO_WORK_SUM);
+            }
+        }
+        pins
+    }
+
+    /// `selects`: whether the file's zip lines show what the build selects.
+    /// go only ever appends to `go.work.sum`, so its lines outlive the
+    /// requirement that raised a module.
+    fn add(&mut self, text: &str, selects: bool) {
+        // go rejects a whole go.sum with any non-blank line of other than
+        // three tokens (only `go mod tidy` skips it).
+        if text
+            .lines()
+            .any(|l| !matches!(l.split_whitespace().count(), 0 | 3))
+        {
+            self.unparseable = true;
+            return;
+        }
         for line in go_sum_lines(text) {
-            if line.extra_tokens
-                || !line.module.starts_with(HOSTED_GO_MODULE_PREFIX)
-                || !is_h1_dirhash(line.hash)
-            {
+            if !line.go_mod && selects {
+                self.zip_versions
+                    .entry(line.module.to_string())
+                    .or_default()
+                    .push(line.version.to_string());
+            }
+            // go ignores hashes of algorithms it does not know.
+            if !line.module.starts_with(HOSTED_GO_MODULE_PREFIX) || !line.hash.starts_with("h1:") {
                 continue;
             }
             let key = (line.module.to_string(), line.version.to_string());
-            if line.go_mod {
-                self.gomod.insert(key);
+            if !is_h1_dirhash(line.hash) {
+                self.malformed.insert(key);
+            } else if line.go_mod {
+                self.gomod
+                    .entry(key)
+                    .or_default()
+                    .insert(line.hash.to_string());
             } else {
                 self.zip
                     .entry(key)
@@ -374,14 +720,36 @@ impl SumPins {
         }
     }
 
-    /// The zip `h1:` of `module@version` iff the rewriter's full pin is
-    /// present: one unambiguous zip hash plus the `/go.mod` line.
-    fn pin(&self, module: &str, version: &str) -> Option<String> {
+    /// The pin of `module@version`: one unambiguous `/go.mod` hash, and at
+    /// most one zip hash.
+    fn pin(&self, module: &str, version: &str) -> SumPin {
         let key = (module.to_string(), version.to_string());
-        let hashes = self.zip.get(&key)?;
-        (hashes.len() == 1 && self.gomod.contains(&key))
-            .then(|| hashes.iter().next().cloned())
-            .flatten()
+        let one = |hashes: Option<&BTreeSet<String>>| match hashes {
+            Some(h) if h.len() == 1 => h.iter().next().cloned(),
+            _ => None,
+        };
+        if self.unparseable || self.malformed.contains(&key) || one(self.gomod.get(&key)).is_none()
+        {
+            return SumPin::Unpinned;
+        }
+        match self.zip.get(&key) {
+            None => SumPin::GoModOnly,
+            some => one(some).map_or(SumPin::Unpinned, SumPin::Zip),
+        }
+    }
+
+    fn zip_versions(&self, module: &str) -> Vec<&str> {
+        self.zip_versions
+            .get(module)
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+}
+
+fn member_file(dir: &str, file: &str) -> String {
+    match dir {
+        "" => file.to_string(),
+        dir => format!("{dir}/{file}"),
     }
 }
 
@@ -406,7 +774,13 @@ mod tests {
         "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n";
 
     async fn run(p: &Project) -> Discovery {
-        p.run(|c, o| Box::pin(super::extract(c, o))).await
+        p.run(|c, o| Box::pin(super::extract_with(c, o, true)))
+            .await
+    }
+
+    async fn gowork_off(p: &Project) -> Discovery {
+        p.run(|c, o| Box::pin(super::extract_with(c, o, false)))
+            .await
     }
 
     fn gopatch(uuid: &str) -> String {
@@ -518,30 +892,75 @@ mod tests {
             let out = run(&p).await;
             assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
             assert_eq!(out.refs[0].locked_integrity, None, "{go_sum:?}");
+            assert!(!out.refs[0].lockfile_basis_ok(), "{go_sum:?}");
+        }
+    }
+
+    /// `go mod tidy` keeps only the `/go.mod` line of a replaced module whose
+    /// packages nothing imports, and the build stays green: that line alone
+    /// is the pin, with nothing to lock the (never fetched) zip to. Not in a
+    /// workspace, whose selection go.mod cannot show.
+    #[tokio::test]
+    async fn tidy_pruned_zip_line_leaves_a_go_mod_line_pin() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n");
+        for (file, sum_file) in [("go.mod", "go.sum"), ("go.work", "go.work.sum")] {
+            let p = Project::new();
+            if file == "go.mod" {
+                p.write("go.mod", &go_mod);
+            } else {
+                p.write("go.mod", BASE_GO_MOD).write(
+                    "go.work",
+                    format!("go 1.21\n\nuse .\n\nreplace {MODULE} {VERSION} => {m} {sver}\n"),
+                );
+            }
+            p.write(sum_file, format!("{m} {sver}/go.mod {MOD_H1}\n"));
+            let out = run(&p).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            let r = &out.refs[0];
+            let attests = file == "go.mod";
+            assert_eq!(r.locked_integrity, None, "{file}");
+            assert_eq!(r.integrity_required, !attests, "{file}");
+            assert_eq!(r.lockfile_basis_ok(), attests, "{file}");
+            assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         }
     }
 
     #[tokio::test]
-    async fn hosted_pin_requires_both_go_sum_lines_and_one_hash() {
+    async fn hosted_pin_requires_the_go_mod_line_and_one_hash_per_line() {
         let m = gopatch(UUID_A);
         let go_mod =
             format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} v1.4.2-socketpatch.1\n");
         for go_sum in [
             // No go.sum at all.
             None,
-            // Zip line only / go.mod line only.
+            // Zip line only.
             Some(format!("{m} v1.4.2-socketpatch.1 {ZIP_H1}\n")),
-            Some(format!("{m} v1.4.2-socketpatch.1/go.mod {MOD_H1}\n")),
             // Conflicting zip hashes (a union-merged go.sum).
             Some(format!(
                 "{}{m} v1.4.2-socketpatch.1 {MOD_H1}\n",
                 go_sum_for(UUID_A, "v1.4.2-socketpatch.1")
             )),
-            // Pinned at another socket version.
+            // Conflicting `/go.mod` hashes, with and without the zip line.
+            Some(format!(
+                "{}{m} v1.4.2-socketpatch.1/go.mod {ZIP_H1}\n",
+                go_sum_for(UUID_A, "v1.4.2-socketpatch.1")
+            )),
+            Some(format!(
+                "{m} v1.4.2-socketpatch.1/go.mod {MOD_H1}\n{m} v1.4.2-socketpatch.1/go.mod {ZIP_H1}\n"
+            )),
+            // Pinned at another socket version (both lines, or the tidy
+            // `/go.mod` line).
             Some(go_sum_for(UUID_A, "v1.4.2-socketpatch.9")),
-            // Malformed hash.
+            Some(format!("{m} v1.4.2-socketpatch.9/go.mod {MOD_H1}\n")),
+            // Malformed hash, on either line.
             Some(format!(
                 "{m} v1.4.2-socketpatch.1 h1:short\n{m} v1.4.2-socketpatch.1/go.mod {MOD_H1}\n"
+            )),
+            Some(format!(
+                "{}{m} v1.4.2-socketpatch.1/go.mod h1:short\n",
+                go_sum_for(UUID_A, "v1.4.2-socketpatch.1")
             )),
         ] {
             let p = Project::new();
@@ -650,6 +1069,414 @@ mod tests {
         let r = &out.refs[0];
         assert_eq!(r.source_file, std::path::PathBuf::from("go.work"));
         assert!(r.lockfile_basis_ok());
+    }
+
+    /// In workspace mode go verifies against every member's go.sum, so the
+    /// zip line may live there; a member outside the root is not read.
+    #[tokio::test]
+    async fn workspace_member_go_sum_holds_the_zip_line() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n");
+        for (use_dir, member_sum, pinned) in [
+            ("./svc", "svc/go.sum", true),
+            ("svc/", "svc/go.sum", true),
+            ("../svc", "../svc/go.sum", false),
+        ] {
+            let p = Project::new();
+            p.write("go.mod", &go_mod)
+                .write(
+                    "go.work",
+                    format!("go 1.21\n\nuse (\n\t.\n\t{use_dir}\n)\n"),
+                )
+                .write("go.sum", format!("{m} {sver}/go.mod {MOD_H1}\n"));
+            if pinned {
+                p.write(member_sum, format!("{m} {sver} {ZIP_H1}\n"));
+            }
+            let out = run(&p).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            let r = &out.refs[0];
+            if pinned {
+                assert_eq!(
+                    r.locked_integrity,
+                    Some(LockIntegrity::GoH1(ZIP_H1.to_string())),
+                    "{use_dir}"
+                );
+                assert!(r.integrity_required);
+                assert!(r.lockfile_basis_ok(), "{use_dir}");
+            } else {
+                assert_eq!(r.locked_integrity, None, "{use_dir}");
+                // Nor can its `require` show the `/go.mod` line's version
+                // is the one the workspace selects.
+                assert!(!r.lockfile_basis_ok(), "{use_dir}");
+            }
+        }
+    }
+
+    /// A workspace builds the union of its members' requirements, and a
+    /// member's dependency can raise the module past every `require` while
+    /// go writes the missing sums to `go.work.sum` itself: a `/go.mod`-only
+    /// pin there is never the basis, and a higher `require` makes it
+    /// inert. A sum file's zip line does not: go never drops one from
+    /// `go.work.sum` once nothing raises the module any more, and a
+    /// member's go.sum may be as stale.
+    #[tokio::test]
+    async fn workspace_go_mod_only_pin_is_never_the_basis() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let svc = |go: &str, require: &str| format!("module example.com/svc\n\ngo {go}\n{require}");
+        let req = |v: &str| format!("\nrequire {MODULE} {v}\n");
+        let zip = |v: &str| format!("{MODULE} {v} {ZIP_H1}\n{MODULE} {v}/go.mod {MOD_H1}\n");
+        let mid = "\nrequire example.com/mid v1.0.0\n";
+        for (name, uses, svc_mod, svc_sum, work_sum, inert) in [
+            (
+                "member requires it too",
+                ". ./svc",
+                Some(svc("1.21", &req(VERSION))),
+                None,
+                None,
+                false,
+            ),
+            (
+                "member does not require it",
+                ". ./svc",
+                Some(svc("1.21", "")),
+                None,
+                None,
+                false,
+            ),
+            (
+                "member requires a lower version",
+                ". ./svc",
+                Some(svc("1.21", &req("v1.4.1"))),
+                None,
+                None,
+                false,
+            ),
+            (
+                "member's dependency, sums not yet written",
+                ". ./svc",
+                Some(svc("1.21", mid)),
+                None,
+                None,
+                false,
+            ),
+            (
+                "member's dependency, go.work.sum written",
+                ". ./svc",
+                Some(svc("1.21", mid)),
+                None,
+                Some(zip("v1.5.0")),
+                false,
+            ),
+            (
+                "stale go.work.sum zip line, member requires it",
+                ". ./svc",
+                Some(svc("1.21", &req(VERSION))),
+                None,
+                Some(zip("v1.5.0")),
+                false,
+            ),
+            (
+                "member's dependency, member go.sum",
+                ". ./svc",
+                Some(svc("1.21", mid)),
+                Some(zip("v1.5.0")),
+                None,
+                false,
+            ),
+            (
+                "member requires a higher version",
+                ". ./svc",
+                Some(svc("1.21", &req("v1.5.0"))),
+                Some(zip("v1.5.0")),
+                None,
+                true,
+            ),
+            (
+                "go 1.16 member builds a higher zip",
+                ". ./svc",
+                Some(svc("1.16", &req("v1.4.1"))),
+                Some(zip("v1.5.0")),
+                None,
+                false,
+            ),
+            (
+                "only a higher /go.mod line",
+                ". ./svc",
+                Some(svc("1.21", mid)),
+                None,
+                Some(format!("{MODULE} v1.5.0/go.mod {MOD_H1}\n")),
+                false,
+            ),
+            ("member go.mod missing", ". ./svc", None, None, None, false),
+            (
+                "member outside the root",
+                ". ../svc",
+                None,
+                None,
+                None,
+                false,
+            ),
+            (
+                "member outside the root, higher zip",
+                ". ../svc",
+                None,
+                None,
+                Some(zip("v1.5.0")),
+                false,
+            ),
+            (
+                "root not a member",
+                "./svc",
+                Some(svc("1.21", &req(VERSION))),
+                None,
+                None,
+                false,
+            ),
+            (
+                "root not a member, nothing requires it",
+                "./svc",
+                Some(svc("1.21", "")),
+                None,
+                None,
+                false,
+            ),
+        ] {
+            let p = Project::new();
+            p.write("go.mod", BASE_GO_MOD)
+                .write(
+                    "go.work",
+                    format!(
+                        "go 1.21\n\nuse (\n{}\n)\n\nreplace {MODULE} {VERSION} => {m} {sver}\n",
+                        uses.replace(' ', "\n")
+                    ),
+                )
+                .write(
+                    "go.work.sum",
+                    format!(
+                        "{m} {sver}/go.mod {MOD_H1}\n{}",
+                        work_sum.unwrap_or_default()
+                    ),
+                );
+            if let Some(text) = &svc_mod {
+                p.write("svc/go.mod", text);
+            }
+            if let Some(text) = &svc_sum {
+                p.write("svc/go.sum", text);
+            }
+            let out = run(&p).await;
+            if inert {
+                assert_refs(&out, &[]);
+                assert_eq!(out.diagnostics.len(), 1, "{name}");
+                assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID, "{name}");
+                assert!(
+                    out.diagnostics[0].detail.contains("v1.5.0"),
+                    "{name}: {:?}",
+                    out.diagnostics
+                );
+            } else {
+                assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+                assert!(out.refs[0].integrity_required, "{name}");
+                assert!(!out.refs[0].lockfile_basis_ok(), "{name}");
+                assert_eq!(out.refs[0].locked_integrity, None, "{name}");
+                assert!(out.diagnostics.is_empty(), "{name}: {:?}", out.diagnostics);
+            }
+        }
+    }
+
+    /// A workspace's sum files are only appended to, so the socket zip line
+    /// can outlive the build that wrote it: a member that requires a higher
+    /// version makes even a zip-pinned replace inert.
+    #[tokio::test]
+    async fn workspace_zip_pin_is_inert_under_a_higher_member_require() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        for (member_version, inert) in [(VERSION, false), ("v1.4.1", false), ("v1.5.0", true)] {
+            let p = Project::new();
+            p.write("go.mod", BASE_GO_MOD)
+                .write(
+                    "go.work",
+                    format!(
+                        "go 1.21\n\nuse (\n\t.\n\t./svc\n)\n\nreplace {MODULE} {VERSION} => {m} {sver}\n"
+                    ),
+                )
+                .write(
+                    "go.work.sum",
+                    format!("{m} {sver} {ZIP_H1}\n{m} {sver}/go.mod {MOD_H1}\n"),
+                )
+                .write(
+                    "svc/go.mod",
+                    format!("module example.com/svc\n\ngo 1.21\n\nrequire {MODULE} {member_version}\n"),
+                );
+            let out = run(&p).await;
+            if inert {
+                assert_refs(&out, &[]);
+                assert_eq!(out.diagnostics.len(), 1, "{member_version}");
+                assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+                let detail = &out.diagnostics[0].detail;
+                assert!(
+                    detail.contains("is inert") && detail.contains("v1.5.0"),
+                    "{detail}"
+                );
+            } else {
+                assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+                assert_eq!(
+                    out.refs[0].locked_integrity,
+                    Some(LockIntegrity::GoH1(ZIP_H1.to_string())),
+                    "{member_version}"
+                );
+                assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+            }
+        }
+    }
+
+    /// A member that cannot be read (outside the root, or missing its
+    /// go.mod) does not hide another member's higher require.
+    #[tokio::test]
+    async fn workspace_unreadable_member_keeps_other_members_requires() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        for extra in ["../outside", "./missing"] {
+            let p = Project::new();
+            p.write("go.mod", BASE_GO_MOD)
+                .write(
+                    "go.work",
+                    format!(
+                        "go 1.21\n\nuse (\n\t.\n\t{extra}\n\t./svc\n)\n\nreplace {MODULE} {VERSION} => {m} {sver}\n"
+                    ),
+                )
+                .write(
+                    "go.work.sum",
+                    format!("{m} {sver} {ZIP_H1}\n{m} {sver}/go.mod {MOD_H1}\n"),
+                )
+                .write(
+                    "svc/go.mod",
+                    format!("module example.com/svc\n\ngo 1.21\n\nrequire {MODULE} v1.5.0\n"),
+                );
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert!(
+                out.diagnostics.iter().any(
+                    |d| d.code == DIAG_REF_INVALID && d.detail.contains("v1.5.0, so the build")
+                ),
+                "{extra}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// go verifies against the sum files of the mode it builds in: in
+    /// workspace mode `go.work.sum` and the members' go.sum (the root's only
+    /// when `.` is a member); under `GOWORK=off` the root go.sum alone, with
+    /// go.work and its replaces ignored.
+    #[tokio::test]
+    async fn sum_files_follow_the_build_mode() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let pair = go_sum_for(UUID_A, sver);
+        let replace = format!("replace {MODULE} {VERSION} => {m} {sver}\n");
+        let svc = format!("module example.com/svc\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n");
+        let pinned = |out: &Discovery| {
+            assert_refs(out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            out.refs[0].locked_integrity.is_some()
+        };
+
+        // Root not a member: its go.sum is not consulted.
+        let p = Project::new();
+        p.write("go.mod", BASE_GO_MOD)
+            .write("go.work", format!("go 1.21\n\nuse ./svc\n\n{replace}"))
+            .write("svc/go.mod", &svc)
+            .write("go.sum", &pair);
+        let out = run(&p).await;
+        assert!(!pinned(&out));
+        assert!(!out.refs[0].lockfile_basis_ok());
+        p.write("svc/go.sum", &pair);
+        assert!(pinned(&run(&p).await));
+
+        // GOWORK=off: the go.work replace does not apply at all.
+        let p = Project::new();
+        p.write("go.mod", BASE_GO_MOD)
+            .write("go.work", format!("go 1.21\n\nuse .\n\n{replace}"))
+            .write("go.work.sum", &pair)
+            .write("go.sum", &pair);
+        assert_refs(&gowork_off(&p).await, &[]);
+        // A go.mod replace is pinned by the root go.sum only.
+        let p = Project::new();
+        p.write("go.mod", format!("{BASE_GO_MOD}\n{replace}"))
+            .write("go.work", "go 1.21\n\nuse .\n")
+            .write("go.work.sum", &pair);
+        assert!(!pinned(&gowork_off(&p).await));
+        p.write("go.sum", &pair);
+        assert!(pinned(&gowork_off(&p).await));
+    }
+
+    /// In a go < 1.17 graph MVS keeps the `/go.mod` line of a version it only
+    /// reads: a `/go.mod`-only pin whose version go.sum shows is not the one
+    /// selected is inert.
+    #[tokio::test]
+    async fn go_mod_line_only_pin_of_an_unselected_version_is_inert() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!(
+            "module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n\
+             replace {MODULE} {VERSION} => {m} {sver}\n"
+        );
+        let pin = format!("{m} {sver}/go.mod {MOD_H1}\n");
+        for (extra, inert) in [
+            (
+                format!("{MODULE} v1.5.0 {ZIP_H1}\n{MODULE} v1.5.0/go.mod {MOD_H1}\n"),
+                true,
+            ),
+            (format!("{MODULE} v1.5.0/go.mod {MOD_H1}\n"), false),
+            (format!("{MODULE} v1.4.1 {ZIP_H1}\n"), true),
+            (String::new(), false),
+        ] {
+            let p = Project::new();
+            p.write("go.mod", &go_mod)
+                .write("go.sum", format!("{extra}{pin}"));
+            let out = run(&p).await;
+            if inert {
+                assert_refs(&out, &[]);
+                assert_eq!(out.diagnostics.len(), 1, "{extra}");
+                assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+                assert!(out.diagnostics[0].detail.contains("is inert"));
+            } else {
+                assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+                assert!(out.refs[0].lockfile_basis_ok(), "{extra}");
+            }
+        }
+        // With the zip line the socket module is loaded, so it is selected.
+        let p = Project::new();
+        p.write("go.mod", &go_mod).write(
+            "go.sum",
+            format!("{MODULE} v1.5.0 {ZIP_H1}\n{}", go_sum_for(UUID_A, sver)),
+        );
+        assert_refs(&run(&p).await, &[(PURL, UUID_A, WiringMode::Hosted)]);
+    }
+
+    /// go rejects a whole go.sum over one line of the wrong token count, and
+    /// ignores hashes of algorithms it does not know.
+    #[tokio::test]
+    async fn sum_file_parse_rules_follow_go() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n");
+        let pair = go_sum_for(UUID_A, sver);
+        for (go_sum, pinned) in [
+            (format!("a.com/x v1.0.0 h1:x= extra\n{pair}"), false),
+            (format!("a.com/x v1.0.0\n{pair}"), false),
+            (format!("\n  \n{pair}"), true),
+            (format!("{pair}{m} {sver} h2:whatever\n"), true),
+            (format!("{pair}{m} {sver}/go.mod h1:short\n"), false),
+        ] {
+            let p = Project::new();
+            p.write("go.mod", &go_mod).write("go.sum", &go_sum);
+            let out = run(&p).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.refs[0].lockfile_basis_ok(), pinned, "{go_sum:?}");
+            assert_eq!(out.refs[0].locked_integrity.is_some(), pinned, "{go_sum:?}");
+        }
     }
 
     #[tokio::test]
@@ -938,5 +1765,195 @@ mod tests {
         p.copy_fixture("redirect/golang/gomod/basic/expected");
         let out = p.discover().await;
         assert!(out.wires(PURL, FIXTURE_UUID, WiringMode::Hosted));
+    }
+
+    /// A go.work root with no go.mod of its own: each in-root member's
+    /// go.mod replace is read (its own file as the source), pinned by that
+    /// member's go.sum; an out-of-root member leaves the selection unproven.
+    #[tokio::test]
+    async fn go_work_root_without_go_mod_reads_member_replaces() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let member = format!(
+            "module example.com/a\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n\n\
+             replace {MODULE} {VERSION} => {m} {sver}\n"
+        );
+        let p = Project::new();
+        p.write("go.work", "go 1.21\n\nuse (\n\t./a\n\t./b\n)\n")
+            .write("a/go.mod", &member)
+            .write("a/go.sum", go_sum_for(UUID_A, sver))
+            .write(
+                "b/go.mod",
+                format!("module example.com/b\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+            );
+        let out = run(&p).await;
+        assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+        assert_eq!(
+            out.refs[0].source_file,
+            std::path::PathBuf::from("a/go.mod")
+        );
+        assert!(out.refs[0].lockfile_basis_ok());
+
+        // Under GOWORK=off there is no workspace and no module here.
+        assert_refs(&gowork_off(&p).await, &[]);
+    }
+
+    /// An explicit `GOWORK` other than the root's go.work (another file, or a
+    /// relative path go rejects) leaves the workspace unread: what discovery
+    /// finds is diagnosed, never a ref.
+    #[tokio::test]
+    async fn gowork_naming_another_workspace_attests_nothing() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let p = Project::new();
+        p.write("go.work", "go 1.21\n\nuse (\n\t./a\n\t./b\n)\n")
+            .write(
+                "a/go.mod",
+                format!(
+                    "module example.com/a\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n\n\
+                     replace {MODULE} {VERSION} => {m} {sver}\n"
+                ),
+            )
+            .write("a/go.sum", go_sum_for(UUID_A, sver))
+            .write("b/go.mod", "module example.com/b\n\ngo 1.21\n");
+        let extract = |gowork: Option<String>| {
+            let p = &p;
+            async move {
+                let ctx = p.ctx();
+                let mut out = Discovery::default();
+                super::extract_gowork(&ctx, &mut out, gowork.as_deref()).await;
+                out
+            }
+        };
+        let own = p.root().join("go.work").to_string_lossy().into_owned();
+        for gowork in [None, Some("auto".to_string()), Some(own)] {
+            let out = extract(gowork.clone()).await;
+            assert_eq!(out.refs.len(), 1, "{gowork:?}: {:?}", out.diagnostics);
+            assert!(
+                out.diagnostics.is_empty(),
+                "{gowork:?}: {:?}",
+                out.diagnostics
+            );
+        }
+        let elsewhere = p.root().join("a").join("go.work");
+        for (gowork, why) in [
+            ("go.work".to_string(), "not an absolute path"),
+            ("/nonexistent/go.work".to_string(), "other than"),
+            (elsewhere.to_string_lossy().into_owned(), "other than"),
+        ] {
+            let out = extract(Some(gowork.clone())).await;
+            assert!(out.refs.is_empty(), "{gowork}");
+            assert_eq!(out.diagnostics.len(), 1, "{gowork}: {:?}", out.diagnostics);
+            assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+            assert!(
+                out.diagnostics[0].detail.contains(why),
+                "{gowork}: {:?}",
+                out.diagnostics
+            );
+        }
+        let out = extract(Some("off".to_string())).await;
+        assert!(out.refs.is_empty() && out.diagnostics.is_empty());
+    }
+
+    /// In a workspace the socket module's zip line does not prove the
+    /// replaced version is built: another member requiring a higher one
+    /// makes the pin inert, as for a `/go.mod`-only pin.
+    #[tokio::test]
+    async fn workspace_zip_pin_of_a_raised_module_is_inert() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let p = Project::new();
+        p.write(
+            "go.mod",
+            format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n"),
+        )
+        .write("go.sum", go_sum_for(UUID_A, sver))
+        .write("go.work", "go 1.21\n\nuse (\n\t.\n\t./svc\n)\n")
+        .write(
+            "svc/go.mod",
+            format!("module example.com/svc\n\ngo 1.21\n\nrequire {MODULE} v1.5.0\n"),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.detail.contains("is inert") && d.detail.contains("v1.5.0")),
+            "{:?}",
+            out.diagnostics
+        );
+        // Without the workspace the zip line is the proof.
+        let out = gowork_off(&p).await;
+        assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.refs[0].lockfile_basis_ok());
+    }
+
+    /// No member `require` names the version a dependency raises the module
+    /// to, so a pin of it is live only when the workspace graph proves the
+    /// build selects it; a pin of a member's `require` it raises is inert.
+    #[test]
+    fn workspace_pin_of_a_dependency_raised_version_is_live() {
+        use super::*;
+        use crate::vendor::go_workspace::DepGoMod;
+        let dep = |requires: &[(&str, &str)]| {
+            Some(DepGoMod {
+                pruned: true,
+                requires: requires
+                    .iter()
+                    .map(|(m, v)| (m.to_string(), v.to_string()))
+                    .collect(),
+            })
+        };
+        let ws = GoWorkspace {
+            work_file: GO_WORK.into(),
+            work: "go 1.21\n\nuse .\n".to_string(),
+            work_sum: None,
+            members: vec![Member {
+                dir: ".".into(),
+                go_mod: Some(format!("{BASE_GO_MOD}\nrequire example.com/mid v1.0.0\n")),
+                go_sum: None,
+            }],
+            graph: Some(
+                [
+                    (format!("{MODULE}@{VERSION}"), dep(&[])),
+                    (format!("{MODULE}@v1.5.0"), dep(&[])),
+                    (
+                        "example.com/mid@v1.0.0".to_string(),
+                        dep(&[(MODULE, "v1.5.0")]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        };
+        let graph = Graph::new(None, Some(&ws));
+        let entry = |version: &str| ReplaceEntry {
+            module: MODULE.to_string(),
+            version: Some(version.to_string()),
+            path: None,
+            rhs_module: Some(gopatch(UUID_A)),
+            rhs_version: Some(format!("{version}-socketpatch.1")),
+            owner: Some(ReplaceOwner::Hosted),
+        };
+        let mut out = Discovery::default();
+        let purl = replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out);
+        assert_eq!(
+            purl.as_deref(),
+            Some("pkg:golang/github.com/foo/bar@v1.5.0")
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // A version the graph does not select stays inert.
+        let purl = replaced_purl(&entry("v1.6.0"), &graph, &HashSet::new(), GO_WORK, &mut out);
+        assert_eq!(purl, None);
+        assert_eq!(out.diagnostics.len(), 1, "{:?}", out.diagnostics);
+        assert!(out.diagnostics[0].detail.contains("is inert"));
+        // Without the graph nothing proves the raise.
+        let ws = GoWorkspace { graph: None, ..ws };
+        let graph = Graph::new(None, Some(&ws));
+        let mut out = Discovery::default();
+        assert_eq!(
+            replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out),
+            None
+        );
     }
 }

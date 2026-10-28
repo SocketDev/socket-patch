@@ -150,13 +150,10 @@ pub struct ChainConfig {
 /// every ancestor directory's, and `$CARGO_HOME`'s (default `~/.cargo`), in
 /// that order (cargo lets a config item replace the manifest item with the
 /// same key, whatever its version). Read-only and fail-soft: missing /
-/// unreadable / malformed files contribute nothing, and with no
-/// `$CARGO_HOME` and no home directory there is no home config.
+/// unreadable / malformed files contribute nothing, and with no cargo home
+/// ([`crate::utils::cargo_home::cargo_home`]) there is no home config.
 pub async fn read_config_chain(project_root: &Path) -> Vec<ChainConfig> {
-    let cargo_home = match std::env::var("CARGO_HOME") {
-        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
-        _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
-    };
+    let cargo_home = crate::utils::cargo_home::cargo_home();
     read_config_chain_with(project_root, cargo_home.as_deref()).await
 }
 

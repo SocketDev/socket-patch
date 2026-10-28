@@ -1358,10 +1358,6 @@ async fn run_redirect_selected_untracked(
     // parent directory's and `$CARGO_HOME`'s): a directory source or local
     // registry in any of them refuses the cargo rewrite like a project one.
     let cargo_outer = || CargoCrawler::crates_io_source_for(&common.cwd);
-    // The other members of the go.work in effect: the workspace build
-    // selects the highest version any of them requires.
-    let go_workspace =
-        || socket_patch_core::vendor::go_build_list::other_workspace_members(&common.cwd);
     // The scan runs in the install's environment: a pnpm setting there
     // (`pnpm_config_trust_lockfile`) overrides the project's files.
     let pnpm_env = |var: &str| std::env::var(var).ok();
@@ -1379,7 +1375,6 @@ async fn run_redirect_selected_untracked(
         npm_outer: &npm_outer,
         yarn_classic_outer: &yarn_classic_outer,
         cargo_outer: &cargo_outer,
-        go_workspace: &go_workspace,
         pnpm_env: &pnpm_env,
         blocking: true,
         takeover_uuids: takeover_uuids.clone(),
@@ -1872,12 +1867,13 @@ async fn run_redirect_selected_untracked(
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
     engine_warnings.extend(done.npm_warnings.iter().cloned());
     // A hosted Go `replace` breaks a committed vendor/ directory until
-    // `go mod vendor` re-records it in vendor/modules.txt (#343).
+    // `go mod vendor` (`go work vendor`) re-records it in
+    // vendor/modules.txt (#343).
     if !common.dry_run
         && done
             .rewritten
             .iter()
-            .any(|f| f == "go.mod" || f.ends_with("/go.mod"))
+            .any(|f| f == "go.mod" || f == "go.work" || f.ends_with("/go.mod"))
     {
         for (code, detail) in socket_patch_core::vendor::go_consumer_sync::audit_warnings(
             &common.cwd,
@@ -4309,6 +4305,8 @@ mod tests {
                 "gems.locked",
                 "go.mod",
                 "go.sum",
+                "go.work",
+                "go.work.sum",
                 "pom.xml",
                 ".mvn/maven.config",
                 ".mvn/checksums/checksums.sha256",

@@ -296,6 +296,17 @@ async fn hosted_pin_another_go_work_member_outranks_is_refused() {
     let server = MockServer::start().await;
     mount_hosted_grant(&server).await;
     let modcache = tmp.path().join("modcache");
+    // The workspace's module graph reads each required version's go.mod
+    // from the module cache; without them the selection is unknown.
+    for v in [UVER, "v1.1.0"] {
+        let dir = modcache.join(format!("cache/download/{UMOD}/@v"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{v}.mod")),
+            format!("module {UMOD}\n\ngo 1.21\n"),
+        )
+        .unwrap();
+    }
     let mismatch = |env: &serde_json::Value| {
         env["warnings"]
             .as_array()

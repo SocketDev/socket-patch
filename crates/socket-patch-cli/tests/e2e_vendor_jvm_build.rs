@@ -505,6 +505,37 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
         "re-vendor: changed {changed:?}, added {added:?}, removed {removed:?}"
     );
 
+    // #534: `b`'s `<relativePath>../corp-parent</relativePath>` names a
+    // directory; `vex` and `vendor --check` read it as Maven does.
+    let (code, doc, stderr) = socket_in(
+        &proj,
+        &m2,
+        None,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--product",
+            "pkg:maven/com.example/aggregator@1.0.0",
+        ],
+    );
+    assert_eq!(code, Some(0), "vex: {doc}\n{stderr}");
+    assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+    let (code, env, stderr) = socket_in(
+        &proj,
+        &m2,
+        None,
+        &[
+            "vendor",
+            "--check",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(0), "vendor --check: {env}\n{stderr}");
+
     // FRESH CHECKOUT: commons-text only from the committed tree.
     let fresh = root.join("fresh");
     fresh_checkout_all(&proj, &fresh);

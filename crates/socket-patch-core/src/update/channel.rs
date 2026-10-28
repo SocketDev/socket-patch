@@ -67,7 +67,7 @@ impl ChannelEnv {
                 .map(PathBuf::from)
         }
         ChannelEnv {
-            cargo_home: path_var("CARGO_HOME"),
+            cargo_home: crate::utils::cargo_home::cargo_home(),
             xdg_cache_home: path_var("XDG_CACHE_HOME"),
             home: crate::utils::fs::home_dir(),
             local_app_data: path_var("LOCALAPPDATA"),

@@ -153,6 +153,10 @@ const REGISTRY: &[FormatFile] = &[
     // legitimately be absent — the planner creates it then.
     row("go.mod", "golang", HOSTED | VENDORED | PROBE | ROOT),
     row("go.sum", "golang", HOSTED | ROOT),
+    // A module a workspace shares is replaced once in the root go.work (any
+    // mode), its hosted pin in go.work.sum; a go.work root needs no go.mod.
+    row("go.work", "golang", HOSTED | VENDORED | PROBE | ROOT),
+    row("go.work.sum", "golang", HOSTED),
     // ── maven ──
     row("pom.xml", "maven", HOSTED | VENDORED | PROBE),
     // Maven Trusted Checksums files the fail-closed maven planner merges

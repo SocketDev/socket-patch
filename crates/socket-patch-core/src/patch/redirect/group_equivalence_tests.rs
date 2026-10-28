@@ -40,7 +40,7 @@ fn serial_oracle(
     rewrite_nuget(files, overrides, &mut result);
     rewrite_gem(files, overrides, &mut result);
     rewrite_maven_pom(files, overrides, &mut result);
-    rewrite_golang(files, overrides, &[], &mut result);
+    rewrite_golang(files, overrides, &mut result);
     result
 }
 
@@ -139,7 +139,6 @@ fn assert_same_with_metadata(
             &no_gradle_unreadable,
             &no_yarn_outer,
             &CratesIoSource::Registry,
-            &[],
         );
         let merged = merge_group_outputs(&prefix, run_groups_concurrently(&prefix, &groups)).map(
             |mut merged| {
