@@ -1591,7 +1591,9 @@ source `go.work`, hosted pins checked against `go.work.sum`), `remove` and
 `vendor --revert` drop the replace from `go.work` byte for byte (the vendored
 ledger records the wiring file as `go.work`), and `rollback` of a hosted pin
 removes the `go.work` replace and the Socket lines of `go.work.sum`, deletes a
-`go.work.sum` the pin alone created, and puts the upstream pair back only
+`go.work.sum` those lines leave empty (hosted mode keeps no record of whether
+the file existed before the pin; go never writes an empty one, so only a
+`go.work.sum` you created empty yourself is lost), and puts the upstream pair back only
 where no sum file still holds it (a member's `go.mod` pin rolled back with it
 gets the pair back in that member's `go.sum`, as every `go.mod` pin does). A committed workspace `vendor/` directory
 needs `go work vendor` after any of these

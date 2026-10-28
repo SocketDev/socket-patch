@@ -12,7 +12,8 @@
 //! beside a go.mod directive (its pin pruned it there); for a go.work
 //! directive, which prunes nothing, only when no sum file holds it, into
 //! each that held the socket pair, else go.work.sum. A go.work.sum left
-//! empty was created for the pin and is removed.
+//! empty is removed: nothing records whether it existed before the pin,
+//! and go never writes an empty one, so the pin almost always created it.
 //!
 //! A directive the hosted run took over from the user (a pre-existing
 //! `replace` it superseded) is not recorded anywhere, so the restore always
@@ -225,7 +226,7 @@ pub(crate) async fn restore(
         if view.read(&file).await.ok().flatten().as_deref() == Some(text.as_str()) {
             continue;
         }
-        // The hosted run created go.work.sum for the pin alone.
+        // go never writes an empty go.work.sum: the pin created it.
         if file == GO_WORK_SUM && text.is_empty() {
             view.remove(&file);
         } else {
