@@ -1850,10 +1850,25 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let installed_sites = vendor::pypi::InstalledSiteListings::default();
     let vendored_at = now_rfc3339();
     let restore_refused: HashSet<String> = refused.iter().map(|(p, _, _)| p.clone()).collect();
+    // The gem backend's dry run does not evaluate its manifest and Gemfile
+    // declaration gates, so ask them directly, as the per-purl takeover
+    // and `scan` / `get --mode vendored` do (#1761).
+    let mut gem_refusals = gem_takeover_refusals_for(
+        &common.cwd,
+        pins.iter().map(|pin| pin.purl.as_str()),
+        &pins,
+        common.offline,
+        origins.clone(),
+    )
+    .await;
     for pin in &pins {
         // A pin the restore already refused keeps its first, accurate
         // reason; previewing it again would add a second failure event.
         if restore_refused.contains(&pin.purl) {
+            continue;
+        }
+        if let Some((code, detail)) = gem_refusals.remove(&pin.purl) {
+            refused.push((pin.purl.clone(), code, detail));
             continue;
         }
         if let Some((code, detail)) = takeover_dry_refusal(

@@ -2588,6 +2588,114 @@ async fn gem_hosted_group_block_pin_survives_a_refused_vendored_takeover() {
             );
         }
     }
+    // #1761: the standalone `vendor` eject of the same pin. Its dry run
+    // must preview the refusal the wet run raises, not `eject_planned`.
+    mount_vendored_grant(&fx).await;
+    for dry_run in [true, false] {
+        vendor_eject_keeps_the_hosted_group_pin(&fx, dry_run);
+    }
+}
+
+/// #1761 on a CHECKSUMS-less lock that an unfrozen `bundle install`
+/// converged (the lock now resolves the hosted gem from the patch
+/// registry): `vendor --dry-run` previewed `eject_planned` (exit 0) while
+/// the wet eject refused `gemfile_declaration_not_editable`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_group_block_pin_survives_a_refused_eject_of_a_converged_lock() {
+    let Some(fx) = redirect_scanned_project(
+        "group-block converged eject",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVexGroupBlock,
+    )
+    .await
+    else {
+        return;
+    };
+    if !fx.bundler.at_least(2, 2) {
+        println!(
+            "SKIP e2e_redirect_gem_build (group-block converged eject): bundler {} merges \
+             every rubygems source into one GEM section",
+            fx.bundler.version
+        );
+        return;
+    }
+    let install = bundle(&fx.proj, &["install"]);
+    assert!(
+        install.status.success(),
+        "converging install:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let lock = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
+    assert!(
+        lock.contains(&format!("remote: {}", fx.index_url)),
+        "converged:\n{lock}"
+    );
+    mount_vendored_grant(&fx).await;
+    for dry_run in [true, false] {
+        vendor_eject_keeps_the_hosted_group_pin(&fx, dry_run);
+    }
+}
+
+/// One refused `vendor` eject of the group-block fixture (#1761): dry or
+/// wet, the eject is refused whole with `gemfile_declaration_not_editable`
+/// and `eject_refused` (exit 1), and the hosted `Gemfile` /
+/// `Gemfile.lock` stay byte-untouched.
+fn vendor_eject_keeps_the_hosted_group_pin(fx: &RedirectFixture, dry_run: bool) {
+    let before: Vec<Vec<u8>> = ["Gemfile", "Gemfile.lock"]
+        .iter()
+        .map(|f| std::fs::read(fx.proj.join(f)).unwrap())
+        .collect();
+    let proj = fx.proj.to_str().expect("utf8 tmp path");
+    let api = fx._server.uri();
+    let mut argv: Vec<&str> = vec![
+        "vendor",
+        "--json",
+        "--yes",
+        "--cwd",
+        proj,
+        "--api-url",
+        &api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--patch-server-url",
+        &api,
+    ];
+    if dry_run {
+        argv.push("--dry-run");
+    }
+    let label = format!("vendor eject (dry_run={dry_run})");
+    let upstream = format!("{api}/upstream");
+    let (code, stdout, stderr) =
+        run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("{label}: not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
+    assert_eq!(code, 1, "{label} must refuse: {env}\nstderr:\n{stderr}");
+    let events = env["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1, "{label}: {env}");
+    assert_eq!(events[0]["action"], "failed", "{label}: {env}");
+    assert_eq!(
+        events[0]["errorCode"], "gemfile_declaration_not_editable",
+        "{label}: {env}"
+    );
+    assert_eq!(env["error"]["code"], "eject_refused", "{label}: {env}");
+    assert!(
+        !stdout.contains("eject_planned") && !stdout.contains("eject_rolled_back"),
+        "{label}: refused before any restore (or a preview of one): {env}"
+    );
+    for (file, before) in ["Gemfile", "Gemfile.lock"].iter().zip(before) {
+        assert_eq!(
+            std::fs::read(fx.proj.join(file)).unwrap(),
+            before,
+            "{label}: {file} keeps its hosted wiring"
+        );
+    }
 }
 
 /// #1056: a gem the user declared inside their own `source "…" do` block
