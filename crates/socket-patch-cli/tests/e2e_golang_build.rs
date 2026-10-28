@@ -500,6 +500,113 @@ fn committed_vendor_dir_needs_go_mod_vendor_after_apply_and_rollback() {
     chmod_writable(tmp.path());
 }
 
+/// #1766: `go work vendor` records a non-root member's replace relative to
+/// the workspace root (`./consumer/.socket/go-patches/…`). After rollback
+/// or remove in that member every workspace build fails "inconsistent
+/// vendoring", so both must warn and `apply --check` must report it.
+#[test]
+fn go_work_vendor_member_needs_go_work_vendor_after_rollback_and_remove() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(go-work-vendor)") {
+        return;
+    }
+    if golang_e2e_matrix::go_minor() < 22 {
+        eprintln!("SKIP: `go work vendor` needs Go 1.22+");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage(tmp.path());
+    let ws = tmp.path();
+    std::fs::write(ws.join("go.work"), "go 1.22\n\nuse ./consumer\n").unwrap();
+    let cs = consumer.to_str().unwrap();
+    let mc = modcache.to_str().unwrap();
+    let mut goenv = go_env(mc, &proxy_url);
+    goenv.retain(|(k, _)| *k != "GOFLAGS");
+    goenv.push(("GOFLAGS", ""));
+    let vendor = |what: &str| {
+        let out = go(ws, &["work", "vendor"], &goenv);
+        assert!(
+            out.status.success(),
+            "go work vendor ({what}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let warns = |args: &[&str], what: &str| {
+        let (code, so, se) = run_socket(&consumer, args, &modcache);
+        assert_eq!(code, 0, "{what} failed.\n{so}\n{se}");
+        assert!(
+            warnings_of(&so).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
+            "{what} must name the vendor/modules.txt regeneration:\n{so}"
+        );
+    };
+    let apply = ["apply", "--offline", "--json", "--cwd", cs];
+    vendor("before apply");
+
+    write_patch(&consumer);
+    warns(&apply, "apply");
+    vendor("after apply");
+    let run = go(ws, &["run", "./consumer"], &goenv);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("OUT: PATCHED"),
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let modules_txt = std::fs::read_to_string(ws.join("vendor/modules.txt")).unwrap();
+    assert!(
+        modules_txt.contains("=> ./consumer/.socket/go-patches/"),
+        "the fixture records the member replace relative to go.work:\n{modules_txt}"
+    );
+
+    for (what, args) in [
+        (
+            "rollback",
+            vec!["rollback", "--offline", "--json", "--cwd", cs],
+        ),
+        (
+            "remove",
+            vec!["remove", UPURL, "--offline", "--json", "--cwd", cs],
+        ),
+    ] {
+        warns(&args, what);
+        let broken = go(ws, &["build", "./consumer"], &goenv);
+        assert!(
+            !broken.status.success()
+                && String::from_utf8_lossy(&broken.stderr).contains("inconsistent vendoring"),
+            "{what}: the fixture reproduces the broken build: {}",
+            String::from_utf8_lossy(&broken.stderr)
+        );
+        let (code, _so, se) = run_socket(
+            &consumer,
+            &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+            &modcache,
+        );
+        assert_eq!(code, 1, "{what}: stale vendor/modules.txt is drift:\n{se}");
+        assert!(
+            se.contains("no longer has") && se.contains("go work vendor"),
+            "{what}: {se}"
+        );
+
+        // The step the warning names fixes the build.
+        vendor(what);
+        let run = go(ws, &["run", "./consumer"], &goenv);
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("OUT: PRISTINE"),
+            "{what}: {}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        if what == "rollback" {
+            // Re-apply and re-vendor so `remove` starts from a patched,
+            // in-sync workspace (rollback dropped the manifest entry).
+            write_patch(&consumer);
+            warns(&apply, "re-apply");
+            vendor("after re-apply");
+        }
+    }
+
+    chmod_writable(tmp.path());
+}
+
 /// #618: a patch whose go.mod raises a requirement (the common security-fix
 /// shape) leaves the default `-mod=readonly` build failing with "updates
 /// to go.mod needed". apply names `go mod tidy`, `apply --check` reports

@@ -343,19 +343,6 @@ async fn load_workspace(project_root: &Path) -> Option<Workspace> {
     })
 }
 
-/// The replaces a workspace `modules.txt` records: `go work vendor` writes
-/// every `use` member's `go.mod` replaces plus the `go.work` ones. Returns
-/// `(go.work replaces, every member's replaces)`.
-async fn workspace_replaces(project_root: &Path) -> (Vec<ReplaceEntry>, Vec<ReplaceEntry>) {
-    match load_workspace(project_root).await {
-        Some(ws) => {
-            let members = ws.members.into_iter().flat_map(|m| m.replaces).collect();
-            (ws.replaces, members)
-        }
-        None => (Vec::new(), Vec::new()),
-    }
-}
-
 /// Whether the `go.work` in effect for `project_root` keeps a project
 /// `go.mod` replace of `module@version` => `ours` (a replace as parsed
 /// from, or about to be written to, that go.mod) from taking effect.
@@ -551,11 +538,19 @@ async fn vendor_modules_txt_issues(
 
     // In a workspace, a `go.work` replace of the same module overrides the
     // member's, and a recorded replacement may come from any member.
-    let (work_replaces, member_replaces) = if workspace {
-        workspace_replaces(project_root).await
+    // `go work vendor` writes every `use` member's `go.mod` replaces plus
+    // the `go.work` ones.
+    let ws = if workspace {
+        load_workspace(project_root).await
     } else {
-        (Vec::new(), Vec::new())
+        None
     };
+    let work_replaces = ws.as_ref().map(|w| w.replaces.clone()).unwrap_or_default();
+    let member_replaces: Vec<ReplaceEntry> = ws
+        .iter()
+        .flat_map(|w| &w.members)
+        .flat_map(|m| m.replaces.iter().cloned())
+        .collect();
     let overridden_by_work = |entry: &ReplaceEntry| {
         work_replaces.iter().any(|w| {
             w.module == entry.module && (w.version.is_none() || w.version == entry.version)
@@ -577,7 +572,10 @@ async fn vendor_modules_txt_issues(
             });
         }
     }
-    for rec in recorded.iter().filter(|r| r.socket_owned()) {
+    for rec in recorded
+        .iter()
+        .filter(|r| r.socket_owned() || ws.as_ref().is_some_and(|w| member_owned(w, r)))
+    {
         if !replaces
             .iter()
             .chain(&member_replaces)
@@ -593,6 +591,26 @@ async fn vendor_modules_txt_issues(
         }
     }
     issues
+}
+
+/// Whether a workspace `modules.txt` replacement is a socket copy of some
+/// `use` member. `go work vendor` rewrites a member's directory replace
+/// relative to the go.work directory (`./a/.socket/go-patches/…`), which
+/// [`go_mod_edit::detect_owner`] alone, anchored at one go.mod's directory,
+/// reads as user-authored. Joined lexically, as go joins them.
+fn member_owned(ws: &Workspace, recorded: &ReplaceEntry) -> bool {
+    let Some(path) = recorded.path.as_deref() else {
+        return false;
+    };
+    let work_dir = ws.work_file.parent().unwrap_or(Path::new(""));
+    let abs = PathBuf::from(lexical_target(work_dir, recorded));
+    let cwd = std::env::current_dir().unwrap_or_default();
+    !Path::new(&path.replace('\\', "/")).is_absolute()
+        && ws.members.iter().any(|m| {
+            let dir = crate::utils::relpath::normalize_lexically_keeping_escapes(&cwd.join(&m.dir));
+            abs.strip_prefix(&dir)
+                .is_ok_and(|rel| go_mod_edit::detect_owner(&rel.to_string_lossy()).is_some())
+        })
 }
 
 /// Whether a `modules.txt` replacement records the `go.mod` one. go writes
@@ -832,6 +850,79 @@ mod tests {
         // problem now (#393), not the vendor directory.
         let codes: Vec<&str> = audit(root, &none).await.iter().map(|i| i.code()).collect();
         assert_eq!(codes, vec![WORKSPACE_CODE]);
+    }
+
+    /// #1766: `go work vendor` records a non-root member's replace relative
+    /// to the workspace root (`./a/.socket/…`). After a rollback or remove
+    /// in that member, the recorded line is stale and the workspace build
+    /// fails "inconsistent vendoring", so the audit must say so, for either
+    /// socket backend and a member nested or outside the go.work directory.
+    #[tokio::test]
+    async fn workspace_member_rollback_leaves_modules_txt_stale() {
+        let vendored = ".socket/vendor/golang/11111111-1111-4111-8111-111111111111/\
+                        example.com/upstream@v1.0.0";
+        for (use_dir, copy) in [
+            ("a", COPY),
+            ("a", vendored),
+            ("sub/a", COPY),
+            ("../a", COPY),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let ws = dir.path().join("ws");
+            let member = ws.join(use_dir);
+            // How go spells a path relative to the go.work directory.
+            let rel = if use_dir.starts_with("../") {
+                use_dir.to_string()
+            } else {
+                format!("./{use_dir}")
+            };
+            consumer(&member, "");
+            write(&ws, "go.work", &format!("go 1.22\n\nuse {rel}\n"));
+            write(
+                &ws,
+                "vendor/modules.txt",
+                &format!(
+                    "# example.com/upstream v1.0.0 => {rel}/{copy}\n\
+                     ## explicit; go 1.21\nexample.com/upstream\n"
+                ),
+            );
+            let issues = audit(&member, &HashMap::new()).await;
+            assert!(
+                matches!(
+                    &issues[..],
+                    [GoSyncIssue::VendorModulesTxt { stale: true, command: "go work vendor", module, .. }]
+                        if module == "example.com/upstream"
+                ),
+                "{use_dir} {copy}: {issues:?}"
+            );
+
+            // Applied again: the recorded line matches the member's replace.
+            consumer(
+                &member,
+                &format!("\nreplace example.com/upstream v1.0.0 => ./{copy}\n"),
+            );
+            assert_eq!(
+                audit(&member, &HashMap::new()).await,
+                vec![],
+                "{use_dir} {copy}"
+            );
+        }
+
+        // A user's replace onto another checkout's copy is not ours, even
+        // when the path has a `.socket/go-patches/` segment.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        consumer(&ws.join("a"), "");
+        write(&ws, "go.work", "go 1.22\n\nuse ./a\n");
+        write(
+            &ws,
+            "vendor/modules.txt",
+            &format!(
+                "# example.com/upstream v1.0.0 => ../sibling/{COPY}\n\
+                 ## explicit; go 1.21\nexample.com/upstream\n"
+            ),
+        );
+        assert_eq!(audit(&ws.join("a"), &HashMap::new()).await, vec![]);
     }
 
     fn codes(issues: &[GoSyncIssue]) -> Vec<&'static str> {
