@@ -35,7 +35,9 @@
 //!   differs from the wiring is `record_mismatch`.
 //! * **g** (hosted) not installed → attests from the go.sum pin (design D5);
 //!   the replacement module installed-and-patched → verified; that copy
-//!   pristine → omitted; a pin-less reference needs a verifying copy.
+//!   pristine → omitted; the `/go.mod` line alone (`go mod tidy` pruned
+//!   the zip line) still attests; a pin-less reference needs a verifying
+//!   copy.
 //!
 //! Flavors: `go.mod` single-line replace, `replace ( … )` block member,
 //! hand-written `go.work` (+ `go.work.sum`), the committed hosted rewriter
@@ -711,8 +713,8 @@ fn golang_hosted_f_spoofed_references_never_attest() {
 
 /// g: only the pristine ORIGINAL `M@v` cached → not installed (the build
 /// never reads it) → the go.sum pin attests; the replacement patched →
-/// verified; the replacement pristine → omitted; no go.sum pin → needs the
-/// verifying replacement.
+/// verified; the replacement pristine → omitted; the tidy `/go.mod`-line
+/// pin → attests; no go.sum pin → needs the verifying replacement.
 #[test]
 fn golang_hosted_g_installed_copy_basis() {
     let api = Api::start(vec![(U, go_view(U))]);
@@ -739,6 +741,17 @@ fn golang_hosted_g_installed_copy_basis() {
     fx.install_module(&go_socket_module(U), GO_SVER, PRISTINE_GO);
     let run = fx.vex(&args);
     assert_omitted(&run, GO_PURL, "not_applied", "replacement pristine");
+
+    // `go mod tidy` drops the zip line when no package of the module is
+    // loaded; nothing downloads the zip, so nothing is installed.
+    let fx = Fx::new();
+    write_go_hosted(&fx, U, GoFile::GoMod);
+    fx.put(
+        "go.sum",
+        format!("{} {GO_SVER}/go.mod {GO_H1_MOD}\n", go_socket_module(U)),
+    );
+    let run = fx.vex(&args);
+    assert_attested(&fx, &run, GO_PURL, U, "redirected", "go.mod line only");
 
     // No (or an incomplete) go.sum pin.
     for (name, sum) in [

@@ -9611,6 +9611,10 @@ fn rewrite_golang(
                 }
             }
         }
+        // Always both lines, even over the `/go.mod` line alone that `go mod
+        // tidy` leaves while no package of the module is loaded: the
+        // rewriter cannot see imports, and without the zip line a later
+        // import fails `missing go.sum entry` with nothing else to restore it.
         if go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
             sum_changed = true;
             result.edits.push(FileEdit {
@@ -23417,6 +23421,29 @@ packages:
         );
         let refused = rewrite_registry_redirect(&conflict, std::slice::from_ref(&ovr));
         assert!(refused.confirmed_golang_uuids.is_empty());
+    }
+
+    /// `go mod tidy` drops the socket module's zip line when no package of it
+    /// is loaded; a re-run restores it, so a later import still builds.
+    #[test]
+    fn golang_rerun_restores_a_tidy_pruned_zip_line() {
+        let files = golang_files();
+        let ovr = golang_override();
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let zip_prefix = format!("{} v1.4.2-socketpatch.1 ", golang_socket_module());
+        let tidied: String = first.files["go.sum"]
+            .lines()
+            .filter(|l| !l.starts_with(&zip_prefix))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_ne!(tidied, first.files["go.sum"]);
+        let mut again = files.clone();
+        again.extend(first.files.clone());
+        again.insert("go.sum".to_string(), tidied);
+        let second = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
+        assert_eq!(second.files.keys().collect::<Vec<_>>(), ["go.sum"]);
+        assert_eq!(second.files["go.sum"], first.files["go.sum"]);
+        assert!(second.confirmed_golang_uuids.contains(GO_UUID));
     }
 
     /// Only `patch.socket.dev/gopatch/<canonical uuid>` is a hosted module;
