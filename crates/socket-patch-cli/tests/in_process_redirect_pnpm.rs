@@ -3132,3 +3132,236 @@ async fn hosted_pnpm_file_copy_is_not_attested_by_the_in_run_vex() {
         "nothing is attested while the file: copy stays unpatched: {statements:?}"
     );
 }
+
+// ── #1268: trust cleanup over `sharedWorkspaceLockfile: false` member locks ──
+
+/// Run `rollback --json --yes [extra]` as a hermetic subprocess against the
+/// mocked npm registry and parse the envelope back (an in-process `run`
+/// prints to the real stdout, which the test can't read). Returns
+/// (exit code, run-level warning codes, envelope).
+fn rollback_subprocess(
+    cwd: &Path,
+    server: &MockServer,
+    extra: &[&str],
+) -> (i32, Vec<String>, serde_json::Value) {
+    let out = hermetic::binary_command()
+        .env_remove("npm_config_registry")
+        .env_remove("NPM_CONFIG_REGISTRY")
+        .env(
+            "SOCKET_NPM_REGISTRY",
+            format!("{}/npm-registry", server.uri()),
+        )
+        .args([
+            "rollback",
+            "--json",
+            "--yes",
+            "--patch-server-url",
+            "http://patch.test",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ])
+        .args(extra)
+        .output()
+        .expect("run socket-patch");
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "rollback --json stdout must be a JSON envelope: {e}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let codes = envelope["warnings"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| w["code"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    (out.status.code().unwrap_or(-1), codes, envelope)
+}
+
+/// Serve the npm registry's version document for `name@version`.
+async fn mock_registry_version(server: &MockServer, name: &str, version: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/npm-registry/{name}/{version}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": name,
+            "version": version,
+            "dist": {
+                "tarball": format!("{}/npm-registry/{name}/-/{name}-{version}.tgz", server.uri()),
+                "integrity": UPSTREAM_SHA512,
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// A lockfileVersion 9.0 lock whose `.` importer depends on `name@version`,
+/// resolved by `resolution`.
+fn single_dep_lock(name: &str, version: &str, resolution: &str) -> String {
+    format!(
+        "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      {name}:
+        specifier: {version}
+        version: {version}
+
+packages:
+  {name}@{version}:
+    resolution: {resolution}
+
+snapshots:
+  {name}@{version}: {{}}
+"
+    )
+}
+
+/// #1268: in a `sharedWorkspaceLockfile: false` workspace hosted mode pins
+/// the member's own `packages/a/pnpm-lock.yaml` and adds `trustLockfile:
+/// true` to the root `pnpm-workspace.yaml`. Once rollback restores that
+/// member lock no lock is hosted any more, so the line the user's file
+/// keeps must be reported with `pnpm_trust_lockfile_left`, exactly as for a
+/// shared root lock.
+#[tokio::test]
+#[serial]
+async fn issue_1268_rollback_of_a_member_lock_warns_trust_lockfile_left() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_registry_version(&server, NAME, VERSION).await;
+    // pnpm 10+ read the setting from the workspace file; pnpm 9 from `.npmrc`.
+    for (user_ws, npmrc) in [
+        (
+            "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n",
+            None,
+        ),
+        (
+            "packages:\n  - packages/*\n",
+            Some("shared-workspace-lockfile=false\n"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root", "version": "1.0.0", "private": true }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("pnpm-workspace.yaml"), user_ws).unwrap();
+        if let Some(npmrc) = npmrc {
+            std::fs::write(root.join(".npmrc"), npmrc).unwrap();
+        }
+        let member = root.join("packages/a");
+        let pkg = member.join("node_modules").join(NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            member.join("package.json"),
+            format!(r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+        let pristine = single_dep_lock(NAME, VERSION, &format!("{{integrity: {UPSTREAM_SHA512}}}"));
+        std::fs::write(member.join("pnpm-lock.yaml"), &pristine).unwrap();
+
+        let code = run(hosted_args(root, server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted should succeed");
+        assert!(
+            std::fs::read_to_string(member.join("pnpm-lock.yaml"))
+                .unwrap()
+                .contains(HOSTED_URL),
+            "the member lock is pinned"
+        );
+        let ws = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap();
+        assert_eq!(ws, format!("{user_ws}trustLockfile: true\n"));
+
+        let (code, warnings, envelope) = rollback_subprocess(root, &server, &[]);
+        assert_eq!(code, 0, "rollback restores the member pin: {envelope}");
+        assert_eq!(
+            std::fs::read_to_string(member.join("pnpm-lock.yaml")).unwrap(),
+            pristine,
+            "the member lock is restored byte for byte"
+        );
+        assert!(
+            warnings.contains(&"pnpm_trust_lockfile_left".to_string()),
+            "the trust line left in the user's file must be reported for {user_ws:?}: {envelope}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+            ws,
+            "a user-authored workspace file is never edited by the restore"
+        );
+    }
+}
+
+/// #1268: the trust setting is still needed while any lock of the
+/// workspace stays hosted. A scoped rollback that restores the root lock
+/// while a member's own lock keeps its hosted pin must not report the
+/// setting as unneeded.
+#[tokio::test]
+#[serial]
+async fn issue_1268_member_lock_still_hosted_keeps_trust_without_warning() {
+    const OTHER: &str = "other-pkg";
+    const OTHER_VERSION: &str = "2.0.0";
+    const OTHER_HOSTED_URL: &str = "http://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/other-pkg-2.0.0.tgz";
+    let server = MockServer::start().await;
+    mock_registry_version(&server, NAME, VERSION).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(r#"{{ "name": "root", "version": "1.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#),
+    )
+    .unwrap();
+    let ws = "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\ntrustLockfile: true\n";
+    std::fs::write(root.join("pnpm-workspace.yaml"), ws).unwrap();
+    let hosted = |url: &str| format!("{{integrity: {PATCHED_SHA512}, tarball: {url}}}");
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        single_dep_lock(NAME, VERSION, &hosted(HOSTED_URL)),
+    )
+    .unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        format!(r#"{{ "name": "a", "version": "1.0.0", "dependencies": {{ "{OTHER}": "{OTHER_VERSION}" }} }}"#),
+    )
+    .unwrap();
+    let member_lock = single_dep_lock(OTHER, OTHER_VERSION, &hosted(OTHER_HOSTED_URL));
+    std::fs::write(member.join("pnpm-lock.yaml"), &member_lock).unwrap();
+
+    let (code, warnings, envelope) = rollback_subprocess(root, &server, &[PURL]);
+    assert_eq!(
+        code, 0,
+        "the scoped rollback restores the root pin: {envelope}"
+    );
+    assert!(
+        !std::fs::read_to_string(root.join("pnpm-lock.yaml"))
+            .unwrap()
+            .contains(HOSTED_URL),
+        "the root pin is restored"
+    );
+    assert_eq!(
+        std::fs::read_to_string(member.join("pnpm-lock.yaml")).unwrap(),
+        member_lock,
+        "the out-of-scope member pin is left hosted"
+    );
+    assert!(
+        !warnings.contains(&"pnpm_trust_lockfile_left".to_string()),
+        "a hosted member lock still needs the trust setting: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
+        ws,
+        "the workspace file is left as it was"
+    );
+}
