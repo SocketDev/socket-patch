@@ -567,6 +567,26 @@ pub fn configured_yarn_global_folders_for_process() -> Vec<PathBuf> {
     )
 }
 
+/// The global folder yarn 1.0.x uses by default, which it can't report:
+/// `yarn global dir` only exists from yarn 1.1.0 (#437). This is yarn
+/// 1.0.2's `GLOBAL_MODULE_DIRECTORY`, `<CONFIG_DIRECTORY>/global`, where
+/// the config directory is `%LOCALAPPDATA%\Yarn\config` on Windows (when
+/// `LOCALAPPDATA` is set) and `<userHome>/.config/yarn` otherwise.
+pub fn yarn_1_0_default_global_folder(env: &NpmConfigEnv, root_user: bool) -> Option<PathBuf> {
+    if env.windows {
+        if let Some(local) = env.var("LOCALAPPDATA") {
+            return Some(Path::new(local).join("Yarn").join("config").join("global"));
+        }
+    }
+    let user_home = RcLayout::new(env, root_user).user_home?;
+    Some(user_home.join(".config").join("yarn").join("global"))
+}
+
+/// [`yarn_1_0_default_global_folder`] for this process.
+pub fn yarn_1_0_default_global_folder_for_process() -> Option<PathBuf> {
+    yarn_1_0_default_global_folder(&NpmConfigEnv::from_process(), process_is_root_user())
+}
+
 /// Whether this process runs as uid 0 (yarn's `getuid() === 0`).
 pub fn process_is_root_user() -> bool {
     #[cfg(unix)]

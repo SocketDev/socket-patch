@@ -10,9 +10,9 @@ use socket_patch_core::crawlers::npm_crawler::{
     build_npm_purl, bun_global_dir_from_env, find_store_peer_variant_copies, get_bun_global_prefix,
     get_bun_global_prefix_with, get_npm_global_prefix, get_npm_global_prefix_with,
     get_pnpm_global_prefix, get_pnpm_global_prefix_with, get_yarn_global_prefix,
-    get_yarn_global_prefix_with, parse_bun_ls_global_output, parse_npm_root_output,
-    parse_package_name, parse_pnpm_root_output, parse_yarn_dir_output, read_package_json,
-    resolve_bun_global_prefix_with,
+    get_yarn_global_prefix_or, get_yarn_global_prefix_with, parse_bun_ls_global_output,
+    parse_npm_root_output, parse_package_name, parse_pnpm_root_output, parse_yarn_dir_output,
+    read_package_json, resolve_bun_global_prefix_with,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::NpmCrawler;
@@ -349,6 +349,83 @@ fn get_yarn_global_prefix_with_mock_runner_success() {
     assert_eq!(
         get_yarn_global_prefix_with(&runner).as_deref(),
         Some("/Users/foo/.yarn/global/node_modules")
+    );
+}
+
+/// #437: yarn 1.0.0 - 1.0.2 has no `yarn global dir` (it exits 1), so
+/// the folder yarn 1.0.x itself uses stands in for the answer it can't
+/// give. Real process environment: HOME points at a scratch home and
+/// FAKEROOTKEY keeps a root test runner on the plain-home layout.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn get_yarn_global_prefix_with_falls_back_for_yarn_1_0() {
+    let home = tempfile::tempdir().unwrap();
+    let saved: Vec<_> = ["HOME", "FAKEROOTKEY"]
+        .iter()
+        .map(|k| (*k, std::env::var_os(k)))
+        .collect();
+    std::env::set_var("HOME", home.path());
+    std::env::set_var("FAKEROOTKEY", "1");
+    let runner = common::MockCommandRunner::new()
+        .with_response("yarn", &["global", "dir"], None)
+        .with_response("yarn", &["--version"], Some("1.0.2\n"));
+    let got = get_yarn_global_prefix_with(&runner);
+    for (k, v) in saved {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    assert_eq!(
+        got.map(PathBuf::from),
+        Some(home.path().join(".config/yarn/global/node_modules"))
+    );
+}
+
+/// The fallback is for yarn 1.0.x only: a newer yarn whose
+/// `yarn global dir` failed, or no yarn at all, still finds nothing.
+#[test]
+#[serial_test::parallel]
+fn get_yarn_global_prefix_or_falls_back_only_for_yarn_1_0() {
+    let folder = || Some(PathBuf::from("/h/.config/yarn/global"));
+    let want = Path::new("/h/.config/yarn/global")
+        .join("node_modules")
+        .to_string_lossy()
+        .to_string();
+    for version in ["1.0.0", "1.0.1\n", "1.0.2", "1.0.2-rc.1"] {
+        let runner = common::MockCommandRunner::new()
+            .with_response("yarn", &["global", "dir"], None)
+            .with_response("yarn", &["--version"], Some(version));
+        assert_eq!(
+            get_yarn_global_prefix_or(&runner, folder).as_deref(),
+            Some(want.as_str()),
+            "{version:?}"
+        );
+    }
+    for version in [
+        Some("1.1.0"),
+        Some("1.22.22"),
+        Some("1.0"),
+        Some("4.5.0"),
+        None,
+    ] {
+        let runner = common::MockCommandRunner::new()
+            .with_response("yarn", &["global", "dir"], None)
+            .with_response("yarn", &["--version"], version);
+        assert_eq!(
+            get_yarn_global_prefix_or(&runner, folder),
+            None,
+            "{version:?}"
+        );
+    }
+    // A yarn that answers `yarn global dir` is taken at its word.
+    let runner = common::MockCommandRunner::new()
+        .with_response("yarn", &["global", "dir"], Some("/other/global\n"))
+        .with_response("yarn", &["--version"], Some("1.0.2"));
+    assert_eq!(
+        get_yarn_global_prefix_or(&runner, folder).map(PathBuf::from),
+        Some(Path::new("/other/global").join("node_modules"))
     );
 }
 
