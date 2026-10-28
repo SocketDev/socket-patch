@@ -269,12 +269,7 @@ async fn takeover_dry_refusal(
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
     installed_sites: &vendor::pypi::InstalledSiteListings,
 ) -> Option<(&'static str, String)> {
-    if restore.reverted_files.is_empty()
-        || !restore.reverted_files.iter().all(|f| {
-            socket_patch_core::utils::group_commit::captures(f)
-                && restore.staged_text.contains_key(f)
-        })
-    {
+    if !restored_text_previewable(restore) {
         return None;
     }
     let probe = GroupCommit::begin(project_root);
@@ -319,6 +314,18 @@ async fn takeover_dry_refusal(
         }
         _ => None,
     }
+}
+
+/// Whether [`takeover_dry_refusal`] can stage `restore`'s text and preview
+/// the backend over it: every reverted file is captured and has staged text.
+fn restored_text_previewable(
+    restore: &socket_patch_core::patch::redirect::upstream::RestoreOutcome,
+) -> bool {
+    !restore.reverted_files.is_empty()
+        && restore.reverted_files.iter().all(|f| {
+            socket_patch_core::utils::group_commit::captures(f)
+                && restore.staged_text.contains_key(f)
+        })
 }
 
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
@@ -3517,11 +3524,21 @@ pub(crate) async fn vendor_records_reusing(
                     // `vendor_sbt_hosted_conflict` the wet run (which
                     // restores first) never sees.
                     //
-                    // And a gem: its hosted `source … do` block still wraps
-                    // the declaration on disk, so the backend's Gemfile
-                    // planner would refuse it as indented. The preview over
-                    // the restored text above already asked the backend.
-                    if candidate.starts_with("pkg:gem/")
+                    // And a gem whose restore rewrote its Gemfile: the hosted
+                    // `source … do` block still wraps the declaration on
+                    // disk, so the backend's Gemfile planner would refuse it
+                    // as indented. When the restored text was previewable,
+                    // the preview above already asked the backend over it.
+                    let gem_block_reverted =
+                        matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Gem))
+                            && restored_text_previewable(&restore)
+                            && restore.reverted_files.iter().any(|f| {
+                                matches!(
+                                    Path::new(f).file_name().and_then(|n| n.to_str()),
+                                    Some("Gemfile" | "gems.rb")
+                                )
+                            });
+                    if gem_block_reverted
                         || restore.reverted_files.iter().any(|f| {
                             f == "bun.lock"
                                 || f == "bun.lockb"
