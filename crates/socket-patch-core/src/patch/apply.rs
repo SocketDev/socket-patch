@@ -1068,11 +1068,19 @@ async fn apply_package_patch_at(
         if verify_result.status != VerifyStatus::Ready
             && verify_result.status != VerifyStatus::AlreadyPatched
         {
+            // npm's LF-shebang form of a Socket blob (see `npm_bin`) is
+            // Socket content too.
+            let socket_content = || async {
+                is_socket_content(sources, verify_result.current_hash.as_deref()).await || {
+                    let path = pkg_path.join(normalize_file_path(file_name));
+                    let source = crate::patch::npm_bin::source_hash(&path).await;
+                    is_socket_content(sources, source.as_deref()).await
+                }
+            };
             let policy = match policy {
                 MismatchPolicy::SocketContent
                     if verify_result.status == VerifyStatus::HashMismatch
-                        && is_socket_content(sources, verify_result.current_hash.as_deref())
-                            .await =>
+                        && socket_content().await =>
                 {
                     MismatchPolicy::Warn
                 }
@@ -4114,6 +4122,43 @@ mod tests {
         assert!(res.success, "{res:?}");
         // Still a disclosed overwrite of unknown content.
         assert!(res.files_verified[0].expected_hash.is_some(), "{res:?}");
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            NPM_BIN_AFTER
+        );
+    }
+
+    /// Regression (#1756): a superseding patch replaces an earlier Socket
+    /// patch npm installed in its LF-shebang form, as it replaces the
+    /// earlier patch's exact bytes.
+    #[tokio::test]
+    async fn socket_content_policy_knows_npm_fixed_socket_blob() {
+        let files = crlf_bin_files();
+        let blobs = crlf_bin_blobs().await;
+        let earlier: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(\"v1\");\r\n";
+        tokio::fs::write(
+            blobs.path().join(compute_git_sha256_from_bytes(earlier)),
+            earlier,
+        )
+        .await
+        .unwrap();
+        let pkg = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            pkg.path().join("cli.js"),
+            b"#!/usr/bin/env node\nconsole.log(\"v1\");\r\n",
+        )
+        .await
+        .unwrap();
+        let res = apply_package_patch(
+            "pkg:npm/crlfbin@1.0.0",
+            pkg.path(),
+            &files,
+            &PatchSources::blobs_only(blobs.path()),
+            false,
+            MismatchPolicy::SocketContent,
+        )
+        .await;
+        assert!(res.success, "{res:?}");
         assert_eq!(
             tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
             NPM_BIN_AFTER

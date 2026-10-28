@@ -60,8 +60,17 @@ pub(crate) fn has_lf_shebang(bytes: &[u8]) -> bool {
 
 /// The hash of the content npm installed as the file at `path`, when the
 /// file is in `fixBin`'s form ([`unfix_bin`]). `None` when it is not, or
-/// it can't be read.
+/// it can't be read. Only a file whose first bytes qualify is read whole,
+/// so a mismatched jar or wheel is not read twice.
 pub(crate) async fn source_hash(path: &Path) -> Option<String> {
+    use tokio::io::AsyncReadExt as _;
+    let (file, _) = crate::utils::fs::open_regular_file(path).await.ok()?;
+    let mut prefix = Vec::with_capacity(PROBE_LEN);
+    file.take(PROBE_LEN as u64)
+        .read_to_end(&mut prefix)
+        .await
+        .ok()?;
+    unfix_bin(&prefix)?;
     let bytes = crate::utils::fs::read_regular_to_bytes(path).await.ok()?;
     unfix_bin(&bytes).map(|src| compute_git_sha256_from_bytes(&src))
 }
