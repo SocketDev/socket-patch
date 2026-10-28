@@ -128,6 +128,19 @@ const GHSA: &str = "GHSA-redirect-gem-real";
 const PRODUCT: &str = "pkg:gem/app@1.0.0";
 const PURL: &str = "pkg:gem/vuln-gem@1.0.0";
 
+/// The gem library a [`Driver::ScanVexGemspecDevDependency`] project
+/// builds: its gemspec declares the vulnerable gem as a development
+/// dependency.
+const GEMSPEC_LIB: &str = "mylib.gemspec";
+
+fn gemspec_lib() -> String {
+    format!(
+        "Gem::Specification.new do |s|\n  s.name = \"mylib\"\n  s.version = \"0.1.0\"\n  \
+         s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.files = [\"lib/mylib.rb\"]\n  \
+         s.add_development_dependency \"{DEP}\"\nend\n"
+    )
+}
+
 /// The runtime probe constant baked into the PATCHED lib — observable at
 /// `require` time, carries the patch uuid so the assert can't pass on any
 /// other content.
@@ -458,6 +471,11 @@ enum Driver {
     /// [`Driver::ScanVex`] on a declaration ending in a bare `;` and a
     /// comment (#826): a complete declaration, so it is redirected.
     ScanVexTrailingSemicolonDeclaration,
+    /// [`Driver::ScanVex`] on a gem library whose Gemfile's `gemspec`
+    /// directive also declares the gem as a development dependency (#985):
+    /// bundler 2.7+ merges the two requirements, and the lock must pin the
+    /// union for frozen installs to accept it.
+    ScanVexGemspecDevDependency,
     /// [`Driver::ScanVexDualBoot`] with `BUNDLE_GEMFILE=Gemfile` exported to
     /// socket-patch too (#507): bundler's local app config outranks the
     /// environment, so bundler still loads `Gemfile.next` and the run must
@@ -554,6 +572,9 @@ impl Driver {
             }
             Driver::ScanVexTrailingSemicolonDeclaration => {
                 "scan --mode hosted (gem line ending in `;`)"
+            }
+            Driver::ScanVexGemspecDevDependency => {
+                "scan --mode hosted (gem also a gemspec development dependency)"
             }
             Driver::ScanVexCustomGitSource => "scan --mode hosted (gem from a custom git_source)",
         }
@@ -946,6 +967,15 @@ async fn redirect_scanned_project(
             "source \"{}/upstream\"\n\ngem \"{DEP}\"; # the vulnerable one\n",
             server.uri()
         ),
+        Driver::ScanVexGemspecDevDependency => {
+            std::fs::create_dir_all(proj.join("lib")).unwrap();
+            std::fs::write(proj.join("lib/mylib.rb"), "module Mylib; end\n").unwrap();
+            std::fs::write(proj.join(GEMSPEC_LIB), gemspec_lib()).unwrap();
+            format!(
+                "source \"{}/upstream\"\n\ngemspec\n\ngem \"{DEP}\"\n",
+                server.uri()
+            )
+        }
         _ => format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
     };
     std::fs::write(proj.join(gemfile_name), gemfile_body).unwrap();
@@ -1139,7 +1169,8 @@ async fn redirect_scanned_project(
         | Driver::ScanVexHeredocDeclaration
         | Driver::ScanVexInterpolatedHeredocDeclaration
         | Driver::ScanVexSemicolonJoinedDeclaration
-        | Driver::ScanVexTrailingSemicolonDeclaration => vec![
+        | Driver::ScanVexTrailingSemicolonDeclaration
+        | Driver::ScanVexGemspecDevDependency => vec![
             "scan",
             "--mode",
             "hosted",
@@ -1340,7 +1371,8 @@ async fn redirect_scanned_project(
         | Driver::ScanVexSourceBlockMultiLineOpener
         | Driver::ScanVexSourceBlockBraces
         | Driver::ScanVexSourceBlockAfterSemicolon
-        | Driver::ScanVexTrailingSemicolonDeclaration => {
+        | Driver::ScanVexTrailingSemicolonDeclaration
+        | Driver::ScanVexGemspecDevDependency => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
             assert!(
                 env["vex"]["warnings"]
@@ -1570,6 +1602,11 @@ fn stage_fresh_checkout(fx: &RedirectFixture, name: &str) -> PathBuf {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join(fx.gemfile_name), fresh.join(fx.gemfile_name)).unwrap();
     std::fs::copy(fx.proj.join(fx.lock_name), fresh.join(fx.lock_name)).unwrap();
+    // A gem library's own sources (Driver::ScanVexGemspecDevDependency).
+    if fx.proj.join(GEMSPEC_LIB).exists() {
+        std::fs::copy(fx.proj.join(GEMSPEC_LIB), fresh.join(GEMSPEC_LIB)).unwrap();
+        copy_dir_recursive(&fx.proj.join("lib"), &fresh.join("lib"));
+    }
     copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
     copy_dir_recursive(&fx.proj.join(".bundle"), &fresh.join(".bundle"));
     assert!(
@@ -3022,6 +3059,87 @@ async fn gem_hosted_trailing_semicolon_declaration_redirects_and_installs() {
         String::from_utf8_lossy(&install.stderr),
     );
     assert_patched_install(&fx, &fresh);
+}
+
+/// #985: a gem library whose Gemfile's `gemspec` directive declares the
+/// vulnerable gem as a development dependency AND whose Gemfile declares it
+/// too. Bundler 2.7+ merges the two into one Gemfile dependency, so the
+/// redirected lock must pin the union (`(>= 0, = 1.0.0)!`): a fresh
+/// checkout's FROZEN install accepts the pair unchanged and installs the
+/// patched bytes (before the fix it exited 16). Older bundlers keep the
+/// plain exact pin, which they accept frozen too. A vendored takeover, which
+/// bundler 2.7+ cannot frozen-install in this shape (the vendored backend
+/// refuses it), must refuse before it restores the hosted pin, in the
+/// preview too, or the gem ends up unpatched in both modes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6); \
+            run with a pinned toolchain via --ignored"]
+async fn gem_hosted_gemspec_dev_dependency_frozen_install_accepts_the_pin() {
+    let Some(fx) = redirect_scanned_project(
+        "gemspec-dev-dependency",
+        Spelling::Gemfile,
+        true,
+        true,
+        None,
+        Driver::ScanVexGemspecDevDependency,
+    )
+    .await
+    else {
+        return;
+    };
+    let lock = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
+    let want = if fx.bundler.at_least(2, 7) {
+        format!("  {DEP} (>= 0, = {DEP_VERSION})!\n")
+    } else {
+        format!("  {DEP} (= {DEP_VERSION})!\n")
+    };
+    assert!(lock.contains(&want), "lock must pin {want:?}:\n{lock}");
+    let fresh = stage_fresh_checkout(&fx, "fresh-frozen");
+    let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        install.status.success(),
+        "fresh-checkout frozen `bundle install` must accept the redirected pair.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert_eq!(
+        std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap(),
+        lock,
+        "the frozen install must leave the lock byte-identical"
+    );
+    assert_patched_install(&fx, &fresh);
+    if fx.bundler.at_least(2, 7) {
+        // As in the #775 takeover test: the restore re-derives the upstream
+        // sha256 only for a rubygems.org remote, so spell the mock upstream
+        // that way (served via `SOCKET_RUBYGEMS_URL`). No bundler runs
+        // after this point.
+        let upstream = format!("{}/upstream", fx._server.uri());
+        for (file, from, to) in [
+            (
+                "Gemfile",
+                format!("\"{upstream}\""),
+                "\"https://rubygems.org\"",
+            ),
+            (
+                "Gemfile.lock",
+                format!("{upstream}/"),
+                "https://rubygems.org/",
+            ),
+        ] {
+            let path = fx.proj.join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains(&from),
+                "{file} names the mock upstream:\n{text}"
+            );
+            std::fs::write(&path, text.replace(&from, to)).unwrap();
+        }
+        for (command, selector) in [("get", Some(UUID)), ("scan", None)] {
+            for dry_run in [true, false] {
+                vendor_takeover_keeps_the_hosted_group_pin(&fx, command, selector, dry_run);
+            }
+        }
+    }
 }
 
 /// #340: a `gem` declaration with an `if` modifier must not be rewritten

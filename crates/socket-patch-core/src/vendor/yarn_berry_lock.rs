@@ -589,7 +589,8 @@ fn root_workspace_gate(blocks: &[LockBlock]) -> Result<String, Box<VendorOutcome
 /// exact version being vendored is TAKEN OVER (its value is rewritten to
 /// our spec — the pin already forced this exact version, so semantics are
 /// preserved — and recorded as the wiring `original` so revert restores
-/// it): `Ok(Some(version))`. Anything else same-name still refuses.
+/// it): `Ok(Some(version))`. Anything else overriding the same package,
+/// parent-scoped selectors included, still refuses.
 fn resolutions_gate(
     pkg_obj: &serde_json::Map<String, Value>,
     name: &str,
@@ -604,17 +605,20 @@ fn resolutions_gate(
             )));
         };
         for (selector, value) in res_obj {
-            let sel_name = split_pattern(selector)
-                .map(|(n, _)| n)
-                .unwrap_or(selector.as_str());
-            if sel_name != name {
+            // The package the selector overrides, through any parent scope
+            // (`pkg-a/left-pad`, `**/left-pad`): yarn applies those before
+            // our bare pin, so they conflict just like a bare entry (#783).
+            if crate::formats::yarn::patterns::resolution_selector_target(selector) != Some(name) {
                 continue;
             }
             // Our own (possibly stale-uuid) entry is fine to overwrite; a
-            // user-authored override is never clobbered silently.
-            let ours = value
-                .as_str()
-                .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
+            // user-authored override is never clobbered silently. Vendoring
+            // only ever writes the bare `name` key, so a parent-scoped
+            // selector pointing into .socket/vendor is not ours.
+            let ours = selector == name
+                && value
+                    .as_str()
+                    .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
             if ours {
                 continue;
             }
@@ -626,9 +630,9 @@ fn resolutions_gate(
                 "vendor_override_conflict",
                 format!(
                     "{PACKAGE_JSON} already has a resolutions entry for `{selector}` \
-                     ({value}); vendor will not overwrite a user-authored override (an \
-                     exact-version pin `\"{name}\": \"{version}\"` is taken over \
-                     automatically)"
+                     ({value}); vendor will not overwrite a user-authored override (only \
+                     a bare exact-version pin `\"{name}\": \"{version}\"` is taken over \
+                     automatically; parent-scoped selectors always refuse)"
                 ),
             )));
         }
@@ -903,6 +907,7 @@ pub async fn revert_yarn_berry_opts(
                         KIND_LOCK_ENTRY,
                         "lock entry",
                         |lines| berry_field(lines, "resolution"),
+                        None,
                         &mut outcome.warnings,
                     );
                 }
@@ -2300,6 +2305,56 @@ __metadata:
         assert!(detail.contains("left-pad"), "{detail}");
         assert!(!fx.root().join(".socket/vendor").exists());
         assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
+    }
+
+    /// #783: a parent-scoped or glob selector that overrides the target
+    /// (`pkg-a/left-pad`, `pkg-a/left-pad@^1.3.0`, `<root>/left-pad`,
+    /// `@scope/parent/left-pad`, `**/left-pad`) is a user-authored override
+    /// too. Yarn applies it before our bare pin, so vendoring beside it
+    /// leaves a lock `--immutable` rejects: refuse and write nothing. A
+    /// selector naming the target only as a PARENT overrides another
+    /// package and still vendors.
+    #[tokio::test]
+    async fn parent_scoped_resolutions_selector_is_refused() {
+        for selector in [
+            "pkg-a/left-pad",
+            "pkg-a/left-pad@^1.3.0",
+            "vendor-spike/left-pad",
+            "@scope/parent/left-pad",
+            "**/left-pad",
+        ] {
+            let pkg = B3_BEFORE_PKG.replace(
+                "  }\n}",
+                &format!("  }},\n  \"resolutions\": {{\n    \"{selector}\": \"1.3.0\"\n  }}\n}}"),
+            );
+            assert_ne!(pkg, B3_BEFORE_PKG, "the fixture edit must hit");
+            let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+            let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+            assert!(detail.contains(selector), "{selector}: {detail}");
+            fx.assert_untouched().await;
+        }
+
+        // Vendoring only writes the bare key, so a parent-scoped selector
+        // pointing into .socket/vendor (hand-copied, or another uuid) is
+        // not ours to overwrite: it still refuses.
+        let pkg = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            &format!(
+                "  }},\n  \"resolutions\": {{\n    \"pkg-a/left-pad\": \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"\n  }}\n}}"
+            ),
+        );
+        let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+        expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        fx.assert_untouched().await;
+
+        let pkg = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            "  },\n  \"resolutions\": {\n    \"left-pad/is-odd\": \"1.0.0\"\n  }\n}",
+        );
+        let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
     }
 
     /// A user-authored BARE-name pin to the exact version being vendored is

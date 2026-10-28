@@ -208,11 +208,14 @@ impl ServicePolicy<'_> {
         })
     }
 
-    /// npm must distinguish unserved patches from failures so the vendor loop
-    /// can keep an older vendored patch of the same package (#954).
+    /// Every backend distinguishes unserved patches from failures so the
+    /// vendor loop can keep an older vendored patch of the same package
+    /// (#954, #1235): a refusal carries the unserved `code` itself, npm's
+    /// failed `Done` carries it as a warning. The vendor loop reports a
+    /// refusal with no older patch to keep as `vendor_prebuilt_required`.
     fn unserved(&self, code: &'static str, detail: String) -> Box<VendorOutcome> {
         match self {
-            Self::Refused => self.miss(detail),
+            Self::Refused => Box::new(refused(code, detail)),
             Self::Failure(purl) => {
                 let warning = VendorWarning::new(code, detail.clone());
                 Box::new(super::common::done(
@@ -660,7 +663,7 @@ mod tests {
         {
             Err(outcome) => match *outcome {
                 VendorOutcome::Refused { code, detail } => {
-                    assert_eq!(code, "vendor_prebuilt_required");
+                    assert_eq!(code, "vendor_prebuilt_pending");
                     assert!(detail.contains("is still building"), "{detail}");
                 }
                 other => panic!("expected Refused, got {other:?}"),
@@ -688,7 +691,7 @@ mod tests {
         {
             Err(outcome) => match *outcome {
                 VendorOutcome::Refused { code, detail } => {
-                    assert_eq!(code, "vendor_prebuilt_required");
+                    assert_eq!(code, "vendor_prebuilt_unavailable");
                     assert_eq!(detail, "prebuilt .jar unavailable: not_found");
                 }
                 other => panic!("expected Refused, got {other:?}"),

@@ -61,7 +61,9 @@ pub fn canonical_base_purl(purl: &str) -> String {
 /// no qualifiers, subpath or percent escapes, and a lowercase type whose
 /// names and versions keep their spelling.
 fn is_canonical_base(purl: &str) -> bool {
-    if purl.trim().len() != purl.len() || purl.contains(['?', '#', '%']) {
+    // A byte scan: these are ASCII, and no multi-byte UTF-8 sequence
+    // contains an ASCII byte. Matching chars costs a decode per char.
+    if purl.trim().len() != purl.len() || purl.bytes().any(|b| matches!(b, b'?' | b'#' | b'%')) {
         return false;
     }
     let Some((ty, _)) = purl
@@ -272,6 +274,9 @@ mod tests {
             "pkg:maven/org.Example/Lib@1.0",
             "pkg:gem/nokogiri@1.16.5",
             "pkg:cargo/serde@1.0.0",
+            "pkg:npm/caf\u{e9}@1.0.0",
+            "pkg:npm/caf\u{e9}%41@1.0.0",
+            "pkg:npm/\u{2603}@1.0.0?x=\u{e9}",
             "pkg:npm/no-version",
             "pkg:npm/@scope",
             "pkg:npm",

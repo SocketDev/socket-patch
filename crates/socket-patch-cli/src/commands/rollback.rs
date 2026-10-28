@@ -289,6 +289,83 @@ fn handled_in_place(results: &[RollbackResult]) -> HashSet<&str> {
         .collect()
 }
 
+/// The manifest records no scope (#450), so this run's view of a record
+/// says nothing about the copy the patch may also have been applied to in
+/// the other scope: a project apply rolled back with `-g` (or a `-g` apply
+/// rolled back from the project) finds an untouched copy, or none, here
+/// while the patched one sits in the other scope. Of `purls` (the records
+/// about to leave the manifest), those with a copy in the other scope (the
+/// project at `--cwd` for a global run, the default global install
+/// otherwise) whose files still hold the patch's afterHash content, with
+/// that copy's path. Their records must stay.
+async fn patched_in_other_scope(
+    purls: &[String],
+    manifest: &PatchManifest,
+    common: &GlobalArgs,
+    socket_dir: &Path,
+    this_scope: &HashSet<&str>,
+) -> Vec<(String, PathBuf)> {
+    if purls.is_empty() {
+        return Vec::new();
+    }
+    let partitioned = partition_purls(purls, common.ecosystems.as_deref());
+    let other = CrawlerOptions {
+        global: !common.is_global(),
+        global_prefix: None,
+        ..common.crawler_options()
+    };
+    let found = find_all_packages_for_rollback(&partitioned, &other, true).await;
+    let blobs = socket_dir.join("blobs");
+    let mut patched = Vec::new();
+    for purl in purls {
+        let (Some(record), Some(paths)) = (manifest.patches.get(purl), found.get(purl)) else {
+            continue;
+        };
+        'copies: for path in paths {
+            // Both scopes can resolve to one tree (a `--cwd` inside the
+            // global root): this run already verified that copy.
+            if this_scope.contains(path.to_string_lossy().as_ref()) {
+                continue;
+            }
+            for (file, info) in &record.files {
+                let v = verify_file_rollback(path, file, info, &blobs).await;
+                // A file that is there but cannot be hashed may still hold
+                // the patched bytes: keep the record rather than strand it.
+                let unverifiable = v.current_hash.is_none()
+                    && v.status != VerifyRollbackStatus::AlreadyOriginal
+                    && !v.is_absent();
+                if unverifiable || v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
+                    patched.push((purl.clone(), path.clone()));
+                    break 'copies;
+                }
+            }
+        }
+    }
+    patched
+}
+
+/// `rollback`'s pointer at the scope that still holds a patched copy: a
+/// rollback of just that purl, naming `--cwd` when the run used one (the record lives in that
+/// project's manifest).
+fn patched_in_other_scope_warning(purl: &str, path: &Path, common: &GlobalArgs) -> String {
+    let (scope, mut command) = if common.is_global() {
+        ("the project", format!("socket-patch rollback {purl}"))
+    } else {
+        (
+            "the global install",
+            format!("socket-patch rollback {purl} -g"),
+        )
+    };
+    if common.cwd != Path::new(".") {
+        command.push_str(&format!(" --cwd {}", common.cwd.display()));
+    }
+    format!(
+        "{purl}: its copy in {scope} ({}) is still patched or could not be \
+         verified, so its manifest record was kept; run `{command}` to restore it",
+        path.display()
+    )
+}
+
 /// The wet run's per-package blocks: what was rolled back (naming each
 /// physical copy when a package has several) and what failed.
 fn format_rollback_results(results: &[RollbackResult], cwd: &Path) -> Vec<String> {
@@ -1961,6 +2038,39 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .cloned()
                 .collect();
             removable.sort();
+            // Records restored (or found original, or not installed) here
+            // whose copy in the other scope is still patched stay, with
+            // their whole variant group (#450).
+            let elsewhere = if cleanup_allowed {
+                let probe: Vec<String> = removable
+                    .iter()
+                    .filter(|purl| {
+                        (succeeded_purls.contains(*purl) || not_installed.contains(purl))
+                            && !vendored_excluded.contains(purl)
+                            && !purl_keys_cover(&vendored_keys, purl)
+                    })
+                    .cloned()
+                    .collect();
+                let this_scope: HashSet<&str> =
+                    results.iter().map(|r| r.package_path.as_str()).collect();
+                patched_in_other_scope(&probe, &manifest, &args.common, &socket_dir, &this_scope)
+                    .await
+            } else {
+                Vec::new()
+            };
+            if !elsewhere.is_empty() {
+                let kept_bases: HashSet<&str> = elsewhere
+                    .iter()
+                    .map(|(purl, _)| strip_purl_qualifiers(purl))
+                    .collect();
+                removable.retain(|purl| !kept_bases.contains(strip_purl_qualifiers(purl)));
+                for (purl, path) in &elsewhere {
+                    run_warnings.push((
+                        "patched_in_other_scope".into(),
+                        patched_in_other_scope_warning(purl, path, &args.common),
+                    ));
+                }
+            }
 
             // The manifest is rewritten only when an entry actually leaves
             // it; an emptied manifest stays on disk as `{"patches": {}}`
@@ -2092,17 +2202,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .iter()
                 .chain(hosted_leg.warnings.iter())
                 .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
-            // A restored package whose ownership could not be put back
-            // (the engine reports it on `error` with `success: true`) is
-            // restored but worth a note, here and in the envelope.
+            // A restored package whose ownership could not be put back, or
+            // whose stale bytecode could not be removed (the engine reports
+            // it on `error` with `success: true`), is restored but worth a
+            // note, here and in the envelope.
             for r in results.iter().filter(|r| r.success) {
                 if let Some(note) = &r.error {
-                    let warning = (
-                        "ownership_not_restored".to_string(),
-                        format!("{}: {note}", r.package_key),
-                    );
-                    human_warnings.push(warning.clone());
-                    run_warnings.push(warning);
+                    let codes = socket_patch_core::patch::apply::advisory_warning_codes(note);
+                    let codes = if codes.is_empty() {
+                        vec!["ownership_not_restored"]
+                    } else {
+                        codes
+                    };
+                    let detail = format!("{}: {note}", r.package_key);
+                    // One human line per note, one envelope entry per code.
+                    human_warnings.push((codes[0].to_string(), detail.clone()));
+                    run_warnings.extend(codes.iter().map(|c| (c.to_string(), detail.clone())));
                 }
             }
 

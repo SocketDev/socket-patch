@@ -1056,3 +1056,90 @@ fn run_revert_after_lock_change(change: LockChange) {
         "the reverted project installs the registry bytes"
     );
 }
+
+/// #783: a user's parent-scoped `resolutions` selector for the patched
+/// package (`pkg-a/left-pad`) is an override vendoring must not stack its
+/// own bare pin beside. Vendoring used to report success and leave a lock
+/// every `yarn install --immutable` rejected (YN0028). It now refuses with
+/// `vendor_override_conflict` and writes nothing, so the project still
+/// installs immutably.
+#[test]
+fn issue_783_parent_scoped_resolution_refuses_vendoring() {
+    let pm = yarn_berry();
+    if !has_corepack_pm(pm) {
+        skip!("SKIP e2e_vendor_yarn_berry_build (#783): `corepack {pm}` unavailable");
+        return;
+    }
+    for selector in ["pkg-a/left-pad", "pkg-a/left-pad@^1.3.0"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let global = tmp.path().join("yarn-global");
+        let env = [("YARN_GLOBAL_FOLDER", global.to_str().unwrap())];
+        std::fs::create_dir_all(proj.join("packages/pkg-a")).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            format!(
+                r#"{{"name":"root","private":true,"workspaces":["packages/*"],"resolutions":{{"{selector}":"{DEP_VERSION}"}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("packages/pkg-a/package.json"),
+            format!(r#"{{"name":"pkg-a","version":"1.0.0","dependencies":{{"{DEP}":"^{DEP_VERSION}"}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join(".yarnrc.yml"),
+            "nodeLinker: node-modules\nenableGlobalCache: false\n",
+        )
+        .unwrap();
+        let out = corepack(&proj, pm, &["install"], &env);
+        if !out.status.success() {
+            skip!(
+                "SKIP e2e_vendor_yarn_berry_build (#783 {selector}): fixture install failed:\n{}",
+                yarn_berry_common::yarn_output(&out)
+            );
+            continue;
+        }
+        let pkg_before = std::fs::read(proj.join("package.json")).unwrap();
+        let lock_before = std::fs::read(proj.join("yarn.lock")).unwrap();
+
+        let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        stage_patch(
+            &proj,
+            &format!("pkg:npm/{DEP}@{DEP_VERSION}"),
+            "package/index.js",
+            &orig,
+            &patched,
+        );
+        let cwd = proj.to_str().unwrap();
+        let (code, stdout, stderr) =
+            run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+        assert_eq!(
+            code, 1,
+            "{selector}: vendor must refuse.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("vendor_override_conflict"),
+            "{selector}: refusal code.\nstdout:\n{stdout}"
+        );
+        assert_eq!(
+            std::fs::read(proj.join("package.json")).unwrap(),
+            pkg_before,
+            "{selector}: package.json untouched"
+        );
+        assert_eq!(
+            std::fs::read(proj.join("yarn.lock")).unwrap(),
+            lock_before,
+            "{selector}: yarn.lock untouched"
+        );
+
+        let out = corepack(&proj, pm, &["install", "--immutable"], &env);
+        assert!(
+            out.status.success(),
+            "{selector}: the project must still install immutably:\n{}",
+            yarn_berry_common::yarn_output(&out)
+        );
+    }
+}

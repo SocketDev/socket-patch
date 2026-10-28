@@ -51,13 +51,16 @@ pub(crate) const MANIFEST_REL: &str = ".socket/manifest.json";
 pub(crate) const NPM_MANIFEST_REL: &str = "package.json";
 
 /// Root-relative text files read beyond `REDIRECT_CANDIDATE_FILES`.
-const EXTRA_TEXT_FILES: [&str; 6] = [
+/// `deno.lock` is advisory: an npm pin it also locks is warned about and
+/// left out of VEX (#406).
+const EXTRA_TEXT_FILES: [&str; 7] = [
     PNPM_WORKSPACE_REL,
     NPMRC_REL,
     crate::patch::redirect::YARNRC_REL,
     VENDOR_STATE_REL,
     MANIFEST_REL,
     NPM_MANIFEST_REL,
+    crate::patch::redirect::DENO_LOCK,
 ];
 
 /// The one directory name the disk Cargo member walk never enters (it
@@ -576,6 +579,7 @@ mod tests {
         let mut entries = vec![
             blob("package-lock.json"),
             blob("package.json"),
+            blob("deno.lock"),
             blob("src/index.js"),
             blob(".npmrc"),
             blob("bun.lockb"),
@@ -608,6 +612,7 @@ mod tests {
             s.fetch_text,
             vec![
                 ".npmrc",
+                "deno.lock",
                 "package-lock.json",
                 "package.json",
                 "tool.py",

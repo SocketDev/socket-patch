@@ -124,8 +124,8 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Some(text) = ctx.read_text(BUN_LOCK, out).await else {
         return;
     };
-    let entries = match bun_text_entries(&text) {
-        Ok(entries) => entries,
+    let lock = match bun_text_entries(&text) {
+        Ok(lock) => lock,
         Err(detail) => {
             out.diag(DIAG_LOCKFILE_UNPARSEABLE, BUN_LOCK, detail);
             return;
@@ -133,7 +133,7 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     };
     let mut bundled = Bundled::default();
     let mut unwired = Unwired::default();
-    for entry in &entries {
+    for entry in &lock.entries {
         let elems = &entry.elems;
         let Some(spec) = elems.first().and_then(|e| decode_json_string(e)) else {
             continue;

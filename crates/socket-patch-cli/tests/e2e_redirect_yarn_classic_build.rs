@@ -1669,6 +1669,191 @@ async fn classic_outside_root_copy_under_another_name_is_named_and_not_attested(
     );
 }
 
+/// #758: `bund` (a local tarball) bundles its own left-pad@1.3.0, which
+/// yarn 1 unpacks into `node_modules/bund/node_modules/left-pad` with no
+/// yarn.lock block. The hosted pin of the registry block can't reach it,
+/// so `scan --mode hosted` must name the bundled copy
+/// (`redirect_copy_unpatched`), and neither its in-run VEX nor a later
+/// `vex` over the installed tree may attest left-pad not_affected.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn classic_bundled_copy_is_named_and_not_attested() {
+    if !require_yarn_classic("e2e_redirect_yarn_classic_build (bundled copy)", |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    // yarn 1.0–1.6 install nothing from a `file:` tarball, so the bundling
+    // parent can't be installed there (not a skip: there is nothing to
+    // test on those releases).
+    if !installs_file_tarballs(&yarn_classic_version()) {
+        println!(
+            "bundled copy: {} installs nothing from a `file:` tarball",
+            yarn_classic()
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let yarn_env = [("YARN_CACHE_FOLDER", cache.to_str().unwrap())];
+    let manifest = |deps: &str| {
+        format!(
+            r#"{{"name":"bundled-classic","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"{deps}}}}}"#
+        )
+    };
+    std::fs::write(proj.join("package.json"), manifest("")).unwrap();
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &yarn_env,
+    );
+    if !install.status.success() {
+        skip!(
+            "(bundled copy): fixture `yarn install` failed:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let installed_dir = proj.join("node_modules").join(DEP);
+    let installed_orig = std::fs::read(installed_dir.join("index.js")).unwrap();
+
+    // The bundling parent: its tarball carries left-pad in its own
+    // node_modules, as `npm pack` writes a bundleDependencies package.
+    let bundsrc = tmp.path().join("bundsrc");
+    copy_dir_recursive(&installed_dir, &bundsrc.join("node_modules").join(DEP));
+    std::fs::write(
+        bundsrc.join("package.json"),
+        format!(
+            r#"{{"name":"bund","version":"1.0.0","main":"index.js","dependencies":{{"{DEP}":"{DEP_VERSION}"}},"bundledDependencies":["{DEP}"]}}"#
+        ),
+    )
+    .unwrap();
+    build_patched_tgz(
+        &bundsrc,
+        format!("module.exports = require('{DEP}');\n").as_bytes(),
+        &proj.join("bund-1.0.0.tgz"),
+    );
+    std::fs::write(
+        proj.join("package.json"),
+        manifest(r#","bund":"file:./bund-1.0.0.tgz""#),
+    )
+    .unwrap();
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &yarn_env,
+    );
+    assert!(
+        install.status.success(),
+        "yarn install with the bundling parent failed:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let bundled = proj.join("node_modules/bund/node_modules").join(DEP);
+    assert_eq!(
+        std::fs::read(bundled.join("index.js")).ok(),
+        Some(installed_orig.clone()),
+        "fixture: yarn must unpack the bundled copy from bund's tarball"
+    );
+
+    let patched: Vec<u8> = [MARKER.as_bytes(), &installed_orig].concat();
+    let tgz_path = tmp.path().join("patched.tgz");
+    build_patched_tgz(&installed_dir, &patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let server = mock_hosted_grant(&tgz, &installed_orig, &patched, "bundled fixture").await;
+    let api_url = server.uri();
+    let api = [
+        "--api-url",
+        api_url.as_str(),
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    let mut args = vec![
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--vex",
+        "out.vex.json",
+        "--vex-product",
+        PRODUCT,
+    ];
+    args.extend(api);
+    let (code, stdout, stderr) = run_socket(&proj, &args);
+    println!("scan exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json output is not JSON: {e}\n{stdout}\n{stderr}"));
+    let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("{UUID}/{DEP}-{DEP_VERSION}.tgz")),
+        "the registry left-pad block must still be pinned:\n{lock}"
+    );
+    let named = env["warnings"].as_array().into_iter().flatten().any(|w| {
+        w["code"] == "redirect_copy_unpatched"
+            && w["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("node_modules/bund/node_modules/left-pad"))
+    });
+    assert!(named, "the bundled copy must be named: {env}");
+    let vex = std::fs::read_to_string(proj.join("out.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "the in-run VEX must not attest left-pad:\n{vex}\n{env}"
+    );
+
+    // After a fresh install from the pinned lock, the bundled copy is still
+    // the unpatched bytes from bund's tarball, and `vex` must say nothing.
+    std::fs::remove_dir_all(proj.join("node_modules")).unwrap();
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--frozen-lockfile", "--no-progress"],
+        &yarn_env,
+    );
+    assert!(
+        install.status.success(),
+        "frozen reinstall failed:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        std::fs::read(installed_dir.join("index.js")).ok(),
+        Some(patched),
+        "the registry copy installs patched"
+    );
+    assert_eq!(
+        std::fs::read(bundled.join("index.js")).ok(),
+        Some(installed_orig),
+        "the bundled copy stays unpatched"
+    );
+    let mut args = vec![
+        "vex",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--output",
+        "installed.vex.json",
+        "--product",
+        PRODUCT,
+        "--patch-server-url",
+        api_url.as_str(),
+    ];
+    args.extend(api);
+    let (code, stdout, stderr) = run_socket(&proj, &args);
+    println!("vex exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let vex = std::fs::read_to_string(proj.join("installed.vex.json")).unwrap_or_default();
+    assert!(
+        !vex.contains("not_affected"),
+        "vex over the installed tree must not attest left-pad:\n{vex}\n{stdout}\n{stderr}"
+    );
+}
+
 /// A mock patch API granting one hosted patch of `DEP@DEP_VERSION` whose
 /// tarball is `tgz` (`index.js` from `orig` to `patched`).
 async fn mock_hosted_grant(tgz: &[u8], orig: &[u8], patched: &[u8], title: &str) -> MockServer {

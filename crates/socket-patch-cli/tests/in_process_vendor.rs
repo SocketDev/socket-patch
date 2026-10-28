@@ -1520,6 +1520,51 @@ async fn berry_lock_only_pnp_project_refused_up_front() {
     }
 }
 
+/// #1611: yarn 4 loads the project's `injectEnvironmentFiles` (`.env.yarn`
+/// by default) before it expands `${NAME}` in `.yarnrc.yml`, so a linker
+/// that a `.env.yarn` variable turns into `node-modules` is not PnP:
+/// vendor wires the project instead of refusing it. An emptied
+/// `injectEnvironmentFiles` loads nothing, and the fallback (`pnp`) is
+/// refused as before.
+#[tokio::test]
+async fn berry_env_file_linker_decides_vendoring() {
+    const RC: &str = "nodeLinker: \"${SOCKET_PATCH_T1611_VL:-pnp}\"\nenableGlobalCache: false\n";
+    for (label, rc_extra, file, vendors) in [
+        ("default .env.yarn", "", ".env.yarn", true),
+        (
+            "custom file",
+            "injectEnvironmentFiles: [\".env.custom\"]\n",
+            ".env.custom",
+            true,
+        ),
+        (
+            "emptied list",
+            "injectEnvironmentFiles: []\n",
+            ".env.yarn",
+            false,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        stage_berry_project(root, BERRY_WIN_PKG, &berry_win_lock());
+        std::fs::write(root.join(".yarnrc.yml"), format!("{RC}{rc_extra}")).unwrap();
+        std::fs::write(root.join(file), "SOCKET_PATCH_T1611_VL=node-modules\n").unwrap();
+        let (code, env) = vendor_cli(root, &[]);
+        let wired = std::fs::read_to_string(root.join("yarn.lock"))
+            .unwrap()
+            .contains(".socket/vendor/npm/");
+        if vendors {
+            assert_eq!(code, 0, "{label}: {env:#}");
+            assert_eq!(env["summary"]["applied"], 1, "{label}: {env:#}");
+            assert!(wired, "{label}: wired");
+        } else {
+            assert_eq!(code, 1, "{label}: {env:#}");
+            find_event(&env, "failed", Some("vendor_yarn_berry_unsupported"));
+            assert!(!wired, "{label}: not wired");
+        }
+    }
+}
+
 /// Mount the hosted-mode API (batch discovery, per-package search, a granted
 /// reference carrying the yarn-berry-zip checksum, the patch view) for the
 /// berry takeover legs. Returns the hosted tarball URL.
@@ -3469,13 +3514,25 @@ fn gem_fixture() -> GemFixture {
 /// [`GEM_PURL_QUALIFIED`]); the batch response's outer package purl stays the
 /// bare purl the crawler requested, mirroring production.
 async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
+    mount_gem_patch_api_at(mock, patch_purl, GEM_UUID, None).await;
+}
+
+/// [`mount_gem_patch_api`] serving patch `uuid`. With `unserved` set, the
+/// patch service answers that status (`pending_build`, `build_failed`, …)
+/// for the patch instead of serving its prebuilt `.gem`.
+async fn mount_gem_patch_api_at(
+    mock: &wiremock::MockServer,
+    patch_purl: &str,
+    uuid: &str,
+    unserved: Option<&str>,
+) {
     use base64::Engine as _;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, ResponseTemplate};
 
     let fx = gem_fixture();
     let record: socket_patch_core::manifest::schema::PatchRecord = serde_json::from_value(json!({
-        "uuid": GEM_UUID, "exportedAt": "2026-01-01T00:00:00Z",
+        "uuid": uuid, "exportedAt": "2026-01-01T00:00:00Z",
         "files": { "lib/demo_gem.rb": { "beforeHash": compute_git_sha256_from_bytes(GEM_ORIG), "afterHash": compute_git_sha256_from_bytes(GEM_PATCHED) } },
         "vulnerabilities": {}, "description": "gem vendor patch", "license": "MIT", "tier": "free"
     })).unwrap();
@@ -3487,14 +3544,29 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
         blobs_path: fx.root(),
         mem_blobs: Some(&blobs),
     };
-    prebuilt_common::mount_record(
-        mock,
-        patch_purl,
-        &record,
-        fx.installed_lib().parent().unwrap().parent().unwrap(),
-        &sources,
-    )
-    .await;
+    match unserved {
+        None => {
+            prebuilt_common::mount_record(
+                mock,
+                patch_purl,
+                &record,
+                fx.installed_lib().parent().unwrap().parent().unwrap(),
+                &sources,
+            )
+            .await
+        }
+        Some(status) => {
+            Mock::given(method("POST"))
+                .and(path_regex(r"/(patch|patches)/package$"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "results": { uuid: { "status": status } } })),
+                )
+                .with_priority(1)
+                .mount(mock)
+                .await
+        }
+    }
     const ORG_SLUG: &str = "test-org";
     /// The exact percent-encoded by-package path segment for the BARE purl —
     /// the spelling the crawler synthesizes and the CLI queries with (the
@@ -3510,7 +3582,7 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
             "packages": [{
                 "purl": GEM_PURL,
                 "patches": [{
-                    "uuid": GEM_UUID,
+                    "uuid": uuid,
                     "purl": patch_purl,
                     "tier": "free",
                     "cveIds": ["CVE-2026-0002"],
@@ -3529,7 +3601,7 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "patches": [{
-                "uuid": GEM_UUID,
+                "uuid": uuid,
                 "purl": patch_purl,
                 "publishedAt": "2026-01-01T00:00:00Z",
                 "description": "gem vendor patch",
@@ -3542,9 +3614,9 @@ async fn mount_gem_patch_api(mock: &wiremock::MockServer, patch_purl: &str) {
         .mount(mock)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{GEM_UUID}")))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uuid": GEM_UUID,
+            "uuid": uuid,
             "purl": patch_purl,
             "publishedAt": "2026-01-01T00:00:00Z",
             "files": {
@@ -3627,6 +3699,101 @@ async fn scan_vendor_gem_refuses_a_gitignored_ledger() {
             GEM_GEMFILE
         );
     }
+}
+
+/// A gem `scan --mode vendored` run at patch A, then the bytes of the
+/// files that wiring owns: Gemfile, lock, ledger and the vendored lib.
+async fn gem_vendored_at_a() -> (GemFixture, [Vec<u8>; 4]) {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
+    let fx = gem_fixture();
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "vendoring patch A must succeed: {env:#}");
+    let wired = gem_wired_bytes(&fx);
+    (fx, wired)
+}
+
+fn gem_wired_bytes(fx: &GemFixture) -> [Vec<u8>; 4] {
+    [
+        std::fs::read(fx.gemfile_path()).unwrap(),
+        std::fs::read(fx.lock_path()).unwrap(),
+        std::fs::read(fx.state_path()).unwrap(),
+        std::fs::read(fx.vendored_lib()).unwrap(),
+    ]
+}
+
+/// The superseding patch of the demo gem in the #1235 tests.
+const GEM_UUID2: &str = "36363636-3636-4636-8636-363636363636";
+
+/// #1235: the #954 skip holds for every vendored backend, not only the npm
+/// family. A gem vendored at patch A, re-scanned once the API offers a
+/// superseding patch B whose prebuilt `.gem` the service is still building
+/// (`pending_build`) or cannot serve (`build_failed`, `not_found`), keeps A
+/// in force: one `skipped` event under the unserved code naming both
+/// patches, exit 0, and the Gemfile, lock, ledger and artifact untouched.
+#[tokio::test]
+async fn scan_vendor_gem_keeps_the_older_patch_while_the_superseding_one_is_unserved() {
+    for (status, code) in [
+        ("pending_build", "vendor_prebuilt_pending"),
+        ("build_failed", "vendor_prebuilt_unavailable"),
+        ("not_found", "vendor_prebuilt_unavailable"),
+    ] {
+        let (fx, wired) = gem_vendored_at_a().await;
+        let mock = wiremock::MockServer::start().await;
+        mount_gem_patch_api_at(&mock, GEM_PURL, GEM_UUID2, Some(status)).await;
+        let (exit, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+        assert_eq!(exit, 0, "{status}: the older patch is kept: {env:#}");
+        let skipped = find_event(&env, "skipped", Some(code));
+        assert_eq!(skipped["purl"], GEM_PURL, "{status}: {skipped}");
+        assert!(
+            skipped.to_string().contains(GEM_UUID) && skipped.to_string().contains(GEM_UUID2),
+            "{status}: names the kept and the unserved patch: {skipped}"
+        );
+        assert_eq!(env["summary"]["failed"], 0, "{status}: {env:#}");
+        assert_eq!(gem_wired_bytes(&fx), wired, "{status}: wiring untouched");
+    }
+}
+
+/// The #1235 skip keeps only an older vendoring that is still wired: once
+/// the Gemfile pair no longer points at `.socket/vendor/` the gem is patched
+/// in neither mode, so the unserved upgrade still fails with the stable
+/// `vendor_prebuilt_required` code, and no unserved marker leaks out.
+#[tokio::test]
+async fn scan_vendor_gem_unserved_upgrade_fails_when_the_old_patch_is_unwired() {
+    let (fx, _) = gem_vendored_at_a().await;
+    std::fs::write(fx.gemfile_path(), GEM_GEMFILE).unwrap();
+    std::fs::write(fx.lock_path(), GEM_LOCK).unwrap();
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api_at(&mock, GEM_PURL, GEM_UUID2, Some("pending_build")).await;
+    let (exit, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(exit, 1, "an unwired older patch is not kept: {env:#}");
+    let failed = find_event(&env, "failed", Some("vendor_prebuilt_required"));
+    assert_eq!(failed["purl"], GEM_PURL);
+    assert!(failed.to_string().contains("still building"), "{failed}");
+    assert!(
+        events(&env)
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_prebuilt_pending"),
+        "no unserved marker leaks out of a real failure: {env:#}"
+    );
+}
+
+/// A first gem vendor whose `.gem` is still building has no older patch to
+/// keep: it fails with the stable `vendor_prebuilt_required` code (#1235).
+#[tokio::test]
+async fn scan_vendor_gem_unserved_first_vendor_still_fails() {
+    let fx = gem_fixture();
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api_at(&mock, GEM_PURL, GEM_UUID, Some("pending_build")).await;
+    let (exit, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(exit, 1, "{env:#}");
+    let failed = find_event(&env, "failed", Some("vendor_prebuilt_required"));
+    assert!(failed.to_string().contains("still building"), "{failed}");
+    assert_eq!(
+        std::fs::read_to_string(fx.gemfile_path()).unwrap(),
+        GEM_GEMFILE
+    );
+    assert_eq!(std::fs::read_to_string(fx.lock_path()).unwrap(), GEM_LOCK);
 }
 
 /// `scan --mode vendored` end to end on a gem project: discover → download →

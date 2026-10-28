@@ -617,6 +617,9 @@ fn yarn_expand_env(value: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<
 struct BerryRegistrySettings {
     rcs: Vec<String>,
     env_registry: Option<String>,
+    /// The variables a value's `${NAME}` reads: this process's
+    /// environment under the project's injected dotenv files (#1611).
+    env: crate::crawlers::pkg_managers::YarnEnv,
 }
 
 impl BerryRegistrySettings {
@@ -653,6 +656,7 @@ impl BerryRegistrySettings {
         BerryRegistrySettings {
             rcs,
             env_registry: std::env::var("YARN_NPM_REGISTRY_SERVER").ok(),
+            env: crate::crawlers::pkg_managers::YarnEnv::for_project(&root),
         }
     }
 
@@ -661,7 +665,7 @@ impl BerryRegistrySettings {
             &self.rcs,
             self.env_registry.as_deref(),
             name,
-            &|key: &str| std::env::var(key).ok(),
+            &|key: &str| self.env.var(key),
         )
     }
 }
@@ -2607,16 +2611,18 @@ pub(crate) async fn restore_bun_locks(
         let Some(text) = read_or_refuse(view, rel, &pins, &mut result).await else {
             continue;
         };
-        let (mut lines, entries) = match super::super::parse_bun_hosted_lock(&text) {
-            Ok(parsed) => parsed,
+        let lock = match super::super::parse_bun_hosted_lock(&text) {
+            Ok(lock) => lock,
             Err(w) => {
                 refuse_all_in(&pins, rel, &mut result, w.detail);
                 continue;
             }
         };
+        let entries = &lock.entries;
+        let mut lines = lock.lines.clone();
         // (line, uuid, name, version, deps)
         let mut hits: Vec<(usize, String, String, String, String)> = Vec::new();
-        for entry in &entries {
+        for entry in entries {
             if !matches!(entry.elems.len(), 2 | 3) || !entry.elems[1].starts_with('{') {
                 continue;
             }

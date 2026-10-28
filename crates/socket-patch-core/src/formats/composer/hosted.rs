@@ -223,6 +223,29 @@ pub(crate) fn rewrite_composer_lock(
         };
         let dist_start = dist_member.key_start;
         let dist_end = dist_member.value_end;
+        // socket-patch's own vendored entry (a `path` dist into
+        // `.socket/vendor/`) is reverted by the vendored → hosted takeover
+        // before this rewrite runs. Reaching it here means the takeover
+        // could not run (no ledger entry): repointing it in place would keep
+        // the patch-uuid `dist.reference` no upstream restore can match
+        // (#536), so leave it vendored.
+        if json_string_field(&content[dist_start..=dist_end], "url")
+            .is_some_and(|url| url.replace("\\/", "/").starts_with(".socket/vendor/"))
+        {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_composer_vendored_entry".into(),
+                detail: format!(
+                    "{composer_name} is wired to socket-patch's vendored copy, whose \
+                     vendored ledger entry is missing, so it cannot be reverted for you; NOT \
+                     redirected — restore its registry entry at {} (check out the \
+                     pre-vendor composer.lock from version control, or re-resolve it with \
+                     `composer update --no-install {composer_name}`, which may also move it \
+                     and its dependents to newer versions), then re-run",
+                    dep.version
+                ),
+            });
+            continue;
+        }
         // The dist's own members only: a `mirrors` entry listed before the
         // dist `url` would otherwise take the redirected url and then be
         // dropped with the mirrors, leaving the upstream url pinned to the
