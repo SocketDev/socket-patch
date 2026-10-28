@@ -166,10 +166,12 @@ pub fn remove_lines(content: &str, added: &str) -> Option<String> {
 /// `str::lines` are those lines again and whose `line_endings::terminator` is `eol` again —
 /// except when a line ends in a bare `\r` under an LF file (a joined `\r\n`
 /// would then split differently), which is kept as text instead.
+#[derive(Clone)]
 pub(crate) struct GoSumEditor {
     state: GoSumState,
 }
 
+#[derive(Clone)]
 enum GoSumState {
     /// The exact content.
     Text(String),

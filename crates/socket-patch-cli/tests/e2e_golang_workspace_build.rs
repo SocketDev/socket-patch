@@ -131,10 +131,15 @@ impl Drop for ChmodGuard {
 /// Zip `mod_path@ver` (go.mod + lib.go) into the file proxy.
 fn publish(tmp: &Path, mod_path: &str, ver: &str, lib: &str) {
     let gomod = format!("module {UMOD}\n\ngo 1.18\n");
+    publish_module(tmp, mod_path, ver, &gomod, lib);
+}
+
+/// Zip `mod_path@ver` with this `gomod` and `lib.go` into the file proxy.
+fn publish_module(tmp: &Path, mod_path: &str, ver: &str, gomod: &str, lib: &str) {
     let stage_root = tmp.join("stage").join(mod_path.replace('/', "_"));
     let stage = stage_root.join(format!("{mod_path}@{ver}"));
     std::fs::create_dir_all(&stage).unwrap();
-    std::fs::write(stage.join("go.mod"), &gomod).unwrap();
+    std::fs::write(stage.join("go.mod"), gomod).unwrap();
     std::fs::write(stage.join("lib.go"), lib).unwrap();
     let pxv = tmp.join("proxy").join(mod_path).join("@v");
     std::fs::create_dir_all(&pxv).unwrap();
@@ -143,7 +148,7 @@ fn publish(tmp: &Path, mod_path: &str, ver: &str, lib: &str) {
         format!("{{\"Version\":\"{ver}\"}}"),
     )
     .unwrap();
-    std::fs::write(pxv.join(format!("{ver}.mod")), &gomod).unwrap();
+    std::fs::write(pxv.join(format!("{ver}.mod")), gomod).unwrap();
     let zip = pxv.join(format!("{ver}.zip"));
     let status = Command::new("zip")
         .args([
@@ -1106,6 +1111,11 @@ fn hosted_gate_follows_go_work_precedence() {
             String::new(),
             "\nreplace example.com/upstream v1.0.0 => ../fork\n",
         ),
+        (
+            "member a replaces every version elsewhere",
+            String::new(),
+            "\nreplace example.com/upstream => ../fork\n",
+        ),
     ] {
         std::fs::write(w.root.join("go.work"), format!("{work}{work_extra}")).unwrap();
         std::fs::write(w.root.join("a/go.mod"), format!("{a_mod}{a_extra}")).unwrap();
@@ -1132,6 +1142,40 @@ fn hosted_gate_follows_go_work_precedence() {
         );
     }
 
+    // What the gate prevents: b's pin beside a's version-less replace never
+    // builds the patched copy (go links the fork or refuses the workspace).
+    std::fs::write(w.root.join("go.work"), &work).unwrap();
+    std::fs::write(
+        w.root.join("a/go.mod"),
+        format!("{a_mod}\nreplace {UMOD} => ../fork\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("go.mod"),
+        format!("{b_mod}\nreplace {UMOD} {UVER} => {} {SVER}\n", w.smod),
+    )
+    .unwrap();
+    let b_sum = read(&b.join("go.sum"));
+    std::fs::write(
+        b.join("go.sum"),
+        format!(
+            "{b_sum}{smod} {SVER} {}\n{smod} {SVER}/go.mod {}\n",
+            w.pin.0,
+            w.pin.1,
+            smod = w.smod
+        ),
+    )
+    .unwrap();
+    for dir in ["a", "b"] {
+        let (stdout, err) = run_member(tmp.path(), &w.root, dir, &w.proxy, &[]);
+        assert!(
+            !stdout.contains("PATCHED"),
+            "{dir}: a wildcard member replace beside the pin: {stdout}\n{err}"
+        );
+    }
+    std::fs::write(b.join("go.mod"), &b_mod).unwrap();
+    std::fs::write(b.join("go.sum"), &b_sum).unwrap();
+
     std::fs::write(w.root.join("a/go.mod"), &a_mod).unwrap();
     std::fs::write(
         w.root.join("go.work"),
@@ -1149,4 +1193,98 @@ fn hosted_gate_follows_go_work_precedence() {
     );
     let (stdout, err) = run_member(tmp.path(), &w.root, "b", &w.proxy, &[]);
     assert!(stdout.contains("B: PATCHED"), "{stdout}\n{err}");
+}
+
+/// go keeps no member's go.mod tidy in workspace mode: `b` requires `x`,
+/// which requires `UMOD` v1.1.0, so the workspace builds v1.1.0 although
+/// every member requires v1.0.0, and only the zip line go writes to
+/// `go.work.sum` shows it. Discovery from the go.work root then calls `a`'s
+/// hosted pin inert, with its zip line or (tidied) without, and so does
+/// the selection `vex` gates on from `a`.
+#[test]
+fn dependency_raise_makes_a_workspace_pin_inert() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    use socket_patch_core::vendor::go_build_list::{project_selection, Selection};
+    use socket_patch_core::vex::discover::discover_patched_refs;
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, UVER);
+    let xmod = "example.com/x";
+    publish_module(
+        tmp.path(),
+        xmod,
+        UVER,
+        &format!("module {xmod}\n\ngo 1.18\n\nrequire {UMOD} {NEXT}\n"),
+        &format!(
+            "package x\n\nimport \"{UMOD}\"\n\nfunc Greeting() string {{ return upstream.Greeting() }}\n"
+        ),
+    );
+    let x = harvest(tmp.path(), &w.proxy, xmod, UVER);
+    let next = harvest(tmp.path(), &w.proxy, UMOD, NEXT);
+    let (a, b) = (w.root.join("a"), w.root.join("b"));
+    let b_mod = read(&b.join("go.mod"));
+    std::fs::write(
+        b.join("go.mod"),
+        format!("{b_mod}\nrequire {xmod} {UVER}\n"),
+    )
+    .unwrap();
+    let b_sum = read(&b.join("go.sum"));
+    std::fs::write(
+        b.join("go.sum"),
+        format!(
+            "{b_sum}{xmod} {UVER} {}\n{xmod} {UVER}/go.mod {}\n{UMOD} {NEXT}/go.mod {}\n",
+            x.0, x.1, next.1
+        ),
+    )
+    .unwrap();
+
+    // Before any build has written go.work.sum, nothing read shows the
+    // raise: hosted pins `a`.
+    let m = Machine::new(tmp.path(), "raise");
+    let (code, out, stderr) = w.api.get(&a, &m.modcache, &[]);
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    assert_eq!(out["summary"]["applied"], 1, "{out}");
+
+    let (stdout, err) = run_member(tmp.path(), &w.root, "a", &w.proxy, &[("GOSUMDB", "off")]);
+    assert!(stdout.contains("A: PRISTINE-NEXT"), "{stdout}\n{err}");
+    let work_sum = read(&w.root.join("go.work.sum"));
+    assert!(
+        work_sum.contains(&format!("{UMOD} {NEXT} {}", next.0)),
+        "go records the zip of the version it builds: {work_sum}"
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let inert = |label: &str| {
+        let out = rt.block_on(discover_patched_refs(&w.root));
+        assert!(
+            !out.refs.iter().any(|r| r.purl == UPURL),
+            "{label}: {:?}",
+            out.refs
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.detail.contains("is inert") && d.detail.contains(NEXT)),
+            "{label}: {:?}",
+            out.diagnostics
+        );
+        assert_eq!(
+            rt.block_on(project_selection(&a, UMOD, UVER)),
+            Some(Selection::Other(NEXT.to_string())),
+            "{label}"
+        );
+    };
+    inert("zip pin");
+    let zip_line = format!("{} {SVER} ", w.smod);
+    let tidied: String = read(&a.join("go.sum"))
+        .lines()
+        .filter(|l| !l.starts_with(&zip_line))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(a.join("go.sum"), tidied).unwrap();
+    inert("/go.mod-only pin");
 }

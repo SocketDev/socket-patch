@@ -62,7 +62,10 @@
 //!   ones go verifies against: the root `go.sum`, or with a `go.work`,
 //!   `go.work.sum` and each in-root `use` member's `go.sum` (the root's
 //!   only when `.` is a member). Under `GOWORK=off` go ignores `go.work`,
-//!   so discovery reads neither it nor its sum files.
+//!   so discovery reads neither it nor its sum files. A `GOWORK` naming
+//!   another file than the root's `go.work`, or a relative one (which go
+//!   rejects), leaves the workspace unreadable here: every Go ref becomes
+//!   a diagnostic.
 //!   NB for the CLI's installed-tree basis: under a hosted replace the
 //!   module cache's `M@v` (if any, e.g. from before the redirect) is
 //!   pristine BY CONSTRUCTION — the build consumes
@@ -110,6 +113,7 @@
 //!   and is not read.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use super::{
     golang_purl, vendor_ref, vendored_leaf_purl, DiscoverCtx, Discovery, PatchedRef,
@@ -123,7 +127,7 @@ use crate::vendor::go_mod_edit::{
     ReplaceOwner, HOSTED_GO_MODULE_PREFIX,
 };
 use crate::vendor::go_sum_edit::{go_semver_cmp, go_sum_lines, is_h1_dirhash};
-use crate::vendor::go_workspace::{in_root_dir, GoWorkspace, Member};
+use crate::vendor::go_workspace::{self, in_root_dir, same_dir_key, GoWork, GoWorkspace, Member};
 use crate::vendor::lock_inventory::LockIntegrity;
 
 const GO_MOD: &str = "go.mod";
@@ -132,8 +136,56 @@ const GO_WORK: &str = "go.work";
 const GO_WORK_SUM: &str = "go.work.sum";
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
-    let workspaces = go_env("GOWORK").as_deref() != Some("off");
-    extract_with(ctx, out, workspaces).await;
+    extract_gowork(ctx, out, go_env("GOWORK").as_deref()).await;
+}
+
+/// [`extract`] for an explicit `GOWORK` value.
+async fn extract_gowork(ctx: &DiscoverCtx<'_>, out: &mut Discovery, gowork: Option<&str>) {
+    match gowork {
+        Some("off") => extract_with(ctx, out, false).await,
+        None | Some("") | Some("auto") => extract_with(ctx, out, true).await,
+        Some(gowork) => match unread_workspace(ctx, gowork) {
+            None => extract_with(ctx, out, true).await,
+            Some(why) => withhold(ctx, out, &why).await,
+        },
+    }
+}
+
+/// Why the `go.work` an explicit `GOWORK` names is not the root's, which
+/// is the only one discovery reads (`None`: it is).
+fn unread_workspace(ctx: &DiscoverCtx<'_>, gowork: &str) -> Option<String> {
+    let root = ctx.disk_root();
+    let why = match go_workspace::resolve_with(root.unwrap_or(Path::new("")), Some(gowork)) {
+        GoWork::Invalid(why) => why,
+        GoWork::File(file) => {
+            let own = root.map(|r| r.join(GO_WORK)).filter(|own| own.is_file());
+            if own.is_some_and(|own| same_dir_key(&own) == same_dir_key(&file)) {
+                return None;
+            }
+            format!(
+                "GOWORK={gowork} names a workspace other than this directory's {GO_WORK}, \
+                 which discovery cannot read"
+            )
+        }
+        GoWork::None => return None,
+    };
+    Some(why)
+}
+
+/// Discovery under a workspace it cannot read: what it would find reported
+/// as unattested, never as refs.
+async fn withhold(ctx: &DiscoverCtx<'_>, out: &mut Discovery, why: &str) {
+    let mut found = Discovery::default();
+    extract_with(ctx, &mut found, true).await;
+    out.diagnostics.append(&mut found.diagnostics);
+    for r in found.refs {
+        let file = r.source_file.to_string_lossy().into_owned();
+        out.diag(
+            DIAG_REF_INVALID,
+            &file,
+            format!("{file}: the replace of {} is not attested: {why}", r.purl),
+        );
+    }
 }
 
 /// [`extract`], with `workspaces` false under `GOWORK=off`: go then ignores
@@ -1195,8 +1247,9 @@ mod tests {
                 assert_eq!(out.diagnostics.len(), 1, "{name}");
                 assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID, "{name}");
                 assert!(
-                    out.diagnostics[0].detail.contains("selects v1.5.0"),
-                    "{name}"
+                    out.diagnostics[0].detail.contains("v1.5.0"),
+                    "{name}: {:?}",
+                    out.diagnostics
                 );
             } else {
                 assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
@@ -1680,6 +1733,63 @@ mod tests {
 
         // Under GOWORK=off there is no workspace and no module here.
         assert_refs(&gowork_off(&p).await, &[]);
+    }
+
+    /// An explicit `GOWORK` other than the root's go.work (another file, or a
+    /// relative path go rejects) leaves the workspace unread: what discovery
+    /// finds is diagnosed, never a ref.
+    #[tokio::test]
+    async fn gowork_naming_another_workspace_attests_nothing() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let p = Project::new();
+        p.write("go.work", "go 1.21\n\nuse (\n\t./a\n\t./b\n)\n")
+            .write(
+                "a/go.mod",
+                format!(
+                    "module example.com/a\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n\n\
+                     replace {MODULE} {VERSION} => {m} {sver}\n"
+                ),
+            )
+            .write("a/go.sum", go_sum_for(UUID_A, sver))
+            .write("b/go.mod", "module example.com/b\n\ngo 1.21\n");
+        let extract = |gowork: Option<String>| {
+            let p = &p;
+            async move {
+                let ctx = p.ctx();
+                let mut out = Discovery::default();
+                super::extract_gowork(&ctx, &mut out, gowork.as_deref()).await;
+                out
+            }
+        };
+        let own = p.root().join("go.work").to_string_lossy().into_owned();
+        for gowork in [None, Some("auto".to_string()), Some(own)] {
+            let out = extract(gowork.clone()).await;
+            assert_eq!(out.refs.len(), 1, "{gowork:?}: {:?}", out.diagnostics);
+            assert!(
+                out.diagnostics.is_empty(),
+                "{gowork:?}: {:?}",
+                out.diagnostics
+            );
+        }
+        let elsewhere = p.root().join("a").join("go.work");
+        for (gowork, why) in [
+            ("go.work".to_string(), "not an absolute path"),
+            ("/nonexistent/go.work".to_string(), "other than"),
+            (elsewhere.to_string_lossy().into_owned(), "other than"),
+        ] {
+            let out = extract(Some(gowork.clone())).await;
+            assert!(out.refs.is_empty(), "{gowork}");
+            assert_eq!(out.diagnostics.len(), 1, "{gowork}: {:?}", out.diagnostics);
+            assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+            assert!(
+                out.diagnostics[0].detail.contains(why),
+                "{gowork}: {:?}",
+                out.diagnostics
+            );
+        }
+        let out = extract(Some("off".to_string())).await;
+        assert!(out.refs.is_empty() && out.diagnostics.is_empty());
     }
 
     /// In a workspace the socket module's zip line does not prove the

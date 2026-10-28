@@ -9,13 +9,18 @@
 //!   the requirements of every `use` member, so another member can raise a
 //!   module above the version a socket replace is pinned to. Each member's
 //!   go.mod adds its `require`s and its go.sum (and `go.work.sum`) the zip
-//!   lines a pre-1.17 graph is read from; a member whose go.mod could not be
-//!   read leaves the answer [`Selection::Unknown`].
+//!   lines a pre-1.17 graph is read from. go keeps no member's go.mod tidy
+//!   in workspace mode, so a member's dependency can raise the module past
+//!   every `require`; the zip line go writes for the version it builds is
+//!   the only trace, and one above the patched version proves it inert. A
+//!   member whose go.mod could not be read otherwise leaves the answer
+//!   [`Selection::Unknown`].
 //! * **Which replace wins** ([`GoWorkspace::conflict`]): go.work's replace
 //!   for this exact version, else its version-less one, overrides every
-//!   member's; otherwise each member's replace applies to the whole
-//!   workspace, and two members replacing one `module@version` with
-//!   different targets make go refuse to build.
+//!   member's; otherwise each member's replace (its exact one, else its
+//!   version-less one) applies to the whole workspace, and two members
+//!   replacing one `module@version` with different targets make go link
+//!   one of them or refuse to build, depending on the `use` order.
 
 use std::path::{Path, PathBuf};
 
@@ -182,6 +187,14 @@ pub enum WorkspaceConflict {
         member: String,
         target: String,
     },
+    /// Another `use` member (`member`) replaces every version of the module
+    /// with a different `target`: go links that target or refuses to build,
+    /// depending on the `use` order.
+    MemberWildcard {
+        work_file: String,
+        member: String,
+        target: String,
+    },
     /// The project is a go.work root with no module of its own: a replace
     /// belongs in a member's go.mod (`members`, comma-separated).
     NoModule { work_file: String, members: String },
@@ -214,6 +227,17 @@ impl WorkspaceConflict {
                  {target}: go refuses to build the {work_file} workspace (\"conflicting \
                  replacements\"); keep one replace for the whole workspace, in {work_file} \
                  or in one member's go.mod"
+            ),
+            WorkspaceConflict::MemberWildcard {
+                work_file,
+                member,
+                target,
+            } => format!(
+                "has no reliable effect: {member}/go.mod replaces every version of {module} \
+                 with {target}, so in the {work_file} workspace go either links {target} \
+                 instead of the patched copy or refuses to build (\"conflicting \
+                 replacements\"), depending on the `use` order; remove that replace, or keep \
+                 one replace for the whole workspace in {work_file}"
             ),
             WorkspaceConflict::NoModule { work_file, members } => format!(
                 "has nowhere to go: this directory holds {work_file} but no go.mod of its \
@@ -261,29 +285,12 @@ impl GoWorkspace {
     /// Which version of `module` the workspace build selects, against the
     /// patched `version`: [`go_build_list::select`] over the union of every
     /// member's requirements and the zip lines of their go.sum files and
-    /// go.work.sum. [`Selection::Unknown`] when a member's go.mod is
-    /// unread or there are no members.
+    /// go.work.sum, with a zip line above `version` outranking every
+    /// `require` (go builds a dependency's higher requirement without
+    /// tidying any member). [`Selection::Unknown`] when no such zip line
+    /// settles it and a member's go.mod is unread, or there are no members.
     pub fn selection(&self, module: &str, version: &str) -> Selection {
-        if self.members.is_empty() {
-            return Selection::Unknown;
-        }
-        let mut pruned = true;
-        let mut required: Option<String> = None;
         let mut zips: Vec<String> = Vec::new();
-        for member in &self.members {
-            let Some(go_mod) = member.go_mod.as_deref() else {
-                return Selection::Unknown;
-            };
-            pruned &= go_mod_edit::prunes_module_graph(go_mod);
-            if let Some(r) = go_mod_edit::parse_required_versions(go_mod).remove(module) {
-                if required
-                    .as_deref()
-                    .is_none_or(|cur| go_semver_cmp(&r, cur).is_gt())
-                {
-                    required = Some(r);
-                }
-            }
-        }
         for text in self
             .members
             .iter()
@@ -296,8 +303,38 @@ impl GoWorkspace {
                     .map(str::to_string),
             );
         }
+        let raised = zips
+            .iter()
+            .filter(|z| go_semver_cmp(z, version).is_gt())
+            .max_by(|a, b| go_semver_cmp(a, b))
+            .cloned();
+        let unproven = || raised.clone().map_or(Selection::Unknown, Selection::Other);
+        if self.members.is_empty() {
+            return unproven();
+        }
+        let mut pruned = true;
+        let mut required: Option<String> = None;
+        for member in &self.members {
+            let Some(go_mod) = member.go_mod.as_deref() else {
+                return unproven();
+            };
+            pruned &= go_mod_edit::prunes_module_graph(go_mod);
+            if let Some(r) = go_mod_edit::parse_required_versions(go_mod).remove(module) {
+                if required
+                    .as_deref()
+                    .is_none_or(|cur| go_semver_cmp(&r, cur).is_gt())
+                {
+                    required = Some(r);
+                }
+            }
+        }
         let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        go_build_list::select(pruned, required.as_deref(), &zips, version)
+        let selected = go_build_list::select(pruned, required.as_deref(), &zips, version);
+        match (raised, &selected) {
+            (Some(zip), Selection::Other(other)) if go_semver_cmp(other, &zip).is_ge() => selected,
+            (Some(zip), _) => Selection::Other(zip),
+            (None, _) => selected,
+        }
     }
 
     /// Whether this workspace keeps the replace `ours` of `module@version`
@@ -360,17 +397,35 @@ impl GoWorkspace {
                 .as_deref()
                 .map(go_mod_edit::parse_replace_entries)
                 .unwrap_or_default();
-            if let Some(other) = replaces.iter().find(|e| {
-                e.module == module
-                    && e.version.as_deref() == Some(version)
-                    && lexical_target(&member.dir, e) != our_target
-            }) {
-                return Some(WorkspaceConflict::MemberConflict {
-                    work_file: display,
-                    member: display_path(project_root, &member.dir),
-                    target: target_display(other),
-                });
-            }
+            let exact = replaces
+                .iter()
+                .find(|e| e.module == module && e.version.as_deref() == Some(version));
+            let applied = exact.or_else(|| {
+                replaces
+                    .iter()
+                    .find(|e| e.module == module && e.version.is_none())
+            });
+            let Some(other) = applied.filter(|e| lexical_target(&member.dir, e) != our_target)
+            else {
+                continue;
+            };
+            let (work_file, member, target) = (
+                display,
+                display_path(project_root, &member.dir),
+                target_display(other),
+            );
+            return Some(match exact {
+                Some(_) => WorkspaceConflict::MemberConflict {
+                    work_file,
+                    member,
+                    target,
+                },
+                None => WorkspaceConflict::MemberWildcard {
+                    work_file,
+                    member,
+                    target,
+                },
+            });
         }
         None
     }
@@ -407,13 +462,18 @@ impl Loaded {
 
 /// The directories whose go.mod a Go command run at `root` operates on:
 /// `root` itself when it holds a go.mod, else (a go.work root without a
-/// module of its own) each `use` member inside `root`.
+/// module of its own) each `use` member inside `root`, listed from the
+/// root's go.work even when `GOWORK` names another or an invalid one, so
+/// each member's own workspace check reports that.
 pub async fn module_roots(root: &Path) -> Vec<PathBuf> {
     if root.join("go.mod").is_file() {
         return vec![root.to_path_buf()];
     }
-    match load(root).await {
-        Loaded::Workspace(ws) if same_dir_key(ws.work_dir()) == same_dir_key(root) => ws
+    if resolve(root) == GoWork::None {
+        return Vec::new();
+    }
+    match load_file(root.join("go.work")).await {
+        Loaded::Workspace(ws) => ws
             .members_within(root)
             .into_iter()
             .filter(|(_, m)| m.go_mod.is_some())
@@ -602,12 +662,44 @@ mod tests {
             Selection::Other("v1.2.0".into())
         );
 
-        // An unreadable member (or one out of reach) proves nothing.
+        // go tidies no member in workspace mode: a go 1.17+ member's
+        // dependency raises the module past every `require`, and only the
+        // zip line go writes for the version it builds shows it.
+        member(root, "b", "1.21", "\nrequire example.com/mid v1.0.0\n");
+        assert_eq!(
+            workspace(root).await.selection(DEP, "v1.0.0"),
+            Selection::Other("v1.2.0".into())
+        );
+        std::fs::remove_file(root.join("go.work.sum")).unwrap();
+        write(root, "b/go.sum", &format!("{DEP} v1.2.0 h1:x=\n"));
+        assert_eq!(
+            workspace(root).await.selection(DEP, "v1.0.0"),
+            Selection::Other("v1.2.0".into())
+        );
+        // A lower zip line, or a higher `/go.mod` line MVS only read, is not.
+        write(
+            root,
+            "b/go.sum",
+            &format!("{DEP} v0.9.0 h1:x=\n{DEP} v1.2.0/go.mod h1:x=\n"),
+        );
+        assert_eq!(
+            workspace(root).await.selection(DEP, "v1.0.0"),
+            Selection::Selected
+        );
+
+        // An unreadable member (or one out of reach) proves nothing, unless
+        // a higher zip line does.
         std::fs::remove_file(root.join("b/go.mod")).unwrap();
         assert_eq!(
             workspace(root).await.selection(DEP, "v1.0.0"),
             Selection::Unknown
         );
+        write(root, "go.work.sum", &format!("{DEP} v1.2.0 h1:x=\n"));
+        assert_eq!(
+            workspace(root).await.selection(DEP, "v1.0.0"),
+            Selection::Other("v1.2.0".into())
+        );
+        std::fs::remove_file(root.join("go.work.sum")).unwrap();
         write(root, "go.work", "go 1.22\n");
         assert_eq!(
             workspace(root).await.selection(DEP, "v1.0.0"),
@@ -681,6 +773,42 @@ mod tests {
                 "{extra}"
             );
         }
+        // b replacing every version elsewhere: go links b's target or
+        // refuses, by `use` order. b's exact replace outranks its own
+        // version-less one.
+        member(
+            root,
+            "b",
+            "1.21",
+            &format!("{}\nreplace {DEP} => ../fork\n", require("v1.0.0")),
+        );
+        work("");
+        assert!(matches!(
+            conflict(&workspace(root).await),
+            Some(WorkspaceConflict::MemberWildcard { .. })
+        ));
+        member(
+            root,
+            "b",
+            "1.21",
+            &format!(
+                "{}\nreplace {DEP} => ../fork\nreplace {DEP} v1.0.0 => {hosted} v1.0.0-socketpatch.1\n",
+                require("v1.0.0")
+            ),
+        );
+        assert_eq!(conflict(&workspace(root).await), None);
+        // A go.work replace of this version settles it for every member.
+        member(
+            root,
+            "b",
+            "1.21",
+            &format!("{}\nreplace {DEP} => ../fork\n", require("v1.0.0")),
+        );
+        work(&format!(
+            "\nreplace {DEP} v1.0.0 => {hosted} v1.0.0-socketpatch.1\n"
+        ));
+        assert_eq!(conflict(&workspace(root).await), None);
+
         // The same hosted target in both members is one replacement.
         member(
             root,
