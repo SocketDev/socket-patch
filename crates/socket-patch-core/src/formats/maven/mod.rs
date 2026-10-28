@@ -77,7 +77,20 @@ pub(crate) struct PomScope {
 impl PomScope {
     /// Fails (fail-closed) on a pom that is not well-formed where it
     /// matters: no `<project>`, or an unterminated element or CDATA.
+    #[cfg(test)]
     pub(crate) fn new(raw: &str) -> Result<PomScope, String> {
+        PomScope::with_user_properties(raw, &BTreeMap::new())
+    }
+
+    /// [`Self::new`], with the user properties the build passes Maven
+    /// (`.mvn/maven.config`'s `-D`, see [`maven_config_properties`]): they
+    /// override a same-named pom property when a coordinate is
+    /// interpolated, as Maven's model interpolator reads them after the
+    /// model's own.
+    pub(crate) fn with_user_properties(
+        raw: &str,
+        user: &BTreeMap<String, String>,
+    ) -> Result<PomScope, String> {
         let masked = blank_non_markup(raw)?;
         if open_tags(&masked, "project")?.is_empty() || !masked.contains("</project>") {
             return Err("no <project> element".to_string());
@@ -92,9 +105,10 @@ impl PomScope {
         let profiles = elements(&masked, "profiles")?;
         let properties = properties(&masked, &ignored, &profiles)?;
         let mut coordinate_refs = properties.clone();
+        coordinate_refs.extend(user.iter().map(|(k, v)| (k.clone(), v.clone())));
         // A `project.*` / `pom.*` reference names the model, whatever a
         // same-named property says; the deprecated bare form yields to one.
-        for (name, value) in model_refs(&masked, &properties)? {
+        for (name, value) in model_refs(&masked, &coordinate_refs.clone())? {
             if name.starts_with("project.") || name.starts_with("pom.") {
                 coordinate_refs.insert(name, value);
             } else {
@@ -205,7 +219,13 @@ impl PomScope {
 /// unterminated element or CDATA section is an error (fail-closed: nothing
 /// is discovered from a pom that is not well-formed where it matters).
 pub(crate) fn parse_pom(raw: &str) -> Result<Pom, String> {
-    let scope = PomScope::new(raw)?;
+    parse_pom_with(raw, &BTreeMap::new())
+}
+
+/// [`parse_pom`] with the build's user properties (see
+/// [`PomScope::with_user_properties`]).
+pub(crate) fn parse_pom_with(raw: &str, user: &BTreeMap<String, String>) -> Result<Pom, String> {
+    let scope = PomScope::with_user_properties(raw, user)?;
     let text = &scope.masked;
     let managed = elements(text, "dependencyManagement")?;
     let mut pom = Pom::default();
@@ -449,6 +469,68 @@ pub(crate) fn may_name(coordinate: &str, want: &str) -> bool {
     true
 }
 
+/// The user properties a `maven.config` defines, as Maven 3.9+ reads it:
+/// one argument per line, `#` lines are comments (older Maven rejects
+/// them), and a wholly quoted argument is unquoted. A property is
+/// `-Dk=v`, `-D k=v`, `--define=k=v` or `--define k=v`, or a bare `-D` /
+/// `--define` whose `k=v` is the next line. The value is the rest of the
+/// argument, so `-Dv=1.0 # note` defines `1.0 # note`, as in Maven.
+/// `-Dk` sets `k=true`; a later definition wins. Maven before 3.9 splits
+/// the file on whitespace instead, so a `-Dk=v` token that only that reading
+/// finds (`-B -Dk=v` on one line) is kept too, unless a line defines `k`.
+pub(crate) fn maven_config_properties(config: &str) -> BTreeMap<String, String> {
+    // Java's `String.trim`: every char up to U+0020, nothing beyond.
+    fn trim(s: &str) -> &str {
+        s.trim_matches(|c: char| c <= ' ')
+    }
+    fn unquote(s: &str) -> &str {
+        s.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .map_or(s, trim)
+    }
+    let mut args = config
+        .lines()
+        .map(|line| unquote(trim(line)))
+        .filter(|arg| !arg.is_empty() && !arg.starts_with('#'))
+        .peekable();
+    let mut props = BTreeMap::new();
+    while let Some(arg) = args.next() {
+        let def = match arg.strip_prefix("--define") {
+            Some(rest) => rest
+                .strip_prefix('=')
+                .or_else(|| (rest.is_empty() || rest.starts_with(' ')).then_some(rest)),
+            None => arg.strip_prefix("-D"),
+        };
+        let Some(def) = def.map(trim) else {
+            continue;
+        };
+        let def = match def {
+            "" => match args.next_if(|next| !next.starts_with('-')) {
+                Some(next) => next,
+                None => continue,
+            },
+            def => def,
+        };
+        let (k, v) = def.split_once('=').unwrap_or((def, "true"));
+        if !k.is_empty() {
+            props.insert(k.to_string(), v.to_string());
+        }
+    }
+    let tokens = config
+        .lines()
+        .filter(|line| !trim(line).starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .filter_map(|t| t.strip_prefix("-D")?.split_once('='));
+    let mut legacy = BTreeMap::new();
+    for (k, v) in tokens {
+        if !k.is_empty() && !props.contains_key(k) {
+            legacy.insert(k.to_string(), v.to_string());
+        }
+    }
+    props.extend(legacy);
+    props
+}
+
 /// Whether a declaration Maven always reads (outside `<profiles>` when
 /// `in_profile` is false) whose coordinates are not `group:artifact` as
 /// written may still be that GA's main jar through an undefined coordinate
@@ -546,9 +628,6 @@ mod tests {
         assert!(PomScope::new("<!-- <project></project> -->").is_err());
     }
 
-    /// #683: a coordinate property the pom defines, or a project model
-    /// reference, is resolved; an undefined one may name only what its
-    /// literal text around it allows.
     #[test]
     fn exponential_property_expansion_is_capped() {
         // Each property names the previous one 40 times: uncapped, `${p6}`
@@ -575,6 +654,9 @@ mod tests {
         assert!(group.contains("${"), "left unresolved, so it fails closed");
     }
 
+    /// #683: a coordinate property the pom defines, or a project model
+    /// reference, is resolved; an undefined one may name only what its
+    /// literal text around it allows.
     #[test]
     fn coordinate_references() {
         let pom = "<project><parent><groupId>org.parent</groupId><version>9</version></parent>\

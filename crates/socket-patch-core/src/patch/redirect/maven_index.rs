@@ -119,9 +119,14 @@ fn authored_element(text: &str, at: usize, name: &str) -> Element {
 }
 
 impl PomIndex {
-    /// Fails (fail-closed) when the pom is not readable as one.
-    pub(super) fn build(pom: &str) -> Result<PomIndex, String> {
-        let scope = PomScope::new(pom)?;
+    /// Fails (fail-closed) when the pom is not readable as one. `user` is
+    /// the build's `.mvn/maven.config` user properties (see
+    /// [`PomScope::with_user_properties`]).
+    pub(super) fn build(
+        pom: &str,
+        user: &std::collections::BTreeMap<String, String>,
+    ) -> Result<PomIndex, String> {
+        let scope = PomScope::with_user_properties(pom, user)?;
         let masked = &scope.masked;
         let deps = scope
             .dependencies()?
@@ -444,7 +449,7 @@ mod tests {
     /// After any sequence of the rewriter's edits, the kept index is the
     /// index a fresh build of the edited pom reads.
     fn assert_in_step(index: &PomIndex, pom: &str) {
-        let fresh = PomIndex::build(pom).expect("the edited pom reads");
+        let fresh = PomIndex::build(pom, &Default::default()).expect("the edited pom reads");
         let key = |i: &PomIndex| {
             let mut deps: Vec<_> = i
                 .deps
@@ -487,7 +492,7 @@ mod tests {
             "<project>\n  <dependencyManagement>\n  </dependencyManagement>\n  <dependencies>\n    <dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version></dependency>\n  </dependencies>\n</project>\n",
         ] {
             let mut pom = pom.to_string();
-            let mut index = PomIndex::build(&pom).unwrap();
+            let mut index = PomIndex::build(&pom, &Default::default()).unwrap();
             let [i] = index.matches("g", "a")[..] else {
                 panic!("one match");
             };
@@ -517,7 +522,7 @@ mod tests {
                 let mut pom = format!(
                     "<project>\n  <dependencies>\n    <dependency><groupId>g</groupId><artifactId>a</artifactId></dependency>\n  </dependencies>\n  {tail}</project>\n"
                 );
-                let mut index = PomIndex::build(&pom).unwrap();
+                let mut index = PomIndex::build(&pom, &Default::default()).unwrap();
                 if dm_first {
                     index.insert_dependency_management(&mut pom, "g", "a", "1-socket.1");
                     assert_in_step(&index, &pom);

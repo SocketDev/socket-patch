@@ -8590,8 +8590,17 @@ fn rewrite_maven_pom(
     // unchanged (a no-op rescan then never re-scans the pom per dep).
     // The hosted rewriter's view of the pom, read once (through `PomScope`)
     // and kept in step with every edit below.
-    let mut index: Option<Result<maven_index::PomIndex, String>> =
-        pom.as_deref().map(maven_index::PomIndex::build);
+    // `.mvn/maven.config`'s `-D` user properties win over the pom's own
+    // when Maven interpolates a coordinate.
+    let user_properties = crate::formats::maven::maven_config_properties(
+        files
+            .get(MVN_CONFIG)
+            .map(String::as_str)
+            .unwrap_or_default(),
+    );
+    let mut index: Option<Result<maven_index::PomIndex, String>> = pom
+        .as_deref()
+        .map(|pom| maven_index::PomIndex::build(pom, &user_properties));
     let original_repos: Vec<(String, Option<String>)> = match (&index, pom.as_deref()) {
         (Some(Ok(index)), Some(pom)) => index.repository_ids_and_urls(pom),
         _ => Vec::new(),
@@ -10198,6 +10207,45 @@ mod tests {
                 r.warnings
             );
         }
+    }
+
+    /// `.mvn/maven.config`'s `-D` user properties override the pom's own
+    /// when Maven interpolates a coordinate: one naming another group is
+    /// not this GA (its literal is left alone), and one defining a property
+    /// the pom lacks makes the declaration this GA.
+    #[test]
+    fn maven_pom_coordinate_properties_read_maven_config_overrides() {
+        let pom = |props: &str| {
+            format!(
+                "<project>\n  <properties>{props}</properties>\n  <dependencies>\n    <dependency><groupId>${{g}}</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version></dependency>\n  </dependencies>\n</project>\n"
+            )
+        };
+        let mut files = BTreeMap::new();
+        files.insert("pom.xml".to_string(), pom("<g>org.slf4j</g>"));
+        files.insert(MVN_CONFIG.to_string(), "-Dg=com.acme.fork\n".to_string());
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains("<groupId>${g}</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version>"),
+            "the com.acme.fork declaration keeps its version: {out}"
+        );
+
+        let mut files = BTreeMap::new();
+        files.insert("pom.xml".to_string(), pom(""));
+        files.insert(MVN_CONFIG.to_string(), "-Dg=org.slf4j\n".to_string());
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains(&format!(
+                "<groupId>${{g}}</groupId><artifactId>slf4j-api</artifactId><version>{MAVEN_SUFFIXED}</version>"
+            )) && !out.contains("<dependencyManagement>"),
+            "the maven.config-defined GA is pinned directly: {out}"
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_maven_coordinate_unresolved"),
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// A versioned declaration whose groupId / artifactId is a property

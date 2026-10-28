@@ -104,8 +104,8 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
-    is_maven_coordinate, is_maven_version_text, may_shadow, parse_pom, split_socket_version, Pom,
-    PomDep, PomRepo,
+    is_maven_coordinate, is_maven_version_text, maven_config_properties, may_shadow,
+    parse_pom_with, split_socket_version, Pom, PomDep, PomRepo,
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
 use crate::utils::digest::sha256_hex;
@@ -128,7 +128,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Some(raw) = ctx.read_text(POM, out).await else {
         return;
     };
-    let pom = match parse_pom(&raw) {
+    // `.mvn/maven.config`'s `-D` user properties win over the pom's own
+    // when Maven interpolates a coordinate.
+    let user_properties = match ctx.read_text(MVN_CONFIG, out).await {
+        Some(config) => maven_config_properties(&config),
+        None => BTreeMap::new(),
+    };
+    let pom = match parse_pom_with(&raw, &user_properties) {
         Ok(pom) => pom,
         Err(e) => {
             out.diag(
@@ -1368,6 +1374,36 @@ mod tests {
             );
             let out = run(&pinned).await;
             assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        }
+    }
+
+    /// `.mvn/maven.config`'s `-D` user properties override the pom's own
+    /// when Maven interpolates a coordinate: a suffixed pin on a
+    /// declaration that Maven reads as another group is not this GA's.
+    #[tokio::test]
+    async fn coordinate_properties_read_maven_config_overrides() {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        for (props, config, attested) in [
+            ("<g>org.slf4j</g>", "-Dg=com.acme.fork\n", false),
+            ("", "-Dg=org.slf4j\n", true),
+        ] {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<properties>{props}</properties>\n<dependencies>\n{}</dependencies>\n\
+                     <repositories>\n{repo}</repositories>\n",
+                    dep("${g}", "slf4j-api", Some(&suffixed(UUID_A))),
+                )),
+            );
+            p.write(".mvn/maven.config", config);
+            let out = run(&p).await;
+            let slf4j = out.refs.iter().any(|r| r.purl == FX_PURL);
+            assert_eq!(
+                slf4j, attested,
+                "{config}: {:?} {:?}",
+                out.refs, out.diagnostics
+            );
         }
     }
 

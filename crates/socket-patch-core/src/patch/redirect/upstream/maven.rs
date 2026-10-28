@@ -21,6 +21,8 @@
 //! Checksum lines keep the file's remaining order (the rewriter re-sorted
 //! and dropped malformed lines; that is not recoverable).
 
+use std::collections::BTreeMap;
+
 use regex::Regex;
 
 use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
@@ -159,6 +161,7 @@ fn remove_repository(pom: &str, uuid: &str, ctx: &Ctx<'_>) -> Result<String, Str
 /// Restore one pin in `pom`, or say why not.
 fn restore_pin(
     pom: &str,
+    user_properties: &BTreeMap<String, String>,
     group: &str,
     artifact: &str,
     base: &str,
@@ -168,7 +171,8 @@ fn restore_pin(
     let suffixed = format!("{base}-socket.{}", &uuid[..8]);
     let mut text = remove_repository(pom, uuid, ctx)?;
 
-    let scoped = crate::formats::maven::PomScope::new(&text).and_then(|s| s.dependencies());
+    let scoped = crate::formats::maven::PomScope::with_user_properties(&text, user_properties)
+        .and_then(|s| s.dependencies());
     let matches = dep_matches(&text, scoped.as_deref().ok(), group, artifact);
     if !matches
         .iter()
@@ -301,6 +305,12 @@ pub(crate) async fn restore(
             })
             .collect();
         let mut text = original.clone();
+        // `.mvn/maven.config`'s `-D` user properties, which Maven reads over
+        // the pom's own when it interpolates a coordinate.
+        let user_properties = match view.read(&format!("{dir}{MVN_CONFIG}")).await {
+            Ok(Some(config)) => crate::formats::maven::maven_config_properties(&config),
+            _ => BTreeMap::new(),
+        };
         // Checksum-file path prefixes of the restored pins.
         let mut checksum_dirs: Vec<String> = Vec::new();
         let mut restored: Vec<&str> = Vec::new();
@@ -339,7 +349,15 @@ pub(crate) async fn restore(
                 );
                 continue;
             }
-            match restore_pin(&text, group, artifact, &base, &pin.uuid, ctx) {
+            match restore_pin(
+                &text,
+                &user_properties,
+                group,
+                artifact,
+                &base,
+                &pin.uuid,
+                ctx,
+            ) {
                 Ok(next) => {
                     text = next;
                     checksum_dirs.push(format!(
