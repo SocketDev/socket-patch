@@ -1510,6 +1510,14 @@ the workspace shares into `go.work`, as `go work edit -replace` would: when
 that directory has no `go.mod` of its own (the usual layout), when another
 `use` member lists the module (requires it, or for a go < 1.17 member has its
 zip line in `go.sum`), or when `go.work` already holds a Socket replace of it.
+The last two need `go.work` to `use` that directory's own module: for one it
+doesn't use, a `go.work` replace would patch the members and never the
+module, so the `go.mod` replace is refused (below). A replace onto a
+`.socket/` copy that `go.mod` holds from before another member listed the
+module moves into `go.work` the next time `apply` or `vendor` writes it (a
+`vendor` takeover then deletes the `.socket/go-patches/` copy no file names
+any more); a hosted pin there stays, its sum lines beside it, and in
+workspace mode the `go.work` replace overrides it.
 One `go.work` replace applies to every member. Member replaces of one
 project-local copy would not: go resolves each against its own member
 directory, sees two targets and refuses the workspace. The target is
@@ -1584,7 +1592,8 @@ source `go.work`, hosted pins checked against `go.work.sum`), `remove` and
 ledger records the wiring file as `go.work`), and `rollback` of a hosted pin
 removes the `go.work` replace and the Socket lines of `go.work.sum`, deletes a
 `go.work.sum` the pin alone created, and puts the upstream pair back only
-where no sum file still holds it. A committed workspace `vendor/` directory
+where no sum file still holds it (a member's `go.mod` pin rolled back with it
+gets the pair back in that member's `go.sum`, as every `go.mod` pin does). A committed workspace `vendor/` directory
 needs `go work vendor` after any of these
 (`go_vendor_modules_txt_out_of_sync`). Discovery also reads each in-root
 member's `go.mod` at a `go.work` root without one of its own (pins an older

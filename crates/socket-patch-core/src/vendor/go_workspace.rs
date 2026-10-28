@@ -527,22 +527,26 @@ impl GoWorkspace {
 
     /// Which file holds the Socket replace of `module` for the project at
     /// `root` (`root_has_go_mod`: it is a module itself): go.work when it
-    /// sits in `root` and the root has no module, go.work already holds a
-    /// Socket replace of `module`, or another member lists `module`.
+    /// sits in `root` and the root has no module, or the root module is a
+    /// `use` member and go.work already holds a Socket replace of `module`
+    /// or another member lists `module`. A root module go.work doesn't use
+    /// keeps go.mod, whose replace [`GoWorkspace::conflict`] refuses: a
+    /// go.work replace would patch the members, never the project.
     pub fn replace_host(&self, root: &Path, root_has_go_mod: bool, module: &str) -> ReplaceHost {
         if !self.rooted_at(root) {
             return ReplaceHost::GoMod;
         }
         let own = same_dir_key(root);
-        let shared = !root_has_go_mod
-            || self
-                .replaces()
-                .iter()
-                .any(|e| e.module == module && e.socket_owned())
-            || self
-                .members
-                .iter()
-                .any(|m| same_dir_key(&m.dir) != own && m.lists(module));
+        let root_is_member = self.members.iter().any(|m| same_dir_key(&m.dir) == own);
+        let ours_here = self
+            .replaces()
+            .iter()
+            .any(|e| e.module == module && e.socket_owned());
+        let listed_elsewhere = self
+            .members
+            .iter()
+            .any(|m| same_dir_key(&m.dir) != own && m.lists(module));
+        let shared = !root_has_go_mod || (root_is_member && (ours_here || listed_elsewhere));
         if shared {
             ReplaceHost::GoWork
         } else {
@@ -1418,6 +1422,17 @@ mod tests {
             ),
         );
         assert_eq!(replace_host(root, DEP).await, ReplaceHost::GoWork);
+        // A root module go.work doesn't use keeps go.mod (refused there).
+        write(
+            root,
+            "go.work",
+            &format!(
+                "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n\nreplace {DEP} v1.0.0 => \
+                 ./.socket/go-patches/{DEP}@v1.0.0\n"
+            ),
+        );
+        member(root, "a", "1.21", &require("v1.0.0"));
+        assert_eq!(replace_host(root, DEP).await, ReplaceHost::GoMod);
         assert_eq!(
             load_with(root, Some("off"))
                 .await

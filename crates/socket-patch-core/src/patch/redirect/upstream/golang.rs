@@ -8,10 +8,11 @@
 //! (a go.work root without a module of its own), or the root go.work. Its
 //! sum lines live where go verifies them: beside a go.mod its go.sum, and
 //! in workspace mode `go.work.sum` (go writes there itself) and the
-//! members' go.sum files. The upstream pair goes back into each sum file
-//! that held the socket pair, else beside the directive, unless a sum file
-//! still holds it (a go.work pin never prunes it); a go.work.sum left empty
-//! was created for the pin and is removed.
+//! members' go.sum files. The upstream pair goes back into the go.sum
+//! beside a go.mod directive (its pin pruned it there); for a go.work
+//! directive, which prunes nothing, only when no sum file holds it, into
+//! each that held the socket pair, else go.work.sum. A go.work.sum left
+//! empty was created for the pin and is removed.
 //!
 //! A directive the hosted run took over from the user (a pre-existing
 //! `replace` it superseded) is not recorded anywhere, so the restore always
@@ -101,6 +102,9 @@ pub(crate) async fn restore(
     if hits.is_empty() {
         return result;
     }
+    // go.work last: the members' go.sum then hold what their own pins'
+    // restores put back.
+    hits.sort_by_key(|h| h.file == GO_WORK);
     let keys: BTreeSet<(String, String)> = hits
         .iter()
         .map(|h| (h.module.clone(), h.version.clone()))
@@ -179,18 +183,18 @@ pub(crate) async fn restore(
                 held.push(sum.clone());
             }
         }
-        // A go.work pin leaves the original's pair where it was (the
-        // members' go.sum keep it for module-mode builds): nothing to put
-        // back.
-        let kept_upstream = candidates.iter().any(|sum| {
+        // A go.mod pin pruned the pair from the go.sum beside it, which alone
+        // needs it back (go.work.sum only held the socket pair for workspace
+        // builds). A go.work pin prunes nothing: the members' go.sum keep the
+        // pair for module-mode builds.
+        let targets = if hit.file != GO_WORK {
+            vec![candidates[0].clone()]
+        } else if candidates.iter().any(|sum| {
             matches!(sum_texts.get(sum), Some(Some(text)) if go_sum_lines(text)
                 .any(|l| l.zip_version_of(&hit.module) == Some(hit.version.as_str())))
-        });
-        if kept_upstream {
-            result.handled.insert(hit.uuid.clone());
-            continue;
-        }
-        let targets = if held.is_empty() {
+        }) {
+            Vec::new()
+        } else if held.is_empty() {
             let own = candidates[0].clone();
             let existing = candidates
                 .iter()

@@ -25,9 +25,8 @@ use crate::patch::redirect::golang_local::{
     are_safe_redirect_coords, copy_dir_for, ensure_module_go_mod,
 };
 use crate::utils::purl::{parse_golang_purl, strip_purl_qualifiers};
-use crate::vendor::go_mod_edit::{
-    self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
-};
+use crate::vendor::go_mod_edit::{self, replace_target_path, ReplaceOwner, GO_PATCHES_DIR};
+use crate::vendor::go_workspace::ReplaceHost;
 
 use super::common::{
     already_patched_result, copy_matches_after_hashes, done, inventory_or_warn,
@@ -55,6 +54,8 @@ struct GoPrelude {
     takeover: bool,
     hosted_takeover: bool,
     prior_target: Option<String>,
+    /// The file `prior_target` was read from.
+    prior_file: Option<ReplaceHost>,
     wired: bool,
     wired_version_ok: bool,
     copy_dir: PathBuf,
@@ -108,10 +109,9 @@ async fn go_prelude(
     // the prior target (path, or `<module> <version>` for hosted) becomes the
     // wiring record's `original` — revert keys its hosted-takeover warning on
     // that text's namespace prefix, so it must be recorded faithfully.
-    let prior = read_replace_entries(project_root)
+    let (prior_file, prior) = go_mod_edit::superseded_replace(project_root, module)
         .await
-        .into_iter()
-        .find(|e| e.module == module && e.socket_owned());
+        .unzip();
     let takeover = prior
         .as_ref()
         .is_some_and(|e| e.owner == Some(ReplaceOwner::GoPatches));
@@ -158,6 +158,7 @@ async fn go_prelude(
         takeover,
         hosted_takeover,
         prior_target,
+        prior_file,
         wired,
         wired_version_ok,
         copy_dir,
@@ -236,6 +237,7 @@ pub async fn vendor_go_module<'a>(
         takeover,
         hosted_takeover,
         prior_target,
+        prior_file,
         wired,
         wired_version_ok,
         copy_dir,
@@ -411,6 +413,31 @@ pub async fn vendor_go_module<'a>(
     write_marker_or_warn(&project_root.join(&base_rel), &marker, &mut warnings).await;
 
     let host = super::go_workspace::replace_host(project_root, module).await;
+    let new_target = serde_json::Value::from(replace_target_path(&base_rel, module, version));
+    let wire = |file: ReplaceHost, action, original: Option<String>, new| WiringRecord {
+        file: file.file_name().to_string(),
+        kind: "go_replace".to_string(),
+        action,
+        key: Some(module.to_string()),
+        original: original.map(serde_json::Value::from),
+        new,
+    };
+    // Rewritten whenever ANY socket-owned directive pre-existed (a go-patches
+    // or hosted takeover, or a re-vendor refreshing an older uuid); one moved
+    // out of the root go.mod is recorded there.
+    let wiring = match prior_file.zip(prior_target) {
+        Some((file, original)) if file == host => vec![wire(
+            host,
+            WiringAction::Rewritten,
+            Some(original),
+            Some(new_target),
+        )],
+        Some((file, original)) => vec![
+            wire(host, WiringAction::Added, None, Some(new_target)),
+            wire(file, WiringAction::Rewritten, Some(original), None),
+        ],
+        None => vec![wire(host, WiringAction::Added, None, Some(new_target))],
+    };
     let entry = VendorEntry {
         took_over_go_patches: takeover,
         ..VendorEntry::new(
@@ -425,23 +452,7 @@ pub async fn vendor_go_module<'a>(
                 platform_locked: None,
                 file_inventory,
             },
-            vec![WiringRecord {
-                file: host.file_name().to_string(),
-                kind: "go_replace".to_string(),
-                // Rewritten whenever ANY socket-owned directive pre-existed (a
-                // go-patches or hosted takeover, or a re-vendor refreshing an
-                // older uuid).
-                action: if prior_target.is_some() {
-                    WiringAction::Rewritten
-                } else {
-                    WiringAction::Added
-                },
-                key: Some(module.to_string()),
-                original: prior_target.map(serde_json::Value::from),
-                new: Some(serde_json::Value::from(replace_target_path(
-                    &base_rel, module, version,
-                ))),
-            }],
+            wiring,
         )
     };
 
@@ -734,6 +745,7 @@ mod tests {
     use crate::patch::apply::ApplyResult;
     use crate::patch::apply::MismatchPolicy;
     use crate::patch::redirect::golang_local::apply_go_redirect;
+    use crate::vendor::go_mod_edit::read_replace_entries;
     use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1114,6 +1126,88 @@ mod tests {
                 "./.socket/go-patches/github.com/foo/bar@v1.4.2"
             )),
             "the old replace target is recorded verbatim"
+        );
+    }
+
+    /// An `apply` redirect written into the root go.mod while only the root
+    /// listed the module, taken over once another `use` member lists it:
+    /// the replace moves into go.work (no go.mod line is left naming the
+    /// deleted go-patches copy), the ledger records the go.mod original
+    /// against go.mod, and revert leaves neither file replacing the module.
+    #[tokio::test]
+    async fn test_takeover_moves_a_root_go_mod_redirect_into_go_work() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let go_mod = std::fs::read_to_string(root.join("go.mod")).unwrap();
+        let work = "go 1.22\n\nuse (\n\t.\n\t./b\n)\n";
+        std::fs::write(root.join("go.work"), work).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("b/go.mod"), "module example.com/b\n\ngo 1.21\n").unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+        let pre = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &record.files,
+            &sources,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(pre.success, "fixture redirect failed: {:?}", pre.error);
+        let stale = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        let go_patches = "./.socket/go-patches/github.com/foo/bar@v1.4.2";
+        assert!(std::fs::read_to_string(root.join("go.mod"))
+            .unwrap()
+            .contains(go_patches));
+        assert_eq!(std::fs::read_to_string(root.join("go.work")).unwrap(), work);
+
+        std::fs::write(
+            root.join("b/go.mod"),
+            format!("module example.com/b\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+        )
+        .unwrap();
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(warnings.iter().any(|w| w.code == "vendor_takeover"));
+        assert!(!stale.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.mod")).unwrap(),
+            go_mod
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.work")).unwrap(),
+            format!("{work}\nreplace {MODULE} {VERSION} => ./{}\n", copy_rel())
+        );
+        let entry = entry.unwrap();
+        assert!(entry.took_over_go_patches);
+        let wiring: Vec<_> = entry
+            .wiring
+            .iter()
+            .map(|w| (w.file.as_str(), w.action, w.original.clone()))
+            .collect();
+        assert_eq!(
+            wiring,
+            vec![
+                ("go.work", WiringAction::Added, None),
+                (
+                    "go.mod",
+                    WiringAction::Rewritten,
+                    Some(serde_json::Value::from(go_patches))
+                ),
+            ]
+        );
+
+        let out = revert_go_vendor(&entry, root, false).await;
+        assert!(out.success, "{:?}", out.error);
+        assert_eq!(std::fs::read_to_string(root.join("go.work")).unwrap(), work);
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.mod")).unwrap(),
+            go_mod
         );
     }
 

@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use crate::patch::path_safety::is_canonical_uuid;
 
 use crate::utils::fs::read_regular_to_string;
+use crate::vendor::go_workspace::ReplaceHost;
 
 /// Project-relative directory holding `apply`'s patched module copies. A
 /// `replace` whose target path is under this prefix is owned by
@@ -180,8 +181,12 @@ pub async fn read_required_versions(project_root: &Path) -> Option<HashMap<Strin
 /// `go.work` (the same target text: it is relative to the project root
 /// either way). Idempotent. An existing socket-owned line for `module` — of
 /// EITHER owner — is rewritten in place (the cross-owner case is `vendor`
-/// taking over an `apply` redirect). Returns whether the file changed.
-/// Errors (without writing) if the file is absent, or if a *user-authored*
+/// taking over an `apply` redirect). A replace onto a project-local copy
+/// that the root `go.mod` still holds when the host is `go.work` (written
+/// before another member listed the module) moves into `go.work` with it:
+/// left behind it would name a copy a takeover deletes. Returns whether a
+/// file changed. Errors (without writing) if the file is absent, or if a
+/// *user-authored*
 /// `replace` already pins the same `module`+`version` (a duplicate would
 /// make the file invalid), or if the `go.work` in effect would override,
 /// ignore or reject the replace
@@ -201,10 +206,83 @@ pub async fn ensure_replace_entry(
         return Err(refusal);
     }
     let host = crate::vendor::go_workspace::replace_host(project_root, module).await;
-    edit_file(&project_root.join(host.file_name()), dry_run, |c| {
+    let host_path = project_root.join(host.file_name());
+    let upsert = plan_edit(&host_path, |c| {
         upsert_replace_entry(c, module, version, base_rel)
     })
-    .await
+    .await?;
+    let go_mod = go_mod_path(project_root);
+    let moved = if host == ReplaceHost::GoWork && go_mod.is_file() {
+        plan_edit(&go_mod, |c| remove_local_copy_replaces(c, module)).await?
+    } else {
+        None
+    };
+    let changed = upsert.is_some() || moved.is_some();
+    if !dry_run {
+        // go.mod first: a failed go.work write then leaves the module
+        // unpatched rather than replaced onto a copy that may be gone.
+        if let Some(new) = moved {
+            write_go_file(&go_mod, &new).await?;
+        }
+        if let Some(new) = upsert {
+            write_go_file(&host_path, &new).await?;
+        }
+    }
+    Ok(changed)
+}
+
+/// The socket-owned replace of `module` that [`ensure_replace_entry`] will
+/// rewrite or move, and the file holding it: the replace host's own, else,
+/// for a `go.work` host, one onto a project-local copy in the root
+/// `go.mod`. A hosted pin left in `go.mod` keeps its go.sum pair beside it
+/// and is not superseded.
+pub async fn superseded_replace(
+    project_root: &Path,
+    module: &str,
+) -> Option<(ReplaceHost, ReplaceEntry)> {
+    let host = crate::vendor::go_workspace::replace_host(project_root, module).await;
+    let in_file = |host: ReplaceHost| async move {
+        read_regular_to_string(&project_root.join(host.file_name()))
+            .await
+            .map(|c| parse_replace_entries(&c))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.module == module)
+            .collect::<Vec<_>>()
+    };
+    if let Some(e) = in_file(host)
+        .await
+        .into_iter()
+        .find(ReplaceEntry::socket_owned)
+    {
+        return Some((host, e));
+    }
+    if host != ReplaceHost::GoWork {
+        return None;
+    }
+    in_file(ReplaceHost::GoMod)
+        .await
+        .into_iter()
+        .find(|e| {
+            matches!(
+                e.owner,
+                Some(ReplaceOwner::GoPatches | ReplaceOwner::Vendor)
+            )
+        })
+        .map(|e| (ReplaceHost::GoMod, e))
+}
+
+/// Drop every replace of `module` onto a project-local Socket copy (either
+/// owner).
+fn remove_local_copy_replaces(content: &str, module: &str) -> Result<Option<String>, String> {
+    let mut out: Option<String> = None;
+    for owner in [ReplaceOwner::GoPatches, ReplaceOwner::Vendor] {
+        if let Some(next) = remove_replace_entry(out.as_deref().unwrap_or(content), module, owner)?
+        {
+            out = Some(next);
+        }
+    }
+    Ok(out)
 }
 
 /// Remove the `replace` directive(s) for `module` owned by `owner` (pruning an
@@ -249,24 +327,37 @@ async fn edit_file(
     dry_run: bool,
     transform: impl FnOnce(&str) -> Result<Option<String>, String>,
 ) -> Result<bool, String> {
-    let content = read_regular_to_string(path)
-        .await
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    match transform(&content)? {
+    match plan_edit(path, transform).await? {
         None => Ok(false),
         Some(new) => {
             if !dry_run {
-                // go.mod is user-owned (their own require/replace directives and
-                // comments live alongside our socket `replace`) — a torn write
-                // would corrupt a manifest that no longer builds, and the swap
-                // must keep the file's permission bits.
-                crate::utils::fs::atomic_write_bytes_preserving_mode(path, new.as_bytes())
-                    .await
-                    .map_err(|e| format!("write {}: {e}", path.display()))?;
+                write_go_file(path, &new).await?;
             }
             Ok(true)
         }
     }
+}
+
+/// [`edit_file`]'s read and transform: the new content, or `None` when it
+/// is unchanged.
+async fn plan_edit(
+    path: &Path,
+    transform: impl FnOnce(&str) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    let content = read_regular_to_string(path)
+        .await
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    transform(&content)
+}
+
+async fn write_go_file(path: &Path, new: &str) -> Result<(), String> {
+    // go.mod is user-owned (their own require/replace directives and
+    // comments live alongside our socket `replace`) — a torn write
+    // would corrupt a manifest that no longer builds, and the swap
+    // must keep the file's permission bits.
+    crate::utils::fs::atomic_write_bytes_preserving_mode(path, new.as_bytes())
+        .await
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 // ── pure reader ────────────────────────────────────────────────────────────
@@ -1847,6 +1938,26 @@ replace (
         assert!(std::fs::read_to_string(root.join("go.mod"))
             .unwrap()
             .contains(line));
+
+        // Once a member lists it too, the go.mod replace moves to go.work.
+        std::fs::write(
+            root.join("a/go.mod"),
+            "module example.com/a\n\ngo 1.21\n\nrequire example.com/m v1.0.0\n",
+        )
+        .unwrap();
+        assert!(
+            ensure_replace_entry(root, "example.com/m", "v1.0.0", GO_PATCHES_DIR, false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.work")).unwrap(),
+            format!("{work}\n{line}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("go.mod")).unwrap(),
+            go_mod
+        );
     }
 
     #[tokio::test]
