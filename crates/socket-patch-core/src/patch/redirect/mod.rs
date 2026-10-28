@@ -604,6 +604,7 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
         &std::collections::BTreeSet::new(),
         &yarnrc::OuterYarnMirror::default(),
         &CratesIoSource::Registry,
+        &[],
     )
 }
 
@@ -684,6 +685,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
+    go_members: &[crate::vendor::go_build_list::ModuleEvidence],
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
     let overrides = withhold_pypi_platform_wheels(overrides, &mut result);
@@ -711,6 +713,7 @@ pub fn rewrite_registry_redirect_withholding_vlt(
         gradle_unreadable,
         yarn_outer,
         cargo_outer,
+        go_members,
     );
     let mut result = rewrite_groups_parallel(result, &groups);
     result.vlt_drives = vlt::vlt_drives(files, bun_lockb_present);
@@ -739,6 +742,7 @@ fn rewriter_groups<'a>(
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
     yarn_outer: &'a yarnrc::OuterYarnMirror,
     cargo_outer: &'a CratesIoSource,
+    go_members: &'a [crate::vendor::go_build_list::ModuleEvidence],
 ) -> Vec<RewriterGroup<'a>> {
     vec![
         Box::new(move |result| {
@@ -765,7 +769,7 @@ fn rewriter_groups<'a>(
         Box::new(move |result| {
             gradle::rewrite_gradle_hosted(files, gradle_unreadable, overrides, result)
         }),
-        Box::new(move |result| rewrite_golang(files, overrides, result)),
+        Box::new(move |result| rewrite_golang(files, overrides, go_members, result)),
         Box::new(move |result| {
             sbt::rewrite_sbt(files, overrides, result);
             scala_guidance::warn(files, overrides, result);
@@ -2827,7 +2831,8 @@ fn is_repinnable_registry_name(value: &str) -> bool {
 /// The `socket-patch-<uuid>` registry name pinning `crate_name` in this
 /// manifest, in EVERY declaration shape [`plan_cargo_toml`] writes: a
 /// `[…dependencies.<key>]` header table (whose pin is a standalone
-/// `registry = …` line), an inline table, a quoted key, and a rename
+/// `registry = …` line), an inline table, dotted keys (`<key>.registry`,
+/// read at the end of their table, #757), a quoted key, and a rename
 /// (`package = "<crate>"` under any key). Readers that probe for a LIVE
 /// hosted redirect use this rather than a single-line regex, which saw only
 /// the inline spelling and read the other three as "not redirected".
@@ -2839,12 +2844,30 @@ fn is_repinnable_registry_name(value: &str) -> bool {
 pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Option<String> {
     let lines: Vec<&str> = content.split('\n').collect();
     let mut section = CargoTomlSection::Other;
+    // Past the last line of a multi-line inline table (#757).
+    let mut skip_until = 0;
+    // The current dependency table's dotted keys, read at its end (#757).
+    let mut dotted = CargoDottedDecls::default();
+    let dotted_pin = |dotted: &mut CargoDottedDecls| {
+        dotted
+            .take()
+            .into_iter()
+            .filter_map(|(key, fields)| cargo_dotted_pin(key, &fields))
+            .find(|(owner, _)| owner == crate_name)
+            .map(|(_, registry)| registry)
+    };
     for (idx, raw) in lines.iter().enumerate() {
+        if idx < skip_until {
+            continue;
+        }
         let trimmed = raw.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            if let Some(registry) = dotted_pin(&mut dotted) {
+                return Some(registry);
+            }
             section = match CARGO_TOML_HEADER_RE.captures(trimmed) {
                 Some(c) => classify_cargo_section(
                     c.get(1)
@@ -2894,19 +2917,10 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
             continue;
         };
         let rest_trim = rest.trim_start();
-        if let Some(dotted) = rest_trim.strip_prefix('.') {
-            // `<crate>.registry = "socket-patch-…"`: a spelling this rewriter
-            // refuses to write, but a hand edit can leave one behind.
-            if key == crate_name {
-                let registry = parse_cargo_entry_key(dotted)
-                    .filter(|(key, _)| key == "registry")
-                    .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
-                    .and_then(cargo_toml_string)
-                    .filter(|registry| is_socket_patch_registry_name(registry));
-                if registry.is_some() {
-                    return registry;
-                }
-            }
+        if let Some(rest) = rest_trim.strip_prefix('.') {
+            // `<key>.registry = "socket-patch-…"`, owned by `<key>.package`
+            // when there is one (#757).
+            dotted.push(idx, key, rest);
             continue;
         }
         let Some(value) = rest_trim.strip_prefix('=').map(str::trim_start) else {
@@ -2915,10 +2929,11 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
         if !value.starts_with('{') {
             continue;
         }
-        let Some(close) = value.find('}') else {
+        let Some((end, inner)) = cargo_inline_table(&lines, idx, value) else {
             continue;
         };
-        let inner = &value[1..close];
+        skip_until = end + 1;
+        let inner = inner.as_ref();
         let is_ours = match cargo_toml_inline_string(inner, "package") {
             Some(package) => package == crate_name,
             None => key == crate_name,
@@ -2931,11 +2946,13 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
             }
         }
     }
-    None
+    dotted_pin(&mut dotted)
 }
 
 /// Every Socket registry pin a manifest carries, as `(crate, registry)` in
-/// file order — [`cargo_socket_registry_pin`] for all crates at once. That
+/// scan order (file order, except that a table's dotted-key pins come at
+/// the end of that table) — [`cargo_socket_registry_pin`] for all crates
+/// at once. That
 /// scan's per-crate test is always "the declaration's owning crate (its
 /// `package` rename, else its key) equals the crate asked about", and
 /// everything else it computes is independent of the crate asked about, so
@@ -2947,12 +2964,28 @@ impl CargoRegistryPins {
         let lines: Vec<&str> = content.split('\n').collect();
         let mut pins = Vec::new();
         let mut section = CargoTomlSection::Other;
+        // Past the last line of a multi-line inline table (#757).
+        let mut skip_until = 0;
+        // The current dependency table's dotted keys, read at its end (#757).
+        let mut dotted = CargoDottedDecls::default();
+        let dotted_pins = |dotted: &mut CargoDottedDecls, pins: &mut Vec<(String, String)>| {
+            pins.extend(
+                dotted
+                    .take()
+                    .into_iter()
+                    .filter_map(|(key, fields)| cargo_dotted_pin(key, &fields)),
+            );
+        };
         for (idx, raw) in lines.iter().enumerate() {
+            if idx < skip_until {
+                continue;
+            }
             let trimmed = raw.trim_start();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
             if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+                dotted_pins(&mut dotted, &mut pins);
                 section = match CARGO_TOML_HEADER_RE.captures(trimmed) {
                     Some(c) => classify_cargo_section(
                         c.get(1)
@@ -2996,15 +3029,8 @@ impl CargoRegistryPins {
                 continue;
             };
             let rest_trim = rest.trim_start();
-            if let Some(dotted) = rest_trim.strip_prefix('.') {
-                let registry = parse_cargo_entry_key(dotted)
-                    .filter(|(k, _)| k == "registry")
-                    .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
-                    .and_then(cargo_toml_string)
-                    .filter(|registry| is_socket_patch_registry_name(registry));
-                if let Some(reg) = registry {
-                    pins.push((key, reg));
-                }
+            if let Some(rest) = rest_trim.strip_prefix('.') {
+                dotted.push(idx, key, rest);
                 continue;
             }
             let Some(value) = rest_trim.strip_prefix('=').map(str::trim_start) else {
@@ -3013,10 +3039,11 @@ impl CargoRegistryPins {
             if !value.starts_with('{') {
                 continue;
             }
-            let Some(close) = value.find('}') else {
+            let Some((end, inner)) = cargo_inline_table(&lines, idx, value) else {
                 continue;
             };
-            let inner = &value[1..close];
+            skip_until = end + 1;
+            let inner = inner.as_ref();
             if let Some(reg) = cargo_toml_inline_string(inner, "registry")
                 .filter(|registry| is_socket_patch_registry_name(registry))
             {
@@ -3024,6 +3051,7 @@ impl CargoRegistryPins {
                 pins.push((owner, reg));
             }
         }
+        dotted_pins(&mut dotted, &mut pins);
         CargoRegistryPins(pins)
     }
 
@@ -3152,11 +3180,231 @@ fn parse_cargo_entry_key(line: &str) -> Option<(String, &str)> {
     }
 }
 
+/// One dotted-key line of a dependency (`serde.version = "1"`, #757): its
+/// line index, the key after the dot (`None` when it can't be read) and
+/// the text after that key (`= "1"`, or `.x = …` for a deeper key).
+struct CargoDottedField<'a> {
+    idx: usize,
+    sub: Option<String>,
+    rest: &'a str,
+}
+
+/// A dependency table's dotted-key declarations, gathered per dependency
+/// key in first-seen order: TOML lets a key's dotted lines sit anywhere in
+/// its table, between other dependencies.
+#[derive(Default)]
+struct CargoDottedDecls<'a>(Vec<(String, Vec<CargoDottedField<'a>>)>);
+
+impl<'a> CargoDottedDecls<'a> {
+    /// Record line `idx`, `key` followed by `dotted` (the text after the dot).
+    fn push(&mut self, idx: usize, key: String, dotted: &'a str) {
+        let (sub, rest) = match parse_cargo_entry_key(dotted.trim_start()) {
+            Some((sub, rest)) => (Some(sub), rest),
+            None => (None, dotted),
+        };
+        let field = CargoDottedField { idx, sub, rest };
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, fields)) => fields.push(field),
+            None => self.0.push((key, vec![field])),
+        }
+    }
+
+    fn take(&mut self) -> Vec<(String, Vec<CargoDottedField<'a>>)> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+/// The dotted `<key>.<name> = …` field: its line index and its value when
+/// that is a one-line string.
+fn cargo_dotted_value(fields: &[CargoDottedField], name: &str) -> Option<(usize, Option<String>)> {
+    fields.iter().find_map(|field| {
+        if field.sub.as_deref() != Some(name) {
+            return None;
+        }
+        let value = field.rest.trim_start().strip_prefix('=')?;
+        Some((field.idx, cargo_toml_string(value)))
+    })
+}
+
+/// The `socket-patch-<uuid>` pin a dependency's dotted keys carry, as
+/// `(owning crate, registry)`: the owner is its `package` rename, else its
+/// key.
+fn cargo_dotted_pin(key: String, fields: &[CargoDottedField]) -> Option<(String, String)> {
+    let registry = cargo_dotted_value(fields, "registry")?
+        .1
+        .filter(|registry| is_socket_patch_registry_name(registry))?;
+    let owner = cargo_dotted_value(fields, "package")
+        .and_then(|(_, package)| package)
+        .unwrap_or(key);
+    Some((owner, registry))
+}
+
 fn cargo_toml_string(value: &str) -> Option<String> {
     let document = format!("value = {value}")
         .parse::<toml_edit::DocumentMut>()
         .ok()?;
     document.get("value")?.as_str().map(str::to_string)
+}
+
+/// The inline table that opens at `value` (the rest of `lines[idx]` from
+/// its `{`): the index of the line holding its closing `}` and the text
+/// between the braces. A table that closes on its own line borrows that
+/// text. One whose array value wraps onto later lines (#757) joins its
+/// lines with `\n` (a CRLF line keeps its `\r`) and leaves out comments,
+/// so a key named only in a comment is not read as one. TOML 1.0 lets an
+/// inline table break a line only inside a value (an array or a
+/// multi-line string), so a break directly inside the braces, a
+/// mismatched bracket or an unterminated string is `None`. Braces and
+/// brackets inside strings and comments do not count.
+fn cargo_inline_table<'a>(
+    lines: &[&str],
+    idx: usize,
+    value: &'a str,
+) -> Option<(usize, Cow<'a, str>)> {
+    #[derive(PartialEq)]
+    enum Str {
+        No,
+        Basic,
+        Literal,
+        MultiBasic,
+        MultiLiteral,
+    }
+    // A multi-line string closes on its first run of three or more quotes;
+    // up to two of them belong to the content (`"""a""""`).
+    let closing_run = |rest: &[u8], quote: u8| -> Option<usize> {
+        let n = rest.iter().take_while(|&&c| c == quote).count();
+        (n >= 3).then_some(n.min(5))
+    };
+    let mut state = Str::No;
+    let mut stack: Vec<u8> = Vec::new();
+    let mut inner = String::new();
+    for (line_idx, &line) in lines.iter().enumerate().skip(idx) {
+        let line = if line_idx == idx { value } else { line };
+        let b = line.as_bytes();
+        let start = usize::from(line_idx == idx);
+        if line_idx == idx {
+            stack.push(b'{');
+        }
+        let mut end = b.len();
+        let mut i = start;
+        while i < b.len() {
+            let rest = &b[i..];
+            match state {
+                Str::No => match b[i] {
+                    b'#' => {
+                        end = i;
+                        break;
+                    }
+                    b'"' if rest.starts_with(b"\"\"\"") => {
+                        state = Str::MultiBasic;
+                        i += 2;
+                    }
+                    b'"' => state = Str::Basic,
+                    b'\'' if rest.starts_with(b"'''") => {
+                        state = Str::MultiLiteral;
+                        i += 2;
+                    }
+                    b'\'' => state = Str::Literal,
+                    open @ (b'[' | b'{') => stack.push(open),
+                    b']' => {
+                        if stack.pop() != Some(b'[') {
+                            return None;
+                        }
+                    }
+                    b'}' => {
+                        if stack.pop() != Some(b'{') {
+                            return None;
+                        }
+                        if stack.is_empty() {
+                            if line_idx == idx {
+                                return Some((idx, Cow::Borrowed(&value[1..i])));
+                            }
+                            inner.push_str(&line[..i]);
+                            return Some((line_idx, Cow::Owned(inner)));
+                        }
+                    }
+                    _ => {}
+                },
+                Str::Basic | Str::MultiBasic if b[i] == b'\\' => i += 1,
+                Str::Basic if b[i] == b'"' => state = Str::No,
+                Str::Literal if b[i] == b'\'' => state = Str::No,
+                Str::MultiBasic if b[i] == b'"' => {
+                    if let Some(n) = closing_run(rest, b'"') {
+                        state = Str::No;
+                        i += n - 1;
+                    }
+                }
+                Str::MultiLiteral if b[i] == b'\'' => {
+                    if let Some(n) = closing_run(rest, b'\'') {
+                        state = Str::No;
+                        i += n - 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let in_value = match state {
+            Str::No => stack.last() == Some(&b'['),
+            Str::Basic | Str::Literal => false,
+            Str::MultiBasic | Str::MultiLiteral => true,
+        };
+        if !in_value {
+            return None;
+        }
+        inner.push_str(&line[start..end]);
+        inner.push('\n');
+    }
+    None
+}
+
+/// The line rewrites that move a wrapped inline table (`lines[idx..=end]`)
+/// from an explicit `registry = "crates-io"` to `reg`: the key is dropped
+/// with one adjacent comma, and the pin goes right after the opening `{`,
+/// the spelling upstream restore unpins. `None` when the key is not found
+/// exactly once outside comments.
+fn cargo_wrapped_crates_io_repin(
+    lines: &[&str],
+    idx: usize,
+    end: usize,
+    reg: &str,
+) -> Option<Vec<(usize, String)>> {
+    let code = |line: &str| line.split('#').next().unwrap_or_default().len();
+    let mut hits = (idx..=end).filter_map(|j| {
+        let line = lines[j];
+        let start = if j == idx { line.find('{')? } else { 0 };
+        CARGO_TOML_CRATES_IO_KEY_RE
+            .find(&line[start..code(line)])
+            .map(|m| (j, start + m.start(), start + m.end()))
+    });
+    let (j, from, to) = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    let line = lines[j];
+    let after = &line[to..];
+    let dropped = match after.trim_start().strip_prefix(',') {
+        Some(rest) => format!("{}{}", &line[..from], rest.trim_start()),
+        None => format!("{}{after}", line[..from].trim_end().strip_suffix(',')?),
+    };
+    let opening = if j == idx {
+        dropped.as_str()
+    } else {
+        lines[idx]
+    };
+    let brace = opening.find('{')?;
+    let mut rewrites = vec![(
+        idx,
+        format!(
+            "{} registry = \"{reg}\",{}",
+            &opening[..=brace],
+            &opening[brace + 1..]
+        ),
+    )];
+    if j != idx {
+        rewrites.push((j, dropped));
+    }
+    Some(rewrites)
 }
 
 fn cargo_toml_inline_string(inner: &str, key: &str) -> Option<String> {
@@ -3311,6 +3559,10 @@ static CARGO_TOML_REGISTRY_VAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:\bregistry|"registry"|'registry')\s*=\s*(?:"[^"]*"|'[^']*')"#)
         .expect("static registry-value regex is valid")
 });
+static CARGO_TOML_CRATES_IO_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:\bregistry|"registry"|'registry')\s*=\s*(?:"crates-io"|'crates-io')"#)
+        .expect("static crates-io key regex is valid")
+});
 static CARGO_TOML_REGISTRY_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid")
 });
@@ -3439,12 +3691,25 @@ fn plan_cargo_toml(
     let mut excluded: Vec<String> = Vec::new();
 
     let mut section = CargoTomlSection::Other;
+    // Past the last line of a multi-line inline table (#757).
+    let mut skip_until = 0;
+    // Dotted-key declarations (#757), gathered per dependency table and
+    // classified once the whole file is read: `(in [workspace.dependencies],
+    // key, fields)`.
+    let mut dotted = CargoDottedDecls::default();
+    let mut dotted_decls: Vec<(bool, String, Vec<CargoDottedField>)> = Vec::new();
     for (idx, raw) in lines.iter().enumerate() {
+        if idx < skip_until {
+            continue;
+        }
         let trimmed = raw.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            if let CargoTomlSection::DepTable { workspace } = section {
+                dotted_decls.extend(dotted.take().into_iter().map(|(k, f)| (workspace, k, f)));
+            }
             section = match header_re.captures(trimmed) {
                 Some(c) => classify_cargo_section(
                     c.get(1)
@@ -3565,24 +3830,11 @@ fn plan_cargo_toml(
             continue;
         };
         let rest_trim = rest.trim_start();
-        if let Some(dotted) = rest_trim.strip_prefix('.') {
+        if let Some(rest) = rest_trim.strip_prefix('.') {
             // Dotted entry (`serde.workspace = true`, `serde.version = "1"`,
-            // `alias.package = "serde"`, …).
-            let sub = parse_cargo_entry_key(dotted);
-            if sub.as_ref().is_some_and(|(key, _)| key == "workspace") {
-                pending.push(Pending::NeedsWorkspacePin(key.clone()));
-            } else if key == crate_name
-                || sub
-                    .filter(|(key, _)| key == "package")
-                    .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
-                    .and_then(cargo_toml_string)
-                    .as_deref()
-                    == Some(crate_name)
-            {
-                pending.push(Pending::Refuse(
-                    "declared with dotted keys this rewriter does not edit".to_string(),
-                ));
-            }
+            // `alias.package = "serde"`, …), classified with the rest of
+            // its key's dotted lines.
+            dotted.push(idx, key, rest);
             continue;
         }
         let Some(value) = rest_trim.strip_prefix('=') else {
@@ -3593,7 +3845,9 @@ fn plan_cargo_toml(
             // Inline table. Rename-aware: `package = "<other>"` under our key
             // means this entry is NOT the patched crate; `package =
             // "<crate>"` under any key means it IS.
-            let Some(close) = value.find('}') else {
+            // A table whose array value wraps (#757) is classified by its
+            // whole text and pinned on its opening line.
+            let Some((end, inner)) = cargo_inline_table(&lines, idx, value) else {
                 if key == crate_name {
                     pending.push(Pending::Refuse(
                         "inline table does not close on its line".to_string(),
@@ -3601,7 +3855,9 @@ fn plan_cargo_toml(
                 }
                 continue;
             };
-            let inner = &value[1..close];
+            skip_until = end + 1;
+            let multi_line = end > idx;
+            let inner = inner.as_ref();
             if workspace_key_re.is_match(inner) {
                 pending.push(Pending::NeedsWorkspacePin(key.clone()));
                 continue;
@@ -3642,6 +3898,47 @@ fn plan_cargo_toml(
                     if workspace {
                         ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                     }
+                } else if multi_line {
+                    // Upstream restore unpins only the opening-line spelling
+                    // this planner writes, so only an earlier pin in that
+                    // spelling is superseded in place.
+                    // An explicit `registry = "crates-io"` (#386) is dropped
+                    // and the pin written in that spelling; restore then
+                    // leaves the declaration without the redundant key, as
+                    // it does for a one-line table.
+                    let brace = raw.find('{').unwrap_or_default();
+                    let earlier = format!(" registry = \"{value}\",");
+                    let rewrites = if is_repinnable_registry_name(&value)
+                        && raw[brace + 1..].starts_with(&earlier)
+                    {
+                        Some(vec![(
+                            idx,
+                            format!(
+                                "{} registry = \"{reg}\",{}",
+                                &raw[..=brace],
+                                &raw[brace + 1 + earlier.len()..]
+                            ),
+                        )])
+                    } else if value == "crates-io" {
+                        cargo_wrapped_crates_io_repin(&lines, idx, end, reg)
+                    } else {
+                        None
+                    };
+                    if let Some(rewrites) = rewrites {
+                        for (idx, new_text) in rewrites {
+                            pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                                idx,
+                                new_text,
+                            }));
+                        }
+                        if workspace {
+                            ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
+                        }
+                    } else {
+                        pending.push(Pending::Refuse(format!(
+                            "a multi-line inline table already names a registry (\"{value}\")"
+                        )));
+                    }
                 } else if is_repinnable_registry_name(&value) {
                     let new_text = registry_val_re
                         .replace(raw, format!("registry = \"{reg}\"").as_str())
@@ -3660,6 +3957,22 @@ fn plan_cargo_toml(
                 }
             } else if registry_key_re.is_match(inner) || registry_index_re.is_match(inner) {
                 pending.push(Pending::Refuse("pinned to another registry".to_string()));
+            } else if multi_line {
+                // The pin goes right after the opening `{`, so restore can
+                // drop exactly the text inserted here.
+                let brace = raw.find('{').unwrap_or_default();
+                let new_text = format!(
+                    "{} registry = \"{reg}\",{}",
+                    &raw[..=brace],
+                    &raw[brace + 1..]
+                );
+                pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                    idx,
+                    new_text,
+                }));
+                if workspace {
+                    ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
+                }
             } else {
                 // Rebuild the line: everything through `{`, the trimmed
                 // inner, the registry pin, then `}` + any trailing bytes
@@ -3686,16 +3999,18 @@ fn plan_cargo_toml(
                     ws_entries.insert(key.clone(), CargoWorkspaceEntry::Pinned);
                 }
             }
-        } else if value.starts_with('"') {
+        } else if value.starts_with('"') || value.starts_with('\'') {
             if key != crate_name {
                 continue;
             }
-            // Plain version: `crate = "1.0"` (+ optional trailing comment).
-            // The rewrite is line-scoped, so the trailing newline / blank
-            // line after the entry is untouched.
+            // Plain version: `crate = "1.0"` or the literal `crate = '1.0'`
+            // (#757), plus an optional trailing comment. The rewrite is
+            // line-scoped, so the trailing newline / blank line after the
+            // entry is untouched, and keeps the version's quotes so restore
+            // can hand the same spelling back.
             let c = regex::escape(crate_name);
             let line_re = Regex::new(&format!(
-                r#"^(\s*(?:{c}|"{c}")\s*=\s*)"([^"]+)"([ \t]*(?:#.*)?)$"#
+                r#"^(\s*(?:{c}|"{c}"|'{c}')\s*=\s*)("[^"]+"|'[^']+')([ \t]*(?:#.*)?)$"#
             ))
             .expect("line regex from the escaped crate name is valid");
             let Some(m) = line_re.captures(raw) else {
@@ -3704,10 +4019,11 @@ fn plan_cargo_toml(
                 ));
                 continue;
             };
-            let req = m
+            let quoted = m
                 .get(2)
                 .expect("line_re always captures group 2 (version)")
                 .as_str();
+            let req = &quoted[1..quoted.len() - 1];
             match cargo_req_selects(Some(req), version, other_versions) {
                 CargoReqMatch::NotOurs => {
                     excluded.push(req.to_string());
@@ -3722,13 +4038,18 @@ fn plan_cargo_toml(
                 }
                 CargoReqMatch::Ours => {}
             }
+            // A literal version is pinned registry-first, a spelling the
+            // one-line inline rewrite never writes, so restore can tell it
+            // from a user's own `{ version = '…' }` table.
+            let fields = if quoted.starts_with('\'') {
+                format!("registry = \"{reg}\", version = {quoted}")
+            } else {
+                format!("version = {quoted}, registry = \"{reg}\"")
+            };
             let new_text = format!(
-                "{}{{ version = \"{}\", registry = \"{reg}\" }}{}",
+                "{}{{ {fields} }}{}",
                 m.get(1)
                     .expect("line_re always captures group 1 (key prefix)")
-                    .as_str(),
-                m.get(2)
-                    .expect("line_re always captures group 2 (version)")
                     .as_str(),
                 m.get(3)
                     .expect("line_re always captures group 3 (trailing comment)")
@@ -3745,6 +4066,116 @@ fn plan_cargo_toml(
             pending.push(Pending::Refuse(
                 "unsupported dependency-entry spelling".to_string(),
             ));
+        }
+    }
+
+    if let CargoTomlSection::DepTable { workspace } = section {
+        dotted_decls.extend(dotted.take().into_iter().map(|(k, f)| (workspace, k, f)));
+    }
+    // A dotted-key declaration (#757) is classified like the table form,
+    // and pinned with a `<key>.registry` line right after its version line,
+    // which restore drops whole.
+    let unreadable_dotted = || "declared with dotted keys this rewriter does not edit".to_string();
+    for (workspace, key, fields) in dotted_decls {
+        let assigns = |name: &str| {
+            fields.iter().any(|field| {
+                field.sub.as_deref() == Some(name) && field.rest.trim_start().starts_with('=')
+            })
+        };
+        if assigns("workspace") {
+            pending.push(Pending::NeedsWorkspacePin(key));
+            continue;
+        }
+        let package = cargo_dotted_value(&fields, "package");
+        // An unreadable rename falls back to the key, as the table form
+        // and the pin readers do.
+        let is_ours = match package.as_ref().and_then(|(_, package)| package.as_deref()) {
+            Some(package) => package == crate_name,
+            None => key == crate_name,
+        };
+        if !is_ours {
+            if workspace {
+                ws_entries.insert(key, CargoWorkspaceEntry::OtherPackage);
+            }
+            continue;
+        }
+        let requirement = cargo_dotted_value(&fields, "version");
+        let deeper = fields
+            .iter()
+            .any(|field| field.sub.is_none() || !field.rest.trim_start().starts_with('='));
+        if deeper || requirement.as_ref().is_some_and(|(_, req)| req.is_none()) {
+            pending.push(Pending::Refuse(unreadable_dotted()));
+            continue;
+        }
+        let req = requirement.as_ref().and_then(|(_, req)| req.clone());
+        match cargo_req_selects(req.as_deref(), version, other_versions) {
+            CargoReqMatch::NotOurs => {
+                excluded.extend(req);
+                if workspace {
+                    ws_entries.insert(key, CargoWorkspaceEntry::OtherVersion);
+                }
+                continue;
+            }
+            CargoReqMatch::Ambiguous => {
+                pending.push(Pending::Refuse(ambiguous()));
+                continue;
+            }
+            CargoReqMatch::Ours => {}
+        }
+        if assigns("path") || assigns("git") {
+            pending.push(Pending::Refuse(
+                "declared as a path/git dependency".to_string(),
+            ));
+            continue;
+        }
+        if assigns("registry-index") {
+            pending.push(Pending::Refuse("pinned to another registry".to_string()));
+            continue;
+        }
+        match cargo_dotted_value(&fields, "registry") {
+            Some((_, Some(value))) if value == reg => {
+                pending.push(Pending::Action(CargoTomlAction::Already));
+            }
+            Some((idx, Some(value))) if is_repinnable_registry_name(&value) => {
+                let new_text = registry_val_re
+                    .replace(lines[idx], format!("registry = \"{reg}\"").as_str())
+                    .into_owned();
+                pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
+                    idx,
+                    new_text,
+                }));
+            }
+            Some((_, Some(value))) => {
+                pending.push(Pending::Refuse(format!(
+                    "pinned to another registry (\"{value}\")"
+                )));
+                continue;
+            }
+            Some((_, None)) => {
+                pending.push(Pending::Refuse(unreadable_dotted()));
+                continue;
+            }
+            None => {
+                // After the version line (else the rename's), spelled with
+                // that line's key, indent and line ending.
+                let Some((idx, _)) = requirement.or(package) else {
+                    pending.push(Pending::Refuse(unreadable_dotted()));
+                    continue;
+                };
+                let raw = lines[idx];
+                let trimmed = raw.trim_start();
+                let indent = &raw[..raw.len() - trimmed.len()];
+                let after_key = parse_cargo_entry_key(trimmed).map_or("", |(_, rest)| rest);
+                let dot = trimmed.len() - after_key.len() + after_key.find('.').unwrap_or(0);
+                let eol = if raw.ends_with('\r') { "\r" } else { "" };
+                pending.push(Pending::Action(CargoTomlAction::InsertAfterHeader {
+                    idx,
+                    inserted: format!("{indent}{}registry = \"{reg}\"{eol}", &trimmed[..=dot]),
+                }));
+            }
+        }
+        if workspace {
+            ws_entries.insert(key, CargoWorkspaceEntry::Pinned);
         }
     }
 
@@ -8878,6 +9309,7 @@ fn go_token_safe(s: &str) -> bool {
 fn rewrite_golang(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
+    go_members: &[crate::vendor::go_build_list::ModuleEvidence],
     result: &mut RewriteResult,
 ) {
     use crate::vendor::go_build_list;
@@ -9022,17 +9454,27 @@ fn rewrite_golang(
         // (`go_build_list`): `require` for a go >= 1.17 graph; for an older
         // one, the highest of `require` and go.sum's zip lines, since a
         // `/go.mod`-only line is written for every version MVS reads, not
-        // only the one it selects (#509).
+        // only the one it selects (#509). In a go.work workspace the other
+        // members' files are weighed too: MVS builds the highest version
+        // any of them asks for (#1753).
         let zips = go_sum.zip_versions(&fname);
         let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        let selection = go_build_list::select(
+        let own = go_build_list::select(
             go_mod_edit::prunes_module_graph(&go_mod),
             scan.required.as_deref(),
             &zips,
             &dep.version,
         );
+        let selection = if go_members.is_empty() {
+            own.clone()
+        } else {
+            let members = go_members.iter().map(|m| m.selection(&fname, &dep.version));
+            go_build_list::workspace_selection(own.clone(), members, &dep.version)
+        };
         if let Some(selected) = selection.other_version() {
-            let basis = if scan.required.as_deref() == Some(selected) {
+            let basis = if own.other_version() != Some(selected) {
+                "another go.work workspace member makes the build select"
+            } else if scan.required.as_deref() == Some(selected) {
                 "go.mod requires"
             } else {
                 "go.sum shows the build selects"
@@ -9086,14 +9528,16 @@ fn rewrite_golang(
             // outside this project's graph (local discovery crawls the whole
             // module cache). Its replace would be inert, and confirming it
             // would attest a patch no build links.
+            let detail = if go_members.is_empty() {
+                "neither go.mod's require nor a go.sum zip line shows the build selecting \
+                 this version — it is not in this project's build graph"
+            } else {
+                "no go.work workspace member's go.mod require or go.sum zip line shows the \
+                 build selecting this version"
+            };
             result.warnings.push(RewriteWarning {
                 code: "redirect_golang_not_in_module_graph".into(),
-                detail: format!(
-                    "{fname}@{}: neither go.mod's require nor a go.sum zip line shows the \
-                     build selecting this version — it is not in this project's build graph; \
-                     nothing redirected",
-                    dep.version
-                ),
+                detail: format!("{fname}@{}: {detail}; nothing redirected", dep.version),
             });
             continue;
         }
@@ -12546,6 +12990,7 @@ mod tests {
             &std::collections::BTreeSet::new(),
             &refusing[3],
             &CratesIoSource::Registry,
+            &[],
         );
         assert!(!r.files.contains_key("yarn.lock"));
         assert!(r
@@ -14592,6 +15037,14 @@ mod tests {
                 "[dependencies]\nlegacy = { package = \"serde\", version = \"1.0.190\" }\n",
             ),
             (
+                "multi-line inline table (#757)",
+                "[dependencies]\nserde = { version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+            ),
+            (
+                "renamed multi-line inline table (#757)",
+                "[dependencies]\nlegacy = { package = \"serde\", features = [\n  \"derive\",\n], version = \"1.0.190\" }\n",
+            ),
+            (
                 "table form",
                 "[dependencies.serde]\nversion = \"1.0.190\"\n",
             ),
@@ -14610,6 +15063,18 @@ mod tests {
             (
                 "workspace dependencies table form",
                 "[workspace.dependencies.serde]\nversion = \"1.0.190\"\n",
+            ),
+            (
+                "literal-string version (#757)",
+                "[dependencies]\nserde = '1.0.190'\n",
+            ),
+            (
+                "dotted keys (#757)",
+                "[dependencies]\nserde.version = \"1.0.190\"\n",
+            ),
+            (
+                "renamed dotted keys (#757)",
+                "[dependencies]\nlegacy.package = \"serde\"\nlog = \"0.4\"\nlegacy.version = \"1.0.190\"\n",
             ),
         ];
         for (shape, body) in shapes {
@@ -15218,8 +15683,11 @@ mod tests {
         }));
     }
 
+    /// #757: a dotted-key rename with literal strings and quoted keys pins
+    /// beside the crate's own declaration, so both resolve from the
+    /// managed registry.
     #[test]
-    fn cargo_dotted_literal_renames_refuse_every_declaration() {
+    fn cargo_dotted_literal_renames_pin_every_declaration() {
         for alias in ["alias", "\"alias\"", "'alias'"] {
             for package_key in ["package", "\"package\"", "'package'"] {
                 let manifest = format!(
@@ -15230,13 +15698,31 @@ mod tests {
                 assert!(manifest.parse::<toml_edit::DocumentMut>().is_ok());
                 let result =
                     rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
-                assert!(result.files.is_empty(), "{manifest}");
-                assert!(result.edits.is_empty(), "{manifest}");
-                assert!(result.confirmed_cargo_uuids.is_empty(), "{manifest}");
-                assert!(result
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.code == "redirect_cargo_toml_dep_unrewritable"));
+                assert!(
+                    result.warnings.is_empty(),
+                    "{manifest}: {:?}",
+                    result.warnings
+                );
+                let toml = result
+                    .files
+                    .get("Cargo.toml")
+                    .expect("Cargo.toml rewritten");
+                assert!(
+                    toml.ends_with(&format!(
+                        "{alias}.version = '1.0.190'\n{alias}.registry = \"{}\"\n",
+                        cargo_reg()
+                    )),
+                    "{toml}"
+                );
+                let doc: toml_edit::DocumentMut = toml.parse().expect("still valid TOML");
+                for key in ["serde", "alias"] {
+                    assert_eq!(
+                        doc["dependencies"][key]["registry"].as_str(),
+                        Some(cargo_reg().as_str()),
+                        "{toml}"
+                    );
+                }
+                assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
             }
         }
     }
@@ -15319,6 +15805,28 @@ mod tests {
             .iter()
             .any(|w| w.code == "redirect_cargo_toml_dep_not_found"));
         assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// #757: an earlier hosted pin on a multi-line inline table moves to the
+    /// new registry in place, in the spelling restore unpins.
+    #[test]
+    fn cargo_supersede_replaces_previous_multiline_pin() {
+        const OLD_UUID: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+        let old_reg = format!("socket-patch-{OLD_UUID}");
+        let manifest = format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde = {{ registry = \"{old_reg}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n"
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("manifest re-pinned");
+        assert!(
+            toml.ends_with(&format!(
+                "serde = {{ registry = \"{}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
     }
 
     /// A re-scan that selects a NEWER patch uuid over an existing redirect
@@ -15451,7 +15959,8 @@ mod tests {
         let files = cargo_files(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
              [dependencies]\nserde = \"1.0.190\"\n\n\
-             [dev-dependencies]\nserde.version = \"1.0.190\"\n",
+             [dev-dependencies]\nserde.version = \"1.0.190\"\n\
+             serde.registry-index = \"sparse+https://index.example/\"\n",
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         assert!(
@@ -22726,6 +23235,78 @@ packages:
         assert!(out.warnings[0].detail.contains("v1.5.0"));
     }
 
+    /// A go.work member that is not the scanned module.
+    fn go_member(require: &str) -> crate::vendor::go_build_list::ModuleEvidence {
+        let go_mod = format!("module example.com/other\n\ngo 1.21\n\n{require}");
+        crate::vendor::go_build_list::ModuleEvidence::from_files(&go_mod, None)
+    }
+
+    /// #1753: in a go.work workspace the build selects the highest version
+    /// any member requires, so a pin for this module's v1.4.2 is inert when
+    /// another member requires v1.5.0.
+    #[test]
+    fn golang_workspace_member_requiring_a_higher_version_skips() {
+        let files = golang_files();
+        let ovr = golang_override();
+        let members = [go_member("require github.com/foo/bar v1.5.0\n")];
+        let mut out = RewriteResult::default();
+        rewrite_golang(&files, std::slice::from_ref(&ovr), &members, &mut out);
+        assert!(out.files.is_empty(), "nothing written: {:?}", out.files);
+        assert_eq!(
+            out.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_golang_version_mismatch"]
+        );
+        assert!(
+            out.warnings[0]
+                .detail
+                .contains("another go.work workspace member makes the build select v1.5.0"),
+            "{}",
+            out.warnings[0].detail
+        );
+    }
+
+    /// #1753: a member requiring a lower version, or not requiring the
+    /// module at all, leaves the build on this module's v1.4.2. A member
+    /// that proves the patched version puts a module this go.mod omits in
+    /// the build.
+    #[test]
+    fn golang_workspace_members_that_do_not_outrank_still_redirect() {
+        let ovr = golang_override();
+        for members in [
+            vec![go_member("require github.com/foo/bar v1.4.1\n")],
+            vec![go_member("require example.com/unrelated v1.0.0\n")],
+            vec![go_member("")],
+        ] {
+            let mut out = RewriteResult::default();
+            rewrite_golang(
+                &golang_files(),
+                std::slice::from_ref(&ovr),
+                &members,
+                &mut out,
+            );
+            assert!(out.warnings.is_empty(), "{members:?}: {:?}", out.warnings);
+            assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+        }
+
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire example.com/direct v2.0.0\n".to_string(),
+        );
+        files.insert("go.sum".to_string(), String::new());
+        let mut out = RewriteResult::default();
+        rewrite_golang(&files, std::slice::from_ref(&ovr), &[], &mut out);
+        assert_eq!(out.warnings[0].code, "redirect_golang_not_in_module_graph");
+        let members = [go_member("require github.com/foo/bar v1.4.2\n")];
+        let mut out = RewriteResult::default();
+        rewrite_golang(&files, std::slice::from_ref(&ovr), &members, &mut out);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+    }
+
     /// A module NOT in the main go.mod's require block may still be resolved
     /// (transitively) at the patched version — the cross-check only fires on a
     /// positive mismatch, never on absence.
@@ -23864,15 +24445,22 @@ packages:
     #[test]
     fn cargo_unsupported_spellings_refuse_whole_dep() {
         for entry in [
-            // Dotted keys (both the crate's own and an alias renaming it).
-            "serde.version = \"1.0.190\"\n",
-            "iffy.package = \"serde\"\n",
             // Inline table that does not close on its line.
             "serde = {\n  version = \"1.0.190\" }\n",
-            // registry-index beside a would-be registry pin is ambiguous.
+            // registry-index beside a would-be registry pin is ambiguous,
+            // in every spelling.
             "serde = { version = \"1.0.190\", registry-index = \"sparse+https://index.example/\" }\n",
-            // Single-quoted and non-string values.
-            "serde = '1.0.190'\n",
+            "serde.version = \"1.0.190\"\nserde.registry-index = \"sparse+https://index.example/\"\n",
+            // Path/git and another registry, as dotted keys.
+            "serde.version = \"1.0.190\"\nserde.path = \"../serde\"\n",
+            "serde.git = \"https://example.com/serde\"\nserde.version = \"1.0.190\"\n",
+            "serde.version = \"1.0.190\"\nserde.registry = \"corp-mirror\"\n",
+            // A dotted registry that is not a one-line string.
+            "serde.version = \"1.0.190\"\nserde.registry = \"\"\"\ncorp\"\"\"\n",
+            // A dotted version that is not a one-line string.
+            "serde.version = \"\"\"\n1.0.190\"\"\"\n",
+            // Multi-line literal and non-string values.
+            "serde = '''1.0.190'''\n",
             "serde = 13\n",
             // A quoted version with trailing junk the line grammar rejects.
             "serde = \"1.0.190\" trailing junk\n",
@@ -23900,6 +24488,246 @@ packages:
         }
     }
 
+    /// #757: a literal-string version (`serde = '1.0.190'`) is pinned like
+    /// a basic-string one, keeping the user's quotes inside the table so
+    /// restore can hand the same spelling back.
+    #[test]
+    fn cargo_literal_string_version_is_pinned() {
+        let reg = cargo_reg();
+        for (entry, want) in [
+            (
+                "serde = '1.0.190'\n",
+                format!("serde = {{ registry = \"{reg}\", version = '1.0.190' }}\n"),
+            ),
+            (
+                "serde = '1.0.190' # why\n",
+                format!("serde = {{ registry = \"{reg}\", version = '1.0.190' }} # why\n"),
+            ),
+            (
+                "'serde' = '^1.0'\n",
+                format!("'serde' = {{ registry = \"{reg}\", version = '^1.0' }}\n"),
+            ),
+        ] {
+            for crlf in [false, true] {
+                let eol = |s: &str| {
+                    if crlf {
+                        s.replace('\n', "\r\n")
+                    } else {
+                        s.to_string()
+                    }
+                };
+                let manifest = eol(&format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n{entry}"
+                ));
+                let r =
+                    rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+                assert!(
+                    r.warnings.is_empty(),
+                    "[{entry:?} crlf={crlf}] {:?}",
+                    r.warnings
+                );
+                let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+                assert!(
+                    toml.ends_with(&eol(&want)),
+                    "[{entry:?} crlf={crlf}] pinned in place: {toml}"
+                );
+                let doc: toml_edit::DocumentMut = toml.parse().expect("still valid TOML");
+                assert_eq!(
+                    doc["dependencies"]["serde"]["registry"].as_str(),
+                    Some(reg.as_str())
+                );
+                assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+            }
+        }
+    }
+
+    /// #757: a dependency declared with dotted keys (`serde.version = …`)
+    /// gains a `<key>.registry` line right after its version line, keeping
+    /// the key's own spelling and the line's ending. A rename, a wrapped
+    /// features array, an indent, other dependencies between the dotted
+    /// lines and an explicit `registry = "crates-io"` (#386) all pin.
+    #[test]
+    fn cargo_dotted_keys_are_pinned() {
+        let reg = cargo_reg();
+        let pin = |key: &str| format!("{key}.registry = \"{reg}\"\n");
+        for (entry, want) in [
+            (
+                "serde.version = \"1.0.190\"\n".to_string(),
+                format!("serde.version = \"1.0.190\"\n{}", pin("serde")),
+            ),
+            (
+                "serde.version = \"1.0.190\" # why\nserde.features = [\n  \"derive\",\n]\n"
+                    .to_string(),
+                format!(
+                    "serde.version = \"1.0.190\" # why\n{}serde.features = [\n  \"derive\",\n]\n",
+                    pin("serde")
+                ),
+            ),
+            (
+                "serde.features = [\"derive\"]\nlog = \"0.4\"\nserde.version = '1.0.190'\n"
+                    .to_string(),
+                format!(
+                    "serde.features = [\"derive\"]\nlog = \"0.4\"\nserde.version = '1.0.190'\n{}",
+                    pin("serde")
+                ),
+            ),
+            (
+                "legacy.package = \"serde\"\nlegacy.version = \"1.0.190\"\n".to_string(),
+                format!(
+                    "legacy.package = \"serde\"\nlegacy.version = \"1.0.190\"\n{}",
+                    pin("legacy")
+                ),
+            ),
+            (
+                "  \"serde\" . version = \"1.0.190\"\n".to_string(),
+                format!(
+                    "  \"serde\" . version = \"1.0.190\"\n  {}",
+                    pin("\"serde\" ")
+                ),
+            ),
+            (
+                "serde.version = \"1.0.190\"\nserde.registry = \"crates-io\" # explicit\n"
+                    .to_string(),
+                format!("serde.version = \"1.0.190\"\nserde.registry = \"{reg}\" # explicit\n"),
+            ),
+        ] {
+            for crlf in [false, true] {
+                let eol = |s: &str| {
+                    if crlf {
+                        s.replace('\n', "\r\n")
+                    } else {
+                        s.to_string()
+                    }
+                };
+                let manifest = eol(&format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n{entry}"
+                ));
+                let r =
+                    rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+                assert!(
+                    r.warnings.is_empty(),
+                    "[{entry:?} crlf={crlf}] {:?}",
+                    r.warnings
+                );
+                let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+                assert!(
+                    toml.ends_with(&eol(&want)),
+                    "[{entry:?} crlf={crlf}] pinned after the version line: {toml}"
+                );
+                let doc: toml_edit::DocumentMut = toml.parse().expect("still valid TOML");
+                let pinned = doc["dependencies"]
+                    .as_table()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(_, dep)| dep.get("registry")?.as_str().map(str::to_string))
+                    .collect::<Vec<_>>();
+                assert_eq!(pinned, vec![reg.clone()], "[{entry:?} crlf={crlf}]");
+                assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+                // A rescan of the planner's own output writes nothing.
+                let again =
+                    rewrite_registry_redirect(&cargo_files(toml), &[cargo_sparse_override()]);
+                assert!(
+                    again.warnings.is_empty(),
+                    "[{entry:?}] {:?}",
+                    again.warnings
+                );
+                assert!(
+                    again.files.get("Cargo.toml").is_none_or(|t| t == toml),
+                    "[{entry:?} crlf={crlf}] an already-pinned manifest is left as is"
+                );
+            }
+        }
+    }
+
+    /// #757: `[workspace.dependencies]` declared with dotted keys is pinned,
+    /// and a member's `serde.workspace = true` inherits it; a dotted entry
+    /// naming another version of the crate is left alone.
+    #[test]
+    fn cargo_dotted_workspace_dependency_is_pinned() {
+        let reg = cargo_reg();
+        let manifest = "[workspace]\nmembers = []\n\n[workspace.dependencies]\n\
+                        serde.version = \"1.0.190\"\n\n[package]\nname = \"app\"\n\
+                        version = \"0.1.0\"\n\n[dependencies]\nserde.workspace = true\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        assert!(
+            toml.contains(&format!(
+                "[workspace.dependencies]\nserde.version = \"1.0.190\"\nserde.registry = \"{reg}\"\n"
+            )),
+            "{toml}"
+        );
+        assert!(toml.ends_with("serde.workspace = true\n"), "{toml}");
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        let other = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                     serde.version = \"2\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(other), &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "another version is not pinned: {:?}",
+            r.files
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
+    }
+
+    /// #757: a dotted rename whose `package` value can't be read falls back
+    /// to the key, as the table form does, so the crate's declarations in
+    /// every dependency kind are pinned together, never partially.
+    #[test]
+    fn cargo_dotted_unreadable_package_falls_back_to_the_key() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n\n[dev-dependencies]\n\
+                        serde.package = \"\"\"\nserde\"\"\"\nserde.version = \"1.0.190\"\n";
+        let r = rewrite_registry_redirect(&cargo_files(manifest), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        let doc: toml_edit::DocumentMut = toml.parse().expect("still valid TOML");
+        for kind in ["dependencies", "dev-dependencies"] {
+            assert_eq!(
+                doc[kind]["serde"]["registry"].as_str(),
+                Some(cargo_reg().as_str()),
+                "{kind}: {toml}"
+            );
+        }
+        let r = rewrite_registry_redirect(
+            &cargo_files(&format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde.version = \"1.0.190\"\nserde.registry = \"\"\"\ncorp\"\"\"\n"
+            )),
+            &[cargo_sparse_override()],
+        );
+        assert!(r.files.is_empty());
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.detail.contains("dotted keys this rewriter does not edit")),
+            "an unreadable registry is not named as another registry: {:?}",
+            r.warnings
+        );
+    }
+
+    /// #757: a rescan that picks a newer patch moves an earlier dotted pin
+    /// to the new registry in place, as it does for every other spelling.
+    #[test]
+    fn cargo_dotted_pin_is_superseded_in_place() {
+        let old = "socket-patch-00000000-0000-4000-8000-000000000000";
+        let manifest = format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde.version = \"1.0.190\"\nserde.registry = \"{old}\"\n"
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+        assert!(
+            toml.ends_with(&format!(
+                "serde.version = \"1.0.190\"\nserde.registry = \"{}\"\n",
+                cargo_reg()
+            )),
+            "{toml}"
+        );
+    }
+
     /// An inline table whose inner already ends with a trailing comma gains
     /// the registry pin without doubling the separator.
     #[test]
@@ -23920,6 +24748,141 @@ packages:
             "no doubled comma: {toml}"
         );
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// #757: an inline table whose array value wraps lines (rustfmt's style
+    /// for a long feature list) is valid TOML 1.0 and is pinned on its
+    /// opening line, for LF and CRLF manifests, a comment inside the array,
+    /// and a rename.
+    #[test]
+    fn cargo_multiline_inline_table_is_pinned_on_its_opening_line() {
+        let reg = cargo_reg();
+        for (entry, want) in [
+            (
+                "serde = { version = \"1.0.190\", features = [\n    \"derive\",\n] }\n",
+                format!(
+                    "serde = {{ registry = \"{reg}\", version = \"1.0.190\", features = [\n    \"derive\",\n] }}\n"
+                ),
+            ),
+            (
+                "serde = { version = \"1.0.190\", features = [ # wrapped\n  \"derive\", # derive\n  \"rc\",\n], default-features = false } # tail\n",
+                format!(
+                    "serde = {{ registry = \"{reg}\", version = \"1.0.190\", features = [ # wrapped\n  \"derive\", # derive\n  \"rc\",\n], default-features = false }} # tail\n"
+                ),
+            ),
+            (
+                "legacy = { package = \"serde\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+                format!(
+                    "legacy = {{ registry = \"{reg}\", package = \"serde\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n"
+                ),
+            ),
+        ] {
+            for crlf in [false, true] {
+                let eol = |s: &str| if crlf { s.replace('\n', "\r\n") } else { s.to_string() };
+                let manifest = eol(&format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n{entry}"
+                ));
+                let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+                assert!(r.warnings.is_empty(), "[{entry:?} crlf={crlf}] {:?}", r.warnings);
+                let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+                assert!(
+                    toml.ends_with(&eol(&want)),
+                    "[{entry:?} crlf={crlf}] pinned on the opening line: {toml}"
+                );
+                let doc: toml_edit::DocumentMut = toml.parse().expect("still valid TOML");
+                let dep = doc["dependencies"].as_table().unwrap().iter().next().unwrap().1;
+                assert_eq!(dep["registry"].as_str(), Some(reg.as_str()));
+                assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+            }
+        }
+    }
+
+    /// #757: a multi-line inline table is classified by its whole text, so a
+    /// `workspace = true`, `path` or other-registry key on a later line is
+    /// seen, and another crate's wrapped table is not mistaken for this one.
+    #[test]
+    fn cargo_multiline_inline_table_is_classified_by_its_whole_text() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n";
+        // Path dependency: the path key sits after the wrapped array.
+        let path = format!(
+            "{head}serde = {{ version = \"1.0.190\", features = [\n  \"derive\",\n], path = \"../serde\" }}\n"
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&path), &[cargo_sparse_override()]);
+        assert!(
+            r.files.is_empty(),
+            "path dep must write nothing: {:?}",
+            r.files
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        // Another crate's multi-line table, renamed away from serde, is
+        // skipped and the real serde line is pinned.
+        let other = format!(
+            "{head}serde = {{ package = \"serde_json\", version = \"1\", features = [\n  \"std\",\n] }}\n\
+             real = {{ package = \"serde\", version = \"1.0.190\" }}\n"
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&other), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let toml = r.files.get("Cargo.toml").expect("rewritten");
+        assert!(
+            toml.contains("serde = { package = \"serde_json\", version = \"1\", features = [\n"),
+            "the renamed-away table is untouched: {toml}"
+        );
+        assert!(toml.contains(&format!(
+            "real = {{ package = \"serde\", version = \"1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        )));
+        // Keys and braces named only in comments are not the table's.
+        for entry in [
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\", # path = \"../x\"\n] }\n",
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\", # workspace = true\n] }\n",
+            "serde = { version = \"1.0.190\", features = [ # {x}\n  \"derive\",\n] }\n",
+            "serde = { version = \"1.0.190\", features = [\"a}\", \"\"\"q\"\"\"\"\", \n  \"derive\",\n] }\n",
+        ] {
+            let manifest = format!("{head}{entry}");
+            let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "[{entry:?}] {:?}", r.warnings);
+            let toml = r.files.get("Cargo.toml").expect("rewritten");
+            assert!(
+                toml.contains(&format!("serde = {{ registry = \"{}\", version", cargo_reg())),
+                "[{entry:?}] pinned on the opening line: {toml}"
+            );
+        }
+        // An explicit `registry = "crates-io"` (#386) anywhere in the
+        // wrapped table is dropped and the pin lands on the opening line.
+        for entry in [
+            "serde = { registry = \"crates-io\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+            "serde = { version = \"1.0.190\", registry = \"crates-io\", features = [\n  \"derive\",\n] }\n",
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\",\n], registry = \"crates-io\" }\n",
+            "serde = { version = \"1.0.190\", features = [\n  \"derive\",\n], registry = 'crates-io' }\n",
+            "serde = { \"registry\" = \"crates-io\", version = \"1.0.190\", features = [\n  \"derive\",\n] }\n",
+        ] {
+            let manifest = format!("{head}{entry}");
+            let r = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "[{entry:?}] {:?}", r.warnings);
+            let toml = r.files.get("Cargo.toml").expect("rewritten");
+            assert!(
+                toml.ends_with(&format!(
+                    "serde = {{ registry = \"{}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n",
+                    cargo_reg()
+                )),
+                "[{entry:?}] crates-io dropped, pinned on the opening line: {toml}"
+            );
+        }
+        // Already pinned (the planner's own output): nothing to write.
+        let pinned = format!(
+            "{head}serde = {{ registry = \"{}\", version = \"1.0.190\", features = [\n  \"derive\",\n] }}\n",
+            cargo_reg()
+        );
+        let r = rewrite_registry_redirect(&cargo_files(&pinned), &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(
+            r.files.get("Cargo.toml").is_none_or(|t| t == &pinned),
+            "an already-pinned manifest is left as is: {:?}",
+            r.files.get("Cargo.toml")
+        );
     }
 
     /// Cargo.lock blocks missing their `checksum` (a `[patch]`-resolved or

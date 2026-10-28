@@ -185,6 +185,26 @@ fn rebuild_reason_label(code: &str) -> &str {
     }
 }
 
+/// The [`scan_vendor_references`] triples whose `(ecosystem, uuid)` no
+/// entry of `state` owns: lockfile wiring the ledger lost (state.json
+/// deleted, or a git merge kept one side of it, #991). `vendor --check`
+/// fails on them and an unscoped `rollback` refuses them.
+pub(crate) async fn unledgered_vendor_references(
+    project_root: &Path,
+    state: &socket_patch_core::vendor::VendorState,
+) -> Vec<(String, String, String)> {
+    scan_vendor_references(project_root)
+        .await
+        .into_iter()
+        .filter(|(eco, uuid, _)| {
+            !state
+                .entries
+                .values()
+                .any(|entry| entry.ecosystem == *eco && entry.uuid == *uuid)
+        })
+        .collect()
+}
+
 /// The `vendor_ledger_missing` detail for a lockfile reference no ledger
 /// entry owns.
 fn format_ledger_missing(eco: &str, uuid: &str) -> String {

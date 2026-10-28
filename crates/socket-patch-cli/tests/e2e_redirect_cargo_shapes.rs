@@ -1074,6 +1074,13 @@ async fn cargo_hosted_explicit_crates_io_registry_is_pinned() {
             consumer_manifest("cfg-if = \"1.0.4\"\n"),
         ),
         (
+            "crates-io-wrapped",
+            consumer_manifest(
+                "cfg-if = { version = \"1.0.4\", features = [\n], registry = \"crates-io\" }\n",
+            ),
+            consumer_manifest("cfg-if = { version = \"1.0.4\", features = [\n] }\n"),
+        ),
+        (
             "crates-io-table",
             format!(
                 "{}\n[dependencies.cfg-if]\nversion = \"1.0.4\"\nregistry = \"crates-io\"\n",
@@ -1102,6 +1109,97 @@ async fn cargo_hosted_explicit_crates_io_registry_is_pinned() {
             prefetch: "",
             contest: None,
             restored: vec![("Cargo.toml", restored)],
+        };
+        if run_shape(shape).await.is_none() {
+            return;
+        }
+    }
+}
+
+/// #757: an inline table whose array value wraps lines (rustfmt's style for
+/// a long feature list) was refused as "inline table does not close on its
+/// line". It is pinned on its opening line, builds against the patched
+/// copy, and `remove` restores every byte, for LF and CRLF manifests.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_multiline_inline_table_is_pinned() {
+    for (tag, crlf) in [("multiline-inline", false), ("multiline-inline-crlf", true)] {
+        let shape = Shape {
+            tag,
+            files: vec![
+                (
+                    "Cargo.toml",
+                    consumer_manifest(
+                        "cfg-if = { version = \"1.0.4\", features = [ # none needed\n] }\n",
+                    ),
+                ),
+                ("src/main.rs", "fn main() {}\n".to_string()),
+            ],
+            patches: vec![CFG_IF_1],
+            oracle: vec![(
+                "src/main.rs",
+                "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
+            )],
+            crlf,
+            lockless: false,
+            refused: None,
+            prefetch: "",
+            contest: None,
+            restored: vec![],
+        };
+        if run_shape(shape).await.is_none() {
+            return;
+        }
+    }
+}
+
+/// #757: dotted keys (`cfg-if.version = …`, here with a wrapped features
+/// array after the version line) and a literal-string version
+/// (`cfg-if = '…'`) were refused as spellings the line grammar does not
+/// edit. Each is pinned, builds against the patched copy, and `remove`
+/// restores every byte, for LF and CRLF manifests.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_dotted_and_literal_spellings_are_pinned() {
+    for (tag, dep, crlf) in [
+        (
+            "dotted",
+            "cfg-if.version = \"1.0.4\" # pinned\ncfg-if.features = [\n]\n",
+            false,
+        ),
+        (
+            "dotted-crlf",
+            "cfg-if.version = \"1.0.4\" # pinned\ncfg-if.features = [\n]\n",
+            true,
+        ),
+        (
+            "dotted-renamed",
+            "legacy.package = \"cfg-if\"\nlegacy.version = '1.0.4'\n",
+            false,
+        ),
+        ("literal", "cfg-if = '1.0.4' # pinned\n", false),
+        ("literal-crlf", "cfg-if = '1.0.4' # pinned\n", true),
+    ] {
+        let crate_ref = if tag == "dotted-renamed" {
+            "legacy"
+        } else {
+            "cfg_if"
+        };
+        let shape = Shape {
+            tag,
+            files: vec![
+                ("Cargo.toml", consumer_manifest(dep)),
+                ("src/main.rs", "fn main() {}\n".to_string()),
+            ],
+            patches: vec![CFG_IF_1],
+            oracle: vec![(
+                "src/main.rs",
+                format!("fn main() {{ println!(\"{{}}\", {crate_ref}::socket_patched()); }}\n"),
+            )],
+            crlf,
+            lockless: false,
+            refused: None,
+            prefetch: "",
+            contest: None,
+            restored: vec![],
         };
         if run_shape(shape).await.is_none() {
             return;

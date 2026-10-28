@@ -1,7 +1,7 @@
 //! `socket-patch vendor` — committable vendoring of patched dependencies.
 //!
-//! Works like `apply`, but instead of patching installed packages in place it
-//! ejects each patched package into `.socket/vendor/<eco>/<patch-uuid>/…` and
+//! Converts the hosted patches pinned in the project's lockfiles into
+//! `.socket/vendor/<eco>/<patch-uuid>/…` without an installed package tree, and
 //! rewires the ecosystem's lockfile/config so the project consumes the
 //! vendored copy. After committing `.socket/vendor/` + the lockfile edits, a
 //! fresh checkout builds with the patched dependency on machines with no
@@ -15,7 +15,8 @@
 //! vendored` drive this module's [`vendor_records`] engine directly in
 //! DETACHED mode: every entry they write carries its patch record embedded
 //! in the ledger and no `.socket/manifest.json` is ever written — this
-//! command is the one manifest-driven writer (`detached: false`). See
+//! command also supports legacy manifest-driven vendoring when no hosted
+//! pins are in scope (`detached: false`). See
 //! CLI_CONTRACT.md "Ownership, state, and reversal".
 
 use clap::Args;
@@ -23,7 +24,7 @@ use futures_util::StreamExt;
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::operations::{manifest_exists, read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
@@ -953,22 +954,37 @@ pub async fn run(args: VendorArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
 
-    // `--revert` derives everything from state.json + the vendor tree; it
-    // must work after the manifest was deleted. Plain vendor needs the
-    // manifest and exits clean without one (same contract as apply). This
-    // is a MANIFEST check, not a `.socket/` check: `scan`/`get --mode
-    // vendored` projects have `.socket/` but never a manifest. Nothing is
-    // locked or written on this path.
-    if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
-        // A hosted project (no manifest, hosted pins in its lockfiles)
-        // ejects: its patch set is the lockfiles' hosted pins.
+    // Only a missing file is "no manifest": one vendor cannot even stat
+    // is refused, never reported as a calm `noManifest` exit 0 (#998).
+    // Revert needs only the vendor ledger, so it never asks.
+    let manifest_present = if args.revert {
+        false
+    } else {
+        match manifest_exists(&manifest_path).await {
+            Ok(present) => present,
+            Err(e) => {
+                let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+                return emit_eject_refusal(&args.common, &err.code, &err.message);
+            }
+        }
+    };
+
+    // Hosted pins are the input, even when an agent manifest also exists.
+    // The raw lockfile inventory does not require VEX eligibility or an
+    // installed copy of a patch. Revert needs only the vendor ledger.
+    if !args.revert {
         let inventory = crate::commands::hosted_inventory(&args.common, &args.common.cwd).await;
         // Contested hosted wiring: the patch set cannot be read off the
-        // lockfiles, and a "nothing to vendor" answer would hide it.
-        if let Some(refusal) = inventory.contested_refusal() {
-            return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
-        }
+        // lockfiles, and a "nothing to vendor" answer would hide it. With
+        // a manifest and no in-scope pins, the manifest is the patch set,
+        // so the legacy manifest arm below runs instead.
+        let refusal = inventory.contested_refusal();
         let pins = hosted_pins_in_scope(&args.common, inventory.pins);
+        if let Some(refusal) = refusal {
+            if !manifest_present || !pins.is_empty() {
+                return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
+            }
+        }
         if !pins.is_empty() {
             // Eject needs every patch record from the API: an offline
             // run (or dry run) refuses before any request.
@@ -986,6 +1002,12 @@ pub async fn run(args: VendorArgs) -> i32 {
             }
             return run_eject(&args, pins).await;
         }
+    }
+
+    // Preserve legacy manifest-only vendoring when there are no hosted
+    // pins. A missing manifest is a no-op; detached vendored projects keep
+    // their records in the ledger instead.
+    if !args.revert && !manifest_present {
         // A requested `--vex` still attests what the `.socket/vendor`
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
         // with no manifest: nothing referenced anywhere keeps exit 0; any
@@ -1233,7 +1255,8 @@ async fn run_check(args: &VendorArgs) -> i32 {
     } else {
         None
     };
-    let go_sync_issues = tokio::sync::OnceCell::new();
+    let go_sync_issues =
+        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new()).await;
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1283,11 +1306,6 @@ async fn run_check(args: &VendorArgs) -> i32 {
             }
             if let Some((module, _)) = socket_patch_core::utils::purl::parse_golang_purl(key) {
                 let issues: Vec<String> = go_sync_issues
-                    .get_or_init(|| async {
-                        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new())
-                            .await
-                    })
-                    .await
                     .iter()
                     .filter(|issue| issue.module() == module)
                     .map(ToString::to_string)
@@ -1341,13 +1359,10 @@ async fn run_check(args: &VendorArgs) -> i32 {
     // know (the ledger was ignored or dropped from the commit along with the
     // manifest) leaves every fresh install failing; the manifest keys above
     // cannot see it, so the references are read from the wiring itself.
-    let references = crate::commands::vendored_backend::repair::scan_vendor_references(root).await;
+    let references =
+        crate::commands::vendored_backend::repair::unledgered_vendor_references(root, &state).await;
     for (eco, uuid, rel) in references {
-        let ledgered = state
-            .entries
-            .values()
-            .any(|entry| entry.uuid == uuid && entry.ecosystem == eco);
-        if ledgered || unledgered_uuids.contains(uuid.as_str()) {
+        if unledgered_uuids.contains(uuid.as_str()) {
             continue;
         }
         // No ledger entry means no purl to name: like repair, the event
@@ -1366,6 +1381,46 @@ async fn run_check(args: &VendorArgs) -> i32 {
                 .with_uuid(uuid)
                 .with_error("vendor_ledger_missing", detail)
                 .with_details(serde_json::json!({ "ecosystem": eco, "path": rel })),
+        );
+    }
+    // A committed vendor/modules.txt still recording a socket `replace`
+    // that go.mod no longer has breaks every default build until it is
+    // regenerated (#1777). The ledger entry it came from is gone after a
+    // revert, so the per-entry check above cannot see it.
+    let ledger_modules: HashSet<String> = state
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.ecosystem == "golang")
+        .filter_map(|(key, _)| socket_patch_core::utils::purl::parse_golang_purl(key))
+        .map(|(module, _)| module.into_owned())
+        .collect();
+    let stale_records: Vec<(String, String)> = go_sync_issues
+        .iter()
+        .filter(|issue| {
+            matches!(
+                issue,
+                socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::VendorModulesTxt {
+                    stale: true,
+                    ..
+                }
+            ) && !ledger_modules.contains(issue.module())
+        })
+        .map(|issue| (issue.module().to_string(), issue.to_string()))
+        .collect();
+    for (module, detail) in stale_records {
+        if !args.common.json {
+            eprintln!(
+                "{}: {detail}",
+                socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
+            );
+        }
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_error(
+                    socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE,
+                    detail,
+                )
+                .with_details(serde_json::json!({ "ecosystem": "golang", "module": module })),
         );
     }
     if args.common.json {
@@ -1709,13 +1764,16 @@ impl EjectSnapshot {
     }
 }
 
-/// Standalone `vendor` in a hosted project — no manifest, hosted pins in the
-/// lockfiles: EJECT. The patch set is the pins themselves (purl + the uuid
-/// in each hosted URL); each record is fetched from the API, vendored into
-/// `.socket/vendor/` exactly like `scan --mode vendored`, and the lock is
-/// rewired from hosted to vendored (the engine's takeover restores each
-/// pin's upstream registry entry first, so `vendor --revert` later returns
-/// the project to upstream, not to hosted).
+/// Standalone `vendor` with hosted pins in scope: EJECT. The patch set comes
+/// only from the lockfile pins (purl + the uuid in each hosted URL), even
+/// when `.socket/manifest.json` exists: manifest-only patches are not
+/// vendored and the manifest is not rewritten (vendoring those takes a full
+/// `scan --mode vendored`). Each record is fetched from the API, vendored
+/// into `.socket/vendor/` exactly like `scan --mode vendored`, and the lock
+/// is rewired from hosted to vendored in one planned transition: every
+/// pin's upstream registry entry is restored first (not per purl by the
+/// engine's takeover), so `vendor --revert` later returns the project to
+/// upstream, not to hosted.
 async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let common = &args.common;
     // A ledger git would not commit refuses before anything is fetched or
@@ -1738,6 +1796,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let telemetry = TelemetryAuth::for_client(&client);
+    let service = common.vendor_service_config(Some(client.clone()), use_public_proxy);
     if !common.json && !common.silent {
         println!(
             "{} {} into .socket/vendor/...",
@@ -1839,11 +1898,45 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         .refused()
         .map(|(pin, why)| (pin.purl.clone(), "redirect_revert_failed", why.to_string()))
         .collect();
-    // An sbt / scala-cli pin is vendored only past the build-evidence gate
-    // (no `target/` evidence in a fresh clone, stale evidence, …). Run it
-    // now, while the hosted pin still serves the patch: a pin the gate
-    // would stop after the restore would end neither hosted nor vendored.
+    // Reuse the takeover's read-only backend preview over the restored
+    // lockfile text. A manifest's presence must not change whether a dry
+    // run catches an unsupported lock entry (for example a pnpm catalog).
+    let uninstalled = common.cwd.join(".socket/vendor/.uninstalled");
+    let blobs = common.socket_dir().join("blobs");
+    let sources = PatchSources {
+        blobs_path: &blobs,
+        mem_blobs: None,
+    };
+    let pipenv_version = tokio::sync::OnceCell::new();
+    let installed_sites = vendor::pypi::InstalledSiteListings::default();
+    let vendored_at = now_rfc3339();
+    let restore_refused: HashSet<String> = refused.iter().map(|(p, _, _)| p.clone()).collect();
     for pin in &pins {
+        // A pin the restore already refused keeps its first, accurate
+        // reason; previewing it again would add a second failure event.
+        if restore_refused.contains(&pin.purl) {
+            continue;
+        }
+        if let Some((code, detail)) = takeover_dry_refusal(
+            &plan,
+            &pin.purl,
+            PackageSource::Installed(&uninstalled),
+            &common.cwd,
+            &records[&pin.purl],
+            &sources,
+            &vendored_at,
+            args.force,
+            Some(&service),
+            &pipenv_version,
+            &installed_sites,
+        )
+        .await
+        {
+            refused.push((pin.purl.clone(), code, detail));
+        }
+        // sbt / scala-cli also require build evidence. The backend treats
+        // that gate as a benign skip, but an eject must retain the hosted
+        // pin if it cannot vendor it.
         if let Err((code, detail)) =
             socket_patch_core::vendor::maven_repo::jvm_gate_preflight(&common.cwd, &pin.purl).await
         {
@@ -1934,11 +2027,10 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     }
 
     // One transaction under one apply lock: snapshot what the eject can
-    // touch, restore every pin upstream (so the vendor engine resolves the
-    // pristine registry package even in a fresh checkout with nothing
-    // installed), vendor, and on ANY failure put back what the eject wrote
-    // — a failed eject leaves the project hosted, exactly as it was, and
-    // every file it never wrote untouched.
+    // touch, restore upstream metadata for the vendor ledger's reversal,
+    // download and wire the prebuilt patches, and on ANY failure put back
+    // what the eject wrote. A failed eject leaves the project hosted,
+    // exactly as it was, and every file it never wrote untouched.
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
     let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
@@ -1981,6 +2073,20 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                 &client,
             ));
     }
+    // The vlt store entries the hosted pins installed, read before the
+    // restore unpins them: once the eject stands they hold hosted bytes the
+    // vendored lock no longer names, and are healed like a takeover's.
+    let pin_purls: Vec<String> = pins.iter().map(|p| p.purl.clone()).collect();
+    let vlt_targets = socket_patch_core::utils::fs::read_regular_to_string(
+        &common
+            .cwd
+            .join(socket_patch_core::constants::npm_family::VLT_LOCK),
+    )
+    .await
+    .map(|lock| {
+        socket_patch_core::patch::redirect::vlt_heal::lock_targets(&lock, &origins, &pin_purls)
+    })
+    .unwrap_or_default();
     let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
         &common.cwd,
         &pins,
@@ -2019,9 +2125,8 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         }
         let manifest = crate::commands::vendored_backend::records_manifest(records);
         // The same vendored apply as `scan --mode vendored`: detached (the
-        // eject is manifest-free) over this run's client and the shared
-        // service-config assembler.
-        let service = common.vendor_service_config(Some(client.clone()), use_public_proxy);
+        // eject does not use the agent manifest) over this run's client
+        // and the shared service-config assembler.
         let applied = VendoredBackend::new(common, Some(&service))
             .apply(
                 ApplyRequest {
@@ -2029,7 +2134,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                     socket_dir: &socket_dir,
                     ledger: load_state(&common.cwd).await,
                     detached: true,
-                    force: false,
+                    force: args.force,
                     prior: None,
                     eject: Some(&mut capture),
                 },
@@ -2104,6 +2209,21 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             env.mark_partial_failure();
         }
     } else {
+        // The eject stands: invalidate the vlt store copies still holding
+        // the hosted bytes (as the per-purl takeover does), so a later
+        // `vendor --revert` cannot leave patched bytes under a registry pin.
+        if let Some(detail) = crate::commands::vlt_heal::takeover_heal(common, &vlt_targets).await {
+            let code = crate::commands::vlt_heal::REINSTALL_REQUIRED;
+            if !common.json && !common.silent {
+                if let Some(line) = format_advisory(code, &detail, common.verbose) {
+                    eprintln!("{line}");
+                }
+            }
+            env.warnings.push(RunWarning {
+                code: code.to_string(),
+                detail,
+            });
+        }
         // The vendored summary and its "Next steps:", deferred until the
         // eject is known to stand: a failed one is rolled back (or needs
         // the manual restore its error names), so neither applies.
@@ -2114,7 +2234,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
 
     // Embedded VEX: same contract as the manifest-driven arm — only on
     // success, never on a dry run, and a requested-but-failed VEX flips the
-    // exit code. The ejected project has no manifest.
+    // exit code. The ejected patches are recorded in the vendor ledger.
     if exit == 0 {
         if let Some(vex_path) = args.vex.vex.as_ref() {
             if common.dry_run {
@@ -2872,41 +2992,48 @@ pub(crate) async fn vendor_records_reusing(
         vendor::prestage::sweep_stale(&common.cwd).await;
     }
 
-    let crawler_options = common.crawler_options();
-    // Resolve installed packages with the qualified-purl-aware resolver, never
-    // a base-keyed one: the manifest keys release-variant ecosystems (gem
-    // `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
-    // *qualified* purls, but the crawler only knows the *base* purl, so a
-    // base-keyed map would misclassify every installed qualified purl as
-    // "not installed". The rollback variant fans each base path back out to
-    // every qualified manifest purl.
-    let mut all_packages: HashMap<String, StagedSource> = find_packages_for_rollback_reusing(
-        &vendorable_partition,
-        &crawler_options,
-        common.silent || common.json,
-        prior,
-    )
-    .await
-    .into_iter()
-    .map(|(purl, dir)| (purl, StagedSource::Installed(dir)))
-    .collect();
-
-    // An npm alias is installed under its dependency key, not its actual
-    // package name. The targeted resolver probes canonical paths; before
-    // fetching a supposedly missing source, resolve aliases by the installed
-    // package.json identity. This also permits offline binary Bun vendoring.
-    let missing_npm: Vec<&String> = vendorable_partition
-        .get(&Ecosystem::Npm)
+    // An eject already selected exact patch UUIDs from the lockfiles. Its
+    // artifacts come from the service: installed copies (including an
+    // unrelated global Python/Ruby environment) cannot select or reject
+    // them. Leave their sources missing and let the backends read the locks.
+    let mut all_packages: HashMap<String, StagedSource> = HashMap::new();
+    if eject.is_none() {
+        let crawler_options = common.crawler_options();
+        // Resolve installed packages with the qualified-purl-aware resolver, never
+        // a base-keyed one: the manifest keys release-variant ecosystems (gem
+        // `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
+        // *qualified* purls, but the crawler only knows the *base* purl, so a
+        // base-keyed map would misclassify every installed qualified purl as
+        // "not installed". The rollback variant fans each base path back out to
+        // every qualified manifest purl.
+        all_packages = find_packages_for_rollback_reusing(
+            &vendorable_partition,
+            &crawler_options,
+            common.silent || common.json,
+            prior,
+        )
+        .await
         .into_iter()
-        .flatten()
-        .filter(|p| !all_packages.contains_key(*p))
+        .map(|(purl, dir)| (purl, StagedSource::Installed(dir)))
         .collect();
-    let by_identity = match prior.and_then(|p| p.packages_for(&crawler_options)) {
-        Some(installed) => npm_paths_by_identity_in(installed, &missing_npm),
-        None => npm_paths_by_identity(&crawler_options, &missing_npm).await,
-    };
-    for (purl, paths) in by_identity {
-        all_packages.insert(purl, StagedSource::Installed(paths[0].clone()));
+
+        // An npm alias is installed under its dependency key, not its actual
+        // package name. The targeted resolver probes canonical paths; before
+        // fetching a supposedly missing source, resolve aliases by the installed
+        // package.json identity. This also permits offline binary Bun vendoring.
+        let missing_npm: Vec<&String> = vendorable_partition
+            .get(&Ecosystem::Npm)
+            .into_iter()
+            .flatten()
+            .filter(|p| !all_packages.contains_key(*p))
+            .collect();
+        let by_identity = match prior.and_then(|p| p.packages_for(&crawler_options)) {
+            Some(installed) => npm_paths_by_identity_in(installed, &missing_npm),
+            None => npm_paths_by_identity(&crawler_options, &missing_npm).await,
+        };
+        for (purl, paths) in by_identity {
+            all_packages.insert(purl, StagedSource::Installed(paths[0].clone()));
+        }
     }
     let vendored_installs =
         drop_vendored_installs_by(&common.cwd, &mut all_packages, |source| match source {
@@ -2987,10 +3114,13 @@ pub(crate) async fn vendor_records_reusing(
     // the lockfiles still pin hosted must restore its upstream registry
     // entry FIRST (see the dispatch loop below). Discovered once, before any
     // write of this run.
-    let hosted_pins: Vec<socket_patch_core::patch::redirect::upstream::HostedPin> =
-        socket_patch_core::patch::redirect::upstream::HostedPin::all(
-            &crate::commands::discover_wiring(common, &common.cwd).await,
-        );
+    // Eject restored all its pins in one transaction before calling us;
+    // there is no per-package takeover or second discovery to perform.
+    let hosted_pins = if eject.is_some() {
+        Vec::new()
+    } else {
+        HostedPin::all(&crate::commands::discover_wiring(common, &common.cwd).await)
+    };
     let hosted_pin_of = |purl: &str| {
         hosted_pins
             .iter()
@@ -4367,7 +4497,8 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // (rollback's vendored leg, both of remove's paths, the manifest
     // reconcile): dispatch → drift-keep → per-entry ledger save. Only the
     // event vocabulary and the human lines are this command's.
-    let reverted = VendoredBackend::new(common, None)
+    let backend = VendoredBackend::new(common, None);
+    let reverted = backend
         .revert(
             &recorded,
             &mut state,
@@ -4375,6 +4506,9 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             false,
         )
         .await;
+    for (purl, w) in backend.go_undo_warnings(&reverted).await {
+        record_warning(env, &purl, &w, common);
+    }
     for RevertedEntry {
         key: purl,
         flavor,

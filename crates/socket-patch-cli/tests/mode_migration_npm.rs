@@ -93,7 +93,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_classic_vex::output_retrying_dns(&mut cmd)
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
@@ -616,10 +616,23 @@ fn assert_pure_vendored_and_round_trip(
 ) {
     let proj = &fx.proj;
 
-    // The takeover is surfaced on the vendor envelope (C7 twin).
+    // A hosted pin is in scope, so plain `vendor` ejected the lockfile's
+    // hosted patch (UUID_H) and ignored the staged manifest's UUID_V:
+    // vendoring manifest patches takes a full `scan --mode vendored`. The
+    // manifest-only patch is neither reported nor vendored, and the
+    // manifest is not rewritten.
     assert!(
-        vendor_stdout.contains("vendor_takeover_reverted_redirect"),
-        "takeover advisory missing from the vendor envelope ({tag}): {vendor_stdout}"
+        !vendor_stdout.contains(UUID_V),
+        "the manifest-only patch is not part of the eject ({tag}): {vendor_stdout}"
+    );
+    assert!(
+        proj.join(format!(".socket/vendor/npm/{UUID_H}")).is_dir()
+            && !proj.join(format!(".socket/vendor/npm/{UUID_V}")).exists(),
+        "only the hosted pin's patch is vendored ({tag})"
+    );
+    assert!(
+        read(proj, ".socket/manifest.json").contains(UUID_V),
+        "the eject must not rewrite the manifest ({tag})"
     );
 
     // v5 hosted mode keeps no ledger: the lock is the only hosted state,
@@ -865,6 +878,9 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
     // --patch-server-url.
     let (registry, lock_upstream) =
         mount_registry_from_classic_lock(&server, &String::from_utf8_lossy(&lock_pristine)).await;
+    // The staged manifest names UUID_V, but the hosted pin is in scope:
+    // `vendor` ejects the hosted patch (UUID_H), fetching its record from
+    // the mock API.
     stage_patch(&proj, &fx.orig, &fx.patched);
     let (code, stdout, stderr) = run_socket_env(
         &proj,
@@ -873,6 +889,12 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
             "--json",
             "--patch-server-url",
             server.uri().as_str(),
+            "--api-url",
+            server.uri().as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
             "--cwd",
             proj.to_str().unwrap(),
         ],
@@ -882,15 +904,16 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
     assert_eq!(envelope["summary"]["applied"], 1, "{stdout}");
 
-    // Manifest-less VEX of the takeover's terminal (vendored) state.
+    // Manifest-less VEX of the eject's terminal (vendored) state: the
+    // hosted patch attests, the manifest-only one never does.
     tokio::task::block_in_place(|| {
         classic_manifestless_vex(
             &fx,
             "classic-h2v-vex",
             yarn_classic_vex::Wiring::Vendored,
-            UUID_V,
-            "CVE-2026-99999",
             UUID_H,
+            "CVE-2026-3333",
+            UUID_V,
             None,
             &lock_pristine,
         )
@@ -939,7 +962,9 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
     // B: vendor over the live hosted pin — the takeover. Online against the
     // REAL registry: berry's restore re-derives the 10c0 checksum from the
     // registry tarball. The mock origin is named hosted via
-    // --patch-server-url.
+    // --patch-server-url. The staged manifest names UUID_V, but the hosted
+    // pin is in scope: `vendor` ejects the hosted patch (UUID_H), fetching
+    // its record from the mock API.
     stage_patch(&proj, &fx.orig, &fx.patched);
     let (code, stdout, stderr) = run_socket(
         &proj,
@@ -948,6 +973,12 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
             "--json",
             "--patch-server-url",
             server.uri().as_str(),
+            "--api-url",
+            server.uri().as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
             "--cwd",
             proj.to_str().unwrap(),
         ],
@@ -957,10 +988,11 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
     assert_eq!(envelope["summary"]["applied"], 1, "{stdout}");
 
     // MANIFEST-LESS VEX over the post-takeover (pure vendored) state, before
-    // the round trip below reverts it: the superseded HOSTED patch (UUID_H,
-    // same advisory) must never be attested alongside the vendored one — the
-    // matrix's exact-statement-set assertions would see it.
-    let tgz_rel = format!(".socket/vendor/npm/{UUID_V}/{DEP}-{DEP_VERSION}.tgz");
+    // the round trip below reverts it: the ejected hosted patch (UUID_H) is
+    // now the vendored one, and the manifest-only UUID_V (same advisory)
+    // must never be attested alongside it — the matrix's
+    // exact-statement-set assertions would see it.
+    let tgz_rel = format!(".socket/vendor/npm/{UUID_H}/{DEP}-{DEP_VERSION}.tgz");
     let registry_state = [
         ("yarn.lock", lock_pristine.clone()),
         ("package.json", pkg_json_pristine.clone().into_bytes()),
@@ -980,8 +1012,8 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
         yarnrc: &yarnrc,
         registry_state: &registry_state,
         purl: PURL,
-        uuid: UUID_V,
-        vulns: &[(GHSA, &["CVE-2026-99999"])],
+        uuid: UUID_H,
+        vulns: &[(GHSA, &["CVE-2026-3333"])],
         patched: &fx.patched,
         pristine: &fx.orig,
         installed: "node_modules/left-pad/index.js",

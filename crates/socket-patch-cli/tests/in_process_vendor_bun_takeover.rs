@@ -355,6 +355,64 @@ fn registry_uri() -> &'static str {
     })
 }
 
+/// The patch API's view of `uuid` over `purl`: [`patch_record`] plus the
+/// patched file's `blobContent`.
+fn patch_view(uuid: &str, purl: &str) -> Value {
+    let mut view = patch_record(uuid);
+    view["purl"] = json!(purl);
+    view["publishedAt"] = json!("2024-01-01T00:00:00Z");
+    view["files"]["package/index.js"]["blobContent"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(PATCHED_INDEX));
+    view
+}
+
+/// One patch API shared by every `vendor` run in this binary, serving the
+/// view of each hosted record the fixtures pin. Plain `vendor` over a
+/// hosted pin ejects it: the patch set is the lockfile's hosted pins (the
+/// agent manifest is not read), and each pinned record is fetched from the
+/// API. Runs on its own thread + runtime for the life of the process, like
+/// [`registry_uri`].
+fn patch_api_uri() -> &'static str {
+    static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URI.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("patch API runtime");
+            rt.block_on(async move {
+                let server = MockServer::start().await;
+                for (uuid, purl) in [(UUID, PURL), (registry::SCOPED_UUID, registry::SCOPED_PURL)] {
+                    Mock::given(method("GET"))
+                        .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+                        .respond_with(
+                            ResponseTemplate::new(200).set_body_json(patch_view(uuid, purl)),
+                        )
+                        .mount(&server)
+                        .await;
+                }
+                tx.send(server.uri()).expect("hand back the patch API uri");
+                std::future::pending::<()>().await;
+            });
+        });
+        rx.recv().expect("patch API started")
+    })
+}
+
+/// The flags pointing a `vendor` run's patch-record fetches at
+/// [`patch_api_uri`].
+fn patch_api_args() -> [&'static str; 6] {
+    [
+        "--api-url",
+        patch_api_uri(),
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ]
+}
+
 /// Run the built `socket-patch` binary in the hermetic environment
 /// (`tests/common/hermetic.rs`); `https://patch.socket.dev` counts as the patch server
 /// (`SOCKET_PATCH_SERVER_URL`) and the registry is the shared mirror
@@ -443,10 +501,11 @@ fn scan_mode(cwd: &Path, api_url: &str, mode: &str, extra: &[&str]) -> (i32, Val
     run_json(cwd, &args)
 }
 
-/// `vendor --json` — online: a takeover's upstream restore reads the
-/// registry mirror.
+/// `vendor --json` — online: an eject's upstream restore reads the
+/// registry mirror and its record fetch the shared [`patch_api_uri`].
 fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
     let mut args = vec!["vendor", "--json", "--cwd", cwd.to_str().unwrap()];
+    args.extend(patch_api_args());
     args.extend_from_slice(extra);
     run_json(cwd, &args)
 }
@@ -932,14 +991,15 @@ async fn bun_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
     // The manifest record `vendor` acts on (the staged blob).
     seed_manifest_and_blob(root);
 
-    // Dry run: the takeover's upstream restore is resolved write-free and
-    // previewed; the backend preview does not run against the still-hosted
-    // lock, so no false `vendor_lock_entry_not_found` and no refusal.
-    // Nothing written.
+    // Dry run: a hosted pin is in scope, so `vendor` previews the eject of
+    // the lockfile's pin (its upstream restore resolved write-free); the
+    // backend preview runs over the restored text, so no false
+    // `vendor_lock_entry_not_found` and no refusal. Nothing written.
+    let manifest = std::fs::read(root.join(".socket/manifest.json")).unwrap();
     let (code, env) = vendor_cli(root, &["--dry-run"]);
     assert_eq!(code, 0, "vendor --dry-run must succeed: {env:#}");
-    let advisory = find_event(&env, "skipped", Some("vendor_would_revert_redirect"));
-    assert_eq!(advisory["purl"], PURL, "{env:#}");
+    let planned = find_event(&env, "applied", Some("eject_planned"));
+    assert_eq!(planned["purl"], PURL, "{env:#}");
     assert_no_event_code(&env, "vendor_lock_entry_not_found");
     assert_no_event_code(&env, "redirect_revert_failed");
     assert_eq!(
@@ -957,13 +1017,18 @@ async fn bun_vendor_dry_run_previews_the_takeover_then_wet_vendor_completes_it()
         "a dry run must not create the vendor ledger"
     );
 
-    // Wet `vendor`: the takeover the preview promised.
+    // Wet `vendor`: the eject the preview promised. The manifest is
+    // neither the eject's input nor rewritten by it.
     let (code, env) = vendor_cli(root, &[]);
     assert_eq!(code, 0, "vendor must succeed: {env:#}");
     assert_eq!(env["summary"]["applied"], 1, "{env:#}");
-    find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
     find_event(&env, "applied", None);
     assert_pure_vendored(root);
+    assert_eq!(
+        std::fs::read(root.join(".socket/manifest.json")).unwrap(),
+        manifest,
+        "the eject must not rewrite the manifest"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1180,6 +1245,7 @@ fn bun_vendor_silent_refusal_keeps_error_diagnosis() {
             "--cwd",
             root.to_str().unwrap(),
         ];
+        args.extend(patch_api_args());
         if dry_run {
             args.push("--dry-run");
         }
@@ -1268,7 +1334,8 @@ fn bun_vendor_over_hosted_v1_workspace_lock_refuses_before_unhosting() {
         code, 1,
         "the preview must exit like the wet run it predicts: {env:#}"
     );
-    assert_eq!(env["status"], "partialFailure", "{env:#}");
+    assert_eq!(env["status"], "error", "{env:#}");
+    assert_eq!(env["error"]["code"], "eject_refused", "{env:#}");
     assert_eq!(env["dryRun"], true, "{env:#}");
     let failed = find_event(&env, "failed", Some(WS_CODE));
     assert_eq!(failed["purl"], PURL, "{env:#}");
@@ -1284,7 +1351,8 @@ fn bun_vendor_over_hosted_v1_workspace_lock_refuses_before_unhosting() {
     // `.socket/vendor/` empty.
     let (code, env) = vendor_cli(root, &[]);
     assert_eq!(code, 1, "the wet run refuses: {env:#}");
-    assert_eq!(env["status"], "partialFailure", "{env:#}");
+    assert_eq!(env["status"], "error", "{env:#}");
+    assert_eq!(env["error"]["code"], "eject_refused", "{env:#}");
     let failed = find_event(&env, "failed", Some(WS_CODE));
     assert_eq!(failed["purl"], PURL, "{env:#}");
     assert!(
@@ -1317,13 +1385,12 @@ fn bun_vendor_over_hosted_v2_workspace_lock_still_takes_over() {
 
     let (code, env) = vendor_cli(root, &["--dry-run"]);
     assert_eq!(code, 0, "{env:#}");
-    find_event(&env, "skipped", Some("vendor_would_revert_redirect"));
+    find_event(&env, "applied", Some("eject_planned"));
     assert_no_event_code(&env, WS_CODE);
 
     let (code, env) = vendor_cli(root, &[]);
-    assert_eq!(code, 0, "the v2 takeover must succeed: {env:#}");
+    assert_eq!(code, 0, "the v2 eject must succeed: {env:#}");
     assert_eq!(env["summary"]["applied"], 1, "{env:#}");
-    find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
     find_event(&env, "applied", None);
     assert_no_event_code(&env, WS_CODE);
     assert_pure_vendored(root);
@@ -1364,16 +1431,26 @@ fn assert_bun_reinstall_event(env: &Value) {
 }
 
 /// A hoisted bun project with left-pad vendored over its (v5) hosted pin
-/// by a plain `vendor` run; returns the pristine registry lock.
+/// by a plain `vendor` run (an eject: a detached ledger entry beside the
+/// untouched manifest); returns the pristine registry lock.
 fn write_vendored_project(root: &Path) -> String {
+    write_vendored_project_from(root, true)
+}
+
+/// [`write_vendored_project`]; with `hosted: false` the lock stays on the
+/// registry line, so the plain `vendor` run is the manifest-driven one and
+/// its ledger entry is tracked by the manifest.
+fn write_vendored_project_from(root: &Path, hosted: bool) -> String {
     let pristine = pristine_lock();
     write_bun_project(root, &pristine, &[(NAME, VERSION)]);
-    let hosted = pristine.replace(
-        LEFT_PAD_REGISTRY_LINE,
-        &hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512),
-    );
-    assert_ne!(hosted, pristine, "the hosted splice must hit");
-    std::fs::write(root.join("bun.lock"), &hosted).unwrap();
+    if hosted {
+        let hosted = pristine.replace(
+            LEFT_PAD_REGISTRY_LINE,
+            &hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512),
+        );
+        assert_ne!(hosted, pristine, "the hosted splice must hit");
+        std::fs::write(root.join("bun.lock"), &hosted).unwrap();
+    }
     seed_manifest_and_blob(root);
     let (code, env) = vendor_cli(root, &[]);
     assert_eq!(code, 0, "vendor must succeed: {env:#}");
@@ -1475,7 +1552,8 @@ async fn bun_scan_prune_revert_advises_a_forced_reinstall() {
         .await;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let pristine = write_vendored_project(root);
+    // A manifest-tracked entry: plain `vendor` with no hosted pin in scope.
+    let pristine = write_vendored_project_from(root, false);
     std::fs::write(root.join(".socket/manifest.json"), "{\"patches\": {}}\n").unwrap();
 
     let (code, env) = scan_mode(root, &server.uri(), "vendored", &["--prune"]);

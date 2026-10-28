@@ -4,7 +4,7 @@ use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::cleanup_blobs::ArtifactReferences;
 use socket_patch_core::manifest::operations::{
-    get_before_hash_blobs, read_manifest, write_manifest,
+    get_before_hash_blobs, manifest_exists, read_manifest, write_manifest,
 };
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
@@ -334,7 +334,12 @@ async fn patched_in_other_scope(
                 let unverifiable = v.current_hash.is_none()
                     && v.status != VerifyRollbackStatus::AlreadyOriginal
                     && !v.is_absent();
-                if unverifiable || v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
+                // `Ready` also covers npm's LF-shebang form of a patched
+                // bin, whose hash is not the afterHash.
+                if unverifiable
+                    || v.status == VerifyRollbackStatus::Ready
+                    || v.current_hash.as_deref() == Some(info.after_hash.as_str())
+                {
                     patched.push((purl.clone(), path.clone()));
                     break 'copies;
                 }
@@ -902,6 +907,40 @@ fn error_envelope(dry_run: bool, err: EnvelopeError) -> Envelope {
     env
 }
 
+/// The `vendor_ledger_missing` refusal for lockfile references into
+/// `.socket/vendor/<eco>/<uuid>/` (in the `--ecosystems` scope) that no
+/// entry of `state` owns, or `None` when every reference is ledgered.
+async fn unledgered_vendor_wiring(
+    common: &crate::args::GlobalArgs,
+    ledger_root: &Path,
+    state: &VendorState,
+) -> Option<String> {
+    let mut dirs: Vec<String> =
+        crate::commands::vendored_backend::repair::unledgered_vendor_references(ledger_root, state)
+            .await
+            .into_iter()
+            // An entry that carries the uuid under another ecosystem (an
+            // unknown backend, a hand edit) still owns it: its own revert
+            // reports what is wrong with it.
+            .filter(|(eco, uuid, _)| {
+                crate::commands::vendor::ecosystem_in_scope(common, eco)
+                    && !state.entries.values().any(|e| e.uuid == *uuid)
+            })
+            .map(|(eco, uuid, _)| format!(".socket/vendor/{eco}/{uuid}/"))
+            .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    dirs.sort();
+    Some(format!(
+        "lockfiles reference {}, which the vendor ledger (.socket/vendor/state.json) has no \
+         entry for, so rollback cannot unwind them; {} and roll back, or return the \
+         lockfiles to their pre-vendor versions",
+        dirs.join(", "),
+        crate::commands::vendor_orphans::UNLEDGERED_WIRING_REMEDY,
+    ))
+}
+
 /// Report a top-level rollback error: the error envelope on `--json`
 /// (message verbatim), an `Error:` stderr line otherwise. Errors print even
 /// under --silent ("errors only", never "nothing").
@@ -955,9 +994,14 @@ async fn run_vendored_leg(
         keep_artifact: preserve,
     };
     let loud = !common.json && !common.silent;
-    let reverted = VendoredBackend::new(common, None)
-        .revert(keys, state, opts, false)
-        .await;
+    let backend = VendoredBackend::new(common, None);
+    let reverted = backend.revert(keys, state, opts, false).await;
+    for (_, w) in backend.go_undo_warnings(&reverted).await {
+        if loud {
+            eprintln!("Warning: {}", w.detail);
+        }
+        out.warnings.push((w.code.to_string(), w.detail));
+    }
     for RevertedEntry {
         key,
         warnings,
@@ -1363,7 +1407,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // not this run's to unwind (see `project_state_in_scope`): a global
     // rollback restores the global copies and their manifest records only.
     let project_state = crate::commands::project_state_in_scope(&args.common);
-    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    // Only a missing file is "no manifest"; one rollback cannot even stat
+    // fails like the load below, not as "Manifest not found" (#998).
+    let manifest_missing = match manifest_exists(&manifest_path).await {
+        Ok(present) => !present,
+        Err(e) => {
+            track_patch_rollback_failed(&e.to_string(), &telemetry).await;
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            emit_rollback_error(
+                args.common.json,
+                args.common.dry_run,
+                &err.code,
+                &err.message,
+            );
+            return 1;
+        }
+    };
     let vendor_ledger_exists = project_state
         && tokio::fs::metadata(ledger_root.join(".socket/vendor/state.json"))
             .await
@@ -1588,6 +1647,28 @@ pub async fn run(args: RollbackArgs) -> i32 {
     };
 
     let scoped = !identifiers.is_empty() || !path_scope.is_empty();
+
+    // A lockfile still wired into a `.socket/vendor/` dir that the present
+    // ledger does not own (a merge kept one side of state.json, #991) is a
+    // patch this run cannot unwind: the pre-vendor originals lived in the
+    // lost entry. An unscoped run promises to unwind everything, so it
+    // refuses before writing, like the ledger-missing case above, instead
+    // of reverting the rest and deleting the ledger around the wiring.
+    if !scoped && project_state {
+        if let Ok(state) = &vendor_state_result {
+            if let Some(detail) = unledgered_vendor_wiring(&args.common, &ledger_root, state).await
+            {
+                track_patch_rollback_failed(&detail, &telemetry).await;
+                emit_rollback_error(
+                    args.common.json,
+                    args.common.dry_run,
+                    "vendor_ledger_missing",
+                    &detail,
+                );
+                return 1;
+            }
+        }
+    }
 
     // Identifier matching runs across ALL THREE stores; an identifier
     // matching nothing anywhere is the familiar exit-1 error.

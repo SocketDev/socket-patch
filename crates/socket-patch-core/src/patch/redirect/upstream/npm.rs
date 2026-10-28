@@ -727,6 +727,14 @@ async fn restore_berry(
     let mut hits: Vec<Hit> = Vec::new();
     // What the lock still declares, read once for the URL-keyed hits.
     let mut declared: Option<BTreeSet<String>> = None;
+    // Hosted pins a user `yarn patch` wraps (#962): restoring the base
+    // entry would leave the `patch:` descriptor naming a URL no entry
+    // resolves, which every `yarn install --immutable` rejects (YN0028).
+    let wrapped: BTreeSet<String> = [Some(raw), pkg_text.as_deref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|text| yarn_patch_wrapped_uuids(text, ctx))
+        .collect();
     for (i, block) in blocks.iter().enumerate() {
         let lines = stanza_lines(block);
         let Some(resolution) = berry_field(&lines, "resolution").map(str::to_string) else {
@@ -739,11 +747,7 @@ async fn restore_berry(
             continue;
         };
         let url_pin = reference.starts_with("https://") || reference.starts_with("http://");
-        let archive = if url_pin {
-            reference
-        } else if let Some((_, binding)) = reference.split_once("::__archiveUrl=") {
-            binding.split('&').next().unwrap_or(binding)
-        } else {
+        let Some(archive) = berry_hosted_archive(reference) else {
             continue;
         };
         let Some(uuid) = ctx.hosted_uuid(archive) else {
@@ -766,6 +770,20 @@ async fn restore_berry(
             );
             continue;
         };
+        if wrapped.contains(&uuid) {
+            result.refuse(
+                &uuid,
+                format!(
+                    "{name}@{version}: a `patch:` entry from `yarn patch` still wraps the \
+                     hosted tarball in {rel}, and restoring the registry entry under it would \
+                     leave a lock `yarn install --immutable` rejects — put the registry range \
+                     back in place of the `patch:` descriptor in the package.json that declares \
+                     it, run `yarn install`, roll back, then re-run `yarn patch` on the registry \
+                     version"
+                ),
+            );
+            continue;
+        }
         // An entry keyed by the tarball descriptor itself takes back the
         // descriptors its `resolutions` selectors route to that URL.
         let keyed_by_url = matches!(
@@ -1039,6 +1057,32 @@ async fn restore_berry(
     }
     doc.stanzas = blocks;
     view.write(rel, doc.render(&moved));
+}
+
+/// The tarball URL a berry hosted pin's locator reference names: the
+/// tarball-URL locator itself, or the percent-encoded `::__archiveUrl=`
+/// binding of an `npm:` locator pinned by releases up to 5.0 (#404).
+fn berry_hosted_archive(reference: &str) -> Option<&str> {
+    if reference.starts_with("https://") || reference.starts_with("http://") {
+        Some(reference)
+    } else {
+        let (_, binding) = reference.split_once("::__archiveUrl=")?;
+        Some(binding.split('&').next().unwrap_or(binding))
+    }
+}
+
+/// The hosted patch uuids a user `patch:` reference in `text` (a berry
+/// lock or a root `package.json`) wraps (#962).
+fn yarn_patch_wrapped_uuids(text: &str, ctx: &Ctx<'_>) -> Vec<String> {
+    use crate::formats::yarn::patterns::{split_pattern, user_patch_sources};
+
+    user_patch_sources(text)
+        .iter()
+        .filter_map(|source| {
+            let (_, reference) = split_pattern(source)?;
+            ctx.hosted_uuid(berry_hosted_archive(reference)?)
+        })
+        .collect()
 }
 
 /// Retire the leftover hosted `resolutions` selectors of a yarn berry root
@@ -2728,6 +2772,35 @@ async fn still_hosted(view: &mut View<'_>, rels: &[&str], ctx: &Ctx<'_>) -> bool
     false
 }
 
+/// Whether this restore put a pnpm lock the root `pnpm-workspace.yaml`
+/// trusts back on the registry and none of those locks is hosted any more.
+/// The file trusts the root lock and, under `sharedWorkspaceLockfile:
+/// false`, every member's own lock (#1268). A workspace whose member locks
+/// cannot be listed fails closed: a member lock may still need the setting.
+async fn trusted_pnpm_locks_restored(view: &mut View<'_>, ctx: &Ctx<'_>) -> bool {
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+    use crate::vendor::lock_inventory::ProjectView;
+
+    if !view
+        .staged
+        .keys()
+        .any(|k| k.rsplit('/').next() == Some("pnpm-lock.yaml"))
+    {
+        return false;
+    }
+    let mut locks = vec!["pnpm-lock.yaml".to_string()];
+    match member_locks(&ProjectView::Disk(view.root())).await {
+        MemberLocks::Shared => {}
+        MemberLocks::PerMember(keys) => locks.extend(keys),
+        MemberLocks::Unresolved(_) => return false,
+    }
+    if !view.staged.keys().any(|k| locks.contains(k)) {
+        return false;
+    }
+    let rels: Vec<&str> = locks.iter().map(String::as_str).collect();
+    !still_hosted(view, &rels, ctx).await
+}
+
 /// Remove the `.npmrc` / pnpm-workspace.yaml a hosted run CREATED (still
 /// byte-identical to the scaffold) once no lock entry needs it; warn about
 /// the setting when the file carries other content too (the line may be
@@ -2764,8 +2837,7 @@ pub(crate) async fn cleanup_side_config(
         }
     }
 
-    let restored_pnpm = view.staged.keys().any(|k| k == "pnpm-lock.yaml");
-    if restored_pnpm && !still_hosted(view, &["pnpm-lock.yaml"], ctx).await {
+    if trusted_pnpm_locks_restored(view, ctx).await {
         const WORKSPACE: &str = "pnpm-workspace.yaml";
         if let Ok(Some(ws)) = view.read(WORKSPACE).await {
             let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;

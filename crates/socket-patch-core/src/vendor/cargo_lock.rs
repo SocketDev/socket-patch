@@ -1891,6 +1891,7 @@ mod tests {
             source: source.map(str::to_string),
             checksum: None,
             dependencies: Vec::new(),
+            replace: None,
         };
         let tagged = format!("1.0.4+socket.{UUID}");
         let other = format!("1.0.4+socket.{UUID2}");

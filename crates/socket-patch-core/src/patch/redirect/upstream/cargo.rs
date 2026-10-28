@@ -326,20 +326,41 @@ fn lock_names_index(text: &str, uuid: &str) -> bool {
 
 static SHORTHAND_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(
-        r#"^(\s*[^=\s][^=]*?\s*=\s*)\{ version = "([^"]+)", registry = "(socket-patch-[0-9a-fA-F-]{36})" \}(.*)$"#,
+        r#"^(\s*[^=\s][^=]*?\s*=\s*)\{ version = ("[^"]+"), registry = "(socket-patch-[0-9a-fA-F-]{36})" \}(.*)$"#,
     )
     .expect("static shorthand regex is valid")
 });
 
+/// The rewriter's pin of a literal-string version (#757), written
+/// registry-first so it is never a user's own `{ version = '…' }` table.
+static LITERAL_SHORTHAND_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(
+        r#"^(\s*[^=\s][^=]*?\s*=\s*)\{ registry = "(socket-patch-[0-9a-fA-F-]{36})", version = ('[^']+') \}(.*)$"#,
+    )
+    .expect("static literal shorthand regex is valid")
+});
+
+/// Whether `body` (a line without its comment) is a dotted-key pin,
+/// `<key>.registry = "<reg>"` (#757).
+fn is_dotted_pin(body: &str, reg: &str) -> bool {
+    let pinned = super::super::parse_cargo_entry_key(body)
+        .and_then(|(_, rest)| rest.trim_start().strip_prefix('.'))
+        .and_then(|rest| super::super::parse_cargo_entry_key(rest.trim_start()))
+        .filter(|(sub, _)| sub == "registry")
+        .and_then(|(_, rest)| rest.trim_start().strip_prefix('='));
+    pinned.is_some_and(|value| value.trim() == format!("\"{reg}\""))
+}
+
 /// The line with its `registry = "<reg>"` pin removed: `Some(None)` drops
-/// the whole line (the table form's `registry = …` line; a trailing
-/// comment on it survives as a comment-only line),
+/// the whole line (the table form's `registry = …` line, or a dotted
+/// `<key>.registry = …` one; a trailing comment on it survives as a
+/// comment-only line),
 /// `Some(Some(line))` is the unpinned declaration, `None` a spelling this
 /// restore does not recognize.
 fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
     let trimmed = line.trim();
     let body = trimmed.split('#').next().unwrap_or(trimmed).trim();
-    if body == format!("registry = \"{reg}\"") {
+    if body == format!("registry = \"{reg}\"") || is_dotted_pin(body, reg) {
         // The pin may have overwritten a user's commented line in place
         // (a superseded pin, or `registry = "crates-io"`): the comment
         // stays, on its own line.
@@ -351,10 +372,26 @@ fn unpin_line(line: &str, reg: &str) -> Option<Option<String>> {
     }
     if let Some(c) = SHORTHAND_RE.captures(line) {
         if &c[3] == reg {
-            return Some(Some(format!("{}\"{}\"{}", &c[1], &c[2], &c[4])));
+            return Some(Some(format!("{}{}{}", &c[1], &c[2], &c[4])));
+        }
+    }
+    if let Some(c) = LITERAL_SHORTHAND_RE.captures(line) {
+        if &c[2] == reg {
+            return Some(Some(format!("{}{}{}", &c[1], &c[3], &c[4])));
         }
     }
     let open = line.find('{')?;
+    // The opening line of a multi-line inline table, which the rewriter
+    // pins right after its `{` (#757).
+    let opening_pin = format!(" registry = \"{reg}\",");
+    let wraps = super::super::cargo_inline_table(&[line], 0, &line[open..]).is_none();
+    if wraps && line[open + 1..].starts_with(&opening_pin) {
+        return Some(Some(format!(
+            "{}{}",
+            &line[..=open],
+            &line[open + 1 + opening_pin.len()..]
+        )));
+    }
     let close = open + line[open..].find('}')?;
     let inner = &line[open + 1..close];
     let pin_re = Regex::new(&format!(
@@ -506,6 +543,169 @@ mod tests {
                 "serde = { version = \"1\", features = [\"derive\"] } # hi".to_string()
             ))
         );
+    }
+
+    /// #757: the rewriter pins a multi-line inline table on its opening
+    /// line; restore drops exactly the text it inserted.
+    #[test]
+    fn multiline_inline_table_opening_line_loses_only_the_pin() {
+        for (pinned, original) in [
+            (
+                format!("serde = {{ registry = \"{REG}\", version = \"1\", features = ["),
+                "serde = { version = \"1\", features = [",
+            ),
+            (
+                format!("serde = {{ registry = \"{REG}\", features = [ # wrapped\r"),
+                "serde = { features = [ # wrapped\r",
+            ),
+            (
+                format!("serde = {{ registry = \"{REG}\", features = [ # see {{x}}"),
+                "serde = { features = [ # see {x}",
+            ),
+        ] {
+            assert_eq!(unpin_line(&pinned, REG), Some(Some(original.to_string())));
+        }
+    }
+
+    /// #757 end to end: restoring a hosted pin on a multi-line inline
+    /// table returns the manifest byte-exact, for LF, CRLF and a BOM.
+    #[tokio::test]
+    async fn restore_unpins_a_multiline_inline_table_byte_exact() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n";
+        let original = format!(
+            "{head}cfg-if = {{ version = \"1.0.4\", features = [\n  \"core\", # why\n] }}\nlog = \"0.4\"\n"
+        );
+        let pinned = format!(
+            "{head}cfg-if = {{ registry = \"socket-patch-{B}\", version = \"1.0.4\", features = [\n  \"core\", # why\n] }}\nlog = \"0.4\"\n"
+        );
+        for (crlf, bom) in [(false, false), (true, false), (false, true), (true, true)] {
+            let shape = |s: &str| {
+                let s = if crlf {
+                    s.replace('\n', "\r\n")
+                } else {
+                    s.to_string()
+                };
+                if bom {
+                    format!("\u{feff}{s}")
+                } else {
+                    s
+                }
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("Cargo.toml"), shape(&pinned)).unwrap();
+            let pins = [super::super::HostedPin {
+                purl: "pkg:cargo/cfg-if@1.0.4".into(),
+                uuid: B.into(),
+                files: vec!["Cargo.toml".into()],
+            }];
+            let opts = super::super::RestoreOptions {
+                offline: true,
+                ..Default::default()
+            };
+            let outcome = super::super::restore_upstream(tmp.path(), &pins, &opts).await;
+            assert_eq!(
+                outcome.restored().count(),
+                1,
+                "crlf={crlf} bom={bom}: {:?}",
+                outcome.pins
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+                shape(&original),
+                "crlf={crlf} bom={bom}"
+            );
+        }
+    }
+
+    /// #757: the rewriter pins a dotted-key dependency with an added
+    /// `<key>.registry` line, and a literal-string version as a table
+    /// that keeps the user's quotes; restore drops or collapses exactly
+    /// that.
+    #[test]
+    fn dotted_and_literal_pins_unpin_to_the_original_spelling() {
+        for (pinned, original) in [
+            (format!("serde.registry = \"{REG}\""), None),
+            (format!("  \"serde\" .registry = \"{REG}\"\r"), None),
+            (format!("'serde'.registry = \"{REG}\""), None),
+            (
+                format!("serde.registry = \"{REG}\" # explicit"),
+                Some("# explicit".to_string()),
+            ),
+            (
+                format!("serde = {{ registry = \"{REG}\", version = '1.0.190' }} # why\r"),
+                Some("serde = '1.0.190' # why\r".to_string()),
+            ),
+            (
+                format!("'serde' = {{ registry = \"{REG}\", version = '^1.0' }}"),
+                Some("'serde' = '^1.0'".to_string()),
+            ),
+            // A user's own one-line literal table keeps its table.
+            (
+                format!("serde = {{ version = '1.0.190', registry = \"{REG}\" }}"),
+                Some("serde = { version = '1.0.190' }".to_string()),
+            ),
+        ] {
+            assert_eq!(unpin_line(&pinned, REG), Some(original), "{pinned:?}");
+        }
+        // Another crate's own `registry` key is not a dotted pin.
+        assert_eq!(
+            unpin_line(&format!("serde.registry.x = \"{REG}\""), REG),
+            None
+        );
+    }
+
+    /// #757 end to end: restoring hosted pins written as dotted keys and
+    /// as a literal-string version returns the manifest byte-exact, for
+    /// LF, CRLF and a BOM.
+    #[tokio::test]
+    async fn restore_unpins_dotted_and_literal_pins_byte_exact() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n";
+        let original = format!(
+            "{head}cfg-if.version = \"1.0.4\" # why\ncfg-if.features = [\n  \"core\",\n]\n\
+             log = '0.4.20'\n"
+        );
+        let pinned = format!(
+            "{head}cfg-if.version = \"1.0.4\" # why\ncfg-if.registry = \"socket-patch-{B}\"\n\
+             cfg-if.features = [\n  \"core\",\n]\n\
+             log = {{ registry = \"socket-patch-{B}\", version = '0.4.20' }}\n"
+        );
+        for (crlf, bom) in [(false, false), (true, false), (false, true), (true, true)] {
+            let shape = |s: &str| {
+                let s = if crlf {
+                    s.replace('\n', "\r\n")
+                } else {
+                    s.to_string()
+                };
+                if bom {
+                    format!("\u{feff}{s}")
+                } else {
+                    s
+                }
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("Cargo.toml"), shape(&pinned)).unwrap();
+            let pins = [super::super::HostedPin {
+                purl: "pkg:cargo/cfg-if@1.0.4".into(),
+                uuid: B.into(),
+                files: vec!["Cargo.toml".into()],
+            }];
+            let opts = super::super::RestoreOptions {
+                offline: true,
+                ..Default::default()
+            };
+            let outcome = super::super::restore_upstream(tmp.path(), &pins, &opts).await;
+            assert_eq!(
+                outcome.restored().count(),
+                1,
+                "crlf={crlf} bom={bom}: {:?}",
+                outcome.pins
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+                shape(&original),
+                "crlf={crlf} bom={bom}"
+            );
+        }
     }
 
     #[test]

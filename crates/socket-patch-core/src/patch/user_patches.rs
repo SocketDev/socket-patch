@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::formats::text::strip_bom;
 use crate::utils::fs::read_regular_to_string;
 use crate::utils::npm_range::npm_range_admits;
-use crate::utils::purl::{normalize_purl, percent_decode_purl_component, strip_purl_qualifiers};
+use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
 
 #[derive(Default, Debug)]
@@ -474,45 +474,14 @@ impl UserPatchIndex {
         if !spec.starts_with("patch:") {
             return;
         }
-        let mut source = spec.to_owned();
-        let mut user_patch = false;
-        // Inspect every layer: a compatibility patch can wrap a user patch,
-        // or vice versa. Both still belong to the original package.
-        for _ in 0..16 {
-            if let Some(inner) = source
-                .strip_prefix("patch:")
-                .or_else(|| source.split_once("@patch:").map(|(_, rest)| rest))
-            {
-                let Some((original, patches)) = inner.split_once('#') else {
-                    self.unknown("npm", path, "unrecognized patch: reference");
-                    return;
-                };
-                // Only Yarn's compatibility namespace is exempt. Plugins can
-                // supply their own builtin patches through getBuiltinPatch.
-                let patches = percent_decode_purl_component(patches);
-                user_patch |= !patches
-                    .split("::")
-                    .next()
-                    .unwrap_or(&patches)
-                    .split('&')
-                    .all(|p| {
-                        let p = p.rsplit('!').next().unwrap_or(p).trim_start_matches('~');
-                        p.starts_with("builtin<compat/") && p.ends_with('>')
-                    });
-                source = percent_decode_purl_component(original).into_owned();
-                continue;
-            }
-            if user_patch {
-                let (name, version) = locator_target(&source);
+        match crate::formats::yarn::patterns::patch_layers(spec) {
+            Ok(Some(layers)) if layers.user_patch => {
+                let (name, version) = locator_target(&layers.source);
                 self.add("npm", name, version, path);
             }
-            return;
+            Ok(_) => {}
+            Err(reason) => self.unknown("npm", path, reason),
         }
-        self.unknown(
-            "npm",
-            path,
-            "patch locator nesting exceeds inspection limit",
-        );
     }
 
     async fn patch_package(&mut self, dir: &Path, value: &Value) {

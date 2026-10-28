@@ -115,7 +115,24 @@ class CiWorkflowContract(unittest.TestCase):
     def test_no_job_tolerates_failure(self):
         # A job-level continue-on-error would let ci-ok pass despite a failed
         # job, and this script would then cancel a run that could still land.
-        self.assertIsNone(re.search(r"^\s*continue-on-error:", self.text, re.M))
+        # A step-level one hides that step's failure the same way, so only
+        # the capped cache restores may carry it: a miss there just means
+        # building cold.
+        self.assertIsNone(re.search(r"^    continue-on-error:", self.text, re.M))
+        steps = re.split(r"(?m)^      - ", self.text)
+        tolerant = [s for s in steps if re.search(r"(?m)^\s*continue-on-error:", s)]
+        self.assertTrue(tolerant)
+        for step in tolerant:
+            self.assertRegex(step, r"(?m)^        uses: (Swatinem/rust-cache|actions/cache/restore)@", step[:80])
+            self.assertRegex(step, r"(?m)^        timeout-minutes: \d+$", step[:80])
+            self.assertRegex(step, r"(?m)^        continue-on-error: true$", step[:80])
+
+    def test_every_cache_restore_is_capped(self):
+        # An uncapped restore that hangs holds the queue head until the job
+        # times out (#1730).
+        for step in re.split(r"(?m)^      - ", self.text):
+            if re.search(r"(?m)^        uses: (Swatinem/rust-cache|actions/cache/restore)@", step):
+                self.assertRegex(step, r"(?m)^        timeout-minutes: \d+$", step[:80])
 
     def test_gate_runs_on_a_cancelled_run(self):
         gate = self.text[self.text.index("\n  ci-ok:"):]

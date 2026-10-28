@@ -233,6 +233,34 @@ async fn mount_hosted_api_serving(
     hosted_url
 }
 
+/// The patch API's record of `UUID` (the one [`stage_manifest`] stages):
+/// plain `vendor` over a hosted pin ejects it, fetching the pinned UUID's
+/// record from the API rather than reading the agent manifest.
+async fn mount_patch_view(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "six.py": {
+                "beforeHash": compute_git_sha256_from_bytes(ORIG),
+                "afterHash": compute_git_sha256_from_bytes(PATCHED),
+            }},
+            "vulnerabilities": {},
+            "description": "pypi mode takeover fixture",
+            "license": "MIT",
+            "tier": "free"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The flags pointing a `vendor` eject's record fetch at `uri`.
+fn api_args(uri: &str) -> [&str; 6] {
+    ["--api-url", uri, "--org", ORG, "--api-token", "fake-token"]
+}
+
 /// Stage the manifest and vendor the project; `files` carry the wiring.
 fn vendor_project(root: &Path, files: &[&str]) {
     stage_manifest(root);
@@ -614,12 +642,17 @@ async fn assert_all_hosted_requirements_unwind(pristine: &str) {
 
         if unwind[0] == "vendor" {
             stage_manifest(&root);
-            // `--patch-server-url` (which names the hosted origin to take
-            // over) also moves the vendored download onto this server.
+            // `--patch-server-url` (which names the hosted origin) also
+            // moves the vendored download onto this server; the eject
+            // fetches the pinned record from its API.
             prebuilt_common::mount_project(&server, &root).await;
+            mount_patch_view(&server).await;
         }
         let mut args = unwind.clone();
         args.extend(["--patch-server-url", uri.as_str()]);
+        if unwind[0] == "vendor" {
+            args.extend(api_args(&uri));
+        }
         let (code, env) = run_cli(&root, &args, &[]);
         assert_eq!(code, 0, "{unwind:?} over {pristine:?}: {env:#}");
         let after = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
@@ -627,7 +660,7 @@ async fn assert_all_hosted_requirements_unwind(pristine: &str) {
             assert!(
                 after.contains(&format!(".socket/vendor/pypi/{UUID}/"))
                     && !after.contains(&hosted_url),
-                "the takeover leaves the project vendored:\n{after}"
+                "the eject leaves the project vendored:\n{after}"
             );
         } else {
             assert_eq!(after, pristine, "{unwind:?} restores the pristine file");
@@ -997,14 +1030,15 @@ async fn poetry_revendors_to_a_superseding_patch_over_a_patched_venv() {
 
 /// #1105: a project hosted at patch A whose venv was then synced from the
 /// hosted lock (`uv sync`, `poetry install`, `uv pip install -r`), so six
-/// holds A's patched bytes, moves to vendored at the superseding patch B.
-/// The installed copy matches neither the pristine release nor B's
-/// output; it used to be dropped as `package_not_installed` (exit 1, the
-/// project left hosted on A) while `scan --mode vendored --dry-run`
-/// previewed success. The takeover must restore the upstream entry and
-/// vendor B.
+/// holds A's patched bytes, while the agent manifest already names the
+/// superseding patch B. Plain `vendor` used to drop the package as
+/// `package_not_installed` (exit 1, the project left hosted on A). It now
+/// ejects the hosted pin: A's record comes from the API, never the
+/// manifest or the venv, and the project ends up vendored at A.
+/// (`scan --mode vendored` is how to move to B; the superseded-install
+/// rule it relies on is covered by `hosted_pin_marks_a_pypi_install_superseded`.)
 #[tokio::test]
-async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
+async fn hosted_to_vendored_ejects_the_hosted_pin_over_a_hosted_venv() {
     let lanes: [(&str, StageFn); 3] = [
         ("uv", stage_uv_with_sibling),
         ("poetry", stage_poetry),
@@ -1026,8 +1060,12 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
 
         let venv = root.join("../hosted-venv");
         venv_installed_from_patch_a(&venv);
-        stage_manifest_with(&root, UUID_B, PATCHED_B);
+        // Serve A's prebuilt artifact and record, then point the manifest
+        // at B: the eject must not read it.
+        stage_manifest(&root);
         prebuilt_common::mount_project(&server, &root).await;
+        mount_patch_view(&server).await;
+        stage_manifest_with(&root, UUID_B, PATCHED_B);
         mount_pypi_json(&server).await;
         let uri = server.uri();
         let pypi = format!("{uri}/pypi");
@@ -1035,10 +1073,11 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
             ("VIRTUAL_ENV", venv.to_str().unwrap()),
             ("SOCKET_PYPI_JSON_API", pypi.as_str()),
         ];
-        let args = ["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+        let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+        args.extend(api_args(&uri));
 
         let (code, env) = run_cli(&root, &args, &extra);
-        assert_eq!(code, 0, "{lane}: takeover onto B: {env:#}");
+        assert_eq!(code, 0, "{lane}: eject of hosted A: {env:#}");
         assert!(
             !env.to_string().contains("package_not_installed"),
             "{lane}: the installed copy is not reported missing: {env:#}"
@@ -1048,10 +1087,10 @@ async fn hosted_to_vendored_takes_a_superseding_patch_over_a_hosted_venv() {
             .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
             .collect();
         assert!(
-            wired.contains(&format!(".socket/vendor/pypi/{UUID_B}/"))
+            wired.contains(&format!(".socket/vendor/pypi/{UUID}/"))
                 && !wired.contains(&hosted_url)
-                && !wired.contains(UUID),
-            "{lane}: wired to vendored B, hosted A gone:\n{wired}"
+                && !wired.contains(UUID_B),
+            "{lane}: wired to vendored A, hosted A gone, manifest B unread:\n{wired}"
         );
     }
 }
@@ -3117,12 +3156,11 @@ async fn pipenv_hosted_to_vendored_keeps_the_requirements_patched() {
     // which also rehosts the prebuilt download: serve the vendored wheel
     // from the same mock.
     prebuilt_common::mount_project(&server, &root).await;
+    mount_patch_view(&server).await;
     let uri = server.uri();
-    let (code, env) = run_cli(
-        &root,
-        &["vendor", "--patch-server-url", &uri, "--vendor-url", &uri],
-        &[],
-    );
+    let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+    args.extend(api_args(&uri));
+    let (code, env) = run_cli(&root, &args, &[]);
     assert_eq!(code, 0, "vendor takeover: {env:#}");
     let lock = std::fs::read_to_string(root.join("Pipfile.lock")).unwrap();
     assert!(
@@ -3138,6 +3176,243 @@ async fn pipenv_hosted_to_vendored_keeps_the_requirements_patched() {
         !env.to_string().contains("UNPATCHED"),
         "no install source is left unpatched: {env:#}"
     );
+}
+
+/// `pip lock -r requirements.txt -o pylock.toml` (pip 26.2.2) over
+/// [`stage_pip_lock`]'s requirements.txt, byte for byte.
+const PIP_LOCK: &str = r#"lock-version = "1.0"
+created-by = "pip"
+
+[[packages]]
+name = "idna"
+version = "3.7"
+
+[[packages.wheels]]
+name = "idna-3.7-py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/e5/3e/741d8c82801c347547f8a2a06aa57dbb1992be9e948df2ea0eda2c8b79e8/idna-3.7-py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "82fee1fc78add43492d3a1898bfa6d8a904cc97d8427f683ed8e798d07761aa0"
+
+[[packages]]
+name = "six"
+version = "1.16.0"
+
+[[packages.wheels]]
+name = "six-1.16.0-py2.py3-none-any.whl"
+url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl"
+
+[packages.wheels.hashes]
+sha256 = "8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"
+"#;
+
+/// A `pip lock` project: the requirements.txt and the PEP 751 lock pip
+/// wrote from it, both pinning six (and idna); returns its wiring files.
+fn stage_pip_lock(root: &Path) -> &'static [&'static str] {
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    std::fs::write(root.join("pylock.toml"), PIP_LOCK).unwrap();
+    &["requirements.txt", "pylock.toml"]
+}
+
+/// #1758: a pip project installs from both `requirements.txt` and the
+/// `pylock.toml` `pip lock` wrote from it. Vendored mode wires both to the
+/// same wheel (as hosted mode pins both), `vendor --check` is green, and
+/// the revert restores both files byte for byte. Before the fix only
+/// pylock.toml was wired and requirements.txt was named as an unpatched
+/// loser.
+#[tokio::test]
+async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
+    let (_tmp, root) = project();
+    let files = stage_pip_lock(&root);
+    let originals: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|f| (*f, std::fs::read(root.join(f)).unwrap()))
+        .collect();
+    stage_manifest(&root);
+    let needle = format!(".socket/vendor/pypi/{UUID}/");
+
+    // The dry run previews the requirements wiring and writes nothing.
+    let (code, env) = run_cli(&root, &["vendor", "--dry-run"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let text = env.to_string();
+    assert!(
+        text.contains("pypi_requirements_sibling_wired")
+            && !text.contains("pypi_multiple_lockfiles"),
+        "{env:#}"
+    );
+    for (file, bytes) in &originals {
+        assert_eq!(&std::fs::read(root.join(file)).unwrap(), bytes, "{file}");
+    }
+
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    for file in files {
+        assert!(
+            std::fs::read_to_string(root.join(file))
+                .unwrap()
+                .contains(&needle),
+            "{file} is wired: {env:#}"
+        );
+    }
+    assert!(
+        !env.to_string().contains("pypi_multiple_lockfiles"),
+        "requirements.txt is wired, not an unpatched loser: {env:#}"
+    );
+
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "both install sources are wired: {env:#}");
+
+    // Re-running is settled: nothing rewritten.
+    let wired: Vec<Vec<u8>> = files
+        .iter()
+        .map(|f| std::fs::read(root.join(f)).unwrap())
+        .collect();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        !env.to_string().contains("pypi_multiple_lockfiles"),
+        "a settled re-run names no lockfile: {env:#}"
+    );
+    for (file, bytes) in files.iter().zip(&wired) {
+        assert_eq!(&std::fs::read(root.join(file)).unwrap(), bytes, "{file}");
+    }
+
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    for (file, bytes) in &originals {
+        assert_eq!(
+            &std::fs::read(root.join(file)).unwrap(),
+            bytes,
+            "{file} is restored"
+        );
+    }
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+}
+
+/// #1758: a pylock vendored while requirements.txt did not pin six yet
+/// (a project vendored before the fix wired only the pylock). Once the
+/// file pins six==1.16.0, the next `vendor` wires it to the committed
+/// wheel and records it in the ledger entry: `vendor --check` is green
+/// and `vendor --revert` restores both files.
+#[tokio::test]
+async fn pip_lock_rerun_wires_a_requirements_pin_added_later() {
+    let (_tmp, root) = project();
+    stage_pip_lock(&root);
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\n").unwrap();
+    stage_manifest(&root);
+    let needle = format!(".socket/vendor/pypi/{UUID}/");
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+        "idna==3.7\n",
+        "{env:#}"
+    );
+
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        env.to_string().contains("pypi_requirements_sibling_wired"),
+        "{env:#}"
+    );
+    assert!(
+        std::fs::read_to_string(root.join("requirements.txt"))
+            .unwrap()
+            .contains(&needle),
+        "{env:#}"
+    );
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        std::fs::read(root.join("requirements.txt")).unwrap(),
+        b"idna==3.7\nsix==1.16.0\n",
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("pylock.toml")).unwrap(),
+        PIP_LOCK.as_bytes(),
+        "{env:#}"
+    );
+}
+
+/// #1758: hosted mode pins six in both `requirements.txt` and the
+/// `pip lock` pylock.toml. The hosted → vendored switch (plain `vendor`,
+/// the eject, and `scan --mode vendored`) restores both files to their
+/// registry entry and must then wire BOTH to the vendored wheel. Before
+/// the fix only pylock.toml was wired, so `pip install -r
+/// requirements.txt` went from patched to unpatched while the run exited
+/// 0, and the run's own `vendor --check` failed on contested wiring.
+#[tokio::test]
+async fn pip_lock_hosted_to_vendored_keeps_the_requirements_patched() {
+    let needle = format!(".socket/vendor/pypi/{UUID}/");
+    for takeover in [false, true] {
+        // A fresh mock per lane: the fixture server's project routes are
+        // mounted per project root.
+        let server = MockServer::start().await;
+        let hosted_url = mount_hosted_api(&server, true).await;
+        mount_patch_view(&server).await;
+        let uri = server.uri();
+        let switch: Vec<&str> = if takeover {
+            vec![
+                "scan",
+                "--mode",
+                "vendored",
+                "--yes",
+                "--api-url",
+                &uri,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake-token",
+                "--patch-server-url",
+                &uri,
+                "--vendor-url",
+                &uri,
+            ]
+        } else {
+            let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+            args.extend(api_args(&uri));
+            args
+        };
+        let (_tmp, root) = project();
+        let files = stage_pip_lock(&root);
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted scan: {env:#}");
+        for file in files {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(
+                text.contains(&hosted_url),
+                "hosted mode pins {file}:\n{text}\n{env:#}"
+            );
+        }
+
+        stage_manifest(&root);
+        prebuilt_common::mount_project(&server, &root).await;
+        let (code, env) = run_cli(&root, &switch, &[]);
+        assert_eq!(code, 0, "{switch:?}: {env:#}");
+        for file in files {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(
+                text.contains(&needle) && !text.contains(&hosted_url),
+                "{switch:?}: {file} is wired to the vendored wheel:\n{text}\n{env:#}"
+            );
+        }
+        assert!(
+            !env.to_string().contains("UNPATCHED")
+                && !env.to_string().contains("retain their existing sources"),
+            "{switch:?}: no install source is left unpatched: {env:#}"
+        );
+
+        let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+        assert_eq!(
+            code, 0,
+            "{switch:?}: both install sources are wired: {env:#}"
+        );
+    }
 }
 
 /// The `pipenv requirements > requirements.txt` export of [`stage_pipenv`]'s
@@ -3247,7 +3522,10 @@ async fn pipenv_vendor_wires_the_exported_requirements_too() {
     }
     stage_manifest(&root);
     prebuilt_common::mount_project(&server, &root).await;
-    let (code, env) = run_cli(&root, &["vendor", "--patch-server-url", uri.as_str()], &[]);
+    mount_patch_view(&server).await;
+    let mut args = vec!["vendor", "--patch-server-url", uri.as_str()];
+    args.extend(api_args(&uri));
+    let (code, env) = run_cli(&root, &args, &[]);
     assert_eq!(code, 0, "takeover: {env:#}");
     assert_both_vendored(&root, "takeover");
 }

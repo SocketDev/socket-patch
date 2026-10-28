@@ -1119,3 +1119,176 @@ fn native_go_vendor_drift_and_tidy_rollback() {
     assert!(String::from_utf8_lossy(&run.stdout).contains("OUT: PRISTINE"));
     chmod_writable(tmp.path());
 }
+
+// ── #1777: vendored undo vs a committed vendor/ ───────────────────────
+
+/// #1777: in a project with a committed `vendor/`, a vendored patch plus
+/// the `go mod vendor` its forward warning asks for leaves
+/// `vendor/modules.txt` recording the socket `replace`. Every vendored undo
+/// (`vendor --revert`, `rollback`, `remove <purl>`) drops that `replace`, so
+/// the next default build fails with "inconsistent vendoring" until
+/// `go mod vendor` runs again. Each undo must name that regeneration (as
+/// agent-mode rollback does, #343), and `apply --check` must report the
+/// stale modules.txt as drift until it is run.
+fn vendored_undo_needs_go_mod_vendor(label: &str, undo: &[&str], workspace: bool) {
+    if !golang_e2e_matrix::toolchain_ready(&format!("e2e_vendor_golang_build({label})")) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy) = stage(tmp.path());
+    let mc = modcache.to_str().unwrap();
+    let mut goenv = go_env(mc, &proxy);
+    // In a workspace, `go work vendor` owns vendor/modules.txt.
+    let regen_cmd: &[&str] = if workspace {
+        std::fs::write(consumer.join("go.work"), "go 1.21\n\nuse .\n").unwrap();
+        &["work", "vendor"]
+    } else {
+        &["mod", "vendor"]
+    };
+    if workspace {
+        // `-mod=mod` is not allowed in workspace mode.
+        goenv.retain(|(k, _)| *k != "GOFLAGS");
+        goenv.push(("GOFLAGS", ""));
+    }
+    let vendored = go(&consumer, regen_cmd, &goenv);
+    assert!(
+        vendored.status.success(),
+        "{regen_cmd:?}: {}",
+        String::from_utf8_lossy(&vendored.stderr)
+    );
+    // Default flags from here on: go builds from vendor/.
+    goenv.retain(|(k, _)| *k != "GOFLAGS");
+    goenv.push(("GOFLAGS", ""));
+
+    write_patch(&consumer);
+    let (code, stdout, stderr) = run_socket(
+        &consumer,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            consumer.to_str().unwrap(),
+        ],
+        &modcache,
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let revendor = go(&consumer, regen_cmd, &goenv);
+    assert!(
+        revendor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revendor.stderr)
+    );
+    let run = go(&consumer, &["run", "."], &goenv);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("OUT: PATCHED"),
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    {
+        let cs = consumer.to_str().unwrap();
+        let mut args = undo.to_vec();
+        args.extend(["--cwd", cs]);
+        let (code, so, se) = run_socket(&consumer, &args, &modcache);
+        assert_eq!(code, 0, "[{label}] failed.\n{so}\n{se}");
+        let renv = parse_json_envelope(&so);
+        assert!(
+            !std::fs::read_to_string(consumer.join("go.mod"))
+                .unwrap()
+                .contains("replace "),
+            "[{label}] the socket replace is gone"
+        );
+        let broken = go(&consumer, &["build", "./..."], &goenv);
+        assert!(
+            !broken.status.success()
+                && String::from_utf8_lossy(&broken.stderr).contains("inconsistent vendoring"),
+            "[{label}] the fixture reproduces the broken build: {}",
+            String::from_utf8_lossy(&broken.stderr)
+        );
+        assert!(
+            common::envelope::all_codes(&renv)
+                .contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
+            "[{label}] must name the vendor/modules.txt regeneration:\n{renv}"
+        );
+        let (code, so, se) = run_socket(
+            &consumer,
+            &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+            &modcache,
+        );
+        assert_eq!(
+            code, 1,
+            "[{label}] stale vendor/modules.txt is drift:\n{so}\n{se}"
+        );
+        let named = format!("go {}", regen_cmd.join(" "));
+        assert!(se.contains(&named), "[{label}] must name `{named}`: {se}");
+        let (code, so, se) = run_socket(&consumer, &["vendor", "--check", "--cwd", cs], &modcache);
+        assert_eq!(
+            code, 1,
+            "[{label}] vendor --check: stale vendor/modules.txt is drift:\n{so}\n{se}"
+        );
+        assert!(se.contains(&named), "[{label}] must name `{named}`: {se}");
+
+        // The step the warning names fixes the build.
+        let regen = go(&consumer, regen_cmd, &goenv);
+        assert!(
+            regen.status.success(),
+            "[{label}] {}",
+            String::from_utf8_lossy(&regen.stderr)
+        );
+        let run = go(&consumer, &["run", "."], &goenv);
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("OUT: PRISTINE"),
+            "[{label}] {}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        // (`vendor --revert` keeps the manifest record, which `--check`
+        // still reports as unledgered; only the modules.txt drift is gone.)
+        let (_code, so, se) = run_socket(&consumer, &["vendor", "--check", "--cwd", cs], &modcache);
+        assert!(
+            !se.contains("go_vendor_modules_txt_out_of_sync") && !so.contains("modules.txt"),
+            "[{label}] in sync after {named}:\n{so}\n{se}"
+        );
+    }
+
+    chmod_writable(tmp.path());
+}
+
+const REVERT: &[&str] = &["vendor", "--revert", "--json"];
+const ROLLBACK: &[&str] = &["rollback", "--offline", "--json"];
+const REMOVE: &[&str] = &["remove", UPURL, "--offline", "--json"];
+
+#[test]
+fn vendor_revert_needs_go_mod_vendor_with_committed_vendor_dir() {
+    vendored_undo_needs_go_mod_vendor("vendor --revert", REVERT, false);
+}
+
+#[test]
+fn vendored_rollback_needs_go_mod_vendor_with_committed_vendor_dir() {
+    vendored_undo_needs_go_mod_vendor("rollback", ROLLBACK, false);
+}
+
+#[test]
+fn vendored_remove_needs_go_mod_vendor_with_committed_vendor_dir() {
+    vendored_undo_needs_go_mod_vendor("remove", REMOVE, false);
+}
+
+#[test]
+fn vendor_revert_needs_go_work_vendor_in_workspace() {
+    vendored_undo_needs_go_mod_vendor("go.work vendor --revert", REVERT, true);
+}
+
+#[test]
+fn vendored_rollback_needs_go_work_vendor_in_workspace() {
+    vendored_undo_needs_go_mod_vendor("go.work rollback", ROLLBACK, true);
+}
+
+#[test]
+fn vendored_remove_needs_go_work_vendor_in_workspace() {
+    vendored_undo_needs_go_mod_vendor("go.work remove", REMOVE, true);
+}

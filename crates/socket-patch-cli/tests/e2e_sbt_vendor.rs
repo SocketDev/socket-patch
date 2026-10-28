@@ -786,17 +786,29 @@ fn drop_evidence(proj: &Path) {
     }
 }
 
-/// A takeover (vendoring over a hosted pin) the vendored gate would skip
-/// (no evidence: a fresh clone) is refused BEFORE the hosted pin is
-/// restored: the project stays hosted, never neither hosted nor vendored.
+/// The `vendor` flags naming the mock patch API of [`mock_gson_api`].
+fn api_flags(uri: &str) -> [&str; 6] {
+    ["--api-url", uri, "--org", "test-org", "--api-token", "fake"]
+}
+
+/// Plain `vendor` over a hosted pin ejects it even beside an agent
+/// manifest. An eject the vendored gate would skip (no evidence: a fresh
+/// clone) is refused BEFORE the hosted pin is restored: the project stays
+/// hosted, never neither hosted nor vendored, and the manifest is untouched.
 #[test]
 fn vendor_takeover_the_gate_would_skip_keeps_the_hosted_pin() {
     let tmp = tempfile::tempdir().unwrap();
     let fx = Fixture::new(tmp.path(), &[(GSON, GSON_UUID)]);
     let hosted = write_hosted_pin(&fx.proj(), GSON_UUID);
+    let manifest = std::fs::read(fx.proj().join(".socket/manifest.json")).unwrap();
     drop_evidence(&fx.proj());
-    let (exit, env) = fx.run(&["vendor"]);
+    let (_rt, server) = mock_gson_api();
+    let uri = server.uri();
+    let mut args = vec!["vendor"];
+    args.extend(api_flags(&uri));
+    let (exit, env) = fx.run(&args);
     assert_eq!(exit, Some(1), "{env}");
+    assert_eq!(env["error"]["code"], "eject_refused", "{env}");
     assert!(
         event_triples(&env).contains(&(
             GSON.purl(),
@@ -807,47 +819,47 @@ fn vendor_takeover_the_gate_would_skip_keeps_the_hosted_pin() {
     );
     assert_eq!(std::fs::read(fx.proj().join(HOSTED_FILE)).unwrap(), hosted);
     assert!(!fx.proj().join(VENDORED_FILE).exists());
+    assert_eq!(
+        std::fs::read(fx.proj().join(".socket/manifest.json")).unwrap(),
+        manifest
+    );
 }
 
-/// A dry-run takeover previews (the restore is dry, so the hosted file
-/// still pins the GA on disk; the planner's hosted-conflict refusal the wet
-/// run never sees is not raised), and the wet run takes over.
+/// A dry-run eject of a hosted sbt pin (beside an agent manifest) previews
+/// the plan and writes nothing; the wet run vendors the pinned patch and
+/// drops the hosted file, leaving the manifest as it was.
 #[test]
 fn vendor_takeover_of_a_hosted_sbt_pin_dry_and_wet() {
     let tmp = tempfile::tempdir().unwrap();
     let fx = Fixture::new(tmp.path(), &[(GSON, GSON_UUID)]);
     let hosted = write_hosted_pin(&fx.proj(), GSON_UUID);
-    let env = fx.ok(&["vendor", "--dry-run"]);
-    assert!(
-        env.to_string().contains("vendor_would_revert_redirect"),
-        "{env}"
-    );
-    assert!(
-        !env.to_string().contains("vendor_sbt_hosted_conflict"),
-        "{env}"
-    );
+    let manifest = std::fs::read(fx.proj().join(".socket/manifest.json")).unwrap();
+    let (_rt, server) = mock_gson_api();
+    let uri = server.uri();
+    let mut args = vec!["vendor"];
+    args.extend(api_flags(&uri));
+    let mut dry = args.clone();
+    dry.push("--dry-run");
+    let env = fx.ok(&dry);
+    assert!(env.to_string().contains("eject_planned"), "{env}");
     assert_eq!(std::fs::read(fx.proj().join(HOSTED_FILE)).unwrap(), hosted);
-    let env = fx.ok(&["vendor"]);
-    assert!(
-        env.to_string()
-            .contains("vendor_takeover_reverted_redirect"),
-        "{env}"
-    );
+    assert!(!fx.proj().join(VENDORED_FILE).exists());
+    let env = fx.ok(&args);
     assert!(!fx.proj().join(HOSTED_FILE).exists(), "{env}");
     assert!(fx.generated().contains(GSON_UUID));
+    assert_eq!(
+        std::fs::read(fx.proj().join(".socket/manifest.json")).unwrap(),
+        manifest
+    );
 }
 
-/// An eject (plain `vendor` in a hosted project) the vendored gate would
-/// skip is refused whole before anything is restored.
-#[test]
-fn vendor_eject_the_gate_would_skip_is_refused() {
+/// A mock patch API serving gson's patch record by `GSON_UUID`: plain
+/// `vendor` over a hosted pin ejects it, fetching the pinned record from
+/// the API (the agent manifest is not its input). Returns the runtime that
+/// keeps the server alive and the server.
+fn mock_gson_api() -> (tokio::runtime::Runtime, wiremock::MockServer) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    let tmp = tempfile::tempdir().unwrap();
-    let fx = Fixture::new(tmp.path(), &[(GSON, GSON_UUID)]);
-    std::fs::remove_file(fx.proj().join(".socket/manifest.json")).unwrap();
-    let hosted = write_hosted_pin(&fx.proj(), GSON_UUID);
-    drop_evidence(&fx.proj());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -868,6 +880,19 @@ fn vendor_eject_the_gate_would_skip_is_refused() {
             .respond_with(ResponseTemplate::new(200).set_body_json(view))
             .mount(&server),
     );
+    (rt, server)
+}
+
+/// An eject (plain `vendor` in a hosted project) the vendored gate would
+/// skip is refused whole before anything is restored.
+#[test]
+fn vendor_eject_the_gate_would_skip_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path(), &[(GSON, GSON_UUID)]);
+    std::fs::remove_file(fx.proj().join(".socket/manifest.json")).unwrap();
+    let hosted = write_hosted_pin(&fx.proj(), GSON_UUID);
+    drop_evidence(&fx.proj());
+    let (_rt, server) = mock_gson_api();
     let uri = server.uri();
     let (exit, env) = fx.run(&[
         "vendor",

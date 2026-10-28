@@ -907,6 +907,59 @@ async fn record_pnpm_file_copies(
     }
 }
 
+/// The `file:` directory and tarball copies of `name@version` that the
+/// pnpm lock at root-relative `file` (text `text`) installs: the entries
+/// discovery contests a wiring of the same lock with (#935), read the way
+/// [`record_pnpm_file_copies`] reads them. The vendored pnpm backend names
+/// each one, since the override it writes reaches only the registry edge.
+pub(crate) async fn pnpm_lock_file_copies(
+    root: &std::path::Path,
+    file: &str,
+    text: &str,
+    name: &str,
+    version: &str,
+) -> Vec<super::UnpatchedCopy> {
+    let Some(purl) = npm_purl(name, version) else {
+        return Vec::new();
+    };
+    let ctx = DiscoverCtx::with_origins(root, &[]);
+    let lock = PnpmLock::parse(text);
+    let mut copies: Vec<PnpmFileCopy> = Vec::new();
+    for package in lock.packages() {
+        // As `pnpm_entry_ref` classifies them: an entry without a tarball
+        // is a directory copy; one with a tarball is a copy unless it is a
+        // Socket wiring (or one discovery rejects as such).
+        let Some(resolution) = &package.resolution else {
+            continue;
+        };
+        let directory = match resolution.tarball() {
+            None => true,
+            Some(tarball) => {
+                let located = ctx.locate(tarball, LocateOpts::LITERAL_CHECKED);
+                if located.vendored.is_some() || located.decorated_leaf || located.hosted.is_some()
+                {
+                    continue;
+                }
+                false
+            }
+        };
+        // Only a copy that may be `name@version` is worth reading: the key
+        // or entry names most of them.
+        copies.extend(pnpm_file_copy(package, directory).filter(|copy| {
+            copy.name.as_deref().is_none_or(|n| n == name)
+                && copy.version.as_deref().is_none_or(|v| v == version)
+        }));
+    }
+    let mut scratch = Discovery::default();
+    record_pnpm_file_copies(&ctx, file, copies, &mut scratch).await;
+    let purl = crate::utils::purl_key::canonical_base_purl(&purl);
+    scratch
+        .unpatched_copies
+        .into_iter()
+        .filter(|copy| copy.purl == purl)
+        .collect()
+}
+
 /// The [`PnpmFileCopy`] of a `file:`-keyed entry, `None` for any other key.
 fn pnpm_file_copy(package: &PnpmPackage<'_>, directory: bool) -> Option<PnpmFileCopy> {
     let (name, path) = match classify_pnpm_key(package.key) {

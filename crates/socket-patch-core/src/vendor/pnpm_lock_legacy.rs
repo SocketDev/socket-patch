@@ -2653,6 +2653,57 @@ packages:
         );
     }
 
+    /// #935 on a legacy (pnpm 7/8) lock: a `file:` directory dependency
+    /// that installs a copy of the vendored release (its key names only the
+    /// path; the name is the entry's `name:`, the version the directory's
+    /// `package.json`) is named with `vendor_copy_unpatched`, and the
+    /// registry entry is still vendored. A copy of another version is not.
+    #[tokio::test]
+    async fn file_copy_of_the_vendored_release_is_named() {
+        let lock = T8_BEFORE_LOCK
+            .replace(
+                "  left-pad-old:\n",
+                "  lp2:\n    specifier: file:forks/left-pad\n    version: file:forks/left-pad\n  left-pad-old:\n",
+            )
+            .replace(
+                "  file:consumer:\n",
+                "  file:forks/left-pad:\n    resolution: {directory: forks/left-pad, type: directory}\n    name: left-pad\n    dev: false\n\n  file:consumer:\n",
+            );
+        for (copy_version, named) in [("1.3.0", true), ("1.2.0", false)] {
+            let fx = fixture_with(T_BEFORE_PKG, &lock).await;
+            let dir = fx.root().join("forks/left-pad");
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(
+                dir.join(PACKAGE_JSON),
+                format!(r#"{{"name":"left-pad","version":"{copy_version}"}}"#),
+            )
+            .await
+            .unwrap();
+            let (result, _, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{copy_version}: {:?}", result.error);
+            let copies: Vec<&VendorWarning> = warnings
+                .iter()
+                .filter(|w| w.code == "vendor_copy_unpatched")
+                .collect();
+            assert_eq!(
+                copies.len(),
+                usize::from(named),
+                "{copy_version}: {warnings:?}"
+            );
+            if named {
+                assert!(
+                    copies[0].detail.contains("`file:forks/left-pad`"),
+                    "{}",
+                    copies[0].detail
+                );
+            }
+            assert!(fx
+                .read(PNPM_LOCK)
+                .await
+                .contains("  file:forks/left-pad:\n"));
+        }
+    }
+
     /// No packages entry for the target → the not-found refusal, nothing
     /// written.
     #[tokio::test]

@@ -1886,11 +1886,51 @@ const DENO_NPM_REGISTRY_MAX_DEPTH: usize = 8;
 /// Deno crawler's JSR root, not an npm registry. Sorted, for a stable
 /// scan order.
 fn deno_npm_cache_roots() -> Vec<PathBuf> {
-    let Some(npm) = super::deno_crawler::deno_dir().map(|dir| dir.join("npm")) else {
+    match super::deno_crawler::deno_dir() {
+        Some(dir) => deno_npm_registry_dirs(&dir.join("npm")),
+        None => Vec::new(),
+    }
+}
+
+/// The registry dirs a `--global-prefix` naming a parent of Deno's npm
+/// cache stands for (#444): `$DENO_DIR` (its `npm` child) or
+/// `$DENO_DIR/npm` itself, walked the way [`deno_npm_cache_roots`] walks
+/// the `-g` one. Empty for anything else: a `node_modules`, a dir that is
+/// itself a package (an `npm` with a `package.json` is the npm CLI, not
+/// Deno's cache), an `npm` holding a `node_modules` (npm's own global
+/// prefix on Windows, `%APPDATA%\npm`), or one with no registry dir below
+/// it, so every other prefix keeps its `node_modules` walk.
+fn deno_cache_parent_registry_dirs(prefix: &Path) -> Vec<PathBuf> {
+    let prefix = std::path::absolute(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+    let prefix = prefix.as_path();
+    let is_cache_npm_dir = |dir: &Path| {
+        dir.file_name().is_some_and(|name| name == "npm")
+            && dir.is_dir()
+            && !dir.join("package.json").exists()
+            && !dir.join("node_modules").exists()
+    };
+    if prefix
+        .file_name()
+        .is_some_and(|name| name == "node_modules")
+        || prefix.join("package.json").exists()
+    {
+        return Vec::new();
+    }
+    let npm = if is_cache_npm_dir(prefix) {
+        prefix.to_path_buf()
+    } else if is_cache_npm_dir(&prefix.join("npm")) {
+        prefix.join("npm")
+    } else {
         return Vec::new();
     };
+    deno_npm_registry_dirs(&npm)
+}
+
+/// Every registry dir below `npm`, a Deno npm cache dir
+/// (`$DENO_DIR/npm`); see [`deno_npm_cache_roots`].
+fn deno_npm_registry_dirs(npm: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    let mut level: Vec<PathBuf> = sorted_subdirs_sync(&npm)
+    let mut level: Vec<PathBuf> = sorted_subdirs_sync(npm)
         .into_iter()
         .filter(|name| name != "jsr.io")
         .map(|name| npm.join(name))
@@ -3278,6 +3318,10 @@ impl NpmCrawler {
             if let Some(ref custom) = options.global_prefix {
                 if is_deno_npm_cache_root(custom) {
                     return vec![custom.clone()];
+                }
+                let registries = deno_cache_parent_registry_dirs(custom);
+                if !registries.is_empty() {
+                    return registries;
                 }
                 return pnpm_isolated_global_install_roots(custom);
             }

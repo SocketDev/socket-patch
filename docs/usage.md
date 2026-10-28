@@ -78,16 +78,18 @@ existing patches. See [gradual rollout](configuration.md#gradual-rollout).
 
 ## Vendoring and offline installs
 
-For an existing hosted project without an agent manifest:
+For an existing hosted project, including a clean checkout with no dependencies installed:
 
 ```sh
 socket-patch vendor --dry-run
 socket-patch vendor
 ```
 
-`vendor` ejects the patches referenced by the project's hosted dependency files.
-When an agent manifest exists, it uses that manifest's patch set. To discover and
-vendor available patches in one run, use:
+`vendor` reads the hosted patch pins from the project's lockfiles, downloads their
+prebuilt patched artifacts, and rewrites the dependency files to use `.socket/vendor/`.
+An agent manifest or an installed package tree does not change that selection.
+When no hosted patches are in scope, it retains the legacy fallback to the agent
+manifest. To discover and vendor available patches in one run, use:
 
 ```sh
 socket-patch scan --mode vendored

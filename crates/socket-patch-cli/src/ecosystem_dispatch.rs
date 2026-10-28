@@ -621,7 +621,7 @@ pub async fn find_all_packages_for_purls(
     // first-wins via their own `merge_first_wins` wiring in
     // `dispatch_find`. An npm purl with no copy can still be reached
     // through a workspace member's alias link (#1494).
-    dispatch_find_with_npm_links(
+    let mut found = dispatch_find_with_npm_links(
         partitioned,
         options,
         silent,
@@ -629,7 +629,31 @@ pub async fn find_all_packages_for_purls(
         None,
         NpmLinks::ForUnresolved,
     )
-    .await
+    .await;
+    retain_locked_cargo_copies(&mut found, options).await;
+    found
+}
+
+/// Drop the Cargo copies a local project's build never consumes: a
+/// registry-cache copy of a crate its `Cargo.lock` takes from a path, git
+/// or `[patch]` source instead (`CargoCrawler::locked_registry_crates`).
+/// The cache is shared machine-wide, so such a copy is often there, and
+/// patching or attesting it would vouch for code cargo does not build
+/// (#506). Only the commands that patch or attest call this: rollback and
+/// `scan --prune` still find the copy, since an earlier apply may have
+/// patched it (#1278).
+async fn retain_locked_cargo_copies(
+    copies: &mut HashMap<String, Vec<PathBuf>>,
+    options: &CrawlerOptions,
+) {
+    let is_cargo = |purl: &str| Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo);
+    if !copies.keys().any(|purl| is_cargo(purl)) {
+        return;
+    }
+    let Some(locked) = CargoCrawler::new().locked_registry_crates(options).await else {
+        return;
+    };
+    copies.retain(|purl, _| !is_cargo(purl) || locked.contains_purl(purl));
 }
 
 /// Multi-copy variant of `find_packages_for_rollback` (qualified-aware
@@ -1075,6 +1099,9 @@ pub async fn find_manifest_package_copies_reusing(
         NpmLinks::ForUnresolved,
     )
     .await;
+    // Only the registry copies of crates the lock takes from a registry
+    // are ones the build consumes, as for `apply` (#506).
+    retain_locked_cargo_copies(&mut copies, &crawler_options).await;
     // `apply` also writes every store variant of each npm copy (a pnpm peer
     // suffix, a Deno `_N` copy index, a vlt peer extra), so "every copy"
     // includes them (#603).

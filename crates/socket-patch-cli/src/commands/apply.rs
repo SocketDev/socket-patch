@@ -6,7 +6,7 @@ use socket_patch_core::crawlers::ruby_crawler::{
 use socket_patch_core::crawlers::{
     bun_uses_global_store, detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler,
 };
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{manifest_exists, read_manifest};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
@@ -358,25 +358,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             }
             return 0;
         }
-        Err(e) => {
-            let msg = format!(
-                "Patch check could not read the manifest ({e}); \
-                 treating it as drift (fail-closed)."
-            );
-            if args.common.json {
-                let mut env = Envelope::new(Command::Apply);
-                env.dry_run = args.common.dry_run;
-                let mut err = crate::json_envelope::manifest_load_error(manifest_path, &e);
-                err.message = msg;
-                env.mark_error(err);
-                println!("{}", env.to_pretty_json());
-            } else {
-                // Errors print even under --silent ("errors only", never
-                // "nothing"): exit 1 with no message would be undiagnosable.
-                eprintln!("Error: {msg}");
-            }
-            return 1;
-        }
+        Err(e) => return refuse_unreadable_manifest(args, manifest_path, &e),
     };
 
     // (purl_or_name, reason_code, detail) for each drift.
@@ -932,6 +914,32 @@ fn manifest_targets_npm(manifest: &PatchManifest) -> bool {
 /// The yarn-berry PnP refusal's envelope error text.
 const YARN_PNP_UNSUPPORTED: &str = "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.";
 
+/// A manifest that exists but cannot be stated, refused before the API
+/// client, the lock or telemetry are touched: the same envelope and exit
+/// as the load failure further down (#931, #998).
+/// `--check` says so as the drift it is treated as, whether the manifest
+/// failed to stat here or to load in [`run_check`].
+fn refuse_unreadable_manifest(args: &ApplyArgs, manifest_path: &Path, e: &std::io::Error) -> i32 {
+    let mut err = crate::json_envelope::manifest_load_error(manifest_path, e);
+    if args.check {
+        err.message = format!(
+            "Patch check could not read the manifest ({e}); \
+             treating it as drift (fail-closed)."
+        );
+    }
+    if args.common.json {
+        let mut env = Envelope::new(Command::Apply);
+        env.dry_run = args.common.dry_run;
+        env.mark_error(err);
+        println!("{}", env.to_pretty_json());
+    } else {
+        // Errors print even under --silent ("errors only", never
+        // "nothing"): exit 1 with no message would be undiagnosable.
+        eprintln!("Error: {}", crate::ui::sentence_case(&err.message));
+    }
+    1
+}
+
 fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
     refuse_yarn_pnp_with_skips(args, &[])
 }
@@ -985,7 +993,14 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // every install).
     // Nothing below this gate is touched — no API client (its config read,
     // stderr advisory and org-slug round-trip), no lock, no `.socket/`.
-    if tokio::fs::metadata(&manifest_path).await.is_err() {
+    // Only a missing file is "no manifest": one apply cannot even stat
+    // (an unsearchable `.socket/`, `.socket` as a file, a symlink loop)
+    // fails closed, or every patch would be skipped with exit 0 (#998).
+    let manifest_present = match manifest_exists(&manifest_path).await {
+        Ok(present) => present,
+        Err(e) => return refuse_unreadable_manifest(&args, &manifest_path, &e),
+    };
+    if !manifest_present {
         // A yarn-PnP layout refuses loudly even with no manifest: scan
         // cannot discover PnP packages (they live inside .yarn/cache zips),
         // so it never writes one — without this hoisted check the layout
@@ -3543,7 +3558,9 @@ fn lock_resolution_is_calm(purl: &str) -> bool {
 }
 
 /// The `package_not_installed` detail of an unmatched purl the lock does
-/// not calmly account for: Cargo's carries the `cargo fetch` remedy.
+/// not calmly account for: Cargo's carries the `cargo fetch` remedy, and
+/// says why a crate the lock takes from a path, git or `[patch]` source
+/// is never found (#506).
 fn not_installed_detail(purl: &str) -> &'static str {
     if Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo) {
         CARGO_NOT_FETCHED_DETAIL
@@ -3555,7 +3572,8 @@ fn not_installed_detail(purl: &str) -> &'static str {
 /// [`not_installed_detail`] for a Cargo crate.
 const CARGO_NOT_FETCHED_DETAIL: &str =
     "No unpacked crate source matches this PURL; run `cargo fetch` first so the crate is in \
-     the Cargo registry cache, then re-run apply";
+     the Cargo registry cache, then re-run apply. A crate Cargo.lock takes from a path, git or \
+     [patch] source is never patched: cargo does not build its registry copy";
 
 /// The `unmatched` purls with no lock evidence (sorted input, sorted
 /// output): the ones that can still fail an all-miss run.
@@ -3631,7 +3649,8 @@ fn cargo_fetch_hint(unmatched: &[String]) -> Option<&'static str> {
         .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
         .then_some(
             "Cargo crates are patched in the registry cache: run `cargo fetch` first so every \
-             locked crate is unpacked there, then re-run apply.",
+             locked crate is unpacked there, then re-run apply. A crate Cargo.lock takes from a \
+             path, git or [patch] source is never patched there: cargo does not build that copy.",
         )
 }
 
