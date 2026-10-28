@@ -86,6 +86,8 @@ pub enum GoSyncIssue {
     Workspace {
         module: String,
         version: String,
+        /// The file holding the replace: `go.mod`, or the root `go.work`.
+        file: &'static str,
         conflict: WorkspaceConflict,
     },
 }
@@ -157,10 +159,11 @@ impl std::fmt::Display for GoSyncIssue {
             GoSyncIssue::Workspace {
                 module,
                 version,
+                file,
                 conflict,
             } => write!(
                 f,
-                "the go.mod `replace` for {module} {version} {}",
+                "the {file} `replace` for {module} {version} {}",
                 conflict.consequence(module, version)
             ),
         }
@@ -217,6 +220,7 @@ async fn work_modfile_issues(project_root: &Path) -> Vec<GoSyncIssue> {
             Some(GoSyncIssue::Workspace {
                 version: e.version?,
                 module: e.module,
+                file: "go.work",
                 conflict: conflict.clone(),
             })
         })
@@ -468,6 +472,7 @@ async fn workspace_issues(project_root: &Path, replaces: &[ReplaceEntry]) -> Vec
             issues.push(GoSyncIssue::Workspace {
                 module: entry.module.clone(),
                 version: version.to_string(),
+                file: "go.mod",
                 conflict,
             });
         }

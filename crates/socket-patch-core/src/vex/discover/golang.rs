@@ -123,16 +123,14 @@ use super::{
     DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::go_env::go_env;
+use crate::utils::go_env::{go_env, goflags_modfile, GoflagsModfile};
 use crate::vendor::go_build_list::{self, Selection};
 use crate::vendor::go_mod_edit::{
     self, block_structure_error, hosted_module_uuid, normalize_for_read, ReplaceEntry,
     ReplaceOwner, HOSTED_GO_MODULE_PREFIX,
 };
 use crate::vendor::go_sum_edit::{go_semver_cmp, go_sum_lines, is_h1_dirhash};
-use crate::vendor::go_workspace::{
-    self, in_root_dir, same_dir_key, GoWork, GoWorkspace, Member, WorkspaceConflict,
-};
+use crate::vendor::go_workspace::{self, in_root_dir, same_dir_key, GoWork, GoWorkspace, Member};
 use crate::vendor::lock_inventory::LockIntegrity;
 
 const GO_MOD: &str = "go.mod";
@@ -159,10 +157,15 @@ async fn extract_goenv(
 ) {
     // `-modfile` sends the build to another go.mod, whose replaces (if
     // any) discovery doesn't read: nothing here is what go builds (#1799).
-    let root = ctx.disk_root().unwrap_or(Path::new(""));
-    if let Some(WorkspaceConflict::ModFile { setting }) =
-        go_workspace::modfile_conflict_with(root, goflags, gowork)
-    {
+    // Only a project on disk is built under this process's GOFLAGS (the
+    // hosted engine reads it for the same views), and only a GOFLAGS that
+    // names `-modfile` or that go refuses needs the root at all, so a
+    // tracked snapshot's reads stay recorded otherwise.
+    let setting = goflags
+        .filter(|g| goflags_modfile(g) != GoflagsModfile::Default)
+        .and_then(|_| ctx.disk_root())
+        .and_then(|root| go_workspace::modfile_setting_with(root, goflags, gowork));
+    if let Some(setting) = setting {
         return withhold(ctx, out, &setting).await;
     }
     extract_gowork(ctx, out, gowork).await;

@@ -9312,7 +9312,7 @@ pub struct HostedGoWorkspace {
     pub root: std::path::PathBuf,
     pub loaded: crate::vendor::go_workspace::Loaded,
     /// `GOFLAGS`' `-modfile` keeping the replace from the build, as
-    /// [`crate::vendor::go_workspace::modfile_conflict`] words it (#1799).
+    /// [`crate::vendor::go_workspace::modfile_setting`] words it (#1799).
     #[serde(default)]
     pub modfile: Option<String>,
 }

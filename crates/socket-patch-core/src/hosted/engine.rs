@@ -562,10 +562,7 @@ async fn read_go_workspace(
             }
             view.disk_root_reading(&touched);
             // `-modfile` in GOFLAGS sends the build to another go.mod (#1799).
-            let modfile = match go_workspace::modfile_conflict(&root) {
-                Some(go_workspace::WorkspaceConflict::ModFile { setting }) => Some(setting),
-                _ => None,
-            };
+            let modfile = go_workspace::modfile_setting(&root);
             (root, loaded, modfile)
         }
     };
