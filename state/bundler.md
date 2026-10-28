@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-28 (run 52), main `a8a10dc`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, **4.1.0.beta3** (new). The redirect (56), vendor (44) and stale-install (42) gem suites pass on 4.1.0.beta3 / Ruby 3.3.6 at `a8a10dc` (run 52), and on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. On Ruby 3.3.6 also export `BUNDLER_VERSION` (4.1.0.beta3 is installed, so it's the default binstub otherwise).
+Last updated: 2026-10-28 (run 53), main `3a5f0d5`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, **4.1.0.beta3** (new). The redirect (56), vendor (44) and stale-install (42) gem suites pass on 4.1.0.beta3 / Ruby 3.3.6 at `a8a10dc` (run 52), and on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. On Ruby 3.3.6 also export `BUNDLER_VERSION` (4.1.0.beta3 is installed, so it's the default binstub otherwise).
 
 ## Coverage matrix
 
@@ -438,6 +438,14 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
 | Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
 
+### Run 53 (main `3a5f0d5`, v5.0.1; Linux Ruby 3.3.6; scratch tests in `e2e_redirect_gem_build.rs`, upstream spelled `https://rubygems.org` and served via `SOCKET_RUBYGEMS_URL` + `BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/`)
+
+| Cell | 4.0.18 | 4.0.23 | 4.1.0.beta3 | 2.6.9 |
+| --- | --- | --- | --- | --- |
+| Eject on a CHECKSUMS lock: dry run → wet run → fresh frozen install → `bundle exec` loads patched | pass | pass | pass | pass |
+| Then `vendor --revert` (upstream sha re-derived) → fresh frozen install | pass | pass | pass | pass |
+| Eject with a `path:` sibling, CHECKSUMS → frozen install → `rollback <purl>` → frozen install | — | pass | pass | pass |
+
 ### Run 52 (main `a8a10dc`, v5.0.1; Linux; scratch tests in `e2e_redirect_gem_build.rs`, real `bundle install` / `bundle exec`)
 
 | Cell | 1.17.3 (Ruby 3.1.6) | 2.1.4 (Ruby 3.1.6) | 4.0.18 (Ruby 3.3.6) | 4.1.0.beta3 (Ruby 3.3.6) |
@@ -520,10 +528,10 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 ## Backlog
 
 1. Re-run #1109 (`agent:needs-human`) when it's fixed.
-2. Eject on a CHECKSUMS lock with a real rubygems.org upstream (the mock upstream can't re-derive the sha), incl. `git:` / `path:` siblings and a platform gem (`-x86_64-linux`).
-3. Vendored superseding patch that changes the gem's runtime deps.
-4. Two-gem merged lock on Bundler 2.2.33 (first split-section release) after an upgrade from 2.1.4, frozen.
-5. The gem suites on 4.1.0 final when it ships. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
+2. Eject on a CHECKSUMS lock with a `git:` sibling (local git source in the scratch harness), and on a platform-gem lock without CHECKSUMS.
+3. The gem suites on 4.1.0 final when it ships.
+4. Vendored stub-vs-lock runtime-dependency drift, only if the service `gem-stub-gemspec` can declare other deps than the lifted GEM spec block (a file patch can't).
+5. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
 
 ## Known non-bugs
 
@@ -665,3 +673,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - Adding a `BUNDLE_GEMFILE` dual boot to a hosted project makes `vendor` (dry and wet) refuse `hosted_wiring_contested`, even when `Gemfile.next` evals `Gemfile`. It fails closed and matches the documented #390 dual-boot refusal (run 51).
 - `vendor` eject on a `gems.rb`-only project (no `Gemfile`) is refused `gemfile_not_loaded`, as documented ("Gemfile spelling only"). The message still says "a gems.rb sits beside the Gemfile" when there's no Gemfile. That's a wording nit only (run 52).
 - Pushed `bughunt/bundler/*` probe branches haven't triggered an Actions run since 2026-10-05, and `git push --delete` from the sandbox hangs up. Nine leftover branches up to `20261028-macos-gem-suites` need a maintainer to delete them.
+- An eject on a CHECKSUMS lock can be driven with the mock upstream by spelling it `https://rubygems.org` in the pair, exporting `SOCKET_RUBYGEMS_URL=<mock>/upstream` for socket-patch and `BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/=<mock>/upstream/` for Bundler. `mount_vendored_grant` supplies the vendored artifacts (run 53).
+- A Bundler 2.1.4 merged multi-remote lock under a newer Bundler is Bundler's own upgrade behaviour (it splits sections on an unfrozen install), not socket-patch output, so it's not a cell (run 53).
