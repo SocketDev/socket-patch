@@ -49,8 +49,10 @@
 //!   `go.work.sum` itself, so a dependency's requirement can raise the
 //!   version past everything discovery reads: there a `/go.mod`-only pin
 //!   is never the basis (`integrity_required = true`), and a higher
-//!   version in a member's `require` or a sum file's zip line makes it
-//!   inert. Anything else — no `/go.mod` line, two
+//!   version in a member's `require` or a member go.sum's zip line makes
+//!   it inert. go only ever appends to `go.work.sum`, so its zip lines
+//!   outlive the requirement that raised a module and prove nothing.
+//!   Anything else — no `/go.mod` line, two
 //!   different hashes for one line, a non-dirhash `h1:` (both a go
 //!   `SECURITY ERROR`), a line of other than three tokens anywhere in a
 //!   sum file (go rejects the whole file) — is not a pin:
@@ -542,13 +544,16 @@ impl SumPins {
         let mut pins = SumPins::default();
         for file in files {
             if let Some(text) = ctx.read_text(file, out).await {
-                pins.add(&text);
+                pins.add(&text, file != GO_WORK_SUM);
             }
         }
         pins
     }
 
-    fn add(&mut self, text: &str) {
+    /// `selects`: whether the file's zip lines show what the build selects.
+    /// go only ever appends to `go.work.sum`, so its lines outlive the
+    /// requirement that raised a module.
+    fn add(&mut self, text: &str, selects: bool) {
         // go rejects a whole go.sum with any non-blank line of other than
         // three tokens (only `go mod tidy` skips it).
         if text
@@ -559,7 +564,7 @@ impl SumPins {
             return;
         }
         for line in go_sum_lines(text) {
-            if !line.go_mod {
+            if !line.go_mod && selects {
                 self.zip_versions
                     .entry(line.module.to_string())
                     .or_default()
@@ -996,8 +1001,9 @@ mod tests {
     /// A workspace builds the union of its members' requirements, and a
     /// member's dependency can raise the module past every `require` while
     /// go writes the missing sums to `go.work.sum` itself: a `/go.mod`-only
-    /// pin there is never the basis, and a higher `require` or zip line
-    /// makes it inert.
+    /// pin there is never the basis, and a higher `require` or member
+    /// go.sum zip line makes it inert. A `go.work.sum` zip line does not:
+    /// go never drops one once nothing raises the module any more.
     #[tokio::test]
     async fn workspace_go_mod_only_pin_is_never_the_basis() {
         let m = gopatch(UUID_A);
@@ -1045,7 +1051,15 @@ mod tests {
                 Some(svc("1.21", mid)),
                 None,
                 Some(zip("v1.5.0")),
-                true,
+                false,
+            ),
+            (
+                "stale go.work.sum zip line, member requires it",
+                ". ./svc",
+                Some(svc("1.21", &req(VERSION))),
+                None,
+                Some(zip("v1.5.0")),
+                false,
             ),
             (
                 "member's dependency, member go.sum",
@@ -1094,7 +1108,7 @@ mod tests {
                 None,
                 None,
                 Some(zip("v1.5.0")),
-                true,
+                false,
             ),
             (
                 "root not a member",
