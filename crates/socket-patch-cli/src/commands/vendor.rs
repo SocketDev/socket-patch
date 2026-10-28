@@ -1362,6 +1362,50 @@ async fn run_check(args: &VendorArgs) -> i32 {
                 .with_details(serde_json::json!({ "ecosystem": eco, "path": rel })),
         );
     }
+    // A committed vendor/modules.txt still recording a socket `replace`
+    // that go.mod no longer has breaks every default build until it is
+    // regenerated (#1777). The ledger entry it came from is gone after a
+    // revert, so the per-entry check above cannot see it.
+    let ledger_modules: HashSet<String> = state
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.ecosystem == "golang")
+        .filter_map(|(key, _)| socket_patch_core::utils::purl::parse_golang_purl(key))
+        .map(|(module, _)| module.into_owned())
+        .collect();
+    let stale_records: Vec<(String, String)> = go_sync_issues
+        .get_or_init(|| async {
+            socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new()).await
+        })
+        .await
+        .iter()
+        .filter(|issue| {
+            matches!(
+                issue,
+                socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::VendorModulesTxt {
+                    stale: true,
+                    ..
+                }
+            ) && !ledger_modules.contains(issue.module())
+        })
+        .map(|issue| (issue.module().to_string(), issue.to_string()))
+        .collect();
+    for (module, detail) in stale_records {
+        if !args.common.json {
+            eprintln!(
+                "{}: {detail}",
+                socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
+            );
+        }
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_error(
+                    socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE,
+                    detail,
+                )
+                .with_details(serde_json::json!({ "ecosystem": "golang", "module": module })),
+        );
+    }
     if args.common.json {
         println!("{}", env.to_pretty_json());
     }

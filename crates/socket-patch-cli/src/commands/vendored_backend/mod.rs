@@ -142,6 +142,7 @@ impl<'a> VendoredBackend<'a> {
         stop_on_failure: bool,
     ) -> Vec<RevertedEntry> {
         let mut out = Vec::with_capacity(keys.len());
+        let mut unwired_go = Vec::new();
         for key in keys {
             // Captured before a clean revert drops the entry.
             let flavor = state.entries.get(key).and_then(|e| e.flavor.clone());
@@ -149,6 +150,10 @@ impl<'a> VendoredBackend<'a> {
                 .entries
                 .get(key)
                 .map(|e| (e.ecosystem.clone(), e.base_purl.clone()));
+            let golang = state
+                .entries
+                .get(key)
+                .is_some_and(|e| e.ecosystem == "golang");
             let mut result = revert_vendor_entry(&self.common.cwd, key, state, opts).await;
             let hard_failure = matches!(
                 result.step,
@@ -187,6 +192,9 @@ impl<'a> VendoredBackend<'a> {
                     .await;
                 }
             }
+            if golang && unwired && !matches!(result.step, VendorRevertStep::WouldRevert) {
+                unwired_go.push(out.len());
+            }
             out.push(RevertedEntry {
                 key: key.clone(),
                 flavor,
@@ -197,7 +205,36 @@ impl<'a> VendoredBackend<'a> {
                 break;
             }
         }
+        self.push_go_consumer_warnings(&unwired_go, &mut out).await;
         out
+    }
+
+    /// Dropping a vendored `replace` leaves a committed vendor/modules.txt
+    /// (or go.mod requirements) still describing it, which breaks every
+    /// default build until `go mod vendor` runs (#343, #1777). Audit once
+    /// after the loop and attach each issue to the unwired Go entry of its
+    /// module (the first one when none matches), so every reverting
+    /// command reports it.
+    async fn push_go_consumer_warnings(&self, unwired_go: &[usize], out: &mut [RevertedEntry]) {
+        let Some(&first) = unwired_go.first() else {
+            return;
+        };
+        let issues =
+            socket_patch_core::vendor::go_consumer_sync::audit(&self.common.cwd, &HashMap::new())
+                .await;
+        for issue in issues {
+            let owner = unwired_go
+                .iter()
+                .copied()
+                .find(|&i| {
+                    socket_patch_core::utils::purl::parse_golang_purl(&out[i].key)
+                        .is_some_and(|(module, _)| module == issue.module())
+                })
+                .unwrap_or(first);
+            out[owner]
+                .warnings
+                .push(VendorWarning::new(issue.code(), issue.to_string()));
+        }
     }
 }
 

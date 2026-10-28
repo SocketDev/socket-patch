@@ -2253,11 +2253,18 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .chain(hosted_leg.warnings.iter())
                 .cloned()
                 .collect();
+            // Both Go legs audit the same go.mod and vendor/modules.txt
+            // (#1777): an issue the agent leg already reported is not
+            // repeated for the vendored one.
             vendored_leg
                 .warnings
                 .iter()
                 .chain(hosted_leg.warnings.iter())
-                .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
+                .for_each(|w| {
+                    if !run_warnings.contains(w) {
+                        run_warnings.push(w.clone());
+                    }
+                });
             // A restored package whose ownership could not be put back, or
             // whose stale bytecode could not be removed (the engine reports
             // it on `error` with `success: true`), is restored but worth a
