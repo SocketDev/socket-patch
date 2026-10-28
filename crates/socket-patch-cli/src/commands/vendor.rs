@@ -24,7 +24,7 @@ use futures_util::StreamExt;
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::operations::{manifest_exists, read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
@@ -954,6 +954,21 @@ pub async fn run(args: VendorArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
 
+    // Only a missing file is "no manifest": one vendor cannot even stat
+    // is refused, never reported as a calm `noManifest` exit 0 (#998).
+    // Revert needs only the vendor ledger, so it never asks.
+    let manifest_present = if args.revert {
+        false
+    } else {
+        match manifest_exists(&manifest_path).await {
+            Ok(present) => present,
+            Err(e) => {
+                let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+                return emit_eject_refusal(&args.common, &err.code, &err.message);
+            }
+        }
+    };
+
     // Hosted pins are the input, even when an agent manifest also exists.
     // The raw lockfile inventory does not require VEX eligibility or an
     // installed copy of a patch. Revert needs only the vendor ledger.
@@ -966,8 +981,7 @@ pub async fn run(args: VendorArgs) -> i32 {
         let refusal = inventory.contested_refusal();
         let pins = hosted_pins_in_scope(&args.common, inventory.pins);
         if let Some(refusal) = refusal {
-            let has_manifest = tokio::fs::metadata(&manifest_path).await.is_ok();
-            if !has_manifest || !pins.is_empty() {
+            if !manifest_present || !pins.is_empty() {
                 return emit_eject_refusal(&args.common, "hosted_wiring_contested", &refusal);
             }
         }
@@ -993,7 +1007,7 @@ pub async fn run(args: VendorArgs) -> i32 {
     // Preserve legacy manifest-only vendoring when there are no hosted
     // pins. A missing manifest is a no-op; detached vendored projects keep
     // their records in the ledger instead.
-    if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
+    if !args.revert && !manifest_present {
         // A requested `--vex` still attests what the `.socket/vendor`
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
         // with no manifest: nothing referenced anywhere keeps exit 0; any
