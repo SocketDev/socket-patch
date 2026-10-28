@@ -2945,6 +2945,90 @@ async fn gem_hosted_group_block_pin_survives_a_refused_eject_of_a_converged_lock
     }
 }
 
+/// The other side of #1761: a top-level hosted gem the vendored backend
+/// can wire previews a clean `vendor --dry-run` eject (exit 0), and the wet
+/// `vendor` then ejects it. The dry run checks the Gemfile/lock edits over
+/// the restored text; the hosted `source … do` block that still wraps the
+/// declaration on disk must not be read as the user's own indented
+/// declaration.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_pin_previews_and_runs_a_clean_eject() {
+    let Some(fx) = redirect_scanned_project(
+        "hosted clean eject",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    // Converge the hosted pair, so the eject can restore its upstream entry.
+    let install = bundle(&fx.proj, &["install"]);
+    assert!(
+        install.status.success(),
+        "converging install:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    mount_vendored_grant(&fx).await;
+    let proj = fx.proj.to_str().expect("utf8 tmp path");
+    let api = fx._server.uri();
+    for dry_run in [true, false] {
+        let before: Vec<Vec<u8>> = ["Gemfile", "Gemfile.lock"]
+            .iter()
+            .map(|f| std::fs::read(fx.proj.join(f)).unwrap())
+            .collect();
+        let mut argv = vec![
+            "vendor",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ];
+        if dry_run {
+            argv.push("--dry-run");
+        }
+        let label = format!("vendor eject (dry_run={dry_run})");
+        let (code, stdout, stderr) = run_socket(&fx.proj, &argv);
+        assert_eq!(code, 0, "{label}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            !stdout.contains("gemfile_declaration_not_editable"),
+            "{label}: the hosted block is not a user declaration:\n{stdout}"
+        );
+        if dry_run {
+            assert!(
+                stdout.contains("eject_planned"),
+                "{label}: previews the eject:\n{stdout}"
+            );
+            for (file, before) in ["Gemfile", "Gemfile.lock"].iter().zip(before) {
+                assert_eq!(
+                    std::fs::read(fx.proj.join(file)).unwrap(),
+                    before,
+                    "{label}: a dry run writes nothing to {file}"
+                );
+            }
+        } else {
+            let gemfile = std::fs::read_to_string(fx.proj.join("Gemfile")).unwrap();
+            assert!(
+                gemfile.contains("path: \".socket/vendor/gem/"),
+                "{label}: the Gemfile now points at the vendored copy:\n{gemfile}"
+            );
+        }
+    }
+}
+
 /// One refused `vendor` eject of the group-block fixture (#1761): dry or
 /// wet, the eject is refused whole with `gemfile_declaration_not_editable`
 /// and `eject_refused` (exit 1), and the hosted `Gemfile` /

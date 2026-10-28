@@ -3516,11 +3516,18 @@ pub(crate) async fn vendor_records_reusing(
                     // disk, so the sbt planner would refuse the
                     // `vendor_sbt_hosted_conflict` the wet run (which
                     // restores first) never sees.
-                    if restore.reverted_files.iter().any(|f| {
-                        f == "bun.lock"
-                            || f == "bun.lockb"
-                            || f == socket_patch_core::formats::sbt::owned_file::HOSTED_FILE
-                    }) {
+                    //
+                    // And a gem: its hosted `source … do` block still wraps
+                    // the declaration on disk, so the backend's Gemfile
+                    // planner would refuse it as indented. The preview over
+                    // the restored text above already asked the backend.
+                    if candidate.starts_with("pkg:gem/")
+                        || restore.reverted_files.iter().any(|f| {
+                            f == "bun.lock"
+                                || f == "bun.lockb"
+                                || f == socket_patch_core::formats::sbt::owned_file::HOSTED_FILE
+                        })
+                    {
                         continue;
                     }
                 } else {
