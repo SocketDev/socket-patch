@@ -497,13 +497,18 @@ async fn read_go_workspace(
 ) {
     use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
     let (root, loaded) = match view {
-        ProjectView::Memory(_) => {
+        ProjectView::Memory(_) => 'memory: {
             let Some(work) = read_advisory(view, unreadable, "go.work").await else {
                 return;
             };
             let work = crate::vendor::go_mod_edit::normalize_for_read(&work);
-            if crate::vendor::go_mod_edit::block_structure_error(&work).is_some() {
-                return;
+            // As on disk (`go_workspace::load`): a go.work go cannot parse
+            // is a workspace go refuses to build, never module mode.
+            if let Some(problem) = crate::vendor::go_mod_edit::block_structure_error(&work) {
+                break 'memory (
+                    std::path::PathBuf::new(),
+                    Loaded::Invalid(format!("go.work: {problem}, so go refuses to build")),
+                );
             }
             let mut members = Vec::new();
             for raw in crate::vendor::go_mod_edit::parse_use_dirs(&work) {
@@ -3601,6 +3606,25 @@ pub fn warning(code: &str, detail: impl Into<String>) -> RewriteWarning {
 mod tests {
     use super::*;
     use crate::vendor::lock_inventory::MemoryProject;
+
+    /// In memory as on disk, a go.work go cannot parse reaches the
+    /// rewriter as a workspace go refuses, never as module mode.
+    #[tokio::test]
+    async fn memory_malformed_go_work_is_invalid() {
+        use crate::vendor::go_workspace::Loaded;
+        let mut p = MemoryProject::new();
+        p.insert_text("go.mod", "module example.com/app\n\ngo 1.21\n");
+        p.insert_text("go.work", "go 1.21\n\nuse (\n\t.\n");
+        let mut out = CandidateFiles::default();
+        read_go_workspace(&ProjectView::Memory(&p), &BTreeSet::new(), &mut out).await;
+        let hosted: crate::patch::redirect::HostedGoWorkspace =
+            serde_json::from_str(&out.files[crate::patch::redirect::GO_WORKSPACE_KEY]).unwrap();
+        assert!(
+            matches!(hosted.loaded, Loaded::Invalid(_)),
+            "{:?}",
+            hosted.loaded
+        );
+    }
 
     fn no_cargo_outer() -> CratesIoSource {
         CratesIoSource::Registry
