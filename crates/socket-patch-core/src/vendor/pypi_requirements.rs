@@ -74,8 +74,8 @@ struct PinScan {
     /// Some occurrence carries extras.
     extras: bool,
     /// Some occurrence with extras pins exactly this version (`==` or
-    /// `===`): the pin hosted mode rewrites, which a wheel path line can't
-    /// (#1794).
+    /// `===`), or is the file's one unpinned line for the package: the pin
+    /// hosted mode rewrites, which a wheel path line can't (#1794).
     exact_extras: bool,
     /// Some occurrence names the package ambiguously on its own.
     range: bool,
@@ -136,8 +136,15 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
     let mut exact_extras = false;
     let mut found_range = false;
     let mut other_branches = false;
+    // Hosted mode also rewrites a file's one line for the package when it
+    // is unpinned (`six[foo]`), so that extras line counts as exact too.
+    let mut named_lines = 0usize;
+    let mut unpinned_extras = false;
     for ll in logical_lines(content) {
         let code = strip_comment(&ll.text);
+        if requirement_name(code).is_some_and(|name| canonicalize_pypi_name(name) == canon_name) {
+            named_lines += 1;
+        }
         let Some(req) = parse_requirement(code) else {
             // A line that names the package but is no requirement pip
             // reads cleanly is never a pin to rewrite (fail closed).
@@ -156,6 +163,7 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
                 .exact_version()
                 .is_some_and(|pinned| crate::utils::pep440::versions_equal(pinned, version))
                 || req.arbitrary_version() == Some(version);
+            unpinned_extras |= req.specifier.is_empty() && req.direct_reference.is_none();
             continue;
         }
         // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
@@ -191,7 +199,7 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
     PinScan {
         exact,
         extras: found_extras,
-        exact_extras,
+        exact_extras: exact_extras || (unpinned_extras && named_lines == 1),
         range: found_range,
         other_branches,
     }
@@ -1876,8 +1884,9 @@ mod tests {
     /// #1794: a requirements pin with extras of the release being vendored
     /// (`==` or `===`, in the root or an include, UTF-8 or UTF-16) refuses
     /// a fresh lock wiring with `pypi_extras_unsupported`, naming the file,
-    /// instead of reading as an unwirable loser. Extras on another version
-    /// or a range, a wirable pin, and a set that already carries a vendor
+    /// instead of reading as an unwirable loser, and so does the file's one
+    /// unpinned extras line (`six[foo]`), which hosted mode rewrites too.
+    /// Extras on another version or a range, two unpinned lines, a wirable pin, and a set that already carries a vendor
     /// line for the package keep the old answer.
     #[tokio::test]
     async fn fresh_sibling_pin_refuses_an_exact_extras_pin() {
@@ -1890,6 +1899,7 @@ mod tests {
             ),
             ("six[foo]===1.16.0\n", None, "requirements.txt"),
             ("-r base.txt\n", Some("six[foo]==1.16.0\n"), "base.txt"),
+            ("idna==3.7\nsix[foo]\n", None, "requirements.txt"),
         ] {
             let tmp = write_root(root).await;
             if let Some(include) = include {
@@ -1924,6 +1934,7 @@ mod tests {
         for (root, wirable) in [
             ("six[foo]==1.15.0\n", false),
             ("six[foo]>=1.15\n", false),
+            ("six[foo]\nsix[bar]\n", false),
             ("idna[foo]==1.16.0\nsix==1.16.0\n", true),
             ("VENDORED", false),
         ] {
