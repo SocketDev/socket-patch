@@ -582,15 +582,23 @@ pub fn yarn_1_0_default_global_folder(env: &NpmConfigEnv, root_user: bool) -> Op
     Some(user_home.join(".config").join("yarn").join("global"))
 }
 
-/// Where yarn 1.0.x run by this process keeps its global packages, most
-/// likely first: any folder configured as yarn's global folder (yarn
-/// 1.0.x reads `--global-folder` from `.yarnrc`), then its default.
+/// Where yarn 1.0.x keeps this user's global packages, most likely
+/// first: any folder configured as yarn's global folder (yarn 1.0.x reads
+/// `--global-folder` from `.yarnrc`), then its default. The config is read
+/// as yarn run from the neutral probe dir sees it, like the `yarn global
+/// dir` probe it stands in for, so a project's `.yarnrc` can't answer
+/// where the machine-wide install lives.
 pub fn yarn_1_0_global_folders_for_process() -> Vec<PathBuf> {
-    let mut folders = configured_yarn_global_folders_for_process();
-    folders.extend(yarn_1_0_default_global_folder(
-        &NpmConfigEnv::from_process(),
-        process_is_root_user(),
-    ));
+    let env = NpmConfigEnv::from_process();
+    let root_user = process_is_root_user();
+    let mut folders = crate::utils::process::neutral_probe_dir()
+        .map(|dir| {
+            configured_yarn_global_folders(&env, root_user, &dir, |path| {
+                crate::utils::fs::read_regular_to_string_sync(path).ok()
+            })
+        })
+        .unwrap_or_default();
+    folders.extend(yarn_1_0_default_global_folder(&env, root_user));
     folders
 }
 

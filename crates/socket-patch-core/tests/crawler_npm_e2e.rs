@@ -398,8 +398,20 @@ fn get_yarn_global_prefix_with_falls_back_for_yarn_1_0() {
         .with_response("yarn", &["--version"], Some("1.0.2\n"));
     assert_eq!(
         get_yarn_global_prefix_with(&runner).map(PathBuf::from),
-        Some(global)
+        Some(global.clone())
     );
+
+    // A project's `.yarnrc` in the cwd names a global folder that exists:
+    // it can't stand in for the machine-wide answer, which yarn run from
+    // the neutral probe dir (HOME) never sees.
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join("g/node_modules")).unwrap();
+    std::fs::write(project.path().join(".yarnrc"), "--global-folder \"./g\"\n").unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(project.path()).unwrap();
+    let got = get_yarn_global_prefix_with(&runner);
+    std::env::set_current_dir(cwd).unwrap();
+    assert_eq!(got.map(PathBuf::from), Some(global));
 }
 
 /// The fallback is for yarn 1.0.x only: a newer yarn whose
