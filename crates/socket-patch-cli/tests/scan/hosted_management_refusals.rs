@@ -125,6 +125,36 @@ fn vendor_refuses_to_eject_contested_hosted_wiring() {
     assert!(!tmp.path().join(".socket").exists());
 }
 
+/// With an agent manifest and no hosted pin in scope, the manifest is the
+/// patch set: contested hosted wiring elsewhere in the tree must not block
+/// legacy manifest vendoring.
+#[test]
+fn vendor_with_a_manifest_and_no_pins_in_scope_ignores_contested_wiring() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_contested(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".socket")).unwrap();
+    std::fs::write(
+        tmp.path().join(".socket/manifest.json"),
+        r#"{"patches":{}}"#,
+    )
+    .unwrap();
+    let before = snapshot(tmp.path());
+    let (code, v) = run_json(
+        &[
+            "vendor",
+            "--offline",
+            "--dry-run",
+            "--json",
+            "--ecosystems",
+            "pypi",
+        ],
+        tmp.path(),
+    );
+    assert_ne!(v["error"]["code"], "hosted_wiring_contested", "{v}");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(snapshot(tmp.path()), before);
+}
+
 /// An offline eject refuses with ZERO requests to the API, whether offline
 /// comes from the flag or the env, and on a dry run too.
 #[tokio::test]

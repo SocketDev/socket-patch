@@ -21,8 +21,22 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && rm -rf /var/lib/apt/lists/*
 
 # Deno install script defaults to ~/.deno/bin. Symlink onto PATH so
-# `deno` works from any shell (test scripts use bash -c).
-RUN curl -fsSL https://deno.land/install.sh | sh -s -- -y \
+# `deno` works from any shell (test scripts use bash -c). Retried like
+# bun in Dockerfile.npm: the script downloads the release zip with no
+# retry of its own, and one stalled download (14 min at 8%, then
+# "curl: (56) Connection reset by peer") failed the whole image build.
+# Each attempt is capped at 5 min so a stall leaves time for a retry
+# inside the job's 30 min budget; a healthy install takes seconds. The
+# binary check catches a failed script fetch, which pipes nothing into
+# `sh` and so exits 0.
+RUN for i in 1 2 3; do \
+      timeout 300 sh -c 'curl -fsSL https://deno.land/install.sh | sh -s -- -y' \
+        && [ -x /root/.deno/bin/deno ] && break; \
+      [ "$i" = 3 ] && exit 1; \
+      echo "deno install attempt $i failed; retrying in $((i * 10))s"; \
+      rm -rf /root/.deno; \
+      sleep $((i * 10)); \
+    done \
  && ln -s /root/.deno/bin/deno /usr/local/bin/deno
 
 RUN node --version && deno --version && socket-patch --version

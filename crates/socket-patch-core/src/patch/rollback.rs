@@ -157,7 +157,14 @@ pub async fn verify_file_rollback(
                 };
             }
         };
-        if current_hash == file_info.after_hash {
+        // npm's LF-shebang form of a patch-added bin is the patched file
+        // too (see `npm_bin`).
+        if current_hash == file_info.after_hash
+            || crate::patch::npm_bin::source_hash(&filepath)
+                .await
+                .as_deref()
+                == Some(file_info.after_hash.as_str())
+        {
             return VerifyRollbackResult {
                 file: file_name.to_string(),
                 status: VerifyRollbackStatus::Ready,
@@ -210,7 +217,18 @@ pub async fn verify_file_rollback(
     // needs no blob to restore, so a garbage-collected blob must not turn
     // a finished, no-op rollback into a spurious `MissingBlob` failure
     // (which would otherwise block the whole package's rollback).
-    if current_hash == file_info.before_hash {
+    // npm installs a CRLF-shebang `bin` with an LF shebang (see
+    // `npm_bin`): hash the content it came from too, once, when the raw
+    // bytes match neither side.
+    let source_hash =
+        if current_hash == file_info.before_hash || current_hash == file_info.after_hash {
+            None
+        } else {
+            crate::patch::npm_bin::source_hash(&filepath).await
+        };
+    if current_hash == file_info.before_hash
+        || source_hash.as_deref() == Some(file_info.before_hash.as_str())
+    {
         return VerifyRollbackResult {
             file: file_name.to_string(),
             status: VerifyRollbackStatus::AlreadyOriginal,
@@ -304,8 +322,11 @@ pub async fn verify_file_rollback(
         }
     }
 
-    // Check if matches expected patched hash (afterHash)
-    if current_hash != file_info.after_hash {
+    // Check if matches expected patched hash (afterHash, or npm's form of
+    // it).
+    if current_hash != file_info.after_hash
+        && source_hash.as_deref() != Some(file_info.after_hash.as_str())
+    {
         return VerifyRollbackResult {
             file: file_name.to_string(),
             status: VerifyRollbackStatus::HashMismatch,
@@ -435,9 +456,19 @@ async fn holds_this_patch(dir: &Path, files: &HashMap<String, PatchFileInfo>) ->
         match crate::utils::fs::read_regular_to_bytes(&dir.join(rel)).await {
             Ok(bytes) => {
                 let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&bytes);
-                if hash == info.after_hash {
+                // npm's LF-shebang form of a bin counts as the content it
+                // came from (see `npm_bin`); hashed once, when needed.
+                let source = std::cell::OnceCell::new();
+                let is = |h: &str| {
+                    hash == h
+                        || source
+                            .get_or_init(|| crate::patch::npm_bin::source_hash_of(&bytes))
+                            .as_deref()
+                            == Some(h)
+                };
+                if is(&info.after_hash) {
                     patched = true;
-                } else if hash != info.before_hash {
+                } else if !is(&info.before_hash) {
                     return false;
                 }
             }
@@ -736,11 +767,29 @@ async fn rollback_package_patch_at(
         // file's original mode + uid/gid restored afterward. pnpm store
         // copies are rolled back by the package-level wrapper, one full
         // verify each.
+        //
+        // A bin npm installed with an LF shebang gets the original in that
+        // form, the bytes `npm install` leaves (see `npm_bin`).
+        let (original_content, restored_hash) = match crate::patch::npm_bin::form_for_write(
+            package_key,
+            &pkg_path.join(normalize_file_path(file_name)),
+            &file_info.after_hash,
+            std::borrow::Cow::Owned(original_content),
+            &file_info.before_hash,
+        )
+        .await
+        {
+            Ok(write) => write,
+            Err(e) => {
+                result.error = Some(e.to_string());
+                return result;
+            }
+        };
         match crate::patch::apply::apply_file_patch_at(
             pkg_path,
             file_name,
             &original_content,
-            &file_info.before_hash,
+            &restored_hash,
         )
         .await
         {
@@ -3101,5 +3150,138 @@ mod tests {
         );
         assert!(!cache.join("mod.cpython-311.pyc").exists());
         assert!(cache.join("other.cpython-311.pyc").exists());
+    }
+
+    /// Regression (#1756): an npm-fixed bin (CRLF shebang in the tarball,
+    /// LF on disk) at its patched content rolls back to npm's form of the
+    /// original, and is then already original.
+    #[tokio::test]
+    async fn rollback_restores_npm_fixed_bin() {
+        let before: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(1);\r\n";
+        let after: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(2);\r\n";
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let before_hash = compute_git_sha256_from_bytes(before);
+        tokio::fs::write(blobs.path().join(&before_hash), before)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            pkg.path().join("cli.js"),
+            b"#!/usr/bin/env node\nconsole.log(2);\r\n",
+        )
+        .await
+        .unwrap();
+        let files = HashMap::from([(
+            "package/cli.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        )]);
+        let res =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(res.files_rolled_back, vec!["package/cli.js".to_string()]);
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            b"#!/usr/bin/env node\nconsole.log(1);\r\n"
+        );
+        let again =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+        assert!(again.success, "{again:?}");
+        assert!(again.files_rolled_back.is_empty(), "{again:?}");
+    }
+
+    /// Regression (#1756): a bin the patch added, installed by npm in its
+    /// LF-shebang form, rolls back (is deleted) like the exact bytes.
+    #[tokio::test]
+    async fn rollback_deletes_npm_fixed_added_bin() {
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            pkg.path().join("cli.js"),
+            b"#!/usr/bin/env node\nnew();\r\n",
+        )
+        .await
+        .unwrap();
+        let files = HashMap::from([(
+            "package/cli.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: compute_git_sha256_from_bytes(b"#!/usr/bin/env node\r\nnew();\r\n"),
+            },
+        )]);
+        let res =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+        assert!(res.success, "{res:?}");
+        assert!(!pkg.path().join("cli.js").exists());
+    }
+
+    /// Regression (Bugbot on #1757): a patch whose patched bin already has
+    /// an LF shebang is applied over npm's form of a CRLF original and
+    /// written as recorded. Rolling it back restores npm's LF form, not
+    /// the CRLF tarball bytes `env` can't run.
+    #[tokio::test]
+    async fn rollback_of_lf_patched_bin_restores_npm_form() {
+        let before: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(1);\r\n";
+        let after: &[u8] = b"#!/usr/bin/env node\nconsole.log(2);\n";
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let before_hash = compute_git_sha256_from_bytes(before);
+        tokio::fs::write(blobs.path().join(&before_hash), before)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg.path().join("cli.js"), after)
+            .await
+            .unwrap();
+        let files = HashMap::from([(
+            "package/cli.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        )]);
+        let res =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            b"#!/usr/bin/env node\nconsole.log(1);\r\n"
+        );
+    }
+
+    /// Outside npm, a rollback restores the recorded original exactly.
+    #[tokio::test]
+    async fn rollback_outside_npm_restores_exact_bytes() {
+        let before: &[u8] = b"#!/usr/bin/env python\r\nprint(1)\r\n";
+        let after: &[u8] = b"#!/usr/bin/env python\nprint(2)\n";
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let before_hash = compute_git_sha256_from_bytes(before);
+        tokio::fs::write(blobs.path().join(&before_hash), before)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg.path().join("cli.py"), after)
+            .await
+            .unwrap();
+        let files = HashMap::from([(
+            "cli.py".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        )]);
+        let res =
+            rollback_package_patch("pkg:pypi/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.py")).await.unwrap(),
+            before
+        );
     }
 }

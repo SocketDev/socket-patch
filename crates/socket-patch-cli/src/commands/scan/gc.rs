@@ -3,7 +3,7 @@
 //! read-only (preview) forms.
 
 use socket_patch_core::manifest::cleanup_blobs::{ArtifactReferences, CleanupResult};
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::operations::{manifest_exists, read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{purl_keys_cover, VENDOR_STATE_REL};
@@ -56,7 +56,9 @@ pub(super) struct GcSummary {
     /// mutations already happened on disk, so the stale record is reported,
     /// not the pass failed. Also the vendored reverts' reinstall advisories
     /// (`vendor_bun_reinstall_required`, `vendor_vlt_reinstall_required`)
-    /// and no other revert warning. Serialized as additive
+    /// and no other revert warning. And `manifest_invalid` /
+    /// `manifest_unreadable` when the manifest half could not load the
+    /// manifest (#1063). Serialized as additive
     /// `warnings[]` on the apply shape only.
     warnings: Vec<(&'static str, String)>,
 }
@@ -71,6 +73,19 @@ impl GcSummary {
     fn vendor_only(v: VendorGcSummary) -> Self {
         let mut gc = GcSummary::default();
         gc.absorb_vendor_gc(v);
+        gc
+    }
+
+    /// The vendored half alone, for a pass whose manifest exists but could
+    /// not be loaded: the manifest half did not run, and the load error
+    /// (`manifest_invalid` / `manifest_unreadable`) joins `warnings`
+    /// instead of the pass reading as "no manifest, nothing to prune".
+    fn manifest_unloadable(v: VendorGcSummary, manifest_path: &Path, e: &std::io::Error) -> Self {
+        let mut gc = GcSummary::vendor_only(v);
+        gc.warnings.push((
+            crate::json_envelope::manifest_load_error_code(e),
+            crate::ui::manifest_error_message(manifest_path, e),
+        ));
         gc
     }
 
@@ -231,9 +246,10 @@ pub(super) async fn run_apply_gc(
     // pristine checkout with neither a manifest nor a ledger must not gain
     // one. Either store alone is enough to proceed; the authoritative reads
     // happen under the lock.
-    let has_manifest = tokio::fs::metadata(manifest_path)
-        .await
-        .is_ok_and(|m| m.is_file());
+    // A manifest that cannot be stated is not absent (#998): the pass goes
+    // on and reports it, as the locked read's load error or, when
+    // `.socket/` itself is unusable, as the lock failure.
+    let has_manifest = manifest_exists(manifest_path).await.unwrap_or(true);
     let has_ledger = tokio::fs::metadata(common.cwd.join(VENDOR_STATE_REL))
         .await
         .is_ok_and(|m| m.is_file());
@@ -261,11 +277,13 @@ pub(super) async fn run_apply_gc(
     // Vendored-state GC FIRST (see the fn doc), under this guard.
     let vendor_gc = run_vendor_gc(common, manifest_path, /*dry_run=*/ false).await;
 
-    // Authoritative read under the lock. Missing or unreadable ⇒ nothing
-    // to prune, and the blob sweep has no referenced-set to work from.
+    // Authoritative read under the lock. Missing ⇒ nothing to prune, and
+    // the blob sweep has no referenced-set to work from; unreadable ⇒ the
+    // same, but said (#1063).
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
-        _ => return GcSummary::vendor_only(vendor_gc),
+        Ok(None) => return GcSummary::vendor_only(vendor_gc),
+        Err(e) => return GcSummary::manifest_unloadable(vendor_gc, manifest_path, &e),
     };
     let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
     let kept = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
@@ -384,7 +402,8 @@ async fn preview_apply_gc(
 
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
-        _ => return GcSummary::vendor_only(vendor_gc),
+        Ok(None) => return GcSummary::vendor_only(vendor_gc),
+        Err(e) => return GcSummary::manifest_unloadable(vendor_gc, manifest_path, &e),
     };
     // Mirror the wet pass, which drops an unused vendored entry's manifest
     // keys before the blob sweep, or the preview under-reports orphans.
@@ -937,6 +956,65 @@ mod tests {
         )
         .unwrap();
         (manifest_path, socket_dir, blob_path)
+    }
+
+    /// #1063: a manifest that exists but cannot be loaded is not "no
+    /// manifest". Both passes skip the manifest half (nothing is pruned or
+    /// swept without a referenced set) and say why with the shared load
+    /// code, instead of a clean summary that reads as nothing to prune.
+    #[tokio::test]
+    async fn apply_gc_reports_an_unloadable_manifest() {
+        for (seed, code) in [
+            (
+                (|p: &std::path::Path| std::fs::write(p, r#"{"patches": {"#).unwrap())
+                    as fn(&std::path::Path),
+                "manifest_invalid",
+            ),
+            (
+                |p: &std::path::Path| std::fs::create_dir_all(p).unwrap(),
+                "manifest_unreadable",
+            ),
+        ] {
+            for dry_run in [true, false] {
+                let tmp = tempfile::tempdir().unwrap();
+                let socket_dir = tmp.path().join(".socket");
+                let blob = socket_dir.join("blobs").join("a".repeat(64));
+                std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+                std::fs::write(&blob, b"orphan?").unwrap();
+                let manifest_path = socket_dir.join("manifest.json");
+                seed(&manifest_path);
+
+                let common = gc_common(tmp.path());
+                let gc = if dry_run {
+                    preview_apply_gc(
+                        &common,
+                        &manifest_path,
+                        &socket_dir,
+                        &HashSet::new(),
+                        &no_vendored(),
+                    )
+                    .await
+                } else {
+                    run_apply_gc(
+                        &common,
+                        &manifest_path,
+                        &socket_dir,
+                        &HashSet::new(),
+                        &no_vendored(),
+                    )
+                    .await
+                };
+                let codes: Vec<&str> = gc.warnings.iter().map(|(c, _)| *c).collect();
+                assert_eq!(codes, vec![code], "dry_run={dry_run}: {gc:?}");
+                assert!(gc.skipped.is_none(), "dry_run={dry_run}: {gc:?}");
+                assert!(gc.pruned.is_empty(), "dry_run={dry_run}: {gc:?}");
+                assert_eq!(gc.blobs.blobs_removed, 0, "dry_run={dry_run}: {gc:?}");
+                assert!(
+                    blob.exists(),
+                    "dry_run={dry_run}: no sweep without a manifest"
+                );
+            }
+        }
     }
 
     #[tokio::test]

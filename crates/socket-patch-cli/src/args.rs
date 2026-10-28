@@ -357,8 +357,8 @@ pub struct GlobalArgs {
 impl GlobalArgs {
     /// Reject path flags that name nothing: `--cwd` and `--global-prefix`
     /// (flag or env) must be existing directories, and a `--manifest-path`
-    /// other than the default must sit in an existing project directory and
-    /// must not itself be a directory. `main` maps `Err` to the usage exit
+    /// other than the default must sit in an existing project directory.
+    /// `main` maps `Err` to the usage exit
     /// (2), the same exit a hosted/vendored `scan` PATH that is not a
     /// directory gets.
     ///
@@ -399,16 +399,15 @@ impl GlobalArgs {
                 ));
             }
         }
+        // A manifest path that names a directory is not refused here: that
+        // is a corrupt project, not a bad flag, and `read_manifest` refuses
+        // it as `manifest_unreadable` under every spelling of the path. A
+        // check keyed on the flag's text gave the explicit spellings exit 2
+        // with no `--json` document instead (#1123).
         if self.manifest_path != DEFAULT_PATCH_MANIFEST_PATH {
-            let manifest = self.resolved_manifest_path();
-            if manifest.is_dir() {
-                return Err(not_dir(
-                    "--manifest-path",
-                    "SOCKET_MANIFEST_PATH",
-                    &manifest,
-                    "is a directory, not a manifest file",
-                ));
-            }
+            // `.`-free for the message: `--cwd .` joined onto
+            // `./.socket/manifest.json` would print `././.socket/…`.
+            let manifest: PathBuf = self.resolved_manifest_path().components().collect();
             // The directory that must exist: the project of a `.socket/`
             // manifest (`.socket/` itself is created on demand), else the
             // manifest file's own directory.

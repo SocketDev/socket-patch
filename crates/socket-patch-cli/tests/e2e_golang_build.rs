@@ -500,6 +500,113 @@ fn committed_vendor_dir_needs_go_mod_vendor_after_apply_and_rollback() {
     chmod_writable(tmp.path());
 }
 
+/// #1766: `go work vendor` records a non-root member's replace relative to
+/// the workspace root (`./consumer/.socket/go-patches/…`). After rollback
+/// or remove in that member every workspace build fails "inconsistent
+/// vendoring", so both must warn and `apply --check` must report it.
+#[test]
+fn go_work_vendor_member_needs_go_work_vendor_after_rollback_and_remove() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(go-work-vendor)") {
+        return;
+    }
+    if golang_e2e_matrix::go_minor() < 22 {
+        eprintln!("SKIP: `go work vendor` needs Go 1.22+");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage(tmp.path());
+    let ws = tmp.path();
+    std::fs::write(ws.join("go.work"), "go 1.22\n\nuse ./consumer\n").unwrap();
+    let cs = consumer.to_str().unwrap();
+    let mc = modcache.to_str().unwrap();
+    let mut goenv = go_env(mc, &proxy_url);
+    goenv.retain(|(k, _)| *k != "GOFLAGS");
+    goenv.push(("GOFLAGS", ""));
+    let vendor = |what: &str| {
+        let out = go(ws, &["work", "vendor"], &goenv);
+        assert!(
+            out.status.success(),
+            "go work vendor ({what}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let warns = |args: &[&str], what: &str| {
+        let (code, so, se) = run_socket(&consumer, args, &modcache);
+        assert_eq!(code, 0, "{what} failed.\n{so}\n{se}");
+        assert!(
+            warnings_of(&so).contains(&"go_vendor_modules_txt_out_of_sync".to_string()),
+            "{what} must name the vendor/modules.txt regeneration:\n{so}"
+        );
+    };
+    let apply = ["apply", "--offline", "--json", "--cwd", cs];
+    vendor("before apply");
+
+    write_patch(&consumer);
+    warns(&apply, "apply");
+    vendor("after apply");
+    let run = go(ws, &["run", "./consumer"], &goenv);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("OUT: PATCHED"),
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let modules_txt = std::fs::read_to_string(ws.join("vendor/modules.txt")).unwrap();
+    assert!(
+        modules_txt.contains("=> ./consumer/.socket/go-patches/"),
+        "the fixture records the member replace relative to go.work:\n{modules_txt}"
+    );
+
+    for (what, args) in [
+        (
+            "rollback",
+            vec!["rollback", "--offline", "--json", "--cwd", cs],
+        ),
+        (
+            "remove",
+            vec!["remove", UPURL, "--offline", "--json", "--cwd", cs],
+        ),
+    ] {
+        warns(&args, what);
+        let broken = go(ws, &["build", "./consumer"], &goenv);
+        assert!(
+            !broken.status.success()
+                && String::from_utf8_lossy(&broken.stderr).contains("inconsistent vendoring"),
+            "{what}: the fixture reproduces the broken build: {}",
+            String::from_utf8_lossy(&broken.stderr)
+        );
+        let (code, _so, se) = run_socket(
+            &consumer,
+            &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+            &modcache,
+        );
+        assert_eq!(code, 1, "{what}: stale vendor/modules.txt is drift:\n{se}");
+        assert!(
+            se.contains("no longer has") && se.contains("go work vendor"),
+            "{what}: {se}"
+        );
+
+        // The step the warning names fixes the build.
+        vendor(what);
+        let run = go(ws, &["run", "./consumer"], &goenv);
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("OUT: PRISTINE"),
+            "{what}: {}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        if what == "rollback" {
+            // Re-apply and re-vendor so `remove` starts from a patched,
+            // in-sync workspace (rollback dropped the manifest entry).
+            write_patch(&consumer);
+            warns(&apply, "re-apply");
+            vendor("after re-apply");
+        }
+    }
+
+    chmod_writable(tmp.path());
+}
+
 /// #618: a patch whose go.mod raises a requirement (the common security-fix
 /// shape) leaves the default `-mod=readonly` build failing with "updates
 /// to go.mod needed". apply names `go mod tidy`, `apply --check` reports
@@ -979,6 +1086,100 @@ fn go_work_member_replaces_must_not_conflict() {
         assert_eq!(code, 1, "apply --check must flag the conflict:\n{so}\n{se}");
     }
     assert_vex_omits(&b, &modcache, "pkg:golang/example.com/b@v0.0.1");
+
+    chmod_writable(tmp.path());
+}
+
+/// #1751: a go.work build list spans every `use` member's requirements, so
+/// when member b requires a newer upstream than a, the workspace builds a
+/// with b's version and a replace pinned to a's is inert. apply in a must
+/// refuse, and a replace written before the go.work appeared fails
+/// `apply --check` and is left out of VEX (`go_version_not_selected`).
+#[test]
+fn go_work_member_requiring_a_newer_version_makes_the_replace_inert() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(go-work-newer-member)") {
+        return;
+    }
+    const NEWER: &str = "v1.1.0";
+    let tmp = tempfile::tempdir().unwrap();
+    let (_consumer, modcache, proxy_url) = stage(tmp.path());
+    let mc = modcache.to_str().unwrap();
+    publish(
+        tmp.path(),
+        UMOD,
+        NEWER,
+        &[
+            ("go.mod", &format!("module {UMOD}\n\ngo 1.21\n")),
+            (
+                "lib.go",
+                "package upstream\n\nfunc Greeting() string { return \"PRISTINE-v1.1.0\" }\n",
+            ),
+        ],
+    );
+    let ws = tmp.path().join("ws");
+    let (a, b) = (ws.join("a"), ws.join("b"));
+    consumer_module(&a, "example.com/a", mc, &proxy_url);
+    consumer_module(&b, "example.com/b", mc, &proxy_url);
+    let go_mod = std::fs::read_to_string(b.join("go.mod")).unwrap();
+    std::fs::write(
+        b.join("go.mod"),
+        go_mod.replace(&format!("{UMOD} {UVER}"), &format!("{UMOD} {NEWER}")),
+    )
+    .unwrap();
+    let mut tidy_env = go_env(mc, &proxy_url);
+    tidy_env.push(("GOWORK", "off"));
+    let tidy = go(&b, &["mod", "tidy"], &tidy_env);
+    assert!(
+        tidy.status.success(),
+        "go mod tidy: {}",
+        String::from_utf8_lossy(&tidy.stderr)
+    );
+    write_patch(&a);
+    let go_work = "go 1.21\n\nuse (\n\t./a\n\t./b\n)\n";
+    std::fs::write(ws.join("go.work"), go_work).unwrap();
+    let env = workspace_env(mc, &proxy_url);
+    assert!(go_out(&a, &env).contains("OUT: PRISTINE-v1.1.0"));
+
+    let (code, so, se) = apply_json(&a, &modcache);
+    assert_ne!(code, 0, "apply must refuse an inert replace:\n{so}\n{se}");
+    assert!(
+        so.contains(&format!("the build selects {UMOD} {NEWER}")),
+        "{so}"
+    );
+    assert!(replace_lines(&a.join("go.mod")).is_empty());
+    assert!(go_out(&a, &env).contains("OUT: PRISTINE-v1.1.0"));
+
+    // Applied before the go.work existed: the replace is inert.
+    std::fs::remove_file(ws.join("go.work")).unwrap();
+    let (code, so, se) = apply_json(&a, &modcache);
+    assert_eq!(code, 0, "apply without go.work:\n{so}\n{se}");
+    assert!(go_out(&a, &tidy_env).contains("OUT: PATCHED"));
+    std::fs::write(ws.join("go.work"), go_work).unwrap();
+    assert!(go_out(&a, &env).contains("OUT: PRISTINE-v1.1.0"));
+    let (code, so, se) = check(&a, &modcache);
+    assert_eq!(
+        code, 1,
+        "apply --check must flag the inert replace:\n{so}\n{se}"
+    );
+    let r = VexRun {
+        offline: true,
+        product: Some("pkg:golang/example.com/a@v0.0.1".into()),
+        ..VexRun::default()
+    }
+    .env("GOMODCACHE", &modcache)
+    .env("GOFLAGS", "");
+    let out = run_vex(&vex_e2e_common::binary(), &a, &r);
+    assert_absent(out.doc.as_ref(), UPURL);
+    vex_e2e_common::assert_not_attested(&out.envelope, UPURL, "go_version_not_selected");
+
+    // Positive control: once b is back on a's version, the replace patches
+    // the whole workspace and nothing is flagged.
+    std::fs::write(b.join("go.mod"), &go_mod).unwrap();
+    let tidy = go(&b, &["mod", "tidy"], &tidy_env);
+    assert!(tidy.status.success());
+    assert!(go_out(&b, &env).contains("OUT: PATCHED"));
+    let (code, so, se) = check(&a, &modcache);
+    assert_eq!(code, 0, "{so}\n{se}");
 
     chmod_writable(tmp.path());
 }

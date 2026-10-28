@@ -491,10 +491,6 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
 /// which the install hook and CI both read as success. Fail closed.
 #[cfg(unix)]
 #[test]
-#[ignore = "RED: apply's manifest probe is `tokio::fs::metadata(..).is_err()`, so \
-            an UNREADABLE manifest is reported as the clean `noManifest` no-op \
-            (exit 0) exactly like a missing one — the install hook and CI both \
-            read that as success. The fail-closed fix was not part of this change."]
 fn apply_with_unreadable_socket_dir_fails_closed() {
     use std::os::unix::fs::PermissionsExt;
 

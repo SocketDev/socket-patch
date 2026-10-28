@@ -707,7 +707,7 @@ async fn get_nuget_package_paths_with_nuget_config_falls_back_to_global() {
 
 /// A staged `obj/project.assets.json` with a `packageFolders` map
 /// must surface those folders alongside the global cache. Covers
-/// `discover_paths_from_assets` and `parse_project_assets_package_folders`.
+/// the restore walk and `parse_project_assets`.
 #[tokio::test]
 #[serial]
 async fn get_nuget_package_paths_discovers_assets_json_package_folders() {
@@ -759,7 +759,7 @@ async fn get_nuget_package_paths_discovers_assets_json_package_folders() {
 }
 
 /// `project.assets.json` exists in a subdirectory (multi-project
-/// solution) — `discover_paths_from_assets` walks one level deep.
+/// solution) — the restore walk finds it (at any depth).
 #[tokio::test]
 #[serial]
 async fn get_nuget_package_paths_discovers_assets_json_in_subproject() {

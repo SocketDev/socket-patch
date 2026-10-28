@@ -5,8 +5,9 @@
 //! The reader is a minimal, bounded XML tokenizer (no parser dependency)
 //! that records only what NuGet routes by: `<add>` directly under
 //! `configuration/packageSources`, the mapping elements directly under
-//! `configuration/packageSourceMapping`, and `disabledPackageSources`
-//! entries whose `value` is `true`. Comments, CDATA, processing instructions
+//! `configuration/packageSourceMapping`, `disabledPackageSources`
+//! entries whose `value` is `true`, and the `<add>` settings under
+//! `configuration/config` (where the package folders live). Comments, CDATA, processing instructions
 //! and DOCTYPEs are skipped; an unterminated tag or comment, an unquoted
 //! attribute or a mismatched close tag makes the whole file `None`.
 
@@ -36,6 +37,12 @@ pub(crate) struct NugetConfig {
     /// farther config (parent directories, the user config) defined are
     /// dropped, and only the ones after it count.
     pub(crate) sources_cleared: bool,
+    /// `configuration/config/add` `(key, value)`, document order: the
+    /// settings such as `globalPackagesFolder` and `repositoryPath`.
+    pub(crate) settings: Vec<(String, String)>,
+    /// `configuration/config` holds a `<clear />`: the settings every
+    /// farther config defined are dropped.
+    pub(crate) settings_cleared: bool,
     /// Where each `mappings` row sits (parallel to it): the whole
     /// `<packageSource>` element and each of its pattern tags, so a writer can
     /// set one aside and put it back byte-exact.
@@ -86,6 +93,10 @@ fn record_clear(cfg: &mut NugetConfig, parents: &[&str], end: usize) {
         cfg.sources_cleared = true;
         // NuGet drops what the file itself defined before the `<clear />`.
         cfg.sources.clear();
+    }
+    if parents == ["configuration", "config"] {
+        cfg.settings_cleared = true;
+        cfg.settings.clear();
     }
     let section = match parents {
         ["configuration", "packageSources"] => cfg.package_sources.as_mut(),
@@ -215,6 +226,11 @@ fn visit(stack: &[&str], tag: &Tag<'_>, cfg: &mut NugetConfig, open_mapping: &mu
         (["configuration", "packageSources"], "add") => {
             if let (Some(key), Some(value)) = (tag.attr("key"), tag.attr("value")) {
                 cfg.sources.push((key.to_string(), value.to_string()));
+            }
+        }
+        (["configuration", "config"], "add") => {
+            if let (Some(key), Some(value)) = (tag.attr("key"), tag.attr("value")) {
+                cfg.settings.push((key.to_string(), value.to_string()));
             }
         }
         (["configuration", "disabledPackageSources"], "add") => {
@@ -372,6 +388,33 @@ pub(crate) fn effective_source_keys<'a>(
     keys
 }
 
+/// The value of the `config` setting `key` (matched ignoring case, as NuGet
+/// does) in `chain`, nearest config first: the nearest config defining it
+/// wins, and a config whose `config` section holds a `<clear />` hides every
+/// farther one. `(index into chain, value)` so the caller can resolve a
+/// relative value against that config's directory.
+pub(crate) fn effective_setting<'a>(
+    chain: impl IntoIterator<Item = &'a NugetConfig>,
+    key: &str,
+) -> Option<(usize, &'a str)> {
+    for (idx, cfg) in chain.into_iter().enumerate() {
+        // A later `<add>` of the same key overrides an earlier one in the
+        // same file.
+        if let Some((_, value)) = cfg
+            .settings
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        {
+            return Some((idx, value.as_str()));
+        }
+        if cfg.settings_cleared {
+            return None;
+        }
+    }
+    None
+}
+
 /// The comment a writer sets a competing mapping element aside in while the
 /// Socket source `key` is wired: `<!-- {key} moved: {element} -->`.
 fn set_aside_open(key: &str) -> String {
@@ -506,6 +549,37 @@ mod tests {
         .unwrap();
         assert_eq!(super::effective_source_keys([&parent, &plain]), ["a", "b"]);
         assert_eq!(super::effective_source_keys([&parent, &cfg]), ["new"]);
+    }
+
+    /// #397/#398: the `config` settings are read, the nearest config
+    /// wins, and a `<clear />` hides farther ones.
+    #[test]
+    fn config_settings_resolve_nearest_first() {
+        let near = super::parse_config(
+            "<configuration><config><add key=\"repositoryPath\" value=\"lib/pkgs\" /></config></configuration>",
+        )
+        .unwrap();
+        let far = super::parse_config(
+            "<configuration><config><add key=\"globalPackagesFolder\" value=\"/far\" /><add key=\"repositoryPath\" value=\"x\" /></config></configuration>",
+        )
+        .unwrap();
+        let cleared = super::parse_config(
+            "<configuration><config><add key=\"globalPackagesFolder\" value=\"/old\" /><clear /></config></configuration>",
+        )
+        .unwrap();
+        assert_eq!(
+            super::effective_setting([&near, &far], "repositorypath"),
+            Some((0, "lib/pkgs"))
+        );
+        assert_eq!(
+            super::effective_setting([&near, &far], "globalPackagesFolder"),
+            Some((1, "/far"))
+        );
+        assert!(cleared.settings.is_empty());
+        assert_eq!(
+            super::effective_setting([&near, &cleared, &far], "globalPackagesFolder"),
+            None
+        );
     }
 
     const COMPETING: &str = "<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n      <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n    <packageSource key=\"corp\">\n      <package pattern=\"newtonsoft.json\" />\n    </packageSource>\n    <packageSource key=\"socket-patch-u\">\n      <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n";
