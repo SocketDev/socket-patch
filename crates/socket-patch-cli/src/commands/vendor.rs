@@ -1255,7 +1255,8 @@ async fn run_check(args: &VendorArgs) -> i32 {
     } else {
         None
     };
-    let go_sync_issues = tokio::sync::OnceCell::new();
+    let go_sync_issues =
+        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new()).await;
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1294,11 +1295,6 @@ async fn run_check(args: &VendorArgs) -> i32 {
         if failure.is_none() && entry.ecosystem == "golang" {
             if let Some((module, _)) = socket_patch_core::utils::purl::parse_golang_purl(key) {
                 let issues: Vec<String> = go_sync_issues
-                    .get_or_init(|| async {
-                        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new())
-                            .await
-                    })
-                    .await
                     .iter()
                     .filter(|issue| issue.module() == module)
                     .map(ToString::to_string)
@@ -1374,6 +1370,46 @@ async fn run_check(args: &VendorArgs) -> i32 {
                 .with_uuid(uuid)
                 .with_error("vendor_ledger_missing", detail)
                 .with_details(serde_json::json!({ "ecosystem": eco, "path": rel })),
+        );
+    }
+    // A committed vendor/modules.txt still recording a socket `replace`
+    // that go.mod no longer has breaks every default build until it is
+    // regenerated (#1777). The ledger entry it came from is gone after a
+    // revert, so the per-entry check above cannot see it.
+    let ledger_modules: HashSet<String> = state
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.ecosystem == "golang")
+        .filter_map(|(key, _)| socket_patch_core::utils::purl::parse_golang_purl(key))
+        .map(|(module, _)| module.into_owned())
+        .collect();
+    let stale_records: Vec<(String, String)> = go_sync_issues
+        .iter()
+        .filter(|issue| {
+            matches!(
+                issue,
+                socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::VendorModulesTxt {
+                    stale: true,
+                    ..
+                }
+            ) && !ledger_modules.contains(issue.module())
+        })
+        .map(|issue| (issue.module().to_string(), issue.to_string()))
+        .collect();
+    for (module, detail) in stale_records {
+        if !args.common.json {
+            eprintln!(
+                "{}: {detail}",
+                socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
+            );
+        }
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed)
+                .with_error(
+                    socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE,
+                    detail,
+                )
+                .with_details(serde_json::json!({ "ecosystem": "golang", "module": module })),
         );
     }
     if args.common.json {
@@ -4450,7 +4486,8 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // (rollback's vendored leg, both of remove's paths, the manifest
     // reconcile): dispatch → drift-keep → per-entry ledger save. Only the
     // event vocabulary and the human lines are this command's.
-    let reverted = VendoredBackend::new(common, None)
+    let backend = VendoredBackend::new(common, None);
+    let reverted = backend
         .revert(
             &recorded,
             &mut state,
@@ -4458,6 +4495,9 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             false,
         )
         .await;
+    for (purl, w) in backend.go_undo_warnings(&reverted).await {
+        record_warning(env, &purl, &w, common);
+    }
     for RevertedEntry {
         key: purl,
         flavor,

@@ -199,6 +199,49 @@ impl<'a> VendoredBackend<'a> {
         }
         out
     }
+
+    /// Dropping a vendored Go `replace` leaves a committed
+    /// vendor/modules.txt still recording it, which breaks every default
+    /// build until `go mod vendor` runs (#343, #1777). The undo commands
+    /// call this after [`Self::revert`]: it audits the Go consumer state
+    /// once and returns the issues of the Go modules `reverted` unwired,
+    /// each keyed by the ledger key of its entry. Not part of `revert`
+    /// itself, whose forward-run caller (the manifest reconcile) audits
+    /// once at the end of the run instead.
+    pub(crate) async fn go_undo_warnings(
+        &self,
+        reverted: &[RevertedEntry],
+    ) -> Vec<(String, VendorWarning)> {
+        let unwired: Vec<(&str, String)> = reverted
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.step,
+                    VendorRevertStep::Reverted
+                        | VendorRevertStep::Preserved
+                        | VendorRevertStep::LedgerWriteFailed(_)
+                )
+            })
+            .filter_map(|e| {
+                socket_patch_core::utils::purl::parse_golang_purl(&e.key)
+                    .map(|(module, _)| (e.key.as_str(), module.into_owned()))
+            })
+            .collect();
+        if unwired.is_empty() {
+            return Vec::new();
+        }
+        socket_patch_core::vendor::go_consumer_sync::audit(&self.common.cwd, &HashMap::new())
+            .await
+            .into_iter()
+            .filter_map(|issue| {
+                let (key, _) = unwired.iter().find(|(_, m)| m == issue.module())?;
+                Some((
+                    key.to_string(),
+                    VendorWarning::new(issue.code(), issue.to_string()),
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Name a patched `<name>-<version>.gem` left in Bundler's cache dir once

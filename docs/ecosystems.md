@@ -1475,8 +1475,9 @@ for it until `rollback -g`.
 
 Two files the go command derives from `go.mod` can disagree with a new or removed
 socket `replace`, and go then refuses to build. socket-patch does not regenerate
-them (that needs the go toolchain and the whole module graph); `apply`, `vendor`,
-`rollback` and `scan --mode hosted` warn with the command that does, and
+them (that needs the go toolchain and the whole module graph); `apply`, `vendor`
+(including `vendor --revert`), `rollback`, `remove` and `scan --mode hosted` warn
+with the command that does, and
 `apply --check` / `vendor --check` report the disagreement as drift until it is run:
 
 | Warning code | When | Fix |

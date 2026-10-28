@@ -994,9 +994,14 @@ async fn run_vendored_leg(
         keep_artifact: preserve,
     };
     let loud = !common.json && !common.silent;
-    let reverted = VendoredBackend::new(common, None)
-        .revert(keys, state, opts, false)
-        .await;
+    let backend = VendoredBackend::new(common, None);
+    let reverted = backend.revert(keys, state, opts, false).await;
+    for (_, w) in backend.go_undo_warnings(&reverted).await {
+        if loud {
+            eprintln!("Warning: {}", w.detail);
+        }
+        out.warnings.push((w.code.to_string(), w.detail));
+    }
     for RevertedEntry {
         key,
         warnings,
