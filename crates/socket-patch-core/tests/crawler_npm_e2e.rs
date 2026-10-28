@@ -4736,6 +4736,20 @@ async fn global_mode_finds_one_segment_registry_behind_same_named_package() {
         let host = deno_dir.join("npm").join("registry.example.com");
         let nested = host.join("npm");
         let npm_pkg = stage_deno_npm_pkg(&host, "npm", "10.9.0", "10.9.0").await;
+        // The outer package's own content: a nested manifest and a
+        // fixture tree laid out like a registry, neither of which is a
+        // package or registry of `<host>/npm`.
+        stage_npm_pkg(&npm_pkg.join("node_modules"), "abbrev", "2.0.0").await;
+        tokio::fs::create_dir_all(npm_pkg.join("dist"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            npm_pkg.join("dist").join("package.json"),
+            r#"{"name":"npm-dist","version":"0.0.1"}"#,
+        )
+        .await
+        .unwrap();
+        stage_deno_npm_pkg(&npm_pkg.join("fixtures"), "bar", "2.0.0", "2.0.0").await;
         let foo = stage_deno_npm_pkg(&nested, nested_pkg, "1.0.0", "1.0.0").await;
 
         std::env::set_var("DENO_DIR", &deno_dir);
