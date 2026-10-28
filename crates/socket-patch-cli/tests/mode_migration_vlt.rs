@@ -111,7 +111,8 @@ fn api_upstream(fx: &Fixture, dir: &Path, head: &[&str], extra: &[&str]) -> Sock
 }
 
 /// `vendor` over a (possibly) hosted project: no `--offline`, since the
-/// takeover restores the hosted pin's upstream entry first.
+/// eject fetches the hosted pin's record and restores its upstream entry
+/// first.
 fn vendor_upstream(fx: &Fixture, dir: &Path, extra: &[&str]) -> SocketOut {
     api_upstream(fx, dir, &["vendor"], extra)
 }
@@ -286,10 +287,12 @@ async fn vlt_pinned_matrix_migration_vendored_then_hosted() {
     fx.leg.ran();
 }
 
-/// Hosted → vendored through `scan --mode vendored` and through `vendor`
-/// (a staged manifest): the takeover restores the hosted pin's upstream
-/// entry first, the lock is vendored, fresh checkouts are patched, and
-/// `vendor --revert` restores the pristine (upstream) lock.
+/// Hosted → vendored through `scan --mode vendored` (a per-purl takeover)
+/// and through `vendor` (a staged manifest, but a hosted pin is in scope,
+/// so `vendor` ejects the lockfile's hosted pin instead): either way the
+/// hosted pin's upstream entry is restored first, the lock is vendored,
+/// fresh checkouts are patched, and `vendor --revert` restores the
+/// pristine (upstream) lock.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_migration_hosted_then_vendored() {
@@ -309,10 +312,7 @@ async fn vlt_pinned_matrix_migration_hosted_then_vendored() {
             vendor_upstream(&fx, &dir, &[])
         };
         assert_eq!(out.code, 0, "{driver}: {out}");
-        assert!(
-            has_code(&out.json(), "vendor_takeover_reverted_redirect"),
-            "{driver}: {out}"
-        );
+        assert_vendored_over_hosted(driver, &out);
         assert_pure_vendored(&dir, fx.t());
         assert_fresh(
             &fx,
@@ -332,14 +332,38 @@ async fn vlt_pinned_matrix_migration_hosted_then_vendored() {
     fx.leg.ran();
 }
 
+/// The wet hosted → vendored advisory for `driver`. `scan --mode vendored`
+/// announces its per-purl takeover; plain `vendor` with a hosted pin in
+/// scope runs the eject instead, which announces no takeover but, having
+/// healed the warm vlt store, asks for a `vlt install`.
+fn assert_vendored_over_hosted(driver: &str, out: &SocketOut) {
+    let doc = out.json();
+    assert!(!has_code(&doc, "redirect_revert_failed"), "{driver}: {out}");
+    if driver == "scan" {
+        assert!(
+            has_code(&doc, "vendor_takeover_reverted_redirect"),
+            "{driver}: {out}"
+        );
+    } else {
+        assert!(
+            !has_code(&doc, "vendor_takeover_reverted_redirect"),
+            "{driver}: the eject is not a takeover: {out}"
+        );
+        assert!(
+            has_code(&doc, "redirect_vlt_reinstall_required"),
+            "{driver}: {out}"
+        );
+    }
+}
+
 fn vendor_revert_all(dir: &Path) -> SocketOut {
     vendor_cmd(dir, &["--revert"])
 }
 
 // ── 3. dry-run parity ─────────────────────────────────────────────────────
 
-/// Over a live hosted redirect `vendor --dry-run` previews the takeover
-/// and `scan --mode vendored --dry-run` says `would_vendor`; over a live
+/// Over a live hosted redirect `vendor --dry-run` previews the eject of
+/// the hosted pin (`eject_planned`) and `scan --mode vendored --dry-run` says `would_vendor`; over a live
 /// vendored state `scan --mode hosted --dry-run` previews
 /// `redirect_would_revert_vendored`. No preview writes a byte, and the wet
 /// runs then do what was previewed.
@@ -357,10 +381,9 @@ async fn vlt_pinned_matrix_migration_dry_run_parity() {
     let before = project_bytes(&fx.proj);
     let out = vendor_upstream(&fx, &fx.proj, &["--dry-run"]);
     assert_eq!(out.code, 0, "{out}");
-    assert!(
-        has_code(&out.json(), "vendor_would_revert_redirect"),
-        "{out}"
-    );
+    let doc = out.json();
+    assert!(has_code(&doc, "eject_planned"), "{out}");
+    assert!(!has_code(&doc, "vendor_would_revert_redirect"), "{out}");
     assert!(!out.stdout.contains("vendor_lock_entry_not_found"), "{out}");
     let out = vendored_scan(&fx, &fx.proj, &["--dry-run"]);
     assert_eq!(out.code, 0, "{out}");
@@ -382,10 +405,7 @@ async fn vlt_pinned_matrix_migration_dry_run_parity() {
     );
     let out = vendor_upstream(&fx, &fx.proj, &[]);
     assert_eq!(out.code, 0, "{out}");
-    assert!(
-        has_code(&out.json(), "vendor_takeover_reverted_redirect"),
-        "{out}"
-    );
+    assert_vendored_over_hosted("vendor", &out);
     assert_pure_vendored(&fx.proj, fx.t());
     let before = project_bytes(&fx.proj);
     let out = hosted_scan(&fx, &fx.proj, &["--dry-run"]);
