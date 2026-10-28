@@ -609,8 +609,10 @@ async fn verify_installed_tree(
             continue;
         };
         'copies: for copy in copies.get(purl).into_iter().flatten() {
-            for file in record.files.keys() {
-                if socket_patch_core::patch::apply::needs_npm_bin_rewrite(purl, copy, file).await {
+            for (file, info) in &record.files {
+                if socket_patch_core::patch::apply::needs_npm_bin_rewrite(purl, copy, file, info)
+                    .await
+                {
                     crlf_bins.push(purl.clone());
                     break 'copies;
                 }

@@ -81,6 +81,10 @@ pub(crate) async fn form_for_write<'a>(
     expected_hash: &str,
 ) -> Result<(std::borrow::Cow<'a, [u8]>, String), std::io::Error> {
     let as_recorded = |content| Ok((content, expected_hash.to_string()));
+    // Content `fixBin` leaves alone needs no evidence read from disk.
+    if fix_bin(&content).is_none() {
+        return as_recorded(content);
+    }
     let path = pkg_path.join(normalized);
     let npm_installed = is_listed_bin(package_key, pkg_path, normalized).await || {
         let lf_shebang = read_prefix(&path)
@@ -119,11 +123,17 @@ pub(crate) async fn is_listed_bin(package_key: &str, pkg_path: &Path, normalized
     lists_bin(&manifest, normalized)
 }
 
-/// Whether the file holding raw bytes `fixBin` would change (a CRLF
-/// shebang npm never leaves in a bin) is a bin of the npm package
-/// `package_key`: the state a release before #1756 left by writing the
-/// recorded bytes over npm's form, which `env` can't run (#1791).
-pub(crate) async fn needs_fix(package_key: &str, pkg_path: &Path, normalized: &str) -> bool {
+/// Whether the file at `normalized` holds exactly the recorded content
+/// `expected_hash`, in bytes `fixBin` would change (a CRLF shebang npm
+/// never leaves in a bin), and is a bin of the npm package `package_key`:
+/// the state a release before #1756 left by writing the recorded bytes
+/// over npm's form, which `env` can't run (#1791).
+pub(crate) async fn needs_fix(
+    package_key: &str,
+    pkg_path: &Path,
+    normalized: &str,
+    expected_hash: &str,
+) -> bool {
     if !is_npm(package_key) {
         return false;
     }
@@ -139,36 +149,51 @@ pub(crate) async fn needs_fix(package_key: &str, pkg_path: &Path, normalized: &s
     }
     crate::utils::fs::read_regular_to_bytes(&path)
         .await
-        .is_ok_and(|bytes| fix_bin(&bytes).is_some())
+        .is_ok_and(|bytes| {
+            fix_bin(&bytes).is_some() && compute_git_sha256_from_bytes(&bytes) == expected_hash
+        })
 }
 
 /// Whether the `package.json` bytes `manifest` list `normalized` as a
-/// bin: a `bin` path (string or object values) or, with no `bin`, a file
-/// under `directories.bin`, as npm's `normalize` reads them. Paths are
-/// resolved as npm does (`./` and `..` folded, never above the package).
+/// bin, as npm's `normalize-package-bin` and `directories.bin` step read
+/// them: a `bin` path (a string, when the package has a `name`, an
+/// object's values, or an array's entries) or, when `bin` is missing or
+/// empty, a non-hidden file under `directories.bin`. Paths are resolved
+/// as npm does (`./` and `..` folded, never above the package).
 fn lists_bin(manifest: &[u8], normalized: &str) -> bool {
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+    use serde_json::Value;
+    let Ok(json) = serde_json::from_slice::<Value>(manifest) else {
         return false;
     };
     let target = clean_path(normalized);
     if target.is_empty() {
         return false;
     }
+    let lists = |bins: &mut dyn Iterator<Item = &Value>| {
+        bins.filter_map(Value::as_str)
+            .any(|bin| clean_path(bin) == target)
+    };
     match json.get("bin") {
-        Some(serde_json::Value::String(bin)) => clean_path(bin) == target,
-        Some(serde_json::Value::Object(bins)) => bins
-            .values()
-            .filter_map(serde_json::Value::as_str)
-            .any(|bin| clean_path(bin) == target),
-        Some(_) => false,
-        None => json
+        Some(Value::String(bin)) if !bin.is_empty() => {
+            json.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty())
+                && clean_path(bin) == target
+        }
+        Some(Value::Object(bins)) => lists(&mut bins.values()),
+        Some(Value::Array(bins)) => lists(&mut bins.iter()),
+        Some(Value::String(_) | Value::Null | Value::Bool(false)) | None => json
             .get("directories")
             .and_then(|d| d.get("bin"))
             .and_then(serde_json::Value::as_str)
             .map(clean_path)
             .is_some_and(|dir| {
-                !dir.is_empty() && target.len() > dir.len() && target.starts_with(&dir[..])
+                !dir.is_empty()
+                    && target.len() > dir.len()
+                    && target.starts_with(&dir[..])
+                    && !target[dir.len()..].iter().any(|seg| seg.starts_with('.'))
             }),
+        Some(_) => false,
     }
 }
 
@@ -344,8 +369,8 @@ mod tests {
     #[test]
     fn lists_bin_reads_every_bin_shape() {
         let listed = |manifest: &str, file: &str| lists_bin(manifest.as_bytes(), file);
-        assert!(listed(r#"{"bin":"cli.js"}"#, "cli.js"));
-        assert!(listed(r#"{"bin":"./bin/../cli.js"}"#, "cli.js"));
+        assert!(listed(r#"{"name":"x","bin":"cli.js"}"#, "cli.js"));
+        assert!(listed(r#"{"name":"x","bin":"./bin/../cli.js"}"#, "cli.js"));
         assert!(listed(
             r#"{"bin":{"a":"x.js","b":"./bin/cli.js"}}"#,
             "bin/cli.js"
@@ -360,6 +385,19 @@ mod tests {
             "bin/cli.js"
         ));
         assert!(!listed(r#"{"bin":{"a":"x.js"}}"#, "cli.js"));
+        assert!(listed(r#"{"bin":["x.js","./cli.js"]}"#, "cli.js"));
+        // npm drops a string `bin` of a package with no name.
+        assert!(!listed(r#"{"bin":"cli.js"}"#, "cli.js"));
+        // A missing or empty `bin` falls back to `directories.bin`, whose
+        // glob skips hidden files.
+        for bin in ["\"\"", "null"] {
+            let manifest = format!(r#"{{"bin":{bin},"directories":{{"bin":"bin"}}}}"#);
+            assert!(listed(&manifest, "bin/cli.js"), "{manifest}");
+        }
+        assert!(!listed(
+            r#"{"directories":{"bin":"bin"}}"#,
+            "bin/.hidden/cli.js"
+        ));
         assert!(!listed(r#"{"name":"x"}"#, "cli.js"));
         assert!(!listed(r#"{"directories":{"bin":"."}}"#, "cli.js"));
         assert!(!listed("not json", "cli.js"));

@@ -1267,13 +1267,6 @@ async fn npm_agent_patches_crlf_shebang_bin_npm_rewrote() {
     let proj = crlf_bin_project(tmp.path());
     let cli = proj.join("node_modules/crlfbin/cli.js");
 
-    let run_bin = || {
-        std::process::Command::new(proj.join("node_modules/.bin/crlfbin"))
-            .current_dir(&proj)
-            .output()
-            .unwrap()
-    };
-
     let (code, stdout, stderr) = run_socket(&proj, &["apply", "--offline"]);
     assert_eq!(code, 0, "apply\nstdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
@@ -1281,13 +1274,7 @@ async fn npm_agent_patches_crlf_shebang_bin_npm_rewrote() {
         "no drift warning: {stderr}"
     );
     assert_eq!(std::fs::read(&cli).unwrap(), installed_after);
-    let ran = run_bin();
-    assert!(
-        ran.status.success(),
-        "{}",
-        npm_e2e_common::output_text(&ran)
-    );
-    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "hi");
+    assert_crlf_bin_runs(&proj, "after apply");
 
     let (code, stdout, stderr) = run_socket(&proj, &["apply", "--offline"]);
     assert_eq!(code, 0, "re-apply\nstdout:\n{stdout}\nstderr:\n{stderr}");
@@ -1315,12 +1302,7 @@ async fn npm_agent_patches_crlf_shebang_bin_npm_rewrote() {
     let (code, stdout, stderr) = run_socket(&proj, &["rollback", "--offline"]);
     assert_eq!(code, 0, "rollback\nstdout:\n{stdout}\nstderr:\n{stderr}");
     assert_eq!(std::fs::read(&cli).unwrap(), installed_before);
-    let ran = run_bin();
-    assert!(
-        ran.status.success(),
-        "{}",
-        npm_e2e_common::output_text(&ran)
-    );
+    assert_crlf_bin_runs(&proj, "after rollback");
 }
 
 /// Regression (#1791): v5.0.1 wrote the raw CRLF patched bytes over the

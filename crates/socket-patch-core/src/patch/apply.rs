@@ -1026,8 +1026,13 @@ async fn mark_crlf_bin_rewrite(
 ) {
     if verify.status == VerifyStatus::AlreadyPatched
         && verify.current_hash.as_deref() == Some(file_info.after_hash.as_str())
-        && crate::patch::npm_bin::needs_fix(package_key, pkg_path, normalize_file_path(file_name))
-            .await
+        && crate::patch::npm_bin::needs_fix(
+            package_key,
+            pkg_path,
+            normalize_file_path(file_name),
+            &file_info.after_hash,
+        )
+        .await
     {
         verify.status = VerifyStatus::Ready;
         verify.target_hash = Some(file_info.after_hash.clone());
@@ -1036,12 +1041,24 @@ async fn mark_crlf_bin_rewrite(
 
 /// Whether `apply` would rewrite `file_name` (a manifest key) of the
 /// installed `package_key` copy at `pkg_path` although its bytes hash to
-/// the patched content: an npm bin left with a CRLF shebang `env` can't
-/// run (#1791). `apply --check` reports it as not applied.
-pub async fn needs_npm_bin_rewrite(package_key: &str, pkg_path: &Path, file_name: &str) -> bool {
+/// the patched content `file_info.after_hash`: an npm bin left with a
+/// CRLF shebang `env` can't run (#1791). `apply --check` reports it as
+/// not applied.
+pub async fn needs_npm_bin_rewrite(
+    package_key: &str,
+    pkg_path: &Path,
+    file_name: &str,
+    file_info: &PatchFileInfo,
+) -> bool {
     let normalized = normalize_file_path(file_name);
     is_safe_relative_subpath(normalized)
-        && crate::patch::npm_bin::needs_fix(package_key, pkg_path, normalized).await
+        && crate::patch::npm_bin::needs_fix(
+            package_key,
+            pkg_path,
+            normalized,
+            &file_info.after_hash,
+        )
+        .await
 }
 
 /// The single-copy apply engine behind [`apply_package_patch`]: verifies
@@ -4195,7 +4212,13 @@ mod tests {
         assert!(again.success, "{again:?}");
         assert!(again.files_patched.is_empty(), "{again:?}");
         assert!(
-            !needs_npm_bin_rewrite("pkg:npm/crlfbin@1.0.0", pkg.path(), "package/cli.js").await
+            !needs_npm_bin_rewrite(
+                "pkg:npm/crlfbin@1.0.0",
+                pkg.path(),
+                "package/cli.js",
+                &files["package/cli.js"]
+            )
+            .await
         );
     }
 
@@ -4223,7 +4246,15 @@ mod tests {
             tokio::fs::write(pkg.path().join("cli.js"), CRLF_BIN_AFTER)
                 .await
                 .unwrap();
-            assert!(!needs_npm_bin_rewrite(purl, pkg.path(), "package/cli.js").await);
+            assert!(
+                !needs_npm_bin_rewrite(
+                    purl,
+                    pkg.path(),
+                    "package/cli.js",
+                    &files["package/cli.js"]
+                )
+                .await
+            );
             let res = apply_package_patch(
                 purl,
                 pkg.path(),
