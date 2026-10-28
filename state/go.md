@@ -18,7 +18,7 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 
 | OS | go | `scan -g` report (+ `--json`) | `-g --mode hosted` refusal | `scan -g --mode agent` / `get -g` apply | installed `go install` binary | `rollback -g` | `vex -g` | unwritable prefix | GOENV GOMODCACHE |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Linux | 1.24.7 | pass | pass | pass (cache) | pass (run 13: warns go_installed_tool_stale; pass after reinstall) | pass | fixed #422 (attests stale binary); pass after cache revert | pass (loud) | fixed #344 (silent 0 packages) | apply pass; rollback/remove fail #1766 (agent, 1.22.12 + 1.24.7) |
+| Linux | 1.24.7 | pass | pass | pass (cache) | pass (run 13: warns go_installed_tool_stale; pass after reinstall) | pass | fixed #422 (attests stale binary); pass after cache revert | pass (loud) | fixed #344 (silent 0 packages) |
 | Linux | 1.25.1 | untested | untested | pass (cache) | fixed #422 | untested | fixed #422 | untested | untested |
 | Linux | 1.22.12 / 1.26.8 | Go hit crawled (report fields untested: mock lacks /patches/batch) | untested | pass (cache) | fixed #422 | pass | pass | untested (ran as root) | untested |
 | Linux | 1.16 / 1.21 | untested | untested | untested | untested | untested | untested | untested | untested |
