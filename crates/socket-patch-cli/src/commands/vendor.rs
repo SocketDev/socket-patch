@@ -2026,6 +2026,17 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         socket_patch_core::patch::redirect::vlt_heal::lock_targets(&lock, &origins, &pin_purls)
     })
     .unwrap_or_default();
+    // The restore runs inside the group commit the vendored apply commits
+    // (handed to it through the capture), so the registry entries it puts
+    // back land in the same journaled commit as the vendored wiring. An
+    // eject killed before that commit (SIGKILL, Ctrl-C, a CI cancel) leaves
+    // the project hosted, exactly as found; one killed after it rolls
+    // forward on the next locked command (#1782).
+    let mut capture = EjectCapture {
+        group: (!socket_patch_core::utils::failpoint::switched_off("group_commit"))
+            .then(|| GroupCommit::begin(&common.cwd)),
+        ..EjectCapture::default()
+    };
     let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
         &common.cwd,
         &pins,
@@ -2042,14 +2053,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         .map(|(_, why)| why.to_string())
         .next()
         .or_else(|| restore.flush_error.clone());
-    // Every file the vendored apply's group commit wrote, with its bytes
-    // from before (the rollback's scope beyond the restore's own files),
-    // and the flavors it wired for the close printed below.
-    let mut capture = EjectCapture::default();
     // The vendored apply's events start here: a rollback retracts them.
     let events_start = env.events.len();
     let mut exit: i32;
     if let Some(why) = restore_failure {
+        // Discard the captured restore before the rollback below writes.
+        drop(capture.group.take());
         env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
         if !common.json {
             eprintln!("Error: {}", crate::ui::sentence_case(&why));
@@ -2081,6 +2090,17 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             )
             .await;
         exit = i32::from(applied);
+        // A vendored apply that returned before its commit leaves the
+        // group, and with it the captured restore, uncommitted: discard
+        // it, so the rollback below writes to disk, and undo the eject.
+        if capture.group.take().is_some() && exit == 0 {
+            let detail = "the vendored apply did not commit, so the eject is undone";
+            if !common.json {
+                eprintln!("Error: {detail}");
+            }
+            env.mark_error(EnvelopeError::new("eject_incomplete", detail));
+            exit = 1;
+        }
         // Backstop: every ejected pin must now be vendored. A package the
         // backend skipped (a vendored gate condition the pre-pass did not
         // see) would otherwise leave the project neither hosted nor
@@ -3146,9 +3166,15 @@ pub(crate) async fn vendor_records_reusing(
     // over. The replaced uuid dirs of re-vendored packages are swept only
     // after the commit, since until then the committed wiring still names
     // them. Dry runs write nothing and capture nothing.
-    let group = (!common.dry_run
-        && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
-    .then(|| GroupCommit::begin(&common.cwd));
+    // An eject hands over the group its upstream restore already wrote
+    // into, so the restore commits with this run's wiring.
+    let handed = eject
+        .as_deref_mut()
+        .and_then(|capture| capture.group.take());
+    let group = handed.or_else(|| {
+        (!common.dry_run && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
+            .then(|| GroupCommit::begin(&common.cwd))
+    });
     let mut stale_artifacts: Vec<StaleArtifact> = Vec::new();
     // The source of a superseded install (see [`superseded_install`]).
     let uninstalled = common.cwd.join(".socket/vendor/.uninstalled");
@@ -4153,8 +4179,11 @@ async fn remove_new_vendor_dirs(
 /// printing its own close: every project file its group commit wrote (with
 /// the bytes from before, for the rollback) and the lockfile flavors it
 /// wired (for the "Next steps:" the eject prints only when it completes).
+/// The eject hands its open group commit IN through `group`, holding the
+/// upstream restore; the vendored apply takes it as its own.
 #[derive(Default)]
 pub(crate) struct EjectCapture {
+    pub(crate) group: Option<GroupCommit>,
     pub(crate) committed: Vec<CommittedFile>,
     pub(crate) wired_flavors: HashSet<String>,
 }
