@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-18T00Z (run 48), main `7d3086f` (v5.0.1 `latest`); the only change since `657fce2` is a CI action-pin bump, so the npm code is unchanged since run 44. Run 48 filed nothing new. It commented on #1581 (`repair` restores a lost npm `<uuid>/` dir without its `.gitignore`, so a `*.tgz` rule keeps the repaired tarball out of git) and on #1618 (`bundleDependencies: true` / `bundledDependencies` spellings). Run 47 filed #1627, run 46 #1618, run 44 #1595. Open: #1627 (draft fix PR #1628), #1618, #1595, #1576, #1554, #1072. **Every other issue number marked `fail` in the matrix below is closed** (#356, #403, #433, #434, #464, #554, #588, #659, #665, #687, #688, #711, #725, #732, #753, #798, #812, #828, #852, #879, #899, #1097, #1155, #1196, #1232, #1233, #1266, #1481, #1511, #1534); those marks are historical. Probe branches remain blocked (`git push --delete` refused).
+Last updated: 2026-10-28T01Z (run 49), main `b787454` (v5.0.1 `latest`). Since run 48 (`7d3086f`), fixes closed #1627 (#1628), #1618 (#1661), #1595 (#1657), #1576 (#1651), #1554 (#1591) and #1581 (#1656); run 49 closed #1072 (fixed by #1739). Two v5-major changes landed: #1646 (consent before patching user-patched packages, `--allow-patch-conflicts`, and agent apply refuses unknown file drift) and #1648 (plain `vendor` over hosted pins ejects straight from the lockfiles). Run 49 filed #1756 (npm's `fixBin` CRLF-shebang rewrite in `bin` files vs patch hashes). **Open npm bughunt issues: #1756 only.** Every issue number marked `fail` in the matrix below other than #1756 is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -24,6 +24,19 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Windows | 10.9.7 | pass: linked `.store` apply/vex/rollback (main). fail #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** (default and custom prefix; `--global-prefix` works) |
 | Windows | 12.1.0 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main). fail #356, #403 (v4) | pass: cycle + `--omit=dev`, revert (main) | pass: cycle, linked cycle (probe) | **fail #434** |
 | Windows 2022 | 10.9.7 / 12.2.0 | pass: linked `.store` apply/vex/rollback (main) | pass: cycle + `--omit=dev`, revert (main) | pass: linked cycle (probe) | **fail #434** |
+| Linux | 6.14.18 / 8.19.4 / 10.9.4 / 12.2.1, `bin` file published with a CRLF shebang (run 49) | **fail #1756** (`apply_failed`; with `--allow-patch-conflicts`, and on v5.0.1 by default, the bin exits 127) | **fail #1756** (8.19.4 / 12.2.1 / 10.9.4: `vex` warns `vendored_tree_out_of_sync` on an in-sync tree) | **fail #1756** (8.19.4 / 10.9.4 / 12.2.1: `vex` omits a correctly patched install) | untested |
+| Linux | 6.14.18 / 8.19.4 / 10.9.4 / 12.2.1, #1648 eject (plain `vendor` over hosted pins, fresh checkout) (run 49) | n/a | pass: v3 plain + nested, dual lock, alias, workspace member copy (10.9.4), v2 lock (8.19.4), plain (12.2.1); `npm ci` patched, `vex`, `vendor --check`, byte-exact `--revert`; `registry=` mirror; allowScripts warning kept. v1 lock (6.14.18): `eject_refused`, nothing changed (documented) | n/a | n/a |
+| Linux | 12.2.1 `npm patch` (lockfileVersion 4) + #1646 consent (run 49) | pass (user-patched copy skipped, the other version patched) | pass (v4 lock refused, documented; the eject refuses `user_patch_conflict`) | pass (user-patched copy skipped, `rollback` keeps a working user patch, `vex` omits the double-patched copy) | untested |
+
+## Run 49 (2026-10-28T01Z, main `b787454`)
+
+- Filed #1756. npm's `bin-links` `fixBin` rewrites a `#!…\r\n` shebang line to `\n` in installed `bin` files, so the installed bytes match neither patch hash.
+  - Agent `apply` fails `apply_failed` on main.
+  - With `--allow-patch-conflicts` (and by default on v5.0.1) it writes the CRLF shebang back and the bin exits 127.
+  - Hosted `vex` omits a correct install, and vendored `vex` warns `vendored_tree_out_of_sync`.
+  - Reproduced on npm 6.14.18 / 8.19.4 / 10.9.4 / 12.2.1. Handed over to pnpm and bun (both rewrite too); yarn classic keeps the CRLF.
+- Closed #1072 (fixed by #1739).
+- pass: the #1648 eject across v2 / v3 / dual / alias / workspace / npm 12, and #1646 consent with real `npm patch`. Details are in the run 49 entry.
 
 ## Run 48 (2026-10-18T00Z, main `7d3086f`)
 
@@ -234,6 +247,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-28T01Z:** #1756 on macOS / Windows once probe branches work; agent `rollback` over a consent-overwritten CRLF bin. Eject shapes: hosted pins under `overrides`, `--ecosystems pypi` beside npm pins, `vendor --dry-run`, an interrupted eject. Consent with patch-package `--patch-dir` and in a workspace member run from its cwd. npm 12 global on a root-owned prefix. The 2026-10-18 items about #1627 / #1581 / #1618 / #1595 / #1576 / #1554 / #1072 re-checks are done (all closed).
 - **New 2026-10-18T00Z:** re-check #1627 when PR #1628 lands (agent `rollback` / `repair` over a `build` member too); re-check #1581 for npm once fixed (missing, not only legacy, `<uuid>/` metadata); `repair` / `vendor --check` with a gitignored artifact in other shapes (workspace, dual lock); #1618 member-level bundles; npm 12 global on a root-owned prefix.
 - **New 2026-10-17T12Z:** #1627 follow-ups (hosted / vendored with a `build`-named member: lock-driven, so are the pins and `vex` right? `scan --mode agent`, `rollback` and `repair` over such a member; `install-strategy=linked` member at `packages/dist`; hand over to pnpm / yarn / bun if their workspaces hit the same `SKIP_DIRS` prune); plus the 2026-10-17T00Z items below.
 - **New 2026-10-17T00Z:** #1618 siblings (`bundleDependencies: true`, `bundledDependencies` spelling, a workspace member's own bundleDependencies, takeover / rollback / remove over a root-bundled entry once fixed); do Bun / vlt / yarn locks flag root bundles too? (hand over if so); re-check #1595 / #1576 / #1554 / #1072 on the next main; `scan . tools/x` once #1591 lands.
@@ -291,6 +305,10 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- A workspace member's own `bundleDependencies` copy (`packages/a/node_modules/ms`, `inBundle: true` in the root lock) is neither pinned nor reported by hosted / vendored. npm itself never reinstalls such a copy from a clean tree (`npm ci` and `npm install` after `rm -rf node_modules` both leave it absent), so no unpatched copy runs (npm 10.9.4, 2026-10-28).
+- After the #1648 eject, a pre-existing `.npmrc` keeps hosted mode's `allow-remote=all` line, with the documented `npm_allow_remote_left` advisory. A `.npmrc` that hosted mode created is deleted (2026-10-28).
+- The #1648 eject over an npm 6 lockfileVersion 1 lock refuses `eject_refused` with nothing changed (v1 vendoring is documented as refused) (2026-10-28).
+- Mock tip (2026-10-28): the org routes (`SOCKET_API_URL` + `SOCKET_API_TOKEN=fake` + `SOCKET_ORG_SLUG`) plus `SOCKET_PATCH_SERVER_URL` and `SOCKET_NPM_REGISTRY` on one mock serve hosted, vendored and the eject. `POST …/patches/package` returns `url` = `<mock>/patch/npm/<name>/<ver>/<tok>/<uuid>/<leaf>-<ver>.tgz` for both. A project `.npmrc` `registry=<mock>/` lets the mock serve hand-made packages. `vex --json` needs `--output <file>`.
 - A `file:` directory dependency whose `package.json` names the patched package with no version (`{"name":"ms"}`), names nothing, or is missing isn't treated as a copy of the patched release: hosted pins, and `vex` / `vendor --check` pass. A versioned one (`ms@2.0.0`) is contested. Unlike yarn portals (#1579), npm records the directory's manifest in the lock, and a directory filled after locking (a submodule) makes `npm ci` fail EUSAGE, so the "fetch step fills it later" path fails closed (npm 10.9.4, 2026-10-18).
 - npm 12.2.1 `npm install <newpkg>` while a hosted pin's URL is unreachable (cold cache) fails loudly and keeps the pin; no silent registry fallback (2026-10-18).
 - Global `-g` cells need a prefix path without a UUID segment (npm >= 11 redacts it in `npm root -g`); the session scratchpad path has one (2026-10-18).
