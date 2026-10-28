@@ -7,7 +7,7 @@ use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::manifest::cleanup_blobs::{
     format_all_in_use, format_cleanup_result_for, ArtifactReferences, CleanupResult,
 };
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{manifest_exists, read_manifest};
 use socket_patch_core::telemetry::{
     track_patch_repair_failed, track_patch_repaired, TelemetryAuth,
 };
@@ -65,7 +65,27 @@ pub async fn run(args: RepairArgs) -> i32 {
     // for a ledger-less project, and that result is reused under the lock.
     let mut vendor_references: Option<Vec<(String, String, String)>> = None;
 
-    if tokio::fs::metadata(&manifest_path).await.is_err() {
+    // Only a missing file is "no manifest"; one repair cannot even stat is
+    // unreadable, not a project with nothing to repair (#998).
+    let manifest_present = match manifest_exists(&manifest_path).await {
+        Ok(present) => present,
+        Err(e) => {
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            if args.common.json {
+                let env = error_envelope(
+                    Command::Repair,
+                    args.common.dry_run,
+                    &err.code,
+                    &err.message,
+                );
+                println!("{}", env.to_pretty_json());
+            } else {
+                eprintln!("Error: {}", crate::ui::sentence_case(&err.message));
+            }
+            return 1;
+        }
+    };
+    if !manifest_present {
         // Hosted mode leaves no local artifacts to repair: the lockfiles
         // point at patch.socket.dev URLs, not `.socket/vendor/...`, and
         // there is no manifest or vendor ledger. A project whose only trace

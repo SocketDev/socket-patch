@@ -121,8 +121,8 @@ fn nonexistent_global_prefix_is_a_usage_error_on_every_command() {
 }
 
 /// A `--manifest-path` in a directory that does not exist fails every
-/// command with exit 2 (`list` used to say "No patches" and exit 0); one
-/// naming a directory fails too.
+/// command with exit 2 (`list` used to say "No patches" and exit 0). One
+/// naming a directory is a manifest that cannot be read, not a bad flag.
 #[test]
 fn manifest_path_in_a_missing_directory_is_a_usage_error_on_every_command() {
     let tmp = tempfile::tempdir().unwrap();
@@ -142,13 +142,16 @@ fn manifest_path_in_a_missing_directory_is_a_usage_error_on_every_command() {
         );
         assert!(stderr.contains("--manifest-path"), "{command:?}: {stderr}");
     }
+    // A directory is an existing (unreadable) manifest, not a bad flag:
+    // `list` runs and refuses it (exit 1), as it does under the default
+    // path (#1123).
     let (code, _stdout, stderr) = run(
         tmp.path(),
         &["list"],
         &["--manifest-path", tmp.path().to_str().unwrap()],
     );
-    assert_eq!(code, 2, "a directory is no manifest file: {stderr}");
-    assert!(stderr.contains("is a directory"), "{stderr}");
+    assert_eq!(code, 1, "a directory is an unreadable manifest: {stderr}");
+    assert!(!stderr.contains("--manifest-path"), "{stderr}");
 }
 
 /// Anti-vacuous controls: real directories still run, and a missing
@@ -191,7 +194,9 @@ fn existing_paths_and_a_missing_manifest_file_still_run() {
 
 /// The commands that create the manifest keep creating its directory: a
 /// fresh checkout's `get --manifest-path state/patches.json` is no usage
-/// error, and neither is `scan`. A directory in that position still is.
+/// error, and neither is `scan`. A directory in that position is no usage
+/// error either, but the run still fails: it is an unreadable manifest
+/// (#1123).
 #[test]
 fn manifest_creating_commands_accept_a_manifest_path_in_a_new_directory() {
     let tmp = tempfile::tempdir().unwrap();
@@ -212,10 +217,11 @@ fn manifest_creating_commands_accept_a_manifest_path_in_a_new_directory() {
             command,
             &["--manifest-path", tmp.path().to_str().unwrap()],
         );
-        assert_eq!(
-            code, 2,
+        assert_ne!(
+            code, 0,
             "{command:?}: a directory is no manifest file: {stderr}"
         );
+        assert!(!stderr.contains("--manifest-path"), "{command:?}: {stderr}");
     }
 }
 

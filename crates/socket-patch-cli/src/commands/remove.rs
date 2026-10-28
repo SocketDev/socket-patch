@@ -5,7 +5,7 @@ use socket_patch_core::ledgers::hosted_pins_matching;
 use socket_patch_core::manifest::cleanup_blobs::{
     format_bytes, format_cleanup_result_for, ArtifactReferences,
 };
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::operations::{manifest_exists, read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed, TelemetryAuth};
@@ -365,7 +365,21 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // remove restores the global copies and drops their manifest records
     // only.
     let project_state = crate::commands::project_state_in_scope(&args.common);
-    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    // Only a missing file is "no manifest"; one remove cannot even stat is
+    // unreadable, not a bare project (#998).
+    let manifest_missing = match manifest_exists(&manifest_path).await {
+        Ok(present) => !present,
+        Err(e) => {
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                &err.code,
+                err.message,
+            );
+            return 1;
+        }
+    };
     let hosted_inventory = if project_state {
         crate::commands::hosted_inventory(&args.common, &args.common.project_root()).await
     } else {
