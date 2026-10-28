@@ -1347,9 +1347,10 @@ async fn apply_package_patch_at(
 /// content as is, or npm's `fixBin` form of it (see
 /// [`npm_bin`](crate::patch::npm_bin)) when the file on disk is a bin npm
 /// installed with an LF shebang. That is the case when verify matched
-/// npm's form of the original, and, for an npm package, when an
-/// overwrite with consent replaces such a file: writing the CRLF shebang
-/// back would leave a bin `env` can't run.
+/// npm's form of the original, and, for an npm package off Windows (where
+/// npm writes cmd-shims and leaves bins alone), when an overwrite with
+/// consent replaces such a file: writing the CRLF shebang back would leave
+/// a bin `env` can't run.
 async fn npm_fixed_write<'a>(
     package_key: &str,
     path: &Path,
@@ -1358,38 +1359,27 @@ async fn npm_fixed_write<'a>(
     patched: Cow<'a, [u8]>,
 ) -> Result<(Cow<'a, [u8]>, String), std::io::Error> {
     use crate::patch::npm_bin;
+    let as_recorded = |patched| Ok((patched, file_info.after_hash.clone()));
     let raw_before = verify.is_none_or(|v| {
         v.current_hash.is_none() || v.current_hash.as_deref() == Some(&file_info.before_hash)
     });
     if file_info.before_hash.is_empty() || raw_before {
-        return Ok((patched, file_info.after_hash.clone()));
+        return as_recorded(patched);
     }
-    let installed = match crate::utils::fs::read_regular_to_bytes(path).await {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok((patched, file_info.after_hash.clone())),
+    let Ok(installed) = crate::utils::fs::read_regular_to_bytes(path).await else {
+        return as_recorded(patched);
     };
     let npm_installed = npm_bin::has_lf_shebang(&installed)
-        && (package_key.starts_with("pkg:npm/")
-            || npm_bin::unfix_bin(&installed)
-                .is_some_and(|src| compute_git_sha256_from_bytes(&src) == file_info.before_hash));
-    let fixed = npm_installed.then(|| npm_bin::fix_bin(&patched)).flatten();
-    let Some(fixed) = fixed else {
-        return Ok((patched, file_info.after_hash.clone()));
-    };
-    // The write below hash-checks what it writes; check the blob here, as
-    // it would have been checked.
-    let blob_hash = compute_git_sha256_from_bytes(&patched);
-    if blob_hash != file_info.after_hash {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Hash verification failed before patch. Expected: {}, Got: {}",
-                file_info.after_hash, blob_hash
-            ),
-        ));
+        && ((!cfg!(windows) && package_key.starts_with("pkg:npm/"))
+            || npm_bin::source_hash_of(&installed).as_deref()
+                == Some(file_info.before_hash.as_str()));
+    if !npm_installed {
+        return as_recorded(patched);
     }
-    let hash = compute_git_sha256_from_bytes(&fixed);
-    Ok((Cow::Owned(fixed), hash))
+    match npm_bin::fixed_for_write(&patched, &file_info.after_hash)? {
+        Some((fixed, hash)) => Ok((Cow::Owned(fixed), hash)),
+        None => as_recorded(patched),
+    }
 }
 
 /// Whether `hash` (a file's current content hash) names a blob Socket
@@ -4098,7 +4088,9 @@ mod tests {
 
     /// Regression (#1756): overwriting a drifted npm bin with consent
     /// writes the patched content with npm's LF shebang, never a
-    /// `#!/usr/bin/env node\r` line `env` can't run.
+    /// `#!/usr/bin/env node\r` line `env` can't run. (On Windows npm
+    /// leaves bins alone, so the patch's exact bytes are written.)
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn consent_overwrite_of_npm_bin_keeps_lf_shebang() {
         let files = crlf_bin_files();

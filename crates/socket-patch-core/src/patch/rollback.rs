@@ -157,7 +157,14 @@ pub async fn verify_file_rollback(
                 };
             }
         };
-        if current_hash == file_info.after_hash {
+        // npm's LF-shebang form of a patch-added bin is the patched file
+        // too (see `npm_bin`).
+        if current_hash == file_info.after_hash
+            || crate::patch::npm_bin::source_hash(&filepath)
+                .await
+                .as_deref()
+                == Some(file_info.after_hash.as_str())
+        {
             return VerifyRollbackResult {
                 file: file_name.to_string(),
                 status: VerifyRollbackStatus::Ready,
@@ -451,12 +458,15 @@ async fn holds_this_patch(dir: &Path, files: &HashMap<String, PatchFileInfo>) ->
             Ok(bytes) => {
                 let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&bytes);
                 // npm's LF-shebang form of a bin counts as the content it
-                // came from (see `npm_bin`).
-                let source = || {
-                    crate::patch::npm_bin::unfix_bin(&bytes)
-                        .map(|src| crate::hash::git_sha256::compute_git_sha256_from_bytes(&src))
+                // came from (see `npm_bin`); hashed once, when needed.
+                let source = std::cell::OnceCell::new();
+                let is = |h: &str| {
+                    hash == h
+                        || source
+                            .get_or_init(|| crate::patch::npm_bin::source_hash_of(&bytes))
+                            .as_deref()
+                            == Some(h)
                 };
-                let is = |h: &str| hash == h || source().as_deref() == Some(h);
                 if is(&info.after_hash) {
                     patched = true;
                 } else if !is(&info.before_hash) {
@@ -763,33 +773,26 @@ async fn rollback_package_patch_at(
         // `current_hash` is not the `afterHash`) gets the original in that
         // form too, the bytes `npm install` leaves (see `npm_bin`). The
         // blob is hash-checked first, as the write would have checked it.
-        let npm_fixed = result
-            .files_verified
-            .iter()
-            .any(|v| {
-                v.file == *file_name
-                    && v.current_hash
-                        .as_deref()
-                        .is_some_and(|h| h != file_info.after_hash)
-            })
-            .then(|| crate::patch::npm_bin::fix_bin(&original_content))
-            .flatten();
-        let (original_content, restored_hash) = match npm_fixed {
-            Some(fixed) => {
-                let blob_hash =
-                    crate::hash::git_sha256::compute_git_sha256_from_bytes(&original_content);
-                if blob_hash != file_info.before_hash {
-                    result.error = Some(format!(
-                        "Hash verification failed before patch. Expected: {}, Got: {}",
-                        file_info.before_hash, blob_hash
-                    ));
+        let npm_fixed = result.files_verified.iter().any(|v| {
+            v.file == *file_name
+                && v.current_hash
+                    .as_deref()
+                    .is_some_and(|h| h != file_info.after_hash)
+        });
+        let fixed = if npm_fixed {
+            match crate::patch::npm_bin::fixed_for_write(&original_content, &file_info.before_hash)
+            {
+                Ok(fixed) => fixed,
+                Err(e) => {
+                    result.error = Some(e.to_string());
                     return result;
                 }
-                let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&fixed);
-                (fixed, hash)
             }
-            None => (original_content, file_info.before_hash.clone()),
+        } else {
+            None
         };
+        let (original_content, restored_hash) =
+            fixed.unwrap_or_else(|| (original_content, file_info.before_hash.clone()));
         match crate::patch::apply::apply_file_patch_at(
             pkg_path,
             file_name,
@@ -3197,5 +3200,31 @@ mod tests {
                 .await;
         assert!(again.success, "{again:?}");
         assert!(again.files_rolled_back.is_empty(), "{again:?}");
+    }
+
+    /// Regression (#1756): a bin the patch added, installed by npm in its
+    /// LF-shebang form, rolls back (is deleted) like the exact bytes.
+    #[tokio::test]
+    async fn rollback_deletes_npm_fixed_added_bin() {
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            pkg.path().join("cli.js"),
+            b"#!/usr/bin/env node\nnew();\r\n",
+        )
+        .await
+        .unwrap();
+        let files = HashMap::from([(
+            "package/cli.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: compute_git_sha256_from_bytes(b"#!/usr/bin/env node\r\nnew();\r\n"),
+            },
+        )]);
+        let res =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+        assert!(res.success, "{res:?}");
+        assert!(!pkg.path().join("cli.js").exists());
     }
 }
