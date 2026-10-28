@@ -68,6 +68,9 @@ pub(crate) async fn vendor_owned_keys(
     if project_state_in_scope(common) {
         return ledger.clone();
     }
+    if !common.ecosystem_selected(Ecosystem::Nuget) {
+        return Default::default();
+    }
     let nuget: std::collections::HashSet<_> = ledger
         .iter()
         .filter(|key| Ecosystem::from_purl(key.as_str()) == Some(Ecosystem::Nuget))

@@ -794,6 +794,12 @@ fn global_rollback_keeps_a_vendored_nuget_projects_install() {
         assert_eq!(code, 0, "{args:?}: stdout={stdout}\nstderr={stderr}");
         let v = parse(&stdout, &stderr);
         assert!(events_with(&v, "rolledBack").is_empty(), "{args:?}: {v}");
+        assert!(
+            events_with(&v, "skipped")
+                .iter()
+                .any(|e| e["purl"] == N_PURL && e["errorCode"] == "vendored"),
+            "{args:?}: the kept install is reported: {v}"
+        );
         project.assert_untouched(&format!("{args:?}"));
         assert!(
             serde_json::from_slice::<Value>(
@@ -816,6 +822,12 @@ fn global_remove_keeps_a_vendored_nuget_projects_install() {
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let v = parse(&stdout, &stderr);
     assert!(events_with(&v, "rolledBack").is_empty(), "{v}");
+    assert!(
+        events_with(&v, "skipped")
+            .iter()
+            .any(|e| e["purl"] == N_PURL && e["errorCode"] == "vendored"),
+        "the kept install is reported: {v}"
+    );
     project.assert_untouched("remove -g");
 }
 

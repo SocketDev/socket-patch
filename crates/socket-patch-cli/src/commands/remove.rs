@@ -619,6 +619,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // still carries an agent-mode patch (#336); an unreadable ledger degrades to
     // "nothing vendored" here and fails closed at that leg. Under global
     // scope the project's ledger still owns its own NuGet install (#489).
+    // The identifier is the scope, so `--ecosystems` does not narrow it.
     let vendored_keys: HashSet<PurlKey> = if project_state {
         vendor_state_result
             .as_ref()
@@ -626,7 +627,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
             .unwrap_or_default()
     } else {
         crate::commands::vendor_owned_keys(
-            &args.common,
+            &GlobalArgs {
+                ecosystems: None,
+                ..args.common.clone()
+            },
             &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
         )
         .await
@@ -635,6 +639,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // `summary.rolledBack` counts them). A dry run restores nothing, so it
     // records none.
     let mut rolled_back_events: Vec<PatchEvent> = Vec::new();
+    // Copies a global run left to the project's vendor ledger (#489): each
+    // a `skipped` / `vendored` event, since no vendored leg reports them.
+    let mut project_owned: Vec<PatchEvent> = Vec::new();
     // In-scope manifest entries the nested rollback SKIPPED because the
     // crawler found no installed package (`RollbackOutcome::not_installed`,
     // sorted). These were NOT reverted — and "not installed" can also mean
@@ -675,6 +682,23 @@ pub async fn run(args: RemoveArgs) -> i32 {
         {
             Ok(outcome) => {
                 rollback_not_installed = outcome.not_installed;
+                if !project_state {
+                    if loud {
+                        super::rollback::print_project_owned(
+                            &args.common,
+                            &outcome.vendored_skipped,
+                        );
+                        printed_progress |= !outcome.vendored_skipped.is_empty();
+                    }
+                    project_owned = outcome
+                        .vendored_skipped
+                        .iter()
+                        .map(|purl| {
+                            PatchEvent::new(PatchAction::Skipped, purl.clone())
+                                .with_reason("vendored", super::rollback::PROJECT_OWNED_INSTALL)
+                        })
+                        .collect();
+                }
                 rollback_warnings = outcome.warnings;
                 if !outcome.success {
                     track_patch_remove_failed("Rollback failed during patch removal", &telemetry)
@@ -799,7 +823,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     };
     let vendored_matches = vendor_entries_matching(&vendor_state, Some(&manifest), &target);
-    let mut vendor_leg = RemoveVendorLeg::default();
+    let mut vendor_leg = RemoveVendorLeg {
+        skipped: project_owned,
+        ..Default::default()
+    };
     if !vendored_matches.is_empty() {
         if args.skip_rollback {
             for (key, _) in &vendored_matches {

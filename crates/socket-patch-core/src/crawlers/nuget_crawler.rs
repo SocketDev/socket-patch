@@ -50,12 +50,19 @@ impl NuGetCrawler {
         Ok(package_roots(options).await.paths)
     }
 
-    /// Whether a global run under `global` reads a package root the
+    /// Whether a global run under `global` reads a package folder the
     /// project at `project_root` restores into (#489). A PackageReference
     /// project restores into the global packages folder, so there the
     /// "global copy" of a package IS the project's installed copy, and the
-    /// project's own patch state still owns it. False when either side has
-    /// no root (no .NET project at `project_root`, no global folder).
+    /// project's own patch state still owns it.
+    ///
+    /// The project's folders are the ones its restores used
+    /// ([`project_restore_folders`]), not every root a project-scope crawl
+    /// would read: a project that restores into `RestorePackagesPath` never
+    /// reads the global folder, so the global copies there stay the global
+    /// run's. Not gated on a root-level .NET marker: the caller already
+    /// knows the project vendors NuGet packages, and its projects may all
+    /// live in subdirectories.
     pub async fn global_roots_shared_with(
         &self,
         global: &CrawlerOptions,
@@ -65,17 +72,19 @@ impl NuGetCrawler {
         if global_roots.is_empty() {
             return false;
         }
-        let project = CrawlerOptions {
-            cwd: project_root.to_path_buf(),
-            global: false,
-            global_prefix: None,
-        };
-        let project_roots = package_roots(&project).await.paths;
-        let canonical = |p: &PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-        let project_roots: HashSet<PathBuf> = project_roots.iter().map(canonical).collect();
-        global_roots
-            .iter()
-            .any(|root| project_roots.contains(&canonical(root)))
+        let chain = settings_chain(Some(project_root)).await;
+        let root = project_root.to_path_buf();
+        run_blocking(move || {
+            let canonical = |p: &PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            let project: HashSet<PathBuf> = project_restore_folders(&root, &chain)
+                .iter()
+                .map(canonical)
+                .collect();
+            global_roots
+                .iter()
+                .any(|root| project.contains(&canonical(root)))
+        })
+        .await
     }
 
     /// Crawl all discovered package paths and return every package found.
@@ -624,6 +633,26 @@ async fn package_roots(options: &CrawlerOptions) -> PackageRoots {
     }
 
     roots
+}
+
+/// The package folders the projects under `root` install into: every
+/// restore's recorded `packageFolders`, plus the global packages folder
+/// NuGet would use when some project has no parsed restore yet (its next
+/// restore lands there) or no restore names a folder at all, plus the
+/// packages.config folder when a `packages.config` lives under `root`.
+fn project_restore_folders(root: &Path, chain: &SettingsChain) -> Vec<PathBuf> {
+    let repository_path = chain.folder("repositoryPath");
+    let global = global_packages_folder(chain);
+    let skip: Vec<PathBuf> = repository_path.iter().chain(&global).cloned().collect();
+    let walk = restore_walk(root, &skip);
+    let mut folders = walk.package_folders;
+    if walk.libraries.is_none() || folders.is_empty() {
+        folders.extend(global);
+    }
+    if walk.packages_config {
+        folders.push(repository_path.unwrap_or_else(|| root.join("packages")));
+    }
+    folders
 }
 
 /// What one `project.assets.json` says.
@@ -1331,45 +1360,87 @@ mod tests {
         );
     }
 
+    /// `dir/obj/project.assets.json` recording a restore into `folder`.
+    fn write_restore(dir: &Path, folder: &Path) {
+        std::fs::create_dir_all(dir.join("obj")).unwrap();
+        std::fs::write(dir.join("app.csproj"), "<Project />").unwrap();
+        let assets = serde_json::json!({
+            "packageFolders": { format!("{}/", folder.display()): {} },
+            "libraries": {},
+        });
+        std::fs::write(dir.join("obj/project.assets.json"), assets.to_string()).unwrap();
+    }
+
+    fn global_at(prefix: &Path) -> CrawlerOptions {
+        CrawlerOptions {
+            cwd: prefix.to_path_buf(),
+            global: true,
+            global_prefix: Some(prefix.to_path_buf()),
+        }
+    }
+
     /// #489: a global prefix the project's restore uses is the project's
-    /// store; any other folder, or a directory with no .NET project, is not.
+    /// store; any other folder is not, and neither is a directory with no
+    /// .NET project and no restore.
     #[tokio::test]
     async fn global_roots_shared_with_the_projects_restore_folder() {
         let store = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("app.csproj"), "<Project />").unwrap();
-        std::fs::create_dir(project.path().join("obj")).unwrap();
-        let assets = serde_json::json!({
-            "packageFolders": { format!("{}/", store.path().display()): {} },
-            "libraries": {},
-        });
-        std::fs::write(
-            project.path().join("obj/project.assets.json"),
-            assets.to_string(),
-        )
-        .unwrap();
-        let global = |prefix: &Path| CrawlerOptions {
-            cwd: project.path().to_path_buf(),
-            global: true,
-            global_prefix: Some(prefix.to_path_buf()),
-        };
+        write_restore(project.path(), store.path());
         let crawler = NuGetCrawler::new();
         assert!(
             crawler
-                .global_roots_shared_with(&global(store.path()), project.path())
+                .global_roots_shared_with(&global_at(store.path()), project.path())
                 .await
         );
         assert!(
             !crawler
-                .global_roots_shared_with(&global(other.path()), project.path())
+                .global_roots_shared_with(&global_at(other.path()), project.path())
                 .await
         );
         assert!(
             !crawler
-                .global_roots_shared_with(&global(store.path()), other.path())
+                .global_roots_shared_with(&global_at(store.path()), other.path())
                 .await,
-            "no .NET project: nothing of the project's lives in the store"
+            "no restore under `other` names the store"
+        );
+    }
+
+    /// A restore relocated by `RestorePackagesPath` never reads the global
+    /// packages folder, so that folder is not the project's (#489 review).
+    #[tokio::test]
+    async fn global_roots_shared_with_ignores_a_folder_the_restore_relocated_away_from() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let pkgs = project.path().join("pkgs");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        write_restore(project.path(), &pkgs);
+        let crawler = NuGetCrawler::new();
+        assert!(
+            !crawler
+                .global_roots_shared_with(&global_at(global.path()), project.path())
+                .await
+        );
+        assert!(
+            crawler
+                .global_roots_shared_with(&global_at(&pkgs), project.path())
+                .await
+        );
+    }
+
+    /// A repository whose projects all live in subdirectories (no root
+    /// `.sln`, project file or NuGet config) still shares its restores'
+    /// folder (#489 review).
+    #[tokio::test]
+    async fn global_roots_shared_with_sees_restores_below_a_markerless_root() {
+        let store = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_restore(&repo.path().join("src/App"), store.path());
+        assert!(
+            NuGetCrawler::new()
+                .global_roots_shared_with(&global_at(store.path()), repo.path())
+                .await
         );
     }
 
