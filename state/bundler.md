@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-28 (run 51), main `b787454`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta2 (no newer release). The redirect, vendor and stale-install gem suites pass on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51), and on 4.0.23 at `4654b7c` (run 49). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`.
+Last updated: 2026-10-28 (run 52), main `a8a10dc`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, **4.1.0.beta3** (new). The redirect (56), vendor (44) and stale-install (42) gem suites pass on 4.1.0.beta3 / Ruby 3.3.6 at `a8a10dc` (run 52), and on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. On Ruby 3.3.6 also export `BUNDLER_VERSION` (4.1.0.beta3 is installed, so it's the default binstub otherwise).
 
 ## Coverage matrix
 
@@ -438,6 +438,22 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
 | Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
 
+### Run 52 (main `a8a10dc`, v5.0.1; Linux; scratch tests in `e2e_redirect_gem_build.rs`, real `bundle install` / `bundle exec`)
+
+| Cell | 1.17.3 (Ruby 3.1.6) | 2.1.4 (Ruby 3.1.6) | 4.0.18 (Ruby 3.3.6) | 4.1.0.beta3 (Ruby 3.3.6) |
+| --- | --- | --- | --- | --- |
+| #1749 two hosted gems, merged lock: re-scan / supersede / `vex` / two-gem eject (`gem_hosted_two_gems_rescan_supersede_and_attest`) | pass (fixed by #1750) | pass (fixed by #1750) | — | pass (suite) |
+| #1761 group-block eject dry run vs wet run | pass (fixed by #1762) | pass (fixed by #1762) | — | pass (suite) |
+| Two hosted gems, supersede one, no converge → fresh frozen install | pass (lock remote moves) | pass | fails (the documented #1626 window) | — |
+| Then `rollback` / `remove` of ONE gem → fresh frozen install, other gem still patched → unwind the second | pass | pass | pass | — |
+| Eject with `git:` + `path:` sibling gems (no CHECKSUMS) → fresh frozen install / `bundle exec` | — | — | pass (GIT/PATH sections kept) | — |
+| Eject with `git:` + `path:` siblings, CHECKSUMS lock, mock upstream | — | — | dry run and wet run both refuse `redirect_revert_failed` (non-rubygems upstream, documented; parity holds) | — |
+| Eject, `gems.rb`-only project | — | — | refused `gemfile_not_loaded` (documented) | — |
+| Eject → `vendor` re-run (idempotent, byte-identical) → `vendor --dry-run` → `scan --mode hosted` | — | — | pass; the V→H scan skips with `redirect_gem_source_option` (known) | — |
+| `BUNDLE_DEPLOYMENT=true` install of the ejected pair | — | — | pass | — |
+| Full redirect (56) + vendor (44) + stale-install (42) suites | — | pass (`two_gems` / `group_block` only) | — | pass |
+| macOS probe of the gem suites (1.17.3 → 4.1.0.beta3) | blocked: pushed `bughunt/bundler/20261028-macos-gem-suites`, no Actions run triggered, and the branch can't be deleted from the sandbox (remote hangs up) | | | |
+
 ### Run 51 (main `b787454`, v5.0.1; Linux; #1648 plain `vendor` eject, scratch tests in `e2e_redirect_gem_build.rs`, real `bundle install` / `bundle exec`)
 
 | Cell | 1.17.3 (Ruby 3.1.6) | 2.1.4 (Ruby 3.1.6) | 4.0.18 (Ruby 3.3.6) |
@@ -503,11 +519,11 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #1749 when #1750 merges (including the two-gem eject on 2.1.4 / 1.17.3), #1761 when #1762 merges, and #1109 (`agent:needs-human`) when it's fixed.
-2. A merged two-gem lock kept merged under a frozen / deployment install after a Bundler upgrade (does any path keep it merged on 2.2+?).
+1. Re-run #1109 (`agent:needs-human`) when it's fixed.
+2. Eject on a CHECKSUMS lock with a real rubygems.org upstream (the mock upstream can't re-derive the sha), incl. `git:` / `path:` siblings and a platform gem (`-x86_64-linux`).
 3. Vendored superseding patch that changes the gem's runtime deps.
-4. Eject on a CHECKSUMS lock with a platform gem (`-x86_64-linux`) and on a git-sourced sibling gem.
-5. The Windows / macOS probe backlog (#952, #1092, #1260); the gem suites on 4.1.0 final when it ships.
+4. Two-gem merged lock on Bundler 2.2.33 (first split-section release) after an upgrade from 2.1.4, frozen.
+5. The gem suites on 4.1.0 final when it ships. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
 
 ## Known non-bugs
 
@@ -647,3 +663,5 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - After an eject (#1648), a later plain `vendor` with a `.socket/manifest.json` present falls back to manifest-driven vendoring, because no hosted pins are left. That's the documented legacy fallback (run 50).
 - An eject's later `vendor --revert` returns the project to the upstream (unpatched) gem, not to hosted. That's documented in CLI_CONTRACT "Eject a hosted project (v5.0)" (run 51).
 - Adding a `BUNDLE_GEMFILE` dual boot to a hosted project makes `vendor` (dry and wet) refuse `hosted_wiring_contested`, even when `Gemfile.next` evals `Gemfile`. It fails closed and matches the documented #390 dual-boot refusal (run 51).
+- `vendor` eject on a `gems.rb`-only project (no `Gemfile`) is refused `gemfile_not_loaded`, as documented ("Gemfile spelling only"). The message still says "a gems.rb sits beside the Gemfile" when there's no Gemfile. That's a wording nit only (run 52).
+- Pushed `bughunt/bundler/*` probe branches haven't triggered an Actions run since 2026-10-05, and `git push --delete` from the sandbox hangs up. Nine leftover branches up to `20261028-macos-gem-suites` need a maintainer to delete them.
