@@ -1882,7 +1882,9 @@ const DENO_NPM_REGISTRY_MAX_DEPTH: usize = 8;
 /// [`is_deno_npm_cache_root`]), so these are global roots beside the npm,
 /// pnpm, yarn and bun `node_modules`. Below a registry dir only the
 /// non-version subdirs of its children are walked (a nested registry
-/// can sit there, not a package's copy), and `jsr.io` is skipped: it is the
+/// can sit there, not a package's copy); a package dir whose other
+/// subdirs hold packages is itself a registry one path segment down
+/// (#1784). `jsr.io` is skipped: it is the
 /// Deno crawler's JSR root, not an npm registry. Sorted, for a stable
 /// scan order.
 fn deno_npm_cache_roots() -> Vec<PathBuf> {
@@ -1945,20 +1947,30 @@ fn deno_npm_registry_dirs(npm: &Path) -> Vec<PathBuf> {
                 // (`<host>/npm/<pkg>/` or `<host>/api/npm/<pkg>/` beside
                 // `<host>/<pkg>/`). A child that is not a package is walked
                 // like any other dir; one that is (a package named like
-                // the path's first segment, `<host>/api/`) holds only
-                // version dirs (named from a digit) of its own, so its
-                // other subdirs are walked.
-                for child in children.into_iter().filter(|name| !name.starts_with('@')) {
-                    let child = dir.join(child);
-                    if is_deno_package_dir(&child) {
-                        next.extend(
-                            sorted_subdirs_sync(&child)
-                                .into_iter()
-                                .filter(|name| !name.starts_with(|c: char| c.is_ascii_digit()))
-                                .map(|name| child.join(name)),
-                        );
-                    } else {
+                // the path's first segment, `<host>/api/`) holds version
+                // dirs of its own, so only its other subdirs are walked.
+                // When those subdirs are packages themselves
+                // (`https://host/npm/` caches `<host>/npm/<pkg>/` beside
+                // the root registry's package `npm`), the package dir is
+                // also a registry (#1784), whose own version dirs (those
+                // of the outer package) are skipped.
+                for name in children.into_iter().filter(|name| !name.starts_with('@')) {
+                    if is_deno_version_dir(&dir, &name) {
+                        continue;
+                    }
+                    let child = dir.join(name);
+                    if !is_deno_package_dir(&child) {
                         next.push(child);
+                        continue;
+                    }
+                    let others: Vec<String> = sorted_subdirs_sync(&child)
+                        .into_iter()
+                        .filter(|name| !is_deno_version_dir(&child, name))
+                        .collect();
+                    if holds_deno_packages_among(&child, &others) {
+                        next.push(child);
+                    } else {
+                        next.extend(others.into_iter().map(|name| child.join(name)));
                     }
                 }
                 roots.push(dir);
@@ -2003,8 +2015,13 @@ pub(super) fn is_deno_npm_cache_root(root: &Path) -> bool {
 /// out the way Deno's npm cache lays one out ([`is_deno_package_dir`]),
 /// stopping at the first that is.
 fn holds_deno_packages(root: &Path) -> bool {
-    sorted_subdirs_sync(root).into_iter().any(|name| {
-        let dir = root.join(&name);
+    holds_deno_packages_among(root, &sorted_subdirs_sync(root))
+}
+
+/// [`holds_deno_packages`] over only the subdirs `names` of `root`.
+fn holds_deno_packages_among(root: &Path, names: &[String]) -> bool {
+    names.iter().any(|name| {
+        let dir = root.join(name);
         if name.starts_with('@') {
             sorted_subdirs_sync(&dir)
                 .into_iter()
@@ -2013,6 +2030,16 @@ fn holds_deno_packages(root: &Path) -> bool {
             is_deno_package_dir(&dir)
         }
     })
+}
+
+/// Whether `parent/name` is a version dir of a package in Deno's npm
+/// cache (`<version>/` or `<version>_<n>/`, named from a digit, with the
+/// package's `package.json`) rather than a package dir: a package named
+/// from a digit (`7zip-bin`) has no `package.json` of its own. Only a
+/// digit-named dir is stat'ed.
+fn is_deno_version_dir(parent: &Path, name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_digit())
+        && parent.join(name).join("package.json").is_file()
 }
 
 /// Whether `dir` is a package dir of Deno's npm cache: it has no
@@ -2026,10 +2053,9 @@ fn is_deno_package_dir(dir: &Path) -> bool {
         return false;
     }
     dir.join("registry.json").is_file()
-        || sorted_subdirs_sync(dir).into_iter().any(|version| {
-            version.starts_with(|c: char| c.is_ascii_digit())
-                && dir.join(version).join("package.json").is_file()
-        })
+        || sorted_subdirs_sync(dir)
+            .into_iter()
+            .any(|version| is_deno_version_dir(dir, &version))
 }
 
 /// The copy index of the Deno npm cache dir `dir_name` when it holds
@@ -2066,6 +2092,12 @@ fn sorted_subdirs_sync(dir: &Path) -> Vec<String> {
 fn deno_npm_cache_package_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for name in sorted_subdirs_sync(root) {
+        // A registry that is also a package dir of the registry above it
+        // (#1784) holds that package's version dirs, which are not
+        // packages of its own.
+        if is_deno_version_dir(root, &name) {
+            continue;
+        }
         if name.starts_with('@') {
             let scope = root.join(&name);
             dirs.extend(

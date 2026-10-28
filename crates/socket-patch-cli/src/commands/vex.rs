@@ -958,11 +958,20 @@ async fn generate_vex(
             let socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::Workspace {
                 module,
                 version,
-                ..
+                conflict,
             } = &issue
             else {
                 continue;
             };
+            // Socket's own go.work replace overriding a leftover member pin
+            // is what the build links; it passes its own selection gate
+            // below, like any go.work replace.
+            if matches!(
+                conflict,
+                socket_patch_core::vendor::go_workspace::WorkspaceConflict::WorkHosted { .. }
+            ) {
+                continue;
+            }
             // PurlKey, not string equality: go.mod spells `+incompatible`
             // with a literal `+`, the manifest key with `%2B` (#484). Report
             // each omission under the record's own spelling.

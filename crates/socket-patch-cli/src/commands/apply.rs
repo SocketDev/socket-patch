@@ -6,7 +6,7 @@ use socket_patch_core::crawlers::ruby_crawler::{
 use socket_patch_core::crawlers::{
     bun_uses_global_store, detect_npm_pkg_manager, Ecosystem, NpmPkgManager, RubyCrawler,
 };
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{manifest_exists, read_manifest};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
@@ -318,25 +318,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             }
             return 0;
         }
-        Err(e) => {
-            let msg = format!(
-                "Patch check could not read the manifest ({e}); \
-                 treating it as drift (fail-closed)."
-            );
-            if args.common.json {
-                let mut env = Envelope::new(Command::Apply);
-                env.dry_run = args.common.dry_run;
-                let mut err = crate::json_envelope::manifest_load_error(manifest_path, &e);
-                err.message = msg;
-                env.mark_error(err);
-                println!("{}", env.to_pretty_json());
-            } else {
-                // Errors print even under --silent ("errors only", never
-                // "nothing"): exit 1 with no message would be undiagnosable.
-                eprintln!("Error: {msg}");
-            }
-            return 1;
-        }
+        Err(e) => return refuse_unreadable_manifest(args, manifest_path, &e),
     };
 
     // (purl_or_name, reason_code, detail) for each drift.
@@ -345,18 +327,19 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
 
     // The `apply` scope: `--ecosystems`, minus vendor-owned purls (matched
     // exactly as `apply` matches them; the ledger owns the PROJECT's
-    // copies only, so a global check verifies every in-scope copy).
+    // copies only, so a global check verifies every in-scope copy but the
+    // project's own NuGet install, #489).
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
     let in_scope: HashSet<String> =
         partition_purls(&manifest_purls, args.common.ecosystems.as_deref())
             .into_values()
             .flatten()
             .collect();
-    let vendored = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
-    } else {
-        Default::default()
-    };
+    let vendored = crate::commands::vendor_owned_keys(
+        &args.common,
+        &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
+    )
+    .await;
     let owned_by_apply = |purl: &str| in_scope.contains(purl) && !purl_keys_cover(&vendored, purl);
 
     {
@@ -618,6 +601,33 @@ async fn verify_installed_tree(
         .failed
         .retain(|f| !(f.reason == "package_not_found" && mismatched_keys.contains(&f.purl)));
     outcome.failed.extend(unmatched);
+
+    // An npm bin holding the patched bytes with a CRLF shebang `env`
+    // can't run (written by a release before #1756) is one `apply`
+    // rewrites, so it is not in sync (#1791).
+    let mut crlf_bins: Vec<String> = Vec::new();
+    for purl in &outcome.applied {
+        let Some(record) = tree.patches.get(purl) else {
+            continue;
+        };
+        'copies: for copy in copies.get(purl).into_iter().flatten() {
+            for (file, info) in &record.files {
+                if socket_patch_core::patch::apply::needs_npm_bin_rewrite(purl, copy, file, info)
+                    .await
+                {
+                    crlf_bins.push(purl.clone());
+                    break 'copies;
+                }
+            }
+        }
+    }
+    outcome.applied.retain(|purl| !crlf_bins.contains(purl));
+    outcome
+        .failed
+        .extend(crlf_bins.into_iter().map(|purl| FailedPatch {
+            purl,
+            reason: "not_applied".to_string(),
+        }));
     outcome
 }
 
@@ -869,6 +879,32 @@ fn manifest_targets_npm(manifest: &PatchManifest) -> bool {
 /// The yarn-berry PnP refusal's envelope error text.
 const YARN_PNP_UNSUPPORTED: &str = "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.";
 
+/// A manifest that exists but cannot be stated, refused before the API
+/// client, the lock or telemetry are touched: the same envelope and exit
+/// as the load failure further down (#931, #998).
+/// `--check` says so as the drift it is treated as, whether the manifest
+/// failed to stat here or to load in [`run_check`].
+fn refuse_unreadable_manifest(args: &ApplyArgs, manifest_path: &Path, e: &std::io::Error) -> i32 {
+    let mut err = crate::json_envelope::manifest_load_error(manifest_path, e);
+    if args.check {
+        err.message = format!(
+            "Patch check could not read the manifest ({e}); \
+             treating it as drift (fail-closed)."
+        );
+    }
+    if args.common.json {
+        let mut env = Envelope::new(Command::Apply);
+        env.dry_run = args.common.dry_run;
+        env.mark_error(err);
+        println!("{}", env.to_pretty_json());
+    } else {
+        // Errors print even under --silent ("errors only", never
+        // "nothing"): exit 1 with no message would be undiagnosable.
+        eprintln!("Error: {}", crate::ui::sentence_case(&err.message));
+    }
+    1
+}
+
 fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
     refuse_yarn_pnp_with_skips(args, &[])
 }
@@ -922,7 +958,14 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // every install).
     // Nothing below this gate is touched — no API client (its config read,
     // stderr advisory and org-slug round-trip), no lock, no `.socket/`.
-    if tokio::fs::metadata(&manifest_path).await.is_err() {
+    // Only a missing file is "no manifest": one apply cannot even stat
+    // (an unsearchable `.socket/`, `.socket` as a file, a symlink loop)
+    // fails closed, or every patch would be skipped with exit 0 (#998).
+    let manifest_present = match manifest_exists(&manifest_path).await {
+        Ok(present) => present,
+        Err(e) => return refuse_unreadable_manifest(&args, &manifest_path, &e),
+    };
+    if !manifest_present {
         // A yarn-PnP layout refuses loudly even with no manifest: scan
         // cannot discover PnP packages (they live inside .yarn/cache zips),
         // so it never writes one — without this hoisted check the layout
@@ -2203,12 +2246,13 @@ async fn apply_patches_inner(
     // unreadable state degrades to "nothing vendored" (fail-open).
     // The ledger owns the PROJECT's copies only: a global apply restores
     // and patches the global copy even when the cwd project vendors the
-    // same purl (see `project_state_in_scope`).
-    let vendored_purls = if crate::commands::project_state_in_scope(&args.common) {
-        socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await
-    } else {
-        Default::default()
-    };
+    // same purl (see `project_state_in_scope`), unless that copy is the
+    // project's own NuGet install (#489).
+    let vendored_purls = crate::commands::vendor_owned_keys(
+        &args.common,
+        &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
+    )
+    .await;
     let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);

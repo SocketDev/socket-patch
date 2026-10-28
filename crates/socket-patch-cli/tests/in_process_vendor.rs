@@ -1790,7 +1790,7 @@ fn split_berry_checksum(lock: &str) -> (String, String) {
 }
 
 /// Mode takeovers on the Windows shapes, both directions, hermetic. Hosted →
-/// vendored: `vendor` restores the CRLF hosted pin's upstream registry
+/// vendored: `vendor` ejects the CRLF hosted pin, restoring its upstream registry
 /// entry (v5: re-resolved from the registry, no ledger) before wiring, and
 /// `vendor --revert` then lands on the upstream CRLF + BOM pair — not the
 /// hosted URL. Vendored → hosted: `scan --mode hosted` reverts the vendored
@@ -1840,14 +1840,23 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
     );
 
     prebuilt_common::mount_project(&server, root).await;
-    let (code, env) = vendor_online_cli(root, &server.uri(), &server.uri(), &[]);
+    // An eject: the hosted pin's record comes from the API.
+    let uri = server.uri();
+    let (code, env) = vendor_online_cli(
+        root,
+        &uri,
+        &uri,
+        &[
+            "--api-url",
+            &uri,
+            "--org",
+            "test-org",
+            "--api-token",
+            "fake",
+        ],
+    );
     assert_eq!(code, 0, "vendor over the hosted pin: {env:#}");
     assert_eq!(env["summary"]["applied"], 1, "{env:#}");
-    assert!(
-        env.to_string()
-            .contains("vendor_takeover_reverted_redirect"),
-        "the takeover is surfaced: {env:#}"
-    );
     let vendored_lock = std::fs::read_to_string(root.join("yarn.lock")).unwrap();
     assert!(
         !vendored_lock.contains("__archiveUrl") && vendored_lock.contains(".socket/vendor/npm/"),
@@ -2352,6 +2361,7 @@ async fn berry_hosted_to_vendored_takeover_runs_package_gates_first() {
             // The hosted pin's origin must count as the patch server, or
             // the vendor run never sees it as a takeover.
             let uri = server.uri();
+            // An eject: the hosted pin's record comes from the API.
             let mut args = vec![
                 "vendor",
                 "--json",
@@ -2359,6 +2369,12 @@ async fn berry_hosted_to_vendored_takeover_runs_package_gates_first() {
                 root.to_str().unwrap(),
                 "--patch-server-url",
                 &uri,
+                "--api-url",
+                &uri,
+                "--org",
+                "test-org",
+                "--api-token",
+                "fake",
             ];
             if dry {
                 args.push("--dry-run");
@@ -4491,6 +4507,33 @@ snapshots:
     /// count as hosted, so every post-scan run passes it.
     const PATCH_ORIGIN: &str = "https://patch.socket.dev";
 
+    /// `vendor` over the hosted pin: an eject. Its patch set is the
+    /// lockfile's hosted pins (the staged manifest is not its input), so it
+    /// fetches each pinned record from `server`'s API (`view/{uuid}`, see
+    /// [`mock_hosted_api`]) and downloads the prebuilt artifact from a
+    /// fixture service; online against `registry` for the upstream restore.
+    fn vendor_eject_cli(
+        root: &Path,
+        server: &MockServer,
+        registry: &str,
+        extra: &[&str],
+    ) -> (i32, Value) {
+        let fixture = prebuilt_common::Server::project(root);
+        let uri = server.uri();
+        let mut args = vec![
+            "--api-url",
+            uri.as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vendor-url",
+            fixture.uri.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        vendor_online_cli(root, registry, PATCH_ORIGIN, &args)
+    }
+
     /// The npm registry's version document for the fixture package, as the
     /// v5 upstream restore reads it (`SOCKET_NPM_REGISTRY`): it hands back
     /// the pristine integrity the fixture lock started with.
@@ -4514,9 +4557,8 @@ snapshots:
     }
 
     /// Hosted → vendored on a pnpm project, v5: the hosted run writes ONLY
-    /// the lock (no ledger); `vendor` over the hosted pin restores the
-    /// upstream registry entry first (`vendor_takeover_reverted_redirect`),
-    /// so the vendor ledger records the PRISTINE registry fragment as the
+    /// the lock (no ledger); `vendor` over the hosted pin ejects it,
+    /// restoring the upstream registry entry first, so the vendor ledger records the PRISTINE registry fragment as the
     /// original; a re-vendor is a quiet no-op; `vendor --revert`
     /// byte-restores the registry lock — never the hosted splice.
     #[tokio::test]
@@ -4546,13 +4588,12 @@ snapshots:
         // 2. Vendor over the hosted lock (staged blob, online only for the
         //    registry lookup of the restore).
         seed_manifest_and_blob(root);
-        let (code, env1) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        let (code, env1) = vendor_eject_cli(root, &server, &registry, &[]);
         assert_eq!(
             code, 0,
             "vendor over the hosted lock must succeed: {env1:#}"
         );
         find_event(&env1, "applied", None);
-        find_event(&env1, "skipped", Some("vendor_takeover_reverted_redirect"));
 
         let vendored_lock_text = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
         assert!(
@@ -4584,7 +4625,7 @@ snapshots:
 
         // 3. Re-vendor: an `already_vendored` no-op with NO takeover event —
         //    the lock no longer pins anything hosted.
-        let (code, env2) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        let (code, env2) = vendor_eject_cli(root, &server, &registry, &[]);
         assert_eq!(code, 0, "re-vendor must succeed: {env2:#}");
         find_event(&env2, "skipped", Some("already_vendored"));
         assert!(
@@ -4604,9 +4645,10 @@ snapshots:
         );
     }
 
-    /// Offline, the hosted pin's upstream entry cannot be re-resolved: the
-    /// takeover REFUSES the purl (`redirect_revert_failed`, checkout remedy)
-    /// and leaves the hosted lock exactly as found.
+    /// Offline, neither the hosted pin's record nor its upstream entry can
+    /// be fetched: the eject is REFUSED before anything is read or written
+    /// (`offline_eject_unavailable`) and the hosted lock stays exactly as
+    /// found.
     #[tokio::test]
     #[serial]
     async fn offline_vendor_over_hosted_pin_is_refused() {
@@ -4621,12 +4663,9 @@ snapshots:
         seed_manifest_and_blob(root);
         let (code, env) = vendor_cli(root, &["--offline", "--patch-server-url", PATCH_ORIGIN]);
         assert_eq!(code, 1, "{env:#}");
-        let failed = find_event(&env, "failed", Some("redirect_revert_failed"));
-        assert!(
-            failed
-                .to_string()
-                .contains("git checkout -- pnpm-lock.yaml"),
-            "the refusal names the checkout remedy: {failed:#}"
+        assert_eq!(
+            env["error"]["code"], "offline_eject_unavailable",
+            "the eject needs the pinned record from the API: {env:#}"
         );
         assert_eq!(
             std::fs::read(root.join("pnpm-lock.yaml")).unwrap(),
@@ -4698,10 +4737,9 @@ snapshots:
         );
 
         seed_manifest_and_blob(root);
-        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        let (code, env) = vendor_eject_cli(root, &server, &registry, &[]);
         assert_eq!(code, 0, "vendor over the hosted lock must succeed: {env:#}");
         find_event(&env, "applied", None);
-        find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
         assert!(
             !root.join(".npmrc").exists(),
             "the takeover must remove the .npmrc the hosted run created: {env:#}"
@@ -4912,8 +4950,7 @@ snapshots:
 
     /// REGRESSION (#828): the hosted → vendored takeover over a hosted pin
     /// beside a bundled copy restores the upstream entry first, exactly as
-    /// without the bundled copy: `vendor_takeover_reverted_redirect`, the
-    /// `.npmrc` deleted, the vendor ledger's original the REGISTRY entry
+    /// without the bundled copy: the pin is ejected, the `.npmrc` deleted, the vendor ledger's original the REGISTRY entry
     /// (it recorded the grant-tokenized hosted URL), and `vendor --revert`
     /// lands on upstream, never back on hosted.
     #[tokio::test]
@@ -4950,9 +4987,9 @@ snapshots:
             .contains(HOSTED_URL));
 
         seed_manifest_and_blob(root);
-        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        let (code, env) = vendor_eject_cli(root, &server, &registry, &[]);
         assert_eq!(code, 0, "vendor over the hosted lock must succeed: {env:#}");
-        find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
+        find_event(&env, "applied", None);
         assert!(
             !root.join(".npmrc").exists(),
             "the takeover must remove the .npmrc the hosted run created: {env:#}"
@@ -5050,7 +5087,7 @@ snapshots:
         assert!(String::from_utf8_lossy(&hosted_lock).contains(HOSTED_URL));
 
         seed_manifest_and_blob(root);
-        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        let (code, env) = vendor_eject_cli(root, &server, &registry, &[]);
         assert_eq!(code, 1, "{env:#}");
         find_event(&env, "failed", Some("vendor_artifact_gitignored"));
         assert!(
@@ -5101,7 +5138,7 @@ snapshots:
         std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
         std::os::unix::fs::symlink(&shared, root.join(".socket/vendor/npm")).unwrap();
 
-        let (code, env) = vendor_online_cli(root, &registry, PATCH_ORIGIN, &[]);
+        let (code, env) = vendor_eject_cli(root, &server, &registry, &[]);
         assert_eq!(code, 1, "{env:#}");
         find_event(&env, "failed", Some("vendor_dir_symlink_unsupported"));
         assert!(

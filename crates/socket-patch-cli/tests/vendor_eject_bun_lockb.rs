@@ -199,8 +199,8 @@ async fn hosted_project(writer: &str) -> Project {
     project
 }
 
-/// `.socket/manifest.json` + the after-hash blob: the per-purl takeover
-/// (instead of the manifest-less eject).
+/// Legacy agent state alongside the hosted pins. Vendor still selects
+/// the lockfile patches and runs the same eject as a manifest-free repo.
 fn stage_record(root: &Path) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
@@ -279,9 +279,7 @@ async fn takeover_vendors_over_a_hosted_bun_lockb_and_reverts_exactly() {
         let (code, env) = p.run_json(&["vendor", "--dry-run"]);
         assert_eq!(code, 0, "{writer}: dry run: {env:#}");
         assert!(
-            codes(&env)
-                .iter()
-                .any(|c| c == "vendor_would_revert_redirect"),
+            codes(&env).iter().any(|c| c == "eject_planned"),
             "{writer}: {env:#}"
         );
         assert_eq!(p.lock(), hosted, "{writer}: a dry run writes nothing");
@@ -292,7 +290,7 @@ async fn takeover_vendors_over_a_hosted_bun_lockb_and_reverts_exactly() {
         assert_eq!(env["summary"]["applied"], 1, "{writer}: {env:#}");
         let codes = codes(&env);
         assert!(
-            codes
+            !codes
                 .iter()
                 .any(|c| c == "vendor_takeover_reverted_redirect"),
             "{writer}: {env:#}"
@@ -395,18 +393,11 @@ async fn rollback_and_offline_vendor_refuse_with_the_checkout_remedy() {
 
     let (code, env) = p.run_json(&["vendor", "--offline"]);
     assert_eq!(code, 1, "{env:#}");
-    let refused = env["events"]
-        .as_array()
-        .and_then(|events| {
-            events
-                .iter()
-                .find(|e| e["errorCode"] == "redirect_revert_failed")
-        })
-        .unwrap_or_else(|| panic!("expected redirect_revert_failed: {env:#}"));
+    assert_eq!(env["error"]["code"], "offline_eject_unavailable", "{env:#}");
     assert!(
-        refused["error"]
+        env["error"]["message"]
             .as_str()
-            .is_some_and(|e| e.contains("offline") && e.contains("git checkout -- bun.lockb")),
+            .is_some_and(|e| e.contains("re-run without --offline")),
         "{env:#}"
     );
     assert_eq!(p.lock(), hosted, "a refused vendor writes nothing");
@@ -487,7 +478,7 @@ async fn takeover_and_revert_keep_the_bunfig_registry_tarball_url() {
         assert_eq!(env["summary"]["applied"], 1, "round {round}: {env:#}");
         let codes = codes(&env);
         assert!(
-            codes
+            !codes
                 .iter()
                 .any(|c| c == "vendor_takeover_reverted_redirect"),
             "round {round}: {env:#}"

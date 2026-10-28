@@ -5,6 +5,7 @@ use super::listing::{list_dir_sync, ListedEntry};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
+use crate::vendor::nuget_config::{settings_chain, SettingsChain};
 use crate::vendor::nuget_feed::normalize_nuget_version;
 
 #[cfg(test)]
@@ -26,20 +27,64 @@ impl NuGetCrawler {
 
     /// Get NuGet package paths based on options.
     ///
-    /// In global mode, returns the global NuGet packages folder
-    /// (`NUGET_PACKAGES` env var or `~/.nuget/packages/`).
+    /// In global mode, returns the global packages folder NuGet uses
+    /// ([`global_packages_folder`] over the user config alone).
     ///
     /// In local mode, discovery is gated on `cwd` actually being a .NET
     /// project (see [`is_dotnet_project`]). When that gate passes, paths
-    /// are returned in priority order:
-    /// 1. `<cwd>/packages/` folder (legacy packages.config layout)
-    /// 2. Global cache (`NUGET_PACKAGES` / `~/.nuget/packages/`)
-    /// 3. Paths discovered from `obj/project.assets.json`
+    /// are returned in priority order, the folders the project's own
+    /// restore uses first, since the first root to yield a purl wins
+    /// (#397, #398):
+    /// 1. The packages.config folder: nuget.config `repositoryPath`, else
+    ///    `<cwd>/packages/`
+    /// 2. The `packageFolders` of every `obj/project.assets.json` under
+    ///    `cwd` (they record `RestorePackagesPath` and a configured
+    ///    `globalPackagesFolder` as the restore resolved them)
+    /// 3. The global packages folder NuGet would use for `cwd`
+    ///    ([`global_packages_folder`]); the default `~/.nuget/packages`
+    ///    only when nothing relocates it
     pub async fn get_nuget_package_paths(
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         Ok(package_roots(options).await.paths)
+    }
+
+    /// Whether a global run under `global` reads a package folder the
+    /// project at `project_root` restores into (#489). A PackageReference
+    /// project restores into the global packages folder, so there the
+    /// "global copy" of a package IS the project's installed copy, and the
+    /// project's own patch state still owns it.
+    ///
+    /// The project's folders are the ones its restores used
+    /// ([`project_restore_folders`]), not every root a project-scope crawl
+    /// would read: a project that restores into `RestorePackagesPath` never
+    /// reads the global folder, so the global copies there stay the global
+    /// run's. Not gated on a root-level .NET marker: the caller already
+    /// knows the project vendors NuGet packages, and its projects may all
+    /// live in subdirectories.
+    pub async fn global_roots_shared_with(
+        &self,
+        global: &CrawlerOptions,
+        project_root: &Path,
+    ) -> bool {
+        let global_roots = package_roots(global).await.paths;
+        if global_roots.is_empty() {
+            return false;
+        }
+        let chain = settings_chain(Some(project_root)).await;
+        let root = project_root.to_path_buf();
+        run_blocking(move || {
+            let canonical = |p: &PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            let project: HashSet<PathBuf> = project_restore_folders(&root, &chain)
+                .iter()
+                .map(canonical)
+                .collect();
+            global_roots
+                .iter()
+                .any(|root| project.contains(&canonical(root)))
+        })
+        .await
     }
 
     /// Crawl all discovered package paths and return every package found.
@@ -62,14 +107,13 @@ impl NuGetCrawler {
         if roots.paths.is_empty() {
             return Vec::new();
         }
-        let local_packages = options.cwd.join("packages");
 
         run_blocking(move || {
             let mut packages = Vec::new();
             let mut seen = HashSet::new();
             for pkg_path in &roots.paths {
                 match &roots.scope {
-                    Some(libraries) if *pkg_path != local_packages => {
+                    Some(libraries) if roots.legacy.as_ref() != Some(pkg_path) => {
                         packages.extend(locate_libraries(pkg_path, libraries, &mut seen));
                     }
                     _ => packages.extend(scan_package_dir(pkg_path, &mut seen)),
@@ -382,7 +426,29 @@ fn nuget_home() -> Option<PathBuf> {
         }
     }
 
-    crate::utils::fs::home_dir().map(|home| home.join(".nuget").join("packages"))
+    // NuGet's home is `DOTNET_CLI_HOME` off Windows when set (the same
+    // rule `vendor::nuget_config` reads the user config by).
+    let cli_home = (!cfg!(windows))
+        .then(|| std::env::var_os("DOTNET_CLI_HOME"))
+        .flatten()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    cli_home
+        .or_else(crate::utils::fs::home_dir)
+        .map(|home| home.join(".nuget").join("packages"))
+}
+
+/// The global packages folder NuGet uses for the configs in `chain`
+/// ([`settings_chain`]): `NUGET_PACKAGES`, else the nearest
+/// `globalPackagesFolder` setting, else the default [`nuget_home`]
+/// (NuGet's `SettingsUtility.GetGlobalPackagesFolder` order). A relocated
+/// folder replaces the default one: NuGet never reads the default then, so
+/// a warm copy left there by another project must not win (#397).
+fn global_packages_folder(chain: &SettingsChain) -> Option<PathBuf> {
+    if std::env::var_os("NUGET_PACKAGES").is_some_and(|v| !v.is_empty()) {
+        return nuget_home();
+    }
+    chain.folder("globalPackagesFolder").or_else(nuget_home)
 }
 
 /// What `cwd` itself holds of a .NET build.
@@ -481,8 +547,12 @@ struct PackageRoots {
     /// The roots, in priority order (see
     /// [`NuGetCrawler::get_nuget_package_paths`]).
     paths: Vec<PathBuf>,
+    /// The packages.config folder among `paths` (`repositoryPath` or
+    /// `<cwd>/packages`): always walked, never scoped, since a
+    /// packages.config project has no restore to scope it by.
+    legacy: Option<PathBuf>,
     /// The `(id, version)` pairs every project under `cwd` restored
-    /// ([`restore_scope`]), when `cwd` is itself a project
+    /// ([`restore_walk`]), when `cwd` is itself a project
     /// ([`DotnetRoot::Project`]): the shared roots (global folder,
     /// `packageFolders`) are then looked up for these instead of walked.
     /// `None` keeps the walk: global mode, a root without a project file,
@@ -496,7 +566,7 @@ async fn package_roots(options: &CrawlerOptions) -> PackageRoots {
     if options.global || options.global_prefix.is_some() {
         if let Some(ref custom) = options.global_prefix {
             roots.paths.push(custom.clone());
-        } else if let Some(home) = nuget_home() {
+        } else if let Some(home) = global_packages_folder(&settings_chain(None).await) {
             if is_dir(&home).await {
                 roots.paths.push(home);
             }
@@ -520,58 +590,69 @@ async fn package_roots(options: &CrawlerOptions) -> PackageRoots {
         return roots;
     }
 
-    // 1. Check <cwd>/packages/ (legacy packages.config layout)
-    let packages_dir = options.cwd.join("packages");
-    if is_dir(&packages_dir).await && seen.insert(packages_dir.clone()) {
-        roots.paths.push(packages_dir);
+    let chain = settings_chain(Some(&options.cwd)).await;
+    let repository_path = chain.folder("repositoryPath");
+    let global = global_packages_folder(&chain);
+
+    // The restores under `cwd`, at any depth. The configured folders are
+    // package stores, never project trees: the walk skips them, so a large
+    // in-tree store cannot spend its directory budget.
+    let skip: Vec<PathBuf> = repository_path.iter().chain(&global).cloned().collect();
+    let cwd = options.cwd.clone();
+    let walk = run_blocking(move || restore_walk(&cwd, &skip)).await;
+
+    // 1. The packages.config folder: `repositoryPath` relocates
+    //    `<cwd>/packages/` (#398). NuGet reads `repositoryPath` only for
+    //    packages.config projects, so a configured one (often a shared
+    //    store set in a parent or user config) counts only when one lives
+    //    under `cwd`.
+    let legacy = match repository_path {
+        Some(folder) if walk.packages_config => folder,
+        _ => options.cwd.join("packages"),
+    };
+    if is_dir(&legacy).await && seen.insert(legacy.clone()) {
+        roots.paths.push(legacy.clone());
+        roots.legacy = Some(legacy);
     }
 
-    // 2. Fall back to the global cache.
-    if let Some(home) = nuget_home() {
-        if is_dir(&home).await && seen.insert(home.clone()) {
-            roots.paths.push(home);
-        }
-    }
-
-    // 3. Check obj/ dirs for project.assets.json
-    for p in discover_paths_from_assets(&options.cwd).await {
+    // 2. The folders the restores under `cwd` actually used.
+    for p in walk.package_folders {
         if is_dir(&p).await && seen.insert(p.clone()) {
             roots.paths.push(p);
         }
     }
+
+    // 3. The global packages folder NuGet would restore into.
+    if let Some(home) = global {
+        if is_dir(&home).await && seen.insert(home.clone()) {
+            roots.paths.push(home);
+        }
+    }
     if root == DotnetRoot::Project {
-        let cwd = options.cwd.clone();
-        roots.scope = run_blocking(move || restore_scope(&cwd)).await;
+        roots.scope = walk.libraries;
     }
 
     roots
 }
 
-/// Discover additional package paths from `obj/project.assets.json` files:
-/// `cwd`'s own and those of its direct subdirectories (multi-project
-/// solutions).
-async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    // Look for obj/project.assets.json in cwd
-    if let Some(root) = read_project_assets(&cwd.join("obj").join("project.assets.json")).await {
-        paths.extend(root.package_folders);
+/// The package folders the projects under `root` install into: every
+/// restore's recorded `packageFolders`, plus the global packages folder
+/// NuGet would use when some project has no parsed restore yet (its next
+/// restore lands there) or no restore names a folder at all, plus the
+/// packages.config folder when a `packages.config` lives under `root`.
+fn project_restore_folders(root: &Path, chain: &SettingsChain) -> Vec<PathBuf> {
+    let repository_path = chain.folder("repositoryPath");
+    let global = global_packages_folder(chain);
+    let skip: Vec<PathBuf> = repository_path.iter().chain(&global).cloned().collect();
+    let walk = restore_walk(root, &skip);
+    let mut folders = walk.package_folders;
+    if walk.libraries.is_none() || folders.is_empty() {
+        folders.extend(global);
     }
-
-    // Also check subdirectories one level deep for multi-project solutions
-    for entry in crate::utils::fs::list_dir_entries(cwd).await {
-        if !crate::utils::fs::entry_is_dir(&entry).await {
-            continue;
-        }
-        let sub_assets = cwd
-            .join(entry.file_name())
-            .join("obj")
-            .join("project.assets.json");
-        if let Some(sub) = read_project_assets(&sub_assets).await {
-            paths.extend(sub.package_folders);
-        }
+    if walk.packages_config {
+        folders.push(repository_path.unwrap_or_else(|| root.join("packages")));
     }
-    paths
+    folders
 }
 
 /// What one `project.assets.json` says.
@@ -584,13 +665,6 @@ struct ProjectAssets {
     /// (`"project"` entries are the solution's own projects, never in a
     /// package folder); `None` when there is no `libraries` object.
     libraries: Option<Vec<(String, String)>>,
-}
-
-/// Read and parse one `project.assets.json`; `None` when the file is
-/// unreadable (or not a regular file) or not JSON.
-async fn read_project_assets(path: &Path) -> Option<ProjectAssets> {
-    let content = crate::utils::fs::read_regular_to_string(path).await.ok()?;
-    parse_project_assets(&content)
 }
 
 /// Parse one `project.assets.json` ([`ProjectAssets`]).
@@ -622,58 +696,117 @@ fn parse_project_assets(content: &str) -> Option<ProjectAssets> {
     })
 }
 
-/// Directories [`restore_scope`] never descends into: build output, the
+/// Directories [`restore_walk`] never descends into: build output, the
 /// restore's own `obj/`, a legacy `packages/` folder, and JS dependencies.
 const SCOPE_SKIPPED_DIRS: [&str; 4] = ["bin", "obj", "packages", "node_modules"];
 
-/// Directories [`restore_scope`] lists before giving up on a scope (the
+/// Directories [`restore_walk`] lists before giving up on a scope (the
 /// crawl then walks the shared roots, as before).
 const SCOPE_DIR_BUDGET: usize = 10_000;
 
-/// The packages every project under `cwd` restored: the union of the
-/// `libraries` of each project directory's `obj/project.assets.json`.
+/// What the restores under a directory say ([`restore_walk`]).
+#[derive(Debug, Default)]
+struct RestoreWalk {
+    /// The `packageFolders` of every `obj/project.assets.json` found, in
+    /// walk order (`cwd`'s own first): the folders those restores used.
+    package_folders: Vec<PathBuf>,
+    /// The packages every project restored ([`PackageRoots::scope`]).
+    libraries: Option<Vec<(String, String)>>,
+    /// A `packages.config` (any casing) was seen: a project under `cwd`
+    /// uses the packages.config layout.
+    packages_config: bool,
+}
+
+/// Walk `cwd` for restores: every directory's `obj/project.assets.json`
+/// contributes its `packageFolders` (best effort, whatever the walk could
+/// see), and the projects' `libraries` form the scope.
 ///
-/// `None` (keep the walk) unless EVERY project file found under `cwd`
-/// (`.csproj`/`.fsproj`/`.vbproj`, at any depth) has a parsed assets file
-/// with a `libraries` object, so a project the scope cannot see (not
-/// restored yet, a relocated `obj/`, an unreadable directory) never loses
-/// its packages. Symlinked directories, hidden ones and
-/// [`SCOPE_SKIPPED_DIRS`] are not entered; more than
+/// The scope is `None` (keep the walk) unless EVERY project file found
+/// under `cwd` (`.csproj`/`.fsproj`/`.vbproj`, at any depth) has a parsed
+/// assets file with a `libraries` object, so a project the scope cannot see
+/// (not restored yet, a relocated `obj/`, an unreadable directory) never
+/// loses its packages. Symlinked directories, hidden ones and
+/// [`SCOPE_SKIPPED_DIRS`] are not entered, nor `skip` or a package folder
+/// a restore already named (package stores, not project trees); more than
 /// [`SCOPE_DIR_BUDGET`] directories also means `None`.
-fn restore_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
-    let mut libraries = Vec::new();
-    let mut pending = vec![cwd.to_path_buf()];
+fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
+    let mut walk = RestoreWalk {
+        package_folders: Vec::new(),
+        libraries: Some(Vec::new()),
+        packages_config: false,
+    };
+    // Absolute, so `skip` and the restores' (absolute) package folders
+    // compare against the walked paths.
+    let root = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut pending = vec![root];
     let mut listed = 0usize;
     while let Some(dir) = pending.pop() {
+        // A store a restore named after `dir` was queued.
+        if walk.package_folders.contains(&dir) {
+            continue;
+        }
         listed += 1;
         if listed > SCOPE_DIR_BUDGET {
-            return None;
+            walk.libraries = None;
+            break;
         }
         let (entries, complete) = super::listing::list_dir_sync_complete(&dir);
         if !complete {
-            return None;
+            walk.libraries = None;
         }
-        let mut is_project = false;
+        let (mut is_project, mut has_obj) = (false, false);
+        // Queued only after this directory's own restore is read, so a
+        // store it names (`RestorePackagesPath` = `pkgs`) is never entered.
+        let mut subdirs = Vec::new();
         for entry in &entries {
             let Some(name) = entry.name.to_str() else {
                 continue;
             };
-            let kind = entry.file_type?;
+            let Some(kind) = entry.file_type else {
+                walk.libraries = None;
+                continue;
+            };
             if kind.is_dir() {
-                if !name.starts_with('.') && !SCOPE_SKIPPED_DIRS.contains(&name) {
-                    pending.push(dir.join(name));
+                has_obj |= name == "obj";
+                let sub = dir.join(name);
+                if !name.starts_with('.')
+                    && !SCOPE_SKIPPED_DIRS.contains(&name)
+                    && !skip.contains(&sub)
+                {
+                    subdirs.push(sub);
                 }
             } else if PROJECT_EXTENSIONS.iter().any(|ext| name.ends_with(ext)) {
                 is_project = true;
+            } else if name.eq_ignore_ascii_case("packages.config") {
+                walk.packages_config = true;
             }
         }
-        if is_project {
+        if is_project || has_obj {
             let assets = dir.join("obj").join("project.assets.json");
-            let content = crate::utils::fs::read_regular_to_string_sync(&assets).ok()?;
-            libraries.extend(parse_project_assets(&content)?.libraries?);
+            let parsed = crate::utils::fs::read_regular_to_string_sync(&assets)
+                .ok()
+                .and_then(|content| parse_project_assets(&content));
+            let libraries = match parsed {
+                Some(assets) => {
+                    walk.package_folders.extend(assets.package_folders);
+                    assets.libraries
+                }
+                None => None,
+            };
+            if is_project {
+                match (walk.libraries.as_mut(), libraries) {
+                    (Some(all), Some(own)) => all.extend(own),
+                    _ => walk.libraries = None,
+                }
+            }
         }
+        pending.extend(
+            subdirs
+                .into_iter()
+                .filter(|sub| !walk.package_folders.contains(sub)),
+        );
     }
-    Some(libraries)
+    walk
 }
 
 /// Look up each resolved `(id, version)` in a shared (global-layout) root,
@@ -1029,7 +1162,12 @@ mod tests {
         .await
         .unwrap();
 
-        let paths = discover_paths_from_assets(dir.path()).await;
+        let paths = run_blocking({
+            let cwd = dir.path().to_path_buf();
+            move || restore_walk(&cwd, &[])
+        })
+        .await
+        .package_folders;
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], pkg_folder);
     }
@@ -1219,6 +1357,90 @@ mod tests {
                 "pkg:nuget/newtonsoft.json@13.0.3".to_string(),
             ],
             "both versions discovered, non-version sibling ignored"
+        );
+    }
+
+    /// `dir/obj/project.assets.json` recording a restore into `folder`.
+    fn write_restore(dir: &Path, folder: &Path) {
+        std::fs::create_dir_all(dir.join("obj")).unwrap();
+        std::fs::write(dir.join("app.csproj"), "<Project />").unwrap();
+        let assets = serde_json::json!({
+            "packageFolders": { format!("{}/", folder.display()): {} },
+            "libraries": {},
+        });
+        std::fs::write(dir.join("obj/project.assets.json"), assets.to_string()).unwrap();
+    }
+
+    fn global_at(prefix: &Path) -> CrawlerOptions {
+        CrawlerOptions {
+            cwd: prefix.to_path_buf(),
+            global: true,
+            global_prefix: Some(prefix.to_path_buf()),
+        }
+    }
+
+    /// #489: a global prefix the project's restore uses is the project's
+    /// store; any other folder is not, and neither is a directory with no
+    /// .NET project and no restore.
+    #[tokio::test]
+    async fn global_roots_shared_with_the_projects_restore_folder() {
+        let store = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        write_restore(project.path(), store.path());
+        let crawler = NuGetCrawler::new();
+        assert!(
+            crawler
+                .global_roots_shared_with(&global_at(store.path()), project.path())
+                .await
+        );
+        assert!(
+            !crawler
+                .global_roots_shared_with(&global_at(other.path()), project.path())
+                .await
+        );
+        assert!(
+            !crawler
+                .global_roots_shared_with(&global_at(store.path()), other.path())
+                .await,
+            "no restore under `other` names the store"
+        );
+    }
+
+    /// A restore relocated by `RestorePackagesPath` never reads the global
+    /// packages folder, so that folder is not the project's (#489 review).
+    #[tokio::test]
+    async fn global_roots_shared_with_ignores_a_folder_the_restore_relocated_away_from() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let pkgs = project.path().join("pkgs");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        write_restore(project.path(), &pkgs);
+        let crawler = NuGetCrawler::new();
+        assert!(
+            !crawler
+                .global_roots_shared_with(&global_at(global.path()), project.path())
+                .await
+        );
+        assert!(
+            crawler
+                .global_roots_shared_with(&global_at(&pkgs), project.path())
+                .await
+        );
+    }
+
+    /// A repository whose projects all live in subdirectories (no root
+    /// `.sln`, project file or NuGet config) still shares its restores'
+    /// folder (#489 review).
+    #[tokio::test]
+    async fn global_roots_shared_with_sees_restores_below_a_markerless_root() {
+        let store = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        write_restore(&repo.path().join("src/App"), store.path());
+        assert!(
+            NuGetCrawler::new()
+                .global_roots_shared_with(&global_at(store.path()), repo.path())
+                .await
         );
     }
 
@@ -2178,6 +2400,385 @@ mod tests {
         assert!(
             paths.contains(&pkg_folder),
             "the readable sub-project assets file must still be discovered, got {paths:?}"
+        );
+    }
+
+    // ── Configured package folders (#397, #398) ───────────────────────
+
+    /// Points `HOME`/`USERPROFILE` at a temp dir, clears `NUGET_PACKAGES`
+    /// and installs `user_config` as the user-level NuGet config, restoring
+    /// all of it on drop. Callers are `#[serial]`.
+    struct NugetEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl NugetEnv {
+        fn new(home: &Path, user_config: Option<PathBuf>) -> Self {
+            let saved = ["HOME", "USERPROFILE", "NUGET_PACKAGES", "DOTNET_CLI_HOME"]
+                .into_iter()
+                .map(|k| (k, std::env::var_os(k)))
+                .collect();
+            std::env::set_var("HOME", home);
+            std::env::set_var("USERPROFILE", home);
+            std::env::remove_var("NUGET_PACKAGES");
+            std::env::remove_var("DOTNET_CLI_HOME");
+            crate::vendor::nuget_config::tests_support::USER_CONFIG
+                .with(|c| *c.borrow_mut() = user_config);
+            Self { saved }
+        }
+    }
+
+    impl Drop for NugetEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+            crate::vendor::nuget_config::tests_support::USER_CONFIG
+                .with(|c| *c.borrow_mut() = None);
+        }
+    }
+
+    /// Install `newtonsoft.json@13.0.3` under `root` in the global layout.
+    async fn install_global(root: &Path) -> PathBuf {
+        let dir = root.join("newtonsoft.json").join("13.0.3");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("newtonsoft.json.nuspec"), "<package/>")
+            .await
+            .unwrap();
+        dir
+    }
+
+    /// A home whose default `~/.nuget/packages` another project warmed
+    /// with the same package.
+    async fn warm_home(root: &Path) -> (PathBuf, PathBuf) {
+        let home = root.join("home");
+        let copy = install_global(&home.join(".nuget").join("packages")).await;
+        (home, copy)
+    }
+
+    async fn write(path: &Path, text: &str) {
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(path, text).await.unwrap();
+    }
+
+    /// Where agent `apply` resolves the purl: the first root (in
+    /// `get_nuget_package_paths` order) holding it, as `merge_first_wins`
+    /// keeps it.
+    async fn applied_copy(cwd: &Path) -> Option<PathBuf> {
+        let purl = "pkg:nuget/Newtonsoft.Json@13.0.3".to_string();
+        for root in NuGetCrawler
+            .get_nuget_package_paths(&local(cwd))
+            .await
+            .unwrap()
+        {
+            let found = NuGetCrawler
+                .find_by_purls(&root, std::slice::from_ref(&purl))
+                .await
+                .unwrap();
+            if let Some(pkg) = found.get(&purl) {
+                return Some(pkg.path.clone());
+            }
+        }
+        None
+    }
+
+    fn crawled_copy(packages: &[CrawledPackage]) -> Option<PathBuf> {
+        packages
+            .iter()
+            .find(|p| p.purl == "pkg:nuget/newtonsoft.json@13.0.3")
+            .map(|p| p.path.clone())
+    }
+
+    /// The #397 repro: a solution root, `src/App/App.csproj`, and a
+    /// nuget.config `globalPackagesFolder` of `.nuget/packages`, restored.
+    async fn relocated_solution(root: &Path) -> (PathBuf, PathBuf) {
+        let proj = root.join("proj");
+        write(
+            &proj.join("nuget.config"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <config><add key="globalPackagesFolder" value=".nuget/packages" /></config>
+</configuration>
+"#,
+        )
+        .await;
+        write(&proj.join("App.sln"), "").await;
+        let app = proj.join("src").join("App");
+        write(&app.join("App.csproj"), "<Project/>").await;
+        let folder = proj.join(".nuget").join("packages");
+        let copy = install_global(&folder).await;
+        write_assets(
+            &app,
+            &folder,
+            serde_json::json!({
+                "Newtonsoft.Json/13.0.3": { "type": "package", "path": "newtonsoft.json/13.0.3" }
+            }),
+        )
+        .await;
+        (proj, copy)
+    }
+
+    /// #397: with a warm default cache, the project's configured
+    /// `globalPackagesFolder` copy is the one patched and crawled, not the
+    /// user-wide one. Red on main (`~/.nuget/packages` won).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn configured_global_packages_folder_beats_a_warm_default_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _default_copy) = warm_home(dir.path()).await;
+        let _env = NugetEnv::new(&home, None);
+        let (proj, copy) = relocated_solution(dir.path()).await;
+
+        assert_eq!(applied_copy(&proj).await, Some(copy.clone()));
+        assert_eq!(
+            crawled_copy(&NuGetCrawler.crawl_all(&local(&proj)).await),
+            Some(copy.clone())
+        );
+        // From the project directory too (restore-scoped crawl).
+        let app = proj.join("src").join("App");
+        assert_eq!(applied_copy(&app).await, Some(copy.clone()));
+        assert_eq!(
+            crawled_copy(&NuGetCrawler.crawl_all(&local(&app)).await),
+            Some(copy)
+        );
+    }
+
+    /// #397: with a cold default cache, a project two levels below the
+    /// solution root is still found through its restore. Red on main
+    /// (assets were read only one level deep: "matched no installed
+    /// package").
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn deep_project_restore_is_found_with_a_cold_default_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let _env = NugetEnv::new(&home, None);
+        let (proj, copy) = relocated_solution(dir.path()).await;
+        // Without the config, only the restore names the folder.
+        tokio::fs::remove_file(proj.join("nuget.config"))
+            .await
+            .unwrap();
+
+        assert_eq!(applied_copy(&proj).await, Some(copy));
+    }
+
+    /// #397: `RestorePackagesPath` (MSBuild, recorded only in the
+    /// restore's `packageFolders`) beats a warm default cache. Red on main.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_packages_path_beats_a_warm_default_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _default_copy) = warm_home(dir.path()).await;
+        let _env = NugetEnv::new(&home, None);
+        let proj = dir.path().join("proj");
+        write(&proj.join("App.csproj"), "<Project/>").await;
+        let pkgs = proj.join("pkgs");
+        let copy = install_global(&pkgs).await;
+        write_assets(
+            &proj,
+            &pkgs,
+            serde_json::json!({
+                "Newtonsoft.Json/13.0.3": { "type": "package", "path": "newtonsoft.json/13.0.3" }
+            }),
+        )
+        .await;
+
+        assert_eq!(applied_copy(&proj).await, Some(copy.clone()));
+        assert_eq!(
+            crawled_copy(&NuGetCrawler.crawl_all(&local(&proj)).await),
+            Some(copy)
+        );
+    }
+
+    /// #397 (global mode): a `globalPackagesFolder` in the user-level
+    /// NuGet.Config relocates the folder `-g` scans. Red on main (only
+    /// `~/.nuget/packages` was crawled).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn global_mode_reads_the_user_config_global_packages_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _default_copy) = warm_home(dir.path()).await;
+        let gpf = dir.path().join("gpf");
+        let copy = install_global(&gpf).await;
+        let user_config = home.join(".nuget").join("NuGet").join("NuGet.Config");
+        write(
+            &user_config,
+            &format!(
+                r#"<configuration><config><add key="globalPackagesFolder" value="{}" /></config></configuration>"#,
+                gpf.display()
+            ),
+        )
+        .await;
+        let _env = NugetEnv::new(&home, Some(user_config));
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: true,
+            global_prefix: None,
+        };
+
+        assert_eq!(
+            NuGetCrawler
+                .get_nuget_package_paths(&options)
+                .await
+                .unwrap(),
+            [gpf]
+        );
+        assert_eq!(
+            crawled_copy(&NuGetCrawler.crawl_all(&options).await),
+            Some(copy)
+        );
+    }
+
+    /// `NUGET_PACKAGES` still overrides a configured folder, as in NuGet.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn nuget_packages_env_overrides_the_configured_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let _env = NugetEnv::new(&home, None);
+        let proj = dir.path().join("proj");
+        write(
+            &proj.join("nuget.config"),
+            r#"<configuration><config><add key="globalPackagesFolder" value="cfg" /></config></configuration>"#,
+        )
+        .await;
+        write(&proj.join("App.sln"), "").await;
+        install_global(&proj.join("cfg")).await;
+        let env_folder = dir.path().join("env");
+        let copy = install_global(&env_folder).await;
+        std::env::set_var("NUGET_PACKAGES", &env_folder);
+
+        assert_eq!(applied_copy(&proj).await, Some(copy));
+    }
+
+    /// #398: a packages.config solution whose nuget.config sets
+    /// `repositoryPath` is patched in that folder, not in the global
+    /// folder nuget.exe also extracted into. Red on main (only
+    /// `<cwd>/packages` was considered, so `~/.nuget/packages` won).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repository_path_folder_beats_the_global_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, _default_copy) = warm_home(dir.path()).await;
+        let _env = NugetEnv::new(&home, None);
+        let repro = dir.path().join("repro");
+        write(
+            &repro.join("nuget.config"),
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<configuration><config><add key="repositoryPath" value="lib/pkgs" /></config></configuration>
+"#,
+        )
+        .await;
+        write(&repro.join("App.sln"), "").await;
+        write(
+            &repro.join("App").join("packages.config"),
+            r#"<packages><package id="Newtonsoft.Json" version="13.0.3" targetFramework="net472" /></packages>"#,
+        )
+        .await;
+        write(&repro.join("App").join("App.csproj"), "<Project/>").await;
+        let copy = repro
+            .join("lib")
+            .join("pkgs")
+            .join("Newtonsoft.Json.13.0.3");
+        write(&copy.join("Newtonsoft.Json.nuspec"), "<package/>").await;
+
+        assert_eq!(applied_copy(&repro).await, Some(copy.clone()));
+        let crawled: Vec<_> = NuGetCrawler
+            .crawl_all(&local(&repro))
+            .await
+            .into_iter()
+            .filter(|p| p.name.eq_ignore_ascii_case("newtonsoft.json"))
+            .map(|p| p.path)
+            .collect();
+        assert_eq!(crawled.first(), Some(&copy));
+        // From the project directory, the parent's config still applies.
+        assert_eq!(applied_copy(&repro.join("App")).await, Some(copy));
+    }
+
+    /// A `repositoryPath` set for a shared store (here in a parent config)
+    /// is not a PackageReference project's folder: NuGet reads it only for
+    /// packages.config, so the project's restore folder still wins and the
+    /// store is not walked.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn repository_path_is_ignored_without_a_packages_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let _env = NugetEnv::new(&home, None);
+        let store = dir.path().join("store");
+        install_global(&store).await;
+        write(
+            &dir.path().join("nuget.config"),
+            &format!(
+                r#"<configuration><config><add key="repositoryPath" value="{}" /></config></configuration>"#,
+                store.display()
+            ),
+        )
+        .await;
+        let proj = dir.path().join("proj");
+        write(&proj.join("App.csproj"), "<Project/>").await;
+        let pkgs = proj.join("pkgs");
+        let copy = install_global(&pkgs).await;
+        write_assets(
+            &proj,
+            &pkgs,
+            serde_json::json!({
+                "Newtonsoft.Json/13.0.3": { "type": "package", "path": "newtonsoft.json/13.0.3" }
+            }),
+        )
+        .await;
+
+        let paths = NuGetCrawler
+            .get_nuget_package_paths(&local(&proj))
+            .await
+            .unwrap();
+        assert!(!paths.contains(&store), "{paths:?}");
+        assert_eq!(applied_copy(&proj).await, Some(copy));
+    }
+
+    /// A store the walked directory's own restore names (a solution-root
+    /// `RestorePackagesPath` of `pkgs/`, written with NuGet's trailing
+    /// separator) is not entered: here a project-shaped folder inside it
+    /// would otherwise drop the scope, and a large store would spend the
+    /// directory budget before deeper restores are seen.
+    #[test]
+    fn restore_walk_does_not_enter_a_store_its_restore_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("App.csproj"), "<Project/>").unwrap();
+        let pkgs = root.join("pkgs");
+        std::fs::create_dir_all(pkgs.join("some.tool").join("1.0.0").join("content")).unwrap();
+        std::fs::write(
+            pkgs.join("some.tool")
+                .join("1.0.0")
+                .join("content")
+                .join("Template.csproj"),
+            "<Project/>",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("obj")).unwrap();
+        let key = format!("{}{}", pkgs.display(), std::path::MAIN_SEPARATOR);
+        std::fs::write(
+            root.join("obj").join("project.assets.json"),
+            serde_json::to_string(&serde_json::json!({
+                "libraries": { "Newtonsoft.Json/13.0.3": { "type": "package" } },
+                "packageFolders": { key: {} }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let walk = restore_walk(root, &[]);
+        assert_eq!(walk.package_folders, [pkgs]);
+        assert_eq!(
+            walk.libraries,
+            Some(vec![("Newtonsoft.Json".to_string(), "13.0.3".to_string())])
         );
     }
 }

@@ -1160,3 +1160,188 @@ async fn npm_get_ghsa_hosted_narrows_and_installs() {
     let (fresh, installed) = fresh_install_patched(&fx);
     manifestless_tail(&fx, &fresh, installed, &[]);
 }
+
+/// The tarball bytes of a bin published from Windows (CRLF shebang), its
+/// patched twin, and what npm's `fixBin` leaves on disk for each: the
+/// first line's `\r` dropped (#1756).
+const CRLF_BIN_BEFORE: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(\"hi\");\r\n";
+const CRLF_BIN_AFTER: &[u8] =
+    b"#!/usr/bin/env node\r\nconsole.log(\"hi\");\r\n// SOCKET-PATCHED\r\n";
+const NPM_BIN_BEFORE: &[u8] = b"#!/usr/bin/env node\nconsole.log(\"hi\");\r\n";
+const NPM_BIN_AFTER: &[u8] = b"#!/usr/bin/env node\nconsole.log(\"hi\");\r\n// SOCKET-PATCHED\r\n";
+
+/// A project under `tmp` with the `crlfbin` tarball (a CRLF-shebang
+/// `bin`) npm-installed, and an agent manifest patching that bin with
+/// its blobs. Returns the project dir.
+fn crlf_bin_project(tmp: &Path) -> PathBuf {
+    let (before, after) = (CRLF_BIN_BEFORE, CRLF_BIN_AFTER);
+    let pkg = tmp.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"crlfbin","version":"1.0.0","bin":{"crlfbin":"cli.js"}}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("cli.js"), before).unwrap();
+    std::fs::write(
+        tmp.join("crlfbin-1.0.0.tgz"),
+        npm_e2e_common::npm_pack_like(&pkg),
+    )
+    .unwrap();
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"p","version":"1.0.0","dependencies":{"crlfbin":"file:../crlfbin-1.0.0.tgz"}}"#,
+    )
+    .unwrap();
+    let cache = tmp.join("cache");
+    let out = npm_e2e_common::npm(
+        &proj,
+        &[
+            "install",
+            "--no-audit",
+            "--no-fund",
+            "--cache",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        npm_e2e_common::output_text(&out)
+    );
+    let cli = proj.join("node_modules/crlfbin/cli.js");
+    assert_eq!(std::fs::read(&cli).unwrap(), NPM_BIN_BEFORE, "npm's fixBin");
+
+    let (b, a) = (git_sha256(before), git_sha256(after));
+    let blobs = proj.join(".socket/blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&b), before).unwrap();
+    std::fs::write(blobs.join(&a), after).unwrap();
+    std::fs::write(
+        proj.join(".socket/manifest.json"),
+        format!(
+            r#"{{"patches":{{"pkg:npm/crlfbin@1.0.0":{{"uuid":"e2f99e5d-3afd-5cbd-be80-6a0102bcd6c2",
+"exportedAt":"2026-01-01T00:00:00Z","files":{{"package/cli.js":{{"beforeHash":"{b}","afterHash":"{a}"}}}},
+"vulnerabilities":{{"GHSA-xxxx-yyyy-zzzz":{{"cves":["CVE-2099-0001"],"summary":"t","severity":"high","description":"d"}}}},
+"description":"d","license":"MIT","tier":"free"}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    proj
+}
+
+/// Runs the project's `crlfbin` bin, asserting it prints `hi`.
+fn assert_crlf_bin_runs(proj: &Path, what: &str) {
+    let ran = std::process::Command::new(proj.join("node_modules/.bin/crlfbin"))
+        .current_dir(proj)
+        .output()
+        .unwrap();
+    assert!(
+        ran.status.success(),
+        "{what}: {}",
+        npm_e2e_common::output_text(&ran)
+    );
+    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "hi", "{what}");
+}
+
+/// Regression (#1756): on Linux and macOS npm's `bin-links` rewrites a
+/// `bin` file's CRLF shebang to LF at install. Agent-mode `apply` patches
+/// that install (it was refused as drift), keeps the bin runnable (a
+/// written-back `#!/usr/bin/env node\r` makes `env` exit 127), re-applies
+/// as a no-op, `vex` attests it, and `rollback` restores npm's form of the
+/// original. Offline: the package is a local tarball.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install; runs on the e2e CI matrix leg"]
+async fn npm_agent_patches_crlf_shebang_bin_npm_rewrote() {
+    const SUITE: &str = "npm_agent_patches_crlf_shebang_bin_npm_rewrote";
+    if npm_e2e_common::npm_version().is_none() {
+        npm_e2e_common::skip(SUITE, "npm not on PATH");
+        return;
+    }
+    let (installed_before, installed_after) = (NPM_BIN_BEFORE, NPM_BIN_AFTER);
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = crlf_bin_project(tmp.path());
+    let cli = proj.join("node_modules/crlfbin/cli.js");
+
+    let (code, stdout, stderr) = run_socket(&proj, &["apply", "--offline"]);
+    assert_eq!(code, 0, "apply\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        !stderr.contains("did not match"),
+        "no drift warning: {stderr}"
+    );
+    assert_eq!(std::fs::read(&cli).unwrap(), installed_after);
+    assert_crlf_bin_runs(&proj, "after apply");
+
+    let (code, stdout, stderr) = run_socket(&proj, &["apply", "--offline"]);
+    assert_eq!(code, 0, "re-apply\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&cli).unwrap(), installed_after);
+
+    let doc = proj.join("vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--offline",
+            "-O",
+            doc.to_str().unwrap(),
+            "--product",
+            "pkg:npm/p@1.0.0",
+        ],
+    );
+    assert_eq!(code, 0, "vex\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let vex = std::fs::read_to_string(&doc).unwrap();
+    assert!(
+        vex.contains("CVE-2099-0001") && vex.contains("not_affected"),
+        "{vex}"
+    );
+
+    let (code, stdout, stderr) = run_socket(&proj, &["rollback", "--offline"]);
+    assert_eq!(code, 0, "rollback\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&cli).unwrap(), installed_before);
+    assert_crlf_bin_runs(&proj, "after rollback");
+}
+
+/// Regression (#1791): v5.0.1 wrote the raw CRLF patched bytes over the
+/// bin npm had fixed, so it exits 127. `apply --check` reports that drift,
+/// `apply` rewrites the bin in npm's form, and from the same broken state
+/// `rollback` restores npm's runnable form of the original.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install; runs on the e2e CI matrix leg"]
+async fn npm_agent_recovers_crlf_bin_left_by_raw_write() {
+    const SUITE: &str = "npm_agent_recovers_crlf_bin_left_by_raw_write";
+    if npm_e2e_common::npm_version().is_none() {
+        npm_e2e_common::skip(SUITE, "npm not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = crlf_bin_project(tmp.path());
+    let cli = proj.join("node_modules/crlfbin/cli.js");
+    // What v5.0.1's apply left: the recorded bytes, CRLF shebang and all.
+    std::fs::write(&cli, CRLF_BIN_AFTER).unwrap();
+
+    let (code, stdout, stderr) = run_socket(&proj, &["apply", "--check", "--offline"]);
+    assert_eq!(code, 1, "check\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("pkg:npm/crlfbin@1.0.0"),
+        "names the drifted patch\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = run_socket(&proj, &["apply", "--offline"]);
+    assert_eq!(code, 0, "apply\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&cli).unwrap(), NPM_BIN_AFTER);
+    assert_crlf_bin_runs(&proj, "after apply");
+
+    let (code, stdout, stderr) = run_socket(&proj, &["apply", "--check", "--offline"]);
+    assert_eq!(code, 0, "re-check\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    std::fs::write(&cli, CRLF_BIN_AFTER).unwrap();
+    let (code, stdout, stderr) = run_socket(&proj, &["rollback", "--offline"]);
+    assert_eq!(code, 0, "rollback\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(std::fs::read(&cli).unwrap(), NPM_BIN_BEFORE);
+    assert_crlf_bin_runs(&proj, "after rollback");
+}

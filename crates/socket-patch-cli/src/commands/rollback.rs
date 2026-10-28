@@ -4,7 +4,7 @@ use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::cleanup_blobs::ArtifactReferences;
 use socket_patch_core::manifest::operations::{
-    get_before_hash_blobs, read_manifest, write_manifest,
+    get_before_hash_blobs, manifest_exists, read_manifest, write_manifest,
 };
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
@@ -334,7 +334,12 @@ async fn patched_in_other_scope(
                 let unverifiable = v.current_hash.is_none()
                     && v.status != VerifyRollbackStatus::AlreadyOriginal
                     && !v.is_absent();
-                if unverifiable || v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
+                // `Ready` also covers npm's LF-shebang form of a patched
+                // bin, whose hash is not the afterHash.
+                if unverifiable
+                    || v.status == VerifyRollbackStatus::Ready
+                    || v.current_hash.as_deref() == Some(info.after_hash.as_str())
+                {
                     patched.push((purl.clone(), path.clone()));
                     break 'copies;
                 }
@@ -989,9 +994,14 @@ async fn run_vendored_leg(
         keep_artifact: preserve,
     };
     let loud = !common.json && !common.silent;
-    let reverted = VendoredBackend::new(common, None)
-        .revert(keys, state, opts, false)
-        .await;
+    let backend = VendoredBackend::new(common, None);
+    let reverted = backend.revert(keys, state, opts, false).await;
+    for (_, w) in backend.go_undo_warnings(&reverted).await {
+        if loud {
+            eprintln!("Warning: {}", w.detail);
+        }
+        out.warnings.push((w.code.to_string(), w.detail));
+    }
     for RevertedEntry {
         key,
         warnings,
@@ -1067,6 +1077,24 @@ async fn run_vendored_leg(
 /// write failure (an artifact-level event, `hosted_write_failed`).
 const HOSTED_WRITE_FAILURE_KEY: &str = "files";
 
+/// Why a global run leaves a copy to the project's vendor ledger (#489): the
+/// `skipped` / `vendored` event detail `rollback -g` and `remove -g` share.
+pub(crate) const PROJECT_OWNED_INSTALL: &str =
+    "the project's own install, managed by `socket-patch vendor`: the global packages \
+     folder is where the project restores it, so a global run leaves it patched";
+
+/// The human `[skip]` lines for the copies a global run left to the
+/// project's vendor ledger (#489); nothing in project scope, where the
+/// vendored leg reports each entry.
+pub(crate) fn print_project_owned(common: &GlobalArgs, purls: &[String]) {
+    if crate::commands::project_state_in_scope(common) || common.silent {
+        return;
+    }
+    for purl in purls {
+        println!("  [skip] {purl} (vendored: {PROJECT_OWNED_INSTALL})");
+    }
+}
+
 /// Everything the main rollback run reports, for [`build_rollback_envelope`].
 struct RollbackReport<'a> {
     dry_run: bool,
@@ -1076,6 +1104,9 @@ struct RollbackReport<'a> {
     manifest: &'a PatchManifest,
     results: &'a [RollbackResult],
     not_installed: &'a [String],
+    /// Manifest entries a global run left to the project's vendor ledger:
+    /// the project's own NuGet install (#489).
+    project_owned: &'a [String],
     vendored: &'a VendoredLegOutcome,
     vendor_entries: &'a [(String, socket_patch_core::vendor::VendorEntry)],
     hosted: &'a HostedLegOutcome,
@@ -1136,6 +1167,13 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
     }
     for purl in report.not_installed {
         env.record(not_installed_event(purl, manifest_uuid(purl)));
+    }
+    for purl in report.project_owned {
+        env.record(with_uuid(
+            PatchEvent::new(PatchAction::Skipped, purl.as_str())
+                .with_reason("vendored", PROJECT_OWNED_INSTALL),
+            manifest_uuid(purl),
+        ));
     }
 
     // ── vendored leg ──
@@ -1397,7 +1435,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // not this run's to unwind (see `project_state_in_scope`): a global
     // rollback restores the global copies and their manifest records only.
     let project_state = crate::commands::project_state_in_scope(&args.common);
-    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    // Only a missing file is "no manifest"; one rollback cannot even stat
+    // fails like the load below, not as "Manifest not found" (#998).
+    let manifest_missing = match manifest_exists(&manifest_path).await {
+        Ok(present) => !present,
+        Err(e) => {
+            track_patch_rollback_failed(&e.to_string(), &telemetry).await;
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            emit_rollback_error(
+                args.common.json,
+                args.common.dry_run,
+                &err.code,
+                &err.message,
+            );
+            return 1;
+        }
+    };
     let vendor_ledger_exists = project_state
         && tokio::fs::metadata(ledger_root.join(".socket/vendor/state.json"))
             .await
@@ -1517,7 +1570,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // Under global scope the ledger is read only to keep the project's
     // vendored manifest records (see the cleanup below): no vendored leg
     // runs, and the ledger does not own the global copies, so the in-place
-    // leg restores them.
+    // leg restores them, except the project's own NuGet install (#489).
     let loaded_vendor_state = socket_patch_core::vendor::load_state(&ledger_root).await;
     let project_vendored_keys: HashSet<PurlKey> = loaded_vendor_state
         .as_ref()
@@ -1532,10 +1585,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let vendor_corrupt = vendor_state_result.is_err();
     // An unreadable ledger degrades to "nothing vendored" for the in-place
     // leg (its own containment is the `vendor_state_unreadable` exit below).
-    let vendored_keys: HashSet<PurlKey> = vendor_state_result
-        .as_ref()
-        .map(VendorState::purl_keys)
-        .unwrap_or_default();
+    let vendored_keys: HashSet<PurlKey> =
+        crate::commands::vendor_owned_keys(&args.common, &project_vendored_keys).await;
 
     // ── scope resolution ────────────────────────────────────────────────
     let manifest = if manifest_missing {
@@ -2330,6 +2381,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     manifest: &manifest,
                     results: &results,
                     not_installed: &not_installed,
+                    project_owned: if project_state {
+                        &[]
+                    } else {
+                        &vendored_excluded
+                    },
                     vendored: &vendored_leg,
                     vendor_entries: &vendor_entries,
                     hosted: &hosted_leg,
@@ -2341,7 +2397,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     paths: path_scope.raw(),
                 });
                 println!("{}", env.to_pretty_json());
-            } else if !args.common.silent && !results.is_empty() {
+            } else if !args.common.silent && results.is_empty() {
+                print_project_owned(&args.common, &vendored_excluded);
+            } else if !args.common.silent {
+                print_project_owned(&args.common, &vendored_excluded);
                 let cwd_abs = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
                 let lines = if args.common.dry_run {
                     format_rollback_dry_run_counts(&results, &cwd_abs)
@@ -6140,6 +6199,7 @@ mod tests {
             manifest,
             results,
             not_installed: &[],
+            project_owned: &[],
             vendored,
             vendor_entries: &[],
             hosted,
@@ -6245,6 +6305,7 @@ mod tests {
         };
         let env = build_rollback_envelope(&RollbackReport {
             not_installed: &not_installed,
+            project_owned: &[],
             removed: &removed,
             warnings: &warnings,
             gc: Some(gc),

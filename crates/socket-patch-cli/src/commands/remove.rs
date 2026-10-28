@@ -5,7 +5,7 @@ use socket_patch_core::ledgers::hosted_pins_matching;
 use socket_patch_core::manifest::cleanup_blobs::{
     format_bytes, format_cleanup_result_for, ArtifactReferences,
 };
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::operations::{manifest_exists, read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed, TelemetryAuth};
@@ -365,7 +365,21 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // remove restores the global copies and drops their manifest records
     // only.
     let project_state = crate::commands::project_state_in_scope(&args.common);
-    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    // Only a missing file is "no manifest"; one remove cannot even stat is
+    // unreadable, not a bare project (#998).
+    let manifest_missing = match manifest_exists(&manifest_path).await {
+        Ok(present) => !present,
+        Err(e) => {
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                &err.code,
+                err.message,
+            );
+            return 1;
+        }
+    };
     let hosted_inventory = if project_state {
         crate::commands::hosted_inventory(&args.common, &args.common.project_root()).await
     } else {
@@ -603,15 +617,31 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // Vendor-owned purls are excluded from the in-place restore (the
     // vendored leg below reverts them) unless their Cargo shared-cache copy
     // still carries an agent-mode patch (#336); an unreadable ledger degrades to
-    // "nothing vendored" here and fails closed at that leg.
-    let vendored_keys: HashSet<PurlKey> = vendor_state_result
-        .as_ref()
-        .map(socket_patch_core::vendor::VendorState::purl_keys)
-        .unwrap_or_default();
+    // "nothing vendored" here and fails closed at that leg. Under global
+    // scope the project's ledger still owns its own NuGet install (#489).
+    // The identifier is the scope, so `--ecosystems` does not narrow it.
+    let vendored_keys: HashSet<PurlKey> = if project_state {
+        vendor_state_result
+            .as_ref()
+            .map(socket_patch_core::vendor::VendorState::purl_keys)
+            .unwrap_or_default()
+    } else {
+        crate::commands::vendor_owned_keys(
+            &GlobalArgs {
+                ecosystems: None,
+                ..args.common.clone()
+            },
+            &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
+        )
+        .await
+    };
     // One `rolledBack` event per restored installed copy (recorded, so
     // `summary.rolledBack` counts them). A dry run restores nothing, so it
     // records none.
     let mut rolled_back_events: Vec<PatchEvent> = Vec::new();
+    // Copies a global run left to the project's vendor ledger (#489): each
+    // a `skipped` / `vendored` event, since no vendored leg reports them.
+    let mut project_owned: Vec<PatchEvent> = Vec::new();
     // In-scope manifest entries the nested rollback SKIPPED because the
     // crawler found no installed package (`RollbackOutcome::not_installed`,
     // sorted). These were NOT reverted — and "not installed" can also mean
@@ -652,6 +682,23 @@ pub async fn run(args: RemoveArgs) -> i32 {
         {
             Ok(outcome) => {
                 rollback_not_installed = outcome.not_installed;
+                if !project_state {
+                    if loud {
+                        super::rollback::print_project_owned(
+                            &args.common,
+                            &outcome.vendored_skipped,
+                        );
+                        printed_progress |= !outcome.vendored_skipped.is_empty();
+                    }
+                    project_owned = outcome
+                        .vendored_skipped
+                        .iter()
+                        .map(|purl| {
+                            PatchEvent::new(PatchAction::Skipped, purl.clone())
+                                .with_reason("vendored", super::rollback::PROJECT_OWNED_INSTALL)
+                        })
+                        .collect();
+                }
                 rollback_warnings = outcome.warnings;
                 if !outcome.success {
                     track_patch_remove_failed("Rollback failed during patch removal", &telemetry)
@@ -776,7 +823,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     };
     let vendored_matches = vendor_entries_matching(&vendor_state, Some(&manifest), &target);
-    let mut vendor_leg = RemoveVendorLeg::default();
+    let mut vendor_leg = RemoveVendorLeg {
+        skipped: project_owned,
+        ..Default::default()
+    };
     if !vendored_matches.is_empty() {
         if args.skip_rollback {
             for (key, _) in &vendored_matches {
@@ -1295,9 +1345,15 @@ async fn revert_vendored_matches(
     let mut leg = RemoveVendorLeg::default();
     // Stops at the first hard failure: remove aborts there, leaving the
     // remaining matches (and the manifest) untouched.
-    let reverted = VendoredBackend::new(&args.common, None)
-        .revert(keys, state, opts, true)
-        .await;
+    let backend = VendoredBackend::new(&args.common, None);
+    let reverted = backend.revert(keys, state, opts, true).await;
+    for (key, w) in backend.go_undo_warnings(&reverted).await {
+        if loud {
+            eprintln!("Warning: {}", w.detail);
+        }
+        leg.skipped
+            .push(PatchEvent::new(PatchAction::Skipped, key).with_reason(w.code, w.detail));
+    }
     for RevertedEntry {
         key,
         warnings,

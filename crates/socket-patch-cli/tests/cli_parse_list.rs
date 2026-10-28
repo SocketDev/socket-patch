@@ -380,14 +380,12 @@ fn missing_manifest_under_valid_cwd_is_not_an_error_via_binary() {
 }
 
 #[test]
-fn manifest_path_is_existing_directory_is_a_usage_error_via_binary() {
-    // A `--manifest-path` naming a directory is never a manifest: v5.0
-    // rejects it before the command runs, as a usage error (exit 2, the
-    // `Error:` line naming the flag), on every project command
-    // (`GlobalArgs::validate_paths`). Before, `list` reached `read_manifest`
-    // and failed with `manifest_unreadable` (exit 1); the I/O
-    // classification itself (a non-absence error is never
-    // `manifest_not_found`) is pinned on `read_manifest` in core.
+fn manifest_path_is_existing_directory_is_manifest_unreadable_via_binary() {
+    // A `--manifest-path` naming a directory is a corrupt project, not a
+    // bad flag: `read_manifest` refuses it as `manifest_unreadable` (exit 1,
+    // with the `--json` envelope), the same verdict the default path gets.
+    // Refusing it in `GlobalArgs::validate_paths` made the verdict depend
+    // on whether the path was spelled out (#1123).
     let tmp = tempfile::tempdir().unwrap();
     let manifest_path = tmp.path().join("manifest-is-a-dir");
     std::fs::create_dir(&manifest_path).unwrap();
@@ -396,12 +394,12 @@ fn manifest_path_is_existing_directory_is_a_usage_error_via_binary() {
         tmp.path(),
         &["--json", "--manifest-path", manifest_path.to_str().unwrap()],
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "stderr={stderr}");
-    assert!(
-        stderr.contains("--manifest-path") && stderr.contains("is a directory"),
-        "{stderr}"
-    );
+    assert_eq!(out.status.code(), Some(1), "stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be one envelope ({e}): {stdout}"));
+    assert_eq!(v["error"]["code"], "manifest_unreadable", "envelope: {v}");
 }
 
 // ---------------------------------------------------------------------------

@@ -1247,7 +1247,10 @@ the repository list, so it is left as a
 Agent mode patches the crate in place wherever the crawler finds it. For a non-vendored
 crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects every
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
-`--mode vendored` for a project-local, committable patch.
+`--mode vendored` for a project-local, committable patch. With `CARGO_HOME` unset the
+cache is `<home>/.cargo/registry`, with `<home>` found the way cargo finds it: `HOME`
+(`USERPROFILE` on Windows), then, on Unix, the account's passwd entry, so a run with
+`HOME` unset or empty still patches the copy cargo builds.
 
 The cache holds one extracted copy of a crate per registry index directory under
 `registry/src` (cargo 1.70–1.84 and cargo 1.85+ use different ones), so two toolchains
@@ -1482,8 +1485,9 @@ for it until `rollback -g`.
 
 Two files the go command derives from `go.mod` can disagree with a new or removed
 socket `replace`, and go then refuses to build. socket-patch does not regenerate
-them (that needs the go toolchain and the whole module graph); `apply`, `vendor`,
-`rollback` and `scan --mode hosted` warn with the command that does, and
+them (that needs the go toolchain and the whole module graph); `apply`, `vendor`
+(including `vendor --revert`), `rollback`, `remove` and `scan --mode hosted` warn
+with the command that does, and
 `apply --check` / `vendor --check` report the disagreement as drift until it is run:
 
 | Warning code | When | Fix |
@@ -1607,9 +1611,14 @@ and `go.sum` (every workspace member's in workspace mode): the `require` line in
 (whose `require` lists only lower bounds and leaves out transitive modules),
 the highest of the required version and the versions `go.sum` has a module
 zip line for. `apply` and `scan --mode hosted` refuse to write a replace for
-any other version. After an upgrade such as `go get M@v1.0.1`, `apply --check`
-fails and `vex` leaves the patch out (`go_version_not_selected`) until you
-get a patch for the new version.
+any other version. In a workspace the build takes the highest version any
+`use` member selects, so `apply`, `vendor`, `apply --check`, `vex` and
+`scan --mode hosted` read every member's `go.mod` and `go.sum` too: a member
+that requires a newer version makes a replace pinned to the older one inert.
+A hosted rescan removes a pin it wrote once another member outranks it.
+After an upgrade such as `go get M@v1.0.1`, `apply --check` fails and `vex`
+leaves the patch out (`go_version_not_selected`) until you get a patch for the
+new version.
 
 Paid hosted Go references are unsupported: embedding credentials in module paths
 would expose them to module proxies and change module identity. Use vendored mode
