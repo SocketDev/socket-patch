@@ -663,6 +663,68 @@ async fn maven_handcrafted_discovery() {
     std::env::remove_var("MAVEN_REPO_LOCAL");
 }
 
+/// #397 (global mode): a `globalPackagesFolder` in the user-level
+/// NuGet.Config relocates the folder NuGet restores into. `scan -g --sync`
+/// patches that copy and leaves the stale default `~/.nuget/packages` one
+/// (warmed by another project) alone. Red on main: the default copy was
+/// patched and the configured one stayed unpatched.
+#[tokio::test]
+#[serial]
+async fn nuget_global_apply_patches_the_user_configured_global_packages_folder() {
+    let _home = NoJvmCaches::new();
+    std::env::remove_var("NUGET_PACKAGES");
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let original = b"MIT License\nCopyright (c) 2007 James Newton-King\n";
+    let install = |root: &Path| {
+        let pkg_dir = root.join("newtonsoft.json").join("13.0.3");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("newtonsoft.json.nuspec"), "<package/>").unwrap();
+        std::fs::write(pkg_dir.join("LICENSE.md"), original).unwrap();
+        pkg_dir.join("LICENSE.md")
+    };
+    let default_copy = install(&home.join(".nuget").join("packages"));
+    let gpf = tmp.path().join("gpf");
+    let configured_copy = install(&gpf);
+    let user_config = home.join(".nuget").join("NuGet").join("NuGet.Config");
+    std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &user_config,
+        format!(
+            r#"<configuration><config><add key="globalPackagesFolder" value="{}" /></config></configuration>"#,
+            gpf.display()
+        ),
+    )
+    .unwrap();
+
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"\n# SOCKET-PATCH-E2E-MARKER\n");
+    let server = MockServer::start().await;
+    setup_apply_mock(
+        &server,
+        "pkg:nuget/Newtonsoft.Json@13.0.3",
+        "39739739-7397-4397-8397-397397397397",
+        "package/LICENSE.md",
+        &git_sha256(original),
+        &git_sha256(&patched),
+        &patched,
+    )
+    .await;
+
+    let code = scan_run(default_scan_args(tmp.path(), "nuget", server.uri())).await;
+    assert_eq!(code, 0, "scan -g --sync should apply the nuget patch");
+    assert_eq!(
+        std::fs::read(&configured_copy).unwrap(),
+        patched,
+        "the configured globalPackagesFolder copy must be patched"
+    );
+    assert_eq!(
+        std::fs::read(&default_copy).unwrap(),
+        original,
+        "the unused default ~/.nuget/packages copy must stay untouched"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn nuget_handcrafted_discovery() {
