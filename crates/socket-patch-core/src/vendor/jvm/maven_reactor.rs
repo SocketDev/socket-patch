@@ -1672,16 +1672,22 @@ impl Reactor {
         std::iter::once(rel)
             .chain(self.inheritors(rel))
             .find_map(|reader| {
+                // `rel` resolves it, so a reader or profile that does not
+                // has redefined something it names: that moves it too.
+                let undefined = || "an undefined value".to_string();
                 let plain = (reader != rel)
-                    .then(|| self.interpolate(reader, declared, 0))
-                    .flatten()
+                    .then(|| {
+                        self.interpolate(reader, declared, 0)
+                            .unwrap_or_else(undefined)
+                    })
                     .filter(|v| moved(v))
                     .map(|v| (v, reader.to_string()));
                 plain.or_else(|| {
                     self.chain(reader).find_map(|at| {
                         self.poms[at].profile_props.iter().find_map(|(id, props)| {
-                            let v =
-                                self.interpolate_with(reader, declared, 0, Some((at, props)))?;
+                            let v = self
+                                .interpolate_with(reader, declared, 0, Some((at, props)))
+                                .unwrap_or_else(undefined);
                             moved(&v).then(|| (v, format!("{reader} under profile {id} of {at}")))
                         })
                     })
@@ -5408,6 +5414,12 @@ mod tests {
             (
                 "<ct.minor>10</ct.minor><ct.version>1.${ct.minor}.0</ct.version>",
                 "<ct.minor>11</ct.minor>",
+            ),
+            // A profile pointing the property at a name the checkout
+            // does not define (Bugbot on #1787).
+            (
+                "<ct.version>1.10.0</ct.version>",
+                "<ct.version>${corp.ct.version}</ct.version>",
             ),
         ] {
             let root = with_profile(
