@@ -307,7 +307,21 @@ pub async fn apply_go_redirect<'a>(
     // fingerprint stays stable across repeated applies (the guard re-runs apply
     // on most "deps changed" builds).
     if redirect_in_sync(&copy_dir, files, project_root, module, version, base_rel).await {
-        return already_patched_result(purl, &copy_dir, files);
+        let mut result = already_patched_result(purl, &copy_dir, files);
+        // A root go.mod mirror of the go.work replace that went missing is
+        // written back without rebuilding the copy: a failed rebuild would
+        // tear down the go.work replace the workspace builds through.
+        let expected = replace_target_path(base_rel, module, version);
+        if !root_go_mod_mirror_ok(project_root, module, version, &expected).await {
+            if let Err(e) =
+                go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false)
+                    .await
+            {
+                result.success = false;
+                result.error = Some(format!("failed to update go.mod: {e}"));
+            }
+        }
+        return result;
     }
 
     if let Err(e) = crate::patch::copy_tree::fresh_copy(pristine_src.path(), &copy_dir, None).await
@@ -618,7 +632,7 @@ pub async fn verify_go_redirect_state(
             {
                 // A root go.mod that mirrors a go.work host must hold it
                 // too, or a `GOWORK=off` build links the unpatched module.
-                if !replace_in_every_host(project_root, module, version, &expected).await {
+                if !root_go_mod_mirror_ok(project_root, module, version, &expected).await {
                     drifts.push(Drift::MissingReplace { purl: purl.clone() });
                 }
             }
@@ -710,27 +724,32 @@ async fn redirect_in_sync(
         return false;
     }
     let expected = replace_target_path(base_rel, module, version);
-    replace_in_every_host(project_root, module, version, &expected).await
+    read_replace_entries(project_root).await.iter().any(|e| {
+        e.module == module
+            && e.socket_owned()
+            && e.path.as_deref() == Some(expected.as_str())
+            && e.version.as_deref() == Some(version)
+    })
 }
 
-/// True if every file apply writes the replace of `module` into (the
-/// replace host, plus a root `go.mod` that mirrors a `go.work` host) holds
-/// a socket-owned `replace` pinning `version` to `expected`. A mirror
-/// missing from go.mod must not count as in sync: a `GOWORK=off` build
-/// would link the unpatched module.
-async fn replace_in_every_host(
+/// False when the replace host is `go.work` and the root `go.mod` that
+/// mirrors it (`ReplaceHost::mirrors_root_go_mod`) lacks a
+/// socket-owned `replace` pinning `version` to `expected`: a `GOWORK=off`
+/// build would link the unpatched module. A replace only in the root
+/// go.mod still patches the workspace, so go.work is not required.
+async fn root_go_mod_mirror_ok(
     project_root: &Path,
     module: &str,
     version: &str,
     expected: &str,
 ) -> bool {
     let files = go_mod_edit::superseded_replace(project_root, module).await;
-    !files.is_empty()
-        && files.iter().all(|(_, e)| {
-            e.as_ref().is_some_and(|e| {
-                e.path.as_deref() == Some(expected) && e.version.as_deref() == Some(version)
-            })
-        })
+    let [_, (_, mirror)] = files.as_slice() else {
+        return true;
+    };
+    mirror.as_ref().is_some_and(|e| {
+        e.path.as_deref() == Some(expected) && e.version.as_deref() == Some(version)
+    })
 }
 
 /// Synthesize Go's minimal `go.mod` (`module <path>`) in the copy iff it has
@@ -983,7 +1002,8 @@ mod tests {
 
     /// A root module that is a go.work member keeps a mirror of the go.work
     /// replace in its go.mod. A deleted mirror is drift: `--check` reports
-    /// it, and a re-apply (otherwise in sync) writes it back.
+    /// it, and a re-apply (otherwise in sync) writes it back without
+    /// rebuilding the copy.
     #[tokio::test]
     async fn test_missing_root_go_mod_mirror_is_drift_and_reapplied() {
         let (dir, blobs, pristine, files, _after) = fixture().await;
@@ -1037,9 +1057,16 @@ mod tests {
             .iter()
             .any(|d| matches!(d, Drift::MissingReplace { .. })));
 
+        // The copy is intact, so the re-apply only writes the mirror back:
+        // with the pristine source gone a rebuild would fail and drop the
+        // go.work replace too.
+        std::fs::remove_dir_all(&pristine).unwrap();
         let result = apply().await;
         assert!(result.success, "{:?}", result.error);
         assert!(std::fs::read_to_string(root.join("go.mod"))
+            .unwrap()
+            .contains(&line));
+        assert!(std::fs::read_to_string(root.join("go.work"))
             .unwrap()
             .contains(&line));
         verify_go_redirect_state(root, &manifest, &desired)
