@@ -1241,7 +1241,8 @@ async fn run_check(args: &VendorArgs) -> i32 {
     } else {
         None
     };
-    let go_sync_issues = tokio::sync::OnceCell::new();
+    let go_sync_issues =
+        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new()).await;
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1280,11 +1281,6 @@ async fn run_check(args: &VendorArgs) -> i32 {
         if failure.is_none() && entry.ecosystem == "golang" {
             if let Some((module, _)) = socket_patch_core::utils::purl::parse_golang_purl(key) {
                 let issues: Vec<String> = go_sync_issues
-                    .get_or_init(|| async {
-                        socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new())
-                            .await
-                    })
-                    .await
                     .iter()
                     .filter(|issue| issue.module() == module)
                     .map(ToString::to_string)
@@ -1374,10 +1370,6 @@ async fn run_check(args: &VendorArgs) -> i32 {
         .map(|(module, _)| module.into_owned())
         .collect();
     let stale_records: Vec<(String, String)> = go_sync_issues
-        .get_or_init(|| async {
-            socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new()).await
-        })
-        .await
         .iter()
         .filter(|issue| {
             matches!(
@@ -4480,7 +4472,8 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // (rollback's vendored leg, both of remove's paths, the manifest
     // reconcile): dispatch → drift-keep → per-entry ledger save. Only the
     // event vocabulary and the human lines are this command's.
-    let reverted = VendoredBackend::new(common, None)
+    let backend = VendoredBackend::new(common, None);
+    let reverted = backend
         .revert(
             &recorded,
             &mut state,
@@ -4488,6 +4481,9 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             false,
         )
         .await;
+    for (purl, w) in backend.go_undo_warnings(&reverted).await {
+        record_warning(env, &purl, &w, common);
+    }
     for RevertedEntry {
         key: purl,
         flavor,

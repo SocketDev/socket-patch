@@ -989,9 +989,14 @@ async fn run_vendored_leg(
         keep_artifact: preserve,
     };
     let loud = !common.json && !common.silent;
-    let reverted = VendoredBackend::new(common, None)
-        .revert(keys, state, opts, false)
-        .await;
+    let backend = VendoredBackend::new(common, None);
+    let reverted = backend.revert(keys, state, opts, false).await;
+    for (_, w) in backend.go_undo_warnings(&reverted).await {
+        if loud {
+            eprintln!("Warning: {}", w.detail);
+        }
+        out.warnings.push((w.code.to_string(), w.detail));
+    }
     for RevertedEntry {
         key,
         warnings,
@@ -2253,18 +2258,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .chain(hosted_leg.warnings.iter())
                 .cloned()
                 .collect();
-            // Both Go legs audit the same go.mod and vendor/modules.txt
-            // (#1777): an issue the agent leg already reported is not
-            // repeated for the vendored one.
             vendored_leg
                 .warnings
                 .iter()
                 .chain(hosted_leg.warnings.iter())
-                .for_each(|w| {
-                    if !run_warnings.contains(w) {
-                        run_warnings.push(w.clone());
-                    }
-                });
+                .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
             // A restored package whose ownership could not be put back, or
             // whose stale bytecode could not be removed (the engine reports
             // it on `error` with `success: true`), is restored but worth a

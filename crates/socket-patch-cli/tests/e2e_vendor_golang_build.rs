@@ -1167,7 +1167,7 @@ fn vendored_undo_needs_go_mod_vendor(label: &str, undo: &[&str], workspace: bool
         // still reports as unledgered; only the modules.txt drift is gone.)
         let (_code, so, se) = run_socket(&consumer, &["vendor", "--check", "--cwd", cs], &modcache);
         assert!(
-            !se.contains("go_vendor_modules_txt_out_of_sync"),
+            !se.contains("go_vendor_modules_txt_out_of_sync") && !so.contains("modules.txt"),
             "[{label}] in sync after {named}:\n{so}\n{se}"
         );
     }

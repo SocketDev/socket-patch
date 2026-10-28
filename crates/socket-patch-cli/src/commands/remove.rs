@@ -1295,9 +1295,15 @@ async fn revert_vendored_matches(
     let mut leg = RemoveVendorLeg::default();
     // Stops at the first hard failure: remove aborts there, leaving the
     // remaining matches (and the manifest) untouched.
-    let reverted = VendoredBackend::new(&args.common, None)
-        .revert(keys, state, opts, true)
-        .await;
+    let backend = VendoredBackend::new(&args.common, None);
+    let reverted = backend.revert(keys, state, opts, true).await;
+    for (key, w) in backend.go_undo_warnings(&reverted).await {
+        if loud {
+            eprintln!("Warning: {}", w.detail);
+        }
+        leg.skipped
+            .push(PatchEvent::new(PatchAction::Skipped, key).with_reason(w.code, w.detail));
+    }
     for RevertedEntry {
         key,
         warnings,
