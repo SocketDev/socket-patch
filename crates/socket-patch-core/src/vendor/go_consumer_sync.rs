@@ -354,7 +354,8 @@ pub async fn workspace_conflict(
 /// Why `apply` / `vendor` must not write `replace module version =>
 /// ./<base_rel>/module@version` into the project's go.mod (or the go.work
 /// at its root, [`go_workspace::replace_host`]), if the `go.work` in effect
-/// would override, ignore or reject it: the refusal message.
+/// would override, ignore or reject it, or that file is a symbolic link
+/// the rewrite would replace: the refusal message.
 pub async fn replace_refusal(
     project_root: &Path,
     module: &str,
@@ -365,6 +366,13 @@ pub async fn replace_refusal(
     let ours = go_mod_edit::parse_replace_body(&format!("{module} {version} => {target}"))?;
     let ws = go_workspace::load(project_root).await;
     let host = ws.replace_host(project_root, project_root.join("go.mod").is_file(), module);
+    if let Some(refusal) = go_mod_edit::symlink_refusal(&project_root.join(host.file_name())).await
+    {
+        return Some(format!(
+            "refusing to write `replace {module} {version} => {target}` to {}: {refusal}",
+            host.file_name()
+        ));
+    }
     let conflict = ws.host_conflict(host, project_root, module, version, &ours)?;
     Some(format!(
         "refusing to write `replace {module} {version} => {target}` to {}: it {}",

@@ -339,7 +339,8 @@ async fn edit_file(
 }
 
 /// [`edit_file`]'s read and transform: the new content, or `None` when it
-/// is unchanged.
+/// is unchanged. A change to a symlinked file is refused: the atomic
+/// rename would replace the link with a regular file.
 async fn plan_edit(
     path: &Path,
     transform: impl FnOnce(&str) -> Result<Option<String>, String>,
@@ -347,7 +348,22 @@ async fn plan_edit(
     let content = read_regular_to_string(path)
         .await
         .map_err(|e| format!("read {}: {e}", path.display()))?;
-    transform(&content)
+    let new = transform(&content)?;
+    if new.is_some() {
+        if let Some(refusal) = symlink_refusal(path).await {
+            return Err(refusal);
+        }
+    }
+    Ok(new)
+}
+
+/// Why `path` cannot be rewritten in place: it is a symbolic link.
+pub(crate) async fn symlink_refusal(path: &Path) -> Option<String> {
+    let linked = tokio::fs::symlink_metadata(path)
+        .await
+        .is_ok_and(|m| m.file_type().is_symlink());
+    let name = path.file_name()?.to_string_lossy();
+    linked.then(|| crate::hosted::engine::symlink_refusal(&name).message)
 }
 
 async fn write_go_file(path: &Path, new: &str) -> Result<(), String> {
@@ -1870,6 +1886,73 @@ replace (
     /// (a go.mod-less root, or a module another member lists), is read
     /// back from it, and drops out of it byte for byte; a module only the
     /// root lists stays in go.mod.
+    /// A symlinked go.work or go.mod is never rewritten: the atomic rename
+    /// would replace the link with a regular file. apply's pre-copy gate
+    /// refuses, and so does every write, dry run and removal included.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_symlinked_replace_host_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().join("ws");
+        for m in ["a", "b"] {
+            std::fs::create_dir_all(root.join(m)).unwrap();
+            std::fs::write(
+                root.join(m).join("go.mod"),
+                format!("module example.com/{m}\n\ngo 1.21\n\nrequire example.com/m v1.0.0\n"),
+            )
+            .unwrap();
+        }
+        let work = "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n";
+        let shared = dir.path().join("shared.go.work");
+        std::fs::write(&shared, work).unwrap();
+        std::os::unix::fs::symlink(&shared, root.join("go.work")).unwrap();
+        let is_link = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        };
+
+        let refusal = crate::vendor::go_consumer_sync::replace_refusal(
+            root,
+            "example.com/m",
+            "v1.0.0",
+            GO_PATCHES_DIR,
+        )
+        .await
+        .unwrap();
+        assert!(refusal.contains("symbolic link"), "{refusal}");
+        for dry_run in [true, false] {
+            let err =
+                ensure_replace_entry(root, "example.com/m", "v1.0.0", GO_PATCHES_DIR, dry_run)
+                    .await
+                    .unwrap_err();
+            assert!(err.contains("symbolic link"), "{err}");
+        }
+        assert!(is_link(&root.join("go.work")));
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), work);
+
+        // A symlinked go.mod holding our replace: removal refuses too.
+        std::fs::remove_file(root.join("go.work")).unwrap();
+        let go_mod = "module example.com/app\n\ngo 1.21\n\nrequire example.com/m v1.0.0\n\n\
+                      replace example.com/m v1.0.0 => ./.socket/go-patches/example.com/m@v1.0.0\n";
+        let real = dir.path().join("real.go.mod");
+        std::fs::write(&real, go_mod).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("go.mod")).unwrap();
+        let err = drop_replace_entry(root, "example.com/m", ReplaceOwner::GoPatches, false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(is_link(&root.join("go.mod")));
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), go_mod);
+        // Nothing to change: no error.
+        assert!(
+            !drop_replace_entry(root, "example.com/other", ReplaceOwner::GoPatches, false)
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn test_shared_module_replace_lives_in_go_work() {
         let dir = tempfile::tempdir().unwrap();
