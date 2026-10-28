@@ -1421,10 +1421,11 @@ fn hosted_pinned(env: &serde_json::Value) -> u64 {
 #[tokio::test(flavor = "multi_thread")]
 async fn takeover_over_unrewritable_spelling_keeps_vendored() {
     for (tag, spelling) in [
-        ("dotted", format!("{DEP}.version = \"1.0\"\n")),
-        ("literal", format!("{DEP} = '1.0'\n")),
-        // `registry = "crates-io"` (#386) and an inline table whose array
-        // wraps lines (#757) were cases here until hosted mode pinned them.
+        ("multi-line-literal", format!("{DEP} = '''1.0'''\n")),
+        ("multi-line-basic", format!("{DEP} = \"\"\"1.0\"\"\"\n")),
+        // `registry = "crates-io"` (#386), an inline table whose array
+        // wraps lines, dotted keys and a literal-string version (#757) were
+        // cases here until hosted mode pinned them.
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path()) else {
