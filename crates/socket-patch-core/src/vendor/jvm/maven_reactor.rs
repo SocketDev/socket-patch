@@ -1835,7 +1835,9 @@ fn has_fallback_repository(doc: &Doc) -> bool {
 /// `-Dk=v`, `-D k=v`, `--define=k=v` or `--define k=v`, or a bare `-D` /
 /// `--define` whose `k=v` is the next line. The value is the rest of the
 /// argument, so `-Dv=1.0 # note` defines `1.0 # note`, as in Maven.
-/// `-Dk` sets `k=true`; a later definition wins.
+/// `-Dk` sets `k=true`; a later definition wins. Maven before 3.9 splits
+/// the file on whitespace instead, so a `-Dk=v` token that only that reading
+/// finds (`-B -Dk=v` on one line) is kept too, unless a line defines `k`.
 fn cli_properties(config: &str) -> BTreeMap<String, String> {
     // Java's `String.trim`: every char up to U+0020, nothing beyond.
     fn trim(s: &str) -> &str {
@@ -1874,6 +1876,18 @@ fn cli_properties(config: &str) -> BTreeMap<String, String> {
             props.insert(k.to_string(), v.to_string());
         }
     }
+    let tokens = config
+        .lines()
+        .filter(|line| !trim(line).starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .filter_map(|t| t.strip_prefix("-D")?.split_once('='));
+    let mut legacy = BTreeMap::new();
+    for (k, v) in tokens {
+        if !k.is_empty() && !props.contains_key(k) {
+            legacy.insert(k.to_string(), v.to_string());
+        }
+    }
+    props.extend(legacy);
     props
 }
 
@@ -3773,6 +3787,9 @@ mod tests {
             "\"-Dct.version=1.11.0\"\n",
             // Maven 3.9+ reads the whole line as the value.
             "-Dct.version=1.10.0 # TODO bump\n",
+            // Maven before 3.9 splits a line into several arguments.
+            "-B -Dct.version=1.11.0\n",
+            "-Dfoo=1 -Dct.version=1.11.0\n",
         ] {
             let (plan, after, a) = vendor_with_maven_config(config);
             assert_eq!(
@@ -3807,7 +3824,7 @@ mod tests {
     fn maven_config_user_properties_parse_like_maven() {
         let props = cli_properties(
             "# -Dgone=1\n-Da=1\n--define=b=2\n-D c=3\n-D\nd=4\n--define e=5\n-Dflag\n  -Da=6  \n\
-             \"-Dq=7\"\n-Dv=1.0 # note\n-D\n-Dw=8\n--defined=x\n-B\n",
+             \"-Dq=7\"\n-Dv=1.0 # note\n-D\n-Dw=8\n--defined=x\n-B\n-T 1C -Dy=9 -Dw=0\n",
         );
         let want = [
             ("a", "6"),
@@ -3819,6 +3836,7 @@ mod tests {
             ("q", "7"),
             ("v", "1.0 # note"),
             ("w", "8"),
+            ("y", "9"),
         ];
         assert_eq!(
             props,
