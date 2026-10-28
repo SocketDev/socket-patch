@@ -187,7 +187,7 @@ pub async fn audit(
     for root in go_workspace::module_roots(project_root).await {
         found.extend(audit_module(&root, pristine_go_mods).await);
     }
-    found.extend(audit_work(project_root).await);
+    found.extend(audit_work(project_root, pristine_go_mods).await);
     for issue in found {
         if !issues.contains(&issue) {
             issues.push(issue);
@@ -197,8 +197,12 @@ pub async fn audit(
 }
 
 /// The Socket replaces in the `go.work` at the project root: `go work
-/// vendor` must record them in the workspace's `vendor/modules.txt`.
-async fn audit_work(project_root: &Path) -> Vec<GoSyncIssue> {
+/// vendor` must record them in the workspace's `vendor/modules.txt`, and
+/// the workspace's members must list what their patched copies require.
+async fn audit_work(
+    project_root: &Path,
+    pristine_go_mods: &HashMap<String, PathBuf>,
+) -> Vec<GoSyncIssue> {
     let Some(work) = go_workspace::root_work_file(project_root) else {
         return Vec::new();
     };
@@ -212,21 +216,55 @@ async fn audit_work(project_root: &Path) -> Vec<GoSyncIssue> {
     if replaces.is_empty() {
         return Vec::new();
     }
+    let work_dir = work.parent().unwrap_or(project_root);
+    let mut issues =
+        workspace_requirement_issues(project_root, work_dir, &replaces, pristine_go_mods).await;
     let (path, command) = modules_txt_location(project_root);
     let Ok(modules_txt) = read_regular_to_string(&path).await else {
-        return Vec::new();
+        return issues;
     };
     let recorded = recorded_replacements(&modules_txt);
-    replaces
-        .into_iter()
-        .filter(|e| !recorded.iter().any(|r| same_replacement(e, r, true)))
-        .map(|e| GoSyncIssue::VendorModulesTxt {
-            module: e.module,
-            modules_txt: display_rel(project_root, &path),
-            command,
-            stale: false,
-        })
-        .collect()
+    issues.extend(
+        replaces
+            .into_iter()
+            .filter(|e| !recorded.iter().any(|r| same_replacement(e, r, true)))
+            .map(|e| GoSyncIssue::VendorModulesTxt {
+                module: e.module,
+                modules_txt: display_rel(project_root, &path),
+                command,
+                stale: false,
+            }),
+    );
+    issues
+}
+
+/// [`requirement_issues`] for the Socket replaces a `go.work` holds. The
+/// workspace builds one module graph, so a requirement counts as listed at
+/// the highest version any member's `go.mod` lists it (MVS across members).
+async fn workspace_requirement_issues(
+    project_root: &Path,
+    work_dir: &Path,
+    replaces: &[ReplaceEntry],
+    pristine_go_mods: &HashMap<String, PathBuf>,
+) -> Vec<GoSyncIssue> {
+    let go_workspace::Loaded::Workspace(ws) = go_workspace::load(project_root).await else {
+        return Vec::new();
+    };
+    let mut listed: HashMap<String, String> = HashMap::new();
+    for member in &ws.members {
+        let Some(go_mod) = member.go_mod.as_deref() else {
+            continue;
+        };
+        for (dep, version) in requirements_of(go_mod) {
+            match listed.get(&dep) {
+                Some(max) if go_semver_cmp(max, &version).is_ge() => {}
+                _ => {
+                    listed.insert(dep, version);
+                }
+            }
+        }
+    }
+    requirement_issues_against(work_dir, &listed, replaces, pristine_go_mods).await
 }
 
 /// The `# module version => target` replacements a `modules.txt` records.
@@ -494,6 +532,17 @@ async fn requirement_issues(
 ) -> Vec<GoSyncIssue> {
     let consumer =
         go_mod_edit::parse_required_versions(&go_mod_edit::normalize_for_read(consumer_go_mod));
+    requirement_issues_against(project_root, &consumer, replaces, pristine_go_mods).await
+}
+
+/// [`requirement_issues`] against an already-parsed `consumer` requirement
+/// map. `base` is the directory the replaces' paths are relative to.
+async fn requirement_issues_against(
+    base: &Path,
+    consumer: &HashMap<String, String>,
+    replaces: &[ReplaceEntry],
+    pristine_go_mods: &HashMap<String, PathBuf>,
+) -> Vec<GoSyncIssue> {
     let mut issues = Vec::new();
     for entry in replaces.iter().filter(|e| e.socket_owned()) {
         // Only a directory copy socket-patch wrote can be read here: a
@@ -507,7 +556,7 @@ async fn requirement_issues(
         if !crate::patch::path_safety::is_safe_multi_segment(rel) {
             continue;
         }
-        let Ok(copy) = read_regular_to_string(&project_root.join(rel).join("go.mod")).await else {
+        let Ok(copy) = read_regular_to_string(&base.join(rel).join("go.mod")).await else {
             continue;
         };
         let patched = requirements_of(&copy);
@@ -954,5 +1003,59 @@ mod tests {
             ),
         );
         assert_eq!(audit(root, &pristine).await, vec![]);
+    }
+
+    /// #618 for a shared patch whose Socket `replace` lives in `go.work`:
+    /// the copy's raised requirement is checked against the workspace's
+    /// members, and listing it in any member satisfies the build list.
+    #[tokio::test]
+    async fn go_work_replace_requirements_must_be_in_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        write(
+            ws,
+            "go.work",
+            &format!("go 1.21\n\nuse (\n\t./a\n\t./b\n)\n{REPLACE}"),
+        );
+        for member in ["a", "b"] {
+            write(
+                ws,
+                &format!("{member}/go.mod"),
+                &format!(
+                    "module example.com/{member}\n\ngo 1.21\n\n\
+                     require example.com/upstream v1.0.0\n\n\
+                     require example.com/dep v1.0.0 // indirect\n"
+                ),
+            );
+        }
+        write(
+            ws,
+            &format!("{COPY}/go.mod"),
+            "module example.com/upstream\n\ngo 1.21\n\nrequire example.com/dep v1.1.0\n",
+        );
+        let requirements = |issues: Vec<GoSyncIssue>| {
+            issues
+                .into_iter()
+                .filter(|i| matches!(i, GoSyncIssue::Requirement { .. }))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            requirements(audit(ws, &HashMap::new()).await),
+            vec![GoSyncIssue::Requirement {
+                module: "example.com/upstream".into(),
+                dep: "example.com/dep".into(),
+                required: "v1.1.0".into(),
+                listed: Some("v1.0.0".into()),
+            }]
+        );
+
+        // One member listing the raised version lifts the whole workspace.
+        write(
+            ws,
+            "b/go.mod",
+            "module example.com/b\n\ngo 1.21\n\nrequire example.com/upstream v1.0.0\n\n\
+             require example.com/dep v1.1.0 // indirect\n",
+        );
+        assert_eq!(requirements(audit(ws, &HashMap::new()).await), vec![]);
     }
 }
