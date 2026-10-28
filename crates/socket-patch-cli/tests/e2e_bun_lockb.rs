@@ -216,6 +216,22 @@ fn scan(project: &Path, server: &MockServer, mode: &str, extra: &[&str]) -> Valu
     cli(project, &args)
 }
 
+/// How many patch-record views the mock API has served: a vendor eject
+/// reads each hosted pin's record through this endpoint.
+async fn record_views(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            r.url
+                .path()
+                .starts_with(&format!("/v0/orgs/{ORG}/patches/view/"))
+        })
+        .count()
+}
+
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -902,14 +918,16 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     // Hosted -> vendored: v5 ejects a hosted pin from its patch record and
     // the npm registry's upstream entry, neither of which an OFFLINE run can
     // fetch, so it is REFUSED up front (dry and wet alike, nothing written)
-    // with the re-run-online remedy. Online, the
-    // takeover rebuilds the binary registry record exactly and vendors over
-    // it; `vendor --revert` then gives back the original bytes. After that
+    // with the re-run-online remedy and no request at all. Online, the eject
+    // reads the pin's record from the patch API and vendors it in place of
+    // the hosted entry, recording the registry record exactly;
+    // `vendor --revert` then gives back the original bytes. After that
     // (equivalently, after `git checkout -- bun.lockb`) the offline vendor
     // proceeds, with a truthful dry run and exact rerun state.
     fixture.stage();
     let uri = server.uri();
     let before = snapshot(project);
+    let requests = server.received_requests().await.unwrap_or_default().len();
     for extra in [&["--dry-run"][..], &[][..]] {
         let mut args = vec!["vendor", "--offline", "--patch-server-url", &uri];
         args.extend_from_slice(extra);
@@ -933,6 +951,11 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
             before,
             "refused vendor {extra:?} wrote nothing"
         );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            requests,
+            "refused vendor {extra:?} made no request"
+        );
     }
     // The npm registry's version document for minimist@1.2.2 (the public
     // registry's values, which the original lock pins), served locally.
@@ -954,6 +977,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
             "integrity": integrity}})))
         .mount(&server)
         .await;
+    let views = record_views(&server).await;
     let taken_over = cli_env(
         project,
         &[
@@ -978,10 +1002,14 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     // An eject vendors the pin's own patch record in place of the hosted
     // entry; there is no separate takeover-revert step to report.
     assert!(
-        !taken_over["events"].as_array().is_some_and(|events| events
+        taken_over["events"].as_array().is_some_and(|events| !events
             .iter()
             .any(|e| e["errorCode"] == "vendor_takeover_reverted_redirect")),
         "the eject reports no takeover revert: {taken_over}"
+    );
+    assert!(
+        record_views(&server).await > views,
+        "the eject read the pin's record from the mock API: {taken_over}"
     );
     let vendor_lock = fixture.lock();
     assert!(
@@ -1121,8 +1149,8 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
 /// tarball. The hosted scan wires that record for the regular install
 /// (warning that the bundled copy stays unpatched); the pin it wrote must
 /// then be listed and unwound like any other: `list` succeeds, the online
-/// hosted → vendored takeover restores the registry record and vendors over
-/// it, and `vendor --revert` gives back the pre-hosted bytes exactly.
+/// hosted → vendored eject vendors the pin's patch record over it, and
+/// `vendor --revert` gives back the pre-hosted bytes exactly.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn binary_shared_bundled_record_hosted_pin_is_managed() {
@@ -1174,6 +1202,7 @@ async fn binary_shared_bundled_record_hosted_pin_is_managed() {
         .mount(&server)
         .await;
     fixture.stage();
+    let views = record_views(&server).await;
     let taken_over = cli_env(
         project,
         &[
@@ -1198,10 +1227,14 @@ async fn binary_shared_bundled_record_hosted_pin_is_managed() {
     // An eject vendors the pin's own patch record in place of the hosted
     // entry; there is no separate takeover-revert step to report.
     assert!(
-        !taken_over["events"].as_array().is_some_and(|events| events
+        taken_over["events"].as_array().is_some_and(|events| !events
             .iter()
             .any(|e| e["errorCode"] == "vendor_takeover_reverted_redirect")),
         "the eject reports no takeover revert: {taken_over}"
+    );
+    assert!(
+        record_views(&server).await > views,
+        "the eject read the pin's record from the mock API: {taken_over}"
     );
     assert!(
         !taken_over
