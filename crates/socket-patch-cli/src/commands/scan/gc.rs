@@ -82,10 +82,9 @@ impl GcSummary {
     /// instead of the pass reading as "no manifest, nothing to prune".
     fn manifest_unloadable(v: VendorGcSummary, manifest_path: &Path, e: &std::io::Error) -> Self {
         let mut gc = GcSummary::vendor_only(v);
-        let err = crate::json_envelope::manifest_load_error(manifest_path, e);
         gc.warnings.push((
             crate::json_envelope::manifest_load_error_code(e),
-            err.message,
+            crate::ui::manifest_error_message(manifest_path, e),
         ));
         gc
     }
@@ -247,8 +246,9 @@ pub(super) async fn run_apply_gc(
     // pristine checkout with neither a manifest nor a ledger must not gain
     // one. Either store alone is enough to proceed; the authoritative reads
     // happen under the lock.
-    // A manifest that cannot be stated is not absent (#998): the locked
-    // read below reports it.
+    // A manifest that cannot be stated is not absent (#998): the pass goes
+    // on and reports it, as the locked read's load error or, when
+    // `.socket/` itself is unusable, as the lock failure.
     let has_manifest = manifest_exists(manifest_path).await.unwrap_or(true);
     let has_ledger = tokio::fs::metadata(common.cwd.join(VENDOR_STATE_REL))
         .await

@@ -163,7 +163,9 @@ fn unreadable_manifest_is_manifest_unreadable_on_every_command() {
 /// #998: `.socket` is a plain file, so stating the manifest fails with
 /// ENOTDIR. That is unreadable, not missing: `apply` and `vendor` used to
 /// report `noManifest` and exit 0, the others `manifest_not_found`. Runs
-/// as root, unlike a `chmod 000` fixture.
+/// as root, unlike a `chmod 000` fixture. Unix only: Windows reports a
+/// path under a file as not found, so there it is no manifest.
+#[cfg(unix)]
 #[test]
 fn socket_dir_as_file_is_manifest_unreadable_on_every_command() {
     assert_matrix_in(

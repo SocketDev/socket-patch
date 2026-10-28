@@ -71,6 +71,10 @@ pub async fn run(args: RepairArgs) -> i32 {
         Ok(present) => present,
         Err(e) => {
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            // Recorded like the load failure in `repair_inner` (no client
+            // is built before this gate).
+            track_patch_repair_failed(&err.message, &TelemetryAuth::from_credentials(None, None))
+                .await;
             if args.common.json {
                 let env = error_envelope(
                     Command::Repair,
