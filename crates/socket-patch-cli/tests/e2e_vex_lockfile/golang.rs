@@ -505,6 +505,9 @@ fn write_go_replace(fx: &Fx, file: GoFile, rhs: &str, sum: Option<&str>) {
             if let Some(sum) = sum {
                 fx.put("go.work.sum", sum);
             }
+            // A workspace's selection is read from its module graph, which
+            // `go mod download` puts in the module cache.
+            fx.cache_go_mod(GO_MODULE, GO_VERSION);
         }
     }
 }
@@ -1040,6 +1043,26 @@ fn golang_workspace_without_its_module_graph_is_not_attested() {
     let fx = Fx::new();
     write_go_hosted(&fx, U, GoFile::GoMod);
     fx.put("go.work", "go 1.21\n\nuse .\n");
+    let run = fx.vex(&["--proxy-url", &api.uri()]);
+    assert_omitted(&run, GO_PURL, "go_version_not_selected", "empty cache");
+    fx.cache_go_mod(GO_MODULE, GO_VERSION);
+    let run = fx.vex(&["--proxy-url", &api.uri()]);
+    assert_attested(&fx, &run, GO_PURL, U, "redirected", "graph cached");
+}
+
+/// The same gate for a replace in go.work itself: it pins the whole
+/// workspace, so an unread module graph leaves it out too.
+#[test]
+fn golang_go_work_pin_without_its_module_graph_is_not_attested() {
+    let api = Api::start(vec![(U, go_view(U))]);
+    let fx = Fx::new();
+    let rhs = format!("{} {GO_SVER}", go_socket_module(U));
+    fx.put("go.mod", go_mod(GO_VERSION, None, false));
+    fx.put(
+        "go.work",
+        format!("go 1.21\n\nuse .\n\nreplace {GO_MODULE} {GO_VERSION} => {rhs}\n"),
+    );
+    fx.put("go.work.sum", go_sum_lines(U));
     let run = fx.vex(&["--proxy-url", &api.uri()]);
     assert_omitted(&run, GO_PURL, "go_version_not_selected", "empty cache");
     fx.cache_go_mod(GO_MODULE, GO_VERSION);
