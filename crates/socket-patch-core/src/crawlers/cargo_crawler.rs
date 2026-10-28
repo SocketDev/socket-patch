@@ -1116,10 +1116,13 @@ version = "fake"
     #[test]
     #[serial_test::serial]
     fn cargo_home_without_home_env_uses_passwd_home() {
-        let Some(passwd) = crate::crawlers::gradle_cache::passwd_home() else {
+        let Some(passwd) = crate::utils::fs::passwd_home() else {
             return;
         };
-        let got = crate::utils::cargo_home::without_home_env(CargoCrawler::cargo_home);
+        let got = {
+            let _env = crate::utils::cargo_home::NoHomeEnv::set();
+            CargoCrawler::cargo_home()
+        };
         assert_eq!(got, Some(passwd.join(".cargo")));
     }
 
