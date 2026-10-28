@@ -8,8 +8,12 @@
 //! (a go.work root without a module of its own), or the root go.work. Its
 //! sum lines live where go verifies them: beside a go.mod its go.sum, and
 //! in workspace mode `go.work.sum` (go writes there itself) and the
-//! members' go.sum files. The upstream pair goes back into each sum file
-//! that held the socket pair, else beside the directive.
+//! members' go.sum files. The upstream pair goes back into the go.sum
+//! beside a go.mod directive (its pin pruned it there); for a go.work
+//! directive, which prunes nothing, only when no sum file holds it, into
+//! each that held the socket pair, else go.work.sum. A go.work.sum left
+//! empty is removed: nothing records whether it existed before the pin,
+//! and go never writes an empty one, so the pin almost always created it.
 //!
 //! A directive the hosted run took over from the user (a pre-existing
 //! `replace` it superseded) is not recorded anywhere, so the restore always
@@ -23,7 +27,7 @@ use crate::vendor::go_mod_edit::{
     hosted_module_uuid, normalize_for_read, parse_replace_entries, parse_use_dirs,
     remove_replace_entry, ReplaceOwner,
 };
-use crate::vendor::go_sum_edit::{reinsert_lines, remove_module_prefix_lines};
+use crate::vendor::go_sum_edit::{go_sum_lines, reinsert_lines, remove_module_prefix_lines};
 use crate::vendor::go_workspace::in_root_dir;
 
 const GO_WORK: &str = "go.work";
@@ -99,6 +103,9 @@ pub(crate) async fn restore(
     if hits.is_empty() {
         return result;
     }
+    // go.work last: the members' go.sum then hold what their own pins'
+    // restores put back.
+    hits.sort_by_key(|h| h.file == GO_WORK);
     let keys: BTreeSet<(String, String)> = hits
         .iter()
         .map(|h| (h.module.clone(), h.version.clone()))
@@ -177,7 +184,18 @@ pub(crate) async fn restore(
                 held.push(sum.clone());
             }
         }
-        let targets = if held.is_empty() {
+        // A go.mod pin pruned the pair from the go.sum beside it, which alone
+        // needs it back (go.work.sum only held the socket pair for workspace
+        // builds). A go.work pin prunes nothing: the members' go.sum keep the
+        // pair for module-mode builds.
+        let targets = if hit.file != GO_WORK {
+            vec![candidates[0].clone()]
+        } else if candidates.iter().any(|sum| {
+            matches!(sum_texts.get(sum), Some(Some(text)) if go_sum_lines(text)
+                .any(|l| l.zip_version_of(&hit.module) == Some(hit.version.as_str())))
+        }) {
+            Vec::new()
+        } else if held.is_empty() {
             let own = candidates[0].clone();
             let existing = candidates
                 .iter()
@@ -205,7 +223,13 @@ pub(crate) async fn restore(
         let Some(text) = text else {
             continue;
         };
-        if view.read(&file).await.ok().flatten().as_deref() != Some(text.as_str()) {
+        if view.read(&file).await.ok().flatten().as_deref() == Some(text.as_str()) {
+            continue;
+        }
+        // go never writes an empty go.work.sum: the pin created it.
+        if file == GO_WORK_SUM && text.is_empty() {
+            view.remove(&file);
+        } else {
             view.write(&file, text);
         }
     }

@@ -93,8 +93,9 @@
 //!   is unknown ([`DIAG_REF_UNATTRIBUTABLE`]). A versioned replace for the
 //!   same `M@<required>` in the same file takes precedence in Go, so the
 //!   version-less one is then inert too.
-//! * **`go.work`** (hand-written — no Socket tool writes it) uses the same
-//!   `replace` grammar and paths relative to the (root) workspace dir; its
+//! * **`go.work`** (where every mode replaces a module the workspace
+//!   shares) uses the same `replace` grammar and paths relative to the
+//!   (root) workspace dir; its
 //!   refs are emitted with `source_file = "go.work"`, and hosted pins looked
 //!   up in the sum files above. Versions are checked against the root
 //!   `go.mod`'s `require` in module mode, and in workspace mode against the

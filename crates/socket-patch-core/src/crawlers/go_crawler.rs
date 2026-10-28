@@ -83,7 +83,8 @@ impl GoCrawler {
     /// directory directly.
     ///
     /// In local mode, only returns the cache path if the cwd contains a
-    /// `go.mod` or `go.sum` file (i.e., is a Go project).
+    /// `go.mod` or `go.sum` file, or the `go.work` in effect (i.e., is a Go
+    /// project).
     pub async fn get_module_cache_paths(
         &self,
         options: &CrawlerOptions,
@@ -103,7 +104,10 @@ impl GoCrawler {
             .await
             .is_ok();
 
-        if has_go_mod || has_go_sum {
+        // A go.work root with no module of its own builds its members.
+        let has_go_work = crate::vendor::go_workspace::root_work_file(&options.cwd).is_some();
+
+        if has_go_mod || has_go_sum || has_go_work {
             return Ok(Self::get_gomodcache().map_or_else(Vec::new, |p| vec![p]));
         }
 

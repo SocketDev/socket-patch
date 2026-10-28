@@ -1508,10 +1508,40 @@ it and attests nothing. `vex` reads only the project's own `go.work`: when
 and reports each as `patched_ref_invalid`.
 
 In workspace mode go reads `replace` directives from `go.work` and from the
-`go.mod` of each module it `use`s. socket-patch writes its `replace` into a
-module's own `go.mod` and first checks how the workspace treats it (Go 1.26
-precedence). A member `go.mod` replace does nothing, or breaks the build,
-when:
+`go.mod` of each module it `use`s. Run in the directory holding `go.work`,
+`apply`, `vendor` and `scan --mode hosted` write the `replace` of a module
+the workspace shares into `go.work`, as `go work edit -replace` would: when
+that directory has no `go.mod` of its own (the usual layout), when another
+`use` member lists the module (requires it, or for a go < 1.17 member has its
+zip line in `go.sum`), or when `go.work` already holds a Socket replace of it.
+The last two need `go.work` to `use` that directory's own module: for one it
+doesn't use, a `go.work` replace would patch the members and never the
+module, so the `go.mod` replace is refused (below). A replace onto a
+`.socket/` copy that `go.mod` holds from before another member listed the
+module moves into `go.work` the next time `apply` or `vendor` writes it (a
+`vendor` takeover then deletes the `.socket/go-patches/` copy no file names
+any more); a hosted pin there stays, its sum lines beside it, and in
+workspace mode the `go.work` replace overrides it.
+One `go.work` replace applies to every member. Member replaces of one
+project-local copy would not: go resolves each against its own member
+directory, sees two targets and refuses the workspace. The target is
+relative to the `go.work` directory, where the copy lives
+(`./.socket/go-patches/…` for `apply`, `./.socket/vendor/golang/<uuid>/…` for
+`vendor`). A hosted pin is version-specific (`replace M v =>
+patch.socket.dev/gopatch/<uuid> <sver>`) and its two sum lines go into
+`go.work.sum`; the members' `go.mod` and `go.sum` are left as they are, so
+their upstream sum lines stay for a `GOWORK=off` build. A `go.work` replace
+does nothing for a build that doesn't read that `go.work` (`GOWORK=off`, or a
+member copied out of the workspace): such a build links the upstream module,
+and `vex` under `GOWORK=off` doesn't attest it.
+
+Before writing a `go.work` replace socket-patch refuses one that would not do
+what it says: `go.work` already replaces that version of the module (or every
+version) with something else, or a member's own `replace` of it would be
+overridden for every member. Run elsewhere, socket-patch writes its `replace`
+into the module's own `go.mod` and first checks how the workspace treats it
+(Go 1.26 precedence). A member `go.mod` replace does nothing, or breaks the
+build, when:
 
 - `go.work` replaces the same version of the module, or every version
   (`replace M => …`). go reads that replace before any member's, so the build
@@ -1521,7 +1551,8 @@ when:
 - another `use` member already replaces the same `module@version` with a
   different target, so go refuses the workspace ("conflicting replacements").
   A hosted replace names the same Socket module in every member and doesn't
-  conflict;
+  conflict. Run socket-patch in the directory holding `go.work` instead,
+  which replaces the module once there;
 - another `use` member replaces every version of the module
   (`replace M => …`) with a different target. Depending on the `use` order,
   go then links that target or refuses the workspace.
@@ -1531,9 +1562,7 @@ say which case applies (hosted: `redirect_golang_workspace_conflict`, nothing
 written and the patch not reported redirected). A replace written before the
 `go.work` changed is reported as `go_workspace_replace_ineffective` by
 `apply`, `vendor` and `scan --mode hosted`, fails `apply --check` and
-`vendor --check`, and `vex` leaves the patch out (`go_workspace_override`). To
-patch the whole workspace, apply in one member it uses, or move the Socket
-`replace` into `go.work`.
+`vendor --check`, and `vex` leaves the patch out (`go_workspace_override`).
 
 The build list of a workspace is the union of every `use` member's
 requirements, so another member can require a higher version of the patched
@@ -1560,17 +1589,21 @@ A module that is itself a `use` member (a local checkout of a dependency,
 it. `apply`, `vendor` and `scan --mode hosted` refuse to replace it and say
 so; patch the checkout itself instead.
 
-A `go.work` root without a `go.mod` of its own (the usual layout) works from
-the root for `scan --mode hosted`, `vex`, `list` and `rollback`: hosted mode
-writes the pin into the `go.mod` and `go.sum` of each in-root member that lists
-the module (into all of them or none: when one member refuses, the others'
-edits are undone), discovery reads each in-root member's `go.mod`, and `rollback`
-removes the pins and puts the upstream sum lines back. `apply` and `vendor`
-write a project-local copy with a path relative to one module, so from such a
-root they refuse and name the members to run them in. `rollback` also removes
-a hosted pin from `go.work` itself, strips the Socket module's lines from
-`go.work.sum` (where go writes sum lines in workspace mode), and puts the
-upstream pair back in the sum file that held the Socket one.
+Every mode records and discovers what it wrote in `go.work`: `apply --check`,
+`vendor --check`, `list` and `vex` read the `go.work` replaces (`vex` with
+source `go.work`, hosted pins checked against `go.work.sum`), `remove` and
+`vendor --revert` drop the replace from `go.work` byte for byte (the vendored
+ledger records the wiring file as `go.work`), and `rollback` of a hosted pin
+removes the `go.work` replace and the Socket lines of `go.work.sum`, deletes a
+`go.work.sum` those lines leave empty (hosted mode keeps no record of whether
+the file existed before the pin; go never writes an empty one, so only a
+`go.work.sum` you created empty yourself is lost), and puts the upstream pair back only
+where no sum file still holds it (a member's `go.mod` pin rolled back with it
+gets the pair back in that member's `go.sum`, as every `go.mod` pin does). A committed workspace `vendor/` directory
+needs `go work vendor` after any of these
+(`go_vendor_modules_txt_out_of_sync`). Discovery also reads each in-root
+member's `go.mod` at a `go.work` root without one of its own (pins an older
+release wrote there), and `rollback` removes those too.
 
 A `replace` names an exact module version, so it only works while the build
 selects that version. socket-patch reads which version that is from `go.mod`

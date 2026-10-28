@@ -958,11 +958,20 @@ async fn generate_vex(
             let socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::Workspace {
                 module,
                 version,
-                ..
+                conflict,
             } = &issue
             else {
                 continue;
             };
+            // Socket's own go.work replace overriding a leftover member pin
+            // is what the build links; it passes its own selection gate
+            // below, like any go.work replace.
+            if matches!(
+                conflict,
+                socket_patch_core::vendor::go_workspace::WorkspaceConflict::WorkHosted { .. }
+            ) {
+                continue;
+            }
             // PurlKey, not string equality: go.mod spells `+incompatible`
             // with a literal `+`, the manifest key with `%2B` (#484). Report
             // each omission under the record's own spelling.
@@ -993,7 +1002,14 @@ async fn generate_vex(
         use socket_patch_core::utils::purl_key::PurlKey;
         use socket_patch_core::vendor::go_build_list::{project_selection, Selection};
         let mut entries = Vec::new();
-        for root in socket_patch_core::vendor::go_workspace::module_roots(&common.cwd).await {
+        let mut roots = socket_patch_core::vendor::go_workspace::module_roots(&common.cwd).await;
+        // A go.work root's own replaces live in its go.work.
+        if !roots.contains(&common.cwd)
+            && socket_patch_core::vendor::go_workspace::root_work_file(&common.cwd).is_some()
+        {
+            roots.push(common.cwd.clone());
+        }
+        for root in roots {
             for entry in socket_patch_core::vendor::go_mod_edit::read_replace_entries(&root).await {
                 entries.push((root.clone(), entry));
             }
