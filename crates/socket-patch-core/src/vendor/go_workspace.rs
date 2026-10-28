@@ -5,16 +5,18 @@
 //!   unset, empty or `auto` searches the project directory and its
 //!   ancestors; any other value must be an absolute path to the file, and a
 //!   relative one makes go fail (`invalid GOWORK: not an absolute path`).
-//! * **What the build selects** ([`GoWorkspace::selection`]): MVS runs over
-//!   the requirements of every `use` member, so another member can raise a
-//!   module above the version a socket replace is pinned to. Each member's
-//!   go.mod adds its `require`s and its go.sum (and `go.work.sum`) the zip
-//!   lines a pre-1.17 graph is read from. go keeps no member's go.mod tidy
-//!   in workspace mode, so a member's dependency can raise the module past
-//!   every `require`; the zip line go writes for the version it builds is
-//!   the only trace, and one above the patched version proves it inert. A
-//!   member whose go.mod could not be read otherwise leaves the answer
-//!   [`Selection::Unknown`].
+//! * **What the build selects** ([`GoWorkspace::selection`]): MVS over the
+//!   module graph go loads ([`GoWorkspace::read_graph`]): every `use`
+//!   member's `require`s, the `require`s in each of those modules' go.mod,
+//!   and below any go.mod older than go 1.17 its whole requirement graph.
+//!   go keeps no member's go.mod tidy in workspace mode, so a dependency's
+//!   requirement can raise a module past every member's `require`, and
+//!   only the dependencies' go.mod files show it. They are read from a
+//!   replacement directory or the module cache; until each is there the
+//!   answer is [`Selection::Unknown`] unless a version above the patched
+//!   one already shows. Sum files are no evidence: go only ever appends to
+//!   `go.work.sum`, and a member's go.sum may be stale. A module that is
+//!   itself a `use` member is built from that directory, at no version.
 //! * **Which replace wins** ([`GoWorkspace::conflict`]): go.work's replace
 //!   for this exact version, else its version-less one, overrides every
 //!   member's; otherwise each member's replace (its exact one, else its
@@ -22,15 +24,16 @@
 //!   replacing one `module@version` with different targets make go link
 //!   one of them or refuse to build, depending on the `use` order.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::utils::fs::read_regular_to_string;
 
-use super::go_build_list::{self, Selection};
+use super::go_build_list::Selection;
 use super::go_mod_edit::{self, ReplaceEntry};
-use super::go_sum_edit::{go_semver_cmp, go_sum_lines};
+use super::go_sum_edit::go_semver_cmp;
 
 /// Which `go.work` go uses for a project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +87,20 @@ pub struct GoWorkspace {
     pub work_sum: Option<String>,
     /// The `use` members, in go.work order.
     pub members: Vec<Member>,
+    /// The go.mod of each dependency go loads to build the module graph,
+    /// keyed `path@version` (`None`: neither a replacement directory nor
+    /// the module cache has it); `None` until [`GoWorkspace::read_graph`].
+    #[serde(default)]
+    pub graph: Option<BTreeMap<String, Option<DepGoMod>>>,
+}
+
+/// What MVS reads from a dependency's go.mod.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepGoMod {
+    /// go 1.17 or later: its own dependencies' requirements are not loaded.
+    pub pruned: bool,
+    /// Its `require`s, `(path, version)`.
+    pub requires: Vec<(String, String)>,
 }
 
 /// One `use` member of a [`GoWorkspace`].
@@ -168,6 +185,7 @@ async fn load_file(work_file: PathBuf) -> Loaded {
         work: text,
         work_sum,
         members,
+        graph: None,
     })
 }
 
@@ -195,6 +213,9 @@ pub enum WorkspaceConflict {
         member: String,
         target: String,
     },
+    /// The module is itself a `use` member (`member`): go builds it from
+    /// that directory and ignores every replace of it.
+    MainModule { work_file: String, member: String },
     /// The project is a go.work root with no module of its own: a replace
     /// belongs in a member's go.mod (`members`, comma-separated).
     NoModule { work_file: String, members: String },
@@ -239,6 +260,11 @@ impl WorkspaceConflict {
                  replacements\"), depending on the `use` order; remove that replace, or keep \
                  one replace for the whole workspace in {work_file}"
             ),
+            WorkspaceConflict::MainModule { work_file, member } => format!(
+                "has no effect: {member} is a module of the {work_file} workspace, so go \
+                 builds {module} from that directory and ignores every replace of it; patch \
+                 the source in {member}, or drop it from the `use` list of {work_file}"
+            ),
             WorkspaceConflict::NoModule { work_file, members } => format!(
                 "has nowhere to go: this directory holds {work_file} but no go.mod of its \
                  own; run socket-patch in the workspace member that requires {module} \
@@ -282,59 +308,138 @@ impl GoWorkspace {
             .collect()
     }
 
+    /// The `use` member whose go.mod declares `module`: go builds that
+    /// module from the member directory (a main module, at no version) and
+    /// ignores every replace of it.
+    pub fn main_module(&self, module: &str) -> Option<&Member> {
+        self.members.iter().find(|m| {
+            m.go_mod
+                .as_deref()
+                .and_then(go_mod_edit::module_path)
+                .is_some_and(|path| path == module)
+        })
+    }
+
     /// Which version of `module` the workspace build selects, against the
-    /// patched `version`: [`go_build_list::select`] over the union of every
-    /// member's requirements and the zip lines of their go.sum files and
-    /// go.work.sum, with a zip line above `version` outranking every
-    /// `require` (go builds a dependency's higher requirement without
-    /// tidying any member). [`Selection::Unknown`] when no such zip line
-    /// settles it and a member's go.mod is unread, or there are no members.
+    /// patched `version`: the highest any member or any go.mod of the
+    /// module graph ([`GoWorkspace::read_graph`]) requires. A version above
+    /// `version` settles it; otherwise the answer needs every member's
+    /// go.mod and every dependency go.mod go loads, and is
+    /// [`Selection::Unknown`] without them. A module that is a `use` member
+    /// is built from its directory, never at `version`.
     pub fn selection(&self, module: &str, version: &str) -> Selection {
-        let mut zips: Vec<String> = Vec::new();
-        for text in self
-            .members
-            .iter()
-            .filter_map(|m| m.go_sum.as_deref())
-            .chain(self.work_sum.as_deref())
-        {
-            zips.extend(
-                go_sum_lines(text)
-                    .filter_map(|l| l.zip_version_of(module))
-                    .map(str::to_string),
-            );
+        if let Some(member) = self.main_module(module) {
+            return Selection::Other(format!(
+                "(the workspace module in {})",
+                display_path(self.work_dir(), &member.dir)
+            ));
         }
-        let raised = zips
-            .iter()
-            .filter(|z| go_semver_cmp(z, version).is_gt())
-            .max_by(|a, b| go_semver_cmp(a, b))
-            .cloned();
-        let unproven = || raised.clone().map_or(Selection::Unknown, Selection::Other);
-        if self.members.is_empty() {
-            return unproven();
-        }
-        let mut pruned = true;
-        let mut required: Option<String> = None;
+        let mut complete = !self.members.is_empty() && self.graph.is_some();
+        let mut versions: Vec<String> = Vec::new();
         for member in &self.members {
             let Some(go_mod) = member.go_mod.as_deref() else {
-                return unproven();
+                complete = false;
+                continue;
             };
-            pruned &= go_mod_edit::prunes_module_graph(go_mod);
-            if let Some(r) = go_mod_edit::parse_required_versions(go_mod).remove(module) {
-                if required
-                    .as_deref()
-                    .is_none_or(|cur| go_semver_cmp(&r, cur).is_gt())
-                {
-                    required = Some(r);
+            for (path, v) in go_mod_edit::parse_required_versions(go_mod) {
+                let key = format!("{path}@{v}");
+                if v != "none" && self.graph.as_ref().is_none_or(|g| !g.contains_key(&key)) {
+                    complete = false;
+                }
+                if path == module {
+                    versions.push(v);
                 }
             }
         }
-        let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        let selected = go_build_list::select(pruned, required.as_deref(), &zips, version);
-        match (raised, &selected) {
-            (Some(zip), Selection::Other(other)) if go_semver_cmp(other, &zip).is_ge() => selected,
-            (Some(zip), _) => Selection::Other(zip),
-            (None, _) => selected,
+        for dep in self.graph.iter().flat_map(BTreeMap::values) {
+            match dep {
+                Some(dep) => versions.extend(
+                    dep.requires
+                        .iter()
+                        .filter(|(path, _)| path == module)
+                        .map(|(_, v)| v.clone()),
+                ),
+                None => complete = false,
+            }
         }
+        let highest = versions.into_iter().max_by(|a, b| go_semver_cmp(a, b));
+        match highest {
+            Some(h) if go_semver_cmp(&h, version).is_gt() => Selection::Other(h),
+            _ if !complete => Selection::Unknown,
+            Some(h) if h == version => Selection::Selected,
+            Some(h) => Selection::Other(h),
+            None => Selection::NotInGraph,
+        }
+    }
+
+    /// Read the go.mod of every dependency go loads to build this
+    /// workspace's module graph (Go 1.26 `readModGraph`): each member
+    /// requirement's, and below a go.mod older than go 1.17 (no graph
+    /// pruning) each of its requirements' in turn. A dependency's go.mod
+    /// comes from its replacement (go.work's, else a member's): a
+    /// directory's go.mod, or the replacing version's in the module cache.
+    /// A Socket replace keeps the replaced module's requirements, so its
+    /// go.mod falls back to the original's in the module cache.
+    pub async fn read_graph(&mut self) {
+        let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
+        self.read_graph_from(cache.as_deref()).await;
+    }
+
+    /// [`GoWorkspace::read_graph`] against the module cache `cache`.
+    pub async fn read_graph_from(&mut self, cache: Option<&Path>) {
+        let replaces = self.replace_sources();
+        let mut graph: BTreeMap<String, Option<DepGoMod>> = BTreeMap::new();
+        let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
+        let mut queue: VecDeque<(String, String, bool)> = self
+            .members
+            .iter()
+            .filter_map(|m| m.go_mod.as_deref())
+            .flat_map(go_mod_edit::parse_required_versions)
+            .map(|(path, v)| (path, v, false))
+            .collect();
+        while let Some((path, version, unpruned)) = queue.pop_front() {
+            let key = format!("{path}@{version}");
+            if version == "none" || !seen.insert((key.clone(), unpruned)) {
+                continue;
+            }
+            if !graph.contains_key(&key) {
+                let dep = read_dep_go_mod(&replaces, cache, &path, &version).await;
+                graph.insert(key.clone(), dep);
+            }
+            let Some(Some(dep)) = graph.get(&key) else {
+                continue;
+            };
+            if unpruned || !dep.pruned {
+                for (p, v) in &dep.requires {
+                    queue.push_back((p.clone(), v.clone(), true));
+                }
+            }
+        }
+        self.graph = Some(graph);
+    }
+
+    /// Every replace of the workspace with the directory its relative
+    /// path resolves against, in go's precedence: go.work's, then the
+    /// members'.
+    fn replace_sources(&self) -> [Vec<(ReplaceEntry, PathBuf)>; 2] {
+        let work = self
+            .replaces()
+            .into_iter()
+            .map(|e| (e, self.work_dir().to_path_buf()))
+            .collect();
+        let members = self
+            .members
+            .iter()
+            .flat_map(|m| {
+                m.go_mod
+                    .as_deref()
+                    .map(go_mod_edit::parse_replace_entries)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| (e, m.dir.clone()))
+            })
+            .collect();
+        [work, members]
     }
 
     /// Whether this workspace keeps the replace `ours` of `module@version`
@@ -348,6 +453,12 @@ impl GoWorkspace {
         ours: &ReplaceEntry,
     ) -> Option<WorkspaceConflict> {
         let display = display_path(project_root, &self.work_file);
+        if let Some(member) = self.main_module(module) {
+            return Some(WorkspaceConflict::MainModule {
+                work_file: display,
+                member: display_path(project_root, &member.dir),
+            });
+        }
         let own = self.member_at(project_root);
         let our_target = lexical_target(own.map_or(project_root, |m| &m.dir), ours);
 
@@ -458,6 +569,74 @@ impl Loaded {
             }),
         }
     }
+}
+
+/// The replace go applies to `path@version`: go.work's for this version,
+/// else its version-less one, else a member's the same way.
+fn replacement_of<'a>(
+    sources: &'a [Vec<(ReplaceEntry, PathBuf)>; 2],
+    path: &str,
+    version: &str,
+) -> Option<&'a (ReplaceEntry, PathBuf)> {
+    sources.iter().find_map(|replaces| {
+        let of = |e: &ReplaceEntry| e.module == path;
+        replaces
+            .iter()
+            .find(|(e, _)| of(e) && e.version.as_deref() == Some(version))
+            .or_else(|| replaces.iter().find(|(e, _)| of(e) && e.version.is_none()))
+    })
+}
+
+/// The go.mod go reads for the dependency `path@version` (see
+/// [`GoWorkspace::read_graph`]).
+async fn read_dep_go_mod(
+    sources: &[Vec<(ReplaceEntry, PathBuf)>; 2],
+    cache: Option<&Path>,
+    path: &str,
+    version: &str,
+) -> Option<DepGoMod> {
+    let cached = |path: &str, version: &str| {
+        cache.map(|cache| {
+            cache
+                .join("cache/download")
+                .join(crate::crawlers::go_crawler::encode_module_path(path))
+                .join("@v")
+                .join(format!(
+                    "{}.mod",
+                    crate::crawlers::go_crawler::encode_module_path(version)
+                ))
+        })
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    match replacement_of(sources, path, version) {
+        Some((entry, dir)) => {
+            match (&entry.path, &entry.rhs_module, &entry.rhs_version) {
+                (Some(rel), _, _) => {
+                    candidates.push(dir.join(rel.replace('\\', "/")).join("go.mod"))
+                }
+                (None, Some(m), Some(v)) => candidates.extend(cached(m, v)),
+                _ => {}
+            }
+            if entry.socket_owned() {
+                candidates.extend(cached(path, version));
+            }
+        }
+        None => candidates.extend(cached(path, version)),
+    }
+    for file in candidates {
+        if let Ok(text) = read_regular_to_string(&file).await {
+            let text = go_mod_edit::normalize_for_read(&text);
+            let mut requires: Vec<(String, String)> = go_mod_edit::parse_required_versions(&text)
+                .into_iter()
+                .collect();
+            requires.sort();
+            return Some(DepGoMod {
+                pruned: go_mod_edit::prunes_module_graph(&text),
+                requires,
+            });
+        }
+    }
+    None
 }
 
 /// The directories whose go.mod a Go command run at `root` operates on:
@@ -626,14 +805,35 @@ mod tests {
 
     /// MVS runs over every member's requirements: another member raising
     /// the module makes a replace pinned to the lower version inert.
+    /// The workspace with its module graph read from the module cache
+    /// `cache`.
+    async fn graphed(root: &Path, cache: &Path) -> GoWorkspace {
+        let mut ws = workspace(root).await;
+        ws.read_graph_from(Some(cache)).await;
+        ws
+    }
+
+    /// A dependency's go.mod in the module cache.
+    fn cached(cache: &Path, path: &str, version: &str, go: &str, requires: &str) {
+        write(
+            cache,
+            &format!("cache/download/{path}/@v/{version}.mod"),
+            &format!("module {path}\n\ngo {go}\n{requires}"),
+        );
+    }
+
     #[tokio::test]
     async fn selection_spans_every_member() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        let root = &tmp.path().join("ws");
+        let cache = &tmp.path().join("cache");
+        for v in ["v1.0.0", "v1.1.0"] {
+            cached(cache, DEP, v, "1.21", "");
+        }
         write(root, "go.work", "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n");
         member(root, "a", "1.21", &require("v1.0.0"));
         member(root, "b", "1.21", &require("v1.1.0"));
-        let ws = workspace(&root.join("a")).await;
+        let ws = graphed(&root.join("a"), cache).await;
         assert_eq!(
             ws.selection(DEP, "v1.0.0"),
             Selection::Other("v1.1.0".into())
@@ -641,70 +841,161 @@ mod tests {
         assert_eq!(ws.selection(DEP, "v1.1.0"), Selection::Selected);
 
         member(root, "b", "1.21", "");
-        let ws = workspace(root).await;
+        let ws = graphed(root, cache).await;
         assert_eq!(ws.selection(DEP, "v1.0.0"), Selection::Selected);
         assert_eq!(
             ws.selection("example.com/other", "v1.0.0"),
             Selection::NotInGraph
         );
-
-        // A go 1.16 member's go.sum zip line shows what it builds.
-        member(root, "b", "1.16", &require("v0.9.0"));
-        write(root, "b/go.sum", &format!("{DEP} v1.2.0 h1:x=\n"));
+        // Without the module graph nothing is proven, but a higher member
+        // requirement still is.
         assert_eq!(
             workspace(root).await.selection(DEP, "v1.0.0"),
-            Selection::Other("v1.2.0".into())
+            Selection::Unknown
         );
-        std::fs::remove_file(root.join("b/go.sum")).unwrap();
-        write(root, "go.work.sum", &format!("{DEP} v1.2.0 h1:x=\n"));
+        member(root, "b", "1.21", &require("v1.1.0"));
         assert_eq!(
             workspace(root).await.selection(DEP, "v1.0.0"),
-            Selection::Other("v1.2.0".into())
+            Selection::Other("v1.1.0".into())
         );
 
-        // go tidies no member in workspace mode: a go 1.17+ member's
-        // dependency raises the module past every `require`, and only the
-        // zip line go writes for the version it builds shows it.
-        member(root, "b", "1.21", "\nrequire example.com/mid v1.0.0\n");
-        assert_eq!(
-            workspace(root).await.selection(DEP, "v1.0.0"),
-            Selection::Other("v1.2.0".into())
-        );
-        std::fs::remove_file(root.join("go.work.sum")).unwrap();
-        write(root, "b/go.sum", &format!("{DEP} v1.2.0 h1:x=\n"));
-        assert_eq!(
-            workspace(root).await.selection(DEP, "v1.0.0"),
-            Selection::Other("v1.2.0".into())
-        );
-        // A lower zip line, or a higher `/go.mod` line MVS only read, is not.
-        write(
-            root,
-            "b/go.sum",
-            &format!("{DEP} v0.9.0 h1:x=\n{DEP} v1.2.0/go.mod h1:x=\n"),
-        );
-        assert_eq!(
-            workspace(root).await.selection(DEP, "v1.0.0"),
-            Selection::Selected
-        );
-
-        // An unreadable member (or one out of reach) proves nothing, unless
-        // a higher zip line does.
+        // An unreadable member (or one out of reach) proves nothing.
         std::fs::remove_file(root.join("b/go.mod")).unwrap();
         assert_eq!(
-            workspace(root).await.selection(DEP, "v1.0.0"),
+            graphed(root, cache).await.selection(DEP, "v1.0.0"),
             Selection::Unknown
         );
-        write(root, "go.work.sum", &format!("{DEP} v1.2.0 h1:x=\n"));
-        assert_eq!(
-            workspace(root).await.selection(DEP, "v1.0.0"),
-            Selection::Other("v1.2.0".into())
-        );
-        std::fs::remove_file(root.join("go.work.sum")).unwrap();
         write(root, "go.work", "go 1.22\n");
         assert_eq!(
-            workspace(root).await.selection(DEP, "v1.0.0"),
+            graphed(root, cache).await.selection(DEP, "v1.0.0"),
             Selection::Unknown
         );
+    }
+
+    /// go tidies no member in workspace mode: a member's dependency raises
+    /// the module past every `require`, which only that dependency's go.mod
+    /// shows. Until the module cache holds it the selection is unknown.
+    #[tokio::test]
+    async fn a_dependency_go_mod_raises_the_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("ws");
+        let cache = &tmp.path().join("cache");
+        write(root, "go.work", "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n");
+        member(root, "a", "1.21", &require("v1.0.0"));
+        member(root, "b", "1.21", "\nrequire example.com/mid v1.0.0\n");
+        cached(cache, DEP, "v1.0.0", "1.21", "");
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.0.0"),
+            Selection::Unknown
+        );
+        cached(
+            cache,
+            "example.com/mid",
+            "v1.0.0",
+            "1.21",
+            &format!("\nrequire {DEP} v1.1.0\n"),
+        );
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.0.0"),
+            Selection::Other("v1.1.0".into())
+        );
+
+        // A pruned (go 1.17+) dependency's own dependencies are not loaded;
+        // below a go 1.16 one, the whole graph is.
+        cached(
+            cache,
+            "example.com/mid",
+            "v1.0.0",
+            "1.21",
+            "\nrequire example.com/leaf v1.0.0\n",
+        );
+        cached(
+            cache,
+            "example.com/leaf",
+            "v1.0.0",
+            "1.21",
+            &format!("\nrequire {DEP} v1.3.0\n"),
+        );
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.0.0"),
+            Selection::Selected
+        );
+        cached(
+            cache,
+            "example.com/mid",
+            "v1.0.0",
+            "1.16",
+            "\nrequire example.com/leaf v1.0.0\n",
+        );
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.0.0"),
+            Selection::Other("v1.3.0".into())
+        );
+
+        // A replaced dependency's go.mod comes from its replacement.
+        member(
+            root,
+            "b",
+            "1.21",
+            "\nrequire example.com/mid v1.0.0\n\nreplace example.com/mid => ../fork\n",
+        );
+        write(
+            root,
+            "fork/go.mod",
+            &format!("module example.com/mid\n\ngo 1.21\n\nrequire {DEP} v1.4.0\n"),
+        );
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.0.0"),
+            Selection::Other("v1.4.0".into())
+        );
+    }
+
+    /// go only ever appends to go.work.sum (and a member's go.sum may be
+    /// stale): a zip line of a version nothing requires any more does not
+    /// make the build select it.
+    #[tokio::test]
+    async fn sum_files_are_no_evidence_of_the_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("ws");
+        let cache = &tmp.path().join("cache");
+        cached(cache, DEP, "v1.0.0", "1.21", "");
+        write(root, "go.work", "go 1.22\n\nuse (\n\t./a\n\t./b\n)\n");
+        member(root, "a", "1.21", &require("v1.0.0"));
+        member(root, "b", "1.21", "");
+        write(root, "go.work.sum", &format!("{DEP} v1.1.0 h1:x=\n"));
+        write(root, "b/go.sum", &format!("{DEP} v1.2.0 h1:x=\n"));
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.0.0"),
+            Selection::Selected
+        );
+    }
+
+    /// A module that is itself a `use` member is built from its directory:
+    /// no version of it is ever selected, and every replace of it is
+    /// ignored.
+    #[tokio::test]
+    async fn a_workspace_module_is_never_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("ws");
+        let cache = &tmp.path().join("cache");
+        cached(cache, DEP, "v1.0.0", "1.21", "");
+        write(root, "go.work", "go 1.22\n\nuse (\n\t./a\n\t./dep\n)\n");
+        member(root, "a", "1.21", &require("v1.0.0"));
+        write(root, "dep/go.mod", &format!("module {DEP}\n\ngo 1.21\n"));
+        let ws = graphed(root, cache).await;
+        assert!(matches!(
+            ws.selection(DEP, "v1.0.0"),
+            Selection::Other(v) if v.contains("dep")
+        ));
+        let ours = replace(&format!(
+            "{DEP} v1.0.0 => ./.socket/go-patches/{DEP}@v1.0.0"
+        ));
+        match ws.conflict(&root.join("a"), DEP, "v1.0.0", &ours) {
+            Some(c @ WorkspaceConflict::MainModule { .. }) => {
+                assert!(c.consequence(DEP, "v1.0.0").contains("ws/dep"), "{c:?}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// Go 1.26 `replacementFrom`: go.work's replace of this version, then

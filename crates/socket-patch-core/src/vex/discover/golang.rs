@@ -46,14 +46,16 @@
 //!   version it reads and does not select, so a `/go.mod`-only pin whose
 //!   version the main modules' `require`s or go.sum show is not selected
 //!   ([`go_build_list::select`]) is inert: diagnosed, no ref. With a
-//!   `go.work` the build list is the union of every `use` member's
-//!   requirements ([`GoWorkspace::selection`]): a pin of either kind whose
-//!   replaced version another member's `require`, or a sum file's zip
-//!   line, shows raised is inert. go keeps no member's go.mod tidy in
-//!   workspace mode and writes missing sums to `go.work.sum` itself, so a
-//!   dependency's requirement can raise the version past everything
-//!   discovery reads: there a `/go.mod`-only pin is never the basis
-//!   (`integrity_required = true`). Anything else — no `/go.mod` line, two
+//!   `go.work` the build list is MVS over every `use` member's module
+//!   graph ([`GoWorkspace::selection`], with the dependencies' go.mod files
+//!   read from the module cache when the root is on disk): a pin of either
+//!   kind whose replaced version a member's or a dependency's `require`
+//!   raises, or that is itself a `use` member, is inert. Sum files are no
+//!   evidence there (go only appends to `go.work.sum`), and without the
+//!   dependencies' go.mod files nothing read shows a dependency did not
+//!   raise it, so a `/go.mod`-only pin is never the basis
+//!   (`integrity_required = true`); the CLI's selection gate withholds
+//!   what the module graph does not prove. Anything else — no `/go.mod` line, two
 //!   different hashes for one line, a non-dirhash `h1:` (both a go
 //!   `SECURITY ERROR`), a line of other than three tokens anywhere in a
 //!   sum file (go rejects the whole file) — is not a pin:
@@ -357,13 +359,24 @@ async fn read_workspace(
         });
     }
     let work_sum = ctx.read_text(GO_WORK_SUM, out).await;
+    let mut model = GoWorkspace {
+        work_file: GO_WORK.into(),
+        work: go_work.to_string(),
+        work_sum,
+        members,
+        graph: None,
+    };
+    if let Some(root) = ctx.disk_root() {
+        let mut on_disk = model.clone();
+        on_disk.work_file = root.join(GO_WORK);
+        for member in &mut on_disk.members {
+            member.dir = root.join(&member.dir);
+        }
+        on_disk.read_graph().await;
+        model.graph = on_disk.graph;
+    }
     Workspace {
-        model: GoWorkspace {
-            work_file: GO_WORK.into(),
-            work: go_work.to_string(),
-            work_sum,
-            members,
-        },
+        model,
         in_root,
         sum_files,
     }
@@ -1093,9 +1106,10 @@ mod tests {
     /// A workspace builds the union of its members' requirements, and a
     /// member's dependency can raise the module past every `require` while
     /// go writes the missing sums to `go.work.sum` itself: a `/go.mod`-only
-    /// pin there is never the basis, and a higher `require` or member
-    /// go.sum zip line makes it inert. A `go.work.sum` zip line does not:
-    /// go never drops one once nothing raises the module any more.
+    /// pin there is never the basis, and a higher `require` makes it
+    /// inert. A sum file's zip line does not: go never drops one from
+    /// `go.work.sum` once nothing raises the module any more, and a
+    /// member's go.sum may be as stale.
     #[tokio::test]
     async fn workspace_go_mod_only_pin_is_never_the_basis() {
         let m = gopatch(UUID_A);
@@ -1159,7 +1173,7 @@ mod tests {
                 Some(svc("1.21", mid)),
                 Some(zip("v1.5.0")),
                 None,
-                true,
+                false,
             ),
             (
                 "member requires a higher version",
@@ -1175,7 +1189,7 @@ mod tests {
                 Some(svc("1.16", &req("v1.4.1"))),
                 Some(zip("v1.5.0")),
                 None,
-                true,
+                false,
             ),
             (
                 "only a higher /go.mod line",

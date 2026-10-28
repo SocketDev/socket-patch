@@ -163,6 +163,34 @@ fn publish_module(tmp: &Path, mod_path: &str, ver: &str, gomod: &str, lib: &str)
     assert!(status.success(), "zip {mod_path}@{ver}");
 }
 
+/// `go mod download` each `(path, version)` into `machine`'s module cache
+/// from a scratch module, as an earlier build would have: socket-patch
+/// reads a workspace's module graph from the go.mod files there.
+fn warm(tmp: &Path, machine: &Machine, proxy: &str, mods: &[(&str, &str)]) {
+    let dir = tmp.join(format!("warm-{}", unique()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("go.mod"), "module example.com/warm\n\ngo 1.18\n").unwrap();
+    let mut args = vec!["mod".to_string(), "download".to_string()];
+    args.extend(mods.iter().map(|(m, v)| format!("{m}@{v}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = go(
+        &dir,
+        machine,
+        &args,
+        &[
+            ("GOPROXY", proxy),
+            ("GOSUMDB", "off"),
+            ("GOFLAGS", "-mod=mod"),
+            ("GOWORK", "off"),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "warm {mods:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The go.sum `(zip h1, go.mod h1)` of `mod_path@ver` (trusted build side).
 fn harvest(tmp: &Path, proxy: &str, mod_path: &str, ver: &str) -> (String, String) {
     let dir = tmp.join("harvest").join(mod_path.replace('/', "_"));
@@ -652,6 +680,7 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
     let api = GrantApi::start(&ws.proxy, &smod, &zip_h1, &mod_h1);
 
     let m1 = Machine::new(tmp.path(), "get");
+    warm(tmp.path(), &m1, &ws.proxy, &[(UMOD, UVER)]);
     let (code, env, stderr) = socket(
         root,
         &[
@@ -851,6 +880,7 @@ fn go_work_root_without_go_mod_hosted_pins_members_and_rolls_back() {
     assert!(out.contains("A: PRISTINE"), "baseline: {out}");
 
     let m = Machine::new(tmp.path(), "get");
+    warm(tmp.path(), &m, &w.proxy, &[(UMOD, UVER)]);
     let (code, env, stderr) = w.api.get(&w.root, &m.modcache, &[]);
     assert_eq!(code, 0, "{env}\n{stderr}");
     assert_eq!(env["summary"]["applied"], 1, "{env}");
@@ -1094,6 +1124,7 @@ fn hosted_gate_follows_go_work_precedence() {
     let a_mod = read(&w.root.join("a/go.mod"));
     let b_mod = read(&b.join("go.mod"));
     let m = Machine::new(tmp.path(), "gate");
+    warm(tmp.path(), &m, &w.proxy, &[(UMOD, UVER)]);
 
     for (label, work_extra, a_extra) in [
         (
@@ -1197,10 +1228,10 @@ fn hosted_gate_follows_go_work_precedence() {
 
 /// go keeps no member's go.mod tidy in workspace mode: `b` requires `x`,
 /// which requires `UMOD` v1.1.0, so the workspace builds v1.1.0 although
-/// every member requires v1.0.0, and only the zip line go writes to
-/// `go.work.sum` shows it. Discovery from the go.work root then calls `a`'s
-/// hosted pin inert, with its zip line or (tidied) without, and so does
-/// the selection `vex` gates on from `a`.
+/// every member requires v1.0.0, and only x's go.mod shows it. Until the
+/// module cache holds it nothing proves the selection and hosted pins
+/// nothing; then hosted refuses, and a pin written in module mode is inert
+/// in the workspace, with its zip line or (tidied) without.
 #[test]
 fn dependency_raise_makes_a_workspace_pin_inert() {
     if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
@@ -1208,8 +1239,7 @@ fn dependency_raise_makes_a_workspace_pin_inert() {
     {
         return;
     }
-    use socket_patch_core::vendor::go_build_list::{project_selection, Selection};
-    use socket_patch_core::vex::discover::discover_patched_refs;
+    use socket_patch_core::vendor::go_build_list::Selection;
     let tmp = tempfile::tempdir().unwrap();
     let _guard = ChmodGuard(tmp.path().to_path_buf());
     let w = stage_members(tmp.path(), UVER, UVER);
@@ -1242,43 +1272,49 @@ fn dependency_raise_makes_a_workspace_pin_inert() {
     )
     .unwrap();
 
-    // Before any build has written go.work.sum, nothing read shows the
-    // raise: hosted pins `a`.
+    // The module cache holds none of the graph yet: nothing proves which
+    // version the workspace builds, so hosted pins nothing.
     let m = Machine::new(tmp.path(), "raise");
+    let a_files = (read(&a.join("go.mod")), read(&a.join("go.sum")));
     let (code, out, stderr) = w.api.get(&a, &m.modcache, &[]);
     assert_eq!(code, 0, "{out}\n{stderr}");
-    assert_eq!(out["summary"]["applied"], 1, "{out}");
+    assert_eq!(out["summary"]["applied"], 0, "{out}");
+    assert!(
+        warning_codes(&out).contains(&"redirect_golang_not_in_module_graph".to_string()),
+        "{out}"
+    );
+    assert_eq!((read(&a.join("go.mod")), read(&a.join("go.sum"))), a_files);
 
+    // With x's go.mod in the cache (any earlier build puts it there) the
+    // raise shows before go.work.sum records anything: hosted refuses.
+    warm(tmp.path(), &m, &w.proxy, &[(UMOD, UVER), (xmod, UVER)]);
+    let (code, out, stderr) = w.api.get(&a, &m.modcache, &[]);
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    assert_eq!(out["summary"]["applied"], 0, "{out}");
+    assert!(
+        warning_codes(&out).contains(&"redirect_golang_version_mismatch".to_string()),
+        "{out}"
+    );
+    assert!(!w.root.join("go.work.sum").exists());
+
+    // A pin written in module mode (`GOWORK=off`, where `a` builds v1.0.0)
+    // is inert in the workspace, which builds v1.1.0.
+    let (code, out, stderr) = w.api.get(&a, &m.modcache, &[("GOWORK", "off")]);
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    assert_eq!(out["summary"]["applied"], 1, "{out}");
     let (stdout, err) = run_member(tmp.path(), &w.root, "a", &w.proxy, &[("GOSUMDB", "off")]);
     assert!(stdout.contains("A: PRISTINE-NEXT"), "{stdout}\n{err}");
-    let work_sum = read(&w.root.join("go.work.sum"));
-    assert!(
-        work_sum.contains(&format!("{UMOD} {NEXT} {}", next.0)),
-        "go records the zip of the version it builds: {work_sum}"
-    );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let inert = |label: &str| {
-        let out = rt.block_on(discover_patched_refs(&w.root));
-        assert!(
-            !out.refs.iter().any(|r| r.purl == UPURL),
-            "{label}: {:?}",
-            out.refs
-        );
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|d| d.detail.contains("is inert") && d.detail.contains(NEXT)),
-            "{label}: {:?}",
-            out.diagnostics
-        );
-        assert_eq!(
-            rt.block_on(project_selection(&a, UMOD, UVER)),
-            Some(Selection::Other(NEXT.to_string())),
-            "{label}"
-        );
+    let selection = || {
+        use socket_patch_core::vendor::go_workspace::{load, Loaded};
+        let Loaded::Workspace(mut ws) = rt.block_on(load(&a)) else {
+            panic!("no workspace");
+        };
+        rt.block_on(ws.read_graph_from(Some(&m.modcache)));
+        ws.selection(UMOD, UVER)
     };
-    inert("zip pin");
+    assert_eq!(selection(), Selection::Other(NEXT.to_string()), "zip pin");
     let zip_line = format!("{} {SVER} ", w.smod);
     let tidied: String = read(&a.join("go.sum"))
         .lines()
@@ -1286,5 +1322,143 @@ fn dependency_raise_makes_a_workspace_pin_inert() {
         .map(|l| format!("{l}\n"))
         .collect();
     std::fs::write(a.join("go.sum"), tidied).unwrap();
-    inert("/go.mod-only pin");
+    assert_eq!(
+        selection(),
+        Selection::Other(NEXT.to_string()),
+        "/go.mod-only pin"
+    );
+}
+
+/// go only ever appends to `go.work.sum`: once `b` stops requiring `x`
+/// (which raised `UMOD` to v1.1.0), the workspace builds v1.0.0 again but
+/// the v1.1.0 zip line stays. That stale line is no evidence: hosted pins
+/// `a`, which builds the patched copy.
+#[test]
+fn a_stale_go_work_sum_line_does_not_refuse_a_pin() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, UVER);
+    let xmod = "example.com/x";
+    publish_module(
+        tmp.path(),
+        xmod,
+        UVER,
+        &format!("module {xmod}\n\ngo 1.18\n\nrequire {UMOD} {NEXT}\n"),
+        &format!(
+            "package x\n\nimport \"{UMOD}\"\n\nfunc Greeting() string {{ return upstream.Greeting() }}\n"
+        ),
+    );
+    let x = harvest(tmp.path(), &w.proxy, xmod, UVER);
+    let next = harvest(tmp.path(), &w.proxy, UMOD, NEXT);
+    let (a, b) = (w.root.join("a"), w.root.join("b"));
+    let (b_mod, b_sum) = (read(&b.join("go.mod")), read(&b.join("go.sum")));
+    std::fs::write(
+        b.join("go.mod"),
+        format!("{b_mod}\nrequire {xmod} {UVER}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("go.sum"),
+        format!(
+            "{b_sum}{xmod} {UVER} {}\n{xmod} {UVER}/go.mod {}\n{UMOD} {NEXT}/go.mod {}\n",
+            x.0, x.1, next.1
+        ),
+    )
+    .unwrap();
+    let (stdout, err) = run_member(tmp.path(), &w.root, "a", &w.proxy, &[("GOSUMDB", "off")]);
+    assert!(stdout.contains("A: PRISTINE-NEXT"), "{stdout}\n{err}");
+    let stale = format!("{UMOD} {NEXT} {}", next.0);
+    assert!(read(&w.root.join("go.work.sum")).contains(&stale));
+
+    std::fs::write(b.join("go.mod"), &b_mod).unwrap();
+    std::fs::write(b.join("go.sum"), &b_sum).unwrap();
+    let m = Machine::new(tmp.path(), "stale");
+    let list = go(&a, &m, &["list", "-m", UMOD], &day2(&w.proxy));
+    assert_eq!(
+        String::from_utf8_lossy(&list.stdout).trim(),
+        format!("{UMOD} {UVER}"),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(read(&w.root.join("go.work.sum")).contains(&stale));
+
+    warm(tmp.path(), &m, &w.proxy, &[(UMOD, UVER)]);
+    let (code, out, stderr) = w.api.get(&a, &m.modcache, &[]);
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    assert_eq!(out["summary"]["applied"], 1, "{out}");
+    let (stdout, err) = run_member(tmp.path(), &w.root, "a", &w.proxy, &[]);
+    assert!(stdout.contains("A: PATCHED"), "{stdout}\n{err}");
+}
+
+/// A local checkout of the patched module that the workspace `use`s is a
+/// main module: go builds it from that directory, at no version, and
+/// ignores every replace of it. Hosted mode refuses to pin it, and the
+/// selection never claims the patched version.
+#[test]
+fn a_workspace_module_is_never_replaced() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    use socket_patch_core::vendor::go_build_list::Selection;
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, UVER);
+    let a = w.root.join("a");
+    let dep = w.root.join("dep");
+    std::fs::create_dir_all(&dep).unwrap();
+    std::fs::write(dep.join("go.mod"), format!("module {UMOD}\n\ngo 1.18\n")).unwrap();
+    std::fs::write(
+        dep.join("lib.go"),
+        "package upstream\n\nfunc Greeting() string { return \"LOCAL\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        w.root.join("go.work"),
+        "go 1.18\n\nuse (\n\t./a\n\t./b\n\t./dep\n)\n",
+    )
+    .unwrap();
+    let m = Machine::new(tmp.path(), "main");
+    warm(tmp.path(), &m, &w.proxy, &[(UMOD, UVER)]);
+    let a_mod = read(&a.join("go.mod"));
+
+    let (code, out, stderr) = w.api.get(&a, &m.modcache, &[]);
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    assert_eq!(out["summary"]["applied"], 0, "{out}");
+    assert!(
+        warning_codes(&out).contains(&"redirect_golang_workspace_conflict".to_string()),
+        "{out}"
+    );
+    assert_eq!(read(&a.join("go.mod")), a_mod);
+
+    // A pin written in module mode does nothing in the workspace.
+    let (code, out, stderr) = w.api.get(&a, &m.modcache, &[("GOWORK", "off")]);
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    assert_eq!(out["summary"]["applied"], 1, "{out}");
+    let (stdout, err) = run_member(tmp.path(), &w.root, "a", &w.proxy, &[]);
+    assert!(stdout.contains("A: LOCAL"), "{stdout}\n{err}");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    use socket_patch_core::vendor::go_workspace::{load, Loaded};
+    let Loaded::Workspace(mut ws) = rt.block_on(load(&a)) else {
+        panic!("no workspace");
+    };
+    rt.block_on(ws.read_graph_from(Some(&m.modcache)));
+    assert!(
+        matches!(ws.selection(UMOD, UVER), Selection::Other(v) if v.contains("dep")),
+        "{:?}",
+        ws.selection(UMOD, UVER)
+    );
+    let ours = socket_patch_core::vendor::go_mod_edit::read_replace_entries(&a);
+    let ours = rt.block_on(ours);
+    let ours = ours.iter().find(|e| e.module == UMOD).unwrap();
+    assert!(matches!(
+        ws.conflict(&a, UMOD, UVER, ours),
+        Some(socket_patch_core::vendor::go_workspace::WorkspaceConflict::MainModule { .. })
+    ));
 }

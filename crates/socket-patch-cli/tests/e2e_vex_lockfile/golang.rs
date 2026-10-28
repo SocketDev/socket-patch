@@ -121,6 +121,17 @@ impl Fx {
         put(&self.cwd, rel, bytes.as_ref());
     }
 
+    /// Put `module@version`'s go.mod in the module cache, as `go mod
+    /// download` would: a workspace's selection is read from its module
+    /// graph there.
+    fn cache_go_mod(&self, module: &str, version: &str) {
+        put(
+            &self.gomodcache,
+            &format!("cache/download/{module}/@v/{version}.mod"),
+            format!("module {module}\n\ngo 1.21\n").as_bytes(),
+        );
+    }
+
     fn rm(&self, rel: &str) {
         let path = self.cwd.join(rel);
         if path.is_dir() {
@@ -998,6 +1009,7 @@ fn golang_go_mod_and_go_work_disagreeing_attest_neither() {
 
     let fx = Fx::new();
     write_go_hosted(&fx, U, GoFile::GoMod);
+    fx.cache_go_mod(GO_MODULE, GO_VERSION);
     fx.put(
         "go.work",
         format!(
@@ -1014,6 +1026,24 @@ fn golang_go_mod_and_go_work_disagreeing_attest_neither() {
         "redirected",
         "same patch in both files",
     );
+}
+
+/// In a go.work workspace a dependency's go.mod can raise the patched
+/// module past every member's `require`, so the selection is read from the
+/// module graph in the module cache. A fresh clone before `go mod
+/// download` has none of it: nothing proves the replace is the one go
+/// builds, and `vex` leaves the patch out until the cache holds the graph.
+#[test]
+fn golang_workspace_without_its_module_graph_is_not_attested() {
+    let api = Api::start(vec![(U, go_view(U))]);
+    let fx = Fx::new();
+    write_go_hosted(&fx, U, GoFile::GoMod);
+    fx.put("go.work", "go 1.21\n\nuse .\n");
+    let run = fx.vex(&["--proxy-url", &api.uri()]);
+    assert_omitted(&run, GO_PURL, "go_version_not_selected", "empty cache");
+    fx.cache_go_mod(GO_MODULE, GO_VERSION);
+    let run = fx.vex(&["--proxy-url", &api.uri()]);
+    assert_attested(&fx, &run, GO_PURL, U, "redirected", "graph cached");
 }
 
 /// A hand-written go.work replace whose pin lines stayed in the root
@@ -1042,6 +1072,7 @@ fn golang_member_module_wiring_attests_from_its_own_root_only() {
         let fx = Fx::new();
         fx.put("go.mod", "module example.com/app\n\ngo 1.21\n");
         fx.put("go.work", "go 1.21\n\nuse (\n\t.\n\t./tools\n)\n");
+        fx.cache_go_mod(GO_MODULE, GO_VERSION);
         let member = fx.cwd.join("tools");
         let rhs = if vendored {
             let rel = go_artifact(U);

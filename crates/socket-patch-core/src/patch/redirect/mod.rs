@@ -9586,12 +9586,21 @@ fn rewrite_golang_target(
             result,
             RewriteWarning {
                 code: "redirect_golang_not_in_module_graph".into(),
-                detail: format!(
-                    "{fname}@{}: neither go.mod's require nor a go.sum zip line shows the \
-                 build selecting this version — it is not in this project's build graph; \
-                 nothing redirected",
-                    dep.version
-                ),
+                detail: if in_workspace && selection == go_build_list::Selection::Unknown {
+                    format!(
+                        "{fname}@{}: nothing shows the go.work workspace building this \
+                         version — a go.mod its module graph needs is not in the module \
+                         cache (`go mod download` fetches it); nothing redirected",
+                        dep.version
+                    )
+                } else {
+                    format!(
+                        "{fname}@{}: neither go.mod's require nor a go.sum zip line shows \
+                         the build selecting this version — it is not in this project's \
+                         build graph; nothing redirected",
+                        dep.version
+                    )
+                },
             },
             shared,
         );
@@ -23405,6 +23414,21 @@ packages:
                         go_sum: None,
                     })
                     .collect(),
+                graph: Some(
+                    members
+                        .iter()
+                        .flat_map(|(_, go_mod)| {
+                            crate::vendor::go_mod_edit::parse_required_versions(go_mod)
+                        })
+                        .map(|(path, v)| {
+                            let leaf = crate::vendor::go_workspace::DepGoMod {
+                                pruned: true,
+                                requires: Vec::new(),
+                            };
+                            (format!("{path}@{v}"), Some(leaf))
+                        })
+                        .collect(),
+                ),
             }),
         };
         (
@@ -23555,6 +23579,7 @@ packages:
                     member("b", Some(&b)),
                     member("../out", None),
                 ],
+                graph: None,
             }),
         };
         files.insert(

@@ -178,7 +178,7 @@ impl GoCrawler {
     /// Each setting resolves as go resolves it: the environment, then the
     /// `go env -w` file ([`crate::utils::go_env`]), so a cache configured
     /// with `go env -w GOMODCACHE=…` is the one crawled (#344).
-    fn get_gomodcache() -> Option<PathBuf> {
+    pub(crate) fn get_gomodcache() -> Option<PathBuf> {
         if let Some(cache) = crate::utils::go_env::go_env("GOMODCACHE") {
             return Some(PathBuf::from(cache));
         }

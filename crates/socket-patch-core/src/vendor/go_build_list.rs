@@ -8,8 +8,10 @@
 //! instead of keeping its own go.mod/go.sum heuristic (#391, #392, #509).
 //!
 //! The answer comes from the project's `go.mod` and `go.sum` only (no
-//! toolchain, no network), so it works on a fresh clone in CI; in workspace
-//! mode from every `use` member's (see [`super::go_workspace`]):
+//! toolchain, no network), so it works on a fresh clone in CI. In workspace
+//! mode it is MVS over the module graph instead, which also needs the
+//! dependencies' go.mod files from the module cache (see
+//! [`super::go_workspace`]). In module mode:
 //!
 //! * **go ≥ 1.17** (pruned graph): `require` lists the selected version of
 //!   every module that provides a package to the build, so it is
@@ -107,20 +109,23 @@ pub fn select(pruned: bool, required: Option<&str>, zips: &[&str], version: &str
 }
 
 /// [`selection`] for a project directory. In workspace mode the build
-/// list spans every `use` member's requirements, so the answer is the
-/// workspace's ([`super::go_workspace::GoWorkspace::selection`]), unknown
-/// when go refuses the workspace. Otherwise it reads `<project_root>/go.mod`
+/// list spans every `use` member's module graph, so the answer is the
+/// workspace's ([`super::go_workspace::GoWorkspace::selection`] after
+/// [`super::go_workspace::GoWorkspace::read_graph`]), unknown when go
+/// refuses the workspace. Otherwise it reads `<project_root>/go.mod`
 /// and `go.sum` (`None` when there is no readable go.mod).
 pub async fn project_selection(
     project_root: &Path,
     module: &str,
     version: &str,
 ) -> Option<Selection> {
-    if let Some(sel) = super::go_workspace::load(project_root)
-        .await
-        .selection(module, version)
-    {
-        return Some(sel);
+    match super::go_workspace::load(project_root).await {
+        super::go_workspace::Loaded::Workspace(mut ws) => {
+            ws.read_graph().await;
+            return Some(ws.selection(module, version));
+        }
+        super::go_workspace::Loaded::Invalid(_) => return Some(Selection::Unknown),
+        super::go_workspace::Loaded::None => {}
     }
     let go_mod = read_regular_to_string(&project_root.join("go.mod"))
         .await

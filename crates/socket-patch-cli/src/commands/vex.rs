@@ -986,7 +986,8 @@ async fn generate_vex(
     // vendored or hosted) pinned to a version the build list does not select
     // is inert, and the build links the unpatched module however intact the
     // copy or pin (#391, #392, #509). go.mod + go.sum say which version the
-    // build selects; never attest a patch for another one.
+    // build selects, and in a go.work workspace the module graph; never
+    // attest a patch for another one, nor one a workspace may not select.
     if !common.is_global() {
         use socket_patch_core::utils::purl::build_golang_purl;
         use socket_patch_core::utils::purl_key::PurlKey;
@@ -1005,10 +1006,25 @@ async fn generate_vex(
             if !outcome.applied.iter().any(|p| PurlKey::new(p) == wanted) {
                 continue;
             }
-            let Some(Selection::Other(selected)) =
-                project_selection(&root, &entry.module, version).await
-            else {
-                continue;
+            let why = match project_selection(&root, &entry.module, version).await {
+                Some(Selection::Other(selected)) => format!(
+                    "the build selects {} {selected}, so the replace pinned to {version} is \
+                     ignored and the build links the unpatched module",
+                    entry.module
+                ),
+                Some(Selection::Unknown)
+                    if socket_patch_core::vendor::go_workspace::resolve(&root)
+                        != socket_patch_core::vendor::go_workspace::GoWork::None =>
+                {
+                    format!(
+                        "the go.work workspace may build another version of {}: the go.mod \
+                         of a module its build graph needs is in neither a replacement \
+                         directory nor the module cache (`go mod download` fetches it), so \
+                         nothing shows the replace pinned to {version} is the one go uses",
+                        entry.module
+                    )
+                }
+                _ => continue,
             };
             // Report each omission under the record's own spelling (`%2B`
             // for `+incompatible`, #484), not go.mod's.
@@ -1022,11 +1038,7 @@ async fn generate_vex(
                     warnings,
                     common,
                     GO_VERSION_NOT_SELECTED,
-                    format!(
-                        "{purl}: the build selects {} {selected}, so the replace pinned to \
-                         {version} is ignored and the build links the unpatched module",
-                        entry.module
-                    ),
+                    format!("{purl}: {why}"),
                 );
                 outcome.failed.push(FailedPatch {
                     purl,
@@ -2023,8 +2035,9 @@ fn omission_phrase(reason: &str) -> &'static str {
              running it until it is rebuilt"
         }
         GO_VERSION_NOT_SELECTED => {
-            "go.mod and go.sum show the build selects another version of the module, so its \
-             version-pinned replace is ignored and the build links the unpatched module"
+            "go.mod and go.sum show the build selects another version of the module (or, in \
+             a go.work workspace, cannot show it selects the patched one), so its \
+             version-pinned replace may be ignored and the build link the unpatched module"
         }
         WIRING_CONFLICT => {
             "the lockfiles wire this package to different patches, so which one the build \

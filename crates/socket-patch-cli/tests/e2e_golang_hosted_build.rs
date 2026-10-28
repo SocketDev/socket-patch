@@ -1046,9 +1046,9 @@ async fn workspace_member_selecting_another_version_never_attests() {
 /// A go.work member's dependency requires a higher version of the patched
 /// module than any member's go.mod names. go builds that version without
 /// asking for a go.mod update and writes its sums to `go.work.sum` itself,
-/// so the `/go.mod`-only pin is never the attestation basis, before or
-/// after the build. The higher zip line go then records proves nothing on
-/// its own: go never drops it once the requirement is gone.
+/// so the `/go.mod`-only pin is never the attestation basis, and once the
+/// dependency's go.mod is in the module cache the replace is diagnosed
+/// inert.
 // #[serial]: see the capstone's note — env mutation vs env iteration.
 #[tokio::test]
 #[serial_test::serial]
@@ -1151,8 +1151,19 @@ async fn workspace_transitive_raise_never_attests() {
         "{work_sum}"
     );
 
+    std::env::set_var("GOMODCACHE", &machine.modcache);
     let discovery = socket_patch_core::vex::discover::discover_patched_refs(&app).await;
-    let refs: Vec<_> = discovery.refs.iter().filter(|r| r.purl == purl).collect();
-    assert_eq!(refs.len(), 1, "{:?}", discovery.refs);
-    assert!(!refs[0].lockfile_basis_ok(), "{:?}", refs[0]);
+    std::env::remove_var("GOMODCACHE");
+    assert!(
+        !discovery.refs.iter().any(|r| r.purl == purl),
+        "{:?}",
+        discovery.refs
+    );
+    assert!(
+        discovery.diagnostics.iter().any(|d| d
+            .detail
+            .contains(&format!("is inert: the build selects {NEXT}"))),
+        "{:?}",
+        discovery.diagnostics
+    );
 }

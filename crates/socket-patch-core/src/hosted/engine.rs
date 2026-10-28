@@ -533,6 +533,7 @@ async fn read_go_workspace(
                 work,
                 work_sum,
                 members,
+                graph: None,
             };
             (std::path::PathBuf::new(), Loaded::Workspace(ws))
         }
@@ -541,7 +542,10 @@ async fn read_go_workspace(
                 return;
             };
             let root = root.to_path_buf();
-            let loaded = go_workspace::load(&root).await;
+            let mut loaded = go_workspace::load(&root).await;
+            if let Loaded::Workspace(ws) = &mut loaded {
+                ws.read_graph().await;
+            }
             let mut touched: Vec<std::path::PathBuf> =
                 root.ancestors().map(|dir| dir.join("go.work")).collect();
             if let Loaded::Workspace(ws) = &loaded {

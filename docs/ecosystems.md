@@ -1535,17 +1535,26 @@ The build list of a workspace is the union of every `use` member's
 requirements, so another member can require a higher version of the patched
 module and make a replace pinned to the lower one inert. go doesn't keep
 member `go.mod` files tidy in workspace mode, so a member's dependency can
-raise the module too, with no member's `require` showing it. Which version
-the workspace selects is read from each member's `go.mod`, and from the zip
-lines of their `go.sum` files and `go.work.sum`, where go records the
-version it builds: a zip line above the patched version makes the replace
-inert even when every member requires the patched one. When a member's
-`go.mod` can't be read and no such zip line settles it, the answer is
-unknown: hosted mode then writes nothing
-(`redirect_golang_not_in_module_graph`). Because nothing socket-patch reads
-proves which version a workspace builds, `vex` never attests a hosted pin in
-a workspace from its `/go.mod` go.sum line alone; it needs the Socket
-module's zip line.
+raise the module too, with no member's `require` showing it. socket-patch
+works out which version the workspace selects the way go does: minimal
+version selection over each member's `require`s and the `go.mod` of every
+dependency go loads, read from the dependency's replacement directory or the
+module cache (`$GOMODCACHE/cache/download`). `go.sum` and `go.work.sum` are
+not evidence: go only ever appends to `go.work.sum`, so it keeps the line of
+a version nothing requires any more. When a `go.mod` it needs is missing
+(a fresh clone before `go mod download`, or a member's `go.mod` it can't
+read) and nothing it did read already shows a higher version, the answer is
+unknown: `apply` still writes the replace, but `apply --check` fails, `vex`
+leaves the patch out (`go_version_not_selected`) and hosted mode writes
+nothing (`redirect_golang_not_in_module_graph`) until `go mod download` puts
+the files in the module cache. For the same reason `vex` never attests a
+hosted pin in a workspace from its `/go.mod` go.sum line alone; it needs the
+Socket module's zip line.
+
+A module that is itself a `use` member (a local checkout of a dependency,
+`use ./dep`) is built from that directory and go ignores every `replace` of
+it. `apply`, `vendor` and `scan --mode hosted` refuse to replace it and say
+so; patch the checkout itself instead.
 
 A `go.work` root without a `go.mod` of its own (the usual layout) works from
 the root for `scan --mode hosted`, `vex`, `list` and `rollback`: hosted mode
