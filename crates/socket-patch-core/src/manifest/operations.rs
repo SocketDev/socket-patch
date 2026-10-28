@@ -68,6 +68,19 @@ pub async fn read_manifest(
     parse_manifest(json).map(Some)
 }
 
+/// Whether a manifest exists at `path`, by [`read_manifest`]'s rule: only
+/// `NotFound` is absence. Any other stat error (an unsearchable `.socket/`,
+/// `.socket` as a plain file, a symlink loop) is returned, so a caller's
+/// "no manifest" path never runs for a manifest it merely cannot read.
+/// Something that is not a regular file still counts as present:
+/// [`read_manifest`] then refuses it, whatever the path's spelling.
+///
+/// Windows reports a path under a plain file as not found, so there (as in
+/// [`read_manifest`]) `.socket` as a file reads as no manifest.
+pub async fn manifest_exists(path: impl AsRef<Path>) -> Result<bool, std::io::Error> {
+    tokio::fs::try_exists(path.as_ref()).await
+}
+
 /// Write a manifest to the filesystem with pretty-printed JSON.
 ///
 /// The write is atomic: the JSON is staged in a sibling temp file, fsync'd,
@@ -469,6 +482,51 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "an existing-but-unreadable path is not a 'missing file'"
         );
+    }
+
+    // #998: `manifest_exists` keeps `read_manifest`'s rule. Only a missing
+    // file is absent; a stat error is returned, never read as "no manifest".
+    #[tokio::test]
+    async fn test_manifest_exists_only_not_found_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        assert!(!manifest_exists(&path).await.unwrap());
+
+        write_manifest(&path, &create_test_manifest())
+            .await
+            .unwrap();
+        assert!(manifest_exists(&path).await.unwrap());
+
+        // A directory is present; `read_manifest` refuses it.
+        let as_dir = dir.path().join("dir").join("manifest.json");
+        std::fs::create_dir_all(&as_dir).unwrap();
+        assert!(manifest_exists(&as_dir).await.unwrap());
+        assert!(read_manifest(&as_dir).await.is_err());
+    }
+
+    // `.socket` as a plain file: ENOTDIR, not NotFound (Windows reports
+    // such a path as not found, for both functions alike).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_manifest_exists_under_a_file_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_file = dir.path().join("socket-file");
+        std::fs::write(&socket_file, "x").unwrap();
+        let under_file = socket_file.join("manifest.json");
+        let err = manifest_exists(&under_file).await.unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(read_manifest(&under_file).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_manifest_exists_symlink_loop_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::os::unix::fs::symlink("manifest.json", &path).unwrap();
+        let err = manifest_exists(&path).await.unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(read_manifest(&path).await.is_err());
     }
 
     // Regression: write_manifest -> read_manifest must preserve the full record,

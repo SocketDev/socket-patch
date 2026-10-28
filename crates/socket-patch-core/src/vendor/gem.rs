@@ -663,6 +663,14 @@ pub async fn vendor_gem<'a>(
     }
 
     if dry_run {
+        // An unwired gem previews the Gemfile and lock edit refusals the wet
+        // run raises (a declaration inside a `group` block, #1761), so a
+        // takeover or eject preview over the restored text refuses too.
+        if !lock_wired {
+            if let Err(outcome) = gem_edits(purl, &prelude) {
+                return *outcome;
+            }
+        }
         if let Err(outcome) =
             super::service_fetch::preview_service(service, record, extract_gem_data).await
         {
@@ -3661,6 +3669,25 @@ mod tests {
             unwrap_refused(run_vendor(&root3, &blobs3, &installed3, &record3, false).await);
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("path:"), "{detail}");
+    }
+
+    /// #1761: a dry run raises the same declaration refusal as the wet run,
+    /// so a `vendor` eject preview does not report a refused gem as planned.
+    #[tokio::test]
+    async fn test_dry_run_previews_declaration_refusal() {
+        let grouped =
+            "source \"https://rubygems.org\"\n\ngroup :test do\n  gem \"rack\", \"~> 3.1\"\nend\n";
+        for dry_run in [true, false] {
+            let (_tmp, root, installed, blobs, record) = fixture(grouped, LOCK_DIRECT).await;
+            let (code, detail) =
+                unwrap_refused(run_vendor(&root, &blobs, &installed, &record, dry_run).await);
+            assert_eq!(
+                code, "gemfile_declaration_not_editable",
+                "dry_run={dry_run}"
+            );
+            assert!(detail.contains("indented"), "dry_run={dry_run}: {detail}");
+            assert!(!root.join(".socket").exists(), "dry_run={dry_run}");
+        }
     }
 
     /// SECURITY: a traversal uuid (tampered manifest) must be refused before

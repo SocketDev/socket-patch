@@ -2,10 +2,8 @@
 //! and lockfiles exist — no `node_modules`, no Cargo home, no `.socket/`.
 //!
 //! The eject is lockfile-only by contract: it restores each hosted pin's
-//! upstream registry entry first, so the vendor engine sees an ordinary
-//! registry pin with a registry checksum and fetches the pristine source
-//! from the registry (verified against that checksum) instead of requiring
-//! an installed tree. Every registry and API endpoint is a wiremock.
+//! upstream registry metadata for reversal, then downloads the prebuilt
+//! patched artifact. Every registry and API endpoint is a wiremock.
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
@@ -135,8 +133,7 @@ fn applied(env: &Value, purl: &str) -> bool {
     })
 }
 
-/// npm: a hosted package-lock.json with NO `node_modules`. The pristine
-/// tarball comes from the registry the restored entry names.
+/// npm: a hosted package-lock.json with NO `node_modules`.
 #[tokio::test]
 async fn npm_eject_needs_no_installed_tree() {
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
@@ -215,9 +212,114 @@ async fn npm_eject_needs_no_installed_tree() {
     assert!(!lock.contains(&hosted), "no hosted residue: {lock}");
 }
 
+#[tokio::test]
+async fn npm_eject_downloads_every_hosted_patch_from_the_lockfile() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir(&root).unwrap();
+    let patches = [
+        ("left-pad", "1.3.0", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f"),
+        ("ms", "2.1.3", "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d11"),
+    ];
+    let mut lock = json!({
+        "lockfileVersion": 3,
+        "packages": {
+            "": { "dependencies": { "left-pad": "1.3.0", "ms": "2.1.3", "unpatched": "1.0.0" } },
+            "node_modules/unpatched": { "version": "1.0.0", "resolved": "https://registry.npmjs.org/unpatched/-/unpatched-1.0.0.tgz" }
+        }
+    });
+    let untouched = lock["packages"]["node_modules/unpatched"].clone();
+    for (name, version, uuid) in patches {
+        let purl = format!("pkg:npm/{name}@{version}");
+        mock_view(
+            &server,
+            uuid,
+            &purl,
+            "package/index.js",
+            b"original\n",
+            b"patched\n",
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/{version}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": name, "version": version,
+                "dist": {
+                    "tarball": format!("{}/{name}/-/{name}-{version}.tgz", server.uri()),
+                    "integrity": "sha512-UPSTREAMupstreamUPSTREAM=="
+                }
+            })))
+            .mount(&server)
+            .await;
+        // No upstream tarball endpoint: vendor needs only its metadata
+        // for --revert, and downloads the patched service artifact.
+        lock["packages"][format!("node_modules/{name}")] = json!({
+            "version": version,
+            "resolved": format!("{}/patch/npm/{name}/{version}/55555555-5555-4555-8555-555555555555/{uuid}/{name}-{version}.tgz", server.uri()),
+            "integrity": "sha512-HOSTEDpatchedHOSTEDpatched=="
+        });
+    }
+    std::fs::write(root.join("package.json"), serde_json::to_vec(&json!({
+        "name": "fixture", "version": "1.0.0", "dependencies": lock["packages"][""]["dependencies"]
+    })).unwrap()).unwrap();
+    std::fs::write(
+        root.join("package-lock.json"),
+        serde_json::to_vec(&lock).unwrap(),
+    )
+    .unwrap();
+
+    let (code, env) = run_json(&root, &server, &["vendor"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["summary"]["applied"], 2, "{env:#}");
+    let lock: Value =
+        serde_json::from_slice(&std::fs::read(root.join("package-lock.json")).unwrap()).unwrap();
+    let requests = server.received_requests().await.unwrap();
+    for (name, version, uuid) in patches {
+        assert!(
+            applied(&env, &format!("pkg:npm/{name}@{version}")),
+            "{env:#}"
+        );
+        let relative = format!(".socket/vendor/npm/{uuid}/{name}-{version}.tgz");
+        let bytes = std::fs::read(root.join(&relative)).unwrap();
+        let entry = &lock["packages"][format!("node_modules/{name}")];
+        assert_eq!(entry["resolved"], format!("file:{relative}"));
+        assert_eq!(
+            entry["integrity"],
+            format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&bytes))
+            )
+        );
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice()));
+        let mut patched = archive
+            .entries()
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|file| file.path().unwrap() == Path::new("package/index.js"))
+            .unwrap();
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut patched, &mut content).unwrap();
+        assert_eq!(content, b"patched\n");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/view/{uuid}"))
+                .count(),
+            1
+        );
+        assert!(!requests
+            .iter()
+            .any(|r| r.url.path() == format!("/{name}/-/{name}-{version}.tgz")));
+    }
+    assert_eq!(lock["packages"]["node_modules/unpatched"], untouched);
+    assert!(!root.join("node_modules").exists());
+    assert!(!root.join(".socket/manifest.json").exists());
+}
+
 /// cargo: the hosted `Cargo.lock` / `Cargo.toml` pin with an EMPTY Cargo
 /// home. The restore re-resolves the crates.io checksum from the sparse
-/// index; the pristine `.crate` is downloaded and verified against it.
+/// index for reversal; the service supplies the patched crate.
 #[tokio::test]
 async fn cargo_eject_needs_no_cargo_home() {
     const UUID: &str = "55555555-5555-5555-5555-555555555555";
@@ -308,10 +410,21 @@ fn wheel(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// pypi: a hash-pinned hosted `requirements.txt` with NO virtualenv. The
-/// restore re-resolves the release file hash from the PyPI JSON API; the
-/// pristine wheel is downloaded and verified against it.
+/// restore re-resolves the release file hash from the PyPI JSON API for
+/// reversal; the service supplies the patched wheel.
 #[tokio::test]
 async fn pypi_eject_needs_no_virtualenv() {
+    pypi_eject_with_virtualenv(false).await;
+}
+
+/// An unrelated environment must not select or reject a patch already
+/// identified by the project's lockfile, even if it has the same release.
+#[tokio::test]
+async fn pypi_eject_ignores_unrelated_virtualenv() {
+    pypi_eject_with_virtualenv(true).await;
+}
+
+async fn pypi_eject_with_virtualenv(unrelated_install: bool) {
     const UUID: &str = "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d11";
     const PURL: &str = "pkg:pypi/six@1.16.0";
     const WHEEL: &str = "six-1.16.0-py2.py3-none-any.whl";
@@ -374,28 +487,38 @@ async fn pypi_eject_needs_no_virtualenv() {
     )
     .unwrap();
 
-    // Nothing installed for the project: VIRTUAL_ENV names an EMPTY
-    // virtualenv. With no venv at all, a Python project falls back to the
-    // global interpreters, and on Ubuntu those carry apt's python3-six
-    // 1.16.0 (`six-1.16.0.egg-info`), whose bytes are not this fixture's.
-    let empty_venv = tmp.path().join("empty-venv");
-    std::fs::create_dir_all(empty_venv.join(if cfg!(windows) {
+    // Nothing is installed in the project. An ambient VIRTUAL_ENV may
+    // belong to another project and contain unrelated bytes for six.
+    let venv = tmp.path().join("ambient-venv");
+    let site = venv.join(if cfg!(windows) {
         "Lib/site-packages"
     } else {
         "lib/python3.11/site-packages"
-    }))
-    .unwrap();
+    });
+    std::fs::create_dir_all(&site).unwrap();
+    if unrelated_install {
+        let metadata = site.join("six-1.16.0.dist-info");
+        std::fs::create_dir(&metadata).unwrap();
+        std::fs::write(metadata.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
+        std::fs::write(site.join("six.py"), b"# unrelated installation\n").unwrap();
+    }
     let (code, env) = run_json_with(
         &root,
         &server,
         &["vendor"],
         &[
             ("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri())),
-            ("VIRTUAL_ENV", empty_venv.display().to_string()),
+            ("VIRTUAL_ENV", venv.display().to_string()),
         ],
     );
     assert_eq!(code, 0, "a fresh hosted pypi checkout ejects: {env:#}");
     assert!(applied(&env, PURL), "{env:#}");
+    if unrelated_install {
+        assert_eq!(
+            std::fs::read(site.join("six.py")).unwrap(),
+            b"# unrelated installation\n"
+        );
+    }
     let reqs = std::fs::read_to_string(root.join("requirements.txt")).unwrap();
     assert!(
         !reqs.contains("patch.socket.dev"),

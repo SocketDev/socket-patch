@@ -544,6 +544,90 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
     );
 }
 
+/// #655: `a` declares the library through `${ct.group}:${ct.artifact}`,
+/// properties the local corp parent defines. Maven interpolates them before
+/// matching, so vendor must rewrite `a`'s literal version too, or `a` builds
+/// Central's unpatched jar.
+#[test]
+#[ignore = "real Maven + Maven Central (fixture); run with --ignored"]
+fn maven_reactor_property_coordinates_vendor_fresh_offline_build_and_revert() {
+    const SUITE: &str = "e2e_vendor_jvm_build::maven_reactor_property_coordinates";
+    let Some(mvn) = Mvn::detect(SUITE) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fixture_root(&tmp);
+    let m2 = root.join("m2");
+    let proj = root.join("proj");
+    let settings = root.join("settings.xml");
+    write_settings(&settings, &[]);
+    let Some((jar, _)) = warm_fixture(SUITE, &mvn, &root.join("warm"), &m2, &settings) else {
+        return;
+    };
+    write_reactor(&proj);
+    let corp = CORP_PARENT_POM.replace(
+        "  </properties>",
+        "    <ct.group>org.apache.commons</ct.group>\n    \
+         <ct.artifact>commons-text</ct.artifact>\n  </properties>",
+    );
+    std::fs::write(proj.join("corp-parent/pom.xml"), corp).unwrap();
+    let a = a_pom()
+        .replace(
+            "<groupId>org.apache.commons</groupId>",
+            "<groupId>${ct.group}</groupId>",
+        )
+        .replace(
+            "<artifactId>commons-text</artifactId>",
+            "<artifactId>${ct.artifact}</artifactId>",
+        );
+    std::fs::write(proj.join("a/pom.xml"), &a).unwrap();
+    let out = with_central_fallback(SUITE, "pre-vendor reactor build", &settings, |s, flags| {
+        mvn_classpath(&mvn, &proj, &m2, s, flags)
+    });
+    assert!(ok(&out), "pre-vendor reactor build:\n{}", dump(&out));
+    assert_eq!(
+        std::fs::read(classpath_entry(&proj.join("a"))).unwrap(),
+        jar,
+        "pre-vendor `a` resolves Central's jar through its property coordinates"
+    );
+    for dir in [
+        "target",
+        "corp-parent/target",
+        "a/target",
+        "b/target",
+        ".mvn/target",
+    ] {
+        let _ = std::fs::remove_dir_all(proj.join(dir));
+    }
+    let _ = std::fs::remove_dir(proj.join(".mvn"));
+
+    let (orig, patched) = patched_member(&jar, UUID);
+    stage_manifest(&proj, &orig, &patched);
+    let before = snapshot(&proj);
+    let env = vendor(&proj, &m2);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let vendored = snapshot(&proj);
+    assert_eq!(
+        text(&vendored["a/pom.xml"]),
+        a.replace(
+            "<version>1.10.0</version>",
+            &format!("<version>{SV}</version>")
+        ),
+        "`a`'s literal version is rewritten"
+    );
+
+    let fresh = root.join("fresh");
+    fresh_checkout_all(&proj, &fresh);
+    purge(&m2);
+    let out = mvn_classpath(&mvn, &fresh, &m2, &settings, &["-o"]);
+    assert!(ok(&out), "fresh offline reactor build:\n{}", dump(&out));
+    assert_vendored_on_classpath(&fresh.join("a"), &patched, "module a");
+    assert_vendored_on_classpath(&fresh.join("b"), &patched, "module b");
+
+    revert(&proj, &m2);
+    assert_restored(&proj, &before);
+}
+
 // ── P2: Gradle multi-project with dependency locking ────────────────────
 
 const GRADLE_SETTINGS: &str = r#"buildscript {

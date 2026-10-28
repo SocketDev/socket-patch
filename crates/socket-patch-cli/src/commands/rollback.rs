@@ -4,7 +4,7 @@ use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::cleanup_blobs::ArtifactReferences;
 use socket_patch_core::manifest::operations::{
-    get_before_hash_blobs, read_manifest, write_manifest,
+    get_before_hash_blobs, manifest_exists, read_manifest, write_manifest,
 };
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
@@ -334,7 +334,12 @@ async fn patched_in_other_scope(
                 let unverifiable = v.current_hash.is_none()
                     && v.status != VerifyRollbackStatus::AlreadyOriginal
                     && !v.is_absent();
-                if unverifiable || v.current_hash.as_deref() == Some(info.after_hash.as_str()) {
+                // `Ready` also covers npm's LF-shebang form of a patched
+                // bin, whose hash is not the afterHash.
+                if unverifiable
+                    || v.status == VerifyRollbackStatus::Ready
+                    || v.current_hash.as_deref() == Some(info.after_hash.as_str())
+                {
                     patched.push((purl.clone(), path.clone()));
                     break 'copies;
                 }
@@ -989,9 +994,14 @@ async fn run_vendored_leg(
         keep_artifact: preserve,
     };
     let loud = !common.json && !common.silent;
-    let reverted = VendoredBackend::new(common, None)
-        .revert(keys, state, opts, false)
-        .await;
+    let backend = VendoredBackend::new(common, None);
+    let reverted = backend.revert(keys, state, opts, false).await;
+    for (_, w) in backend.go_undo_warnings(&reverted).await {
+        if loud {
+            eprintln!("Warning: {}", w.detail);
+        }
+        out.warnings.push((w.code.to_string(), w.detail));
+    }
     for RevertedEntry {
         key,
         warnings,
@@ -1397,7 +1407,22 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // not this run's to unwind (see `project_state_in_scope`): a global
     // rollback restores the global copies and their manifest records only.
     let project_state = crate::commands::project_state_in_scope(&args.common);
-    let manifest_missing = tokio::fs::metadata(&manifest_path).await.is_err();
+    // Only a missing file is "no manifest"; one rollback cannot even stat
+    // fails like the load below, not as "Manifest not found" (#998).
+    let manifest_missing = match manifest_exists(&manifest_path).await {
+        Ok(present) => !present,
+        Err(e) => {
+            track_patch_rollback_failed(&e.to_string(), &telemetry).await;
+            let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
+            emit_rollback_error(
+                args.common.json,
+                args.common.dry_run,
+                &err.code,
+                &err.message,
+            );
+            return 1;
+        }
+    };
     let vendor_ledger_exists = project_state
         && tokio::fs::metadata(ledger_root.join(".socket/vendor/state.json"))
             .await

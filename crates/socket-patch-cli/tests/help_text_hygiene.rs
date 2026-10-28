@@ -227,7 +227,7 @@ fn vendor_and_repair_summaries_read_as_one_line() {
     let text = long_help(&[]);
     assert!(
         text.lines().any(|l| l
-            == "  vendor    Store patched dependencies in .socket/vendor/ for offline installs"),
+            == "  vendor    Download hosted patches from lockfiles into .socket/vendor/"),
         "{text}"
     );
     assert!(
