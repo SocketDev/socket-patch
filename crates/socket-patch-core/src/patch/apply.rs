@@ -261,8 +261,21 @@ pub async fn verify_file_patch(
         }
     };
 
+    // npm installs a CRLF-shebang `bin` with an LF shebang (see
+    // `npm_bin`): hash the content it came from too, once, when the raw
+    // bytes match neither side.
+    let source_hash = if current_hash == file_info.after_hash
+        || (!is_new_file && current_hash == file_info.before_hash)
+    {
+        None
+    } else {
+        crate::patch::npm_bin::source_hash(&filepath).await
+    };
+
     // Check if already patched
-    if current_hash == file_info.after_hash {
+    if current_hash == file_info.after_hash
+        || source_hash.as_deref() == Some(file_info.after_hash.as_str())
+    {
         return VerifyResult {
             file: file_name.to_string(),
             status: VerifyStatus::AlreadyPatched,
@@ -286,8 +299,12 @@ pub async fn verify_file_patch(
         };
     }
 
-    // Check if matches expected before hash
-    if current_hash != file_info.before_hash {
+    // Check if matches expected before hash. A `Ready` whose
+    // `current_hash` is not the `beforeHash` is npm's form of it; the apply
+    // engine writes the patched bytes in the same form.
+    if current_hash != file_info.before_hash
+        && source_hash.as_deref() != Some(file_info.before_hash.as_str())
+    {
         return VerifyResult {
             file: file_name.to_string(),
             status: VerifyStatus::HashMismatch,
@@ -1223,14 +1240,30 @@ async fn apply_package_patch_at(
                 }
             };
 
+        // A bin npm installed with an LF shebang gets the patched bytes in
+        // that form too (see `npm_bin`).
+        let (patched_content, written_hash) = match npm_fixed_write(
+            package_key,
+            &pkg_path.join(normalized),
+            verify_result,
+            file_info,
+            patched_content,
+        )
+        .await
+        {
+            Ok(write) => write,
+            Err(e) => {
+                result.error = Some(e.to_string());
+                return result;
+            }
+        };
+
         // ONE write site for every source, so a write failure (EACCES on
         // the stage, ENOSPC, a failed rename) is reported as what it is.
         // Single copy:
         // the public `apply_package_patch` wrapper fans out to pnpm
         // peer-variant copies itself, with per-copy verification.
-        match apply_file_patch_at(pkg_path, file_name, &patched_content, &file_info.after_hash)
-            .await
-        {
+        match apply_file_patch_at(pkg_path, file_name, &patched_content, &written_hash).await {
             Ok(warning) => warnings.extend(warning),
             Err(e) => {
                 // A Windows daemon holding a cached jar open: say which
@@ -1300,6 +1333,55 @@ async fn apply_package_patch_at(
     result.error = join_notes(warnings);
     result.success = true;
     result
+}
+
+/// The bytes to write for a patched file, and their hash: the patched
+/// content as is, or npm's `fixBin` form of it (see
+/// [`npm_bin`](crate::patch::npm_bin)) when the file on disk is a bin npm
+/// installed with an LF shebang. That is the case when verify matched
+/// npm's form of the original, and, for an npm package, when an
+/// overwrite with consent replaces such a file: writing the CRLF shebang
+/// back would leave a bin `env` can't run.
+async fn npm_fixed_write<'a>(
+    package_key: &str,
+    path: &Path,
+    verify: Option<&VerifyResult>,
+    file_info: &PatchFileInfo,
+    patched: Cow<'a, [u8]>,
+) -> Result<(Cow<'a, [u8]>, String), std::io::Error> {
+    use crate::patch::npm_bin;
+    let raw_before = verify.is_none_or(|v| {
+        v.current_hash.is_none() || v.current_hash.as_deref() == Some(&file_info.before_hash)
+    });
+    if file_info.before_hash.is_empty() || raw_before {
+        return Ok((patched, file_info.after_hash.clone()));
+    }
+    let installed = match crate::utils::fs::read_regular_to_bytes(path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok((patched, file_info.after_hash.clone())),
+    };
+    let npm_installed = npm_bin::has_lf_shebang(&installed)
+        && (package_key.starts_with("pkg:npm/")
+            || npm_bin::unfix_bin(&installed)
+                .is_some_and(|src| compute_git_sha256_from_bytes(&src) == file_info.before_hash));
+    let fixed = npm_installed.then(|| npm_bin::fix_bin(&patched)).flatten();
+    let Some(fixed) = fixed else {
+        return Ok((patched, file_info.after_hash.clone()));
+    };
+    // The write below hash-checks what it writes; check the blob here, as
+    // it would have been checked.
+    let blob_hash = compute_git_sha256_from_bytes(&patched);
+    if blob_hash != file_info.after_hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Hash verification failed before patch. Expected: {}, Got: {}",
+                file_info.after_hash, blob_hash
+            ),
+        ));
+    }
+    let hash = compute_git_sha256_from_bytes(&fixed);
+    Ok((Cow::Owned(fixed), hash))
 }
 
 /// Whether `hash` (a file's current content hash) names a blob Socket
@@ -3909,5 +3991,184 @@ mod tests {
             ["ownership_not_restored", "stale_bytecode_not_removed"]
         );
         assert!(advisory_warning_codes("All patch files were skipped").is_empty());
+    }
+
+    /// The tarball bytes of a bin published from Windows (CRLF shebang),
+    /// and the bytes npm's `bin-links` `fixBin` leaves on disk for it on
+    /// Linux and macOS: only the first line's `\r` is dropped (#1756).
+    const CRLF_BIN_BEFORE: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(\"hi\");\r\n";
+    const CRLF_BIN_AFTER: &[u8] =
+        b"#!/usr/bin/env node\r\nconsole.log(\"hi\");\r\n// SOCKET-PATCHED\r\n";
+    const NPM_BIN_BEFORE: &[u8] = b"#!/usr/bin/env node\nconsole.log(\"hi\");\r\n";
+    const NPM_BIN_AFTER: &[u8] =
+        b"#!/usr/bin/env node\nconsole.log(\"hi\");\r\n// SOCKET-PATCHED\r\n";
+
+    fn crlf_bin_files() -> HashMap<String, PatchFileInfo> {
+        HashMap::from([(
+            "package/cli.js".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(CRLF_BIN_BEFORE),
+                after_hash: compute_git_sha256_from_bytes(CRLF_BIN_AFTER),
+            },
+        )])
+    }
+
+    async fn crlf_bin_blobs() -> tempfile::TempDir {
+        let blobs = tempfile::tempdir().unwrap();
+        for bytes in [CRLF_BIN_BEFORE, CRLF_BIN_AFTER] {
+            tokio::fs::write(
+                blobs.path().join(compute_git_sha256_from_bytes(bytes)),
+                bytes,
+            )
+            .await
+            .unwrap();
+        }
+        blobs
+    }
+
+    /// Regression (#1756): a pristine npm install of a CRLF-shebang bin is
+    /// the original, and its patched twin is already patched.
+    #[tokio::test]
+    async fn verify_accepts_npm_fixed_crlf_shebang() {
+        let files = crlf_bin_files();
+        let info = &files["package/cli.js"];
+        let pkg = tempfile::tempdir().unwrap();
+        tokio::fs::write(pkg.path().join("cli.js"), NPM_BIN_BEFORE)
+            .await
+            .unwrap();
+        let ready = verify_file_patch(pkg.path(), "package/cli.js", info).await;
+        assert_eq!(ready.status, VerifyStatus::Ready, "{ready:?}");
+        assert_eq!(ready.expected_hash, None, "no mismatch warning: {ready:?}");
+
+        tokio::fs::write(pkg.path().join("cli.js"), NPM_BIN_AFTER)
+            .await
+            .unwrap();
+        let done = verify_file_patch(pkg.path(), "package/cli.js", info).await;
+        assert_eq!(done.status, VerifyStatus::AlreadyPatched, "{done:?}");
+    }
+
+    /// Regression (#1756): strict apply patches an npm-fixed bin and keeps
+    /// its shebang LF-terminated, so the bin still runs; a second apply is
+    /// a no-op.
+    #[tokio::test]
+    async fn apply_patches_npm_fixed_bin_and_keeps_it_runnable() {
+        let files = crlf_bin_files();
+        let blobs = crlf_bin_blobs().await;
+        let pkg = tempfile::tempdir().unwrap();
+        tokio::fs::write(pkg.path().join("cli.js"), NPM_BIN_BEFORE)
+            .await
+            .unwrap();
+        let sources = PatchSources::blobs_only(blobs.path());
+        let res = apply_package_patch(
+            "pkg:npm/crlfbin@1.0.0",
+            pkg.path(),
+            &files,
+            &sources,
+            false,
+            MismatchPolicy::Strict,
+        )
+        .await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(res.files_patched, vec!["package/cli.js".to_string()]);
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            NPM_BIN_AFTER
+        );
+
+        let again = apply_package_patch(
+            "pkg:npm/crlfbin@1.0.0",
+            pkg.path(),
+            &files,
+            &sources,
+            false,
+            MismatchPolicy::Strict,
+        )
+        .await;
+        assert!(again.success, "{again:?}");
+        assert!(again.files_patched.is_empty(), "{again:?}");
+    }
+
+    /// Regression (#1756): overwriting a drifted npm bin with consent
+    /// writes the patched content with npm's LF shebang, never a
+    /// `#!/usr/bin/env node\r` line `env` can't run.
+    #[tokio::test]
+    async fn consent_overwrite_of_npm_bin_keeps_lf_shebang() {
+        let files = crlf_bin_files();
+        let blobs = crlf_bin_blobs().await;
+        let pkg = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            pkg.path().join("cli.js"),
+            b"#!/usr/bin/env node\nconsole.log(\"edited\");\n",
+        )
+        .await
+        .unwrap();
+        let res = apply_package_patch(
+            "pkg:npm/crlfbin@1.0.0",
+            pkg.path(),
+            &files,
+            &PatchSources::blobs_only(blobs.path()),
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(res.success, "{res:?}");
+        // Still a disclosed overwrite of unknown content.
+        assert!(res.files_verified[0].expected_hash.is_some(), "{res:?}");
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            NPM_BIN_AFTER
+        );
+    }
+
+    /// A non-npm package keeps the patch's exact bytes on a consent
+    /// overwrite: only npm rewrites bin shebangs.
+    #[tokio::test]
+    async fn consent_overwrite_outside_npm_writes_exact_bytes() {
+        let files = crlf_bin_files();
+        let blobs = crlf_bin_blobs().await;
+        let pkg = tempfile::tempdir().unwrap();
+        tokio::fs::write(pkg.path().join("cli.js"), b"#!/usr/bin/env node\nedited\n")
+            .await
+            .unwrap();
+        let res = apply_package_patch(
+            "pkg:pypi/crlfbin@1.0.0",
+            pkg.path(),
+            &files,
+            &PatchSources::blobs_only(blobs.path()),
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            CRLF_BIN_AFTER
+        );
+    }
+
+    /// A CRLF-shebang file npm left alone (not a `bin` entry) still
+    /// matches the raw hashes and gets the patch's exact bytes.
+    #[tokio::test]
+    async fn apply_keeps_exact_bytes_for_unfixed_crlf_file() {
+        let files = crlf_bin_files();
+        let blobs = crlf_bin_blobs().await;
+        let pkg = tempfile::tempdir().unwrap();
+        tokio::fs::write(pkg.path().join("cli.js"), CRLF_BIN_BEFORE)
+            .await
+            .unwrap();
+        let res = apply_package_patch(
+            "pkg:npm/crlfbin@1.0.0",
+            pkg.path(),
+            &files,
+            &PatchSources::blobs_only(blobs.path()),
+            false,
+            MismatchPolicy::Strict,
+        )
+        .await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            CRLF_BIN_AFTER
+        );
     }
 }

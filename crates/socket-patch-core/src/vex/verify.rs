@@ -783,6 +783,32 @@ mod tests {
         assert!(out.failed.is_empty());
     }
 
+    /// Regression (#1756): npm drops the `\r` of a bin's CRLF shebang at
+    /// install, so a correctly patched hosted install carries the patched
+    /// bytes in npm's form. VEX attests it instead of omitting it as
+    /// `hash_mismatch`.
+    #[tokio::test]
+    async fn applied_when_npm_fixed_the_patched_bin_shebang() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let hash = compute_git_sha256_from_bytes(b"#!/usr/bin/env node\r\npatched();\r\n");
+        tokio::fs::write(
+            pkg_dir.path().join("index.js"),
+            b"#!/usr/bin/env node\npatched();\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert("pkg:npm/x@1.0.0".to_string(), record_with_one_file(&hash));
+        let paths = HashMap::from([("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf())]);
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert_eq!(out.applied, vec!["pkg:npm/x@1.0.0".to_string()], "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+    }
+
     /// Two nested copies of one `name@version`: `(dir, bytes)` each.
     async fn two_copies(a: &[u8], b: &[u8]) -> (tempfile::TempDir, Vec<PathBuf>) {
         let root = tempfile::tempdir().unwrap();
