@@ -42,6 +42,7 @@ use crate::patch::redirect::{
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
 use crate::utils::redact::url_host;
+use crate::vendor::go_build_list::ModuleEvidence;
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
@@ -1546,6 +1547,11 @@ pub struct RewriteOptions<'a> {
     /// resolved only when a cargo dep is rewritten (the cargo rewriter's
     /// offline-source refusal).
     pub cargo_outer: &'a (dyn Fn() -> CratesIoSource + Send + Sync),
+    /// The other `use` members of the go.work in effect for the project,
+    /// resolved only when a golang dep is rewritten: the Go rewriter weighs
+    /// their requirements, since the workspace build selects the highest
+    /// version any member asks for (#1753).
+    pub go_workspace: &'a (dyn Fn() -> Vec<ModuleEvidence> + Send + Sync),
     /// A variable of the environment pnpm installs the project in, by
     /// name: a `pnpm_config_trust_lockfile` there beats the
     /// pnpm-workspace.yaml key the trust auto-config writes (#1514).
@@ -2272,6 +2278,11 @@ async fn rewrite_once(
     } else {
         CratesIoSource::Registry
     };
+    let go_members = if rewrite_overrides.iter().any(|o| o.ecosystem == "golang") {
+        (options.go_workspace)()
+    } else {
+        Vec::new()
+    };
     let (files, mut rewrite) = if options.blocking {
         // Pure CPU over every lock text (the independent rewriter groups
         // run concurrently inside), so it runs on the blocking pool rather
@@ -2288,6 +2299,7 @@ async fn rewrite_once(
                 &gradle_unreadable,
                 &yarn_outer,
                 &cargo_outer,
+                &go_members,
             );
             (files, rewrite)
         })
@@ -2307,6 +2319,7 @@ async fn rewrite_once(
             &gradle_unreadable,
             &yarn_outer,
             &cargo_outer,
+            &go_members,
         );
         (files, rewrite)
     };
@@ -3800,6 +3813,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -3873,6 +3887,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -4188,6 +4203,7 @@ mod tests {
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            go_workspace: &Vec::new,
             pnpm_env: env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -4624,6 +4640,7 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
+                go_workspace: &Vec::new,
                 pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
@@ -4729,6 +4746,7 @@ snapshots:
                 npm_outer: &outer,
                 yarn_classic_outer: &OuterYarnMirror::default,
                 cargo_outer: &no_cargo_outer,
+                go_workspace: &Vec::new,
                 pnpm_env: &no_env,
                 blocking: false,
                 takeover_uuids: Default::default(),
@@ -4905,6 +4923,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5246,6 +5265,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5462,6 +5482,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5517,6 +5538,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),
@@ -5715,6 +5737,7 @@ snapshots:
                     npm_outer: &outer,
                     yarn_classic_outer: &OuterYarnMirror::default,
                     cargo_outer: &no_cargo_outer,
+                    go_workspace: &Vec::new,
                     pnpm_env: &no_env,
                     blocking: false,
                     takeover_uuids: Default::default(),
@@ -6124,6 +6147,7 @@ snapshots:
             npm_outer: &outer,
             yarn_classic_outer: &OuterYarnMirror::default,
             cargo_outer: &no_cargo_outer,
+            go_workspace: &Vec::new,
             pnpm_env: &no_env,
             blocking: false,
             takeover_uuids: Default::default(),

@@ -309,6 +309,18 @@ pub(crate) async fn workspace_member_dirs(project_root: &Path) -> Option<Vec<Pat
     })
 }
 
+/// [`workspace_member_dirs`] on the calling thread, for the hosted engine's
+/// synchronous config resolvers.
+pub(crate) fn workspace_member_dirs_sync(project_root: &Path) -> Option<Vec<PathBuf>> {
+    let work_file = workspace_file(project_root)?;
+    Some(
+        match crate::utils::fs::read_regular_to_string_sync(&work_file) {
+            Ok(text) => use_dirs(&work_file, &go_mod_edit::normalize_for_read(&text)),
+            Err(_) => Vec::new(),
+        },
+    )
+}
+
 /// `work_file`'s text, normalized for parsing.
 async fn read_work_file(work_file: &Path) -> Option<String> {
     let text = read_regular_to_string(work_file).await.ok()?;
@@ -486,7 +498,7 @@ async fn workspace_issues(project_root: &Path, replaces: &[ReplaceEntry]) -> Vec
 /// exists once folded (`./x/../app` with no `x`, which go's `filepath.Join`
 /// folds) is folded lexically and then resolved, so it still matches a
 /// project under a symlinked dir (macOS `/var` -> `/private/var`).
-fn same_dir_key(dir: &Path) -> PathBuf {
+pub(crate) fn same_dir_key(dir: &Path) -> PathBuf {
     let abs = std::env::current_dir().unwrap_or_default().join(dir);
     std::fs::canonicalize(&abs).unwrap_or_else(|_| {
         let folded = crate::utils::relpath::normalize_lexically_keeping_escapes(&abs);

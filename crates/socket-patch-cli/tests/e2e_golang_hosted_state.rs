@@ -132,10 +132,16 @@ fn get_hosted_with(
         "fake",
     ];
     args.extend_from_slice(extra);
+    // The go.work in effect is the one above the project (#1753), whatever
+    // GOWORK the machine running the tests sets.
     let (code, stdout, stderr) = run_with_prebuilt(
         consumer,
         &args,
-        &[("GOMODCACHE", modcache.to_str().unwrap())],
+        &[
+            ("GOMODCACHE", modcache.to_str().unwrap()),
+            ("GOWORK", "auto"),
+            ("GOENV", "off"),
+        ],
     );
     assert_eq!(
         code, 0,
@@ -265,6 +271,72 @@ async fn leftover_go_sum_lines_do_not_confirm_a_refused_rewrite() {
     let ledger = std::fs::read_to_string(consumer.join(".socket/vendor/redirect-state.json"))
         .unwrap_or_default();
     assert!(!ledger.contains(UPURL), "{ledger}");
+}
+
+/// #1753: in a go.work workspace the build selects the highest version any
+/// `use` member requires. Once another member requires v1.1.0, a hosted
+/// pin for this member's v1.0.0 is inert: the scan must refuse to write it
+/// and take back the one it wrote before, never report it as redirected.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_pin_another_go_work_member_outranks_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let consumer = ws.join("consumer");
+    write_consumer(&consumer, &format!("require {UMOD} {UVER}\n"), UPSTREAM_SUM);
+    let other = ws.join("other");
+    let other_mod =
+        |v: &str| format!("module example.com/other\n\ngo 1.21\n\nrequire {UMOD} {v}\n");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("go.mod"), other_mod(UVER)).unwrap();
+    std::fs::write(
+        ws.join("go.work"),
+        "go 1.21\n\nuse (\n\t./consumer\n\t./other\n)\n",
+    )
+    .unwrap();
+    let server = MockServer::start().await;
+    mount_hosted_grant(&server).await;
+    let modcache = tmp.path().join("modcache");
+    let mismatch = |env: &serde_json::Value| {
+        env["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "redirect_golang_version_mismatch")
+    };
+
+    // Control: the other member requires the same version, so the pin is
+    // the one the workspace builds.
+    let env = get_hosted(&consumer, &server, &modcache);
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
+    let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    assert!(
+        go_mod.contains(&format!("replace {UMOD} {UVER} => {}", smod())),
+        "{go_mod}"
+    );
+
+    // The other member moves to v1.1.0: re-running takes the inert pin back.
+    std::fs::write(other.join("go.mod"), other_mod("v1.1.0")).unwrap();
+    let env = get_hosted(&consumer, &server, &modcache);
+    assert_eq!(hosted_pinned(&env), 0, "envelope: {env}");
+    assert!(mismatch(&env), "{env}");
+    let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    assert!(
+        !go_mod.contains(&smod()),
+        "the inert pin is removed: {go_mod}"
+    );
+    let go_sum = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+    assert!(!go_sum.contains(&smod()), "{go_sum}");
+
+    // A fresh project in that state never gets the pin.
+    write_consumer(&consumer, &format!("require {UMOD} {UVER}\n"), UPSTREAM_SUM);
+    let _ = std::fs::remove_dir_all(consumer.join(".socket"));
+    let env = get_hosted(&consumer, &server, &modcache);
+    assert_eq!(hosted_pinned(&env), 0, "envelope: {env}");
+    assert!(mismatch(&env), "{env}");
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.mod")).unwrap(),
+        format!("module example.com/consumer\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n")
+    );
 }
 
 /// vendored → hosted takeover: the hosted run must revert the vendored
