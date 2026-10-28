@@ -1947,10 +1947,17 @@ fn deno_npm_registry_dirs(npm: &Path) -> Vec<PathBuf> {
                 // like any other dir; one that is (a package named like
                 // the path's first segment, `<host>/api/`) holds only
                 // version dirs (named from a digit) of its own, so its
-                // other subdirs are walked.
+                // other subdirs are walked. When those subdirs are
+                // packages themselves (`https://host/npm/` caches
+                // `<host>/npm/<pkg>/` beside the root registry's package
+                // `npm`), the package dir is also a registry (#1784). A
+                // version dir (it has a `package.json`) is never one.
                 for child in children.into_iter().filter(|name| !name.starts_with('@')) {
                     let child = dir.join(child);
-                    if is_deno_package_dir(&child) {
+                    if child.join("package.json").exists() {
+                        continue;
+                    }
+                    if is_deno_package_dir(&child) && !holds_deno_packages(&child) {
                         next.extend(
                             sorted_subdirs_sync(&child)
                                 .into_iter()
@@ -2066,6 +2073,12 @@ fn sorted_subdirs_sync(dir: &Path) -> Vec<String> {
 fn deno_npm_cache_package_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for name in sorted_subdirs_sync(root) {
+        // A registry that is also a package dir of the registry above it
+        // (#1784) holds that package's version dirs, which are not
+        // packages of its own.
+        if root.join(&name).join("package.json").exists() {
+            continue;
+        }
         if name.starts_with('@') {
             let scope = root.join(&name);
             dirs.extend(
