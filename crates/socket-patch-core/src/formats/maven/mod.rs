@@ -94,7 +94,7 @@ impl PomScope {
         let mut coordinate_refs = properties.clone();
         // A `project.*` / `pom.*` reference names the model, whatever a
         // same-named property says; the deprecated bare form yields to one.
-        for (name, value) in model_refs(&masked)? {
+        for (name, value) in model_refs(&masked, &properties)? {
             if name.starts_with("project.") || name.starts_with("pom.") {
                 coordinate_refs.insert(name, value);
             } else {
@@ -343,8 +343,13 @@ fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> String
 /// `${groupId}`, `${project.parent.groupId}`), read from the project's own
 /// `<groupId>` / `<artifactId>` / `<version>` and its `<parent>`'s; groupId
 /// and version fall back to the parent's, which the project inherits when
-/// it omits them.
-fn model_refs(masked: &str) -> Result<BTreeMap<String, String>, String> {
+/// it omits them. A coordinate written through a property is resolved from
+/// `properties` (never inherited instead: Maven interpolates a present
+/// element), and one that stays unresolved is not bound.
+fn model_refs(
+    masked: &str,
+    properties: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
     let Some(project) = elements(masked, "project")?.into_iter().next() else {
         return Ok(BTreeMap::new());
     };
@@ -365,15 +370,19 @@ fn model_refs(masked: &str) -> Result<BTreeMap<String, String>, String> {
         "dependencyManagement",
         "parent",
         "dependencies",
+        "properties",
     ] {
         own = blank_elements(&own, section)?;
     }
-    let usable = |v: Option<String>| v.filter(|v| !v.is_empty() && !v.contains("${"));
+    let usable = |v: Option<String>| {
+        v.map(|v| interpolate(&v, properties))
+            .filter(|v| !v.is_empty() && !v.contains("${"))
+    };
     let mut refs = BTreeMap::new();
     for (field, inherited) in [("groupId", true), ("artifactId", false), ("version", true)] {
         let parent_value = usable(parent_text(field)?);
-        let value = match usable(child_text(&own, field)?) {
-            Some(v) => Some(v),
+        let value = match child_text(&own, field)? {
+            Some(v) => usable(Some(v)),
             None if inherited => parent_value.clone(),
             None => None,
         };
@@ -430,7 +439,8 @@ pub(crate) fn may_name(coordinate: &str, want: &str) -> bool {
 /// Whether a declaration Maven always reads (outside `<profiles>` when
 /// `in_profile` is false) whose coordinates are not `group:artifact` as
 /// written may still be that GA's main jar through an undefined coordinate
-/// property (#683): a jar-typed (or untyped), classifier-less declaration
+/// property (#683): a jar-typed (or untyped, or typed through a property
+/// that may be `jar`), classifier-less declaration
 /// whose coordinates [`may_name`] it. The hosted rewriter and VEX share this
 /// rule, so what one pins the other attests.
 pub(crate) fn may_shadow(
@@ -441,7 +451,7 @@ pub(crate) fn may_shadow(
 ) -> bool {
     (dep_group != group || dep_artifact != artifact)
         && classifier.is_none()
-        && type_text.is_none_or(|t| t == "jar")
+        && type_text.is_none_or(|t| t == "jar" || t.contains("${"))
         && may_name(dep_group, group)
         && may_name(dep_artifact, artifact)
 }
@@ -578,7 +588,28 @@ mod tests {
             Some("tests"),
             ga
         ));
+        assert!(super::may_shadow(
+            ("${g}", "slf4j-api"),
+            Some("${t}"),
+            None,
+            ga
+        ));
         assert!(!super::may_shadow(ga, None, None, ga));
+
+        // Bugbot: a project coordinate written through a property is
+        // interpolated, not inherited from the parent, and a same-named
+        // element inside <properties> is not the project's own.
+        let pom = "<project><parent><groupId>org.parent</groupId><version>9</version></parent>\
+                   <properties><groupId>org.wrong</groupId><g>com.acme</g></properties>\
+                   <groupId>${g}</groupId><version>${undefined}</version>\
+                   <dependencies>\
+                   <dependency><groupId>${project.groupId}</groupId><artifactId>a</artifactId>\
+                   <version>${project.version}</version></dependency>\
+                   </dependencies></project>";
+        let scope = PomScope::new(pom).unwrap();
+        let deps = scope.dependencies().unwrap();
+        assert_eq!(deps[0].group.as_deref(), Some("com.acme"));
+        assert!(!scope.coordinate_refs.contains_key("project.version"));
     }
 
     #[test]
