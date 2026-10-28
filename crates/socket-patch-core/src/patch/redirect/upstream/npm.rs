@@ -2772,6 +2772,35 @@ async fn still_hosted(view: &mut View<'_>, rels: &[&str], ctx: &Ctx<'_>) -> bool
     false
 }
 
+/// Whether this restore put a pnpm lock the root `pnpm-workspace.yaml`
+/// trusts back on the registry and none of those locks is hosted any more.
+/// The file trusts the root lock and, under `sharedWorkspaceLockfile:
+/// false`, every member's own lock (#1268). A workspace whose member locks
+/// cannot be listed fails closed: a member lock may still need the setting.
+async fn trusted_pnpm_locks_restored(view: &mut View<'_>, ctx: &Ctx<'_>) -> bool {
+    use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
+    use crate::vendor::lock_inventory::ProjectView;
+
+    if !view
+        .staged
+        .keys()
+        .any(|k| k.rsplit('/').next() == Some("pnpm-lock.yaml"))
+    {
+        return false;
+    }
+    let mut locks = vec!["pnpm-lock.yaml".to_string()];
+    match member_locks(&ProjectView::Disk(view.root())).await {
+        MemberLocks::Shared => {}
+        MemberLocks::PerMember(keys) => locks.extend(keys),
+        MemberLocks::Unresolved(_) => return false,
+    }
+    if !view.staged.keys().any(|k| locks.contains(k)) {
+        return false;
+    }
+    let rels: Vec<&str> = locks.iter().map(String::as_str).collect();
+    !still_hosted(view, &rels, ctx).await
+}
+
 /// Remove the `.npmrc` / pnpm-workspace.yaml a hosted run CREATED (still
 /// byte-identical to the scaffold) once no lock entry needs it; warn about
 /// the setting when the file carries other content too (the line may be
@@ -2808,22 +2837,7 @@ pub(crate) async fn cleanup_side_config(
         }
     }
 
-    // The root `pnpm-workspace.yaml` trusts the root lock and, under
-    // `sharedWorkspaceLockfile: false`, every member's own lock (#1268):
-    // a restore of any of them may leave the setting unneeded, and it is
-    // still needed while any of them stays hosted.
-    let mut pnpm_locks = vec!["pnpm-lock.yaml".to_string()];
-    if let crate::utils::pnpm_workspace::MemberLocks::PerMember(keys) =
-        crate::utils::pnpm_workspace::member_locks(
-            &crate::vendor::lock_inventory::ProjectView::Disk(view.root()),
-        )
-        .await
-    {
-        pnpm_locks.extend(keys);
-    }
-    let restored_pnpm = view.staged.keys().any(|k| pnpm_locks.contains(k));
-    let pnpm_locks: Vec<&str> = pnpm_locks.iter().map(String::as_str).collect();
-    if restored_pnpm && !still_hosted(view, &pnpm_locks, ctx).await {
+    if trusted_pnpm_locks_restored(view, ctx).await {
         const WORKSPACE: &str = "pnpm-workspace.yaml";
         if let Ok(Some(ws)) = view.read(WORKSPACE).await {
             let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;

@@ -46,18 +46,7 @@ fn assert_no_ledger(root: &Path) {
 /// re-resolves `NAME@VERSION` from a mocked npm registry serving
 /// `UPSTREAM_SHA512`.
 async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
-    Mock::given(method("GET"))
-        .and(path(format!("/npm-registry/{NAME}/{VERSION}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "name": NAME,
-            "version": VERSION,
-            "dist": {
-                "tarball": format!("{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz", server.uri()),
-                "integrity": UPSTREAM_SHA512,
-            }
-        })))
-        .mount(server)
-        .await;
+    mock_registry_version(server, NAME, VERSION).await;
     std::env::set_var(
         "SOCKET_NPM_REGISTRY",
         format!("{}/npm-registry", server.uri()),
