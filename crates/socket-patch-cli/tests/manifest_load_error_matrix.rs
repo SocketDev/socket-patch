@@ -93,13 +93,13 @@ enum Spelling {
 }
 
 fn assert_matrix(seed: impl Fn(&Path), code: &str) {
-    assert_matrix_in(project, &seed, code, Spelling::Default);
+    assert_matrix_in(project, &seed, &[code], Spelling::Default);
 }
 
 fn assert_matrix_in(
     make: fn(&dyn Fn(&Path)) -> tempfile::TempDir,
     seed: &dyn Fn(&Path),
-    code: &str,
+    codes: &[&str],
     spelling: Spelling,
 ) {
     for (argv, command, exit) in MATRIX {
@@ -121,7 +121,10 @@ fn assert_matrix_in(
         let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
             panic!("{argv:?}: stdout must be one JSON envelope ({e}): {stdout:?}\nstderr={stderr}")
         });
-        assert_eq!(v["error"]["code"], code, "{argv:?}: {v}");
+        assert!(
+            codes.iter().any(|c| v["error"]["code"] == *c),
+            "{argv:?}: expected one of {codes:?}: {v}"
+        );
         assert_eq!(got_exit, *exit, "{argv:?}: {v}\nstderr={stderr}");
         // A full envelope, not a bare `{status, error}`.
         assert_eq!(v["command"], *command, "{argv:?}: {v}");
@@ -166,7 +169,9 @@ fn socket_dir_as_file_is_manifest_unreadable_on_every_command() {
     assert_matrix_in(
         project_root,
         &|root| std::fs::write(root.join(".socket"), "not a directory").unwrap(),
-        "manifest_unreadable",
+        // `vendor --check` reads the vendor ledger under the same `.socket`
+        // first, and refuses that store just as closed.
+        &["manifest_unreadable", "vendor_state_unreadable"],
         Spelling::Default,
     );
 }
@@ -194,7 +199,7 @@ fn directory_manifest_verdict_does_not_depend_on_spelling() {
         assert_matrix_in(
             project,
             &|path| std::fs::create_dir_all(path).unwrap(),
-            "manifest_unreadable",
+            &["manifest_unreadable"],
             spelling,
         );
     }

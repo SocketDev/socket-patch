@@ -56,7 +56,9 @@ pub(super) struct GcSummary {
     /// mutations already happened on disk, so the stale record is reported,
     /// not the pass failed. Also the vendored reverts' reinstall advisories
     /// (`vendor_bun_reinstall_required`, `vendor_vlt_reinstall_required`)
-    /// and no other revert warning. Serialized as additive
+    /// and no other revert warning. And `manifest_invalid` /
+    /// `manifest_unreadable` when the manifest half could not load the
+    /// manifest (#1063). Serialized as additive
     /// `warnings[]` on the apply shape only.
     warnings: Vec<(&'static str, String)>,
 }
