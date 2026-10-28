@@ -1304,7 +1304,11 @@ mod tests {
                 assert_refs(&out, &[]);
                 assert_eq!(out.diagnostics.len(), 1, "{member_version}");
                 assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
-                assert!(out.diagnostics[0].detail.contains("selects v1.5.0"));
+                let detail = &out.diagnostics[0].detail;
+                assert!(
+                    detail.contains("is inert") && detail.contains("v1.5.0"),
+                    "{detail}"
+                );
             } else {
                 assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
                 assert_eq!(
