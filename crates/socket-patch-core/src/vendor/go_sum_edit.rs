@@ -293,9 +293,18 @@ impl GoSumEditor {
     /// module tree) line for, in file order — the versions whose packages
     /// the build loads, unlike the `/go.mod` lines go writes for every
     /// version MVS reads.
+    ///
+    /// The hosted Go rewriter calls this once per patched dep, so a line
+    /// whose first token can't be `module` is skipped with one prefix
+    /// compare instead of being tokenized (#1424).
     pub(crate) fn zip_versions(&self, module: &str) -> Vec<String> {
         self.current_lines()
-            .flat_map(go_sum_lines)
+            .filter(|l| {
+                l.trim_start()
+                    .strip_prefix(module)
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+            })
+            .filter_map(parse_go_sum_line)
             .filter_map(|l| l.zip_version_of(module).map(str::to_string))
             .collect()
     }
@@ -388,20 +397,24 @@ impl<'a> GoSumLine<'a> {
 /// lines are skipped. Each caller keeps its own token rule
 /// ([`GoSumLine::extra_tokens`]) and hash filter.
 pub(crate) fn go_sum_lines(text: &str) -> impl Iterator<Item = GoSumLine<'_>> {
-    text.lines().filter_map(|line| {
-        let mut tokens = line.split_whitespace();
-        let (module, version, hash) = (tokens.next()?, tokens.next()?, tokens.next()?);
-        let (version, go_mod) = match version.strip_suffix("/go.mod") {
-            Some(version) => (version, true),
-            None => (version, false),
-        };
-        Some(GoSumLine {
-            module,
-            version,
-            go_mod,
-            hash,
-            extra_tokens: tokens.next().is_some(),
-        })
+    text.lines().filter_map(parse_go_sum_line)
+}
+
+/// One line of [`go_sum_lines`], or `None` when it has fewer than three
+/// tokens.
+fn parse_go_sum_line(line: &str) -> Option<GoSumLine<'_>> {
+    let mut tokens = line.split_whitespace();
+    let (module, version, hash) = (tokens.next()?, tokens.next()?, tokens.next()?);
+    let (version, go_mod) = match version.strip_suffix("/go.mod") {
+        Some(version) => (version, true),
+        None => (version, false),
+    };
+    Some(GoSumLine {
+        module,
+        version,
+        go_mod,
+        hash,
+        extra_tokens: tokens.next().is_some(),
     })
 }
 
@@ -815,6 +828,55 @@ mod tests {
                     "seed {seed} step {step}: {start:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn zip_versions_reads_only_the_modules_own_zip_lines() {
+        let content = "example.com/a v1.0.0 h1:A=\n\
+                       example.com/a v1.1.0/go.mod h1:B=\n\
+                       example.com/ab v9.0.0 h1:C=\n\
+                       example.com/a/v2 v2.0.0 h1:D=\n\
+                       \t  example.com/a  v1.2.0\th1:E=\n\
+                       example.com/a v1.3.0\n\
+                       example.com/a\n\
+                       \n\
+                       example.com/a v1.4.0 h1:F= extra\n\
+                       Example.com/a v1.5.0 h1:G=\n\
+                       example.com/a v1.0.0 h1:A=\r\n";
+        let want = ["v1.0.0", "v1.2.0", "v1.4.0", "v1.0.0"];
+        let mut editor = GoSumEditor::new(content.to_string());
+        assert_eq!(editor.zip_versions("example.com/a"), want);
+        assert_eq!(editor.zip_versions("example.com/ab"), ["v9.0.0"]);
+        assert_eq!(editor.zip_versions("example.com/a/v2"), ["v2.0.0"]);
+        assert!(editor.zip_versions("example.com").is_empty());
+        assert!(editor.zip_versions("v1.0.0").is_empty());
+        // Same answer once an edit has split the content into lines.
+        assert!(editor.upsert_module_lines(MOD, VER, ZIP_H1, GOMOD_H1));
+        assert_eq!(editor.zip_versions("example.com/a"), want);
+        assert_eq!(editor.zip_versions(MOD), [VER]);
+    }
+
+    #[test]
+    fn zip_versions_matches_the_full_line_reader() {
+        // The prefilter must never change the answer of tokenizing every
+        // line (#1424): compare against `go_sum_lines` over odd spacing.
+        let content =
+            "m v1 h1:a\n m v2 h\n\u{a0}m v3 h\nm\u{a0}v4 h\nmm v5 h\nm v6/go.mod h\nm\tv7\th\n";
+        let text = GoSumEditor::new(content.to_string());
+        // An edit leaves the editor holding split lines; ask both forms.
+        let mut lines = GoSumEditor::new(content.to_string());
+        assert!(lines.upsert_module_lines(MOD, VER, ZIP_H1, GOMOD_H1));
+        for module in ["m", "mm", "m\u{a0}v4", ""] {
+            let reference: Vec<String> = go_sum_lines(content)
+                .filter_map(|l| l.zip_version_of(module).map(str::to_string))
+                .collect();
+            assert_eq!(text.zip_versions(module), reference, "module {module:?}");
+            assert_eq!(
+                lines.zip_versions(module),
+                reference,
+                "lines, module {module:?}"
+            );
         }
     }
 }
