@@ -1321,6 +1321,41 @@ mod tests {
         }
     }
 
+    /// A member that cannot be read (outside the root, or missing its
+    /// go.mod) does not hide another member's higher require.
+    #[tokio::test]
+    async fn workspace_unreadable_member_keeps_other_members_requires() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        for extra in ["../outside", "./missing"] {
+            let p = Project::new();
+            p.write("go.mod", BASE_GO_MOD)
+                .write(
+                    "go.work",
+                    format!(
+                        "go 1.21\n\nuse (\n\t.\n\t{extra}\n\t./svc\n)\n\nreplace {MODULE} {VERSION} => {m} {sver}\n"
+                    ),
+                )
+                .write(
+                    "go.work.sum",
+                    format!("{m} {sver} {ZIP_H1}\n{m} {sver}/go.mod {MOD_H1}\n"),
+                )
+                .write(
+                    "svc/go.mod",
+                    format!("module example.com/svc\n\ngo 1.21\n\nrequire {MODULE} v1.5.0\n"),
+                );
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert!(
+                out.diagnostics.iter().any(
+                    |d| d.code == DIAG_REF_INVALID && d.detail.contains("v1.5.0, so the build")
+                ),
+                "{extra}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
     /// go verifies against the sum files of the mode it builds in: in
     /// workspace mode `go.work.sum` and the members' go.sum (the root's only
     /// when `.` is a member); under `GOWORK=off` the root go.sum alone, with
