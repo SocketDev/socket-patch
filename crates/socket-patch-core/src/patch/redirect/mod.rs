@@ -9311,6 +9311,10 @@ pub const GO_WORKSPACE_KEY: &str = "<socket-patch:go-workspace>";
 pub struct HostedGoWorkspace {
     pub root: std::path::PathBuf,
     pub loaded: crate::vendor::go_workspace::Loaded,
+    /// `GOFLAGS`' `-modfile` keeping the replace from the build, as
+    /// [`crate::vendor::go_workspace::modfile_conflict`] words it (#1799).
+    #[serde(default)]
+    pub modfile: Option<String>,
 }
 
 fn rewrite_golang(
@@ -9450,10 +9454,14 @@ fn rewrite_golang(
                 rhs_version: Some(rhs_version.clone()),
                 owner: Some(go_mod_edit::ReplaceOwner::Hosted),
             };
-            if let Some(conflict) =
+            let modfile = ws
+                .modfile
+                .clone()
+                .map(|setting| crate::vendor::go_workspace::WorkspaceConflict::ModFile { setting });
+            if let Some(conflict) = modfile.or_else(|| {
                 ws.loaded
                     .host_conflict(host, &ws.root, &fname, &dep.version, &ours)
-            {
+            }) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_golang_workspace_conflict".into(),
                     detail: format!(
@@ -23578,6 +23586,7 @@ packages:
                         .collect(),
                 ),
             }),
+            modfile: None,
         };
         (
             GO_WORKSPACE_KEY.to_string(),
@@ -23799,6 +23808,7 @@ packages:
                 ],
                 graph: None,
             }),
+            modfile: None,
         };
         again.insert(
             GO_WORKSPACE_KEY.to_string(),
@@ -23810,6 +23820,34 @@ packages:
             out.warnings
                 .iter()
                 .any(|w| w.code == "redirect_golang_not_in_module_graph"),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// #1799: `-modfile` in GOFLAGS sends the build to another go.mod, so
+    /// the hosted pin is refused, nothing written or confirmed.
+    #[test]
+    fn golang_goflags_modfile_refuses_the_pin() {
+        use crate::vendor::go_workspace::Loaded;
+        let ovr = golang_override();
+        let mut files = golang_files();
+        let hosted = HostedGoWorkspace {
+            root: std::path::PathBuf::new(),
+            loaded: Loaded::None,
+            modfile: Some("GOFLAGS sets -modfile=go.alt.mod, so go builds from go.alt.mod".into()),
+        };
+        files.insert(
+            GO_WORKSPACE_KEY.to_string(),
+            serde_json::to_string(&hosted).unwrap(),
+        );
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
+        assert!(
+            out.warnings[0].detail.contains("-modfile=go.alt.mod"),
             "{:?}",
             out.warnings
         );

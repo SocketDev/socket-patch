@@ -37,6 +37,67 @@ pub(crate) fn go_env_with(key: &str, env: impl Fn(&str) -> Option<String>) -> Op
     lookup_in_env_file(&text, key).filter(|v| !v.is_empty())
 }
 
+/// The `-modfile` value in a `GOFLAGS` setting, read as go reads it
+/// (`cmd/go/internal/base.InitGOFLAGS`): fields split on whitespace, a field
+/// opening with `'` or `"` quoted to the matching quote, `-flag` or
+/// `--flag`, and the last `-modfile` winning. `None` when go reads the
+/// module's own go.mod (no `-modfile`, or an empty `-modfile=`); `Some("")`
+/// when go refuses the setting itself (a bare `-modfile` without a value, or
+/// an unterminated quote), which no build gets past either.
+pub(crate) fn goflags_modfile(goflags: &str) -> Option<String> {
+    let Some(fields) = split_goflags(goflags) else {
+        return Some(String::new());
+    };
+    // `Some(None)`: a bare `-modfile`, which go rejects for want of a value.
+    let mut modfile: Option<Option<&str>> = None;
+    for field in &fields {
+        let name = field
+            .strip_prefix("--")
+            .or_else(|| field.strip_prefix('-'))
+            .unwrap_or("");
+        match name.split_once('=') {
+            Some(("modfile", value)) => modfile = Some(Some(value)),
+            None if name == "modfile" => modfile = Some(None),
+            _ => {}
+        }
+    }
+    match modfile? {
+        None => Some(String::new()),
+        // go's flag default: the module's own go.mod.
+        Some("") => None,
+        Some(value) => Some(value.to_string()),
+    }
+}
+
+/// Go's `cmd/internal/quoted.Split`: whitespace-separated fields, a field
+/// that opens with `'` or `"` running to the same quote, which must end the
+/// field. `None` when a quote is unterminated or runs into the next field.
+fn split_goflags(s: &str) -> Option<Vec<String>> {
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let mut fields = Vec::new();
+    let mut rest = s.trim_start_matches(is_space);
+    while !rest.is_empty() {
+        let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"');
+        let (field, after) = match quote {
+            Some(q) => {
+                let end = rest[1..].find(q)? + 1;
+                let after = &rest[end + 1..];
+                if after.starts_with(|c: char| !is_space(c)) {
+                    return None;
+                }
+                (&rest[1..end], after)
+            }
+            None => {
+                let end = rest.find(is_space).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        fields.push(field.to_string());
+        rest = after.trim_start_matches(is_space);
+    }
+    Some(fields)
+}
+
 /// The Go environment file go would read, or `None` when `GOENV=off` or no
 /// user config directory resolves.
 fn go_env_file(env: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
@@ -114,6 +175,30 @@ mod tests {
         assert_eq!(lookup_in_env_file(text, "lower"), None);
         assert_eq!(lookup_in_env_file(text, "NOEQUALS"), None);
         assert_eq!(lookup_in_env_file(text, "GONOPROXY"), None);
+    }
+
+    /// `-modfile` read from GOFLAGS as go reads it (#1799).
+    #[test]
+    fn goflags_modfile_reads_the_last_modfile() {
+        let m = |s: &str| goflags_modfile(s);
+        assert_eq!(m(""), None);
+        assert_eq!(m("-mod=mod -tags=a=b"), None);
+        assert_eq!(m("-modfile=alt.mod").as_deref(), Some("alt.mod"));
+        assert_eq!(
+            m("  --modfile=alt.mod\t-mod=mod ").as_deref(),
+            Some("alt.mod")
+        );
+        assert_eq!(m("-modfile=a.mod -modfile=b.mod").as_deref(), Some("b.mod"));
+        assert_eq!(m("-modfile=a.mod -modfile="), None);
+        assert_eq!(m("'-modfile=a b.mod'").as_deref(), Some("a b.mod"));
+        assert_eq!(m("\"-modfile=a.mod\" -mod=mod").as_deref(), Some("a.mod"));
+        // go rejects these settings outright.
+        assert_eq!(m("-modfile").as_deref(), Some(""));
+        assert_eq!(m("-modfile=a.mod -modfile").as_deref(), Some(""));
+        assert_eq!(m("'-modfile=a.mod").as_deref(), Some(""));
+        assert_eq!(m("'-mod=mod'x").as_deref(), Some(""));
+        // Not a modfile flag.
+        assert_eq!(m("-modfiles=a.mod modfile=a.mod ---modfile=a.mod"), None);
     }
 
     /// env (non-empty) → `$GOENV` file → `None`; an empty env var falls

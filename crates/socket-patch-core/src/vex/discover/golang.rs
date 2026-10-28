@@ -130,7 +130,9 @@ use crate::vendor::go_mod_edit::{
     ReplaceOwner, HOSTED_GO_MODULE_PREFIX,
 };
 use crate::vendor::go_sum_edit::{go_semver_cmp, go_sum_lines, is_h1_dirhash};
-use crate::vendor::go_workspace::{self, in_root_dir, same_dir_key, GoWork, GoWorkspace, Member};
+use crate::vendor::go_workspace::{
+    self, in_root_dir, same_dir_key, GoWork, GoWorkspace, Member, WorkspaceConflict,
+};
 use crate::vendor::lock_inventory::LockIntegrity;
 
 const GO_MOD: &str = "go.mod";
@@ -139,7 +141,31 @@ const GO_WORK: &str = "go.work";
 const GO_WORK_SUM: &str = "go.work.sum";
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
-    extract_gowork(ctx, out, go_env("GOWORK").as_deref()).await;
+    extract_goenv(
+        ctx,
+        out,
+        go_env("GOWORK").as_deref(),
+        go_env("GOFLAGS").as_deref(),
+    )
+    .await;
+}
+
+/// [`extract`] for explicit `GOWORK` and `GOFLAGS` values.
+async fn extract_goenv(
+    ctx: &DiscoverCtx<'_>,
+    out: &mut Discovery,
+    gowork: Option<&str>,
+    goflags: Option<&str>,
+) {
+    // `-modfile` sends the build to another go.mod, whose replaces (if
+    // any) discovery doesn't read: nothing here is what go builds (#1799).
+    let root = ctx.disk_root().unwrap_or(Path::new(""));
+    if let Some(WorkspaceConflict::ModFile { setting }) =
+        go_workspace::modfile_conflict_with(root, goflags, gowork)
+    {
+        return withhold(ctx, out, &setting).await;
+    }
+    extract_gowork(ctx, out, gowork).await;
 }
 
 /// [`extract`] for an explicit `GOWORK` value.
@@ -1853,6 +1879,54 @@ mod tests {
         }
         let out = extract(Some("off".to_string())).await;
         assert!(out.refs.is_empty() && out.diagnostics.is_empty());
+    }
+
+    /// #1799: `-modfile` in GOFLAGS naming another go.mod sends the build
+    /// there, so the root go.mod's replace is diagnosed, never a ref; one
+    /// naming the root's own go.mod (or an empty one) is go's default.
+    #[tokio::test]
+    async fn goflags_modfile_naming_another_go_mod_attests_nothing() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let p = Project::new();
+        p.write(
+            "go.mod",
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n\n\
+                 replace {MODULE} {VERSION} => {m} {sver}\n"
+            ),
+        )
+        .write("go.sum", go_sum_for(UUID_A, sver));
+        let extract = |goflags: &'static str| {
+            let p = &p;
+            async move {
+                let ctx = p.ctx();
+                let mut out = Discovery::default();
+                super::extract_goenv(&ctx, &mut out, None, Some(goflags)).await;
+                out
+            }
+        };
+        let own = p.root().join("go.mod").to_string_lossy().into_owned();
+        let own: &'static str = Box::leak(format!("-mod=mod --modfile={own}").into_boxed_str());
+        for goflags in ["", "-mod=mod", "-modfile=", "-modfile=go.mod", own] {
+            let out = extract(goflags).await;
+            assert_eq!(out.refs.len(), 1, "{goflags}: {:?}", out.diagnostics);
+        }
+        for goflags in [
+            "-modfile=go.alt.mod",
+            "-modfile=go.mod \"-modfile=alt dir/go.mod\"",
+            "-modfile",
+        ] {
+            let out = extract(goflags).await;
+            assert!(out.refs.is_empty(), "{goflags}");
+            assert_eq!(out.diagnostics.len(), 1, "{goflags}: {:?}", out.diagnostics);
+            assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+            assert!(
+                out.diagnostics[0].detail.contains("-modfile"),
+                "{goflags}: {:?}",
+                out.diagnostics
+            );
+        }
     }
 
     /// In a workspace the socket module's zip line does not prove the

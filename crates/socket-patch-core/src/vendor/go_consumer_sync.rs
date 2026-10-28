@@ -188,12 +188,39 @@ pub async fn audit(
         found.extend(audit_module(&root, pristine_go_mods).await);
     }
     found.extend(audit_work(project_root, pristine_go_mods).await);
+    found.extend(work_modfile_issues(project_root).await);
     for issue in found {
         if !issues.contains(&issue) {
             issues.push(issue);
         }
     }
     issues
+}
+
+/// A [`GoSyncIssue::Workspace`] for each Socket replace in the `go.work`
+/// at the project root while `-modfile` in GOFLAGS makes go refuse the
+/// workspace (#1799). The go.mod replaces are [`workspace_issues`]'.
+async fn work_modfile_issues(project_root: &Path) -> Vec<GoSyncIssue> {
+    let Some(conflict) = go_workspace::modfile_conflict(project_root) else {
+        return Vec::new();
+    };
+    let Some(work) = go_workspace::root_work_file(project_root) else {
+        return Vec::new();
+    };
+    let Ok(text) = read_regular_to_string(&work).await else {
+        return Vec::new();
+    };
+    go_mod_edit::parse_replace_entries(&text)
+        .into_iter()
+        .filter(ReplaceEntry::socket_owned)
+        .filter_map(|e| {
+            Some(GoSyncIssue::Workspace {
+                version: e.version?,
+                module: e.module,
+                conflict: conflict.clone(),
+            })
+        })
+        .collect()
 }
 
 /// The Socket replaces in the `go.work` at the project root: `go work
@@ -335,6 +362,7 @@ pub async fn workspace_audit(project_root: &Path) -> Vec<GoSyncIssue> {
             );
         }
     }
+    issues.extend(work_modfile_issues(project_root).await);
     issues
 }
 
@@ -410,7 +438,9 @@ pub async fn replace_refusal(
             ));
         }
     }
-    let conflict = ws.host_conflict(host, project_root, module, version, &ours)?;
+    // `-modfile` in GOFLAGS sends the build to another go.mod (#1799).
+    let conflict = go_workspace::modfile_conflict(project_root)
+        .or_else(|| ws.host_conflict(host, project_root, module, version, &ours))?;
     Some(format!(
         "refusing to write `replace {module} {version} => {target}` to {}: it {}",
         host.file_name(),
@@ -425,12 +455,16 @@ async fn workspace_issues(project_root: &Path, replaces: &[ReplaceEntry]) -> Vec
         return Vec::new();
     }
     let ws = go_workspace::load(project_root).await;
+    let modfile = go_workspace::modfile_conflict(project_root);
     let mut issues = Vec::new();
     for entry in replaces.iter().filter(|e| e.socket_owned()) {
         let Some(version) = entry.version.as_deref() else {
             continue;
         };
-        if let Some(conflict) = ws.conflict(project_root, &entry.module, version, entry) {
+        let conflict = modfile
+            .clone()
+            .or_else(|| ws.conflict(project_root, &entry.module, version, entry));
+        if let Some(conflict) = conflict {
             issues.push(GoSyncIssue::Workspace {
                 module: entry.module.clone(),
                 version: version.to_string(),
