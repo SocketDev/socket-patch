@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Go modules bug-hunt routine (label pm:go).
 
-Last updated: 2026-10-28 (run 14), main `b787454` (5.0.1+171), latest release v5.0.1. Run 14 filed #1766: after rollback or remove in a non-root go.work member, a stale `go work vendor` modules.txt goes unreported. Run 13 was on the same main. Between runs 12 and 13, fixes on main closed #343, #344, #346, #391, #392, #393, #422, #458, #484, #509, #531, #618 and #682. Cells marked "fixed #N" haven't been re-verified unless they say "pass (run 13)". Run 13 filed #1751: in a go.work, a member's replace for a version that another member out-requires is inert, but apply, --check and VEX report it patched. #549 is still open (PR #1698 pending).
+Last updated: 2026-10-28 (run 15), main `b787454` (5.0.1+171), latest release v5.0.1. Run 15 filed #1777: vendored-mode undo (`vendor --revert`, `rollback`, `remove`) never warns about a stale `vendor/modules.txt`, so every build fails (not a regression; v5.0.1 does the same). It also covered mode takeovers. Run 14 filed #1766: after rollback or remove in a non-root go.work member, a stale `go work vendor` modules.txt goes unreported. Run 13 was on the same main. Between runs 12 and 13, fixes on main closed #343, #344, #346, #391, #392, #393, #422, #458, #484, #509, #531, #618 and #682. Cells marked "fixed #N" haven't been re-verified unless they say "pass (run 13)". Run 13 filed #1751: in a go.work, a member's replace for a version that another member out-requires is inert, but apply, --check and VEX report it patched. #549 is still open (PR #1698 pending).
 
 ## Coverage matrix
 
@@ -10,7 +10,7 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 1.16.15 | untested | untested | untested | untested | fixed #343 | fixed #344 | untested | untested | n/a (no go.work) | n/a | n/a (no go.work) | untested | untested | n/a | n/a (no proxy toolchain) | untested | untested | n/a (no go.work) | n/a |
 | Linux | 1.21.13 | pass (probe) | untested | untested | pass (probe) | fixed #343 | fixed #344 | fixed #391 (agent) | untested | fixed #393 (agent) | untested | untested | untested | untested | untested | fixed #618 (agent) | fixed #682 | pass | untested | n/a (go < 1.22) |
-| Linux | 1.24.7 (+1.22.12) | pass (run 13; CRLF go.mod/go.sum pass) | pass | apply/check/rollback pass; vex fixed #484 (agent only; vendored + takeover pass) | pass | fixed #343 (agent, vendored, hosted) | fixed #344 | fixed #391 (agent) / vendored pass / hosted pass (vex exits 2) | fixed #392 (agent + vendored), fixed #509 (hosted, go 1.16) | fixed #393 (agent, vendored, hosted) | fixed #458 (agent, vendored, hosted) | fixed #531 (agent, 1.22 + 1.24; vendored 1.24); hosted pass (identical module-path replaces) | plain get/day-2/idempotent/rollback/CRLF pass; `+incompatible` blocked (server contract) | fail #549 (agent, 1.22 + 1.24; vendored 1.24); hosted pass | off pass; `<path>` pass; `<path>` + user replace fixed #393 | fixed #618 (agent 1.22 + 1.24, vendored 1.24, hosted 1.21/1.22/1.24/1.26) | fixed #682 | pass | fail #1751 (agent, 1.22.12 + 1.24.7) | apply pass; rollback/remove fail #1766 (agent, 1.22.12 + 1.24.7) |
+| Linux | 1.24.7 (+1.22.12) | pass (run 13; CRLF go.mod/go.sum pass) | pass | apply/check/rollback pass; vex fixed #484 (agent only; vendored + takeover pass) | pass | fixed #343 (agent, vendored, hosted apply/rollback); vendored undo (`vendor --revert`/`rollback`/`remove`) fail #1777 (1.22.12, 1.24.7, 1.26.8) | fixed #344 | fixed #391 (agent) / vendored pass / hosted pass (vex exits 2) | fixed #392 (agent + vendored), fixed #509 (hosted, go 1.16) | fixed #393 (agent, vendored, hosted) | fixed #458 (agent, vendored, hosted) | fixed #531 (agent, 1.22 + 1.24; vendored 1.24); hosted pass (identical module-path replaces) | plain get/day-2/idempotent/rollback/CRLF pass; `+incompatible` blocked (server contract) | fail #549 (agent, 1.22 + 1.24; vendored 1.24); hosted pass | off pass; `<path>` pass; `<path>` + user replace fixed #393 | fixed #618 (agent 1.22 + 1.24, vendored 1.24, hosted 1.21/1.22/1.24/1.26) | fixed #682 | pass | fail #1751 (agent, 1.22.12 + 1.24.7) | apply pass; rollback/remove fail #1766 (agent, 1.22.12 + 1.24.7) |
 | Linux | 1.26.3 | pass (probe) | untested | untested | pass (probe) | fixed #343 | fixed #344 | fixed #391 (agent (1.26.8)) | untested | fixed #393 (agent (1.26.8)) | fixed #458 (agent, 1.26.8) | fixed #531 (agent, 1.26.8) | untested | fail #549 (agent, 1.26.8) | untested | fixed #618 (agent, 1.26.8) | fixed #682 (1.26.8) | pass (1.26.8) | fail #1751 (agent, 1.26.8) | rollback/remove fail #1766 (agent, 1.26.8) |
 | macOS | 1.24.13 / 1.26.3 | untested (plain; the vendor/-dir cell got as far as apply exit 0) | untested | untested | untested | fixed #343 | fixed #344 | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested | untested |
 | Windows | 1.16.15 / 1.21.13 / 1.26.3 | fixed #346 | untested (#346 fixed) | untested (#346 fixed) | fixed #346 | untested (#346 fixed) | fixed #344 | untested (#346 fixed) | untested (#346 fixed) | untested (#346 fixed) | untested (#346 fixed) | untested (#346 fixed) | untested | untested (#346 fixed) | untested | untested (#346 fixed) | untested | untested | untested | untested |
@@ -28,12 +28,22 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 
 ## Backlog
 
+### Mode takeovers (run 15, Linux, go 1.24.7)
+
+| Takeover | Result |
+| --- | --- |
+| agent → hosted (`get --mode hosted` over a go-patches replace) | go.mod/go.sum rewritten, PATCHED, tidy clean; leaves the agent manifest entry and copy behind, so later `apply` exits 1 (refuses the hosted replace). Docs say to roll back first: known non-bug |
+| hosted → agent (`apply`) | refuses (intended) |
+| hosted → vendored (`vendor` eject) | pass (LF + CRLF go.mod), `vendor --check` pass, `vendor --revert` restores upstream byte for byte |
+| vendored undo with committed `vendor/` | fail #1777 |
+
+
 0. **Maintainer request (partly covered, keep it on top):** global (`-g`) mode on macOS and Windows. Linux is done (#422 is fixed; its warning passed in run 13). The full checklist is in the 20261001T040000Z entry.
 1. **Needs a maintainer:** delete the stale probe branches `bughunt/go/20260930-goenv-vendor`, `bughunt/go/20260930-windows-apply` and `bughunt/go/20260930-windows-bisect`. `git push --delete` from the sandbox was denied by the permission classifier again in run 13. Until they're gone, no new probe branches get pushed.
-2. #1766 in vendored mode and with several members. #1751 in vendored mode (the hosted half is #1753), and a go.work-level `replace M vX => M vY` variant. Once #1764 (go.work writer) merges: go.work/go.work.sum writes, byte-for-byte rollback, and `go work vendor` with them.
+2. Re-check #1777 when a fix lands (all three undo commands, plain and go.work). #1766 with several members. #1751 in vendored mode (the hosted half is #1753), and a go.work-level `replace M vX => M vY` variant. Once #1764 (go.work writer) merges: go.work/go.work.sum writes, byte-for-byte rollback, and `go work vendor` with them.
 3. Regression re-checks of the run-12→13 fixes (#343/#618 warnings, #344 `go env -w`, #393/#458/#531 refusals, #484 vex) on 1.21 and 1.26, plus Windows/macOS now that #346 is closed.
 4. Once #1698 merges: re-check #549 and the native-vendor audit (`go_vendor_content_mismatch`). Once #1748 merges: hosted pins after tidy drops the zip line.
-5. Hosted takeovers (agent→hosted, hosted→agent/vendored) and their go.sum state; `scan --mode hosted` with `/patches/batch` in the mock and a `%2B` purl.
+5. Agent→vendored takeover (`get --mode vendored` over a go-patches replace) and vendored→hosted; `scan --mode hosted` with `/patches/batch` in the mock and a `%2B` purl.
 6. GOPRIVATE / GONOSUMDB / custom GOSUMDB in hosted rollback; `go.work.sum` in hosted workspace mode; a CRLF go.sum in vendored mode.
 7. Windows `HOME` vs `USERPROFILE` mismatch (`go_crawler.rs::get_gomodcache`).
 
@@ -75,3 +85,7 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real `go build`/`go
 - A relative `GOWORK`: go rejects it ("not an absolute path"). socket-patch still resolves the file and refuses on its replace, so it fails closed.
 - go.work `use` spellings (`a`, `./a/`, `./b/../a`, quoted, absolute) and symlinked members all match correctly for the #458 member check (run 14).
 - The #422 `go_installed_tool_stale` check dates binaries by mtime: an older-touched rebuilt binary is flagged again (conservative). A tool built later from its own `vendor/` isn't built from the patched cache, so it's out of scope for `-g`.
+- A direct agent → hosted takeover (`get --mode hosted` without `rollback` first) leaves the agent manifest entry and `.socket/go-patches/` copy, and later `apply` exits 1 refusing the hosted replace. migrating-to-v5.md says to run `rollback` before moving to hosted. Not filed.
+- An offline `rollback` of that mixed state removes the agent record, then fails the hosted restore (exit 1, "restore it from version control"). It fails closed.
+- A hosted → vendored eject on a CRLF go.sum that lists only the patched module writes it back as LF. Cosmetic, the same as the hosted-rollback note above.
+- My mock read cfg.json only once at startup. Reload it on every request, or `get` returns `notFound`.
