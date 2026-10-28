@@ -793,9 +793,11 @@ fn apply_socket_replace(
     // from the previous stanza by one blank line (the shape `go mod tidy`
     // itself produces — anything else makes the first day-2 tidy churn the
     // committed go.mod). New lines use the file's own terminator so a CRLF
-    // go.mod round-trips byte-identical through ensure→drop.
+    // go.mod round-trips byte-identical through ensure→drop, and a file
+    // without a final newline stays without one so removal can restore it.
     let eol = crate::utils::line_endings::terminator(content);
     let body = content;
+    let final_newline = body.is_empty() || body.ends_with('\n');
     if !body.is_empty() && !body.ends_with('\n') {
         body.push_str(eol);
     }
@@ -809,7 +811,9 @@ fn apply_socket_replace(
         body.push_str(eol);
     }
     body.push_str(&want_line);
-    body.push_str(eol);
+    if final_newline {
+        body.push_str(eol);
+    }
     true
 }
 
@@ -1315,19 +1319,36 @@ replace (
             .unwrap();
         assert_eq!(
             out,
-            "module m\n\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n"
+            "module m\n\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2"
         );
-        // KNOWN GAP (characterized, not endorsed): the reverse transform only
-        // sees the upserted content — which ends with a newline — so removal
-        // restores "module m\n", gaining the trailing newline the original
-        // never had. Pin today's exact shape so a change is deliberate.
         let restored = remove_replace_entry(&out, "github.com/foo/bar", ReplaceOwner::GoPatches)
             .unwrap()
             .unwrap();
         assert_eq!(
-            restored, "module m\n",
-            "trailing newline gained on round-trip (known gap)"
+            restored, "module m",
+            "no final newline gained on round-trip"
         );
+        // A go.work block without a final newline round-trips too, through
+        // a second replace and either removal order.
+        let work = "go 1.18\n\nuse (\n\t./a\n\t./b\n)";
+        let one = upsert_replace_entry(work, "example.com/x", "v1.0.0", GO_PATCHES_DIR)
+            .unwrap()
+            .unwrap();
+        let two = upsert_replace_entry(&one, "example.com/y", "v1.0.0", GO_PATCHES_DIR)
+            .unwrap()
+            .unwrap();
+        for (first, second) in [
+            ("example.com/x", "example.com/y"),
+            ("example.com/y", "example.com/x"),
+        ] {
+            let mid = remove_replace_entry(&two, first, ReplaceOwner::GoPatches)
+                .unwrap()
+                .unwrap();
+            let back = remove_replace_entry(&mid, second, ReplaceOwner::GoPatches)
+                .unwrap()
+                .unwrap();
+            assert_eq!(back, work, "{first} first");
+        }
     }
 
     #[test]
