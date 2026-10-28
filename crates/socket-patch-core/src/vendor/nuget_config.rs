@@ -171,20 +171,24 @@ pub(crate) async fn inherited_source_keys_traced(
 
 /// The configs NuGet merges for a build in `start` (every directory from
 /// `start` up to the filesystem root, then the user config), NEAREST
-/// first, each with the directory its relative paths resolve against. A
-/// file that cannot be read or parsed is skipped, as in
+/// first, each with the directory its relative paths resolve against
+/// ([`settings_chain`]).
+pub(crate) struct SettingsChain(Vec<(std::path::PathBuf, crate::formats::nuget::NugetConfig)>);
+
+/// [`SettingsChain`] for `start`. A relative `start` (the default `--cwd`
+/// is `.`) is made absolute first, so its parents' configs are read. A file
+/// that cannot be read or parsed is skipped, as in
 /// [`inherited_source_keys_traced`]. `None` reads the user config alone
 /// (global mode: no project directory takes part).
-async fn settings_chain(
-    start: Option<&std::path::Path>,
-) -> Vec<(std::path::PathBuf, crate::formats::nuget::NugetConfig)> {
+pub(crate) async fn settings_chain(start: Option<&std::path::Path>) -> SettingsChain {
     use crate::formats::nuget::parse_config;
     async fn read(path: &std::path::Path) -> Option<crate::formats::nuget::NugetConfig> {
         let text = crate::utils::fs::read_regular_to_string(path).await.ok()?;
         parse_config(crate::formats::text::strip_bom(&text))
     }
+    let start = start.map(|s| std::path::absolute(s).unwrap_or_else(|_| s.to_path_buf()));
     let mut chain = Vec::new();
-    for dir in start.into_iter().flat_map(std::path::Path::ancestors) {
+    for dir in start.iter().flat_map(|s| s.ancestors()) {
         for name in CONFIG_NAMES {
             let path = dir.join(name);
             if !crate::utils::fs::file_exists(&path).await {
@@ -201,53 +205,111 @@ async fn settings_chain(
             chain.push((dir.to_path_buf(), cfg));
         }
     }
-    chain
+    SettingsChain(chain)
 }
 
-/// The folder the `config` setting `key` (`globalPackagesFolder`,
-/// `repositoryPath`) names for a build in `start` ([`settings_chain`]):
-/// the nearest config defining it wins, `%VAR%` references are expanded
-/// (NuGet expands them on every OS), and a relative value resolves against
-/// the directory of the config that set it. `None` when no config sets it,
-/// or its value is empty or names an unset variable.
-pub(crate) async fn configured_folder(
-    start: Option<&std::path::Path>,
-    key: &str,
-) -> Option<std::path::PathBuf> {
-    let chain = settings_chain(start).await;
-    let (idx, value) = crate::formats::nuget::effective_setting(chain.iter().map(|(_, c)| c), key)?;
-    let value = expand_env_vars(value.trim())?;
-    if value.is_empty() {
-        return None;
+impl SettingsChain {
+    /// The folder the `config` setting `key` (`globalPackagesFolder`,
+    /// `repositoryPath`) names: the nearest config defining it wins,
+    /// `%VAR%` references are expanded as .NET does (NuGet expands them on
+    /// every OS; an unset one stays literal), and a relative value resolves
+    /// against the directory of the config that set it. `None` when no
+    /// config sets it or its value is empty.
+    pub(crate) fn folder(&self, key: &str) -> Option<std::path::PathBuf> {
+        let (idx, value) =
+            crate::formats::nuget::effective_setting(self.0.iter().map(|(_, c)| c), key)?;
+        let value = expand_env_vars(value.trim());
+        if value.is_empty() {
+            return None;
+        }
+        let path = std::path::PathBuf::from(value);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            self.0[idx].0.join(path)
+        })
     }
-    let path = std::path::PathBuf::from(value);
-    Some(if path.is_absolute() {
-        path
-    } else {
-        chain[idx].0.join(path)
-    })
 }
 
-/// Expand every `%NAME%` in `value`; `None` when one names an unset (or
-/// empty) variable, so a half-expanded path is never probed.
-fn expand_env_vars(value: &str) -> Option<String> {
+/// Expand every `%NAME%` naming a set variable in `value`, as .NET's
+/// `Environment.ExpandEnvironmentVariables` does: an unset name is kept
+/// literally, and its closing `%` may open the next reference.
+fn expand_env_vars(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find('%') {
-        let Some(len) = rest[start + 1..].find('%') else {
-            break;
-        };
-        let name = &rest[start + 1..start + 1 + len];
         out.push_str(&rest[..start]);
-        if name.is_empty() {
-            out.push('%');
-        } else {
-            out.push_str(&std::env::var(name).ok().filter(|v| !v.is_empty())?);
+        let after = &rest[start + 1..];
+        let Some(len) = after.find('%') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        match std::env::var(&after[..len]).ok().filter(|_| len > 0) {
+            Some(v) => {
+                out.push_str(&v);
+                rest = &after[len + 1..];
+            }
+            None => {
+                out.push('%');
+                out.push_str(&after[..len]);
+                rest = &after[len..];
+            }
         }
-        rest = &rest[start + len + 2..];
     }
     out.push_str(rest);
-    Some(out)
+    out
+}
+
+#[cfg(test)]
+mod settings_tests {
+    /// A set `%VAR%` expands; an unset or empty-named one stays literal,
+    /// as in .NET.
+    #[test]
+    #[serial_test::serial]
+    fn env_vars_expand_like_dotnet() {
+        std::env::set_var("SP_NUGET_TEST_ROOT", "/r");
+        std::env::remove_var("SP_NUGET_TEST_UNSET");
+        assert_eq!(
+            super::expand_env_vars("%SP_NUGET_TEST_ROOT%/pkgs"),
+            "/r/pkgs"
+        );
+        assert_eq!(
+            super::expand_env_vars("%SP_NUGET_TEST_UNSET%/x"),
+            "%SP_NUGET_TEST_UNSET%/x"
+        );
+        assert_eq!(
+            super::expand_env_vars("a%SP_NUGET_TEST_UNSET%SP_NUGET_TEST_ROOT%"),
+            "a%SP_NUGET_TEST_UNSET/r"
+        );
+        assert_eq!(super::expand_env_vars("100%%"), "100%%");
+        assert_eq!(super::expand_env_vars("50%"), "50%");
+        std::env::remove_var("SP_NUGET_TEST_ROOT");
+    }
+
+    /// The default `--cwd .` still reads its parents' configs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_relative_start_reads_parent_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nuget.config"),
+            r#"<configuration><config><add key="repositoryPath" value="lib/pkgs" /></config></configuration>"#,
+        )
+        .unwrap();
+        let app = dir.path().join("App");
+        std::fs::create_dir(&app).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&app).unwrap();
+        let folder = super::settings_chain(Some(std::path::Path::new(".")))
+            .await
+            .folder("repositoryPath");
+        std::env::set_current_dir(prev).unwrap();
+        let folder = folder.expect("the parent config's repositoryPath");
+        assert!(
+            folder.is_absolute() && folder.ends_with("lib/pkgs"),
+            "{folder:?}"
+        );
+    }
 }
 
 // ── project walk ──

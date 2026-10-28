@@ -672,8 +672,22 @@ async fn maven_handcrafted_discovery() {
 #[serial]
 async fn nuget_global_apply_patches_the_user_configured_global_packages_folder() {
     let _home = NoJvmCaches::new();
+    let saved: Vec<_> = ["NUGET_PACKAGES", "DOTNET_CLI_HOME", "APPDATA"]
+        .into_iter()
+        .map(|k| (k, std::env::var_os(k)))
+        .collect();
     std::env::remove_var("NUGET_PACKAGES");
+    std::env::remove_var("DOTNET_CLI_HOME");
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    // NuGet's user config: %APPDATA%\NuGet\NuGet.Config on Windows, else
+    // ~/.nuget/NuGet/NuGet.Config.
+    let user_config = if cfg!(windows) {
+        let appdata = home.join("AppData").join("Roaming");
+        std::env::set_var("APPDATA", &appdata);
+        appdata.join("NuGet").join("NuGet.Config")
+    } else {
+        home.join(".nuget").join("NuGet").join("NuGet.Config")
+    };
     let tmp = tempfile::tempdir().expect("tempdir");
     let original = b"MIT License\nCopyright (c) 2007 James Newton-King\n";
     let install = |root: &Path| {
@@ -686,7 +700,6 @@ async fn nuget_global_apply_patches_the_user_configured_global_packages_folder()
     let default_copy = install(&home.join(".nuget").join("packages"));
     let gpf = tmp.path().join("gpf");
     let configured_copy = install(&gpf);
-    let user_config = home.join(".nuget").join("NuGet").join("NuGet.Config");
     std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
     std::fs::write(
         &user_config,
@@ -712,6 +725,12 @@ async fn nuget_global_apply_patches_the_user_configured_global_packages_folder()
     .await;
 
     let code = scan_run(default_scan_args(tmp.path(), "nuget", server.uri())).await;
+    for (k, v) in saved {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
     assert_eq!(code, 0, "scan -g --sync should apply the nuget patch");
     assert_eq!(
         std::fs::read(&configured_copy).unwrap(),
