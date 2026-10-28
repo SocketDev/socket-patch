@@ -389,31 +389,76 @@ impl GoWorkspace {
     pub async fn read_graph_from(&mut self, cache: Option<&Path>) {
         let replaces = self.replace_sources();
         let mut graph: BTreeMap<String, Option<DepGoMod>> = BTreeMap::new();
-        let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
-        let mut queue: VecDeque<(String, String, bool)> = self
+        let mut seen: BTreeSet<(String, Pruning)> = BTreeSet::new();
+        let member_requires: Vec<Vec<(String, String)>> = self
             .members
             .iter()
             .filter_map(|m| m.go_mod.as_deref())
-            .flat_map(go_mod_edit::parse_required_versions)
-            .map(|(path, v)| (path, v, false))
+            .map(|go_mod| {
+                go_mod_edit::parse_required_versions(go_mod)
+                    .into_iter()
+                    .collect()
+            })
             .collect();
-        while let Some((path, version, unpruned)) = queue.pop_front() {
-            let key = format!("{path}@{version}");
-            if version == "none" || !seen.insert((key.clone(), unpruned)) {
-                continue;
-            }
-            if !graph.contains_key(&key) {
-                let dep = read_dep_go_mod(&replaces, cache, &path, &version).await;
-                graph.insert(key.clone(), dep);
-            }
-            let Some(Some(dep)) = graph.get(&key) else {
-                continue;
+        let main: BTreeSet<String> = self
+            .members
+            .iter()
+            .filter_map(|m| m.go_mod.as_deref().and_then(go_mod_edit::module_path))
+            .collect();
+        let mut queue: VecDeque<(String, String, Pruning)> = member_requires
+            .iter()
+            .flatten()
+            .map(|(path, v)| (path.clone(), v.clone(), Pruning::Pruned))
+            .collect();
+        load_graph(&replaces, cache, &mut graph, &mut seen, &mut queue).await;
+
+        // Go then reloads, at workspace pruning, every dependency MVS
+        // raises above what a loaded module requires, starting from the
+        // members' requirements, until nothing more is raised
+        // (`readModGraph`, `pruning == workspace`): the raised version's
+        // go.mod can raise further modules.
+        let mut has_deps_in_all: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let selected = selected_versions(&member_requires, &graph);
+            let at = |path: &str| selected.get(path).cloned().unwrap_or_default();
+            let requires_of = |path: &str| -> Vec<(String, String)> {
+                match graph.get(&format!("{path}@{}", at(path))) {
+                    Some(Some(dep)) => dep.requires.clone(),
+                    _ => Vec::new(),
+                }
             };
-            if unpruned || !dep.pruned {
-                for (p, v) in &dep.requires {
-                    queue.push_back((p.clone(), v.clone(), true));
+            let mut raised: BTreeSet<(String, String)> = BTreeSet::new();
+            let consider = |reqs: &[(String, String)], raised: &mut BTreeSet<_>| {
+                for (path, v) in reqs {
+                    let s = at(path);
+                    if !main.contains(path)
+                        && go_semver_cmp(&s, v).is_gt()
+                        && !seen.contains(&(format!("{path}@{s}"), Pruning::Workspace))
+                    {
+                        raised.insert((path.clone(), s));
+                    }
+                }
+            };
+            for reqs in &member_requires {
+                consider(reqs, &mut raised);
+            }
+            for path in &has_deps_in_all {
+                let s = at(path);
+                if seen.contains(&(format!("{path}@{s}"), Pruning::Workspace)) {
+                    consider(&requires_of(path), &mut raised);
+                } else {
+                    raised.insert((path.clone(), s));
                 }
             }
+            raised.retain(|(_, v)| !v.is_empty() && v != "none");
+            if raised.is_empty() {
+                break;
+            }
+            for (path, v) in raised {
+                has_deps_in_all.insert(path.clone());
+                queue.push_back((path, v, Pruning::Workspace));
+            }
+            load_graph(&replaces, cache, &mut graph, &mut seen, &mut queue).await;
         }
         self.graph = Some(graph);
     }
@@ -585,6 +630,76 @@ fn replacement_of<'a>(
             .find(|(e, _)| of(e) && e.version.as_deref() == Some(version))
             .or_else(|| replaces.iter().find(|(e, _)| of(e) && e.version.is_none()))
     })
+}
+
+/// How far below a dependency go loads the module graph (Go's
+/// `modPruning`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Pruning {
+    /// Its requirements count; their go.mods are read only below a go.mod
+    /// older than go 1.17.
+    Pruned,
+    /// Its whole requirement graph is read.
+    Unpruned,
+    /// Its requirements' go.mods are read too (a dependency MVS raised).
+    Workspace,
+}
+
+/// Read the go.mod of each queued dependency into `graph`, following its
+/// requirements as its [`Pruning`] says.
+async fn load_graph(
+    replaces: &[Vec<(ReplaceEntry, PathBuf)>; 2],
+    cache: Option<&Path>,
+    graph: &mut BTreeMap<String, Option<DepGoMod>>,
+    seen: &mut BTreeSet<(String, Pruning)>,
+    queue: &mut VecDeque<(String, String, Pruning)>,
+) {
+    while let Some((path, version, pruning)) = queue.pop_front() {
+        let key = format!("{path}@{version}");
+        if version == "none" || !seen.insert((key.clone(), pruning)) {
+            continue;
+        }
+        if !graph.contains_key(&key) {
+            let dep = read_dep_go_mod(replaces, cache, &path, &version).await;
+            graph.insert(key.clone(), dep);
+        }
+        let Some(Some(dep)) = graph.get(&key) else {
+            continue;
+        };
+        let next = match pruning {
+            Pruning::Unpruned => Some(Pruning::Unpruned),
+            Pruning::Pruned if !dep.pruned => Some(Pruning::Unpruned),
+            Pruning::Pruned => None,
+            Pruning::Workspace if dep.pruned => Some(Pruning::Pruned),
+            Pruning::Workspace => Some(Pruning::Unpruned),
+        };
+        if let Some(next) = next {
+            for (p, v) in &dep.requires {
+                queue.push_back((p.clone(), v.clone(), next));
+            }
+        }
+    }
+}
+
+/// The version MVS selects of each module the members or `graph` require.
+fn selected_versions(
+    member_requires: &[Vec<(String, String)>],
+    graph: &BTreeMap<String, Option<DepGoMod>>,
+) -> BTreeMap<String, String> {
+    let mut selected: BTreeMap<String, String> = BTreeMap::new();
+    let edges = member_requires
+        .iter()
+        .flatten()
+        .chain(graph.values().flatten().flat_map(|dep| dep.requires.iter()));
+    for (path, v) in edges {
+        let higher = selected
+            .get(path)
+            .is_none_or(|s| go_semver_cmp(v, s).is_gt());
+        if higher && v != "none" {
+            selected.insert(path.clone(), v.clone());
+        }
+    }
+    selected
 }
 
 /// The go.mod go reads for the dependency `path@version` (see
@@ -947,6 +1062,75 @@ mod tests {
         assert_eq!(
             graphed(root, cache).await.selection(DEP, "v1.0.0"),
             Selection::Other("v1.4.0".into())
+        );
+    }
+
+    /// go reloads a dependency MVS raised above a member's requirement
+    /// (`readModGraph` in workspace mode): the raised version's go.mod can
+    /// raise the module further, past every version the first pass read.
+    #[tokio::test]
+    async fn a_raised_dependency_go_mod_raises_the_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("ws");
+        let cache = &tmp.path().join("cache");
+        let (a, c) = ("example.com/a", "example.com/c");
+        write(root, "go.work", "go 1.22\n\nuse (\n\t./app\n\t./x\n)\n");
+        member(
+            root,
+            "app",
+            "1.21",
+            &format!("\nrequire (\n\t{a} v1.0.0\n\t{DEP} v1.2.3\n)\n"),
+        );
+        member(root, "x", "1.21", &format!("\nrequire {c} v1.0.0\n"));
+        cached(cache, a, "v1.0.0", "1.21", "");
+        cached(
+            cache,
+            c,
+            "v1.0.0",
+            "1.21",
+            &format!("\nrequire {a} v1.1.0\n"),
+        );
+        for v in ["v1.2.3", "v1.5.0"] {
+            cached(cache, DEP, v, "1.21", "");
+        }
+        // Until the raised a v1.1.0's go.mod is cached, nothing is proven.
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.2.3"),
+            Selection::Unknown
+        );
+        cached(
+            cache,
+            a,
+            "v1.1.0",
+            "1.21",
+            &format!("\nrequire {DEP} v1.5.0\n"),
+        );
+        let ws = graphed(root, cache).await;
+        assert_eq!(
+            ws.selection(DEP, "v1.2.3"),
+            Selection::Other("v1.5.0".into())
+        );
+        assert_eq!(ws.selection(DEP, "v1.5.0"), Selection::Selected);
+
+        // The raised version is reloaded at workspace pruning: its
+        // requirements' go.mods count too.
+        cached(
+            cache,
+            a,
+            "v1.1.0",
+            "1.21",
+            "\nrequire example.com/leaf v1.0.0\n",
+        );
+        cached(
+            cache,
+            "example.com/leaf",
+            "v1.0.0",
+            "1.21",
+            &format!("\nrequire {DEP} v1.6.0\n"),
+        );
+        assert_eq!(
+            graphed(root, cache).await.selection(DEP, "v1.2.3"),
+            Selection::Other("v1.6.0".into())
         );
     }
 
