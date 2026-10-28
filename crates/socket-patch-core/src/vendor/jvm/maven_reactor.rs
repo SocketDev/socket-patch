@@ -1840,12 +1840,7 @@ fn resolve_module(
             format!("{declaring}: <module>{module}</module> leaves the project root"),
         ));
     };
-    let candidates = if path.is_empty() {
-        vec!["pom.xml".to_string()]
-    } else {
-        vec![format!("{path}/pom.xml"), path]
-    };
-    candidates
+    pom_candidates(path)
         .into_iter()
         .find_map(|c| read(&c).map(|bytes| (c, bytes)))
         .ok_or_else(|| {
@@ -1854,6 +1849,17 @@ fn resolve_module(
                 format!("{declaring}: <module>{module}</module> has no pom"),
             )
         })
+}
+
+/// Where Maven looks for the pom at the normalized `path` a `<module>` or
+/// `<relativePath>` names: a directory means its `pom.xml` (`""`, from
+/// `..`, is the root), else the file itself.
+fn pom_candidates(path: String) -> Vec<String> {
+    if path.is_empty() {
+        vec!["pom.xml".to_string()]
+    } else {
+        vec![format!("{path}/pom.xml"), path]
+    }
 }
 
 /// The local parent of `rel`: its `<parent>` file exists in the checkout
@@ -1881,21 +1887,18 @@ fn local_parent_of(
         parent.artifact.clone(),
         parent.version.clone(),
     );
-    // Like a `<module>`: Maven reads a directory as its `pom.xml`, and `..`
-    // normalizes to the root itself (#534).
-    let candidates = if path.is_empty() {
-        vec!["pom.xml".to_string()]
-    } else {
-        vec![format!("{path}/pom.xml"), path]
-    };
-    let Some(parent_rel) = candidates
-        .into_iter()
-        .find(|c| poms.contains_key(c) || read(c).is_some())
-    else {
+    // Like a `<module>`: a directory names its `pom.xml` (#534).
+    let found = pom_candidates(path).into_iter().find_map(|c| {
+        if poms.contains_key(&c) {
+            Some((c, None))
+        } else {
+            read(&c).map(|bytes| (c, Some(bytes)))
+        }
+    });
+    let Some((parent_rel, bytes)) = found else {
         return Ok(None);
     };
-    if !poms.contains_key(&parent_rel) {
-        let bytes = read(&parent_rel).unwrap_or_default();
+    if let Some(bytes) = bytes {
         let parsed = Pom::parse(&parent_rel, bytes)?;
         poms.insert(parent_rel.clone(), parsed);
     }

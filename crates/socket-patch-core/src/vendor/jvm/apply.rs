@@ -172,10 +172,11 @@ impl ProjectReader {
         }
     }
 
-    /// Regular files only; a directory, special file or unsafe path reads
-    /// as missing.
+    /// Regular files only. A path that does not exist, or that runs through
+    /// a regular file, reads as missing; a directory, special file or
+    /// unsafe path reads as `None` and records a read error.
     pub fn read(&self, rel: &str) -> Option<Vec<u8>> {
-        let path = match self.resolve(rel) {
+        let path = match self.resolve_in(rel, true) {
             Ok(path) => path,
             Err(e) => {
                 self.read_error.borrow_mut().get_or_insert(e);
@@ -232,6 +233,13 @@ impl ProjectReader {
 
     /// `rel` under the canonical root, following in-checkout symlinks.
     fn resolve(&self, rel: &str) -> Result<PathBuf, String> {
+        self.resolve_in(rel, false)
+    }
+
+    /// [`Self::resolve`]; `through_file` lets a path that runs through a
+    /// regular file resolve (a read then sees it as missing). Writes keep
+    /// refusing it up front.
+    fn resolve_in(&self, rel: &str, through_file: bool) -> Result<PathBuf, String> {
         if !safe_rel(rel) {
             return Err(format!("unsafe path {rel:?}"));
         }
@@ -246,7 +254,10 @@ impl ProjectReader {
         for (i, seg) in segments.iter().enumerate() {
             let next = cur.join(seg);
             match std::fs::symlink_metadata(&next) {
-                Err(e) if is_missing(&e) => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || through_file && is_missing(&e) =>
+                {
                     return Ok(segments[i + 1..].iter().fold(next, |p, s| p.join(s)));
                 }
                 Err(e) => return Err(format!("cannot inspect {}: {e}", next.display())),
@@ -272,7 +283,7 @@ impl ProjectReader {
 
 /// A path that does not exist, including one that runs through a regular
 /// file (`pom.xml/pom.xml`, probed when a `relativePath` or `<module>`
-/// names a pom file rather than its directory).
+/// names a pom file rather than its directory, #534).
 fn is_missing(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -1409,7 +1420,8 @@ mod tests {
 
     /// #534: probing `<dir>/pom.xml` where `<dir>` is a pom file reads as
     /// missing, not as a read error that withholds `vex` liveness; a
-    /// directory read itself still records one.
+    /// directory read itself still records one, and writes still refuse
+    /// a path through a file.
     #[test]
     fn a_path_through_a_file_reads_as_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1422,6 +1434,8 @@ mod tests {
         assert_eq!(reader.read_error.borrow().as_deref(), None);
         assert_eq!(reader.read("parent"), None);
         assert!(reader.read_error.borrow().is_some());
+        // A write through a file is still refused before anything lands.
+        assert!(reader.resolve("pom.xml/pom.xml").is_err());
     }
 
     #[cfg(unix)]
