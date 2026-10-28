@@ -19,10 +19,10 @@ count-based split.
 CI_TEST_COVERAGE=1 runs the shard under cargo-llvm-cov for ci.yml's
 `coverage` job: `cargo llvm-cov --no-report` in place of `cargo test`, and
 no doctests, which cargo-llvm-cov leaves out without `--doctests`. A later
-`cargo llvm-cov report` exports the shard's profiles. Unless CI_TEST_TIMINGS
-is set, coverage shards balance on scripts/ci-test-durations.json: the count
-split left shard 2 running ~80 s longer than shard 1 (246 s vs 167 s of
-tests), and it set the end of every CI run.
+`cargo llvm-cov report` exports the shard's profiles. Coverage shards
+balance on scripts/ci-test-durations.json unless CI_TEST_TIMINGS is set (an
+empty value selects the count split): under the count split shard 2 ran well
+past shard 1 and set the end of every CI run.
 
 Extra arguments after `SHARD COUNT` go to every `cargo` invocation.
 Each invocation runs with `--no-fail-fast`; the exit status is non-zero if
@@ -107,7 +107,7 @@ def main(argv):
         check=True, capture_output=True, text=True).stdout)
     names = integration_targets(metadata)
     coverage = os.environ.get("CI_TEST_COVERAGE") == "1"
-    timing_path = os.environ.get("CI_TEST_TIMINGS") or (DEFAULT_COVERAGE_TIMINGS if coverage else None)
+    timing_path = os.environ.get("CI_TEST_TIMINGS", DEFAULT_COVERAGE_TIMINGS if coverage else None)
     timings = json.loads(Path(timing_path).read_text(encoding="utf-8")) if timing_path else None
     print(f"ci-test-shard: shard {shard}/{count}: "
           f"{len(partition(names, count, timings)[shard - 1])} of {len(names)} integration targets", flush=True)

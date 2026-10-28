@@ -97,20 +97,26 @@ class Partition(unittest.TestCase):
         self.assertEqual(run.call_args_list[-1].args[0][:3], ["cargo", "llvm-cov", "--no-report"])
 
     def test_coverage_shards_default_to_the_timing_sample(self):
-        names = ["e2e_heavy", "e2e_light", "e2e_mid", "unit_only"]
+        timings = json.loads(shard.DEFAULT_COVERAGE_TIMINGS.read_text())
+        names = sorted(timings["targets"])
+        timed, counted = shard.partition(names, 2, timings), shard.partition(names, 2)
+        self.assertNotEqual(timed, counted)
         metadata = {"workspace_members": ["a"], "packages": [
             {"id": "a", "targets": [{"name": n, "kind": ["test"]} for n in names]}]}
-        timings = json.loads(shard.DEFAULT_COVERAGE_TIMINGS.read_text())
         env = {k: v for k, v in shard.os.environ.items() if k != "CI_TEST_TIMINGS"}
-        for coverage, expected in (("1", shard.partition(names, 2, timings)), ("", shard.partition(names, 2))):
-            with self.subTest(coverage=coverage), \
-                    patch.dict(shard.os.environ, {**env, "CI_TEST_COVERAGE": coverage}, clear=True), \
-                    patch.object(shard.subprocess, "run", side_effect=[
-                        subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata)),
-                        subprocess.CompletedProcess([], 0),
-                    ]) as run:
-                self.assertEqual(shard.main(["2", "2"]), 0)
-                self.assertCountEqual(selected([c.args[0] for c in run.call_args_list[1:]]), expected[1])
+        cases = (({"CI_TEST_COVERAGE": "1"}, timed),
+                 ({"CI_TEST_COVERAGE": "1", "CI_TEST_TIMINGS": ""}, counted),
+                 ({}, counted))
+        for extra, expected in cases:
+            for k in (1, 2):
+                with self.subTest(env=extra, shard=k), \
+                        patch.dict(shard.os.environ, {**env, **extra}, clear=True), \
+                        patch.object(shard.subprocess, "run", side_effect=[
+                            subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata)),
+                        ] + [subprocess.CompletedProcess([], 0)] * 2) as run:
+                    self.assertEqual(shard.main([str(k), "2"]), 0)
+                    self.assertCountEqual(selected([c.args[0] for c in run.call_args_list[1:]]),
+                                          expected[k - 1])
 
     def test_negative_bad_shard(self):
         with self.assertRaises(ValueError):
