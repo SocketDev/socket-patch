@@ -261,15 +261,10 @@ impl CargoCrawler {
         Some((name.to_string(), version.to_string()))
     }
 
-    /// Get `CARGO_HOME`, defaulting to `$HOME/.cargo` (`None` with no
-    /// home). An empty value means unset (the env_non_empty convention) —
-    /// `PathBuf::from("")` would otherwise resolve `registry/src` against
-    /// the CWD and silently crawl nothing.
+    /// The cargo home cargo itself would use
+    /// ([`crate::utils::cargo_home::cargo_home`]).
     fn cargo_home() -> Option<PathBuf> {
-        match std::env::var("CARGO_HOME") {
-            Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
-            _ => crate::utils::fs::home_dir().map(|home| home.join(".cargo")),
-        }
+        crate::utils::cargo_home::cargo_home()
     }
 
     /// Where cargo takes crates.io packages from for a build in `cwd`: the
@@ -1112,6 +1107,23 @@ version = "fake"
         let packages = crawler.crawl_all(&options).await;
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].purl, "pkg:cargo/serde@1.0.200");
+    }
+
+    /// #1135: with `HOME`, `USERPROFILE` and `CARGO_HOME` unset cargo still
+    /// builds from the passwd home's `~/.cargo`, so the crawler must probe
+    /// that registry instead of reporting every crate lockfile-only.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cargo_home_without_home_env_uses_passwd_home() {
+        let Some(passwd) = crate::utils::fs::passwd_home() else {
+            return;
+        };
+        let got = {
+            let _env = crate::utils::cargo_home::NoHomeEnv::set();
+            CargoCrawler::cargo_home()
+        };
+        assert_eq!(got, Some(passwd.join(".cargo")));
     }
 
     // ── Project-mode registry scope (#595) ──────────────────────────────

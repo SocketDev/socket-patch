@@ -1247,7 +1247,10 @@ the repository list, so it is left as a
 Agent mode patches the crate in place wherever the crawler finds it. For a non-vendored
 crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects every
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
-`--mode vendored` for a project-local, committable patch.
+`--mode vendored` for a project-local, committable patch. With `CARGO_HOME` unset the
+cache is `<home>/.cargo/registry`, with `<home>` found the way cargo finds it: `HOME`
+(`USERPROFILE` on Windows), then, on Unix, the account's passwd entry, so a run with
+`HOME` unset or empty still patches the copy cargo builds.
 
 The cache holds one extracted copy of a crate per registry index directory under
 `registry/src` (cargo 1.70–1.84 and cargo 1.85+ use different ones), so two toolchains
