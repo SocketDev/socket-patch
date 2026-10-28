@@ -3217,6 +3217,7 @@ pub(crate) async fn vendor_records_reusing(
         .as_deref_mut()
         .and_then(|capture| capture.group.take())
         .filter(|_| !common.dry_run);
+    let eject_group = handed.is_some();
     let group = handed.or_else(|| {
         (!common.dry_run && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
             .then(|| GroupCommit::begin(&common.cwd))
@@ -3898,6 +3899,34 @@ pub(crate) async fn vendor_records_reusing(
     // others failed — a failed package's backend already put back what it
     // had touched, in the captured state — so a completed run ends exactly
     // where committing after every package would have left it.
+    //
+    // Not for an eject: its group also holds every pin's upstream restore,
+    // so committing past a failed or skipped package would land that
+    // package on the plain registry entry, unpatched, and a crash (or a
+    // commit left pending) before the eject's rollback would make it stick.
+    // The eject is all-or-nothing, so it drops the group unless every pin
+    // is vendored in the captured ledger; nothing of it reached the disk
+    // but the artifacts, which are removed here (#1782).
+    let group = match group {
+        Some(group) if eject_group => {
+            let ledger = load_state(&common.cwd).await.ok();
+            let complete = !has_errors
+                && records.keys().all(|purl| {
+                    ledger
+                        .as_ref()
+                        .is_some_and(|l| lookup_entry(&l.entries, purl).is_some())
+                });
+            if complete {
+                Some(group)
+            } else {
+                drop(group);
+                has_errors = true;
+                let _ = remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                None
+            }
+        }
+        group => group,
+    };
     let mut commit_failed = false;
     if let Some(group) = group {
         socket_patch_core::utils::failpoint::hit("vendor_group_commit");
