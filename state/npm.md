@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-28T07Z (run 50), main `b787454` (v5.0.1 `latest`), unchanged since run 49. Run 50 filed nothing; it commented on #1756 (agent `rollback` after a consent overwrite leaves the CRLF bin broken; a fix is in draft PR #1757). **Open npm bughunt issues: #1756 only.** Every issue number marked `fail` in the matrix below other than #1756 is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
+Last updated: 2026-10-28T13Z (run 51), main `b787454` (v5.0.1 `latest`), unchanged since run 49. Run 51 filed #1782 (an interrupted `vendor` eject leaves the lock un-hosted with no journal). **Open npm bughunt issues: #1756 (fix in PR #1757, not merged) and #1782.** Every issue number marked `fail` in the matrix below other than these two is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -31,6 +31,11 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Linux | 6.14.18 / 10.9.4, patch that adds a file (empty `beforeHash`), incl. a path with a space and `é` (run 50) | pass: apply, `vex`, `vex` refuses when the added file is missing, `apply` re-creates it, `rollback` removes it and its new directory | pass (`npm ci` patched, `vex`, `rollback`) | pass (10.9.4; and npm 6.14.18 v1 lock: `rollback` byte-exact) | untested |
 | Linux | 10.9.4, user-patch consent with patch-package 8.0.0 (run 50) | pass: `--patch-dir fixes`, a root `patches/` with a workspace member's dep, and a member-owned `patches/` all skip `user_patch_conflict` | n/a | pass: same three shapes | n/a |
 | Linux | 10.9.9 / 11.21.1 suites (run 50) | n/a | pass: `e2e_vendor_npm_build` 43/43 (both) | pass: `e2e_redirect_npm_build` 30/30 plus the 6 `#[ignore]` real-npm legs via `--ignored` (both) | n/a |
+
+## Run 51 (2026-10-28T13Z, main `b787454`)
+
+- Filed #1782. A `vendor` eject that is SIGKILLed, SIGINTed or SIGTERMed between the upstream restore (lock rewritten to the registry, `.npmrc` deleted) and the vendored commit journal leaves the project neither hosted nor vendored. A re-run then says `noManifest`, exit 0. Present in v5.0.1 and on main, npm 10.9.4 and 12.2.1. The `scan --mode vendored` takeover is crash-safe at every rename.
+- pass: add-a-file patches on npm 12.2.1 with `install-strategy=linked` (transitive `ms@2.0.0` in `.store`), in agent (apply / vex / `apply --check` / rollback removes the new dir), hosted (`npm ci` installs the added file; `vex` fails safe when it's missing; byte-exact lock rollback) and vendored (`npm ci` / `vex` / `vendor --check` / byte-exact `vendor --revert`).
 
 ## Run 50 (2026-10-28T07Z, main `b787454`)
 
@@ -256,6 +261,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-28T13Z:** re-check #1782 when fixed: kill the eject at each rename (an `LD_PRELOAD` rename shim works; strace `-P` doesn't match relative paths), and with SIGINT / SIGTERM. A multi-package eject: does the window grow per package? `vendor --revert` / `rollback` killed mid-write (are they journaled?). Re-check #1756 when #1757 lands. (Add-a-file on npm 12 / linked: done, pass.)
 - **New 2026-10-28T07Z:** re-check #1756 when #1757 lands, including a bin already overwritten by v5.0.1 then rolled back with the fixed build; `vendor --check` on a shrinkwrap-only vendored lock (passes, while `vex` refuses `vex_npm_shrinkwrap_only`: parity question); an eject killed inside the write window (needs a slower hook than the download); patches that add a file on npm 12 / linked store; macOS / Windows for everything once probe branches work.
 - **New 2026-10-28T01Z (done in run 50 except macOS / Windows and the root-owned prefix, which the root sandbox can't test):** #1756 on macOS / Windows once probe branches work; agent `rollback` over a consent-overwritten CRLF bin. Eject shapes: hosted pins under `overrides`, `--ecosystems pypi` beside npm pins, `vendor --dry-run`, an interrupted eject. Consent with patch-package `--patch-dir` and in a workspace member run from its cwd. npm 12 global on a root-owned prefix. The 2026-10-18 items about #1627 / #1581 / #1618 / #1595 / #1576 / #1554 / #1072 re-checks are done (all closed).
 - **New 2026-10-18T00Z:** re-check #1627 when PR #1628 lands (agent `rollback` / `repair` over a `build` member too); re-check #1581 for npm once fixed (missing, not only legacy, `<uuid>/` metadata); `repair` / `vendor --check` with a gitignored artifact in other shapes (workspace, dual lock); #1618 member-level bundles; npm 12 global on a root-owned prefix.
@@ -315,6 +321,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- A Ctrl-C or kill during the eject's artifact *download* is safe: the download runs before the upstream restore, so the lock is still hosted (main `b787454`, 2026-10-28T13Z).
 - After vendoring, `npm shrinkwrap` renames package-lock.json to npm-shrinkwrap.json. `vendor --revert` then refuses with advice that names the rename ("was the wired lockfile renamed — e.g. by `npm shrinkwrap`"), and `vex` omits the patches (`vex_npm_shrinkwrap_only`, documented). Hosted `rollback` restores the renamed lock (npm 10.9.4, 2026-10-28T07Z).
 - `repair` of a deleted `<uuid>/` dir restores the tarball, `.gitignore` and `.gitattributes`, but not the `socket-patch.vendor.json` marker. The marker is documented as informational ("never a trust input"), and `repair` is documented to restore the ignore/attributes pair; `vendor --check` and a fresh clone's `npm ci` pass (npm 10.9.4 dual lock + workspace + `*.tgz` ignore, 2026-10-28T07Z).
 - patch-package treats subdirectories of `patches/` as nested package paths (`patches/sub/x+1.0.0.patch` targets `node_modules/sub/x`), so the non-recursive `patches/` read in `user_patches.rs` is correct (patch-package 8.0.0, 2026-10-28T07Z).
