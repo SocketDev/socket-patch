@@ -2282,7 +2282,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
         WiringPlan::PythonLocks(project, sibling) => {
             // The files as they are before the wiring, to put back if the
             // requirements pin then refuses.
-            let lock_before = if sibling {
+            let mut lock_before = if sibling {
                 snapshot_files(project_root, &project.file_names()).await
             } else {
                 Vec::new()
@@ -2298,20 +2298,26 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             .await
             {
                 // #1758: the requirements pin goes to the same wheel.
-                Ok(mut wiring) if sibling => wire_sibling_requirements(
-                    project_root,
-                    &lock_before,
-                    None,
-                    &canon_name,
-                    version,
-                    &rel_wheel,
-                    &artifact.sha256_hex,
-                )
-                .await
-                .map(|lines| {
-                    wiring.extend(lines);
-                    (wiring, MetaSlot::None)
-                }),
+                Ok(mut wiring) if sibling => {
+                    // Put back only what the wiring rewrote (it refused a
+                    // symlink there): a file it left alone, such as a
+                    // symlinked script, must not be replaced by a copy.
+                    lock_before.retain(|(file, _)| wiring.iter().any(|r| &r.file == file));
+                    wire_sibling_requirements(
+                        project_root,
+                        &lock_before,
+                        None,
+                        &canon_name,
+                        version,
+                        &rel_wheel,
+                        &artifact.sha256_hex,
+                    )
+                    .await
+                    .map(|lines| {
+                        wiring.extend(lines);
+                        (wiring, MetaSlot::None)
+                    })
+                }
                 other => other.map(|wiring| (wiring, MetaSlot::None)),
             }
         }
