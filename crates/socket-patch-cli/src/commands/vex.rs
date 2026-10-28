@@ -1028,6 +1028,67 @@ async fn generate_vex(
         }
     }
 
+    // A natively vendored build compiles vendor/, not the replacement the
+    // checks above verified: attest a Go patch only when the vendor tree go
+    // selects carries it too. Local only, like the checks above, and after
+    // them, so a more specific reason wins; `--no-verify` skips it with the
+    // rest of the hashing; and a purl an in-run hosted redirect just
+    // confirmed stays exempt (its bytes arrive with the next vendoring, which
+    // the run's own consumer-sync warning names).
+    if !common.is_global() && !params.no_verify {
+        use socket_patch_core::utils::purl::strip_purl_qualifiers;
+        use socket_patch_core::vendor::go_consumer_sync::{
+            patched_go_mod_hash, verify_native_vendor, NATIVE_VENDOR_CODE,
+        };
+        let exempt: HashSet<&str> = params
+            .assume_applied
+            .iter()
+            .map(|s| strip_purl_qualifiers(s))
+            .collect();
+        let mut kept = Vec::new();
+        for purl in std::mem::take(&mut outcome.applied) {
+            let Some(record) = manifest
+                .patches
+                .get(&purl)
+                .filter(|_| !exempt.contains(strip_purl_qualifiers(&purl)))
+            else {
+                kept.push(purl);
+                continue;
+            };
+            let mut verdict =
+                verify_native_vendor(&common.cwd, &purl, record, &HashMap::new()).await;
+            // A vendored or hosted checkout may keep no local copy of the
+            // patched go.mod its dependency check needs: fetch it.
+            if verdict.is_err() {
+                if let Some(hash) = patched_go_mod_hash(record) {
+                    if let Some(text) = patched_blob(common, params, hash)
+                        .await
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                    {
+                        let known = HashMap::from([(hash.to_string(), text)]);
+                        verdict = verify_native_vendor(&common.cwd, &purl, record, &known).await;
+                    }
+                }
+            }
+            match verdict {
+                Ok(()) => kept.push(purl),
+                Err(detail) => {
+                    note_warning(
+                        warnings,
+                        common,
+                        NATIVE_VENDOR_CODE,
+                        format!("{purl}: {detail}"),
+                    );
+                    outcome.failed.push(FailedPatch {
+                        purl,
+                        reason: NATIVE_VENDOR_CODE.to_string(),
+                    });
+                }
+            }
+        }
+        outcome.applied = kept;
+    }
+
     // The plan's gate omissions (record_unavailable / record_mismatch /
     // vendor_unwired / redirect_unwired / wiring_conflict) join the omission
     // channel so they surface as per-purl `skipped` events like any

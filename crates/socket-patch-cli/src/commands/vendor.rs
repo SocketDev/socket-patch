@@ -1257,8 +1257,12 @@ async fn run_check(args: &VendorArgs) -> i32 {
         // requirements out of step with the `replace` (#343, #618).
         if failure.is_none() && entry.ecosystem == "golang" {
             if let Some(record) = record {
-                failure = socket_patch_core::vendor::go_consumer_sync::verify_native_vendor(
-                    root, key, record,
+                // Its modules.txt drift is the audit's just below.
+                failure = socket_patch_core::vendor::go_consumer_sync::verify_native_vendor_tree(
+                    root,
+                    key,
+                    record,
+                    &HashMap::new(),
                 )
                 .await
                 .err();

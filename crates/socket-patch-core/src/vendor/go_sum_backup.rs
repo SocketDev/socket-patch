@@ -81,7 +81,16 @@ fn backup(root: &Path, entry: &ReplaceEntry) -> Option<PathBuf> {
 
 /// Restore only this module's saved checksums, preserving unrelated sums and
 /// refusing a conflicting live pin. The backup travels with the local copy.
-pub(super) async fn restore(root: &Path, entries: &[ReplaceEntry]) -> Result<(), String> {
+/// A version the build no longer selects (go.mod now requires another one,
+/// or a pruned graph no longer has the module) needs no checksums: restoring
+/// them would leave go.sum untidy and make discovery see the old version
+/// again. `dry_run` makes every check without writing go.sum.
+pub(super) async fn restore(
+    root: &Path,
+    entries: &[ReplaceEntry],
+    dry_run: bool,
+) -> Result<(), String> {
+    use super::go_build_list::{project_selection, Selection};
     let path = root.join("go.sum");
     let mut sums = read(&path).await?;
     let original = sums.clone();
@@ -89,6 +98,12 @@ pub(super) async fn restore(root: &Path, entries: &[ReplaceEntry]) -> Result<(),
         let (Some(backup), Some(version)) = (backup(root, entry), entry.version.as_deref()) else {
             continue;
         };
+        if matches!(
+            project_selection(root, &entry.module, version).await,
+            Some(Selection::Other(_) | Selection::NotInGraph)
+        ) {
+            continue;
+        }
         let saved = selected(&read(&backup).await?, &entry.module, version);
         for line in saved.lines() {
             let fields: Vec<_> = line.split_whitespace().collect();
@@ -109,7 +124,7 @@ pub(super) async fn restore(root: &Path, entries: &[ReplaceEntry]) -> Result<(),
             sums = new;
         }
     }
-    if sums != original {
+    if !dry_run && sums != original {
         atomic_write_bytes_preserving_mode(&path, sums.as_bytes())
             .await
             .map_err(|e| e.to_string())?;
@@ -210,5 +225,71 @@ mod tests {
         );
         assert_eq!(read(&root.join("go.mod")).await.unwrap(), before);
         assert_eq!(read(&root.join("go.sum")).await.unwrap(), conflict);
+        // A dry run makes the same refusal, and writes nothing either.
+        assert!(
+            drop_replace_entry(root, MODULE, ReplaceOwner::GoPatches, true)
+                .await
+                .unwrap_err()
+                .contains("conflicts")
+        );
+        assert_eq!(read(&root.join("go.mod")).await.unwrap(), before);
+        assert_eq!(read(&root.join("go.sum")).await.unwrap(), conflict);
+    }
+
+    #[tokio::test]
+    async fn dry_run_drop_restores_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module consumer\ngo 1.21\nrequire example.com/upstream v1.0.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.join("go.sum"), SUMS).await.unwrap();
+        ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
+            .await
+            .unwrap();
+        // `go mod tidy` under the directory replace drops the sums.
+        tokio::fs::write(root.join("go.sum"), "").await.unwrap();
+        drop_replace_entry(root, MODULE, ReplaceOwner::GoPatches, true)
+            .await
+            .unwrap();
+        assert_eq!(read(&root.join("go.sum")).await.unwrap(), "");
+        drop_replace_entry(root, MODULE, ReplaceOwner::GoPatches, false)
+            .await
+            .unwrap();
+        assert_eq!(read(&root.join("go.sum")).await.unwrap(), SUMS);
+    }
+
+    /// After `go get` moves the module to another version, the patched
+    /// version's sums are not needed: restoring them would leave go.sum
+    /// untidy and make discovery see the old version again.
+    #[tokio::test]
+    async fn restore_skips_a_version_the_build_no_longer_selects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module consumer\ngo 1.21\nrequire example.com/upstream v1.0.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.join("go.sum"), SUMS).await.unwrap();
+        ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
+            .await
+            .unwrap();
+        let go_mod = read(&root.join("go.mod")).await.unwrap().replace(
+            "require example.com/upstream v1.0.0",
+            "require example.com/upstream v1.0.1",
+        );
+        tokio::fs::write(root.join("go.mod"), go_mod).await.unwrap();
+        let bumped =
+            "example.com/upstream v1.0.1 h1:ccccccccccccccccccccccccccccccccccccccccccc=\n";
+        tokio::fs::write(root.join("go.sum"), bumped).await.unwrap();
+        drop_replace_entry(root, MODULE, ReplaceOwner::GoPatches, false)
+            .await
+            .unwrap();
+        assert_eq!(read(&root.join("go.sum")).await.unwrap(), bumped);
     }
 }

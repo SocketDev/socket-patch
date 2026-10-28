@@ -281,14 +281,17 @@ fn modules_txt_location(project_root: &Path) -> (PathBuf, &'static str) {
 }
 
 // GOFLAGS uses Go's quoted.Split: quotes surround a whole argument and do
-// not unescape its contents. Both -flag and --flag are accepted.
+// not unescape its contents. Both -flag and --flag are accepted. Like Go's
+// explicitStringFlag, an empty `-mod=` leaves the mode to be chosen
+// automatically unless an earlier non-empty `-mod` already made it explicit.
 fn go_mod_flag(mut flags: &str) -> Option<&str> {
     let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
     let mut mode = None;
+    let mut explicit = false;
     loop {
         flags = flags.trim_start_matches(space);
         if flags.is_empty() {
-            return mode;
+            return mode.filter(|_| explicit);
         }
         let (word, rest) =
             if let Some(quote) = flags.chars().next().filter(|c| *c == '\'' || *c == '"') {
@@ -302,6 +305,7 @@ fn go_mod_flag(mut flags: &str) -> Option<&str> {
             .strip_prefix("-mod=")
             .or_else(|| word.strip_prefix("--mod="))
         {
+            explicit |= !value.is_empty();
             mode = Some(value);
         }
         flags = rest;
@@ -337,26 +341,71 @@ pub async fn native_vendor_dir(project_root: &Path) -> Option<PathBuf> {
     if workspace_tree != work.is_some() {
         return None;
     }
-    let config = work.clone().unwrap_or_else(|| project_root.join("go.mod"));
+    let config = work.unwrap_or_else(|| project_root.join("go.mod"));
     let text = read_regular_to_string(&config).await.ok()?;
-    let normalized = go_mod_edit::normalize_for_read(&text);
-    let version = normalized.lines().find_map(|line| {
-        let mut words = line.split_whitespace();
-        (words.next()? == "go").then(|| words.next()).flatten()
-    })?;
-    let mut parts = version.split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts.next()?.parse::<u64>().ok()?;
-    (major > 1 || major == 1 && minor >= 14).then_some(dir)
+    let go = go_mod_edit::go_directive_version(&go_mod_edit::normalize_for_read(&text))?;
+    vendor_by_default(go).then_some(dir)
+}
+
+/// Whether a `go` directive makes Go select an existing vendor tree without
+/// `-mod=vendor`: go 1.14 or later by gover.Compare, so a prerelease such as
+/// `1.22rc1` counts while `1.14rc1` sorts below 1.14.
+fn vendor_by_default(go: go_mod_edit::GoDirective) -> bool {
+    go.major > 1 || go.major == 1 && (go.minor > 14 || go.minor == 14 && go.release)
+}
+
+/// Drift / omission code for a patch whose bytes the native vendor tree Go
+/// builds does not carry (or cannot be shown to carry).
+pub const NATIVE_VENDOR_CODE: &str = "go_vendor_content_mismatch";
+
+/// The `afterHash` of a Go patch record's module-root `go.mod`, when the
+/// patch changes it: the dependency requirements the native vendor check
+/// needs the patched text for (see [`verify_native_vendor`]'s `known`).
+pub fn patched_go_mod_hash(record: &crate::manifest::schema::PatchRecord) -> Option<&str> {
+    record.files.iter().find_map(|(name, info)| {
+        (crate::patch::apply::normalize_file_path(name) == "go.mod")
+            .then_some(info.after_hash.as_str())
+            .filter(|hash| !hash.is_empty())
+    })
 }
 
 /// Native vendoring copies runtime files and omits dependency tests and
 /// manifests. Its bytes must agree with the patch even when the Socket copy
 /// is intact: Go builds this tree without reading the replacement directory.
+///
+/// Also fails the patch when `vendor/modules.txt` does not record its
+/// module's socket `replace`, for callers (`vex`) that do not run
+/// [`audit`]; the audits that report that drift themselves use
+/// [`verify_native_vendor_tree`]. `known` maps an `afterHash` to patched
+/// text the caller already holds (e.g. fetched from the patch API), for a
+/// patched `go.mod` no local blob or copy provides.
 pub async fn verify_native_vendor(
     project_root: &Path,
     purl: &str,
     record: &crate::manifest::schema::PatchRecord,
+    known: &HashMap<String, String>,
+) -> Result<(), String> {
+    verify_native_vendor_with(project_root, purl, record, known, true).await
+}
+
+/// [`verify_native_vendor`] without the modules.txt replacement check, for
+/// callers that report [`GoSyncIssue::VendorModulesTxt`] through [`audit`]:
+/// one root cause, one report.
+pub async fn verify_native_vendor_tree(
+    project_root: &Path,
+    purl: &str,
+    record: &crate::manifest::schema::PatchRecord,
+    known: &HashMap<String, String>,
+) -> Result<(), String> {
+    verify_native_vendor_with(project_root, purl, record, known, false).await
+}
+
+async fn verify_native_vendor_with(
+    project_root: &Path,
+    purl: &str,
+    record: &crate::manifest::schema::PatchRecord,
+    known: &HashMap<String, String>,
+    check_modules_txt: bool,
 ) -> Result<(), String> {
     let Some((module, version)) = crate::utils::purl::parse_golang_purl(purl) else {
         return Ok(());
@@ -368,17 +417,29 @@ pub async fn verify_native_vendor(
         return Err("invalid Go module coordinates".into());
     }
     let replaces = go_mod_edit::read_replace_entries(project_root).await;
-    if let Some(issue) = vendor_modules_txt_issues(project_root, &replaces)
-        .await
-        .into_iter()
-        .find(|issue| issue.module() == module)
-    {
-        return Err(issue.to_string());
+    if check_modules_txt {
+        if let Some(issue) = vendor_modules_txt_issues(project_root, &replaces)
+            .await
+            .into_iter()
+            .find(|issue| issue.module() == module)
+        {
+            return Err(issue.to_string());
+        }
     }
     let (_, command) = modules_txt_location(project_root);
-    super::go_native_vendor::verify(project_root, &dir, &module, &version, record, &replaces)
-        .await
-        .map_err(|detail| format!("{detail}; run `{command}` and commit vendor/"))
+    super::go_native_vendor::verify(
+        &super::go_native_vendor::Target {
+            root: project_root,
+            dir: &dir,
+            module: module.as_ref(),
+            version: version.as_ref(),
+            replaces: &replaces,
+            known,
+            command,
+        },
+        record,
+    )
+    .await
 }
 
 /// Whether the go command builds `project_root` in workspace mode (a
@@ -808,6 +869,31 @@ mod tests {
         );
         assert_eq!(go_mod_flag("'-ldflags=-X main.flag=-mod=vendor'"), None);
         assert_eq!(go_mod_flag("'unterminated"), None);
+        // An empty value is not explicit: Go still selects vendor/ itself...
+        assert_eq!(go_mod_flag("-mod="), None);
+        assert_eq!(go_mod_flag("--mod= -tags=linux"), None);
+        // ...unless an earlier non-empty -mod already made the mode explicit.
+        assert_eq!(go_mod_flag("-mod=vendor -mod="), Some(""));
+    }
+
+    #[test]
+    fn vendor_is_selected_by_default_from_go_1_14_including_prereleases() {
+        let go = |text: &str| go_mod_edit::go_directive_version(text).unwrap();
+        for selected in [
+            "go 1.14",
+            "go 1.14.1",
+            "go 1.21",
+            "go 1.21.0",
+            "go 1.22rc1",
+            "go 1.21beta1",
+            "go 2",
+        ] {
+            assert!(vendor_by_default(go(selected)), "{selected}");
+        }
+        for ignored in ["go 1.13", "go 1.14rc1", "go 1.14beta2", "go 1"] {
+            assert!(!vendor_by_default(go(ignored)), "{ignored}");
+        }
+        assert!(go_mod_edit::go_directive_version("module m\n").is_none());
     }
 
     const COPY: &str = ".socket/go-patches/example.com/upstream@v1.0.0";

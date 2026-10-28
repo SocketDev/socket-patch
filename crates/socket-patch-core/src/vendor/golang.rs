@@ -595,12 +595,16 @@ async fn teardown_failed_service_copy(
     wired: bool,
 ) {
     let uuid_dir = project_root.join(base_rel);
+    if wired {
+        // Before the uuid dir goes: it holds the saved upstream go.sum lines
+        // the drop restores. A refused restore still drops the directive,
+        // which would otherwise dangle at the deleted copy.
+        let _ =
+            go_mod_edit::drop_replace_entry_for_cleanup(project_root, module, ReplaceOwner::Vendor)
+                .await;
+    }
     let _ = remove_tree(&uuid_dir).await;
     prune_empty_vendor_levels(&uuid_dir).await;
-    if wired {
-        let _ = go_mod_edit::drop_replace_entry(project_root, module, ReplaceOwner::Vendor, false)
-            .await;
-    }
 }
 
 /// Failure cleanup for the STAGED service leg: the stage is always removed. A

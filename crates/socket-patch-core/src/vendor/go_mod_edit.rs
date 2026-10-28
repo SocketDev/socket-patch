@@ -217,14 +217,40 @@ pub async fn drop_replace_entry(
         .into_iter()
         .filter(|entry| entry.module == module && entry.owner == Some(owner))
         .collect();
-    if !dry_run && !entries.is_empty() {
-        super::go_sum_backup::restore(project_root, &entries).await?;
+    if !entries.is_empty() {
+        // A dry run makes the same checks (a conflicting or invalid saved
+        // checksum refuses) without writing go.sum, so it predicts the run.
+        super::go_sum_backup::restore(project_root, &entries, dry_run).await?;
     }
-    let changed = edit_go_mod(project_root, dry_run, |c| {
+    edit_go_mod(project_root, dry_run, |c| {
         remove_replace_entry(c, module, owner)
     })
-    .await?;
-    Ok(changed)
+    .await
+}
+
+/// [`drop_replace_entry`] for failure cleanup that has removed, or is about
+/// to remove, the directive's target: the directive must not survive a
+/// refused go.sum restore (a conflicting or unreadable saved checksum), or
+/// every `go build` fails on the missing replacement directory. The restore
+/// is attempted first; when it refuses, the directive is still dropped and
+/// go.sum (and the saved lines) are left as they were. Returns whether the
+/// saved lines were restored.
+pub(crate) async fn drop_replace_entry_for_cleanup(
+    project_root: &Path,
+    module: &str,
+    owner: ReplaceOwner,
+) -> Result<bool, String> {
+    if drop_replace_entry(project_root, module, owner, false)
+        .await
+        .is_ok()
+    {
+        return Ok(true);
+    }
+    edit_go_mod(project_root, false, |c| {
+        remove_replace_entry(c, module, owner)
+    })
+    .await
+    .map(|_| false)
 }
 
 // ── file resolution + read/write ──────────────────────────────────────────────
@@ -426,19 +452,44 @@ pub fn parse_required_versions(content: &str) -> HashMap<String, String> {
 /// provides a package to the build. Without the directive go assumes 1.16,
 /// whose `require` set is only a set of lower bounds.
 pub fn prunes_module_graph(content: &str) -> bool {
-    let mut pruned = false;
+    matches!(go_directive_version(content), Some(GoDirective { major, minor, .. }) if major > 1 || major == 1 && minor >= 17)
+}
+
+/// The version a go.mod / go.work `go` directive declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GoDirective {
+    pub major: u32,
+    pub minor: u32,
+    /// False for a prerelease of `minor` (`1.22rc1`, `1.21beta1`), which Go
+    /// orders below the release it precedes (`1.22rc1 < 1.22`).
+    pub release: bool,
+}
+
+/// The last `go` directive in `content`, parsed as [`GoDirective`]: the
+/// minor version's leading digits, so `1.22rc1` reads as a 1.22 prerelease.
+/// `None` without a directive or with an unparseable version.
+pub(crate) fn go_directive_version(content: &str) -> Option<GoDirective> {
+    let mut found = None;
     let _ = for_each_directive_body(content, "go", |_, body| {
-        let mut parts = body.split_whitespace().next().unwrap_or("").split('.');
-        let major = parts.next().and_then(|p| p.parse::<u32>().ok());
-        let minor = parts.next().and_then(|p| {
-            let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse::<u32>().ok()
-        });
-        pruned = matches!((major, minor), (Some(m), _) if m > 1)
-            || matches!((major, minor), (Some(1), Some(n)) if n >= 17);
+        let version = body.split_whitespace().next().unwrap_or("");
+        let mut parts = version.splitn(2, '.');
+        found = parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .and_then(|major| {
+                let rest = parts.next().unwrap_or("0");
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                let minor = digits.parse::<u32>().ok()?;
+                let suffix = &rest[digits.len()..];
+                Some(GoDirective {
+                    major,
+                    minor,
+                    release: suffix.is_empty() || suffix.starts_with('.'),
+                })
+            });
         Ok(())
     });
-    pruned
+    found
 }
 
 /// The module path the go.mod `module` directive declares, in its

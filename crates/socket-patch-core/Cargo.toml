@@ -37,7 +37,6 @@ thiserror = { workspace = true }
 walkdir = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
-glob = { workspace = true }
 aho-corasick = { workspace = true }
 toml_edit = { workspace = true }
 once_cell = { workspace = true }

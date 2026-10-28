@@ -254,21 +254,26 @@ async fn try_local_go_apply(
     )
 }
 
-/// After the apply loop: prune local-go redirects whose patches were dropped
-/// from the manifest. No-op unless local go is in scope.
+/// Before the apply loop: prune local-go redirects whose patches were
+/// dropped from the manifest. No-op unless local go is in scope. An orphan
+/// whose directive cannot be dropped (go.sum conflicts with its saved
+/// upstream checksum, say) is kept, and comes back as a failed result: the
+/// run fails, but every other patch still applies.
 async fn reconcile_local_go(
-    common: &GlobalArgs,
+    args: &ApplyArgs,
     target_manifest_purls: &HashSet<String>,
-) -> Result<(), String> {
+) -> Vec<ApplyResult> {
+    let common = &args.common;
     if !eco_in_local_scope(common, Ecosystem::Golang) {
-        return Ok(());
+        return Vec::new();
     }
     let desired: HashSet<String> = target_manifest_purls
         .iter()
         .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Golang))
         .cloned()
         .collect();
-    let removed = reconcile_go_redirects(&common.cwd, &desired, common.dry_run).await?;
+    let reconciled = reconcile_go_redirects(&common.cwd, &desired, common.dry_run).await;
+    let removed = reconciled.removed;
     if !removed.is_empty() && !common.silent && !common.json {
         let verb = if common.dry_run {
             "Would remove"
@@ -287,7 +292,36 @@ async fn reconcile_local_go(
             println!("  {purl}");
         }
     }
-    Ok(())
+    reconciled
+        .failed
+        .into_iter()
+        .map(|(purl, error)| {
+            // Errors print even under --silent.
+            if args.prints_errors() {
+                eprintln!("{}", format_patch_failure(&purl, &error));
+            }
+            let package_path = parse_golang_purl(&purl)
+                .map(|(module, version)| {
+                    socket_patch_core::patch::redirect::golang_local::copy_dir_for(
+                        &common.cwd,
+                        socket_patch_core::vendor::go_mod_edit::GO_PATCHES_DIR,
+                        &module,
+                        &version,
+                    )
+                })
+                .unwrap_or_else(|| common.cwd.clone());
+            ApplyResult {
+                package_key: purl,
+                package_path: package_path.display().to_string(),
+                success: false,
+                files_verified: Vec::new(),
+                files_patched: Vec::new(),
+                applied_via: HashMap::new(),
+                error: Some(error),
+                sidecar: None,
+            }
+        })
+        .collect()
 }
 
 /// Read-only verification that the manifest's patches are in place, for CI
@@ -298,7 +332,9 @@ async fn reconcile_local_go(
 /// not vendor-owned (`vendor --check` audits those):
 ///
 /// * local Go patches: the committed `.socket/go-patches/` copies and
-///   `go.mod` `replace` directives ([`verify_go_redirect_state`]);
+///   `go.mod` `replace` directives ([`verify_go_redirect_state`]); and, for
+///   every in-scope Go patch (vendor-owned ones too), the native `vendor/`
+///   tree a default build compiles and the consumer-sync state;
 /// * every other patch: each installed copy must hash to the record's
 ///   `afterHash` — the same verifier `vex` attests with
 ///   ([`applied_patches_with_copies`](socket_patch_core::vex::applied_patches_with_copies)),
@@ -387,17 +423,26 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                     drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));
                 }
             }
+            // The native vendor tree a default build compiles must carry
+            // every in-scope Go patch, vendor-owned ones included. Its
+            // modules.txt drift is the audit's below: one report per cause.
+            let no_texts = HashMap::new();
             for (purl, record) in &manifest.patches {
                 if in_scope.contains(purl) {
                     if let Err(detail) =
-                        socket_patch_core::vendor::go_consumer_sync::verify_native_vendor(
+                        socket_patch_core::vendor::go_consumer_sync::verify_native_vendor_tree(
                             &args.common.cwd,
                             purl,
                             record,
+                            &no_texts,
                         )
                         .await
                     {
-                        drifts.push((purl.clone(), "go_vendor_content_mismatch".into(), detail));
+                        drifts.push((
+                            purl.clone(),
+                            socket_patch_core::vendor::go_consumer_sync::NATIVE_VENDOR_CODE.into(),
+                            detail,
+                        ));
                     }
                 }
             }
@@ -499,10 +544,11 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 eprintln!("  {detail}");
             }
             // A go consumer-sync drift names its own go command; apply
-            // cannot regenerate vendor/modules.txt or go.sum.
+            // cannot regenerate vendor/ or go.sum.
             if drifts.iter().any(|(_, code, _)| {
                 code != socket_patch_core::vendor::go_consumer_sync::VENDOR_MODULES_TXT_CODE
                     && code != socket_patch_core::vendor::go_consumer_sync::REQUIREMENTS_CODE
+                    && code != socket_patch_core::vendor::go_consumer_sync::NATIVE_VENDOR_CODE
             }) {
                 eprintln!("{}", check_remedy(&args.common, !protected.is_empty()));
             }
@@ -1642,10 +1688,16 @@ pub(crate) async fn run_locked(
                 .await;
             }
 
-            // The mismatch overwrites, for a nested caller's envelope (the
-            // JSON events above are the standalone apply's copy).
+            // The mismatch overwrites and the run's advisories, for a nested
+            // caller's envelope (the JSON events above are the standalone
+            // apply's copy). A stage failure reaches it as `run_error`.
             let mut warnings = mismatch_overwrite_warnings(&results, args.common.dry_run);
-            warnings.extend(run_warnings.iter().cloned());
+            warnings.extend(
+                run_warnings
+                    .iter()
+                    .filter(|w| !is_stage_failure_code(&w.code))
+                    .cloned(),
+            );
             let (applied, skipped) = collect_apply_outcomes(
                 &results,
                 &unmatched,
@@ -2163,7 +2215,7 @@ async fn apply_patches_inner(
         .chain(user_patched)
         .cloned()
         .collect();
-    reconcile_local_go(&args.common, &recorded).await?;
+    let reconcile_failures = reconcile_local_go(args, &recorded).await;
 
     if partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
@@ -2172,13 +2224,14 @@ async fn apply_patches_inner(
         // `postinstall` hook runs `apply` on every install, including fresh
         // projects whose manifest has no matching patches yet. Decided
         // BEFORE the ledger read, gem discovery and the crawl — none of which
-        // can add work to an empty scope — but AFTER the staging above.
-        if !args.common.silent && !args.common.json {
+        // can add work to an empty scope — but AFTER the staging above. A
+        // stale Go redirect the reconcile had to keep still fails the run.
+        if reconcile_failures.is_empty() && !args.common.silent && !args.common.json {
             println!("No patches to apply.");
         }
         return Ok(ApplyOutcome {
-            success: true,
-            results: Vec::new(),
+            success: reconcile_failures.is_empty(),
+            results: reconcile_failures,
             unmatched: Vec::new(),
             lockfile_only: HashSet::new(),
             run_warnings: Vec::new(),
@@ -2206,6 +2259,7 @@ async fn apply_patches_inner(
     let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
+    results.extend(reconcile_failures);
 
     let crawler_options = args.common.crawler_options();
 
@@ -2304,15 +2358,8 @@ async fn apply_patches_inner(
 
     if all_packages.is_empty() {
         if reused_go && !args.common.dry_run {
-            run_warnings.extend(
-                socket_patch_core::vendor::go_consumer_sync::audit_warnings(
-                    &args.common.cwd,
-                    &go_pristine_mods,
-                )
-                .await
-                .into_iter()
-                .map(|(code, detail)| RunWarning { code, detail }),
-            );
+            run_warnings
+                .extend(go_sync_warnings(&args.common, &HashMap::new(), &manifest, &results).await);
         }
         // Vendored purls are already accounted for (synthesized Skipped/
         // vendored results above); only the remainder is genuinely
@@ -2815,15 +2862,8 @@ async fn apply_patches_inner(
     // `vendor/modules.txt` and its go.mod requirements still agree with the
     // `replace` directives (#343, #618): name the regeneration step.
     if !args.common.dry_run && eco_in_local_scope(&args.common, Ecosystem::Golang) {
-        run_warnings.extend(
-            socket_patch_core::vendor::go_consumer_sync::audit_warnings(
-                &args.common.cwd,
-                &go_pristine_mods,
-            )
-            .await
-            .into_iter()
-            .map(|(code, detail)| RunWarning { code, detail }),
-        );
+        run_warnings
+            .extend(go_sync_warnings(&args.common, &go_pristine_mods, &manifest, &results).await);
     }
 
     // Note: `apply` deliberately does NOT garbage-collect unused blobs in
@@ -2842,6 +2882,60 @@ async fn apply_patches_inner(
         targeted: target_manifest_purls.len(),
         show_summary: true,
     })
+}
+
+/// The Go consumer-sync advisories after a run that wired or reused local Go
+/// redirects (#343, #618), plus the native vendor tree's content: the tree a
+/// default build compiles must carry each Go patch the run applied (a patch
+/// superseded at the same version leaves modules.txt in sync while vendor/
+/// still holds the old bytes). A module whose modules.txt drift is already
+/// named is not reported twice.
+async fn go_sync_warnings(
+    common: &GlobalArgs,
+    pristine_go_mods: &HashMap<String, PathBuf>,
+    manifest: &PatchManifest,
+    results: &[ApplyResult],
+) -> Vec<RunWarning> {
+    use socket_patch_core::vendor::go_consumer_sync::{
+        audit, verify_native_vendor_tree, GoSyncIssue, NATIVE_VENDOR_CODE,
+    };
+    let issues = audit(&common.cwd, pristine_go_mods).await;
+    let stale: HashSet<&str> = issues
+        .iter()
+        .filter(|issue| matches!(issue, GoSyncIssue::VendorModulesTxt { .. }))
+        .map(GoSyncIssue::module)
+        .collect();
+    let mut warnings: Vec<RunWarning> = issues
+        .iter()
+        .map(|issue| RunWarning {
+            code: issue.code().to_string(),
+            detail: issue.to_string(),
+        })
+        .collect();
+    let no_texts = HashMap::new();
+    let mut checked: HashSet<&str> = HashSet::new();
+    for result in results
+        .iter()
+        .filter(|r| r.success && r.package_path != VENDOR_OWNED_MARKER)
+    {
+        let purl = result.package_key.as_str();
+        let Some((module, _)) = parse_golang_purl(purl) else {
+            continue;
+        };
+        if stale.contains(module.as_ref()) || !checked.insert(purl) {
+            continue;
+        }
+        let Some(record) = manifest.patches.get(purl) else {
+            continue;
+        };
+        if let Err(detail) = verify_native_vendor_tree(&common.cwd, purl, record, &no_texts).await {
+            warnings.push(RunWarning {
+                code: NATIVE_VENDOR_CODE.to_string(),
+                detail: format!("{purl}: {detail}"),
+            });
+        }
+    }
+    warnings
 }
 
 /// One Maven base purl for [`apply_maven_base`].

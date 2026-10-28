@@ -186,22 +186,6 @@ pub async fn applied_patches_with_copies(
     let mut out = VerifyOutcome::default();
 
     for (purl, record) in &manifest.patches {
-        if let Some(ctx) = vendor {
-            if crate::vendor::go_consumer_sync::verify_native_vendor(
-                &ctx.project_root,
-                purl,
-                record,
-            )
-            .await
-            .is_err()
-            {
-                out.failed.push(FailedPatch {
-                    purl: purl.clone(),
-                    reason: "go_vendor_content_mismatch".to_string(),
-                });
-                continue;
-            }
-        }
         let vendor_entry =
             vendor.and_then(|ctx| lookup_entry(&ctx.entries, purl).map(|e| (ctx, e)));
         let result = if let Some((ctx, entry)) = vendor_entry {
