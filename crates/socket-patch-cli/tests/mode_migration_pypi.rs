@@ -3415,6 +3415,86 @@ async fn pip_lock_hosted_to_vendored_keeps_the_requirements_patched() {
     }
 }
 
+/// #1794: a `requirements.txt` pin with extras (`six[foo]==1.16.0`) can't
+/// be written as a vendored wheel path line, so the pylock beside it can't
+/// be vendored alone: the switch's upstream restore had just un-hosted the
+/// requirements pin, and `pip install -r requirements.txt` would then go
+/// from patched to unpatched. The switch refuses the purl with the
+/// requirements wiring's own code, and the restore is rolled back, so both
+/// files keep their hosted pin byte for byte. Before the fix both files
+/// were un-hosted, only pylock.toml was wired, and the run exited 0.
+#[tokio::test]
+async fn pip_lock_hosted_to_vendored_refuses_an_extras_pin() {
+    for takeover in [false, true] {
+        let server = MockServer::start().await;
+        let hosted_url = mount_hosted_api(&server, true).await;
+        mount_patch_view(&server).await;
+        let uri = server.uri();
+        let switch: Vec<&str> = if takeover {
+            vec![
+                "scan",
+                "--mode",
+                "vendored",
+                "--yes",
+                "--api-url",
+                &uri,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake-token",
+                "--patch-server-url",
+                &uri,
+                "--vendor-url",
+                &uri,
+            ]
+        } else {
+            let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+            args.extend(api_args(&uri));
+            args
+        };
+        let (_tmp, root) = project();
+        std::fs::write(
+            root.join("requirements.txt"),
+            "idna==3.7\nsix[foo]==1.16.0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pylock.toml"), PIP_LOCK).unwrap();
+        let files = ["requirements.txt", "pylock.toml"];
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted scan: {env:#}");
+        let hosted: Vec<String> = files
+            .iter()
+            .map(|file| std::fs::read_to_string(root.join(file)).unwrap())
+            .collect();
+        for (file, text) in files.iter().zip(&hosted) {
+            assert!(
+                text.contains(&hosted_url),
+                "hosted mode pins {file}:\n{text}\n{env:#}"
+            );
+        }
+
+        stage_manifest(&root);
+        prebuilt_common::mount_project(&server, &root).await;
+        let (code, env) = run_cli(&root, &switch, &[]);
+        assert_eq!(code, 1, "{switch:?}: the purl is refused: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_extras_unsupported"),
+            "{switch:?}: refused with the requirements wiring's code: {env:#}"
+        );
+        for (file, before) in files.iter().zip(&hosted) {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert_eq!(
+                &text, before,
+                "{switch:?}: {file} keeps its hosted pin byte for byte\n{env:#}"
+            );
+        }
+        assert!(
+            !root.join(".socket/vendor/pypi").exists(),
+            "{switch:?}: nothing is vendored"
+        );
+    }
+}
+
 /// The `pipenv requirements > requirements.txt` export of [`stage_pipenv`]'s
 /// lock: the file Docker / plain-pip installs read.
 const PIPENV_EXPORT: &str = "-i https://pypi.org/simple\nsix==1.16.0 ; python_version >= '2.7' and python_version not in '3.0, 3.1, 3.2'\n";

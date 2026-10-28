@@ -361,9 +361,10 @@ fn wired_pin_in(content: &str, canon_name: &str, record_uuid: &str) -> Option<(S
 /// the registry in a shape the wiring rewrites in place, with no vendor line
 /// for the package yet (#612, #1368). Vendored Pipenv and uv wire such a pin
 /// together with their lock, as hosted mode rewrites both; anything else (no
-/// pin, a range, extras, an include outside the root, an existing vendor
-/// line, a symlinked file the rewrite would replace) is left to the
-/// `pypi_multiple_lockfiles` warning.
+/// pin, a range, an include outside the root, an existing vendor line, a
+/// symlinked file the rewrite would replace) is left to the
+/// `pypi_multiple_lockfiles` warning, except an exact pin with extras, which
+/// refuses ([`sibling_extras_refusal`]).
 pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: &str) -> bool {
     let Ok(files) = collect_requirements_files(root).await else {
         return false;
@@ -384,6 +385,52 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
             .flat_map(|f| f.records.iter())
             .all(|r| r.action == WiringAction::Rewritten)
         && refuse_symlinked(root, &rels).await.is_ok()
+}
+
+/// The refusal for a requirements pin with extras, which a vendored wheel
+/// path line cannot express.
+fn extras_refusal(rel: &str, canon_name: &str) -> (&'static str, String) {
+    (
+        "pypi_extras_unsupported",
+        format!(
+            "{rel}: the {canon_name} pin declares extras, which a vendored wheel path line \
+             cannot express; remove the extras or use agent mode \
+             (`scan --mode agent` + `socket-patch apply`) instead"
+        ),
+    )
+}
+
+/// The refusal for a requirements set beside a lock that pins exactly
+/// `canon_name==version` with extras (`six[foo]==1.16.0`), if it does (#1794).
+/// The wiring can't rewrite that pin ([`sibling_pin_wirable`]), and wiring
+/// the lock alone is no answer: after a hosted → vendored switch the pin is
+/// the one the upstream restore just un-hosted, so `pip install -r` would
+/// go from patched to unpatched. Refusing instead keeps the hosted pin
+/// (the takeover rolls its restore back), as the requirements-only wiring
+/// does for the same pin.
+pub(super) async fn sibling_extras_refusal(
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+) -> Option<(&'static str, String)> {
+    let files = collect_requirements_files(root).await.ok()?;
+    files
+        .iter()
+        .find(|f| exact_extras_pin(&f.content, canon_name, version))
+        .map(|f| extras_refusal(&f.rel, canon_name))
+}
+
+/// Whether `content` pins exactly `canon_name==version` with extras.
+fn exact_extras_pin(content: &str, canon_name: &str, version: &str) -> bool {
+    logical_lines(content).into_iter().any(|ll| {
+        parse_requirement(strip_comment(&ll.text)).is_some_and(|req| {
+            req.extras.is_some()
+                && canonicalize_pypi_name(req.name) == canon_name
+                && req
+                    .exact_version()
+                    .is_some_and(|pinned| crate::utils::pep440::versions_equal(pinned, version))
+        })
+    })
 }
 
 /// The `requirements_line` records of a mixed entry (a Pipenv or uv entry
@@ -775,17 +822,7 @@ async fn plan_requirements(
 
     for (file, scan) in files.iter().zip(scans) {
         match pin_refusal(&scan, split_ok) {
-            Some(PinRefusal::Extras) => {
-                return Err((
-                    "pypi_extras_unsupported",
-                    format!(
-                        "{}: the {canon_name} pin declares extras, which a vendored wheel path \
-                         line cannot express; remove the extras or use agent mode \
-                         (`scan --mode agent` + `socket-patch apply`) instead",
-                        file.rel
-                    ),
-                ));
-            }
+            Some(PinRefusal::Extras) => return Err(extras_refusal(&file.rel, canon_name)),
             Some(PinRefusal::NotPinned) => {
                 return Err((
                     "pypi_requirement_not_pinned",

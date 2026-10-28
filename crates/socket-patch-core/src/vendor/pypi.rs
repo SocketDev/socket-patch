@@ -392,6 +392,16 @@ async fn detect_pypi_flavor(
         // hosted mode pins both, so it is no loser.
         let wired_with_lock = match target {
             Some((name, version)) => {
+                // #1794: a pin with extras can't be wired with the lock,
+                // and leaving it as a loser would leave `pip install -r`
+                // unpatched (a hosted -> vendored switch has just
+                // un-hosted it), so refuse the package instead.
+                if let Some(refusal) =
+                    super::pypi_requirements::sibling_extras_refusal(project_root, name, version)
+                        .await
+                {
+                    return Err(refusal);
+                }
                 super::pypi_requirements::sibling_pin_wirable(project_root, name, version).await
             }
             None => false,
@@ -445,6 +455,13 @@ async fn detect_pypi_flavor(
     // its lock instead (`wire_in_sync_sibling`), so it is no loser.
     let wired_with_lock = match (governing, target) {
         (Some("Pipfile.lock" | "uv.lock"), Some((name, version))) => {
+            // #1794: as for a pylock above, an extras pin can't be wired
+            // with the lock, so it refuses rather than go unpatched.
+            if let Some(refusal) =
+                super::pypi_requirements::sibling_extras_refusal(project_root, name, version).await
+            {
+                return Err(refusal);
+            }
             super::pypi_requirements::sibling_pin_wirable(project_root, name, version).await
         }
         _ => false,
@@ -4082,6 +4099,54 @@ mod tests {
                 warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
                 "{lock}: {warnings:?}"
             );
+        }
+    }
+
+    /// #1794: a requirements.txt beside a pylock, Pipfile.lock or uv.lock
+    /// that pins the package exactly with extras can't be wired with the
+    /// lock, so the package is refused (`pypi_extras_unsupported`, as the
+    /// requirements-only wiring refuses it) instead of wiring the lock and
+    /// leaving `pip install -r` unpatched. Extras on another version, or a
+    /// range with extras, aren't the release being vendored: they stay a
+    /// loud loser.
+    #[tokio::test]
+    async fn extras_pin_beside_a_lock_refuses() {
+        for (lock, content) in [
+            ("pylock.toml", PIPENV_PYLOCK),
+            ("Pipfile.lock", "{}"),
+            ("uv.lock", "version = 1\n"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), lock, content).await;
+            for pin in [
+                "six[foo]==1.16.0",
+                "Six[foo,bar] == 1.16 ; python_version >= \"3\"",
+            ] {
+                touch(
+                    tmp.path(),
+                    "requirements.txt",
+                    &format!("idna==3.7\n{pin}\n"),
+                )
+                .await;
+                let (code, detail) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                    .await
+                    .unwrap_err();
+                assert_eq!(code, "pypi_extras_unsupported", "{lock} {pin}: {detail}");
+                assert!(
+                    detail.starts_with("requirements.txt: ") && detail.contains("extras"),
+                    "{lock} {pin}: {detail}"
+                );
+            }
+            for pin in ["six[foo]==1.15.0", "six[foo]>=1.15"] {
+                touch(tmp.path(), "requirements.txt", &format!("{pin}\n")).await;
+                let (_, warnings) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+                    .await
+                    .unwrap();
+                assert!(
+                    warnings.iter().any(|w| w.code == "pypi_multiple_lockfiles"),
+                    "{lock} {pin}: {warnings:?}"
+                );
+            }
         }
     }
 
