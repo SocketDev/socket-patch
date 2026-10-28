@@ -158,13 +158,29 @@ async fn extract_goenv(
     // `-modfile` sends the build to another go.mod, whose replaces (if
     // any) discovery doesn't read: nothing here is what go builds (#1799).
     // Only a project on disk is built under this process's GOFLAGS (the
-    // hosted engine reads it for the same views), and only a GOFLAGS that
-    // names `-modfile` or that go refuses needs the root at all, so a
-    // tracked snapshot's reads stay recorded otherwise.
-    let setting = goflags
-        .filter(|g| goflags_modfile(g) != GoflagsModfile::Default)
-        .and_then(|_| ctx.disk_root())
-        .and_then(|root| go_workspace::modfile_setting_with(root, goflags, gowork));
+    // hosted engine reads it for the same views). The probe reads exactly
+    // the go.work candidates, go.mod and the named file, and declares them
+    // so a tracked snapshot keeps recording.
+    let setting = match goflags.map(goflags_modfile) {
+        None | Some(GoflagsModfile::Default) => None,
+        Some(flag) => ctx
+            .disk_root_reading(std::iter::empty::<&Path>())
+            .and_then(|root| {
+                let mut touched: Vec<std::path::PathBuf> =
+                    root.ancestors().map(|dir| dir.join(GO_WORK)).collect();
+                touched.extend(
+                    gowork
+                        .filter(|g| Path::new(g).is_absolute())
+                        .map(Into::into),
+                );
+                touched.push(GO_MOD.into());
+                if let GoflagsModfile::File(file) = flag {
+                    touched.push(file.into());
+                }
+                ctx.disk_root_reading(&touched)?;
+                go_workspace::modfile_setting_with(root, goflags, gowork)
+            }),
+    };
     if let Some(setting) = setting {
         return withhold(ctx, out, &setting).await;
     }
@@ -1929,6 +1945,33 @@ mod tests {
                 "{goflags}: {:?}",
                 out.diagnostics
             );
+        }
+    }
+
+    /// The `-modfile` probe declares what it reads: a tracked snapshot
+    /// keeps recording whether or not it withholds (#1799).
+    #[tokio::test]
+    async fn goflags_modfile_probe_keeps_a_snapshot_recording() {
+        use crate::vendor::lock_inventory::{DiskSnapshot, ProjectView};
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let p = Project::new();
+        p.write(
+            "go.mod",
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n\n\
+                 replace {MODULE} {VERSION} => {m} {sver}\n"
+            ),
+        )
+        .write("go.sum", go_sum_for(UUID_A, sver));
+        for (goflags, refs) in [("-modfile=go.mod", 1), ("-modfile=go.alt.mod", 0)] {
+            let snap = DiskSnapshot::tracked(p.root());
+            snap.begin_recording();
+            let ctx = DiscoverCtx::over(ProjectView::Snapshot(&snap), &[]);
+            let mut out = Discovery::default();
+            super::extract_goenv(&ctx, &mut out, None, Some(goflags)).await;
+            assert_eq!(out.refs.len(), refs, "{goflags}: {:?}", out.diagnostics);
+            assert!(snap.end_recording().is_some(), "{goflags}");
         }
     }
 
