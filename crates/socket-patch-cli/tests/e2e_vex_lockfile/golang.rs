@@ -497,6 +497,7 @@ fn write_go_replace(fx: &Fx, file: GoFile, rhs: &str, sum: Option<&str>) {
         }
         GoFile::GoWork => {
             fx.put("go.mod", go_mod(GO_VERSION, None, false));
+            fx.cache_go_mod(GO_MODULE, GO_VERSION);
             fx.put(
                 "go.work",
                 format!("go 1.21\n\nuse .\n\nreplace {GO_MODULE} {GO_VERSION} => {rhs}\n"),
