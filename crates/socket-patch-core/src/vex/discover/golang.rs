@@ -345,31 +345,40 @@ fn extract_file(
                 let Some(purl) = replaced_purl(entry, required, &versioned, file, out) else {
                     continue;
                 };
-                let (integrity, integrity_required) = match sums.pin(rhs, rhs_version) {
-                    SumPin::Zip(h1) => (Some(LockIntegrity::GoH1(h1)), true),
-                    SumPin::GoModOnly => {
-                        // MVS reads (and go.sum keeps the `/go.mod` line of)
-                        // versions it does not select; only a zip line shows
-                        // the replaced version is the one built.
-                        let req = required.get(&entry.module).map(String::as_str);
-                        // `replaced_purl` resolved one of the two.
-                        let version = entry.version.as_deref().or(req).unwrap_or_default();
-                        let zips = sums.zip_versions(&entry.module);
-                        let selected = graph.select(&entry.module, version, &zips);
-                        if let Some(other) = selected.other_version() {
-                            out.diag(
-                                DIAG_REF_INVALID,
-                                file,
-                                format!(
-                                    "{file}: replace {} {version} is inert: the build \
-                                     selects {other}, so it uses the unpatched module",
-                                    entry.module
-                                ),
-                            );
-                            continue;
-                        }
-                        (None, graph.workspace)
+                let pin = sums.pin(rhs, rhs_version);
+                // MVS reads (and go.sum keeps the `/go.mod` line of) versions
+                // it does not select, so a `/go.mod`-only pin needs proof the
+                // replaced version is the one built. In a workspace a zip
+                // line is no proof either: a sum file is only appended to, so
+                // a member that later raises the module leaves the socket zip
+                // line in place while go builds the higher version.
+                let check = match pin {
+                    SumPin::GoModOnly => true,
+                    SumPin::Zip(_) => graph.workspace,
+                    SumPin::Unpinned => false,
+                };
+                if check {
+                    let req = required.get(&entry.module).map(String::as_str);
+                    // `replaced_purl` resolved one of the two.
+                    let version = entry.version.as_deref().or(req).unwrap_or_default();
+                    let zips = sums.zip_versions(&entry.module);
+                    let selected = graph.select(&entry.module, version, &zips);
+                    if let Some(other) = selected.other_version() {
+                        out.diag(
+                            DIAG_REF_INVALID,
+                            file,
+                            format!(
+                                "{file}: replace {} {version} is inert: the build \
+                                 selects {other}, so it uses the unpatched module",
+                                entry.module
+                            ),
+                        );
+                        continue;
                     }
+                }
+                let (integrity, integrity_required) = match pin {
+                    SumPin::Zip(h1) => (Some(LockIntegrity::GoH1(h1)), true),
+                    SumPin::GoModOnly => (None, graph.workspace),
                     SumPin::Unpinned => (None, true),
                 };
                 let url = format!("{rhs}@{rhs_version}");
@@ -1164,6 +1173,48 @@ mod tests {
                 assert!(!out.refs[0].lockfile_basis_ok(), "{name}");
                 assert_eq!(out.refs[0].locked_integrity, None, "{name}");
                 assert!(out.diagnostics.is_empty(), "{name}: {:?}", out.diagnostics);
+            }
+        }
+    }
+
+    /// A workspace's sum files are only appended to, so the socket zip line
+    /// can outlive the build that wrote it: a member that requires a higher
+    /// version makes even a zip-pinned replace inert.
+    #[tokio::test]
+    async fn workspace_zip_pin_is_inert_under_a_higher_member_require() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        for (member_version, inert) in [(VERSION, false), ("v1.4.1", false), ("v1.5.0", true)] {
+            let p = Project::new();
+            p.write("go.mod", BASE_GO_MOD)
+                .write(
+                    "go.work",
+                    format!(
+                        "go 1.21\n\nuse (\n\t.\n\t./svc\n)\n\nreplace {MODULE} {VERSION} => {m} {sver}\n"
+                    ),
+                )
+                .write(
+                    "go.work.sum",
+                    format!("{m} {sver} {ZIP_H1}\n{m} {sver}/go.mod {MOD_H1}\n"),
+                )
+                .write(
+                    "svc/go.mod",
+                    format!("module example.com/svc\n\ngo 1.21\n\nrequire {MODULE} {member_version}\n"),
+                );
+            let out = run(&p).await;
+            if inert {
+                assert_refs(&out, &[]);
+                assert_eq!(out.diagnostics.len(), 1, "{member_version}");
+                assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+                assert!(out.diagnostics[0].detail.contains("selects v1.5.0"));
+            } else {
+                assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+                assert_eq!(
+                    out.refs[0].locked_integrity,
+                    Some(LockIntegrity::GoH1(ZIP_H1.to_string())),
+                    "{member_version}"
+                );
+                assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
             }
         }
     }
