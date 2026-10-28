@@ -464,16 +464,26 @@ pub(crate) async fn plan(
             .as_ref()
             .filter(|e| socket_patch_core::vendor::jvm::apply::is_jvm_entry(e))
         {
-            if let Err(detail) =
-                socket_patch_core::vendor::jvm::apply::entry_wired_checked(root, entry)
-            {
-                const CODE: &str = "vendor_jvm_shape_unsupported";
-                gated.push(failed(&cand.key, CODE));
-                notes.push(note(
-                    CODE,
-                    format!("{}: cannot establish JVM wiring: {detail}", cand.key),
-                ));
-                continue;
+            match socket_patch_core::vendor::jvm::apply::entry_wired_checked(root, entry) {
+                Err(detail) => {
+                    const CODE: &str = "vendor_jvm_shape_unsupported";
+                    gated.push(failed(&cand.key, CODE));
+                    notes.push(note(
+                        CODE,
+                        format!("{}: cannot establish JVM wiring: {detail}", cand.key),
+                    ));
+                    continue;
+                }
+                Ok(false) => {
+                    const CODE: &str = "vendor_jvm_uncertain";
+                    gated.push(failed(&cand.key, CODE));
+                    notes.push(note(
+                        CODE,
+                        format!("{}: Maven declaration may still read the base", cand.key),
+                    ));
+                    continue;
+                }
+                Ok(true) => {}
             }
         }
         let basis = if let Some(vref) = cand
