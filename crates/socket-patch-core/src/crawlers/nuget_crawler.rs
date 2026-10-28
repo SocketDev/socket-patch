@@ -50,6 +50,34 @@ impl NuGetCrawler {
         Ok(package_roots(options).await.paths)
     }
 
+    /// Whether a global run under `global` reads a package root the
+    /// project at `project_root` restores into (#489). A PackageReference
+    /// project restores into the global packages folder, so there the
+    /// "global copy" of a package IS the project's installed copy, and the
+    /// project's own patch state still owns it. False when either side has
+    /// no root (no .NET project at `project_root`, no global folder).
+    pub async fn global_roots_shared_with(
+        &self,
+        global: &CrawlerOptions,
+        project_root: &Path,
+    ) -> bool {
+        let global_roots = package_roots(global).await.paths;
+        if global_roots.is_empty() {
+            return false;
+        }
+        let project = CrawlerOptions {
+            cwd: project_root.to_path_buf(),
+            global: false,
+            global_prefix: None,
+        };
+        let project_roots = package_roots(&project).await.paths;
+        let canonical = |p: &PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        let project_roots: HashSet<PathBuf> = project_roots.iter().map(canonical).collect();
+        global_roots
+            .iter()
+            .any(|root| project_roots.contains(&canonical(root)))
+    }
+
     /// Crawl all discovered package paths and return every package found.
     ///
     /// A project-local `packages/` folder (and every root of a project
@@ -1300,6 +1328,48 @@ mod tests {
                 "pkg:nuget/newtonsoft.json@13.0.3".to_string(),
             ],
             "both versions discovered, non-version sibling ignored"
+        );
+    }
+
+    /// #489: a global prefix the project's restore uses is the project's
+    /// store; any other folder, or a directory with no .NET project, is not.
+    #[tokio::test]
+    async fn global_roots_shared_with_the_projects_restore_folder() {
+        let store = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("app.csproj"), "<Project />").unwrap();
+        std::fs::create_dir(project.path().join("obj")).unwrap();
+        let assets = serde_json::json!({
+            "packageFolders": { format!("{}/", store.path().display()): {} },
+            "libraries": {},
+        });
+        std::fs::write(
+            project.path().join("obj/project.assets.json"),
+            assets.to_string(),
+        )
+        .unwrap();
+        let global = |prefix: &Path| CrawlerOptions {
+            cwd: project.path().to_path_buf(),
+            global: true,
+            global_prefix: Some(prefix.to_path_buf()),
+        };
+        let crawler = NuGetCrawler::new();
+        assert!(
+            crawler
+                .global_roots_shared_with(&global(store.path()), project.path())
+                .await
+        );
+        assert!(
+            !crawler
+                .global_roots_shared_with(&global(other.path()), project.path())
+                .await
+        );
+        assert!(
+            !crawler
+                .global_roots_shared_with(&global(store.path()), other.path())
+                .await,
+            "no .NET project: nothing of the project's lives in the store"
         );
     }
 

@@ -617,11 +617,20 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // Vendor-owned purls are excluded from the in-place restore (the
     // vendored leg below reverts them) unless their Cargo shared-cache copy
     // still carries an agent-mode patch (#336); an unreadable ledger degrades to
-    // "nothing vendored" here and fails closed at that leg.
-    let vendored_keys: HashSet<PurlKey> = vendor_state_result
-        .as_ref()
-        .map(socket_patch_core::vendor::VendorState::purl_keys)
-        .unwrap_or_default();
+    // "nothing vendored" here and fails closed at that leg. Under global
+    // scope the project's ledger still owns its own NuGet install (#489).
+    let vendored_keys: HashSet<PurlKey> = if project_state {
+        vendor_state_result
+            .as_ref()
+            .map(socket_patch_core::vendor::VendorState::purl_keys)
+            .unwrap_or_default()
+    } else {
+        crate::commands::vendor_owned_keys(
+            &args.common,
+            &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
+        )
+        .await
+    };
     // One `rolledBack` event per restored installed copy (recorded, so
     // `summary.rolledBack` counts them). A dry run restores nothing, so it
     // records none.

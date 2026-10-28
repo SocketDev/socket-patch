@@ -1542,7 +1542,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // Under global scope the ledger is read only to keep the project's
     // vendored manifest records (see the cleanup below): no vendored leg
     // runs, and the ledger does not own the global copies, so the in-place
-    // leg restores them.
+    // leg restores them, except the project's own NuGet install (#489).
     let loaded_vendor_state = socket_patch_core::vendor::load_state(&ledger_root).await;
     let project_vendored_keys: HashSet<PurlKey> = loaded_vendor_state
         .as_ref()
@@ -1557,10 +1557,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let vendor_corrupt = vendor_state_result.is_err();
     // An unreadable ledger degrades to "nothing vendored" for the in-place
     // leg (its own containment is the `vendor_state_unreadable` exit below).
-    let vendored_keys: HashSet<PurlKey> = vendor_state_result
-        .as_ref()
-        .map(VendorState::purl_keys)
-        .unwrap_or_default();
+    let vendored_keys: HashSet<PurlKey> = if project_state {
+        vendor_state_result
+            .as_ref()
+            .map(VendorState::purl_keys)
+            .unwrap_or_default()
+    } else {
+        crate::commands::vendor_owned_keys(&args.common, &project_vendored_keys).await
+    };
 
     // ── scope resolution ────────────────────────────────────────────────
     let manifest = if manifest_missing {

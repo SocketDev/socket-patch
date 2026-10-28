@@ -50,6 +50,39 @@ pub(crate) fn project_state_in_scope(common: &crate::args::GlobalArgs) -> bool {
     !common.is_global()
 }
 
+/// The vendor-ledger keys (`ledger`, the project's
+/// [`VendorState::purl_keys`]) that own this run's installed copies. In
+/// project scope that is the whole ledger. Under global scope the ledger
+/// owns only the project's copies ([`project_state_in_scope`]), and one
+/// global store is the project's install: a NuGet PackageReference project
+/// restores into the global packages folder, so its global copy of a
+/// vendored package IS the project's patched copy (#489). There the
+/// ledger's NuGet keys still own it, and every other key owns nothing.
+///
+/// [`VendorState::purl_keys`]: socket_patch_core::vendor::VendorState::purl_keys
+pub(crate) async fn vendor_owned_keys(
+    common: &crate::args::GlobalArgs,
+    ledger: &std::collections::HashSet<socket_patch_core::utils::purl_key::PurlKey>,
+) -> std::collections::HashSet<socket_patch_core::utils::purl_key::PurlKey> {
+    use socket_patch_core::crawlers::types::Ecosystem;
+    if project_state_in_scope(common) {
+        return ledger.clone();
+    }
+    let nuget: std::collections::HashSet<_> = ledger
+        .iter()
+        .filter(|key| Ecosystem::from_purl(key.as_str()) == Some(Ecosystem::Nuget))
+        .cloned()
+        .collect();
+    if nuget.is_empty()
+        || !socket_patch_core::crawlers::NuGetCrawler::new()
+            .global_roots_shared_with(&common.crawler_options(), &common.project_root())
+            .await
+    {
+        return Default::default();
+    }
+    nuget
+}
+
 /// The mode a `scan`/`get` run with no `--mode` uses for the project
 /// (CLI_CONTRACT.md, Mode resolution): the mode the project's own patch
 /// state already records, so a bare run never converts the project to
