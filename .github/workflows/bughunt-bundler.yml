@@ -1,0 +1,55 @@
+name: bughunt bundler probe
+on:
+  push:
+    branches: ['bughunt/bundler/**']
+permissions:
+  contents: read
+jobs:
+  gem-suites:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-latest, ruby: '3.1', bundler: '1.17.3'}
+          - {os: macos-latest, ruby: '3.1', bundler: '2.1.4'}
+          - {os: macos-latest, ruby: '2.7', bundler: '2.2.33'}
+          - {os: macos-latest, ruby: '3.4', bundler: '4.0.23'}
+          - {os: macos-latest, ruby: '3.4', bundler: '4.1.0.beta3'}
+          - {os: macos-15-intel, ruby: '3.3', bundler: '2.6.9'}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler: ${{ startsWith(matrix.bundler, '1.') && 'none' || matrix.bundler }}
+          bundler-cache: false
+      - name: Install Bundler 1.x
+        if: startsWith(matrix.bundler, '1.')
+        shell: bash
+        env:
+          V: ${{ matrix.bundler }}
+        run: gem install bundler -v "$V" --no-document
+      - name: Select bundler
+        shell: bash
+        env:
+          V: ${{ matrix.bundler }}
+        run: |
+          echo "BUNDLER_VERSION=$V" >> "$GITHUB_ENV"
+          BUNDLER_VERSION="$V" bundle --version
+          ruby --version
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Gem suites
+        shell: bash
+        env:
+          SOCKET_PATCH_BUNDLER_E2E_VERSION: ${{ matrix.bundler }}
+          SOCKET_PATCH_BUNDLER_E2E_REQUIRED: '1'
+        run: |
+          set -o pipefail
+          cargo test -p socket-patch-cli --test e2e_redirect_gem_build --test e2e_vendor_gem_build --test e2e_redirect_gem_stale_install -- --include-ignored 2>&1 | tee suites.log
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: log-${{ matrix.os }}-${{ matrix.bundler }}
+          path: suites.log
