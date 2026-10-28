@@ -1542,7 +1542,12 @@ impl Reactor {
             "project.version" | "pom.version" => {
                 return pom.effective_version().map(str::to_string);
             }
+            "project.groupId" | "pom.groupId" => {
+                return pom.effective_group().map(str::to_string);
+            }
+            "project.artifactId" | "pom.artifactId" => return pom.artifact.clone(),
             "project.parent.version" => return pom.parent.as_ref()?.version.clone(),
+            "project.parent.groupId" => return pom.parent.as_ref()?.group.clone(),
             _ => {}
         }
         if let Some(v) = self.cli_props.get(name) {
@@ -1599,8 +1604,30 @@ impl Reactor {
                 ));
                 continue;
             }
-            let top_managed = doc.is_top_level_managed(dep);
             let root = self.local_root(rel);
+            // Maven interpolates after inheritance: a pom that inherits this
+            // declaration may name another artifact through it, which the
+            // literal SV must not reach.
+            if doc.has_property_coordinate(dep) {
+                let other = self.inheritors(rel).find(|p| {
+                    let resolve = |v: &str| self.interpolate(p, v, 0);
+                    doc.coordinate(dep, "groupId", &resolve).as_deref() != Some(patch.group_id)
+                        || doc.coordinate(dep, "artifactId", &resolve).as_deref()
+                            != Some(patch.artifact_id)
+                });
+                if let Some(p) = other {
+                    warnings.push(degraded(
+                        "coordinates_overridden",
+                        format!(
+                            "{at}: {ga} is named through properties that {p} resolves \
+                             differently; left as is and {root} is not pinned"
+                        ),
+                    ));
+                    unpinned.insert(root);
+                    continue;
+                }
+            }
+            let top_managed = doc.is_top_level_managed(dep);
             if top_managed && root == rel {
                 managed_roots.insert(root.clone());
             }
@@ -1704,10 +1731,18 @@ impl Reactor {
                 .filter(|c| c.contains("${") && resolve(c).is_none())
                 .map(String::as_str)
                 .collect();
-            let could_be = |raw: &str, want: &str| {
-                raw == want || (raw.contains("${") && resolve(raw).is_none_or(|v| v == want))
+            let could_be = |raw: &str, want: &str| match resolve(raw) {
+                Some(v) => v == want,
+                None => may_interpolate_to(raw, want),
             };
+            let other_variant = doc
+                .child_text(dep, "type")
+                .is_some_and(|t| !t.is_empty() && t != "jar")
+                || doc
+                    .child_text(dep, "classifier")
+                    .is_some_and(|c| !c.is_empty());
             if unresolved.is_empty()
+                || other_variant
                 || !could_be(&g, patch.group_id)
                 || !could_be(&a, patch.artifact_id)
             {
@@ -1726,6 +1761,33 @@ impl Reactor {
             ));
         }
     }
+}
+
+/// Whether `raw`, with each `${...}` standing for any text, can read
+/// `want`.
+fn may_interpolate_to(raw: &str, want: &str) -> bool {
+    let mut literals = Vec::new();
+    let mut rest = raw;
+    while let Some(at) = rest.find("${") {
+        literals.push(&rest[..at]);
+        let Some(close) = rest[at..].find('}') else {
+            return false;
+        };
+        rest = &rest[at + close + 1..];
+    }
+    let Some((first, tail)) = literals.split_first() else {
+        return raw == want;
+    };
+    let Some(mut left) = want.strip_prefix(first) else {
+        return false;
+    };
+    for middle in tail {
+        let Some(i) = left.find(middle) else {
+            return false;
+        };
+        left = &left[i + middle.len()..];
+    }
+    left.ends_with(rest)
 }
 
 /// The base version, or a suffixed version of it from any patch uuid.
@@ -2569,7 +2631,13 @@ impl Doc {
             {
                 continue;
             }
-            let section = self.section_of(dep);
+            // Declarations named through properties count apart, so literal
+            // declarations keep the keys of records written before they
+            // were matched.
+            let mut section = self.section_of(dep);
+            if self.has_property_coordinate(dep) {
+                section.push_str(":$");
+            }
             let ordinal = seen.entry(section.clone()).or_default();
             out.push((dep, format!("version:{g}:{a}:{section}:{ordinal}")));
             *ordinal += 1;
@@ -2591,6 +2659,13 @@ impl Doc {
         } else {
             Some(raw)
         }
+    }
+
+    /// Whether `dep` names its groupId or artifactId through `${...}`.
+    fn has_property_coordinate(&self, dep: usize) -> bool {
+        ["groupId", "artifactId"]
+            .iter()
+            .any(|n| self.child_text(dep, n).is_some_and(|t| t.contains("${")))
     }
 
     /// `dependencies` / `dependencyManagement`, prefixed with
@@ -4750,6 +4825,107 @@ mod tests {
             plan.warnings[0].detail
         );
         assert_eq!(text(&after, "a/pom.xml"), a);
+    }
+
+    #[test]
+    fn property_coordinates_keep_literal_record_keys() {
+        // Records written before #655 keyed the literal declaration as
+        // ordinal 0; a `${...}` declaration ahead of it must not shift that.
+        let deps = format!(
+            "<dependency><groupId>${{ct.group}}</groupId>\
+             <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>{}",
+            dep("1.10.0")
+        );
+        let doc = Doc::parse(module("a", &deps)).unwrap();
+        let resolve = |_: &str| Some("org.apache.commons".to_string());
+        let keys: Vec<String> = doc
+            .keyed_declarations("org.apache.commons", "commons-text", &resolve)
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "version:org.apache.commons:commons-text:dependencies:$:0",
+                "version:org.apache.commons:commons-text:dependencies:0",
+            ]
+        );
+    }
+
+    #[test]
+    fn property_coordinates_another_module_overrides_are_left_alone() {
+        let root = ROOT.replace(
+            "  <modules>",
+            "  <properties>\n    <lib.artifact>commons-text</lib.artifact>\n  </properties>\n  \
+             <dependencyManagement><dependencies><dependency><groupId>org.apache.commons</groupId>\
+             <artifactId>${lib.artifact}</artifactId><version>1.10.0</version></dependency>\
+             </dependencies></dependencyManagement>\n  <modules>",
+        );
+        let b = module("b", "").replace(
+            "  <dependencies>",
+            "  <properties><lib.artifact>commons-lang3</lib.artifact></properties>\n  <dependencies>",
+        );
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &module("a", "")),
+            ("b/pom.xml", &b),
+        ]);
+        let plan = run(&files).expect("plan");
+        assert_eq!(reasons(&plan), ["coordinates_overridden"]);
+        let after = applied(&files, &plan);
+        let out = text(&after, "pom.xml");
+        assert!(!out.contains(SV), "{out}");
+        assert!(
+            out.contains("<artifactId>${lib.artifact}</artifactId><version>1.10.0</version>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn project_group_id_coordinate_resolves() {
+        let root = ROOT.replace(
+            "<groupId>t</groupId>",
+            "<groupId>org.apache.commons</groupId>",
+        );
+        let decl = "<dependency><groupId>${project.groupId}</groupId>\
+             <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>";
+        let a = module("a", decl).replace(
+            "<groupId>t</groupId>",
+            "<groupId>org.apache.commons</groupId>",
+        );
+        let b = module("b", "").replace(
+            "<groupId>t</groupId>",
+            "<groupId>org.apache.commons</groupId>",
+        );
+        let files = fs(&[("pom.xml", &root), ("a/pom.xml", &a), ("b/pom.xml", &b)]);
+        let (plan, after) = vendor(&files);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(text(&after, "a/pom.xml"), a.replace("1.10.0", SV));
+    }
+
+    #[test]
+    fn unresolvable_coordinate_of_another_artifact_does_not_warn() {
+        let decls = "<dependency><groupId>org.apache.commons</groupId>\
+             <artifactId>${remote.x}-lang3</artifactId><version>3.0</version></dependency>\
+             <dependency><groupId>${remote.group}</groupId><artifactId>commons-text</artifactId>\
+             <classifier>sources</classifier><version>1.10.0</version></dependency>";
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", decls)),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (plan, _) = vendor(&files);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn may_interpolate_to_keeps_literal_text() {
+        assert!(may_interpolate_to("${g}", "org.apache.commons"));
+        assert!(may_interpolate_to("org.${x}.commons", "org.apache.commons"));
+        assert!(may_interpolate_to("${a}-${b}", "commons-text"));
+        assert!(!may_interpolate_to("${x}-lang3", "commons-text"));
+        assert!(!may_interpolate_to("com.${x}", "org.apache.commons"));
+        assert!(!may_interpolate_to("${x", "commons-text"));
     }
 
     #[test]
