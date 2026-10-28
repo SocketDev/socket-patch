@@ -167,6 +167,89 @@ pub(crate) async fn inherited_source_keys_traced(
     )
 }
 
+// ── package folder settings ──
+
+/// The configs NuGet merges for a build in `start` (every directory from
+/// `start` up to the filesystem root, then the user config), NEAREST
+/// first, each with the directory its relative paths resolve against. A
+/// file that cannot be read or parsed is skipped, as in
+/// [`inherited_source_keys_traced`]. `None` reads the user config alone
+/// (global mode: no project directory takes part).
+async fn settings_chain(
+    start: Option<&std::path::Path>,
+) -> Vec<(std::path::PathBuf, crate::formats::nuget::NugetConfig)> {
+    use crate::formats::nuget::parse_config;
+    async fn read(path: &std::path::Path) -> Option<crate::formats::nuget::NugetConfig> {
+        let text = crate::utils::fs::read_regular_to_string(path).await.ok()?;
+        parse_config(crate::formats::text::strip_bom(&text))
+    }
+    let mut chain = Vec::new();
+    for dir in start.into_iter().flat_map(std::path::Path::ancestors) {
+        for name in CONFIG_NAMES {
+            let path = dir.join(name);
+            if !crate::utils::fs::file_exists(&path).await {
+                continue;
+            }
+            if let Some(cfg) = read(&path).await {
+                chain.push((dir.to_path_buf(), cfg));
+            }
+            break;
+        }
+    }
+    if let Some(path) = user_config_path() {
+        if let (Some(cfg), Some(dir)) = (read(&path).await, path.parent()) {
+            chain.push((dir.to_path_buf(), cfg));
+        }
+    }
+    chain
+}
+
+/// The folder the `config` setting `key` (`globalPackagesFolder`,
+/// `repositoryPath`) names for a build in `start` ([`settings_chain`]):
+/// the nearest config defining it wins, `%VAR%` references are expanded
+/// (NuGet expands them on every OS), and a relative value resolves against
+/// the directory of the config that set it. `None` when no config sets it,
+/// or its value is empty or names an unset variable.
+pub(crate) async fn configured_folder(
+    start: Option<&std::path::Path>,
+    key: &str,
+) -> Option<std::path::PathBuf> {
+    let chain = settings_chain(start).await;
+    let (idx, value) = crate::formats::nuget::effective_setting(chain.iter().map(|(_, c)| c), key)?;
+    let value = expand_env_vars(value.trim())?;
+    if value.is_empty() {
+        return None;
+    }
+    let path = std::path::PathBuf::from(value);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        chain[idx].0.join(path)
+    })
+}
+
+/// Expand every `%NAME%` in `value`; `None` when one names an unset (or
+/// empty) variable, so a half-expanded path is never probed.
+fn expand_env_vars(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('%') {
+        let Some(len) = rest[start + 1..].find('%') else {
+            break;
+        };
+        let name = &rest[start + 1..start + 1 + len];
+        out.push_str(&rest[..start]);
+        if name.is_empty() {
+            out.push('%');
+        } else {
+            out.push_str(&std::env::var(name).ok().filter(|v| !v.is_empty())?);
+        }
+        rest = &rest[start + len + 2..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 // ── project walk ──
 
 /// Directories the project walk never enters: build output, the restore's
