@@ -42,6 +42,26 @@ fn resolve(
         .map(|home| home.join(".cargo"))
 }
 
+/// Runs `f` with `HOME`, `USERPROFILE` and `CARGO_HOME` removed from the
+/// process environment, restoring them after. Callers are
+/// `#[serial_test::serial]`.
+#[cfg(test)]
+pub(crate) fn without_home_env<T>(f: impl FnOnce() -> T) -> T {
+    let keys = ["HOME", "USERPROFILE", "CARGO_HOME"];
+    let saved: Vec<_> = keys.iter().map(std::env::var_os).collect();
+    for k in keys {
+        std::env::remove_var(k);
+    }
+    let out = f();
+    for (k, v) in keys.iter().zip(saved) {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,18 +116,7 @@ mod tests {
         let Some(passwd) = crate::crawlers::gradle_cache::passwd_home() else {
             return; // no passwd entry for this uid: nothing cargo could use either
         };
-        let keys = ["HOME", "USERPROFILE", "CARGO_HOME"];
-        let saved: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
-        for k in keys {
-            std::env::remove_var(k);
-        }
-        let got = cargo_home();
-        for (k, v) in keys.iter().zip(saved) {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
+        let got = without_home_env(cargo_home);
         assert_eq!(got, Some(passwd.join(".cargo")));
     }
 }

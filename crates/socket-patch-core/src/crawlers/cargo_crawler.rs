@@ -1119,18 +1119,7 @@ version = "fake"
         let Some(passwd) = crate::crawlers::gradle_cache::passwd_home() else {
             return;
         };
-        let keys = ["HOME", "USERPROFILE", "CARGO_HOME"];
-        let saved: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
-        for k in keys {
-            std::env::remove_var(k);
-        }
-        let got = CargoCrawler::cargo_home();
-        for (k, v) in keys.iter().zip(saved) {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
+        let got = crate::utils::cargo_home::without_home_env(CargoCrawler::cargo_home);
         assert_eq!(got, Some(passwd.join(".cargo")));
     }
 
