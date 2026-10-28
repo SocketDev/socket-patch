@@ -772,7 +772,8 @@ async fn rollback_package_patch_at(
         // form, the bytes `npm install` leaves (see `npm_bin`).
         let (original_content, restored_hash) = match crate::patch::npm_bin::form_for_write(
             package_key,
-            &pkg_path.join(normalize_file_path(file_name)),
+            pkg_path,
+            normalize_file_path(file_name),
             &file_info.after_hash,
             std::borrow::Cow::Owned(original_content),
             &file_info.before_hash,
@@ -3192,6 +3193,45 @@ mod tests {
                 .await;
         assert!(again.success, "{again:?}");
         assert!(again.files_rolled_back.is_empty(), "{again:?}");
+    }
+
+    /// Regression (#1791): a bin v5.0.1 patched with the raw CRLF bytes
+    /// rolls back to npm's runnable form of the original, the bytes
+    /// `npm install` wrote, not the CRLF tarball bytes.
+    #[tokio::test]
+    async fn rollback_of_raw_crlf_bin_restores_npm_form() {
+        let before: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(1);\r\n";
+        let after: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(2);\r\n";
+        let pkg = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let before_hash = compute_git_sha256_from_bytes(before);
+        tokio::fs::write(blobs.path().join(&before_hash), before)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            pkg.path().join("package.json"),
+            br#"{"name":"x","version":"1.0.0","bin":"cli.js"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(pkg.path().join("cli.js"), after)
+            .await
+            .unwrap();
+        let files = HashMap::from([(
+            "package/cli.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        )]);
+        let res =
+            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
+                .await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            b"#!/usr/bin/env node\nconsole.log(1);\r\n"
+        );
     }
 
     /// Regression (#1756): a bin the patch added, installed by npm in its

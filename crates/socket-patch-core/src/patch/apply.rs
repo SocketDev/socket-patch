@@ -1011,6 +1011,39 @@ fn mark_new_file_collision(verify: &mut VerifyResult, file_info: &PatchFileInfo)
     }
 }
 
+/// A bin of an npm package holding the raw patched bytes with their CRLF
+/// shebang, which a release before #1756 wrote over npm's form, can't be
+/// run by `env`, so it is not patched yet: `Ready`, and the write puts it
+/// in npm's form (#1791). [`verify_file_patch`] keeps calling it
+/// `AlreadyPatched`, since a vendored tarball's staging copy rightly
+/// holds those bytes.
+async fn mark_crlf_bin_rewrite(
+    package_key: &str,
+    pkg_path: &Path,
+    file_name: &str,
+    file_info: &PatchFileInfo,
+    verify: &mut VerifyResult,
+) {
+    if verify.status == VerifyStatus::AlreadyPatched
+        && verify.current_hash.as_deref() == Some(file_info.after_hash.as_str())
+        && crate::patch::npm_bin::needs_fix(package_key, pkg_path, normalize_file_path(file_name))
+            .await
+    {
+        verify.status = VerifyStatus::Ready;
+        verify.target_hash = Some(file_info.after_hash.clone());
+    }
+}
+
+/// Whether `apply` would rewrite `file_name` (a manifest key) of the
+/// installed `package_key` copy at `pkg_path` although its bytes hash to
+/// the patched content: an npm bin left with a CRLF shebang `env` can't
+/// run (#1791). `apply --check` reports it as not applied.
+pub async fn needs_npm_bin_rewrite(package_key: &str, pkg_path: &Path, file_name: &str) -> bool {
+    let normalized = normalize_file_path(file_name);
+    is_safe_relative_subpath(normalized)
+        && crate::patch::npm_bin::needs_fix(package_key, pkg_path, normalized).await
+}
+
 /// The single-copy apply engine behind [`apply_package_patch`]: verifies
 /// and patches the package at exactly the one `pkg_path` it is given.
 async fn apply_package_patch_at(
@@ -1062,6 +1095,14 @@ async fn apply_package_patch_at(
 
         let mut verify_result = verify_file_patch(pkg_path, file_name, file_info).await;
         mark_new_file_collision(&mut verify_result, file_info);
+        mark_crlf_bin_rewrite(
+            package_key,
+            pkg_path,
+            file_name,
+            file_info,
+            &mut verify_result,
+        )
+        .await;
 
         if verify_result.status != VerifyStatus::Ready
             && verify_result.status != VerifyStatus::AlreadyPatched
@@ -1250,7 +1291,8 @@ async fn apply_package_patch_at(
         // that form too (see `npm_bin`).
         let (patched_content, written_hash) = match crate::patch::npm_bin::form_for_write(
             package_key,
-            &pkg_path.join(normalized),
+            pkg_path,
+            normalized,
             &file_info.before_hash,
             patched_content,
             &file_info.after_hash,
@@ -4112,6 +4154,92 @@ mod tests {
             tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
             NPM_BIN_AFTER
         );
+    }
+
+    /// Regression (#1791): v5.0.1 wrote the raw CRLF `afterHash` bytes
+    /// over a bin npm had fixed, so it can't run. Apply rewrites it in
+    /// npm's form, once.
+    #[tokio::test]
+    async fn apply_repairs_crlf_bin_left_by_raw_write() {
+        let files = crlf_bin_files();
+        let blobs = crlf_bin_blobs().await;
+        let pkg = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            pkg.path().join("package.json"),
+            br#"{"name":"crlfbin","version":"1.0.0","bin":{"crlfbin":"./cli.js"}}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(pkg.path().join("cli.js"), CRLF_BIN_AFTER)
+            .await
+            .unwrap();
+        let sources = PatchSources::blobs_only(blobs.path());
+        let apply = || {
+            apply_package_patch(
+                "pkg:npm/crlfbin@1.0.0",
+                pkg.path(),
+                &files,
+                &sources,
+                false,
+                MismatchPolicy::Strict,
+            )
+        };
+        let res = apply().await;
+        assert!(res.success, "{res:?}");
+        assert_eq!(res.files_patched, vec!["package/cli.js".to_string()]);
+        assert_eq!(
+            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            NPM_BIN_AFTER
+        );
+        let again = apply().await;
+        assert!(again.success, "{again:?}");
+        assert!(again.files_patched.is_empty(), "{again:?}");
+        assert!(
+            !needs_npm_bin_rewrite("pkg:npm/crlfbin@1.0.0", pkg.path(), "package/cli.js").await
+        );
+    }
+
+    /// The #1791 rewrite is for files the package lists as bins, in npm
+    /// packages: npm leaves any other CRLF shebang alone.
+    #[tokio::test]
+    async fn apply_keeps_crlf_shebang_npm_does_not_fix() {
+        let files = crlf_bin_files();
+        let blobs = crlf_bin_blobs().await;
+        for (purl, manifest) in [
+            (
+                "pkg:npm/crlfbin@1.0.0",
+                &br#"{"name":"crlfbin","version":"1.0.0","bin":{"other":"other.js"}}"#[..],
+            ),
+            ("pkg:npm/crlfbin@1.0.0", br#"{"name":"crlfbin"}"#),
+            (
+                "pkg:composer/a/crlfbin@1.0.0",
+                br#"{"name":"crlfbin","bin":"cli.js"}"#,
+            ),
+        ] {
+            let pkg = tempfile::tempdir().unwrap();
+            tokio::fs::write(pkg.path().join("package.json"), manifest)
+                .await
+                .unwrap();
+            tokio::fs::write(pkg.path().join("cli.js"), CRLF_BIN_AFTER)
+                .await
+                .unwrap();
+            assert!(!needs_npm_bin_rewrite(purl, pkg.path(), "package/cli.js").await);
+            let res = apply_package_patch(
+                purl,
+                pkg.path(),
+                &files,
+                &PatchSources::blobs_only(blobs.path()),
+                false,
+                MismatchPolicy::Strict,
+            )
+            .await;
+            assert!(res.success, "{purl}: {res:?}");
+            assert!(res.files_patched.is_empty(), "{purl}: {res:?}");
+            assert_eq!(
+                tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+                CRLF_BIN_AFTER
+            );
+        }
     }
 
     /// A non-npm package keeps the patch's exact bytes on a consent

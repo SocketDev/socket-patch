@@ -599,6 +599,31 @@ async fn verify_installed_tree(
         .failed
         .retain(|f| !(f.reason == "package_not_found" && mismatched_keys.contains(&f.purl)));
     outcome.failed.extend(unmatched);
+
+    // An npm bin holding the patched bytes with a CRLF shebang `env`
+    // can't run (written by a release before #1756) is one `apply`
+    // rewrites, so it is not in sync (#1791).
+    let mut crlf_bins: Vec<String> = Vec::new();
+    for purl in &outcome.applied {
+        let Some(record) = tree.patches.get(purl) else {
+            continue;
+        };
+        'copies: for copy in copies.get(purl).into_iter().flatten() {
+            for file in record.files.keys() {
+                if socket_patch_core::patch::apply::needs_npm_bin_rewrite(purl, copy, file).await {
+                    crlf_bins.push(purl.clone());
+                    break 'copies;
+                }
+            }
+        }
+    }
+    outcome.applied.retain(|purl| !crlf_bins.contains(purl));
+    outcome
+        .failed
+        .extend(crlf_bins.into_iter().map(|purl| FailedPatch {
+            purl,
+            reason: "not_applied".to_string(),
+        }));
     outcome
 }
 

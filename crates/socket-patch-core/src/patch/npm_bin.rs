@@ -60,31 +60,37 @@ pub(crate) fn fixed_for_write(
     Ok(Some((fixed, hash)))
 }
 
-/// The bytes to write over the file at `path` for `content` (recorded as
-/// `expected_hash`), and their hash: `content` in `fixBin`'s form when
-/// the file now on disk is a bin npm installed with an LF shebang, else
-/// `content` as recorded. Writing a CRLF shebang there would leave a bin
-/// `env` can't run.
+/// The bytes to write over `normalized` (a safe path relative to
+/// `pkg_path`) for `content` (recorded as `expected_hash`), and their
+/// hash: `content` in `fixBin`'s form when the file is a bin npm
+/// installed, else `content` as recorded. Writing a CRLF shebang there
+/// would leave a bin `env` can't run.
 ///
-/// The file is taken for an npm-installed bin when it has an LF shebang
-/// and either belongs to an npm package, or hashes, in npm's original
-/// form, to `installed_source` (the content this write replaces).
+/// The file is taken for an npm-installed bin when its npm package lists
+/// it in `bin` ([`is_listed_bin`]), whatever shebang is on disk now (a
+/// release before #1756 wrote the CRLF one, #1791). Without that
+/// evidence, when the file now on disk has an LF shebang and either
+/// belongs to an npm package, or hashes, in npm's original form, to
+/// `installed_source` (the content this write replaces).
 pub(crate) async fn form_for_write<'a>(
     package_key: &str,
-    path: &Path,
+    pkg_path: &Path,
+    normalized: &str,
     installed_source: &str,
     content: std::borrow::Cow<'a, [u8]>,
     expected_hash: &str,
 ) -> Result<(std::borrow::Cow<'a, [u8]>, String), std::io::Error> {
     let as_recorded = |content| Ok((content, expected_hash.to_string()));
-    let lf_shebang = read_prefix(path)
-        .await
-        .is_some_and(|prefix| has_lf_shebang(&prefix));
-    let npm_installed = lf_shebang
-        && (crate::crawlers::Ecosystem::from_purl(package_key)
-            == Some(crate::crawlers::Ecosystem::Npm)
-            || (!installed_source.is_empty()
-                && source_hash(path).await.as_deref() == Some(installed_source)));
+    let path = pkg_path.join(normalized);
+    let npm_installed = is_listed_bin(package_key, pkg_path, normalized).await || {
+        let lf_shebang = read_prefix(&path)
+            .await
+            .is_some_and(|prefix| has_lf_shebang(&prefix));
+        lf_shebang
+            && (is_npm(package_key)
+                || (!installed_source.is_empty()
+                    && source_hash(&path).await.as_deref() == Some(installed_source)))
+    };
     if !npm_installed {
         return as_recorded(content);
     }
@@ -92,6 +98,94 @@ pub(crate) async fn form_for_write<'a>(
         Some((fixed, hash)) => Ok((std::borrow::Cow::Owned(fixed), hash)),
         None => as_recorded(content),
     }
+}
+
+fn is_npm(package_key: &str) -> bool {
+    crate::crawlers::Ecosystem::from_purl(package_key) == Some(crate::crawlers::Ecosystem::Npm)
+}
+
+/// Whether `normalized` (a safe path relative to `pkg_path`) is a file
+/// the npm package `package_key` lists as a bin in its `package.json`:
+/// a file npm's `bin-links` runs `fixBin` on.
+pub(crate) async fn is_listed_bin(package_key: &str, pkg_path: &Path, normalized: &str) -> bool {
+    if !is_npm(package_key) {
+        return false;
+    }
+    let Ok(manifest) =
+        crate::utils::fs::read_regular_to_bytes(&pkg_path.join("package.json")).await
+    else {
+        return false;
+    };
+    lists_bin(&manifest, normalized)
+}
+
+/// Whether the file holding raw bytes `fixBin` would change (a CRLF
+/// shebang npm never leaves in a bin) is a bin of the npm package
+/// `package_key`: the state a release before #1756 left by writing the
+/// recorded bytes over npm's form, which `env` can't run (#1791).
+pub(crate) async fn needs_fix(package_key: &str, pkg_path: &Path, normalized: &str) -> bool {
+    if !is_npm(package_key) {
+        return false;
+    }
+    let path = pkg_path.join(normalized);
+    // Cheap probe first: only a `#!…\r\n` first line can need it.
+    if !read_prefix(&path).await.is_some_and(|prefix| {
+        first_newline(&prefix).is_some_and(|lf| lf >= 4 && prefix[lf - 1] == b'\r')
+    }) {
+        return false;
+    }
+    if !is_listed_bin(package_key, pkg_path, normalized).await {
+        return false;
+    }
+    crate::utils::fs::read_regular_to_bytes(&path)
+        .await
+        .is_ok_and(|bytes| fix_bin(&bytes).is_some())
+}
+
+/// Whether the `package.json` bytes `manifest` list `normalized` as a
+/// bin: a `bin` path (string or object values) or, with no `bin`, a file
+/// under `directories.bin`, as npm's `normalize` reads them. Paths are
+/// resolved as npm does (`./` and `..` folded, never above the package).
+fn lists_bin(manifest: &[u8], normalized: &str) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(manifest) else {
+        return false;
+    };
+    let target = clean_path(normalized);
+    if target.is_empty() {
+        return false;
+    }
+    match json.get("bin") {
+        Some(serde_json::Value::String(bin)) => clean_path(bin) == target,
+        Some(serde_json::Value::Object(bins)) => bins
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .any(|bin| clean_path(bin) == target),
+        Some(_) => false,
+        None => json
+            .get("directories")
+            .and_then(|d| d.get("bin"))
+            .and_then(serde_json::Value::as_str)
+            .map(clean_path)
+            .is_some_and(|dir| {
+                !dir.is_empty() && target.len() > dir.len() && target.starts_with(&dir[..])
+            }),
+    }
+}
+
+/// `path`'s segments with `.`, empty segments and `..` folded, rooted at
+/// the package as npm's `path.join('/', …)` roots it.
+fn clean_path(path: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            seg => out.push(seg),
+        }
+    }
+    out
 }
 
 /// The content `fixBin` turned into `bytes`, or `None` when `bytes` is not
@@ -245,6 +339,30 @@ mod tests {
         assert!(!has_lf_shebang(b"#!/bin/sh\r\necho\n"));
         assert!(!has_lf_shebang(b"#!\n"));
         assert!(!has_lf_shebang(b"echo\n"));
+    }
+
+    #[test]
+    fn lists_bin_reads_every_bin_shape() {
+        let listed = |manifest: &str, file: &str| lists_bin(manifest.as_bytes(), file);
+        assert!(listed(r#"{"bin":"cli.js"}"#, "cli.js"));
+        assert!(listed(r#"{"bin":"./bin/../cli.js"}"#, "cli.js"));
+        assert!(listed(
+            r#"{"bin":{"a":"x.js","b":"./bin/cli.js"}}"#,
+            "bin/cli.js"
+        ));
+        assert!(listed(
+            r#"{"directories":{"bin":"./bin"}}"#,
+            "bin/sub/cli.js"
+        ));
+        // `bin` wins over `directories.bin`, as in npm's normalize.
+        assert!(!listed(
+            r#"{"bin":{"a":"x.js"},"directories":{"bin":"bin"}}"#,
+            "bin/cli.js"
+        ));
+        assert!(!listed(r#"{"bin":{"a":"x.js"}}"#, "cli.js"));
+        assert!(!listed(r#"{"name":"x"}"#, "cli.js"));
+        assert!(!listed(r#"{"directories":{"bin":"."}}"#, "cli.js"));
+        assert!(!listed("not json", "cli.js"));
     }
 
     #[tokio::test]
