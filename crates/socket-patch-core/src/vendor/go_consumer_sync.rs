@@ -227,7 +227,15 @@ async fn audit_work(
     issues.extend(
         replaces
             .into_iter()
-            .filter(|e| !recorded.iter().any(|r| same_replacement(e, r, true)))
+            // go.work's replaces and the workspace vendor directory's
+            // modules.txt both resolve against the go.work directory.
+            .filter(|e| {
+                !recorded.iter().any(|r| {
+                    e.module == r.module
+                        && e.version == r.version
+                        && lexical_target(work_dir, e) == lexical_target(work_dir, r)
+                })
+            })
             .map(|e| GoSyncIssue::VendorModulesTxt {
                 module: e.module,
                 modules_txt: display_rel(project_root, &path),
