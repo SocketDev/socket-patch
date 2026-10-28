@@ -985,6 +985,62 @@ mod tests {
         assert_eq!(testing::dirs(root), pristine_dirs);
     }
 
+    /// #534: Maven reads a `<parent><relativePath>` naming a directory
+    /// (`..`, `../corp-parent`) as that directory's `pom.xml`. A reactor
+    /// vendored that way stays live for `vex` and passes `vendor --check`
+    /// instead of failing on "is not a regular file" / "unsafe path".
+    #[tokio::test]
+    async fn parent_relative_path_naming_a_directory_stays_checkable() {
+        let parent = |artifact: &str, relative: &str| {
+            format!(
+                "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+                 <groupId>com.x</groupId>\n    <artifactId>{artifact}</artifactId>\n    \
+                 <version>1</version>\n    <relativePath>{relative}</relativePath>\n  \
+                 </parent>\n  <artifactId>a</artifactId>\n  <dependencies>\n    \
+                 <dependency>\n      <groupId>org.apache.commons</groupId>\n      \
+                 <artifactId>commons-text</artifactId>\n      <version>1.10.0</version>\n    \
+                 </dependency>\n  </dependencies>\n</project>\n"
+            )
+        };
+        let pom = |artifact: &str, modules: &str| {
+            format!(
+                "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.x</groupId>\n  \
+                 <artifactId>{artifact}</artifactId>\n  <version>1</version>\n  \
+                 <packaging>pom</packaging>\n  <modules>{modules}</modules>\n</project>\n"
+            )
+        };
+        let up = pom("root", "<module>a</module>");
+        let up_a = parent("root", "..");
+        let corp = pom("root", "<module>corp-parent</module><module>a</module>");
+        let corp_parent = pom("corp", "");
+        let corp_a = parent("corp", "../corp-parent");
+        let layouts: [&[(&str, &str)]; 2] = [
+            &[("pom.xml", &up), ("a/pom.xml", &up_a)],
+            &[
+                ("pom.xml", &corp),
+                ("corp-parent/pom.xml", &corp_parent),
+                ("a/pom.xml", &corp_a),
+            ],
+        ];
+        for files in layouts {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            testing::populate(root, files);
+            let mut ledger = std::collections::BTreeMap::new();
+            let p = mixed_patch();
+            testing::vendor(root, Shape::MavenReactor, &p, &mut ledger)
+                .await
+                .unwrap();
+            let entry = ledger.values().next().unwrap().clone();
+            assert_eq!(
+                apply::entry_wired_checked(root, &entry),
+                Ok(true),
+                "{files:?}"
+            );
+            apply::check_entry(root, &entry, None).unwrap_or_else(|e| panic!("{files:?}: {e}"));
+        }
+    }
+
     /// #488: `vendor --check` weighs an imported BOM from the local
     /// repository. A BOM it cannot read accepts the pin `vendor` wrote; a
     /// BOM bumped to another version of the artifact reports the pin as
