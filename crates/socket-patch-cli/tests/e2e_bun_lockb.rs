@@ -899,14 +899,15 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     );
     std::fs::rename(&modules, project.join("node_modules")).unwrap();
 
-    // Hosted -> vendored: v5 restores a hosted pin's upstream entry before
-    // vendoring over it, re-resolving the registry record from the npm
-    // registry — which an OFFLINE takeover cannot do, so it is REFUSED (dry
-    // and wet alike, nothing written) with the checkout remedy. Online, the
-    // takeover rebuilds the binary registry record exactly and vendors over
-    // it; `vendor --revert` then gives back the original bytes. After that
-    // (equivalently, after `git checkout -- bun.lockb`) the offline vendor
-    // proceeds, with a truthful dry run and exact rerun state.
+    // Hosted -> vendored: plain `vendor` ejects the hosted pin, fetching its
+    // patch record from the API and re-resolving the registry record from
+    // the npm registry — which an OFFLINE run cannot do, so it is REFUSED up
+    // front (`offline_eject_unavailable`, dry and wet alike, nothing
+    // written). Online, the eject rebuilds the binary registry record
+    // exactly and vendors over it; `vendor --revert` then gives back the
+    // original bytes. After that (equivalently, after `git checkout --
+    // bun.lockb`) the offline vendor proceeds, with a truthful dry run and
+    // exact rerun state.
     fixture.stage();
     let uri = server.uri();
     let before = snapshot(project);
@@ -918,20 +919,14 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
             code, 1,
             "vendor {extra:?} over a binary hosted pin: {refused}"
         );
-        let failed = refused["events"]
-            .as_array()
-            .and_then(|events| {
-                events
-                    .iter()
-                    .find(|e| e["errorCode"] == "redirect_revert_failed")
-            })
-            .unwrap_or_else(|| panic!("expected redirect_revert_failed: {refused}"));
-        assert_eq!(failed["purl"], PURL, "{refused}");
+        assert_eq!(
+            refused["error"]["code"], "offline_eject_unavailable",
+            "{refused}"
+        );
         assert!(
-            failed["error"].as_str().is_some_and(|e| {
-                e.contains("cannot vendor over the live hosted pin")
-                    && e.contains("git checkout -- bun.lockb")
-            }),
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|e| e.contains("re-run without --offline")),
             "{refused}"
         );
         assert_eq!(
@@ -966,6 +961,12 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
             "vendor",
             "--patch-server-url",
             &uri,
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
             "--vendor-source",
             "service",
         ],
@@ -975,11 +976,13 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         taken_over["summary"]["applied"], 1,
         "online vendor over the binary hosted pin: {taken_over}"
     );
+    // An eject, not the retired per-purl takeover: no takeover advisory.
     assert!(
-        taken_over["events"].as_array().is_some_and(|events| events
-            .iter()
-            .any(|e| e["errorCode"] == "vendor_takeover_reverted_redirect")),
-        "the takeover is reported: {taken_over}"
+        !taken_over
+            .to_string()
+            .contains("vendor_takeover_reverted_redirect")
+            && !taken_over.to_string().contains("redirect_revert_failed"),
+        "{taken_over}"
     );
     let vendor_lock = fixture.lock();
     assert!(
@@ -1178,6 +1181,12 @@ async fn binary_shared_bundled_record_hosted_pin_is_managed() {
             "vendor",
             "--patch-server-url",
             &uri,
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
             "--vendor-source",
             "service",
         ],
@@ -1187,11 +1196,13 @@ async fn binary_shared_bundled_record_hosted_pin_is_managed() {
         taken_over["summary"]["applied"], 1,
         "online vendor over the shared hosted pin: {taken_over}"
     );
+    // An eject, not the retired per-purl takeover: no takeover advisory.
     assert!(
-        taken_over["events"].as_array().is_some_and(|events| events
-            .iter()
-            .any(|e| e["errorCode"] == "vendor_takeover_reverted_redirect")),
-        "the takeover is reported: {taken_over}"
+        !taken_over
+            .to_string()
+            .contains("vendor_takeover_reverted_redirect")
+            && !taken_over.to_string().contains("redirect_revert_failed"),
+        "{taken_over}"
     );
     assert!(
         !taken_over
