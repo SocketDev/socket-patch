@@ -4047,9 +4047,7 @@ mod tests {
 
     /// Regression (#1756): overwriting a drifted npm bin with consent
     /// writes the patched content with npm's LF shebang, never a
-    /// `#!/usr/bin/env node\r` line `env` can't run. (On Windows npm
-    /// leaves bins alone, so the patch's exact bytes are written.)
-    #[cfg(not(windows))]
+    /// `#!/usr/bin/env node\r` line `env` can't run.
     #[tokio::test]
     async fn consent_overwrite_of_npm_bin_keeps_lf_shebang() {
         let files = crlf_bin_files();
@@ -4081,9 +4079,7 @@ mod tests {
 
     /// Regression (#1756): a superseding patch replaces an earlier Socket
     /// patch npm installed in its LF-shebang form, as it replaces the
-    /// earlier patch's exact bytes. (On Windows npm leaves bins alone, so
-    /// the patch's exact bytes are written.)
-    #[cfg(not(windows))]
+    /// earlier patch's exact bytes.
     #[tokio::test]
     async fn socket_content_policy_knows_npm_fixed_socket_blob() {
         let files = crlf_bin_files();

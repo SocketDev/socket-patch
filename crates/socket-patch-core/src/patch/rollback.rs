@@ -3224,7 +3224,6 @@ mod tests {
     /// an LF shebang is applied over npm's form of a CRLF original and
     /// written as recorded. Rolling it back restores npm's LF form, not
     /// the CRLF tarball bytes `env` can't run.
-    #[cfg(not(windows))]
     #[tokio::test]
     async fn rollback_of_lf_patched_bin_restores_npm_form() {
         let before: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(1);\r\n";

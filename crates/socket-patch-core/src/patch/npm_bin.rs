@@ -1,7 +1,8 @@
 //! npm's install-time rewrite of a `bin` file's Windows shebang.
 //!
-//! On Linux and macOS, npm's `bin-links` runs `fixBin` on every file a
-//! package lists in `bin` (`lib/fix-bin.js`): when the first 2048 bytes
+//! npm's `bin-links` runs `fixBin` on every file a package lists in
+//! `bin` (`lib/fix-bin.js`), on Windows too, after writing the cmd-shim
+//! (`lib/shim-bin.js`): when the first 2048 bytes
 //! match `^#![^\n]+\r\n`, it rewrites the file with that first `\r\n`
 //! turned into `\n` (`dos2Unix`). pnpm links bins through the same
 //! module. So an untouched install of a bin published from Windows
@@ -66,8 +67,7 @@ pub(crate) fn fixed_for_write(
 /// `env` can't run.
 ///
 /// The file is taken for an npm-installed bin when it has an LF shebang
-/// and either belongs to an npm package (off Windows: npm writes
-/// cmd-shims there and leaves bins alone), or hashes, in npm's original
+/// and either belongs to an npm package, or hashes, in npm's original
 /// form, to `installed_source` (the content this write replaces).
 pub(crate) async fn form_for_write<'a>(
     package_key: &str,
@@ -81,9 +81,8 @@ pub(crate) async fn form_for_write<'a>(
         .await
         .is_some_and(|prefix| has_lf_shebang(&prefix));
     let npm_installed = lf_shebang
-        && ((!cfg!(windows)
-            && crate::crawlers::Ecosystem::from_purl(package_key)
-                == Some(crate::crawlers::Ecosystem::Npm))
+        && (crate::crawlers::Ecosystem::from_purl(package_key)
+            == Some(crate::crawlers::Ecosystem::Npm)
             || (!installed_source.is_empty()
                 && source_hash(path).await.as_deref() == Some(installed_source)));
     if !npm_installed {
