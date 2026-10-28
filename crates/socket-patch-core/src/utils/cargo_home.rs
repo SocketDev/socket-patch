@@ -21,8 +21,8 @@ const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
 
 /// The process's cargo home: `$CARGO_HOME` when set and non-blank, else
 /// `<home>/.cargo`, where `<home>` is `HOME` (`USERPROFILE` on Windows) or,
-/// with that variable unset on Unix, the passwd entry. `None` when none of
-/// them names an absolute directory.
+/// with that variable unset or empty on Unix, the passwd entry. `None` when
+/// none of them names an absolute directory.
 pub fn cargo_home() -> Option<PathBuf> {
     resolve(
         std::env::var_os("CARGO_HOME"),
@@ -32,7 +32,7 @@ pub fn cargo_home() -> Option<PathBuf> {
 }
 
 /// [`cargo_home`] over an injected `CARGO_HOME`, home variable and passwd
-/// home (consulted only when the home variable is unset).
+/// home (consulted only when the home variable is unset or empty).
 fn resolve(
     cargo_home_var: Option<OsString>,
     home_var: Option<OsString>,
@@ -43,10 +43,12 @@ fn resolve(
     if let Some(v) = cargo_home_var.filter(|v| !v.to_string_lossy().trim().is_empty()) {
         return Some(PathBuf::from(v));
     }
-    // A set-but-empty or relative home stays no home (see
-    // `fs::home_dir`): probing it would read directories inside the
-    // project, and the passwd home is not where cargo looks then either.
-    let home = match home_var {
+    // std's `home_dir` (which cargo's `home` crate calls on Unix) skips an
+    // empty `HOME` for the passwd entry. A relative one it uses as is, so
+    // that stays no home here (see `fs::home_dir`): probing it would read
+    // directories inside the project, and the passwd home is not where
+    // cargo looks then either.
+    let home = match home_var.filter(|v| !v.is_empty()) {
         Some(v) => Some(PathBuf::from(v)),
         None => passwd_home(),
     };
@@ -130,11 +132,18 @@ mod tests {
         assert_eq!(got, Some(PathBuf::from("/root/.cargo")));
     }
 
-    /// A set-but-unusable home is no home, not a cue to patch the shared
+    /// std's `home_dir` treats `HOME=` like an unset `HOME`, so cargo
+    /// builds from the passwd home then too.
+    #[test]
+    fn empty_home_var_falls_back_to_passwd_home() {
+        let got = resolve(None, Some("".into()), || Some("/root".into()));
+        assert_eq!(got, Some(PathBuf::from("/root/.cargo")));
+    }
+
+    /// A relative home is no home, not a cue to patch the shared
     /// passwd-home cache cargo isn't using.
     #[test]
-    fn empty_or_relative_home_var_is_no_home() {
-        assert_eq!(resolve(None, Some("".into()), passwd_unused), None);
+    fn relative_home_var_is_no_home() {
         assert_eq!(resolve(None, Some("rel/home".into()), passwd_unused), None);
     }
 
@@ -161,7 +170,8 @@ mod tests {
     }
 
     /// #1135 through the process environment: `HOME`, `USERPROFILE` and
-    /// `CARGO_HOME` all unset still finds the passwd home's `.cargo`.
+    /// `CARGO_HOME` all unset, or `HOME` empty, still finds the passwd
+    /// home's `.cargo`.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -169,10 +179,13 @@ mod tests {
         let Some(passwd) = super::super::fs::passwd_home() else {
             return; // no passwd entry for this uid: nothing cargo could use either
         };
-        let got = {
+        let (unset, empty) = {
             let _env = NoHomeEnv::set();
-            cargo_home()
+            let unset = cargo_home();
+            std::env::set_var("HOME", "");
+            (unset, cargo_home())
         };
-        assert_eq!(got, Some(passwd.join(".cargo")));
+        assert_eq!(unset, Some(passwd.join(".cargo")));
+        assert_eq!(empty, Some(passwd.join(".cargo")));
     }
 }
