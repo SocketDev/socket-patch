@@ -424,3 +424,69 @@ fn go_patches_replace_of_an_incompatible_module_matches_the_encoded_key() {
         }
     }
 }
+
+/// Socket's own go.work replace overriding a leftover member pin of the
+/// same `module@version` is what the workspace builds: vex attests it
+/// rather than omitting the purl as `go_workspace_override`.
+#[test]
+fn go_work_socket_pin_over_a_leftover_member_pin_is_attested() {
+    let module = "github.com/foo/bar";
+    let version = "v1.4.2";
+    let purl = format!("pkg:golang/{module}@{version}");
+    let replace =
+        format!("replace {module} {version} => ./.socket/go-patches/{module}@{version}\n");
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    std::fs::write(
+        cwd.join("go.work"),
+        format!("go 1.21\n\nuse ./app\n\n{replace}"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(cwd.join("app")).unwrap();
+    std::fs::write(
+        cwd.join("app/go.mod"),
+        format!("module example.com/app\n\ngo 1.21\n\nrequire {module} {version}\n\n{replace}"),
+    )
+    .unwrap();
+    let patched = b"package bar // patched\n";
+    for root in [cwd.to_path_buf(), cwd.join("app")] {
+        let copy = root.join(format!(".socket/go-patches/{module}@{version}"));
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("bar.go"), patched).unwrap();
+    }
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        purl.clone(),
+        make_record(
+            GOOD_UUID,
+            "bar.go",
+            &"a".repeat(64),
+            &compute_git_sha256_from_bytes(patched),
+            "GHSA-go-work-hosted",
+            &["CVE-2026-1764"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+
+    // The module graph needs the patched module's own go.mod.
+    let cached = cwd.join(format!("empty-gomodcache/cache/download/{module}/@v"));
+    std::fs::create_dir_all(&cached).unwrap();
+    std::fs::write(
+        cached.join(format!("{version}.mod")),
+        format!("module {module}\n\ngo 1.21\n"),
+    )
+    .unwrap();
+
+    let go_work = cwd.join("go.work");
+    let (o, env) = vex_go(cwd, &[("GOWORK", go_work.as_os_str())]);
+    assert!(
+        !has_event(&env, "skipped", "go_workspace_override", &purl),
+        "{env}"
+    );
+    assert_eq!(o.status.code(), Some(0), "{env}");
+    let doc = read_doc(&cwd.join("out.vex.json"));
+    assert_eq!(
+        doc["statements"][0]["vulnerability"]["name"], "GHSA-go-work-hosted",
+        "{doc:#}"
+    );
+}
