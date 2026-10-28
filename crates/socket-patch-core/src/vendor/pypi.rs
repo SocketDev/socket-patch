@@ -387,7 +387,16 @@ async fn detect_pypi_flavor(
         !additional_locks.is_empty()
     };
     if !has_uv_lock && matching_additional_lock {
-        if exists(PYPI_REQUIREMENTS).await {
+        // #1758: a requirements.txt beside the lock (`pip lock -r
+        // requirements.txt`) pinning this release is wired with it, as
+        // hosted mode pins both, so it is no loser.
+        let wired_with_lock = match target {
+            Some((name, version)) => {
+                super::pypi_requirements::sibling_pin_wirable(project_root, name, version).await
+            }
+            None => false,
+        };
+        if !wired_with_lock && exists(PYPI_REQUIREMENTS).await {
             present.push(PYPI_REQUIREMENTS);
         }
         // #1524: a requirements.txt an earlier run vendored for this
@@ -576,7 +585,9 @@ enum WiringPlan {
     /// The uv.lock plan, and whether the exported requirements file is
     /// wired too (#1368).
     Uv(Box<UvProject>, bool),
-    PythonLocks(super::pypi_lock::PythonLocks),
+    /// The PEP 751 / script lock plan, and whether the requirements file
+    /// beside it is wired too (#1758).
+    PythonLocks(super::pypi_lock::PythonLocks, bool),
     Requirements,
     /// Re-wire the vendor lines an OLDER patch uuid's ledger entry recorded
     /// to this uuid in place (#765).
@@ -1146,9 +1157,29 @@ async fn pypi_prelude<'p>(
             {
                 Ok(project) if project.in_sync => {
                     wired_pin = project.pin;
+                    sibling_pending = super::pypi_requirements::sibling_pin_wirable(
+                        project_root,
+                        &canon_name,
+                        version,
+                    )
+                    .await;
                     WiringPlan::InSync
                 }
-                Ok(project) => WiringPlan::PythonLocks(project),
+                Ok(project) => {
+                    // #1758: the requirements.txt the pylock was locked
+                    // from is an install path of its own; wire its pin
+                    // with the lock.
+                    let sibling = super::pypi_requirements::sibling_pin_wirable(
+                        project_root,
+                        &canon_name,
+                        version,
+                    )
+                    .await;
+                    if sibling && dry_run {
+                        warnings.push(sibling_dry_run_notice(flavor, &canon_name, version));
+                    }
+                    WiringPlan::PythonLocks(project, sibling)
+                }
                 Err(refusal) => {
                     supersede_or_refuse(project_root, flavor, &canon_name, version, record, refusal)
                         .await?
@@ -1570,17 +1601,24 @@ async fn pypi_prelude<'p>(
     })
 }
 
-/// The lock an exported requirements pin is wired with, and the command
-/// that exports it, for the flavors that co-wire one (#612, #1368).
+/// The lock an exported requirements pin is wired with, and how to bring
+/// the pin back in line with it, for the flavors that co-wire one (#612,
+/// #1368, #1758).
 fn sibling_lock(flavor: PypiFlavor) -> Option<(&'static str, &'static str)> {
     match flavor {
-        PypiFlavor::Pipenv => Some((super::pypi_pipenv::LOCK_FILE, "pipenv requirements")),
-        PypiFlavor::UvProject => Some(("uv.lock", "uv export --frozen -o requirements.txt")),
-        PypiFlavor::PythonLocks
-        | PypiFlavor::Poetry
-        | PypiFlavor::Pdm
-        | PypiFlavor::Requirements
-        | PypiFlavor::Hatch => None,
+        PypiFlavor::Pipenv => Some((
+            super::pypi_pipenv::LOCK_FILE,
+            "re-export it from Pipfile.lock with `pipenv requirements`",
+        )),
+        PypiFlavor::UvProject => Some((
+            "uv.lock",
+            "re-export it from uv.lock with `uv export --frozen -o requirements.txt`",
+        )),
+        PypiFlavor::PythonLocks => Some((
+            "the Python lockfile",
+            "run `socket-patch vendor --revert` and vendor again",
+        )),
+        PypiFlavor::Poetry | PypiFlavor::Pdm | PypiFlavor::Requirements | PypiFlavor::Hatch => None,
     }
 }
 
@@ -1646,7 +1684,7 @@ async fn wire_in_sync_sibling(
     dry_run: bool,
     mut warnings: Vec<VendorWarning>,
 ) -> VendorOutcome {
-    let Some((lock, export)) = sibling_lock(flavor) else {
+    let Some((lock, remedy)) = sibling_lock(flavor) else {
         return done(result, None, warnings);
     };
     let export_pending =
@@ -1665,7 +1703,7 @@ async fn wire_in_sync_sibling(
                 format!(
                     "{lock} is wired, but {} still pins {canon_name}=={version} from the \
                      registry and {why}; installs driven by it will still install the \
-                     UNPATCHED registry bytes (re-export it from {lock} with `{export}`)",
+                     UNPATCHED registry bytes ({remedy})",
                     crate::formats::governing_locks::PYPI_REQUIREMENTS
                 ),
             ));
@@ -2241,16 +2279,46 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
                 Err(refusal) => Err(refusal),
             }
         }
-        WiringPlan::PythonLocks(project) => super::pypi_lock::wire_python_locks(
-            &project,
-            project_root,
-            &canon_name,
-            version,
-            &rel_wheel,
-            &artifact.sha256_hex,
-        )
-        .await
-        .map(|wiring| (wiring, MetaSlot::None)),
+        WiringPlan::PythonLocks(project, sibling) => {
+            // The locks as `wire_python_locks` checks they still are, to
+            // put back if the requirements pin then refuses.
+            let lock_before: Snapshot = if sibling {
+                project
+                    .loaded_files()
+                    .into_iter()
+                    .map(|(file, text)| (file, Some(text.into_bytes())))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            match super::pypi_lock::wire_python_locks(
+                &project,
+                project_root,
+                &canon_name,
+                version,
+                &rel_wheel,
+                &artifact.sha256_hex,
+            )
+            .await
+            {
+                // #1758: the requirements pin goes to the same wheel.
+                Ok(mut wiring) if sibling => wire_sibling_requirements(
+                    project_root,
+                    &lock_before,
+                    None,
+                    &canon_name,
+                    version,
+                    &rel_wheel,
+                    &artifact.sha256_hex,
+                )
+                .await
+                .map(|lines| {
+                    wiring.extend(lines);
+                    (wiring, MetaSlot::None)
+                }),
+                other => other.map(|wiring| (wiring, MetaSlot::None)),
+            }
+        }
         WiringPlan::Hatch(project) => super::pypi_hatch::wire(
             &project,
             project_root,
@@ -2466,7 +2534,9 @@ async fn planned_requirements_targets(
     let fresh =
         || super::pypi_requirements::planned_files(project_root, canon_name, version, rel_wheel);
     let mut targets = match plan {
-        WiringPlan::Requirements | WiringPlan::Uv(_, true) => fresh().await,
+        WiringPlan::Requirements | WiringPlan::Uv(_, true) | WiringPlan::PythonLocks(_, true) => {
+            fresh().await
+        }
         WiringPlan::Pipenv(_, superseded, true, _) => {
             let mut files = fresh().await;
             if let Some(prev) = superseded {
@@ -2821,7 +2891,12 @@ async fn fresh_pyproject_plan(
             if project.in_sync {
                 return not_fresh("pypi_lock_source_already_exists");
             }
-            Ok((WiringPlan::PythonLocks(project), Vec::new()))
+            // The revert just put the requirements pin back (#1758): wire
+            // it again with the lock.
+            let sibling =
+                super::pypi_requirements::sibling_pin_wirable(project_root, canon_name, version)
+                    .await;
+            Ok((WiringPlan::PythonLocks(project, sibling), Vec::new()))
         }
         PypiFlavor::Hatch => {
             let project = super::pypi_hatch::load(project_root, canon_name, version, uuid).await?;

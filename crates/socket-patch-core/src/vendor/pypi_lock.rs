@@ -41,6 +41,21 @@ pub(super) struct PythonLocks {
     pub pin: Option<(String, String)>,
 }
 
+impl PythonLocks {
+    /// Each file [`wire_python_locks`] may rewrite, with its text as
+    /// loaded: every lock, and a script lock's script.
+    pub(super) fn loaded_files(&self) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        for file in &self.files {
+            files.push((file.name.clone(), file.text.clone()));
+            if let (Some(script), Some(name)) = (&file.script, script_of_lock(&file.name)) {
+                files.push((name.to_string(), script.clone()));
+            }
+        }
+        files
+    }
+}
+
 /// FIFO-safe read that FOLLOWS a symlink to a regular file. Discovery
 /// (`python_lock_paths`) follows links too, so a shared `pylock.dev.toml`
 /// link beside a regular `pylock.toml` reads like the file it points at —
