@@ -2345,17 +2345,20 @@ pub fn get_yarn_global_prefix() -> Option<String> {
 pub fn get_yarn_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
     get_yarn_global_prefix_or(
         runner,
-        crate::patch::redirect::yarnrc::yarn_1_0_default_global_folder_for_process,
+        crate::patch::redirect::yarnrc::yarn_1_0_global_folders_for_process,
     )
 }
 
-/// [`get_yarn_global_prefix_with`] with the yarn 1.0.x default global
-/// folder injected. Yarn 1.0.0 - 1.0.2 has no `yarn global dir` (it
-/// exits 1 with "Invalid subcommand"), so when `yarn --version` reports
-/// 1.0.x the folder yarn itself would use stands in (#437).
+/// [`get_yarn_global_prefix_with`] with the yarn 1.0.x global folder
+/// candidates injected. Yarn 1.0.0 - 1.0.2 has no `yarn global dir` (it
+/// exits 1 with "Invalid subcommand"), so the first candidate that holds
+/// a `node_modules` stands in for its answer when `yarn --version`
+/// reports 1.0.x (#437). The version is asked only once such a folder
+/// exists, so a yarn without the subcommand for another reason (Berry
+/// has no `global`) costs no second spawn.
 pub fn get_yarn_global_prefix_or(
     runner: &dyn CommandRunner,
-    yarn_1_0_folder: impl FnOnce() -> Option<PathBuf>,
+    yarn_1_0_folders: impl FnOnce() -> Vec<PathBuf>,
 ) -> Option<String> {
     let reported = parse_yarn_dir_output(
         runner
@@ -2366,12 +2369,12 @@ pub fn get_yarn_global_prefix_or(
     if reported.is_some() {
         return reported;
     }
+    let node_modules = yarn_1_0_folders()
+        .into_iter()
+        .map(|dir| dir.join("node_modules"))
+        .find(|dir| is_dir_sync(dir))?;
     let version = runner.run("yarn", &["--version"])?;
-    if !is_yarn_1_0(&version) {
-        return None;
-    }
-    let dir = yarn_1_0_folder()?;
-    Some(dir.join("node_modules").to_string_lossy().to_string())
+    is_yarn_1_0(&version).then(|| node_modules.to_string_lossy().to_string())
 }
 
 /// Whether `yarn --version` stdout names a 1.0.x release.

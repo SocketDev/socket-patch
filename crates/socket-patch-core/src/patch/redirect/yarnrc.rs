@@ -582,9 +582,16 @@ pub fn yarn_1_0_default_global_folder(env: &NpmConfigEnv, root_user: bool) -> Op
     Some(user_home.join(".config").join("yarn").join("global"))
 }
 
-/// [`yarn_1_0_default_global_folder`] for this process.
-pub fn yarn_1_0_default_global_folder_for_process() -> Option<PathBuf> {
-    yarn_1_0_default_global_folder(&NpmConfigEnv::from_process(), process_is_root_user())
+/// Where yarn 1.0.x run by this process keeps its global packages, most
+/// likely first: any folder configured as yarn's global folder (yarn
+/// 1.0.x reads `--global-folder` from `.yarnrc`), then its default.
+pub fn yarn_1_0_global_folders_for_process() -> Vec<PathBuf> {
+    let mut folders = configured_yarn_global_folders_for_process();
+    folders.extend(yarn_1_0_default_global_folder(
+        &NpmConfigEnv::from_process(),
+        process_is_root_user(),
+    ));
+    folders
 }
 
 /// Whether this process runs as uid 0 (yarn's `getuid() === 0`).

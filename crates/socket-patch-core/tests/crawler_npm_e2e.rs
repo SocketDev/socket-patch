@@ -352,6 +352,35 @@ fn get_yarn_global_prefix_with_mock_runner_success() {
     );
 }
 
+/// Sets environment variables for a test and puts the old values back on
+/// drop, a panic included.
+struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvGuard {
+    fn set(vars: &[(&'static str, &Path)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(k, v)| {
+                let old = std::env::var_os(k);
+                std::env::set_var(k, v);
+                (*k, old)
+            })
+            .collect();
+        EnvGuard(saved)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in self.0.drain(..) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
 /// #437: yarn 1.0.0 - 1.0.2 has no `yarn global dir` (it exits 1), so
 /// the folder yarn 1.0.x itself uses stands in for the answer it can't
 /// give. Real process environment: HOME points at a scratch home and
@@ -361,45 +390,38 @@ fn get_yarn_global_prefix_with_mock_runner_success() {
 #[serial_test::serial]
 fn get_yarn_global_prefix_with_falls_back_for_yarn_1_0() {
     let home = tempfile::tempdir().unwrap();
-    let saved: Vec<_> = ["HOME", "FAKEROOTKEY"]
-        .iter()
-        .map(|k| (*k, std::env::var_os(k)))
-        .collect();
-    std::env::set_var("HOME", home.path());
-    std::env::set_var("FAKEROOTKEY", "1");
+    let global = home.path().join(".config/yarn/global/node_modules");
+    std::fs::create_dir_all(global.join("left-pad")).unwrap();
+    let _env = EnvGuard::set(&[("HOME", home.path()), ("FAKEROOTKEY", Path::new("1"))]);
     let runner = common::MockCommandRunner::new()
         .with_response("yarn", &["global", "dir"], None)
         .with_response("yarn", &["--version"], Some("1.0.2\n"));
-    let got = get_yarn_global_prefix_with(&runner);
-    for (k, v) in saved {
-        match v {
-            Some(v) => std::env::set_var(k, v),
-            None => std::env::remove_var(k),
-        }
-    }
     assert_eq!(
-        got.map(PathBuf::from),
-        Some(home.path().join(".config/yarn/global/node_modules"))
+        get_yarn_global_prefix_with(&runner).map(PathBuf::from),
+        Some(global)
     );
 }
 
 /// The fallback is for yarn 1.0.x only: a newer yarn whose
-/// `yarn global dir` failed, or no yarn at all, still finds nothing.
+/// `yarn global dir` failed, or no yarn at all, still finds nothing. The
+/// first candidate folder that exists wins, and none existing finds
+/// nothing without asking yarn for its version.
 #[test]
 #[serial_test::parallel]
 fn get_yarn_global_prefix_or_falls_back_only_for_yarn_1_0() {
-    let folder = || Some(PathBuf::from("/h/.config/yarn/global"));
-    let want = Path::new("/h/.config/yarn/global")
-        .join("node_modules")
-        .to_string_lossy()
-        .to_string();
+    let tmp = tempfile::tempdir().unwrap();
+    let configured = tmp.path().join("configured");
+    let default = tmp.path().join("default");
+    std::fs::create_dir_all(default.join("node_modules")).unwrap();
+    let folders = || vec![configured.clone(), default.clone()];
+    let want = default.join("node_modules");
     for version in ["1.0.0", "1.0.1\n", "1.0.2", "1.0.2-rc.1"] {
         let runner = common::MockCommandRunner::new()
             .with_response("yarn", &["global", "dir"], None)
             .with_response("yarn", &["--version"], Some(version));
         assert_eq!(
-            get_yarn_global_prefix_or(&runner, folder).as_deref(),
-            Some(want.as_str()),
+            get_yarn_global_prefix_or(&runner, folders).map(PathBuf::from),
+            Some(want.clone()),
             "{version:?}"
         );
     }
@@ -414,17 +436,30 @@ fn get_yarn_global_prefix_or_falls_back_only_for_yarn_1_0() {
             .with_response("yarn", &["global", "dir"], None)
             .with_response("yarn", &["--version"], version);
         assert_eq!(
-            get_yarn_global_prefix_or(&runner, folder),
+            get_yarn_global_prefix_or(&runner, folders),
             None,
             "{version:?}"
         );
     }
+    // A configured global folder that exists comes before the default.
+    std::fs::create_dir_all(configured.join("node_modules")).unwrap();
+    let runner = common::MockCommandRunner::new()
+        .with_response("yarn", &["global", "dir"], None)
+        .with_response("yarn", &["--version"], Some("1.0.2"));
+    assert_eq!(
+        get_yarn_global_prefix_or(&runner, folders).map(PathBuf::from),
+        Some(configured.join("node_modules"))
+    );
+    // No candidate folder: no version probe is needed (the mock has no
+    // answer for it either way).
+    let runner = common::MockCommandRunner::new().with_response("yarn", &["global", "dir"], None);
+    assert_eq!(get_yarn_global_prefix_or(&runner, Vec::new), None);
     // A yarn that answers `yarn global dir` is taken at its word.
     let runner = common::MockCommandRunner::new()
         .with_response("yarn", &["global", "dir"], Some("/other/global\n"))
         .with_response("yarn", &["--version"], Some("1.0.2"));
     assert_eq!(
-        get_yarn_global_prefix_or(&runner, folder).map(PathBuf::from),
+        get_yarn_global_prefix_or(&runner, folders).map(PathBuf::from),
         Some(Path::new("/other/global").join("node_modules"))
     );
 }
