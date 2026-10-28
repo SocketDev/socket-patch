@@ -567,6 +567,12 @@ impl GoWorkspace {
         ours: &ReplaceEntry,
     ) -> Option<WorkspaceConflict> {
         let display = display_path(project_root, &self.work_file);
+        if let Some(member) = self.main_module(module) {
+            return Some(WorkspaceConflict::MainModule {
+                work_file: display,
+                member: display_path(project_root, &member.dir),
+            });
+        }
         let our_target = lexical_target(self.work_dir(), ours);
         let applies = |e: &ReplaceEntry| {
             e.module == module
@@ -1221,6 +1227,17 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        assert_eq!(replace_host_of(&ws, root), ReplaceHost::GoWork);
+        match ws.work_conflict(root, DEP, "v1.0.0", &ours) {
+            Some(c @ WorkspaceConflict::MainModule { .. }) => {
+                assert!(c.consequence(DEP, "v1.0.0").contains(" dep "), "{c:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn replace_host_of(ws: &GoWorkspace, root: &Path) -> ReplaceHost {
+        ws.replace_host(root, root.join("go.mod").is_file(), DEP)
     }
 
     /// Go 1.26 `replacementFrom`: go.work's replace of this version, then

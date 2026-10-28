@@ -1387,6 +1387,7 @@ fn shared_module_hosted_rerun_is_stable_and_builds_readonly() {
     let _guard = ChmodGuard(tmp.path().to_path_buf());
     let w = stage_members(tmp.path(), UVER, UVER);
     let m = Machine::new(tmp.path(), "get");
+    warm(tmp.path(), &m, &w.proxy, &[(UMOD, UVER)]);
     let (code, env, stderr) = w.api.get(&w.root, &m.modcache, &[]);
     assert_eq!(code, 0, "{env}\n{stderr}");
     let after = snapshot(&w.root);
@@ -1626,15 +1627,19 @@ fn a_workspace_module_is_never_replaced() {
     let m = Machine::new(tmp.path(), "main");
     warm(tmp.path(), &m, &w.proxy, &[(UMOD, UVER)]);
     let a_mod = read(&a.join("go.mod"));
+    let work = read(&w.root.join("go.work"));
 
-    let (code, out, stderr) = w.api.get(&a, &m.modcache, &[]);
-    assert_eq!(code, 0, "{out}\n{stderr}");
-    assert_eq!(out["summary"]["applied"], 0, "{out}");
-    assert!(
-        warning_codes(&out).contains(&"redirect_golang_workspace_conflict".to_string()),
-        "{out}"
-    );
-    assert_eq!(read(&a.join("go.mod")), a_mod);
+    for cwd in [&a, &w.root] {
+        let (code, out, stderr) = w.api.get(cwd, &m.modcache, &[]);
+        assert_eq!(code, 0, "{out}\n{stderr}");
+        assert_eq!(out["summary"]["applied"], 0, "{out}");
+        assert!(
+            warning_codes(&out).contains(&"redirect_golang_workspace_conflict".to_string()),
+            "{out}"
+        );
+        assert_eq!(read(&a.join("go.mod")), a_mod);
+        assert_eq!(read(&w.root.join("go.work")), work);
+    }
 
     // A pin written in module mode does nothing in the workspace.
     let (code, out, stderr) = w.api.get(&a, &m.modcache, &[("GOWORK", "off")]);
