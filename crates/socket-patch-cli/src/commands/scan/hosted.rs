@@ -4305,6 +4305,8 @@ mod tests {
                 "gems.locked",
                 "go.mod",
                 "go.sum",
+                "go.work",
+                "go.work.sum",
                 "pom.xml",
                 ".mvn/maven.config",
                 ".mvn/checksums/checksums.sha256",
