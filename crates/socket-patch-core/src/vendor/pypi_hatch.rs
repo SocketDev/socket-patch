@@ -1088,6 +1088,15 @@ mod tests {
 
     /// An executable `hatch` script in `dir` that touches `marker` and prints
     /// a Hatch version banner that passes the >=1.2 gate.
+    ///
+    /// The probe folds a spawn error into the "too old" refusal, so the
+    /// first exec of a freshly written script must not happen there: a
+    /// sibling test thread that forks while `fs::write` holds the file open
+    /// keeps a write fd until its own exec, and exec'ing the script in that
+    /// window fails with ETXTBSY. Exec it once here, tolerating only that
+    /// error; after one exec succeeds no process holds a write fd and none
+    /// can gain one, so the probe's spawn can't race. This run's `marker` is
+    /// removed so the marker records only the probe's run.
     #[cfg(unix)]
     fn fake_hatch(dir: &Path, marker: &Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -1101,6 +1110,11 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let settle = crate::utils::process::tests::output_of_fresh_shim(|| {
+            std::process::Command::new(&script)
+        });
+        assert!(settle.status.success(), "fake hatch: {settle:?}");
+        std::fs::remove_file(marker).unwrap();
     }
 
     #[cfg(unix)]

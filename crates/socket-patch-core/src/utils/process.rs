@@ -340,7 +340,7 @@ fn run_resolved_within(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Confirm the real runner returns Some for a tiny command we
@@ -553,7 +553,7 @@ mod tests {
     /// not a property of the shim, so retry only that error, briefly — the
     /// same pattern as `sanity_exec` and the CLI's `exec_freshly_written`.
     #[cfg(unix)]
-    fn output_of_fresh_shim(make: impl Fn() -> Command) -> Output {
+    pub(crate) fn output_of_fresh_shim(make: impl Fn() -> Command) -> Output {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match make().output() {
