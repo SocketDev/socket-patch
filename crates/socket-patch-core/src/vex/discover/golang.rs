@@ -305,6 +305,13 @@ impl<'a> Graph<'a> {
             }
         }
     }
+
+    /// Whether the workspace module graph proves the build selects exactly
+    /// `module@version`.
+    fn selects(&self, module: &str, version: &str) -> bool {
+        self.workspace
+            .is_some_and(|ws| ws.selection(module, version) == Selection::Selected)
+    }
 }
 
 /// The `go.work` in effect, as discovery reads it.
@@ -584,7 +591,9 @@ fn replaced_purl(
         "go.mod requires"
     };
     let version = match (entry.version.as_deref(), req) {
-        (Some(v), Some(r)) if v != r => {
+        // In a workspace a dependency can raise the module above every
+        // member's `require`; a pin of the version the graph selects is live.
+        (Some(v), Some(r)) if v != r && !graph.selects(module, v) => {
             out.diag(
                 DIAG_REF_INVALID,
                 file,
@@ -1876,5 +1885,74 @@ mod tests {
         let out = gowork_off(&p).await;
         assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
         assert!(out.refs[0].lockfile_basis_ok());
+    }
+
+    /// No member `require` names the version a dependency raises the module
+    /// to, so a pin of it is live only when the workspace graph proves the
+    /// build selects it; a pin of a member's `require` it raises is inert.
+    #[test]
+    fn workspace_pin_of_a_dependency_raised_version_is_live() {
+        use super::*;
+        use crate::vendor::go_workspace::DepGoMod;
+        let dep = |requires: &[(&str, &str)]| {
+            Some(DepGoMod {
+                pruned: true,
+                requires: requires
+                    .iter()
+                    .map(|(m, v)| (m.to_string(), v.to_string()))
+                    .collect(),
+            })
+        };
+        let ws = GoWorkspace {
+            work_file: GO_WORK.into(),
+            work: "go 1.21\n\nuse .\n".to_string(),
+            work_sum: None,
+            members: vec![Member {
+                dir: ".".into(),
+                go_mod: Some(format!("{BASE_GO_MOD}\nrequire example.com/mid v1.0.0\n")),
+                go_sum: None,
+            }],
+            graph: Some(
+                [
+                    (format!("{MODULE}@{VERSION}"), dep(&[])),
+                    (format!("{MODULE}@v1.5.0"), dep(&[])),
+                    (
+                        "example.com/mid@v1.0.0".to_string(),
+                        dep(&[(MODULE, "v1.5.0")]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        };
+        let graph = Graph::new(None, Some(&ws));
+        let entry = |version: &str| ReplaceEntry {
+            module: MODULE.to_string(),
+            version: Some(version.to_string()),
+            path: None,
+            rhs_module: Some(gopatch(UUID_A)),
+            rhs_version: Some(format!("{version}-socketpatch.1")),
+            owner: Some(ReplaceOwner::Hosted),
+        };
+        let mut out = Discovery::default();
+        let purl = replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out);
+        assert_eq!(
+            purl.as_deref(),
+            Some("pkg:golang/github.com/foo/bar@v1.5.0")
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // A version the graph does not select stays inert.
+        let purl = replaced_purl(&entry("v1.6.0"), &graph, &HashSet::new(), GO_WORK, &mut out);
+        assert_eq!(purl, None);
+        assert_eq!(out.diagnostics.len(), 1, "{:?}", out.diagnostics);
+        assert!(out.diagnostics[0].detail.contains("is inert"));
+        // Without the graph nothing proves the raise.
+        let ws = GoWorkspace { graph: None, ..ws };
+        let graph = Graph::new(None, Some(&ws));
+        let mut out = Discovery::default();
+        assert_eq!(
+            replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out),
+            None
+        );
     }
 }
