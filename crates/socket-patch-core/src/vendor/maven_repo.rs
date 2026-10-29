@@ -1070,7 +1070,22 @@ async fn vendor_maven_jvm(
     );
     let jar_path = project_root.join(&plan.jar_rel);
     result.package_path = jar_path.display().to_string();
-    if plan.writes.is_empty() && (previous.is_none() || registry_verified == prior_verified) {
+    // Anything else in the tree fails the build and `vendor --check`
+    // (#656), so it is drift a re-vendor sweeps.
+    let indexed: std::collections::BTreeSet<String> = plan
+        .tree_files
+        .iter()
+        .map(|(rel, _)| rel.clone())
+        .chain(plan.writes.iter().filter(|w| w.tree).map(|w| w.rel.clone()))
+        .collect();
+    let unindexed = match super::jvm::apply::unindexed_tree_entries(project_root, &indexed) {
+        Ok(found) => found,
+        Err(e) => return done(failed_result(purl, &jar_path, e), None, warnings),
+    };
+    if plan.writes.is_empty()
+        && unindexed.is_empty()
+        && (previous.is_none() || registry_verified == prior_verified)
+    {
         // Notes describe what a vendoring did; an in-sync run did nothing.
         warnings.retain(|w| w.code != super::jvm::gradle::NOTE);
         return done(
@@ -1090,6 +1105,13 @@ async fn vendor_maven_jvm(
         Ok(records) => records,
         Err(e) => return done(failed_result(purl, &jar_path, e), None, warnings),
     };
+    if !unindexed.is_empty() {
+        if let Err(e) =
+            super::jvm::apply::sweep_unindexed_tree_entries(project_root, &indexed).await
+        {
+            return done(failed_result(purl, &jar_path, e), None, warnings);
+        }
+    }
     // Shared fragments another JVM entry wrote, and the pristine originals
     // of a patch update, come from the ledger.
     if let Some(state) = &state {
@@ -3486,6 +3508,105 @@ mod tests {
         let (code, detail) = unwrap_refused(run_jvm(root, &blobs, &installed, &record, None).await);
         assert_eq!(code, "vendor_prebuilt_required");
         assert!(detail.contains("patch service request failed"), "{detail}");
+    }
+
+    /// A file the index does not list in the vendored tree (a Finder
+    /// `.DS_Store`, a stray directory) fails the Gradle build and
+    /// `vendor --check` (#656), so a re-run is not in sync: a dry run
+    /// previews the re-vendor and a real one sweeps the strays.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn jvm_rerun_sweeps_unindexed_tree_files() {
+        for gradle in [false, true] {
+            let (dir, blobs, installed, record) = reactor_fixture(true).await;
+            let root = dir.path();
+            let shape = if gradle {
+                tokio::fs::remove_file(root.join("pom.xml")).await.unwrap();
+                tokio::fs::write(
+                    root.join("settings.gradle"),
+                    "rootProject.name = 'fixture'\n",
+                )
+                .await
+                .unwrap();
+                tokio::fs::write(root.join("build.gradle"), "plugins { id 'java' }\nrepositories { mavenCentral() }\ndependencies { implementation 'org.apache.commons:commons-text:1.10.0' }\n").await.unwrap();
+                super::super::jvm::Shape::Gradle
+            } else {
+                super::super::jvm::Shape::MavenReactor
+            };
+            let sources = PatchSources::blobs_only(&blobs);
+            let service = crate::vendor::test_support::service_fixture::Fixture::new(
+                PURL,
+                installed.as_path().into(),
+                &record,
+                &sources,
+            )
+            .await;
+            let run = |dry_run| {
+                vendor_maven_jvm(
+                    shape,
+                    PURL,
+                    &installed,
+                    root,
+                    &record,
+                    &sources,
+                    dry_run,
+                    false,
+                    Some(&service.cfg),
+                )
+            };
+            let (result, entry, _) = unwrap_done(run(false).await);
+            assert!(result.success, "gradle={gradle}: {:?}", result.error);
+            let entry = entry.unwrap();
+            crate::vendor::test_support::persist(root, PURL, entry.clone()).await;
+            let (_, again, _) = unwrap_done(run(false).await);
+            assert!(
+                again.is_none(),
+                "gradle={gradle}: a clean re-run is in sync"
+            );
+
+            let tree = root.join(&entry.artifact.path);
+            let tree = tree.parent().unwrap();
+            let ds_store = tree.join(".DS_Store");
+            let stray_dir = tree.join("backup");
+            tokio::fs::write(&ds_store, b"\0\0\0\x01Bud1")
+                .await
+                .unwrap();
+            tokio::fs::create_dir_all(&stray_dir).await.unwrap();
+            tokio::fs::write(stray_dir.join("old.jar"), b"x")
+                .await
+                .unwrap();
+            let check = super::super::jvm::apply::check_entry(root, &entry, None).unwrap_err();
+            assert!(check.contains("unindexed vendored file"), "{check}");
+
+            let (preview, none, _) = unwrap_done(run(true).await);
+            assert!(none.is_none() && preview.success, "gradle={gradle}");
+            assert!(
+                preview
+                    .files_verified
+                    .iter()
+                    .all(|f| f.status == crate::patch::apply::VerifyStatus::Ready),
+                "gradle={gradle}: the dry run previews a re-vendor: {preview:?}"
+            );
+            assert!(
+                ds_store.exists() && stray_dir.exists(),
+                "dry run writes nothing"
+            );
+
+            let (result, swept, _) = unwrap_done(run(false).await);
+            assert!(result.success, "gradle={gradle}: {:?}", result.error);
+            let swept = swept.expect("the re-run is not in sync");
+            assert!(!ds_store.exists(), "gradle={gradle}: .DS_Store swept");
+            assert!(
+                !stray_dir.exists(),
+                "gradle={gradle}: stray directory swept"
+            );
+            assert!(root.join(&entry.artifact.path).is_file(), "the jar stays");
+            crate::vendor::test_support::persist(root, PURL, swept.clone()).await;
+            super::super::jvm::apply::check_entry(root, &swept, None)
+                .unwrap_or_else(|e| panic!("gradle={gradle}: {e}"));
+            let (_, again, _) = unwrap_done(run(false).await);
+            assert!(again.is_none(), "gradle={gradle}: in sync after the sweep");
+        }
     }
 
     #[tokio::test]

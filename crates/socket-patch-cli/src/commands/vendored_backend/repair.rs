@@ -550,6 +550,45 @@ impl VendoredBackend<'_> {
                             );
                             continue;
                         }
+                        // A stray file in the tree (a Finder `.DS_Store`)
+                        // fails the Gradle build (#656); the index says
+                        // what belongs there, so it goes offline too.
+                        let indexed = vendor::jvm::apply::recorded_tree_files(&entry);
+                        match vendor::jvm::apply::sweep_unindexed_tree_entries(
+                            &common.cwd,
+                            &indexed,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                if !quiet {
+                                    println!(
+                                        "Removed unindexed files from the vendored tree of {}",
+                                        normalize_purl(purl)
+                                    );
+                                }
+                                env.record(
+                                    PatchEvent::new(PatchAction::Rebuilt, purl.clone())
+                                        .with_details(serde_json::json!({
+                                            "path": entry.artifact.path,
+                                            "unindexedRemoved": true,
+                                            "artifactRebuilt": false,
+                                        })),
+                                );
+                                repaired += 1;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                fail(
+                                    env,
+                                    common.json,
+                                    purl,
+                                    "vendor_artifact_unrepairable",
+                                    format!("cannot remove unindexed vendored files: {e}"),
+                                );
+                                continue;
+                            }
+                        }
                     }
                     // Dir-shaped gem artifacts from pre-inventory vendors:
                     // the health check could only verify the PATCHED members

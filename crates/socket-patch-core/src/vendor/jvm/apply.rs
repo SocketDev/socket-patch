@@ -811,6 +811,111 @@ pub async fn sweep_replaced_tree<'e>(
     Ok(!removed.is_empty())
 }
 
+/// The vendored tree directories among `indexed` (each holds a recorded
+/// marker), resolved, with the names `indexed` lists in each.
+fn indexed_tree_dirs(
+    reader: &ProjectReader,
+    indexed: &BTreeSet<String>,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut dirs = Vec::new();
+    for rel in indexed {
+        let Some((dir, name)) = rel.rsplit_once('/') else {
+            continue;
+        };
+        let in_tree = layout::VENDOR_TREES
+            .iter()
+            .any(|tree| dir.strip_prefix(tree).is_some_and(|r| r.starts_with('/')));
+        if name == layout::MARKER_FILE && in_tree && safe_rel(rel) {
+            dirs.push((dir.to_string(), reader.resolve(dir)?));
+        }
+    }
+    Ok(dirs)
+}
+
+/// What the vendored tree directories hold beyond the files `indexed`
+/// lists (project-relative): a Finder `.DS_Store`, an editor backup, a
+/// stray directory. The Gradle settings script and `vendor --check` refuse
+/// any of them, so a re-vendor sweeps them (#656).
+pub fn unindexed_tree_entries(
+    root: &Path,
+    indexed: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let reader = ProjectReader::new(root);
+    let mut stray = Vec::new();
+    for (dir, path) in indexed_tree_dirs(&reader, indexed)? {
+        let items = match std::fs::read_dir(&path) {
+            Ok(items) => items,
+            Err(e) if is_missing(&e) => continue,
+            Err(e) => return Err(format!("cannot list {dir}: {e}")),
+        };
+        for item in items {
+            let item = item.map_err(|e| format!("cannot list {dir}: {e}"))?;
+            let rel = format!("{dir}/{}", item.file_name().to_string_lossy());
+            if !indexed.contains(&rel) {
+                stray.push(rel);
+            }
+        }
+    }
+    stray.sort();
+    stray.dedup();
+    Ok(stray)
+}
+
+/// Delete [`unindexed_tree_entries`]: a stray symlink goes, not its
+/// target, and a stray directory goes with everything in it (the tree is
+/// socket-patch's own; nothing else may live there). `Ok(true)` when
+/// anything went.
+pub async fn sweep_unindexed_tree_entries(
+    root: &Path,
+    indexed: &BTreeSet<String>,
+) -> Result<bool, String> {
+    let reader = ProjectReader::new(root);
+    let mut removed = false;
+    for (dir, path) in indexed_tree_dirs(&reader, indexed)? {
+        let items = match std::fs::read_dir(&path) {
+            Ok(items) => items,
+            Err(e) if is_missing(&e) => continue,
+            Err(e) => return Err(format!("cannot list {dir}: {e}")),
+        };
+        for item in items {
+            let item = item.map_err(|e| format!("cannot list {dir}: {e}"))?;
+            let name = item.file_name();
+            let rel = format!("{dir}/{}", name.to_string_lossy());
+            if indexed.contains(&rel) {
+                continue;
+            }
+            // Never through the entry itself: `path` is the resolved,
+            // in-checkout directory and `name` one of its own entries.
+            let target = path.join(&name);
+            let gone = match tokio::fs::symlink_metadata(&target).await {
+                // Like a revert's tree, a directory goes once the run's
+                // commit is on disk (now when no group is open).
+                Ok(meta) if meta.is_dir() => {
+                    group_commit::remove_after_commit(&target, &target).await;
+                    Ok(())
+                }
+                Ok(_) => remove_file(&target).await,
+                Err(e) if is_missing(&e) => continue,
+                Err(e) => Err(e),
+            };
+            gone.map_err(|e| format!("failed to remove unindexed {rel}: {e}"))?;
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
+/// The tree files `entry` records, the index [`unindexed_tree_entries`]
+/// holds its directories to.
+pub fn recorded_tree_files(entry: &VendorEntry) -> BTreeSet<String> {
+    entry
+        .wiring
+        .iter()
+        .filter(|w| w.kind == TREE_KIND)
+        .map(|w| w.file.clone())
+        .collect()
+}
+
 /// Whether the project still wires the JVM `entry` for `vex` (see
 /// [`entry_wired_checked`]).
 pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
