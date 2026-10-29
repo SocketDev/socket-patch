@@ -1,11 +1,13 @@
 """ci-test-shard.py: the debug/release shards preserve the workspace tests."""
 
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,13 +64,11 @@ class Partition(unittest.TestCase):
     def test_failed_unit_or_integration_run_still_runs_docs_and_fails_the_shard(self):
         metadata = {"workspace_members": ["a"], "packages": [
             {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
-        with patch.object(shard.subprocess, "run", side_effect=[
-            subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata)),
-            subprocess.CompletedProcess([], 1),
-            subprocess.CompletedProcess([], 0),
-        ]) as run:
+        with patch.object(shard.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(metadata))), \
+                patch.object(shard, "run", side_effect=[1, 0]) as run:
             self.assertEqual(shard.main(["1", "3", "--locked", "--profile", "ci-release"]), 1)
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 2)
         self.assertIn("--doc", run.call_args_list[-1].args[0])
 
     def test_coverage_shards_run_llvm_cov_without_doctests(self):
@@ -88,13 +88,51 @@ class Partition(unittest.TestCase):
             {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
         env = {k: v for k, v in shard.os.environ.items() if k != "CI_TEST_TIMINGS"}
         with patch.dict(shard.os.environ, {**env, "CI_TEST_COVERAGE": "1"}, clear=True), \
-                patch.object(shard.subprocess, "run", side_effect=[
-                    subprocess.CompletedProcess([], 0, stdout=json.dumps(metadata)),
-                    subprocess.CompletedProcess([], 0),
-                ]) as run:
+                patch.object(shard.subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps(metadata))), \
+                patch.object(shard, "run", return_value=0) as run:
             self.assertEqual(shard.main(["1", "2"]), 0)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args_list[-1].args[0][:3], ["cargo", "llvm-cov", "--no-report"])
+
+    def test_run_echoes_output_and_records_each_binary_time(self):
+        script = (
+            "import sys\n"
+            "print('     Running unittests src/lib.rs (target/debug/deps/socket_patch_core-0123456789abcdef)',"
+            " file=sys.stderr, flush=True)\n"
+            "print('test result: ok. 3 passed; 0 failed; finished in 30.12s', flush=True)\n"
+            "print(r'     Running tests\\apply\\main.rs (target\\debug\\deps\\apply-fedcba9876543210.exe)',"
+            " file=sys.stderr, flush=True)\n"
+            "print('test result: FAILED. 1 passed; 1 failed; finished in 1.50s', flush=True)\n"
+            "print('   Doc-tests socket_patch_core', file=sys.stderr, flush=True)\n"
+            "print('test result: ok. 9 passed; 0 failed; finished in 4.00s', flush=True)\n"
+            "sys.exit(3)\n")
+        timings = {}
+        with patch.object(shard.sys, "stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(shard.run([sys.executable, "-c", script], timings), 3)
+        timings.pop("_first_binary")
+        self.assertEqual(timings, {"unit:socket_patch_core": 30.12, "apply": 1.5})
+        self.assertIn("Doc-tests socket_patch_core", out.getvalue())
+        self.assertIn("finished in 4.00s", out.getvalue())
+
+    def test_main_prints_the_timing_sample_last(self):
+        metadata = {"workspace_members": ["a"], "packages": [
+            {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
+
+        def fake_run(args, timings):
+            timings["_first_binary"] = shard.time.monotonic()
+            timings["integration"] = 2.0
+            return 0
+        with patch.object(shard.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(metadata))), \
+                patch.object(shard, "run", side_effect=fake_run), \
+                patch.object(shard.sys, "stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(shard.main(["2", "2"]), 0)
+        last = out.getvalue().splitlines()[-1]
+        self.assertTrue(last.startswith("ci-test-shard: timings "), last)
+        sample = json.loads(last.removeprefix("ci-test-shard: timings "))
+        self.assertEqual(list(sample), ["_build_seconds", "integration"])
+        self.assertEqual(sample["integration"], 2.0)
 
     def test_negative_bad_shard(self):
         with self.assertRaises(ValueError):
