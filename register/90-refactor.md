@@ -1,11 +1,11 @@
 ### Refactor routine
-_Last updated 2026-10-29T19:40Z · main @ c07af61_
+_Last updated 2026-10-29T20:39Z · main @ c07af61_
 
 #### In flight
 | PR | Kind | Scope | State |
 |---|---|---|---|
 | [#1842](https://github.com/SocketDev/socket-patch/pull/1842) | sweep | `cli/src/args.rs` (+ the Deno guard moved into `lib.rs`) | ready |
-| [#1849](https://github.com/SocketDev/socket-patch/pull/1849) | structural | A01 [#1832](https://github.com/SocketDev/socket-patch/issues/1832): `utils/cargo_build_cache.rs` | ready; CI and Bugbot pending |
+| [#1849](https://github.com/SocketDev/socket-patch/pull/1849) | structural | A01 [#1832](https://github.com/SocketDev/socket-patch/issues/1832): `utils/cargo_build_cache.rs` | ready; Bugbot clean; CI on 2c715eb needs a re-run (Depot runners lost twice, no test failed) |
 
 #### Merged
 _None._
