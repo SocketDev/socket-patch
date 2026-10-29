@@ -27,6 +27,21 @@ fn selected(text: &str, module: &str, version: &str) -> String {
         .join("\n")
 }
 
+/// Whether some line of `b` pins the same module and version as a line of
+/// `a` with a different hash. Merging the two would leave go.sum with both.
+fn conflicts(a: &str, b: &str) -> bool {
+    b.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        a.lines().any(|other| {
+            let other: Vec<_> = other.split_whitespace().collect();
+            fields.len() == 3
+                && other.len() == 3
+                && other[..2] == fields[..2]
+                && other[2] != fields[2]
+        })
+    })
+}
+
 pub(super) async fn save(
     root: &Path,
     base: &str,
@@ -38,6 +53,12 @@ pub(super) async fn save(
         if entry.module == module && entry.version.as_deref() == Some(version) {
             if let Some(path) = backup(root, &entry) {
                 let saved = selected(&read(&path).await?, module, version);
+                if conflicts(&sums, &saved) {
+                    return Err(format!(
+                        "go.sum conflicts with the checksum saved in {} for {module} {version}",
+                        path.display()
+                    ));
+                }
                 if let Some(merged) = reinsert_lines(&sums, &saved) {
                     sums = merged;
                 }
@@ -49,6 +70,12 @@ pub(super) async fn save(
     }
     let path = root.join(base).join(NAME);
     let old = read(&path).await?;
+    if conflicts(&old, &sums) {
+        return Err(format!(
+            "go.sum conflicts with the checksum saved in {} for {module} {version}",
+            path.display()
+        ));
+    }
     if let Some(new) = reinsert_lines(&old, &sums) {
         tokio::fs::create_dir_all(root.join(base))
             .await
@@ -105,6 +132,12 @@ pub(super) async fn restore(
             continue;
         }
         let saved = selected(&read(&backup).await?, &entry.module, version);
+        if conflicts(&saved, &saved) {
+            return Err(format!(
+                "conflicting saved checksums in {}",
+                backup.display()
+            ));
+        }
         for line in saved.lines() {
             let fields: Vec<_> = line.split_whitespace().collect();
             if fields.len() != 3 || !fields[2].starts_with("h1:") {
@@ -234,6 +267,56 @@ mod tests {
         );
         assert_eq!(read(&root.join("go.mod")).await.unwrap(), before);
         assert_eq!(read(&root.join("go.sum")).await.unwrap(), conflict);
+    }
+
+    /// Re-pinning over a backup that saved a different hash refuses instead
+    /// of keeping both, which a rollback after tidy would write to go.sum.
+    #[tokio::test]
+    async fn save_refuses_a_checksum_conflicting_with_the_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("go.mod"), "module consumer\ngo 1.21\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("go.sum"), SUMS).await.unwrap();
+        save(root, GO_PATCHES_DIR, MODULE, VERSION).await.unwrap();
+        let backup = root.join(GO_PATCHES_DIR).join(NAME);
+        let saved = read(&backup).await.unwrap();
+        tokio::fs::write(root.join("go.sum"), SUMS.replace("h1:aaaa", "h1:zzzz"))
+            .await
+            .unwrap();
+        assert!(save(root, GO_PATCHES_DIR, MODULE, VERSION)
+            .await
+            .unwrap_err()
+            .contains("conflicts"));
+        assert_eq!(read(&backup).await.unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_backup_with_conflicting_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module consumer\ngo 1.21\nrequire example.com/upstream v1.0.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.join("go.sum"), SUMS).await.unwrap();
+        ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
+            .await
+            .unwrap();
+        let backup = root.join(GO_PATCHES_DIR).join(NAME);
+        let both = format!("{SUMS}{}", SUMS.replace("h1:aaaa", "h1:zzzz"));
+        tokio::fs::write(&backup, both).await.unwrap();
+        tokio::fs::write(root.join("go.sum"), "").await.unwrap();
+        assert!(
+            drop_replace_entry(root, MODULE, ReplaceOwner::GoPatches, false)
+                .await
+                .unwrap_err()
+                .contains("conflicting")
+        );
+        assert_eq!(read(&root.join("go.sum")).await.unwrap(), "");
     }
 
     #[tokio::test]
