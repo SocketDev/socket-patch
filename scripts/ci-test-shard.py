@@ -125,9 +125,16 @@ def run(args, timings):
     def forward(pipe):
         nonlocal first
         current = None
+        echo = True
         for raw in pipe:
-            sys.stdout.buffer.write(raw)
-            sys.stdout.buffer.flush()
+            # Keep draining after a failed write (say `tee` died): a reader
+            # that stops would leave cargo blocked on a full pipe.
+            if echo:
+                try:
+                    sys.stdout.buffer.write(raw)
+                    sys.stdout.buffer.flush()
+                except (OSError, ValueError):
+                    echo = False
             line = ANSI.sub("", raw.decode("utf-8", "replace"))
             if m := RUNNING.match(line):
                 current = ("unit:" if m[1] else "") + m[2]

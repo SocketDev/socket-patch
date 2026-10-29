@@ -135,6 +135,26 @@ class Partition(unittest.TestCase):
             self.assertEqual(shard.run([sys.executable, "-c", script], {})[0], 0)
         self.assertLess(time.monotonic() - start, 15)
 
+    def test_run_keeps_draining_when_its_own_stdout_breaks(self):
+        # 1 MB is far past a pipe buffer: if the reader stopped at the first
+        # failed write, the child would block and run() would never return.
+        script = ("import sys\n"
+                  "for _ in range(1024): sys.stdout.write('x' * 1023 + '\\n')\n"
+                  "print('     Running tests/late.rs (target/debug/deps/late-0123456789abcdef)', flush=True)\n"
+                  "print('test result: ok. 1 passed; finished in 2.00s', flush=True)\n")
+
+        class Broken(io.RawIOBase):
+            def writable(self):
+                return True
+
+            def write(self, b):
+                raise BrokenPipeError
+
+        timings = {}
+        with patch.object(shard.sys, "stdout", io.TextIOWrapper(io.BufferedWriter(Broken()))):
+            self.assertEqual(shard.run([sys.executable, "-c", script], timings)[0], 0)
+        self.assertEqual(timings, {"late": 2.0})
+
     def test_main_prints_the_timing_sample_last(self):
         metadata = {"workspace_members": ["a"], "packages": [
             {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
