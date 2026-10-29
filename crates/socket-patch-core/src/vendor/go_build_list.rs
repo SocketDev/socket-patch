@@ -269,6 +269,17 @@ fn replaced_module(
     in_effect
 }
 
+/// The project files [`super::go_workspace::module_graph`] reads for
+/// `go_mod` besides the module cache: each directory replacement's go.mod,
+/// root-relative.
+pub fn module_graph_reads(go_mod: &str) -> Vec<String> {
+    parse_replace_entries(go_mod)
+        .into_iter()
+        .filter_map(|e| e.path)
+        .map(|dir| format!("{}/go.mod", dir.replace('\\', "/").trim_end_matches('/')))
+        .collect()
+}
+
 /// The [`ModuleGraph`] of the module-mode project at `project_root`, read
 /// from the module cache, when [`needs_module_graph`] says the answer for
 /// `module@version` can turn on it.

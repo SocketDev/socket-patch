@@ -495,7 +495,7 @@ async fn read_go_workspace(
     out: &mut CandidateFiles,
 ) {
     use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
-    let (root, loaded, modfile) = match view {
+    let (root, loaded, modfile, module_graph) = match view {
         ProjectView::Memory(_) => 'memory: {
             let Some(work) = read_advisory(view, unreadable, "go.work").await else {
                 return;
@@ -507,6 +507,7 @@ async fn read_go_workspace(
                 break 'memory (
                     std::path::PathBuf::new(),
                     Loaded::Invalid(format!("go.work: {problem}, so go refuses to build")),
+                    None,
                     None,
                 );
             }
@@ -540,7 +541,7 @@ async fn read_go_workspace(
                 members,
                 graph: None,
             };
-            (std::path::PathBuf::new(), Loaded::Workspace(ws), None)
+            (std::path::PathBuf::new(), Loaded::Workspace(ws), None, None)
         }
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let Some(root) = view.disk_root_reading(std::iter::empty::<&std::path::Path>()) else {
@@ -560,25 +561,31 @@ async fn read_go_workspace(
                     touched.push(member.dir.join("go.sum"));
                 }
             }
+            // Module mode: whether a module-to-module replace is in effect
+            // can turn on modules only the dependencies require (#1840).
+            let mut module_graph = None;
+            if loaded == Loaded::None {
+                touched.push(root.join("go.mod"));
+                let go_mod = crate::utils::fs::read_regular_to_string(&root.join("go.mod")).await;
+                if let Ok(go_mod) = go_mod {
+                    if crate::vendor::go_build_list::may_need_module_graph(&go_mod) {
+                        touched.extend(
+                            crate::vendor::go_build_list::module_graph_reads(&go_mod)
+                                .into_iter()
+                                .map(|rel| root.join(rel)),
+                        );
+                        let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
+                        module_graph = Some(
+                            go_workspace::module_graph(&root, &go_mod, cache.as_deref()).await,
+                        );
+                    }
+                }
+            }
             view.disk_root_reading(&touched);
             // `-modfile` in GOFLAGS sends the build to another go.mod (#1799).
             let modfile = go_workspace::modfile_setting(&root);
-            (root, loaded, modfile)
+            (root, loaded, modfile, module_graph)
         }
-    };
-    // Module mode: whether a module-to-module replace is in effect can turn
-    // on modules only the dependencies require (#1840).
-    let module_graph = match (&loaded, view) {
-        (Loaded::None, ProjectView::Disk(_) | ProjectView::Snapshot(_)) => {
-            match crate::utils::fs::read_regular_to_string(&root.join("go.mod")).await {
-                Ok(go_mod) if crate::vendor::go_build_list::may_need_module_graph(&go_mod) => {
-                    let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
-                    Some(go_workspace::module_graph(&root, &go_mod, cache.as_deref()).await)
-                }
-                _ => None,
-            }
-        }
-        _ => None,
     };
     if loaded == Loaded::None && modfile.is_none() && module_graph.is_none() {
         return;

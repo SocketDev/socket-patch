@@ -285,13 +285,17 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bo
         .any(|e| e.owner == Some(ReplaceOwner::Hosted));
     // Module mode: whether a module-to-module replace is in effect can turn
     // on modules only the dependencies require (#1840).
-    let module_graph = match (&go_mod, &workspace, ctx.disk_root()) {
-        (Some(text), None, Some(root)) if go_build_list::may_need_module_graph(text) => {
-            let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
-            Some(crate::vendor::go_workspace::module_graph(root, text, cache.as_deref()).await)
+    let mut module_graph = None;
+    if let (Some(text), None) = (&go_mod, &workspace) {
+        if go_build_list::may_need_module_graph(text) {
+            if let Some(root) = ctx.disk_root_reading(go_build_list::module_graph_reads(text)) {
+                let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
+                module_graph = Some(
+                    crate::vendor::go_workspace::module_graph(root, text, cache.as_deref()).await,
+                );
+            }
         }
-        _ => None,
-    };
+    }
     let graph = Graph::new(
         go_mod.as_deref(),
         workspace.as_ref().map(|ws| &ws.model),
