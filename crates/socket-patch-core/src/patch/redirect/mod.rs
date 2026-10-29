@@ -9657,10 +9657,9 @@ fn rewrite_golang_target(
             code: "redirect_golang_not_in_module_graph".into(),
             detail: format!(
                 "{fname}@{}: the build uses this version only as the replacement of \
-                 {via} (go.mod's `replace {via} => {fname} {}`), and go doesn't apply a \
-                 replace to a replacement — its replace would be ignored; nothing \
-                 redirected",
-                dep.version, dep.version
+                 {via} (go.mod's replace of {via}), and go doesn't apply a replace to a \
+                 replacement — its replace would be ignored; nothing redirected",
+                dep.version
             ),
         }),
         _ => None,

@@ -138,16 +138,32 @@ pub fn select(
 }
 
 /// The module whose module-to-module `replace` in `go_mod` targets exactly
-/// `module@version`, if any.
+/// `module@version`, if that replace is the one in effect: go.mod requires
+/// the replaced module, and no replace pinned to the required version
+/// shadows a version-less one (go prefers the versioned replace). `go mod
+/// tidy` keeps unused replaces, so one of a module the build doesn't use, or
+/// pinned to a version it doesn't require, explains nothing.
 fn replaced_module(go_mod: &str, module: &str, version: &str) -> Option<String> {
-    parse_replace_entries(go_mod)
-        .into_iter()
-        .find(|e| {
-            e.module != module
-                && e.rhs_module.as_deref() == Some(module)
-                && e.rhs_version.as_deref() == Some(version)
+    let required = parse_required_versions(go_mod);
+    let entries = parse_replace_entries(go_mod);
+    entries
+        .iter()
+        .filter(|e| e.module != module)
+        .filter(|e| {
+            e.rhs_module.as_deref() == Some(module) && e.rhs_version.as_deref() == Some(version)
         })
-        .map(|e| e.module)
+        .find(|e| {
+            let Some(req) = required.get(&e.module) else {
+                return false;
+            };
+            match e.version.as_deref() {
+                Some(v) => v == req,
+                None => !entries
+                    .iter()
+                    .any(|o| o.module == e.module && o.version.as_deref() == Some(req.as_str())),
+            }
+        })
+        .map(|e| e.module.clone())
 }
 
 /// [`selection`] for a project directory. In workspace mode the build
@@ -293,6 +309,37 @@ mod tests {
                 assert_eq!(
                     selection(&m, Some(&s), UP, "v1.0.0"),
                     via,
+                    "{go} / {replace}"
+                );
+            }
+        }
+    }
+
+    /// `go mod tidy` keeps unused replaces: one of a module go.mod doesn't
+    /// require, one pinned to another version than the required one, or a
+    /// version-less one a versioned replace shadows doesn't explain the zip.
+    #[test]
+    fn inactive_replace_target_keeps_the_zip_as_evidence() {
+        let s = sum(&[&format!("{UP} v1.0.0")]);
+        for go in ["go 1.21", "go 1.16"] {
+            for (require, replace) in [
+                ("", format!("replace other.com/fork => {UP} v1.0.0")),
+                (
+                    "require other.com/fork v1.0.0\n",
+                    format!("replace other.com/fork v0.5.0 => {UP} v1.0.0"),
+                ),
+                (
+                    "require other.com/fork v1.0.0\n",
+                    format!(
+                        "replace other.com/fork => {UP} v1.0.0\n\
+                         replace other.com/fork v1.0.0 => ../fork"
+                    ),
+                ),
+            ] {
+                let m = format!("module c\n\n{go}\n\n{require}\n{replace}\n");
+                assert_eq!(
+                    selection(&m, Some(&s), UP, "v1.0.0"),
+                    Selection::Selected,
                     "{go} / {replace}"
                 );
             }

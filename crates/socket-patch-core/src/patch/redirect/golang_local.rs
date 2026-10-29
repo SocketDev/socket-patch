@@ -708,7 +708,7 @@ pub(crate) async fn selection_refusal(
         )),
         Selection::ReplaceTarget(via) => Some(format!(
             "the build uses {module} {version} only as the replacement of {via} \
-             (go.mod's `replace {via} => {module} {version}`), and go doesn't apply a \
+             (go.mod's replace of {via}), and go doesn't apply a \
              replace to a replacement: its replace would be ignored and the build would \
              link the unpatched module; nothing written"
         )),
@@ -2097,6 +2097,51 @@ mod tests {
                 patched_version: VERSION.into(),
                 required_version: "v1.5.0".into(),
             }]
+        );
+    }
+
+    /// #1823: a module the build uses only as another module's replacement
+    /// is refused by apply and flagged by `apply --check`.
+    #[tokio::test]
+    async fn test_replace_target_only_module_is_refused_and_flagged() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        assert!(apply_fixture(root, &blobs, &pristine, &files).await.success);
+        let fork = format!(
+            "module example.com/app\n\ngo 1.21\n\nrequire other.com/fork {VERSION}\n\n\
+             replace other.com/fork => {MODULE} {VERSION}\n"
+        );
+        let socket =
+            format!("\nreplace {MODULE} {VERSION} => ./.socket/go-patches/{MODULE}@{VERSION}\n");
+        tokio::fs::write(root.join("go.mod"), format!("{fork}{socket}"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("go.sum"),
+            format!("{MODULE} {VERSION} h1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\n"),
+        )
+        .await
+        .unwrap();
+        let manifest = manifest_with(&files);
+        let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            drifts,
+            vec![Drift::ReplaceTargetOnly {
+                purl: PURL.into(),
+                patched_version: VERSION.into(),
+                via: "other.com/fork".into(),
+            }]
+        );
+        assert!(drifts[0].to_string().contains("UNPATCHED"));
+
+        tokio::fs::write(root.join("go.mod"), &fork).await.unwrap();
+        let refusal = selection_refusal(root, MODULE, VERSION).await.unwrap();
+        assert!(
+            refusal.contains("only as the replacement of other.com/fork"),
+            "{refusal}"
         );
     }
 
