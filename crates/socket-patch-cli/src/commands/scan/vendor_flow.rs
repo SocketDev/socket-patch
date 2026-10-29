@@ -158,24 +158,23 @@ impl VendorPreview {
     }
 
     /// The human `--dry-run` headline: every row, less the ones the wet
-    /// run would refuse or skip as already vendored (#1850). Shared by
-    /// `scan --mode vendored --dry-run` and `get … --mode vendored
-    /// --dry-run` so the two cannot drift.
-    pub(crate) fn dry_run_line(&self) -> String {
-        super::render::dry_run_line(
-            super::render::Plan::Vendor(self.rows.len()),
-            self.refused_count(),
-            self.in_sync_count(),
-        )
+    /// run would refuse or skip as already vendored (#1850).
+    fn dry_run_line(&self) -> String {
+        super::render::dry_run_line(super::render::Plan::Vendor {
+            total: self.rows.len(),
+            refused: self.refused_count(),
+            in_sync: self.in_sync_count(),
+        })
     }
 
-    /// Human rendering of the rows the headline left out and of the
-    /// symlink advisories: a `[skip] … (already vendored)` line for each
-    /// in-sync row (stderr, the wet run's line and stream), then a
-    /// `[would-refuse]` line naming what the wet run would refuse and why.
-    /// Shared by `scan` and `get` like [`Self::dry_run_line`]. Callers gate
-    /// it on `--silent`.
-    pub(crate) fn print_rows(&self) {
+    /// Human rendering of the preview: the headline, then a `[skip] …
+    /// (already vendored)` line for each in-sync row (stderr, the wet
+    /// run's line and stream), a `[would-refuse]` line naming what the wet
+    /// run would refuse and why, and the symlink advisories. Shared by
+    /// `scan --mode vendored --dry-run` and `get … --mode vendored
+    /// --dry-run` so the two cannot drift. Callers gate it on `--silent`.
+    pub(crate) fn print_human(&self) {
+        println!("{}", self.dry_run_line());
         for row in &self.rows {
             if matches!(row.verdict, PreviewVerdict::AlreadyVendored) {
                 eprintln!(

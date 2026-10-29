@@ -2300,8 +2300,7 @@ async fn run_get_vendored(
             preview.record_into(&mut env);
             emit(&env);
         } else if !args.common.silent {
-            println!("{}", preview.dry_run_line());
-            preview.print_rows();
+            preview.print_human();
         }
         return 0;
     }

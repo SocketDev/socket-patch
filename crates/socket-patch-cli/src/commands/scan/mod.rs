@@ -3433,13 +3433,10 @@ async fn run_scan(
                 None
             };
             match &preview {
-                Some(preview) => {
-                    println!("{}", preview.dry_run_line());
-                    preview.print_rows();
-                }
+                Some(preview) => preview.print_human(),
                 None => println!(
                     "{}",
-                    render::dry_run_line(render::Plan::Apply(selected.len()), 0, 0)
+                    render::dry_run_line(render::Plan::Apply(selected.len()))
                 ),
             }
         }
