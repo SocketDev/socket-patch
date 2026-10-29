@@ -300,24 +300,63 @@ pub(super) async fn preflight_requirements(
 
 /// The vendor lines for `canon_name` in one file's content, read as pip's
 /// logical lines: `(wheel-path token's vendor path parts, bare token, code)`
-/// for every line whose comment carries the
-/// `# socket-patch vendor: <name>==<version>` tag ([`vendor_tag`]) and whose
-/// first token is a pypi vendor path — the exact shape [`vendor_line`]
-/// writes, lexed like lockfile discovery reads it.
+/// for every line whose first token is a pypi vendor path — the shape
+/// [`vendor_line`] writes, lexed like lockfile discovery reads it — for
+/// `canon_name`. The `# socket-patch vendor: <name>==<version>` tag
+/// ([`vendor_tag`]) names the package; pip never reads that comment, so a
+/// line whose tag was edited away or stripped still installs our wheel and
+/// is named by the wheel's file name instead (#977).
 fn vendor_lines<'a>(
     content: &'a str,
     canon_name: &'a str,
 ) -> impl Iterator<Item = (super::path::VendorPathParts, String, String)> + 'a {
     logical_lines(content).into_iter().filter_map(move |ll| {
         let (code, comment) = split_comment(&ll.text);
-        let (name, _) = comment.and_then(vendor_tag)?;
-        if name != canon_name {
-            return None;
-        }
         let token = code.split_whitespace().next()?;
         let parts = super::path::parse_vendor_path(token).filter(|p| p.eco == "pypi")?;
-        Some((parts, token.to_string(), code.to_string()))
+        let named = match comment.and_then(vendor_tag) {
+            Some((name, _)) => name == canon_name,
+            None => {
+                let file = parts.leaf.rsplit('/').next().unwrap_or_default();
+                super::pypi_distribution::distribution_name(file).as_deref() == Some(canon_name)
+            }
+        };
+        named.then(|| (parts, token.to_string(), code.to_string()))
     })
+}
+
+/// Pair each recorded vendor line (`recorded`, bottom-up record order) with
+/// a distinct line of `lines`, or `None` when none matches. An exact copy
+/// of the recorded line is paired first; then a line whose code part (what
+/// pip reads) is the recorded one's, so an edit to the trailing
+/// `# socket-patch vendor:` comment alone — respaced, a note appended, the
+/// comment stripped — is not drift (#977). Each pass pairs bottom-up, so
+/// identical vendor lines pair with their own records.
+fn pair_recorded_lines(lines: &[Line], recorded: &[Option<&str>]) -> Vec<Option<usize>> {
+    let code_of = |text: &str| split_comment(text).0.trim().to_string();
+    let same = |line: &str, rec: &str, by_code: bool| {
+        if !by_code {
+            return line.trim() == rec.trim();
+        }
+        let code = code_of(rec);
+        !code.is_empty() && code_of(line) == code
+    };
+    let mut paired: Vec<Option<usize>> = vec![None; recorded.len()];
+    let mut taken: HashSet<usize> = HashSet::new();
+    for by_code in [false, true] {
+        for (slot, rec) in paired.iter_mut().zip(recorded) {
+            let (None, Some(rec)) = (*slot, rec) else {
+                continue;
+            };
+            *slot = (0..lines.len())
+                .rev()
+                .find(|i| !taken.contains(i) && same(&lines[*i].text, rec, by_code));
+            if let Some(idx) = *slot {
+                taken.insert(idx);
+            }
+        }
+    }
+    paired
 }
 
 /// Whether one file's content holds a socket vendor line for `canon_name`
@@ -576,15 +615,26 @@ pub(super) async fn revert_requirements(
 
         // Reverse order = bottom-up matching, so identical vendor lines pair
         // with their own originals (records were emitted top-down).
-        for rec in entry.wiring.iter().rev().filter(|r| &r.file == file) {
-            let Some(new_line) = rec.new.as_ref().and_then(serde_json::Value::as_str) else {
-                warnings.push(drift_warning(file, rec));
-                continue;
-            };
-            let Some(idx) = lines.iter().rposition(|l| l.text.trim() == new_line.trim()) else {
-                warnings.push(drift_warning(file, rec));
-                continue;
-            };
+        let recs: Vec<&WiringRecord> = entry
+            .wiring
+            .iter()
+            .rev()
+            .filter(|r| &r.file == file)
+            .collect();
+        let recorded: Vec<Option<&str>> = recs
+            .iter()
+            .map(|r| r.new.as_ref().and_then(serde_json::Value::as_str))
+            .collect();
+        let mut edits: Vec<(usize, &WiringRecord)> = Vec::new();
+        for (rec, idx) in recs.iter().zip(pair_recorded_lines(&lines, &recorded)) {
+            match idx {
+                Some(idx) => edits.push((idx, rec)),
+                None => warnings.push(drift_warning(file, rec)),
+            }
+        }
+        // Splice bottom-up so every paired index still names its line.
+        edits.sort_by(|a, b| b.0.cmp(&a.0));
+        for (idx, rec) in edits {
             match rec.action {
                 WiringAction::Added => {
                     lines.remove(idx);
@@ -984,20 +1034,19 @@ fn plan_rewire(
             return Err(format!("{rel} is outside the project root"));
         }
         let mut lines = split_lines(&file.content);
-        let mut taken: HashSet<usize> = HashSet::new();
         let mut records = Vec::new();
         // Bottom-up, pairing identical lines with their own records exactly
         // as the revert does.
-        for rec in prev.wiring.iter().rev().filter(|r| r.file == rel) {
-            let old = rec
-                .new
-                .as_ref()
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("{rel}: a recorded vendor line is empty"))?;
-            let idx = (0..lines.len())
-                .rev()
-                .find(|i| !taken.contains(i) && lines[*i].text.trim() == old.trim())
-                .ok_or_else(|| format!("{rel}: the vendor line changed since vendoring"))?;
+        let recs: Vec<&WiringRecord> = prev.wiring.iter().rev().filter(|r| r.file == rel).collect();
+        let recorded: Vec<Option<&str>> = recs
+            .iter()
+            .map(|r| r.new.as_ref().and_then(serde_json::Value::as_str))
+            .collect();
+        let paired = pair_recorded_lines(&lines, &recorded);
+        for ((rec, old), idx) in recs.into_iter().zip(recorded).zip(paired) {
+            let old = old.ok_or_else(|| format!("{rel}: a recorded vendor line is empty"))?;
+            let idx =
+                idx.ok_or_else(|| format!("{rel}: the vendor line changed since vendoring"))?;
             let marker = vendor_line_marker(split_comment(old).0);
             let line = vendor_line(
                 rel_wheel,
@@ -1008,7 +1057,6 @@ fn plan_rewire(
                 rec.action == WiringAction::Added,
             );
             lines[idx].text = line.clone();
-            taken.insert(idx);
             records.push(WiringRecord {
                 new: Some(serde_json::Value::String(line)),
                 ..rec.clone()
@@ -2893,6 +2941,159 @@ mod tests {
             read_root(tmp.path()).await,
             format!("six==1.16.0\n./{REL_WHEEL}\n")
         );
+    }
+
+    /// #977: the `# socket-patch vendor:` comment is bookkeeping pip never
+    /// reads. A comment-only edit (respaced, a note appended after it, or
+    /// stripped by a formatter) leaves a line pip installs exactly as
+    /// vendor wrote it, so the revert still restores the original pin.
+    fn comment_edits(line: &str) -> [(&'static str, String); 3] {
+        [
+            (
+                "respaced",
+                line.replace("  # socket-patch vendor", " # socket-patch vendor"),
+            ),
+            ("note appended", format!("{line}  # CVE fix, do not bump")),
+            (
+                "stripped",
+                line.split("  # socket-patch vendor")
+                    .next()
+                    .unwrap()
+                    .to_string(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn revert_ignores_edits_to_the_vendor_comment() {
+        for original in [
+            "idna==3.7\nsix==1.16.0\n",
+            "idna==3.7\nsix==1.16.0 --hash=sha256:aaaa\n",
+            "idna==3.7\n",
+        ] {
+            let tmp = write_root(original).await;
+            let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap();
+            let wired = read_root(tmp.path()).await;
+            let line = wired.lines().nth(1).unwrap().to_string();
+            for (edit, edited) in comment_edits(&line) {
+                assert_ne!(edited, line, "{edit}");
+                tokio::fs::write(
+                    tmp.path().join("requirements.txt"),
+                    wired.replace(&line, &edited),
+                )
+                .await
+                .unwrap();
+                let outcome =
+                    revert_requirements(&entry_for(wiring.clone()), tmp.path(), false).await;
+                assert!(outcome.success, "{original:?} {edit}: {:?}", outcome.error);
+                assert!(
+                    outcome.warnings.is_empty(),
+                    "{original:?} {edit}: {:?}",
+                    outcome.warnings
+                );
+                assert_eq!(read_root(tmp.path()).await, original, "{edit}");
+            }
+        }
+    }
+
+    /// #977: an exact copy of the recorded line still pairs with its own
+    /// record first, so a bare manual reference to the same wheel is the
+    /// line left behind (and warned about), not the managed one.
+    #[tokio::test]
+    async fn revert_prefers_the_exact_vendor_line_over_a_bare_copy() {
+        let tmp = write_root("six==1.16.0\n").await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        let wired = read_root(tmp.path()).await;
+        let content = format!("./{REL_WHEEL}\n{wired}");
+        tokio::fs::write(tmp.path().join("requirements.txt"), &content)
+            .await
+            .unwrap();
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success);
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!("./{REL_WHEEL}\nsix==1.16.0\n")
+        );
+    }
+
+    /// #977: a vendor line whose comment was edited or stripped still routes
+    /// the package to this patch's wheel, so a re-run of `vendor` is in sync
+    /// rather than appending a second `(transitive)` line for the same wheel.
+    #[tokio::test]
+    async fn an_edited_vendor_comment_is_still_in_sync() {
+        for original in ["idna==3.7\nsix==1.16.0\n", "idna==3.7\n"] {
+            let tmp = write_root(original).await;
+            wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap();
+            let wired = read_root(tmp.path()).await;
+            let line = wired.lines().nth(1).unwrap().to_string();
+            for (edit, edited) in comment_edits(&line) {
+                let content = wired.replace(&line, &edited);
+                tokio::fs::write(tmp.path().join("requirements.txt"), &content)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(
+                        preflight_requirements(tmp.path(), "six", "1.16.0", UUID).await,
+                        Ok(RequirementsTarget::InSync { pin: Some((path, _)) })
+                            if path == REL_WHEEL
+                    ),
+                    "{original:?} {edit}"
+                );
+                assert!(has_vendor_line(&content, "six"), "{edit}");
+                assert!(!has_vendor_line(&content, "idna"), "{edit}");
+            }
+        }
+    }
+
+    /// #977: a superseding patch re-wires a vendor line whose comment was
+    /// edited, and reverting the new entry restores the user's own pin.
+    #[tokio::test]
+    async fn rewire_and_revert_after_an_edited_vendor_comment() {
+        let original = "idna==3.7\nsix==1.16.0\n";
+        let newer = format!(".socket/vendor/pypi/{OTHER_UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let tmp = write_root(original).await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        let wired = read_root(tmp.path()).await;
+        let line = wired.lines().nth(1).unwrap().to_string();
+        for (edit, edited) in comment_edits(&line) {
+            tokio::fs::write(
+                tmp.path().join("requirements.txt"),
+                wired.replace(&line, &edited),
+            )
+            .await
+            .unwrap();
+            let rewired = rewire_requirements(
+                tmp.path(),
+                &entry_for(wiring.clone()),
+                "six",
+                "1.16.0",
+                &newer,
+                SHA,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{edit}: {e:?}"));
+            assert_eq!(
+                read_root(tmp.path()).await,
+                format!("idna==3.7\n./{newer}  # socket-patch vendor: six==1.16.0\n"),
+                "{edit}"
+            );
+            let outcome = revert_requirements(&entry_for(rewired), tmp.path(), false).await;
+            assert!(outcome.success, "{edit}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{edit}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(read_root(tmp.path()).await, original, "{edit}");
+        }
     }
 
     #[tokio::test]

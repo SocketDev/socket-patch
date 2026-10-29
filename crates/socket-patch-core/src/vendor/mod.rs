@@ -879,7 +879,8 @@ impl RevertOutcome {
             "vendor_artifact_kept",
             format!(
                 "kept {uuid_dir_rel}: some recorded lock entries were left alone (see the \
-                 vendor_lock_entry_drifted / vendor_lock_entry_removed warnings) and the vendored artifacts may still be \
+                 vendor_lock_entry_drifted / vendor_lock_entry_removed / \
+                 vendor_revert_line_drifted warnings) and the vendored artifacts may still be \
                  needed for a later restore; undo the drift (restore the vendored lock entries \
                  or re-vendor) and re-run `vendor --revert` to finish cleaning up"
             ),
