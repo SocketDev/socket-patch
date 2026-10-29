@@ -21,6 +21,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::formats::cargo::source_replacement::config_layer_paths;
+
 /// The build directories of the project at `cwd`, and the config values
 /// naming one this module cannot resolve (a `{workspace-path-hash}`
 /// template) — the caller tells the user to clean those by hand.
@@ -136,10 +138,9 @@ fn workspace_root(cwd: &Path) -> PathBuf {
 }
 
 /// `build.target-dir` / `build.build-dir` from the config files cargo
-/// reads for `cwd`: `.cargo/config.toml` (or legacy `.cargo/config`) in
-/// `cwd` and every ancestor, then `$CARGO_HOME/config.toml`; the deepest
-/// file that sets a key wins. A relative value resolves against the
-/// directory holding the `.cargo` directory.
+/// reads for `cwd` ([`config_layer_paths`]); the deepest file that sets a
+/// key wins. A relative value resolves against the directory holding the
+/// `.cargo` directory.
 #[derive(Default)]
 struct ConfigDirs {
     target_dir: Option<PathBuf>,
@@ -149,19 +150,9 @@ struct ConfigDirs {
 
 impl ConfigDirs {
     fn read(cwd: &Path, cargo_home: Option<&Path>) -> Self {
-        let mut files: Vec<(PathBuf, PathBuf)> = cwd
-            .ancestors()
-            .map(|d| (d.join(".cargo"), d.to_path_buf()))
-            .collect();
-        if let Some(home) = cargo_home {
-            let base = home.parent().map(Path::to_path_buf).unwrap_or_default();
-            files.push((home.to_path_buf(), base));
-        }
         let mut out = ConfigDirs::default();
-        for (dot_cargo, base) in files {
-            let text = ["config.toml", "config"].iter().find_map(|f| {
-                crate::utils::fs::read_regular_to_string_sync(&dot_cargo.join(f)).ok()
-            });
+        for (file, base) in config_layer_paths(cwd, cargo_home, Path::is_file) {
+            let text = crate::utils::fs::read_regular_to_string_sync(&file).ok();
             let Some(doc) = text.and_then(|t| t.parse::<toml_edit::DocumentMut>().ok()) else {
                 continue;
             };
@@ -422,6 +413,32 @@ mod tests {
         for p in [out, keep1, keep2, keep3] {
             assert!(p.exists(), "{p:?} must be kept");
         }
+    }
+
+    /// With both `.cargo/config` and `.cargo/config.toml`, cargo reads the
+    /// extensionless one; so must the cleaner.
+    #[test]
+    fn build_dirs_read_the_legacy_config_when_both_exist() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("ws");
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::create_dir_all(root.join("legacy")).unwrap();
+        std::fs::create_dir_all(root.join("modern")).unwrap();
+        std::fs::write(
+            root.join(".cargo/config"),
+            "[build]\ntarget-dir = \"legacy\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"modern\"\n",
+        )
+        .unwrap();
+        let d = build_dirs_with(&root, &|_| None, None);
+        assert_eq!(
+            d.dirs,
+            vec![std::fs::canonicalize(root.join("legacy")).unwrap()]
+        );
     }
 
     #[test]
