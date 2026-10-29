@@ -785,8 +785,9 @@ async fn vendor_maven_jvm(
             }
             Ok(plan) if matches!(shape, Shape::MavenReactor | Shape::Mixed) => {
                 let read = |rel: &str| reader.read(rel);
+                let list = |dir: &str| reader.list(dir);
                 if let Err(e) =
-                    super::jvm::maven_reactor::refuse_unwired(&read, &patch.coords(), &plan)
+                    super::jvm::maven_reactor::refuse_unwired(&read, &list, &patch.coords(), &plan)
                 {
                     return refused(e.code, e.detail);
                 }
@@ -987,7 +988,7 @@ async fn vendor_maven_jvm(
     };
     if matches!(shape, Shape::MavenReactor | Shape::Mixed) {
         if let Err(refusal) =
-            super::jvm::maven_reactor::refuse_unwired(&read, &patch.coords(), &plan)
+            super::jvm::maven_reactor::refuse_unwired(&read, &list, &patch.coords(), &plan)
         {
             return refused(refusal.code, refusal.detail);
         }

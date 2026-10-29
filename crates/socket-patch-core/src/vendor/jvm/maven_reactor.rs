@@ -483,12 +483,17 @@ pub fn wired_checked(
 /// root pinned (#513). Vendoring it would count the patch as applied while
 /// the build keeps resolving the base; the refusal carries the degraded
 /// reasons that left it unwired.
-pub fn refuse_unwired(read: ReadFn<'_>, c: &Coords<'_>, plan: &JvmPlan) -> Result<(), JvmRefusal> {
+pub fn refuse_unwired(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+    plan: &JvmPlan,
+) -> Result<(), JvmRefusal> {
     let planned = |rel: &str| match plan.writes.iter().find(|w| w.rel == rel) {
         Some(w) => Some(w.bytes.clone()),
         None => read(rel),
     };
-    if wired_checked(&planned, c)? {
+    if wired_checked(&planned, list, c)? {
         return Ok(());
     }
     // Only the reasons that leave a declaration or a root alone; the
@@ -5445,7 +5450,7 @@ mod tests {
         files.insert("a/pom.xml".into(), a.into_bytes());
         let plan = run(&files).unwrap();
         let read = |p: &str| files.get(p).cloned();
-        let r = refuse_unwired(&read, &patch().coords(), &plan).unwrap_err();
+        let r = refuse_unwired(&read, &lister(&files), &patch().coords(), &plan).unwrap_err();
         assert_eq!(r.code, SHAPE_UNSUPPORTED);
         assert_eq!(refusal_reason(&r), "nothing_wired");
         assert!(
@@ -5469,10 +5474,10 @@ mod tests {
         ]);
         let (plan, after) = vendor(&files);
         let read = |p: &str| files.get(p).cloned();
-        refuse_unwired(&read, &patch().coords(), &plan).unwrap();
+        refuse_unwired(&read, &lister(&files), &patch().coords(), &plan).unwrap();
         let again = run(&after).unwrap();
         let read = |p: &str| after.get(p).cloned();
-        refuse_unwired(&read, &patch().coords(), &again).unwrap();
+        refuse_unwired(&read, &lister(&after), &patch().coords(), &again).unwrap();
     }
 
     /// #513 case 2: Maven 4.1.0 infers an empty `<parent/>` from
