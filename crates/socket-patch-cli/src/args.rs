@@ -383,7 +383,8 @@ impl GlobalArgs {
         }
         // A manifest path that names a directory is not refused here: that
         // is a corrupt project, not a bad flag, and `read_manifest` refuses
-        // it as `manifest_unreadable` with a `--json` document.
+        // it as `manifest_unreadable` with a `--json` document, where a check
+        // here would exit 2 with none.
         if self.manifest_path != DEFAULT_PATCH_MANIFEST_PATH {
             // `.`-free for the message: `--cwd .` joined onto
             // `./.socket/manifest.json` would print `././.socket/…`.
@@ -530,15 +531,16 @@ impl GlobalArgs {
     /// org rather than the public proxy. A run that has a client uses
     /// [`TelemetryAuth::for_client`] instead.
     pub(crate) fn telemetry_auth(&self) -> TelemetryAuth {
+        let overrides = self.api_client_overrides();
         let (api_token, org_slug) =
-            resolve_ambient_credentials(self.api_token.clone(), self.org.clone());
+            resolve_ambient_credentials(overrides.api_token, overrides.org_slug);
         TelemetryAuth::from_credentials(api_token.as_deref(), org_slug.as_deref())
     }
 
     /// The vendoring-service config every vendor entry point (`vendor`,
     /// `scan`/`get --mode vendored`) builds from the same flags, so they
-    /// commit byte-identical artifacts for the same patch. `vendor_source`
-    /// was validated by clap, so the parse cannot fail.
+    /// commit byte-identical artifacts for the same patch. Clap validated
+    /// `vendor_source`; a struct literal with a bad one gets the default.
     pub(crate) fn vendor_service_config(
         &self,
         client: Option<ApiClient>,
@@ -643,7 +645,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
 
 /// Every env var a subcommand-local flag binds (one per `env = "..."`
 /// attribute in `commands/*.rs`), for the same users as
-/// [`GLOBAL_ARG_ENV_VARS`].
+/// [`GLOBAL_ARG_ENV_VARS`]. A var missing here escapes the empty-var scrub.
 pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
@@ -725,12 +727,7 @@ mod tests {
 
     #[test]
     fn ecosystem_rejection_messages() {
-        let supported = Ecosystem::all()
-            .iter()
-            .map(|e| e.cli_name())
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert!(supported.starts_with("npm, "), "{supported}");
+        let supported = "npm, pypi, cargo, gem, golang, maven, composer, nuget, deno";
         for bad in ["bogus", "NPM", "py-pi"] {
             assert_eq!(
                 parse_supported_ecosystem(bad),
@@ -985,8 +982,8 @@ mod tests {
         });
     }
 
-    /// The service overrides (`--vendor-url` / `--patch-server-url` /
-    /// `--offline`) thread through unchanged, so every entry point targets
+    /// The proxy state and the service overrides (`--vendor-url` /
+    /// `--patch-server-url` / `--offline`) thread through unchanged, so every entry point targets
     /// the same hosts.
     #[test]
     fn vendor_service_config_threads_overrides_through() {
@@ -997,7 +994,8 @@ mod tests {
             offline: true,
             ..Default::default()
         };
-        let cfg = common.vendor_service_config(None, false);
+        let cfg = common.vendor_service_config(None, true);
+        assert!(cfg.use_public_proxy);
         assert_eq!(cfg.vendor_url.as_deref(), Some("https://vendor.example"));
         assert_eq!(
             cfg.patch_server_url.as_deref(),
@@ -1071,30 +1069,34 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn telemetry_auth_prefers_explicit_values_and_treats_empty_as_unset() {
-        with_clean_socket_env(|| {
-            let explicit = GlobalArgs {
-                api_token: Some("sktsec_flag_api".to_string()),
-                org: Some("flag-org".to_string()),
-                ..GlobalArgs::default()
-            };
-            let auth = explicit.telemetry_auth();
-            assert_eq!(
-                auth.url(),
-                format!(
-                    "{}/v0/orgs/flag-org/telemetry",
-                    socket_patch_core::constants::DEFAULT_SOCKET_API_URL
-                )
-            );
-            assert!(auth.is_authenticated());
+        // Keep a developer's `socket login` config out of the chain.
+        with_env_cleared(&["SOCKET_NO_CONFIG"], || {
+            std::env::set_var("SOCKET_NO_CONFIG", "1");
+            with_clean_socket_env(|| {
+                let explicit = GlobalArgs {
+                    api_token: Some("sktsec_flag_api".to_string()),
+                    org: Some("flag-org".to_string()),
+                    ..GlobalArgs::default()
+                };
+                let auth = explicit.telemetry_auth();
+                assert_eq!(
+                    auth.url(),
+                    format!(
+                        "{}/v0/orgs/flag-org/telemetry",
+                        socket_patch_core::constants::DEFAULT_SOCKET_API_URL
+                    )
+                );
+                assert!(auth.is_authenticated());
 
-            let empty = GlobalArgs {
-                api_token: Some(String::new()),
-                org: Some(String::new()),
-                ..GlobalArgs::default()
-            };
-            let auth = empty.telemetry_auth();
-            assert!(!auth.is_authenticated());
-            assert!(auth.url().ends_with("/patch/telemetry"), "{}", auth.url());
+                let empty = GlobalArgs {
+                    api_token: Some(String::new()),
+                    org: Some(String::new()),
+                    ..GlobalArgs::default()
+                };
+                let auth = empty.telemetry_auth();
+                assert!(!auth.is_authenticated());
+                assert!(auth.url().ends_with("/patch/telemetry"), "{}", auth.url());
+            });
         });
     }
 

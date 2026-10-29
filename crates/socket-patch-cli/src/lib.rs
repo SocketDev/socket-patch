@@ -155,7 +155,8 @@ impl Commands {
     /// internal `hosted-bundle` harness (stdin in, stdout out) never touch
     /// `--cwd`, so an ambient `SOCKET_CWD` must not fail them. `get` and
     /// `scan` create the manifest, so a `--manifest-path` into a directory
-    /// that does not exist yet stays legal for them.
+    /// that does not exist yet stays legal for them. Commands that patch,
+    /// find or attest also refuse an unloaded Deno `--global-prefix`.
     pub fn validate_paths(&self) -> Result<(), String> {
         match self {
             Commands::SelfUpdate(_) | Commands::HostedBundle(_) => return Ok(()),
@@ -166,16 +167,17 @@ impl Commands {
         // Deno never loads: patching it reported `applied` while the tool kept
         // running the copy in Deno's npm cache. The restoring commands still
         // reach a tree an earlier release patched.
-        let prefix = match self {
-            Commands::Rollback(_) | Commands::Remove(_) | Commands::Repair(_) => return Ok(()),
-            Commands::Vendor(args) if args.revert => return Ok(()),
-            other => &other.global_args().global_prefix,
+        let restores = match self {
+            Commands::Rollback(_) | Commands::Remove(_) | Commands::Repair(_) => true,
+            Commands::Vendor(args) => args.revert,
+            _ => false,
         };
-        match prefix {
+        match &self.global_args().global_prefix {
             Some(prefix)
-                if socket_patch_core::crawlers::deno_crawler::is_unloaded_deno_tool_node_modules(
-                    prefix,
-                ) =>
+                if !restores
+                    && socket_patch_core::crawlers::deno_crawler::is_unloaded_deno_tool_node_modules(
+                        prefix,
+                    ) =>
             {
                 Err(format!(
                     "--global-prefix (or SOCKET_GLOBAL_PREFIX) `{}` is inside a Deno tool's \
