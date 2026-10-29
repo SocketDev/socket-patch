@@ -29,6 +29,17 @@ on:
         type: choice
         default: auto
         options: [auto, force, skip]
+      os:
+        # Run only one OS's jobs (plus the clippy and release-readiness
+        # preflights every leg waits on). A fix for a Windows-only nightly
+        # failure dispatches `-f os=windows` instead of re-running ~95 Linux
+        # and macOS jobs its PR run and the merge queue already cover. Only
+        # a dispatch sets inputs.os; on every other event it is empty, so
+        # the `inputs.os != ...` terms below are always true there.
+        description: 'Only run jobs for this OS (all = the full nightly matrix)'
+        type: choice
+        default: all
+        options: [all, linux, windows, macos]
 
 permissions:
   contents: read
@@ -144,7 +155,7 @@ jobs:
   # The napi addon is only ever loaded by Node, so cargo's own tests never
   # exercise its JS loader or the engine/provider boundary.
   node-addon:
-    if: (github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: ((github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: [release-readiness, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
@@ -182,7 +193,7 @@ jobs:
   # Check the standalone installer, release scripts, and native installer
   # test harnesses.
   lint-ecosystems:
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && (inputs.os != 'windows' && inputs.os != 'macos')
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 10
     steps:
@@ -362,7 +373,7 @@ jobs:
           bash scripts/release-lint.sh --sync-only
 
   test:
-    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: (((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'linux')
     needs: [release-readiness, clippy]
     # No ubuntu-latest leg: `coverage` runs this same `cargo test
     # --workspace` (debug, default features, plus Go and vexctl) on ubuntu,
@@ -381,6 +392,8 @@ jobs:
         exclude:
           # macOS legs run on main, the merge queue and nightly, not per PR push.
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || '' }}
+          # `workflow_dispatch -f os=windows|macos` runs that OS's legs only.
+          - os: ${{ inputs.os == 'windows' && 'macos-latest' || inputs.os == 'macos' && 'windows-latest' || '' }}
           # One compile-only cache writer per OS is enough for an already
           # tested SHA.
           - shard: ${{ needs.release-readiness.outputs.reuse == 'true' && 2 || 0 }}
@@ -559,7 +572,7 @@ jobs:
     # Each PR and main push runs the complete release-mode suite. The merge
     # queue already skips this job because each constituent PR ran it, so
     # an unchanged merge-main PR push (pr_unchanged) still runs it too.
-    if: (github.event.pull_request.draft != true && github.event_name != 'merge_group') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: ((github.event.pull_request.draft != true && github.event_name != 'merge_group') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     strategy:
@@ -607,7 +620,7 @@ jobs:
         run: python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" --locked --profile ci-release
 
   coverage:
-    if: (github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: ((github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: release-readiness
     # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
     # Reports as a markdown table in the job summary and uploads the raw
@@ -765,7 +778,7 @@ jobs:
   # Dockerfile.base compiles the full-LTO release binary inside Docker, with
   # no cache. Build it once per run and hand the image to every docker leg.
   docker-base:
-    if: ((github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: (((github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.head_ref == 'release/v5-prerelease')) && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: [release-readiness, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-22.04' || 'depot-ubuntu-22.04-4' }}
     timeout-minutes: 30
@@ -1018,7 +1031,7 @@ jobs:
           retention-days: 30
 
   dispatch-tests:
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && (inputs.os != 'windows' && inputs.os != 'macos')
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 10
     steps:
@@ -1055,7 +1068,7 @@ jobs:
   # test binaries directly from the same checkout path, so `CARGO_BIN_EXE_*`
   # and `CARGO_MANIFEST_DIR` resolve as they did under `cargo test`.
   e2e-build:
-    if: (github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: ((github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: release-readiness
     outputs:
       reuse: ${{ needs.release-readiness.outputs.reuse }}
@@ -1162,7 +1175,7 @@ jobs:
     # Builds the Windows test binaries for e2e-windows and
     # cargo-vex-matrix-windows. The lean merge queue runs
     # windows-compile-check instead.
-    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: (((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'linux' && inputs.os != 'macos')
     needs: [release-readiness, clippy]
     outputs:
       reuse: ${{ needs.release-readiness.outputs.reuse }}
@@ -1176,7 +1189,7 @@ jobs:
     steps: *e2e-build-steps
 
   e2e-build-macos:
-    if: (github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: ((github.event_name != 'pull_request') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && (inputs.os != 'linux' && inputs.os != 'windows')
     needs: [release-readiness, clippy]
     outputs:
       reuse: ${{ needs.release-readiness.outputs.reuse }}
@@ -2317,7 +2330,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy and release-readiness preflights.
-    if: (github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: ((github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: [release-readiness, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 40
@@ -2363,7 +2376,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy and release-readiness preflights.
-    if: (github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: ((github.event.pull_request.draft != true && needs.release-readiness.outputs.reuse != 'true') && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'macos')
     needs: [release-readiness, clippy]
     strategy:
       fail-fast: false
@@ -2372,7 +2385,7 @@ jobs:
         # `10c0/` writer, current, and 4.12.0 on macOS / Windows. The rest
         # of the spread (4.6.0, 4.12.0 on ubuntu) is yarn-berry-full.
         # LEAN SCOPE: the newest Linux release only, unless CI_SCOPE=full / nightly.
-        include: ${{ fromJSON((vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '[{"os":"ubuntu-latest","yarn":"4.0.2"},{"os":"ubuntu-latest","yarn":"4.1.0"},{"os":"ubuntu-latest","yarn":"4.18.0"},{"os":"windows-latest","yarn":"4.12.0"}]' || '[{"os":"ubuntu-latest","yarn":"4.18.0"}]') }}
+        include: ${{ fromJSON((vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (inputs.os == 'windows' && '[{"os":"windows-latest","yarn":"4.12.0"}]' || inputs.os == 'linux' && '[{"os":"ubuntu-latest","yarn":"4.0.2"},{"os":"ubuntu-latest","yarn":"4.1.0"},{"os":"ubuntu-latest","yarn":"4.18.0"}]' || '[{"os":"ubuntu-latest","yarn":"4.0.2"},{"os":"ubuntu-latest","yarn":"4.1.0"},{"os":"ubuntu-latest","yarn":"4.18.0"},{"os":"windows-latest","yarn":"4.12.0"}]') || '[{"os":"ubuntu-latest","yarn":"4.18.0"}]') }}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     timeout-minutes: 30
     steps: &yarn-berry-steps
@@ -2406,7 +2419,7 @@ jobs:
   # nightly, not on every PR push, so PRs stop queueing on the small
   # macOS runner pool.
   yarn-berry-e2e-macos:
-    if: (github.event_name != 'pull_request' && needs.release-readiness.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: ((github.event_name != 'pull_request' && needs.release-readiness.outputs.reuse != 'true') && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && (inputs.os != 'linux' && inputs.os != 'windows')
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
     needs: [release-readiness, clippy]
     strategy:
@@ -2424,7 +2437,7 @@ jobs:
   yarn-berry-full:
     name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
     # Same gate as e2e-full.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.CI_SCOPE == 'full') || github.head_ref == 'release/v5-prerelease') && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: clippy
     strategy:
       fail-fast: false
@@ -2604,7 +2617,7 @@ jobs:
     # Dropping that `needs` also dropped the draft skip it inherited, so
     # gate on draft here directly (push/merge_group/schedule still run).
     # Only wait for the clippy and release-readiness preflights.
-    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true'
+    if: (((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: [release-readiness, clippy]
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
@@ -2676,7 +2689,7 @@ jobs:
   # ----------------------------------------------------------------------
   hosted-e2e:
     name: hosted-e2e            # may be a required check; do not rename
-    if: github.event.pull_request.draft != true
+    if: (github.event.pull_request.draft != true) && (inputs.os != 'windows' && inputs.os != 'macos')
     needs: clippy
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     permissions:

@@ -14,6 +14,34 @@ TEXT = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 JOBS = reader.jobs(TEXT)
 
 
+# `workflow_dispatch -f os=<os>` (#1818) appends one OS term to a job's
+# `if:`. Off dispatch inputs.os is empty, so the term is always true there
+# and the rest of the condition is what PRs, the queue and the nightly see.
+OS_TERM = re.compile(r"^    if: \((.*)\) && \((inputs\.os [^()]*)\)$")
+OS_TERMS = {
+    "linux": "inputs.os != 'windows' && inputs.os != 'macos'",
+    "windows": "inputs.os != 'linux' && inputs.os != 'macos'",
+    "macos": "inputs.os != 'linux' && inputs.os != 'windows'",
+    "test": "inputs.os != 'linux'",
+    "yarn-berry-e2e": "inputs.os != 'macos'",
+}
+
+
+def raw_if(job):
+    return next((line for line in JOBS[job] if line.startswith("    if:")), "")
+
+
+def os_term(job):
+    match = OS_TERM.match(raw_if(job))
+    return match[2] if match else None
+
+
+def job_if(job):
+    """The job's `if:` line without its dispatch-only OS term."""
+    match = OS_TERM.match(raw_if(job))
+    return f"    if: {match[1]}" if match else raw_if(job)
+
+
 def dependencies(job):
     for line in JOBS[job]:
         match = re.match(r"^    needs: (.*)$", line)
@@ -103,7 +131,7 @@ class Scheduling(unittest.TestCase):
             self.assertIn("pattern: e2e-bin-${{ matrix.os }}*", "\n".join(JOBS[family]))
         for job in ("e2e-build-macos", "e2e-macos", "cargo-vex-matrix-macos", "yarn-berry-e2e-macos"):
             # Never on pull_request; lean scope also skips them (CI_SCOPE).
-            condition = next(line for line in JOBS[job] if line.startswith("    if:"))
+            condition = job_if(job)
             self.assertTrue(condition.startswith("    if: (github.event_name != 'pull_request'"), condition)
             self.assertTrue(condition.endswith(" && (vars.CI_SCOPE == 'full' || github.event_name == 'schedule'"
                                                " || github.event_name == 'workflow_dispatch')"), condition)
@@ -126,7 +154,7 @@ class Scheduling(unittest.TestCase):
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", body)
         self.assertNotIn("upload-artifact", body)
         self.assertNotIn("--no-run", body)
-        build = next(line for line in JOBS["e2e-build-windows"] if line.startswith("    if:"))
+        build = job_if("e2e-build-windows")
         self.assertEqual(build, "    if: ((github.event.pull_request.draft != true) && (vars.CI_SCOPE == 'full'"
                                 " || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'))"
                                 " && needs.release-readiness.outputs.pr_unchanged != 'true'")
@@ -140,7 +168,7 @@ class Scheduling(unittest.TestCase):
                     "e2e-build-windows", "e2e-build-macos", "cargo-old-toolchains",
                     "e2e-full", "cargo-vex-matrix-full", "yarn-berry-full", "hosted-e2e"):
             with self.subTest(job=job):
-                condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
+                condition = job_if(job)
                 self.assertNotIn("outputs.reuse", condition)
         ship = [body for name, body in reader.steps(JOBS["e2e-build"])
                 if name.startswith(("Bundle ", "Compress ")) or "upload-artifact" in body]
@@ -150,17 +178,17 @@ class Scheduling(unittest.TestCase):
                           " || (matrix.os == 'ubuntu-latest' && vars.CI_SCOPE == 'full')", body)
         for job in ("docker-base", "yarn-classic-matrix", "yarn-berry-e2e", "yarn-berry-e2e-macos"):
             with self.subTest(job=job):
-                condition = next(line for line in JOBS[job] if line.startswith("    if:"))
+                condition = job_if(job)
                 self.assertIn("needs.release-readiness.outputs.reuse != 'true'", condition)
         for family in ("e2e", "cargo-vex-matrix"):
             for suffix in ("", "-windows", "-macos"):
                 build = "e2e-build" + suffix
                 with self.subTest(job=family + suffix):
-                    condition = next(line for line in JOBS[family + suffix] if line.startswith("    if:"))
+                    condition = job_if(family + suffix)
                     self.assertIn(f"needs.{build}.outputs.reuse != 'true'", condition)
                     self.assertIn("      reuse: ${{ needs.release-readiness.outputs.reuse }}", JOBS[build])
         self.assertIn("needs.e2e-build.outputs.reuse != 'true'",
-                      next(line for line in JOBS["e2e-extended"] if line.startswith("    if:")))
+                      job_if("e2e-extended"))
         for job in ("test", "coverage", "cargo-old-toolchains"):
             with self.subTest(job=job):
                 warm = [body for name, body in reader.steps(JOBS[job]) if name.startswith("Warm ")]
@@ -196,7 +224,7 @@ class Scheduling(unittest.TestCase):
                      " || (github.event_name == 'push' && vars.CI_SCOPE == 'full')"
                      " || github.head_ref == 'release/v5-prerelease'")
         for job in JOBS:
-            condition = next((line for line in JOBS[job] if line.startswith("    if:")), "")
+            condition = job_if(job)
             with self.subTest(job=job):
                 self.assertEqual("needs.release-readiness.outputs.pr_unchanged != 'true'" in condition,
                                  job in gated)
@@ -204,7 +232,7 @@ class Scheduling(unittest.TestCase):
                     self.assertTrue(condition.endswith(") && needs.release-readiness.outputs.pr_unchanged != 'true'"))
         pr_tier = {job for job in JOBS if ancestors(job) & {"clippy", "release-readiness"}}
         for job in sorted(pr_tier - gated - {"hosted-e2e", "test-release"}):
-            condition = next(line for line in JOBS[job] if line.startswith("    if:"))
+            condition = job_if(job)
             with self.subTest(job=job):
                 # Ungated jobs wait on a gated build, never run on a PR, or run
                 # only on the v5 integration PR, which never reuses (below).
@@ -215,6 +243,54 @@ class Scheduling(unittest.TestCase):
         self.assertIn("python3 scripts/ci-reuse-pr-head.py", owner)
         self.assertIn("if: github.event_name == 'pull_request' && github.base_ref == 'main'"
                       " && github.head_ref != 'release/v5-prerelease'", owner)
+
+    def test_dispatch_os_runs_only_that_os(self):
+        # A Windows-only fix dispatches `-f os=windows` (#1818): its PR run
+        # and the queue already cover Linux, so the ~95 Linux and macOS
+        # nightly-tier jobs must not run again. clippy and release-readiness
+        # always run because every OS leg waits on them.
+        self.assertRegex(TEXT, r"(?m)^      os:\n(?:        #.*\n)*        description: .*\n"
+                               r"        type: choice\n        default: all\n"
+                               r"        options: \[all, linux, windows, macos\]$")
+        oses = ("linux", "windows", "macos")
+        excluded = {job: set(re.findall(r"inputs\.os != '([a-z]+)'", os_term(job) or ""))
+                    for job in JOBS}
+
+        def runs(job, os_name):
+            return all(os_name not in excluded[j] for j in {job} | ancestors(job))
+
+        def platforms(job):
+            # Matrix rows and a fixed runner name the OS; every runs-on
+            # mapping mentions ubuntu, and comments mention anything.
+            body = "\n".join(reader.strip_comment(line) for line in JOBS[job]
+                              if not line.startswith("    runs-on: ${{"))
+            found = {os_name for os_name in oses
+                     if re.search(rf"\b{'ubuntu' if os_name == 'linux' else os_name}-(latest|22\.04)", body)}
+            return found or {"linux"}
+
+        always = {"clippy", "release-readiness", "ci-ok", "windows-compile-check"}
+        for job in JOBS:
+            with self.subTest(job=job):
+                if job in always:
+                    self.assertIsNone(os_term(job))
+                    continue
+                if os_term(job) is not None:
+                    self.assertIn(os_term(job), OS_TERMS.values())
+                ran = {os_name for os_name in oses if runs(job, os_name)}
+                self.assertEqual(ran, platforms(job))
+        # Mixed-OS matrices narrow their rows to the requested OS.
+        self.assertIn("          - os: ${{ inputs.os == 'windows' && 'macos-latest'"
+                      " || inputs.os == 'macos' && 'windows-latest' || '' }}", JOBS["test"])
+        include = next(line for line in JOBS["yarn-berry-e2e"] if "include:" in line)
+        self.assertIn("""(inputs.os == 'windows' && '[{"os":"windows-latest","yarn":"4.12.0"}]'""", include)
+        self.assertIn("""inputs.os == 'linux' && '[{"os":"ubuntu-latest","yarn":"4.0.2"},""", include)
+        # Each OS still runs at least its build and one consumer.
+        for os_name, jobs in (("linux", {"e2e-build", "e2e", "coverage"}),
+                              ("windows", {"e2e-build-windows", "e2e-windows", "test"}),
+                              ("macos", {"e2e-build-macos", "e2e-macos", "test"})):
+            for job in jobs:
+                with self.subTest(os=os_name, job=job):
+                    self.assertTrue(runs(job, os_name))
 
     def test_late_draft_run_cannot_cancel_the_ready_run(self):
         # A push's draft-payload `synchronize` can land after `ready_for_review`

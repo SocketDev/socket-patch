@@ -77,9 +77,13 @@ class Tiers(unittest.TestCase):
                 # Nightly, dispatch (release-qa) and v5 landings, like
                 # e2e-docker: not on PRs, the merge queue or a lean push to
                 # main, where its 41 legs ran on every landing.
-                self.assertIn("    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
-                              " || (github.event_name == 'push' && vars.CI_SCOPE == 'full')"
-                              " || github.head_ref == 'release/v5-prerelease'\n", text)
+                # A job with no OS-gated ancestor carries the Linux-only
+                # term for `workflow_dispatch -f os=...` (#1818).
+                gate = ("github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+                        " || (github.event_name == 'push' && vars.CI_SCOPE == 'full')"
+                        " || github.head_ref == 'release/v5-prerelease'")
+                self.assertTrue(f"    if: {gate}\n" in text or f"    if: ({gate}) && (inputs.os != 'windows'"
+                                " && inputs.os != 'macos')\n" in text, text)
                 self.assertIn(f"steps: *{anchor}", text)
                 self.assertIn(f"steps: &{anchor}", TEXT)
 
