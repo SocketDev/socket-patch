@@ -906,12 +906,23 @@ pub async fn sweep_unindexed_tree_entries(
 }
 
 /// The tree files `entry` records, the index [`unindexed_tree_entries`]
-/// holds its directories to.
+/// holds its directories to. The ledger is committed and tamper-able, so
+/// only records inside the entry's own version directories count: a
+/// forged marker elsewhere names no directory to sweep.
 pub fn recorded_tree_files(entry: &VendorEntry) -> BTreeSet<String> {
+    let Ok((g, a, v)) = entry_gav(entry) else {
+        return BTreeSet::new();
+    };
+    let c = Coords {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid: &entry.uuid,
+    };
     entry
         .wiring
         .iter()
-        .filter(|w| w.kind == TREE_KIND)
+        .filter(|w| w.kind == TREE_KIND && record_allowed(w, &c))
         .map(|w| w.file.clone())
         .collect()
 }
@@ -1789,5 +1800,53 @@ mod tests {
         assert!(!root.join(tree_file("a-1-socket.1d3c1fd2.jar")).exists());
         assert!(root.join(tree_file("a-1-socket.1d3c1fd2.pom")).is_file());
         assert!(!sweep_replaced_tree(root, &prev, [&live]).await.unwrap());
+    }
+
+    /// #656: the sweep removes what the index does not list from the
+    /// entry's own tree (files, a stray directory, a symlink but not its
+    /// target) and nothing a forged ledger marker points elsewhere at.
+    #[tokio::test]
+    async fn sweep_unindexed_removes_only_strays_in_the_own_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let marker = tree_file(layout::MARKER_FILE);
+        let jar = tree_file("a-1-socket.1d3c1fd2.jar");
+        let peer = ".socket/vendor/maven2/g/b/1-socket.1d3c1fd2/b-1-socket.1d3c1fd2.jar";
+        for (rel, bytes) in [(&marker[..], "{}"), (&jar, "JAR"), (peer, "PEER")] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let own = root.join(tree_file(""));
+        std::fs::write(own.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir_all(own.join("backup")).unwrap();
+        std::fs::write(own.join("backup/old.jar"), "x").unwrap();
+        let outside = root.join("keep.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, own.join("link")).unwrap();
+
+        // A forged marker one level up would make `g/` a "tree" whose
+        // other artifacts are all unindexed.
+        let forged = format!(".socket/vendor/maven2/g/{}", layout::MARKER_FILE);
+        let indexed = recorded_tree_files(&entry(vec![
+            record(TREE_KIND, &marker),
+            record(TREE_KIND, &jar),
+            record(TREE_KIND, &forged),
+        ]));
+        assert_eq!(indexed, BTreeSet::from([marker.clone(), jar.clone()]));
+        let mut want = vec![tree_file(".DS_Store"), tree_file("backup")];
+        if cfg!(unix) {
+            want.push(tree_file("link"));
+        }
+        want.sort();
+        assert_eq!(unindexed_tree_entries(root, &indexed).unwrap(), want);
+
+        assert!(sweep_unindexed_tree_entries(root, &indexed).await.unwrap());
+        assert!(unindexed_tree_entries(root, &indexed).unwrap().is_empty());
+        assert!(root.join(&jar).is_file() && root.join(&marker).is_file());
+        assert!(root.join(peer).is_file(), "another tree is never swept");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        assert!(!sweep_unindexed_tree_entries(root, &indexed).await.unwrap());
     }
 }
