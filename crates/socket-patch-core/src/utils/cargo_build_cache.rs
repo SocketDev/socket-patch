@@ -58,6 +58,9 @@ pub fn build_dirs_with(
     env: &dyn Fn(&str) -> Option<String>,
     cargo_home: Option<&Path>,
 ) -> BuildDirs {
+    // `--cwd` defaults to `.`, whose `ancestors()` stop at `.`: walk the
+    // absolute path so a parent's `Cargo.lock` and `.cargo/config` count.
+    let cwd = &std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let env = |k: &str| env(k).filter(|v| !v.trim().is_empty());
     let ws_root = workspace_root(cwd);
     let config = ConfigDirs::read(cwd, cargo_home);
@@ -151,7 +154,9 @@ struct ConfigDirs {
 impl ConfigDirs {
     fn read(cwd: &Path, cargo_home: Option<&Path>) -> Self {
         let mut out = ConfigDirs::default();
-        for (file, base) in config_layer_paths(cwd, cargo_home, Path::is_file) {
+        for (file, base) in config_layer_paths(cwd, cargo_home, |p| {
+            crate::utils::group_commit::exists(p).unwrap_or_else(|| p.is_file())
+        }) {
             let text = crate::utils::fs::read_regular_to_string_sync(&file).ok();
             let Some(doc) = text.and_then(|t| t.parse::<toml_edit::DocumentMut>().ok()) else {
                 continue;
@@ -438,6 +443,33 @@ mod tests {
         assert_eq!(
             d.dirs,
             vec![std::fs::canonicalize(root.join("legacy")).unwrap()]
+        );
+    }
+
+    /// The default `--cwd .` still finds the workspace root and the
+    /// ancestor config above it.
+    #[test]
+    #[serial_test::serial]
+    fn build_dirs_walk_above_a_relative_cwd() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("ws");
+        let member = root.join("member");
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(root.join("Cargo.lock"), "").unwrap();
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"out\"\n",
+        )
+        .unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&member).unwrap();
+        let d = build_dirs_with(Path::new("."), &|_| None, None);
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(
+            d.dirs,
+            vec![std::fs::canonicalize(root.join("out")).unwrap()]
         );
     }
 
