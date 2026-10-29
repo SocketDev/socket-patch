@@ -149,12 +149,44 @@ impl VendorPreview {
         }
     }
 
-    /// Human rendering of the preview's refusals and symlink advisories:
-    /// the count line above it still says "would download and vendor", so
-    /// name what the wet run would refuse and why. Shared by `scan --mode
-    /// vendored --dry-run` and `get … --mode vendored --dry-run` so the two
-    /// cannot drift. Callers gate it on `--silent`.
-    pub(crate) fn print_refusals(&self) {
+    /// How many rows the ledger already holds at their uuid.
+    pub(crate) fn in_sync_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r.verdict, PreviewVerdict::AlreadyVendored))
+            .count()
+    }
+
+    /// The human `--dry-run` headline: every row, less the ones the wet
+    /// run would refuse or skip as already vendored (#1850). Shared by
+    /// `scan --mode vendored --dry-run` and `get … --mode vendored
+    /// --dry-run` so the two cannot drift.
+    pub(crate) fn dry_run_line(&self) -> String {
+        super::render::dry_run_line(
+            super::render::Plan::Vendor(self.rows.len()),
+            self.refused_count(),
+            self.in_sync_count(),
+        )
+    }
+
+    /// Human rendering of the rows the headline left out and of the
+    /// symlink advisories: a `[skip] … (already vendored)` line for each
+    /// in-sync row (stderr, the wet run's line and stream), then a
+    /// `[would-refuse]` line naming what the wet run would refuse and why.
+    /// Shared by `scan` and `get` like [`Self::dry_run_line`]. Callers gate
+    /// it on `--silent`.
+    pub(crate) fn print_rows(&self) {
+        for row in &self.rows {
+            if matches!(row.verdict, PreviewVerdict::AlreadyVendored) {
+                eprintln!(
+                    "{}",
+                    crate::commands::agent_download::format_record_skip(
+                        &row.purl,
+                        "already vendored"
+                    )
+                );
+            }
+        }
         for row in &self.rows {
             if let PreviewVerdict::WouldRefuse { code, detail } = &row.verdict {
                 println!("  [would-refuse] {} ({code}): {detail}", row.purl);
@@ -1478,6 +1510,48 @@ mod preview_tests {
         assert_eq!(v["summary"]["skipped"], 2);
         assert_eq!(v["status"], "success");
         assert_eq!(preview.refused_count(), 1);
+    }
+
+    /// #1850: the human dry-run headline, shared by `scan` and `get`,
+    /// leaves out what the JSON records as `already_vendored`, so it
+    /// never offers to vendor a patch the wet run skips as in sync.
+    #[tokio::test]
+    async fn preview_headline_leaves_out_already_vendored() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_entry(tmp.path(), NPM, UUID);
+        let in_sync = preview_vendor(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
+        assert_eq!(in_sync.in_sync_count(), 1);
+        assert_eq!(
+            in_sync.dry_run_line(),
+            "[dry-run] Would download and vendor 0 of 1 patch (1 already vendored). \
+             No changes made."
+        );
+
+        let other = "pkg:npm/preview-new@1.0.0";
+        let mixed = preview_vendor(
+            tmp.path(),
+            &[sel(UUID, NPM), sel(UUID, other), sel(UUID, PYPI)],
+            &[],
+            &HashMap::from([(
+                PYPI.to_string(),
+                ("vendor_test_refusal", "refused".to_string()),
+            )]),
+        )
+        .await;
+        assert_eq!(
+            mixed.dry_run_line(),
+            "[dry-run] Would download and vendor 1 of 3 patches (1 already vendored, \
+             1 would be refused). No changes made."
+        );
+
+        // Nothing in sync: the plain headline.
+        let fresh = tempfile::tempdir().unwrap();
+        let plain = preview_vendor(fresh.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
+        assert_eq!(plain.in_sync_count(), 0);
+        assert_eq!(
+            plain.dry_run_line(),
+            "[dry-run] Would download and vendor 1 patch. No changes made."
+        );
     }
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";

@@ -253,17 +253,30 @@ pub(super) enum Plan {
     Vendor(usize),
 }
 
-/// The `--dry-run` headline. `refused` counts the patches the vendored
-/// preflight would refuse (listed right after as `[would-refuse]` lines),
-/// so the headline never promises to vendor what the wet run refuses.
-pub(super) fn dry_run_line(plan: Plan, refused: usize) -> String {
+/// The `--dry-run` headline. For a vendored plan, `refused` counts the
+/// patches the vendored preflight would refuse (listed right after as
+/// `[would-refuse]` lines) and `in_sync` the ones the ledger already holds
+/// at this uuid (listed as `[skip] … (already vendored)` lines), so the
+/// headline never promises to vendor what the wet run refuses or skips
+/// (#1850).
+pub(super) fn dry_run_line(plan: Plan, refused: usize, in_sync: usize) -> String {
     let what = match plan {
         Plan::Apply(n) => format!("download and apply {}", plural(n, "patch", "patches")),
-        Plan::Vendor(n) if refused > 0 => format!(
-            "download and vendor {} of {} ({refused} would be refused)",
-            n.saturating_sub(refused),
-            plural(n, "patch", "patches")
-        ),
+        Plan::Vendor(n) if refused > 0 || in_sync > 0 => {
+            let mut why = Vec::new();
+            if in_sync > 0 {
+                why.push(format!("{in_sync} already vendored"));
+            }
+            if refused > 0 {
+                why.push(format!("{refused} would be refused"));
+            }
+            format!(
+                "download and vendor {} of {} ({})",
+                n.saturating_sub(refused + in_sync),
+                plural(n, "patch", "patches"),
+                why.join(", ")
+            )
+        }
         Plan::Vendor(n) => format!("download and vendor {}", plural(n, "patch", "patches")),
     };
     format!("[dry-run] Would {what}. No changes made.")
@@ -751,20 +764,34 @@ mod tests {
     #[test]
     fn dry_run_line_counts_refusals() {
         assert_eq!(
-            dry_run_line(Plan::Apply(1), 0),
+            dry_run_line(Plan::Apply(1), 0, 0),
             "[dry-run] Would download and apply 1 patch. No changes made."
         );
         assert_eq!(
-            dry_run_line(Plan::Vendor(2), 0),
+            dry_run_line(Plan::Vendor(2), 0, 0),
             "[dry-run] Would download and vendor 2 patches. No changes made."
         );
         assert_eq!(
-            dry_run_line(Plan::Vendor(2), 2),
+            dry_run_line(Plan::Vendor(2), 2, 0),
             "[dry-run] Would download and vendor 0 of 2 patches (2 would be refused). No changes made."
         );
         assert_eq!(
-            dry_run_line(Plan::Vendor(1), 1),
+            dry_run_line(Plan::Vendor(1), 1, 0),
             "[dry-run] Would download and vendor 0 of 1 patch (1 would be refused). No changes made."
+        );
+    }
+
+    #[test]
+    fn dry_run_line_counts_already_vendored() {
+        // #1850: an in-sync patch is not work the wet run would do.
+        assert_eq!(
+            dry_run_line(Plan::Vendor(1), 0, 1),
+            "[dry-run] Would download and vendor 0 of 1 patch (1 already vendored). No changes made."
+        );
+        assert_eq!(
+            dry_run_line(Plan::Vendor(4), 1, 2),
+            "[dry-run] Would download and vendor 1 of 4 patches (2 already vendored, \
+             1 would be refused). No changes made."
         );
     }
 
