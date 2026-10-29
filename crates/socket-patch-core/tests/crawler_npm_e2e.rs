@@ -1052,11 +1052,14 @@ async fn crawl_all_finds_declared_members_in_hidden_dirs() {
         ),
         (r#"[".config/tool"]"#, &[".config/tool"][..]),
         (r#"{"packages":[".github/**"]}"#, &[".github/actions/x"][..]),
-        // npm's and yarn's wildcards match a dot component.
-        (r#"["packages/*"]"#, &["packages/.hidden"][..]),
-        // A hidden dir below a skip-named one, and the other way round.
         (
-            r#"["build/*",".tools/*"]"#,
+            r#"["{.github/actions,tools}/*"]"#,
+            &[".github/actions/x"][..],
+        ),
+        // A dot the glob part spells, below a skip-named dir, and a
+        // skip-named member below a hidden one.
+        (
+            r#"["build/.*",".tools/*"]"#,
             &["build/.x", ".tools/dist"][..],
         ),
     ] {
@@ -1082,8 +1085,10 @@ async fn crawl_all_finds_declared_members_in_hidden_dirs() {
     }
 }
 
-/// #1827 control: a hidden dir no `workspaces` pattern declares, or one
-/// declared but without a `package.json`, stays pruned.
+/// #1827 control: a hidden dir no `workspaces` pattern declares, one
+/// declared but without a `package.json`, and one a wildcard reaches but
+/// no pattern spells (build output such as Nuxt's `.output/server`)
+/// stay pruned.
 #[tokio::test]
 #[serial_test::parallel]
 async fn crawl_all_still_skips_undeclared_hidden_dirs() {
@@ -1091,10 +1096,13 @@ async fn crawl_all_still_skips_undeclared_hidden_dirs() {
     let root = tmp.path();
     tokio::fs::write(
         root.join("package.json"),
-        r#"{"name":"root","private":true,"workspaces":["packages/*",".github/actions/*"]}"#,
+        r#"{"name":"root","private":true,"workspaces":["packages/*",".github/actions/*","apps/**"]}"#,
     )
     .await
     .unwrap();
+    // Reached only through a wildcard.
+    stage_member(root, "packages/.hidden").await;
+    stage_member(root, "apps/site/.output/server").await;
     // Undeclared: `.cache/tool` at the root and `packages/x/.out` below a
     // member, each a would-be member with its own `package.json`.
     stage_member(root, ".cache/tool").await;

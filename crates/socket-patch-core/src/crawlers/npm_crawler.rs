@@ -96,6 +96,13 @@ pub(super) fn skipped_workspace_member_roots(
     roots
 }
 
+/// Whether the workspace walk prunes a dir by its name alone: a hidden dir
+/// or a well-known build dir ([`SKIP_DIRS`]). Declared workspace members
+/// under such a name are added back by [`skipped_workspace_member_roots`].
+fn walk_prunes_name(name: &str) -> bool {
+    name.starts_with('.') || SKIP_DIRS.contains(&name)
+}
+
 /// [`skipped_workspace_member_roots`] for the one workspace root `root`. A
 /// member is a dir the root `package.json` `workspaces` patterns list in
 /// any package manager's reading ([`WorkspacesDialect::ALL`]: an extra root
@@ -104,10 +111,14 @@ pub(super) fn skipped_workspace_member_roots(
 /// allow (any depth for `**`, within [`WORKSPACE_GLOB_DIR_BUDGET`] dirs per
 /// pattern), with the walk's own rules: real dirs only (never a symlink),
 /// never a `node_modules` or a tagged cache dir below the root, literal
-/// prefix included. Hidden dirs are walked, as each dialect's matcher
-/// decides whether a wildcard matches a dot component. Names are read
-/// from the listings, so the pruned-name test sees each dir as the walk
-/// does even when a pattern spells it in another case.
+/// prefix included. A hidden dir counts only where the pattern spells the
+/// dot (`.github/actions/*`, `.config/tool`): the glob part descends into
+/// one only when it names a dot, and a path through one is read with no
+/// wildcard matching a dot component, as pnpm, Bun and vlt read it. So a
+/// `**` never spends its budget on `.git` or `.next`, and build output
+/// such as `.output/server` never becomes a member. Names are read from
+/// the listings, so the pruned-name test sees each dir as the walk does
+/// even when a pattern spells it in another case.
 fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
     use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
 
@@ -165,6 +176,7 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
             continue;
         }
         let rest = &segments[literal..];
+        let rest_names_dot = rest.iter().any(|s| s.contains('.'));
         let max_depth = if rest.contains(&"**") {
             usize::MAX
         } else {
@@ -180,21 +192,28 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
             if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
                 continue;
             }
-            if rel
-                .iter()
-                .any(|seg| seg.starts_with('.') || SKIP_DIRS.contains(&seg.as_str()))
-                && WorkspacesDialect::ALL
-                    .iter()
-                    .any(|&dialect| workspaces_include_as(&patterns, &rel, dialect))
-                && dir.join("package.json").is_file()
+            let hidden = rel.iter().any(|seg| seg.starts_with('.'));
+            if rel.iter().any(|seg| walk_prunes_name(seg))
                 && has_node_modules_dir(&dir, &listing)
+                && dir.join("package.json").is_file()
+                && WorkspacesDialect::ALL.iter().any(|&dialect| {
+                    let dialect = WorkspacesDialect {
+                        dot: dialect.dot && !hidden,
+                        ..dialect
+                    };
+                    workspaces_include_as(&patterns, &rel, dialect)
+                })
             {
                 roots.push(dir.join("node_modules"));
             }
             if depth >= max_depth {
                 continue;
             }
-            for entry in listing.entries.into_iter().filter(|e| walkable(e)) {
+            for entry in listing
+                .entries
+                .into_iter()
+                .filter(|e| walkable(e) && (rest_names_dot || !e.name_str.starts_with('.')))
+            {
                 let Some(left) = budget.checked_sub(1) else {
                     break;
                 };
@@ -3509,9 +3528,7 @@ impl NpmCrawler {
             .into_iter()
             .filter(|entry| {
                 entry.file_type.is_some_and(|ft| ft.is_dir())
-                    && !(entry.name_str == "node_modules"
-                        || entry.name_str.starts_with('.')
-                        || SKIP_DIRS.contains(&entry.name_str.as_str()))
+                    && !(entry.name_str == "node_modules" || walk_prunes_name(&entry.name_str))
             })
             .map(|entry| dir.join(&entry.name))
             .collect()

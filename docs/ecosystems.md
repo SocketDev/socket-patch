@@ -494,7 +494,9 @@ or `vendor`, except that a workspace member the root `package.json`
 `workspaces` field declares (a directory holding a `package.json` that any
 of npm, yarn or Bun reads the patterns as listing, such as `packages/build`,
 `vendor/lib`, or a GitHub Action kept at `.github/actions/<name>`) still has
-its own `node_modules` crawled. npm, yarn and
+its own `node_modules` crawled. A hidden directory counts only where a
+pattern spells its dot (`.github/actions/*`, `.config/tool`); a wildcard
+alone never reaches one. npm, yarn and
 Bun install a member's unhoistable dependencies there from the root lock.
 It also prunes every directory that carries a
 [Cache Directory Tagging](https://bford.info/cachedir/) `CACHEDIR.TAG` file
