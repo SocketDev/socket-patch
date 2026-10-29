@@ -62,7 +62,7 @@ use super::{Ctx, FormatResult, HostedPin, UpstreamClient, View};
 use crate::formats::gem::{
     bundler_manifest_for, parse_spec, same_remote, split_checksum_entry, BUNDLER_LOCKS,
 };
-use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::utils::line_endings::{self, to_lf, LineEndings};
 use crate::vendor::gem::{gem_declaration_any, quoted_literal};
 
 /// The default upstream `GEM` remote.
@@ -1178,7 +1178,14 @@ fn line_before_start(text: &str, at: usize) -> usize {
 }
 
 fn restore_manifest(text: &str, block: &Block, gem: &Gem<'_>, decl: &Decl) -> String {
-    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    // The restored line takes the block's ending: the rewriter writes it in
+    // the ending of the line it replaced (#1831). A block in LF, the only
+    // spelling before #1831, takes the ending of the lines around it.
+    let eol = if text[block.start..block.end].contains("\r\n") {
+        "\r\n"
+    } else {
+        line_endings::terminator(&format!("{}{}", &text[..block.start], &text[block.end..]))
+    };
     let mut start = block.start;
     let replacement = match decl {
         // The append's own blank separator goes with it.
@@ -1785,7 +1792,7 @@ mod tests {
             run(&t, &direct),
             "group :test do\n  gem \"rails\", \"7.0.0\", require: false\nend\n"
         );
-        // CRLF manifest (the rewriter wrote its block in LF).
+        // CRLF manifest, its block in LF (written before #1831).
         let t = format!("source \"https://rubygems.org\"\r\ngem \"puma\"\r\n{block}\n");
         assert_eq!(
             run(&t, &direct),

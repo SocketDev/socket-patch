@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::formats::yarn::berry_gates::{self, Yarnrc};
 use crate::utils::digest::is_hex64_lower;
+use crate::utils::line_endings;
 #[cfg(test)]
 use crate::utils::line_endings::LineEndings;
 use crate::vendor::common::{parse_json_text, JsonLayout};
@@ -7649,7 +7650,8 @@ pub(crate) fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> Strin
 /// divergence the rewriter itself created. Trailing whitespace is trimmed (a
 /// block appended to a newline-less file adds a final newline the other
 /// spelling never had). `\r?` mirrors the block recognizer in `rewrite_gem`:
-/// a `core.autocrlf` checkout rewrites run 1's LF block to CRLF, and a block
+/// a CRLF manifest gets a CRLF block (#1831) and a `core.autocrlf` checkout
+/// rewrites run 1's LF block to CRLF, and a block
 /// the recognizer accepts must also be erased here or the re-run is trapped
 /// behind the divergence warning before it can reach the recognizer.
 fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
@@ -7950,10 +7952,11 @@ fn rewrite_gem(
             // Wildcard the rotating segments instead (mirrors the CHECKSUMS
             // at-target guard below).
             let url_pat = gem_index_url_pattern(dep, &ov.index_url);
-            // `\r?\n`: the rewriter emits LF, but a `core.autocrlf` checkout
-            // rewrites the working tree to CRLF — the guard must still
-            // recognize the block there, or the indented `gem` line inside
-            // it falls through to `gem_line_re` and gets wrapped again.
+            // `\r?\n`: the rewriter writes a CRLF Gemfile's block in CRLF
+            // (#1831), and a `core.autocrlf` checkout rewrites an LF one to
+            // CRLF — the guard must recognize the block either way, or the
+            // indented `gem` line inside it falls through to `gem_line_re`
+            // and gets wrapped again.
             let block_re = Regex::new(
                 &(String::from(r#"(?m)^source "("#)
                     + &url_pat
@@ -8004,8 +8007,24 @@ fn rewrite_gem(
                     let raw_tail = m
                         .get(2)
                         .expect("gem_line_re always captures group 2 (tail)")
-                        .as_str()
-                        .to_string();
+                        .as_str();
+                    // The CR of a CRLF line is its ending, not part of the
+                    // declaration: the block's own lines take that ending
+                    // and the CR goes back at its end (#1831). An
+                    // unterminated last line (a lone trailing CR included)
+                    // takes the file's.
+                    let terminated = range.end < gf.len();
+                    let cr = if terminated && raw_tail.ends_with('\r') {
+                        "\r"
+                    } else {
+                        ""
+                    };
+                    let raw_tail = raw_tail.strip_suffix('\r').unwrap_or(raw_tail).to_string();
+                    let nl = match (cr, terminated) {
+                        ("\r", _) => "\r\n",
+                        (_, true) => "\n",
+                        _ => line_endings::terminator(gf),
+                    };
                     // A parenthesized call keeps its closing `)` in the tail:
                     // strip it (dropping any comment with it), or fail closed
                     // when it is absent (the call continues past this line).
@@ -8075,12 +8094,12 @@ fn rewrite_gem(
                     let opts = gemfile::trailing_options(&tail);
                     let block = if opts.is_empty() {
                         format!(
-                            "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
+                            "source \"{}\" do{nl}  gem \"{}\", \"{}\"{nl}end",
                             ov.index_url, dep.name, dep.version
                         )
                     } else {
                         format!(
-                            "source \"{}\" do\n  gem \"{}\", \"{}\", {opts}\nend",
+                            "source \"{}\" do{nl}  gem \"{}\", \"{}\", {opts}{nl}end",
                             ov.index_url, dep.name, dep.version
                         )
                     };
@@ -8089,6 +8108,7 @@ fn rewrite_gem(
                     // duplicate earlier in the file and corrupt it (and the
                     // block may carry user text a regex replacement would
                     // `$`-expand).
+                    let block = format!("{block}{cr}");
                     gf.replace_range(range, &block);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
@@ -8131,9 +8151,11 @@ fn rewrite_gem(
                     });
                     continue;
                 } else {
-                    // Genuinely undeclared (a transitive dep): append a block.
+                    // Genuinely undeclared (a transitive dep): append a block
+                    // in the file's line endings (#1831).
+                    let eol = line_endings::terminator(gf);
                     let block = format!(
-                        "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
+                        "source \"{}\" do{eol}  gem \"{}\", \"{}\"{eol}end",
                         ov.index_url, dep.name, dep.version
                     );
                     // Always one blank line before the block: the in-place
@@ -8141,13 +8163,12 @@ fn rewrite_gem(
                     // declaration, so this is what lets `rollback` /
                     // `remove` prove the block is this append and drop it
                     // instead of restoring a direct exact pin (#457).
-                    let eol = if gf.contains("\r\n") { "\r\n" } else { "\n" };
                     let sep = if gf.is_empty() || gf.ends_with('\n') {
                         eol.to_string()
                     } else {
                         eol.repeat(2)
                     };
-                    *gf = format!("{gf}{sep}{block}\n");
+                    *gf = format!("{gf}{sep}{block}{eol}");
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
                         path: gemfile_name.into(),
@@ -18019,6 +18040,124 @@ mod tests {
         );
     }
 
+    /// #1831: the Socket source block takes the CRLF endings of the Gemfile
+    /// it is written into, for a rewritten direct declaration (plain, with
+    /// options, parenthesized, inside a user `source … do` block, on an
+    /// unterminated last line) and for the block appended for a transitive
+    /// gem. The re-run over the result is a no-op.
+    #[test]
+    fn gemfile_source_block_keeps_crlf_line_endings() {
+        let direct = gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails"]);
+        let transitive = gem_lock_resolving(
+            &[
+                ("puma", "6.0.0", &["rails (>= 0)"]),
+                ("rails", "7.0.0", &[]),
+            ],
+            &["puma"],
+        );
+        let head = "source \"https://rubygems.org\"\r\n\r\n";
+        let block = "source \"https://patch.test/gem/tok/uuid/\" do\r\n  gem \"rails\", \"7.0.0\"";
+        for (gemfile, lock, want) in [
+            (
+                format!("{head}gem \"rails\"\r\n"),
+                &direct,
+                format!("{block}\r\nend\r\n"),
+            ),
+            (
+                format!("{head}gem \"rails\", require: false # boot\r\n"),
+                &direct,
+                format!("{block}, require: false # boot\r\nend\r\n"),
+            ),
+            (
+                format!("{head}gem(\"rails\")\r\n"),
+                &direct,
+                format!("{block}\r\nend\r\n"),
+            ),
+            (
+                format!("{head}source \"https://gems.example\" do\r\n  gem \"rails\"\r\nend\r\n"),
+                &direct,
+                format!("do\r\n{block}\r\nend\r\nend\r\n"),
+            ),
+            (
+                format!("{head}gem \"rails\""),
+                &direct,
+                format!("{block}\r\nend"),
+            ),
+            // A lone CR at the end of the file is not a line ending.
+            (
+                format!("{head}gem \"rails\"\r"),
+                &direct,
+                format!("{block}\r\nend"),
+            ),
+            (
+                format!("{head}gem \"puma\"\r\n"),
+                &transitive,
+                format!("gem \"puma\"\r\n\r\n{block}\r\nend\r\n"),
+            ),
+            (
+                format!("{head}gem \"puma\""),
+                &transitive,
+                format!("gem \"puma\"\r\n\r\n{block}\r\nend\r\n"),
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.clone());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let res = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            let out = res
+                .files
+                .get("Gemfile")
+                .unwrap_or_else(|| panic!("{gemfile:?} is redirected: {:?}", res.warnings));
+            assert_eq!(
+                LineEndings::of(out),
+                LineEndings::Crlf,
+                "{gemfile:?}: mixed line endings: {out:?}"
+            );
+            assert!(out.ends_with(&want), "{gemfile:?}: {out:?}");
+
+            files.insert("Gemfile".to_string(), out.clone());
+            files.insert(
+                "Gemfile.lock".to_string(),
+                res.files
+                    .get("Gemfile.lock")
+                    .cloned()
+                    .unwrap_or_else(|| lock.to_string()),
+            );
+            let again = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            assert!(
+                !again.files.contains_key("Gemfile"),
+                "{gemfile:?}: re-run rewrote the Gemfile: {:?}",
+                again.files.get("Gemfile")
+            );
+        }
+    }
+
+    /// #1831: an LF Gemfile still gets an LF block, and a line ending in LF
+    /// inside a mostly-CRLF file keeps its own LF (the block takes the
+    /// ending of the line it replaces).
+    #[test]
+    fn gemfile_source_block_keeps_lf_line_endings() {
+        let direct = gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails"]);
+        for (gemfile, want) in [
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\"\n",
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend\n",
+            ),
+            (
+                "source \"https://rubygems.org\"\r\n\r\ngem \"rails\"\n",
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend\n",
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), direct.clone());
+            let res = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            let out = res.files.get("Gemfile").expect("redirected");
+            assert!(out.ends_with(want), "{gemfile:?}: {out:?}");
+            assert!(!out.contains("\r\r"), "{out:?}");
+        }
+    }
+
     /// A gem-level source option (`git:` / `path:` / `github:` / `source:`)
     /// preserved into the Socket source block OVERRIDES it in bundler's DSL,
     /// leaving the redirect a silent no-op that still gets attested. Fail
@@ -18762,10 +18901,12 @@ mod tests {
                 r.warnings
             );
             let out = r.files.get("Gemfile").expect("declaration rewritten");
+            // A CRLF declaration's block takes its CRLF (#1831).
+            let nl = if decl.ends_with('\r') { "\r\n" } else { "\n" };
             let want = if opts.is_empty() {
-                "  gem \"vuln-gem\", \"1.0.0\"\nend".to_string()
+                format!("  gem \"vuln-gem\", \"1.0.0\"{nl}end")
             } else {
-                format!("  gem \"vuln-gem\", \"1.0.0\", {opts}\nend")
+                format!("  gem \"vuln-gem\", \"1.0.0\", {opts}{nl}end")
             };
             assert!(out.contains(&want), "{decl:?}: {out}");
         }
