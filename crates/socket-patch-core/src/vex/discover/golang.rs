@@ -1836,9 +1836,11 @@ mod tests {
             );
         }
         let elsewhere = p.root().join("a").join("go.work");
+        // Absolute on this platform: `/nonexistent` has no drive on Windows.
+        let missing = p.root().join("nonexistent").join("go.work");
         for (gowork, why) in [
             ("go.work".to_string(), "not an absolute path"),
-            ("/nonexistent/go.work".to_string(), "other than"),
+            (missing.to_string_lossy().into_owned(), "other than"),
             (elsewhere.to_string_lossy().into_owned(), "other than"),
         ] {
             let out = extract(Some(gowork.clone())).await;
