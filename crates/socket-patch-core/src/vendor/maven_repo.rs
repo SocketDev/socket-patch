@@ -975,6 +975,13 @@ async fn vendor_maven_jvm(
         Ok(plan) => plan,
         Err(refusal) => return refused(refusal.code, refusal.detail),
     };
+    if matches!(shape, Shape::MavenReactor | Shape::Mixed) {
+        if let Err(refusal) =
+            super::jvm::maven_reactor::refuse_unwired(&read, &patch.coords(), &plan)
+        {
+            return refused(refusal.code, refusal.detail);
+        }
+    }
     if gradle
         && reader
             .read(super::jvm::gradle::VERIFICATION_REL)

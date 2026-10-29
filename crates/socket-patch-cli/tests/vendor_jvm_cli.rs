@@ -1156,7 +1156,8 @@ fn gradle_vendor_533_unpatched_classifier_copy_withholds_vex() {
 /// #513 / #459: a reactor `${prop}` version that can't be pinned with
 /// certainty (undefined in the checkout, or raised by a profile) is left
 /// as is with a warning, and `vex` does not attest the package the build
-/// still takes unpatched.
+/// still takes unpatched. With nothing else to wire, `vendor` refuses
+/// rather than counting the patch as applied (#513).
 #[test]
 fn maven_reactor_uncertain_property_version_withholds_vex() {
     let cases = [
@@ -1199,6 +1200,25 @@ fn maven_reactor_uncertain_property_version_withholds_vex() {
             let b = pristine.replace("<artifactId>a</artifactId>", "<artifactId>b</artifactId>");
             write(root, "proj/b/pom.xml", b.as_bytes());
         }
+        let vex = root.join("vex.json");
+        if !sibling {
+            assert_refused(root, "nothing_wired", reason);
+            let (_, env) = socket(
+                root,
+                &[
+                    "vex",
+                    "-O",
+                    vex.to_str().unwrap(),
+                    "--product",
+                    "pkg:generic/x@1",
+                ],
+            );
+            if let Ok(bytes) = std::fs::read(&vex) {
+                let doc = String::from_utf8_lossy(&bytes);
+                assert!(!doc.contains("not_affected"), "{reason}: {env}");
+            }
+            continue;
+        }
         let env = ok(root, &["vendor"]);
         assert!(
             env.to_string().contains(&format!("reason: {reason}")),
@@ -1208,12 +1228,7 @@ fn maven_reactor_uncertain_property_version_withholds_vex() {
             std::fs::read_to_string(root.join("proj/a/pom.xml")).unwrap(),
             a
         );
-        assert_eq!(
-            wiring_text(root).contains("-socket."),
-            sibling,
-            "{reason}: wired"
-        );
-        let vex = root.join("vex.json");
+        assert!(wiring_text(root).contains("-socket."), "{reason}: wired");
         let (_, env) = socket(
             root,
             &[
