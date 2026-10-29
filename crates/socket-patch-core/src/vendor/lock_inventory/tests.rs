@@ -3254,6 +3254,37 @@ async fn already_vendored_requirements_lines_stay_in_the_inventory() {
     }
 }
 
+/// #977: pip never reads the `socket-patch vendor:` tag, so a vendored line
+/// whose tag was edited away or stripped still installs the package and is
+/// named by its wheel. A tag naming another package still keeps it out.
+#[tokio::test]
+async fn vendored_requirements_lines_without_their_tag_stay_in_the_inventory() {
+    const UUID: &str = "55555555-5555-5555-5555-555555555555";
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "requirements.txt",
+        &format!(
+            "./.socket/vendor/pypi/{UUID}/requests-2.28.1-py3-none-any.whl \
+             --hash=sha256:{sha}\n\
+             ./.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl  # CVE fix\n\
+             ./.socket/vendor/pypi/{UUID}/idna-3.7-py3-none-any.whl  \
+             # socket-patch vendor: urllib3==1.26.18\n",
+            sha = "c".repeat(64),
+        ),
+    )
+    .await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("requests".to_string(), "2.28.1".to_string()),
+            ("six".to_string(), "1.16.0".to_string()),
+        ],
+        "{entries:?}"
+    );
+}
+
 /// The vendored writer's OWN output must re-inventory: build the line with
 /// the writer's formatter and feed it straight back in.
 #[tokio::test]

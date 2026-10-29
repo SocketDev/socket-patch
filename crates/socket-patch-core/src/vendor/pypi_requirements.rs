@@ -316,10 +316,8 @@ fn vendor_lines<'a>(
         let parts = super::path::parse_vendor_path(token).filter(|p| p.eco == "pypi")?;
         let named = match comment.and_then(vendor_tag) {
             Some((name, _)) => name == canon_name,
-            None => {
-                let file = parts.leaf.rsplit('/').next().unwrap_or_default();
-                super::pypi_distribution::distribution_name(file).as_deref() == Some(canon_name)
-            }
+            None => super::lock_inventory::pypi::socket_reference_coords(token)
+                .is_some_and(|(name, _)| name == canon_name),
         };
         named.then(|| (parts, token.to_string(), code.to_string()))
     })
@@ -330,30 +328,45 @@ fn vendor_lines<'a>(
 /// of the recorded line is paired first; then a line whose code part (what
 /// pip reads) is the recorded one's, so an edit to the trailing
 /// `# socket-patch vendor:` comment alone — respaced, a note appended, the
-/// comment stripped — is not drift (#977). Each pass pairs bottom-up, so
-/// identical vendor lines pair with their own records.
+/// comment stripped — is not drift (#977). Records that wrote the same line
+/// then take their paired lines in file order, so identical vendor lines
+/// pair with their own records whichever of them the user edited.
 fn pair_recorded_lines(lines: &[Line], recorded: &[Option<&str>]) -> Vec<Option<usize>> {
-    let code_of = |text: &str| split_comment(text).0.trim().to_string();
-    let same = |line: &str, rec: &str, by_code: bool| {
-        if !by_code {
-            return line.trim() == rec.trim();
-        }
-        let code = code_of(rec);
-        !code.is_empty() && code_of(line) == code
-    };
+    fn code_of(text: &str) -> &str {
+        split_comment(text).0.trim()
+    }
     let mut paired: Vec<Option<usize>> = vec![None; recorded.len()];
-    let mut taken: HashSet<usize> = HashSet::new();
     for by_code in [false, true] {
-        for (slot, rec) in paired.iter_mut().zip(recorded) {
-            let (None, Some(rec)) = (*slot, rec) else {
+        for i in 0..recorded.len() {
+            let Some(rec) = recorded[i].filter(|_| paired[i].is_none()) else {
                 continue;
             };
-            *slot = (0..lines.len())
-                .rev()
-                .find(|i| !taken.contains(i) && same(&lines[*i].text, rec, by_code));
-            if let Some(idx) = *slot {
-                taken.insert(idx);
-            }
+            let rec_code = code_of(rec);
+            paired[i] = (0..lines.len()).rev().find(|idx| {
+                let line = lines[*idx].text.as_str();
+                !paired.contains(&Some(*idx))
+                    && if by_code {
+                        !rec_code.is_empty() && code_of(line) == rec_code
+                    } else {
+                        line.trim() == rec.trim()
+                    }
+            });
+        }
+    }
+    // Bottom-up record order: the first record of a group of identical
+    // lines takes the group's bottom-most line.
+    for i in 0..recorded.len() {
+        let group: Vec<usize> = (0..recorded.len())
+            .filter(|j| recorded[*j].is_some() && recorded[*j] == recorded[i])
+            .collect();
+        if group.first() != Some(&i) {
+            continue;
+        }
+        let mut idxs: Vec<usize> = group.iter().filter_map(|j| paired[*j]).collect();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        let members: Vec<usize> = group.into_iter().filter(|j| paired[*j].is_some()).collect();
+        for (j, idx) in members.into_iter().zip(idxs) {
+            paired[j] = Some(idx);
         }
     }
     paired
@@ -3020,6 +3033,28 @@ mod tests {
         );
     }
 
+    /// #977: identical vendor lines whose originals differ pair with their
+    /// own records when only one of them had its comment edited.
+    #[tokio::test]
+    async fn revert_pairs_identical_vendor_lines_in_order_after_an_edit() {
+        let original = "six==1.16.0\nidna==3.7\nsix == 1.16.0\n";
+        let tmp = write_root(original).await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(wiring.len(), 2);
+        let wired = read_root(tmp.path()).await;
+        let line = wired.lines().next().unwrap().to_string();
+        let edited = format!("{line}\nidna==3.7\n{line}  # CVE fix\n");
+        assert_eq!(wired, format!("{line}\nidna==3.7\n{line}\n"));
+        tokio::fs::write(tmp.path().join("requirements.txt"), &edited)
+            .await
+            .unwrap();
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(read_root(tmp.path()).await, original);
+    }
+
     /// #977: a vendor line whose comment was edited or stripped still routes
     /// the package to this patch's wheel, so a re-run of `vendor` is in sync
     /// rather than appending a second `(transitive)` line for the same wheel.
@@ -3285,7 +3320,8 @@ mod tests {
     // ── preflight / vendored_uuid_for ────────────────────────────────────
 
     /// `vendored_uuid_for` must recognize ONLY this module's own line shape
-    /// for the queried package: another package's tag, a name-prefix tag
+    /// for the queried package (its tag, or with the tag edited away the
+    /// wheel's own name, #977): another package's tag, a name-prefix tag
     /// (`sixty`), a non-vendor path token, and a foreign-ecosystem vendor
     /// path are all invisible. Each false positive would misroute preflight
     /// into InSync (skipping the wire) or an already-vendored refusal for a

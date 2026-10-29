@@ -35,24 +35,6 @@ pub(crate) fn matches(name: &str, package: &str, version: &str) -> bool {
         })
 }
 
-/// The PEP 503-normalized distribution a wheel or sdist file name names:
-/// a wheel's leading `<name>` field, an sdist's `<name>` before its last
-/// `-<version>`. `None` for a name [`supported`] rejects.
-pub(crate) fn distribution_name(name: &str) -> Option<String> {
-    if !supported(name) {
-        return None;
-    }
-    let dist = match name.strip_suffix(".whl") {
-        Some(stem) => stem.split('-').next(),
-        None => [".tar.gz", ".tgz", ".zip"]
-            .iter()
-            .find_map(|suffix| name.strip_suffix(suffix))
-            .and_then(|stem| stem.rsplit_once('-'))
-            .map(|(dist, _)| dist),
-    }?;
-    (!dist.is_empty()).then(|| canonicalize_pypi_name(dist))
-}
-
 pub(crate) fn read_members(bytes: &[u8], name: &str) -> Result<HashMap<String, Vec<u8>>, String> {
     let members = if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         crate::patch::package::read_sdist_tar_bytes_to_map_strict(bytes)
