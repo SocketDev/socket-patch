@@ -291,9 +291,16 @@ pub struct ApiClient {
     /// `/patch/batch` POSTs and the legacy per-package GETs they degrade
     /// to. Shared by clones, so concurrent [`Self::search_patches_batch`]
     /// calls on one client (scan's batch windows) stay within
-    /// [`PROXY_BATCH_PATH_CONCURRENCY`] requests in total: the peak the
-    /// serial batch loop reached, never that peak times the window.
+    /// [`Self::proxy_batch_cap`] requests in total, never that cap times
+    /// the window.
     proxy_batch_slots: Arc<tokio::sync::Semaphore>,
+    /// The public proxy's in-flight cap
+    /// ([`crate::utils::concurrent::api_concurrency`]), read when the
+    /// client is built: the size of [`Self::proxy_batch_slots`] and of the
+    /// legacy per-package fallback's groups. `SOCKET_API_CONCURRENCY` and
+    /// a tight `RLIMIT_NOFILE` lower it here as in every other patch-API
+    /// window (#614).
+    proxy_batch_cap: usize,
     /// The vendor loop's download plan, while one is attached
     /// ([`Self::prefetch_vendor_packages`]): [`Self::fetch_vendor_package`]
     /// takes a planned uuid's outcome from it instead of requesting it.
@@ -320,11 +327,6 @@ enum Sent {
         gave_up: Option<String>,
     },
 }
-
-/// Most requests the public proxy's batch path keeps in flight per client:
-/// the legacy per-package fallback's fan-out (one call runs its PURLs in
-/// groups of this size), and the cap all concurrent calls share.
-const PROXY_BATCH_PATH_CONCURRENCY: usize = 10;
 
 /// Retry policy for the vendoring service's package-reference POST and
 /// archive GET: `attempts` tries in total, exponential delays from `base`
@@ -455,6 +457,7 @@ impl ApiClient {
             ApiRoute::Proxy => None,
         };
 
+        let proxy_batch_cap = crate::utils::concurrent::api_concurrency(true);
         Self {
             client: api_client(api_token.as_deref(), &timeouts),
             plain: plain_client(&timeouts),
@@ -464,7 +467,8 @@ impl ApiClient {
             org_unresolved: None,
             vendor_retry: VendorRetryPolicy::default(),
             vendor_outage: Arc::new(AtomicU32::new(0)),
-            proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(PROXY_BATCH_PATH_CONCURRENCY)),
+            proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(proxy_batch_cap)),
+            proxy_batch_cap,
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
             api_retry: ApiRetry::from_env(),
         }
@@ -1000,8 +1004,8 @@ impl ApiClient {
     /// proxy gained `POST /patch/batch`, this is the legacy path for
     /// deployments that predate it.
     ///
-    /// Processes PURLs in batches of `PROXY_BATCH_PATH_CONCURRENCY` to
-    /// avoid overwhelming the server while remaining efficient; each GET
+    /// Processes PURLs in groups of [`Self::proxy_batch_cap`] to avoid
+    /// overwhelming the server while remaining efficient; each GET
     /// also takes a [`Self::proxy_batch_slots`] slot, so concurrent calls
     /// on one client share that cap instead of multiplying it.
     async fn search_patches_batch_via_individual_queries(
@@ -1016,12 +1020,12 @@ impl ApiClient {
         // would drop the package from the scan without a word.
         let mut throttled: Option<(usize, ApiError)> = None;
 
-        for (chunk_idx, chunk) in purls.chunks(PROXY_BATCH_PATH_CONCURRENCY).enumerate() {
+        for (chunk_idx, chunk) in purls.chunks(self.proxy_batch_cap).enumerate() {
             // Use tokio::JoinSet for concurrent execution within each chunk
             let mut join_set = tokio::task::JoinSet::new();
 
             for (offset, purl) in chunk.iter().enumerate() {
-                let index = chunk_idx * PROXY_BATCH_PATH_CONCURRENCY + offset;
+                let index = chunk_idx * self.proxy_batch_cap + offset;
                 let purl = purl.clone();
                 let client = self.clone();
                 join_set.spawn(async move {
@@ -6209,9 +6213,13 @@ mod proxy_batch_path_cap_tests {
     //! Concurrent `search_patches_batch` calls on one public-proxy client
     //! (scan's batch windows) must share the batch path's in-flight cap,
     //! not multiply it: when every chunk degrades to the legacy per-package
-    //! GETs, the proxy sees at most `PROXY_BATCH_PATH_CONCURRENCY` of them
-    //! at once — what the serial batch loop peaked at.
+    //! GETs, the proxy sees at most `api_concurrency(true)` of them at
+    //! once: the one patch-API pacing policy (#614).
+    //!
+    //! Serial with the other tests that set `SOCKET_API_CONCURRENCY`: the
+    //! client reads it when it is built.
     use super::*;
+    use crate::utils::concurrent::{api_concurrency, API_CONCURRENCY_ENV};
     use std::sync::Mutex;
     use std::time::Instant;
     use wiremock::matchers::{method, path, path_regex};
@@ -6256,8 +6264,10 @@ mod proxy_batch_path_cap_tests {
             .unwrap_or(0)
     }
 
-    #[tokio::test]
-    async fn concurrent_batches_share_the_legacy_fallback_cap() {
+    /// Four windows of 10 PURLs, every chunk rejected by a validation 400
+    /// and degraded to per-package GETs, run concurrently on one public
+    /// proxy client. Returns the peak number of GETs in flight.
+    async fn fallback_peak_in_flight() -> usize {
         let server = MockServer::start().await;
         // A validation 400 for every chunk: each degrades to per-package
         // GETs (one exotic PURL per chunk is enough in the wild).
@@ -6281,7 +6291,7 @@ mod proxy_batch_path_cap_tests {
         // Four windows of 10 PURLs, as scan's proxy batch windows run them.
         let chunks: Vec<Vec<String>> = (0..4)
             .map(|c| {
-                (0..PROXY_BATCH_PATH_CONCURRENCY)
+                (0..10)
                     .map(|i| format!("pkg:npm/cap-{c}-{i}@1.0.0"))
                     .collect()
             })
@@ -6299,13 +6309,53 @@ mod proxy_batch_path_cap_tests {
 
         let arrivals = arrivals.lock().unwrap();
         assert_eq!(arrivals.len(), 40, "one GET per PURL");
-        let peak = peak_in_flight(&arrivals);
+        peak_in_flight(&arrivals)
+    }
+
+    /// Set [`API_CONCURRENCY_ENV`] to `value` (`None` unsets it) for the
+    /// guard's lifetime.
+    struct EnvGuard(Option<String>);
+
+    impl EnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let orig = std::env::var(API_CONCURRENCY_ENV).ok();
+            match value {
+                Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+                None => std::env::remove_var(API_CONCURRENCY_ENV),
+            }
+            Self(orig)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+                None => std::env::remove_var(API_CONCURRENCY_ENV),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn concurrent_batches_share_the_legacy_fallback_cap() {
+        let _env = EnvGuard::set(None);
+        let cap = api_concurrency(true);
+        let peak = fallback_peak_in_flight().await;
         assert!(
-            peak <= PROXY_BATCH_PATH_CONCURRENCY,
-            "{peak} by-package GETs in flight at once; the cap is \
-             {PROXY_BATCH_PATH_CONCURRENCY}"
+            peak <= cap,
+            "{peak} by-package GETs in flight at once; the cap is {cap}"
         );
         // And the cap is reached, not undershot: the calls still overlap.
-        assert_eq!(peak, PROXY_BATCH_PATH_CONCURRENCY);
+        assert_eq!(peak, cap);
+    }
+
+    /// `SOCKET_API_CONCURRENCY=1` makes the per-package fallback serial,
+    /// like every other patch-API window (#614).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_legacy_fallback_honors_the_concurrency_override() {
+        let _env = EnvGuard::set(Some("1"));
+        assert_eq!(fallback_peak_in_flight().await, 1);
     }
 }
