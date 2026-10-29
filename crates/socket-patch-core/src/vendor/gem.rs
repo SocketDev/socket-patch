@@ -2339,7 +2339,12 @@ async fn revert_gemfile_record(
                 // ALREADY CONVERGED: the pre-vendor line is back (a hand
                 // restore, a `bundle update` regeneration, an earlier partial
                 // revert) — not drift, nothing to write.
-                if lines.contains(&original) {
+                // Either line ending: a re-checkout may have changed it.
+                let original = original.strip_suffix('\r').unwrap_or(original);
+                if lines
+                    .iter()
+                    .any(|l| l.strip_suffix('\r').unwrap_or(l) == original)
+                {
                     return Ok(RecordRevert::Done);
                 }
                 return Ok(gemfile_left_without_our_line(text, written));
@@ -2352,17 +2357,17 @@ async fn revert_gemfile_record(
             // A re-checkout may have changed the block's line endings since
             // vendor wrote it (`core.autocrlf`): look for it as written, then
             // as the file now spells its lines.
-            let respelled;
-            let mut written = written;
-            if !text.contains(written) {
-                respelled = line_endings::respell(written, line_endings::terminator(text));
-                written = &respelled;
+            let mut written = std::borrow::Cow::Borrowed(written);
+            let mut found = text.find(&*written);
+            if found.is_none() {
+                written = line_endings::respell(&written, line_endings::terminator(text)).into();
+                found = text.find(&*written);
             }
-            let Some(at) = text.find(written) else {
+            let Some(at) = found else {
                 // ALREADY CONVERGED: an Added block's reverted state is its
                 // absence (the LIVENESS CONTRACT's "key is absent" case) —
                 // unless an edited copy of it still wires the gem in.
-                return Ok(gemfile_left_without_our_line(text, written));
+                return Ok(gemfile_left_without_our_line(text, &written));
             };
             let mut out = String::with_capacity(text.len());
             out.push_str(&text[..at]);
@@ -2423,12 +2428,18 @@ fn gemfile_left_without_our_line(text: &str, written: &str) -> RecordRevert {
 /// as found. When the user changed the trailing comment vendor wrote, their
 /// comment (and the spacing before it) replaces the original's, so a note
 /// like `# CVE fix, do not bump` survives the revert. A CR line ending is
-/// the live line's: a re-checkout may have changed the file's line endings
-/// since vendor recorded `original` (#1821).
+/// the original's, unless the live line's ending differs from the one
+/// vendor wrote: a re-checkout changed the file's line endings since, and
+/// the restored line follows the file (#1821).
 fn restore_gemfile_line(live: &str, written: &str, original: &str) -> String {
     let (live_code, live_comment) = split_line_comment(live);
     let (_, written_comment) = split_line_comment(written);
-    let cr = if live.ends_with('\r') { "\r" } else { "" };
+    let ends_cr = if live.ends_with('\r') == written.ends_with('\r') {
+        original.ends_with('\r')
+    } else {
+        live.ends_with('\r')
+    };
+    let cr = if ends_cr { "\r" } else { "" };
     if live == written || live_comment.trim() == written_comment.trim() {
         return format!("{}{cr}", original.strip_suffix('\r').unwrap_or(original));
     }
@@ -4107,9 +4118,31 @@ mod tests {
         );
     }
 
-    /// Whether every line break in `text` is CRLF.
+    /// Whether every line break in `text` is CRLF (and no CR stands alone).
     fn all_crlf(text: &str) -> bool {
-        !text.replace("\r\n", "").contains('\n')
+        let crlf = text.matches("\r\n").count();
+        crlf > 0 && crlf == text.matches('\n').count() && crlf == text.matches('\r').count()
+    }
+
+    /// #1821: the restored line keeps the original's ending unless a
+    /// re-checkout changed the wired line's ending since vendor wrote it.
+    /// A ledger from before #1821 recorded a bare-LF wired line beside a
+    /// CRLF original; that line, untouched, still restores CRLF.
+    #[test]
+    fn restore_gemfile_line_ending() {
+        for (live, written, original, want) in [
+            ("new", "new", "orig\r", "orig\r"),
+            ("new\r", "new\r", "orig\r", "orig\r"),
+            ("new", "new", "orig", "orig"),
+            ("new\r", "new", "orig", "orig\r"),
+            ("new", "new\r", "orig\r", "orig"),
+        ] {
+            assert_eq!(
+                restore_gemfile_line(live, written, original),
+                want,
+                "{live:?} {written:?} {original:?}"
+            );
+        }
     }
 
     /// #1821: vendoring over a CRLF Gemfile keeps it CRLF, for the rewired

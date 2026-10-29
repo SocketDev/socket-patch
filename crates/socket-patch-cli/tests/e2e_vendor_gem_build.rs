@@ -1982,7 +1982,9 @@ fn gem_vendor_keeps_a_crlf_gemfile_crlf() {
         assert_eq!(env["summary"]["applied"], 1, "{gemfile:?}: {env}");
         let wired = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
         assert!(
-            wired.contains(".socket/vendor/gem/") && !wired.replace("\r\n", "").contains('\n'),
+            wired.contains(".socket/vendor/gem/")
+                && wired.matches("\r\n").count() == wired.matches('\n').count()
+                && wired.matches("\r\n").count() == wired.matches('\r').count(),
             "{gemfile:?}: the vendored Gemfile must stay CRLF throughout: {wired:?}"
         );
 
