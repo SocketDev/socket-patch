@@ -778,10 +778,19 @@ async fn vendor_maven_jvm(
             );
         }
         // A declared classifier is sourced only for a real patch.
-        if let Err(e) = plan {
-            if !e.detail.starts_with("reason: classifier_unavailable:") {
+        match plan {
+            Err(e) if !e.detail.starts_with("reason: classifier_unavailable:") => {
                 return refused(e.code, e.detail);
             }
+            Ok(plan) if matches!(shape, Shape::MavenReactor | Shape::Mixed) => {
+                let read = |rel: &str| reader.read(rel);
+                if let Err(e) =
+                    super::jvm::maven_reactor::refuse_unwired(&read, &patch.coords(), &plan)
+                {
+                    return refused(e.code, e.detail);
+                }
+            }
+            _ => {}
         }
         return done(
             synthesized_result(purl, &display_path, Vec::new(), true, None),

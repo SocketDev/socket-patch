@@ -1213,6 +1213,7 @@ fn maven_reactor_uncertain_property_version_withholds_vex() {
                     "pkg:generic/x@1",
                 ],
             );
+            assert!(!env.to_string().contains("not_affected"), "{reason}: {env}");
             if let Ok(bytes) = std::fs::read(&vex) {
                 let doc = String::from_utf8_lossy(&bytes);
                 assert!(!doc.contains("not_affected"), "{reason}: {env}");

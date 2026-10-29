@@ -474,13 +474,28 @@ pub fn refuse_unwired(read: ReadFn<'_>, c: &Coords<'_>, plan: &JvmPlan) -> Resul
     if wired_checked(&planned, c)? {
         return Ok(());
     }
+    // Only the reasons that leave a declaration or a root alone; the
+    // repository and config notes (and a mixed root's Gradle warnings)
+    // say nothing about why the reactor is unwired.
+    const UNWIRING: [&str; 7] = [
+        "property_unresolved",
+        "conflicting_literal_version",
+        "conflicting_managed_version",
+        "management_unresolved",
+        "range",
+        "coordinates_overridden",
+        "classifier_declared",
+    ];
     let why: Vec<&str> = plan
         .warnings
         .iter()
         .filter(|w| w.code == DEGRADED)
         .map(|w| w.detail.as_str())
-        .filter(|d| !d.starts_with("reason: maven_f_outside_root:"))
-        .filter(|d| !d.starts_with("reason: maven_mirror_of_all:"))
+        .filter(|d| {
+            UNWIRING
+                .iter()
+                .any(|r| d.starts_with(&format!("reason: {r}: ")))
+        })
         .collect();
     let why = if why.is_empty() {
         "no declaration or pin of the reactor can take it".to_string()
@@ -490,8 +505,8 @@ pub fn refuse_unwired(read: ReadFn<'_>, c: &Coords<'_>, plan: &JvmPlan) -> Resul
     Err(JvmRefusal {
         code: SHAPE_UNSUPPORTED,
         detail: format!(
-            "reason: nothing_wired: no pom would build {}:{}:{}, so the build keeps \
-             resolving {} ({why})",
+            "reason: nothing_wired: no pom of the reactor would build {}:{}:{}, so Maven \
+             keeps resolving {} ({why})",
             c.group_id,
             c.artifact_id,
             c.suffixed_version(),
@@ -5413,6 +5428,7 @@ mod tests {
             r.detail
         );
         assert!(!r.detail.contains("maven_f_outside_root"), "{}", r.detail);
+        assert!(!r.detail.contains("maven_mirror_of_all"), "{}", r.detail);
     }
 
     /// The same check passes a plan that pins the root or rewrites a
