@@ -3029,6 +3029,192 @@ async fn gem_hosted_pin_previews_and_runs_a_clean_eject() {
     }
 }
 
+/// #1808: a hosted gem whose `Gemfile.lock` (or whole pair) is CRLF, as a
+/// Git for Windows `autocrlf` checkout leaves it, ejects to vendored mode
+/// like an LF one. The `vendor` eject and the `scan --mode vendored`
+/// takeover agree dry and wet: both exit 0, and the wet run wires the
+/// vendored copy with the lock still CRLF on every line instead of failing
+/// `apply_failed` ("Gemfile.lock has no GEM section") and rolling back.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_pin_with_a_crlf_lock_ejects_cleanly() {
+    for (command, crlf_files) in [
+        ("vendor", &["Gemfile.lock"][..]),
+        ("vendor", &["Gemfile", "Gemfile.lock"][..]),
+        ("scan", &["Gemfile", "Gemfile.lock"][..]),
+    ] {
+        let Some(fx) = redirect_scanned_project(
+            "hosted crlf eject",
+            Spelling::Gemfile,
+            false,
+            true,
+            None,
+            Driver::ScanVex,
+        )
+        .await
+        else {
+            return;
+        };
+        let install = bundle(&fx.proj, &["install"]);
+        assert!(
+            install.status.success(),
+            "converging install:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        for file in crlf_files {
+            let path = fx.proj.join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, text.replace('\n', "\r\n")).unwrap();
+        }
+        mount_vendored_grant(&fx).await;
+        let proj = fx.proj.to_str().expect("utf8 tmp path");
+        let api = fx._server.uri();
+        let upstream = format!("{api}/upstream");
+        for dry_run in [true, false] {
+            let before: Vec<Vec<u8>> = ["Gemfile", "Gemfile.lock"]
+                .iter()
+                .map(|f| std::fs::read(fx.proj.join(f)).unwrap())
+                .collect();
+            let mut argv = vec![command];
+            if command == "scan" {
+                argv.extend(["--mode", "vendored"]);
+            }
+            argv.extend([
+                "--json",
+                "--yes",
+                "--cwd",
+                proj,
+                "--api-url",
+                &api,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--patch-server-url",
+                &api,
+            ]);
+            if dry_run {
+                argv.push("--dry-run");
+            }
+            let label = format!("{command} eject, CRLF {crlf_files:?} (dry_run={dry_run})");
+            let (code, stdout, stderr) =
+                run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+            assert_eq!(code, 0, "{label}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            for bad in ["apply_failed", "eject_rolled_back", "no GEM section"] {
+                assert!(!stdout.contains(bad), "{label}: {bad}:\n{stdout}");
+            }
+            if dry_run {
+                for (file, before) in ["Gemfile", "Gemfile.lock"].iter().zip(before) {
+                    assert_eq!(
+                        std::fs::read(fx.proj.join(file)).unwrap(),
+                        before,
+                        "{label}: a dry run writes nothing to {file}"
+                    );
+                }
+            } else {
+                let gemfile = std::fs::read_to_string(fx.proj.join("Gemfile")).unwrap();
+                assert!(
+                    gemfile.contains("path: \".socket/vendor/gem/"),
+                    "{label}: the Gemfile now points at the vendored copy:\n{gemfile}"
+                );
+                let lock = std::fs::read_to_string(fx.proj.join("Gemfile.lock")).unwrap();
+                assert!(
+                    lock.contains("PATH\r\n  remote: .socket/vendor/gem/"),
+                    "{label}: the lock wires the vendored copy:\n{lock:?}"
+                );
+                assert_eq!(
+                    lock.matches('\n').count(),
+                    lock.matches("\r\n").count(),
+                    "{label}: every line of the lock keeps CRLF:\n{lock:?}"
+                );
+            }
+        }
+    }
+}
+
+/// #1808, the dry/wet parity half: a lock the vendored edit cannot write
+/// back (CRLF and LF mixed) fails the wet `vendor` eject, which rolls the
+/// restore back, so the dry run must report that failure too instead of
+/// previewing `eject_planned`. Neither run leaves the hosted pair changed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_pin_with_a_mixed_eol_lock_fails_the_eject_dry_and_wet() {
+    let Some(fx) = redirect_scanned_project(
+        "hosted mixed-eol eject",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let install = bundle(&fx.proj, &["install"]);
+    assert!(
+        install.status.success(),
+        "converging install:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let lock_path = fx.proj.join("Gemfile.lock");
+    let lf = std::fs::read_to_string(&lock_path).unwrap();
+    // Only the trailing BUNDLED WITH lines go CRLF: the hosted restore
+    // still finds its entry, and the vendored edit has no single ending.
+    let at = lf.find("BUNDLED WITH").expect("BUNDLED WITH");
+    let mixed = format!("{}{}", &lf[..at], lf[at..].replace('\n', "\r\n"));
+    std::fs::write(&lock_path, &mixed).unwrap();
+    mount_vendored_grant(&fx).await;
+    let proj = fx.proj.to_str().expect("utf8 tmp path");
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    for dry_run in [true, false] {
+        let before: Vec<Vec<u8>> = ["Gemfile", "Gemfile.lock"]
+            .iter()
+            .map(|f| std::fs::read(fx.proj.join(f)).unwrap())
+            .collect();
+        let mut argv = vec![
+            "vendor",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ];
+        if dry_run {
+            argv.push("--dry-run");
+        }
+        let label = format!("vendor eject, mixed-eol lock (dry_run={dry_run})");
+        let (code, stdout, stderr) =
+            run_socket_env(&fx.proj, &argv, &[("SOCKET_RUBYGEMS_URL", &upstream)]);
+        assert_eq!(code, 1, "{label}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("apply_failed") && stdout.contains("mixes CRLF and LF"),
+            "{label}: names the failure:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("eject_planned"),
+            "{label}: no eject is planned:\n{stdout}"
+        );
+        for (file, before) in ["Gemfile", "Gemfile.lock"].iter().zip(before) {
+            assert_eq!(
+                std::fs::read(fx.proj.join(file)).unwrap(),
+                before,
+                "{label}: {file} keeps its hosted wiring"
+            );
+        }
+    }
+}
+
 /// One refused `vendor` eject of the group-block fixture (#1761): dry or
 /// wet, the eject is refused whole with `gemfile_declaration_not_editable`
 /// and `eject_refused` (exit 1), and the hosted `Gemfile` /

@@ -62,6 +62,7 @@ use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_tail_blocks_edit;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 
 use super::common::{
@@ -130,7 +131,12 @@ struct GemPrelude {
     gemfile_path: PathBuf,
     gemfile_text: String,
     lock_path: PathBuf,
+    /// The lock in LF form; [`GemPrelude::lock_eol`] spells an edit back.
     lock_text: String,
+    /// The lock's own line ending (#1808): a CRLF lock (a Git for Windows
+    /// `autocrlf` checkout; bundler keeps CRLF) is edited in LF form and
+    /// written back in CRLF.
+    lock_eol: LineEndings,
     /// Gemfile and Gemfile.lock already wire this uuid's copy.
     lock_wired: bool,
     /// ...and the committed copy is intact (the in-sync hot path, which
@@ -234,6 +240,7 @@ pub async fn gem_vendor_target_preflight(
             .await
             .ok()?,
     };
+    let lock_text = to_lf(&lock_text);
     plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
         .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
         .and_then(|plan| {
@@ -385,6 +392,13 @@ async fn gem_prelude(
             ));
         }
     };
+    // A mixed lock stays as read: `gem_edits` refuses it, and its
+    // already-wired checks see what is on disk.
+    let lock_eol = LineEndings::of(&lock_text);
+    let lock_text = match lock_eol {
+        LineEndings::Crlf => to_lf(&lock_text).into_owned(),
+        _ => lock_text,
+    };
 
     let local_stub = {
         let spec_src = installed_path
@@ -466,6 +480,7 @@ async fn gem_prelude(
         gemfile_text,
         lock_path,
         lock_text,
+        lock_eol,
         lock_wired,
         copy_ok,
     })
@@ -508,7 +523,14 @@ fn gem_edits(
     // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
     // A lock-shape failure therefore costs no download / copy / patch and no
     // Gemfile write.
-    let lock_edit = match edit_lock(&prelude.lock_text, name, version, &prelude.copy_rel) {
+    let lock_edit = match prelude.lock_eol {
+        LineEndings::Mixed => Err(
+            "Gemfile.lock mixes CRLF and LF line endings, so there is no one line ending to write the edit back in (re-run `bundle lock` or normalize the file first)"
+                .to_string(),
+        ),
+        _ => edit_lock(&prelude.lock_text, name, version, &prelude.copy_rel),
+    };
+    let lock_edit = match lock_edit {
         Ok(edit) => edit,
         Err(e) => {
             return Err(Box::new(done(
@@ -583,6 +605,7 @@ pub async fn vendor_gem<'a>(
         gemfile_text,
         lock_path,
         lock_text: _,
+        lock_eol,
         lock_wired,
         copy_ok,
     } = &prelude;
@@ -731,7 +754,8 @@ pub async fn vendor_gem<'a>(
     }
 
     // ── Gemfile.lock write (a failure here unwinds the Gemfile) ──────────
-    if let Err(e) = atomic_write_bytes_preserving_mode(lock_path, lock_edit.text.as_bytes()).await {
+    let new_lock = lock_eol.restore(&lock_edit.text);
+    if let Err(e) = atomic_write_bytes_preserving_mode(lock_path, new_lock.as_bytes()).await {
         let mut detail = format!("failed to write Gemfile.lock: {e}");
         // Unwind: a Gemfile pointing at a path the lock doesn't agree with
         // is exactly the half-wired state the pair edit exists to prevent —
@@ -2222,6 +2246,9 @@ struct RevertFile {
     text: Option<String>,
     /// The bytes as read, to put back if a later write fails.
     read: Option<String>,
+    /// The line ending `text` is written back in: a CRLF lock is reverted
+    /// in LF form, like [`edit_lock`] edits it (#1808).
+    eol: LineEndings,
     changed: bool,
 }
 
@@ -2249,9 +2276,17 @@ impl<'a> RevertFiles<'a> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(format!("unreadable {name}: {e}")),
             };
+            let eol = match (&text, name == GEMFILE_LOCK) {
+                (Some(t), true) if LineEndings::of(t) == LineEndings::Crlf => LineEndings::Crlf,
+                _ => LineEndings::Lf,
+            };
             *slot = Some(RevertFile {
                 read: text.clone(),
-                text,
+                text: text.map(|t| match eol {
+                    LineEndings::Crlf => to_lf(&t).into_owned(),
+                    _ => t,
+                }),
+                eol,
                 changed: false,
             });
         }
@@ -2268,11 +2303,13 @@ impl<'a> RevertFiles<'a> {
             let Some(RevertFile {
                 text: Some(text),
                 read,
+                eol,
                 changed: true,
             }) = file
             else {
                 continue;
             };
+            let text = eol.restore(text);
             if let Err(e) =
                 atomic_write_bytes_preserving_mode(&self.root.join(name), text.as_bytes()).await
             {
@@ -4540,6 +4577,145 @@ mod tests {
         assert_eq!(
             tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
             lock1
+        );
+    }
+
+    /// #1808: a CRLF lock (a Git for Windows `autocrlf` checkout; bundler
+    /// keeps CRLF) is edited in its own line ending — the dry run and the
+    /// wet run both succeed — and a revert hands it back byte for byte.
+    #[tokio::test]
+    async fn crlf_lock_vendors_in_crlf_and_reverts_byte_exact() {
+        let cases = [
+            (GEMFILE_DIRECT, LOCK_DIRECT, Some(expected_lock_direct())),
+            (GEMFILE_TRANSITIVE, LOCK_TRANSITIVE, None),
+        ];
+        for (gemfile, lf_lock, expected_lf) in cases {
+            let crlf = lf_lock.replace('\n', "\r\n");
+            let (_tmp, root, installed, blobs, record) = fixture(gemfile, &crlf).await;
+
+            let (dry, _, _) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, true).await);
+            assert!(dry.success, "dry run: {:?}", dry.error);
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert!(result.success, "vendor: {:?}", result.error);
+            let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap();
+            assert_eq!(
+                wired.matches('\n').count(),
+                wired.matches("\r\n").count(),
+                "every line keeps CRLF: {wired:?}"
+            );
+            if let Some(expected) = expected_lf {
+                assert_eq!(wired, expected.replace('\n', "\r\n"));
+            }
+            // The ledger records bare lines, as for an LF lock.
+            let entry = entry.unwrap();
+            let lk = entry
+                .wiring
+                .iter()
+                .find(|w| w.kind == LOCK_WIRING_KIND)
+                .unwrap();
+            assert!(
+                !lk.new.as_ref().unwrap().to_string().contains("\\r"),
+                "{:?}",
+                lk.new
+            );
+
+            // The in-sync hot path recognises the CRLF wiring.
+            let (rerun, again, _) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert!(rerun.success, "{:?}", rerun.error);
+            assert!(again.is_none(), "hot path must not re-record");
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                wired
+            );
+
+            let outcome = revert_gem(&entry, &root, false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(
+                !outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
+                "{:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                crlf,
+                "lock byte-identical to the CRLF fixture"
+            );
+        }
+    }
+
+    /// #1808: a CRLF bundler >= 2.6 lock — the CHECKSUMS rewrite and its
+    /// revert keep CRLF too.
+    #[tokio::test]
+    async fn crlf_checksums_lock_vendors_and_reverts_byte_exact() {
+        let crlf = SPIKE_LOCK_CHECKSUMS_BEFORE.replace('\n', "\r\n");
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, &crlf).await;
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        assert!(
+            wired.contains("\r\nCHECKSUMS\r\n  rack (3.1.8)\r\n"),
+            "{wired:?}"
+        );
+        assert_eq!(wired.matches('\n').count(), wired.matches("\r\n").count());
+
+        let (rerun, again, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(rerun.success, "{:?}", rerun.error);
+        assert!(again.is_none(), "hot path must not re-record");
+
+        let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            crlf
+        );
+    }
+
+    /// A lock mixing CRLF and LF has no one line ending to write the edit
+    /// back in: vendor fails closed (dry run too) and writes nothing.
+    #[tokio::test]
+    async fn mixed_line_ending_lock_fails_closed() {
+        let mixed = LOCK_DIRECT.replacen('\n', "\r\n", 3);
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, &mixed).await;
+        for dry_run in [true, false] {
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, dry_run).await);
+            assert!(!result.success, "dry_run={dry_run}");
+            assert!(entry.is_none());
+            let err = result.error.unwrap_or_default();
+            assert!(err.contains("mixes CRLF and LF"), "{err}");
+        }
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            mixed
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
         );
     }
 

@@ -2106,3 +2106,99 @@ fn gem_vendor_gemspec_dev_dependency_refuses_or_installs_frozen() {
         "revert restores Gemfile.lock byte-identical"
     );
 }
+
+/// #1808: a CRLF `Gemfile.lock` (a Git for Windows `autocrlf` checkout, or
+/// `eol=crlf`; bundler keeps CRLF on purpose) vendors like an LF one. The
+/// dry run and the wet run both succeed, the wired lock keeps CRLF on every
+/// line, a frozen fresh-checkout install accepts it byte-stably, a re-run
+/// is byte-stable, and `--revert` hands back the CRLF lock byte for byte.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_crlf_lock_fresh_checkout_and_revert() {
+    let Some((tmp, proj, _bundler, _purl)) = staged_rack_project("crlf lock") else {
+        return;
+    };
+    let lock_path = proj.join("Gemfile.lock");
+    let gemfile_path = proj.join("Gemfile");
+    let lf = std::fs::read_to_string(&lock_path).unwrap();
+    let crlf = lf.replace('\n', "\r\n");
+    std::fs::write(&lock_path, &crlf).unwrap();
+    let gemfile_before = std::fs::read(&gemfile_path).unwrap();
+    let cwd = proj.to_str().unwrap();
+    let vendor = |extra: &[&str]| {
+        let mut args = vec!["vendor", "--json", "--offline", "--cwd", cwd];
+        args.extend_from_slice(extra);
+        run_socket(&proj, &args)
+    };
+
+    let (code, stdout, stderr) = vendor(&["--dry-run"]);
+    assert_eq!(code, 0, "dry run:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.contains("apply_failed"), "dry run:\n{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        crlf,
+        "a dry run writes nothing"
+    );
+
+    let (code, stdout, stderr) = vendor(&[]);
+    assert_eq!(code, 0, "vendor:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let wired = std::fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(
+        wired.matches('\n').count(),
+        wired.matches("\r\n").count(),
+        "every line of the wired lock keeps CRLF:\n{wired:?}"
+    );
+    let copy_rel = format!(".socket/vendor/gem/{UUID}/");
+    assert!(
+        wired.starts_with(&format!("PATH\r\n  remote: {copy_rel}")),
+        "the PATH section is spliced in CRLF:\n{wired:?}"
+    );
+    assert!(
+        wired.contains(&format!("\r\n  {DEP} (= ")),
+        "the DEPENDENCIES pin is spliced in CRLF:\n{wired:?}"
+    );
+
+    // Bundler reads the CRLF pair as wired and keeps it byte-identical.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
+    std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    copy_dir_recursive(&proj.join(".bundle"), &fresh.join(".bundle"));
+    let ci = bundle(&fresh, &["install"], true);
+    assert!(
+        ci.status.success(),
+        "frozen install of the CRLF pair:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    assert_eq!(
+        std::fs::read_to_string(fresh.join("Gemfile.lock")).unwrap(),
+        wired,
+        "frozen install leaves the CRLF lock byte-identical"
+    );
+
+    let (code, stdout, stderr) = vendor(&[]);
+    assert_eq!(code, 0, "re-run:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        wired,
+        "a re-run takes the in-sync path and leaves the lock alone"
+    );
+
+    let (code, stdout, stderr) = run_socket(&proj, &["vendor", "--revert", "--json", "--cwd", cwd]);
+    assert_eq!(code, 0, "revert:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        !stdout.contains("drifted"),
+        "a clean revert reports no drift:\n{stdout}"
+    );
+    assert_eq!(std::fs::read(&gemfile_path).unwrap(), gemfile_before);
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        crlf,
+        "revert restores the CRLF lock byte for byte"
+    );
+}
