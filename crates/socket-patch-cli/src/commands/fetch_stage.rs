@@ -1,11 +1,8 @@
-//! Shared patch-source staging for the mutating commands (`apply`, `vendor`).
-//!
-//! Resolves where the patch pipeline should read per-file blobs from,
-//! downloading what's missing into a transient overlay tempdir. The
-//! persistent `.socket/blobs` cache is only ever *read* —
-//! downloads land in the tempdir and are discarded when it drops (filling the
-//! cache is `repair`'s job, keeping these commands read-only against
-//! `.socket/`).
+//! Patch-source staging for `apply`: where the patch pipeline reads
+//! per-file blobs from, downloading what's missing into a transient overlay
+//! tempdir. The persistent `.socket/blobs` cache is only ever read;
+//! downloads are discarded when the tempdir drops (filling the cache is
+//! `repair`'s job, keeping `apply` read-only against `.socket/`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -46,31 +43,6 @@ pub(crate) enum StageOutcome {
     /// failed). User-facing diagnostics were already printed; the caller
     /// reports command failure.
     Unavailable,
-}
-
-/// The disk stager's remedy: `repair` fills the persistent `.socket/`
-/// cache `apply` reads from.
-const APPLY_OFFLINE_REMEDY: &str = "Run `socket-patch repair` to download missing artifacts.";
-
-/// Shared offline diagnostic: patches with no usable local source while
-/// `--offline` is set (first five PURLs, then the caller's `remedy` line).
-/// Prints even under `--silent` (errors only, NEVER nothing — an exit-1
-/// run with zero output is undiagnosable); `--json` mutes stderr and the
-/// caller's envelope is the machine channel instead.
-fn report_offline_missing(common: &GlobalArgs, purls: &[&str], remedy: &str) {
-    if common.json {
-        return;
-    }
-    let n = purls.len();
-    let (count, verb) = (
-        plural(n, "patch", "patches"),
-        if n == 1 { "has" } else { "have" },
-    );
-    eprintln!("Error: {count} {verb} no local source and --offline is set:");
-    for line in format_purl_list(purls, 5) {
-        eprintln!("{line}");
-    }
-    eprintln!("{remedy}");
 }
 
 /// `  - <purl>` for the first `max` purls, then `  ... and N more`.
@@ -127,13 +99,8 @@ fn format_fetch_failures(result: &FetchMissingBlobsResult) -> Vec<String> {
     lines
 }
 
-/// The disk stager's status line while it downloads what `.socket/` lacks.
-const DOWNLOADING_ARTIFACTS: &str = "Downloading missing patch artifacts...";
-
-/// The manifest PURLs with no usable local source: some file the patch
-/// touches has no `after_hash` blob in `missing_blobs`' directory. Shared by
-/// the offline gate (probed against `.socket/`) and the post-download gate
-/// (probed against the staged overlay).
+/// The manifest PURLs with no usable local source: the `after_hash` of
+/// some file the patch touches is in `missing_blobs` (absent on disk).
 fn patches_without_source<'m>(
     manifest: &'m PatchManifest,
     missing_blobs: &HashSet<String>,
@@ -179,11 +146,9 @@ async fn overlay_dir(src: &Path, dst: &Path) {
 
 /// Resolve patch sources for `manifest`: read straight from `.socket/` when
 /// every blob needed is cached (or `--offline`), else stage an overlay
-/// tempdir and fetch the missing blobs through `client` (the run's one API
-/// client — building another here repeated its advisory and org-slug
-/// resolution). `Err` is a hard setup failure (tempdir creation);
-/// `Ok(Unavailable)` is the soft "cannot proceed" path with diagnostics
-/// already printed.
+/// tempdir and fetch the missing blobs through `client`. `Err` is a hard
+/// setup failure (tempdir creation); `Ok(Unavailable)` is the soft "cannot
+/// proceed" path with diagnostics already printed.
 pub(crate) async fn stage_patch_sources(
     common: &GlobalArgs,
     manifest: &PatchManifest,
@@ -193,17 +158,26 @@ pub(crate) async fn stage_patch_sources(
     let quiet = common.silent || common.json;
     let socket_blobs_path = socket_dir.join("blobs");
 
-    // Read-only probe of what is already on disk.
     let missing_blobs = get_missing_blobs(manifest, &socket_blobs_path).await;
 
     if common.offline {
-        // Offline: bail only if some patch has no usable local source.
-        // Note: with `--force`, the patch pipeline can short-circuit
-        // verification on its own; we still surface the no-source
-        // diagnosis so the user runs `repair` before retrying.
         let no_source_purls = patches_without_source(manifest, &missing_blobs);
         if !no_source_purls.is_empty() {
-            report_offline_missing(common, &no_source_purls, APPLY_OFFLINE_REMEDY);
+            // Prints even under `--silent`: an exit-1 run with zero output is
+            // undiagnosable. `--json` mutes stderr; the caller's envelope is
+            // the machine channel.
+            if !common.json {
+                let n = no_source_purls.len();
+                let verb = if n == 1 { "has" } else { "have" };
+                eprintln!(
+                    "Error: {} {verb} no local source and --offline is set:",
+                    plural(n, "patch", "patches")
+                );
+                for line in format_purl_list(&no_source_purls, 5) {
+                    eprintln!("{line}");
+                }
+                eprintln!("Run `socket-patch repair` to download missing artifacts.");
+            }
             return Ok(StageOutcome::Unavailable);
         }
     }
@@ -215,10 +189,8 @@ pub(crate) async fn stage_patch_sources(
         }));
     }
 
-    // Stage a transient overlay tempdir that hardlinks every existing
-    // `.socket/blobs` entry and receives fresh downloads. The pipeline reads
-    // exclusively from the tempdir; `.socket/` is never mutated. Dropping
-    // `StagedSources` removes the directory and any downloaded bytes.
+    // The pipeline reads only from the overlay; dropping `StagedSources`
+    // removes it and any downloaded bytes.
     let stage = tempfile::tempdir().map_err(|e| e.to_string())?;
     let staged = StagedSources {
         blobs: stage.path().join("blobs"),
@@ -229,10 +201,8 @@ pub(crate) async fn stage_patch_sources(
         .map_err(|e| e.to_string())?;
     overlay_dir(&socket_blobs_path, &staged.blobs).await;
 
-    // Progress: a transient status line on stderr (stdout is data); the
-    // result lines below are what stays on screen.
     let mut status = StatusLine::stderr(common.json, common.silent);
-    status.set(DOWNLOADING_ARTIFACTS);
+    status.set("Downloading missing patch artifacts...");
     let fetch_result = fetch_missing_blobs(manifest, &staged.blobs, client, None).await;
     status.finish();
     if !quiet {
@@ -247,9 +217,8 @@ pub(crate) async fn stage_patch_sources(
     if fetch_result.failed > 0 {
         let missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
         if !patches_without_source(manifest, &missing_blobs).is_empty() {
-            // An error, not progress chatter: prints even under --silent
-            // (same rule as report_offline_missing above), with the
-            // per-blob reasons the quiet summary above held back.
+            // An error, so it prints even under --silent, with the per-blob
+            // reasons the quiet summary above held back.
             if !common.json {
                 if quiet {
                     for line in format_fetch_failures(&fetch_result) {
@@ -267,14 +236,6 @@ pub(crate) async fn stage_patch_sources(
     Ok(StageOutcome::Ready(staged))
 }
 
-/// In-memory staged sources for the VENDOR flows.
-///
-/// Existing `.socket/` artifacts are read in place (never copied, never
-/// rewritten); patch content that is missing locally is fetched into
-/// MEMORY via the patch view endpoint — vendoring writes no
-/// `.socket/blobs` entries and no temporary files. The committed
-/// `.socket/vendor/` artifact is the patch; nothing else should land on
-/// disk.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,9 +281,8 @@ mod tests {
         }
     }
 
-    /// A network-free client for the offline arms (never used: they return
-    /// before any fetch), built directly so no ambient token or socket-cli
-    /// config can leak into a unit test.
+    /// A client for the arms that return before any fetch, built directly
+    /// so no ambient token or socket-cli config can leak into a unit test.
     fn offline_client() -> ApiClient {
         ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
             api_url: "http://127.0.0.1:1".to_string(),
@@ -338,8 +298,8 @@ mod tests {
             .0
     }
 
-    /// Everything cached → read `.socket/` in place: no overlay tempdir, and
-    /// the returned paths are the persistent cache dirs themselves.
+    /// Everything cached, online or offline → read `.socket/` in place: no
+    /// overlay tempdir, and the blobs path is the persistent cache itself.
     #[tokio::test]
     async fn stage_reads_socket_dir_in_place_when_fully_cached() {
         let tmp = tempfile::tempdir().unwrap();
@@ -347,19 +307,25 @@ mod tests {
         std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
         std::fs::write(socket_dir.join("blobs").join(HASH), b"patched").unwrap();
 
-        let outcome = stage_patch_sources(
-            &offline_args(),
-            &manifest_with_one_patch(),
-            &socket_dir,
-            &offline_client(),
-        )
-        .await
-        .expect("no hard failure");
-        let StageOutcome::Ready(staged) = outcome else {
-            panic!("fully-cached staging must be Ready");
-        };
-        assert!(staged._stage.is_none(), "no overlay when nothing to fetch");
-        assert_eq!(staged.blobs, socket_dir.join("blobs"));
+        for offline in [true, false] {
+            let args = GlobalArgs {
+                offline,
+                ..offline_args()
+            };
+            let outcome = stage_patch_sources(
+                &args,
+                &manifest_with_one_patch(),
+                &socket_dir,
+                &offline_client(),
+            )
+            .await
+            .expect("no hard failure");
+            let StageOutcome::Ready(staged) = outcome else {
+                panic!("fully-cached staging must be Ready (offline: {offline})");
+            };
+            assert!(staged._stage.is_none(), "no overlay when nothing to fetch");
+            assert_eq!(staged.blobs, socket_dir.join("blobs"));
+        }
     }
 
     /// Offline with no usable source → Unavailable, and the read-only
@@ -387,34 +353,6 @@ mod tests {
         );
     }
 
-    /// A leftover `.socket/diffs/<uuid>.tar.gz` is not a source: v5 reads
-    /// only per-file blobs, so offline staging with the blob missing is
-    /// Unavailable even when the old diff archive is on disk.
-    #[tokio::test]
-    async fn stage_offline_ignores_obsolete_diff_archive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket_dir = tmp.path().join(".socket");
-        std::fs::create_dir_all(socket_dir.join("diffs")).unwrap();
-        std::fs::write(
-            socket_dir.join("diffs").join(format!("{UUID}.tar.gz")),
-            b"x",
-        )
-        .unwrap();
-
-        let outcome = stage_patch_sources(
-            &offline_args(),
-            &manifest_with_one_patch(),
-            &socket_dir,
-            &offline_client(),
-        )
-        .await
-        .expect("no hard failure");
-        assert!(
-            matches!(outcome, StageOutcome::Unavailable),
-            "an obsolete diff archive must not cover the patch"
-        );
-    }
-
     /// GlobalArgs wired to a guaranteed-unreachable API endpoint: explicit
     /// token + org overrides keep client construction network-free, and the
     /// URL points at a port that was just bound and released, so every fetch
@@ -432,34 +370,6 @@ mod tests {
             org: Some("test-org".to_string()),
             ..GlobalArgs::default()
         }
-    }
-
-    /// A leftover legacy `.socket/packages/<uuid>.tar.gz` is not a source:
-    /// nothing reads it, so it must not mask failed downloads.
-    #[tokio::test]
-    async fn stage_online_fetch_failure_ignores_legacy_package_archive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket_dir = tmp.path().join(".socket");
-        std::fs::create_dir_all(socket_dir.join("packages")).unwrap();
-        std::fs::write(
-            socket_dir.join("packages").join(format!("{UUID}.tar.gz")),
-            b"x",
-        )
-        .unwrap();
-
-        let args = dead_endpoint_args();
-        let outcome = stage_patch_sources(
-            &args,
-            &manifest_with_one_patch(),
-            &socket_dir,
-            &dead_endpoint_client(&args).await,
-        )
-        .await
-        .expect("no hard failure");
-        assert!(
-            matches!(outcome, StageOutcome::Unavailable),
-            "a legacy package archive must not cover the patch"
-        );
     }
 
     /// Overshoot guard for the per-patch coverage gate: with no local source

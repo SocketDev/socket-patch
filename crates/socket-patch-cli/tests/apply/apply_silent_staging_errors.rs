@@ -7,7 +7,7 @@
 //!
 //! 1. `apply --silent --offline` with a manifest patch that has no local
 //!    blob/diff/package source exited 1 with zero bytes on stdout+stderr
-//!    (`report_offline_missing` returned early on `silent || json`).
+//!    (the offline report returned early on `silent || json`).
 //! 2. Online `apply --silent` whose downloads all fail (dead endpoint)
 //!    exited 1 with zero output (the "Some artifacts could not be
 //!    downloaded" line was gated on `!quiet`, i.e. muted by `--silent`).
