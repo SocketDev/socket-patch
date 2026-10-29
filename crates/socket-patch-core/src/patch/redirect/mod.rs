@@ -9686,29 +9686,42 @@ fn rewrite_golang_target(
     let selection = selection.unwrap_or_else(|| {
         let zips = go_sum.zip_versions(fname);
         let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        go_build_list::select(
-            go_mod_edit::prunes_module_graph(go_mod),
-            scan.required.as_deref(),
-            &zips,
-            &dep.version,
-        )
+        go_build_list::select(go_mod, fname, scan.required.as_deref(), &zips, &dep.version)
     });
-    if let Some(selected) = selection.other_version() {
-        let basis = if in_workspace {
-            "the go.work workspace selects"
-        } else if scan.required.as_deref() == Some(selected) {
-            "go.mod requires"
-        } else {
-            "go.sum shows the build selects"
-        };
-        result.warnings.push(RewriteWarning {
-            code: "redirect_golang_version_mismatch".into(),
+    // A pin the build provably doesn't use: a selected version other than
+    // the patched one, or a module go builds only as the target of another
+    // module's replace (go doesn't chain replaces, #1823).
+    let inert = match &selection {
+        go_build_list::Selection::Other(selected) => {
+            let basis = if in_workspace {
+                "the go.work workspace selects"
+            } else if scan.required.as_deref() == Some(selected.as_str()) {
+                "go.mod requires"
+            } else {
+                "go.sum shows the build selects"
+            };
+            Some(RewriteWarning {
+                code: "redirect_golang_version_mismatch".into(),
+                detail: format!(
+                    "{fname}: {basis} {selected} but the patch targets {} — \
+                     a version-pinned replace would be silently ignored",
+                    dep.version
+                ),
+            })
+        }
+        go_build_list::Selection::ReplaceTarget(via) => Some(RewriteWarning {
+            code: "redirect_golang_not_in_module_graph".into(),
             detail: format!(
-                "{fname}: {basis} {selected} but the patch targets {} — \
-                 a version-pinned replace would be silently ignored",
+                "{fname}@{}: the build uses this version only as the replacement of \
+                 {via} (go.mod's replace of {via}), and go doesn't apply a replace to a \
+                 replacement — its replace would be ignored; nothing redirected",
                 dep.version
             ),
-        });
+        }),
+        _ => None,
+    };
+    if let Some(warning) = inert {
+        result.warnings.push(warning);
         let stale_hosted = prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
         if let Some(stale) = stale_hosted {
             if let Ok(Some(new)) =
@@ -23655,6 +23668,35 @@ packages:
         assert!(out.files.is_empty());
         assert_eq!(out.warnings[0].code, "redirect_golang_version_mismatch");
         assert!(out.warnings[0].detail.contains("v1.5.0"));
+    }
+
+    /// #1823: a module go builds only as the target of another module's
+    /// replace has its go.sum lines under its own path, but go doesn't chain
+    /// replaces, so a replace of it would be inert.
+    #[test]
+    fn golang_replace_target_only_module_skips() {
+        for go in ["go 1.21", "go 1.16"] {
+            let mut files = golang_files();
+            files.insert(
+                "go.mod".to_string(),
+                format!(
+                    "module example.com/app\n\n{go}\n\nrequire other.com/fork v1.4.2\n\n\
+                     replace other.com/fork => github.com/foo/bar v1.4.2\n"
+                ),
+            );
+            let ovr = golang_override();
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(out.files.is_empty(), "{go}: {:?}", out.files);
+            assert_eq!(out.warnings.len(), 1, "{go}: {:?}", out.warnings);
+            assert_eq!(out.warnings[0].code, "redirect_golang_not_in_module_graph");
+            assert!(
+                out.warnings[0]
+                    .detail
+                    .contains("only as the replacement of other.com/fork"),
+                "{}",
+                out.warnings[0].detail
+            );
+        }
     }
 
     /// A module NOT in the main go.mod's require block may still be resolved

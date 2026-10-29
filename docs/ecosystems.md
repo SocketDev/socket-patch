@@ -1625,6 +1625,16 @@ After an upgrade such as `go get M@v1.0.1`, `apply --check` fails and `vex`
 leaves the patch out (`go_version_not_selected`) until you get a patch for the
 new version.
 
+A module the build uses only as the target of another module's replacement
+(`replace other.com/fork => example.com/upstream v1.0.0`) is not patched
+either. go downloads the target and records its `go.sum` lines under the
+target's own path, but the build list holds only `other.com/fork`, and go
+doesn't apply a replace to a replacement. So a zip line at the target's version
+doesn't count: `apply`, `vendor` and `scan --mode hosted` refuse the patch
+(hosted: `redirect_golang_not_in_module_graph`), and a replace written before
+the fork replace appeared fails `apply --check` and is left out of `vex`
+(`go_version_not_selected`).
+
 Paid hosted Go references are unsupported: embedding credentials in module paths
 would expose them to module proxies and change module identity. Use vendored mode
 for those patches; the CLI reports `redirect_golang_unsupported` when the required

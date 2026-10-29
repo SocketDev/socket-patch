@@ -1191,6 +1191,138 @@ fn go_work_member_requiring_a_newer_version_makes_the_replace_inert() {
     chmod_writable(tmp.path());
 }
 
+// ── a module built only as another module's replacement (#1823) ──
+
+const FORK: &str = "other.com/fork";
+
+/// Point the consumer at `FORK`, replaced by the upstream module
+/// (`replace_line`), and tidy it: go.sum then holds the upstream's lines
+/// under the upstream's own path, but the build list holds only `FORK`.
+fn fork_consumer(consumer: &Path, go_directive: &str, replace_line: &str, env: &[(&str, &str)]) {
+    std::fs::write(
+        consumer.join("go.mod"),
+        format!(
+            "module example.com/consumer\n\n{go_directive}\n\nrequire {FORK} {UVER}\n\n{replace_line}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join("main.go"),
+        format!(
+            "package main\n\nimport (\n\t\"fmt\"\n\tu \"{FORK}\"\n)\n\nfunc main() {{ fmt.Println(\"OUT:\", u.Greeting()) }}\n"
+        ),
+    )
+    .unwrap();
+    let tidy = go(consumer, &["mod", "tidy"], env);
+    assert!(
+        tidy.status.success(),
+        "go mod tidy: {}",
+        String::from_utf8_lossy(&tidy.stderr)
+    );
+}
+
+/// #1823: `replace other.com/fork => example.com/upstream v1.0.0` makes go
+/// download the upstream and record its go.sum lines under its own path,
+/// but go doesn't chain replaces, so a replace of the upstream is inert.
+/// apply must refuse instead of reporting the patch applied, and a replace
+/// written before the fork replace appeared must fail `apply --check` and
+/// be left out of VEX. Covers the versioned and versionless fork replace in
+/// a pruned (go 1.21) and an unpruned (go 1.16) graph.
+#[test]
+fn module_built_only_as_a_replace_target_is_not_patched() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(replace-target)") {
+        return;
+    }
+    for (go_directive, replace_line) in [
+        ("go 1.21", format!("replace {FORK} {UVER} => {UMOD} {UVER}")),
+        ("go 1.16", format!("replace {FORK} => {UMOD} {UVER}")),
+    ] {
+        let case = format!("{go_directive} / {replace_line}");
+        let tmp = tempfile::tempdir().unwrap();
+        let (consumer, modcache, proxy_url) = stage(tmp.path());
+        let env = go_env(modcache.to_str().unwrap(), &proxy_url);
+        let readonly: Vec<(&str, &str)> = env
+            .iter()
+            .map(|&(k, v)| {
+                if k == "GOFLAGS" {
+                    (k, "-mod=readonly")
+                } else {
+                    (k, v)
+                }
+            })
+            .collect();
+
+        // Applied while the consumer still required the upstream directly.
+        write_patch(&consumer);
+        let (code, so, se) = apply_json(&consumer, &modcache);
+        assert_eq!(code, 0, "{case}: direct apply:\n{so}\n{se}");
+        assert!(
+            go_out(&consumer, &readonly).contains("OUT: PATCHED"),
+            "{case}"
+        );
+
+        // Now the upstream is only the fork's replacement: the Socket
+        // replace (kept from the earlier apply) is inert.
+        let socket_replace = replace_lines(&consumer.join("go.mod"));
+        assert_eq!(socket_replace.len(), 1, "{case}: {socket_replace:?}");
+        fork_consumer(
+            &consumer,
+            go_directive,
+            &format!("{replace_line}\n\n{}", socket_replace[0]),
+            &env,
+        );
+        let sum = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+        assert!(sum.contains(&format!("{UMOD} {UVER} h1:")), "{case}: {sum}");
+        assert!(
+            go_out(&consumer, &readonly).contains("OUT: PRISTINE"),
+            "{case}"
+        );
+        let (code, so, se) = check(&consumer, &modcache);
+        assert_eq!(
+            code, 1,
+            "{case}: apply --check must flag the inert replace:\n{so}\n{se}"
+        );
+        assert!(
+            so.contains(&format!("only as the replacement of {FORK}"))
+                || se.contains(&format!("only as the replacement of {FORK}")),
+            "{case}:\n{so}\n{se}"
+        );
+        let r = VexRun {
+            offline: true,
+            product: Some("pkg:golang/example.com/consumer".into()),
+            ..VexRun::default()
+        }
+        .env("GOMODCACHE", &modcache)
+        .env("GOFLAGS", "");
+        let out = run_vex(&vex_e2e_common::binary(), &consumer, &r);
+        assert_absent(out.doc.as_ref(), UPURL);
+        vex_e2e_common::assert_not_attested(&out.envelope, UPURL, "go_version_not_selected");
+
+        // A fresh apply over the fork shape refuses and writes nothing.
+        fork_consumer(&consumer, go_directive, &replace_line, &env);
+        let (code, so, se) = apply_json(&consumer, &modcache);
+        assert_ne!(
+            code, 0,
+            "{case}: apply must refuse an inert replace:\n{so}\n{se}"
+        );
+        assert!(
+            so.contains(&format!("only as the replacement of {FORK}")),
+            "{case}:\n{so}\n{se}"
+        );
+        assert_eq!(
+            replace_lines(&consumer.join("go.mod")),
+            vec![replace_line.clone()],
+            "{case}"
+        );
+        assert!(
+            go_out(&consumer, &readonly).contains("OUT: PRISTINE"),
+            "{case}"
+        );
+
+        chmod_writable(tmp.path());
+    }
+}
+
 // ── global mode: tools already built with `go install` (#422) ──
 
 const TOOL: &str = "example.com/tool";
