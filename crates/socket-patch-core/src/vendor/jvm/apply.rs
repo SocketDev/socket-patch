@@ -914,6 +914,13 @@ pub async fn sweep_unindexed(stray: &[UnindexedEntry]) -> Result<(), String> {
     for entry in stray {
         let gone = match tokio::fs::symlink_metadata(&entry.path).await {
             Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&entry.path).await,
+            // A Windows directory symlink or junction is unlinked with
+            // `remove_dir` (which leaves its target alone), not
+            // `remove_file`.
+            #[cfg(windows)]
+            Ok(meta) if std::os::windows::fs::FileTypeExt::is_symlink_dir(&meta.file_type()) => {
+                tokio::fs::remove_dir(&entry.path).await
+            }
             Ok(_) => tokio::fs::remove_file(&entry.path).await,
             Err(e) => Err(e),
         };

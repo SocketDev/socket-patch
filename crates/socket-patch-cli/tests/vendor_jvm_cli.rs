@@ -379,8 +379,8 @@ fn stray_tree_files_are_swept_by_vendor_and_repair() {
         let stray = root.join(tree).join(".DS_Store");
 
         std::fs::write(&stray, b"\0\0\0\x01Bud1").unwrap();
-        // A stray symlink goes (not its target) inside vendor's group
-        // commit too.
+        // A stray symlink goes, not its target: vendor deletes it
+        // directly, outside its group commit.
         let target = root.join("proj/keep.txt");
         std::fs::write(&target, b"keep").unwrap();
         #[cfg(unix)]
