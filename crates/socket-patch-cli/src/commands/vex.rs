@@ -959,6 +959,7 @@ async fn generate_vex(
                 module,
                 version,
                 conflict,
+                ..
             } = &issue
             else {
                 continue;

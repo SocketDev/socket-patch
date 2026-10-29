@@ -86,6 +86,60 @@ pub fn resolve_with(project_root: &Path, gowork: Option<&str>) -> GoWork {
     }
 }
 
+/// Why the `GOFLAGS` in effect (the environment, then the `go env -w`
+/// file) keeps a Socket replace in `project_root`'s go.mod or go.work from
+/// reaching the build, as a [`WorkspaceConflict::ModFile`]; `None` when go
+/// reads that go.mod (#1799).
+pub fn modfile_conflict(project_root: &Path) -> Option<WorkspaceConflict> {
+    modfile_setting(project_root).map(|setting| WorkspaceConflict::ModFile { setting })
+}
+
+/// [`modfile_conflict`]'s `setting`.
+pub fn modfile_setting(project_root: &Path) -> Option<String> {
+    use crate::utils::go_env::go_env;
+    modfile_setting_with(
+        project_root,
+        go_env("GOFLAGS").as_deref(),
+        go_env("GOWORK").as_deref(),
+    )
+}
+
+/// [`modfile_setting`] for explicit `GOFLAGS` and `GOWORK` values.
+///
+/// A relative `-modfile` is resolved against `project_root`, where go is
+/// taken to run. Any `-modfile` other than that go.mod makes go read
+/// another file (and its `.sum`); with a `go.work` in effect go refuses
+/// `-modfile` outright ("-modfile cannot be used in workspace mode"), and a
+/// `GOFLAGS` go cannot parse stops every go command.
+pub fn modfile_setting_with(
+    project_root: &Path,
+    goflags: Option<&str>,
+    gowork: Option<&str>,
+) -> Option<String> {
+    use crate::utils::go_env::{goflags_modfile, GoflagsModfile};
+    let modfile = match goflags_modfile(goflags?) {
+        GoflagsModfile::Default => return None,
+        GoflagsModfile::Refused(why) => return Some(format!("{why}, so go refuses to run")),
+        GoflagsModfile::File(file) => file,
+    };
+    // An invalid GOWORK is its own refusal; only a go.work go loads is
+    // workspace mode.
+    if matches!(resolve_with(project_root, gowork), GoWork::File(_)) {
+        return Some(format!(
+            "GOFLAGS sets -modfile={modfile}, which go refuses in workspace mode \
+             (\"-modfile cannot be used in workspace mode\"), so go refuses to build"
+        ));
+    }
+    let own = same_dir_key(&project_root.join("go.mod"));
+    if same_dir_key(&project_root.join(&modfile)) == own {
+        return None;
+    }
+    Some(format!(
+        "GOFLAGS sets -modfile={modfile}, so go builds from {modfile} instead of go.mod \
+         and ignores go.mod's replaces"
+    ))
+}
+
 /// The workspace go builds a project in, read once.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoWorkspace {
@@ -304,6 +358,10 @@ pub enum WorkspaceConflict {
     },
     /// go refuses to load the workspace at all.
     Invalid { reason: String },
+    /// `GOFLAGS` sets `-modfile`, so go builds from another go.mod (or
+    /// refuses to build): `setting` says which, as [`modfile_setting`]
+    /// words it.
+    ModFile { setting: String },
 }
 
 impl WorkspaceConflict {
@@ -391,6 +449,10 @@ impl WorkspaceConflict {
             WorkspaceConflict::Invalid { reason } => {
                 format!("cannot take effect: {reason}; fix the workspace setting and re-run")
             }
+            WorkspaceConflict::ModFile { setting } => format!(
+                "has no effect on the build of {module}: {setting}; fix GOFLAGS (`go env \
+                 -u GOFLAGS` if `go env -w` set it) and re-run"
+            ),
         }
     }
 }
@@ -1183,6 +1245,48 @@ mod tests {
         std::fs::remove_file(&work).unwrap();
         std::fs::create_dir(&work).unwrap();
         assert_eq!(resolve_with(&project, None), GoWork::None);
+    }
+
+    /// #1799: `-modfile` keeps a go.mod replace from the build unless it
+    /// names the project's own go.mod; in workspace mode go refuses it.
+    #[test]
+    fn goflags_modfile_conflicts_unless_it_names_the_own_go_mod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        write(tmp.path(), "app/go.mod", "module example.com/app\n");
+        let conflict = |goflags: &str, gowork: Option<&str>| {
+            modfile_setting_with(&project, Some(goflags), gowork)
+        };
+        assert_eq!(modfile_setting_with(&project, None, None), None);
+        let own = project.join("go.mod").to_string_lossy().into_owned();
+        for same in [
+            "".to_string(),
+            "-mod=mod".to_string(),
+            "-modfile=".to_string(),
+            "-modfile=go.mod".to_string(),
+            "-modfile=./go.mod".to_string(),
+            format!("-modfile={own}"),
+        ] {
+            assert_eq!(conflict(&same, None), None, "{same}");
+        }
+        let why = conflict("-modfile=go.alt.mod", None).unwrap();
+        assert!(why.contains("go builds from go.alt.mod"), "{why}");
+        let why = conflict("-modfile", None).unwrap();
+        assert!(why.contains("go refuses to run"), "{why}");
+        // A relative GOWORK is go's own refusal, not workspace mode.
+        let why = conflict("-modfile=go.alt.mod", Some("rel/go.work")).unwrap();
+        assert!(why.contains("go builds from go.alt.mod"), "{why}");
+        assert_eq!(conflict("-modfile=go.mod", Some("rel/go.work")), None);
+
+        // Workspace mode: go refuses any -modfile, its own go.mod included.
+        write(tmp.path(), "go.work", "go 1.22\n\nuse ./app\n");
+        let why = conflict("-modfile=go.mod", None).unwrap();
+        assert!(why.contains("workspace mode"), "{why}");
+        assert_eq!(conflict("-modfile=go.mod", Some("off")), None);
+        assert_eq!(conflict("-modfile=", None), None);
+
+        let consequence = WorkspaceConflict::ModFile { setting: why }.consequence("m", "v1");
+        assert!(consequence.contains("go env -u GOFLAGS"), "{consequence}");
     }
 
     /// MVS runs over every member's requirements: another member raising

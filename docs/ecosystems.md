@@ -1512,6 +1512,16 @@ it and attests nothing. `vex` reads only the project's own `go.work`: when
 `GOWORK` names any other file, it attests none of the project's Go patches
 and reports each as `patched_ref_invalid`.
 
+`GOFLAGS` is read the same way (the environment, then the `go env -w`
+file). A `-modfile` in it that names any file other than the project's
+`go.mod` makes go build from that file and its `.sum` and ignore `go.mod`'s
+replaces, and in workspace mode go refuses `-modfile` outright. socket-patch
+then writes no replace, `apply --check` and `vendor --check` fail on one
+already written, and `vex` attests none of the project's Go patches. A
+relative `-modfile` is taken from the project directory, where go is
+assumed to run. Unset it (`go env -u GOFLAGS` if `go env -w` set it) and
+re-run.
+
 In workspace mode go reads `replace` directives from `go.work` and from the
 `go.mod` of each module it `use`s. Run in the directory holding `go.work`,
 `apply`, `vendor` and `scan --mode hosted` write the `replace` of a module

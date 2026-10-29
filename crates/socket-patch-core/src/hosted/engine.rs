@@ -487,15 +487,15 @@ async fn read_advisory(
 /// The Go workspace in effect for the project, handed to the golang
 /// rewriter under [`crate::patch::redirect::GO_WORKSPACE_KEY`]. On disk it is
 /// the one go resolves (`GOWORK`, else a go.work at or above the root, with
-/// members anywhere); in memory a root `go.work` and its in-root members.
-/// A root go.work and go.work.sum are candidate files the rewriter writes.
+/// members anywhere, plus a `-modfile` that GOFLAGS sets); in memory a root
+/// `go.work` and its in-root members. A root go.work and go.work.sum are candidate files the rewriter writes.
 async fn read_go_workspace(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
     out: &mut CandidateFiles,
 ) {
     use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
-    let (root, loaded) = match view {
+    let (root, loaded, modfile) = match view {
         ProjectView::Memory(_) => 'memory: {
             let Some(work) = read_advisory(view, unreadable, "go.work").await else {
                 return;
@@ -507,6 +507,7 @@ async fn read_go_workspace(
                 break 'memory (
                     std::path::PathBuf::new(),
                     Loaded::Invalid(format!("go.work: {problem}, so go refuses to build")),
+                    None,
                 );
             }
             let mut members = Vec::new();
@@ -539,7 +540,7 @@ async fn read_go_workspace(
                 members,
                 graph: None,
             };
-            (std::path::PathBuf::new(), Loaded::Workspace(ws))
+            (std::path::PathBuf::new(), Loaded::Workspace(ws), None)
         }
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let Some(root) = view.disk_root_reading(std::iter::empty::<&std::path::Path>()) else {
@@ -560,13 +561,19 @@ async fn read_go_workspace(
                 }
             }
             view.disk_root_reading(&touched);
-            (root, loaded)
+            // `-modfile` in GOFLAGS sends the build to another go.mod (#1799).
+            let modfile = go_workspace::modfile_setting(&root);
+            (root, loaded, modfile)
         }
     };
-    if loaded == Loaded::None {
+    if loaded == Loaded::None && modfile.is_none() {
         return;
     }
-    let hosted = crate::patch::redirect::HostedGoWorkspace { root, loaded };
+    let hosted = crate::patch::redirect::HostedGoWorkspace {
+        root,
+        loaded,
+        modfile,
+    };
     if let Ok(json) = serde_json::to_string(&hosted) {
         out.files
             .insert(crate::patch::redirect::GO_WORKSPACE_KEY.to_string(), json);

@@ -123,7 +123,7 @@ use super::{
     DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::go_env::go_env;
+use crate::utils::go_env::{go_env, goflags_modfile, GoflagsModfile};
 use crate::vendor::go_build_list::{self, Selection};
 use crate::vendor::go_mod_edit::{
     self, block_structure_error, hosted_module_uuid, normalize_for_read, ReplaceEntry,
@@ -139,7 +139,52 @@ const GO_WORK: &str = "go.work";
 const GO_WORK_SUM: &str = "go.work.sum";
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
-    extract_gowork(ctx, out, go_env("GOWORK").as_deref()).await;
+    extract_goenv(
+        ctx,
+        out,
+        go_env("GOWORK").as_deref(),
+        go_env("GOFLAGS").as_deref(),
+    )
+    .await;
+}
+
+/// [`extract`] for explicit `GOWORK` and `GOFLAGS` values.
+async fn extract_goenv(
+    ctx: &DiscoverCtx<'_>,
+    out: &mut Discovery,
+    gowork: Option<&str>,
+    goflags: Option<&str>,
+) {
+    // `-modfile` sends the build to another go.mod, whose replaces (if
+    // any) discovery doesn't read: nothing here is what go builds (#1799).
+    // Only a project on disk is built under this process's GOFLAGS (the
+    // hosted engine reads it for the same views). The probe reads exactly
+    // the go.work candidates, go.mod and the named file, and declares them
+    // so a tracked snapshot keeps recording.
+    let setting = match goflags.map(goflags_modfile) {
+        None | Some(GoflagsModfile::Default) => None,
+        Some(flag) => ctx
+            .disk_root_reading(std::iter::empty::<&Path>())
+            .and_then(|root| {
+                let mut touched: Vec<std::path::PathBuf> =
+                    root.ancestors().map(|dir| dir.join(GO_WORK)).collect();
+                touched.extend(
+                    gowork
+                        .filter(|g| Path::new(g).is_absolute())
+                        .map(Into::into),
+                );
+                touched.push(GO_MOD.into());
+                if let GoflagsModfile::File(file) = flag {
+                    touched.push(file.into());
+                }
+                ctx.disk_root_reading(&touched)?;
+                go_workspace::modfile_setting_with(root, goflags, gowork)
+            }),
+    };
+    if let Some(setting) = setting {
+        return withhold(ctx, out, &setting).await;
+    }
+    extract_gowork(ctx, out, gowork).await;
 }
 
 /// [`extract`] for an explicit `GOWORK` value.
@@ -1912,6 +1957,81 @@ mod tests {
         }
         let out = extract(Some("off".to_string())).await;
         assert!(out.refs.is_empty() && out.diagnostics.is_empty());
+    }
+
+    /// #1799: `-modfile` in GOFLAGS naming another go.mod sends the build
+    /// there, so the root go.mod's replace is diagnosed, never a ref; one
+    /// naming the root's own go.mod (or an empty one) is go's default.
+    #[tokio::test]
+    async fn goflags_modfile_naming_another_go_mod_attests_nothing() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let p = Project::new();
+        p.write(
+            "go.mod",
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n\n\
+                 replace {MODULE} {VERSION} => {m} {sver}\n"
+            ),
+        )
+        .write("go.sum", go_sum_for(UUID_A, sver));
+        let extract = |goflags: &'static str| {
+            let p = &p;
+            async move {
+                let ctx = p.ctx();
+                let mut out = Discovery::default();
+                super::extract_goenv(&ctx, &mut out, None, Some(goflags)).await;
+                out
+            }
+        };
+        let own = p.root().join("go.mod").to_string_lossy().into_owned();
+        let own: &'static str = Box::leak(format!("-mod=mod --modfile={own}").into_boxed_str());
+        for goflags in ["", "-mod=mod", "-modfile=", "-modfile=go.mod", own] {
+            let out = extract(goflags).await;
+            assert_eq!(out.refs.len(), 1, "{goflags}: {:?}", out.diagnostics);
+        }
+        for goflags in [
+            "-modfile=go.alt.mod",
+            "-modfile=go.mod \"-modfile=alt dir/go.mod\"",
+            "-modfile",
+        ] {
+            let out = extract(goflags).await;
+            assert!(out.refs.is_empty(), "{goflags}");
+            assert_eq!(out.diagnostics.len(), 1, "{goflags}: {:?}", out.diagnostics);
+            assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+            assert!(
+                out.diagnostics[0].detail.contains("-modfile"),
+                "{goflags}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// The `-modfile` probe declares what it reads: a tracked snapshot
+    /// keeps recording whether or not it withholds (#1799).
+    #[tokio::test]
+    async fn goflags_modfile_probe_keeps_a_snapshot_recording() {
+        use crate::vendor::lock_inventory::{DiskSnapshot, ProjectView};
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let p = Project::new();
+        p.write(
+            "go.mod",
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n\n\
+                 replace {MODULE} {VERSION} => {m} {sver}\n"
+            ),
+        )
+        .write("go.sum", go_sum_for(UUID_A, sver));
+        for (goflags, refs) in [("-modfile=go.mod", 1), ("-modfile=go.alt.mod", 0)] {
+            let snap = DiskSnapshot::tracked(p.root());
+            snap.begin_recording();
+            let ctx = DiscoverCtx::over(ProjectView::Snapshot(&snap), &[]);
+            let mut out = Discovery::default();
+            super::extract_goenv(&ctx, &mut out, None, Some(goflags)).await;
+            assert_eq!(out.refs.len(), refs, "{goflags}: {:?}", out.diagnostics);
+            assert!(snap.end_recording().is_some(), "{goflags}");
+        }
     }
 
     /// In a workspace the socket module's zip line does not prove the

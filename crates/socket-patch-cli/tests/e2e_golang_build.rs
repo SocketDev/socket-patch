@@ -1469,3 +1469,123 @@ fn global_apply_flags_tools_built_from_the_unpatched_module() {
 
     chmod_writable(&modcache);
 }
+
+// ── GOFLAGS=-modfile (#1799) ─────────────────────────────────────────
+
+/// `socket-patch <args>` in `dir` with `GOFLAGS` (and `GOENV`) set.
+fn run_goflags(
+    dir: &Path,
+    args: &[&str],
+    modcache: &Path,
+    goflags: &str,
+    goenv: &str,
+) -> (i32, String, String) {
+    let mut full = args.to_vec();
+    full.extend(["--cwd", dir.to_str().unwrap()]);
+    common::run_with_env(
+        dir,
+        &full,
+        &[
+            ("GOMODCACHE", modcache.to_str().unwrap()),
+            ("GOFLAGS", goflags),
+            ("GOENV", goenv),
+        ],
+    )
+}
+
+/// #1799: with `-modfile` in `GOFLAGS` go builds from another go.mod, so a
+/// replace in go.mod never reaches the build. apply must refuse instead of
+/// reporting the patch applied; one written before `-modfile` was set fails
+/// `apply --check` and is left out of VEX, whether `-modfile` comes from
+/// the environment or the `go env -w` file.
+#[test]
+fn goflags_modfile_keeps_the_go_mod_replace_from_the_build() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(goflags-modfile)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage(tmp.path());
+    let mc = modcache.to_str().unwrap();
+    let env = go_env(mc, &proxy_url);
+    assert!(go(&consumer, &["mod", "tidy"], &env).status.success());
+    std::fs::copy(consumer.join("go.mod"), consumer.join("go.alt.mod")).unwrap();
+    std::fs::copy(consumer.join("go.sum"), consumer.join("go.alt.sum")).unwrap();
+    let alt_env: Vec<(&str, &str)> = env
+        .iter()
+        .map(|&(k, v)| match k {
+            "GOFLAGS" => (k, "-mod=mod -modfile=go.alt.mod"),
+            _ => (k, v),
+        })
+        .collect();
+    assert!(go_out(&consumer, &alt_env).contains("OUT: PRISTINE"));
+    write_patch(&consumer);
+    let modfile = "-modfile=go.alt.mod";
+    let no_goenv = "off";
+
+    // The dry run predicts the refusal; the real run writes nothing.
+    for dry in [true, false] {
+        let mut args = vec!["apply", "--offline", "--ecosystems", "golang", "--json"];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (code, so, se) = run_goflags(&consumer, &args, &modcache, modfile, no_goenv);
+        assert_ne!(code, 0, "apply (dry run {dry}) must refuse:\n{so}\n{se}");
+        assert!(so.contains("-modfile=go.alt.mod"), "{so}");
+        assert!(replace_lines(&consumer.join("go.mod")).is_empty());
+        assert!(
+            !consumer.join(".socket/go-patches").exists(),
+            "a refused apply leaves no copy behind"
+        );
+    }
+    assert!(go_out(&consumer, &alt_env).contains("OUT: PRISTINE"));
+
+    // Applied without -modfile: the replace patches the default build...
+    let (code, so, se) = run_goflags(
+        &consumer,
+        &["apply", "--offline", "--ecosystems", "golang", "--json"],
+        &modcache,
+        "",
+        no_goenv,
+    );
+    assert_eq!(code, 0, "apply without -modfile:\n{so}\n{se}");
+    assert!(go_out(&consumer, &env).contains("OUT: PATCHED"));
+    // ...but not the -modfile one, which neither --check nor vex may pass.
+    assert!(go_out(&consumer, &alt_env).contains("OUT: PRISTINE"));
+    let goenv_file = tmp.path().join("goenv");
+    std::fs::write(&goenv_file, format!("GOFLAGS={modfile}\n")).unwrap();
+    for (goflags, goenv) in [(modfile, no_goenv), ("", goenv_file.to_str().unwrap())] {
+        let (code, so, se) = run_goflags(
+            &consumer,
+            &["apply", "--check", "--ecosystems", "golang"],
+            &modcache,
+            goflags,
+            goenv,
+        );
+        assert_eq!(code, 1, "apply --check must flag the replace:\n{so}\n{se}");
+        assert!(se.contains("-modfile=go.alt.mod"), "{se}");
+
+        let r = VexRun {
+            offline: true,
+            product: Some("pkg:golang/example.com/consumer@v0.0.1".into()),
+            ..VexRun::default()
+        }
+        .env("GOMODCACHE", &modcache)
+        .env("GOFLAGS", goflags)
+        .env("GOENV", goenv);
+        let out = run_vex(&vex_e2e_common::binary(), &consumer, &r);
+        assert_absent(out.doc.as_ref(), UPURL);
+        vex_e2e_common::assert_not_attested(&out.envelope, UPURL, "go_workspace_override");
+    }
+
+    // -modfile naming the project's own go.mod is go's default.
+    let (code, so, se) = run_goflags(
+        &consumer,
+        &["apply", "--check", "--ecosystems", "golang"],
+        &modcache,
+        "-modfile=go.mod",
+        no_goenv,
+    );
+    assert_eq!(code, 0, "-modfile=go.mod is in sync:\n{so}\n{se}");
+
+    chmod_writable(tmp.path());
+}
