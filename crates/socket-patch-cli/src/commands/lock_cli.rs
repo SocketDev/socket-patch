@@ -1,15 +1,6 @@
-//! Envelope-aware wrapper around the
-//! `socket_patch_core::patch::apply_lock` advisory lock.
-//!
-//! Mutating subcommands (`apply`, `rollback`, `repair`, `remove`,
-//! `vendor`) all need the same shape: acquire the lock at the top of
-//! `run`, on contention emit a JSON envelope with `error.code:
-//! "lock_held"` (status "error") (or stderr in human mode) and exit 1. This module
-//! centralises that emission so the call sites stay one line each.
-//!
-//! The lock itself is in `socket-patch-core` (cross-crate, also used
-//! by tests). This module is the CLI-side glue that knows how to
-//! render the failure through the shared [`crate::json_envelope`].
+//! CLI rendering of the `socket_patch_core::patch::apply_lock` advisory
+//! lock: acquire it with a waiting status line, and report a failure as a
+//! `lock_held` / `lock_io` JSON envelope or an `Error:` line on stderr.
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,30 +12,9 @@ use crate::json_envelope::{Command, Envelope, EnvelopeError};
 /// Try to acquire `<socket_dir>/apply.lock` and return the guard, or
 /// emit a failure envelope and a non-zero exit code.
 ///
-/// `command` selects the envelope's `command` field so downstream
-/// consumers see `apply` / `rollback` / `repair` / `remove` rather
-/// than a generic "lock failed". `dry_run` is plumbed through to the
-/// envelope's `dry_run` field for the (rare) case where lock
-/// contention happens during a dry-run apply.
-///
-/// `timeout = Duration::ZERO` keeps the historical non-blocking
-/// try-once shape. Positive values wait with a 100 ms backoff —
-/// see `socket_patch_core::patch::apply_lock::acquire`.
-///
-/// The lock's whole lifecycle lives in the core guard: `acquire`
-/// creates a missing `.socket/` itself, and the returned guard's drop
-/// unlinks `apply.lock` while still holding the lock, releases it, and
-/// prunes an otherwise-empty `.socket/` — so no command leaves a lock
-/// file (or a bare `.socket/`) behind, and this wrapper never has to
-/// touch the file. An interrupted run removes the file too: the
-/// `interrupt` handlers (SIGINT/SIGTERM/SIGHUP, Windows console ctrl)
-/// clean up the held lock before the signal ends the process. Only an
-/// uncatchable kill (SIGKILL, power loss) can leave it, and such a
-/// leftover never contends: the kernel released the dead holder's
-/// advisory lock along with its file handle, so the acquire reclaims the
-/// file in place and removes it on exit. `Held` therefore always means a
-/// *live* process. socket-patch never keeps a persistent lock file in the
-/// project; one that is ever needed lives outside it.
+/// `Duration::ZERO` tries once; a positive `timeout` waits for the lock.
+/// The core guard owns the lock file's whole lifecycle (see
+/// `socket_patch_core::patch::apply_lock`).
 pub(crate) fn acquire_or_emit(
     socket_dir: &Path,
     command: Command,
@@ -52,15 +22,22 @@ pub(crate) fn acquire_or_emit(
     dry_run: bool,
     timeout: Duration,
 ) -> Result<LockGuard, i32> {
-    match acquire_with_status(socket_dir, timeout) {
-        Ok(guard) => Ok(guard),
-        Err(err) => {
-            let hint = failure_hint(&err, &socket_dir.join("apply.lock"), timeout);
-            let (code, message) = lock_failure(&err, timeout);
-            emit(command, json, dry_run, code, &message, &hint);
-            Err(1)
-        }
+    let err = match acquire_with_status(socket_dir, timeout) {
+        Ok(guard) => return Ok(guard),
+        Err(err) => err,
+    };
+    let (code, message) = lock_failure(&err, timeout);
+    if json {
+        println!(
+            "{}",
+            error_envelope(command, dry_run, code, &message).to_pretty_json()
+        );
+    } else {
+        // Errors print even under --silent ("errors only", CLI_CONTRACT.md),
+        // and the hint is part of the error report.
+        eprint!("{}", format_lock_error(socket_dir, &err, timeout));
     }
+    Err(1)
 }
 
 /// [`acquire`] with the contended-wait status line: a `--lock-timeout 30`
@@ -88,7 +65,19 @@ pub(crate) fn acquire_with_status(
 /// useful advice).
 fn failure_hint(err: &LockError, lock_path: &Path, timeout: Duration) -> String {
     match err {
-        LockError::Held => held_hint(lock_path, timeout),
+        // `Held` always means a live process (a leftover file never
+        // contends), so the only honest advice is to wait.
+        LockError::Held => {
+            let how = if timeout > Duration::ZERO {
+                "retry with a longer --lock-timeout"
+            } else {
+                "pass --lock-timeout <secs> to wait for it automatically"
+            };
+            format!(
+                "Wait for it to finish, or {how}. (Lock file: {})",
+                lock_path.display()
+            )
+        }
         LockError::Io { path, source } if source.kind() == std::io::ErrorKind::PermissionDenied => {
             format!(
                 "Check that {} is writable.",
@@ -125,31 +114,17 @@ fn waiting_message(lock_path: &Path, timeout: Duration) -> String {
 pub(crate) const HELD_RETRY_HINT: &str =
     "Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock.";
 
-/// Remediation printed under a human-mode `lock_held` error. `Held`
-/// always means a live process (leftover files never contend), so the
-/// only honest advice is to wait; how depends on whether this run already
-/// waited.
-fn held_hint(lock_path: &Path, timeout: Duration) -> String {
-    let how = if timeout > Duration::ZERO {
-        "retry with a longer --lock-timeout"
-    } else {
-        "pass --lock-timeout <secs> to wait for it automatically"
-    };
-    format!(
-        "Wait for it to finish, or {how}. (Lock file: {})",
-        lock_path.display()
-    )
-}
-
-/// The one `LockError` → (`errorCode`, message) mapping every lock
-/// site renders: `Held` → `lock_held` with the wait budget spelled out
-/// by [`held_message`], `Io` → `lock_io` naming the path and the OS
-/// error. Callers that build their own envelope (the scan/vendor step,
-/// GC, hosted) use this rather than re-deriving the strings, so the
-/// contention text and the waited clause cannot drift between commands.
+/// The one `LockError` → (`errorCode`, message) mapping every lock site
+/// renders, so the error message cannot drift between commands.
 pub(crate) fn lock_failure(err: &LockError, timeout: Duration) -> (&'static str, String) {
+    const HELD: &str = "another socket-patch process is operating in this directory";
     match err {
-        LockError::Held => ("lock_held", held_message(timeout)),
+        // A zero budget never waited, so it claims no wait.
+        LockError::Held if timeout > Duration::ZERO => (
+            "lock_held",
+            format!("{HELD} (waited {})", fmt_duration(timeout)),
+        ),
+        LockError::Held => ("lock_held", HELD.to_string()),
         LockError::Io { path, source } => (
             "lock_io",
             format!("failed to open lock file at {}: {}", path.display(), source),
@@ -157,24 +132,8 @@ pub(crate) fn lock_failure(err: &LockError, timeout: Duration) -> (&'static str,
     }
 }
 
-/// Human-readable description of a `lock_held` contention for the given
-/// wait budget. A zero budget means the historical non-blocking
-/// try-once, so we omit the "(waited …)" clause entirely.
-fn held_message(timeout: Duration) -> String {
-    if timeout > Duration::ZERO {
-        format!(
-            "another socket-patch process is operating in this directory (waited {})",
-            fmt_duration(timeout)
-        )
-    } else {
-        "another socket-patch process is operating in this directory".to_string()
-    }
-}
-
-/// Format a wait budget for humans. Whole seconds read naturally
-/// (`5s`); sub-second budgets — reachable through the library API even
-/// though the CLI only ever passes whole seconds — render as
-/// milliseconds rather than truncating to a misleading `0s`.
+/// A wait budget for humans: whole seconds as `5s`, a sub-second budget
+/// (tests pass them) as milliseconds rather than a misleading `0s`.
 fn fmt_duration(d: Duration) -> String {
     if d.subsec_nanos() == 0 {
         format!("{}s", d.as_secs())
@@ -183,11 +142,8 @@ fn fmt_duration(d: Duration) -> String {
     }
 }
 
-/// Build the top-level error envelope emitted in `--json` mode when a
-/// command fails before doing real work (lock acquisition here; `repair`
-/// reuses it for its early error exits). Split out from [`emit`] so the
-/// serialized shape (status / error.code / command / dryRun) is
-/// unit-testable without capturing stdout.
+/// The `--json` error envelope of a command that fails before doing real
+/// work (lock acquisition here; `repair` and `update` reuse it).
 pub(crate) fn error_envelope(
     command: Command,
     dry_run: bool,
@@ -198,21 +154,6 @@ pub(crate) fn error_envelope(
     env.dry_run = dry_run;
     env.mark_error(EnvelopeError::new(code, message));
     env
-}
-
-fn emit(command: Command, json: bool, dry_run: bool, code: &str, message: &str, hint: &str) {
-    if json {
-        println!(
-            "{}",
-            error_envelope(command, dry_run, code, message).to_pretty_json()
-        );
-    } else {
-        // Errors print even under --silent ("errors only", never "nothing"
-        // — CLI_CONTRACT.md): exit 1 with no message would be
-        // undiagnosable. The remediation hint is part of the error report,
-        // not informational chatter, so it prints with the error.
-        eprint!("{}", format_human_error(message, hint));
-    }
 }
 
 /// The human-mode error report: `Error: <Message>` (first letter
@@ -266,9 +207,7 @@ mod tests {
         assert!(!socket.exists(), "empty .socket/ must be pruned on release");
     }
 
-    /// A file squatting where `.socket/` should be still surfaces as
-    /// `lock_io` / exit 1 — the acquire-mkdirs change did not turn
-    /// genuine faults into silent successes.
+    /// A file squatting where `.socket/` should be is still a failure.
     #[test]
     fn acquire_or_emit_returns_one_when_socket_dir_is_a_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -279,10 +218,7 @@ mod tests {
         assert_eq!(code, 1);
     }
 
-    /// Positive timeout waits then errors `lock_held` — confirms the
-    /// budget is plumbed through to `acquire`. Mirrors the
-    /// `apply_lock::tests::timeout_held` shape so a regression in
-    /// either layer surfaces here.
+    /// A positive timeout waits before it gives up.
     #[test]
     fn acquire_or_emit_honors_lock_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -309,10 +245,7 @@ mod tests {
     /// A leftover lock file from a crashed run never contends — the
     /// kernel released the dead holder's advisory lock along with its
     /// file handle, so a plain acquire reclaims the file in place and
-    /// the guard's drop removes it. This is the fact that made
-    /// `--break-lock` redundant (and, with it, the `unlock`
-    /// subcommand): there is no stale-lock state a user ever needs to
-    /// clear before running a mutating command.
+    /// the guard's drop removes it.
     #[test]
     fn acquire_or_emit_reclaims_stale_leftover_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -336,8 +269,7 @@ mod tests {
         );
     }
 
-    /// Regression guard carried over from the `--break-lock` era: the
-    /// wrapper must never open a window in which a competitor can be
+    /// The wrapper must never open a window in which a competitor can be
     /// robbed of a lock it legitimately acquired: a competitor that
     /// flocked (or had merely *opened*) the file before an unlink keeps a
     /// valid lock on the orphaned inode while a re-acquire locks a fresh
@@ -505,21 +437,6 @@ mod tests {
     }
 
     #[test]
-    fn held_hint_depends_on_whether_we_already_waited() {
-        let lock = Path::new("proj/.socket/apply.lock");
-        assert_eq!(
-            held_hint(lock, Duration::ZERO),
-            "Wait for it to finish, or pass --lock-timeout <secs> to wait for it \
-             automatically. (Lock file: proj/.socket/apply.lock)"
-        );
-        assert_eq!(
-            held_hint(lock, Duration::from_secs(2)),
-            "Wait for it to finish, or retry with a longer --lock-timeout. \
-             (Lock file: proj/.socket/apply.lock)"
-        );
-    }
-
-    #[test]
     fn waiting_message_names_lock_and_budget() {
         assert_eq!(
             waiting_message(Path::new("p/.socket/apply.lock"), Duration::from_secs(5)),
@@ -531,38 +448,17 @@ mod tests {
         );
     }
 
-    /// Whole-second budgets read naturally in the contention message.
+    /// A sub-second budget renders as milliseconds, not `0s`, and a zero
+    /// budget claims no wait.
     #[test]
-    fn held_message_reports_whole_seconds() {
+    fn lock_failure_renders_the_waited_budget() {
         assert_eq!(
-            held_message(Duration::from_secs(5)),
-            "another socket-patch process is operating in this directory (waited 5s)"
+            lock_failure(&LockError::Held, Duration::from_millis(250)).1,
+            "another socket-patch process is operating in this directory (waited 250ms)"
         );
-    }
-
-    /// Regression: `timeout.as_secs()` truncated a 250ms budget to
-    /// `(waited 0s)`, which read as "we didn't wait at all". Sub-second
-    /// budgets now surface as milliseconds. The 250ms budget mirrors
-    /// `acquire_or_emit_honors_lock_timeout`, so the message stays
-    /// honest for the exact value that test exercises.
-    #[test]
-    fn held_message_does_not_truncate_sub_second_to_zero() {
-        let msg = held_message(Duration::from_millis(250));
-        assert!(msg.contains("250ms"), "expected ms rendering, got: {msg}");
-        assert!(
-            !msg.contains("0s"),
-            "sub-second budget must not collapse to 0s: {msg}"
-        );
-    }
-
-    /// A zero budget is the non-blocking try-once shape — no "(waited …)"
-    /// clause, since we never actually waited.
-    #[test]
-    fn held_message_zero_timeout_omits_waited_clause() {
-        let msg = held_message(Duration::ZERO);
-        assert!(
-            !msg.contains("waited"),
-            "zero budget should not claim a wait: {msg}"
+        assert_eq!(
+            lock_failure(&LockError::Held, Duration::ZERO).1,
+            "another socket-patch process is operating in this directory"
         );
     }
 
@@ -582,9 +478,8 @@ mod tests {
         assert_eq!(v["events"].as_array().unwrap().len(), 0);
     }
 
-    /// `dry_run` and `command` are plumbed through to the envelope so a
-    /// contention during a dry-run apply/rollback is still reported as
-    /// a dry run. Covers the other two reason tags too.
+    /// `dry_run` and `command` reach the envelope, so a contention during
+    /// a dry-run rollback is still reported as a dry run.
     #[test]
     fn error_envelope_propagates_dry_run_and_command() {
         let env = error_envelope(Command::Rollback, true, "lock_io", "open failed");
