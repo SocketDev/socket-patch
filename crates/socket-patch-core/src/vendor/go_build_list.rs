@@ -35,7 +35,9 @@
 //! replace to a replacement. go also refuses a build that uses one
 //! module@version under two module paths, so the zip can't be from the
 //! target being built in its own right. Such a module is
-//! [`Selection::ReplaceTarget`] (#1823).
+//! [`Selection::ReplaceTarget`] (#1823). In an unpruned graph that holds
+//! even when only a dependency requires the replaced module, since the
+//! root go.mod doesn't list it but its replace still applies (#1840).
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -143,9 +145,18 @@ pub fn select(
 /// shadows a version-less one (go prefers the versioned replace). `go mod
 /// tidy` keeps unused replaces, so one of a module the build doesn't use, or
 /// pinned to a version it doesn't require, explains nothing.
+///
+/// An unpruned graph (go < 1.17) is the exception: its root go.mod omits
+/// modules only a dependency requires, yet the root's replaces still apply
+/// to them, so a replace of a fork go.mod doesn't list may be in effect
+/// (#1840). Without the dependencies' go.mod files there is no telling, so
+/// it counts as in effect (the safe side: no patch is reported built that
+/// isn't) unless go.mod requires `module` itself. That puts `module` in the
+/// build under its own path, and go refuses one module@version under two.
 fn replaced_module(go_mod: &str, module: &str, version: &str) -> Option<String> {
     let required = parse_required_versions(go_mod);
     let entries = parse_replace_entries(go_mod);
+    let unlisted_in_effect = !prunes_module_graph(go_mod) && !required.contains_key(module);
     entries
         .iter()
         .filter(|e| e.module != module)
@@ -154,7 +165,7 @@ fn replaced_module(go_mod: &str, module: &str, version: &str) -> Option<String> 
         })
         .find(|e| {
             let Some(req) = required.get(&e.module) else {
-                return false;
+                return unlisted_in_effect;
             };
             match e.version.as_deref() {
                 Some(v) => v == req,
@@ -322,8 +333,11 @@ mod tests {
     fn inactive_replace_target_keeps_the_zip_as_evidence() {
         let s = sum(&[&format!("{UP} v1.0.0")]);
         for go in ["go 1.21", "go 1.16"] {
-            for (require, replace) in [
-                ("", format!("replace other.com/fork => {UP} v1.0.0")),
+            // A pruned graph lists every module it builds, so a fork the
+            // root go.mod doesn't require is not in the build.
+            let unrequired =
+                (go == "go 1.21").then(|| ("", format!("replace other.com/fork => {UP} v1.0.0")));
+            for (require, replace) in unrequired.into_iter().chain([
                 (
                     "require other.com/fork v1.0.0\n",
                     format!("replace other.com/fork v0.5.0 => {UP} v1.0.0"),
@@ -335,7 +349,7 @@ mod tests {
                          replace other.com/fork v1.0.0 => ../fork"
                     ),
                 ),
-            ] {
+            ]) {
                 let m = format!("module c\n\n{go}\n\n{require}\n{replace}\n");
                 assert_eq!(
                     selection(&m, Some(&s), UP, "v1.0.0"),
@@ -344,6 +358,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1840: an unpruned graph (go 1.16, or no `go` directive) omits from
+    /// the root go.mod a fork only a dependency requires, but the root's
+    /// replace still applies to it, so the zip line is the fork's.
+    #[test]
+    fn unpruned_replace_of_a_transitive_fork_is_a_replace_target() {
+        let s = sum(&[&format!("{UP} v1.0.0"), &format!("{UP} v1.0.0/go.mod")]);
+        let via = Selection::ReplaceTarget("other.com/fork".into());
+        for go in ["go 1.16", ""] {
+            for replace in [
+                format!("replace other.com/fork => {UP} v1.0.0"),
+                format!("replace other.com/fork v1.0.0 => {UP} v1.0.0"),
+                format!("replace (\n\tother.com/fork => {UP} v1.0.0\n)"),
+            ] {
+                let m =
+                    format!("module c\n\n{go}\n\nrequire example.com/mid v1.0.0\n\n{replace}\n");
+                assert_eq!(
+                    selection(&m, Some(&s), UP, "v1.0.0"),
+                    via,
+                    "{go} / {replace}"
+                );
+                // No zip line at all: still built only as the replacement.
+                assert_eq!(selection(&m, None, UP, "v1.0.0"), via, "{go} / {replace}");
+            }
+        }
+    }
+
+    /// A root require of the module puts it in the build under its own
+    /// path, and go refuses one module@version under two paths, so a
+    /// replace of an unrequired fork can't explain its zip line.
+    #[test]
+    fn unpruned_root_require_of_the_module_keeps_its_zip() {
+        let m = format!(
+            "module c\n\ngo 1.16\n\nrequire {UP} v1.0.0\n\n\
+             replace other.com/fork => {UP} v1.0.0\n"
+        );
+        let s = sum(&[&format!("{UP} v1.0.0")]);
+        assert_eq!(selection(&m, Some(&s), UP, "v1.0.0"), Selection::Selected);
     }
 
     #[test]
