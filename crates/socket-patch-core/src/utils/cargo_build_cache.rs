@@ -59,8 +59,11 @@ pub fn build_dirs_with(
     cargo_home: Option<&Path>,
 ) -> BuildDirs {
     // `--cwd` defaults to `.`, whose `ancestors()` stop at `.`: walk the
-    // absolute path so a parent's `Cargo.lock` and `.cargo/config` count.
-    let cwd = &std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    // absolute path so a parent's `Cargo.lock` and `.cargo/config` count,
+    // with `..` folded so `--cwd ../app` doesn't walk the directory left.
+    let cwd = &crate::utils::relpath::normalize_lexically_keeping_escapes(
+        &std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+    );
     let env = |k: &str| env(k).filter(|v| !v.trim().is_empty());
     let ws_root = workspace_root(cwd);
     let config = ConfigDirs::read(cwd, cargo_home);
@@ -446,8 +449,8 @@ mod tests {
         );
     }
 
-    /// The default `--cwd .` still finds the workspace root and the
-    /// ancestor config above it.
+    /// A relative cwd (the default `--cwd .`, or `../ws/member`) finds the
+    /// workspace root and the ancestor config above it, and nothing else.
     #[test]
     #[serial_test::serial]
     fn build_dirs_walk_above_a_relative_cwd() {
@@ -463,14 +466,24 @@ mod tests {
             "[build]\ntarget-dir = \"out\"\n",
         )
         .unwrap();
+        // `--cwd ../ws/member` from a sibling whose config must not count.
+        let left = t.path().join("left");
+        std::fs::create_dir_all(left.join(".cargo")).unwrap();
+        std::fs::create_dir_all(left.join("wrong")).unwrap();
+        std::fs::write(
+            left.join(".cargo/config.toml"),
+            "[build]\nbuild-dir = \"wrong\"\n",
+        )
+        .unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&member).unwrap();
-        let d = build_dirs_with(Path::new("."), &|_| None, None);
+        let from_member = build_dirs_with(Path::new("."), &|_| None, None);
+        std::env::set_current_dir(&left).unwrap();
+        let from_sibling = build_dirs_with(Path::new("../ws/member"), &|_| None, None);
         std::env::set_current_dir(prev).unwrap();
-        assert_eq!(
-            d.dirs,
-            vec![std::fs::canonicalize(root.join("out")).unwrap()]
-        );
+        let out = vec![std::fs::canonicalize(root.join("out")).unwrap()];
+        assert_eq!(from_member.dirs, out);
+        assert_eq!(from_sibling.dirs, out);
     }
 
     #[test]
