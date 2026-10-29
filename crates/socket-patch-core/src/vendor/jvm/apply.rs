@@ -30,7 +30,7 @@ use super::super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::super::{RevertOpts, RevertOutcome, VendorWarning};
 use super::{
     coursier_tree, gradle, layout, maven_reactor, op_of, op_str, sbt, scala_cli, sha256_hex,
-    Coords, JvmPlan, JvmUnplan, ReadFn, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND,
+    Coords, JvmPlan, JvmUnplan, ListFn, ReadFn, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND,
     CREATED_DIR_KIND, DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
     SBT_FRAGMENT_KIND, SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
 };
@@ -593,6 +593,7 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
     }
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
+    let list = |dir: &str| reader.list(dir);
     let peers = match super::super::state::load_state(root).await {
         Ok(state) => state,
         Err(e) => return RevertOutcome::failed(format!("vendor_state_unreadable: {e}")),
@@ -625,7 +626,10 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
             unplan = merge_unplans(unplan, gradle::unplan(&read, &c, &records));
         }
         if maven {
-            unplan = merge_unplans(unplan, maven_reactor::unplan(&read, &c, &entry.wiring));
+            unplan = merge_unplans(
+                unplan,
+                maven_reactor::unplan(&read, &list, &c, &entry.wiring),
+            );
         }
         unplan
     };
@@ -837,13 +841,14 @@ pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
     };
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
+    let list = |dir: &str| reader.list(dir);
     let referenced = if sbt::owns(&entry.wiring) {
         sbt::wired_checked(&read, &c).unwrap_or(true)
     } else if scala_cli::owns(&entry.wiring) {
         scala_cli::wired_checked(&read, &c).unwrap_or(true)
     } else {
         let (maven, gradle) = sides(&entry.wiring);
-        (maven && maven_reactor::wired_checked(&read, &c).unwrap_or(true))
+        (maven && maven_reactor::wired_checked(&read, &list, &c).unwrap_or(true))
             || (gradle && gradle::references_checked(&read, &c).unwrap_or(true))
     };
     // `read` answers `None` for an unreadable file as for a missing one;
@@ -878,7 +883,7 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
             wired = gradle::wired_checked(&read, &list, &c).map_err(|e| e.detail);
         }
         if maven && wired == Ok(true) {
-            wired = maven_reactor::attestable_checked(&read, &c).map_err(|e| e.detail);
+            wired = maven_reactor::attestable_checked(&read, &list, &c).map_err(|e| e.detail);
         }
         wired
     };
@@ -892,12 +897,13 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
 /// repository `local_repo` alone (`None` entries: not there).
 fn local_external_poms(
     read: ReadFn<'_>,
+    list: ListFn<'_>,
     patch: &super::JvmPatch<'_>,
     local_repo: Option<&Path>,
 ) -> maven_reactor::ExternalPoms {
     let mut known = maven_reactor::ExternalPoms::new();
     loop {
-        let need = maven_reactor::external_poms_needed(read, patch, &known);
+        let need = maven_reactor::external_poms_needed(read, list, patch, &known);
         if need.is_empty() {
             return known;
         }
@@ -1000,7 +1006,7 @@ pub fn check_entry(
     // sync: the pin it wrote when it could read it, or none.
     let shape = shape_of(&entry.wiring);
     let external = if matches!(shape, Shape::MavenReactor | Shape::Mixed) {
-        Some(local_external_poms(&read, &patch, local_repo))
+        Some(local_external_poms(&read, &list, &patch, local_repo))
     } else {
         None
     };
@@ -1020,7 +1026,7 @@ pub fn check_entry(
     let referenced = if sbt_entry || scala_cli_entry {
         entry_wired_checked(root, entry)?
     } else {
-        (!maven || maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail)?)
+        (!maven || maven_reactor::wired_checked(&read, &list, &c).map_err(|e| e.detail)?)
             && (!gradle || gradle::references(&read, &c))
     };
     if !referenced {

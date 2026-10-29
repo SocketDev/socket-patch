@@ -399,12 +399,13 @@ pub fn plan_with_external(
 ) -> Result<JvmPlan, JvmRefusal> {
     match shape {
         Shape::MavenReactor => {
-            maven_reactor::plan_with_external(read, patch, config_enabled, external)
+            maven_reactor::plan_with_external(read, list, patch, config_enabled, external)
         }
         Shape::Gradle => gradle::plan(read, list, patch),
         Shape::Mixed => {
             // Both halves or neither: a refusal of either writes nothing.
-            let maven = maven_reactor::plan_with_external(read, patch, config_enabled, external)?;
+            let maven =
+                maven_reactor::plan_with_external(read, list, patch, config_enabled, external)?;
             let gradle = gradle::plan(read, list, patch)?;
             Ok(compose(maven, gradle))
         }
