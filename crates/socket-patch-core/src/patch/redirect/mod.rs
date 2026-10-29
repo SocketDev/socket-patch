@@ -9371,6 +9371,10 @@ pub struct HostedGoWorkspace {
     /// [`crate::vendor::go_workspace::modfile_setting`] words it (#1799).
     #[serde(default)]
     pub modfile: Option<String>,
+    /// The root module's unpruned module graph from the module cache, when
+    /// a module-to-module replace makes it matter (#1840).
+    #[serde(default)]
+    pub module_graph: Option<crate::vendor::go_build_list::ModuleGraph>,
 }
 
 fn rewrite_golang(
@@ -9410,6 +9414,9 @@ fn rewrite_golang(
         return;
     }
     let mut mod_target = has_go_mod.then(|| GoTarget::new(files, "go.mod", "go.sum", true));
+    if let Some(target) = mod_target.as_mut() {
+        target.graph = workspace.as_ref().and_then(|ws| ws.module_graph.clone());
+    }
     let mut work_target = root_work.map(|_| GoTarget::new(files, "go.work", "go.work.sum", false));
 
     for dep in &golang {
@@ -9591,6 +9598,9 @@ struct GoTarget {
     go_sum: crate::vendor::go_sum_edit::GoSumEditor,
     mod_changed: bool,
     sum_changed: bool,
+    /// The module graph [`HostedGoWorkspace::module_graph`] read for this
+    /// go.mod.
+    graph: Option<crate::vendor::go_build_list::ModuleGraph>,
 }
 
 impl GoTarget {
@@ -9614,6 +9624,7 @@ impl GoTarget {
             go_sum,
             mod_changed: false,
             sum_changed: false,
+            graph: None,
         }
     }
 
@@ -9654,6 +9665,7 @@ fn rewrite_golang_target(
         go_sum,
         mod_changed,
         sum_changed,
+        graph,
         ..
     } = target;
     let in_workspace = selection.is_some();
@@ -9694,7 +9706,14 @@ fn rewrite_golang_target(
     let selection = selection.unwrap_or_else(|| {
         let zips = go_sum.zip_versions(fname);
         let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        go_build_list::select(go_mod, fname, scan.required.as_deref(), &zips, &dep.version)
+        go_build_list::select_in(
+            go_mod,
+            graph.as_ref(),
+            fname,
+            scan.required.as_deref(),
+            &zips,
+            &dep.version,
+        )
     });
     // A pin the build provably doesn't use: a selected version other than
     // the patched one, or a module go builds only as the target of another
@@ -23878,6 +23897,7 @@ packages:
                 ),
             }),
             modfile: None,
+            module_graph: None,
         };
         (
             GO_WORKSPACE_KEY.to_string(),
@@ -24100,6 +24120,7 @@ packages:
                 graph: None,
             }),
             modfile: None,
+            module_graph: None,
         };
         again.insert(
             GO_WORKSPACE_KEY.to_string(),
@@ -24116,6 +24137,72 @@ packages:
         );
     }
 
+    /// #1840: in a go 1.16 module the fork replace applies to a fork only a
+    /// dependency requires. The module graph read from the module cache
+    /// decides: with the fork in it the pin is refused; with a stale fork
+    /// replace nothing requires, the module is built in its own right and
+    /// the pin is written.
+    #[test]
+    fn golang_go116_module_graph_decides_the_fork_replace() {
+        use crate::vendor::go_build_list::ModuleGraph;
+        use crate::vendor::go_workspace::Loaded;
+        let go_mod = "module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n\
+                      replace other.com/fork => github.com/foo/bar v1.4.2\n";
+        let graph = |modules: &[(&str, &str)]| ModuleGraph {
+            selected: modules
+                .iter()
+                .map(|(m, v)| (m.to_string(), v.to_string()))
+                .collect(),
+            complete: true,
+        };
+        for (module_graph, inert) in [
+            (None, true),
+            (
+                Some(graph(&[
+                    ("example.com/mid", "v1.0.0"),
+                    ("other.com/fork", "v1.4.2"),
+                ])),
+                true,
+            ),
+            (
+                Some(graph(&[
+                    ("example.com/mid", "v1.0.0"),
+                    ("github.com/foo/bar", "v1.4.2"),
+                ])),
+                false,
+            ),
+        ] {
+            let mut files = golang_files();
+            files.insert("go.mod".to_string(), go_mod.to_string());
+            let hosted = HostedGoWorkspace {
+                root: std::path::PathBuf::new(),
+                loaded: Loaded::None,
+                modfile: None,
+                module_graph: module_graph.clone(),
+            };
+            files.insert(
+                GO_WORKSPACE_KEY.to_string(),
+                serde_json::to_string(&hosted).unwrap(),
+            );
+            let ovr = golang_override();
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            if inert {
+                assert!(out.files.is_empty(), "{module_graph:?}: {:?}", out.files);
+                assert_eq!(
+                    out.warnings
+                        .iter()
+                        .map(|w| w.code.as_str())
+                        .collect::<Vec<_>>(),
+                    ["redirect_golang_not_in_module_graph"],
+                    "{module_graph:?}"
+                );
+            } else {
+                assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+                assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+            }
+        }
+    }
+
     /// #1799: `-modfile` in GOFLAGS sends the build to another go.mod, so
     /// the hosted pin is refused, nothing written or confirmed.
     #[test]
@@ -24127,6 +24214,7 @@ packages:
             root: std::path::PathBuf::new(),
             loaded: Loaded::None,
             modfile: Some("GOFLAGS sets -modfile=go.alt.mod, so go builds from go.alt.mod".into()),
+            module_graph: None,
         };
         files.insert(
             GO_WORKSPACE_KEY.to_string(),

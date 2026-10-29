@@ -566,13 +566,28 @@ async fn read_go_workspace(
             (root, loaded, modfile)
         }
     };
-    if loaded == Loaded::None && modfile.is_none() {
+    // Module mode: whether a module-to-module replace is in effect can turn
+    // on modules only the dependencies require (#1840).
+    let module_graph = match (&loaded, view) {
+        (Loaded::None, ProjectView::Disk(_) | ProjectView::Snapshot(_)) => {
+            match crate::utils::fs::read_regular_to_string(&root.join("go.mod")).await {
+                Ok(go_mod) if crate::vendor::go_build_list::may_need_module_graph(&go_mod) => {
+                    let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
+                    Some(go_workspace::module_graph(&root, &go_mod, cache.as_deref()).await)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if loaded == Loaded::None && modfile.is_none() && module_graph.is_none() {
         return;
     }
     let hosted = crate::patch::redirect::HostedGoWorkspace {
         root,
         loaded,
         modfile,
+        module_graph,
     };
     if let Ok(json) = serde_json::to_string(&hosted) {
         out.files

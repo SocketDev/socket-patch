@@ -1412,6 +1412,10 @@ fn fork_required_only_by_a_dependency_is_a_replace_target() {
         write_patch(&consumer);
         let (code, so, se) = apply_json(&consumer, &modcache);
         assert_eq!(code, 0, "{case}: direct apply:\n{so}\n{se}");
+        assert!(
+            go_out(&consumer, &readonly).contains("OUT: PATCHED"),
+            "{case}"
+        );
         let socket_replace = replace_lines(&consumer.join("go.mod"));
         assert_eq!(socket_replace.len(), 1, "{case}: {socket_replace:?}");
 
@@ -1478,6 +1482,58 @@ fn fork_required_only_by_a_dependency_is_a_replace_target() {
 
         chmod_writable(tmp.path());
     }
+}
+
+/// #1840 positive control: `go mod tidy` keeps a fork replace nothing
+/// requires. With the dependency requiring the upstream itself, the build
+/// links it under its own path, so the patch applies, builds and checks
+/// in sync: the module graph read from the module cache shows the fork is
+/// not in the build.
+#[test]
+fn stale_fork_replace_keeps_a_transitive_patch() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(stale-fork-replace)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "go 1.16");
+    publish(
+        tmp.path(),
+        MID,
+        UVER,
+        &[
+            (
+                "go.mod",
+                &format!("module {MID}\n\ngo 1.16\n\nrequire {UMOD} {UVER}\n"),
+            ),
+            (
+                "mid.go",
+                &format!(
+                    "package mid\n\nimport u \"{UMOD}\"\n\nfunc Hello() string {{ return u.Greeting() }}\n"
+                ),
+            ),
+        ],
+    );
+    let env = go_env(modcache.to_str().unwrap(), &proxy_url);
+    let readonly: Vec<(&str, &str)> = env
+        .iter()
+        .map(|&(k, v)| {
+            if k == "GOFLAGS" {
+                (k, "-mod=readonly")
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    mid_fork_consumer(&consumer, &format!("replace {FORK} => {UMOD} {UVER}"), &env);
+    assert!(go_out(&consumer, &readonly).contains("OUT: PRISTINE"));
+    write_patch(&consumer);
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 0, "apply:\n{so}\n{se}");
+    assert!(go_out(&consumer, &readonly).contains("OUT: PATCHED"));
+    let (code, so, se) = check(&consumer, &modcache);
+    assert_eq!(code, 0, "apply --check:\n{so}\n{se}");
+
+    chmod_writable(tmp.path());
 }
 
 // ── global mode: tools already built with `go install` (#422) ──
