@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-29 (run 56), main `b291caa`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta3. At `b291caa` the redirect (59), vendor (48) and stale-install (42) gem suites pass on 4.0.23 / Ruby 3.3.6, and the vendor suite passes on 2.6.9 (run 56). They passed on 4.1.0.beta3 at `a8a10dc` (run 52) and on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. A fresh container's Ruby 3.3.6 only has 2.5.22 / 4.0.18, so `gem install bundler -v 2.6.9` / `4.0.23` first and export `BUNDLER_VERSION`.
+Last updated: 2026-10-29 (run 57), main `c8e26f6`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta3. At `c8e26f6` (no gem code changes since `b291caa`) the redirect (58), vendor (46) and stale-install (42) gem suites pass on 4.1.0.beta3 / Ruby 3.3.6 and on 1.17.3 / Ruby 3.1.6, and the in-process gem suites (apply 22, multi-platform 27) pass on 4.1.0.beta3 (run 57). At `b291caa` they passed on 4.0.23 and the vendor suite on 2.6.9 (run 56). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. A fresh container's Ruby 3.3.6 only has 2.5.22 / 4.0.18, so `gem install bundler -v 2.6.9` / `4.0.23` / `4.1.0.beta3` first and export `BUNDLER_VERSION`.
 
 ## Coverage matrix
 
@@ -438,6 +438,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
 | Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
 
+### Run 57 (main `c8e26f6`, v5.0.1; Linux; scratch platform-gem variant of `e2e_redirect_gem_build.rs` (mock upstream serving `vuln-gem-1.0.0.gem` + `vuln-gem-1.0.0-x86_64-linux.gem`), real `bundle install` / `bundle exec`)
+
+| Cell | 4.0.23 | 2.6.9 | 1.17.3 (Ruby 3.1.6) |
+| --- | --- | --- | --- |
+| Hosted redirect of a platform-resolved gem, no CHECKSUMS → converging install → `vendor` eject (dry: `eject_planned`; wet: PATH wiring, no platform sibling left) → frozen fresh install / `bundle exec` loads the patched copy | pass | pass | pass (1.17 locks only the ruby variant) |
+| Same, eject in the unconverged window (lock still holds `vuln-gem (1.0.0)` + `(1.0.0-x86_64-linux)` upstream) | pass (`noManifest`, exit 0, nothing written; documented mixed state) | — | — |
+| Ejected platform project → `vendor --revert` / `remove <purl>` / `rollback` → frozen fresh install | pass (all three) | — | — |
+| Platform gem + CHECKSUMS lock: hosted scan | pass (`redirect_gem_platform_unsupported`, nothing written) | — | — |
+| Repo gem suites (redirect 58 / vendor 46 / stale 42 / in-process apply 22 / multi-platform 27), `SOCKET_PATCH_BUNDLER_E2E_REQUIRED=1` | — | — | pass (redirect / vendor / stale) |
+| Same suites on 4.1.0.beta3 / Ruby 3.3.6 | pass (all five) | | |
+
 ### Run 56 (main `b291caa`, v5.0.1; Linux Ruby 3.3.6; scratch tests in `e2e_vendor_gem_build.rs` / `e2e_redirect_gem_build.rs`, real `bundle install`)
 
 | Cell | 2.6.9 | 4.0.23 |
@@ -562,13 +573,15 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 1. Re-check #1831 once fixed: hosted redirect on a CRLF Gemfile keeps CRLF in the in-place and the append (transitive) arms; `rollback` / `remove` still byte-exact; an autocrlf re-checkout of a redirected LF Gemfile re-scans as a no-op.
 2. Re-run #1109 (`agent:needs-human`) when it's fixed.
-3. Eject on a platform-gem lock without CHECKSUMS (vendored refuses platform-suffixed GEM siblings by design, so check that the refusal is whole and leaves the hosted pin intact).
-4. The gem suites on 4.1.0 final when it ships; 1.17.3 / 2.2 legs on the new main.
+3. The gem suites on 4.1.0 final when it ships; a 2.2 / 2.4 leg (Ruby 3.1.6) on the next main that touches gem code.
+4. Platform-gem eject on Bundler 2.2–2.5 (they lock only the resolved platform variant, unlike 1.17's ruby-only and 2.6+'s every-variant locks).
 5. Vendored stub-vs-lock runtime-dependency drift, only if the service `gem-stub-gemspec` can declare other deps than the lifted GEM spec block (a file patch can't).
 6. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
 
 ## Known non-bugs
 
+- After a hosted redirect of a platform-resolved gem converges, the lock holds only the ruby-platform patched gem, so a later eject or unwind (`vendor --revert` / `remove` / `rollback`) restores the plain `x (V)` upstream entry, not the original `x (V-x86_64-linux)` sibling, and the next install uses the ruby build. That follows from the documented hosted platform behaviour; frozen installs pass (run 57).
+- The `redirect_scanned_project` fixture deletes `vendor/` after its install (lock-only checkout), so a re-scan inside it reports `notInstalled: true` / `package_not_installed`. That's the fixture, not a crawler miss (run 57 near-miss).
 - Hosted redirect and `rollback` swallow the blank line before a rewritten single-line declaration, and `rollback` restores a direct dep as an exact pin (`gem "x", "1.0.0"`). That's the same on LF and CRLF, and it's documented (#457, "Hosted unwind coverage") (run 56).
 - Mixed line endings in a rewritten Gemfile are no longer "cosmetic": the vendored case was filed and fixed (#1821 / #1822), and the hosted case is #1831 (run 56).
 
