@@ -298,7 +298,8 @@ impl<'a> Graph<'a> {
             None => {
                 let root = self.root.unwrap_or_default();
                 go_build_list::select(
-                    go_mod_edit::prunes_module_graph(root),
+                    root,
+                    module,
                     self.required.get(module).map(String::as_str),
                     zips,
                     version,
@@ -467,6 +468,23 @@ fn extract_file(
                 // is the one built; in one, another member may raise the
                 // module above the replaced version all the same.
                 let proven = matches!(pin, SumPin::Zip(_)) && graph.workspace.is_none();
+                // A module go builds only as another module's replacement
+                // is never redirected by its own replace, whatever the sum
+                // files hold: go doesn't chain replaces (#1823).
+                if let Selection::ReplaceTarget(via) = &selected {
+                    out.diag(
+                        DIAG_REF_INVALID,
+                        file,
+                        format!(
+                            "{file}: replace {} {version} is inert: the build uses {} \
+                             {version} only as the replacement of {via}, and go doesn't \
+                             apply a replace to a replacement, so it uses the unpatched \
+                             module",
+                            entry.module, entry.module
+                        ),
+                    );
+                    continue;
+                }
                 if let Some(other) = selected.other_version().filter(|_| !proven) {
                     out.diag(
                         DIAG_REF_INVALID,
@@ -1409,6 +1427,43 @@ mod tests {
         assert!(!pinned(&gowork_off(&p).await));
         p.write("go.sum", &pair);
         assert!(pinned(&gowork_off(&p).await));
+    }
+
+    /// #1823: a hosted pin of a module go builds only as another module's
+    /// replacement is inert, even with both sum lines of the socket module.
+    #[tokio::test]
+    async fn pin_of_a_module_built_only_as_a_replace_target_is_inert() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        for go in ["go 1.21", "go 1.16"] {
+            let p = Project::new();
+            p.write(
+                "go.mod",
+                format!(
+                    "module example.com/app\n\n{go}\n\nrequire other.com/fork {VERSION}\n\n\
+                     replace other.com/fork => {MODULE} {VERSION}\n\n\
+                     replace {MODULE} {VERSION} => {m} {sver}\n"
+                ),
+            )
+            .write(
+                "go.sum",
+                format!(
+                    "{MODULE} {VERSION} {ZIP_H1}\n{MODULE} {VERSION}/go.mod {MOD_H1}\n\
+                     {m} {sver} {ZIP_H1}\n{m} {sver}/go.mod {MOD_H1}\n"
+                ),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert_eq!(out.diagnostics.len(), 1, "{go}: {:?}", out.diagnostics);
+            assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+            assert!(
+                out.diagnostics[0]
+                    .detail
+                    .contains("only as the replacement of other.com/fork"),
+                "{}",
+                out.diagnostics[0].detail
+            );
+        }
     }
 
     /// In a go < 1.17 graph MVS keeps the `/go.mod` line of a version it only

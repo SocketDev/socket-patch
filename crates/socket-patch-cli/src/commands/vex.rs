@@ -1037,6 +1037,12 @@ async fn generate_vex(
                      ignored and the build links the unpatched module",
                     entry.module
                 ),
+                Some(Selection::ReplaceTarget(via)) => format!(
+                    "the build uses {} {version} only as the replacement of {via}, and go \
+                     doesn't apply a replace to a replacement, so the replace pinned to \
+                     {version} is ignored and the build links the unpatched module",
+                    entry.module
+                ),
                 Some(Selection::Unknown)
                     if socket_patch_core::vendor::go_workspace::resolve(&root)
                         != socket_patch_core::vendor::go_workspace::GoWork::None =>
