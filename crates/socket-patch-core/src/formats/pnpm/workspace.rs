@@ -153,12 +153,28 @@ pub(crate) fn is_keyless(text: &str) -> bool {
 /// importers comes from pnpm <= 10.4, and the root-only
 /// [`PACKAGES_SCAFFOLD`] would drop those members.
 pub(crate) fn lock_has_member_importers(lines: &[String]) -> bool {
-    // CRLF-blind: a Windows checkout's lock reads like its LF twin.
+    member_importers(lines.iter().map(String::as_str))
+}
+
+/// [`lock_has_member_importers`] over a whole lock's text. A root lock
+/// that lists member importers is a SHARED workspace lock: pnpm installs
+/// every member from it, whatever the settings say now, so member locks
+/// beside it are stale leftovers.
+pub(crate) fn lock_text_has_member_importers(lock: &str) -> bool {
+    member_importers(lock.lines())
+}
+
+fn member_importers<'a>(lines: impl IntoIterator<Item = &'a str>) -> bool {
+    // CRLF-blind: a Windows checkout's lock reads like its LF twin. A
+    // comment is no key and, even at column 0, does not end the section.
     let mut in_importers = false;
     for line in lines {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if !line.is_empty() && !line.starts_with(' ') {
-            in_importers = line == "importers:";
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !line.is_empty() && !line.starts_with([' ', '\t']) {
+            in_importers = line.trim_end() == "importers:";
         } else if in_importers
             && super::lines::parse_key_line(line, 2).is_some_and(|(key, _, _)| key != ".")
         {
@@ -504,6 +520,37 @@ mod tests {
                 .map(|l| format!("{l}\r"))
                 .collect();
         assert!(lock_has_member_importers(&crlf));
+        // #1846: a comment is no importer, and a column-0 comment does not
+        // end the section.
+        assert!(!lock_has_member_importers(&lock(
+            "  .:\n    dependencies: {}\n  # sub: {}\n#  other: {}\n"
+        )));
+        assert!(lock_has_member_importers(&lock(
+            "  .: {}\n# note\n  sub: {}\n"
+        )));
+    }
+
+    /// The text entry point reads a whole lock the way the line one does
+    /// (#1846: it replaced `pnpm_workspace::root_lock_lists_members`).
+    #[test]
+    fn lock_text_member_importers_read_every_lock_shape() {
+        let root_only = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a:\n        specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n";
+        assert!(!lock_text_has_member_importers(root_only));
+        assert!(!lock_text_has_member_importers(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n"
+        ));
+        assert!(!lock_text_has_member_importers(
+            "lockfileVersion: 5.4\n\ndependencies:\n  a: 1.0.0\n"
+        ));
+        assert!(!lock_text_has_member_importers(
+            "lockfileVersion: '9.0'\nimporters:\n  .: {}\n  # packages/a: {}\n"
+        ));
+        assert!(lock_text_has_member_importers(
+            "lockfileVersion: '9.0'\r\n\r\nimporters:\r\n\r\n  .: {}\r\n\r\n  packages/a:\r\n    dependencies: {}\r\n"
+        ));
+        assert!(lock_text_has_member_importers(
+            "lockfileVersion: '6.0'\nimporters:\n  '.': {}\n  'packages/a': {}\n"
+        ));
     }
 
     #[test]
