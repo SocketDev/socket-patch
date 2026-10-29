@@ -1391,6 +1391,98 @@ fn shared_module_applied_once_in_go_work() {
     assert!(stdout.contains("A: PRISTINE"), "{stdout}\n{stderr}");
 }
 
+/// `GOWORK` naming another file beside the root's go.work (#1810): `apply`
+/// never writes the replace into the root's go.work, which go doesn't
+/// read. A root with no module refuses and writes nothing, with or without
+/// a root go.work; a root module the workspace uses takes the replace in
+/// its go.mod, and both members build the patched copy through it.
+#[test]
+fn apply_never_writes_go_work_when_gowork_names_a_sibling_file() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_workspace_build")
+        || !golang_e2e_matrix::supports_go_work()
+    {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = ChmodGuard(tmp.path().to_path_buf());
+    let w = stage_members(tmp.path(), UVER, UVER);
+    let m = Machine::new(tmp.path(), "sibling");
+    download(&w.root, &m, &w.proxy);
+    write_local_patch(&w.root, VENDOR_UUID);
+    let ci = w.root.join("ci.work");
+    std::fs::write(&ci, "go 1.18\n\nuse (\n\t./a\n\t./b\n)\n").unwrap();
+    std::fs::write(w.root.join("go.work"), "go 1.18\n\nuse ./a\n").unwrap();
+    let gowork = [("GOWORK", ci.to_str().unwrap())];
+    let cwd = w.root.to_str().unwrap();
+    let apply = || {
+        socket_env(
+            &w.root,
+            &[
+                "apply",
+                "--offline",
+                "--json",
+                "--ecosystems",
+                "golang",
+                "--cwd",
+                cwd,
+            ],
+            &m.modcache,
+            &gowork,
+        )
+    };
+    let files = |root: &Path| {
+        let mut all = snapshot(root);
+        all.push(("ci.work".into(), std::fs::read(root.join("ci.work")).ok()));
+        all
+    };
+
+    let before = files(&w.root);
+    let (code, out, stderr) = apply();
+    assert_ne!(code, 0, "{out}\n{stderr}");
+    assert!(out.to_string().contains("has nowhere to go"), "{out}");
+    assert_snapshot(&w.root, &before, "no root module, root go.work");
+
+    std::fs::remove_file(w.root.join("go.work")).unwrap();
+    let before = files(&w.root);
+    let (code, out, stderr) = apply();
+    assert_ne!(code, 0, "{out}\n{stderr}");
+    let text = out.to_string();
+    assert!(text.contains("has nowhere to go"), "{out}");
+    assert!(!text.contains("No such file"), "{out}");
+    assert_snapshot(&w.root, &before, "no root module, no root go.work");
+
+    // A root module both workspace files use.
+    let root_mod = format!("module example.com/root\n\ngo 1.18\n\nrequire {UMOD} {UVER}\n");
+    std::fs::write(w.root.join("go.mod"), &root_mod).unwrap();
+    std::fs::write(
+        w.root.join("go.sum"),
+        format!(
+            "{UMOD} {UVER} {}\n{UMOD} {UVER}/go.mod {}\n",
+            w.upstream.0, w.upstream.1
+        ),
+    )
+    .unwrap();
+    let work = "go 1.18\n\nuse (\n\t.\n\t./a\n\t./b\n)\n";
+    std::fs::write(&ci, work).unwrap();
+    std::fs::write(w.root.join("go.work"), work).unwrap();
+    let (code, out, stderr) = apply();
+    assert_eq!(code, 0, "{out}\n{stderr}");
+    let copy = format!(".socket/go-patches/{UMOD}@{UVER}");
+    assert_eq!(
+        read(&w.root.join("go.mod")),
+        format!("{root_mod}\nreplace {UMOD} {UVER} => ./{copy}\n")
+    );
+    assert_eq!(read(&w.root.join("go.work")), work, "go.work untouched");
+    assert_eq!(read(&ci), work, "ci.work untouched");
+    for dir in ["a", "b"] {
+        let (stdout, stderr) = run_member(tmp.path(), &w.root, dir, &w.proxy, &gowork);
+        assert!(
+            stdout.contains(&format!("{}: PATCHED", dir.to_uppercase())),
+            "{dir}: {stdout}\n{stderr}"
+        );
+    }
+}
+
 /// `get --mode hosted` from a go.work root, re-run: nothing changes, and
 /// the workspace builds the Socket module `-mod=readonly` from the
 /// committed go.work.sum on a fresh day-2 machine (bogus sumdb).

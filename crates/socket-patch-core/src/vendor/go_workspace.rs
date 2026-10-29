@@ -638,9 +638,12 @@ impl GoWorkspace {
         [work, members]
     }
 
-    /// Whether go.work sits in `root`.
+    /// Whether this is `root`'s own `go.work`, the file the replace host
+    /// [`ReplaceHost::GoWork`] names. A `GOWORK` naming another file in
+    /// `root` (`ci.work`) is not: go doesn't read `root/go.work` then, so
+    /// a replace written there would do nothing (#1810).
     pub fn rooted_at(&self, root: &Path) -> bool {
-        same_dir_key(self.work_dir()) == same_dir_key(root)
+        same_dir_key(&self.work_file) == same_dir_key(&root.join("go.work"))
     }
 
     /// Which file holds the Socket replace of `module` for the project at
@@ -1708,6 +1711,65 @@ mod tests {
                 .await
                 .replace_host(root, true, DEP),
             ReplaceHost::GoMod
+        );
+    }
+
+    /// `GOWORK` naming another file beside the root's go.work (#1810): the
+    /// root's go.work is not the workspace go reads, so the replace never
+    /// goes there. A root that is a member keeps its go.mod; one with no
+    /// module is refused. The root's go.work named by path still is it.
+    #[tokio::test]
+    async fn a_sibling_gowork_file_is_not_the_roots_go_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ci = root.join("ci.work");
+        let ci_env = Some(ci.to_str().unwrap());
+        write(root, "ci.work", "go 1.18\n\nuse (\n\t./a\n\t./b\n)\n");
+        write(root, "go.work", "go 1.18\n\nuse ./a\n");
+        member(root, "a", "1.21", &require("v1.0.0"));
+        member(root, "b", "1.21", &require("v1.0.0"));
+        let loaded = load_with(root, ci_env).await;
+        let Loaded::Workspace(ws) = &loaded else {
+            panic!("no workspace: {loaded:?}");
+        };
+        assert_eq!(same_dir_key(&ws.work_file), same_dir_key(&ci));
+        assert!(!ws.rooted_at(root));
+        assert_eq!(loaded.replace_host(root, false, DEP), ReplaceHost::GoMod);
+        let ours = replace(&format!(
+            "{DEP} v1.0.0 => ./.socket/go-patches/{DEP}@v1.0.0"
+        ));
+        assert!(matches!(
+            loaded.host_conflict(ReplaceHost::GoMod, root, DEP, "v1.0.0", &ours),
+            Some(WorkspaceConflict::NoModule { .. })
+        ));
+
+        // Without the root's go.work the same holds.
+        std::fs::remove_file(root.join("go.work")).unwrap();
+        let loaded = load_with(root, ci_env).await;
+        assert_eq!(loaded.replace_host(root, false, DEP), ReplaceHost::GoMod);
+
+        // A root module ci.work uses keeps (and is patched by) its go.mod.
+        write(root, "go.work", "go 1.18\n\nuse (\n\t.\n\t./a\n\t./b\n)\n");
+        write(root, "ci.work", "go 1.18\n\nuse (\n\t.\n\t./a\n\t./b\n)\n");
+        write(
+            root,
+            "go.mod",
+            &format!("module example.com/root\n\ngo 1.21\n{}", require("v1.0.0")),
+        );
+        let loaded = load_with(root, ci_env).await;
+        assert_eq!(loaded.replace_host(root, true, DEP), ReplaceHost::GoMod);
+        assert_eq!(
+            load_with(root, None).await.replace_host(root, true, DEP),
+            ReplaceHost::GoWork,
+            "the root's own go.work shares it"
+        );
+        let own = root.join("go.work");
+        assert_eq!(
+            load_with(root, Some(own.to_str().unwrap()))
+                .await
+                .replace_host(root, true, DEP),
+            ReplaceHost::GoWork,
+            "GOWORK naming the root's go.work is the same workspace"
         );
     }
 

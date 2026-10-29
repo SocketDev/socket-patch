@@ -1522,6 +1522,11 @@ module moves into `go.work` the next time `apply` or `vendor` writes it (a
 `vendor` takeover then deletes the `.socket/go-patches/` copy no file names
 any more); a hosted pin there stays, its sum lines beside it, and in
 workspace mode the `go.work` replace overrides it.
+Only the directory's own `go.work` counts: when `GOWORK` names another file
+in it (say `ci.work`), go doesn't read `go.work`, so socket-patch never
+writes the replace there. It treats that file like a workspace file in
+another directory: a module it `use`s takes the replace in its own `go.mod`,
+and a directory with no module is refused ("has nowhere to go").
 One `go.work` replace applies to every member. Member replaces of one
 project-local copy would not: go resolves each against its own member
 directory, sees two targets and refuses the workspace. The target is
