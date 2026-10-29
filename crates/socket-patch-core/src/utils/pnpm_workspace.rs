@@ -298,8 +298,8 @@ fn lists_modeled_member(globs: &[String], rel: &[String]) -> bool {
 /// `Err` naming the first glob that uses syntax the shared matcher does
 /// not read the way pnpm does (probed on pnpm 10.28.0, #1846): extglob and
 /// regex groups, more brace alternatives than the matcher expands, and any
-/// character class but a closed one of letters, digits, `_` and `-`
-/// ranges. pnpm reads `[!a]` as `[a]`, lets `[^a]` and `[.]` match a
+/// character class but a closed one of letters, digits, `_`, a literal
+/// `-` and ranges not starting at `-`. pnpm reads `[!a]` as `[a]`, lets `[^a]` and `[.]` match a
 /// leading `.` that the matcher keeps wildcards off, and reads POSIX
 /// classes. Beside a class or brace set, a `+` (pnpm's quantifier:
 /// `packages/[ab]+` lists `packages/ab`) and a `\` (pnpm's escape:
@@ -314,8 +314,11 @@ fn modeled(globs: &[String]) -> Result<(), String> {
                 return false;
             };
             let body = &rest[open + 1..open + 1 + len];
+            // Every allowed character sorts above `/` except `-`, so only a
+            // range starting at `-` (`[--9]`) could match `.` or `/`.
             if body.is_empty()
                 || body.starts_with(['!', '^'])
+                || body.contains("--")
                 || !body
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -1344,6 +1347,7 @@ mod tests {
             (&["packages/*", "!packages/[ab]"], &["ab", "c", "x"]),
             (&["packages/*", "!packages/{a,c}"], &["ab", "b", "x"]),
             (&["packages/{[ab],x}"], &["a", "b", "x"]),
+            (&["packages/[-a]"], &["a"]),
         ] {
             let expected: Vec<String> = expected.iter().map(|d| format!("packages/{d}")).collect();
             let patterns = globs(patterns);
@@ -1382,6 +1386,8 @@ mod tests {
             "packages/{a,b}+",
             "packages/\\[a]",
             "packages/{Z..a}",
+            // A range from `-` spans `.` and `/`.
+            "packages/[--9]h",
         ] {
             let patterns = globs(&[unmodeled]);
             assert!(
