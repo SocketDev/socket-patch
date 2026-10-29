@@ -5567,6 +5567,48 @@ mod tests {
         );
     }
 
+    /// #622: a directory symlinked outside the checkout (a `target/` on
+    /// another disk) is probed for a `pom.xml` without being reported. It
+    /// holds none, so Maven ignores it and so does the plan; one that holds
+    /// a pom is a subproject built from outside, reported as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maven_4_subproject_discovery_through_an_outbound_symlink() {
+        let a = implicit_child("a", "jar", &dep("1.10.0"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::testing::populate(root, &[("pom.xml", IMPLICIT_ROOT), ("a/pom.xml", &a)]);
+        let outside = tempfile::tempdir().unwrap();
+        super::super::testing::populate(outside.path(), &[("classes/A.class", "x")]);
+        std::os::unix::fs::symlink(outside.path(), root.join("target")).unwrap();
+        let mut ledger = BTreeMap::new();
+        // `testing::vendor` asserts nothing escaped.
+        let planned =
+            super::super::testing::vendor(root, Shape::MavenReactor, &patch(), &mut ledger)
+                .await
+                .unwrap();
+        assert!(planned.writes.iter().any(|w| w.rel == "a/pom.xml"));
+        let entry = ledger.values().next().unwrap();
+        assert_eq!(
+            super::super::apply::entry_wired_checked(root, entry),
+            Ok(true)
+        );
+
+        let ext = tempfile::tempdir().unwrap();
+        super::super::testing::populate(
+            ext.path(),
+            &[("pom.xml", &implicit_child("x", "jar", ""))],
+        );
+        std::os::unix::fs::symlink(ext.path(), root.join("ext")).unwrap();
+        let reader = super::super::apply::ProjectReader::new(root);
+        let _ = plan(
+            &|rel: &str| reader.read(rel),
+            &|d: &str| reader.list(d),
+            &patch(),
+        );
+        assert_eq!(reader.escaped().as_deref(), Some("ext"));
+    }
+
     /// #622: no discovery for a 4.0.0 model, a non-`pom` packaging, a root
     /// that lists its subprojects, or `maven.project.discoverSubprojects`
     /// set to anything but `true` (Java's `Boolean.parseBoolean`). The

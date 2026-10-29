@@ -198,15 +198,31 @@ impl ProjectReader {
     /// The children of the project directory `rel` (`""` = the root) for
     /// the script graph: names, directories ending in `/`. Resolved like
     /// [`Self::read`]; anything unsafe or unreadable lists as empty.
+    ///
+    /// A directory reached through a symlink that leaves the checkout is
+    /// only peeked at: its files are listed, its subdirectories are not,
+    /// and no escape is recorded. A probe (Maven 4 subproject discovery
+    /// asking whether a linked `target/` holds a `pom.xml`) then refuses
+    /// nothing for a link it never reads through, while reading any file
+    /// under the link still records the escape the caller refuses.
     pub fn list(&self, rel: &str) -> Vec<String> {
-        let path = if rel.is_empty() {
+        let (path, outside) = if rel.is_empty() {
             match &self.canonical {
-                Some(c) => c.clone(),
+                Some(c) => (c.clone(), false),
                 None => return Vec::new(),
             }
         } else {
-            match self.resolve(rel.trim_end_matches('/')) {
-                Ok(path) => path,
+            let rel = rel.trim_end_matches('/');
+            let before = self.escaped.borrow().clone();
+            match self.resolve(rel) {
+                Ok(path) => (path, false),
+                Err(e) if e.contains(LEAVES_PROJECT) => {
+                    *self.escaped.borrow_mut() = before;
+                    match self.outside_target(rel) {
+                        Some(target) => (target, true),
+                        None => return Vec::new(),
+                    }
+                }
                 Err(_) => return Vec::new(),
             }
         };
@@ -219,11 +235,26 @@ impl ProjectReader {
                 // Followed like `read` (in-checkout links only).
                 let dir = e.metadata().ok()?.is_dir()
                     || (e.file_type().ok()?.is_symlink() && e.path().is_dir());
-                Some(if dir { format!("{name}/") } else { name })
+                match (dir, outside) {
+                    (true, true) => None,
+                    (true, false) => Some(format!("{name}/")),
+                    (false, _) => Some(name),
+                }
             })
             .collect();
         out.sort();
         out
+    }
+
+    /// The directory a project-relative `rel` names once its symlinks are
+    /// followed wherever they lead (for [`Self::list`]'s peek). `None` for
+    /// an unsafe path or one that does not resolve to a directory.
+    fn outside_target(&self, rel: &str) -> Option<PathBuf> {
+        if !safe_rel(rel) {
+            return None;
+        }
+        let target = std::fs::canonicalize(self.canonical.as_ref()?.join(rel)).ok()?;
+        target.is_dir().then_some(target)
     }
 
     /// The first path that resolved outside the checkout.
@@ -269,7 +300,7 @@ impl ProjectReader {
                         let at = segments[..=i].join("/");
                         self.escaped.borrow_mut().get_or_insert(at.clone());
                         return Err(format!(
-                            "{at} is a symlink that leaves the project (or dangles)"
+                            "{at} is a symlink that {LEAVES_PROJECT} (or dangles)"
                         ));
                     };
                     cur = target;
@@ -280,6 +311,9 @@ impl ProjectReader {
         Ok(cur)
     }
 }
+
+/// How [`ProjectReader`] words a symlink resolving outside the checkout.
+const LEAVES_PROJECT: &str = "leaves the project";
 
 /// A path that does not exist, including one that runs through a regular
 /// file (`pom.xml/pom.xml`, probed when a `relativePath` or `<module>`
