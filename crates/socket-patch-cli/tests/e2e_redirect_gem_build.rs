@@ -4769,3 +4769,93 @@ async fn gem_vendored_unwind_names_a_patched_archive_in_vendor_cache() {
         vendored_unwind_names_the_patched_cached_archive(&fx, command);
     }
 }
+
+/// #1831: a hosted redirect over a CRLF Gemfile (a Windows checkout, or
+/// `core.autocrlf=true`) keeps it CRLF throughout, for a plain top-level
+/// declaration and for one inside the user's own `source … do` block; a
+/// real bundler converges the result, a re-scan is a no-op, and `rollback`
+/// hands back a CRLF Gemfile that still declares the gem.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_redirect_keeps_a_crlf_gemfile_crlf() {
+    fn all_crlf(text: &str) -> bool {
+        let crlf = text.matches("\r\n").count();
+        crlf > 0 && crlf == text.matches('\n').count() && crlf == text.matches('\r').count()
+    }
+    for (tag, driver) in [
+        ("crlf-gemfile", Driver::ScanVex),
+        ("crlf-gemfile-source-block", Driver::ScanVexSourceBlock),
+    ] {
+        let Some(fx) =
+            redirect_scanned_project(tag, Spelling::Gemfile, false, true, None, driver).await
+        else {
+            return;
+        };
+        let api = fx._server.uri();
+        let gemfile_path = fx.proj.join(fx.gemfile_name);
+        let lock_path = fx.proj.join(fx.lock_name);
+        // Start over from the pristine pair, its Gemfile in CRLF.
+        let pristine = String::from_utf8(fx.pristine_gemfile.clone()).unwrap();
+        let crlf = pristine.replace("\r\n", "\n").replace('\n', "\r\n");
+        let _ = std::fs::remove_dir_all(fx.proj.join(".socket"));
+        std::fs::write(&gemfile_path, &crlf).unwrap();
+        std::fs::write(&lock_path, &fx.pristine_lock).unwrap();
+
+        let (code, out, err) = run_hosted_scan(&fx.proj, &api);
+        assert_eq!(code, 0, "{tag}: hosted scan: {out}\n{err}");
+        let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+        assert!(
+            gemfile.contains(&fx.index_url),
+            "{tag}: the Gemfile is redirected: {gemfile:?}"
+        );
+        assert!(
+            all_crlf(&gemfile),
+            "{tag}: the redirected Gemfile mixes line endings: {gemfile:?}"
+        );
+
+        let install = bundle(&fx.proj, &["install"]);
+        assert!(
+            install.status.success(),
+            "{tag}: converging install of the CRLF Gemfile:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        let (code, out, err) = run_hosted_scan(&fx.proj, &api);
+        assert_eq!(code, 0, "{tag}: re-scan: {out}\n{err}");
+        assert_eq!(
+            std::fs::read_to_string(&gemfile_path).unwrap(),
+            gemfile,
+            "{tag}: a re-scan leaves the Gemfile byte-identical"
+        );
+
+        let upstream = format!("{api}/upstream");
+        let cwd = fx.proj.to_str().expect("utf8 tmp path");
+        let (code, stdout, stderr) = run_socket_env(
+            &fx.proj,
+            &[
+                "rollback",
+                PURL,
+                "--json",
+                "--cwd",
+                cwd,
+                "--api-url",
+                &api,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake",
+                "--patch-server-url",
+                &api,
+            ],
+            &[("SOCKET_RUBYGEMS_URL", &upstream)],
+        );
+        assert_eq!(code, 0, "{tag}: rollback: {stdout}\nstderr:\n{stderr}");
+        let restored = std::fs::read_to_string(&gemfile_path).unwrap();
+        assert!(
+            !restored.contains("patch-registry")
+                && restored.contains(&format!("gem \"{DEP}\""))
+                && all_crlf(&restored),
+            "{tag}: rollback restores a CRLF Gemfile declaring the gem: {restored:?}"
+        );
+    }
+}
