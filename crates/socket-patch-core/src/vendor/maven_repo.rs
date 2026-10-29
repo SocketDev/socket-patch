@@ -346,6 +346,7 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
         let shown = || shown_ancestor(project_root, ancestor, &canonical_root);
         if super::jvm::maven_reactor::contains_module(
             &|p| reader.read(p),
+            &|d| reader.list(d),
             &format!("{rel}/pom.xml"),
         ) {
             return Some(format!(
@@ -953,7 +954,7 @@ async fn vendor_maven_jvm(
             super::jvm::sbt::plan_with_digest(&read, &patch, gate_pass.deps_digest.as_deref())
         }
         Shape::MavenReactor | Shape::Mixed => {
-            let external = external_maven_poms(&read, &patch, &local, service).await;
+            let external = external_maven_poms(&read, &list, &patch, &local, service).await;
             super::jvm::plan_with_external(
                 shape,
                 &read,
@@ -1342,13 +1343,14 @@ async fn collect_gradle_metadata(
 /// recorded unavailable, and the planner then leaves that root unpinned.
 async fn external_maven_poms(
     read: super::jvm::ReadFn<'_>,
+    list: super::jvm::ListFn<'_>,
     patch: &super::jvm::JvmPatch<'_>,
     local: &LocalSources,
     service: Option<&VendorServiceConfig>,
 ) -> super::jvm::maven_reactor::ExternalPoms {
     let mut known = super::jvm::maven_reactor::ExternalPoms::new();
     loop {
-        let need = super::jvm::maven_reactor::external_poms_needed(read, patch, &known);
+        let need = super::jvm::maven_reactor::external_poms_needed(read, list, patch, &known);
         if need.is_empty() {
             return known;
         }

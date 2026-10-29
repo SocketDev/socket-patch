@@ -798,7 +798,7 @@ mod tests {
             ),
             _ => None,
         };
-        let planned = maven_reactor::plan(&reactor, &p).unwrap();
+        let planned = maven_reactor::plan(&reactor, &super::super::no_list, &p).unwrap();
         let tree: Vec<_> = planned.writes.into_iter().filter(|w| w.tree).collect();
         assert_eq!(tree, writes);
         assert_eq!(planned.jar_rel, jar);

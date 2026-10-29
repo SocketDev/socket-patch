@@ -2443,6 +2443,7 @@ fn line_start(text: &str, at: usize) -> usize {
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::super::testing::list_of;
     use super::super::{apply, detect, Shape};
     use super::*;
 
@@ -2493,29 +2494,6 @@ mod tests {
     fn run(files: &BTreeMap<String, Vec<u8>>, p: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusal> {
         let read = |rel: &str| files.get(rel).cloned();
         plan(&read, &|dir: &str| list_of(files, dir), p)
-    }
-
-    /// The children of `dir` in an in-memory tree (the planner's ListFn).
-    fn list_of(files: &BTreeMap<String, Vec<u8>>, dir: &str) -> Vec<String> {
-        let prefix = if dir.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", dir.trim_end_matches('/'))
-        };
-        let mut out: Vec<String> = Vec::new();
-        for key in files.keys() {
-            let Some(rest) = key.strip_prefix(&prefix) else {
-                continue;
-            };
-            let child = match rest.find('/') {
-                Some(i) => format!("{}/", &rest[..i]),
-                None => rest.to_string(),
-            };
-            if !out.contains(&child) {
-                out.push(child);
-            }
-        }
-        out
     }
 
     fn vendored_line(kotlin: bool, prefix: &str) -> String {
