@@ -819,6 +819,9 @@ pub struct UnindexedEntry {
     /// The entry itself, inside its resolved in-checkout tree directory
     /// (never resolved through the entry, so a stray symlink is the link).
     pub path: PathBuf,
+    /// The tree directory is reached through a symlink, so its entries
+    /// may belong to another tree: [`sweep_unindexed`] refuses them.
+    pub linked: bool,
 }
 
 /// What `dirs` (vendored tree directories) hold beyond the files `indexed`
@@ -835,6 +838,10 @@ pub fn unindexed_in(
     let mut stray = Vec::new();
     for dir in dirs {
         let path = reader.resolve(dir)?;
+        let linked = reader
+            .canonical
+            .as_ref()
+            .is_none_or(|root| path != dir.split('/').fold(root.clone(), |p, s| p.join(s)));
         let items = match std::fs::read_dir(&path) {
             Ok(items) => items,
             Err(e) if is_missing(&e) => continue,
@@ -848,6 +855,7 @@ pub fn unindexed_in(
                 stray.push(UnindexedEntry {
                     rel,
                     path: path.join(name),
+                    linked,
                 });
             }
         }
@@ -888,6 +896,15 @@ pub fn unindexed_tree_entries(
 /// socket-patch's own). One already gone counts as removed.
 pub async fn sweep_unindexed(stray: &[UnindexedEntry]) -> Result<(), String> {
     for entry in stray {
+        // Through a linked tree directory the entry may be another
+        // artifact's file: leave the call to the user.
+        if entry.linked {
+            return Err(format!(
+                "{} is in a vendored tree directory reached through a symlink; delete it \
+                 by hand if it is not another artifact's file",
+                entry.rel
+            ));
+        }
         let gone = match tokio::fs::symlink_metadata(&entry.path).await {
             Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&entry.path).await,
             Ok(_) => tokio::fs::remove_file(&entry.path).await,
@@ -1844,5 +1861,29 @@ mod tests {
         sweep_unindexed(&stray)
             .await
             .expect("already gone is removed");
+    }
+
+    /// A tree directory reached through an in-checkout symlink may be
+    /// another artifact's: its entries are listed (so `--check` still
+    /// fails) but never swept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_unindexed_refuses_a_linked_tree_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let peer = root.join(".socket/vendor/maven2/g/b/1-socket.1d3c1fd2");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::write(peer.join("b-1-socket.1d3c1fd2.jar"), "PEER").unwrap();
+        let own = root.join(tree_file("x"));
+        let own = own.parent().unwrap();
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&peer, own).unwrap();
+        let indexed = BTreeSet::from([tree_file(layout::MARKER_FILE)]);
+        let stray = unindexed_tree_entries(root, &indexed).unwrap();
+        assert_eq!(stray.len(), 1);
+        assert!(stray[0].linked);
+        let err = sweep_unindexed(&stray).await.unwrap_err();
+        assert!(err.contains("through a symlink"), "{err}");
+        assert!(peer.join("b-1-socket.1d3c1fd2.jar").is_file());
     }
 }
