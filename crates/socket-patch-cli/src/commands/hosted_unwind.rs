@@ -1,7 +1,7 @@
 //! The hosted unwind leg: restore in-scope hosted pins to their default
 //! upstream registry entries. A helper module, not a command: `rollback`,
-//! `remove` and `vendor` (a pre-v5 vendored-over-hosted revert) all run it
-//! without importing each other.
+//! `remove`, scan's withdrawn-patch restore and `vendor` (a pre-v5
+//! vendored-over-hosted revert) all run it without importing each other.
 
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 
@@ -12,8 +12,6 @@ use crate::args::GlobalArgs;
 pub(crate) struct HostedLegOutcome {
     pub(crate) reverted: Vec<String>,
     pub(crate) failed: Vec<(String, String)>,
-    /// Scoped targets whose ecosystem has no per-purl hosted revert.
-    pub(crate) unsupported: Vec<String>,
     pub(crate) warnings: Vec<(String, String)>,
     pub(crate) edited_files: std::collections::BTreeSet<String>,
 }
@@ -42,7 +40,7 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
     use socket_patch_core::patch::redirect::upstream::{
         restore_upstream, PinStatus, RestoreOptions,
     };
-    // The pins are the manifest's project's (#745): restore them there.
+    // The pins are the manifest's project's: restore them there.
     let rooted = common.at_project_root();
     let common: &GlobalArgs = &rooted;
 
@@ -76,7 +74,11 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
         // rebuilt registry record is not byte-exact for every lock.
         bun_lockb: false,
     };
-    let live_before = socket_patch_core::vendor::bun_lock::live_user_patch_keys(&common.cwd).await;
+    let live_before = if common.dry_run {
+        Default::default()
+    } else {
+        socket_patch_core::vendor::bun_lock::live_user_patch_keys(&common.cwd).await
+    };
     let outcome = restore_upstream(&common.cwd, pins, &opts).await;
     for pin in &outcome.pins {
         match &pin.status {
@@ -115,7 +117,7 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
     out.edited_files
         .extend(outcome.reverted_files.iter().cloned());
     // Bun's hoisted linker keeps the patched copies of the pins it no
-    // longer pins (#764): say so, with the install that does reinstall.
+    // longer pins: say so, with the install that does reinstall.
     // A dry run says it too, so the preview's reinstall note names
     // `bun install --force` like the real run's.
     if outcome.flush_error.is_none() {
@@ -133,7 +135,7 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
             ));
         }
         // A `bun patch` keyed by a hosted URL the restore took out of the
-        // lock stops applying (#1019).
+        // lock stops applying.
         if !common.dry_run {
             let live_after = bun_lock::live_user_patch_keys(&common.cwd).await;
             for key in live_before.difference(&live_after) {
@@ -143,10 +145,8 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
                 ));
             }
         }
-    }
-    // PDM, uv and Pipenv keep a same-version install through a plain sync
-    // (#477): name the reinstall that restores the upstream bytes.
-    if outcome.flush_error.is_none() {
+        // PDM, uv and Pipenv keep a same-version install through a plain
+        // sync: name the reinstall that restores the upstream bytes.
         use crate::commands::pypi_reinstall::{advisory, Tool, HOSTED_CODE};
         let unwound: Vec<(String, Tool)> = outcome
             .restored()
