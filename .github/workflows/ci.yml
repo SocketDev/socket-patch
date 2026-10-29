@@ -1610,7 +1610,7 @@ jobs:
         shell: bash
         env:
           BUNDLER_TEST_VERSION: ${{ matrix.bundler }}
-        run: gem install bundler -v "$BUNDLER_TEST_VERSION" --no-document
+        run: scripts/gem-install-retry.sh bundler -v "$BUNDLER_TEST_VERSION" --no-document
 
       # Installing a bundler does not make `bundle` run it: with no lockfile
       # to read, RubyGems' binstub activates the HIGHEST installed bundler,
@@ -2847,10 +2847,20 @@ jobs:
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
           ruby-version: '3.2.10'
-          # The gem hosted rewrite pins into the Gemfile.lock CHECKSUMS
-          # section, which `bundle lock --add-checksums` only emits on >= 2.6.
-          bundler: '2.6'
+          # Bundler comes from the next step, which retries rubygems.org
+          # blips; setup-ruby's own install is a single bare `gem install`.
+          bundler: 'none'
           bundler-cache: false
+
+      - name: Install Bundler
+        if: steps.gate.outputs.run == 'true'
+        # The gem hosted rewrite pins into the Gemfile.lock CHECKSUMS
+        # section, which `bundle lock --add-checksums` only emits on >= 2.6.
+        # `~> 2.6.0` is what setup-ruby's `bundler: '2.6'` installed; as the
+        # highest installed bundler it is the one `bundle` runs.
+        run: |
+          scripts/gem-install-retry.sh bundler -v '~> 2.6.0' --no-document
+          bundle --version
 
       - name: Setup Go
         if: steps.gate.outputs.run == 'true'
