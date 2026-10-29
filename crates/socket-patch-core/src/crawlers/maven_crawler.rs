@@ -690,7 +690,8 @@ fn settings_local_repository(
 ) -> Option<PathBuf> {
     use crate::formats::xml;
 
-    let raw = std::fs::read_to_string(path).ok()?;
+    // FIFO-safe: a FIFO planted as settings.xml is refused, not opened.
+    let raw = crate::utils::fs::read_regular_to_string_sync(path).ok()?;
     let text = xml::blank_non_markup(&raw).ok()?;
     let settings = *xml::elements(&text, "settings").ok()?.first()?;
     // `<localRepository>` is a child of `<settings>`; a profile property of
