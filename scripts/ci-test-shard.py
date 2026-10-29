@@ -12,12 +12,20 @@ the union of the shards is the old single `cargo test --workspace` run.
 
 Windows debug CI sets CI_TEST_TIMINGS to the checked-in runtime sample.
 Those shards balance measured test time plus linking work, with shard 1's
-unit tests reserved up front. Other runners retain the count-based split.
+unit tests reserved up front. Coverage shards do the same on their own
+Linux sample (scripts/ci-coverage-durations.json) unless CI_TEST_TIMINGS
+is set; setting it empty on the coverage step keeps the count split.
 
 CI_TEST_COVERAGE=1 runs the shard under cargo-llvm-cov for ci.yml's
 `coverage` job: `cargo llvm-cov --no-report` in place of `cargo test`, and
 no doctests, which cargo-llvm-cov leaves out without `--doctests`. A later
 `cargo llvm-cov report` exports the shard's profiles.
+
+Each test binary's `finished in` time is collected from cargo's output and
+printed at the end as one `ci-test-shard: timings {...}` JSON line, along
+with how long cargo took to reach its first test binary. The log tail is
+what log viewers and the log API return, so a fresh runtime sample can be
+read from any shard's log.
 
 Extra arguments after `SHARD COUNT` go to every `cargo` invocation.
 Each invocation runs with `--no-fail-fast`; the exit status is non-zero if
@@ -30,12 +38,30 @@ any of them failed.
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import threading
+import time
+
+# The Linux runtime sample coverage shards balance on (the Windows one,
+# scripts/ci-test-durations.json, doesn't model them: #1768).
+COVERAGE_TIMINGS = Path(__file__).with_name("ci-coverage-durations.json")
 
 # Shard 1's share of the integration targets, relative to every other
 # shard's 1.0 (it also carries the unit tests and doctests).
 FIRST_SHARD_WEIGHT = 0.5
+
+# cargo's `Running tests/x.rs (target/debug/deps/x-0123456789abcdef)` and
+# `test result: ... finished in 1.23s` lines. The binary name, not the source
+# path, is the target name (tests/apply/main.rs is `apply`); unit-test
+# binaries are recorded as `unit:<crate>`. ANSI colour is stripped first.
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+RUNNING = re.compile(r"^\s*Running (unittests )?\S+ \(.*?([^/\\]+)-[0-9a-f]{16}(?:\.exe)?\)\s*$")
+RESULT = re.compile(r"^test result: .*finished in ([0-9.]+)s\s*$")
+
+# How long run() keeps reading cargo's pipe after cargo exits.
+DRAIN_SECONDS = 10
 
 
 def integration_targets(metadata):
@@ -90,6 +116,45 @@ def invocations(shard, count, names, extra=(), timings=None, coverage=False):
     return runs
 
 
+def run(args, timings):
+    """Run `args`, echoing its merged output byte for byte, and add each test
+    binary's `finished in` seconds to `timings`. Returns the exit status and
+    when the first test binary started (None if none did)."""
+    first = None
+
+    def forward(pipe):
+        nonlocal first
+        current = None
+        echo = True
+        for raw in pipe:
+            # Keep draining after a failed write (say `tee` died): a reader
+            # that stops would leave cargo blocked on a full pipe.
+            if echo:
+                try:
+                    sys.stdout.buffer.write(raw)
+                    sys.stdout.buffer.flush()
+                except (OSError, ValueError):
+                    echo = False
+            line = ANSI.sub("", raw.decode("utf-8", "replace"))
+            if m := RUNNING.match(line):
+                current = ("unit:" if m[1] else "") + m[2]
+                first = first or time.monotonic()
+            elif current and (m := RESULT.match(line)):
+                timings[current] = timings.get(current, 0.0) + float(m[1])
+                current = None
+
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    reader = threading.Thread(target=forward, args=(proc.stdout,), daemon=True)
+    reader.start()
+    status = proc.wait()
+    # A process a test left behind (a build daemon, say) can hold the pipe
+    # open after cargo exits; don't wait for it past a short drain.
+    reader.join(timeout=DRAIN_SECONDS)
+    if not reader.is_alive():
+        proc.stdout.close()
+    return status, first
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
@@ -99,16 +164,26 @@ def main(argv):
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
         check=True, capture_output=True, text=True).stdout)
     names = integration_targets(metadata)
-    timing_path = os.environ.get("CI_TEST_TIMINGS")
-    timings = json.loads(Path(timing_path).read_text(encoding="utf-8")) if timing_path else None
     coverage = os.environ.get("CI_TEST_COVERAGE") == "1"
+    timing_path = os.environ.get("CI_TEST_TIMINGS", COVERAGE_TIMINGS if coverage else None)
+    timings = json.loads(Path(timing_path).read_text(encoding="utf-8")) if timing_path else None
     print(f"ci-test-shard: shard {shard}/{count}: "
           f"{len(partition(names, count, timings)[shard - 1])} of {len(names)} integration targets", flush=True)
     status = 0
+    measured = {}
+    build = 0.0
     for args in invocations(shard, count, names, argv[2:], timings, coverage):
         print("+ " + " ".join(args), flush=True)
-        if subprocess.run(args).returncode != 0:
+        start = time.monotonic()
+        code, first = run(args, measured)
+        if code != 0:
             status = 1
+        # Build time of this invocation: start to its first test binary.
+        # (The doctest run prints no `Running` line and isn't counted.)
+        if first is not None:
+            build += first - start
+    measured = {"_build_seconds": build, **dict(sorted(measured.items(), key=lambda kv: (-kv[1], kv[0])))}
+    print("ci-test-shard: timings " + json.dumps({k: round(v, 2) for k, v in measured.items()}), flush=True)
     return status
 
 
