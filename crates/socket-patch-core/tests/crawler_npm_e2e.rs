@@ -1036,6 +1036,83 @@ async fn crawl_all_finds_declared_members_with_skip_dir_names() {
     }
 }
 
+/// #1827: a declared `workspaces` member inside a hidden directory (a
+/// JavaScript GitHub Action kept at `.github/actions/<name>`, an explicit
+/// `.config/tool`) is crawled too, though the walk prunes hidden dirs:
+/// npm, yarn and Bun install its unhoistable deps into
+/// `<member>/node_modules` from the root lock.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_finds_declared_members_in_hidden_dirs() {
+    for (workspaces, members) in [
+        (r#"[".github/actions/*"]"#, &[".github/actions/x"][..]),
+        (
+            r#"["packages/*",".github/actions/*"]"#,
+            &["packages/y", ".github/actions/x"][..],
+        ),
+        (r#"[".config/tool"]"#, &[".config/tool"][..]),
+        (r#"{"packages":[".github/**"]}"#, &[".github/actions/x"][..]),
+        // npm's and yarn's wildcards match a dot component.
+        (r#"["packages/*"]"#, &["packages/.hidden"][..]),
+        // A hidden dir below a skip-named one, and the other way round.
+        (
+            r#"["build/*",".tools/*"]"#,
+            &["build/.x", ".tools/dist"][..],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"root","private":true,"workspaces":{workspaces}}}"#),
+        )
+        .await
+        .unwrap();
+        stage_npm_pkg(&root.join("node_modules"), "ms", "2.1.3").await;
+        let mut expected = vec![root.join("node_modules").join("ms")];
+        for member in members {
+            expected.push(stage_member(root, member).await);
+        }
+
+        let result = NpmCrawler.crawl_all(&options_at(root)).await;
+        let mut got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "workspaces {workspaces}");
+    }
+}
+
+/// #1827 control: a hidden dir no `workspaces` pattern declares, or one
+/// declared but without a `package.json`, stays pruned.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_still_skips_undeclared_hidden_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    tokio::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*",".github/actions/*"]}"#,
+    )
+    .await
+    .unwrap();
+    // Undeclared: `.cache/tool` at the root and `packages/x/.out` below a
+    // member, each a would-be member with its own `package.json`.
+    stage_member(root, ".cache/tool").await;
+    let member = stage_member(root, "packages/x").await;
+    stage_member(root, "packages/x/.out").await;
+    // Declared by `.github/actions/*` but no package.json.
+    stage_npm_pkg(
+        &root.join(".github/actions/bare/node_modules"),
+        "not-a-member",
+        "1.0",
+    )
+    .await;
+
+    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+    assert_eq!(got, vec![member]);
+}
+
 /// #1627: the members of a workspace nested below the scan root (found by
 /// the walk through its own `node_modules`) count too.
 #[tokio::test]

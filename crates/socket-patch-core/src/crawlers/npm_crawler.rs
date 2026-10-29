@@ -66,8 +66,9 @@ pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
 }
 
 /// The `node_modules` dirs of declared workspace members that the
-/// workspace walk prunes by name (#1627): members whose path crosses a
-/// [`SKIP_DIRS`] name (`packages/build`, `vendor/lib`). npm, yarn and Bun
+/// workspace walk prunes by name: members whose path crosses a
+/// [`SKIP_DIRS`] name (`packages/build`, `vendor/lib`, #1627) or a hidden
+/// one (`.github/actions/x`, `.config/tool`, #1827). npm, yarn and Bun
 /// install a member's unhoistable deps into `<member>/node_modules` from
 /// the root lock, so such a copy is as live as any other member's. The
 /// workspace roots are `start_path` and the project of every `walked`
@@ -102,10 +103,11 @@ pub(super) fn skipped_workspace_member_roots(
 /// pattern is walked from its literal prefix to the depth its segments
 /// allow (any depth for `**`, within [`WORKSPACE_GLOB_DIR_BUDGET`] dirs per
 /// pattern), with the walk's own rules: real dirs only (never a symlink),
-/// never a hidden dir, a `node_modules` or a tagged cache dir below the
-/// root, literal prefix included. Names are
-/// read from the listings, so the [`SKIP_DIRS`] test sees each dir as the
-/// walk does even when a pattern spells it in another case.
+/// never a `node_modules` or a tagged cache dir below the root, literal
+/// prefix included. Hidden dirs are walked, as each dialect's matcher
+/// decides whether a wildcard matches a dot component. Names are read
+/// from the listings, so the pruned-name test sees each dir as the walk
+/// does even when a pattern spells it in another case.
 fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
     use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
 
@@ -116,9 +118,7 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let walkable = |entry: &ListedEntry| {
-        entry.file_type.is_some_and(|ft| ft.is_dir())
-            && entry.name_str != "node_modules"
-            && !entry.name_str.starts_with('.')
+        entry.file_type.is_some_and(|ft| ft.is_dir()) && entry.name_str != "node_modules"
     };
     let mut roots = Vec::new();
     // A leading `!` is a negation in some readings and part of an extglob
@@ -180,7 +180,9 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
             if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
                 continue;
             }
-            if rel.iter().any(|seg| SKIP_DIRS.contains(&seg.as_str()))
+            if rel
+                .iter()
+                .any(|seg| seg.starts_with('.') || SKIP_DIRS.contains(&seg.as_str()))
                 && WorkspacesDialect::ALL
                     .iter()
                     .any(|&dialect| workspaces_include_as(&patterns, &rel, dialect))
@@ -3412,7 +3414,7 @@ impl NpmCrawler {
 
         // Recursively search for workspace node_modules
         results.extend(Self::find_workspace_node_modules(start_path, listing));
-        // Plus the declared members the walk prunes by name (#1627).
+        // Plus the declared members the walk prunes by name (#1627, #1827).
         let members = skipped_workspace_member_roots(start_path, &results);
         results.extend(members);
 

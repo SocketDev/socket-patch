@@ -494,7 +494,7 @@ impl LegacyNpmCrawler {
 
         // Recursively search for workspace node_modules
         Self::find_workspace_node_modules(start_path, &mut results).await;
-        // The declared members the walk prunes by name (#1627) and the
+        // The declared members the walk prunes by name (#1627, #1827) and the
         // package-manager-configured roots are shared with the parent
         // module (not part of the walk this oracle checks).
         let members = skipped_workspace_member_roots(start_path, &results);
