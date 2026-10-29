@@ -550,34 +550,54 @@ impl VendoredBackend<'_> {
                             );
                             continue;
                         }
-                        // A stray file in the tree (a Finder `.DS_Store`)
-                        // fails the Gradle build (#656); the index says
-                        // what belongs there, so it goes offline too.
+                    }
+                    // A stray file in the tree (a Finder `.DS_Store`) fails
+                    // the Gradle build (#656); the index says what belongs
+                    // there, so it goes offline too.
+                    if vendor::jvm::apply::is_jvm_entry(&entry) {
                         let indexed = vendor::jvm::apply::recorded_tree_files(&entry);
-                        match vendor::jvm::apply::sweep_unindexed_tree_entries(
-                            &common.cwd,
-                            &indexed,
-                        )
-                        .await
-                        {
-                            Ok(true) => {
+                        let swept =
+                            match vendor::jvm::apply::unindexed_tree_entries(&common.cwd, &indexed)
+                            {
+                                Ok(stray) if stray.is_empty() || common.dry_run => Ok(stray),
+                                Ok(stray) => vendor::jvm::apply::sweep_unindexed(&stray)
+                                    .await
+                                    .map(|()| stray),
+                                Err(e) => Err(e),
+                            };
+                        match swept {
+                            Ok(stray) if stray.is_empty() => {}
+                            Ok(stray) if common.dry_run => {
+                                env.record(
+                                    PatchEvent::new(PatchAction::Verified, purl.clone())
+                                        .with_details(serde_json::json!({
+                                            "vendorArtifact": true,
+                                            "wouldRemoveUnindexed": stray
+                                                .iter()
+                                                .map(|s| s.rel.as_str())
+                                                .collect::<Vec<_>>(),
+                                        })),
+                                );
+                            }
+                            Ok(stray) => {
                                 if !quiet {
-                                    println!(
-                                        "Removed unindexed files from the vendored tree of {}",
-                                        normalize_purl(purl)
-                                    );
+                                    for s in &stray {
+                                        println!("Removed unindexed vendored file {}", s.rel);
+                                    }
                                 }
                                 env.record(
                                     PatchEvent::new(PatchAction::Rebuilt, purl.clone())
                                         .with_details(serde_json::json!({
                                             "path": entry.artifact.path,
-                                            "unindexedRemoved": true,
+                                            "unindexedRemoved": stray
+                                                .iter()
+                                                .map(|s| s.rel.as_str())
+                                                .collect::<Vec<_>>(),
                                             "artifactRebuilt": false,
                                         })),
                                 );
                                 repaired += 1;
                             }
-                            Ok(false) => {}
                             Err(e) => {
                                 fail(
                                     env,

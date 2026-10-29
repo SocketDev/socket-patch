@@ -1101,17 +1101,15 @@ async fn vendor_maven_jvm(
             warnings,
         );
     }
+    // Before any wiring is written, so a stray that cannot go leaves
+    // nothing half-done.
+    if let Err(e) = super::jvm::apply::sweep_unindexed(&unindexed).await {
+        return done(failed_result(purl, &jar_path, e), None, warnings);
+    }
     let mut wiring = match super::jvm::apply::write_plan(project_root, &plan).await {
         Ok(records) => records,
         Err(e) => return done(failed_result(purl, &jar_path, e), None, warnings),
     };
-    if !unindexed.is_empty() {
-        if let Err(e) =
-            super::jvm::apply::sweep_unindexed_tree_entries(project_root, &indexed).await
-        {
-            return done(failed_result(purl, &jar_path, e), None, warnings);
-        }
-    }
     // Shared fragments another JVM entry wrote, and the pristine originals
     // of a patch update, come from the ledger.
     if let Some(state) = &state {

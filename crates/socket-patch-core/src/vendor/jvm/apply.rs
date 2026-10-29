@@ -811,67 +811,30 @@ pub async fn sweep_replaced_tree<'e>(
     Ok(!removed.is_empty())
 }
 
-/// The vendored tree directories among `indexed` (each holds a recorded
-/// marker), resolved, with the names `indexed` lists in each.
-fn indexed_tree_dirs(
-    reader: &ProjectReader,
-    indexed: &BTreeSet<String>,
-) -> Result<Vec<(String, PathBuf)>, String> {
-    let mut dirs = Vec::new();
-    for rel in indexed {
-        let Some((dir, name)) = rel.rsplit_once('/') else {
-            continue;
-        };
-        let in_tree = layout::VENDOR_TREES
-            .iter()
-            .any(|tree| dir.strip_prefix(tree).is_some_and(|r| r.starts_with('/')));
-        if name == layout::MARKER_FILE && in_tree && safe_rel(rel) {
-            dirs.push((dir.to_string(), reader.resolve(dir)?));
-        }
-    }
-    Ok(dirs)
+/// A file or directory in a vendored tree that its index does not list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnindexedEntry {
+    /// Project-relative, for messages.
+    pub rel: String,
+    /// The entry itself, inside its resolved in-checkout tree directory
+    /// (never resolved through the entry, so a stray symlink is the link).
+    pub path: PathBuf,
 }
 
-/// What the vendored tree directories hold beyond the files `indexed`
-/// lists (project-relative): a Finder `.DS_Store`, an editor backup, a
-/// stray directory. The Gradle settings script and `vendor --check` refuse
-/// any of them, so a re-vendor sweeps them (#656).
-pub fn unindexed_tree_entries(
+/// What `dirs` (vendored tree directories) hold beyond the files `indexed`
+/// lists: a Finder `.DS_Store`, an editor backup, a stray directory. The
+/// Gradle settings script and `vendor --check` refuse any of them, so a
+/// re-vendor and `repair` sweep them (#656). A missing directory holds
+/// nothing.
+pub fn unindexed_in(
     root: &Path,
+    dirs: &[String],
     indexed: &BTreeSet<String>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<UnindexedEntry>, String> {
     let reader = ProjectReader::new(root);
     let mut stray = Vec::new();
-    for (dir, path) in indexed_tree_dirs(&reader, indexed)? {
-        let items = match std::fs::read_dir(&path) {
-            Ok(items) => items,
-            Err(e) if is_missing(&e) => continue,
-            Err(e) => return Err(format!("cannot list {dir}: {e}")),
-        };
-        for item in items {
-            let item = item.map_err(|e| format!("cannot list {dir}: {e}"))?;
-            let rel = format!("{dir}/{}", item.file_name().to_string_lossy());
-            if !indexed.contains(&rel) {
-                stray.push(rel);
-            }
-        }
-    }
-    stray.sort();
-    stray.dedup();
-    Ok(stray)
-}
-
-/// Delete [`unindexed_tree_entries`]: a stray symlink goes, not its
-/// target, and a stray directory goes with everything in it (the tree is
-/// socket-patch's own; nothing else may live there). `Ok(true)` when
-/// anything went.
-pub async fn sweep_unindexed_tree_entries(
-    root: &Path,
-    indexed: &BTreeSet<String>,
-) -> Result<bool, String> {
-    let reader = ProjectReader::new(root);
-    let mut removed = false;
-    for (dir, path) in indexed_tree_dirs(&reader, indexed)? {
+    for dir in dirs {
+        let path = reader.resolve(dir)?;
         let items = match std::fs::read_dir(&path) {
             Ok(items) => items,
             Err(e) if is_missing(&e) => continue,
@@ -881,28 +844,62 @@ pub async fn sweep_unindexed_tree_entries(
             let item = item.map_err(|e| format!("cannot list {dir}: {e}"))?;
             let name = item.file_name();
             let rel = format!("{dir}/{}", name.to_string_lossy());
-            if indexed.contains(&rel) {
-                continue;
+            if !indexed.contains(&rel) {
+                stray.push(UnindexedEntry {
+                    rel,
+                    path: path.join(name),
+                });
             }
-            // Never through the entry itself: `path` is the resolved,
-            // in-checkout directory and `name` one of its own entries.
-            let target = path.join(&name);
-            let gone = match tokio::fs::symlink_metadata(&target).await {
-                // Like a revert's tree, a directory goes once the run's
-                // commit is on disk (now when no group is open).
-                Ok(meta) if meta.is_dir() => {
-                    group_commit::remove_after_commit(&target, &target).await;
-                    Ok(())
-                }
-                Ok(_) => remove_file(&target).await,
-                Err(e) if is_missing(&e) => continue,
-                Err(e) => Err(e),
-            };
-            gone.map_err(|e| format!("failed to remove unindexed {rel}: {e}"))?;
-            removed = true;
         }
     }
-    Ok(removed)
+    stray.sort_by(|a, b| a.rel.cmp(&b.rel));
+    stray.dedup();
+    Ok(stray)
+}
+
+/// The vendored tree directories `indexed` lists files in.
+pub fn indexed_tree_dirs(indexed: &BTreeSet<String>) -> Vec<String> {
+    let dirs: BTreeSet<String> = indexed
+        .iter()
+        .filter(|rel| safe_rel(rel))
+        .filter_map(|rel| rel.rsplit_once('/').map(|(dir, _)| dir))
+        .filter(|dir| {
+            layout::VENDOR_TREES
+                .iter()
+                .any(|tree| dir.strip_prefix(tree).is_some_and(|r| r.starts_with('/')))
+        })
+        .map(str::to_string)
+        .collect();
+    dirs.into_iter().collect()
+}
+
+/// [`unindexed_in`] over the directories `indexed` lists files in.
+pub fn unindexed_tree_entries(
+    root: &Path,
+    indexed: &BTreeSet<String>,
+) -> Result<Vec<UnindexedEntry>, String> {
+    unindexed_in(root, &indexed_tree_dirs(indexed), indexed)
+}
+
+/// Delete `stray` now, outside any group commit: nothing names these
+/// entries, so there is nothing to journal, and a captured removal would
+/// be read back through a stray symlink at the commit. A symlink goes,
+/// not its target; a directory goes with everything in it (the tree is
+/// socket-patch's own). One already gone counts as removed.
+pub async fn sweep_unindexed(stray: &[UnindexedEntry]) -> Result<(), String> {
+    for entry in stray {
+        let gone = match tokio::fs::symlink_metadata(&entry.path).await {
+            Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&entry.path).await,
+            Ok(_) => tokio::fs::remove_file(&entry.path).await,
+            Err(e) => Err(e),
+        };
+        match gone {
+            Ok(()) => {}
+            Err(e) if is_missing(&e) => {}
+            Err(e) => return Err(format!("failed to remove unindexed {}: {e}", entry.rel)),
+        }
+    }
+    Ok(())
 }
 
 /// The tree files `entry` records, the index [`unindexed_tree_entries`]
@@ -1146,19 +1143,14 @@ pub fn check_entry(
     if maven && gradle {
         tree_dirs.push(gradle::tree_dir(&c));
     }
-    for tree_dir in tree_dirs {
-        let dir = reader.resolve(&tree_dir)?;
-        for item in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-            let item = item.map_err(|e| e.to_string())?;
-            let rel = format!("{tree_dir}/{}", item.file_name().to_string_lossy());
-            if !entry
-                .wiring
-                .iter()
-                .any(|w| w.kind == TREE_KIND && w.file == rel)
-            {
-                return Err(format!("unindexed vendored file: {rel}"));
-            }
-        }
+    let indexed: BTreeSet<String> = entry
+        .wiring
+        .iter()
+        .filter(|w| w.kind == TREE_KIND)
+        .map(|w| w.file.clone())
+        .collect();
+    if let Some(stray) = unindexed_in(root, &tree_dirs, &indexed)?.first() {
+        return Err(format!("unindexed vendored file: {}", stray.rel));
     }
     // The sbt tree is the reactor's suffixed layout, so a Maven local
     // repository may cache the same suffixed GAV.
@@ -1840,13 +1832,17 @@ mod tests {
             want.push(tree_file("link"));
         }
         want.sort();
-        assert_eq!(unindexed_tree_entries(root, &indexed).unwrap(), want);
+        let stray = unindexed_tree_entries(root, &indexed).unwrap();
+        let rels: Vec<String> = stray.iter().map(|s| s.rel.clone()).collect();
+        assert_eq!(rels, want);
 
-        assert!(sweep_unindexed_tree_entries(root, &indexed).await.unwrap());
+        sweep_unindexed(&stray).await.unwrap();
         assert!(unindexed_tree_entries(root, &indexed).unwrap().is_empty());
         assert!(root.join(&jar).is_file() && root.join(&marker).is_file());
         assert!(root.join(peer).is_file(), "another tree is never swept");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
-        assert!(!sweep_unindexed_tree_entries(root, &indexed).await.unwrap());
+        sweep_unindexed(&stray)
+            .await
+            .expect("already gone is removed");
     }
 }
