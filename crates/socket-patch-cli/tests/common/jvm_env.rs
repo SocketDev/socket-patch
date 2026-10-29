@@ -34,6 +34,12 @@ pub const AMBIENT: &[&str] = &[
     // ambient value would aim a test's crawl at a real cache.
     "COURSIER_CACHE",
     "SBT_OPTS",
+    // The Maven local-repository lookup reads these (#423): `-D`s in
+    // MAVEN_OPTS / MAVEN_ARGS and the install's conf/settings.xml.
+    "MAVEN_OPTS",
+    "MAVEN_ARGS",
+    "MAVEN_HOME",
+    "M2_HOME",
 ];
 
 /// The cache roots a test may hand the CLI explicitly (they survive

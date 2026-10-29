@@ -610,3 +610,69 @@ fn global_folder_values_read_like_yarn() {
         paths(&["/opt/nq"])
     );
 }
+
+/// #437: yarn 1.0.x can't report its global folder, so it is derived the
+/// way yarn 1.0.2's `constants.js` does: `<userHome>/.config/yarn/global`
+/// (`userHome` is `/usr/local/share` for a root user that isn't under
+/// fakeroot), or `%LOCALAPPDATA%\Yarn\config\global` on Windows.
+#[test]
+fn yarn_1_0_default_global_folder_follows_yarn_1_0_2() {
+    let vars = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let unix = NpmConfigEnv::from_parts(vars(&[("HOME", "/home/u")]), None, false);
+    assert_eq!(
+        yarn_1_0_default_global_folder(&unix, false),
+        Some(PathBuf::from("/home/u/.config/yarn/global"))
+    );
+    assert_eq!(
+        yarn_1_0_default_global_folder(&unix, true),
+        Some(PathBuf::from("/usr/local/share/.config/yarn/global"))
+    );
+    let fakeroot = NpmConfigEnv::from_parts(
+        vars(&[("HOME", "/home/u"), ("FAKEROOTKEY", "1")]),
+        None,
+        false,
+    );
+    assert_eq!(
+        yarn_1_0_default_global_folder(&fakeroot, true),
+        Some(PathBuf::from("/home/u/.config/yarn/global"))
+    );
+    assert_eq!(
+        yarn_1_0_default_global_folder(&NpmConfigEnv::from_parts(Vec::new(), None, false), false),
+        None,
+        "no home, no folder"
+    );
+
+    let windows = NpmConfigEnv::from_parts(
+        vars(&[
+            ("USERPROFILE", r"C:\Users\u"),
+            ("LOCALAPPDATA", r"C:\Users\u\AppData\Local"),
+        ]),
+        None,
+        true,
+    );
+    assert_eq!(
+        yarn_1_0_default_global_folder(&windows, false),
+        Some(
+            Path::new(r"C:\Users\u\AppData\Local")
+                .join("Yarn")
+                .join("config")
+                .join("global")
+        )
+    );
+    // Without LOCALAPPDATA yarn 1.0.x falls back to the home layout.
+    let windows = NpmConfigEnv::from_parts(vars(&[("USERPROFILE", r"C:\Users\u")]), None, true);
+    assert_eq!(
+        yarn_1_0_default_global_folder(&windows, false),
+        Some(
+            Path::new(r"C:\Users\u")
+                .join(".config")
+                .join("yarn")
+                .join("global")
+        )
+    );
+}

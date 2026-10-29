@@ -637,11 +637,9 @@ fn home_precedence() {
         JvmEnv::resolve(&env, Os::Unix, None).m2_repo,
         Some(PathBuf::from("/mrl"))
     );
+    // M2_HOME is the Maven install, not a local repository (#423).
     env.remove("MAVEN_REPO_LOCAL");
-    assert_eq!(
-        JvmEnv::resolve(&env, Os::Unix, None).m2_repo,
-        Some(PathBuf::from("/m2home/repository"))
-    );
+    assert_eq!(JvmEnv::resolve(&env, Os::Unix, None).m2_repo, Some(m.m2()));
 }
 
 /// The read-only cache is scanned after the user home's, and is reported as

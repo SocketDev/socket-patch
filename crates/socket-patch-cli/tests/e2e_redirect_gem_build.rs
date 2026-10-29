@@ -3035,7 +3035,7 @@ async fn gem_hosted_pin_previews_and_runs_a_clean_eject() {
 /// takeover agree dry and wet: both exit 0, and the wet run wires the
 /// vendored copy with the lock still CRLF on every line instead of failing
 /// `apply_failed` ("Gemfile.lock has no GEM section") and rolling back.
-/// (The Gemfile's spliced line still takes LF, a gap #815 tracks.)
+/// A CRLF Gemfile keeps CRLF on every line too (#1821).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -3119,6 +3119,13 @@ async fn gem_hosted_pin_with_a_crlf_lock_ejects_cleanly() {
                     gemfile.contains("path: \".socket/vendor/gem/"),
                     "{label}: the Gemfile now points at the vendored copy:\n{gemfile}"
                 );
+                if crlf_files.contains(&"Gemfile") {
+                    assert_eq!(
+                        gemfile.matches('\n').count(),
+                        gemfile.matches("\r\n").count(),
+                        "{label}: every line of the Gemfile keeps CRLF:\n{gemfile:?}"
+                    );
+                }
                 let lock = std::fs::read_to_string(fx.proj.join("Gemfile.lock")).unwrap();
                 assert!(
                     lock.contains("PATH\r\n  remote: .socket/vendor/gem/"),

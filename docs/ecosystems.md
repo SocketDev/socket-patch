@@ -830,6 +830,11 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   `<profiles>` (a literal or a `${property}`) is left as-is and reported
   (`redirect_maven_profile_dependency_unpatched`), because an active profile's version
   beats the pin, and when a profile holds the GA's only declaration nothing is pinned.
+  A `${property}` groupId or artifactId is resolved from the pom's own `<properties>`
+  before matching, so `<groupId>${ct.group}</groupId>` is rewritten like a literal. One
+  the pom does not define (a parent's) may be the patched GA, and then its own version
+  wins: the dep is refused with nothing written (`redirect_maven_coordinate_unresolved`),
+  and `vex` does not attest a pin past such a declaration.
   The grant serves the main jar only: a `<classifier>` variant keeps its version
   (`redirect_maven_classifier_unsupported`), and the literal-or-pin decision is made from
   the classifier-less declarations. A `sources` / `javadoc` variant at the patched release
@@ -954,6 +959,12 @@ read-only cache in `$GRADLE_RO_DEP_CACHE`) before `~/.m2`. The user home is foun
 way Gradle finds it: `-Dgradle.user.home` in `GRADLE_OPTS`, then `GRADLE_USER_HOME`,
 then `.gradle` in the account's home directory. On Unix that is the passwd entry, not
 `$HOME`; when they differ, scan notes `gradle_user_home_differs`.
+
+`~/.m2` here means the Maven local repository, found the way Maven finds it:
+`MAVEN_REPO_LOCAL`, then `-Dmaven.repo.local` in `MAVEN_ARGS` or `MAVEN_OPTS`, then
+`<localRepository>` in `~/.m2/settings.xml`, then in the install's `conf/settings.xml`
+(`MAVEN_HOME` or `M2_HOME`), then `.m2/repository` in `user.home`. `M2_HOME` itself
+never names a local repository. On Windows `user.home` is `USERPROFILE`, not `HOME`.
 
 A Gradle-only build reads `~/.m2` only through `mavenLocal()`. Scan looks for it in
 every settings, build, `buildSrc`, included-build, applied and init script, including
@@ -1507,6 +1518,16 @@ it and attests nothing. `vex` reads only the project's own `go.work`: when
 `GOWORK` names any other file, it attests none of the project's Go patches
 and reports each as `patched_ref_invalid`.
 
+`GOFLAGS` is read the same way (the environment, then the `go env -w`
+file). A `-modfile` in it that names any file other than the project's
+`go.mod` makes go build from that file and its `.sum` and ignore `go.mod`'s
+replaces, and in workspace mode go refuses `-modfile` outright. socket-patch
+then writes no replace, `apply --check` and `vendor --check` fail on one
+already written, and `vex` attests none of the project's Go patches. A
+relative `-modfile` is taken from the project directory, where go is
+assumed to run. Unset it (`go env -u GOFLAGS` if `go env -w` set it) and
+re-run.
+
 In workspace mode go reads `replace` directives from `go.work` and from the
 `go.mod` of each module it `use`s. Run in the directory holding `go.work`,
 `apply`, `vendor` and `scan --mode hosted` write the `replace` of a module
@@ -1522,6 +1543,11 @@ module moves into `go.work` the next time `apply` or `vendor` writes it (a
 `vendor` takeover then deletes the `.socket/go-patches/` copy no file names
 any more); a hosted pin there stays, its sum lines beside it, and in
 workspace mode the `go.work` replace overrides it.
+Only the directory's own `go.work` counts: when `GOWORK` names another file
+in it (say `ci.work`), go doesn't read `go.work`, so socket-patch never
+writes the replace there. It treats that file like a workspace file in
+another directory: a module it `use`s takes the replace in its own `go.mod`,
+and a directory with no module is refused ("has nowhere to go").
 One `go.work` replace applies to every member. Member replaces of one
 project-local copy would not: go resolves each against its own member
 directory, sees two targets and refuses the workspace. The target is
@@ -1619,6 +1645,16 @@ A hosted rescan removes a pin it wrote once another member outranks it.
 After an upgrade such as `go get M@v1.0.1`, `apply --check` fails and `vex`
 leaves the patch out (`go_version_not_selected`) until you get a patch for the
 new version.
+
+A module the build uses only as the target of another module's replacement
+(`replace other.com/fork => example.com/upstream v1.0.0`) is not patched
+either. go downloads the target and records its `go.sum` lines under the
+target's own path, but the build list holds only `other.com/fork`, and go
+doesn't apply a replace to a replacement. So a zip line at the target's version
+doesn't count: `apply`, `vendor` and `scan --mode hosted` refuse the patch
+(hosted: `redirect_golang_not_in_module_graph`), and a replace written before
+the fork replace appeared fails `apply --check` and is left out of `vex`
+(`go_version_not_selected`).
 
 Paid hosted Go references are unsupported: embedding credentials in module paths
 would expose them to module proxies and change module identity. Use vendored mode

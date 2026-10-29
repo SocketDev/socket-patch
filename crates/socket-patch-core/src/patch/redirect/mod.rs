@@ -8586,8 +8586,17 @@ fn rewrite_maven_pom(
     // unchanged (a no-op rescan then never re-scans the pom per dep).
     // The hosted rewriter's view of the pom, read once (through `PomScope`)
     // and kept in step with every edit below.
-    let mut index: Option<Result<maven_index::PomIndex, String>> =
-        pom.as_deref().map(maven_index::PomIndex::build);
+    // `.mvn/maven.config`'s `-D` user properties win over the pom's own
+    // when Maven interpolates a coordinate.
+    let user_properties = crate::formats::maven::maven_config_properties(
+        files
+            .get(MVN_CONFIG)
+            .map(String::as_str)
+            .unwrap_or_default(),
+    );
+    let mut index: Option<Result<maven_index::PomIndex, String>> = pom
+        .as_deref()
+        .map(|pom| maven_index::PomIndex::build(pom, &user_properties));
     let original_repos: Vec<(String, Option<String>)> = match (&index, pom.as_deref()) {
         (Some(Ok(index)), Some(pom)) => index.repository_ids_and_urls(pom),
         _ => Vec::new(),
@@ -8734,6 +8743,53 @@ fn rewrite_maven_pom(
             });
             if matches.is_empty() {
                 continue;
+            }
+        }
+        // A declaration whose groupId / artifactId is a property this pom
+        // does not define (a parent's) may be this GA, and then its own
+        // `<version>` beats any pin written here (#683): nothing is pinned.
+        // One inside `<profiles>` beats it only while that profile is
+        // active, and is reported like a literal profile declaration.
+        let shadow_text = |d: &maven_index::IndexedDep| {
+            format!(
+                "{}:{} <version>{}</version>",
+                d.group.as_deref().unwrap_or_default(),
+                d.artifact.as_deref().unwrap_or_default(),
+                d.version_text.as_deref().unwrap_or_default(),
+            )
+        };
+        if let Some(shadow) = idx.placeholder_shadow(&group_id, &artifact_id, false) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_coordinate_unresolved".into(),
+                detail: format!(
+                    "{} names a property pom.xml does not define, so it may be \
+                     {group_id}:{artifact_id} and its own version would win over a pin; pom.xml \
+                     was left as it is and the dep is not counted as redirected",
+                    shadow_text(shadow),
+                ),
+            });
+            continue;
+        }
+        if profile_version.is_none() {
+            if let Some(shadow) = idx.placeholder_shadow(&group_id, &artifact_id, true) {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_profile_dependency_unpatched".into(),
+                    detail: format!(
+                        "{} inside <profiles> names a property pom.xml does not define, so it \
+                         may be {group_id}:{artifact_id}; it is not edited, and while that \
+                         profile is active it may resolve that version, not the patched \
+                         artifact{}",
+                        shadow_text(shadow),
+                        if matches.is_empty() {
+                            " (no declaration outside <profiles>, so nothing is pinned)"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+                if matches.is_empty() {
+                    continue;
+                }
             }
         }
         let has_live_repo = idx.has_repository(&repo_id);
@@ -9311,6 +9367,10 @@ pub const GO_WORKSPACE_KEY: &str = "<socket-patch:go-workspace>";
 pub struct HostedGoWorkspace {
     pub root: std::path::PathBuf,
     pub loaded: crate::vendor::go_workspace::Loaded,
+    /// `GOFLAGS`' `-modfile` keeping the replace from the build, as
+    /// [`crate::vendor::go_workspace::modfile_setting`] words it (#1799).
+    #[serde(default)]
+    pub modfile: Option<String>,
 }
 
 fn rewrite_golang(
@@ -9450,10 +9510,14 @@ fn rewrite_golang(
                 rhs_version: Some(rhs_version.clone()),
                 owner: Some(go_mod_edit::ReplaceOwner::Hosted),
             };
-            if let Some(conflict) =
+            let modfile = ws
+                .modfile
+                .clone()
+                .map(|setting| crate::vendor::go_workspace::WorkspaceConflict::ModFile { setting });
+            if let Some(conflict) = modfile.or_else(|| {
                 ws.loaded
                     .host_conflict(host, &ws.root, &fname, &dep.version, &ours)
-            {
+            }) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_golang_workspace_conflict".into(),
                     detail: format!(
@@ -9630,29 +9694,42 @@ fn rewrite_golang_target(
     let selection = selection.unwrap_or_else(|| {
         let zips = go_sum.zip_versions(fname);
         let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        go_build_list::select(
-            go_mod_edit::prunes_module_graph(go_mod),
-            scan.required.as_deref(),
-            &zips,
-            &dep.version,
-        )
+        go_build_list::select(go_mod, fname, scan.required.as_deref(), &zips, &dep.version)
     });
-    if let Some(selected) = selection.other_version() {
-        let basis = if in_workspace {
-            "the go.work workspace selects"
-        } else if scan.required.as_deref() == Some(selected) {
-            "go.mod requires"
-        } else {
-            "go.sum shows the build selects"
-        };
-        result.warnings.push(RewriteWarning {
-            code: "redirect_golang_version_mismatch".into(),
+    // A pin the build provably doesn't use: a selected version other than
+    // the patched one, or a module go builds only as the target of another
+    // module's replace (go doesn't chain replaces, #1823).
+    let inert = match &selection {
+        go_build_list::Selection::Other(selected) => {
+            let basis = if in_workspace {
+                "the go.work workspace selects"
+            } else if scan.required.as_deref() == Some(selected.as_str()) {
+                "go.mod requires"
+            } else {
+                "go.sum shows the build selects"
+            };
+            Some(RewriteWarning {
+                code: "redirect_golang_version_mismatch".into(),
+                detail: format!(
+                    "{fname}: {basis} {selected} but the patch targets {} — \
+                     a version-pinned replace would be silently ignored",
+                    dep.version
+                ),
+            })
+        }
+        go_build_list::Selection::ReplaceTarget(via) => Some(RewriteWarning {
+            code: "redirect_golang_not_in_module_graph".into(),
             detail: format!(
-                "{fname}: {basis} {selected} but the patch targets {} — \
-                 a version-pinned replace would be silently ignored",
+                "{fname}@{}: the build uses this version only as the replacement of \
+                 {via} (go.mod's replace of {via}), and go doesn't apply a replace to a \
+                 replacement — its replace would be ignored; nothing redirected",
                 dep.version
             ),
-        });
+        }),
+        _ => None,
+    };
+    if let Some(warning) = inert {
+        result.warnings.push(warning);
         let stale_hosted = prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
         if let Some(stale) = stale_hosted {
             if let Ok(Some(new)) =
@@ -10271,6 +10348,199 @@ mod tests {
             "single-module root still rewritten"
         );
         assert!(!warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"));
+    }
+
+    /// A direct declaration whose groupId / artifactId is a property of
+    /// the pom's own `<properties>` is the GA (#683): its literal is
+    /// rewritten, not shadowed by an added `<dependencyManagement>` pin
+    /// Maven would never apply. `<exclusions>` before the coordinates do
+    /// not hide it either.
+    #[test]
+    fn maven_pom_property_coordinates_are_the_direct_declaration() {
+        for (case, props, coords) in [
+            (
+                "property groupId",
+                "<g>org.slf4j</g>",
+                "<groupId>${g}</groupId><artifactId>slf4j-api</artifactId>",
+            ),
+            (
+                "property artifactId",
+                "<a>slf4j-api</a>",
+                "<groupId>org.slf4j</groupId><artifactId>${a}</artifactId>",
+            ),
+            (
+                "interpolated groupId",
+                "<vendor>slf4j</vendor>",
+                "<groupId>org.${vendor}</groupId><artifactId>slf4j-api</artifactId>",
+            ),
+            (
+                "exclusions first",
+                "",
+                "<exclusions><exclusion><groupId>org.example</groupId><artifactId>none</artifactId></exclusion></exclusions><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>",
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                format!(
+                    "<project>\n  <properties>{props}</properties>\n  <dependencies>\n    <dependency>{coords}<version>1.7.36</version></dependency>\n  </dependencies>\n</project>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let out = r.files.get("pom.xml").expect("pom rewritten");
+            assert!(
+                out.contains(&format!("{coords}<version>{MAVEN_SUFFIXED}</version>")),
+                "{case}: the direct literal is pinned: {out}"
+            );
+            assert!(
+                !out.contains("<dependencyManagement>"),
+                "{case}: no shadowed managed pin: {out}"
+            );
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_dep_management_added"),
+                "{case}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// `.mvn/maven.config`'s `-D` user properties override the pom's own
+    /// when Maven interpolates a coordinate: one naming another group is
+    /// not this GA (its literal is left alone), and one defining a property
+    /// the pom lacks makes the declaration this GA.
+    #[test]
+    fn maven_pom_coordinate_properties_read_maven_config_overrides() {
+        let pom = |props: &str| {
+            format!(
+                "<project>\n  <properties>{props}</properties>\n  <dependencies>\n    <dependency><groupId>${{g}}</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version></dependency>\n  </dependencies>\n</project>\n"
+            )
+        };
+        let mut files = BTreeMap::new();
+        files.insert("pom.xml".to_string(), pom("<g>org.slf4j</g>"));
+        files.insert(MVN_CONFIG.to_string(), "-Dg=com.acme.fork\n".to_string());
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains("<groupId>${g}</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version>"),
+            "the com.acme.fork declaration keeps its version: {out}"
+        );
+
+        let mut files = BTreeMap::new();
+        files.insert("pom.xml".to_string(), pom(""));
+        files.insert(MVN_CONFIG.to_string(), "-Dg=org.slf4j\n".to_string());
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains(&format!(
+                "<groupId>${{g}}</groupId><artifactId>slf4j-api</artifactId><version>{MAVEN_SUFFIXED}</version>"
+            )) && !out.contains("<dependencyManagement>"),
+            "the maven.config-defined GA is pinned directly: {out}"
+        );
+        assert!(
+            !warning_codes(&r).contains(&"redirect_maven_coordinate_unresolved"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// A versioned declaration whose groupId / artifactId is a property
+    /// the pom does not define (a parent's) may be the GA, and its own
+    /// version would then beat any pin (#683): the dep is refused with
+    /// nothing written, not pinned through `<dependencyManagement>`.
+    #[test]
+    fn maven_pom_undefined_coordinate_property_refuses_the_dep() {
+        for coords in [
+            "<groupId>${parent.g}</groupId><artifactId>slf4j-api</artifactId>",
+            "<groupId>org.slf4j</groupId><artifactId>${parent.a}</artifactId>",
+            "<groupId>${g}</groupId><artifactId>${a}</artifactId>",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                format!(
+                    "<project>\n  <dependencies>\n    <dependency>{coords}<version>1.7.36</version></dependency>\n  </dependencies>\n</project>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{coords}: nothing written: {:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_coordinate_unresolved"],
+                "{coords}"
+            );
+        }
+        // A placeholder that cannot be the GA (the other coordinate, or the
+        // literal text around the reference, differs), or a versionless
+        // one (it takes the managed pin), does not block the pin.
+        for other in [
+            "<groupId>${parent.g}</groupId><artifactId>logback-classic</artifactId><version>1.4.14</version>",
+            "<groupId>${parent.g}</groupId><artifactId>slf4j-api</artifactId>",
+            "<groupId>${project.groupId}</groupId><artifactId>${project.artifactId}-core</artifactId><version>${project.version}</version>",
+            "<groupId>${parent.g}</groupId><artifactId>${bom}</artifactId><version>3</version><type>pom</type><scope>import</scope>",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                format!(
+                    "<project>\n  <dependencies>\n    <dependency>{other}</dependency>\n  </dependencies>\n</project>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_coordinate_unresolved"),
+                "{other}: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.files
+                    .get("pom.xml")
+                    .is_some_and(|p| p.contains(MAVEN_SUFFIXED)),
+                "{other}: pinned: {:?}",
+                r.warnings
+            );
+        }
+    }
+
+    /// A versioned `<profiles>` declaration through an undefined coordinate
+    /// property may be the GA while its profile is active: reported like a
+    /// literal profile declaration (#683), pinned beside a top-level
+    /// literal and skipped when it is the only declaration.
+    #[test]
+    fn maven_pom_undefined_coordinate_property_in_a_profile_is_reported() {
+        let profile = "<profiles><profile><id>p</id><dependencies><dependency>\
+                       <groupId>${parent.g}</groupId><artifactId>slf4j-api</artifactId>\
+                       <version>1.7.36</version></dependency></dependencies></profile></profiles>";
+        for (top, pinned) in [
+            (
+                "<dependencies><dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version></dependency></dependencies>",
+                true,
+            ),
+            ("", false),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                format!("<project>\n  {top}\n  {profile}\n</project>\n"),
+            );
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_profile_dependency_unpatched"),
+                "{pinned}: {:?}",
+                r.warnings
+            );
+            assert_eq!(
+                r.files
+                    .get("pom.xml")
+                    .is_some_and(|p| p.contains(MAVEN_SUFFIXED)),
+                pinned,
+                "{:?}",
+                r.files
+            );
+        }
     }
 
     /// Fail-closed transitive-only (no matching dependency): a
@@ -23408,6 +23678,35 @@ packages:
         assert!(out.warnings[0].detail.contains("v1.5.0"));
     }
 
+    /// #1823: a module go builds only as the target of another module's
+    /// replace has its go.sum lines under its own path, but go doesn't chain
+    /// replaces, so a replace of it would be inert.
+    #[test]
+    fn golang_replace_target_only_module_skips() {
+        for go in ["go 1.21", "go 1.16"] {
+            let mut files = golang_files();
+            files.insert(
+                "go.mod".to_string(),
+                format!(
+                    "module example.com/app\n\n{go}\n\nrequire other.com/fork v1.4.2\n\n\
+                     replace other.com/fork => github.com/foo/bar v1.4.2\n"
+                ),
+            );
+            let ovr = golang_override();
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(out.files.is_empty(), "{go}: {:?}", out.files);
+            assert_eq!(out.warnings.len(), 1, "{go}: {:?}", out.warnings);
+            assert_eq!(out.warnings[0].code, "redirect_golang_not_in_module_graph");
+            assert!(
+                out.warnings[0]
+                    .detail
+                    .contains("only as the replacement of other.com/fork"),
+                "{}",
+                out.warnings[0].detail
+            );
+        }
+    }
+
     /// A module NOT in the main go.mod's require block may still be resolved
     /// (transitively) at the patched version — the cross-check only fires on a
     /// positive mismatch, never on absence.
@@ -23578,6 +23877,7 @@ packages:
                         .collect(),
                 ),
             }),
+            modfile: None,
         };
         (
             GO_WORKSPACE_KEY.to_string(),
@@ -23799,6 +24099,7 @@ packages:
                 ],
                 graph: None,
             }),
+            modfile: None,
         };
         again.insert(
             GO_WORKSPACE_KEY.to_string(),
@@ -23810,6 +24111,34 @@ packages:
             out.warnings
                 .iter()
                 .any(|w| w.code == "redirect_golang_not_in_module_graph"),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// #1799: `-modfile` in GOFLAGS sends the build to another go.mod, so
+    /// the hosted pin is refused, nothing written or confirmed.
+    #[test]
+    fn golang_goflags_modfile_refuses_the_pin() {
+        use crate::vendor::go_workspace::Loaded;
+        let ovr = golang_override();
+        let mut files = golang_files();
+        let hosted = HostedGoWorkspace {
+            root: std::path::PathBuf::new(),
+            loaded: Loaded::None,
+            modfile: Some("GOFLAGS sets -modfile=go.alt.mod, so go builds from go.alt.mod".into()),
+        };
+        files.insert(
+            GO_WORKSPACE_KEY.to_string(),
+            serde_json::to_string(&hosted).unwrap(),
+        );
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
+        assert!(
+            out.warnings[0].detail.contains("-modfile=go.alt.mod"),
             "{:?}",
             out.warnings
         );

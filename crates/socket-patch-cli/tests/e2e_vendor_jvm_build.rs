@@ -575,6 +575,171 @@ fn maven_reactor_vendor_fresh_checkout_offline_build_and_byte_exact_revert() {
     );
 }
 
+/// A Maven 4 (model 4.1.0) aggregator that lists no subprojects: Maven 4
+/// discovers `a` and `b` itself.
+const IMPLICIT_ROOT_POM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.1.0" root="true">
+  <modelVersion>4.1.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>root</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+</project>
+"#;
+
+const IMPLICIT_A_POM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.1.0">
+  <modelVersion>4.1.0</modelVersion>
+  <parent/>
+  <artifactId>a</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-text</artifactId>
+      <version>1.10.0</version>
+    </dependency>
+  </dependencies>
+</project>
+"#;
+
+const IMPLICIT_B_POM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.1.0">
+  <modelVersion>4.1.0</modelVersion>
+  <parent/>
+  <artifactId>b</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>a</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+  </dependencies>
+</project>
+"#;
+
+/// #622: Maven 4 builds `a` and `b` of a 4.1.0 root that lists no
+/// `<subprojects>`. Vendoring must plan them as the reactor (suffixed
+/// version in `a`, the root pinned), so the developer's own warm `~/.m2`
+/// build, which already holds Central's 1.10.0, resolves the patched jar,
+/// and so does a fresh offline checkout. Before the fix the root was a
+/// reactor of one: `a` kept the base version and built Central's jar.
+#[test]
+#[ignore = "real Maven + Maven Central (fixture); run with --ignored"]
+fn maven_reactor_implicit_subprojects_warm_and_offline_build_and_revert() {
+    const SUITE: &str = "e2e_vendor_jvm_build::maven_reactor_implicit_subprojects";
+    let Some(mvn) = Mvn::detect(SUITE) else {
+        return;
+    };
+    if mvn.major() < 4 {
+        println!(
+            "{SUITE}: SKIP (Maven {} has no subproject discovery)",
+            mvn.version
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fixture_root(&tmp);
+    let m2 = root.join("m2");
+    let proj = root.join("proj");
+    let settings = root.join("settings.xml");
+    write_settings(&settings, &[]);
+    let Some((jar, _)) = warm_fixture(SUITE, &mvn, &root.join("warm"), &m2, &settings) else {
+        return;
+    };
+    for (rel, body) in [
+        ("pom.xml", IMPLICIT_ROOT_POM),
+        ("a/pom.xml", IMPLICIT_A_POM),
+        ("b/pom.xml", IMPLICIT_B_POM),
+    ] {
+        let path = proj.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let out = with_central_fallback(SUITE, "pre-vendor reactor build", &settings, |s, flags| {
+        mvn_classpath(&mvn, &proj, &m2, s, flags)
+    });
+    assert!(ok(&out), "pre-vendor reactor build:\n{}", dump(&out));
+    assert_eq!(
+        std::fs::read(classpath_entry(&proj.join("b"))).unwrap(),
+        jar,
+        "pre-vendor `b` resolves Central's jar through the discovered `a`"
+    );
+    for dir in ["target", "a/target", "b/target", ".mvn/target"] {
+        let _ = std::fs::remove_dir_all(proj.join(dir));
+    }
+    let _ = std::fs::remove_dir(proj.join(".mvn"));
+
+    let (orig, patched) = patched_member(&jar, UUID);
+    stage_manifest(&proj, &orig, &patched);
+    let before = snapshot(&proj);
+    let env = vendor(&proj, &m2);
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let vendored = snapshot(&proj);
+    assert_eq!(
+        text(&vendored["a/pom.xml"]),
+        IMPLICIT_A_POM.replace(
+            "<version>1.10.0</version>",
+            &format!("<version>{SV}</version>")
+        ),
+        "the discovered module's declaration is suffixed"
+    );
+    assert_eq!(text(&vendored["b/pom.xml"]), IMPLICIT_B_POM);
+    assert!(
+        text(&vendored["pom.xml"]).contains(&format!("<version>{SV}</version>")),
+        "the root is pinned"
+    );
+
+    // The developer's own tree: `~/.m2` still holds Central's 1.10.0.
+    let out = mvn_classpath(&mvn, &proj, &m2, &settings, &["-o"]);
+    assert!(ok(&out), "warm offline reactor build:\n{}", dump(&out));
+    assert_vendored_on_classpath(&proj.join("a"), &patched, "warm build, module a");
+    assert_vendored_on_classpath(&proj.join("b"), &patched, "warm build, module b");
+    for dir in ["target", "a/target", "b/target", ".mvn/target"] {
+        let _ = std::fs::remove_dir_all(proj.join(dir));
+    }
+
+    let (code, doc, stderr) = socket_in(
+        &proj,
+        &m2,
+        None,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--product",
+            "pkg:maven/com.example/root@1.0.0",
+        ],
+    );
+    assert_eq!(code, Some(0), "vex: {doc}\n{stderr}");
+    assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+    let (code, env, stderr) = socket_in(
+        &proj,
+        &m2,
+        None,
+        &[
+            "vendor",
+            "--check",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, Some(0), "vendor --check: {env}\n{stderr}");
+
+    let fresh = root.join("fresh");
+    fresh_checkout_all(&proj, &fresh);
+    purge(&m2);
+    let out = mvn_classpath(&mvn, &fresh, &m2, &settings, &["-o"]);
+    assert!(ok(&out), "fresh offline reactor build:\n{}", dump(&out));
+    assert_vendored_on_classpath(&fresh.join("a"), &patched, "fresh build, module a");
+    assert_vendored_on_classpath(&fresh.join("b"), &patched, "fresh build, module b");
+
+    revert(&proj, &m2);
+    assert_restored(&proj, &before);
+    assert!(!proj.join(".mvn").exists(), ".mvn residue");
+}
+
 /// #655: `a` declares the library through `${ct.group}:${ct.artifact}`,
 /// properties the local corp parent defines. Maven interpolates them before
 /// matching, so vendor must rewrite `a`'s literal version too, or `a` builds

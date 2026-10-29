@@ -30,7 +30,7 @@ use super::super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::super::{RevertOpts, RevertOutcome, VendorWarning};
 use super::{
     coursier_tree, gradle, layout, maven_reactor, op_of, op_str, sbt, scala_cli, sha256_hex,
-    Coords, JvmPlan, JvmUnplan, ReadFn, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND,
+    Coords, JvmPlan, JvmUnplan, ListFn, ReadFn, Shape, CONFIG_LINE_KIND, COURSIER_INDEX_KIND,
     CREATED_DIR_KIND, DERIVED_METADATA_KIND, KINDS, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
     SBT_FRAGMENT_KIND, SETTINGS_FRAGMENT_KIND, TREE_KIND, VERIFICATION_FRAGMENT_KIND,
 };
@@ -198,15 +198,31 @@ impl ProjectReader {
     /// The children of the project directory `rel` (`""` = the root) for
     /// the script graph: names, directories ending in `/`. Resolved like
     /// [`Self::read`]; anything unsafe or unreadable lists as empty.
+    ///
+    /// A directory reached through a symlink that leaves the checkout is
+    /// only peeked at: its files are listed, its subdirectories are not,
+    /// and no escape is recorded. A probe (Maven 4 subproject discovery
+    /// asking whether a linked `target/` holds a `pom.xml`) then refuses
+    /// nothing for a link it never reads through, while reading any file
+    /// under the link still records the escape the caller refuses.
     pub fn list(&self, rel: &str) -> Vec<String> {
-        let path = if rel.is_empty() {
+        let (path, outside) = if rel.is_empty() {
             match &self.canonical {
-                Some(c) => c.clone(),
+                Some(c) => (c.clone(), false),
                 None => return Vec::new(),
             }
         } else {
-            match self.resolve(rel.trim_end_matches('/')) {
-                Ok(path) => path,
+            let rel = rel.trim_end_matches('/');
+            let before = self.escaped.borrow().clone();
+            match self.resolve(rel) {
+                Ok(path) => (path, false),
+                Err(e) if e.contains(LEAVES_PROJECT) => {
+                    *self.escaped.borrow_mut() = before;
+                    match self.outside_target(rel) {
+                        Some(target) => (target, true),
+                        None => return Vec::new(),
+                    }
+                }
                 Err(_) => return Vec::new(),
             }
         };
@@ -219,11 +235,26 @@ impl ProjectReader {
                 // Followed like `read` (in-checkout links only).
                 let dir = e.metadata().ok()?.is_dir()
                     || (e.file_type().ok()?.is_symlink() && e.path().is_dir());
-                Some(if dir { format!("{name}/") } else { name })
+                match (dir, outside) {
+                    (true, true) => None,
+                    (true, false) => Some(format!("{name}/")),
+                    (false, _) => Some(name),
+                }
             })
             .collect();
         out.sort();
         out
+    }
+
+    /// The directory a project-relative `rel` names once its symlinks are
+    /// followed wherever they lead (for [`Self::list`]'s peek). `None` for
+    /// an unsafe path or one that does not resolve to a directory.
+    fn outside_target(&self, rel: &str) -> Option<PathBuf> {
+        if !safe_rel(rel) {
+            return None;
+        }
+        let target = std::fs::canonicalize(self.canonical.as_ref()?.join(rel)).ok()?;
+        target.is_dir().then_some(target)
     }
 
     /// The first path that resolved outside the checkout.
@@ -269,7 +300,7 @@ impl ProjectReader {
                         let at = segments[..=i].join("/");
                         self.escaped.borrow_mut().get_or_insert(at.clone());
                         return Err(format!(
-                            "{at} is a symlink that leaves the project (or dangles)"
+                            "{at} is a symlink that {LEAVES_PROJECT} (or dangles)"
                         ));
                     };
                     cur = target;
@@ -280,6 +311,9 @@ impl ProjectReader {
         Ok(cur)
     }
 }
+
+/// How [`ProjectReader`] words a symlink resolving outside the checkout.
+const LEAVES_PROJECT: &str = "leaves the project";
 
 /// A path that does not exist, including one that runs through a regular
 /// file (`pom.xml/pom.xml`, probed when a `relativePath` or `<module>`
@@ -593,6 +627,7 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
     }
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
+    let list = |dir: &str| reader.list(dir);
     let peers = match super::super::state::load_state(root).await {
         Ok(state) => state,
         Err(e) => return RevertOutcome::failed(format!("vendor_state_unreadable: {e}")),
@@ -625,7 +660,10 @@ pub async fn revert(root: &Path, entry: &VendorEntry, opts: RevertOpts) -> Rever
             unplan = merge_unplans(unplan, gradle::unplan(&read, &c, &records));
         }
         if maven {
-            unplan = merge_unplans(unplan, maven_reactor::unplan(&read, &c, &entry.wiring));
+            unplan = merge_unplans(
+                unplan,
+                maven_reactor::unplan(&read, &list, &c, &entry.wiring),
+            );
         }
         unplan
     };
@@ -837,13 +875,14 @@ pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
     };
     let reader = ProjectReader::new(root);
     let read = |rel: &str| reader.read(rel);
+    let list = |dir: &str| reader.list(dir);
     let referenced = if sbt::owns(&entry.wiring) {
         sbt::wired_checked(&read, &c).unwrap_or(true)
     } else if scala_cli::owns(&entry.wiring) {
         scala_cli::wired_checked(&read, &c).unwrap_or(true)
     } else {
         let (maven, gradle) = sides(&entry.wiring);
-        (maven && maven_reactor::wired_checked(&read, &c).unwrap_or(true))
+        (maven && maven_reactor::wired_checked(&read, &list, &c).unwrap_or(true))
             || (gradle && gradle::references_checked(&read, &c).unwrap_or(true))
     };
     // `read` answers `None` for an unreadable file as for a missing one;
@@ -878,7 +917,7 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
             wired = gradle::wired_checked(&read, &list, &c).map_err(|e| e.detail);
         }
         if maven && wired == Ok(true) {
-            wired = maven_reactor::attestable_checked(&read, &c).map_err(|e| e.detail);
+            wired = maven_reactor::attestable_checked(&read, &list, &c).map_err(|e| e.detail);
         }
         wired
     };
@@ -892,12 +931,13 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
 /// repository `local_repo` alone (`None` entries: not there).
 fn local_external_poms(
     read: ReadFn<'_>,
+    list: ListFn<'_>,
     patch: &super::JvmPatch<'_>,
     local_repo: Option<&Path>,
 ) -> maven_reactor::ExternalPoms {
     let mut known = maven_reactor::ExternalPoms::new();
     loop {
-        let need = maven_reactor::external_poms_needed(read, patch, &known);
+        let need = maven_reactor::external_poms_needed(read, list, patch, &known);
         if need.is_empty() {
             return known;
         }
@@ -1000,7 +1040,7 @@ pub fn check_entry(
     // sync: the pin it wrote when it could read it, or none.
     let shape = shape_of(&entry.wiring);
     let external = if matches!(shape, Shape::MavenReactor | Shape::Mixed) {
-        Some(local_external_poms(&read, &patch, local_repo))
+        Some(local_external_poms(&read, &list, &patch, local_repo))
     } else {
         None
     };
@@ -1020,7 +1060,7 @@ pub fn check_entry(
     let referenced = if sbt_entry || scala_cli_entry {
         entry_wired_checked(root, entry)?
     } else {
-        (!maven || maven_reactor::wired_checked(&read, &c).map_err(|e| e.detail)?)
+        (!maven || maven_reactor::wired_checked(&read, &list, &c).map_err(|e| e.detail)?)
             && (!gradle || gradle::references(&read, &c))
     };
     if !referenced {

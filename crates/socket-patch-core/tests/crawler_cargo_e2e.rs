@@ -8,6 +8,10 @@ use socket_patch_core::formats::cargo::manifest::package_name_version;
 
 const ORG_PURL: &str = "pkg:cargo/serde@1.0.200";
 
+/// The variable cargo reads the user home from: `HOME` on Unix,
+/// `USERPROFILE` on Windows (it ignores `HOME` there).
+const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
 fn options_at(root: &Path) -> CrawlerOptions {
     CrawlerOptions {
         cwd: root.to_path_buf(),
@@ -143,9 +147,9 @@ async fn cargo_home_fallback_to_home_dot_cargo() {
     tokio::fs::create_dir_all(&stamp_dir).await.unwrap();
 
     let prev_cargo = std::env::var("CARGO_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
+    let prev_home = std::env::var(HOME_VAR).ok();
     std::env::remove_var("CARGO_HOME");
-    std::env::set_var("HOME", tmp.path());
+    std::env::set_var(HOME_VAR, tmp.path());
 
     let crawler = CargoCrawler;
     let opts = CrawlerOptions {
@@ -159,9 +163,9 @@ async fn cargo_home_fallback_to_home_dot_cargo() {
         std::env::set_var("CARGO_HOME", v);
     }
     if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
+        std::env::set_var(HOME_VAR, v);
     } else {
-        std::env::remove_var("HOME");
+        std::env::remove_var(HOME_VAR);
     }
 
     // Exactly the one staged index dir — proves the fallback resolved to
@@ -198,9 +202,9 @@ async fn empty_cargo_home_falls_back_to_home_dot_cargo() {
     tokio::fs::create_dir_all(&stamp_dir).await.unwrap();
 
     let prev_cargo = std::env::var("CARGO_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
+    let prev_home = std::env::var(HOME_VAR).ok();
     std::env::set_var("CARGO_HOME", "");
-    std::env::set_var("HOME", tmp.path());
+    std::env::set_var(HOME_VAR, tmp.path());
 
     let crawler = CargoCrawler;
     let opts = CrawlerOptions {
@@ -215,8 +219,8 @@ async fn empty_cargo_home_falls_back_to_home_dot_cargo() {
         None => std::env::remove_var("CARGO_HOME"),
     }
     match prev_home {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
+        Some(v) => std::env::set_var(HOME_VAR, v),
+        None => std::env::remove_var(HOME_VAR),
     }
 
     assert_eq!(

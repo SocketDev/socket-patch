@@ -37,6 +37,74 @@ pub(crate) fn go_env_with(key: &str, env: impl Fn(&str) -> Option<String>) -> Op
     lookup_in_env_file(&text, key).filter(|v| !v.is_empty())
 }
 
+/// What a `GOFLAGS` setting makes go do about `-modfile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GoflagsModfile {
+    /// go reads the module's own go.mod: no `-modfile`, or an empty one.
+    Default,
+    /// go reads this file instead (the last `-modfile` wins).
+    File(String),
+    /// go refuses the setting, so no go command runs: why.
+    Refused(String),
+}
+
+/// `-modfile` in a `GOFLAGS` setting, read as go reads it
+/// (`cmd/go/internal/base.InitGOFLAGS`): fields split by
+/// [`split_goflags`], each `-flag` or `--flag` (anything else makes go
+/// fail: "non-flag"), the last `-modfile` winning, and a bare `-modfile`
+/// refused for want of a value.
+pub(crate) fn goflags_modfile(goflags: &str) -> GoflagsModfile {
+    let Some(fields) = split_goflags(goflags) else {
+        return GoflagsModfile::Refused("GOFLAGS has an unterminated quote".into());
+    };
+    // `Some(None)`: a bare `-modfile`.
+    let mut modfile: Option<Option<&str>> = None;
+    for field in &fields {
+        let name = field
+            .strip_prefix("--")
+            .or_else(|| field.strip_prefix('-'))
+            .filter(|n| !n.is_empty() && !n.starts_with(['-', '=']));
+        let Some(name) = name else {
+            return GoflagsModfile::Refused(format!("GOFLAGS has the non-flag \"{field}\""));
+        };
+        match name.split_once('=') {
+            Some(("modfile", value)) => modfile = Some(Some(value)),
+            None if name == "modfile" => modfile = Some(None),
+            _ => {}
+        }
+    }
+    match modfile {
+        None | Some(Some("")) => GoflagsModfile::Default,
+        Some(None) => GoflagsModfile::Refused("GOFLAGS sets -modfile without a value".into()),
+        Some(Some(value)) => GoflagsModfile::File(value.to_string()),
+    }
+}
+
+/// Go's `cmd/internal/quoted.Split`: whitespace-separated fields, a field
+/// that opens with `'` or `"` running to the same quote (the next field
+/// starts right after it). `None` when a quote is unterminated.
+fn split_goflags(s: &str) -> Option<Vec<String>> {
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let mut fields = Vec::new();
+    let mut rest = s.trim_start_matches(is_space);
+    while !rest.is_empty() {
+        let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"');
+        let (field, after) = match quote {
+            Some(q) => {
+                let end = rest[1..].find(q)? + 1;
+                (&rest[1..end], &rest[end + 1..])
+            }
+            None => {
+                let end = rest.find(is_space).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        fields.push(field.to_string());
+        rest = after.trim_start_matches(is_space);
+    }
+    Some(fields)
+}
+
 /// The Go environment file go would read, or `None` when `GOENV=off` or no
 /// user config directory resolves.
 fn go_env_file(env: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
@@ -114,6 +182,42 @@ mod tests {
         assert_eq!(lookup_in_env_file(text, "lower"), None);
         assert_eq!(lookup_in_env_file(text, "NOEQUALS"), None);
         assert_eq!(lookup_in_env_file(text, "GONOPROXY"), None);
+    }
+
+    /// `-modfile` read from GOFLAGS as go reads it (#1799).
+    #[test]
+    fn goflags_modfile_reads_the_last_modfile() {
+        use GoflagsModfile::*;
+        let file = |f: &str| File(f.to_string());
+        let refused = |s: &str| matches!(goflags_modfile(s), Refused(_));
+        assert_eq!(goflags_modfile(""), Default);
+        assert_eq!(goflags_modfile("-mod=mod -tags=a=b"), Default);
+        assert_eq!(goflags_modfile("-modfiles=a.mod"), Default);
+        assert_eq!(goflags_modfile("-modfile=alt.mod"), file("alt.mod"));
+        assert_eq!(
+            goflags_modfile("  --modfile=alt.mod\t-mod=mod "),
+            file("alt.mod")
+        );
+        assert_eq!(
+            goflags_modfile("-modfile=a.mod -modfile=b.mod"),
+            file("b.mod")
+        );
+        assert_eq!(goflags_modfile("-modfile=a.mod -modfile="), Default);
+        assert_eq!(goflags_modfile("'-modfile=a b.mod'"), file("a b.mod"));
+        assert_eq!(goflags_modfile("\"-mod=mod\"-modfile=a.mod"), file("a.mod"));
+        // go rejects these settings outright.
+        for s in [
+            "-modfile",
+            "-modfile=a.mod -modfile",
+            "'-modfile=a.mod",
+            "modfile=a.mod",
+            "---modfile=a.mod",
+            "-mod=mod -",
+            "--",
+            "-=x",
+        ] {
+            assert!(refused(s), "{s}");
+        }
     }
 
     /// env (non-empty) → `$GOENV` file → `None`; an empty env var falls

@@ -980,6 +980,24 @@ pub async fn run(args: VendorArgs) -> i32 {
     // The raw lockfile inventory does not require VEX eligibility or an
     // installed copy of a patch. Revert needs only the vendor ledger.
     if !args.revert {
+        // A commit journal a killed eject left is replayed (by taking the
+        // apply lock) before the lockfiles are read: the pins must come
+        // off the committed state, or a re-run would eject again from the
+        // hosted lock the replay is about to replace (#1782).
+        if tokio::fs::symlink_metadata(
+            args.common
+                .cwd
+                .join(socket_patch_core::utils::group_commit::COMMIT_JOURNAL_REL),
+        )
+        .await
+        .is_ok()
+        {
+            let timeout = Duration::from_secs(args.common.lock_timeout.unwrap_or(0));
+            if let Err(e) = crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
+                let (code, message) = crate::commands::lock_cli::lock_failure(&e, timeout);
+                return emit_eject_refusal(&args.common, code, &message);
+            }
+        }
         let inventory = crate::commands::hosted_inventory(&args.common, &args.common.cwd).await;
         // Contested hosted wiring: the patch set cannot be read off the
         // lockfiles, and a "nothing to vendor" answer would hide it. With
@@ -2083,6 +2101,25 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         socket_patch_core::patch::redirect::vlt_heal::lock_targets(&lock, &origins, &pin_purls)
     })
     .unwrap_or_default();
+    // The restore runs inside the group commit the vendored apply commits
+    // (handed to it through the capture), so the registry entries it puts
+    // back land in the same journaled commit as the vendored wiring. An
+    // eject killed before that commit (SIGKILL, Ctrl-C, a CI cancel) leaves
+    // the project hosted, exactly as found; one killed after it rolls
+    // forward on the next locked command (#1782). Only when the overlay
+    // captures every file the restore writes (a Gradle pin's hosted index
+    // and settings script under `.socket/gradle/` go straight to disk, and
+    // a half-captured restore would leave settings.gradle applying a
+    // deleted script) and the vendored apply runs at this same root.
+    let journaled_restore = !socket_patch_core::utils::failpoint::switched_off("group_commit")
+        && common.project_root() == common.cwd
+        && touched
+            .iter()
+            .all(|rel| socket_patch_core::utils::group_commit::captures(rel));
+    let mut capture = EjectCapture {
+        group: journaled_restore.then(|| GroupCommit::begin(&common.cwd)),
+        ..EjectCapture::default()
+    };
     let restore = socket_patch_core::patch::redirect::upstream::restore_upstream(
         &common.cwd,
         &pins,
@@ -2099,14 +2136,12 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         .map(|(_, why)| why.to_string())
         .next()
         .or_else(|| restore.flush_error.clone());
-    // Every file the vendored apply's group commit wrote, with its bytes
-    // from before (the rollback's scope beyond the restore's own files),
-    // and the flavors it wired for the close printed below.
-    let mut capture = EjectCapture::default();
     // The vendored apply's events start here: a rollback retracts them.
     let events_start = env.events.len();
     let mut exit: i32;
     if let Some(why) = restore_failure {
+        // Discard the captured restore before the rollback below writes.
+        drop(capture.group.take());
         env.mark_error(EnvelopeError::new("redirect_revert_failed", why.clone()));
         if !common.json {
             eprintln!("Error: {}", crate::ui::sentence_case(&why));
@@ -2138,6 +2173,17 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             )
             .await;
         exit = i32::from(applied);
+        // A vendored apply that returned before its commit leaves the
+        // group, and with it the captured restore, uncommitted: discard
+        // it, so the rollback below writes to disk, and undo the eject.
+        if capture.group.take().is_some() && exit == 0 {
+            let detail = "the vendored apply did not commit, so the eject is undone";
+            if !common.json {
+                eprintln!("Error: {detail}");
+            }
+            env.mark_error(EnvelopeError::new("eject_incomplete", detail));
+            exit = 1;
+        }
         // Backstop: every ejected pin must now be vendored. A package the
         // backend skipped (a vendored gate condition the pre-pass did not
         // see) would otherwise leave the project neither hosted nor
@@ -2168,9 +2214,28 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         }
     }
     let committed = &capture.committed;
+    // A commit that failed part-way and could not put its files back keeps
+    // its journal, and the next locked command rolls it forward: putting
+    // the hosted files back now would match the journal's recorded old
+    // bytes and be replayed over, so the rollback is left to that replay
+    // (the error the vendored apply recorded already says so).
+    let commit_pending = exit != 0
+        && tokio::fs::symlink_metadata(
+            common
+                .cwd
+                .join(socket_patch_core::utils::group_commit::COMMIT_JOURNAL_REL),
+        )
+        .await
+        .is_ok();
     if exit != 0 {
-        match snapshot.restore(&restore.reverted_files, committed).await {
-            Ok(()) => {
+        let rollback = if commit_pending {
+            None
+        } else {
+            Some(snapshot.restore(&restore.reverted_files, committed).await)
+        };
+        match rollback {
+            None => {}
+            Some(Ok(())) => {
                 let detail = "the eject did not complete, so every file it touched was \
                               restored: the project is still hosted, exactly as before";
                 // Nothing the vendored apply did survives the rollback: a
@@ -2189,7 +2254,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
                     detail: detail.to_string(),
                 });
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 let detail = format!(
                     "the eject did not complete and restoring the pre-eject files failed ({e}); \
                      restore them from version control (`git checkout -- {}`)",
@@ -3203,9 +3268,17 @@ pub(crate) async fn vendor_records_reusing(
     // over. The replaced uuid dirs of re-vendored packages are swept only
     // after the commit, since until then the committed wiring still names
     // them. Dry runs write nothing and capture nothing.
-    let group = (!common.dry_run
-        && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
-    .then(|| GroupCommit::begin(&common.cwd));
+    // An eject hands over the group its upstream restore already wrote
+    // into, so the restore commits with this run's wiring.
+    let handed = eject
+        .as_deref_mut()
+        .and_then(|capture| capture.group.take())
+        .filter(|_| !common.dry_run);
+    let eject_group = handed.is_some();
+    let group = handed.or_else(|| {
+        (!common.dry_run && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
+            .then(|| GroupCommit::begin(&common.cwd))
+    });
     let mut stale_artifacts: Vec<StaleArtifact> = Vec::new();
     // The source of a superseded install (see [`superseded_install`]).
     let uninstalled = common.cwd.join(".socket/vendor/.uninstalled");
@@ -3900,6 +3973,34 @@ pub(crate) async fn vendor_records_reusing(
     // others failed — a failed package's backend already put back what it
     // had touched, in the captured state — so a completed run ends exactly
     // where committing after every package would have left it.
+    //
+    // Not for an eject: its group also holds every pin's upstream restore,
+    // so committing past a failed or skipped package would land that
+    // package on the plain registry entry, unpatched, and a crash (or a
+    // commit left pending) before the eject's rollback would make it stick.
+    // The eject is all-or-nothing, so it drops the group unless every pin
+    // is vendored in the captured ledger; nothing of it reached the disk
+    // but the artifacts, which are removed here (#1782).
+    let group = match group {
+        Some(group) if eject_group => {
+            let ledger = load_state(&common.cwd).await.ok();
+            let complete = !has_errors
+                && records.keys().all(|purl| {
+                    ledger
+                        .as_ref()
+                        .is_some_and(|l| lookup_entry(&l.entries, purl).is_some())
+                });
+            if complete {
+                Some(group)
+            } else {
+                drop(group);
+                has_errors = true;
+                let _ = remove_new_vendor_dirs(common, vendor_dirs_before.as_ref()).await;
+                None
+            }
+        }
+        group => group,
+    };
     let mut commit_failed = false;
     if let Some(group) = group {
         socket_patch_core::utils::failpoint::hit("vendor_group_commit");
@@ -4227,8 +4328,11 @@ async fn remove_new_vendor_dirs(
 /// printing its own close: every project file its group commit wrote (with
 /// the bytes from before, for the rollback) and the lockfile flavors it
 /// wired (for the "Next steps:" the eject prints only when it completes).
+/// The eject hands its open group commit IN through `group`, holding the
+/// upstream restore; the vendored apply takes it as its own.
 #[derive(Default)]
 pub(crate) struct EjectCapture {
+    pub(crate) group: Option<GroupCommit>,
     pub(crate) committed: Vec<CommittedFile>,
     pub(crate) wired_flavors: HashSet<String>,
 }

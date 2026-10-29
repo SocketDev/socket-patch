@@ -116,16 +116,29 @@ class CiWorkflowContract(unittest.TestCase):
         # A job-level continue-on-error would let ci-ok pass despite a failed
         # job, and this script would then cancel a run that could still land.
         # A step-level one hides that step's failure the same way, so only
-        # the capped cache restores may carry it: a miss there just means
-        # building cold.
+        # the capped cache restores may carry it (a miss there just means
+        # building cold), plus a capped first attempt that the very next
+        # step retries without tolerance.
         self.assertIsNone(re.search(r"^    continue-on-error:", self.text, re.M))
         steps = re.split(r"(?m)^      - ", self.text)
-        tolerant = [s for s in steps if re.search(r"(?m)^\s*continue-on-error:", s)]
+        tolerant = [i for i, s in enumerate(steps) if re.search(r"(?m)^\s*continue-on-error:", s)]
         self.assertTrue(tolerant)
-        for step in tolerant:
-            self.assertRegex(step, r"(?m)^        uses: (Swatinem/rust-cache|actions/cache/restore)@", step[:80])
+        for i in tolerant:
+            step = steps[i]
             self.assertRegex(step, r"(?m)^        timeout-minutes: \d+$", step[:80])
             self.assertRegex(step, r"(?m)^        continue-on-error: true$", step[:80])
+            if re.search(r"(?m)^        uses: (Swatinem/rust-cache|actions/cache/restore)@", step):
+                continue
+            self.assertRegex(step, r"^name: .* \(attempt 1\)\n", step[:80])
+            sid = re.search(r"(?m)^        id: (\S+)$", step).group(1)
+            retry = steps[i + 1]
+            self.assertRegex(retry, r"^name: .* \(attempt 2\)\n", retry[:80])
+            self.assertIn(f"steps.{sid}.outcome != 'success'", retry, retry[:80])
+            self.assertEqual(
+                re.search(r"(?m)^        uses: .*$", step).group(0),
+                re.search(r"(?m)^        uses: .*$", retry).group(0),
+            )
+            self.assertNotRegex(retry, r"(?m)^\s*continue-on-error:", retry[:80])
 
     def test_every_cache_restore_is_capped(self):
         # An uncapped restore that hangs holds the queue head until the job
