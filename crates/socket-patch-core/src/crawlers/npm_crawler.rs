@@ -120,7 +120,7 @@ fn walk_prunes_name(name: &str) -> bool {
 /// the listings, so the pruned-name test sees each dir as the walk does
 /// even when a pattern spells it in another case.
 fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
-    use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
+    use crate::utils::workspace_globs::{expand_braces, workspaces_include_as, WorkspacesDialect};
 
     let Some(patterns) = crate::utils::fs::read_regular_to_string_sync(&root.join("package.json"))
         .ok()
@@ -134,93 +134,100 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     // A leading `!` is a negation in some readings and part of an extglob
     // or a literal name in others; the dirs it can reach are walked either
-    // way, and `workspaces_include_as` decides.
+    // way, and `workspaces_include_as` decides. Braces are expanded first,
+    // so each alternative walks from its own literal prefix and only an
+    // alternative that spells a dot descends into hidden dirs; the
+    // alternatives of one pattern share its dir budget.
     for pattern in &patterns {
-        let segments: Vec<&str> = pattern
-            .trim_start_matches('!')
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty() && *s != ".")
-            .collect();
-        let is_glob = |s: &str| s.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!', '+', '@']);
-        let literal = segments.iter().take_while(|s| !is_glob(s)).count();
-        // The literal prefix, each component as its parent lists it (an
-        // exact name first, else the ASCII-case-insensitive match a
-        // case-insensitive filesystem resolves). A prefix that climbs out
-        // (`..`) or is not walkable names nothing here.
-        let mut dir = root.to_path_buf();
-        let mut rel: Vec<String> = Vec::new();
-        let mut reachable = true;
-        for segment in &segments[..literal] {
-            let entries: Vec<ListedEntry> = list_dir_sync(&dir)
-                .entries
-                .into_iter()
-                .filter(|e| walkable(e))
-                .collect();
-            let found = entries.iter().find(|e| e.name_str == *segment).or_else(|| {
-                entries
-                    .iter()
-                    .find(|e| e.name_str.eq_ignore_ascii_case(segment))
-            });
-            let Some(entry) = found else {
-                reachable = false;
-                break;
-            };
-            dir.push(&entry.name);
-            rel.push(entry.name_str.clone());
-            if is_tagged_cache_dir(&dir, &list_dir_sync(&dir)) {
-                reachable = false;
-                break;
-            }
-        }
-        if !reachable {
-            continue;
-        }
-        let rest = &segments[literal..];
-        let rest_names_dot = rest.iter().any(|s| s.contains('.'));
-        let max_depth = if rest.contains(&"**") {
-            usize::MAX
-        } else {
-            rest.len()
-        };
         let mut budget = WORKSPACE_GLOB_DIR_BUDGET;
-        let mut stack = vec![(dir, rel, 0usize)];
-        while let Some((dir, rel, depth)) = stack.pop() {
-            let listing = list_dir_sync(&dir);
-            // The workspace root itself is exempt, as the walk always
-            // crawls the scan root (and never reaches a nested project
-            // inside a tagged dir).
-            if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
-                continue;
-            }
-            let hidden = rel.iter().any(|seg| seg.starts_with('.'));
-            if rel.iter().any(|seg| walk_prunes_name(seg))
-                && has_node_modules_dir(&dir, &listing)
-                && dir.join("package.json").is_file()
-                && WorkspacesDialect::ALL.iter().any(|&dialect| {
-                    let dialect = WorkspacesDialect {
-                        dot: dialect.dot && !hidden,
-                        ..dialect
-                    };
-                    workspaces_include_as(&patterns, &rel, dialect)
-                })
-            {
-                roots.push(dir.join("node_modules"));
-            }
-            if depth >= max_depth {
-                continue;
-            }
-            for entry in listing
-                .entries
-                .into_iter()
-                .filter(|e| walkable(e) && (rest_names_dot || !e.name_str.starts_with('.')))
-            {
-                let Some(left) = budget.checked_sub(1) else {
+        for alternative in expand_braces(pattern.trim_start_matches('!')) {
+            let segments: Vec<&str> = alternative
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty() && *s != ".")
+                .collect();
+            let is_glob =
+                |s: &str| s.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!', '+', '@']);
+            let literal = segments.iter().take_while(|s| !is_glob(s)).count();
+            // The literal prefix, each component as its parent lists it (an
+            // exact name first, else the ASCII-case-insensitive match a
+            // case-insensitive filesystem resolves). A prefix that climbs out
+            // (`..`) or is not walkable names nothing here.
+            let mut dir = root.to_path_buf();
+            let mut rel: Vec<String> = Vec::new();
+            let mut reachable = true;
+            for segment in &segments[..literal] {
+                let entries: Vec<ListedEntry> = list_dir_sync(&dir)
+                    .entries
+                    .into_iter()
+                    .filter(|e| walkable(e))
+                    .collect();
+                let found = entries.iter().find(|e| e.name_str == *segment).or_else(|| {
+                    entries
+                        .iter()
+                        .find(|e| e.name_str.eq_ignore_ascii_case(segment))
+                });
+                let Some(entry) = found else {
+                    reachable = false;
                     break;
                 };
-                budget = left;
-                let mut child_rel = rel.clone();
-                child_rel.push(entry.name_str.clone());
-                stack.push((dir.join(&entry.name), child_rel, depth + 1));
+                dir.push(&entry.name);
+                rel.push(entry.name_str.clone());
+                if is_tagged_cache_dir(&dir, &list_dir_sync(&dir)) {
+                    reachable = false;
+                    break;
+                }
+            }
+            if !reachable {
+                continue;
+            }
+            let rest = &segments[literal..];
+            let rest_names_dot = rest
+                .iter()
+                .any(|s| s.starts_with('.') || s.contains("(.") || s.contains("|."));
+            let max_depth = if rest.contains(&"**") {
+                usize::MAX
+            } else {
+                rest.len()
+            };
+            let mut stack = vec![(dir, rel, 0usize)];
+            while let Some((dir, rel, depth)) = stack.pop() {
+                let listing = list_dir_sync(&dir);
+                // The workspace root itself is exempt, as the walk always
+                // crawls the scan root (and never reaches a nested project
+                // inside a tagged dir).
+                if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
+                    continue;
+                }
+                let hidden = rel.iter().any(|seg| seg.starts_with('.'));
+                if rel.iter().any(|seg| walk_prunes_name(seg))
+                    && has_node_modules_dir(&dir, &listing)
+                    && dir.join("package.json").is_file()
+                    && WorkspacesDialect::ALL.iter().any(|&dialect| {
+                        let dialect = WorkspacesDialect {
+                            dot: dialect.dot && !hidden,
+                            ..dialect
+                        };
+                        workspaces_include_as(&patterns, &rel, dialect)
+                    })
+                {
+                    roots.push(dir.join("node_modules"));
+                }
+                if depth >= max_depth {
+                    continue;
+                }
+                for entry in listing
+                    .entries
+                    .into_iter()
+                    .filter(|e| walkable(e) && (rest_names_dot || !e.name_str.starts_with('.')))
+                {
+                    let Some(left) = budget.checked_sub(1) else {
+                        break;
+                    };
+                    budget = left;
+                    let mut child_rel = rel.clone();
+                    child_rel.push(entry.name_str.clone());
+                    stack.push((dir.join(&entry.name), child_rel, depth + 1));
+                }
             }
         }
     }

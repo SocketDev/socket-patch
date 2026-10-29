@@ -1056,6 +1056,10 @@ async fn crawl_all_finds_declared_members_in_hidden_dirs() {
             r#"["{.github/actions,tools}/*"]"#,
             &[".github/actions/x"][..],
         ),
+        (
+            r#"["{.github,packages}/**"]"#,
+            &[".github/actions/x", "packages/build"][..],
+        ),
         // A dot the glob part spells, below a skip-named dir, and a
         // skip-named member below a hidden one.
         (
@@ -1096,13 +1100,17 @@ async fn crawl_all_still_skips_undeclared_hidden_dirs() {
     let root = tmp.path();
     tokio::fs::write(
         root.join("package.json"),
-        r#"{"name":"root","private":true,"workspaces":["packages/*",".github/actions/*","apps/**"]}"#,
+        r#"{"name":"root","private":true,"workspaces":["packages/*",".github/actions/*","apps/**","{.github,tools}/**"]}"#,
     )
     .await
     .unwrap();
     // Reached only through a wildcard.
     stage_member(root, "packages/.hidden").await;
     stage_member(root, "apps/site/.output/server").await;
+    // A brace alternative that spells a dot reaches only the dir it
+    // names, not every hidden dir.
+    stage_member(root, ".git/build").await;
+    stage_member(root, "tools/.cache/build").await;
     // Undeclared: `.cache/tool` at the root and `packages/x/.out` below a
     // member, each a would-be member with its own `package.json`.
     stage_member(root, ".cache/tool").await;
