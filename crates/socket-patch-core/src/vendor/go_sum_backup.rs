@@ -111,12 +111,12 @@ fn backup(root: &Path, entry: &ReplaceEntry) -> Option<PathBuf> {
 /// A version the build no longer selects (go.mod now requires another one,
 /// or a pruned graph no longer has the module) needs no checksums: restoring
 /// them would leave go.sum untidy and make discovery see the old version
-/// again. `dry_run` makes every check without writing go.sum.
+/// again. Returns the restored go.sum without writing it (`None`: no
+/// change), so the caller writes it only once the directive is gone.
 pub(super) async fn restore(
     root: &Path,
     entries: &[ReplaceEntry],
-    dry_run: bool,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     use super::go_build_list::{project_selection, Selection};
     let path = root.join("go.sum");
     let mut sums = read(&path).await?;
@@ -157,12 +157,14 @@ pub(super) async fn restore(
             sums = new;
         }
     }
-    if !dry_run && sums != original {
-        atomic_write_bytes_preserving_mode(&path, sums.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    Ok((sums != original).then_some(sums))
+}
+
+/// Write the go.sum [`restore`] planned.
+pub(super) async fn write(root: &Path, sums: &str) -> Result<(), String> {
+    atomic_write_bytes_preserving_mode(&root.join("go.sum"), sums.as_bytes())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) async fn forget(root: &Path, entries: &[ReplaceEntry]) {
@@ -315,6 +317,35 @@ mod tests {
                 .await
                 .unwrap_err()
                 .contains("conflicting")
+        );
+        assert_eq!(read(&root.join("go.sum")).await.unwrap(), "");
+    }
+
+    /// go.sum changes only after the directive is removed: a refused go.mod
+    /// edit leaves both as they were.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_directive_edit_leaves_go_sum_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module consumer\ngo 1.21\nrequire example.com/upstream v1.0.0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(root.join("go.sum"), SUMS).await.unwrap();
+        ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("go.sum"), "").await.unwrap();
+        let real = tmp.path().join("real.mod");
+        tokio::fs::rename(root.join("go.mod"), &real).await.unwrap();
+        std::os::unix::fs::symlink(&real, root.join("go.mod")).unwrap();
+        assert!(
+            drop_replace_entry(root, MODULE, ReplaceOwner::GoPatches, false)
+                .await
+                .is_err()
         );
         assert_eq!(read(&root.join("go.sum")).await.unwrap(), "");
     }

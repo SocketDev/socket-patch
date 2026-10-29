@@ -407,38 +407,52 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                     drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));
                 }
             }
-            // The native vendor tree a default build compiles must carry
-            // every in-scope Go patch, vendor-owned ones included. Its
-            // modules.txt drift is the audit's below: one report per cause.
-            let no_texts = HashMap::new();
-            for (purl, record) in &manifest.patches {
-                if in_scope.contains(purl) {
-                    if let Err(detail) =
-                        socket_patch_core::vendor::go_consumer_sync::verify_native_vendor_tree(
-                            &args.common.cwd,
-                            purl,
-                            record,
-                            &no_texts,
-                        )
-                        .await
-                    {
-                        drifts.push((
-                            purl.clone(),
-                            socket_patch_core::vendor::go_consumer_sync::NATIVE_VENDOR_CODE.into(),
-                            detail,
-                        ));
-                    }
-                }
-            }
             // The redirects can be intact while the project no longer
             // builds: a committed vendor/modules.txt or the go.mod
             // requirements out of step with them (#343, #618).
-            for issue in socket_patch_core::vendor::go_consumer_sync::audit(
+            let issues = socket_patch_core::vendor::go_consumer_sync::audit(
                 &args.common.cwd,
                 &HashMap::new(),
             )
-            .await
-            {
+            .await;
+            // The native vendor tree a default build compiles must carry
+            // every in-scope Go patch, vendor-owned ones included. A module
+            // whose modules.txt drift the audit reports is skipped: one
+            // report per cause.
+            let stale: HashSet<&str> = issues
+                .iter()
+                .filter(|issue| {
+                    matches!(
+                        issue,
+                        socket_patch_core::vendor::go_consumer_sync::GoSyncIssue::VendorModulesTxt { .. }
+                    )
+                })
+                .map(|issue| issue.module())
+                .collect();
+            let no_texts = HashMap::new();
+            for (purl, record) in &manifest.patches {
+                if !in_scope.contains(purl)
+                    || parse_golang_purl(purl).is_some_and(|(m, _)| stale.contains(m.as_ref()))
+                {
+                    continue;
+                }
+                if let Err(detail) =
+                    socket_patch_core::vendor::go_consumer_sync::verify_native_vendor_tree(
+                        &args.common.cwd,
+                        purl,
+                        record,
+                        &no_texts,
+                    )
+                    .await
+                {
+                    drifts.push((
+                        purl.clone(),
+                        socket_patch_core::vendor::go_consumer_sync::NATIVE_VENDOR_CODE.into(),
+                        detail,
+                    ));
+                }
+            }
+            for issue in &issues {
                 drifts.push((
                     issue.module().to_string(),
                     issue.code().to_string(),

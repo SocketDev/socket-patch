@@ -199,14 +199,16 @@ pub async fn reuse_go_redirect(
     }) {
         return None;
     }
-    let refusal = crate::vendor::go_consumer_sync::replace_refusal(
+    let mut refusal = crate::vendor::go_consumer_sync::replace_refusal(
         project_root,
         &module,
         &version,
         GO_PATCHES_DIR,
     )
-    .await
-    .or(selection_refusal(project_root, &module, &version).await);
+    .await;
+    if refusal.is_none() {
+        refusal = selection_refusal(project_root, &module, &version).await;
+    }
     if let Some(refusal) = refusal {
         return Some(synthesized_result(
             purl,
@@ -531,7 +533,14 @@ pub async fn reconcile_go_redirects(
             )
             .await
             {
-                let purl = purl.unwrap_or_else(|| entry.module.clone());
+                // A version-less directive names its version in the copy
+                // path; a failure still needs a PURL to report.
+                let purl = purl
+                    .or_else(|| {
+                        let (_, v) = entry.path.as_deref()?.rsplit_once('@')?;
+                        Some(build_golang_purl(&entry.module, v))
+                    })
+                    .unwrap_or_else(|| entry.module.clone());
                 out.failed.push((
                     purl.clone(),
                     format!("kept the stale Go patch redirect for {purl}: {e}"),

@@ -282,12 +282,20 @@ pub async fn drop_replace_entry(
         .into_iter()
         .filter(|entry| entry.module == module && entry.owner == Some(owner))
         .collect();
-    if !entries.is_empty() {
-        // A dry run makes the same checks (a conflicting or invalid saved
-        // checksum refuses) without writing go.sum, so it predicts the run.
-        super::go_sum_backup::restore(project_root, &entries, dry_run).await?;
+    // A dry run makes the same checks (a conflicting or invalid saved
+    // checksum refuses) without writing go.sum, so it predicts the run.
+    let sums = if entries.is_empty() {
+        None
+    } else {
+        super::go_sum_backup::restore(project_root, &entries).await?
+    };
+    // go.sum changes only once the directive is gone, so a failed edit
+    // leaves both as they were.
+    let changed = remove_from_replace_files(project_root, module, owner, dry_run).await?;
+    if let (Some(sums), false) = (sums, dry_run) {
+        super::go_sum_backup::write(project_root, &sums).await?;
     }
-    remove_from_replace_files(project_root, module, owner, dry_run).await
+    Ok(changed)
 }
 
 /// Remove `module`'s `owner` replace from the root `go.work` (when present)

@@ -698,8 +698,10 @@ fn omitted_by_build_constraint(text: &str) -> bool {
         }
         if !block {
             if let Some(expr) = go_build_expr(line) {
+                // imports.ShouldBuild rejects a second `//go:build` line,
+                // so `go mod vendor` leaves the file out.
                 if modern.replace(expr).is_some() {
-                    return false;
+                    return true;
                 }
             } else if legacy_allowed {
                 if let Some(expr) = plus_build_expr(line) {
@@ -730,7 +732,8 @@ fn omitted_by_build_constraint(text: &str) -> bool {
         }
     }
     if let Some(expr) = modern {
-        return constraint(expr) == Some(false);
+        // An expression constraint.Parse rejects also leaves the file out.
+        return constraint(expr) != Some(true);
     }
     legacy[..legacy_end]
         .iter()
@@ -912,6 +915,8 @@ mod tests {
             "// +build !",
             "// +build integration-test",
             "// +build linux,!!amd64 darwin-x",
+            "//go:build linux &&",
+            "//go:build linux\n//go:build darwin",
         ] {
             assert!(
                 omitted_by_build_constraint(&format!("{header}\n\npackage main\n")),
