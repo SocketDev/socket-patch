@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-29 (run 54), main `ecd4924`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, **4.1.0.beta3** (new). The redirect (56), vendor (44) and stale-install (42) gem suites pass on 4.1.0.beta3 / Ruby 3.3.6 at `a8a10dc` (run 52), and on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. On Ruby 3.3.6 also export `BUNDLER_VERSION` (4.1.0.beta3 is installed, so it's the default binstub otherwise).
+Last updated: 2026-10-29 (run 55), main `ecd4924`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, **4.1.0.beta3** (new). The redirect (56), vendor (44) and stale-install (42) gem suites pass on 4.1.0.beta3 / Ruby 3.3.6 at `a8a10dc` (run 52), and on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. On Ruby 3.3.6 also export `BUNDLER_VERSION` (4.1.0.beta3 is installed, so it's the default binstub otherwise).
 
 ## Coverage matrix
 
@@ -438,6 +438,15 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
 | Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
 
+### Run 55 (main `ecd4924`, v5.0.1 + #1811 head; Linux Ruby 3.3.6; vendored CRLF Gemfile / autocrlf re-checkout, scratch probes in `e2e_vendor_gem_build.rs`)
+
+| Cell | 2.6.9 | 4.0.23 | #1811 head (4.0.23) |
+| --- | --- | --- | --- |
+| `vendor` on CRLF `Gemfile` + LF lock: rewired line keeps CRLF | **fail #1821** | **fail #1821** | — |
+| … then revert / rollback / remove byte-exact | pass | pass | — |
+| Vendored LF pair re-checked-out CRLF → `vendor` re-run / `rollback` / `remove` | — | fail #1808 | pass |
+| … → `vendor --revert` | — | drift-kept exit 0 (documented; root cause #1808) | pass (Gemfile line restored LF, #1821 note) |
+
 ### Run 54 (main `ecd4924`, v5.0.1; Linux Ruby 3.3.6; scratch tests in `e2e_redirect_gem_build.rs` / `e2e_vendor_gem_build.rs`, real `bundle install` / `bundle exec`)
 
 | Cell | 2.6.9 | 4.0.23 | 4.1.0.beta3 |
@@ -540,14 +549,16 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 ## Backlog
 
 1. Re-run #1109 (`agent:needs-human`) when it's fixed.
-2. Eject on a CHECKSUMS lock with a `git:` sibling (local git source in the scratch harness), and on a platform-gem lock without CHECKSUMS.
-3. The gem suites on 4.1.0 final when it ships.
-4. Re-check #1808 once fixed: plain vendored + eject on a CRLF lock, then `vendor --revert` / `rollback` keep CRLF and a fresh unfrozen install leaves the lock byte-identical; also a mixed-ending lock.
-5. Vendored `remove` / `repair` on a project whose lock was vendored LF and then re-checked-out CRLF (autocrlf after vendoring).
+2. Re-check #1808 once #1811 lands: plain vendored + eject on a CRLF lock, then `vendor --revert` / `rollback` / `remove` keep CRLF and a fresh unfrozen install leaves the lock byte-identical; the autocrlf re-checkout of a vendored LF pair un-vendors (passes on the #1811 head, run 55); a mixed-ending lock is refused.
+3. Re-check #1821 once fixed: vendoring a CRLF Gemfile keeps CRLF on the rewired line; also the `Append` arm (transitive gem) and the H→V eject on a CRLF Gemfile.
+4. Eject on a platform-gem lock without CHECKSUMS.
+5. The gem suites on 4.1.0 final when it ships.
 6. Vendored stub-vs-lock runtime-dependency drift, only if the service `gem-stub-gemspec` can declare other deps than the lifted GEM spec block (a file patch can't).
 7. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
 
 ## Known non-bugs
+
+- `vendor --revert` exits 0 (`status: success`) when every vendored entry is drift-kept (`vendor_lock_entry_drifted` + `vendor_artifact_kept` + `vendor_revert_kept`). That's documented in CLI_CONTRACT.md; `remove` / `rollback` exit 1 on the same state (run 55).
 
 - Bundler keeps a CRLF `Gemfile.lock` CRLF on purpose (`definition.rb:428`, autocrlf), so a CRLF lock is a supported shape. A frozen fresh install of any CRLF lock exits 16 on Bundler 4.0.23 / 4.1.0.beta3 ("Your lockfile needs to be updated"), pristine or patched, and passes on 2.6.9. That's Bundler's own behaviour, not socket-patch (run 54).
 
