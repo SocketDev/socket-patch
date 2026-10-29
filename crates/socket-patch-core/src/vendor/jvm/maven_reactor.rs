@@ -5549,7 +5549,14 @@ mod tests {
         added_module.insert("c/pom.xml".into(), module("c", &dep("1.10.0")).into_bytes());
         let mut added_dep = after.clone();
         added_dep.insert("b/pom.xml".into(), module("b", &dep("1.10.0")).into_bytes());
-        for drifted in [added_module, added_dep] {
+        // A module still on an earlier patch's suffix builds that patch's
+        // jar, not this one.
+        let mut earlier_patch = after.clone();
+        earlier_patch.insert(
+            "b/pom.xml".into(),
+            module("b", &dep("1.10.0-socket.deadbeef")).into_bytes(),
+        );
+        for drifted in [added_module, added_dep, earlier_patch] {
             assert_eq!(attestable(&drifted), (true, false));
             // Re-vendoring rewrites it and the reactor attests again.
             let (_, again) = vendor(&drifted);
