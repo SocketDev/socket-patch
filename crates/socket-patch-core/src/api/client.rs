@@ -290,17 +290,13 @@ pub struct ApiClient {
     /// In-flight slots for the public proxy's batch path — the
     /// `/patch/batch` POSTs and the legacy per-package GETs they degrade
     /// to. Shared by clones, so concurrent [`Self::search_patches_batch`]
-    /// calls on one client (scan's batch windows) stay within
-    /// [`Self::proxy_batch_cap`] requests in total, never that cap times
-    /// the window.
+    /// calls on one client (scan's batch windows) stay within the public
+    /// proxy's in-flight cap in total, never that cap times the window.
+    /// Sized when a proxy client is built from
+    /// [`crate::utils::concurrent::api_concurrency`], so
+    /// `SOCKET_API_CONCURRENCY` and a tight `RLIMIT_NOFILE` lower it as in
+    /// every other patch-API window (#614).
     proxy_batch_slots: Arc<tokio::sync::Semaphore>,
-    /// The public proxy's in-flight cap
-    /// ([`crate::utils::concurrent::api_concurrency`]), read when the
-    /// client is built: the size of [`Self::proxy_batch_slots`] and of the
-    /// legacy per-package fallback's groups. `SOCKET_API_CONCURRENCY` and
-    /// a tight `RLIMIT_NOFILE` lower it here as in every other patch-API
-    /// window (#614).
-    proxy_batch_cap: usize,
     /// The vendor loop's download plan, while one is attached
     /// ([`Self::prefetch_vendor_packages`]): [`Self::fetch_vendor_package`]
     /// takes a planned uuid's outcome from it instead of requesting it.
@@ -457,7 +453,12 @@ impl ApiClient {
             ApiRoute::Proxy => None,
         };
 
-        let proxy_batch_cap = crate::utils::concurrent::api_concurrency(true);
+        // Only the proxy route uses the batch slots: an org client never
+        // reads the environment for them.
+        let proxy_batch_cap = match options.route {
+            ApiRoute::Proxy => crate::utils::concurrent::api_concurrency(true),
+            ApiRoute::Org { .. } => crate::utils::concurrent::PROXY_API_CONCURRENCY,
+        };
         Self {
             client: api_client(api_token.as_deref(), &timeouts),
             plain: plain_client(&timeouts),
@@ -468,7 +469,6 @@ impl ApiClient {
             vendor_retry: VendorRetryPolicy::default(),
             vendor_outage: Arc::new(AtomicU32::new(0)),
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(proxy_batch_cap)),
-            proxy_batch_cap,
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
             api_retry: ApiRetry::from_env(),
         }
@@ -818,8 +818,10 @@ impl ApiClient {
     /// For authenticated API, uses the POST `/v0/orgs/{slug}/patches/batch`
     /// endpoint. For the public proxy, POSTs `/patch/batch` (served
     /// `Cache-Control: no-store` — POST bodies are not CDN-cacheable) and
-    /// only degrades to individual GET requests per PURL (concurrency 10)
-    /// when the deployed proxy predates the batch endpoint.
+    /// only degrades to individual GET requests per PURL (at most the
+    /// proxy's in-flight cap, [`crate::utils::concurrent::api_concurrency`])
+    /// when the deployed proxy predates the batch endpoint or rejects the
+    /// chunk's validation.
     ///
     /// Maximum 500 PURLs per request.
     ///
@@ -1004,10 +1006,10 @@ impl ApiClient {
     /// proxy gained `POST /patch/batch`, this is the legacy path for
     /// deployments that predate it.
     ///
-    /// Processes PURLs in groups of [`Self::proxy_batch_cap`] to avoid
-    /// overwhelming the server while remaining efficient; each GET
-    /// also takes a [`Self::proxy_batch_slots`] slot, so concurrent calls
-    /// on one client share that cap instead of multiplying it.
+    /// Every GET takes a [`Self::proxy_batch_slots`] slot, so this call and
+    /// any concurrent ones on the same client keep at most the proxy's
+    /// in-flight cap between them, and a slow or throttled GET holds one
+    /// slot rather than stalling a whole group.
     async fn search_patches_batch_via_individual_queries(
         &self,
         purls: &[String],
@@ -1020,40 +1022,35 @@ impl ApiClient {
         // would drop the package from the scan without a word.
         let mut throttled: Option<(usize, ApiError)> = None;
 
-        for (chunk_idx, chunk) in purls.chunks(self.proxy_batch_cap).enumerate() {
-            // Use tokio::JoinSet for concurrent execution within each chunk
-            let mut join_set = tokio::task::JoinSet::new();
-
-            for (offset, purl) in chunk.iter().enumerate() {
-                let index = chunk_idx * self.proxy_batch_cap + offset;
-                let purl = purl.clone();
-                let client = self.clone();
-                join_set.spawn(async move {
-                    let slot = client.proxy_batch_slot().await;
-                    let resp = client.search_patches_by_package(&purl).await;
-                    drop(slot);
-                    match resp {
-                        Ok(r) => (index, purl, Ok(Some(r))),
-                        Err(e) if is_throttle_error(&e) => (index, purl, Err(e)),
-                        Err(e) => {
-                            debug_log(&format!("Error fetching patches for {}: {}", purl, e));
-                            (index, purl, Ok(None))
-                        }
-                    }
-                });
-            }
-
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok((_, purl, Ok(resp))) => all_results.push((purl, resp)),
-                    Ok((index, _, Err(e))) => {
-                        if throttled.as_ref().is_none_or(|(first, _)| index < *first) {
-                            throttled = Some((index, e));
-                        }
-                    }
+        let mut join_set = tokio::task::JoinSet::new();
+        for (index, purl) in purls.iter().enumerate() {
+            let purl = purl.clone();
+            let client = self.clone();
+            join_set.spawn(async move {
+                let slot = client.proxy_batch_slot().await;
+                let resp = client.search_patches_by_package(&purl).await;
+                drop(slot);
+                match resp {
+                    Ok(r) => (index, purl, Ok(Some(r))),
+                    Err(e) if is_throttle_error(&e) => (index, purl, Err(e)),
                     Err(e) => {
-                        debug_log(&format!("Task join error: {}", e));
+                        debug_log(&format!("Error fetching patches for {}: {}", purl, e));
+                        (index, purl, Ok(None))
                     }
+                }
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((_, purl, Ok(resp))) => all_results.push((purl, resp)),
+                Ok((index, _, Err(e))) => {
+                    if throttled.as_ref().is_none_or(|(first, _)| index < *first) {
+                        throttled = Some((index, e));
+                    }
+                }
+                Err(e) => {
+                    debug_log(&format!("Task join error: {}", e));
                 }
             }
         }
@@ -6219,7 +6216,7 @@ mod proxy_batch_path_cap_tests {
     //! Serial with the other tests that set `SOCKET_API_CONCURRENCY`: the
     //! client reads it when it is built.
     use super::*;
-    use crate::utils::concurrent::{api_concurrency, API_CONCURRENCY_ENV};
+    use crate::utils::concurrent::API_CONCURRENCY_ENV;
     use std::sync::Mutex;
     use std::time::Instant;
     use wiremock::matchers::{method, path, path_regex};
@@ -6264,10 +6261,38 @@ mod proxy_batch_path_cap_tests {
             .unwrap_or(0)
     }
 
-    /// Four windows of 10 PURLs, every chunk rejected by a validation 400
-    /// and degraded to per-package GETs, run concurrently on one public
-    /// proxy client. Returns the peak number of GETs in flight.
-    async fn fallback_peak_in_flight() -> usize {
+    /// A public-proxy client built while [`API_CONCURRENCY_ENV`] is
+    /// `value` (`None` unsets it). The client reads the variable only when
+    /// it is built, so it is restored right away rather than left set
+    /// while the requests run.
+    fn proxy_client_under(uri: String, value: Option<&str>) -> ApiClient {
+        let orig = std::env::var(API_CONCURRENCY_ENV).ok();
+        match value {
+            Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+            None => std::env::remove_var(API_CONCURRENCY_ENV),
+        }
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: None,
+            route: ApiRoute::Proxy,
+        });
+        match orig {
+            Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+            None => std::env::remove_var(API_CONCURRENCY_ENV),
+        }
+        client
+    }
+
+    /// `windows` concurrent [`ApiClient::search_patches_batch`] calls of
+    /// `per_window` PURLs on one public-proxy client built under
+    /// [`API_CONCURRENCY_ENV`] = `value`, every chunk rejected by a
+    /// validation 400 and degraded to per-package GETs. Returns the peak
+    /// number of GETs in flight.
+    async fn fallback_peak_in_flight(
+        value: Option<&str>,
+        windows: usize,
+        per_window: usize,
+    ) -> usize {
         let server = MockServer::start().await;
         // A validation 400 for every chunk: each degrades to per-package
         // GETs (one exotic PURL per chunk is enough in the wild).
@@ -6283,15 +6308,10 @@ mod proxy_batch_path_cap_tests {
             .mount(&server)
             .await;
 
-        let client = ApiClient::new(ApiClientOptions {
-            api_url: server.uri(),
-            api_token: None,
-            route: ApiRoute::Proxy,
-        });
-        // Four windows of 10 PURLs, as scan's proxy batch windows run them.
-        let chunks: Vec<Vec<String>> = (0..4)
+        let client = proxy_client_under(server.uri(), value);
+        let chunks: Vec<Vec<String>> = (0..windows)
             .map(|c| {
-                (0..10)
+                (0..per_window)
                     .map(|i| format!("pkg:npm/cap-{c}-{i}@1.0.0"))
                     .collect()
             })
@@ -6308,40 +6328,16 @@ mod proxy_batch_path_cap_tests {
         }
 
         let arrivals = arrivals.lock().unwrap();
-        assert_eq!(arrivals.len(), 40, "one GET per PURL");
+        assert_eq!(arrivals.len(), windows * per_window, "one GET per PURL");
         peak_in_flight(&arrivals)
-    }
-
-    /// Set [`API_CONCURRENCY_ENV`] to `value` (`None` unsets it) for the
-    /// guard's lifetime.
-    struct EnvGuard(Option<String>);
-
-    impl EnvGuard {
-        fn set(value: Option<&str>) -> Self {
-            let orig = std::env::var(API_CONCURRENCY_ENV).ok();
-            match value {
-                Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
-                None => std::env::remove_var(API_CONCURRENCY_ENV),
-            }
-            Self(orig)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
-                None => std::env::remove_var(API_CONCURRENCY_ENV),
-            }
-        }
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn concurrent_batches_share_the_legacy_fallback_cap() {
-        let _env = EnvGuard::set(None);
-        let cap = api_concurrency(true);
-        let peak = fallback_peak_in_flight().await;
+        let cap = crate::utils::concurrent::PROXY_API_CONCURRENCY;
+        // Four windows of 10 PURLs, as scan's proxy batch windows run them.
+        let peak = fallback_peak_in_flight(None, 4, 10).await;
         assert!(
             peak <= cap,
             "{peak} by-package GETs in flight at once; the cap is {cap}"
@@ -6355,7 +6351,6 @@ mod proxy_batch_path_cap_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn the_legacy_fallback_honors_the_concurrency_override() {
-        let _env = EnvGuard::set(Some("1"));
-        assert_eq!(fallback_peak_in_flight().await, 1);
+        assert_eq!(fallback_peak_in_flight(Some("1"), 2, 3).await, 1);
     }
 }
