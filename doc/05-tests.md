@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ c07af61 on 2026-10-29 by audit-core._
+_Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -38,3 +38,9 @@ _Last checked against main @ c07af61 on 2026-10-29 by audit-core._
   - Weak asserts: `poetry_lock` malformed-integrity (`!err.is_empty()`), `python_lock` "ours" test (`is_ok()` passes on `Ok(None)`).
   - Misplaced: `purl_key_nuget_vendor_tests.rs` (an end-to-end vendor test), `redact`'s lint of `vendor/service_fetch.rs`.
 - **Coverage gaps:** `python_script` `refuse_uv_no_binary`/`no_sources` (project form) have no unit test.
+- **Tally for `crates/socket-patch-cli/src/commands` (next 10 files): about 30 fake, duplicate or misplaced tests.**
+  - Can't fail: `list` `ordering_is_deterministic_across_builds` (iterates one HashMap twice); remove `dry_run_footer_matches_repair` and repair's `HOSTED_ONLY_REASON` assert (a const equals its literal).
+  - Asserts the test's own stub: rollback `rollback_patches_missing_manifest_is_identifier_error` (the message comes from the test helper's `ok_or_else`).
+  - Duplicates of core tests: discovery's 5 `severity_order` tests (core `ranking.rs`), 4 `candidate_supersedes` and 1 `unsupported_layout_warnings` test of core functions; ~5 remove `remove_matching` tests repeat core `Target` tests.
+  - Subset or overclaiming tests: lock_cli ×4, repair ×3, mod.rs ×3 (only `is_err()` or a `.contains` that a sibling message also satisfies).
+- **Coverage gaps:** no test of `remove --preserve-state --dry-run` over a vendored entry {{T16}}; no test that `scan --json` keeps stderr empty on a held lock {{T09}}; no bidi/zero-width test for `list` {{T23}}.

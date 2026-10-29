@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ c07af61 on 2026-10-29 by audit-core._
+_Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -29,3 +29,11 @@ _Last checked against main @ c07af61 on 2026-10-29 by audit-core._
   - `toml_edit_ext.rs` is a two-function module whose functions each have one caller elsewhere;
   - about 210 deletable comment lines.
 - **Module docs that claim a monopoly they don't have:** `relpath` ("every normalizer") {{A19}}, `repo_root` ("the one walk") {{A21}}, `redact` (VEX `@id`) {{A20}}.
+- **Tally for `crates/socket-patch-cli/src/commands` (next 10 files, 15.5K lines: `hosted_bundle.rs` → `scan/discovery.rs`):**
+  - about 57 single-caller functions (≈20 worth inlining; the rest are tested formatters);
+  - about 12 trivial wrappers or shims (`patch_server_origins`, `HostedUnwindError`, 2 `pub use` re-exports in discovery);
+  - dead code: `HostedLegOutcome::unsupported` (never written; rollback still branches on it), `InnerSelection::Identifier(None)` (test-only), repair's `ArtifactNoun` parameter (always `BLOB`);
+  - about 380 deletable comment lines.
+- **Giant functions (cont.):** `rollback::run` (~1,210 lines), `rollback::rollback_patches_inner` (~830), `remove::run` (~920). C11/#843 covers `run_scan` only.
+- **`rollback.rs` is `remove`'s helper library:** remove imports 12 items from it (text helpers such as `join_clauses`/`as_question` belong in `ui`; hosted ones such as `retire_legacy_redirect_ledger` in `hosted_unwind`). Local notes.
+- **`scan/discovery.rs` is a grab-bag:** discovery, update detection, severity helpers and hosted/vendored nested-project policy (`nested_project_skips`, which belongs in `scan/hosted.rs`). Local note; C11.

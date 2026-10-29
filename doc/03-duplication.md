@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ c07af61 on 2026-10-29 by audit-core._
+_Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -18,8 +18,8 @@ _Last checked against main @ c07af61 on 2026-10-29 by audit-core._
 - **Blob fetch-summary text:** `fetch_stage` copies core `blob_fetcher`'s formatters, drifted. {{T04}}
 - **Bun/vlt vendored preflight glue:** five callers, each with its own per-purl lookup. {{T05}}
 - **Release-variant gating:** the CLI copies core's private `variant_installed_at`. {{T06}}
-- **Apply/rollback mirror pieces:** gem build-sibling rule and verbose verification printer, both drifted. {{T08}}
-- **Severity ladder:** 3 copies. {{T10}} **Top-ranked patch per purl:** 4 copies. {{T15}} **Overlay staging:** 2 copies with different staging roots. {{T13}}
+- **Apply/rollback mirror pieces:** gem build-sibling rule (drifted: any copy vs variant-matched copy) and verbose verification printer (same output, two label sources). {{T08}}
+- **Worst-severity label picker:** 3 copies, drifted on unknown labels (the ladder itself is single). {{T10}} **Top-ranked patch per purl:** 4 copies. {{T15}} **Overlay staging:** 2 copies with different staging roots. {{T13}}
 - **Mode resolution** in `get` and `scan`, checks in different orders. {{T14}}
 - **purl `name@version` split:** about 12 hand copies, 3 in `purl.rs` alone, disagreeing on empty parts. {{A14}}
 - **Uuid shape:** 4 checks; `python_script`'s `Uuid::parse_str` accepts forms the others reject. {{A15}}
@@ -29,3 +29,9 @@ _Last checked against main @ c07af61 on 2026-10-29 by audit-core._
 - **requirements.txt logical lines:** hosted keeps its own lexer and comment split. {{A23}}
 - **"Our earlier hosted pin":** pdm/poetry vs uv/pylock rules. {{A24}}
 - **PEP 508 leading name:** 3 scanners. {{A25}}
+- **Vendored revert rendering:** remove and rollback each turn `VendorRevertStep` into events in their own loop (vendor.rs twice more); drifted on `--preserve-state --dry-run`, go-undo warnings, keep text and failure handling. {{T16}}
+- **"No manifest" gate:** remove, repair and rollback, drifted on unledgered vendor wiring, a legacy redirect ledger, contested hosted wiring and global scope. {{T17}}
+- **GC human text and warning channel:** 4 renderers; repair counts `cleanup_failed` as a skipped event. {{T19}}
+- **uuid-only `PatchRecord`:** core `ledgers::uuid_only_record` beside 3 literals (list.rs L81, commands/mod.rs L388, core vendor/mod.rs L943). Local notes.
+- **`--global`/`--global-prefix` flag text:** `commands::global_scope_flag` vs `ui::global_scope_arg`, drifted when both are set. Local note on `commands/mod.rs`.
+- **purl shape rule:** CLI `scan/discovery::crawled_from_purl` and core `hosted::memory::discover::supplement_purl` (identical today; the core test asserts literals, not the CLI function). Part of {{A14}}.
