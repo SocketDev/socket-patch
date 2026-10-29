@@ -1332,9 +1332,6 @@ mod tests {
         );
     }
 
-    /// #1554: a project installed without a lock (`package-lock=false`,
-    /// `npm install --no-package-lock`) is independent too, unless a
-    /// workspace lists it, whether or not that workspace was ever locked.
     /// #1846: hosted reads pnpm brace and class globs through the same
     /// reader as `pnpm_workspace::member_dirs`, so both name the same
     /// members; syntax that reader refuses lists nothing here.
@@ -1376,6 +1373,9 @@ mod tests {
         }
     }
 
+    /// #1554: a project installed without a lock (`package-lock=false`,
+    /// `npm install --no-package-lock`) is independent too, unless a
+    /// workspace lists it, whether or not that workspace was ever locked.
     #[tokio::test]
     async fn nested_npm_project_finds_a_lockless_project() {
         let tmp = tempfile::tempdir().unwrap();

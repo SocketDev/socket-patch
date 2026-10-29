@@ -279,15 +279,20 @@ pub fn shared_lockfile_disabled(workspace: &str, npmrc: Option<&str>) -> bool {
 /// members' locks does pnpm install from", answer through here.
 pub(crate) fn lists_member(globs: &[String], rel: &[String]) -> Result<bool, String> {
     modeled(globs)?;
+    Ok(lists_modeled_member(globs, rel))
+}
+
+/// [`lists_member`] over globs [`modeled`] already accepted.
+fn lists_modeled_member(globs: &[String], rel: &[String]) -> bool {
     if rel.is_empty() || rel.iter().any(|seg| MEMBER_SKIP.contains(&seg.as_str())) {
-        return Ok(false);
+        return false;
     }
     let (negated, listed): (Vec<_>, Vec<_>) = globs
         .iter()
         .map(|g| split_negation(g))
         .partition(|(negated, _)| *negated);
-    Ok(listed.iter().any(|(_, g)| glob_matches_no_dot(g, rel))
-        && !negated.iter().any(|(_, g)| glob_matches_no_dot(g, rel)))
+    listed.iter().any(|(_, g)| glob_matches_no_dot(g, rel))
+        && !negated.iter().any(|(_, g)| glob_matches_no_dot(g, rel))
 }
 
 /// `Err` naming the first glob that uses syntax the shared matcher does
@@ -296,7 +301,11 @@ pub(crate) fn lists_member(globs: &[String], rel: &[String]) -> Result<bool, Str
 /// character class but a closed one of letters, digits, `_` and `-`
 /// ranges. pnpm reads `[!a]` as `[a]`, lets `[^a]` and `[.]` match a
 /// leading `.` that the matcher keeps wildcards off, and reads POSIX
-/// classes.
+/// classes. Beside a class or brace set, a `+` (pnpm's quantifier:
+/// `packages/[ab]+` lists `packages/ab`) and a `\` (pnpm's escape:
+/// `packages/\[a]` lists only `packages/[a]`, the matcher's separator) are
+/// refused too, in the glob and in each brace alternative. A glob with
+/// none of `[ ] { }` reads as it did before #1846.
 fn modeled(globs: &[String]) -> Result<(), String> {
     let plain_classes = |glob: &str| {
         let mut rest = glob;
@@ -317,10 +326,21 @@ fn modeled(globs: &[String]) -> Result<(), String> {
         }
         true
     };
-    match globs
-        .iter()
-        .find(|g| g.contains(['(', ')']) || brace_alternatives(g).is_none() || !plain_classes(g))
-    {
+    let read = |glob: &String| {
+        if glob.contains(['(', ')']) {
+            return false;
+        }
+        if !glob.contains(['[', ']', '{', '}']) {
+            return true;
+        }
+        !glob.contains(['+', '\\'])
+            && brace_alternatives(glob).is_some_and(|alternatives| {
+                alternatives.iter().all(|alternative| {
+                    !alternative.contains(['(', ')', '+', '\\']) && plain_classes(alternative)
+                })
+            })
+    };
+    match globs.iter().find(|g| !read(g)) {
         Some(glob) => Err(format!(
             "`packages:` glob {glob:?} uses syntax socket-patch does not read"
         )),
@@ -359,16 +379,20 @@ pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Result<Vec<St
     for glob in globs.iter().filter(|g| !g.starts_with('!')) {
         // The tree walk reads neither braces nor classes: it walks each
         // brace alternative with its classes widened ([`widen_classes`]).
-        for alternative in brace_alternatives(glob).unwrap_or_default() {
+        // One bound covers every alternative of every glob.
+        let alternatives = brace_alternatives(glob).ok_or_else(|| {
+            format!("`packages:` glob {glob:?} uses syntax socket-patch does not read")
+        })?;
+        for alternative in alternatives {
             let walked = widen_classes(&alternative);
             let (dirs, truncated) = expand_glob_bounded(tree, &walked, MEMBER_SKIP);
-            if truncated {
+            candidates.extend(dirs);
+            if truncated || candidates.len() >= MAX_MANIFESTS {
                 return Err(format!(
                     "`packages:` glob {glob:?} names more than {MAX_MANIFESTS} directories, \
                      more than socket-patch walks"
                 ));
             }
-            candidates.extend(dirs);
         }
     }
     let mut dirs = Vec::new();
@@ -378,7 +402,7 @@ pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Result<Vec<St
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        if lists_member(globs, &rel)? {
+        if lists_modeled_member(globs, &rel) {
             dirs.push(dir);
         }
     }
@@ -1351,6 +1375,13 @@ mod tests {
             "packages/@(a|b)",
             "packages/(a|b)",
             "packages/[ab",
+            // pnpm reads `+` beside a class or brace set as a quantifier
+            // (`[ab]+` lists `ab`) and `\` as an escape (`\[a]` lists only
+            // a directory named `[a]`), also when a sequence spells them.
+            "packages/[ab]+",
+            "packages/{a,b}+",
+            "packages/\\[a]",
+            "packages/{Z..a}",
         ] {
             let patterns = globs(&[unmodeled]);
             assert!(
@@ -1385,6 +1416,25 @@ mod tests {
         assert!(err.contains("packages/**"), "{err}");
         let listed = member_dirs(&Wide(10), &globs).unwrap();
         assert_eq!(listed.len(), 11, "packages itself plus its ten children");
+        // One bound covers every brace alternative: each of `a/*` and
+        // `b/*` stays under it, together they do not (#1846).
+        struct Two(usize);
+        impl DirTree for Two {
+            fn is_real_dir(&self, rel: &str) -> bool {
+                !rel.is_empty()
+            }
+            fn child_dirs(&self, rel: &str) -> Option<Vec<String>> {
+                Some(match rel {
+                    "" => vec!["a".to_string(), "b".to_string()],
+                    "a" | "b" => (0..self.0).map(|i| format!("p{i:05}")).collect(),
+                    _ => Vec::new(),
+                })
+            }
+        }
+        let globs = vec!["{a,b}/*".to_string()];
+        let half = MAX_MANIFESTS / 2 + 1;
+        assert!(member_dirs(&Two(half), &globs).is_err());
+        assert_eq!(member_dirs(&Two(10), &globs).unwrap().len(), 20);
     }
 
     #[test]
