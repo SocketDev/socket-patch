@@ -629,9 +629,9 @@ async fn inventory_pdm_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>
 ///   `./.socket/vendor/pypi/<uuid>/<wheel> --hash=sha256:…
 ///   # socket-patch vendor: <name>==<ver>`
 ///   (`vendor::pypi_requirements::vendor_line`), whose requirement name
-///   lives ONLY in that comment tag
-///   (`utils::requirements::vendor_tag`, the reader
-///   `vex::discover::pypi_other` already uses).
+///   lives in that comment tag (`utils::requirements::vendor_tag`, the
+///   reader `vex::discover::pypi_other` already uses), or, with the tag
+///   edited away, in the wheel's own file name (#977).
 ///
 /// A user's OWN file/url/path reference is not ours to resolve and stays
 /// out.
@@ -689,14 +689,20 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
             }
             None => {
                 let Some((raw_name, reference)) = crate::utils::requirements::direct_reference(t)
-                    .and_then(|(n, r)| Some((n, socket_reference_coords(r)?)))
+                    .and_then(|(n, r)| Some((n.to_string(), socket_reference_coords(r)?)))
                     .or_else(|| {
                         // The VENDORED writer's shape: a bare path line
-                        // whose requirement name lives only in the
+                        // whose requirement name lives in the
                         // `socket-patch vendor:` comment tag it appends.
+                        // pip never reads that comment, so a line whose tag
+                        // was edited away or stripped is named by its
+                        // wheel (#977).
                         let coords = socket_reference_coords(t.split_whitespace().next()?)?;
-                        let (tag_name, _) = crate::utils::requirements::vendor_tag(comment?)?;
-                        Some((tag_name, coords))
+                        let name = match comment.and_then(crate::utils::requirements::vendor_tag) {
+                            Some((tag_name, _)) => tag_name.to_string(),
+                            None => coords.0.clone(),
+                        };
+                        Some((name, coords))
                     })
                 else {
                     continue;
@@ -704,7 +710,7 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
                 // The line's own name must agree with the artifact's:
                 // a reference whose coordinates contradict the requirement
                 // it stands on is not one of ours, whoever wrote it.
-                if canonicalize_pypi_name(raw_name) != reference.0 {
+                if canonicalize_pypi_name(&raw_name) != reference.0 {
                     continue;
                 }
                 reference
