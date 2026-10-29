@@ -573,6 +573,44 @@ fn gradle_vendor_428_subproject_refuses() {
     assert_victim(&out, "pristine", None, "`cd app && gradle` still builds");
 }
 
+// ── #656 ────────────────────────────────────────────────────────────────
+
+/// #656: a Finder `.DS_Store` in the vendored tree fails the build with
+/// "unindexed files … re-run `socket-patch vendor`". That re-run, and
+/// `repair`, now remove it, and the build consumes the patched jar again.
+#[test]
+#[ignore = "real Gradle (the fake Central); run with --ignored"]
+fn gradle_vendor_656_stray_tree_file() {
+    const SUITE: &str = "e2e_vendor_gradle_build::656";
+    let Some(world) = World::new(SUITE) else {
+        return;
+    };
+    let proj = world.root.join("proj");
+    simple_project(&proj);
+    prepare(&world, &proj, "printRuntimeClasspath");
+    world.vendor(&proj);
+    let out = world.build(&proj, &["printRuntimeClasspath"]);
+    assert_victim(&out, "patched", Some(&proj), "vendored build");
+    let stray = proj
+        .join(tree_rel(VICTIM, VICTIM_VERSION))
+        .join(".DS_Store");
+    for remedy in [&["vendor"][..], &["repair"]] {
+        std::fs::write(&stray, b"\0\0\0\x01Bud1").unwrap();
+        let out = world.build(&proj, &["printRuntimeClasspath"]);
+        assert!(!ok(&out), "{remedy:?}: the stray file fails the build");
+        assert!(
+            dump(&out).contains("unindexed files"),
+            "{remedy:?}:\n{}",
+            dump(&out)
+        );
+        world.socket_ok(&proj, remedy);
+        assert!(!stray.exists(), "{remedy:?} removes the stray file");
+        world.socket_ok(&proj, &["vendor", "--check"]);
+        let out = world.build(&proj, &["printRuntimeClasspath"]);
+        assert_victim(&out, "patched", Some(&proj), &format!("after {remedy:?}"));
+    }
+}
+
 // ── #429 ────────────────────────────────────────────────────────────────
 
 /// #429: a `core.autocrlf=true` clone of a vendored checkout (buildSrc

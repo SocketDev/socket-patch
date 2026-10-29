@@ -51,6 +51,11 @@ with `vendor_ledger_missing`. Offline upstream metadata is identified by the
 `vendor_jvm_upstream_unverified` warning; run vendor online to authenticate it
 against registry checksums.
 
+A vendored tree directory holds only the files its index lists. `vendor` and
+`repair` delete anything else found there (a Finder `.DS_Store`, an editor
+backup, a stray directory), since the Gradle script and `vendor --check`
+reject it (#656); `vendor --dry-run` previews that as a re-vendor.
+
 ## Maven
 
 Supported reactors have an explicit root `pom.xml` and `<modules>` or
