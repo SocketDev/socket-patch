@@ -328,7 +328,8 @@ fn vendor_lines<'a>(
 /// of the recorded line is paired first; then a line whose code part (what
 /// pip reads) is the recorded one's, so an edit to the trailing
 /// `# socket-patch vendor:` comment alone — respaced, a note appended, the
-/// comment stripped — is not drift (#977). Records that wrote the same line
+/// comment stripped — is not drift (#977). Among those, a line still tagged
+/// as a vendor line wins over a bare copy of the same wheel line. Records that wrote the same line
 /// then take their paired lines in file order, so identical vendor lines
 /// pair with their own records whichever of them the user edited.
 fn pair_recorded_lines(lines: &[Line], recorded: &[Option<&str>]) -> Vec<Option<usize>> {
@@ -336,7 +337,10 @@ fn pair_recorded_lines(lines: &[Line], recorded: &[Option<&str>]) -> Vec<Option<
         split_comment(text).0.trim()
     }
     let mut paired: Vec<Option<usize>> = vec![None; recorded.len()];
-    for by_code in [false, true] {
+    // Pass 0: exact copy. Pass 1: same code part, still tagged as a vendor
+    // line (its comment respaced or extended), so a bare manual copy of the
+    // same wheel line is not taken for it. Pass 2: same code part.
+    for pass in 0..3 {
         for i in 0..recorded.len() {
             let Some(rec) = recorded[i].filter(|_| paired[i].is_none()) else {
                 continue;
@@ -345,10 +349,14 @@ fn pair_recorded_lines(lines: &[Line], recorded: &[Option<&str>]) -> Vec<Option<
             paired[i] = (0..lines.len()).rev().find(|idx| {
                 let line = lines[*idx].text.as_str();
                 !paired.contains(&Some(*idx))
-                    && if by_code {
-                        !rec_code.is_empty() && code_of(line) == rec_code
-                    } else {
-                        line.trim() == rec.trim()
+                    && match pass {
+                        0 => line.trim() == rec.trim(),
+                        _ => {
+                            !rec_code.is_empty()
+                                && code_of(line) == rec_code
+                                && (pass == 2
+                                    || split_comment(line).1.and_then(vendor_tag).is_some())
+                        }
                     }
             });
         }
@@ -3053,6 +3061,36 @@ mod tests {
         let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         assert_eq!(read_root(tmp.path()).await, original);
+    }
+
+    /// #977: a vendor line with a note appended pairs with its record even
+    /// when a bare manual copy of the same wheel line sits below it; the
+    /// copy is the user's own line, left behind and warned about.
+    #[tokio::test]
+    async fn revert_prefers_an_edited_vendor_line_over_a_bare_copy() {
+        let tmp = write_root("six==1.16.0\n").await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        let line = read_root(tmp.path()).await.trim_end().to_string();
+        let content = format!("{line}  # CVE fix\n./{REL_WHEEL}\n");
+        tokio::fs::write(tmp.path().join("requirements.txt"), &content)
+            .await
+            .unwrap();
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success);
+        assert!(
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_revert_line_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!("six==1.16.0\n./{REL_WHEEL}\n")
+        );
     }
 
     /// #977: a vendor line whose comment was edited or stripped still routes
