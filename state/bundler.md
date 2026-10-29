@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-29 (run 55), main `ecd4924`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, **4.1.0.beta3** (new). The redirect (56), vendor (44) and stale-install (42) gem suites pass on 4.1.0.beta3 / Ruby 3.3.6 at `a8a10dc` (run 52), and on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. On Ruby 3.3.6 also export `BUNDLER_VERSION` (4.1.0.beta3 is installed, so it's the default binstub otherwise).
+Last updated: 2026-10-29 (run 56), main `b291caa`, latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta3. At `b291caa` the redirect (59), vendor (48) and stale-install (42) gem suites pass on 4.0.23 / Ruby 3.3.6, and the vendor suite passes on 2.6.9 (run 56). They passed on 4.1.0.beta3 at `a8a10dc` (run 52) and on 1.17.3 / Ruby 3.1.6 at `b787454` (run 51). Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. A fresh container's Ruby 3.3.6 only has 2.5.22 / 4.0.18, so `gem install bundler -v 2.6.9` / `4.0.23` first and export `BUNDLER_VERSION`.
 
 ## Coverage matrix
 
@@ -438,6 +438,18 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | Unwind after a superseding rescan with the gen-2 archive in `vendor/cache` → `upstream_gem_stale_cache` | pass | pass | pass |
 | Unwind in the unconverged (no-CHECKSUMS) supersede window → consistent pair | **fail #1626** | **fail #1626** | **fail #1626** |
 
+### Run 56 (main `b291caa`, v5.0.1; Linux Ruby 3.3.6; scratch tests in `e2e_vendor_gem_build.rs` / `e2e_redirect_gem_build.rs`, real `bundle install`)
+
+| Cell | 2.6.9 | 4.0.23 |
+| --- | --- | --- |
+| Re-check #1808 (CRLF lock vendor / revert, repo test `gem_vendor_crlf_lock_fresh_checkout_and_revert`) | pass | pass (fixed, #1811) |
+| Re-check #1821 (CRLF Gemfile vendor keeps CRLF, `gem_vendor_keeps_a_crlf_gemfile_crlf`) | pass | pass (fixed, #1822) |
+| H→V eject on a CRLF Gemfile / lock (`gem_hosted_pin_with_a_crlf_lock_ejects_cleanly`) | — | pass |
+| Vendored `Append` arm (transitive rack via rack-test), CRLF Gemfile ± CRLF lock: no mixed endings, re-run `already`, revert byte-exact | — | pass |
+| Vendored `Append` arm, LF pair re-checked-out CRLF → `vendor --revert` / `rollback` / `remove` (CRLF kept, no mixed) / re-run no-op | — | pass |
+| Hosted redirect, CRLF Gemfile (single-line decl, user `source` block; LF or CRLF lock): Gemfile endings | **fail #1831** | **fail #1831** |
+| … lock endings, converging install, re-scan no-op, `rollback` / `remove` restore CRLF | pass | pass |
+
 ### Run 55 (main `ecd4924`, v5.0.1 + #1811 head; Linux Ruby 3.3.6; vendored CRLF Gemfile / autocrlf re-checkout, scratch probes in `e2e_vendor_gem_build.rs`)
 
 | Cell | 2.6.9 | 4.0.23 | #1811 head (4.0.23) |
@@ -548,15 +560,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-run #1109 (`agent:needs-human`) when it's fixed.
-2. Re-check #1808 once #1811 lands: plain vendored + eject on a CRLF lock, then `vendor --revert` / `rollback` / `remove` keep CRLF and a fresh unfrozen install leaves the lock byte-identical; the autocrlf re-checkout of a vendored LF pair un-vendors (passes on the #1811 head, run 55); a mixed-ending lock is refused.
-3. Re-check #1821 once fixed: vendoring a CRLF Gemfile keeps CRLF on the rewired line; also the `Append` arm (transitive gem) and the H→V eject on a CRLF Gemfile.
-4. Eject on a platform-gem lock without CHECKSUMS.
-5. The gem suites on 4.1.0 final when it ships.
-6. Vendored stub-vs-lock runtime-dependency drift, only if the service `gem-stub-gemspec` can declare other deps than the lifted GEM spec block (a file patch can't).
-7. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
+1. Re-check #1831 once fixed: hosted redirect on a CRLF Gemfile keeps CRLF in the in-place and the append (transitive) arms; `rollback` / `remove` still byte-exact; an autocrlf re-checkout of a redirected LF Gemfile re-scans as a no-op.
+2. Re-run #1109 (`agent:needs-human`) when it's fixed.
+3. Eject on a platform-gem lock without CHECKSUMS (vendored refuses platform-suffixed GEM siblings by design, so check that the refusal is whole and leaves the hosted pin intact).
+4. The gem suites on 4.1.0 final when it ships; 1.17.3 / 2.2 legs on the new main.
+5. Vendored stub-vs-lock runtime-dependency drift, only if the service `gem-stub-gemspec` can declare other deps than the lifted GEM spec block (a file patch can't).
+6. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
 
 ## Known non-bugs
+
+- Hosted redirect and `rollback` swallow the blank line before a rewritten single-line declaration, and `rollback` restores a direct dep as an exact pin (`gem "x", "1.0.0"`). That's the same on LF and CRLF, and it's documented (#457, "Hosted unwind coverage") (run 56).
+- Mixed line endings in a rewritten Gemfile are no longer "cosmetic": the vendored case was filed and fixed (#1821 / #1822), and the hosted case is #1831 (run 56).
 
 - `vendor --revert` exits 0 (`status: success`) when every vendored entry is drift-kept (`vendor_lock_entry_drifted` + `vendor_artifact_kept` + `vendor_revert_kept`). That's documented in CLI_CONTRACT.md; `remove` / `rollback` exit 1 on the same state (run 55).
 
@@ -597,7 +611,6 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - On a CHECKSUMS lock whose install failed (nothing installed), the post-install `vex` still attests the redirected gem. That's consistent with the "missing files never prove staleness" rule in CLI_CONTRACT.md.
 - `get <uuid> --mode hosted` for a version the lock doesn't hold pins (and downgrades to) the patched version, adds a second CHECKSUMS entry, and leaves a mixed pair that `rollback` / `remove` can't see (`Manifest not found`) until the prescribed unfrozen `bundle install` converges it (after that, rollback works). The uuid path is documented as exempt from installed narrowing (run 13).
 - Bundler 4 prints "Cannot write a changed lockfile while frozen." (exit 0) for any CRLF lock under `BUNDLE_FROZEN`, including the pristine lock. It's Bundler's own behaviour.
-- The in-place hosted rewrite of a CRLF manifest writes the `source … do` block with LF endings (mixed endings). Bundler, frozen installs and `rollback` accept it, so it's cosmetic.
 - Hosted `rollback` / `remove` can be exercised by hand with no Rust harness: a Python mock of the patch API + the patch-registry compact index (rebuild the real `.gem` with `gem unpack` / `gem spec --ruby` / `gem build`), with rubygems.org as the real upstream. The run-13 entry describes it; the mock must ignore nothing the CLI checks (`registryOverride.identifiers.gemChecksumSha256` = the sha256 of the served `.gem`).
 - `bughunt/bundler/20261003-hosted-xos` is also left behind (`git push --delete` hangs up / 403); its workflow is push-triggered only.
 - `BUNDLE_IGNORE_CONFIG` is not honored when the crawler reads `.bundle/config` `path` (it is for `cache_path`/`gemfile`). It's harmless on its own: a non-default config path still gets the `gem env` homes appended. The only harmful shape is a populated `vendor/bundle` that bundler doesn't use (agent patches it, `vex` attests while the system copy loads), and that's the documented "`vendor/bundle` holds stores, so no `gem env` homes" rule; a leftover `vendor/bundle` with no config does the same (run 14).
@@ -688,7 +701,6 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 - A superseded (gen-2) patched archive in `vendor/cache` after a superseding rescan is flagged by `upstream_gem_stale_cache` on unwind (it compares against upstream). Its scan-side wording ("UNPATCHED") is cosmetic (runs 46–47).
 - A hosted grant rotation (new token, same uuid) in the no-CHECKSUMS window unwinds cleanly: `find_block` matches on the uuid, so only a uuid change hits #1626 (run 48).
 - A hosted→vendored takeover in the #1626 unconverged-supersede window fails closed with `gemfile_declaration_not_editable` and writes nothing (run 48).
-- Vendored gem rewrites of a CRLF Gemfile write the new line with LF (mixed endings). Bundler accepts it and the unwind is byte-exact, so it's cosmetic, like the hosted case (run 48).
 - Successful vendored gem fixtures in `e2e_redirect_gem_build.rs`: the `.gem` lives at `<stage>/<uuid>/<name>-src/<name>-<v>.gem` (not `<stage>/<uuid>/`), the stub is `gem spec <that .gem> --ruby`, and the grant needs a `tarball` with `sha512` SRI plus a `gem-stub-gemspec` artifact. Reset the fixture to `pristine_gemfile` / `pristine_lock` and delete `.socket` to start from an unpatched project (run 48).
 - A Gemfile that gets the vulnerable gem only through a `gemspec` development dependency (no `gem` line) is refused with `redirect_gem_declaration_not_visible`, which names the gemspec case. That's a documented refusal (run 49).
 - The #1646 user-patch consent gate has no gem evidence (CLI_CONTRACT.md's detection table lists no Bundler mechanism). That's documented scope (run 49).
