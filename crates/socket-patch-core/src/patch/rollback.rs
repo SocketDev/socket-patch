@@ -3244,21 +3244,24 @@ mod tests {
     async fn rollback_of_raw_crlf_bin_restores_npm_form() {
         let before: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(1);\r\n";
         let after: &[u8] = b"#!/usr/bin/env node\r\nconsole.log(2);\r\n";
-        let pkg = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // npm linked the bin, so it ran `fixBin` on it at install.
+        let pkg = root.path().join("node_modules/x");
+        std::fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
+        std::fs::write(root.path().join("node_modules/.bin/x"), b"shim").unwrap();
+        std::fs::create_dir_all(&pkg).unwrap();
         let blobs = tempfile::tempdir().unwrap();
         let before_hash = compute_git_sha256_from_bytes(before);
         tokio::fs::write(blobs.path().join(&before_hash), before)
             .await
             .unwrap();
         tokio::fs::write(
-            pkg.path().join("package.json"),
+            pkg.join("package.json"),
             br#"{"name":"x","version":"1.0.0","bin":"cli.js"}"#,
         )
         .await
         .unwrap();
-        tokio::fs::write(pkg.path().join("cli.js"), after)
-            .await
-            .unwrap();
+        tokio::fs::write(pkg.join("cli.js"), after).await.unwrap();
         let files = HashMap::from([(
             "package/cli.js".to_string(),
             PatchFileInfo {
@@ -3267,11 +3270,10 @@ mod tests {
             },
         )]);
         let res =
-            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                .await;
+            rollback_package_patch("pkg:npm/x@1.0.0", &pkg, &files, blobs.path(), false).await;
         assert!(res.success, "{res:?}");
         assert_eq!(
-            tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+            tokio::fs::read(pkg.join("cli.js")).await.unwrap(),
             b"#!/usr/bin/env node\nconsole.log(1);\r\n"
         );
     }
@@ -3292,7 +3294,12 @@ mod tests {
             },
         )]);
         for with_blob in [true, false] {
-            let pkg = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            // npm linked the bin, so it ran `fixBin` on it at install.
+            let pkg = root.path().join("node_modules/x");
+            std::fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
+            std::fs::write(root.path().join("node_modules/.bin/x"), b"shim").unwrap();
+            std::fs::create_dir_all(&pkg).unwrap();
             let blobs = tempfile::tempdir().unwrap();
             if with_blob {
                 tokio::fs::write(blobs.path().join(&before_hash), before)
@@ -3300,17 +3307,14 @@ mod tests {
                     .unwrap();
             }
             tokio::fs::write(
-                pkg.path().join("package.json"),
+                pkg.join("package.json"),
                 br#"{"name":"x","version":"1.0.0","bin":"cli.js"}"#,
             )
             .await
             .unwrap();
-            tokio::fs::write(pkg.path().join("cli.js"), before)
-                .await
-                .unwrap();
+            tokio::fs::write(pkg.join("cli.js"), before).await.unwrap();
             let res =
-                rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                    .await;
+                rollback_package_patch("pkg:npm/x@1.0.0", &pkg, &files, blobs.path(), false).await;
             assert!(res.success, "{with_blob}: {res:?}");
             let expected: &[u8] = if with_blob {
                 b"#!/usr/bin/env node\nconsole.log(1);\r\n"
@@ -3318,7 +3322,7 @@ mod tests {
                 before
             };
             assert_eq!(
-                tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+                tokio::fs::read(pkg.join("cli.js")).await.unwrap(),
                 expected,
                 "{with_blob}"
             );

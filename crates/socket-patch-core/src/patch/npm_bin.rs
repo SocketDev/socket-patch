@@ -67,9 +67,12 @@ pub(crate) fn fixed_for_write(
 /// would leave a bin `env` can't run.
 ///
 /// The file is taken for an npm-installed bin when its npm package lists
-/// it in `bin` ([`is_listed_bin`]), whatever shebang is on disk now (a
-/// release before #1756 wrote the CRLF one, #1791). Without that
-/// evidence, when the file now on disk has an LF shebang and either
+/// it in `bin` and npm linked it ([`is_linked_bin`]), whatever shebang is
+/// on disk now (a release before #1756 wrote the CRLF one, #1791). A bin
+/// npm didn't link (`bin-links=false`, or a `directories.bin` file of a
+/// non-registry install) keeps its published shebang, so it is written as
+/// recorded (#1804). Without that evidence, when the file now on disk has
+/// an LF shebang and either
 /// belongs to an npm package, or hashes, in npm's original form, to
 /// `installed_source` (the content this write replaces).
 pub(crate) async fn form_for_write<'a>(
@@ -86,7 +89,7 @@ pub(crate) async fn form_for_write<'a>(
         return as_recorded(content);
     }
     let path = pkg_path.join(normalized);
-    let npm_installed = is_listed_bin(package_key, pkg_path, normalized).await || {
+    let npm_installed = is_linked_bin(package_key, pkg_path, normalized).await || {
         let lf_shebang = read_prefix(&path)
             .await
             .is_some_and(|prefix| has_lf_shebang(&prefix));
@@ -109,9 +112,18 @@ fn is_npm(package_key: &str) -> bool {
 }
 
 /// Whether `normalized` (a safe path relative to `pkg_path`) is a file
-/// the npm package `package_key` lists as a bin in its `package.json`:
-/// a file npm's `bin-links` runs `fixBin` on.
-pub(crate) async fn is_listed_bin(package_key: &str, pkg_path: &Path, normalized: &str) -> bool {
+/// the npm package `package_key` lists as a bin in its `package.json` and
+/// npm linked: a file npm's `bin-links` ran `fixBin` on.
+///
+/// npm rewrites only the bins it links, so the listing alone is not
+/// enough: with `bin-links=false`, or for a `directories.bin` file of a
+/// package installed from a tarball or folder (npm expands that field
+/// only in registry packuments), the file keeps its published shebang
+/// (#1804). The link is a `.bin/<name>` entry in a `node_modules` the
+/// package sits under (a symlink must resolve to this file; a cmd or
+/// shell shim is taken as is), a pnpm virtual-store dependent's
+/// `.bin/<name>`, or a global prefix's `bin/<name>` or `<name>.cmd`.
+pub(crate) async fn is_linked_bin(package_key: &str, pkg_path: &Path, normalized: &str) -> bool {
     if !is_npm(package_key) {
         return false;
     }
@@ -120,7 +132,66 @@ pub(crate) async fn is_listed_bin(package_key: &str, pkg_path: &Path, normalized
     else {
         return false;
     };
-    lists_bin(&manifest, normalized)
+    let names = bin_names(&manifest, normalized);
+    if names.is_empty() {
+        return false;
+    }
+    let file = pkg_path.join(normalized);
+    let pkg_path = pkg_path.to_path_buf();
+    crate::utils::fs::run_blocking(move || has_bin_link(&pkg_path, &file, &names)).await
+}
+
+/// Whether an entry named one of `names` links the bin `file` of the
+/// package at `pkg_path`, in the places [`is_linked_bin`] lists.
+fn has_bin_link(pkg_path: &Path, file: &Path, names: &[String]) -> bool {
+    let target = std::fs::canonicalize(file).ok();
+    let links = |entry: &Path| match std::fs::symlink_metadata(entry) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            target.is_some() && std::fs::canonicalize(entry).ok() == target
+        }
+        Ok(meta) => meta.is_file(),
+        Err(_) => false,
+    };
+    let in_dir = |dir: &Path, suffix: &str| {
+        names
+            .iter()
+            .any(|name| links(&dir.join(format!("{name}{suffix}"))))
+    };
+    for dir in pkg_path.ancestors().skip(1) {
+        match dir.file_name().and_then(|n| n.to_str()) {
+            Some("node_modules") => {
+                if in_dir(&dir.join(".bin"), "") {
+                    return true;
+                }
+                let Some(prefix) = dir.parent() else { continue };
+                // Windows global: `<prefix>/node_modules`, shims in `<prefix>`.
+                if in_dir(prefix, ".cmd") {
+                    return true;
+                }
+                // Unix global: `<prefix>/lib/node_modules`, links in `<prefix>/bin`.
+                if prefix.file_name().is_some_and(|n| n == "lib")
+                    && prefix.parent().is_some_and(|p| in_dir(&p.join("bin"), ""))
+                {
+                    return true;
+                }
+            }
+            // pnpm links a package's bins into each dependent's
+            // `.pnpm/<dependent>/node_modules/.bin`.
+            Some(".pnpm") => {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                if entries
+                    .flatten()
+                    .any(|e| in_dir(&e.path().join("node_modules").join(".bin"), ""))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Whether the file at `normalized` holds exactly the recorded content
@@ -144,7 +215,7 @@ pub(crate) async fn needs_fix(
     }) {
         return false;
     }
-    if !is_listed_bin(package_key, pkg_path, normalized).await {
+    if !is_linked_bin(package_key, pkg_path, normalized).await {
         return false;
     }
     crate::utils::fs::read_regular_to_bytes(&path)
@@ -154,47 +225,81 @@ pub(crate) async fn needs_fix(
         })
 }
 
-/// Whether the `package.json` bytes `manifest` list `normalized` as a
-/// bin, as npm's `normalize-package-bin` and `directories.bin` step read
-/// them: a `bin` path (a string, when the package has a `name`, an
-/// object's values, or an array's entries) or, when `bin` is missing or
-/// empty, a non-hidden file under `directories.bin`. Paths are resolved
-/// as npm does (`./` and `..` folded, never above the package).
-fn lists_bin(manifest: &[u8], normalized: &str) -> bool {
+/// The names npm links `normalized` under when the `package.json` bytes
+/// `manifest` list it as a bin, as npm's `normalize-package-bin` and
+/// `directories.bin` step read them: a `bin` path (a string, linked under
+/// the unscoped package `name`, an object's values under their keys, or
+/// an array's entries under their file names) or, when `bin` is missing
+/// or empty, a non-hidden file under `directories.bin`, under its file
+/// name. Paths are resolved as npm does (`./` and `..` folded, never
+/// above the package). Empty when the file is not a listed bin.
+fn bin_names(manifest: &[u8], normalized: &str) -> Vec<String> {
     use serde_json::Value;
     let Ok(json) = serde_json::from_slice::<Value>(manifest) else {
-        return false;
+        return Vec::new();
     };
     let target = clean_path(normalized);
-    if target.is_empty() {
-        return false;
-    }
-    let lists = |bins: &mut dyn Iterator<Item = &Value>| {
-        bins.filter_map(Value::as_str)
-            .any(|bin| clean_path(bin) == target)
+    let Some(file_name) = target.last().map(|n| n.to_string()) else {
+        return Vec::new();
+    };
+    // npm keeps only a key's last segment, `\` and `:` taken for `/`.
+    let link_name = |key: &str| {
+        key.rsplit(['/', '\\', ':'])
+            .next()
+            .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+            .map(str::to_string)
     };
     match json.get("bin") {
-        Some(Value::String(bin)) if !bin.is_empty() => {
-            json.get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|n| !n.is_empty())
-                && clean_path(bin) == target
+        Some(Value::String(bin)) if !bin.is_empty() => json
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|_| clean_path(bin) == target)
+            .and_then(link_name)
+            .into_iter()
+            .collect(),
+        Some(Value::Object(bins)) => bins
+            .iter()
+            .filter(|(_, bin)| bin.as_str().is_some_and(|bin| clean_path(bin) == target))
+            .filter_map(|(key, _)| link_name(key))
+            .collect(),
+        Some(Value::Array(bins)) => {
+            if bins
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|bin| clean_path(bin) == target)
+            {
+                vec![file_name]
+            } else {
+                Vec::new()
+            }
         }
-        Some(Value::Object(bins)) => lists(&mut bins.values()),
-        Some(Value::Array(bins)) => lists(&mut bins.iter()),
-        Some(Value::String(_) | Value::Null | Value::Bool(false)) | None => json
-            .get("directories")
-            .and_then(|d| d.get("bin"))
-            .and_then(serde_json::Value::as_str)
-            .map(clean_path)
-            .is_some_and(|dir| {
-                !dir.is_empty()
-                    && target.len() > dir.len()
-                    && target.starts_with(&dir[..])
-                    && !target[dir.len()..].iter().any(|seg| seg.starts_with('.'))
-            }),
-        Some(_) => false,
+        Some(Value::String(_) | Value::Null | Value::Bool(false)) | None => {
+            let in_dir = json
+                .get("directories")
+                .and_then(|d| d.get("bin"))
+                .and_then(serde_json::Value::as_str)
+                .map(clean_path)
+                .is_some_and(|dir| {
+                    !dir.is_empty()
+                        && target.len() > dir.len()
+                        && target.starts_with(&dir[..])
+                        && !target[dir.len()..].iter().any(|seg| seg.starts_with('.'))
+                });
+            if in_dir {
+                vec![file_name]
+            } else {
+                Vec::new()
+            }
+        }
+        Some(_) => Vec::new(),
     }
+}
+
+/// Whether the `package.json` bytes `manifest` list `normalized` as a bin
+/// ([`bin_names`]).
+#[cfg(test)]
+fn lists_bin(manifest: &[u8], normalized: &str) -> bool {
+    !bin_names(manifest, normalized).is_empty()
 }
 
 /// `path`'s segments with `.`, empty segments and `..` folded, rooted at
@@ -401,6 +506,111 @@ mod tests {
         assert!(!listed(r#"{"name":"x"}"#, "cli.js"));
         assert!(!listed(r#"{"directories":{"bin":"."}}"#, "cli.js"));
         assert!(!listed("not json", "cli.js"));
+    }
+
+    #[test]
+    fn bin_names_are_npms_link_names() {
+        let names = |manifest: &str, file: &str| bin_names(manifest.as_bytes(), file);
+        assert_eq!(names(r#"{"name":"@s/x","bin":"cli.js"}"#, "cli.js"), ["x"]);
+        assert_eq!(
+            names(
+                r#"{"bin":{"a":"cli.js","b":"other.js","c":"./cli.js"}}"#,
+                "cli.js"
+            ),
+            ["a", "c"]
+        );
+        assert_eq!(names(r#"{"bin":{"../../a":"cli.js"}}"#, "cli.js"), ["a"]);
+        assert_eq!(names(r#"{"bin":["bin/cli.js"]}"#, "bin/cli.js"), ["cli.js"]);
+        assert_eq!(
+            names(r#"{"directories":{"bin":"bin"}}"#, "bin/sub/run"),
+            ["run"]
+        );
+        assert!(names(r#"{"bin":{"a":"x.js"}}"#, "cli.js").is_empty());
+    }
+
+    /// `node_modules/<name>/cli.js` under `root`, its package.json listing
+    /// it as the bin `crlfbin`. Returns the package dir.
+    fn installed_bin(root: &Path, under: &str) -> std::path::PathBuf {
+        let pkg = root.join(under).join("crlfbin");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            br#"{"name":"crlfbin","bin":{"crlfbin":"cli.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("cli.js"), b"#!/usr/bin/env node\r\n").unwrap();
+        pkg
+    }
+
+    fn shim(path: std::path::PathBuf) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+    }
+
+    const PURL: &str = "pkg:npm/crlfbin@1.0.0";
+
+    /// Regression (#1804): npm runs `fixBin` only on bins it links, so a
+    /// listed bin without a link (`bin-links=false`) is not npm's form.
+    #[tokio::test]
+    async fn is_linked_bin_wants_npms_link() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "node_modules");
+        assert!(
+            !is_linked_bin(PURL, &pkg, "cli.js").await,
+            "bin-links=false"
+        );
+        shim(root.path().join("node_modules/.bin/other"));
+        assert!(!is_linked_bin(PURL, &pkg, "cli.js").await, "another bin");
+        shim(root.path().join("node_modules/.bin/crlfbin"));
+        assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
+        assert!(!is_linked_bin("pkg:pypi/crlfbin@1.0.0", &pkg, "cli.js").await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn is_linked_bin_follows_a_symlink_to_this_file() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "node_modules");
+        let bin = root.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(pkg.join("other.js"), b"x").unwrap();
+        std::os::unix::fs::symlink("../crlfbin/other.js", bin.join("crlfbin")).unwrap();
+        assert!(
+            !is_linked_bin(PURL, &pkg, "cli.js").await,
+            "links elsewhere"
+        );
+        std::fs::remove_file(bin.join("crlfbin")).unwrap();
+        std::os::unix::fs::symlink("../crlfbin/cli.js", bin.join("crlfbin")).unwrap();
+        assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
+    }
+
+    #[tokio::test]
+    async fn is_linked_bin_finds_global_and_pnpm_links() {
+        // Unix global prefix.
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "lib/node_modules");
+        assert!(!is_linked_bin(PURL, &pkg, "cli.js").await);
+        shim(root.path().join("bin/crlfbin"));
+        assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
+        // Windows global prefix.
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "node_modules");
+        shim(root.path().join("crlfbin.cmd"));
+        assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
+        // A pnpm transitive dependency, linked into its dependent's `.bin`.
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "node_modules/.pnpm/crlfbin@1.0.0/node_modules");
+        std::fs::create_dir_all(
+            root.path()
+                .join("node_modules/.pnpm/app@1.0.0/node_modules"),
+        )
+        .unwrap();
+        assert!(!is_linked_bin(PURL, &pkg, "cli.js").await);
+        shim(
+            root.path()
+                .join("node_modules/.pnpm/app@1.0.0/node_modules/.bin/crlfbin"),
+        );
+        assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
     }
 
     #[tokio::test]
