@@ -1948,6 +1948,46 @@ pub(crate) async fn service_preflight(
     })
 }
 
+/// The refusal a vendor of `purl` (patch `uuid`) would raise before it
+/// builds, downloads or writes anything: the flavor routing and every
+/// wiring guard of [`pypi_prelude`], run as a dry run. `None` when the
+/// prelude gets past them (or answers in sync).
+///
+/// The `scan` / `get --mode vendored --dry-run` preview has no patch
+/// record yet (nothing is downloaded), so the prelude sees one with no
+/// files: none of its refusals reads them. `hosted_origins` are the run's
+/// patch-server origins, as the wet run passes them (#891).
+pub async fn preview_refusal(
+    purl: &str,
+    project_root: &Path,
+    uuid: &str,
+    hosted_origins: &[String],
+) -> Option<(&'static str, String)> {
+    let record = PatchRecord {
+        uuid: uuid.to_string(),
+        exported_at: String::new(),
+        files: std::collections::HashMap::new(),
+        vulnerabilities: std::collections::HashMap::new(),
+        description: String::new(),
+        license: String::new(),
+        tier: String::new(),
+    };
+    match pypi_prelude(
+        purl,
+        project_root,
+        &record,
+        true,
+        &tokio::sync::OnceCell::new(),
+        &InstalledSiteListings::default(),
+        hosted_origins,
+    )
+    .await
+    {
+        Err(VendorOutcome::Refused { code, detail }) => Some((code, detail)),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_pypi_with_pipenv_version<'a>(
     purl: &str,

@@ -177,11 +177,13 @@ impl VendorPreview {
 /// [`crate::commands::vlt_preflight`], [`npm_lock_refusal`]) would refuse
 /// before any download, or whose hosted pnpm pin the takeover would fail
 /// to replace ([`hosted_pnpm_refusals`]: the pnpm backend's lock-text
-/// refusal, #853). `origins` are the run's `--patch-server-url` origins.
-/// The preview stays a ledger classification otherwise (engine refusals
-/// outside the preflights are not predicted), and a would-refuse never
-/// flips the run's status or exit code. The preflights (the only disk
-/// access besides the ledger) run only when the selection holds an npm purl.
+/// refusal, #853), and would-refuse for PyPI purls the PyPI backend's
+/// wiring guards refuse ([`pypi_refusals`], #891). `origins` are the
+/// run's `--patch-server-url` origins. The preview stays a ledger
+/// classification otherwise (engine refusals outside the preflights are
+/// not predicted), and a would-refuse never flips the run's status or exit
+/// code. The preflights (the only disk access besides the ledger) run only
+/// when the selection holds an npm or PyPI purl.
 /// `takeover_refusals` adds the hosted→vendored takeover refusals the
 /// caller resolved (the gem gates of
 /// [`crate::commands::vendor::gem_takeover_preview_refusals`]), keyed by
@@ -203,6 +205,7 @@ pub(crate) async fn preview_vendor(
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     let state = state.unwrap_or_default();
     let pnpm_refusals = hosted_pnpm_refusals(cwd, selected, origins, &state).await;
+    let pypi_refusals = pypi_refusals(cwd, selected, origins).await;
     let refuse = |code: &str, detail: &str| PreviewVerdict::WouldRefuse {
         code: code.to_string(),
         detail: detail.to_string(),
@@ -233,6 +236,10 @@ pub(crate) async fn preview_vendor(
                     let (code, detail) = &takeover_refusals[&p.purl];
                     refuse(code, detail)
                 }
+                _ if pypi_refusals.contains_key(&p.purl) => {
+                    let (code, detail) = &pypi_refusals[&p.purl];
+                    refuse(code, detail)
+                }
                 Some(e) if e.uuid == p.uuid => PreviewVerdict::AlreadyVendored,
                 Some(e) => PreviewVerdict::WouldRevendor {
                     old_uuid: e.uuid.clone(),
@@ -258,6 +265,26 @@ pub(crate) async fn preview_vendor(
         .collect();
     rows.sort_by(|a, b| a.purl.cmp(&b.purl));
     VendorPreview { rows }
+}
+
+/// The PyPI purls of `selected` the vendor backend's prelude refuses
+/// before it builds or downloads anything (the wiring guards a standalone
+/// `vendor --dry-run` already reports, such as `pypi_uv_no_sources`), keyed
+/// by purl (#891). Read-only.
+async fn pypi_refusals(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+    origins: &[String],
+) -> HashMap<String, (&'static str, String)> {
+    let mut refusals = HashMap::new();
+    for p in selected.iter().filter(|p| p.purl.starts_with("pkg:pypi/")) {
+        if let Some(refusal) =
+            socket_patch_core::vendor::pypi::preview_refusal(&p.purl, cwd, &p.uuid, origins).await
+        {
+            refusals.insert(p.purl.clone(), refusal);
+        }
+    }
+    refusals
 }
 
 /// Fold the vendor engine's envelope into a `scan` / `get` envelope (no
@@ -1573,6 +1600,12 @@ mod preview_tests {
     async fn preview_marks_would_refuse_for_refused_bun_tree() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
+        // A PyPI project the PyPI backend can wire (#891 runs its guards).
+        std::fs::write(
+            tmp.path().join("requirements.txt"),
+            "preview-other==1.0.0\n",
+        )
+        .unwrap();
         let preview = preview_vendor_json(
             tmp.path(),
             &[sel(UUID, NPM), sel(UUID, PYPI)],
@@ -1772,6 +1805,171 @@ mod preview_tests {
             "would_vendor",
             "{preview}"
         );
+    }
+    const SIX: &str = "pkg:pypi/six@1.16.0";
+    const TWO: &str = "pkg:pypi/two@2";
+
+    const UV_PYPROJECT: &str = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n\
+        requires-python = \">=3.10\"\ndependencies = [\"six==1.16.0\"]\n";
+    const UV_LOCK: &str = r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "six", specifier = "==1.16.0" }]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
+]
+"#;
+    /// A PEP 723 script and the `uv lock --script` lock beside it.
+    const SCRIPT: &str = "# /// script\n# dependencies = [\"two==2\"]\n# ///\nimport two\n";
+    const SCRIPT_NO_SOURCES: &str =
+        "# /// script\n# dependencies = [\"two==2\"]\n#\n# [tool.uv]\n# no-sources = true\n# ///\n";
+    const SCRIPT_LOCK: &str = "version = 1\n[[package]]\nname = \"two\"\nversion = \"2\"\n\
+        source = {registry = \"https://pypi.org/simple\"}\n";
+    /// A PEP 751 lock (`uv export --format pylock.toml`).
+    const PYLOCK: &str = "lock-version = \"1.0\"\ncreated-by = \"uv\"\n\n[[packages]]\n\
+        name = \"two\"\nversion = \"2\"\nwheels = [{url = \"https://example.test/two-2-py3-none-any.whl\", \
+        hashes = {sha256 = \"two\"}}]\n";
+
+    /// #891: the preview runs the PyPI backend's wiring guards, so a uv
+    /// project whose settings make uv ignore `[tool.uv.sources]` previews
+    /// the wet run's `pypi_uv_no_sources` refusal instead of `would_vendor`
+    /// — set in pyproject's `[tool.uv]` or in a uv.toml, as `no-sources` or
+    /// as a `no-sources-package` list naming the package.
+    #[tokio::test]
+    async fn preview_refuses_a_uv_project_that_ignores_sources() {
+        for (file, setting) in [
+            ("pyproject.toml", "no-sources = true"),
+            ("pyproject.toml", "no-sources-package = [\"Six\"]"),
+            ("uv.toml", "no-sources = true"),
+            ("uv.toml", "no-sources-package = [\"six\"]"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("uv.lock"), UV_LOCK).unwrap();
+            if file == "pyproject.toml" {
+                std::fs::write(
+                    tmp.path().join(file),
+                    format!("{UV_PYPROJECT}\n[tool.uv]\n{setting}\n"),
+                )
+                .unwrap();
+            } else {
+                std::fs::write(tmp.path().join("pyproject.toml"), UV_PYPROJECT).unwrap();
+                std::fs::write(tmp.path().join(file), format!("{setting}\n")).unwrap();
+            }
+            let preview =
+                preview_vendor_json(tmp.path(), &[sel(UUID, SIX)], &[], &HashMap::new()).await;
+            let six = action_of(&preview, SIX);
+            assert_eq!(six["action"], "would_refuse", "{file} {setting}: {preview}");
+            assert_eq!(
+                six["errorCode"], "pypi_uv_no_sources",
+                "{file} {setting}: {preview}"
+            );
+            // Read-only: nothing is wired or vendored.
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("uv.lock")).unwrap(),
+                UV_LOCK
+            );
+            assert!(!tmp.path().join(".socket").exists(), "{file} {setting}");
+        }
+        // Control: the same project without the setting previews clean.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("uv.lock"), UV_LOCK).unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), UV_PYPROJECT).unwrap();
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, SIX)], &[], &HashMap::new()).await;
+        assert_eq!(
+            action_of(&preview, SIX)["action"],
+            "would_vendor",
+            "{preview}"
+        );
+    }
+
+    /// #891: the same refusal on the PEP 723 script lane, where the
+    /// script's own `[tool.uv]` block sets `no-sources`.
+    #[tokio::test]
+    async fn preview_refuses_a_script_lock_that_ignores_sources() {
+        for (script, expected) in [
+            (SCRIPT_NO_SOURCES, Some("pypi_uv_no_sources")),
+            (SCRIPT, None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("job.py"), script).unwrap();
+            std::fs::write(tmp.path().join("job.py.lock"), SCRIPT_LOCK).unwrap();
+            let preview =
+                preview_vendor_json(tmp.path(), &[sel(UUID, TWO)], &[], &HashMap::new()).await;
+            let two = action_of(&preview, TWO);
+            match expected {
+                Some(code) => {
+                    assert_eq!(two["action"], "would_refuse", "{preview}");
+                    assert_eq!(two["errorCode"], code, "{preview}");
+                }
+                None => assert_eq!(two["action"], "would_vendor", "{preview}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("job.py")).unwrap(),
+                script
+            );
+        }
+    }
+
+    /// #891: the symlink advisory covers the PyPI wiring files whose names
+    /// vary — a PEP 723 script and its lock, and PEP 751 `pylock.toml` /
+    /// `pylock.<name>.toml` — not only the registry's fixed names.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_warns_about_symlinked_variable_name_pypi_files() {
+        for (linked, files) in [
+            (
+                "job.py",
+                &[("job.py", SCRIPT), ("job.py.lock", SCRIPT_LOCK)][..],
+            ),
+            (
+                "job.py.lock",
+                &[("job.py", SCRIPT), ("job.py.lock", SCRIPT_LOCK)][..],
+            ),
+            ("pylock.toml", &[("pylock.toml", PYLOCK)][..]),
+            ("pylock.dev.toml", &[("pylock.dev.toml", PYLOCK)][..]),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let shared = tempfile::tempdir().unwrap();
+            for (name, text) in files {
+                if *name == linked {
+                    std::fs::write(shared.path().join(name), text).unwrap();
+                    std::os::unix::fs::symlink(shared.path().join(name), tmp.path().join(name))
+                        .unwrap();
+                } else {
+                    std::fs::write(tmp.path().join(name), text).unwrap();
+                }
+            }
+            let preview =
+                preview_vendor_json(tmp.path(), &[sel(UUID, TWO)], &[], &HashMap::new()).await;
+            let two = action_of(&preview, TWO);
+            assert_eq!(two["action"], "would_vendor", "{linked}: {preview}");
+            let warnings = two["warnings"].as_array().cloned().unwrap_or_default();
+            assert!(
+                warnings.iter().any(|w| {
+                    w["code"] == "vendor_would_refuse_symlinked_file"
+                        && w["detail"]
+                            .as_str()
+                            .is_some_and(|d| d.starts_with(&format!("{linked} is a symbolic link")))
+                }),
+                "{linked}: {preview}"
+            );
+        }
     }
 }
 
