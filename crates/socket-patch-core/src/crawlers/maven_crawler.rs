@@ -633,7 +633,11 @@ pub fn m2_repo_path_with(env: &dyn Env, os: Os, home_dir: Option<&Path>) -> Opti
                 .filter(|v| !v.is_empty())
         })
     };
-    let user_home = property("user.home")
+    // `user.home` is fixed when the JVM starts: the launcher's MAVEN_OPTS
+    // can move it, a command-line `-D` (MAVEN_ARGS) comes too late for the
+    // `~/.m2` paths Maven derives from it.
+    let user_home = set("MAVEN_OPTS")
+        .and_then(|opts| system_property(&opts, "user.home", os))
         .map(PathBuf::from)
         .filter(|h| is_usable_home(h))
         .or_else(|| match os {
@@ -689,12 +693,27 @@ fn settings_local_repository(
     let raw = std::fs::read_to_string(path).ok()?;
     let text = xml::blank_non_markup(&raw).ok()?;
     let settings = *xml::elements(&text, "settings").ok()?.first()?;
-    let value = xml::children(&text, &settings, "localRepository")
+    // `<localRepository>` is a child of `<settings>`; a profile property of
+    // the same name is not it.
+    let profiles = xml::children(&text, &settings, "profiles").ok()?;
+    let element = xml::children(&text, &settings, "localRepository")
         .ok()?
-        .first()?
-        .inner(&text)
-        .trim()
-        .to_string();
+        .into_iter()
+        .find(|e| {
+            !profiles
+                .iter()
+                .any(|p| e.start > p.start && e.start < p.end)
+        })?;
+    // Read from the unmasked text (offsets are kept), so a CDATA value is
+    // its character data and entities decode, as Maven's parser does.
+    let inner = raw[element.inner_start..element.inner_end].trim();
+    let value = match inner
+        .strip_prefix("<![CDATA[")
+        .and_then(|rest| rest.strip_suffix("]]>"))
+    {
+        Some(cdata) => cdata.trim().to_string(),
+        None => crate::formats::nuget::decode_entities(inner),
+    };
     let repo = PathBuf::from(interpolate(&value, lookup)?);
     repo.has_root().then_some(repo)
 }

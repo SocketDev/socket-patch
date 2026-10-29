@@ -211,3 +211,64 @@ fn unusable_settings_fall_through_to_the_default() {
         assert_eq!(m2_repo(&e, Os::Unix), default, "{text}");
     }
 }
+
+/// `<localRepository>` is read as Maven's XML parser reads it: a CDATA
+/// value is its character data, entities decode, and a profile property
+/// of the same name is not the setting.
+#[test]
+fn settings_local_repository_is_read_as_xml() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let user_settings = home.path().join(".m2").join("settings.xml");
+    let e = env(&[("HOME", home.path())]);
+    let data_s = data.path().to_str().unwrap();
+
+    write(&user_settings, &settings(&format!("<![CDATA[{data_s}]]>")));
+    assert_eq!(m2_repo(&e, Os::Unix), Some(data.path().to_path_buf()));
+
+    write(&user_settings, &settings(&format!("{data_s}/a&amp;b")));
+    assert_eq!(
+        m2_repo(&e, Os::Unix),
+        Some(PathBuf::from(format!("{data_s}/a&b")))
+    );
+
+    write(
+        &user_settings,
+        &format!(
+            "<settings><profiles><profile><properties>\
+             <localRepository>/opt/other</localRepository>\
+             </properties></profile></profiles></settings>"
+        ),
+    );
+    assert_eq!(
+        m2_repo(&e, Os::Unix),
+        Some(home.path().join(".m2").join("repository"))
+    );
+    write(
+        &user_settings,
+        &format!(
+            "<settings><profiles><profile><properties>\
+             <localRepository>/opt/other</localRepository>\
+             </properties></profile></profiles>\
+             <localRepository>{data_s}</localRepository></settings>"
+        ),
+    );
+    assert_eq!(m2_repo(&e, Os::Unix), Some(data.path().to_path_buf()));
+}
+
+/// A command-line `-Duser.home` (MAVEN_ARGS) is set after Maven has
+/// derived its `~/.m2` paths, so it does not move them.
+#[test]
+fn maven_args_user_home_does_not_move_the_m2_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut e = env(&[("HOME", home.path())]);
+    e.insert(
+        "MAVEN_ARGS".into(),
+        format!("-Duser.home={}", elsewhere.path().display()),
+    );
+    assert_eq!(
+        m2_repo(&e, Os::Unix),
+        Some(home.path().join(".m2").join("repository"))
+    );
+}

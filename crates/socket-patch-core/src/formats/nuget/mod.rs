@@ -327,7 +327,7 @@ fn leading_ws(s: &str) -> usize {
 /// Decode the five predefined XML entities and numeric character references;
 /// anything else is kept literally (it then fails the later grammar checks
 /// rather than being guessed at).
-fn decode_entities(raw: &str) -> String {
+pub(crate) fn decode_entities(raw: &str) -> String {
     if !raw.contains('&') {
         return raw.to_string();
     }
