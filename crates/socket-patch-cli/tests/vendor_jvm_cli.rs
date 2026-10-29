@@ -1237,6 +1237,62 @@ fn maven_reactor_uncertain_property_version_withholds_vex() {
     }
 }
 
+/// #584: a module added after vendoring that declares the base literally
+/// builds the unpatched jar. `vendor --check` flags the drift and `vex`
+/// withholds attestation until a re-vendor rewrites the module.
+#[test]
+fn maven_reactor_module_added_at_base_after_vendoring_withholds_vex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root, Shape::Reactor, &[("foo", FOO_UUID)]);
+    let pristine = std::fs::read_to_string(root.join("proj/a/pom.xml")).unwrap();
+    ok(root, &["vendor"]);
+    let vex = root.join("vex.json");
+    let vex_args = [
+        "vex",
+        "-O",
+        vex.to_str().unwrap(),
+        "--product",
+        "pkg:generic/x@1",
+    ];
+    ok(root, &vex_args);
+    std::fs::remove_file(&vex).unwrap();
+
+    let agg = std::fs::read_to_string(root.join("proj/pom.xml")).unwrap();
+    let agg = agg.replace(
+        "<module>a</module>",
+        "<module>a</module>\n    <module>b</module>",
+    );
+    write(root, "proj/pom.xml", agg.as_bytes());
+    std::fs::create_dir_all(root.join("proj/b")).unwrap();
+    let b = pristine.replace("<artifactId>a</artifactId>", "<artifactId>b</artifactId>");
+    assert!(b.contains("<version>1.0</version></dependency>"), "{b}");
+    write(root, "proj/b/pom.xml", b.as_bytes());
+
+    let (code, env) = socket(root, &["vendor", "--check"]);
+    assert_ne!(code, Some(0), "{env}");
+    let (_, env) = socket(root, &vex_args);
+    assert_eq!(
+        events(&env),
+        [(
+            purl("foo"),
+            "skipped".to_string(),
+            "vendor_unwired".to_string()
+        )],
+        "{env}"
+    );
+    assert!(!vex.exists(), "{env}");
+
+    // Re-vendoring wires `b` too, and the reactor attests again.
+    ok(root, &["vendor"]);
+    assert!(!std::fs::read_to_string(root.join("proj/b/pom.xml"))
+        .unwrap()
+        .contains("<version>1.0</version></dependency>"));
+    ok(root, &vex_args);
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&vex).unwrap()).unwrap();
+    assert_eq!(doc["statements"][0]["status"], "not_affected", "{doc}");
+}
+
 /// #429 repair: a deleted owned `.gitattributes` (and nothing else) is
 /// rewritten by `repair` (no download), so the next autocrlf clone keeps the
 /// script and index LF.
