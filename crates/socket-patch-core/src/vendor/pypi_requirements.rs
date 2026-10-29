@@ -446,6 +446,105 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
         && refuse_symlinked(root, &rels).await.is_ok()
 }
 
+/// The out-of-root `-r` include (`../shared/base.txt`) through which pip
+/// installs `canon_name==version` from somewhere other than a vendored
+/// wheel, if the requirements set has one (#1851). Vendor cannot edit that
+/// file, so wiring only a lock beside it would leave `pip install -r` on
+/// the upstream release: the lock flavors refuse it as the
+/// requirements-only planner does (`pypi_requirements_outside_root`).
+///
+/// Files are decoded as pip decodes them (a UTF-16 `pip freeze` export
+/// included), and a line counts when discovery would read it as evidence
+/// against the wiring: an `==` / `===` pin of the release (extras and
+/// per-requirement options allowed), a direct reference or editable
+/// checkout naming the package (any version: its artifact is not ours),
+/// and a bare url / VCS / path line whose artifact filename or `#egg=`
+/// names it (at the filename's version, else any). An out-of-root include
+/// that exists but can't be read or decoded refuses too: its pins are
+/// unknowable. `Some` is the refusal to return.
+pub(super) async fn pin_outside_root(
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+) -> Option<(&'static str, String)> {
+    let view = crate::vendor::lock_inventory::ProjectView::Disk(root);
+    let mut found = None;
+    let _ = walk_requirements_tree(view, decode_requirements, |rel, read| {
+        if found.is_some() {
+            return Ok::<bool, std::convert::Infallible>(false);
+        }
+        let outside = !is_in_root_rel(rel);
+        match read {
+            Ok(content) => {
+                if outside && installs_outside_vendor(&content, canon_name, version) {
+                    found = Some(outside_root_refusal(rel, canon_name));
+                }
+                Ok(true)
+            }
+            // pip reads an include this walk can't (or fails the install):
+            // its pins are unknowable, so fail closed rather than wire the
+            // lock beside it. Discovery diagnoses the same file.
+            Err(e) if outside && e.kind() != std::io::ErrorKind::NotFound => {
+                found = Some((
+                    "pypi_requirements_outside_root",
+                    format!(
+                        "{rel}: a requirements include outside the project root cannot be \
+                         read ({e}), so vendor cannot tell whether pip installs {canon_name} \
+                         from it; make it readable UTF-8 text or use agent mode (`scan --mode \
+                         agent` + `socket-patch apply`) instead"
+                    ),
+                ));
+                Ok(false)
+            }
+            Err(_) => Ok(false),
+        }
+    })
+    .await;
+    found
+}
+
+/// Whether a requirements file's `content` installs `canon_name==version`
+/// (see [`pin_outside_root`]) from a source other than a vendored wheel.
+fn installs_outside_vendor(content: &str, canon_name: &str, version: &str) -> bool {
+    use crate::utils::requirements::{
+        editable_location, egg_name, logical_lines, parse_requirement, split_comment,
+    };
+    let names = |name: &str| canonicalize_pypi_name(name) == canon_name;
+    logical_lines(content).iter().any(|line| {
+        let code = split_comment(&line.text).0.trim();
+        if let Some(location) = editable_location(code) {
+            return egg_name(location).is_some_and(names);
+        }
+        if let Some((name, pinned)) = crate::vex::discover::pypi_other::bare_line_release(code) {
+            return names(&name)
+                && pinned
+                    .is_none_or(|pinned| crate::utils::pep440::versions_equal(&pinned, version));
+        }
+        let Some(req) = parse_requirement(code).filter(|req| names(req.name)) else {
+            return false;
+        };
+        req.direct_reference
+            .is_some_and(|location| !location.replace('\\', "/").contains(".socket/vendor/"))
+            || req
+                .exact_version()
+                .is_some_and(|pinned| crate::utils::pep440::versions_equal(pinned, version))
+            || req.arbitrary_version() == Some(version)
+    })
+}
+
+/// The `pypi_requirements_outside_root` refusal for a pin in the
+/// out-of-root include `rel`.
+pub(super) fn outside_root_refusal(rel: &str, canon_name: &str) -> (&'static str, String) {
+    (
+        "pypi_requirements_outside_root",
+        format!(
+            "{rel}: {canon_name} is pinned in a requirements include outside the project \
+             root, which vendor cannot edit; inline it or use agent mode \
+             (`scan --mode agent` + `socket-patch apply`) instead"
+        ),
+    )
+}
+
 /// The `requirements_line` records of a mixed entry (a Pipenv or uv entry
 /// that also wired its exported requirements file, #612 / #1368).
 pub(super) const RECORD_KIND: &str = "requirements_line";
@@ -889,15 +988,7 @@ async fn plan_requirements(
             // SECURITY/scope: an include outside the project root cannot be
             // edited by a committable vendor flow; rewriting only the in-root
             // copy would leave pip a duplicate requirement. Fail closed.
-            return Err((
-                "pypi_requirements_outside_root",
-                format!(
-                    "{}: {canon_name} is pinned in a requirements include outside the project \
-                     root, which vendor cannot edit; inline it or use agent mode \
-                     (`scan --mode agent` + `socket-patch apply`) instead",
-                    file.rel
-                ),
-            ));
+            return Err(outside_root_refusal(&file.rel, canon_name));
         }
 
         // Rewrite EVERY exact-pin occurrence in this file, bottom-up so the
@@ -1241,6 +1332,30 @@ pub(crate) async fn requirements_include_names_in(
     .await?;
     names.sort_by_key(|rel| rel != "requirements.txt");
     Ok(names)
+}
+
+/// The out-of-root (`../…`) and absolute `-r` includes the root
+/// `requirements.txt` reaches, through in-root files and through each
+/// other, in walk order (#1851). Vendor never edits or names them
+/// ([`requirements_include_names_in`]), but pip installs their pins, so
+/// discovery reads them as evidence against a lock's wiring. A file that
+/// exists but can't be read or decoded is named too, so the reader
+/// diagnoses it instead of losing its pins silently.
+pub(crate) async fn requirements_outside_root_names_in(
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let _ = walk_requirements_tree(view, decode_requirements, |rel, read| {
+        // An unreadable one is still named, so the reader diagnoses it.
+        if !is_in_root_rel(rel)
+            && !matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            names.push(rel.to_string());
+        }
+        Ok::<bool, std::convert::Infallible>(read.is_ok())
+    })
+    .await;
+    names
 }
 
 /// A root-relative requirements path that stays inside the project root

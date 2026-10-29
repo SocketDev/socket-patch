@@ -1392,6 +1392,80 @@ mod tests {
         )
     }
 
+    /// #1851: `pip install -r requirements.txt` installs an exact pin from a
+    /// `-r` include outside the project root, so that pin contests a
+    /// vendored pylock's wiring of the same release (`vendor --check` fails,
+    /// `vex` omits it), as an in-root pin does. Another release in the
+    /// include, or a package the include doesn't pin, leaves the wiring live.
+    #[tokio::test]
+    async fn out_of_root_include_pin_contests_a_vendored_pylock() {
+        let rel = click_vendored(UUID_B);
+        let lock = rewrite_python_lock(
+            &pylock_registry(),
+            "click",
+            "8.1.7",
+            ArtifactSource::Path(&rel),
+            SHA,
+        )
+        .unwrap()
+        .unwrap();
+        for (base, contested) in [
+            ("click==8.1.7\n", true),
+            ("-r more.txt\n", true),
+            ("click[extra]===8.1.7 --config-settings=x=y\n", true),
+            (
+                "click @ https://files.pythonhosted.org/packages/click-8.1.7-py3-none-any.whl\n",
+                true,
+            ),
+            ("-e git+https://example.com/click.git#egg=click\n", true),
+            ("git+https://example.com/click.git#egg=click\n", true),
+            ("../wheels/click-8.1.7-py3-none-any.whl\n", true),
+            (
+                "click @ https://files.pythonhosted.org/packages/click-8.1.6-py3-none-any.whl\n",
+                false,
+            ),
+            ("click==8.1.6\n", false),
+            ("idna==3.7\n", false),
+        ] {
+            let p = Project::nested("app");
+            p.write("pylock.toml", &lock)
+                .write("requirements.txt", "-r ../shared/base.txt\nidna==3.7\n")
+                .write("../shared/base.txt", base)
+                .write("../shared/more.txt", "click==8.1.7\n");
+            // The whole project: the requirements extractor supplies the pin.
+            let out = p.discover().await;
+            if contested {
+                assert_refs(&out, &[]);
+                assert_eq!(out.contested.len(), 1, "{base:?}: {:#?}", out.contested);
+                assert_eq!(out.contested[0].file, Path::new("pylock.toml"), "{base:?}");
+            } else {
+                assert_refs(&out, &[(CLICK, UUID_B, WiringMode::Vendored)]);
+                assert!(out.contested.is_empty(), "{base:?}: {:#?}", out.contested);
+            }
+        }
+
+        // An include pip can't decode for this reader is diagnosed, not
+        // silently dropped.
+        let p = Project::nested("app");
+        p.write("pylock.toml", &lock)
+            .write("requirements.txt", "-r ../shared/base.txt\n");
+        std::fs::create_dir_all(p.root().join("../shared")).unwrap();
+        std::fs::write(
+            p.root().join("../shared/base.txt"),
+            b"\x80\x81click==8.1.7\n",
+        )
+        .unwrap();
+        let out = p.discover().await;
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_LOCKFILE_UNREADABLE
+                    && d.detail.contains("../shared/base.txt")),
+            "{:#?}",
+            out.diagnostics
+        );
+    }
+
     #[tokio::test]
     async fn pylock_archive_hosted_and_vendored() {
         let url = click_url(UUID_A);

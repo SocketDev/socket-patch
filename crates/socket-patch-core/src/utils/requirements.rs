@@ -381,6 +381,40 @@ pub(crate) fn shlex_split(text: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// The location of an editable requirement (`-e <loc>`, `-e<loc>`,
+/// `--editable <loc>`, `--editable=<loc>`), as pip's option parser reads it.
+pub(crate) fn editable_location(code: &str) -> Option<&str> {
+    let rest = if let Some(rest) = code.strip_prefix("--editable") {
+        match rest.strip_prefix('=') {
+            Some(rest) => rest,
+            None if rest.starts_with(char::is_whitespace) => rest,
+            None => return None,
+        }
+    } else {
+        // A short option takes its value attached or after a space.
+        let rest = code.strip_prefix("-e")?;
+        rest.strip_prefix('=').unwrap_or(rest)
+    };
+    rest.split_whitespace().next()
+}
+
+/// The package a VCS / url requirement names in its `#egg=<name>` fragment.
+/// A legacy `#egg=<name>-<version>` fragment names the package before its
+/// first `-<digit>`, as setuptools and older pip read it.
+pub(crate) fn egg_name(location: &str) -> Option<&str> {
+    let (_, fragment) = location.split_once('#')?;
+    let egg = fragment.split('&').find_map(|p| p.strip_prefix("egg="))?;
+    let end = egg
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .unwrap_or(egg.len());
+    let egg = &egg[..end];
+    let end = egg
+        .match_indices('-')
+        .find(|(i, _)| egg[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+        .map_or(egg.len(), |(i, _)| i);
+    Some(&egg[..end]).filter(|name| !name.is_empty())
+}
+
 /// One requirements.txt requirement, read from a logical line's code part
 /// (comment already stripped) the way pip reads it. The ONE requirements
 /// grammar: the lock inventory, lockfile discovery, the hosted rewriter and

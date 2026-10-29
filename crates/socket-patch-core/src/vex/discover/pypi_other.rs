@@ -66,7 +66,11 @@
 //! and a stale one would otherwise gate the live wiring as a
 //! `wiring_conflict`. Lines are pip's logical lines, cut with the planner's
 //! own lexer ([`crate::utils::requirements`]: `\` continuations joined, `#`
-//! comments at column 0 or after whitespace, one leading BOM):
+//! comments at column 0 or after whitespace, one leading BOM).
+//! Includes outside the root (`-r ../shared/base.txt`) are read too, but
+//! only as evidence: pip installs their registry pins, which contest a
+//! lock's wiring of the same release (#1851); neither writer edits them,
+//! so nothing in them is wiring. The wiring shapes are:
 //!
 //! * hosted (`patch::redirect::requirements`):
 //!   `Name[extras] @ <artifact_url>[ ; marker] --hash=sha256:<hex>`;
@@ -119,7 +123,8 @@ use crate::utils::digest::sha256_hex;
 use crate::utils::hatch::dependency_specs;
 use crate::utils::requirements;
 use crate::utils::requirements::{
-    hash_options, logical_lines, parse_requirement, split_comment, url_sha256_fragment, vendor_tag,
+    editable_location, egg_name, hash_options, logical_lines, parse_requirement, split_comment,
+    url_sha256_fragment, vendor_tag,
 };
 use crate::vendor::common::DeclTable;
 use crate::vendor::lock_inventory::pypi::{hosted_artifact_url, parse_pipfile_lock};
@@ -264,6 +269,56 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             requirements_line(ctx, file, &line.text, out);
         }
     }
+    // #1851: pip installs the pins of an include outside the project root
+    // too. Neither writer edits such a file, so it holds no Socket wiring,
+    // but its registry pins contest a lock's wiring like an in-root pin.
+    let budget = MAX_REQUIREMENTS_FILES.saturating_sub(files.len());
+    let outside =
+        crate::vendor::pypi_requirements::requirements_outside_root_names_in(ctx.view).await;
+    for file in outside.iter().take(budget) {
+        out.install_tree(file, ROOT_REQUIREMENTS);
+        let Some(text) = ctx.read_requirements_text(file, out).await else {
+            continue;
+        };
+        for line in logical_lines(&text) {
+            outside_root_line(ctx, file, &line.text, out);
+        }
+    }
+}
+
+/// One logical line of an out-of-root include. Nothing in it is wiring,
+/// but what pip installs from it is evidence: a registry pin, an editable
+/// checkout, and a direct reference to anything but a Socket artifact
+/// (read as [`foreign_reference`] reads an in-root one).
+fn outside_root_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Discovery) {
+    let (code, _) = split_comment(line);
+    let code = code.trim();
+    if let Some(location) = editable_location(code) {
+        if !mentions_vendor_dir(location) {
+            if let Some(name) = egg_name(location) {
+                out.resolved_elsewhere_any_version(file, pypi_name_purl(name));
+            }
+        }
+        return;
+    }
+    if code.is_empty() || code.starts_with('-') {
+        return;
+    }
+    let Some((name, location)) = requirement_location(code) else {
+        registry_pin(file, code, out);
+        return;
+    };
+    if matches!(classify(ctx, location, url_form(location)), Ok(None)) {
+        let entry = Entry {
+            file,
+            name,
+            pinned_version: None,
+            tag: None,
+            root_uri: false,
+            foreign_is_evidence: true,
+        };
+        foreign_reference(&entry, location, out);
+    }
 }
 
 /// One logical requirements line (see the module docs for the two shapes).
@@ -307,40 +362,6 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
         integrity_of(location, hash_options(code)),
         out,
     );
-}
-
-/// The location of an editable requirement (`-e <loc>`, `-e<loc>`,
-/// `--editable <loc>`, `--editable=<loc>`), as pip's option parser reads it.
-fn editable_location(code: &str) -> Option<&str> {
-    let rest = if let Some(rest) = code.strip_prefix("--editable") {
-        match rest.strip_prefix('=') {
-            Some(rest) => rest,
-            None if rest.starts_with(char::is_whitespace) => rest,
-            None => return None,
-        }
-    } else {
-        // A short option takes its value attached or after a space.
-        let rest = code.strip_prefix("-e")?;
-        rest.strip_prefix('=').unwrap_or(rest)
-    };
-    rest.split_whitespace().next()
-}
-
-/// The package a VCS / url requirement names in its `#egg=<name>` fragment.
-/// A legacy `#egg=<name>-<version>` fragment names the package before its
-/// first `-<digit>`, as setuptools and older pip read it.
-fn egg_name(location: &str) -> Option<&str> {
-    let (_, fragment) = location.split_once('#')?;
-    let egg = fragment.split('&').find_map(|p| p.strip_prefix("egg="))?;
-    let end = egg
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-        .unwrap_or(egg.len());
-    let egg = &egg[..end];
-    let end = egg
-        .match_indices('-')
-        .find(|(i, _)| egg[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
-        .map_or(egg.len(), |(i, _)| i);
-    Some(&egg[..end]).filter(|name| !name.is_empty())
 }
 
 /// Record a registry requirement that can only install one release as
@@ -587,29 +608,48 @@ fn emit(
 /// requirements line names its package only through its filename or an
 /// `#egg=` fragment, so one with neither (a source directory) is left out.
 fn foreign_reference(entry: &Entry<'_>, location: &str, out: &mut Discovery) {
+    let Some((name, version)) = foreign_release(entry.name, location, entry.pinned_version) else {
+        return;
+    };
+    match version {
+        Some(version) => out.resolved_elsewhere(entry.file, pypi_purl(&name, &version)),
+        None => out.resolved_elsewhere_any_version(entry.file, pypi_name_purl(&name)),
+    }
+}
+
+/// The `(name, version)` a non-Socket reference `location` installs, read
+/// as [`foreign_reference`] documents: `name` is the declared one, else the
+/// artifact filename's, else the `#egg=` fragment's; `None` version means
+/// any. `None` when no package name can be read.
+fn foreign_release<'a>(
+    declared: Option<&'a str>,
+    location: &'a str,
+    pinned: Option<&'a str>,
+) -> Option<(String, Option<String>)> {
     let leaf = artifact_leaf(location).and_then(|leaf| vendored_leaf_purl("pypi", &leaf));
     let leaf = leaf
         .as_deref()
         .and_then(|purl| purl.strip_prefix("pkg:pypi/"))
         .and_then(|nv| nv.rsplit_once('@'));
-    let Some(name) = entry
-        .name
+    let name = declared
         .or(leaf.map(|(name, _)| name))
-        .or_else(|| egg_name(location))
-    else {
-        return;
-    };
+        .or_else(|| egg_name(location))?;
     let version = leaf
         .filter(|(leaf_name, _)| *leaf_name == canonicalize_pypi_name(name))
         .map(|(_, version)| version)
-        .or_else(|| {
-            entry
-                .pinned_version
-                .filter(|v| !v.is_empty() && !v.contains('*'))
-        });
-    match version {
-        Some(version) => out.resolved_elsewhere(entry.file, pypi_purl(name, version)),
-        None => out.resolved_elsewhere_any_version(entry.file, pypi_name_purl(name)),
+        .or_else(|| pinned.filter(|v| !v.is_empty() && !v.contains('*')));
+    Some((name.to_string(), version.map(str::to_string)))
+}
+
+/// The `(name, version)` a bare url / path requirements line
+/// (`git+https://…#egg=six`, `../six-1.16.0-py3-none-any.whl`) installs, as
+/// discovery reads it ([`foreign_release`]; `None` version means any).
+/// `None` for any other line, and for a vendored wheel path. The vendored
+/// planner refuses the same lines discovery counts as evidence (#1851).
+pub(crate) fn bare_line_release(code: &str) -> Option<(String, Option<String>)> {
+    match requirement_location(code)? {
+        (None, location) if !mentions_vendor_dir(location) => foreign_release(None, location, None),
+        _ => None,
     }
 }
 
