@@ -574,27 +574,45 @@ pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
 /// commit refuses to rename over (`redirect_symlinked_file_unsupported`).
 /// Shared by `vendor --dry-run` and the `scan` / `get --mode vendored`
 /// dry-run preview.
+///
+/// Besides the registry's fixed names, PyPI wires files whose names vary
+/// (#891): every Python lock the backend discovers in the project root
+/// (`pylock.toml`, `pylock.<name>.toml`, a PEP 723 `<script>.py.lock`)
+/// and the `<script>.py` a script lock pairs with.
 pub(crate) fn symlinked_wiring_warnings(cwd: &Path, purl: &str) -> Vec<VendorWarning> {
     let Some(eco) = Ecosystem::from_purl(purl) else {
         return Vec::new();
     };
-    socket_patch_core::utils::group_commit::symlinked_paths(
-        cwd,
-        socket_patch_core::formats::registry::wiring_paths(eco.cli_name()),
-    )
-    .into_iter()
-    .map(|linked| {
-        VendorWarning::new(
-            "vendor_would_refuse_symlinked_file",
-            format!(
-                "{linked} is a symbolic link; a non-dry-run vendor refuses with \
+    let mut paths: Vec<String> = socket_patch_core::formats::registry::wiring_paths(eco.cli_name())
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if eco == Ecosystem::Pypi {
+        for lock in
+            socket_patch_core::utils::python_lock::python_lock_paths(cwd).unwrap_or_default()
+        {
+            let script = lock.strip_suffix(".lock").filter(|s| s.ends_with(".py"));
+            for path in script.map(str::to_string).into_iter().chain([lock]) {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    socket_patch_core::utils::group_commit::symlinked_paths(cwd, paths.iter().map(String::as_str))
+        .into_iter()
+        .map(|linked| {
+            VendorWarning::new(
+                "vendor_would_refuse_symlinked_file",
+                format!(
+                    "{linked} is a symbolic link; a non-dry-run vendor refuses with \
                  redirect_symlinked_file_unsupported if it must rewrite it (an atomic \
                  rename would replace the link) — replace the link with a regular file, \
                  or run socket-patch in the directory it points to"
-            ),
-        )
-    })
-    .collect()
+                ),
+            )
+        })
+        .collect()
 }
 
 /// A hosted-restore advisory as a takeover reports it. The gem stale-cache

@@ -1948,6 +1948,53 @@ pub(crate) async fn service_preflight(
     })
 }
 
+/// The refusals a vendor of each `(purl, uuid)` candidate would raise
+/// before it builds, downloads or writes anything: the flavor routing and
+/// every wiring guard of [`pypi_prelude`], run as a dry run, keyed by
+/// purl. A candidate the prelude gets past (or answers in sync) is absent.
+/// One Pipenv-release probe and one set of site listings serve every
+/// candidate, as in the vendor loop.
+///
+/// The `scan` / `get --mode vendored --dry-run` preview has no patch
+/// record yet (nothing is downloaded), so the prelude sees one with no
+/// files: its routing and wiring refusals read only the purl, the uuid
+/// and the project. `hosted_origins` are the run's patch-server origins,
+/// as the wet run passes them (#891).
+pub async fn preview_refusals(
+    project_root: &Path,
+    candidates: &[(&str, &str)],
+    hosted_origins: &[String],
+) -> std::collections::HashMap<String, (&'static str, String)> {
+    let pipenv_version = tokio::sync::OnceCell::new();
+    let installed_sites = InstalledSiteListings::default();
+    let mut refusals = std::collections::HashMap::new();
+    for &(purl, uuid) in candidates {
+        let record = PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: String::new(),
+            files: std::collections::HashMap::new(),
+            vulnerabilities: std::collections::HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        if let Err(VendorOutcome::Refused { code, detail }) = pypi_prelude(
+            purl,
+            project_root,
+            &record,
+            true,
+            &pipenv_version,
+            &installed_sites,
+            hosted_origins,
+        )
+        .await
+        {
+            refusals.insert(purl.to_string(), (code, detail));
+        }
+    }
+    refusals
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_pypi_with_pipenv_version<'a>(
     purl: &str,
