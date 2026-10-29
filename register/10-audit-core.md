@@ -3,7 +3,7 @@ _Last updated 2026-10-29T18:49Z · main @ c07af61 · owner: audit-core_
 
 | ID | P | Problem | Issues | Status |
 |---|---|---|---|---|
-| A01 | 1 | Cargo config chain is read twice. `cargo_build_cache::ConfigDirs::read` prefers `config.toml`, while `source_replacement::config_layer_paths` and cargo prefer `config`, so the build-cache cleaner invalidates the wrong target dir (executed). | #1832 | filed #1832 |
+| A01 | 1 | Cargo config chain is read twice. `cargo_build_cache::ConfigDirs::read` prefers `config.toml`, while `source_replacement::config_layer_paths` and cargo prefer `config`, so the build-cache cleaner invalidates the wrong target dir (executed). | #1832 | in PR #1849 |
 | A02 | 1 | `cargo_workspace::wildcard_match` has no `[...]` classes, so `members = ["crates/[ab]*"]` expands to nothing (executed). It is one of three segment glob matchers, with `workspace_globs::segment_glob_matches` (= `ExtglobMatcher::segment_uncached` minus the memo) and `hatch_workspace::fnmatch`. A fourth walk, `npm_crawler::expand_workspace_pattern_sync` (L940), has no brace expansion (bun workspaces; unexecuted). | #1833 | filed #1833 |
 | A03 | 2 | GOMODCACHE/GOPATH default is written twice (`go_crawler::get_gomodcache`, `go_installed_tools` L176-186), and the copies drifted on empty GOPATH entries and the home fallback. | #1834 | filed #1834 |
 | A04 | 2 | Callers re-derive `utils::line_endings`: `vendor/common.rs:198` copies `terminator`, and `python_lock::preserve_line_endings` and `lock_fragments` L434 hand-roll CRLF detection that ignores bare `\r`. There are three more `eol_eq` copies (`hosted/engine.rs:2900`, `vendor/jvm/scala_cli.rs:76`, `vendor/nuget_feed.rs:1004`). | #814, #815 | filed #814; new sites added to the tracker's scope |
