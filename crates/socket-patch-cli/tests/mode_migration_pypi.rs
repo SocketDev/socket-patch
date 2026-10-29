@@ -3289,6 +3289,69 @@ async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
     assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
 }
 
+/// #1851: requirements.txt pins six only through a `-r` include outside
+/// the project root, beside the `pip lock` pylock.toml. `pip install -r
+/// requirements.txt` installs that pin, and vendor can't edit the
+/// include, so vendoring six refuses with `pypi_requirements_outside_root`
+/// (as it does without the pylock) and writes nothing. Before the fix only
+/// the pylock was wired and the run exited 0. A pylock already wired
+/// beside such a pin (vendored before the fix, or a pin added later)
+/// fails `vendor --check` as contested instead of passing.
+#[tokio::test]
+async fn pip_lock_beside_an_out_of_root_include_pin_refuses() {
+    let (tmp, root) = project();
+    stage_pip_lock(&root);
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("base.txt"), "six==1.16.0\n").unwrap();
+    std::fs::write(
+        root.join("requirements.txt"),
+        "-r ../shared/base.txt\nidna==3.7\n",
+    )
+    .unwrap();
+    stage_manifest(&root);
+
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_ne!(code, 0, "{env:#}");
+    assert!(
+        env.to_string().contains("pypi_requirements_outside_root"),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("pylock.toml")).unwrap(),
+        PIP_LOCK.as_bytes(),
+        "the pylock is not wired: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("requirements.txt")).unwrap(),
+        b"-r ../shared/base.txt\nidna==3.7\n"
+    );
+    assert_eq!(
+        std::fs::read(shared.join("base.txt")).unwrap(),
+        b"six==1.16.0\n"
+    );
+
+    // The include pins another release: six is wired in the pylock only.
+    std::fs::write(shared.join("base.txt"), "six==1.15.0\n").unwrap();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        std::fs::read_to_string(root.join("pylock.toml"))
+            .unwrap()
+            .contains(&format!(".socket/vendor/pypi/{UUID}/")),
+        "{env:#}"
+    );
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+
+    // Once the include pins the vendored release, pip installs the
+    // upstream six again: the pylock wiring is contested.
+    std::fs::write(shared.join("base.txt"), "six==1.16.0\n").unwrap();
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_ne!(code, 0, "the out-of-root pin contests the pylock: {env:#}");
+    assert!(env.to_string().contains("contested"), "{env:#}");
+}
+
 /// #1758: a pylock vendored while requirements.txt did not pin six yet
 /// (a project vendored before the fix wired only the pylock). Once the
 /// file pins six==1.16.0, the next `vendor` wires it to the committed
