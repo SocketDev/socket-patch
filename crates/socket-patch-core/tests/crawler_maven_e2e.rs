@@ -10,6 +10,10 @@ use socket_patch_core::crawlers::maven_crawler::parse_pom_group_artifact_version
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::MavenCrawler;
 
+/// The variable Maven's `user.home` comes from: `HOME` on Unix,
+/// `USERPROFILE` on Windows (the crawler prefers it over `HOME` there).
+const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
 fn options_at(root: &Path) -> CrawlerOptions {
     CrawlerOptions {
         cwd: root.to_path_buf(),
@@ -269,10 +273,10 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
 
     let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
     let prev_m2 = std::env::var("M2_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
+    let prev_home = std::env::var(HOME_VAR).ok();
     std::env::remove_var("MAVEN_REPO_LOCAL");
     std::env::remove_var("M2_HOME");
-    std::env::set_var("HOME", tmp.path());
+    std::env::set_var(HOME_VAR, tmp.path());
 
     let crawler = MavenCrawler;
     let paths = crawler
@@ -287,9 +291,9 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
         std::env::set_var("M2_HOME", v);
     }
     if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
+        std::env::set_var(HOME_VAR, v);
     } else {
-        std::env::remove_var("HOME");
+        std::env::remove_var(HOME_VAR);
     }
 
     // Production returns exactly the single resolved repo path — assert the
@@ -340,10 +344,10 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
     let prev_m2 = std::env::var("M2_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
+    let prev_home = std::env::var(HOME_VAR).ok();
     std::env::remove_var("MAVEN_REPO_LOCAL");
     std::env::remove_var("M2_HOME");
-    std::env::set_var("HOME", tmp.path()); // No .m2/ inside
+    std::env::set_var(HOME_VAR, tmp.path()); // No .m2/ inside
 
     let crawler = MavenCrawler;
     let opts = CrawlerOptions {
@@ -360,9 +364,9 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
         std::env::set_var("M2_HOME", v);
     }
     if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
+        std::env::set_var(HOME_VAR, v);
     } else {
-        std::env::remove_var("HOME");
+        std::env::remove_var(HOME_VAR);
     }
 
     assert!(
