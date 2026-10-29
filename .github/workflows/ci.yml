@@ -1499,9 +1499,24 @@ jobs:
         with:
           node-version: '24.21.0' # exact: bump deliberately (#1645)
 
-      - name: Setup Python
+      - name: Setup Python (attempt 1)
+        # setup-python downloads 3.12.10 on runners that don't cache it,
+        # which takes ~6 s. On 2026-10-28 (run 40771482790) the manifest
+        # fetch died on `getaddrinfo EAI_AGAIN raw.githubusercontent.com`
+        # and the step held the leg for 19 min before failing it. Cap the
+        # download and try once more; a second failure is not a blip.
+        id: setup-python
         if: matrix.suite == 'e2e_pypi' || matrix.uv != '' || matrix.poetry != '' || matrix.pdm != '' || matrix.hatch != ''
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        timeout-minutes: 4
+        continue-on-error: true
+        with:
+          python-version: '3.12.10' # exact: last 3.12 with Windows+macOS builds; bump deliberately (#1645)
+
+      - name: Setup Python (attempt 2)
+        if: (matrix.suite == 'e2e_pypi' || matrix.uv != '' || matrix.poetry != '' || matrix.pdm != '' || matrix.hatch != '') && steps.setup-python.outcome != 'success'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        timeout-minutes: 4
         with:
           python-version: '3.12.10' # exact: last 3.12 with Windows+macOS builds; bump deliberately (#1645)
 
@@ -2790,9 +2805,20 @@ jobs:
           bun --version
           node --no-warnings "$js" --version
 
-      - name: Setup Python + uv
+      - name: Setup Python (attempt 1)
+        # Capped and retried once, as in the e2e job.
+        id: setup-python
         if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        timeout-minutes: 4
+        continue-on-error: true
+        with:
+          python-version: '3.12.10' # exact: last 3.12 with Windows+macOS builds; bump deliberately (#1645)
+
+      - name: Setup Python (attempt 2)
+        if: (steps.gate.outputs.run == 'true') && steps.setup-python.outcome != 'success'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        timeout-minutes: 4
         with:
           python-version: '3.12.10' # exact: last 3.12 with Windows+macOS builds; bump deliberately (#1645)
 
