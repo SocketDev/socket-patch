@@ -249,7 +249,7 @@ impl TakeoverUndo {
 }
 
 /// The dry-run twin of the wet takeover's rollback: the vendored backend's
-/// refusal or failure over the project as `restore` would leave it, or `None` when it
+/// refusal over the project as `restore` would leave it, or `None` when it
 /// would vendor (or the restored project cannot be previewed). The
 /// restored text is staged in a throwaway group commit that is never
 /// committed, so nothing reaches the disk: a restore touching a file the
@@ -312,17 +312,6 @@ async fn takeover_dry_refusal(
         Some(VendorOutcome::Refused { code, detail }) if !refusal_is_benign(code) => {
             Some((code, detail))
         }
-        // An edit that fails over the restored text (a lock shape the
-        // backend cannot splice, #1808) fails the wet run, which rolls the
-        // restore back: the preview reports the same failure.
-        Some(VendorOutcome::Done {
-            result, warnings, ..
-        }) if !result.success && !warnings.iter().any(|w| vendor::is_unserved(w.code)) => Some((
-            "apply_failed",
-            result
-                .error
-                .unwrap_or_else(|| "the vendored backend failed".to_string()),
-        )),
         _ => None,
     }
 }
