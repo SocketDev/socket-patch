@@ -1616,7 +1616,8 @@ async fn an_unconfirmed_pnpm_member_keeps_its_lock() {
     let server = pnpm_server().await;
     let per_member = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
     let unmodeled = pnpm_workspace(
-        "packages:\n  - 'packages/{a,b}'\nsharedWorkspaceLockfile: false\n",
+        // Brace sets and classes are read (#1846); an extglob is not.
+        "packages:\n  - 'packages/@(a|b)'\nsharedWorkspaceLockfile: false\n",
         Some(PNPM_ROOT_ONLY_LOCK),
         &["packages/a"],
         &[],
