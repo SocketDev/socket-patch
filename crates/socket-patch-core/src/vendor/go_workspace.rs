@@ -1138,9 +1138,12 @@ mod tests {
             );
         }
         assert_eq!(resolve_with(&project, Some("off")), GoWork::None);
+        // Absolute on this platform (`/x` has no drive on Windows, where go
+        // rejects it as relative too).
+        let elsewhere = tmp.path().join("elsewhere").join("go.work");
         assert_eq!(
-            resolve_with(&project, Some("/elsewhere/go.work")),
-            GoWork::File(PathBuf::from("/elsewhere/go.work"))
+            resolve_with(&project, Some(&elsewhere.to_string_lossy())),
+            GoWork::File(elsewhere.clone())
         );
         for relative in ["go.work", "../go.work"] {
             assert!(
@@ -1476,7 +1479,10 @@ mod tests {
         ));
         match ws.conflict(&root.join("a"), DEP, "v1.0.0", &ours) {
             Some(c @ WorkspaceConflict::MainModule { .. }) => {
-                assert!(c.consequence(DEP, "v1.0.0").contains("ws/dep"), "{c:?}");
+                // Outside the project the member shows as a native path.
+                let member = Path::new("ws").join("dep");
+                let member = member.to_string_lossy();
+                assert!(c.consequence(DEP, "v1.0.0").contains(&*member), "{c:?}");
             }
             other => panic!("{other:?}"),
         }

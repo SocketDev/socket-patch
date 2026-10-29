@@ -1426,8 +1426,10 @@ mod tests {
             }
             std::fs::remove_file(f.project.join("go.work")).unwrap();
 
-            // GOWORK naming a file elsewhere.
-            let _gowork = EnvGuard::set("GOWORK", "/elsewhere/go.work");
+            // GOWORK naming a file elsewhere (absolute on every platform:
+            // `/x` has no drive on Windows, so go rejects it as relative).
+            let elsewhere = f.project.parent().unwrap().join("elsewhere/go.work");
+            let _gowork = EnvGuard::set("GOWORK", &elsewhere.to_string_lossy());
             assert_eq!(f.crawl().await, walked);
         }
 
