@@ -1078,7 +1078,23 @@ async fn vendor_maven_jvm(
         .map(|(rel, _)| rel.clone())
         .chain(plan.writes.iter().filter(|w| w.tree).map(|w| w.rel.clone()))
         .collect();
+    // A file the committed ledger still records is not a stray: this sweep
+    // runs before the commit, so deleting it here would outlive a refused
+    // or rolled-back write. A patch update's dropped files go after the
+    // commit, through `sweep_replaced_tree`.
+    let recorded: std::collections::BTreeSet<String> = state
+        .iter()
+        .flat_map(|s| s.entries.values())
+        .filter(|e| super::jvm::apply::is_jvm_entry(e))
+        .flat_map(super::jvm::apply::recorded_tree_files)
+        .collect();
     let unindexed = match super::jvm::apply::unindexed_tree_entries(project_root, &indexed)
+        .map(|found| {
+            found
+                .into_iter()
+                .filter(|s| !recorded.contains(&s.rel))
+                .collect::<Vec<_>>()
+        })
         .and_then(|found| super::jvm::apply::refuse_linked(&found).map(|()| found))
     {
         Ok(found) => found,
@@ -3607,6 +3623,60 @@ mod tests {
             let (_, again, _) = unwrap_done(run(false).await);
             assert!(again.is_none(), "gradle={gradle}: in sync after the sweep");
         }
+    }
+
+    /// A tree file the committed ledger records but the new plan drops is
+    /// not a stray: the pre-commit sweep would delete it even when the
+    /// write is then refused or rolled back, leaving the restored ledger
+    /// and index naming a missing file. It goes only after a commit,
+    /// through `sweep_replaced_tree`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn jvm_rerun_keeps_tree_files_the_ledger_records() {
+        let (dir, blobs, installed, record) = reactor_fixture(true).await;
+        let root = dir.path();
+        let (result, entry, _) =
+            unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert!(result.success, "{result:?}");
+        let mut entry = entry.unwrap();
+        let tree = std::path::Path::new(&entry.artifact.path)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let name = entry
+            .artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .replace(".jar", "-dropped.jar");
+        let dropped = format!("{tree}/{name}");
+        tokio::fs::write(root.join(&dropped), b"OLD CLASSIFIER")
+            .await
+            .unwrap();
+        entry.wiring.push(WiringRecord {
+            file: dropped.clone(),
+            kind: super::super::jvm::TREE_KIND.into(),
+            action: WiringAction::Added,
+            key: None,
+            original: None,
+            new: Some(serde_json::Value::String(super::super::jvm::sha256_hex(
+                b"OLD CLASSIFIER",
+            ))),
+        });
+        crate::vendor::test_support::persist(root, PURL, entry).await;
+        let (result, again, _) =
+            unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert!(result.success && again.is_none(), "in sync: {result:?}");
+        assert!(root.join(&dropped).is_file(), "a recorded file is kept");
+        // A file nothing records is still swept.
+        tokio::fs::write(root.join(&tree).join(".DS_Store"), b"x")
+            .await
+            .unwrap();
+        let (_, swept, _) = unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert!(swept.is_some() && !root.join(&tree).join(".DS_Store").exists());
+        assert!(root.join(&dropped).is_file(), "still kept");
     }
 
     #[tokio::test]
