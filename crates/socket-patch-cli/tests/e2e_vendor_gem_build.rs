@@ -1941,6 +1941,87 @@ fn gem_vendor_drops_positional_constraints() {
     }
 }
 
+/// #1821: vendoring over a CRLF Gemfile keeps every line CRLF (the rewired
+/// `gem` line used to end in a bare LF), a real frozen install accepts the
+/// result, and revert restores the Gemfile byte for byte.
+#[test]
+#[ignore = "host capstone: shells out to a real bundler >= 1.17; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+fn gem_vendor_keeps_a_crlf_gemfile_crlf() {
+    for gemfile in [
+        "source \"https://rubygems.org\"\r\n\r\ngem \"rack\", \"~> 3.1\"\r\n",
+        "source \"https://rubygems.org\"\r\n\r\ngem \"rack\", \"~> 3.1\", require: false # pinned\r\n",
+    ] {
+        let Some((_tmp, proj, _bundler, _purl)) = staged_rack_project("crlf gemfile") else {
+            return;
+        };
+        std::fs::write(proj.join("Gemfile"), gemfile).unwrap();
+        let relock = bundle(&proj, &["install"], false);
+        assert!(
+            relock.status.success(),
+            "{gemfile:?} installs before vendor (test premise):\n{}",
+            String::from_utf8_lossy(&relock.stderr)
+        );
+        let lock_before = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--json",
+                "--offline",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "{gemfile:?}: vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(env["summary"]["applied"], 1, "{gemfile:?}: {env}");
+        let wired = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+        assert!(
+            wired.contains(".socket/vendor/gem/")
+                && wired.matches("\r\n").count() == wired.matches('\n').count()
+                && wired.matches("\r\n").count() == wired.matches('\r').count(),
+            "{gemfile:?}: the vendored Gemfile must stay CRLF throughout: {wired:?}"
+        );
+
+        let install = bundle(&proj, &["install"], true);
+        assert!(
+            install.status.success(),
+            "{gemfile:?}: frozen install of the rewritten Gemfile failed:\n{wired}\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--revert",
+                "--json",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "{gemfile:?}: revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("Gemfile")).unwrap(),
+            gemfile,
+            "revert restores the Gemfile byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(proj.join("Gemfile.lock")).unwrap(),
+            lock_before,
+            "revert restores Gemfile.lock byte-identical"
+        );
+    }
+}
+
 /// The gem library a #985 project builds: its gemspec declares rack as a
 /// development dependency. Writes `Gemfile` (the given body), the gemspec
 /// and its lib, then installs unfrozen.
