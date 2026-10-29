@@ -1418,6 +1418,8 @@ mod tests {
                 true,
             ),
             ("-e git+https://example.com/click.git#egg=click\n", true),
+            ("git+https://example.com/click.git#egg=click\n", true),
+            ("../wheels/click-8.1.7-py3-none-any.whl\n", true),
             (
                 "click @ https://files.pythonhosted.org/packages/click-8.1.6-py3-none-any.whl\n",
                 false,

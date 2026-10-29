@@ -457,7 +457,9 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
 /// included), and a line counts when discovery would read it as evidence
 /// against the wiring: an `==` / `===` pin of the release (extras and
 /// per-requirement options allowed), a direct reference or editable
-/// checkout naming the package (any version: its artifact is not ours).
+/// checkout naming the package (any version: its artifact is not ours),
+/// and a bare url / VCS / path line whose artifact filename or `#egg=`
+/// names it (at the filename's version, else any).
 pub(super) async fn pin_outside_root(
     root: &Path,
     canon_name: &str,
@@ -492,6 +494,11 @@ fn installs_outside_vendor(content: &str, canon_name: &str, version: &str) -> bo
         let code = split_comment(&line.text).0.trim();
         if let Some(location) = editable_location(code) {
             return egg_name(location).is_some_and(names);
+        }
+        if let Some((name, pinned)) = crate::vex::discover::pypi_other::bare_line_release(code) {
+            return names(&name)
+                && pinned
+                    .is_none_or(|pinned| crate::utils::pep440::versions_equal(&pinned, version));
         }
         let Some(req) = parse_requirement(code).filter(|req| names(req.name)) else {
             return false;

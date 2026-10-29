@@ -4217,6 +4217,9 @@ mod tests {
             "six @ https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\n",
             "-e git+https://example.com/six.git#egg=six\n",
             "--editable=git+https://example.com/six.git#egg=six\n",
+            "git+https://example.com/six.git#egg=six\n",
+            "https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\n",
+            "../wheels/six-1.16.0-py2.py3-none-any.whl\n",
         ]
         .into_iter()
         .map(|text| (text, text.as_bytes().to_vec()))
@@ -4236,6 +4239,26 @@ mod tests {
                 err.map_err(|(code, _)| code).map(|(flavor, _)| flavor),
                 Err("pypi_requirements_outside_root"),
                 "{shape}"
+            );
+        }
+
+        // A bare artifact of another release, or of another package, is
+        // not this pin.
+        for other in [
+            "https://files.pythonhosted.org/packages/six-1.15.0-py2.py3-none-any.whl\n",
+            "../wheels/idna-3.7-py3-none-any.whl\n",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("app");
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            touch(tmp.path(), "base.txt", other).await;
+            touch(&root, "pylock.toml", &pylock).await;
+            touch(&root, "requirements.txt", "-r ../base.txt\n").await;
+            assert!(
+                detect_pypi_flavor(&root, Some(("six", "1.16.0")))
+                    .await
+                    .is_ok(),
+                "{other}"
             );
         }
     }

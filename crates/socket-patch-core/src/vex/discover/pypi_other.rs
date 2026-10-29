@@ -608,29 +608,48 @@ fn emit(
 /// requirements line names its package only through its filename or an
 /// `#egg=` fragment, so one with neither (a source directory) is left out.
 fn foreign_reference(entry: &Entry<'_>, location: &str, out: &mut Discovery) {
+    let Some((name, version)) = foreign_release(entry.name, location, entry.pinned_version) else {
+        return;
+    };
+    match version {
+        Some(version) => out.resolved_elsewhere(entry.file, pypi_purl(&name, &version)),
+        None => out.resolved_elsewhere_any_version(entry.file, pypi_name_purl(&name)),
+    }
+}
+
+/// The `(name, version)` a non-Socket reference `location` installs, read
+/// as [`foreign_reference`] documents: `name` is the declared one, else the
+/// artifact filename's, else the `#egg=` fragment's; `None` version means
+/// any. `None` when no package name can be read.
+fn foreign_release<'a>(
+    declared: Option<&'a str>,
+    location: &'a str,
+    pinned: Option<&'a str>,
+) -> Option<(String, Option<String>)> {
     let leaf = artifact_leaf(location).and_then(|leaf| vendored_leaf_purl("pypi", &leaf));
     let leaf = leaf
         .as_deref()
         .and_then(|purl| purl.strip_prefix("pkg:pypi/"))
         .and_then(|nv| nv.rsplit_once('@'));
-    let Some(name) = entry
-        .name
+    let name = declared
         .or(leaf.map(|(name, _)| name))
-        .or_else(|| egg_name(location))
-    else {
-        return;
-    };
+        .or_else(|| egg_name(location))?;
     let version = leaf
         .filter(|(leaf_name, _)| *leaf_name == canonicalize_pypi_name(name))
         .map(|(_, version)| version)
-        .or_else(|| {
-            entry
-                .pinned_version
-                .filter(|v| !v.is_empty() && !v.contains('*'))
-        });
-    match version {
-        Some(version) => out.resolved_elsewhere(entry.file, pypi_purl(name, version)),
-        None => out.resolved_elsewhere_any_version(entry.file, pypi_name_purl(name)),
+        .or_else(|| pinned.filter(|v| !v.is_empty() && !v.contains('*')));
+    Some((name.to_string(), version.map(str::to_string)))
+}
+
+/// The `(name, version)` a bare url / path requirements line
+/// (`git+https://…#egg=six`, `../six-1.16.0-py3-none-any.whl`) installs, as
+/// discovery reads it ([`foreign_release`]; `None` version means any).
+/// `None` for any other line, and for a vendored wheel path. The vendored
+/// planner refuses the same lines discovery counts as evidence (#1851).
+pub(crate) fn bare_line_release(code: &str) -> Option<(String, Option<String>)> {
+    match requirement_location(code)? {
+        (None, location) if !mentions_vendor_dir(location) => foreign_release(None, location, None),
+        _ => None,
     }
 }
 
