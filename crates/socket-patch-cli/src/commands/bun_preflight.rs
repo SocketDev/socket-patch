@@ -1,17 +1,12 @@
-//! The Bun vendored-mode preflight shared by EVERY path that feeds the
-//! vendor engine: `scan --mode vendored` (its in-memory download phase),
-//! `get … --mode vendored`
-//! (search and uuid paths), their `--dry-run` previews, and the `vendor` command's engine
-//! loop itself ([`crate::commands::vendor::vendor_records`], where it runs
-//! BEFORE the hosted→vendored takeover reverts anything).
+//! The Bun vendored-mode preflight shared by every path that feeds the
+//! vendor engine: `scan --mode vendored`, `get … --mode vendored`, their
+//! `--dry-run` previews, and the `vendor` command itself (BEFORE the
+//! hosted→vendored takeover reverts anything).
 //!
-//! One read-only [`preflight_vendor`] per run, evaluated before any
-//! `/patches/view/` fetch and before any write, so an incompatible Bun
-//! project (malformed binary `bun.lockb`, an unreadable lock, an
-//! unsupported `lockfileVersion`, a pre-version-2 `workspace:` lock) never
-//! has a patch downloaded on its behalf — let alone recorded in the
-//! manifest, or its live hosted redirect stripped — and every entry point
-//! reports the SAME vendor code the engine would have emitted.
+//! It runs [`preflight_vendor`] once, before any `/patches/view/` fetch and
+//! before any write, so an incompatible Bun project never has a patch
+//! downloaded, recorded, or its hosted redirect stripped, and every entry
+//! point reports the same vendor code the engine would have emitted.
 //!
 //! [`preflight_vendor`]: socket_patch_core::vendor::bun_lock::preflight_vendor
 
@@ -23,58 +18,50 @@ use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::vendor::load_state;
 use socket_patch_core::vendor::state::VendorEntry;
 
-/// The vendor ledger as the preflight consumes it: the caller's own
-/// `load_state` outcome, so an UNREADABLE ledger is a fact the refusal can
-/// report instead of a silently-emptied exemption set.
+/// The caller's own `load_state` outcome, so an unreadable ledger is a fact
+/// the refusal can report instead of a silently-emptied exemption set.
 pub(crate) type LedgerLoad<'a> = Result<&'a HashMap<String, VendorEntry>, &'a std::io::Error>;
 
 /// The outcome of the preflight when the project is refused.
 ///
-/// `exempt` holds the selected purls the refusal must NOT pre-empt — they
-/// flow through to the engine, which lets them in exactly as on a non-Bun
-/// project. A purl is exempt only when `bun.lock` wires every instance of
-/// its `name@version` to one of our `.socket/vendor/npm/` tuples, at any
-/// UUID ([`wired_instances_all_ours`]). This matches the engine's workspace
-/// gate: updating an already-local tuple introduces no new relative path,
-/// so in-sync runs, superseding patches and repairs remain supported.
-///
+/// `exempt` holds the selected purls the refusal must NOT pre-empt. A purl
+/// is exempt only when `bun.lock` wires every instance of its
+/// `name@version` to one of our `.socket/vendor/npm/` tuples, at any UUID
+/// ([`wired_instances_all_ours`]). This matches the engine's workspace
+/// gate: updating an already-local tuple introduces no new relative path.
 /// A matching ledger UUID alone is insufficient: `rollback --preserve-state`
 /// retains the entry after removing its wiring.
 ///
 /// An unreadable ledger exempts nothing (fail closed) and the refusal
-/// itself becomes `vendor_state_unreadable` with the io/parse detail:
-/// the vendor step does NOT reliably report the corrupt ledger itself
-/// (`get <uuid> --mode vendored` returns before it runs, and the
-/// scan/search paths reach it only when the manifest already holds another
-/// vendorable record), so the one refusal this run emits has to name the
-/// real problem rather than send the operator off to re-lock bun.lock.
+/// becomes `vendor_state_unreadable`: the vendor step does not reliably
+/// report the corrupt ledger itself (`get <uuid> --mode vendored` returns
+/// before it runs), so this refusal has to name the real problem rather
+/// than send the operator off to re-lock bun.lock.
 ///
 /// [`wired_instances_all_ours`]: socket_patch_core::vendor::bun_lock::wired_instances_all_ours
 pub(crate) struct BunVendorRefusal {
-    /// The stable vendor error code (`vendor_bun_lockb_invalid`,
-    /// `vendor_lockfile_missing`, `vendor_lockfile_version_unsupported`,
-    /// `vendor_bun_workspace_unsupported`) — the same string the vendor
-    /// engine would have emitted as a `failed` event — or
-    /// `vendor_state_unreadable` when the ledger could not be read.
+    /// The vendor error code the engine would have emitted, or
+    /// `vendor_state_unreadable`.
     pub(crate) code: &'static str,
-    /// The engine's (or the ledger loader's) human-readable detail, relayed
-    /// verbatim.
     pub(crate) detail: String,
     exempt: HashSet<String>,
 }
 
 impl BunVendorRefusal {
-    /// Whether the refusal applies to `purl`: npm-family only (no other
-    /// ecosystem's backend consults `bun.lock`), minus the already-vendored
-    /// exemption.
+    /// npm-family only (no other ecosystem's backend consults `bun.lock`),
+    /// minus the already-vendored exemption.
     pub(crate) fn applies_to(&self, purl: &str) -> bool {
-        Ecosystem::from_purl(purl) == Some(Ecosystem::Npm) && !self.exempt.contains(purl)
+        is_npm(purl) && !self.exempt.contains(purl)
     }
 }
 
-/// Run the Bun preflight once for `selected` — only when it holds at least
-/// one npm purl, since nothing else can be affected — loading the vendor
-/// ledger at `cwd` to detect corruption. `None` means nothing to refuse.
+fn is_npm(purl: &str) -> bool {
+    Ecosystem::from_purl(purl) == Some(Ecosystem::Npm)
+}
+
+/// The preflight for `selected`, loading the vendor ledger only once the
+/// project is known to refuse, so an accepted project never touches
+/// `state.json`.
 pub(crate) async fn bun_vendor_preflight(
     cwd: &Path,
     selected: &[PatchSearchResult],
@@ -82,9 +69,7 @@ pub(crate) async fn bun_vendor_preflight(
     preflight_pairs(cwd, &selection_pairs(selected), None).await
 }
 
-/// [`bun_vendor_preflight`] for callers that already loaded the ledger (the
-/// detached download phase, the dry-run preview), handed the load outcome
-/// so an unreadable ledger reports as such.
+/// [`bun_vendor_preflight`] with the caller's ledger load.
 pub(crate) async fn bun_vendor_preflight_with_ledger(
     cwd: &Path,
     selected: &[PatchSearchResult],
@@ -93,10 +78,8 @@ pub(crate) async fn bun_vendor_preflight_with_ledger(
     preflight_pairs(cwd, &selection_pairs(selected), Some(ledger)).await
 }
 
-/// The preflight over bare `(purl, uuid)` pairs — the `vendor` command's
-/// view of its selection (manifest records, not search results) — with a
-/// caller-loaded ledger. `None` when no npm purl is selected or the
-/// project is accepted.
+/// The preflight over bare `(purl, uuid)` pairs (the `vendor` command's
+/// manifest records) with the caller's ledger load.
 pub(crate) async fn bun_vendor_preflight_pairs(
     cwd: &Path,
     pairs: &[(&str, &str)],
@@ -105,19 +88,15 @@ pub(crate) async fn bun_vendor_preflight_pairs(
     preflight_pairs(cwd, pairs, Some(ledger)).await
 }
 
-/// The one preflight every entry point above funnels into. `ledger` is the
-/// caller's own load when it has one; `None` loads the ledger here — and
-/// only once the project is known to refuse, so an accepted project never
-/// touches `state.json` (the vendor step owns it).
+/// `ledger` is the caller's own load, or `None` to load it here once the
+/// project is known to refuse. `None` when no npm purl is selected or the
+/// project is accepted.
 async fn preflight_pairs(
     cwd: &Path,
     pairs: &[(&str, &str)],
     ledger: Option<LedgerLoad<'_>>,
 ) -> Option<BunVendorRefusal> {
-    if !pairs
-        .iter()
-        .any(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Npm))
-    {
+    if !pairs.iter().any(|(purl, _)| is_npm(purl)) {
         return None;
     }
     // vlt wins the router (DESIGN D2): a Bun lock beside `vlt-lock.json`
@@ -139,7 +118,31 @@ async fn preflight_pairs(
             loaded.as_ref().map(|s| &s.entries)
         }
     };
-    Some(refusal_with_exemptions(cwd, code, detail, pairs, ledger).await)
+    if let Err(e) = ledger {
+        return Some(BunVendorRefusal {
+            code: "vendor_state_unreadable",
+            detail: e.to_string(),
+            exempt: HashSet::new(),
+        });
+    }
+    // The exemption exists only for the workspace gate: every other code
+    // means bun.lock could not be read or parsed, so nothing in it is ours.
+    let mut exempt = HashSet::new();
+    if code == "vendor_bun_workspace_unsupported" {
+        for (purl, _) in pairs.iter().filter(|(purl, _)| is_npm(purl)) {
+            if socket_patch_core::vendor::bun_lock::wired_instances_all_ours(cwd, purl)
+                .await
+                .unwrap_or(false)
+            {
+                exempt.insert((*purl).to_string());
+            }
+        }
+    }
+    Some(BunVendorRefusal {
+        code,
+        detail,
+        exempt,
+    })
 }
 
 fn selection_pairs(selected: &[PatchSearchResult]) -> Vec<(&str, &str)> {
@@ -147,50 +150,6 @@ fn selection_pairs(selected: &[PatchSearchResult]) -> Vec<(&str, &str)> {
         .iter()
         .map(|s| (s.purl.as_str(), s.uuid.as_str()))
         .collect()
-}
-
-/// Turn the engine's project-level refusal into the per-purl verdict: the
-/// live-lock exemption described on [`BunVendorRefusal`], or the
-/// `vendor_state_unreadable` refusal when the ledger cannot be read.
-async fn refusal_with_exemptions(
-    cwd: &Path,
-    code: &'static str,
-    detail: String,
-    pairs: &[(&str, &str)],
-    ledger: LedgerLoad<'_>,
-) -> BunVendorRefusal {
-    if let Err(e) = ledger {
-        return BunVendorRefusal {
-            code: "vendor_state_unreadable",
-            detail: e.to_string(),
-            exempt: HashSet::new(),
-        };
-    }
-    // The lock-derived exemption exists only for the workspace gate: every
-    // other preflight code means bun.lock could not be read or parsed, so
-    // nothing in it can be ours and re-reading it per purl would be wasted
-    // (guarded, but still) I/O.
-    let lock_parsed = code == "vendor_bun_workspace_unsupported";
-    let mut exempt = HashSet::new();
-    for (purl, _) in pairs {
-        if Ecosystem::from_purl(purl) != Some(Ecosystem::Npm) {
-            continue;
-        }
-        // A preserved ledger can outlive its wiring (rollback --preserve-state).
-        // Only live lock tuples prove the engine can skip the workspace gate.
-        let lock_all_ours = lock_parsed
-            && socket_patch_core::vendor::bun_lock::wired_instances_all_ours(cwd, purl)
-                .await
-                .unwrap_or(false);
-        if lock_all_ours {
-            exempt.insert((*purl).to_string());
-        }
-    }
-    BunVendorRefusal {
-        code,
-        detail,
-        exempt,
-    }
 }
 
 #[cfg(test)]
