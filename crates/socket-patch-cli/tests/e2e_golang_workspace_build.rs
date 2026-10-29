@@ -1439,7 +1439,9 @@ fn apply_never_writes_go_work_when_gowork_names_a_sibling_file() {
     let before = files(&w.root);
     let (code, out, stderr) = apply();
     assert_ne!(code, 0, "{out}\n{stderr}");
-    assert!(out.to_string().contains("has nowhere to go"), "{out}");
+    let text = out.to_string();
+    assert!(text.contains("has nowhere to go"), "{out}");
+    assert!(text.contains("GOWORK selects"), "{out}");
     assert_snapshot(&w.root, &before, "no root module, root go.work");
 
     std::fs::remove_file(w.root.join("go.work")).unwrap();
