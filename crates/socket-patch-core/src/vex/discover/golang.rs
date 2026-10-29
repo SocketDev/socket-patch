@@ -1836,8 +1836,10 @@ mod tests {
             );
         }
         let elsewhere = p.root().join("a").join("go.work");
-        // Absolute on this platform: `/nonexistent` has no drive on Windows.
-        let missing = p.root().join("nonexistent").join("go.work");
+        // Outside the project and absolute on this platform (`/nonexistent`
+        // has no drive on Windows, so go rejects it as relative).
+        let outside = tempfile::tempdir().unwrap();
+        let missing = outside.path().join("nonexistent").join("go.work");
         for (gowork, why) in [
             ("go.work".to_string(), "not an absolute path"),
             (missing.to_string_lossy().into_owned(), "other than"),
