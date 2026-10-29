@@ -1787,6 +1787,126 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
     );
 }
 
+/// #977: the `# socket-patch vendor:` comment is bookkeeping pip never
+/// reads. With it edited (respaced, a note appended) or stripped, a re-run
+/// of `vendor` is in sync instead of appending a second line for the same
+/// wheel, and `vendor --revert` still restores the registry pin.
+#[test]
+#[serial_test::serial]
+fn pip_requirements_revert_after_the_vendor_comment_is_edited() {
+    let Some(python) = find_python() else {
+        println!("SKIP e2e_vendor_pypi_build(pip #977): no python3/python on PATH");
+        return;
+    };
+    bake_leak_guards();
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("requirements.txt"), "idna==3.7\nsix==1.16.0\n").unwrap();
+    let venv = proj.join(".venv");
+    let mkvenv = tool(Path::new(python), &proj, &["-m", "venv", ".venv"], &[]);
+    assert_tool_ok(&mkvenv, "python -m venv");
+    let install = tool(
+        &venv.join("bin/pip"),
+        &proj,
+        &[
+            "install",
+            "--disable-pip-version-check",
+            "--quiet",
+            "--no-cache-dir",
+            "-r",
+            "requirements.txt",
+        ],
+        &[],
+    );
+    if !install.status.success() {
+        println!(
+            "SKIP e2e_vendor_pypi_build(pip #977): `pip install` failed (PyPI \
+             unreachable?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    stage_patch(&proj, &site_packages(&venv).join("six.py"));
+    let requirements_before = std::fs::read(proj.join("requirements.txt")).unwrap();
+    let blobs = proj.join(".socket/blobs");
+    let blobs_before = tmp.path().join("blobs");
+    copy_dir_recursive(&blobs, &blobs_before);
+
+    let edits: [(&str, fn(&str) -> String); 3] = [
+        ("respaced", |l| {
+            l.replace("  # socket-patch vendor", " # socket-patch vendor")
+        }),
+        ("note appended", |l| format!("{l}  # CVE fix, do not bump")),
+        ("stripped", |l| {
+            l.split("  # socket-patch vendor")
+                .next()
+                .unwrap()
+                .to_string()
+        }),
+    ];
+    for (edit, apply_edit) in edits {
+        if !blobs.exists() {
+            copy_dir_recursive(&blobs_before, &blobs);
+        }
+        let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+        assert_eq!(
+            code, 0,
+            "{edit}: vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let wired = std::fs::read_to_string(proj.join("requirements.txt")).unwrap();
+        let line = wired
+            .lines()
+            .find(|l| l.contains(".socket/vendor/pypi/"))
+            .unwrap_or_else(|| panic!("{edit}: no vendor line:\n{wired}"))
+            .to_string();
+        let edited = wired.replace(&line, &apply_edit(&line));
+        assert_ne!(edited, wired, "{edit}");
+        std::fs::write(proj.join("requirements.txt"), &edited).unwrap();
+
+        // Re-vendor: in sync, no second wheel line.
+        let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
+        assert_eq!(
+            code, 0,
+            "{edit}: re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let after = std::fs::read_to_string(proj.join("requirements.txt")).unwrap();
+        assert_eq!(
+            after, edited,
+            "{edit}: re-vendor must leave the wired file alone"
+        );
+
+        let (code, stdout, stderr) = run_socket(
+            &proj,
+            &[
+                "vendor",
+                "--revert",
+                "--json",
+                "--cwd",
+                proj.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "{edit}: revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let renv = parse_envelope(&stdout);
+        assert_eq!(
+            renv["summary"]["removed"], 1,
+            "{edit}: one entry reverted: {renv}"
+        );
+        assert_eq!(
+            std::fs::read(proj.join("requirements.txt")).unwrap(),
+            requirements_before,
+            "{edit}: revert must restore the registry pin"
+        );
+        assert!(
+            !proj.join(".socket/vendor").exists(),
+            "{edit}: .socket/vendor must be removed after revert"
+        );
+    }
+}
+
 #[test]
 #[serial_test::serial]
 fn pip_vendored_requirements_evaluate_environment_markers() {
