@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-29T01Z (run 53), main `ecd4924` (v5.0.1 `latest`). #1792 merged and closed #1791 (verified: a v5.0.1-broken bin recovers on `apply`, and `rollback` is byte-exact). Run 53 filed #1804, a regression from #1792: with `bin-links=false` or a non-registry `directories.bin`-only package, npm keeps the CRLF shebang, but main writes the LF form, so rollback isn't byte-exact. **Open npm bughunt issues: #1782 and #1804.** Every issue number marked `fail` in the matrix below other than these two is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
+Last updated: 2026-10-29T07Z (run 54), main `ecd4924` (unchanged since run 53; v5.0.1 `latest`). Run 54 found two more #1804 shapes (bin-name collision, `rebuild-bundle=false` bundle), commented on #1804, and verified that draft PR #1805 fixes both. **Open npm bughunt issues: #1782 (PR #1783) and #1804 (PR #1805).** Every issue number marked `fail` in the matrix below other than these two is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -33,6 +33,12 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Linux | 10.9.9 / 11.21.1 suites (run 50) | n/a | pass: `e2e_vendor_npm_build` 43/43 (both) | pass: `e2e_redirect_npm_build` 30/30 plus the 6 `#[ignore]` real-npm legs via `--ignored` (both) | n/a |
 | Linux | 6.14.18 / 10.9.4 / 12.2.1, CRLF-shebang bin npm doesn't link (`--no-bin-links`; `directories.bin`-only `file:` tarball) (run 53) | **fail #1804** (main writes the LF `fixBin` form, `rollback` not byte-exact; `--no-bin-links` on all three, `directories.bin` on 10.9.4). `b4b6d98` / v5.0.1 pass | untested | untested | n/a |
 | Linux | 10.9.4, v5.0.1-broken CRLF bin upgraded to main (run 53) | pass (#1791 fixed: `apply` rewrites, bin runs, `apply --check`, `vex`, `repair`, byte-exact `rollback`) | n/a | n/a | n/a |
+
+## Run 54 (2026-10-29T07Z, main `ecd4924`)
+
+- Main unchanged since run 53. Not re-triaged: #1782 and #1804 are both claimed with draft PRs (#1783, #1805), and their code is unchanged on main.
+- Two more #1804 shapes, both of which fail on main: (1) a **bin-name collision**: two deps declare bin `x`, and bin-links' `seen` set plus `linked && fixBin` leave the losing package's CRLF shebang (npm 10.9.4 2/2, 12.2.1; npm 6.14.18 passes because it runs `fixBin` on both packages); (2) a **bundled dep with `--no-rebuild-bundle`** (npm 6.14.18 / 10.9.4 2/2 / 12.2.1). A bundled dep with the default `rebuild-bundle` passes: npm runs `fixBin` on it and main agrees. PR #1805 (`5789c73`) passes all of these on npm 10.9.4 and 12.2.1. Commented on #1804.
+- Non-bug: after `rm -rf node_modules/<pkg> && npm install`, a surviving `.bin` link makes `link-gently` return SKIP, so npm leaves a CRLF bin that exits 127. Main writes LF, which repairs the bin.
 
 ## Run 53 (2026-10-29T01Z, main `ecd4924`)
 
@@ -276,6 +282,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-29T07Z:** when #1805 lands, re-run its shapes on main: collision, `--no-rebuild-bundle`, `--no-bin-links`, `directories.bin` `file:`, the #1791 recovery, and a global `-g` bin under `<prefix>/bin`. Also test #1805 on a workspace member (`.bin` at the root `node_modules`, hoisted) and under `install-strategy=linked` (does the `.store` virtual-store check keep the listing?). Re-check #1782 when #1783 lands. Hosted / vendored `vex` with a CRLF bin (mock) is still open.
 - **New 2026-10-29T01Z:** re-check #1804 when fixed (`bin-links=false` in `.npmrc`, `directories.bin` with `file:` dir / git deps, and the #1791 recovery must still pass). A bundled dep with a CRLF bin: does npm `fixBin` it, and does main agree? Hosted / vendored `vex` with a CRLF bin (mock). Re-check #1782 when its fix lands.
 - **New 2026-10-28T19Z:** re-check #1791 when fixed (apply / repair / rollback over a v5.0.1-overwritten bin; also a non-bin file with a CRLF shebang must keep CRLF). Re-run the hosted / vendored `vex` halves of #1756 on `b4b6d98` with the mock (npm 8 / 12). Re-check #1782 when its fix lands (the kill-test plan below).
 - **New 2026-10-28T13Z:** re-check #1782 when fixed: kill the eject at each rename (an `LD_PRELOAD` rename shim works; strace `-P` doesn't match relative paths), and with SIGINT / SIGTERM. A multi-package eject: does the window grow per package? (`vendor --revert` / hosted `rollback` kill-tested in run 51: they converge.) Re-check #1756 when #1757 lands. (Add-a-file on npm 12 / linked: done, pass.)
@@ -338,6 +345,8 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- `rm -rf node_modules/<pkg> && npm install` with the `.bin/<name>` link still present: npm skips `fixBin` (`link-gently` SKIP) and leaves a CRLF bin that exits 127. socket-patch writing the LF form there (so rollback isn't byte-exact against npm's broken bytes) is acceptable (run 54).
+- A bundled dep's CRLF bin with the default `rebuild-bundle=true`: npm runs `fixBin` on it (LF), and main's LF writes and byte-exact rollback are correct (run 54, npm 6 / 10 / 12).
 - A registry package that declares bins only via `directories.bin`: the packument carries the expanded `bin`, so npm links it and runs `fixBin`, and main's LF form is correct (run 53). Only non-registry installs hit #1804.
 
 - A Ctrl-C or kill during the eject's artifact *download* is safe: the download runs before the upstream restore, so the lock is still hosted (main `b787454`, 2026-10-28T13Z).
