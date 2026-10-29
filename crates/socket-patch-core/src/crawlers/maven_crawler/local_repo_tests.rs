@@ -256,6 +256,34 @@ fn settings_local_repository_is_read_as_xml() {
     assert_eq!(m2_repo(&e, Os::Unix), Some(data.path().to_path_buf()));
 }
 
+/// A comment inside `<localRepository>` is not part of its value, as
+/// Maven's parser skips it; text and CDATA around it join up.
+#[test]
+fn settings_local_repository_skips_comments() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let user_settings = home.path().join(".m2").join("settings.xml");
+    let e = env(&[("HOME", home.path())]);
+    let data_s = data.path().to_str().unwrap();
+
+    write(
+        &user_settings,
+        &settings(&format!("<!-- moved -->{data_s}")),
+    );
+    assert_eq!(m2_repo(&e, Os::Unix), Some(data.path().to_path_buf()));
+
+    write(
+        &user_settings,
+        &settings(&format!(
+            "\n  {data_s}<!-- was /old -->/r&amp;<![CDATA[&x]]>\n"
+        )),
+    );
+    assert_eq!(
+        m2_repo(&e, Os::Unix),
+        Some(PathBuf::from(format!("{data_s}/r&&x")))
+    );
+}
+
 /// A command-line `-Duser.home` (MAVEN_ARGS) is set after Maven has
 /// derived its `~/.m2` paths, so it does not move them.
 #[test]

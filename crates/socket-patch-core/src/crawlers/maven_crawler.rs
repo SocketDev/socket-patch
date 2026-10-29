@@ -705,18 +705,34 @@ fn settings_local_repository(
                 .iter()
                 .any(|p| e.start > p.start && e.start < p.end)
         })?;
-    // Read from the unmasked text (offsets are kept), so a CDATA value is
-    // its character data and entities decode, as Maven's parser does.
-    let inner = raw[element.inner_start..element.inner_end].trim();
-    let value = match inner
-        .strip_prefix("<![CDATA[")
-        .and_then(|rest| rest.strip_suffix("]]>"))
-    {
-        Some(cdata) => cdata.trim().to_string(),
-        None => crate::formats::nuget::decode_entities(inner),
-    };
-    let repo = PathBuf::from(interpolate(&value, lookup)?);
+    // Read from the unmasked text (offsets are kept), so CDATA is its
+    // character data, entities decode and comments drop out, as Maven's
+    // parser does.
+    let value = character_data(&raw[element.inner_start..element.inner_end])?;
+    let repo = PathBuf::from(interpolate(value.trim(), lookup)?);
     repo.has_root().then_some(repo)
+}
+
+/// The character data of a text-only element's raw content: text with its
+/// entities decoded, CDATA sections verbatim, comments skipped. `None` when
+/// a comment or CDATA section is unterminated.
+fn character_data(inner: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = inner;
+    while let Some(at) = rest.find("<!") {
+        out.push_str(&crate::formats::nuget::decode_entities(&rest[..at]));
+        rest = &rest[at..];
+        if let Some(body) = rest.strip_prefix("<![CDATA[") {
+            let end = body.find("]]>")?;
+            out.push_str(&body[..end]);
+            rest = &body[end + 3..];
+        } else {
+            let end = rest.strip_prefix("<!--")?.find("-->")?;
+            rest = &rest[4 + end + 3..];
+        }
+    }
+    out.push_str(&crate::formats::nuget::decode_entities(rest));
+    Some(out)
 }
 
 /// `text` with every `${name}` replaced by `lookup(name)`; `None` when one

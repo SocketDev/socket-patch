@@ -41,6 +41,7 @@ impl NoJvmCaches {
             "MAVEN_OPTS",
             "MAVEN_ARGS",
             "MAVEN_HOME",
+            "M2_HOME",
         ];
         let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
         for key in keys {
