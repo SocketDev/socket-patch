@@ -2125,6 +2125,15 @@ fn gem_vendor_crlf_lock_fresh_checkout_and_revert() {
     let crlf = lf.replace('\n', "\r\n");
     std::fs::write(&lock_path, &crlf).unwrap();
     let gemfile_before = std::fs::read(&gemfile_path).unwrap();
+    // Some bundlers (4.0.21) refuse a frozen install of any CRLF lock, even
+    // one socket-patch never touched; the frozen leg below then has nothing
+    // to compare against.
+    let pristine = tmp.path().join("pristine");
+    std::fs::create_dir_all(&pristine).unwrap();
+    std::fs::copy(&gemfile_path, pristine.join("Gemfile")).unwrap();
+    std::fs::copy(&lock_path, pristine.join("Gemfile.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".bundle"), &pristine.join(".bundle"));
+    let frozen_crlf_ok = bundle(&pristine, &["install"], true).status.success();
     let cwd = proj.to_str().unwrap();
     let vendor = |extra: &[&str]| {
         let mut args = vec!["vendor", "--json", "--offline", "--cwd", cwd];
@@ -2163,22 +2172,28 @@ fn gem_vendor_crlf_lock_fresh_checkout_and_revert() {
 
     // Bundler reads the CRLF pair as wired and keeps it byte-identical.
     let fresh = tmp.path().join("fresh");
+    if !frozen_crlf_ok {
+        println!(
+            "SKIP frozen leg of e2e_vendor_gem_build (crlf lock): this bundler refuses a \
+             frozen install of the pristine CRLF lock too"
+        );
+    }
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
     copy_dir_recursive(&proj.join(".bundle"), &fresh.join(".bundle"));
-    let ci = bundle(&fresh, &["install"], true);
+    let ci = bundle(&fresh, &["install"], frozen_crlf_ok);
     assert!(
         ci.status.success(),
-        "frozen install of the CRLF pair:\nstdout:\n{}\nstderr:\n{}",
+        "install of the CRLF pair (frozen: {frozen_crlf_ok}):\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
     );
     assert_eq!(
         std::fs::read_to_string(fresh.join("Gemfile.lock")).unwrap(),
         wired,
-        "frozen install leaves the CRLF lock byte-identical"
+        "bundler accepts the wired CRLF lock as is"
     );
 
     let (code, stdout, stderr) = vendor(&[]);
