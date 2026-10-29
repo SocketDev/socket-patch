@@ -3406,21 +3406,14 @@ async fn run_scan(
         }
     }
 
-    // What the dry-run line offers.
-    let plan = if vendor {
-        render::Plan::Vendor(selected.len())
-    } else {
-        render::Plan::Apply(selected.len())
-    };
-
     // `--dry-run` is a non-mutating preview: stop here, having printed the
     // table and the per-patch plan above, before the download/apply and the
     // prune GC (which runs as a read-only preview instead).
     if args.common.dry_run {
         if !silent {
             // Vendored preview: the JSON arm's ledger classification,
-            // rendered as `[would-refuse]` lines so a preview never
-            // advertises vendoring the wet run would refuse.
+            // rendered as `[skip]` and `[would-refuse]` lines so a preview
+            // never advertises vendoring the wet run would skip or refuse.
             let preview = if vendor {
                 let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
                     &args.common,
@@ -3439,10 +3432,12 @@ async fn run_scan(
             } else {
                 None
             };
-            let refused = preview.as_ref().map_or(0, |p| p.refused_count());
-            println!("{}", render::dry_run_line(plan, refused));
-            if let Some(preview) = &preview {
-                preview.print_refusals();
+            match &preview {
+                Some(preview) => preview.print_human(),
+                None => println!(
+                    "{}",
+                    render::dry_run_line(render::Plan::Apply(selected.len()))
+                ),
             }
         }
         print_rollout_human(&stage, true, silent);

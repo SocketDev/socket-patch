@@ -105,6 +105,51 @@ async fn human_vendored_uuid_dry_run_prints_line() {
     assert!(!tmp.path().join(".socket").exists());
 }
 
+/// #1850: `get <uuid> --mode vendored --dry-run` on a project the ledger
+/// already holds at this uuid shares scan's preview headline: nothing to
+/// download and vendor, and the in-sync patch named as skipped.
+#[tokio::test]
+async fn human_vendored_uuid_dry_run_skips_already_vendored() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(
+        vendor_dir.join("state.json"),
+        serde_json::json!({
+            "version": 1,
+            "entries": { PURL: {
+                "ecosystem": "npm", "basePurl": PURL, "uuid": UUID,
+                "artifact": { "path": format!(".socket/vendor/npm/{UUID}/{NAME}-1.0.0.tgz") },
+                "wiring": [],
+            }}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--mode", "vendored", "--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(
+            "[dry-run] Would download and vendor 0 of 1 patch (1 already vendored). \
+             No changes made."
+        ),
+        "stdout={stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("  [skip] {PURL} (already vendored)")),
+        "stderr={stderr}"
+    );
+}
+
 /// Human search-path vendored dry-run line (the pluralized count flavor).
 #[tokio::test]
 async fn human_vendored_search_dry_run_prints_count() {

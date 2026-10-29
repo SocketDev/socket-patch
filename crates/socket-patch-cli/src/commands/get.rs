@@ -2300,8 +2300,7 @@ async fn run_get_vendored(
             preview.record_into(&mut env);
             emit(&env);
         } else if !args.common.silent {
-            println!("{}", format_dry_run("download and vendor", selected.len()));
-            preview.print_refusals();
+            preview.print_human();
         }
         return 0;
     }
