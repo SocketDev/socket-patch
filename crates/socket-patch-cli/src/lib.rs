@@ -162,10 +162,31 @@ impl Commands {
             Commands::Get(_) | Commands::Scan(_) => self.global_args().validate_paths(true)?,
             other => other.global_args().validate_paths(false)?,
         }
-        match self {
-            Commands::Rollback(_) | Commands::Remove(_) | Commands::Repair(_) => Ok(()),
-            Commands::Vendor(args) if args.revert => Ok(()),
-            other => other.global_args().refuse_unloaded_deno_prefix(),
+        // Refuse a `--global-prefix` inside a Deno tool's `node_modules` that
+        // Deno never loads: patching it reported `applied` while the tool kept
+        // running the copy in Deno's npm cache. The restoring commands still
+        // reach a tree an earlier release patched.
+        let prefix = match self {
+            Commands::Rollback(_) | Commands::Remove(_) | Commands::Repair(_) => return Ok(()),
+            Commands::Vendor(args) if args.revert => return Ok(()),
+            other => &other.global_args().global_prefix,
+        };
+        match prefix {
+            Some(prefix)
+                if socket_patch_core::crawlers::deno_crawler::is_unloaded_deno_tool_node_modules(
+                    prefix,
+                ) =>
+            {
+                Err(format!(
+                    "--global-prefix (or SOCKET_GLOBAL_PREFIX) `{}` is inside a Deno tool's \
+                     node_modules that Deno does not load (the tool's Deno config leaves \
+                     nodeModulesDir unset or \"none\"); the tool runs its npm packages from \
+                     Deno's npm cache, so use -g, or --global-prefix naming $DENO_DIR or \
+                     $DENO_DIR/npm",
+                    prefix.display()
+                ))
+            }
+            _ => Ok(()),
         }
     }
 }
