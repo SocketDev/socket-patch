@@ -248,12 +248,13 @@ async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &st
 /// the target sits in an out-of-root `-r` include. pip installs that pin,
 /// vendor cannot edit the file, and naming requirements.txt a loser would
 /// let the lock wiring report the package patched.
+/// A pin the lock wiring rewrites with it ([`super::pypi_requirements::
+/// sibling_pin_wirable`]) never has one: the planner refuses it first.
 async fn refuse_pin_outside_root(
     project_root: &Path,
     target: Option<(&str, &str)>,
-    wired_with_lock: bool,
 ) -> Result<(), (&'static str, String)> {
-    let Some((name, version)) = target.filter(|_| !wired_with_lock) else {
+    let Some((name, version)) = target else {
         return Ok(());
     };
     match super::pypi_requirements::pin_outside_root(project_root, name, version).await {
@@ -414,7 +415,7 @@ async fn detect_pypi_flavor(
             }
             None => false,
         };
-        refuse_pin_outside_root(project_root, target, wired_with_lock).await?;
+        refuse_pin_outside_root(project_root, target).await?;
         if !wired_with_lock && exists(PYPI_REQUIREMENTS).await {
             present.push(PYPI_REQUIREMENTS);
         }
@@ -469,7 +470,7 @@ async fn detect_pypi_flavor(
         _ => false,
     };
     if governing.is_some() {
-        refuse_pin_outside_root(project_root, target, wired_with_lock).await?;
+        refuse_pin_outside_root(project_root, target).await?;
     }
     if governing.is_some()
         && !wired_with_lock
@@ -4194,6 +4195,47 @@ mod tests {
                     .await
                     .is_ok(),
                 "{lock}"
+            );
+        }
+    }
+
+    /// #1851: every shape through which pip installs the release from an
+    /// out-of-root include refuses, as discovery would contest the wiring
+    /// it leaves: extras, `===`, per-requirement options, a direct
+    /// reference, an editable checkout, and a UTF-16 `pip freeze` export.
+    #[tokio::test]
+    async fn every_installing_shape_in_an_out_of_root_include_refuses() {
+        let pylock = PIPENV_PYLOCK.replace("pipenv", "pip");
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain("six==1.16.0\r\n".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let mut shapes: Vec<(&str, Vec<u8>)> = [
+            "six[socks]==1.16.0\n",
+            "six===1.16.0\n",
+            "Six==1.16.0 --config-settings=x=y\n",
+            "six @ https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\n",
+            "-e git+https://example.com/six.git#egg=six\n",
+            "--editable=git+https://example.com/six.git#egg=six\n",
+        ]
+        .into_iter()
+        .map(|text| (text, text.as_bytes().to_vec()))
+        .collect();
+        shapes.push(("utf-16 six==1.16.0", utf16));
+        for (shape, bytes) in shapes {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("app");
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            tokio::fs::write(tmp.path().join("base.txt"), &bytes)
+                .await
+                .unwrap();
+            touch(&root, "pylock.toml", &pylock).await;
+            touch(&root, "requirements.txt", "-r ../base.txt\n").await;
+            let err = detect_pypi_flavor(&root, Some(("six", "1.16.0"))).await;
+            assert_eq!(
+                err.map_err(|(code, _)| code).map(|(flavor, _)| flavor),
+                Err("pypi_requirements_outside_root"),
+                "{shape}"
             );
         }
     }

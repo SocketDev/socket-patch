@@ -446,22 +446,63 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
         && refuse_symlinked(root, &rels).await.is_ok()
 }
 
-/// The out-of-root `-r` include (`../shared/base.txt`) that pins
-/// `canon_name==version` exactly from the registry, if the requirements set
-/// has one (#1851). pip installs that pin, but vendor cannot edit the file,
-/// so wiring only a lock beside it would leave `pip install -r` on the
-/// upstream release: the lock flavors refuse it as the requirements-only
-/// planner does (`pypi_requirements_outside_root`).
+/// The out-of-root `-r` include (`../shared/base.txt`) through which pip
+/// installs `canon_name==version` from somewhere other than a vendored
+/// wheel, if the requirements set has one (#1851). Vendor cannot edit that
+/// file, so wiring only a lock beside it would leave `pip install -r` on
+/// the upstream release: the lock flavors refuse it as the
+/// requirements-only planner does (`pypi_requirements_outside_root`).
+///
+/// Files are decoded as pip decodes them (a UTF-16 `pip freeze` export
+/// included), and a line counts when discovery would read it as evidence
+/// against the wiring: an `==` / `===` pin of the release (extras and
+/// per-requirement options allowed), a direct reference or editable
+/// checkout naming the package (any version: its artifact is not ours).
 pub(super) async fn pin_outside_root(
     root: &Path,
     canon_name: &str,
     version: &str,
 ) -> Option<String> {
-    let files = collect_requirements_files(root).await.ok()?;
-    files
-        .into_iter()
-        .find(|f| !f.editable && !scan_pins(&f.content, canon_name, version).exact.is_empty())
-        .map(|f| f.rel)
+    let view = crate::vendor::lock_inventory::ProjectView::Disk(root);
+    let mut found = None;
+    let _ = walk_requirements_tree(view, decode_requirements, |rel, read| {
+        let Ok(content) = read else {
+            return Ok::<bool, std::convert::Infallible>(false);
+        };
+        if found.is_none()
+            && !is_in_root_rel(rel)
+            && installs_outside_vendor(&content, canon_name, version)
+        {
+            found = Some(rel.to_string());
+        }
+        Ok(true)
+    })
+    .await;
+    found
+}
+
+/// Whether a requirements file's `content` installs `canon_name==version`
+/// (see [`pin_outside_root`]) from a source other than a vendored wheel.
+fn installs_outside_vendor(content: &str, canon_name: &str, version: &str) -> bool {
+    use crate::utils::requirements::{
+        editable_location, egg_name, logical_lines, parse_requirement, split_comment,
+    };
+    let names = |name: &str| canonicalize_pypi_name(name) == canon_name;
+    logical_lines(content).iter().any(|line| {
+        let code = split_comment(&line.text).0.trim();
+        if let Some(location) = editable_location(code) {
+            return egg_name(location).is_some_and(names);
+        }
+        let Some(req) = parse_requirement(code).filter(|req| names(req.name)) else {
+            return false;
+        };
+        req.direct_reference
+            .is_some_and(|location| !location.contains(".socket/vendor/"))
+            || req
+                .exact_version()
+                .is_some_and(|pinned| crate::utils::pep440::versions_equal(pinned, version))
+            || req.arbitrary_version() == Some(version)
+    })
 }
 
 /// The `pypi_requirements_outside_root` refusal for a pin in the
@@ -1271,20 +1312,20 @@ pub(crate) async fn requirements_include_names_in(
 /// other, in walk order (#1851). Vendor never edits or names them
 /// ([`requirements_include_names_in`]), but pip installs their pins, so
 /// discovery reads them as evidence against a lock's wiring. A file that
-/// can't be read is skipped: the in-root walk already diagnoses a broken
-/// tree.
+/// exists but can't be read or decoded is named too, so the reader
+/// diagnoses it instead of losing its pins silently.
 pub(crate) async fn requirements_outside_root_names_in(
     view: crate::vendor::lock_inventory::ProjectView<'_>,
 ) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let _ = walk_requirements_tree(view, decode_requirements, |rel, read| {
-        if read.is_err() {
-            return Ok::<bool, std::convert::Infallible>(false);
-        }
-        if !is_in_root_rel(rel) {
+        // An unreadable one is still named, so the reader diagnoses it.
+        if !is_in_root_rel(rel)
+            && !matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
             names.push(rel.to_string());
         }
-        Ok(true)
+        Ok::<bool, std::convert::Infallible>(read.is_ok())
     })
     .await;
     names

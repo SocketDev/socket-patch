@@ -123,7 +123,8 @@ use crate::utils::digest::sha256_hex;
 use crate::utils::hatch::dependency_specs;
 use crate::utils::requirements;
 use crate::utils::requirements::{
-    hash_options, logical_lines, parse_requirement, split_comment, url_sha256_fragment, vendor_tag,
+    editable_location, egg_name, hash_options, logical_lines, parse_requirement, split_comment,
+    url_sha256_fragment, vendor_tag,
 };
 use crate::vendor::common::DeclTable;
 use crate::vendor::lock_inventory::pypi::{hosted_artifact_url, parse_pipfile_lock};
@@ -280,26 +281,44 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             continue;
         };
         for line in logical_lines(&text) {
-            outside_root_line(file, &line.text, out);
+            outside_root_line(ctx, file, &line.text, out);
         }
     }
 }
 
-/// One logical line of an out-of-root include: its registry pins and
-/// editable checkouts are evidence, nothing in it is wiring.
-fn outside_root_line(file: &str, line: &str, out: &mut Discovery) {
+/// One logical line of an out-of-root include. Nothing in it is wiring,
+/// but what pip installs from it is evidence: a registry pin, an editable
+/// checkout, and a direct reference to anything but a Socket artifact
+/// (read as [`foreign_reference`] reads an in-root one).
+fn outside_root_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Discovery) {
     let (code, _) = split_comment(line);
     let code = code.trim();
     if let Some(location) = editable_location(code) {
-        if let Some(name) = egg_name(location) {
-            out.resolved_elsewhere_any_version(file, pypi_name_purl(name));
+        if !mentions_vendor_dir(location) {
+            if let Some(name) = egg_name(location) {
+                out.resolved_elsewhere_any_version(file, pypi_name_purl(name));
+            }
         }
         return;
     }
-    if code.is_empty() || code.starts_with('-') || requirement_location(code).is_some() {
+    if code.is_empty() || code.starts_with('-') {
         return;
     }
-    registry_pin(file, code, out);
+    let Some((name, location)) = requirement_location(code) else {
+        registry_pin(file, code, out);
+        return;
+    };
+    if matches!(classify(ctx, location, url_form(location)), Ok(None)) {
+        let entry = Entry {
+            file,
+            name,
+            pinned_version: None,
+            tag: None,
+            root_uri: false,
+            foreign_is_evidence: true,
+        };
+        foreign_reference(&entry, location, out);
+    }
 }
 
 /// One logical requirements line (see the module docs for the two shapes).
@@ -343,40 +362,6 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
         integrity_of(location, hash_options(code)),
         out,
     );
-}
-
-/// The location of an editable requirement (`-e <loc>`, `-e<loc>`,
-/// `--editable <loc>`, `--editable=<loc>`), as pip's option parser reads it.
-fn editable_location(code: &str) -> Option<&str> {
-    let rest = if let Some(rest) = code.strip_prefix("--editable") {
-        match rest.strip_prefix('=') {
-            Some(rest) => rest,
-            None if rest.starts_with(char::is_whitespace) => rest,
-            None => return None,
-        }
-    } else {
-        // A short option takes its value attached or after a space.
-        let rest = code.strip_prefix("-e")?;
-        rest.strip_prefix('=').unwrap_or(rest)
-    };
-    rest.split_whitespace().next()
-}
-
-/// The package a VCS / url requirement names in its `#egg=<name>` fragment.
-/// A legacy `#egg=<name>-<version>` fragment names the package before its
-/// first `-<digit>`, as setuptools and older pip read it.
-fn egg_name(location: &str) -> Option<&str> {
-    let (_, fragment) = location.split_once('#')?;
-    let egg = fragment.split('&').find_map(|p| p.strip_prefix("egg="))?;
-    let end = egg
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-        .unwrap_or(egg.len());
-    let egg = &egg[..end];
-    let end = egg
-        .match_indices('-')
-        .find(|(i, _)| egg[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
-        .map_or(egg.len(), |(i, _)| i);
-    Some(&egg[..end]).filter(|name| !name.is_empty())
 }
 
 /// Record a registry requirement that can only install one release as

@@ -1412,6 +1412,16 @@ mod tests {
         for (base, contested) in [
             ("click==8.1.7\n", true),
             ("-r more.txt\n", true),
+            ("click[extra]===8.1.7 --config-settings=x=y\n", true),
+            (
+                "click @ https://files.pythonhosted.org/packages/click-8.1.7-py3-none-any.whl\n",
+                true,
+            ),
+            ("-e git+https://example.com/click.git#egg=click\n", true),
+            (
+                "click @ https://files.pythonhosted.org/packages/click-8.1.6-py3-none-any.whl\n",
+                false,
+            ),
             ("click==8.1.6\n", false),
             ("idna==3.7\n", false),
         ] {
@@ -1431,6 +1441,27 @@ mod tests {
                 assert!(out.contested.is_empty(), "{base:?}: {:#?}", out.contested);
             }
         }
+
+        // An include pip can't decode for this reader is diagnosed, not
+        // silently dropped.
+        let p = Project::nested("app");
+        p.write("pylock.toml", &lock)
+            .write("requirements.txt", "-r ../shared/base.txt\n");
+        std::fs::create_dir_all(p.root().join("../shared")).unwrap();
+        std::fs::write(
+            p.root().join("../shared/base.txt"),
+            b"\x80\x81click==8.1.7\n",
+        )
+        .unwrap();
+        let out = p.discover().await;
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_LOCKFILE_UNREADABLE
+                    && d.detail.contains("../shared/base.txt")),
+            "{:#?}",
+            out.diagnostics
+        );
     }
 
     #[tokio::test]
