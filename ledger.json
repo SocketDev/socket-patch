@@ -1,66 +1,55 @@
 {
-  "discussion": 560,
-  "discussion_url": "https://github.com/SocketDev/socket-patch/discussions/560",
-  "discussion_node_id": "D_kwDOQS_zEM4ApuI_",
-  "register_comment_id": "DC_kwDOQS_zEM4BHZiT",
-  "register_comment_url": "https://github.com/SocketDev/socket-patch/discussions/560#discussioncomment-18716819",
-  "review_snapshot": "2463257",
+  "discussion": 1830,
+  "discussion_url": "https://github.com/SocketDev/socket-patch/discussions/1830",
+  "discussion_node_id": "D_kwDOQS_zEM4AqpO5",
+  "register_comment_id": "DC_kwDOQS_zEM4BJgmp",
+  "register_comment_url": "https://github.com/SocketDev/socket-patch/discussions/1830#discussioncomment-19270057",
+  "started_at_main": "b291caa",
+  "previous_thread": {
+    "discussion": 560,
+    "archive": "review/2026-10-v1/"
+  },
   "routines": {
-    "audit-ecosystems": {
-      "trigger_id": "trig_011c8MKh4EpUVLRoY9utrxKc",
-      "name": "socket-patch architecture audit: ecosystems and formats",
+    "audit-core": {
+      "trigger_id": "trig_01HsW456BQWRLq1bxEDoXeMv",
+      "name": "socket-patch arch audit: core",
       "cron": "40 0,6,12,18 * * *"
     },
-    "audit-core": {
-      "trigger_id": "trig_01MwFn5EYKHCD1FNYAdbC1xN",
-      "name": "socket-patch architecture audit: CLI and core",
+    "audit-cli-tests": {
+      "trigger_id": "trig_01WmdhNjdQxeti1B4cuedRk2",
+      "name": "socket-patch arch audit: CLI and tests",
       "cron": "40 3,9,15,21 * * *"
     },
     "refactor": {
-      "trigger_id": "trig_01YJDeWJdcV9oqp7vBEdYMAe",
-      "name": "socket-patch architecture refactor: highest leverage (hourly)",
-      "cron": "55 * * * *"
+      "trigger_id": "trig_016qiS4DEccutYafgpit2qUt",
+      "name": "socket-patch arch refactor",
+      "cron": "55 */2 * * *"
     }
   },
   "doc_targets": {
     "doc/01-summary.md": {
       "kind": "discussion_body",
-      "id": "D_kwDOQS_zEM4ApuI_"
+      "id": "D_kwDOQS_zEM4AqpO5"
     },
-    "doc/02-cli.md": {
+    "doc/02-mechanisms.md": {
       "kind": "comment",
-      "id": "DC_kwDOQS_zEM4BHZiU"
+      "id": "DC_kwDOQS_zEM4BJgmr"
     },
-    "doc/03-hosted.md": {
+    "doc/03-duplication.md": {
       "kind": "comment",
-      "id": "DC_kwDOQS_zEM4BHZiX"
+      "id": "DC_kwDOQS_zEM4BJgmu"
     },
-    "doc/04-js-lockfiles.md": {
+    "doc/04-structure.md": {
       "kind": "comment",
-      "id": "DC_kwDOQS_zEM4BHZiZ"
+      "id": "DC_kwDOQS_zEM4BJgmv"
     },
-    "doc/05-vendored.md": {
+    "doc/05-tests.md": {
       "kind": "comment",
-      "id": "DC_kwDOQS_zEM4BHZib"
+      "id": "DC_kwDOQS_zEM4BJgmz"
     },
-    "doc/06-discovery-vex.md": {
+    "doc/06-history.md": {
       "kind": "comment",
-      "id": "DC_kwDOQS_zEM4BHZie"
-    },
-    "doc/07-infra-agent.md": {
-      "kind": "comment",
-      "id": "DC_kwDOQS_zEM4BHZig"
-    },
-    "doc/08-tests-ci-docs.md": {
-      "kind": "comment",
-      "id": "DC_kwDOQS_zEM4BHZih"
-    },
-    "doc/09-appendix.md": {
-      "kind": "comment",
-      "id": "DC_kwDOQS_zEM4BHZii"
+      "id": "DC_kwDOQS_zEM4BJgm1"
     }
-  },
-  "retired_routines": {
-    "trig_01NTdy2rEpze5NfvsG6RNs4v": "socket-patch architecture refactor (every 4h); disabled 2026-10-02, replaced by the hourly highest-leverage routine"
   }
 }

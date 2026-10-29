@@ -7,7 +7,8 @@
    tokens from the register, and update every target whose text changed.
 
 Tokens: {{E01}} one register row, {{E07-E20}} a range, {{E33,E45}} a list,
-{{PROGRESS}} the progress line, {{UPDATED}} the render time.
+{{PROGRESS}} the progress line, {{COVERAGE}} the file-by-file pass, {{UPDATED}}
+the render time.
 """
 import argparse
 import collections
@@ -27,7 +28,7 @@ ROW = re.compile(r'^\|\s*([A-Z][0-9]+)\s*\|')
 # a target is re-rendered whenever the ledger commit named in its stamp changes.
 RENDER_TIME = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC(?= \(ledger `)')
 ENTRY_MARKER = re.compile(r'<!-- arch-audit-entry: (\S+) -->')
-ORDER = ['fixed', 'partly fixed', 'already fixed', 'in PR', 'filed', 'decision pending', 'to verify',
+ORDER = ['fixed', 'partly fixed', 'already fixed', 'in PR', 'filed', 'decision pending', 'carried', 'to verify',
          'rejected', 'handed off', 'other', 'missing']
 warnings = []
 
@@ -68,7 +69,7 @@ class Tree:
 # (`filed #595; tracking …`, `in PR #1008`, `fixed (#597); …`), so classify by
 # the start of the cell only: a substring match would read `filed #1; fixed
 # upstream` as fixed.
-STATUS_PREFIXES = [('already fixed', 'already fixed'), ('to verify', 'to verify'),
+STATUS_PREFIXES = [('already fixed', 'already fixed'), ('to verify', 'to verify'), ('carried', 'carried'),
                    ('handed off', 'handed off'), ('not a defect', 'rejected'),
                    ('decision', 'decision pending'), ('decide', 'decision pending'),
                    ('rejected', 'rejected'), ('in pr', 'in PR'), ('partly fixed', 'partly fixed'),
@@ -135,11 +136,33 @@ def live_counts():
             f"`arch-refactor` PRs.")
 
 
-def render(text, rows, progress, updated):
+def coverage_text(tree):
+    try:
+        lines = tree.read('coverage/files.tsv').splitlines()[1:]
+    except (OSError, subprocess.CalledProcessError):
+        return '**Coverage:** no `coverage/files.tsv`.'
+    total = audited = swept = size = size_audited = 0
+    for line in lines:
+        cols = line.split('\t')
+        if len(cols) < 5 or cols[3] == 'deleted':
+            continue
+        n = int(cols[1]) if cols[1].isdigit() else 0
+        total, size = total + 1, size + n
+        if cols[3] not in ('-', ''):
+            audited, size_audited = audited + 1, size_audited + n
+        if cols[4] not in ('-', ''):
+            swept += 1
+    return (f'**Coverage:** {audited}/{total} files audited ({size_audited:,} of {size:,} lines) · '
+            f'{swept}/{total} swept.')
+
+
+def render(text, rows, progress, coverage, updated):
     def sub(m):
         spec = m.group(1)
         if spec == 'PROGRESS':
             return progress
+        if spec == 'COVERAGE':
+            return coverage
         if spec == 'UPDATED':
             return updated
         if '-' not in spec and ',' not in spec:
@@ -251,6 +274,7 @@ def main():
     rows = parse_register(tree)
     progress = (f"**Progress:** {len(rows)} problems tracked · "
                 f"{counts_text(classify(s) for s in rows.values())}.{live_counts()}")
+    coverage = coverage_text(tree)
     sha = 'worktree' if args.worktree else git('rev-parse', '--short', args.ref).strip()
     now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     updated = f'{now} (ledger `{sha}`)'
@@ -262,7 +286,7 @@ def main():
 
     failed = False
     for name, kind, node_id, text in targets:
-        body = fit(name, render(text, rows, progress, updated))
+        body = fit(name, render(text, rows, progress, coverage, updated))
         if args.out:
             out = pathlib.Path(args.out) / (pathlib.Path(name).name + ('.md' if name == 'register' else ''))
             out.parent.mkdir(parents=True, exist_ok=True)
