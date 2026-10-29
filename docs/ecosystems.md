@@ -960,6 +960,12 @@ way Gradle finds it: `-Dgradle.user.home` in `GRADLE_OPTS`, then `GRADLE_USER_HO
 then `.gradle` in the account's home directory. On Unix that is the passwd entry, not
 `$HOME`; when they differ, scan notes `gradle_user_home_differs`.
 
+`~/.m2` here means the Maven local repository, found the way Maven finds it:
+`MAVEN_REPO_LOCAL`, then `-Dmaven.repo.local` in `MAVEN_ARGS` or `MAVEN_OPTS`, then
+`<localRepository>` in `~/.m2/settings.xml`, then in the install's `conf/settings.xml`
+(`MAVEN_HOME` or `M2_HOME`), then `.m2/repository` in `user.home`. `M2_HOME` itself
+never names a local repository. On Windows `user.home` is `USERPROFILE`, not `HOME`.
+
 A Gradle-only build reads `~/.m2` only through `mavenLocal()`. Scan looks for it in
 every settings, build, `buildSrc`, included-build, applied and init script, including
 the wrapper distribution's `init.d`. Without it, `~/.m2` is not scanned, and modules

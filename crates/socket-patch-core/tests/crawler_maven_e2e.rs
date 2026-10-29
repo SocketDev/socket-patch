@@ -38,6 +38,10 @@ impl NoJvmCaches {
             "COURSIER_CACHE",
             "SBT_OPTS",
             "JAVA_OPTS",
+            "MAVEN_OPTS",
+            "MAVEN_ARGS",
+            "MAVEN_HOME",
+            "M2_HOME",
         ];
         let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
         for key in keys {
@@ -658,24 +662,46 @@ async fn get_maven_repo_paths_with_build_gradle_kts_returns_repo() {
     assert_gradle_marker_gates_m2("build.gradle.kts", true).await;
 }
 
+/// `M2_HOME` is the Maven install (#423): its `repository/` is never a
+/// local repository, but the `<localRepository>` its `conf/settings.xml`
+/// names is.
 #[tokio::test]
 #[serial]
-async fn get_maven_repo_paths_m2_home_fallback() {
+async fn get_maven_repo_paths_m2_home_global_settings() {
     let _no_jvm_caches = NoJvmCaches::new();
     let tmp = tempfile::tempdir().unwrap();
     tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>")
         .await
         .unwrap();
     let m2_home = tempfile::tempdir().unwrap();
-    let repo_dir = m2_home.path().join("repository");
-    tokio::fs::create_dir(&repo_dir).await.unwrap();
+    tokio::fs::create_dir(m2_home.path().join("repository"))
+        .await
+        .unwrap();
     let prev_maven_repo = std::env::var("MAVEN_REPO_LOCAL").ok();
     let prev_m2 = std::env::var("M2_HOME").ok();
     std::env::remove_var("MAVEN_REPO_LOCAL");
     std::env::set_var("M2_HOME", m2_home.path());
 
     let crawler = MavenCrawler;
-    let paths = crawler
+    let without_settings = crawler
+        .get_maven_repo_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir(m2_home.path().join("conf"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        m2_home.path().join("conf").join("settings.xml"),
+        format!(
+            "<settings><localRepository>{}</localRepository></settings>",
+            repo_dir.path().display()
+        ),
+    )
+    .await
+    .unwrap();
+    let with_settings = crawler
         .get_maven_repo_paths(&options_at(tmp.path()))
         .await
         .unwrap();
@@ -688,9 +714,13 @@ async fn get_maven_repo_paths_m2_home_fallback() {
         std::env::set_var("M2_HOME", v);
     }
 
+    assert!(
+        without_settings.is_empty(),
+        "$M2_HOME/repository is not a local repository; got {without_settings:?}"
+    );
     assert_eq!(
-        paths,
-        vec![repo_dir],
-        "M2_HOME/repository fallback must be the sole discovered repo; got {paths:?}"
+        with_settings,
+        vec![repo_dir.path().to_path_buf()],
+        "the global settings' <localRepository> must be the sole discovered repo"
     );
 }
