@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-29T13Z (run 55), main `ecd4924` (unchanged since run 53; v5.0.1 `latest`). Run 55 filed #1827: agent mode skips a workspace member in a hidden dir (`.github/actions/x`), so `vex` attests an unpatched copy. Hosted `vex` misses a reverted copy there too. **Open npm bughunt issues: #1782 (PR #1783), #1804 (PR #1805) and #1827.** Every issue number marked `fail` in the matrix below other than these three is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
+Last updated: 2026-10-29T19Z (run 56), main `c07af61` (v5.0.1 `latest`). Run 56: #1782 and #1804 were closed by #1783 / #1805 and verified on main (multi-package eject kill test at every rename; CRLF bin in a workspace member, `install-strategy=linked`, and `-g` on npm 6 / 8 / 10). Filed #1850: the vendored `--dry-run` human output promises to vendor already-vendored patches. Commented on #1827 with the vendored cell. **Open npm bughunt issues: #1827 and #1850.** Every other issue number marked `fail` in the matrix below is closed; those marks are historical. Probe branches are still blocked (`git push --delete` is refused by the session policy, re-checked in run 56).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -35,6 +35,17 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Linux | 10.9.4, v5.0.1-broken CRLF bin upgraded to main (run 53) | pass (#1791 fixed: `apply` rewrites, bin runs, `apply --check`, `vex`, `repair`, byte-exact `rollback`) | n/a | n/a | n/a |
 | Linux | 8.19.4 / 10.9.4 / 12.2.1, workspace member in a hidden dir (`.github/actions/*`, `.config/tool`) (run 55) | **fail #1827** (member copy unpatched; `apply --check` in sync; `vex` not_affected; v5.0.1 too). Control `tools/build/x`: pass | untested | pins + `npm ci` pass (10.9.4); **fail #1827** (`vex` attests a reverted hidden copy) | n/a |
 | Linux | 10.9.4 / 12.2.1, hosted workspace + `npm install -w b <pkg>`, `npm ci -w a`, `npm ci -w b`; `os`-restricted optional dep (`fsevents`) (run 55) | n/a | n/a | pass (pin kept, patched, lock-only `vex` documented, `rollback` byte-exact / `.npmrc` removed) | n/a |
+| Linux | 6.14.18 / 8.19.4 / 10.9.4 / 12.2.1, #1805 CRLF-bin shapes on main (run 56) | pass: workspace member with an unhoisted copy (`packages/a/node_modules/.bin`), `install-strategy=linked` `.store` copy, `--no-bin-links` (CRLF kept, byte-exact `rollback`), `-g --global-prefix` on 6.14.18 / 8.19.4 / 10.9.4 (apply, bin runs, `apply --check`, byte-exact `rollback`) | n/a | n/a | pass (see Agent) |
+| Linux | 10.9.4, #1782 multi-package eject (`vendor` over 2 hosted pins), SIGKILL at each of 11 renames via an `LD_PRELOAD` shim (run 56) | n/a | pass: before the journal, the project stays hosted (`npm ci` patched); after it, a re-run converges (2 `file:` pins, `.npmrc` removed, `vendor --check` passes). A refused package (patch not on the API) leaves everything hosted. One window (journal written, lock still hosted, `.npmrc` already unlinked) would fail npm 12 `npm ci` with EALLOWREMOTE; the journal rolls it forward on the next command | n/a | n/a |
+| Linux | 8.19.4 / 10.9.4 / 12.2.1, vendored `--dry-run` over an already-vendored project (run 56) | pass (agent dry run says already recorded) | **fail #1850** (human "Would download and vendor N"; JSON `already_vendored`; `get --dry-run` too; v5.0.1 too) | pass ("already on hosted patches") | n/a |
+| Linux | 10.9.4 / 12.2.1, hosted pins vs npm tree commands (run 56) | n/a | n/a | pass: `dedupe`, `prune`, `install --prefer-dedupe`, `install --package-lock-only`, `uninstall <other>`, `audit fix`, `install --force` and `shrinkwrap` keep the pin. `npm update` and `npm install <pkg>@<same ver>` re-resolve to the registry; `vex` then refuses (exit 2) and a re-scan re-pins (npm behaviour; see Known non-bugs). Root `bundleDependencies: true` and `bundledDependencies` spelling: pinned, `npm ci` patched, `vex`. npm 12 `allow-remote=root` with a transitive pin: warned, not rewritten, `npm ci` EALLOWREMOTE (documented) | n/a |
+| Linux | 10.9.4, workspace member in a hidden dir, vendored (run 56) | n/a | **fail #1827** (commented): `vex` warns on a reverted visible copy but not on a reverted hidden copy | n/a | n/a |
+
+## Run 56 (2026-10-29T19Z, main `c07af61`)
+
+- Re-triage: #1782 (closed by #1783) and #1804 (closed by #1805) both verified on main. The #1805 shapes in a workspace member, under `install-strategy=linked` and with `-g` on npm 6 / 8 / 10 pass. A multi-package eject killed at each rename stays hosted or converges.
+- Filed #1850 (vendored `--dry-run` human headline counts already-vendored patches). Commented on #1827 (vendored `vex` drift warning misses the hidden member).
+- Known non-bugs: symlinked `.npmrc` (never written through, loud warning), and `npm update` dropping a hosted pin.
 
 ## Run 55 (2026-10-29T13Z, main `ecd4924`)
 
@@ -289,6 +300,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-29T19Z:** re-check #1850 when fixed (scan and `get --dry-run`, a mix of in-sync, re-vendor and would-refuse rows); re-check #1827 (agent, hosted `vex`, vendored drift warning). Next new cells: `npm update` / `npm install <pkg>` right after a vendored scan (does `vendor --check` flag the lost wiring?), hosted pins with `omit-lockfile-registry-resolved` plus `npm update`, CACHEDIR.TAG inside a workspace member (agent walk prune, same class as #1827), and macOS / Windows once probe branches work.
 - **New 2026-10-29T13Z:** re-check #1827 when fixed (agent `scan` / `apply --check` / `vex`, hosted `vex` with a reverted hidden copy, `rollback` / `repair` over a hidden member); check the yarn / Bun workspace walks for the same hidden-member prune (hand over if confirmed). Hosted / vendored `vex` with a CRLF bin is still open (the mock is ready).
 - **New 2026-10-29T07Z:** when #1805 lands, re-run its shapes on main: collision, `--no-rebuild-bundle`, `--no-bin-links`, `directories.bin` `file:`, the #1791 recovery, and a global `-g` bin under `<prefix>/bin`. Also test #1805 on a workspace member (`.bin` at the root `node_modules`, hoisted) and under `install-strategy=linked` (does the `.store` virtual-store check keep the listing?). Re-check #1782 when #1783 lands. Hosted / vendored `vex` with a CRLF bin (mock) is still open.
 - **New 2026-10-29T01Z:** re-check #1804 when fixed (`bin-links=false` in `.npmrc`, `directories.bin` with `file:` dir / git deps, and the #1791 recovery must still pass). A bundled dep with a CRLF bin: does npm `fixBin` it, and does main agree? Hosted / vendored `vex` with a CRLF bin (mock). Re-check #1782 when its fix lands.
@@ -353,6 +365,9 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- A project `.npmrc` that is a symlink is never written through: the hosted run pins the lock, leaves the link and its target untouched, and warns `redirect_npm_allow_remote` ("is a symbolic link … add `allow-remote=all` to it yourself"). npm 12 `npm ci` then fails closed with EALLOWREMOTE. Deliberate (run 56).
+- `npm update` (and `npm install <pkg>@<same version>`) re-resolves a hosted pin to the registry `resolved`. That's npm behaviour: socket-patch keeps no hosted state outside the lock, so `vex` refuses (exit 2, nothing to attest) and a re-scan re-pins (run 56).
+- A workspace member's own `bundleDependencies` gets no `inBundle` flag in the lock (npm 8 / 10 / 12), so its deps are ordinary entries (run 56).
 - Hosted lock-only `vex` attests a pin whose package isn't installed on this platform (an `os`-restricted optional dep) or by a workspace-scoped `npm ci -w`. Documented: installed copies are verified "when available" (run 55).
 - `rm -rf node_modules/<pkg> && npm install` with the `.bin/<name>` link still present: npm skips `fixBin` (`link-gently` SKIP) and leaves a CRLF bin that exits 127. socket-patch writing the LF form there (so rollback isn't byte-exact against npm's broken bytes) is acceptable (run 54).
 - A bundled dep's CRLF bin with the default `rebuild-bundle=true`: npm runs `fixBin` on it (LF), and main's LF writes and byte-exact rollback are correct (run 54, npm 6 / 10 / 12).
