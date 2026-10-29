@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-29T07Z (run 54), main `ecd4924` (unchanged since run 53; v5.0.1 `latest`). Run 54 found two more #1804 shapes (bin-name collision, `rebuild-bundle=false` bundle), commented on #1804, and verified that draft PR #1805 fixes both. **Open npm bughunt issues: #1782 (PR #1783) and #1804 (PR #1805).** Every issue number marked `fail` in the matrix below other than these two is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
+Last updated: 2026-10-29T13Z (run 55), main `ecd4924` (unchanged since run 53; v5.0.1 `latest`). Run 55 filed #1827: agent mode skips a workspace member in a hidden dir (`.github/actions/x`), so `vex` attests an unpatched copy. Hosted `vex` misses a reverted copy there too. **Open npm bughunt issues: #1782 (PR #1783), #1804 (PR #1805) and #1827.** Every issue number marked `fail` in the matrix below other than these three is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -33,6 +33,13 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Linux | 10.9.9 / 11.21.1 suites (run 50) | n/a | pass: `e2e_vendor_npm_build` 43/43 (both) | pass: `e2e_redirect_npm_build` 30/30 plus the 6 `#[ignore]` real-npm legs via `--ignored` (both) | n/a |
 | Linux | 6.14.18 / 10.9.4 / 12.2.1, CRLF-shebang bin npm doesn't link (`--no-bin-links`; `directories.bin`-only `file:` tarball) (run 53) | **fail #1804** (main writes the LF `fixBin` form, `rollback` not byte-exact; `--no-bin-links` on all three, `directories.bin` on 10.9.4). `b4b6d98` / v5.0.1 pass | untested | untested | n/a |
 | Linux | 10.9.4, v5.0.1-broken CRLF bin upgraded to main (run 53) | pass (#1791 fixed: `apply` rewrites, bin runs, `apply --check`, `vex`, `repair`, byte-exact `rollback`) | n/a | n/a | n/a |
+| Linux | 8.19.4 / 10.9.4 / 12.2.1, workspace member in a hidden dir (`.github/actions/*`, `.config/tool`) (run 55) | **fail #1827** (member copy unpatched; `apply --check` in sync; `vex` not_affected; v5.0.1 too). Control `tools/build/x`: pass | untested | pins + `npm ci` pass (10.9.4); **fail #1827** (`vex` attests a reverted hidden copy) | n/a |
+| Linux | 10.9.4 / 12.2.1, hosted workspace + `npm install -w b <pkg>`, `npm ci -w a`, `npm ci -w b`; `os`-restricted optional dep (`fsevents`) (run 55) | n/a | n/a | pass (pin kept, patched, lock-only `vex` documented, `rollback` byte-exact / `.npmrc` removed) | n/a |
+
+## Run 55 (2026-10-29T13Z, main `ecd4924`)
+
+- Filed #1827. A declared workspace member under a hidden dir (`.github/actions/x` via a `.github/actions/*` glob, or an explicit `.config/tool`) is pruned by the agent walk (`skipped_members_of` and `workspace_children` reject `.` names; #1627 only exempted `SKIP_DIRS`). Its nested copy stays unpatched while `apply --check` is in sync and `vex` attests `not_affected`. npm 8.19.4 / 10.9.4 (2/2) / 12.2.1, and v5.0.1. Hosted pins and `npm ci` cover the hidden member, but hosted `vex` attests when that copy holds the original bytes (commented).
+- pass: hosted `os`-restricted optional dep on Linux, and hosted workspace with `npm install -w` / `npm ci -w`. Mock: a Python patch-API mock replaces wiremock (details in the run 55 entry).
 
 ## Run 54 (2026-10-29T07Z, main `ecd4924`)
 
@@ -282,6 +289,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-29T13Z:** re-check #1827 when fixed (agent `scan` / `apply --check` / `vex`, hosted `vex` with a reverted hidden copy, `rollback` / `repair` over a hidden member); check the yarn / Bun workspace walks for the same hidden-member prune (hand over if confirmed). Hosted / vendored `vex` with a CRLF bin is still open (the mock is ready).
 - **New 2026-10-29T07Z:** when #1805 lands, re-run its shapes on main: collision, `--no-rebuild-bundle`, `--no-bin-links`, `directories.bin` `file:`, the #1791 recovery, and a global `-g` bin under `<prefix>/bin`. Also test #1805 on a workspace member (`.bin` at the root `node_modules`, hoisted) and under `install-strategy=linked` (does the `.store` virtual-store check keep the listing?). Re-check #1782 when #1783 lands. Hosted / vendored `vex` with a CRLF bin (mock) is still open.
 - **New 2026-10-29T01Z:** re-check #1804 when fixed (`bin-links=false` in `.npmrc`, `directories.bin` with `file:` dir / git deps, and the #1791 recovery must still pass). A bundled dep with a CRLF bin: does npm `fixBin` it, and does main agree? Hosted / vendored `vex` with a CRLF bin (mock). Re-check #1782 when its fix lands.
 - **New 2026-10-28T19Z:** re-check #1791 when fixed (apply / repair / rollback over a v5.0.1-overwritten bin; also a non-bin file with a CRLF shebang must keep CRLF). Re-run the hosted / vendored `vex` halves of #1756 on `b4b6d98` with the mock (npm 8 / 12). Re-check #1782 when its fix lands (the kill-test plan below).
@@ -345,6 +353,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- Hosted lock-only `vex` attests a pin whose package isn't installed on this platform (an `os`-restricted optional dep) or by a workspace-scoped `npm ci -w`. Documented: installed copies are verified "when available" (run 55).
 - `rm -rf node_modules/<pkg> && npm install` with the `.bin/<name>` link still present: npm skips `fixBin` (`link-gently` SKIP) and leaves a CRLF bin that exits 127. socket-patch writing the LF form there (so rollback isn't byte-exact against npm's broken bytes) is acceptable (run 54).
 - A bundled dep's CRLF bin with the default `rebuild-bundle=true`: npm runs `fixBin` on it (LF), and main's LF writes and byte-exact rollback are correct (run 54, npm 6 / 10 / 12).
 - A registry package that declares bins only via `directories.bin`: the packument carries the expanded `bin`, so npm links it and runs `fixBin`, and main's LF form is correct (run 53). Only non-registry installs hit #1804.
