@@ -3248,7 +3248,11 @@ mod tests {
         // npm linked the bin, so it ran `fixBin` on it at install.
         let pkg = root.path().join("node_modules/x");
         std::fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
-        std::fs::write(root.path().join("node_modules/.bin/x"), b"shim").unwrap();
+        std::fs::write(
+            root.path().join("node_modules/.bin/x"),
+            b"node \"$basedir/../x/cli.js\" \"$@\"",
+        )
+        .unwrap();
         std::fs::create_dir_all(&pkg).unwrap();
         let blobs = tempfile::tempdir().unwrap();
         let before_hash = compute_git_sha256_from_bytes(before);
@@ -3298,7 +3302,11 @@ mod tests {
             // npm linked the bin, so it ran `fixBin` on it at install.
             let pkg = root.path().join("node_modules/x");
             std::fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
-            std::fs::write(root.path().join("node_modules/.bin/x"), b"shim").unwrap();
+            std::fs::write(
+                root.path().join("node_modules/.bin/x"),
+                b"node \"$basedir/../x/cli.js\" \"$@\"",
+            )
+            .unwrap();
             std::fs::create_dir_all(&pkg).unwrap();
             let blobs = tempfile::tempdir().unwrap();
             if with_blob {

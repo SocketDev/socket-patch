@@ -119,12 +119,13 @@ fn is_npm(package_key: &str) -> bool {
 /// package installed from a tarball or folder (npm expands that field
 /// only in registry packuments), the file keeps its published shebang
 /// (#1804). The link is a `.bin/<name>` entry in the `node_modules` the
-/// package sits in, where npm links it (a symlink must resolve to this
-/// file; a cmd or shell shim is taken as is), or a global prefix's
-/// `bin/<name>` or `<name>.cmd`. A package in a virtual store (pnpm's
-/// `.pnpm`, npm's linked `.store`, vlt, Bun) has its bins linked into
-/// each dependent's `.bin`, wherever that is, so there the listing alone
-/// is taken for the link, as before.
+/// package sits in, where npm links it, or a global prefix's
+/// `bin/<name>` or `<name>.cmd`: a symlink resolving to this file, or a
+/// cmd or shell shim naming it. A package in a virtual store (pnpm's
+/// `.pnpm` or a relocated `virtualStoreDir`, npm's linked `.store`, vlt,
+/// Bun, Yarn's `pnpmStoreFolder`) has its bins linked into each
+/// dependent's `.bin`, wherever that is, so there the listing alone is
+/// taken for the link, as before.
 pub(crate) async fn is_linked_bin(package_key: &str, pkg_path: &Path, normalized: &str) -> bool {
     if !is_npm(package_key) {
         return false;
@@ -146,37 +147,41 @@ pub(crate) async fn is_linked_bin(package_key: &str, pkg_path: &Path, normalized
 /// Whether an entry named one of `names` links the bin `file` of the
 /// package at `pkg_path`, in the places [`is_linked_bin`] lists.
 fn has_bin_link(pkg_path: &Path, file: &Path, names: &[String]) -> bool {
+    let mut ancestors = pkg_path.ancestors().skip(1);
+    // npm installs every package under a `node_modules`; a copy outside
+    // one is in a relocated store.
+    let Some(node_modules) = ancestors
+        .by_ref()
+        .find(|dir| dir.file_name().is_some_and(|n| n == "node_modules"))
+    else {
+        return true;
+    };
+    if in_virtual_store(node_modules) {
+        return true;
+    }
+    // A shim names the file by its path below `node_modules`, from
+    // wherever it is (`..\crlfbin\cli.js`, `node_modules/crlfbin/cli.js`).
+    let Some(below) = file
+        .strip_prefix(node_modules)
+        .ok()
+        .and_then(Path::to_str)
+        .map(|p| p.replace('\\', "/"))
+    else {
+        return false;
+    };
     let target = std::fs::canonicalize(file).ok();
     let links = |entry: &Path| match std::fs::symlink_metadata(entry) {
         Ok(meta) if meta.file_type().is_symlink() => {
             target.is_some() && std::fs::canonicalize(entry).ok() == target
         }
-        Ok(meta) => meta.is_file(),
-        Err(_) => false,
+        Ok(meta) if meta.is_file() => shim_names(entry, &below),
+        _ => false,
     };
     let in_dir = |dir: &Path, suffix: &str| {
         names
             .iter()
             .any(|name| links(&dir.join(format!("{name}{suffix}"))))
     };
-    let mut ancestors = pkg_path.ancestors().skip(1);
-    let Some(node_modules) = ancestors
-        .by_ref()
-        .find(|dir| dir.file_name().is_some_and(|n| n == "node_modules"))
-    else {
-        return false;
-    };
-    if ancestors.any(|dir| {
-        dir.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.'))
-            && dir
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|n| n == "node_modules")
-    }) {
-        return true;
-    }
     if in_dir(&node_modules.join(".bin"), "") {
         return true;
     }
@@ -188,6 +193,45 @@ fn has_bin_link(pkg_path: &Path, file: &Path, names: &[String]) -> bool {
         // Unix global: `<prefix>/lib/node_modules`, links in `<prefix>/bin`.
         || (prefix.file_name().is_some_and(|n| n == "lib")
             && prefix.parent().is_some_and(|p| in_dir(&p.join("bin"), "")))
+}
+
+/// Whether `node_modules` (the one a package sits in) is inside a virtual
+/// store: below a dot folder of a `node_modules` (`.pnpm`, `.store`,
+/// `.vlt`, `.bun`), or in a `<name>@<version>` store entry, which no
+/// project folder is (a relocated pnpm `virtualStoreDir`).
+fn in_virtual_store(node_modules: &Path) -> bool {
+    let entry = node_modules.parent();
+    entry.is_some_and(|entry| {
+        entry
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.get(1..).is_some_and(|rest| rest.contains('@')))
+            && !entry.join("package.json").exists()
+    }) || node_modules.ancestors().skip(1).any(|dir| {
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+            && dir
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "node_modules")
+    })
+}
+
+/// Whether the shim at `path` (a cmd-shim or shell script) names the
+/// file at `below`, its `/`-separated path below `node_modules`.
+fn shim_names(path: &Path, below: &str) -> bool {
+    use std::io::Read as _;
+    let Ok((file, _)) = crate::utils::fs::open_regular_file_sync(path) else {
+        return false;
+    };
+    let mut text = Vec::new();
+    if file.take(8192).read_to_end(&mut text).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&text)
+        .replace('\\', "/")
+        .contains(below)
 }
 
 /// Whether the file at `normalized` holds exactly the recorded content
@@ -533,9 +577,15 @@ mod tests {
         pkg
     }
 
-    fn shim(path: std::path::PathBuf) {
+    /// A cmd-shim at `path` running `target` (relative to the shim).
+    fn shim_to(path: std::path::PathBuf, target: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        let target = target.replace('/', "\\");
+        std::fs::write(path, format!("@\"%dp0%\\{target}\" %*\r\n")).unwrap();
+    }
+
+    fn shim(path: std::path::PathBuf) {
+        shim_to(path, "../crlfbin/cli.js");
     }
 
     const PURL: &str = "pkg:npm/crlfbin@1.0.0";
@@ -612,7 +662,46 @@ mod tests {
         // Scoped: `node_modules/@s/crlfbin` links into `node_modules/.bin`.
         let root = tempfile::tempdir().unwrap();
         let pkg = installed_bin(root.path(), "node_modules/@s");
-        shim(root.path().join("node_modules/.bin/crlfbin"));
+        shim_to(
+            root.path().join("node_modules/.bin/crlfbin"),
+            "../@s/crlfbin/cli.js",
+        );
+        assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
+    }
+
+    /// A file that merely has a bin's name, where a global prefix would
+    /// keep its shim, is not npm's link unless it runs this file.
+    #[tokio::test]
+    async fn is_linked_bin_wants_the_shim_to_run_this_file() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "node_modules");
+        shim_to(root.path().join("crlfbin.cmd"), "scripts/crlfbin.js");
+        shim_to(
+            root.path().join("node_modules/.bin/crlfbin"),
+            "../other/cli.js",
+        );
+        assert!(!is_linked_bin(PURL, &pkg, "cli.js").await);
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "lib/node_modules");
+        shim_to(root.path().join("bin/crlfbin"), "../tools/crlfbin");
+        assert!(!is_linked_bin(PURL, &pkg, "cli.js").await);
+    }
+
+    /// Stores outside a `node_modules` dot folder: a relocated pnpm
+    /// `virtualStoreDir`, and Yarn's `pnpmStoreFolder` (`<slug>/package`).
+    #[tokio::test]
+    async fn is_linked_bin_takes_the_listing_in_relocated_stores() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "vstore/crlfbin@1.0.0/node_modules");
+        assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
+        let root = tempfile::tempdir().unwrap();
+        let pkg = root.path().join("store/crlfbin-npm-1.0.0-abc/package");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            br#"{"name":"crlfbin","bin":{"crlfbin":"cli.js"}}"#,
+        )
+        .unwrap();
         assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
     }
 

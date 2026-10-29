@@ -4184,7 +4184,11 @@ mod tests {
         // npm linked the bin, so it ran `fixBin` on it at install.
         let pkg = root.path().join("node_modules/crlfbin");
         std::fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
-        std::fs::write(root.path().join("node_modules/.bin/crlfbin"), b"shim").unwrap();
+        std::fs::write(
+            root.path().join("node_modules/.bin/crlfbin"),
+            b"node \"$basedir/../crlfbin/cli.js\" \"$@\"",
+        )
+        .unwrap();
         std::fs::create_dir_all(&pkg).unwrap();
         tokio::fs::write(
             pkg.join("package.json"),
@@ -4248,7 +4252,11 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let pkg = root.path().join("node_modules/crlfbin");
             std::fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
-            std::fs::write(root.path().join("node_modules/.bin/crlfbin"), b"shim").unwrap();
+            std::fs::write(
+                root.path().join("node_modules/.bin/crlfbin"),
+                b"node \"$basedir/../crlfbin/cli.js\" \"$@\"",
+            )
+            .unwrap();
             std::fs::create_dir_all(&pkg).unwrap();
             tokio::fs::write(pkg.join("package.json"), manifest)
                 .await
