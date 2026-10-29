@@ -43,6 +43,12 @@ The first thread asked what to cut and combine at the level of **products and mo
 ## Top problems
 _Filled in as the audit progresses. Each bullet carries its register token._
 
+- **Duplicated rules have already drifted into bugs.**
+  - The cargo build-cache cleaner and cargo disagree on which `.cargo/config` file wins {{A01}}.
+  - The cargo workspace glob has no character classes {{A02}}.
+  - Both bugs were shown by running the code.
+- **`utils/` is a mix of ecosystem-specific code and true utilities.** Some of it imports `vendor::*` {{A08}}.
+
 ## The numbers
 | | Value |
 |---|---|

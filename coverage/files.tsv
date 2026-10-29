@@ -492,34 +492,34 @@ crates/socket-patch-cli/build.rs	11	audit-cli-tests	-	-
 crates/socket-patch-node/build.rs	3	audit-cli-tests	-	-	
 crates/socket-patch-node/src/lib.rs	369	audit-cli-tests	-	-	
 crates/socket-patch-node/src/provider.rs	276	audit-cli-tests	-	-	
-crates/socket-patch-core/src/constants.rs	108	audit-core	-	-	
-crates/socket-patch-core/src/lib.rs	22	audit-core	-	-	
-crates/socket-patch-core/src/utils/cargo_build_cache.rs	483	audit-core	-	-	
-crates/socket-patch-core/src/utils/cargo_home.rs	191	audit-core	-	-	
-crates/socket-patch-core/src/utils/cargo_workspace.rs	690	audit-core	-	-	
-crates/socket-patch-core/src/utils/composer_version.rs	415	audit-core	-	-	
-crates/socket-patch-core/src/utils/concurrent.rs	429	audit-core	-	-	
-crates/socket-patch-core/src/utils/containment.rs	216	audit-core	-	-	
-crates/socket-patch-core/src/utils/digest.rs	224	audit-core	-	-	
-crates/socket-patch-core/src/utils/durability.rs	365	audit-core	-	-	
-crates/socket-patch-core/src/utils/env_compat.rs	193	audit-core	-	-	
-crates/socket-patch-core/src/utils/failpoint.rs	87	audit-core	-	-	
-crates/socket-patch-core/src/utils/fs.rs	1991	audit-core	-	-	
-crates/socket-patch-core/src/utils/go_env.rs	287	audit-core	-	-	
-crates/socket-patch-core/src/utils/go_installed_tools.rs	644	audit-core	-	-	
-crates/socket-patch-core/src/utils/group_commit.rs	2163	audit-core	-	-	
-crates/socket-patch-core/src/utils/hatch.rs	1738	audit-core	-	-	
-crates/socket-patch-core/src/utils/hatch_workspace.rs	604	audit-core	-	-	
-crates/socket-patch-core/src/utils/http.rs	546	audit-core	-	-	
-crates/socket-patch-core/src/utils/line_endings.rs	238	audit-core	-	-	
-crates/socket-patch-core/src/utils/lock_fragments.rs	654	audit-core	-	-	
-crates/socket-patch-core/src/utils/mod.rs	45	audit-core	-	-	
-crates/socket-patch-core/src/utils/notice.rs	99	audit-core	-	-	
-crates/socket-patch-core/src/utils/npm_range.rs	117	audit-core	-	-	
-crates/socket-patch-core/src/utils/package_manager.rs	31	audit-core	-	-	
-crates/socket-patch-core/src/utils/pdm_lock.rs	1315	audit-core	-	-	
-crates/socket-patch-core/src/utils/pep440.rs	347	audit-core	-	-	
-crates/socket-patch-core/src/utils/pipenv.rs	224	audit-core	-	-	
+crates/socket-patch-core/src/constants.rs	108	audit-core	b291caa 2026-10-29	-	delete tautology tests user_agent_reports_real_crate_version, manifest_path_is_under_dot_socket; trim api_urls test to https/no-slash/distinct asserts; move test mod to file end; derive DEFAULT_PATCH_MANIFEST_PATH from SOCKET_DIR (concat!); ~8 comment lines (history L17-20)
+crates/socket-patch-core/src/lib.rs	22	audit-core	b291caa 2026-10-29	-	clean
+crates/socket-patch-core/src/utils/cargo_build_cache.rs	483	audit-core	b291caa 2026-10-29	-	make private: build_dirs_with, invalidate, BuildDirs, Invalidation, STALE_WARNING, cargo_purl_name (only invalidate_project is external); inline build_dirs, is_unit_hash; hex check x2 -> digest helper (A06); drop bare #387; config read duplicates config_layer_paths (A01 #1832); gap: warning text untested
+crates/socket-patch-core/src/utils/cargo_home.rs	191	audit-core	b291caa 2026-10-29	-	cut module-doc story + #1135 (L5-13, L127); drop forwarder CargoCrawler::cargo_home (cargo_crawler.rs:266) and call utils::cargo_home directly; consider moving the one fn beside fs::home_dir (A10)
+crates/socket-patch-core/src/utils/cargo_workspace.rs	690	audit-core	b291caa 2026-10-29	-	drop expand_glob (call expand_glob_bounded(..).0); inline is_real_dir; make is_real_dir_path private; expect() in member_manifests_in L41; trim FACTS_MEMO doc; drop B74:/V-7:/pre-memo notes; wildcard_match -> segment_glob_matches (A02 #1833); move glob walk to workspace_globs, normalize_rel+join_rel(x3) to relpath; is_real_dir x3
+crates/socket-patch-core/src/utils/composer_version.rs	415	audit-core	b291caa 2026-10-29	-	delete composer_version_identity_key (no external caller); composer_versions_equivalent = key(a)==key(b); drop \u{1} sentinel doc L22-26 and history L7-8; fold identity_key equality test into sentinel test; strip_leading_v duplicates composer_crawler::normalize_version (E37, #748)
+crates/socket-patch-core/src/utils/concurrent.rs	429	audit-core	b291caa 2026-10-29	-	make API_CONCURRENCY, _FLOOR, REQUESTS_PER_SLOT, REGISTRY_CONCURRENCY private; MAX_API_CONCURRENCY==API_CONCURRENCY: keep one; drop adaptive_concurrency floor/ceiling params (one value); per_window_cap test recomputes via code under test: assert literals; env override read twice in api_concurrency_for_under; env parse style (A09)
+crates/socket-patch-core/src/utils/containment.rs	216	audit-core	b291caa 2026-10-29	-	make linked_level_refusal private; move nearest_socket_dir/socket_project_root to socket_dir.rs (only user); is_link doc stale (claims all vendor probes delegate); delete async fs::is_symlink wrapper, call is_link; point lock_inventory/view.rs:895 at is_link
+crates/socket-patch-core/src/utils/digest.rs	224	audit-core	b291caa 2026-10-29	-	PENDING_INLINE_DIGESTS doc cites #706 as pending: one-line instruction; vendor/jvm/mod.rs:621-631 sha1_hex/sha256_hex compute under the validator names: delete, use *_hex_of; move the listed pending inline digests and drop the list; lint only skips `mod tests {` (A06)
+crates/socket-patch-core/src/utils/durability.rs	365	audit-core	b291caa 2026-10-29	-	make sync_all_blocking private; barrier = failpoint + spawn_blocking(barrier_blocking) (-10); ~25 comment lines (78-line module doc; history 'as it always did' L17/L41/L72/L166/L227); dead if-let in Pending::moved L128; join error loses panic L185; test sync_skips_vanished... asserts only Ok: rename
+crates/socket-patch-core/src/utils/env_compat.rs	193	audit-core	b291caa 2026-10-29	-	is_debug_enabled/is_offline_env share one exact-'1'/'true' parse: private env_flag(); move debug_log/debug_message to utils/debug.rs; three env vocabularies with socket_cli_config/concurrent (A09); debug_lines_have_one_printer scan only skips `mod tests {`
+crates/socket-patch-core/src/utils/failpoint.rs	87	audit-core	b291caa 2026-10-29	-	hit(): check point==name&&at==count once, then branch on pause; malformed @n silently becomes 1 (unwrap_or): panic instead (test-only)
+crates/socket-patch-core/src/utils/fs.rs	1991	audit-core	b291caa 2026-10-29	-	split grab-bag: home -> utils/home.rs, writers -> utils/atomic_write.rs (A10); delete asyncify, use run_blocking (two join policies); delete async is_symlink; make first_symlink sync; entry_file_type + its 2 tests -> npm oracle (test-only); WriteOpts presets -> enum; ~65 comment lines (L1543-1575 narrative, history/#refs); ~5 dup/merge tests; with_home_env -> injected closure
+crates/socket-patch-core/src/utils/go_env.rs	287	audit-core	b291caa 2026-10-29	-	go_env_with private/cfg(test); env file re-read+parsed per go_env() call (go_workspace reads twice); Go-only code in utils: move with go_installed_tools to a golang module (A08); GOMODCACHE rule duplicated (A03 #1834); drop #344/#1799 refs
+crates/socket-patch-core/src/utils/go_installed_tools.rs	644	audit-core	b291caa 2026-10-29	-	make private: GoBinary, BinDirs, Inspection, parse_version_m, bin_dirs(_with), installed_binaries, stale_tools(_with), audit_sync, unchecked/unlocated_detail; audit returns Vec<(code,detail)> with one code: return details; drop redundant !is_empty filters; test an_unlistable_directory_is_reported_unchecked asserts 0 when go on PATH: inject go path; A03 #1834
+crates/socket-patch-core/src/utils/group_commit.rs	2163	audit-core	b291caa 2026-10-29	-	add lock() helper for 15 `.lock().unwrap_or_else(into_inner)`; overlay_covering() for 3 prefix searches L420/456/486; build Captured value once (L254/L307); write(journaled: bool) mode flag: split; sha256_hex L932 -> digest; inline symlinked_paths into cli; ~20 comment lines; journal test name overclaims; root-skip tests silent; A07, A12
+crates/socket-patch-core/src/utils/hatch.rs	1738	audit-core	b291caa 2026-10-29	-	merge HatchPermission into HatchEdit; one Round::new for duplicated Target/Round builds (L744-764, L923-936); hatch key lookup x5 + hatch.toml override rule x2 -> hatch_key(); require_pip_installer re-implements parse_documents; {root:uri} literal x3 -> const; uv-path env read + message dup with vendor/pypi_hatch.rs:180; bare #refs; utils->vendor import (A08)
+crates/socket-patch-core/src/utils/hatch_workspace.rs	604	audit-core	b291caa 2026-10-29	-	roots L102 constant take_while -> if; inline expand into members_of; name HATCH_FILES[0]/[1]; pub mod -> pub(crate); ~8 test-doc history (#505, Bugbot); {home} expansion uses a third home rule (A10); fnmatch is a third glob matcher (A02); move under a hatch/pypi module with hatch.rs (A08)
+crates/socket-patch-core/src/utils/http.rs	546	audit-core	b291caa 2026-10-29	-	delete read_capped String wrapper, move 5 callers to read_capped_typed; cap tests match 'too large' text: assert ReadCappedError::CapExceeded; production_builder_builds doc overclaims (asserts only build ok); drop history L205-206 and (#1107) banner; gaps: mid-stream cap branch L236 and Truncated untested
+crates/socket-patch-core/src/utils/line_endings.rs	238	audit-core	b291caa 2026-10-29	-	clean (callers re-derive it: A04)
+crates/socket-patch-core/src/utils/lock_fragments.rs	654	audit-core	b291caa 2026-10-29	-	pairing loop x3 (pair_fragments L191, finish L306, rewrite_batch L476) has drifted on which text it checks: one helper; finish carries before: Result and re-raises after render; extend_span &mut out-param: return range; compute edits eagerly, shrink FragmentRewrite to {text, edits}; L434 CRLF test re-derives LineEndings::of (A04); make pub(crate); A05
+crates/socket-patch-core/src/utils/mod.rs	45	audit-core	b291caa 2026-10-29	-	sort hatch/hatch_workspace into order; lock_fragments, pdm_lock, hatch_workspace pub -> pub(crate) (exposes dead items to the lint)
+crates/socket-patch-core/src/utils/notice.rs	99	audit-core	b291caa 2026-10-29	-	inline is_muted into notice_once
+crates/socket-patch-core/src/utils/npm_range.rs	117	audit-core	b291caa 2026-10-29	-	operator char set written twice (L41, L56): one const fn
+crates/socket-patch-core/src/utils/package_manager.rs	31	audit-core	b291caa 2026-10-29	-	one-fn module; yarn major parse duplicated in update/channel.rs:361-367 (no trim) and vendor/mod.rs:274-279: add yarn_major() here (A13)
+crates/socket-patch-core/src/utils/pdm_lock.rs	1315	audit-core	b291caa 2026-10-29	-	delete dead wheel_matches (0 callers); rewrite_pdm_lock, pdm_lock_edits test-only: cfg(test); rewrite_pdm_lock_in private; lock_version list in 3 matches -> one table; sha256 check x2 + vendor/pypi_pdm.rs:367 copy -> files_all_sha256(); unit filter x2; orphan doc L841; delete dup test pairing_refuses_a_fragment_shape_change; unsafe_sources test asserts only is_err; ~10 #refs
+crates/socket-patch-core/src/utils/pep440.rs	347	audit-core	b291caa 2026-10-29	-	trailing-zero trim loop duplicated (L110-116, L195-197); drop #1589 ref
+crates/socket-patch-core/src/utils/pipenv.rs	224	audit-core	b291caa 2026-10-29	-	installed_major ignores root (let _ = root): drop param at 3 callers; inline resolve_on_path; delete 3 resolve_on_path tests duplicating process.rs tests (L583/L658/L713) and the 7-line wrapper doc; --version probe duplicated with vendor/pypi_hatch.rs (A11)
 crates/socket-patch-core/src/utils/pnpm_workspace.rs	1682	audit-core	-	-	
 crates/socket-patch-core/src/utils/poetry_lock.rs	1859	audit-core	-	-	
 crates/socket-patch-core/src/utils/process.rs	783	audit-core	-	-	
