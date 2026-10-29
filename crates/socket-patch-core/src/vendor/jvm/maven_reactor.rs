@@ -479,9 +479,11 @@ pub fn wired_checked(
 }
 
 /// [`wired_checked`], and no declaration of `c`'s g:a is left at a version
-/// that may still read the base: a `${...}` the checkout does not define
-/// or that an inheriting pom or a profile moves (#513, #459). Such a
-/// module builds the unpatched jar, so `vex` must not attest.
+/// that may still read the base: the base itself, as a module or
+/// dependency added since vendoring declares it (#584), or a `${...}` the
+/// checkout does not define or that an inheriting pom or a profile moves
+/// (#513, #459). Such a module builds the unpatched jar, so `vex` must
+/// not attest.
 pub fn attestable_checked(
     read: ReadFn<'_>,
     list: ListFn<'_>,
@@ -507,20 +509,21 @@ pub fn attestable_checked(
         extra_artifacts: &[],
         patched_members: &[],
     };
+    let mut edits = BTreeMap::new();
     let mut uncertain = BTreeSet::new();
     for rel in &reactor.scope {
         reactor.rewrite_declarations(
             rel,
             &patch,
             &sv,
-            &mut BTreeMap::new(),
+            &mut edits,
             &mut Vec::new(),
             &mut BTreeSet::new(),
             &mut BTreeSet::new(),
             &mut uncertain,
         );
     }
-    Ok(uncertain.is_empty())
+    Ok(edits.is_empty() && uncertain.is_empty())
 }
 
 /// `<!-- socket-patch <uuid>:` — the start of `c`'s pin comment.
@@ -5744,6 +5747,47 @@ mod tests {
         ]);
         let (_, after) = vendor(&files);
         assert_eq!(attestable(&after), (true, true));
+    }
+
+    /// #584: a module added after vendoring, or a dependency added to an
+    /// existing one, that declares the base literally beats the root's
+    /// pin and builds the unpatched jar: not attestable until re-vendored.
+    #[test]
+    fn a_base_declaration_added_after_vendoring_is_not_attestable() {
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", &dep("1.10.0"))),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (_, after) = vendor(&files);
+        assert_eq!(attestable(&after), (true, true));
+
+        let mut added_module = after.clone();
+        added_module.insert(
+            "pom.xml".into(),
+            text(&after, "pom.xml")
+                .replace(
+                    "<module>b</module>",
+                    "<module>b</module>\n    <module>c</module>",
+                )
+                .into_bytes(),
+        );
+        added_module.insert("c/pom.xml".into(), module("c", &dep("1.10.0")).into_bytes());
+        let mut added_dep = after.clone();
+        added_dep.insert("b/pom.xml".into(), module("b", &dep("1.10.0")).into_bytes());
+        // A module still on an earlier patch's suffix builds that patch's
+        // jar, not this one.
+        let mut earlier_patch = after.clone();
+        earlier_patch.insert(
+            "b/pom.xml".into(),
+            module("b", &dep("1.10.0-socket.deadbeef")).into_bytes(),
+        );
+        for drifted in [added_module, added_dep, earlier_patch] {
+            assert_eq!(attestable(&drifted), (true, false));
+            // Re-vendoring rewrites it and the reactor attests again.
+            let (_, again) = vendor(&drifted);
+            assert_eq!(attestable(&again), (true, true));
+        }
     }
 
     /// #513: a possibly-matching declaration named through an undefined
