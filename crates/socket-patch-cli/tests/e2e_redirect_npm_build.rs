@@ -1174,15 +1174,27 @@ const NPM_BIN_AFTER: &[u8] = b"#!/usr/bin/env node\nconsole.log(\"hi\");\r\n// S
 /// `bin`) npm-installed, and an agent manifest patching that bin with
 /// its blobs. Returns the project dir.
 fn crlf_bin_project(tmp: &Path) -> PathBuf {
+    let proj = crlf_bin_project_with(
+        tmp,
+        r#"{"name":"crlfbin","version":"1.0.0","bin":{"crlfbin":"cli.js"}}"#,
+        "cli.js",
+        &[],
+    );
+    let cli = proj.join("node_modules/crlfbin/cli.js");
+    assert_eq!(std::fs::read(&cli).unwrap(), NPM_BIN_BEFORE, "npm's fixBin");
+    proj
+}
+
+/// [`crlf_bin_project`] with the package's `package.json` `manifest`, the
+/// CRLF-shebang file at `rel` in the package, and `flags` added to
+/// `npm install`.
+fn crlf_bin_project_with(tmp: &Path, manifest: &str, rel: &str, flags: &[&str]) -> PathBuf {
     let (before, after) = (CRLF_BIN_BEFORE, CRLF_BIN_AFTER);
     let pkg = tmp.join("pkg");
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(
-        pkg.join("package.json"),
-        r#"{"name":"crlfbin","version":"1.0.0","bin":{"crlfbin":"cli.js"}}"#,
-    )
-    .unwrap();
-    std::fs::write(pkg.join("cli.js"), before).unwrap();
+    let file = pkg.join(rel);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(pkg.join("package.json"), manifest).unwrap();
+    std::fs::write(&file, before).unwrap();
     std::fs::write(
         tmp.join("crlfbin-1.0.0.tgz"),
         npm_e2e_common::npm_pack_like(&pkg),
@@ -1196,23 +1208,20 @@ fn crlf_bin_project(tmp: &Path) -> PathBuf {
     )
     .unwrap();
     let cache = tmp.join("cache");
-    let out = npm_e2e_common::npm(
-        &proj,
-        &[
-            "install",
-            "--no-audit",
-            "--no-fund",
-            "--cache",
-            cache.to_str().unwrap(),
-        ],
-    );
+    let mut args = vec![
+        "install",
+        "--no-audit",
+        "--no-fund",
+        "--cache",
+        cache.to_str().unwrap(),
+    ];
+    args.extend_from_slice(flags);
+    let out = npm_e2e_common::npm(&proj, &args);
     assert!(
         out.status.success(),
         "{}",
         npm_e2e_common::output_text(&out)
     );
-    let cli = proj.join("node_modules/crlfbin/cli.js");
-    assert_eq!(std::fs::read(&cli).unwrap(), NPM_BIN_BEFORE, "npm's fixBin");
 
     let (b, a) = (git_sha256(before), git_sha256(after));
     let blobs = proj.join(".socket/blobs");
@@ -1223,7 +1232,7 @@ fn crlf_bin_project(tmp: &Path) -> PathBuf {
         proj.join(".socket/manifest.json"),
         format!(
             r#"{{"patches":{{"pkg:npm/crlfbin@1.0.0":{{"uuid":"e2f99e5d-3afd-5cbd-be80-6a0102bcd6c2",
-"exportedAt":"2026-01-01T00:00:00Z","files":{{"package/cli.js":{{"beforeHash":"{b}","afterHash":"{a}"}}}},
+"exportedAt":"2026-01-01T00:00:00Z","files":{{"package/{rel}":{{"beforeHash":"{b}","afterHash":"{a}"}}}},
 "vulnerabilities":{{"GHSA-xxxx-yyyy-zzzz":{{"cves":["CVE-2099-0001"],"summary":"t","severity":"high","description":"d"}}}},
 "description":"d","license":"MIT","tier":"free"}}}}}}"#
         ),
@@ -1344,4 +1353,66 @@ async fn npm_agent_recovers_crlf_bin_left_by_raw_write() {
     assert_eq!(code, 0, "rollback\nstdout:\n{stdout}\nstderr:\n{stderr}");
     assert_eq!(std::fs::read(&cli).unwrap(), NPM_BIN_BEFORE);
     assert_crlf_bin_runs(&proj, "after rollback");
+}
+
+/// Regression (#1804): npm rewrites the shebang only of bins it links.
+/// With `--no-bin-links`, or for a `directories.bin`-only package
+/// installed from a `file:` tarball (npm doesn't expand that field from a
+/// tarball's `package.json`), the installed bin keeps its CRLF shebang.
+/// `apply` writes the patch's recorded bytes, `apply --check` agrees, and
+/// `rollback` restores what `npm install` wrote, byte for byte.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install; runs on the e2e CI matrix leg"]
+async fn npm_agent_keeps_crlf_shebang_of_bin_npm_did_not_link() {
+    const SUITE: &str = "npm_agent_keeps_crlf_shebang_of_bin_npm_did_not_link";
+    if npm_e2e_common::npm_version().is_none() {
+        npm_e2e_common::skip(SUITE, "npm not on PATH");
+        return;
+    }
+    for (manifest, rel, flags) in [
+        (
+            r#"{"name":"crlfbin","version":"1.0.0","bin":{"crlfbin":"cli.js"}}"#,
+            "cli.js",
+            &["--no-bin-links"][..],
+        ),
+        (
+            r#"{"name":"crlfbin","version":"1.0.0","directories":{"bin":"bin"}}"#,
+            "bin/cli.js",
+            &[][..],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = crlf_bin_project_with(tmp.path(), manifest, rel, flags);
+        let cli = proj.join("node_modules/crlfbin").join(rel);
+        assert_eq!(
+            std::fs::read(&cli).unwrap(),
+            CRLF_BIN_BEFORE,
+            "{rel}: npm left the shebang alone"
+        );
+
+        let (code, stdout, stderr) = run_socket(&proj, &["apply", "--offline"]);
+        assert_eq!(
+            code, 0,
+            "{rel}: apply\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(std::fs::read(&cli).unwrap(), CRLF_BIN_AFTER, "{rel}: apply");
+
+        let (code, stdout, stderr) = run_socket(&proj, &["apply", "--check", "--offline"]);
+        assert_eq!(
+            code, 0,
+            "{rel}: check\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let (code, stdout, stderr) = run_socket(&proj, &["rollback", "--offline"]);
+        assert_eq!(
+            code, 0,
+            "{rel}: rollback\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&cli).unwrap(),
+            CRLF_BIN_BEFORE,
+            "{rel}: rollback is byte-exact"
+        );
+    }
 }
