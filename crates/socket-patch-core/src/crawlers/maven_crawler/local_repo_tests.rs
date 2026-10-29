@@ -144,17 +144,26 @@ fn maven_repo_local_system_property_beats_settings() {
         "MAVEN_OPTS".into(),
         format!("-Xmx1g -Dmaven.repo.local={}", from_opts.path().display()),
     );
-    assert_eq!(m2_repo(&e, Os::Unix), Some(from_opts.path().to_path_buf()));
+    assert_eq!(
+        m2_repo(&e, Os::current()),
+        Some(from_opts.path().to_path_buf())
+    );
     e.insert(
         "MAVEN_ARGS".into(),
         format!("-B -Dmaven.repo.local={}", from_args.path().display()),
     );
-    assert_eq!(m2_repo(&e, Os::Unix), Some(from_args.path().to_path_buf()));
+    assert_eq!(
+        m2_repo(&e, Os::current()),
+        Some(from_args.path().to_path_buf())
+    );
     e.insert(
         "MAVEN_REPO_LOCAL".into(),
         from_env.path().to_str().unwrap().into(),
     );
-    assert_eq!(m2_repo(&e, Os::Unix), Some(from_env.path().to_path_buf()));
+    assert_eq!(
+        m2_repo(&e, Os::current()),
+        Some(from_env.path().to_path_buf())
+    );
 }
 
 /// `-Duser.home` in `MAVEN_OPTS` moves `~/.m2` (settings and repository)
@@ -169,7 +178,7 @@ fn maven_opts_user_home_moves_the_m2_directory() {
         format!("-Duser.home={}", jvm_home.path().display()),
     );
     assert_eq!(
-        m2_repo(&e, Os::Unix),
+        m2_repo(&e, Os::current()),
         Some(jvm_home.path().join(".m2").join("repository"))
     );
 }
@@ -294,7 +303,7 @@ fn maven_args_user_home_does_not_move_the_m2_directory() {
         format!("-Duser.home={}", elsewhere.path().display()),
     );
     assert_eq!(
-        m2_repo(&e, Os::Unix),
+        m2_repo(&e, Os::current()),
         Some(home.path().join(".m2").join("repository"))
     );
 }
