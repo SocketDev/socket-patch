@@ -1078,7 +1078,9 @@ async fn vendor_maven_jvm(
         .map(|(rel, _)| rel.clone())
         .chain(plan.writes.iter().filter(|w| w.tree).map(|w| w.rel.clone()))
         .collect();
-    let unindexed = match super::jvm::apply::unindexed_tree_entries(project_root, &indexed) {
+    let unindexed = match super::jvm::apply::unindexed_tree_entries(project_root, &indexed)
+        .and_then(|found| super::jvm::apply::refuse_linked(&found).map(|()| found))
+    {
         Ok(found) => found,
         Err(e) => return done(failed_result(purl, &jar_path, e), None, warnings),
     };

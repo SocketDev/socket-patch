@@ -889,22 +889,29 @@ pub fn unindexed_tree_entries(
     unindexed_in(root, &indexed_tree_dirs(indexed), indexed)
 }
 
+/// Through a linked tree directory a stray may be another artifact's
+/// file, so [`sweep_unindexed`] refuses it and leaves the call to the
+/// user. A dry run checks this too, so it never previews a sweep the real
+/// run refuses.
+pub fn refuse_linked(stray: &[UnindexedEntry]) -> Result<(), String> {
+    match stray.iter().find(|s| s.linked) {
+        Some(s) => Err(format!(
+            "{} is in a vendored tree directory reached through a symlink; delete it by \
+             hand if it is not another artifact's file",
+            s.rel
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Delete `stray` now, outside any group commit: nothing names these
 /// entries, so there is nothing to journal, and a captured removal would
 /// be read back through a stray symlink at the commit. A symlink goes,
 /// not its target; a directory goes with everything in it (the tree is
 /// socket-patch's own). One already gone counts as removed.
 pub async fn sweep_unindexed(stray: &[UnindexedEntry]) -> Result<(), String> {
+    refuse_linked(stray)?;
     for entry in stray {
-        // Through a linked tree directory the entry may be another
-        // artifact's file: leave the call to the user.
-        if entry.linked {
-            return Err(format!(
-                "{} is in a vendored tree directory reached through a symlink; delete it \
-                 by hand if it is not another artifact's file",
-                entry.rel
-            ));
-        }
         let gone = match tokio::fs::symlink_metadata(&entry.path).await {
             Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&entry.path).await,
             Ok(_) => tokio::fs::remove_file(&entry.path).await,
@@ -1882,8 +1889,12 @@ mod tests {
         let stray = unindexed_tree_entries(root, &indexed).unwrap();
         assert_eq!(stray.len(), 1);
         assert!(stray[0].linked);
-        let err = sweep_unindexed(&stray).await.unwrap_err();
-        assert!(err.contains("through a symlink"), "{err}");
+        let err = refuse_linked(&stray).unwrap_err();
+        assert!(
+            err.contains("through a symlink"),
+            "a dry run refuses too: {err}"
+        );
+        assert_eq!(sweep_unindexed(&stray).await.unwrap_err(), err);
         assert!(peer.join("b-1-socket.1d3c1fd2.jar").is_file());
     }
 }

@@ -558,7 +558,9 @@ impl VendoredBackend<'_> {
                         let indexed = vendor::jvm::apply::recorded_tree_files(&entry);
                         let swept =
                             match vendor::jvm::apply::unindexed_tree_entries(&common.cwd, &indexed)
-                            {
+                                .and_then(|found| {
+                                    vendor::jvm::apply::refuse_linked(&found).map(|()| found)
+                                }) {
                                 Ok(stray) if stray.is_empty() || common.dry_run => Ok(stray),
                                 Ok(stray) => vendor::jvm::apply::sweep_unindexed(&stray)
                                     .await
