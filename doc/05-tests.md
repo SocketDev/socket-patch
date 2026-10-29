@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ c07af61 on 2026-10-29 by audit-cli-tests._
+_Last checked against main @ c07af61 on 2026-10-29 by audit-core._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -31,3 +31,10 @@ _Last checked against main @ c07af61 on 2026-10-29 by audit-cli-tests._
   - Name overclaims: get `select_json_mode_multi_free_options_serialize_vulnerabilities` asserts only `Err(1)`. {{T02}}
   - Misplaced: ~63 `agent_download` tests (~2,800 lines) live in `get.rs`.
 - **Coverage gaps:** no assert on any Gradle detail text in apply (a broken string continuation at apply.rs L3111 ships 17-space runs); no 401 test on get's search path; no test ties the env lists to clap. {{T03}}
+- **Tally for the rest of `utils/` (20 files): 23 fake or weak tests.**
+  - Tautologies: `purl.rs` ×15 (7 `test_build_*_purl`, 7 `*_round_trip`, `test_is_purl`); `process.rs` ×2 (assert std's `Command::new`).
+  - Expected value recomputed with the code under test: `purl_key` `nuget_key_agrees_with_the_vendored_version_match`.
+  - Duplicates: `poetry_lock` shape-change test (third copy) {{A05}}; `uri.rs`'s asserts repeated byte for byte in `yarn_berry_lock.rs`.
+  - Weak asserts: `poetry_lock` malformed-integrity (`!err.is_empty()`), `python_lock` "ours" test (`is_ok()` passes on `Ok(None)`).
+  - Misplaced: `purl_key_nuget_vendor_tests.rs` (an end-to-end vendor test), `redact`'s lint of `vendor/service_fetch.rs`.
+- **Coverage gaps:** `python_script` `refuse_uv_no_binary`/`no_sources` (project form) have no unit test.

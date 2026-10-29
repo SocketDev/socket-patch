@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ c07af61 on 2026-10-29 by audit-cli-tests._
+_Last checked against main @ c07af61 on 2026-10-29 by audit-core._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -21,3 +21,11 @@ _Last checked against main @ c07af61 on 2026-10-29 by audit-cli-tests._
 - **Apply/rollback mirror pieces:** gem build-sibling rule and verbose verification printer, both drifted. {{T08}}
 - **Severity ladder:** 3 copies. {{T10}} **Top-ranked patch per purl:** 4 copies. {{T15}} **Overlay staging:** 2 copies with different staging roots. {{T13}}
 - **Mode resolution** in `get` and `scan`, checks in different orders. {{T14}}
+- **purl `name@version` split:** about 12 hand copies, 3 in `purl.rs` alone, disagreeing on empty parts. {{A14}}
+- **Uuid shape:** 4 checks; `python_script`'s `Uuid::parse_str` accepts forms the others reject. {{A15}}
+- **pnpm `packages:` membership:** `lists_member` refuses brace/class globs that hosted reads with a second reader; the lock-member detector is written twice. {{A17}}
+- **Poetry lock writer < 1.4:** hosted and vendored copies; the shared reader is dead. {{A18}}
+- **uv settings file and `no-binary` precedence:** `python_script` and `redirect/upstream/uv`. {{A22}}
+- **requirements.txt logical lines:** hosted keeps its own lexer and comment split. {{A23}}
+- **"Our earlier hosted pin":** pdm/poetry vs uv/pylock rules. {{A24}}
+- **PEP 508 leading name:** 3 scanners. {{A25}}
