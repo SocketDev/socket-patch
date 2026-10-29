@@ -11,6 +11,8 @@ use std::ops::Range;
 
 use serde_json::{json, Value};
 
+use crate::formats::maven::maven_config_properties as cli_properties;
+
 use super::super::state::{WiringAction, WiringRecord};
 use super::layout::{self, safe_coordinates};
 use super::{
@@ -2119,68 +2121,6 @@ fn has_fallback_repository(doc: &Doc) -> bool {
         doc.children(r, "repository")
             .any(|repo| doc.child_text(repo, "id").as_deref() == Some(REPO_ID))
     })
-}
-
-/// The user properties a `maven.config` defines, as Maven 3.9+ reads it:
-/// one argument per line, `#` lines are comments (older Maven rejects
-/// them), and a wholly quoted argument is unquoted. A property is
-/// `-Dk=v`, `-D k=v`, `--define=k=v` or `--define k=v`, or a bare `-D` /
-/// `--define` whose `k=v` is the next line. The value is the rest of the
-/// argument, so `-Dv=1.0 # note` defines `1.0 # note`, as in Maven.
-/// `-Dk` sets `k=true`; a later definition wins. Maven before 3.9 splits
-/// the file on whitespace instead, so a `-Dk=v` token that only that reading
-/// finds (`-B -Dk=v` on one line) is kept too, unless a line defines `k`.
-fn cli_properties(config: &str) -> BTreeMap<String, String> {
-    // Java's `String.trim`: every char up to U+0020, nothing beyond.
-    fn trim(s: &str) -> &str {
-        s.trim_matches(|c: char| c <= ' ')
-    }
-    fn unquote(s: &str) -> &str {
-        s.strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .map_or(s, trim)
-    }
-    let mut args = config
-        .lines()
-        .map(|line| unquote(trim(line)))
-        .filter(|arg| !arg.is_empty() && !arg.starts_with('#'))
-        .peekable();
-    let mut props = BTreeMap::new();
-    while let Some(arg) = args.next() {
-        let def = match arg.strip_prefix("--define") {
-            Some(rest) => rest
-                .strip_prefix('=')
-                .or_else(|| (rest.is_empty() || rest.starts_with(' ')).then_some(rest)),
-            None => arg.strip_prefix("-D"),
-        };
-        let Some(def) = def.map(trim) else {
-            continue;
-        };
-        let def = match def {
-            "" => match args.next_if(|next| !next.starts_with('-')) {
-                Some(next) => next,
-                None => continue,
-            },
-            def => def,
-        };
-        let (k, v) = def.split_once('=').unwrap_or((def, "true"));
-        if !k.is_empty() {
-            props.insert(k.to_string(), v.to_string());
-        }
-    }
-    let tokens = config
-        .lines()
-        .filter(|line| !trim(line).starts_with('#'))
-        .flat_map(str::split_whitespace)
-        .filter_map(|t| t.strip_prefix("-D")?.split_once('='));
-    let mut legacy = BTreeMap::new();
-    for (k, v) in tokens {
-        if !k.is_empty() && !props.contains_key(k) {
-            legacy.insert(k.to_string(), v.to_string());
-        }
-    }
-    props.extend(legacy);
-    props
 }
 
 // ── pom edits ───────────────────────────────────────────────────

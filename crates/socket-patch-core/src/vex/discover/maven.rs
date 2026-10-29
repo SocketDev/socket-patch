@@ -104,8 +104,8 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
-    is_maven_coordinate, is_maven_version_text, parse_pom, split_socket_version, Pom, PomDep,
-    PomRepo,
+    is_maven_coordinate, is_maven_version_text, maven_config_properties, may_shadow,
+    parse_pom_with, split_socket_version, Pom, PomDep, PomRepo,
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
 use crate::utils::digest::sha256_hex;
@@ -128,7 +128,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let Some(raw) = ctx.read_text(POM, out).await else {
         return;
     };
-    let pom = match parse_pom(&raw) {
+    // `.mvn/maven.config`'s `-D` user properties win over the pom's own
+    // when Maven interpolates a coordinate.
+    let user_properties = match ctx.read_text(MVN_CONFIG, out).await {
+        Some(config) => maven_config_properties(&config),
+        None => BTreeMap::new(),
+    };
+    let pom = match parse_pom_with(&raw, &user_properties) {
         Ok(pom) => pom,
         Err(e) => {
             out.diag(
@@ -158,7 +164,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw);
     extract_hosted(ctx, &pom, &gas, &hosted, reactor, out).await;
     if !vendored.is_empty() {
-        extract_vendored(ctx, &gas, &vendored, out).await;
+        extract_vendored(ctx, &pom.deps, &gas, &vendored, out).await;
     }
 }
 
@@ -197,7 +203,8 @@ async fn extract_hosted(
         }
     }
 
-    for ((group, artifact), versions) in gas {
+    for (group, artifact) in gas.keys() {
+        let versions = &ga_versions(&pom.deps, gas, group, artifact);
         let socket_pins: BTreeSet<&str> = versions
             .direct
             .iter()
@@ -417,6 +424,7 @@ async fn trusted_checksums(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> BTreeM
 
 async fn extract_vendored(
     ctx: &DiscoverCtx<'_>,
+    deps: &[PomDep],
     gas: &BTreeMap<(String, String), GaVersions>,
     vendored: &BTreeSet<String>,
     out: &mut Discovery,
@@ -495,7 +503,8 @@ async fn extract_vendored(
         }
         // The vendored repository serves the ORIGINAL GAV; a pom that now
         // pins this GA to another version no longer consumes the artifact.
-        if let Some(versions) = gas.get(&(group.to_string(), artifact.to_string())) {
+        {
+            let versions = ga_versions(deps, gas, group, artifact);
             let effective = if versions.direct.is_empty() {
                 &versions.managed
             } else {
@@ -631,10 +640,46 @@ fn classify_repo(ctx: &DiscoverCtx<'_>, repo: &PomRepo, out: &mut Discovery) -> 
 
 /// Distinct literal versions of one `groupId:artifactId`, split by where
 /// they are declared (profile-scoped declarations excluded).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct GaVersions {
     direct: BTreeSet<String>,
     managed: BTreeSet<String>,
+}
+
+/// What Maven may resolve for `group:artifact`'s main jar: its own
+/// declarations ([`group_by_ga`]) plus the version of every declaration
+/// Maven always reads whose groupId or artifactId is a property this pom
+/// does not define and may be this GA (#683,
+/// [`may_shadow`](crate::formats::maven::may_shadow)) — its version then
+/// takes part in Maven's precedence, unseen under the literal key.
+fn ga_versions(
+    deps: &[PomDep],
+    gas: &BTreeMap<(String, String), GaVersions>,
+    group: &str,
+    artifact: &str,
+) -> GaVersions {
+    let mut versions = gas
+        .get(&(group.to_string(), artifact.to_string()))
+        .cloned()
+        .unwrap_or_default();
+    for dep in deps.iter().filter(|d| !d.in_profile) {
+        let Some(version) = &dep.version else {
+            continue;
+        };
+        if may_shadow(
+            (&dep.group, &dep.artifact),
+            dep.type_text.as_deref(),
+            dep.classifier.as_deref(),
+            (group, artifact),
+        ) {
+            if dep.managed {
+                versions.managed.insert(version.clone());
+            } else {
+                versions.direct.insert(version.clone());
+            }
+        }
+    }
+    versions
 }
 
 fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
@@ -1288,6 +1333,132 @@ mod tests {
         assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
     }
 
+    /// A `${property}` groupId / artifactId is read through the pom's own
+    /// `<properties>` (#683): a property-named direct declaration keeping
+    /// the plain version shadows the managed pin (Maven resolves Central's
+    /// jar), and one carrying the suffixed version is the pin.
+    #[tokio::test]
+    async fn property_coordinates_are_the_declared_ga() {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        for (props, g, a) in [
+            ("<g>org.slf4j</g>", "${g}", "slf4j-api"),
+            ("<a>slf4j-api</a>", "org.slf4j", "${a}"),
+        ] {
+            let shadowed = Project::new();
+            shadowed.write(
+                "pom.xml",
+                pom(&format!(
+                    "<properties>{props}</properties>\n\
+                     <dependencyManagement><dependencies>\n{}</dependencies></dependencyManagement>\n\
+                     <dependencies>\n{}</dependencies>\n<repositories>\n{repo}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                    dep(g, a, Some("1.7.36")),
+                )),
+            );
+            let out = run(&shadowed).await;
+            assert_refs(&out, &[]);
+            assert!(
+                diag_codes(&out).contains(&DIAG_REF_INVALID),
+                "{g}:{a}: {:?}",
+                out.diagnostics
+            );
+
+            let pinned = Project::new();
+            pinned.write(
+                "pom.xml",
+                pom(&format!(
+                    "<properties>{props}</properties>\n<dependencies>\n{}</dependencies>\n\
+                     <repositories>\n{repo}</repositories>\n",
+                    dep(g, a, Some(&suffixed(UUID_A))),
+                )),
+            );
+            let out = run(&pinned).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        }
+    }
+
+    /// `.mvn/maven.config`'s `-D` user properties override the pom's own
+    /// when Maven interpolates a coordinate: a suffixed pin on a
+    /// declaration that Maven reads as another group is not this GA's.
+    #[tokio::test]
+    async fn coordinate_properties_read_maven_config_overrides() {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        for (props, config, attested) in [
+            ("<g>org.slf4j</g>", "-Dg=com.acme.fork\n", false),
+            ("", "-Dg=org.slf4j\n", true),
+        ] {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<properties>{props}</properties>\n<dependencies>\n{}</dependencies>\n\
+                     <repositories>\n{repo}</repositories>\n",
+                    dep("${g}", "slf4j-api", Some(&suffixed(UUID_A))),
+                )),
+            );
+            p.write(".mvn/maven.config", config);
+            let out = run(&p).await;
+            let slf4j = out.refs.iter().any(|r| r.purl == FX_PURL);
+            assert_eq!(
+                slf4j, attested,
+                "{config}: {:?} {:?}",
+                out.refs, out.diagnostics
+            );
+        }
+    }
+
+    /// A versioned declaration whose coordinate is a property this pom
+    /// does not define may be the pinned GA, so the pin is not attested
+    /// past it (#683).
+    #[tokio::test]
+    async fn undefined_coordinate_property_is_not_attested_past() {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            pom(&format!(
+                "<dependencyManagement><dependencies>\n{}</dependencies></dependencyManagement>\n\
+                 <dependencies>\n{}</dependencies>\n<repositories>\n{repo}</repositories>\n",
+                dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                dep("${parent.g}", "slf4j-api", Some("1.7.36")),
+            )),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert!(
+            diag_codes(&out).contains(&DIAG_REF_INVALID),
+            "{:?}",
+            out.diagnostics
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.detail.contains("org.slf4j:slf4j-api") && d.detail.contains("1.7.36")),
+            "{:?}",
+            out.diagnostics
+        );
+
+        // A placeholder that cannot be the GA (a non-jar type, or literal
+        // text around the reference that differs) does not.
+        for other in [
+            "<dependency><groupId>${parent.g}</groupId><artifactId>${bom}</artifactId>\
+             <version>3</version><type>pom</type><scope>import</scope></dependency>",
+            "<dependency><groupId>${parent.g}</groupId><artifactId>${a}-core</artifactId>\
+             <version>3</version></dependency>",
+        ] {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<dependencies>\n{}{other}\n</dependencies>\n<repositories>\n{repo}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                )),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        }
+    }
+
     #[tokio::test]
     async fn unsafe_coordinates_on_a_socket_pin_are_invalid() {
         let p = Project::new();
@@ -1543,6 +1714,32 @@ mod tests {
         );
         let out = run(&p).await;
         assert_refs(&out, &[(V_PURL, UUID_A, WiringMode::Vendored)]);
+
+        // #683: a declaration whose groupId is a property this pom does not
+        // define may be the GA. At the vendored version it consumes the
+        // vendored jar; at another version it may not.
+        for (version, attested) in [("1.10.0", true), ("1.11.0", false)] {
+            let p = vendored_project(UUID_A);
+            let text = std::fs::read_to_string(p.root().join("pom.xml")).expect("pom");
+            p.write(
+                "pom.xml",
+                text.replace(
+                    "<groupId>org.apache.commons</groupId>",
+                    "<groupId>${parent.g}</groupId>",
+                )
+                .replace(
+                    "<version>1.10.0</version>",
+                    &format!("<version>{version}</version>"),
+                ),
+            );
+            let out = run(&p).await;
+            if attested {
+                assert_refs(&out, &[(V_PURL, UUID_A, WiringMode::Vendored)]);
+            } else {
+                assert_refs(&out, &[]);
+                assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID], "{version}");
+            }
+        }
     }
 
     /// REGRESSION: the vendored repository is `checksumPolicy=fail`, so the
