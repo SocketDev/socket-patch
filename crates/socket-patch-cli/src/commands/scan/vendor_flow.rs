@@ -182,8 +182,10 @@ impl VendorPreview {
 /// run's `--patch-server-url` origins. The preview stays a ledger
 /// classification otherwise (engine refusals outside the preflights are
 /// not predicted), and a would-refuse never flips the run's status or exit
-/// code. The preflights (the only disk access besides the ledger) run only
-/// when the selection holds an npm or PyPI purl.
+/// code. The preflights (the only disk access besides the ledger; the PyPI
+/// one may also probe `pipenv --version` and list Hatch environments, as
+/// the wet run's guards do) run only when the selection holds an npm or
+/// PyPI purl.
 /// `takeover_refusals` adds the hosted→vendored takeover refusals the
 /// caller resolved (the gem gates of
 /// [`crate::commands::vendor::gem_takeover_preview_refusals`]), keyed by
@@ -205,7 +207,7 @@ pub(crate) async fn preview_vendor(
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     let state = state.unwrap_or_default();
     let pnpm_refusals = hosted_pnpm_refusals(cwd, selected, origins, &state).await;
-    let pypi_refusals = pypi_refusals(cwd, selected, origins).await;
+    let pypi_refusals = pypi_refusals(cwd, selected, origins, takeover_refusals).await;
     let refuse = |code: &str, detail: &str| PreviewVerdict::WouldRefuse {
         code: code.to_string(),
         detail: detail.to_string(),
@@ -268,23 +270,35 @@ pub(crate) async fn preview_vendor(
 }
 
 /// The PyPI purls of `selected` the vendor backend's prelude refuses
-/// before it builds or downloads anything (the wiring guards a standalone
-/// `vendor --dry-run` already reports, such as `pypi_uv_no_sources`), keyed
-/// by purl (#891). Read-only.
+/// before it builds or downloads anything (the routing and wiring guards a
+/// standalone `vendor --dry-run` already reports, such as
+/// `pypi_no_requirements` or `pypi_uv_no_sources`), keyed by purl (#891).
+/// Read-only. A purl the caller's takeover gates already refuse is not
+/// asked again, and neither is one with a live hosted pin: the wet run
+/// restores its upstream entry before the backend runs, so its guards
+/// would judge text this preview never stages (as for the takeovers of
+/// every ecosystem but pnpm, see [`hosted_pnpm_refusals`]).
 async fn pypi_refusals(
     cwd: &Path,
     selected: &[PatchSearchResult],
     origins: &[String],
+    takeover_refusals: &HashMap<String, (&'static str, String)>,
 ) -> HashMap<String, (&'static str, String)> {
-    let mut refusals = HashMap::new();
-    for p in selected.iter().filter(|p| p.purl.starts_with("pkg:pypi/")) {
-        if let Some(refusal) =
-            socket_patch_core::vendor::pypi::preview_refusal(&p.purl, cwd, &p.uuid, origins).await
-        {
-            refusals.insert(p.purl.clone(), refusal);
-        }
+    let pypi: Vec<&PatchSearchResult> = selected
+        .iter()
+        .filter(|p| p.purl.starts_with("pkg:pypi/") && !takeover_refusals.contains_key(&p.purl))
+        .collect();
+    if pypi.is_empty() {
+        return HashMap::new();
     }
-    refusals
+    let claimed =
+        crate::commands::agent_download::hosted_claimed_purls(cwd, origins.to_vec()).await;
+    let candidates: Vec<(&str, &str)> = pypi
+        .into_iter()
+        .filter(|p| !claimed.contains(&PurlKey::new(&p.purl)))
+        .map(|p| (p.purl.as_str(), p.uuid.as_str()))
+        .collect();
+    socket_patch_core::vendor::pypi::preview_refusals(cwd, &candidates, origins).await
 }
 
 /// Fold the vendor engine's envelope into a `scan` / `get` envelope (no
@@ -1563,6 +1577,13 @@ mod preview_tests {
     async fn preview_warns_about_a_symlinked_wiring_file() {
         let tmp = tempfile::tempdir().unwrap();
         let shared = tempfile::tempdir().unwrap();
+        // A PyPI project the PyPI backend can wire, so its row is a
+        // would-vendor row whose advisories are computed (#891).
+        std::fs::write(
+            tmp.path().join("requirements.txt"),
+            "preview-other==1.0.0\n",
+        )
+        .unwrap();
         std::fs::write(shared.path().join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
         std::os::unix::fs::symlink(
             shared.path().join("yarn.lock"),
@@ -1588,10 +1609,9 @@ mod preview_tests {
                 .is_some_and(|d| d.starts_with("yarn.lock is a symbolic link")),
             "{preview}"
         );
-        assert!(
-            action_of(&preview, PYPI).get("warnings").is_none(),
-            "{preview}"
-        );
+        let pypi = action_of(&preview, PYPI);
+        assert_eq!(pypi["action"], "would_vendor", "{preview}");
+        assert!(pypi.get("warnings").is_none(), "{preview}");
     }
 
     /// A refused Bun tree flips npm purls to the additive `would_refuse`
@@ -1889,6 +1909,30 @@ wheels = [
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("uv.lock"), UV_LOCK).unwrap();
         std::fs::write(tmp.path().join("pyproject.toml"), UV_PYPROJECT).unwrap();
+        let preview =
+            preview_vendor_json(tmp.path(), &[sel(UUID, SIX)], &[], &HashMap::new()).await;
+        assert_eq!(
+            action_of(&preview, SIX)["action"],
+            "would_vendor",
+            "{preview}"
+        );
+    }
+
+    /// #891: a PyPI purl with a live hosted pin is not judged by the PyPI
+    /// guards on the still-hosted text: the wet run restores the upstream
+    /// pin first, so the preview keeps it `would_vendor`.
+    #[tokio::test]
+    async fn preview_does_not_refuse_a_hosted_pypi_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("requirements.txt"),
+            format!(
+                "six @ https://patch.socket.dev/patch/pypi/six/1.16.0/g/{UUID}/\
+                 six-1.16.0-py2.py3-none-any.whl --hash=sha256:{}\n",
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
         let preview =
             preview_vendor_json(tmp.path(), &[sel(UUID, SIX)], &[], &HashMap::new()).await;
         assert_eq!(
