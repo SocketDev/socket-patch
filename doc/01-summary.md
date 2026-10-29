@@ -48,6 +48,7 @@ _Filled in as the audit progresses. Each bullet carries its register token._
   - The cargo workspace glob has no character classes {{A02}}.
   - Both bugs were shown by running the code.
 - **`utils/` is a mix of ecosystem-specific code and true utilities.** Some of it imports `vendor::*` {{A08}}.
+- **CLI commands carry second copies of shared engines.** `get <uuid>` re-implements the agent download engine {{T01}}, and five callers glue the Bun and vlt preflights by hand {{T05}}. The copies have drifted in user-visible text and JSON {{T02,T04}}.
 
 ## The numbers
 | | Value |

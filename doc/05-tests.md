@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ b291caa on 2026-10-29 by audit-core._
+_Last checked against main @ c07af61 on 2026-10-29 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -24,3 +24,10 @@ _Last checked against main @ b291caa on 2026-10-29 by audit-core._
   - `http` mid-stream cap and `Truncated`;
   - `cargo_build_cache` warning text;
   - the cargo config precedence, now covered by {{A01}}'s acceptance criteria.
+- **Tally for `crates/socket-patch-cli/src` (first 8 files): about 38 fake, duplicate or misplaced tests.**
+  - Duplicates of core tests: get's 10 `detect_*` (core `target.rs`) and 9 `select_*` ranking tests (core `ranking.rs`).
+  - Duplicates of `tests/cli_global_args.rs`: 6 inline tests in `args.rs`.
+  - Can't fail: `fetch_stage` obsolete diff/package archive tests ×2; `get` `apply_failed_line_is_an_error_even_when_silent` (a const equals its literal); `args` env-list and `VendorSource` tests ×3.
+  - Name overclaims: get `select_json_mode_multi_free_options_serialize_vulnerabilities` asserts only `Err(1)`. {{T02}}
+  - Misplaced: ~63 `agent_download` tests (~2,800 lines) live in `get.rs`.
+- **Coverage gaps:** no assert on any Gradle detail text in apply (a broken string continuation at apply.rs L3111 ships 17-space runs); no 401 test on get's search path; no test ties the env lists to clap. {{T03}}
