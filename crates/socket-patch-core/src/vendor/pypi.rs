@@ -244,6 +244,24 @@ async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &st
     }
 }
 
+/// #1851: refuse wiring a lock beside a requirements set whose exact pin of
+/// the target sits in an out-of-root `-r` include. pip installs that pin,
+/// vendor cannot edit the file, and naming requirements.txt a loser would
+/// let the lock wiring report the package patched.
+async fn refuse_pin_outside_root(
+    project_root: &Path,
+    target: Option<(&str, &str)>,
+    wired_with_lock: bool,
+) -> Result<(), (&'static str, String)> {
+    let Some((name, version)) = target.filter(|_| !wired_with_lock) else {
+        return Ok(());
+    };
+    match super::pypi_requirements::pin_outside_root(project_root, name, version).await {
+        Some(rel) => Err(super::pypi_requirements::outside_root_refusal(&rel, name)),
+        None => Ok(()),
+    }
+}
+
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
 /// with locks (precedence follows migration direction / ecosystem currency:
@@ -396,6 +414,7 @@ async fn detect_pypi_flavor(
             }
             None => false,
         };
+        refuse_pin_outside_root(project_root, target, wired_with_lock).await?;
         if !wired_with_lock && exists(PYPI_REQUIREMENTS).await {
             present.push(PYPI_REQUIREMENTS);
         }
@@ -449,6 +468,9 @@ async fn detect_pypi_flavor(
         }
         _ => false,
     };
+    if governing.is_some() {
+        refuse_pin_outside_root(project_root, target, wired_with_lock).await?;
+    }
     if governing.is_some()
         && !wired_with_lock
         && requirements_pins_target(project_root, target).await
@@ -4128,6 +4150,50 @@ mod tests {
             assert!(
                 warnings.iter().all(|w| w.code != "pypi_multiple_lockfiles"),
                 "{lock}: {warnings:?}"
+            );
+        }
+    }
+
+    /// #1851: pip installs an exact pin from a `-r` include outside the
+    /// project root, which vendor cannot edit. Wiring only the lock beside
+    /// it would leave `pip install -r requirements.txt` on the upstream
+    /// release, so every lock flavor refuses it as the requirements-only
+    /// planner does, instead of naming requirements.txt a loser.
+    #[tokio::test]
+    async fn exact_pin_in_an_out_of_root_include_refuses_beside_a_lock() {
+        let pylock = PIPENV_PYLOCK.replace("pipenv", "pip");
+        for (lock, content) in [
+            ("pylock.toml", pylock.as_str()),
+            ("uv.lock", "version = 1\n"),
+            ("Pipfile.lock", "{}"),
+            ("poetry.lock", ""),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("app");
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            touch(tmp.path(), "base.txt", "six==1.16.0\n").await;
+            touch(&root, lock, content).await;
+            touch(&root, "requirements.txt", "-r ../base.txt\nidna==3.7\n").await;
+            let (code, detail) = detect_pypi_flavor(&root, Some(("six", "1.16.0")))
+                .await
+                .unwrap_err();
+            assert_eq!(code, "pypi_requirements_outside_root", "{lock}: {detail}");
+            assert!(detail.contains("../base.txt"), "{lock}: {detail}");
+
+            // Another release, or a package only the in-root file names,
+            // is not refused.
+            touch(tmp.path(), "base.txt", "six==1.15.0\n").await;
+            assert!(
+                detect_pypi_flavor(&root, Some(("six", "1.16.0")))
+                    .await
+                    .is_ok(),
+                "{lock}"
+            );
+            assert!(
+                detect_pypi_flavor(&root, Some(("idna", "3.7")))
+                    .await
+                    .is_ok(),
+                "{lock}"
             );
         }
     }

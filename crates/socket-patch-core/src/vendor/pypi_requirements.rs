@@ -446,6 +446,37 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
         && refuse_symlinked(root, &rels).await.is_ok()
 }
 
+/// The out-of-root `-r` include (`../shared/base.txt`) that pins
+/// `canon_name==version` exactly from the registry, if the requirements set
+/// has one (#1851). pip installs that pin, but vendor cannot edit the file,
+/// so wiring only a lock beside it would leave `pip install -r` on the
+/// upstream release: the lock flavors refuse it as the requirements-only
+/// planner does (`pypi_requirements_outside_root`).
+pub(super) async fn pin_outside_root(
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+) -> Option<String> {
+    let files = collect_requirements_files(root).await.ok()?;
+    files
+        .into_iter()
+        .find(|f| !f.editable && !scan_pins(&f.content, canon_name, version).exact.is_empty())
+        .map(|f| f.rel)
+}
+
+/// The `pypi_requirements_outside_root` refusal for a pin in the
+/// out-of-root include `rel`.
+pub(super) fn outside_root_refusal(rel: &str, canon_name: &str) -> (&'static str, String) {
+    (
+        "pypi_requirements_outside_root",
+        format!(
+            "{rel}: {canon_name} is pinned in a requirements include outside the project \
+             root, which vendor cannot edit; inline it or use agent mode \
+             (`scan --mode agent` + `socket-patch apply`) instead"
+        ),
+    )
+}
+
 /// The `requirements_line` records of a mixed entry (a Pipenv or uv entry
 /// that also wired its exported requirements file, #612 / #1368).
 pub(super) const RECORD_KIND: &str = "requirements_line";
@@ -889,15 +920,7 @@ async fn plan_requirements(
             // SECURITY/scope: an include outside the project root cannot be
             // edited by a committable vendor flow; rewriting only the in-root
             // copy would leave pip a duplicate requirement. Fail closed.
-            return Err((
-                "pypi_requirements_outside_root",
-                format!(
-                    "{}: {canon_name} is pinned in a requirements include outside the project \
-                     root, which vendor cannot edit; inline it or use agent mode \
-                     (`scan --mode agent` + `socket-patch apply`) instead",
-                    file.rel
-                ),
-            ));
+            return Err(outside_root_refusal(&file.rel, canon_name));
         }
 
         // Rewrite EVERY exact-pin occurrence in this file, bottom-up so the
