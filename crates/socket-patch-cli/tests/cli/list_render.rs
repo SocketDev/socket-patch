@@ -1,7 +1,7 @@
 //! `list` output: the `--debug` provenance
 //! echoes for config-sourced telemetry credentials (the two `inspect`
 //! closures in core api/client.rs's credential resolution, reached via
-//! `GlobalArgs::telemetry_credentials` -> `resolve_ambient_credentials`),
+//! `GlobalArgs::telemetry_auth` -> `resolve_ambient_credentials`),
 //! and the
 //! human-readable listing's sparse-record branches — a vulnerability with
 //! no CVE ids (GHSA-only advisories are a real production shape), and a
@@ -28,7 +28,7 @@ use crate::vlt_hosted_common;
 use crate::vlt_vendored;
 
 // ---------------------------------------------------------------------------
-// `--debug` provenance echoes (GlobalArgs::telemetry_credentials, config layer)
+// `--debug` provenance echoes (GlobalArgs::telemetry_auth, config layer)
 // ---------------------------------------------------------------------------
 
 /// The platform env var that positions the socket-cli data dir.
@@ -81,7 +81,7 @@ fn list_cmd(project: &Path, data_dir: &Path, debug: bool) -> Command {
 /// With credentials resolved from the socket-cli config layer (no flag, no
 /// env var), `--debug` must echo the resolution source for BOTH the api
 /// token and the org slug — the documented provenance contract of
-/// `telemetry_credentials` — and the echoes must tell the truth: the
+/// `telemetry_auth` — and the echoes must tell the truth: the
 /// telemetry POST actually goes out under those config credentials.
 #[tokio::test]
 async fn list_debug_echoes_config_credential_provenance() {

@@ -17,25 +17,23 @@ use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 /// Reject unknown ecosystems before they can produce a misleading empty scan.
 fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
     if Ecosystem::all().iter().any(|e| e.cli_name() == s) {
-        Ok(s.to_string())
-    } else {
-        let supported = Ecosystem::all()
-            .iter()
-            .map(|e| e.cli_name())
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(unsupported_ecosystem_message(s, &supported))
+        return Ok(s.to_string());
     }
-}
-
-/// The `--ecosystems` rejection text. An empty token (`--ecosystems ,npm`,
-/// a trailing comma) gets its own wording: "unsupported ecosystem ``"
-/// reads like a rendering glitch.
-fn unsupported_ecosystem_message(token: &str, supported: &str) -> String {
-    if token.trim().is_empty() {
-        format!("empty ecosystem name in the list (supported: {supported})")
+    let supported = Ecosystem::all()
+        .iter()
+        .map(|e| e.cli_name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // An empty token (`--ecosystems ,npm`, a trailing comma) gets its own
+    // wording: "unsupported ecosystem ``" reads like a rendering glitch.
+    if s.trim().is_empty() {
+        Err(format!(
+            "empty ecosystem name in the list (supported: {supported})"
+        ))
     } else {
-        format!("unsupported ecosystem `{token}` (supported: {supported})")
+        Err(format!(
+            "unsupported ecosystem `{s}` (supported: {supported})"
+        ))
     }
 }
 
@@ -355,55 +353,38 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
-    /// Reject path flags that name nothing: `--cwd` and `--global-prefix`
-    /// (flag or env) must be existing directories, and a `--manifest-path`
-    /// other than the default must sit in an existing project directory.
-    /// `main` maps `Err` to the usage exit
-    /// (2), the same exit a hosted/vendored `scan` PATH that is not a
-    /// directory gets.
-    ///
-    /// Without this a typo in `--cwd` / `SOCKET_CWD` read as an empty
-    /// project: `apply`, `list`, `scan`, `get` and the `vendor --check` CI
-    /// gate all exited 0 having checked nothing.
+    /// Reject path flags that name nothing, so a typo in `--cwd` never reads
+    /// as an empty project that passes every check: `--cwd` and
+    /// `--global-prefix` (flag or env) must be existing directories, and a
+    /// `--manifest-path` other than the default must sit in an existing
+    /// project directory. `main` maps `Err` to the usage exit (2).
     ///
     /// A missing manifest FILE stays legal: hosted and vendored projects
-    /// have none, and `get` / `scan --mode agent` create it. Only its
-    /// project directory has to exist — except for the commands that
-    /// create the manifest (`creates_manifest`: `get`, `scan`), which make
-    /// a missing directory as they always have; writing it is no vacuous
-    /// pass.
+    /// have none. The commands that create the manifest
+    /// (`creates_manifest`: `get`, `scan`) also create its directory.
     pub fn validate_paths(&self, creates_manifest: bool) -> Result<(), String> {
         let not_dir = |flag: &str, env: &str, path: &Path, what: &str| {
             format!("{flag} (or {env}) `{}` {what}", path.display())
         };
-        if !self.cwd.is_dir() {
-            let what = if self.cwd.exists() {
+        let require_dir = |flag: &str, env: &str, path: &Path| {
+            if path.is_dir() {
+                return Ok(());
+            }
+            let what = if path.exists() {
                 "is not a directory"
             } else {
                 "does not exist"
             };
-            return Err(not_dir("--cwd", "SOCKET_CWD", &self.cwd, what));
-        }
+            Err(not_dir(flag, env, path, what))
+        };
+        require_dir("--cwd", "SOCKET_CWD", &self.cwd)?;
         if let Some(prefix) = &self.global_prefix {
-            if !prefix.is_dir() {
-                let what = if prefix.exists() {
-                    "is not a directory"
-                } else {
-                    "does not exist"
-                };
-                return Err(not_dir(
-                    "--global-prefix",
-                    "SOCKET_GLOBAL_PREFIX",
-                    prefix,
-                    what,
-                ));
-            }
+            require_dir("--global-prefix", "SOCKET_GLOBAL_PREFIX", prefix)?;
         }
         // A manifest path that names a directory is not refused here: that
         // is a corrupt project, not a bad flag, and `read_manifest` refuses
-        // it as `manifest_unreadable` under every spelling of the path. A
-        // check keyed on the flag's text gave the explicit spellings exit 2
-        // with no `--json` document instead (#1123).
+        // it as `manifest_unreadable` with a `--json` document, where a check
+        // here would exit 2 with none.
         if self.manifest_path != DEFAULT_PATCH_MANIFEST_PATH {
             // `.`-free for the message: `--cwd .` joined onto
             // `./.socket/manifest.json` would print `././.socket/…`.
@@ -433,33 +414,6 @@ impl GlobalArgs {
             }
         }
         Ok(())
-    }
-
-    /// Refuse a `--global-prefix` naming a Deno tool's per-tool
-    /// `node_modules` that Deno never loads (#444): patching it reported
-    /// `applied` (and VEX `not_affected`) while the tool kept running the
-    /// copy in Deno's npm cache. Only commands that patch, find or attest
-    /// call this; the ones that restore (`rollback`, `remove`,
-    /// `vendor --revert`, `repair`) still reach a tree an earlier release
-    /// patched.
-    pub fn refuse_unloaded_deno_prefix(&self) -> Result<(), String> {
-        match &self.global_prefix {
-            Some(prefix)
-                if socket_patch_core::crawlers::deno_crawler::is_unloaded_deno_tool_node_modules(
-                    prefix,
-                ) =>
-            {
-                Err(format!(
-                    "--global-prefix (or SOCKET_GLOBAL_PREFIX) `{}` is inside a Deno tool's \
-                     node_modules that Deno does not load (the tool's Deno config leaves \
-                     nodeModulesDir unset or \"none\"); the tool runs its npm packages from \
-                     Deno's npm cache, so use -g, or --global-prefix naming $DENO_DIR or \
-                     $DENO_DIR/npm",
-                    prefix.display()
-                ))
-            }
-            _ => Ok(()),
-        }
     }
 
     /// The crawler options this run's `--cwd` / `--global` /
@@ -506,24 +460,18 @@ impl GlobalArgs {
         }
     }
 
-    /// The project root whose state stores — manifest, vendor ledger and
-    /// its `.socket/vendor/` artifacts — belong together. For the default
-    /// `<cwd>/.socket/manifest.json` this is exactly `cwd`; for a
-    /// `--manifest-path` into another project's `.socket/` it is that
-    /// project's root (the `.socket` parent's parent); a manifest file
-    /// outside any `.socket/` directory (`--manifest-path
-    /// state/patches.json`, `/etc/socket/manifest.json`) relocates only
-    /// the manifest — the project stays `cwd`. Every command derives every
-    /// store from THIS root, so `--manifest-path` can never interleave two
-    /// projects' state (CLI_CONTRACT.md `--manifest-path` row; #745).
+    /// The project root whose state stores (manifest, vendor ledger,
+    /// `.socket/vendor/` artifacts) belong together: `cwd` by default, the
+    /// `.socket` parent's parent for a `--manifest-path` into another
+    /// project's `.socket/`, and still `cwd` for a manifest file outside any
+    /// `.socket/` directory. Every command derives every store from this
+    /// root, so `--manifest-path` never interleaves two projects' state.
     pub(crate) fn project_root(&self) -> PathBuf {
         project_root_of(&self.resolved_manifest_path(), &self.cwd)
     }
 
     /// Whether the resolved manifest belongs to a project other than
-    /// `--cwd` ([`Self::project_root`] names a different directory). Only
-    /// a non-default `--manifest-path` / `SOCKET_MANIFEST_PATH` can make
-    /// this true.
+    /// `--cwd`.
     pub(crate) fn manifest_project_is_foreign(&self) -> bool {
         let root = self.project_root();
         if root == self.cwd {
@@ -538,12 +486,9 @@ impl GlobalArgs {
         }
     }
 
-    /// `self` with `cwd` moved to [`Self::project_root`] (and the manifest
-    /// path re-expressed relative to it, so it resolves to the same file):
-    /// the view the vendored backend runs under, so a revert or repair
-    /// touches the ledger, `.socket/vendor/` artifacts and lockfile wiring
-    /// of ONE project — the manifest's (#745). Borrowed unchanged for the
-    /// default layout.
+    /// `self` with `cwd` moved to [`Self::project_root`] and the manifest
+    /// path re-expressed relative to it, so a revert or repair touches the
+    /// state of one project: the manifest's.
     pub(crate) fn at_project_root(&self) -> std::borrow::Cow<'_, GlobalArgs> {
         let root = self.project_root();
         if root == self.cwd {
@@ -560,23 +505,16 @@ impl GlobalArgs {
         std::borrow::Cow::Owned(rooted)
     }
 
-    /// The directory the manifest lives in — where `apply.lock` and `blobs/`
-    /// sit, and the obsolete `diffs/` and `packages/` the cleanup sweeps
-    /// remove (`<cwd>/.socket` by default). The one
-    /// derivation every lock acquire and artifact probe uses; see
-    /// [`socket_dir_of`] for callers holding a raw manifest path.
+    /// The directory the manifest lives in, where `apply.lock` and `blobs/`
+    /// sit (`<cwd>/.socket` by default).
     pub(crate) fn socket_dir(&self) -> PathBuf {
         socket_dir_of(&self.resolved_manifest_path(), &self.cwd)
     }
 
-    /// Build [`ApiClientEnvOverrides`] from the CLI flags.
-    ///
-    /// Every field is forwarded as `Some(_)` only when set and non-empty.
-    /// `None` (no flag, no env var — the fields carry no clap default)
-    /// defers resolution to `get_api_client_with_overrides`, which falls
-    /// through env vars and the socket-cli config file to the built-in
-    /// defaults. The empty filter keeps `--api-url ""` meaning "unset"
-    /// rather than forwarding a blank override.
+    /// The API client overrides from the CLI flags. `None` defers to env,
+    /// the socket-cli config file and the built-in defaults. Empty values
+    /// are dropped: `build_proxy_fallback_client` would use a blank
+    /// `--proxy-url` as is.
     pub fn api_client_overrides(&self) -> ApiClientEnvOverrides {
         ApiClientEnvOverrides {
             api_url: self.api_url.clone().filter(|s| !s.is_empty()),
@@ -586,38 +524,23 @@ impl GlobalArgs {
         }
     }
 
-    /// The `(api_token, org_slug)` telemetry is attributed with, resolved
-    /// through the API client's own credential chain (flag → the
-    /// `SOCKET_NO_API_TOKEN` veto → env → `socket login` config) WITHOUT
-    /// building a client. For the purely local commands (`list`,
-    /// `vex`): a client would add the org-slug auto-resolve round-trip and
-    /// the "No SOCKET_API_TOKEN set" advisory to a command that needs
-    /// neither, while anything less than the full chain reported a
-    /// `socket login`-only caller's events anonymously to the public proxy
-    /// — off the on-prem host every other command reports to.
-    pub(crate) fn telemetry_credentials(&self) -> (Option<String>, Option<String>) {
-        let overrides = self.api_client_overrides();
-        resolve_ambient_credentials(overrides.api_token, overrides.org_slug)
-    }
-
-    /// Telemetry's route for a run that built no API client:
-    /// [`Self::telemetry_credentials`] as a [`TelemetryAuth`] (the org
-    /// endpoint only for a token + slug; never a network call). A run that
-    /// has a client uses [`TelemetryAuth::for_client`] instead.
+    /// Telemetry's route for a run that built no API client, resolved
+    /// through the client's own credential chain (flag, the
+    /// `SOCKET_NO_API_TOKEN` veto, env, `socket login` config) without a
+    /// network call, so a `socket login`-only caller's events reach their
+    /// org rather than the public proxy. A run that has a client uses
+    /// [`TelemetryAuth::for_client`] instead.
     pub(crate) fn telemetry_auth(&self) -> TelemetryAuth {
-        let (api_token, org_slug) = self.telemetry_credentials();
+        let overrides = self.api_client_overrides();
+        let (api_token, org_slug) =
+            resolve_ambient_credentials(overrides.api_token, overrides.org_slug);
         TelemetryAuth::from_credentials(api_token.as_deref(), org_slug.as_deref())
     }
 
     /// The vendoring-service config every vendor entry point (`vendor`,
-    /// `scan`/`get --mode vendored`) builds from the same flags —
-    /// `--vendor-source` / `--vendor-url` / `--patch-server-url` /
-    /// `--offline` — so they commit byte-identical artifacts and lock
-    /// integrity for the same patch. `client` is the run-level API client
-    /// (moved in; the service reuses it for the package-reference request)
-    /// and `use_public_proxy` its proxy-fallback state. `vendor_source` was
-    /// validated by clap, so the parse cannot fail; the `auto` default is
-    /// the defensive fallback. A pure assembler (no async, no network).
+    /// `scan`/`get --mode vendored`) builds from the same flags, so they
+    /// commit byte-identical artifacts for the same patch. Clap validated
+    /// `vendor_source`; a struct literal with a bad one gets the default.
     pub(crate) fn vendor_service_config(
         &self,
         client: Option<ApiClient>,
@@ -652,11 +575,8 @@ pub(crate) fn project_root_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
         .map_or_else(|| cwd.to_path_buf(), Path::to_path_buf)
 }
 
-/// The `.socket/`-role directory for `manifest_path`: its parent, falling
-/// back to `cwd` for a bare relative file name — never `"."`, which is
-/// wrong under a non-default `--cwd`. [`GlobalArgs::resolved_manifest_path`]
-/// always joins a relative path onto `cwd`, so the fallback is reachable
-/// only for callers handed an unresolved path.
+/// [`GlobalArgs::socket_dir`] for a caller holding a manifest path: its
+/// parent, falling back to `cwd` (never `"."`) for a bare file name.
 pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
     manifest_path
         .parent()
@@ -665,28 +585,15 @@ pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
         .unwrap_or_else(|| cwd.to_path_buf())
 }
 
-/// Apply CLI-flag toggles for env-driven knobs by mirroring them into env
-/// vars. This is how `--offline` / `--debug` / `--no-telemetry` reach core
-/// code that reads `SOCKET_OFFLINE` / `SOCKET_DEBUG` /
-/// `SOCKET_TELEMETRY_DISABLED` directly. Idempotent and a no-op when the
-/// flags are off.
-///
-/// `offline` matters most: the telemetry kill-switch
-/// (`socket_patch_core::telemetry::is_telemetry_disabled`) honors the
-/// strict-airgap contract by reading `SOCKET_OFFLINE` from the env, so
-/// without this mirror a bare `--offline` flag (or a truthy spelling like
-/// `SOCKET_OFFLINE=yes` that core's `"1" | "true"` match doesn't recognize)
-/// still let telemetry fire a network request.
-///
-/// `--api-url` / `--proxy-url` are mirrored for the same reason: the
-/// telemetry sender resolves its endpoint from the env only
-/// (`resolve_api_base_url` / `proxy_url_from_env`) and never sees the parsed
-/// flags, so without the mirror an on-prem `--api-url` run POSTed the event —
-/// Bearer token included — to the default `api.socket.dev`. Empty values mean
-/// "unset" (as in [`GlobalArgs::api_client_overrides`]) and are not mirrored.
-/// `--api-token` / `--org` are deliberately NOT mirrored: telemetry receives
-/// them as explicit arguments, and exporting a secret into the process env
-/// would leak it to every spawned package-manager child.
+/// Mirror the flags that core reads from the env (`SOCKET_OFFLINE`,
+/// `SOCKET_DEBUG`, `SOCKET_TELEMETRY_DISABLED`, `SOCKET_API_URL`,
+/// `SOCKET_PROXY_URL`) into it. Core's own parse matches only `"1" | "true"`,
+/// and the telemetry kill-switch and endpoint resolvers never see the parsed
+/// flags: without the mirror `--offline` still sent telemetry, and an
+/// on-prem `--api-url` run sent it, token included, to `api.socket.dev`.
+/// Empty URLs mean "unset" and are not mirrored. `--api-token` / `--org` are
+/// deliberately not mirrored: exporting a secret into the process env would
+/// leak it to every spawned package-manager child.
 pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     if common.offline {
         std::env::set_var("SOCKET_OFFLINE", "1");
@@ -736,12 +643,9 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
 ];
 
-/// Every env var a **subcommand-local** flag binds (one per `env = "..."`
-/// attribute in `commands/*.rs`). Same contract as [`GLOBAL_ARG_ENV_VARS`]:
-/// single source of truth for [`scrub_empty_env_vars`] and the
-/// clean-environment test harnesses. A flag added with an `env` binding but
-/// missing here escapes the empty-var scrub — the invariant tests below
-/// parse every entry against its owning subcommand to keep this honest.
+/// Every env var a subcommand-local flag binds (one per `env = "..."`
+/// attribute in `commands/*.rs`), for the same users as
+/// [`GLOBAL_ARG_ENV_VARS`]. A var missing here escapes the empty-var scrub.
 pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_PATCH_VERSION",
     "SOCKET_SAVE_ONLY",
@@ -760,21 +664,11 @@ pub const LOCAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_VEX_COMPACT",
 ];
 
-/// Remove exported-but-**empty** flag-bound env vars before clap parses.
-///
-/// `SOCKET_CWD=` — the conventional shell/CI idiom for blanking a variable
-/// without unsetting it — must mean "unset, fall back to the default", not
-/// abort the command. [`parse_bool_flag`] already gives the bool flags that
-/// semantic, but clap rejects an empty `SOCKET_CWD` / `SOCKET_GLOBAL_PREFIX`
-/// ("a value is required"), `SOCKET_LOCK_TIMEOUT` / `SOCKET_BATCH_SIZE`
-/// ("cannot parse integer from empty string") and `SOCKET_ECOSYSTEMS` (the
-/// per-token validator) outright — a single stray blank var crashed every
-/// subcommand — and an empty `SOCKET_MANIFEST_PATH`
-/// (or `SOCKET_VEX_OUTPUT`, which would silently target `""`) leaked `""`
-/// past the documented defaults. Called from `main` after peer-alias
-/// promotion and before clap runs. Only exactly-empty values are scrubbed;
-/// whitespace is significant in paths, so it is left for the parsers to
-/// judge.
+/// Remove exported-but-empty flag-bound env vars before clap parses, so
+/// `SOCKET_CWD=` (the shell idiom for blanking a variable) means "unset"
+/// instead of aborting the parse or leaking `""` past the defaults. Called
+/// from `main` after peer-alias promotion. Only exactly-empty values are
+/// scrubbed: whitespace is significant in paths.
 pub fn scrub_empty_env_vars() {
     for &var in GLOBAL_ARG_ENV_VARS.iter().chain(LOCAL_ARG_ENV_VARS) {
         if matches!(std::env::var(var).as_deref(), Ok("")) {
@@ -784,19 +678,8 @@ pub fn scrub_empty_env_vars() {
 }
 
 impl Default for GlobalArgs {
-    /// Defaults intended for **test struct literals** (e.g. `..GlobalArgs::default()`).
-    ///
-    /// In production every field is populated by clap (with the
-    /// `default_value = ".."` attribute providing the documented defaults
-    /// when neither CLI flag nor env var is set), so this `Default` is
-    /// only reached from tests building `GlobalArgs` directly.
-    ///
-    /// `api_url` and `proxy_url` are `None` here (not the production
-    /// default URLs). That lets tests set `SOCKET_API_URL` /
-    /// `SOCKET_PROXY_URL` via `std::env::set_var` *after* constructing
-    /// the args struct and have those env vars flow through to the API
-    /// client — `api_client_overrides` forwards `None` so the underlying
-    /// `get_api_client_with_overrides` falls back to env-var resolution.
+    /// Defaults for test struct literals; clap populates every field in
+    /// production.
     fn default() -> Self {
         Self {
             cwd: PathBuf::from("."),
@@ -844,24 +727,23 @@ mod tests {
 
     #[test]
     fn ecosystem_rejection_messages() {
-        assert_eq!(
-            unsupported_ecosystem_message("rubygems", "npm, pypi"),
-            "unsupported ecosystem `rubygems` (supported: npm, pypi)"
-        );
-        assert_eq!(
-            unsupported_ecosystem_message("", "npm, pypi"),
-            "empty ecosystem name in the list (supported: npm, pypi)"
-        );
-        assert_eq!(
-            unsupported_ecosystem_message("  ", "npm"),
-            "empty ecosystem name in the list (supported: npm)"
-        );
-        let err = parse_supported_ecosystem("bogus").unwrap_err();
-        assert!(
-            err.starts_with("unsupported ecosystem `bogus` (supported: npm"),
-            "{err}"
-        );
-        assert!(!err.contains("in this build"), "{err}");
+        let supported = "npm, pypi, cargo, gem, golang, maven, composer, nuget, deno";
+        for bad in ["bogus", "NPM", "py-pi"] {
+            assert_eq!(
+                parse_supported_ecosystem(bad),
+                Err(format!(
+                    "unsupported ecosystem `{bad}` (supported: {supported})"
+                ))
+            );
+        }
+        for empty in ["", "  "] {
+            assert_eq!(
+                parse_supported_ecosystem(empty),
+                Err(format!(
+                    "empty ecosystem name in the list (supported: {supported})"
+                ))
+            );
+        }
     }
 
     /// Minimal harness so we can exercise clap's parse + env-var resolution of
@@ -1070,33 +952,29 @@ mod tests {
             assert!(cli.common.ecosystems.is_none());
             assert_eq!(
                 cli.common.vendor_source, "service",
-                "empty SOCKET_VENDOR_SOURCE must fall back to the `auto` default"
+                "empty SOCKET_VENDOR_SOURCE must fall back to the default"
             );
             assert_eq!(cli.common.manifest_path, "keep.json");
         });
     }
 
-    /// `--vendor-source` parses every known token, normalizes case, honors the
-    /// env var, and defaults to `auto`; an unknown token aborts the parse.
+    /// `--vendor-source` normalizes case and the `auto` alias to `service`;
+    /// the removed `build` source (flag or env) and unknown tokens abort the
+    /// parse.
     #[test]
     #[serial_test::serial]
-    fn vendor_source_flag_parses_normalizes_and_defaults() {
+    fn vendor_source_flag_normalizes_and_rejects_removed_sources() {
         with_clean_socket_env(|| {
-            // Default when unset.
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert_eq!(cli.common.vendor_source, "service");
+            for token in ["SERVICE", "auto"] {
+                let cli =
+                    TestCli::try_parse_from(["socket-patch", "--vendor-source", token]).unwrap();
+                assert_eq!(cli.common.vendor_source, "service");
+            }
 
-            // CLI value, case-normalized to the canonical tag.
-            let cli =
-                TestCli::try_parse_from(["socket-patch", "--vendor-source", "SERVICE"]).unwrap();
-            assert_eq!(cli.common.vendor_source, "service");
-
-            // Env var honored.
             std::env::set_var("SOCKET_VENDOR_SOURCE", "build");
             assert!(TestCli::try_parse_from(["socket-patch"]).is_err());
             std::env::remove_var("SOCKET_VENDOR_SOURCE");
 
-            // Garbage is rejected at parse time.
             assert!(
                 TestCli::try_parse_from(["socket-patch", "--vendor-source", "download"]).is_err(),
                 "an unknown vendor source must fail the parse",
@@ -1104,49 +982,8 @@ mod tests {
         });
     }
 
-    // ---- vendor_service_config ------------------------------------------
-    // Moved from scan's vendored flow: the config every vendor entry point
-    // builds must be the same assembler, so `scan --mode vendored` and a
-    // plain `vendor` commit byte-identical artifacts for the same patch.
-
-    fn common_with_source(source: &str) -> GlobalArgs {
-        GlobalArgs {
-            vendor_source: source.to_string(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn vendor_service_config_default_source_permits_service() {
-        let cfg = common_with_source("auto").vendor_service_config(None, false);
-        assert_eq!(cfg.source, VendorSource::Service);
-        assert!(
-            cfg.source.may_use_service(),
-            "the default must be able to use the service (matching `vendor`)"
-        );
-        assert!(cfg.source.requires_service());
-        assert!(cfg.client.is_none());
-        assert!(!cfg.use_public_proxy);
-    }
-
-    /// The assembler fails closed even if a caller bypasses argument validation.
-    #[test]
-    fn vendor_service_config_honors_service_and_build_sources() {
-        let cfg = common_with_source("service").vendor_service_config(None, true);
-        assert_eq!(cfg.source, VendorSource::Service);
-        assert!(cfg.source.requires_service());
-        assert!(
-            cfg.use_public_proxy,
-            "the proxy-fallback state threads through"
-        );
-
-        let cfg = common_with_source("build").vendor_service_config(None, false);
-        assert_eq!(cfg.source, VendorSource::Service);
-        assert!(cfg.source.requires_service());
-    }
-
-    /// The service overrides (`--vendor-url` / `--patch-server-url` /
-    /// `--offline`) thread through unchanged, so every entry point targets
+    /// The proxy state and the service overrides (`--vendor-url` /
+    /// `--patch-server-url` / `--offline`) thread through unchanged, so every entry point targets
     /// the same hosts.
     #[test]
     fn vendor_service_config_threads_overrides_through() {
@@ -1157,65 +994,14 @@ mod tests {
             offline: true,
             ..Default::default()
         };
-        let cfg = common.vendor_service_config(None, false);
+        let cfg = common.vendor_service_config(None, true);
+        assert!(cfg.use_public_proxy);
         assert_eq!(cfg.vendor_url.as_deref(), Some("https://vendor.example"));
         assert_eq!(
             cfg.patch_server_url.as_deref(),
             Some("https://patch.example")
         );
         assert!(cfg.offline);
-    }
-
-    /// The new URL knobs flow through to the parsed args from CLI and env.
-    #[test]
-    #[serial_test::serial]
-    fn vendor_url_and_patch_server_url_flow_from_cli_and_env() {
-        with_clean_socket_env(|| {
-            let cli = TestCli::try_parse_from([
-                "socket-patch",
-                "--vendor-url",
-                "https://patch.socket-staging.dev",
-                "--patch-server-url",
-                "http://localhost:4026",
-            ])
-            .unwrap();
-            assert_eq!(
-                cli.common.vendor_url.as_deref(),
-                Some("https://patch.socket-staging.dev")
-            );
-            assert_eq!(
-                cli.common.patch_server_url.as_deref(),
-                Some("http://localhost:4026")
-            );
-
-            std::env::set_var("SOCKET_VENDOR_URL", "https://from-env.example");
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert_eq!(
-                cli.common.vendor_url.as_deref(),
-                Some("https://from-env.example")
-            );
-            std::env::remove_var("SOCKET_VENDOR_URL");
-            // Unset by default.
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert!(cli.common.vendor_url.is_none());
-            assert!(cli.common.patch_server_url.is_none());
-        });
-    }
-
-    /// Single-source-of-truth guard: the new env vars must be registered in
-    /// `GLOBAL_ARG_ENV_VARS` (drives the scrub + clean-env harness).
-    #[test]
-    fn global_arg_env_vars_includes_vendor_knobs() {
-        for var in [
-            "SOCKET_VENDOR_SOURCE",
-            "SOCKET_VENDOR_URL",
-            "SOCKET_PATCH_SERVER_URL",
-        ] {
-            assert!(
-                GLOBAL_ARG_ENV_VARS.contains(&var),
-                "{var} must be in GLOBAL_ARG_ENV_VARS",
-            );
-        }
     }
 
     /// `parse_bool_flag` accepts the same vocabulary as clap's
@@ -1248,53 +1034,6 @@ mod tests {
         assert!(parse_bool_flag("tru").is_err());
     }
 
-    /// Regression: an exported-but-empty bool env var must NOT crash the parse
-    /// (`BoolishValueParser` rejects it, taking down every subcommand); it
-    /// resolves to `false`.
-    #[test]
-    #[serial_test::serial]
-    fn empty_bool_env_var_parses_as_false_not_crash() {
-        with_clean_socket_env(|| {
-            for var in [
-                "SOCKET_OFFLINE",
-                "SOCKET_JSON",
-                "SOCKET_VERBOSE",
-                "SOCKET_GLOBAL",
-            ] {
-                std::env::set_var(var, "");
-            }
-            let cli = TestCli::try_parse_from(["socket-patch"])
-                .expect("empty bool env vars must not abort the parse");
-            assert!(!cli.common.offline);
-            assert!(!cli.common.json);
-            assert!(!cli.common.verbose);
-            assert!(!cli.common.global);
-            for var in [
-                "SOCKET_OFFLINE",
-                "SOCKET_JSON",
-                "SOCKET_VERBOSE",
-                "SOCKET_GLOBAL",
-            ] {
-                std::env::remove_var(var);
-            }
-        });
-    }
-
-    /// A truthy bool env var resolves to `true` through clap.
-    #[test]
-    #[serial_test::serial]
-    fn truthy_bool_env_var_parses_as_true() {
-        with_clean_socket_env(|| {
-            std::env::set_var("SOCKET_OFFLINE", "1");
-            std::env::set_var("SOCKET_JSON", "true");
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert!(cli.common.offline);
-            assert!(cli.common.json);
-            std::env::remove_var("SOCKET_OFFLINE");
-            std::env::remove_var("SOCKET_JSON");
-        });
-    }
-
     /// A non-boolean bool env var is still a hard parse error — the empty-string
     /// special case must not have widened into "accept anything".
     #[test]
@@ -1304,36 +1043,6 @@ mod tests {
             std::env::set_var("SOCKET_OFFLINE", "garbage");
             assert!(TestCli::try_parse_from(["socket-patch"]).is_err());
             std::env::remove_var("SOCKET_OFFLINE");
-        });
-    }
-
-    /// The bare CLI flag still toggles `true` (the value_parser applies to the
-    /// env path; on the command line `--offline` remains a no-value flag).
-    #[test]
-    #[serial_test::serial]
-    fn bare_cli_flag_sets_true() {
-        with_clean_socket_env(|| {
-            let cli = TestCli::try_parse_from(["socket-patch", "--offline", "--json"]).unwrap();
-            assert!(cli.common.offline);
-            assert!(cli.common.json);
-        });
-    }
-
-    /// With nothing set, every bool defaults to `false`.
-    #[test]
-    #[serial_test::serial]
-    fn bools_default_false_when_unset() {
-        with_clean_socket_env(|| {
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert!(!cli.common.offline);
-            assert!(!cli.common.json);
-            assert!(!cli.common.verbose);
-            assert!(!cli.common.silent);
-            assert!(!cli.common.global);
-            assert!(!cli.common.dry_run);
-            assert!(!cli.common.yes);
-            assert!(!cli.common.debug);
-            assert!(!cli.common.no_telemetry);
         });
     }
 
@@ -1354,55 +1063,45 @@ mod tests {
         assert_eq!(o.proxy_url.as_deref(), Some("https://proxy.example.com"));
     }
 
-    /// `GlobalArgs::default()` leaves every field `None`,
-    /// so every override must come back `None` —
-    /// this is what lets integration tests set `SOCKET_*` env vars *after*
-    /// constructing args and still have env-var resolution win downstream.
+    /// Telemetry without a client uses explicit flag values verbatim (the
+    /// org endpoint with a bearer), and empty values mean "unset" (the
+    /// proxy, with no bearer) rather than a `/v0/orgs//telemetry` URL.
     #[test]
-    fn api_client_overrides_default_is_all_none() {
-        let o = GlobalArgs::default().api_client_overrides();
-        assert!(o.api_url.is_none(), "empty api_url must not be forwarded");
-        assert!(
-            o.proxy_url.is_none(),
-            "empty proxy_url must not be forwarded"
-        );
-        assert!(o.api_token.is_none());
-        assert!(o.org_slug.is_none());
+    #[serial_test::serial]
+    fn telemetry_auth_prefers_explicit_values_and_treats_empty_as_unset() {
+        // Keep a developer's `socket login` config out of the chain.
+        with_env_cleared(&["SOCKET_NO_CONFIG"], || {
+            std::env::set_var("SOCKET_NO_CONFIG", "1");
+            with_clean_socket_env(|| {
+                let explicit = GlobalArgs {
+                    api_token: Some("sktsec_flag_api".to_string()),
+                    org: Some("flag-org".to_string()),
+                    ..GlobalArgs::default()
+                };
+                let auth = explicit.telemetry_auth();
+                assert_eq!(
+                    auth.url(),
+                    format!(
+                        "{}/v0/orgs/flag-org/telemetry",
+                        socket_patch_core::constants::DEFAULT_SOCKET_API_URL
+                    )
+                );
+                assert!(auth.is_authenticated());
+
+                let empty = GlobalArgs {
+                    api_token: Some(String::new()),
+                    org: Some(String::new()),
+                    ..GlobalArgs::default()
+                };
+                let auth = empty.telemetry_auth();
+                assert!(!auth.is_authenticated());
+                assert!(auth.url().ends_with("/patch/telemetry"), "{}", auth.url());
+            });
+        });
     }
 
-    /// Telemetry attribution runs the client's credential chain over the
-    /// same overrides: explicit values — the flag, or the env var clap folds
-    /// into the same field — are used verbatim, and empty means "unset"
-    /// (`Some("")` would build a malformed `/v0/orgs//telemetry` URL and an
-    /// empty `Bearer ` header). The ambient layers below the flags are
-    /// pinned in core (`resolve_ambient_credentials_*`) and end-to-end by
-    /// `tests/cli_config_fallback.rs::list_telemetry_follows_socket_cli_login`.
-    #[test]
-    fn telemetry_credentials_prefer_explicit_values_and_treat_empty_as_unset() {
-        let explicit = GlobalArgs {
-            api_token: Some("sktsec_flag_api".to_string()),
-            org: Some("flag-org".to_string()),
-            ..GlobalArgs::default()
-        };
-        assert_eq!(
-            explicit.telemetry_credentials(),
-            (
-                Some("sktsec_flag_api".to_string()),
-                Some("flag-org".to_string())
-            )
-        );
-        let empty = GlobalArgs {
-            api_token: Some(String::new()),
-            org: Some(String::new()),
-            ..GlobalArgs::default()
-        };
-        let (api_token, org_slug) = empty.telemetry_credentials();
-        assert_ne!(api_token.as_deref(), Some(""));
-        assert_ne!(org_slug.as_deref(), Some(""));
-    }
-
-    /// Empty strings for url/token/org are filtered out, not forwarded as
-    /// `Some("")` — otherwise an empty CLI value would mask env-var fallback.
+    /// Empty strings for url/token/org are dropped, not forwarded as
+    /// `Some("")`: an empty value would mask the env-var fallback.
     #[test]
     fn api_client_overrides_filters_empty_strings() {
         let args = GlobalArgs {
@@ -1541,24 +1240,6 @@ mod tests {
         }
     }
 
-    /// Unsupported / misspelled ecosystem names are rejected with a message
-    /// that names the offending token and lists the supported set.
-    #[test]
-    fn parse_supported_ecosystem_rejects_unknown_names() {
-        for bad in ["bogus", "NPM", "py-pi", ""] {
-            let err = parse_supported_ecosystem(bad)
-                .expect_err("unsupported ecosystem name must be rejected");
-            assert!(
-                err.contains(bad),
-                "error should echo the bad token: {err:?}"
-            );
-            assert!(
-                err.contains("supported:"),
-                "error should list the supported set: {err:?}",
-            );
-        }
-    }
-
     /// End-to-end through clap: `--ecosystems` splits on commas, validates each
     /// token, and rejects the whole parse if any token is unsupported.
     #[test]
@@ -1577,36 +1258,6 @@ mod tests {
                 TestCli::try_parse_from(["socket-patch", "--ecosystems", "npm,bogus"]).is_err(),
                 "an unsupported token must fail the parse",
             );
-        });
-    }
-
-    /// Precedence contract: a CLI value wins over the env var for a string flag.
-    #[test]
-    #[serial_test::serial]
-    fn cli_arg_overrides_env_var() {
-        with_clean_socket_env(|| {
-            std::env::set_var("SOCKET_MANIFEST_PATH", "from-env.json");
-            let cli = TestCli::try_parse_from(["socket-patch", "--manifest-path", "from-cli.json"])
-                .unwrap();
-            assert_eq!(cli.common.manifest_path, "from-cli.json");
-            std::env::remove_var("SOCKET_MANIFEST_PATH");
-        });
-    }
-
-    /// Precedence contract: the env var is honored when no CLI value is given,
-    /// and the clap-declared default applies when neither is set.
-    #[test]
-    #[serial_test::serial]
-    fn env_var_used_then_default_applies() {
-        with_clean_socket_env(|| {
-            std::env::set_var("SOCKET_MANIFEST_PATH", "from-env.json");
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert_eq!(cli.common.manifest_path, "from-env.json");
-            std::env::remove_var("SOCKET_MANIFEST_PATH");
-
-            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
-            assert_eq!(cli.common.manifest_path, DEFAULT_PATCH_MANIFEST_PATH);
-            assert_eq!(cli.common.cwd, PathBuf::from("."));
         });
     }
 
