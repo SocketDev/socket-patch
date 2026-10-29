@@ -35,8 +35,7 @@ pub(crate) fn acquire_or_emit(
     } else {
         // Errors print even under --silent ("errors only", CLI_CONTRACT.md),
         // and the hint is part of the error report.
-        let hint = failure_hint(&err, &socket_dir.join("apply.lock"), timeout);
-        eprint!("{}", format_human_error(&message, &hint));
+        eprint!("{}", format_lock_error(socket_dir, &err, timeout));
     }
     Err(1)
 }
@@ -116,7 +115,7 @@ pub(crate) const HELD_RETRY_HINT: &str =
     "Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock.";
 
 /// The one `LockError` → (`errorCode`, message) mapping every lock site
-/// renders, so the contention text cannot drift between commands.
+/// renders, so the error message cannot drift between commands.
 pub(crate) fn lock_failure(err: &LockError, timeout: Duration) -> (&'static str, String) {
     const HELD: &str = "another socket-patch process is operating in this directory";
     match err {
@@ -452,7 +451,7 @@ mod tests {
     /// A sub-second budget renders as milliseconds, not `0s`, and a zero
     /// budget claims no wait.
     #[test]
-    fn held_message_renders_the_waited_budget() {
+    fn lock_failure_renders_the_waited_budget() {
         assert_eq!(
             lock_failure(&LockError::Held, Duration::from_millis(250)).1,
             "another socket-patch process is operating in this directory (waited 250ms)"
