@@ -234,11 +234,9 @@ fn settings_local_repository_is_read_as_xml() {
 
     write(
         &user_settings,
-        &format!(
-            "<settings><profiles><profile><properties>\
-             <localRepository>/opt/other</localRepository>\
-             </properties></profile></profiles></settings>"
-        ),
+        "<settings><profiles><profile><properties>\
+         <localRepository>/opt/other</localRepository>\
+         </properties></profile></profiles></settings>",
     );
     assert_eq!(
         m2_repo(&e, Os::Unix),

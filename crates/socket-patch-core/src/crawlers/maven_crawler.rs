@@ -2609,6 +2609,11 @@ mod tests {
         let _opts = EnvGuard::unset("MAVEN_OPTS");
         let _maven_home = EnvGuard::unset("MAVEN_HOME");
         let _m2 = EnvGuard::set("M2_HOME", "");
+        // Point the home directory at an empty dir so a developer's own
+        // `~/.m2/settings.xml` <localRepository> can't change the result.
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", home.path().to_str().unwrap());
+        let _profile = EnvGuard::set("USERPROFILE", home.path().to_str().unwrap());
 
         let repo = MavenCrawler::m2_repo_path();
         assert_ne!(
