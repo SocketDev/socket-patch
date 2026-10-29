@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +18,11 @@ ROOT = Path(__file__).parents[2]
 spec = importlib.util.spec_from_file_location("ci_test_shard", ROOT / "scripts" / "ci-test-shard.py")
 shard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shard)
+
+
+def quiet():
+    """Capture the script's stdout (text and raw bytes) instead of printing it."""
+    return patch.object(shard.sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True))
 
 
 def selected(runs):
@@ -66,7 +72,7 @@ class Partition(unittest.TestCase):
             {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
         with patch.object(shard.subprocess, "run", return_value=subprocess.CompletedProcess(
                 [], 0, stdout=json.dumps(metadata))), \
-                patch.object(shard, "run", side_effect=[1, 0]) as run:
+                patch.object(shard, "run", side_effect=[(1, None), (0, None)]) as run, quiet():
             self.assertEqual(shard.main(["1", "3", "--locked", "--profile", "ci-release"]), 1)
         self.assertEqual(run.call_count, 2)
         self.assertIn("--doc", run.call_args_list[-1].args[0])
@@ -90,7 +96,7 @@ class Partition(unittest.TestCase):
         with patch.dict(shard.os.environ, {**env, "CI_TEST_COVERAGE": "1"}, clear=True), \
                 patch.object(shard.subprocess, "run", return_value=subprocess.CompletedProcess(
                     [], 0, stdout=json.dumps(metadata))), \
-                patch.object(shard, "run", return_value=0) as run:
+                patch.object(shard, "run", return_value=(0, None)) as run, quiet():
             self.assertEqual(shard.main(["1", "2"]), 0)
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args_list[-1].args[0][:3], ["cargo", "llvm-cov", "--no-report"])
@@ -98,7 +104,7 @@ class Partition(unittest.TestCase):
     def test_run_echoes_output_and_records_each_binary_time(self):
         script = (
             "import sys\n"
-            "print('     Running unittests src/lib.rs (target/debug/deps/socket_patch_core-0123456789abcdef)',"
+            "print('\\x1b[1m\\x1b[92m     Running\\x1b[0m unittests src/lib.rs (target/debug/deps/socket_patch_core-0123456789abcdef)',"
             " file=sys.stderr, flush=True)\n"
             "print('test result: ok. 3 passed; 0 failed; finished in 30.12s', flush=True)\n"
             "print(r'     Running tests\\apply\\main.rs (target\\debug\\deps\\apply-fedcba9876543210.exe)',"
@@ -106,29 +112,41 @@ class Partition(unittest.TestCase):
             "print('test result: FAILED. 1 passed; 1 failed; finished in 1.50s', flush=True)\n"
             "print('   Doc-tests socket_patch_core', file=sys.stderr, flush=True)\n"
             "print('test result: ok. 9 passed; 0 failed; finished in 4.00s', flush=True)\n"
+            "sys.stdout.buffer.write('\\u2550\\u274c\\n'.encode('utf-8'))\n"
             "sys.exit(3)\n")
         timings = {}
-        with patch.object(shard.sys, "stdout", new_callable=io.StringIO) as out:
-            self.assertEqual(shard.run([sys.executable, "-c", script], timings), 3)
-        timings.pop("_first_binary")
+        with quiet() as out:
+            status, first = shard.run([sys.executable, "-c", script], timings)
+        self.assertEqual(status, 3)
+        self.assertIsNotNone(first)
         self.assertEqual(timings, {"unit:socket_patch_core": 30.12, "apply": 1.5})
-        self.assertIn("Doc-tests socket_patch_core", out.getvalue())
-        self.assertIn("finished in 4.00s", out.getvalue())
+        text = out.buffer.getvalue().decode("utf-8")
+        self.assertIn("Doc-tests socket_patch_core", text)
+        self.assertIn("finished in 4.00s", text)
+        self.assertIn("\u2550\u274c", text)
+
+    def test_run_does_not_wait_for_a_leftover_process_holding_the_pipe(self):
+        # A test can leave a daemon behind with cargo's stdout inherited; the
+        # old subprocess.run(args) returned when cargo exited, and so must this.
+        script = ("import subprocess, sys\n"
+                  "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n")
+        start = time.monotonic()
+        with quiet(), patch.object(shard, "DRAIN_SECONDS", 0.5):
+            self.assertEqual(shard.run([sys.executable, "-c", script], {})[0], 0)
+        self.assertLess(time.monotonic() - start, 15)
 
     def test_main_prints_the_timing_sample_last(self):
         metadata = {"workspace_members": ["a"], "packages": [
             {"id": "a", "targets": [{"name": "integration", "kind": ["test"]}]}]}
 
         def fake_run(args, timings):
-            timings["_first_binary"] = shard.time.monotonic()
             timings["integration"] = 2.0
-            return 0
+            return 0, shard.time.monotonic()
         with patch.object(shard.subprocess, "run", return_value=subprocess.CompletedProcess(
                 [], 0, stdout=json.dumps(metadata))), \
-                patch.object(shard, "run", side_effect=fake_run), \
-                patch.object(shard.sys, "stdout", new_callable=io.StringIO) as out:
+                patch.object(shard, "run", side_effect=fake_run), quiet() as out:
             self.assertEqual(shard.main(["2", "2"]), 0)
-        last = out.getvalue().splitlines()[-1]
+        last = out.buffer.getvalue().decode("utf-8").splitlines()[-1]
         self.assertTrue(last.startswith("ci-test-shard: timings "), last)
         sample = json.loads(last.removeprefix("ci-test-shard: timings "))
         self.assertEqual(list(sample), ["_build_seconds", "integration"])
@@ -154,7 +172,7 @@ class Partition(unittest.TestCase):
                         patch.object(shard, "COVERAGE_TIMINGS", path), \
                         patch.object(shard.subprocess, "run", return_value=subprocess.CompletedProcess(
                             [], 0, stdout=json.dumps(metadata))), \
-                        patch.object(shard, "run", return_value=0) as run:
+                        patch.object(shard, "run", return_value=(0, None)) as run, quiet():
                     shard.main(["1", "2"])
                     self.assertEqual(selected([run.call_args_list[0].args[0]]), expected)
 
