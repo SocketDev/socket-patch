@@ -66,7 +66,11 @@
 //! and a stale one would otherwise gate the live wiring as a
 //! `wiring_conflict`. Lines are pip's logical lines, cut with the planner's
 //! own lexer ([`crate::utils::requirements`]: `\` continuations joined, `#`
-//! comments at column 0 or after whitespace, one leading BOM):
+//! comments at column 0 or after whitespace, one leading BOM).
+//! Includes outside the root (`-r ../shared/base.txt`) are read too, but
+//! only as evidence: pip installs their registry pins, which contest a
+//! lock's wiring of the same release (#1851); neither writer edits them,
+//! so nothing in them is wiring. The wiring shapes are:
 //!
 //! * hosted (`patch::redirect::requirements`):
 //!   `Name[extras] @ <artifact_url>[ ; marker] --hash=sha256:<hex>`;
@@ -264,6 +268,38 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             requirements_line(ctx, file, &line.text, out);
         }
     }
+    // #1851: pip installs the pins of an include outside the project root
+    // too. Neither writer edits such a file, so it holds no Socket wiring,
+    // but its registry pins contest a lock's wiring like an in-root pin.
+    let budget = MAX_REQUIREMENTS_FILES.saturating_sub(files.len());
+    let outside =
+        crate::vendor::pypi_requirements::requirements_outside_root_names_in(ctx.view).await;
+    for file in outside.iter().take(budget) {
+        out.install_tree(file, ROOT_REQUIREMENTS);
+        let Some(text) = ctx.read_requirements_text(file, out).await else {
+            continue;
+        };
+        for line in logical_lines(&text) {
+            outside_root_line(file, &line.text, out);
+        }
+    }
+}
+
+/// One logical line of an out-of-root include: its registry pins and
+/// editable checkouts are evidence, nothing in it is wiring.
+fn outside_root_line(file: &str, line: &str, out: &mut Discovery) {
+    let (code, _) = split_comment(line);
+    let code = code.trim();
+    if let Some(location) = editable_location(code) {
+        if let Some(name) = egg_name(location) {
+            out.resolved_elsewhere_any_version(file, pypi_name_purl(name));
+        }
+        return;
+    }
+    if code.is_empty() || code.starts_with('-') || requirement_location(code).is_some() {
+        return;
+    }
+    registry_pin(file, code, out);
 }
 
 /// One logical requirements line (see the module docs for the two shapes).

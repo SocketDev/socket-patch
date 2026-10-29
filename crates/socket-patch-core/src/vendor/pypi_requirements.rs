@@ -1266,6 +1266,30 @@ pub(crate) async fn requirements_include_names_in(
     Ok(names)
 }
 
+/// The out-of-root (`../…`) and absolute `-r` includes the root
+/// `requirements.txt` reaches, through in-root files and through each
+/// other, in walk order (#1851). Vendor never edits or names them
+/// ([`requirements_include_names_in`]), but pip installs their pins, so
+/// discovery reads them as evidence against a lock's wiring. A file that
+/// can't be read is skipped: the in-root walk already diagnoses a broken
+/// tree.
+pub(crate) async fn requirements_outside_root_names_in(
+    view: crate::vendor::lock_inventory::ProjectView<'_>,
+) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let _ = walk_requirements_tree(view, decode_requirements, |rel, read| {
+        if read.is_err() {
+            return Ok::<bool, std::convert::Infallible>(false);
+        }
+        if !is_in_root_rel(rel) {
+            names.push(rel.to_string());
+        }
+        Ok(true)
+    })
+    .await;
+    names
+}
+
 /// A root-relative requirements path that stays inside the project root
 /// (not `../…`, not absolute) — the only files the planner may edit.
 pub(crate) fn is_in_root_rel(rel: &str) -> bool {
