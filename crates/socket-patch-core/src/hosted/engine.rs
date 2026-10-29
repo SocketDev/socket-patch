@@ -568,16 +568,15 @@ async fn read_go_workspace(
                 touched.push(root.join("go.mod"));
                 let go_mod = crate::utils::fs::read_regular_to_string(&root.join("go.mod")).await;
                 if let Ok(go_mod) = go_mod {
+                    let go_mod = crate::vendor::go_mod_edit::normalize_for_read(&go_mod);
                     if crate::vendor::go_build_list::may_need_module_graph(&go_mod) {
                         touched.extend(
                             crate::vendor::go_build_list::module_graph_reads(&go_mod)
                                 .into_iter()
                                 .map(|rel| root.join(rel)),
                         );
-                        let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
-                        module_graph = Some(
-                            go_workspace::module_graph(&root, &go_mod, cache.as_deref()).await,
-                        );
+                        module_graph =
+                            Some(crate::vendor::go_build_list::module_graph(&root, &go_mod).await);
                     }
                 }
             }

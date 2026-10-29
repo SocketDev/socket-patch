@@ -60,6 +60,20 @@ fn go_env<'a>(modcache: &'a str, proxy_url: &'a str) -> Vec<(&'a str, &'a str)> 
     ]
 }
 
+/// [`go_env`] with `GOFLAGS=-mod=readonly`: a build that proves the
+/// committed go.mod and go.sum are complete.
+fn readonly_env<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    env.iter()
+        .map(|&(k, v)| {
+            if k == "GOFLAGS" {
+                (k, "-mod=readonly")
+            } else {
+                (k, v)
+            }
+        })
+        .collect()
+}
+
 /// Run socket-patch through the shared hermetic runner with the fixture
 /// GOMODCACHE (the go crawler resolves installed modules through it).
 fn run_socket(cwd: &Path, args: &[&str], modcache: &Path) -> (i32, String, String) {
@@ -1252,16 +1266,7 @@ fn module_built_only_as_a_replace_target_is_not_patched() {
         let tmp = tempfile::tempdir().unwrap();
         let (consumer, modcache, proxy_url) = stage(tmp.path());
         let env = go_env(modcache.to_str().unwrap(), &proxy_url);
-        let readonly: Vec<(&str, &str)> = env
-            .iter()
-            .map(|&(k, v)| {
-                if k == "GOFLAGS" {
-                    (k, "-mod=readonly")
-                } else {
-                    (k, v)
-                }
-            })
-            .collect();
+        let readonly = readonly_env(&env);
 
         // Applied while the consumer still required the upstream directly.
         write_patch(&consumer);
@@ -1397,16 +1402,7 @@ fn fork_required_only_by_a_dependency_is_a_replace_target() {
             ],
         );
         let env = go_env(modcache.to_str().unwrap(), &proxy_url);
-        let readonly: Vec<(&str, &str)> = env
-            .iter()
-            .map(|&(k, v)| {
-                if k == "GOFLAGS" {
-                    (k, "-mod=readonly")
-                } else {
-                    (k, v)
-                }
-            })
-            .collect();
+        let readonly = readonly_env(&env);
 
         // Applied while the consumer still required the upstream directly.
         write_patch(&consumer);
@@ -1514,16 +1510,7 @@ fn stale_fork_replace_keeps_a_transitive_patch() {
         ],
     );
     let env = go_env(modcache.to_str().unwrap(), &proxy_url);
-    let readonly: Vec<(&str, &str)> = env
-        .iter()
-        .map(|&(k, v)| {
-            if k == "GOFLAGS" {
-                (k, "-mod=readonly")
-            } else {
-                (k, v)
-            }
-        })
-        .collect();
+    let readonly = readonly_env(&env);
     mid_fork_consumer(&consumer, &format!("replace {FORK} => {UMOD} {UVER}"), &env);
     assert!(go_out(&consumer, &readonly).contains("OUT: PRISTINE"));
     write_patch(&consumer);

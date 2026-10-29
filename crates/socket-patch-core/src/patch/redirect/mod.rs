@@ -9747,9 +9747,16 @@ fn rewrite_golang_target(
         }),
         _ => None,
     };
+    // A replace target the files only suspect (a go 1.16 graph whose
+    // go.mod files the module cache lacks, #1840) refuses a new pin but
+    // never removes one that may be working.
+    let proven = !matches!(selection, go_build_list::Selection::ReplaceTarget(_))
+        || go_build_list::proves_replace_target(go_mod, graph.as_ref());
     if let Some(warning) = inert {
         result.warnings.push(warning);
-        let stale_hosted = prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
+        let stale_hosted = prior
+            .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted))
+            .filter(|_| proven);
         if let Some(stale) = stale_hosted {
             if let Ok(Some(new)) =
                 go_mod_edit::remove_replace_entry(go_mod, fname, go_mod_edit::ReplaceOwner::Hosted)
@@ -24199,6 +24206,60 @@ packages:
             } else {
                 assert!(out.warnings.is_empty(), "{:?}", out.warnings);
                 assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+            }
+        }
+    }
+
+    /// #1840: without a complete module graph a go 1.16 fork replace is
+    /// only suspected to make the hosted pin inert, so the pin is neither
+    /// confirmed nor removed; a graph that shows the fork removes it.
+    #[test]
+    fn golang_go116_suspected_replace_target_keeps_the_hosted_pin() {
+        use crate::vendor::go_build_list::ModuleGraph;
+        use crate::vendor::go_workspace::Loaded;
+        let pin = format!(
+            "replace github.com/foo/bar v1.4.2 => {} v1.4.2-socketpatch.1",
+            golang_socket_module()
+        );
+        let go_mod = format!(
+            "module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n\
+             replace other.com/fork => github.com/foo/bar v1.4.2\n\n{pin}\n"
+        );
+        let fork = ModuleGraph {
+            selected: [("other.com/fork".to_string(), "v1.4.2".to_string())].into(),
+            complete: true,
+        };
+        let partial = ModuleGraph {
+            selected: Default::default(),
+            complete: false,
+        };
+        for (module_graph, removed) in [(None, false), (Some(partial), false), (Some(fork), true)] {
+            let mut files = golang_files();
+            files.insert("go.mod".to_string(), go_mod.clone());
+            let hosted = HostedGoWorkspace {
+                root: std::path::PathBuf::new(),
+                loaded: Loaded::None,
+                modfile: None,
+                module_graph: module_graph.clone(),
+            };
+            files.insert(
+                GO_WORKSPACE_KEY.to_string(),
+                serde_json::to_string(&hosted).unwrap(),
+            );
+            let ovr = golang_override();
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(out.confirmed_golang_uuids.is_empty(), "{module_graph:?}");
+            assert_eq!(
+                out.warnings[0].code, "redirect_golang_not_in_module_graph",
+                "{module_graph:?}: {:?}",
+                out.warnings
+            );
+            match out.files.get("go.mod") {
+                Some(text) => {
+                    assert!(removed, "{module_graph:?}: {text}");
+                    assert!(!text.contains(&pin), "{text}");
+                }
+                None => assert!(!removed, "{module_graph:?}"),
             }
         }
     }

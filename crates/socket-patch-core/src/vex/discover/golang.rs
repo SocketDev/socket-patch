@@ -289,10 +289,7 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bo
     if let (Some(text), None) = (&go_mod, &workspace) {
         if go_build_list::may_need_module_graph(text) {
             if let Some(root) = ctx.disk_root_reading(go_build_list::module_graph_reads(text)) {
-                let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
-                module_graph = Some(
-                    crate::vendor::go_workspace::module_graph(root, text, cache.as_deref()).await,
-                );
+                module_graph = Some(go_build_list::module_graph(root, text).await);
             }
         }
     }

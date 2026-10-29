@@ -190,7 +190,8 @@ fn replaces_targeting<'a>(
     version: &'a str,
 ) -> impl Iterator<Item = &'a ReplaceEntry> {
     entries.iter().filter(move |e| {
-        e.module != module
+        !e.socket_owned()
+            && e.module != module
             && e.rhs_module.as_deref() == Some(module)
             && e.rhs_version.as_deref() == Some(version)
     })
@@ -212,7 +213,7 @@ pub fn may_need_module_graph(go_mod: &str) -> bool {
     !prunes_module_graph(go_mod)
         && parse_replace_entries(go_mod)
             .iter()
-            .any(|e| e.rhs_module.is_some() && e.rhs_version.is_some())
+            .any(|e| !e.socket_owned() && e.rhs_module.is_some() && e.rhs_version.is_some())
 }
 
 /// The module whose module-to-module `replace` in `go_mod` targets exactly
@@ -224,9 +225,9 @@ pub fn may_need_module_graph(go_mod: &str) -> bool {
 ///
 /// A pruned go.mod's `require` holds the selected version. An unpruned
 /// one's holds only lower bounds and omits modules only a dependency
-/// requires, so `graph` answers there (#1840). Without a complete graph a
-/// replace of a module go.mod doesn't list counts as in effect (the safe
-/// side: no patch is reported built that isn't), unless go.mod requires
+/// requires, so a complete `graph` answers there (#1840). Without one, a
+/// replace that may be in effect counts as in effect (the safe side: no
+/// patch is reported built that isn't), unless go.mod requires
 /// `module@version` itself: that puts it in the build under its own path,
 /// and go refuses one module@version under two.
 fn replaced_module(
@@ -235,38 +236,49 @@ fn replaced_module(
     module: &str,
     version: &str,
 ) -> Option<String> {
+    /// What the files show of the replaced module's selected version.
+    enum Fork {
+        Selected(String),
+        Absent,
+        AtLeast(String),
+        Unknown,
+    }
     let pruned = prunes_module_graph(go_mod);
     let required = parse_required_versions(go_mod);
     let entries = parse_replace_entries(go_mod);
-    // The version of `fork` the build selects: `Some(None)` when it isn't
-    // in the build, `None` when the files can't tell.
-    let selected = |fork: &str| -> Option<Option<String>> {
-        if pruned {
-            return Some(required.get(fork).cloned());
-        }
-        if let Some(graph) = graph {
-            if let Some(v) = graph.selected.get(fork) {
-                return Some(Some(v.clone()));
-            }
-            if graph.complete {
-                return Some(None);
-            }
-        }
-        required.get(fork).map(|v| Some(v.clone()))
+    let graph = graph.filter(|g| g.complete && !pruned);
+    let fork = |m: &str| match (graph, required.get(m)) {
+        (Some(g), _) => g
+            .selected
+            .get(m)
+            .cloned()
+            .map_or(Fork::Absent, Fork::Selected),
+        (None, Some(r)) if pruned => Fork::Selected(r.clone()),
+        (None, None) if pruned => Fork::Absent,
+        (None, Some(r)) => Fork::AtLeast(r.clone()),
+        (None, None) => Fork::Unknown,
     };
+    let built_itself = required.get(module).map(String::as_str) == Some(version);
     let in_effect = replaces_targeting(&entries, module, version)
-        .find(|e| match selected(&e.module) {
-            Some(Some(sel)) => match e.version.as_deref() {
-                Some(v) => v == sel,
-                None => !entries
-                    .iter()
-                    .any(|o| o.module == e.module && o.version.as_deref() == Some(sel.as_str())),
-            },
-            Some(None) => false,
-            None => required.get(module).map(String::as_str) != Some(version),
+        .find(|e| match (fork(&e.module), e.version.as_deref()) {
+            (Fork::Selected(sel), Some(v)) => v == sel,
+            (Fork::Selected(sel), None) => !entries
+                .iter()
+                .any(|o| o.module == e.module && o.version.as_deref() == Some(sel.as_str())),
+            (Fork::Absent, _) => false,
+            // MVS never selects below go.mod's own require.
+            (Fork::AtLeast(min), Some(v)) => go_semver_cmp(v, &min).is_ge() && !built_itself,
+            (Fork::AtLeast(_), None) | (Fork::Unknown, _) => !built_itself,
         })
         .map(|e| e.module.clone());
     in_effect
+}
+
+/// Whether a [`Selection::ReplaceTarget`] from [`select_in`] over `go_mod`
+/// is proven, not only the safe guess for an unpruned graph read without
+/// every go.mod it needs.
+pub fn proves_replace_target(go_mod: &str, graph: Option<&ModuleGraph>) -> bool {
+    prunes_module_graph(go_mod) || graph.is_some_and(|g| g.complete)
 }
 
 /// The project files [`super::go_workspace::module_graph`] reads for
@@ -292,8 +304,14 @@ pub async fn module_graph_for(
     if !needs_module_graph(go_mod, module, version) {
         return None;
     }
+    Some(module_graph(project_root, go_mod).await)
+}
+
+/// [`super::go_workspace::module_graph`] of the module-mode project at
+/// `project_root` against the module cache go uses.
+pub async fn module_graph(project_root: &Path, go_mod: &str) -> ModuleGraph {
     let cache = crate::crawlers::go_crawler::GoCrawler::get_gomodcache();
-    Some(super::go_workspace::module_graph(project_root, go_mod, cache.as_deref()).await)
+    super::go_workspace::module_graph(project_root, go_mod, cache.as_deref()).await
 }
 
 /// [`selection`] for a project directory. In workspace mode the build
@@ -463,19 +481,23 @@ mod tests {
             // root go.mod doesn't require is not in the build.
             let unrequired =
                 (go == "go 1.21").then(|| ("", format!("replace other.com/fork => {UP} v1.0.0")));
-            for (require, replace) in unrequired.into_iter().chain([
-                (
-                    "require other.com/fork v1.0.0\n",
-                    format!("replace other.com/fork v0.5.0 => {UP} v1.0.0"),
-                ),
+            // A pruned go.mod's require is the selected version, so the
+            // versioned replace pinned there shadows the version-less one.
+            // An unpruned one's is a lower bound: see
+            // `unpruned_module_graph_settles_the_fork_replace`.
+            let shadowed = (go == "go 1.21").then(|| {
                 (
                     "require other.com/fork v1.0.0\n",
                     format!(
                         "replace other.com/fork => {UP} v1.0.0\n\
                          replace other.com/fork v1.0.0 => ../fork"
                     ),
-                ),
-            ]) {
+                )
+            });
+            for (require, replace) in unrequired.into_iter().chain(shadowed).chain([(
+                "require other.com/fork v1.0.0\n",
+                format!("replace other.com/fork v0.5.0 => {UP} v1.0.0"),
+            )]) {
                 let m = format!("module c\n\n{go}\n\n{require}\n{replace}\n");
                 assert_eq!(
                     selection(&m, Some(&s), UP, "v1.0.0"),
@@ -553,32 +575,61 @@ mod tests {
         );
 
         // go.mod requires fork v0.9.0, a dependency raises it to v1.0.0,
-        // where the versioned replace applies.
+        // where the versioned replace applies. Without a complete graph
+        // go.mod's lower bound can't rule that out.
         let m = format!(
             "module c\n\ngo 1.16\n\nrequire other.com/fork v0.9.0\n\n\
              replace other.com/fork v1.0.0 => {UP} v1.0.0\n"
         );
-        assert_eq!(selection(&m, Some(&s), UP, "v1.0.0"), Selection::Selected);
         let raised = graph(&[("other.com/fork", "v1.0.0")], true);
         assert_eq!(selection_in(&m, Some(&s), Some(&raised), UP, "v1.0.0"), via);
-        // At another version, a versioned replace pinned there wins over the
-        // version-less one.
-        let m = format!(
-            "module c\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n\
-             replace other.com/fork => {UP} v1.0.0\n\
-             replace other.com/fork v1.1.0 => ../fork\n"
-        );
-        let shadowed = graph(&[("other.com/fork", "v1.1.0")], true);
+        let partial = graph(&[("other.com/fork", "v0.9.0")], false);
         assert_eq!(
-            selection_in(&m, Some(&s), Some(&shadowed), UP, "v1.0.0"),
+            selection_in(&m, Some(&s), Some(&partial), UP, "v1.0.0"),
+            via
+        );
+        assert_eq!(selection(&m, Some(&s), UP, "v1.0.0"), via);
+        let kept = graph(&[("other.com/fork", "v0.9.0")], true);
+        assert_eq!(
+            selection_in(&m, Some(&s), Some(&kept), UP, "v1.0.0"),
             Selection::Selected
         );
+        // A versioned replace pinned at the selected version wins over the
+        // version-less one.
+        for (require, selected) in [
+            ("example.com/mid v1.0.0", "v1.1.0"),
+            ("other.com/fork v1.1.0", "v1.1.0"),
+        ] {
+            let m = format!(
+                "module c\n\ngo 1.16\n\nrequire {require}\n\n\
+                 replace other.com/fork => {UP} v1.0.0\n\
+                 replace other.com/fork {selected} => ../fork\n"
+            );
+            let shadowed = graph(&[("other.com/fork", selected)], true);
+            assert_eq!(
+                selection_in(&m, Some(&s), Some(&shadowed), UP, "v1.0.0"),
+                Selection::Selected,
+                "{require}"
+            );
+            // go.mod alone can't tell a dependency didn't raise the fork
+            // past the shadowing version.
+            assert_eq!(selection(&m, Some(&s), UP, "v1.0.0"), via, "{require}");
+        }
         // A pruned go.mod lists what it builds: the graph isn't consulted.
         let m = format!("module c\n\ngo 1.21\n\nreplace other.com/fork => {UP} v1.0.0\n");
         assert_eq!(
             selection_in(&m, Some(&s), Some(&forked), UP, "v1.0.0"),
             Selection::Selected
         );
+    }
+
+    #[test]
+    fn only_a_pruned_go_mod_or_a_complete_graph_proves_a_replace_target() {
+        let m16 = "module c\n\ngo 1.16\n";
+        assert!(proves_replace_target("module c\n\ngo 1.21\n", None));
+        assert!(!proves_replace_target(m16, None));
+        assert!(!proves_replace_target(m16, Some(&graph(&[], false))));
+        assert!(proves_replace_target(m16, Some(&graph(&[], true))));
     }
 
     #[test]
@@ -590,6 +641,11 @@ mod tests {
             ("go 1.21", fork.as_str(), false),
             ("go 1.16", "replace other.com/fork => ../fork\n", false),
             ("go 1.16", "", false),
+            (
+                "go 1.16",
+                "replace other.com/fork v1.0.0 => patch.socket.dev/gopatch/4d5e6f70-8192-4a1b-8c2d-0123456789ab v1.0.0-socketpatch.1\n",
+                false,
+            ),
         ] {
             let m = format!("module c\n\n{go}\n\n{replace}");
             assert_eq!(needs_module_graph(&m, UP, "v1.0.0"), needed, "{m}");
