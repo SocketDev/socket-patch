@@ -361,7 +361,8 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                         | GoDrift::MissingReplace { purl }
                         | GoDrift::WrongReplacePath { purl, .. }
                         | GoDrift::ResolvedVersionMismatch { purl, .. }
-                        | GoDrift::UnprovenSelection { purl, .. } => purl.clone(),
+                        | GoDrift::UnprovenSelection { purl, .. }
+                        | GoDrift::ReplaceTargetOnly { purl, .. } => purl.clone(),
                         GoDrift::OrphanReplace { module } => module.clone(),
                     };
                     drifts.push((id, "go_redirect_drift".to_string(), d.to_string()));

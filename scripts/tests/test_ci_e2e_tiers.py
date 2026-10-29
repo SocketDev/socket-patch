@@ -77,9 +77,15 @@ class Tiers(unittest.TestCase):
                 # Nightly, dispatch (release-qa) and v5 landings, like
                 # e2e-docker: not on PRs, the merge queue or a lean push to
                 # main, where its 41 legs ran on every landing.
-                self.assertIn("    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
-                              " || (github.event_name == 'push' && vars.CI_SCOPE == 'full')"
-                              " || github.head_ref == 'release/v5-prerelease'\n", text)
+                # yarn-berry-full waits only on clippy, so it carries the
+                # Linux-only term for `workflow_dispatch -f os=...` itself
+                # (#1818); the others skip with e2e-build.
+                gate = ("    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+                        " || (github.event_name == 'push' && vars.CI_SCOPE == 'full')"
+                        " || github.head_ref == 'release/v5-prerelease'")
+                if job == "yarn-berry-full":
+                    gate = gate.replace("    if: ", "    if: (") + ") && (inputs.os != 'windows' && inputs.os != 'macos')"
+                self.assertIn(gate + "\n", text)
                 self.assertIn(f"steps: *{anchor}", text)
                 self.assertIn(f"steps: &{anchor}", TEXT)
 

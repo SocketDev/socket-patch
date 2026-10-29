@@ -959,6 +959,7 @@ async fn generate_vex(
                 module,
                 version,
                 conflict,
+                ..
             } = &issue
             else {
                 continue;
@@ -1035,6 +1036,12 @@ async fn generate_vex(
                 Some(Selection::Other(selected)) => format!(
                     "the build selects {} {selected}, so the replace pinned to {version} is \
                      ignored and the build links the unpatched module",
+                    entry.module
+                ),
+                Some(Selection::ReplaceTarget(via)) => format!(
+                    "the build uses {} {version} only as the replacement of {via}, and go \
+                     doesn't apply a replace to a replacement, so the replace pinned to \
+                     {version} is ignored and the build links the unpatched module",
                     entry.module
                 ),
                 Some(Selection::Unknown)

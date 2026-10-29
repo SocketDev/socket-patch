@@ -11,12 +11,14 @@ use std::ops::Range;
 
 use serde_json::{json, Value};
 
+use crate::formats::maven::maven_config_properties as cli_properties;
+
 use super::super::state::{WiringAction, WiringRecord};
 use super::layout::{self, safe_coordinates};
 use super::{
     adopt, changes_between, finish_writes, fragment, op_of, op_str, owned_file, replace_op,
     sha1_hex, sha256_hex, undo_replace, Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal,
-    JvmUnplan, JvmWarning, ReadFn, CONFIG_LINE_KIND, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
+    JvmUnplan, JvmWarning, ListFn, ReadFn, CONFIG_LINE_KIND, OWNED_FILE_KIND, POM_FRAGMENT_KIND,
     TREE_GITATTRIBUTES,
 };
 
@@ -98,17 +100,22 @@ pub fn committed(read: ReadFn<'_>, c: &Coords<'_>) -> Option<(Vec<u8>, Vec<u8>)>
 }
 
 /// Plan vendoring `patch` into the reactor rooted at `pom.xml`.
-pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusal> {
-    plan_with_config(read, patch, true)
+pub fn plan(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+) -> Result<JvmPlan, JvmRefusal> {
+    plan_with_config(read, list, patch, true)
 }
 
 /// Plan with an explicit Maven config policy. A disabled policy is recorded for re-runs.
 pub fn plan_with_config(
     read: ReadFn<'_>,
+    list: ListFn<'_>,
     patch: &JvmPatch<'_>,
     config_enabled: bool,
 ) -> Result<JvmPlan, JvmRefusal> {
-    plan_with_external(read, patch, config_enabled, None)
+    plan_with_external(read, list, patch, config_enabled, None)
 }
 
 /// [`plan_with_config`] that also weighs the management a local root's pin
@@ -118,6 +125,7 @@ pub fn plan_with_config(
 /// skips the check (callers that plan only to probe a shape).
 pub fn plan_with_external(
     read: ReadFn<'_>,
+    list: ListFn<'_>,
     patch: &JvmPatch<'_>,
     config_enabled: bool,
     external: Option<&ExternalPoms>,
@@ -141,7 +149,7 @@ pub fn plan_with_external(
             ),
         })?;
 
-    let reactor = Reactor::discover(read)?;
+    let reactor = Reactor::discover(read, list)?;
     let mut warnings = Vec::new();
     let wrapper = super::wrapper_version(read, "maven");
     if config_enabled && wrapper.is_none_or(|v| ((3, 9, 2)..(3, 9, 9)).contains(&v)) {
@@ -344,14 +352,19 @@ fn op_of_value(op: &Value) -> &str {
 /// versions go now; `pin_section` shells once empty; the repository block,
 /// the `maven.config` lines and the tree `.gitattributes` only once no pom
 /// references another patch.
-pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> JvmUnplan {
+pub fn unplan(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+    records: &[WiringRecord],
+) -> JvmUnplan {
     let sv = c.suffixed_version();
     let mut files: BTreeSet<String> = records
         .iter()
         .filter(|w| w.kind == POM_FRAGMENT_KIND)
         .map(|w| w.file.clone())
         .collect();
-    let reactor = Reactor::discover(read).ok();
+    let reactor = Reactor::discover(read, list).ok();
     if let Some(reactor) = &reactor {
         files.extend(reactor.scope.iter().cloned());
     }
@@ -447,13 +460,17 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
 
 /// Whether a pom of the reactor still declares `c`'s suffixed version
 /// (outside comments): the liveness proof `vex` needs for this layout.
-pub fn wired(read: ReadFn<'_>, c: &Coords<'_>) -> bool {
-    wired_checked(read, c).unwrap_or(false)
+pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
+    wired_checked(read, list, c).unwrap_or(false)
 }
 
-pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusal> {
+pub fn wired_checked(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+) -> Result<bool, JvmRefusal> {
     let sv = c.suffixed_version();
-    Reactor::discover(read).map(|reactor| {
+    Reactor::discover(read, list).map(|reactor| {
         reactor
             .scope
             .iter()
@@ -519,9 +536,13 @@ pub fn refuse_unwired(read: ReadFn<'_>, c: &Coords<'_>, plan: &JvmPlan) -> Resul
 /// that may still read the base: a `${...}` the checkout does not define
 /// or that an inheriting pom or a profile moves (#513, #459). Such a
 /// module builds the unpatched jar, so `vex` must not attest.
-pub fn attestable_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusal> {
+pub fn attestable_checked(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+) -> Result<bool, JvmRefusal> {
     let sv = c.suffixed_version();
-    let reactor = Reactor::discover(read)?;
+    let reactor = Reactor::discover(read, list)?;
     if !reactor
         .scope
         .iter()
@@ -777,8 +798,8 @@ fn degraded(reason: &str, detail: impl std::fmt::Display) -> JvmWarning {
 }
 
 /// Whether an ancestor reactor owns the requested pom. Used to reject partial vendoring.
-pub fn contains_module(read: ReadFn<'_>, rel: &str) -> bool {
-    Reactor::discover(read).is_ok_and(|r| r.reactor.iter().any(|p| p == rel))
+pub fn contains_module(read: ReadFn<'_>, list: ListFn<'_>, rel: &str) -> bool {
+    Reactor::discover(read, list).is_ok_and(|r| r.reactor.iter().any(|p| p == rel))
 }
 
 pub(crate) type Gav = (String, String, String);
@@ -936,10 +957,11 @@ struct ManagedConflict {
 /// plan refuses it on its own).
 pub fn external_poms_needed(
     read: ReadFn<'_>,
+    list: ListFn<'_>,
     patch: &JvmPatch<'_>,
     known: &ExternalPoms,
 ) -> Vec<Gav> {
-    let Ok(reactor) = Reactor::discover(read) else {
+    let Ok(reactor) = Reactor::discover(read, list) else {
         return Vec::new();
     };
     if known.len() >= MAX_EXTERNAL_POMS {
@@ -1412,6 +1434,9 @@ struct Pom {
     /// Model 4.1.0 (Maven 4): omitted parent coordinates are inferred
     /// from the pom at the relative path.
     infers_parent: bool,
+    /// Maven 4 discovers this pom's subprojects itself: see
+    /// [`discovers_subprojects`].
+    discovers_subprojects: bool,
 }
 
 /// A pom and one of its profiles' `<properties>`.
@@ -1463,6 +1488,7 @@ impl Pom {
             || doc.masked.contains("maven.apache.org/POM/4.1.0");
         Ok(Pom {
             infers_parent,
+            discovers_subprojects: discovers_subprojects(&doc),
             dir: rel.rsplit_once('/').map_or("", |(d, _)| d).to_string(),
             group: doc.child_text(project, "groupId"),
             artifact: doc.child_text(project, "artifactId"),
@@ -1526,9 +1552,17 @@ struct Reactor {
 }
 
 impl Reactor {
-    fn discover(read: ReadFn<'_>) -> Result<Reactor, JvmRefusal> {
+    fn discover(read: ReadFn<'_>, list: ListFn<'_>) -> Result<Reactor, JvmRefusal> {
         let root = read("pom.xml")
             .ok_or_else(|| shape_refusal("no_build_file", "no pom.xml at the project root"))?;
+        let cli_props = read(MAVEN_CONFIG)
+            .map(|bytes| cli_properties(&String::from_utf8_lossy(&bytes)))
+            .unwrap_or_default();
+        // Maven 4's opt-out, read with Java's `Boolean.parseBoolean`: once
+        // set, anything but `true` turns discovery off.
+        let discovery = cli_props
+            .get(DISCOVER_SUBPROJECTS)
+            .is_none_or(|v| v.eq_ignore_ascii_case("true"));
         let mut poms = BTreeMap::new();
         poms.insert("pom.xml".to_string(), Pom::parse("pom.xml", root)?);
         let mut reactor = vec!["pom.xml".to_string()];
@@ -1536,7 +1570,11 @@ impl Reactor {
         while next < reactor.len() {
             let rel = reactor[next].clone();
             next += 1;
-            for module in module_refs(&poms[&rel].doc) {
+            let mut modules = module_refs(&poms[&rel].doc);
+            if discovery && poms[&rel].discovers_subprojects {
+                modules.extend(implicit_subprojects(list, &poms[&rel].dir));
+            }
+            for module in modules {
                 let (module_rel, bytes) = resolve_module(read, &poms[&rel].dir, &rel, &module)?;
                 if poms.contains_key(&module_rel) {
                     if !reactor.contains(&module_rel) {
@@ -1578,9 +1616,6 @@ impl Reactor {
             }
         }
 
-        let cli_props = read(MAVEN_CONFIG)
-            .map(|bytes| cli_properties(&String::from_utf8_lossy(&bytes)))
-            .unwrap_or_default();
         Ok(Reactor {
             poms,
             reactor,
@@ -2031,6 +2066,54 @@ fn module_refs(doc: &Doc) -> Vec<String> {
     out
 }
 
+/// The user property that turns Maven 4's subproject discovery off.
+const DISCOVER_SUBPROJECTS: &str = "maven.project.discoverSubprojects";
+
+/// Whether Maven 4 discovers the subprojects of this pom on its own
+/// (`DefaultModelBuilder`, "subprojects discovery"): its model version is
+/// not 4.0.0 (the `<modelVersion>`, else the POM namespace), it is
+/// packaged `pom`, and it lists no top-level `<subprojects>` or
+/// `<modules>` entry. Maven 3 never discovers, and reads no 4.1.0 pom.
+fn discovers_subprojects(doc: &Doc) -> bool {
+    let project = doc.project;
+    let model = doc.child_text(project, "modelVersion").or_else(|| {
+        let at = doc.masked.find(POM_NAMESPACE)? + POM_NAMESPACE.len();
+        let rest = &doc.masked[at..];
+        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))?;
+        Some(rest[..end].to_string())
+    });
+    let lists = |list: &str, item: &str| {
+        doc.child(project, list)
+            .is_some_and(|l| doc.children(l, item).next().is_some())
+    };
+    model.is_some_and(|v| v != "4.0.0")
+        && doc.child_text(project, "packaging").as_deref() == Some("pom")
+        && !lists("subprojects", "subproject")
+        && !lists("modules", "module")
+}
+
+const POM_NAMESPACE: &str = "maven.apache.org/POM/";
+
+/// The subprojects Maven 4 discovers under the pom at `dir`: every direct
+/// subdirectory holding a `pom.xml`, hidden ones included, as
+/// `<subproject>` names relative to `dir`. Probed through the listing, not
+/// a read: a directory the reader refuses (`.git/`) lists as empty, where
+/// reading its `pom.xml` would record a read error.
+fn implicit_subprojects(list: ListFn<'_>, dir: &str) -> Vec<String> {
+    list(dir)
+        .iter()
+        .filter_map(|entry| entry.strip_suffix('/'))
+        .filter(|name| {
+            let sub = match dir {
+                "" => name.to_string(),
+                _ => format!("{dir}/{name}"),
+            };
+            list(&sub).iter().any(|e| e == "pom.xml")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// `module` of the pom at `dir` → the module pom's path and bytes.
 fn resolve_module(
     read: ReadFn<'_>,
@@ -2173,68 +2256,6 @@ fn has_fallback_repository(doc: &Doc) -> bool {
         doc.children(r, "repository")
             .any(|repo| doc.child_text(repo, "id").as_deref() == Some(REPO_ID))
     })
-}
-
-/// The user properties a `maven.config` defines, as Maven 3.9+ reads it:
-/// one argument per line, `#` lines are comments (older Maven rejects
-/// them), and a wholly quoted argument is unquoted. A property is
-/// `-Dk=v`, `-D k=v`, `--define=k=v` or `--define k=v`, or a bare `-D` /
-/// `--define` whose `k=v` is the next line. The value is the rest of the
-/// argument, so `-Dv=1.0 # note` defines `1.0 # note`, as in Maven.
-/// `-Dk` sets `k=true`; a later definition wins. Maven before 3.9 splits
-/// the file on whitespace instead, so a `-Dk=v` token that only that reading
-/// finds (`-B -Dk=v` on one line) is kept too, unless a line defines `k`.
-fn cli_properties(config: &str) -> BTreeMap<String, String> {
-    // Java's `String.trim`: every char up to U+0020, nothing beyond.
-    fn trim(s: &str) -> &str {
-        s.trim_matches(|c: char| c <= ' ')
-    }
-    fn unquote(s: &str) -> &str {
-        s.strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .map_or(s, trim)
-    }
-    let mut args = config
-        .lines()
-        .map(|line| unquote(trim(line)))
-        .filter(|arg| !arg.is_empty() && !arg.starts_with('#'))
-        .peekable();
-    let mut props = BTreeMap::new();
-    while let Some(arg) = args.next() {
-        let def = match arg.strip_prefix("--define") {
-            Some(rest) => rest
-                .strip_prefix('=')
-                .or_else(|| (rest.is_empty() || rest.starts_with(' ')).then_some(rest)),
-            None => arg.strip_prefix("-D"),
-        };
-        let Some(def) = def.map(trim) else {
-            continue;
-        };
-        let def = match def {
-            "" => match args.next_if(|next| !next.starts_with('-')) {
-                Some(next) => next,
-                None => continue,
-            },
-            def => def,
-        };
-        let (k, v) = def.split_once('=').unwrap_or((def, "true"));
-        if !k.is_empty() {
-            props.insert(k.to_string(), v.to_string());
-        }
-    }
-    let tokens = config
-        .lines()
-        .filter(|line| !trim(line).starts_with('#'))
-        .flat_map(str::split_whitespace)
-        .filter_map(|t| t.strip_prefix("-D")?.split_once('='));
-    let mut legacy = BTreeMap::new();
-    for (k, v) in tokens {
-        if !k.is_empty() && !props.contains_key(k) {
-            legacy.insert(k.to_string(), v.to_string());
-        }
-    }
-    props.extend(legacy);
-    props
 }
 
 // ── pom edits ───────────────────────────────────────────────────
@@ -3464,9 +3485,13 @@ mod tests {
         defaults
     }
 
+    fn lister(files: &Fs) -> impl Fn(&str) -> Vec<String> + '_ {
+        move |dir: &str| super::super::testing::list_of(files, dir)
+    }
+
     fn run(files: &Fs) -> Result<JvmPlan, JvmRefusal> {
         let read = |p: &str| files.get(p).cloned();
-        plan(&read, &patch())
+        plan(&read, &lister(files), &patch())
     }
 
     fn applied(files: &Fs, plan: &JvmPlan) -> Fs {
@@ -3600,7 +3625,7 @@ mod tests {
         let read = |p: &str| files.get(p).cloned();
         let mut known = ExternalPoms::new();
         loop {
-            let need = external_poms_needed(&read, &patch(), &known);
+            let need = external_poms_needed(&read, &lister(&files), &patch(), &known);
             if need.is_empty() {
                 break;
             }
@@ -3610,7 +3635,7 @@ mod tests {
             }
         }
         (
-            plan_with_external(&read, &patch(), true, Some(&known)),
+            plan_with_external(&read, &lister(&files), &patch(), true, Some(&known)),
             known,
         )
     }
@@ -4594,6 +4619,7 @@ mod tests {
         let read = |p: &str| files.get(p).cloned();
         let r = plan(
             &read,
+            &lister(&files),
             &patch_with("<project><version>${revision}</version></project>"),
         )
         .unwrap_err();
@@ -4848,7 +4874,7 @@ mod tests {
 
     fn replan_writes(root: &std::path::Path, p: &JvmPatch<'_>) -> Vec<String> {
         let reader = super::super::apply::ProjectReader::new(root);
-        plan(&|rel: &str| reader.read(rel), p)
+        plan(&|rel: &str| reader.read(rel), &|d: &str| reader.list(d), p)
             .unwrap()
             .writes
             .into_iter()
@@ -5044,7 +5070,7 @@ mod tests {
         ]);
         let (_, after) = vendor(&files);
         let read = |rel: &str| after.get(rel).cloned();
-        let undo = unplan(&read, &patch().coords(), &[]);
+        let undo = unplan(&read, &lister(&after), &patch().coords(), &[]);
         let changed: BTreeMap<String, Option<Vec<u8>>> = undo.changes.into_iter().collect();
         assert_eq!(
             changed["a/pom.xml"].as_deref(),
@@ -5135,7 +5161,7 @@ mod tests {
             module("a", &cdata.replace("<![CDATA[1.10.0]]>", SV))
         );
         let read = |rel: &str| after.get(rel).cloned();
-        let undo = unplan(&read, &patch().coords(), &plan.records);
+        let undo = unplan(&read, &lister(&after), &patch().coords(), &plan.records);
         let a = undo.changes.iter().find(|(r, _)| r == "a/pom.xml").unwrap();
         assert_eq!(a.1.as_deref(), Some(module("a", cdata).as_bytes()));
     }
@@ -5161,7 +5187,7 @@ mod tests {
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         assert_eq!(text(&after, "a/pom.xml"), a.replace("1.10.0", SV));
         let read = |rel: &str| after.get(rel).cloned();
-        let undo = unplan(&read, &patch().coords(), &plan.records);
+        let undo = unplan(&read, &lister(&after), &patch().coords(), &plan.records);
         assert!(undo.drifted.is_empty(), "{:?}", undo.drifted);
         let a_undo = undo.changes.iter().find(|(r, _)| r == "a/pom.xml").unwrap();
         assert_eq!(a_undo.1.as_deref(), Some(a.as_bytes()));
@@ -5471,6 +5497,206 @@ mod tests {
         assert!(root_pinned(&plan, &files));
     }
 
+    /// A Maven 4 (model 4.1.0) aggregator root that lists no subprojects.
+    const IMPLICIT_ROOT: &str = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\" \
+        root=\"true\">\n  <modelVersion>4.1.0</modelVersion>\n  \
+        <groupId>com.example</groupId>\n  <artifactId>root</artifactId>\n  \
+        <version>1.0.0</version>\n  <packaging>pom</packaging>\n</project>\n";
+
+    fn implicit_child(artifact: &str, packaging: &str, deps: &str) -> String {
+        format!(
+            "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  \
+             <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  \
+             <artifactId>{artifact}</artifactId>\n  <packaging>{packaging}</packaging>\n  \
+             <dependencies>\n    {deps}\n  </dependencies>\n</project>\n"
+        )
+    }
+
+    /// #622: Maven 4 builds every child directory holding a `pom.xml` of a
+    /// 4.1.0 `pom`-packaged root that lists no `<subprojects>`, so those
+    /// children are the reactor: the declaring module is rewritten to the
+    /// suffixed version (immune to a warm `~/.m2`) and the root pinned,
+    /// instead of a reactor of one that wires nothing the modules read.
+    #[test]
+    fn maven_4_implicit_subprojects_are_planned_as_the_reactor() {
+        let a = implicit_child("a", "jar", &dep("1.10.0"));
+        let b = implicit_child(
+            "b",
+            "jar",
+            "<dependency><groupId>com.example</groupId><artifactId>a</artifactId>\
+             <version>${project.version}</version></dependency>",
+        );
+        let files = fs(&[
+            ("pom.xml", IMPLICIT_ROOT),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &b),
+        ]);
+        let (plan, after) = vendor(&files);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(text(&after, "a/pom.xml"), a.replace("1.10.0", SV));
+        assert_eq!(text(&after, "b/pom.xml"), b);
+        assert!(root_pinned(&plan, &files));
+        let c = patch().coords();
+        let read = |p: &str| after.get(p).cloned();
+        assert!(wired_checked(&read, &lister(&after), &c).unwrap());
+        assert!(attestable_checked(&read, &lister(&after), &c).unwrap());
+        // `vendor` run from a discovered module is not the build root.
+        assert!(contains_module(&read, &lister(&after), "a/pom.xml"));
+    }
+
+    fn reactor_of(files: &Fs) -> Vec<String> {
+        let read = |p: &str| files.get(p).cloned();
+        Reactor::discover(&read, &lister(files)).unwrap().reactor
+    }
+
+    /// #622: discovery as Maven 4.0.0-rc-7 does it (`DefaultModelBuilder`),
+    /// checked against `mvn validate`'s reactor: every direct subdirectory
+    /// holding a `pom.xml`, hidden ones included, recursively through a
+    /// discovered `pom`-packaged child; not a deeper pom nor a directory
+    /// without one.
+    #[test]
+    fn maven_4_subproject_discovery_follows_maven() {
+        let files = fs(&[
+            ("pom.xml", IMPLICIT_ROOT),
+            ("a/pom.xml", &implicit_child("a", "pom", "")),
+            ("a/sub/pom.xml", &implicit_child("sub", "jar", "")),
+            ("b/pom.xml", &implicit_child("b", "jar", "")),
+            ("b/nested/pom.xml", &implicit_child("nested", "jar", "")),
+            (".h/pom.xml", &implicit_child("h", "jar", "")),
+            ("nopom/c/pom.xml", &implicit_child("c", "jar", "")),
+            ("src/main/java/A.java", "class A {}"),
+        ]);
+        assert_eq!(
+            reactor_of(&files),
+            [
+                "pom.xml",
+                ".h/pom.xml",
+                "a/pom.xml",
+                "b/pom.xml",
+                "a/sub/pom.xml"
+            ]
+        );
+    }
+
+    /// #622: in a git checkout, discovery lists `.git/` like any directory.
+    /// Probing it must not record a read error (the reader refuses every
+    /// path through `.git`), or `vex` and `vendor --check` fail on it.
+    #[tokio::test]
+    async fn maven_4_subproject_discovery_in_a_git_checkout_stays_readable() {
+        let a = implicit_child("a", "jar", &dep("1.10.0"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::testing::populate(
+            root,
+            &[
+                ("pom.xml", IMPLICIT_ROOT),
+                ("a/pom.xml", &a),
+                (".git/HEAD", "ref: refs/heads/main\n"),
+            ],
+        );
+        let mut ledger = BTreeMap::new();
+        let plan = super::super::testing::vendor(root, Shape::MavenReactor, &patch(), &mut ledger)
+            .await
+            .unwrap();
+        assert!(plan.writes.iter().any(|w| w.rel == "a/pom.xml"));
+        let entry = ledger.values().next().unwrap();
+        assert_eq!(
+            super::super::apply::entry_wired_checked(root, entry),
+            Ok(true)
+        );
+    }
+
+    /// #622: a directory symlinked outside the checkout (a `target/` on
+    /// another disk) is probed for a `pom.xml` without being reported. It
+    /// holds none, so Maven ignores it and so does the plan; one that holds
+    /// a pom is a subproject built from outside, reported as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maven_4_subproject_discovery_through_an_outbound_symlink() {
+        let a = implicit_child("a", "jar", &dep("1.10.0"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::testing::populate(root, &[("pom.xml", IMPLICIT_ROOT), ("a/pom.xml", &a)]);
+        let outside = tempfile::tempdir().unwrap();
+        super::super::testing::populate(outside.path(), &[("classes/A.class", "x")]);
+        std::os::unix::fs::symlink(outside.path(), root.join("target")).unwrap();
+        let mut ledger = BTreeMap::new();
+        // `testing::vendor` asserts nothing escaped.
+        let planned =
+            super::super::testing::vendor(root, Shape::MavenReactor, &patch(), &mut ledger)
+                .await
+                .unwrap();
+        assert!(planned.writes.iter().any(|w| w.rel == "a/pom.xml"));
+        let entry = ledger.values().next().unwrap();
+        assert_eq!(
+            super::super::apply::entry_wired_checked(root, entry),
+            Ok(true)
+        );
+
+        let ext = tempfile::tempdir().unwrap();
+        super::super::testing::populate(
+            ext.path(),
+            &[("pom.xml", &implicit_child("x", "jar", ""))],
+        );
+        std::os::unix::fs::symlink(ext.path(), root.join("ext")).unwrap();
+        let reader = super::super::apply::ProjectReader::new(root);
+        let _ = plan(
+            &|rel: &str| reader.read(rel),
+            &|d: &str| reader.list(d),
+            &patch(),
+        );
+        assert_eq!(reader.escaped().as_deref(), Some("ext"));
+    }
+
+    /// #622: no discovery for a 4.0.0 model, a non-`pom` packaging, a root
+    /// that lists its subprojects, or `maven.project.discoverSubprojects`
+    /// set to anything but `true` (Java's `Boolean.parseBoolean`). The
+    /// model version may come from the namespace alone, and an empty
+    /// `<subprojects/>` lists nothing, so both still discover.
+    #[test]
+    fn maven_4_subproject_discovery_is_gated_like_maven() {
+        let a = implicit_child("a", "jar", "");
+        let b = implicit_child("b", "jar", "");
+        let tree = |root: &str, extra: &[(&str, &str)]| {
+            let mut files = fs(&[("pom.xml", root), ("a/pom.xml", &a), ("b/pom.xml", &b)]);
+            files.extend(
+                extra
+                    .iter()
+                    .map(|(p, c)| (p.to_string(), c.as_bytes().to_vec())),
+            );
+            reactor_of(&files)
+        };
+        let all = ["pom.xml", "a/pom.xml", "b/pom.xml"];
+        let model_4_0 = IMPLICIT_ROOT
+            .replace("POM/4.1.0\" root=\"true\"", "POM/4.0.0\"")
+            .replace("<modelVersion>4.1.0", "<modelVersion>4.0.0");
+        assert_eq!(tree(&model_4_0, &[]), ["pom.xml"]);
+        let jar = IMPLICIT_ROOT.replace("<packaging>pom", "<packaging>jar");
+        assert_eq!(tree(&jar, &[]), ["pom.xml"]);
+        let no_packaging = IMPLICIT_ROOT.replace("  <packaging>pom</packaging>\n", "");
+        assert_eq!(tree(&no_packaging, &[]), ["pom.xml"]);
+        let listed = IMPLICIT_ROOT.replace(
+            "</packaging>",
+            "</packaging>\n  <subprojects><subproject>a</subproject></subprojects>",
+        );
+        assert_eq!(tree(&listed, &[]), ["pom.xml", "a/pom.xml"]);
+        let empty_list = IMPLICIT_ROOT.replace("</packaging>", "</packaging>\n  <subprojects/>");
+        assert_eq!(tree(&empty_list, &[]), all);
+        let namespace_only = IMPLICIT_ROOT.replace("  <modelVersion>4.1.0</modelVersion>\n", "");
+        assert_eq!(tree(&namespace_only, &[]), all);
+        for (value, discovers) in [
+            ("true", true),
+            ("TRUE", true),
+            ("false", false),
+            ("no", false),
+        ] {
+            let config = format!("-Dmaven.project.discoverSubprojects={value}\n");
+            let got = tree(IMPLICIT_ROOT, &[(MAVEN_CONFIG, &config)]);
+            let want: &[&str] = if discovers { &all } else { &["pom.xml"] };
+            assert_eq!(got, want, "{value}");
+        }
+    }
+
     /// #459: a profile of the declaring module raising the property keeps
     /// the declaration and leaves the root unpinned.
     #[test]
@@ -5578,8 +5804,8 @@ mod tests {
             uuid: UUID,
         };
         (
-            wired_checked(&read, &c).unwrap(),
-            attestable_checked(&read, &c).unwrap(),
+            wired_checked(&read, &lister(&files), &c).unwrap(),
+            attestable_checked(&read, &lister(&files), &c).unwrap(),
         )
     }
 
@@ -5771,7 +5997,7 @@ mod tests {
                 ..patch()
             };
             assert_eq!(
-                plan(&read, &p).unwrap_err().code,
+                plan(&read, &lister(&files), &p).unwrap_err().code,
                 "unsafe_coordinates",
                 "{g}:{a}:{v}"
             );
@@ -5785,7 +6011,11 @@ mod tests {
         let outside = disk(&[("pom.xml", &module("a", &dep("1.10.0")))]);
         std::os::unix::fs::symlink(outside.path(), dir.path().join("a")).unwrap();
         let reader = super::super::apply::ProjectReader::new(dir.path());
-        let _ = plan(&|rel: &str| reader.read(rel), &patch());
+        let _ = plan(
+            &|rel: &str| reader.read(rel),
+            &|d: &str| reader.list(d),
+            &patch(),
+        );
         assert_eq!(reader.escaped().as_deref(), Some("a"));
     }
 
@@ -5804,7 +6034,7 @@ mod tests {
             upstream_pom: &pom,
             ..patch()
         };
-        assert!(plan(&read, &p).unwrap().writes.is_empty());
+        assert!(plan(&read, &lister(&after), &p).unwrap().writes.is_empty());
         // A parent-inherited upstream version (inserted by the suffixing).
         let parent_only = "<project>\n  <parent>\n    <groupId>org.apache.commons</groupId>\n    \
             <artifactId>commons-parent</artifactId>\n    <version>1.10.0</version>\n  </parent>\n  \
@@ -5816,6 +6046,7 @@ mod tests {
         ]);
         let first = plan(
             &|rel: &str| files.get(rel).cloned(),
+            &lister(&files),
             &patch_with(parent_only),
         )
         .unwrap();
@@ -5827,7 +6058,7 @@ mod tests {
             upstream_pom: &pom,
             ..patch()
         };
-        assert!(plan(&read, &p).unwrap().writes.is_empty());
+        assert!(plan(&read, &lister(&after), &p).unwrap().writes.is_empty());
         assert!(committed(&|_: &str| None, &patch().coords()).is_none());
     }
 

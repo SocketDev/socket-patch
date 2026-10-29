@@ -399,12 +399,13 @@ pub fn plan_with_external(
 ) -> Result<JvmPlan, JvmRefusal> {
     match shape {
         Shape::MavenReactor => {
-            maven_reactor::plan_with_external(read, patch, config_enabled, external)
+            maven_reactor::plan_with_external(read, list, patch, config_enabled, external)
         }
         Shape::Gradle => gradle::plan(read, list, patch),
         Shape::Mixed => {
             // Both halves or neither: a refusal of either writes nothing.
-            let maven = maven_reactor::plan_with_external(read, patch, config_enabled, external)?;
+            let maven =
+                maven_reactor::plan_with_external(read, list, patch, config_enabled, external)?;
             let gradle = gradle::plan(read, list, patch)?;
             Ok(compose(maven, gradle))
         }
@@ -643,6 +644,29 @@ pub(crate) fn is_ours(current: Option<&[u8]>, ours: &str) -> bool {
 #[cfg(test)]
 pub(crate) mod testing {
     use std::collections::BTreeMap;
+
+    /// The children of `dir` in an in-memory tree (the planners' ListFn).
+    pub(crate) fn list_of(files: &BTreeMap<String, Vec<u8>>, dir: &str) -> Vec<String> {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir.trim_end_matches('/'))
+        };
+        let mut out: Vec<String> = Vec::new();
+        for key in files.keys() {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let child = match rest.find('/') {
+                Some(i) => format!("{}/", &rest[..i]),
+                None => rest.to_string(),
+            };
+            if !out.contains(&child) {
+                out.push(child);
+            }
+        }
+        out
+    }
     use std::path::Path;
 
     use super::super::state::{carry_forward_wiring, VendorEntry};
