@@ -3035,6 +3035,7 @@ async fn gem_hosted_pin_previews_and_runs_a_clean_eject() {
 /// takeover agree dry and wet: both exit 0, and the wet run wires the
 /// vendored copy with the lock still CRLF on every line instead of failing
 /// `apply_failed` ("Gemfile.lock has no GEM section") and rolling back.
+/// (The Gemfile's spliced line still takes LF, a gap #815 tracks.)
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]

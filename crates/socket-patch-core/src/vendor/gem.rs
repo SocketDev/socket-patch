@@ -240,7 +240,6 @@ pub async fn gem_vendor_target_preflight(
             .await
             .ok()?,
     };
-    let lock_text = to_lf(&lock_text);
     plan_gemfile_edit(&gemfile_text, &name, &version, &copy_rel)
         .and_then(|plan| refuse_append_of_direct_dependency(plan, &lock_text, &name))
         .and_then(|plan| {
@@ -392,13 +391,7 @@ async fn gem_prelude(
             ));
         }
     };
-    // A mixed lock stays as read: `gem_edits` refuses it, and its
-    // already-wired checks see what is on disk.
-    let lock_eol = LineEndings::of(&lock_text);
-    let lock_text = match lock_eol {
-        LineEndings::Crlf => to_lf(&lock_text).into_owned(),
-        _ => lock_text,
-    };
+    let (lock_eol, lock_text) = lock_lf_form(lock_text);
 
     let local_stub = {
         let spec_src = installed_path
@@ -494,6 +487,19 @@ fn gem_edits(
     prelude: &GemPrelude,
 ) -> Result<(GemfilePlan, LockEdit), Box<VendorOutcome>> {
     let (name, version) = (prelude.name.as_str(), prelude.version.as_str());
+    // ── a lock the edit cannot be written back into (#1808) ──────────────
+    // Checked first: no Gemfile fix makes such a lock editable.
+    if prelude.lock_eol == LineEndings::Mixed {
+        return Err(Box::new(done(
+            failed_result(
+                purl,
+                &prelude.copy_dir,
+                "failed to edit Gemfile.lock: it mixes CRLF and LF line endings, so there is no one line ending to write the edit back in (normalize the file, e.g. re-run `bundle lock`, first)".to_string(),
+            ),
+            None,
+            Vec::new(),
+        )));
+    }
     // ── Gemfile edit plan (refusals before any write) ────────────────────
     let plan = match plan_gemfile_edit(&prelude.gemfile_text, name, version, &prelude.copy_rel)
         .and_then(|plan| refuse_append_of_direct_dependency(plan, &prelude.lock_text, name))
@@ -523,14 +529,7 @@ fn gem_edits(
     // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
     // A lock-shape failure therefore costs no download / copy / patch and no
     // Gemfile write.
-    let lock_edit = match prelude.lock_eol {
-        LineEndings::Mixed => Err(
-            "Gemfile.lock mixes CRLF and LF line endings, so there is no one line ending to write the edit back in (re-run `bundle lock` or normalize the file first)"
-                .to_string(),
-        ),
-        _ => edit_lock(&prelude.lock_text, name, version, &prelude.copy_rel),
-    };
-    let lock_edit = match lock_edit {
+    let lock_edit = match edit_lock(&prelude.lock_text, name, version, &prelude.copy_rel) {
         Ok(edit) => edit,
         Err(e) => {
             return Err(Box::new(done(
@@ -1770,6 +1769,17 @@ fn gemspec_listing(project_root: &Path, dir: &str) -> crate::formats::gem::gemsp
     Ok(out)
 }
 
+/// `text` (a Gemfile.lock as read) in the form the lock surgery reads, and
+/// the line ending an edit of it is written back in (#1808): a CRLF lock is
+/// folded to LF and restored as CRLF. Any other lock stays as read — a
+/// mixed one has no single ending to restore, so [`gem_edits`] refuses it.
+fn lock_lf_form(text: String) -> (LineEndings, String) {
+    match LineEndings::of(&text) {
+        LineEndings::Crlf => (LineEndings::Crlf, to_lf(&text).into_owned()),
+        eol => (eol, text),
+    }
+}
+
 /// Produce the pair-edited lock text (see the module doc for the canonical
 /// form). Pure string surgery on exact line spans — every byte not
 /// deliberately changed is preserved, which is what keeps the result
@@ -2276,16 +2286,17 @@ impl<'a> RevertFiles<'a> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(format!("unreadable {name}: {e}")),
             };
-            let eol = match (&text, name == GEMFILE_LOCK) {
-                (Some(t), true) if LineEndings::of(t) == LineEndings::Crlf => LineEndings::Crlf,
-                _ => LineEndings::Lf,
+            let read = text.clone();
+            let (eol, text) = match text {
+                Some(t) if name == GEMFILE_LOCK => {
+                    let (eol, t) = lock_lf_form(t);
+                    (eol, Some(t))
+                }
+                other => (LineEndings::Lf, other),
             };
             *slot = Some(RevertFile {
-                read: text.clone(),
-                text: text.map(|t| match eol {
-                    LineEndings::Crlf => to_lf(&t).into_owned(),
-                    _ => t,
-                }),
+                read,
+                text,
                 eol,
                 changed: false,
             });
