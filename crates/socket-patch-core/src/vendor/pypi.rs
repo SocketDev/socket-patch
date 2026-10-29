@@ -258,7 +258,7 @@ async fn refuse_pin_outside_root(
         return Ok(());
     };
     match super::pypi_requirements::pin_outside_root(project_root, name, version).await {
-        Some(rel) => Err(super::pypi_requirements::outside_root_refusal(&rel, name)),
+        Some(refusal) => Err(refusal),
         None => Ok(()),
     }
 }
@@ -4240,6 +4240,24 @@ mod tests {
                 Err("pypi_requirements_outside_root"),
                 "{shape}"
             );
+        }
+
+        // An include pip may read but this walk can't decode: its pins are
+        // unknowable, so it refuses too.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("app");
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            tokio::fs::write(tmp.path().join("base.txt"), b"\x80\x81six==1.16.0\n")
+                .await
+                .unwrap();
+            touch(&root, "pylock.toml", &pylock).await;
+            touch(&root, "requirements.txt", "-r ../base.txt\n").await;
+            let (code, detail) = detect_pypi_flavor(&root, Some(("six", "1.16.0")))
+                .await
+                .unwrap_err();
+            assert_eq!(code, "pypi_requirements_outside_root", "{detail}");
+            assert!(detail.contains("cannot be read"), "{detail}");
         }
 
         // A bare artifact of another release, or of another package, is

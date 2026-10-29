@@ -459,25 +459,45 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
 /// per-requirement options allowed), a direct reference or editable
 /// checkout naming the package (any version: its artifact is not ours),
 /// and a bare url / VCS / path line whose artifact filename or `#egg=`
-/// names it (at the filename's version, else any).
+/// names it (at the filename's version, else any). An out-of-root include
+/// that exists but can't be read or decoded refuses too: its pins are
+/// unknowable. `Some` is the refusal to return.
 pub(super) async fn pin_outside_root(
     root: &Path,
     canon_name: &str,
     version: &str,
-) -> Option<String> {
+) -> Option<(&'static str, String)> {
     let view = crate::vendor::lock_inventory::ProjectView::Disk(root);
     let mut found = None;
     let _ = walk_requirements_tree(view, decode_requirements, |rel, read| {
-        let Ok(content) = read else {
+        if found.is_some() {
             return Ok::<bool, std::convert::Infallible>(false);
-        };
-        if found.is_none()
-            && !is_in_root_rel(rel)
-            && installs_outside_vendor(&content, canon_name, version)
-        {
-            found = Some(rel.to_string());
         }
-        Ok(true)
+        let outside = !is_in_root_rel(rel);
+        match read {
+            Ok(content) => {
+                if outside && installs_outside_vendor(&content, canon_name, version) {
+                    found = Some(outside_root_refusal(rel, canon_name));
+                }
+                Ok(true)
+            }
+            // pip reads an include this walk can't (or fails the install):
+            // its pins are unknowable, so fail closed rather than wire the
+            // lock beside it. Discovery diagnoses the same file.
+            Err(e) if outside && e.kind() != std::io::ErrorKind::NotFound => {
+                found = Some((
+                    "pypi_requirements_outside_root",
+                    format!(
+                        "{rel}: a requirements include outside the project root cannot be \
+                         read ({e}), so vendor cannot tell whether pip installs {canon_name} \
+                         from it; make it readable UTF-8 text or use agent mode (`scan --mode \
+                         agent` + `socket-patch apply`) instead"
+                    ),
+                ));
+                Ok(false)
+            }
+            Err(_) => Ok(false),
+        }
     })
     .await;
     found
@@ -504,7 +524,7 @@ fn installs_outside_vendor(content: &str, canon_name: &str, version: &str) -> bo
             return false;
         };
         req.direct_reference
-            .is_some_and(|location| !location.contains(".socket/vendor/"))
+            .is_some_and(|location| !location.replace('\\', "/").contains(".socket/vendor/"))
             || req
                 .exact_version()
                 .is_some_and(|pinned| crate::utils::pep440::versions_equal(pinned, version))
