@@ -62,6 +62,7 @@ use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_tail_blocks_edit;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::line_endings;
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 
 use super::common::{
@@ -1284,9 +1285,12 @@ fn plan_gemfile_edit(
                  refusing to append a second declaration (bundler hard-fails on duplicates)"
             ));
         }
+        // The block takes the file's line endings: an LF block in a CRLF
+        // Gemfile leaves it mixed (#1821).
+        let nl = line_endings::terminator(text);
         return Ok(GemfilePlan::Append {
             block: format!(
-                "{MANAGED_OPEN}\ngem \"{name}\", \"{version}\", path: \"{rel}\"\n{MANAGED_CLOSE}\n"
+                "{MANAGED_OPEN}{nl}gem \"{name}\", \"{version}\", path: \"{rel}\"{nl}{MANAGED_CLOSE}{nl}"
             ),
         });
     }
@@ -1296,6 +1300,10 @@ fn plan_gemfile_edit(
         ));
     }
     let (idx, top_level, paren, q, rest) = found.remove(0);
+    // The CR of a CRLF line is its ending, not part of the declaration: the
+    // rewritten line puts it back at its end (#1821).
+    let cr = if lines[idx].ends_with('\r') { "\r" } else { "" };
+    let rest = rest.strip_suffix('\r').unwrap_or(&rest);
     if !top_level {
         return Err(format!(
             "the `gem \"{name}\"` declaration is indented (inside a group/conditional block)"
@@ -1311,7 +1319,7 @@ fn plan_gemfile_edit(
     // refusing here (the source-option blocklist below) would make every
     // patch update demand a manual `vendor --revert` first. A path that
     // parses as anything else (a user fork, another gem's dir) still refuses.
-    if let Some(prev_rel) = gem_line_path_value(&rest) {
+    if let Some(prev_rel) = gem_line_path_value(rest) {
         if is_our_vendor_rel(prev_rel, name, version) {
             let original_line = lines[idx].to_string();
             // The rel appears exactly once (its charset excludes quotes and
@@ -1319,10 +1327,16 @@ fn plan_gemfile_edit(
             // token); swapping just the value preserves quote style and
             // trailing options verbatim.
             let new_line = original_line.replacen(prev_rel, rel, 1);
-            let managed_block = (idx > 0
-                && lines[idx - 1] == MANAGED_OPEN
-                && lines.get(idx + 1).is_some_and(|l| *l == MANAGED_CLOSE))
-            .then(|| format!("{MANAGED_OPEN}\n{new_line}\n{MANAGED_CLOSE}\n"));
+            // The fence lines are matched and recorded with their own
+            // endings, so the record is the block as it stands in the file.
+            let fence = |i: usize, want: &str| {
+                lines
+                    .get(i)
+                    .is_some_and(|l| l.strip_suffix('\r').unwrap_or(l) == want)
+            };
+            let managed_block =
+                (idx > 0 && fence(idx - 1, MANAGED_OPEN) && fence(idx + 1, MANAGED_CLOSE))
+                    .then(|| format!("{}\n{new_line}\n{}\n", lines[idx - 1], lines[idx + 1]));
             return Ok(GemfilePlan::RewireOurs {
                 original_line,
                 new_line,
@@ -1330,7 +1344,7 @@ fn plan_gemfile_edit(
             });
         }
     }
-    if let Some(reason) = rest_blocks_edit(&rest) {
+    if let Some(reason) = rest_blocks_edit(rest) {
         return Err(format!(
             "the `gem \"{name}\"` declaration is not editable: {reason}"
         ));
@@ -1343,7 +1357,7 @@ fn plan_gemfile_edit(
     // exact pin exactly like quoted ones: carried after `path:` they are a
     // Ruby syntax error, and carried before it bundler sees `(= v, ~> 1)`
     // against the lock's `(= v)!` and refuses every frozen install (#847).
-    let opts = gemfile::trailing_options(&rest);
+    let opts = gemfile::trailing_options(rest);
     let tail = split_kept_tail(&opts);
     let mut new_line = format!("gem {q}{name}{q}, {q}{version}{q}, path: {q}{rel}{q}");
     if !tail.keywords.is_empty() {
@@ -1354,6 +1368,7 @@ fn plan_gemfile_edit(
         new_line.push(' ');
         new_line.push_str(tail.comment);
     }
+    new_line.push_str(cr);
     Ok(GemfilePlan::Rewrite {
         original_line: lines[idx].to_string(),
         new_line,
@@ -1627,7 +1642,7 @@ fn apply_gemfile_plan(text: &str, plan: &GemfilePlan) -> String {
         GemfilePlan::Append { block } => {
             let mut out = text.to_string();
             if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
+                out.push_str(line_endings::terminator(text));
             }
             out.push_str(block);
             out
@@ -2334,6 +2349,15 @@ async fn revert_gemfile_record(
             lines.join("\n")
         }
         WiringAction::Added => {
+            // A re-checkout may have changed the block's line endings since
+            // vendor wrote it (`core.autocrlf`): look for it as written, then
+            // as the file now spells its lines.
+            let respelled;
+            let mut written = written;
+            if !text.contains(written) {
+                respelled = line_endings::respell(written, line_endings::terminator(text));
+                written = &respelled;
+            }
             let Some(at) = text.find(written) else {
                 // ALREADY CONVERGED: an Added block's reverted state is its
                 // absence (the LIVENESS CONTRACT's "key is absent" case) —
@@ -2399,15 +2423,16 @@ fn gemfile_left_without_our_line(text: &str, written: &str) -> RecordRevert {
 /// as found. When the user changed the trailing comment vendor wrote, their
 /// comment (and the spacing before it) replaces the original's, so a note
 /// like `# CVE fix, do not bump` survives the revert. A CR line ending is
-/// the original's.
+/// the live line's: a re-checkout may have changed the file's line endings
+/// since vendor recorded `original` (#1821).
 fn restore_gemfile_line(live: &str, written: &str, original: &str) -> String {
     let (live_code, live_comment) = split_line_comment(live);
     let (_, written_comment) = split_line_comment(written);
+    let cr = if live.ends_with('\r') { "\r" } else { "" };
     if live == written || live_comment.trim() == written_comment.trim() {
-        return original.to_string();
+        return format!("{}{cr}", original.strip_suffix('\r').unwrap_or(original));
     }
     let (original_code, _) = split_line_comment(original);
-    let cr = if original.ends_with('\r') { "\r" } else { "" };
     let live_body = live.strip_suffix('\r').unwrap_or(live);
     let suffix = &live_body[live_code.trim_end().len()..];
     if suffix.trim().is_empty() {
@@ -4057,11 +4082,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         let entry = entry.unwrap();
         let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
-        // The forward rewrite writes the wired line with a bare LF (a
-        // separate line-ending gap); revert restores the original's CRLF.
-        let wired_line = format!("gem \"rack\", \"3.2.6\", path: \"{}\"\n", copy_rel());
+        let wired_line = format!("gem \"rack\", \"3.2.6\", path: \"{}\"\r\n", copy_rel());
         assert!(wired.contains(&wired_line), "{wired:?}");
-        let annotated = wired.replace(&wired_line, &wired_line.replace('\n', " # keep\n"));
+        let annotated = wired.replace(&wired_line, &wired_line.replace("\r\n", " # keep\r\n"));
         tokio::fs::write(root.join(GEMFILE), &annotated)
             .await
             .unwrap();
@@ -4082,6 +4105,154 @@ mod tests {
                 .unwrap(),
             LOCK_DIRECT
         );
+    }
+
+    /// Whether every line break in `text` is CRLF.
+    fn all_crlf(text: &str) -> bool {
+        !text.replace("\r\n", "").contains('\n')
+    }
+
+    /// #1821: vendoring over a CRLF Gemfile keeps it CRLF, for the rewired
+    /// direct declaration and for the appended managed block alike, and the
+    /// revert hands the file back byte for byte.
+    #[tokio::test]
+    async fn vendor_keeps_a_crlf_gemfile_crlf() {
+        for (gemfile, lock, expected_line) in [
+            (
+                GEMFILE_DIRECT,
+                LOCK_DIRECT,
+                format!("gem \"rack\", \"3.2.6\", path: \"{}\"\r\n", copy_rel()),
+            ),
+            (
+                GEMFILE_TRANSITIVE,
+                LOCK_TRANSITIVE,
+                format!(
+                    "{MANAGED_OPEN}\r\ngem \"rack\", \"3.2.6\", path: \"{}\"\r\n{MANAGED_CLOSE}\r\n",
+                    copy_rel()
+                ),
+            ),
+        ] {
+            let gemfile = gemfile.replace('\n', "\r\n");
+            let (_tmp, root, installed, blobs, record) = fixture(&gemfile, lock).await;
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+            assert!(all_crlf(&wired), "mixed line endings: {wired:?}");
+            assert!(wired.contains(&expected_line), "{wired:?}");
+
+            let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile
+            );
+        }
+    }
+
+    /// #1821: a trailing option or comment on the rewired line keeps the
+    /// CR in one place, the end of the line.
+    #[test]
+    fn plan_gemfile_edit_keeps_the_lines_crlf() {
+        for (line, want) in [
+            (
+                "gem \"rack\", \"~> 3.1\"\r",
+                "gem \"rack\", \"3.2.6\", path: \"p\"\r",
+            ),
+            (
+                "gem \"rack\", \"~> 3.1\", require: false\r",
+                "gem \"rack\", \"3.2.6\", path: \"p\", require: false\r",
+            ),
+            (
+                "gem \"rack\", \"~> 3.1\", require: false # pinned\r",
+                "gem \"rack\", \"3.2.6\", path: \"p\", require: false # pinned\r",
+            ),
+            ("gem \"rack\"\r", "gem \"rack\", \"3.2.6\", path: \"p\"\r"),
+        ] {
+            let text = format!("source \"https://rubygems.org\"\r\n{line}\n");
+            let Ok(GemfilePlan::Rewrite { new_line, .. }) =
+                plan_gemfile_edit(&text, "rack", "3.2.6", "p")
+            else {
+                panic!("{line:?} should rewrite");
+            };
+            assert_eq!(new_line, want, "{line:?}");
+        }
+    }
+
+    /// #1821: re-vendoring a new patch uuid over a CRLF Gemfile's managed
+    /// block still finds the fence, records the whole block as written, and
+    /// a revert deletes the fence.
+    #[tokio::test]
+    async fn revendor_crlf_managed_block_keeps_the_fence() {
+        let gemfile = GEMFILE_TRANSITIVE.replace('\n', "\r\n");
+        let (_tmp, root, installed, blobs, record) = fixture(&gemfile, LOCK_TRANSITIVE).await;
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let mut record2 = record.clone();
+        record2.uuid = UUID2.to_string();
+        let (r2, e2, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record2, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+
+        let new_block = format!(
+            "{MANAGED_OPEN}\r\ngem \"rack\", \"3.2.6\", path: \".socket/vendor/gem/{UUID2}/rack-3.2.6\"\r\n{MANAGED_CLOSE}\r\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            format!("{gemfile}{new_block}")
+        );
+        let mut entry2 = e2.unwrap();
+        assert_eq!(entry2.wiring[0].action, WiringAction::Added);
+        assert_eq!(
+            entry2.wiring[0].new.as_ref().unwrap(),
+            &Value::String(new_block)
+        );
+
+        carry_forward_originals(&e1.unwrap(), &mut entry2);
+        let outcome = revert_gem(&entry2, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+    }
+
+    /// #1821: a vendored Gemfile re-checked-out in the other line-ending
+    /// style (`core.autocrlf`) reverts to the original in the style it has
+    /// now, never a mix of the two.
+    #[tokio::test]
+    async fn revert_follows_a_recheckout_line_ending_change() {
+        for (gemfile, lock) in [
+            (GEMFILE_DIRECT, LOCK_DIRECT),
+            (GEMFILE_TRANSITIVE, LOCK_TRANSITIVE),
+        ] {
+            for (vendored_nl, checkout_nl) in [("\n", "\r\n"), ("\r\n", "\n")] {
+                let at_vendor = gemfile.replace('\n', vendored_nl);
+                let (_tmp, root, installed, blobs, record) = fixture(&at_vendor, lock).await;
+                let (result, entry, _w) =
+                    unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+                assert!(result.success, "{:?}", result.error);
+                let wired = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+                let recheckout = crate::utils::line_endings::respell(&wired, checkout_nl);
+                assert_ne!(recheckout, wired);
+                tokio::fs::write(root.join(GEMFILE), &recheckout)
+                    .await
+                    .unwrap();
+
+                let outcome = revert_gem(&entry.unwrap(), &root, false).await;
+                assert!(outcome.success, "{vendored_nl:?}: {:?}", outcome.error);
+                assert!(
+                    outcome.warnings.is_empty(),
+                    "{vendored_nl:?}: {:?}",
+                    outcome.warnings
+                );
+                assert_eq!(
+                    tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                    gemfile.replace('\n', checkout_nl),
+                    "{gemfile:?} vendored with {vendored_nl:?}"
+                );
+            }
+        }
     }
 
     /// #988: genuine Gemfile drift (the `path:` now points at a user fork)
