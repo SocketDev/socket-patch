@@ -7650,7 +7650,8 @@ pub(crate) fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> Strin
 /// divergence the rewriter itself created. Trailing whitespace is trimmed (a
 /// block appended to a newline-less file adds a final newline the other
 /// spelling never had). `\r?` mirrors the block recognizer in `rewrite_gem`:
-/// a `core.autocrlf` checkout rewrites run 1's LF block to CRLF, and a block
+/// a CRLF manifest gets a CRLF block (#1831) and a `core.autocrlf` checkout
+/// rewrites run 1's LF block to CRLF, and a block
 /// the recognizer accepts must also be erased here or the re-run is trapped
 /// behind the divergence warning before it can reach the recognizer.
 fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
@@ -7951,10 +7952,11 @@ fn rewrite_gem(
             // Wildcard the rotating segments instead (mirrors the CHECKSUMS
             // at-target guard below).
             let url_pat = gem_index_url_pattern(dep, &ov.index_url);
-            // `\r?\n`: the rewriter emits LF, but a `core.autocrlf` checkout
-            // rewrites the working tree to CRLF — the guard must still
-            // recognize the block there, or the indented `gem` line inside
-            // it falls through to `gem_line_re` and gets wrapped again.
+            // `\r?\n`: the rewriter writes a CRLF Gemfile's block in CRLF
+            // (#1831), and a `core.autocrlf` checkout rewrites an LF one to
+            // CRLF — the guard must recognize the block either way, or the
+            // indented `gem` line inside it falls through to `gem_line_re`
+            // and gets wrapped again.
             let block_re = Regex::new(
                 &(String::from(r#"(?m)^source "("#)
                     + &url_pat
@@ -8009,15 +8011,19 @@ fn rewrite_gem(
                     // The CR of a CRLF line is its ending, not part of the
                     // declaration: the block's own lines take that ending
                     // and the CR goes back at its end (#1831). An
-                    // unterminated last line takes the file's.
-                    let cr = if raw_tail.ends_with('\r') { "\r" } else { "" };
-                    let raw_tail = raw_tail.strip_suffix('\r').unwrap_or(raw_tail).to_string();
-                    let nl = if !cr.is_empty() {
-                        "\r\n"
-                    } else if range.end < gf.len() {
-                        "\n"
+                    // unterminated last line (a lone trailing CR included)
+                    // takes the file's.
+                    let terminated = range.end < gf.len();
+                    let cr = if terminated && raw_tail.ends_with('\r') {
+                        "\r"
                     } else {
-                        line_endings::terminator(gf)
+                        ""
+                    };
+                    let raw_tail = raw_tail.strip_suffix('\r').unwrap_or(raw_tail).to_string();
+                    let nl = match (cr, terminated) {
+                        ("\r", _) => "\r\n",
+                        (_, true) => "\n",
+                        _ => line_endings::terminator(gf),
                     };
                     // A parenthesized call keeps its closing `)` in the tail:
                     // strip it (dropping any comment with it), or fail closed
@@ -8102,7 +8108,8 @@ fn rewrite_gem(
                     // duplicate earlier in the file and corrupt it (and the
                     // block may carry user text a regex replacement would
                     // `$`-expand).
-                    gf.replace_range(range, &format!("{block}{cr}"));
+                    let block = format!("{block}{cr}");
+                    gf.replace_range(range, &block);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
                         path: gemfile_name.into(),
@@ -18033,12 +18040,6 @@ mod tests {
         );
     }
 
-    /// Whether every line break in `text` is CRLF (and no CR stands alone).
-    fn all_crlf(text: &str) -> bool {
-        let crlf = text.matches("\r\n").count();
-        crlf > 0 && crlf == text.matches('\n').count() && crlf == text.matches('\r').count()
-    }
-
     /// #1831: the Socket source block takes the CRLF endings of the Gemfile
     /// it is written into, for a rewritten direct declaration (plain, with
     /// options, parenthesized, inside a user `source … do` block, on an
@@ -18101,7 +18102,11 @@ mod tests {
                 .files
                 .get("Gemfile")
                 .unwrap_or_else(|| panic!("{gemfile:?} is redirected: {:?}", res.warnings));
-            assert!(all_crlf(out), "{gemfile:?}: mixed line endings: {out:?}");
+            assert_eq!(
+                LineEndings::of(out),
+                LineEndings::Crlf,
+                "{gemfile:?}: mixed line endings: {out:?}"
+            );
             assert!(out.ends_with(&want), "{gemfile:?}: {out:?}");
 
             files.insert("Gemfile".to_string(), out.clone());
