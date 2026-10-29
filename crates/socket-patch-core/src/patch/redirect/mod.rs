@@ -18083,6 +18083,12 @@ mod tests {
                 &direct,
                 format!("{block}\r\nend"),
             ),
+            // A lone CR at the end of the file is not a line ending.
+            (
+                format!("{head}gem \"rails\"\r"),
+                &direct,
+                format!("{block}\r\nend"),
+            ),
             (
                 format!("{head}gem \"puma\"\r\n"),
                 &transitive,
