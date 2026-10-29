@@ -4244,25 +4244,25 @@ mod tests {
                 br#"{"name":"crlfbin","bin":"cli.js"}"#,
             ),
         ] {
-            let pkg = tempfile::tempdir().unwrap();
-            tokio::fs::write(pkg.path().join("package.json"), manifest)
+            // npm linked a `crlfbin` bin, but not to this file.
+            let root = tempfile::tempdir().unwrap();
+            let pkg = root.path().join("node_modules/crlfbin");
+            std::fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
+            std::fs::write(root.path().join("node_modules/.bin/crlfbin"), b"shim").unwrap();
+            std::fs::create_dir_all(&pkg).unwrap();
+            tokio::fs::write(pkg.join("package.json"), manifest)
                 .await
                 .unwrap();
-            tokio::fs::write(pkg.path().join("cli.js"), CRLF_BIN_AFTER)
+            tokio::fs::write(pkg.join("cli.js"), CRLF_BIN_AFTER)
                 .await
                 .unwrap();
             assert!(
-                !needs_npm_bin_rewrite(
-                    purl,
-                    pkg.path(),
-                    "package/cli.js",
-                    &files["package/cli.js"]
-                )
-                .await
+                !needs_npm_bin_rewrite(purl, &pkg, "package/cli.js", &files["package/cli.js"])
+                    .await
             );
             let res = apply_package_patch(
                 purl,
-                pkg.path(),
+                &pkg,
                 &files,
                 &PatchSources::blobs_only(blobs.path()),
                 false,
@@ -4272,7 +4272,7 @@ mod tests {
             assert!(res.success, "{purl}: {res:?}");
             assert!(res.files_patched.is_empty(), "{purl}: {res:?}");
             assert_eq!(
-                tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
+                tokio::fs::read(pkg.join("cli.js")).await.unwrap(),
                 CRLF_BIN_AFTER
             );
         }

@@ -89,15 +89,14 @@ pub(crate) async fn form_for_write<'a>(
         return as_recorded(content);
     }
     let path = pkg_path.join(normalized);
-    let npm_installed = is_linked_bin(package_key, pkg_path, normalized).await || {
-        let lf_shebang = read_prefix(&path)
-            .await
-            .is_some_and(|prefix| has_lf_shebang(&prefix));
-        lf_shebang
-            && (is_npm(package_key)
-                || (!installed_source.is_empty()
-                    && source_hash(&path).await.as_deref() == Some(installed_source)))
-    };
+    let lf_shebang = read_prefix(&path)
+        .await
+        .is_some_and(|prefix| has_lf_shebang(&prefix));
+    let npm_installed = (lf_shebang
+        && (is_npm(package_key)
+            || (!installed_source.is_empty()
+                && source_hash(&path).await.as_deref() == Some(installed_source))))
+        || is_linked_bin(package_key, pkg_path, normalized).await;
     if !npm_installed {
         return as_recorded(content);
     }
@@ -119,10 +118,13 @@ fn is_npm(package_key: &str) -> bool {
 /// enough: with `bin-links=false`, or for a `directories.bin` file of a
 /// package installed from a tarball or folder (npm expands that field
 /// only in registry packuments), the file keeps its published shebang
-/// (#1804). The link is a `.bin/<name>` entry in a `node_modules` the
-/// package sits under (a symlink must resolve to this file; a cmd or
-/// shell shim is taken as is), a pnpm virtual-store dependent's
-/// `.bin/<name>`, or a global prefix's `bin/<name>` or `<name>.cmd`.
+/// (#1804). The link is a `.bin/<name>` entry in the `node_modules` the
+/// package sits in, where npm links it (a symlink must resolve to this
+/// file; a cmd or shell shim is taken as is), or a global prefix's
+/// `bin/<name>` or `<name>.cmd`. A package in a virtual store (pnpm's
+/// `.pnpm`, npm's linked `.store`, vlt, Bun) has its bins linked into
+/// each dependent's `.bin`, wherever that is, so there the listing alone
+/// is taken for the link, as before.
 pub(crate) async fn is_linked_bin(package_key: &str, pkg_path: &Path, normalized: &str) -> bool {
     if !is_npm(package_key) {
         return false;
@@ -157,41 +159,35 @@ fn has_bin_link(pkg_path: &Path, file: &Path, names: &[String]) -> bool {
             .iter()
             .any(|name| links(&dir.join(format!("{name}{suffix}"))))
     };
-    for dir in pkg_path.ancestors().skip(1) {
-        match dir.file_name().and_then(|n| n.to_str()) {
-            Some("node_modules") => {
-                if in_dir(&dir.join(".bin"), "") {
-                    return true;
-                }
-                let Some(prefix) = dir.parent() else { continue };
-                // Windows global: `<prefix>/node_modules`, shims in `<prefix>`.
-                if in_dir(prefix, ".cmd") {
-                    return true;
-                }
-                // Unix global: `<prefix>/lib/node_modules`, links in `<prefix>/bin`.
-                if prefix.file_name().is_some_and(|n| n == "lib")
-                    && prefix.parent().is_some_and(|p| in_dir(&p.join("bin"), ""))
-                {
-                    return true;
-                }
-            }
-            // pnpm links a package's bins into each dependent's
-            // `.pnpm/<dependent>/node_modules/.bin`.
-            Some(".pnpm") => {
-                let Ok(entries) = std::fs::read_dir(dir) else {
-                    continue;
-                };
-                if entries
-                    .flatten()
-                    .any(|e| in_dir(&e.path().join("node_modules").join(".bin"), ""))
-                {
-                    return true;
-                }
-            }
-            _ => {}
-        }
+    let mut ancestors = pkg_path.ancestors().skip(1);
+    let Some(node_modules) = ancestors
+        .by_ref()
+        .find(|dir| dir.file_name().is_some_and(|n| n == "node_modules"))
+    else {
+        return false;
+    };
+    if ancestors.any(|dir| {
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+            && dir
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "node_modules")
+    }) {
+        return true;
     }
-    false
+    if in_dir(&node_modules.join(".bin"), "") {
+        return true;
+    }
+    let Some(prefix) = node_modules.parent() else {
+        return false;
+    };
+    // Windows global: `<prefix>/node_modules`, shims in `<prefix>`.
+    in_dir(prefix, ".cmd")
+        // Unix global: `<prefix>/lib/node_modules`, links in `<prefix>/bin`.
+        || (prefix.file_name().is_some_and(|n| n == "lib")
+            && prefix.parent().is_some_and(|p| in_dir(&p.join("bin"), "")))
 }
 
 /// Whether the file at `normalized` holds exactly the recorded content
@@ -244,7 +240,8 @@ fn bin_names(manifest: &[u8], normalized: &str) -> Vec<String> {
     };
     // npm keeps only a key's last segment, `\` and `:` taken for `/`.
     let link_name = |key: &str| {
-        key.rsplit(['/', '\\', ':'])
+        key.trim_end_matches(['/', '\\', ':'])
+            .rsplit(['/', '\\', ':'])
             .next()
             .filter(|n| !n.is_empty() && *n != "." && *n != "..")
             .map(str::to_string)
@@ -263,18 +260,18 @@ fn bin_names(manifest: &[u8], normalized: &str) -> Vec<String> {
             .filter_map(|(key, _)| link_name(key))
             .collect(),
         Some(Value::Array(bins)) => {
-            if bins
+            let listed = bins
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|bin| clean_path(bin) == target)
-            {
+                .any(|bin| clean_path(bin) == target);
+            if listed {
                 vec![file_name]
             } else {
                 Vec::new()
             }
         }
         Some(Value::String(_) | Value::Null | Value::Bool(false)) | None => {
-            let in_dir = json
+            let listed = json
                 .get("directories")
                 .and_then(|d| d.get("bin"))
                 .and_then(serde_json::Value::as_str)
@@ -285,7 +282,7 @@ fn bin_names(manifest: &[u8], normalized: &str) -> Vec<String> {
                         && target.starts_with(&dir[..])
                         && !target[dir.len()..].iter().any(|seg| seg.starts_with('.'))
                 });
-            if in_dir {
+            if listed {
                 vec![file_name]
             } else {
                 Vec::new()
@@ -293,13 +290,6 @@ fn bin_names(manifest: &[u8], normalized: &str) -> Vec<String> {
         }
         Some(_) => Vec::new(),
     }
-}
-
-/// Whether the `package.json` bytes `manifest` list `normalized` as a bin
-/// ([`bin_names`]).
-#[cfg(test)]
-fn lists_bin(manifest: &[u8], normalized: &str) -> bool {
-    !bin_names(manifest, normalized).is_empty()
 }
 
 /// `path`'s segments with `.`, empty segments and `..` folded, rooted at
@@ -473,7 +463,7 @@ mod tests {
 
     #[test]
     fn lists_bin_reads_every_bin_shape() {
-        let listed = |manifest: &str, file: &str| lists_bin(manifest.as_bytes(), file);
+        let listed = |manifest: &str, file: &str| !bin_names(manifest.as_bytes(), file).is_empty();
         assert!(listed(r#"{"name":"x","bin":"cli.js"}"#, "cli.js"));
         assert!(listed(r#"{"name":"x","bin":"./bin/../cli.js"}"#, "cli.js"));
         assert!(listed(
@@ -520,6 +510,7 @@ mod tests {
             ["a", "c"]
         );
         assert_eq!(names(r#"{"bin":{"../../a":"cli.js"}}"#, "cli.js"), ["a"]);
+        assert_eq!(names(r#"{"bin":{"a/":"cli.js"}}"#, "cli.js"), ["a"]);
         assert_eq!(names(r#"{"bin":["bin/cli.js"]}"#, "bin/cli.js"), ["cli.js"]);
         assert_eq!(
             names(r#"{"directories":{"bin":"bin"}}"#, "bin/sub/run"),
@@ -597,19 +588,31 @@ mod tests {
         let pkg = installed_bin(root.path(), "node_modules");
         shim(root.path().join("crlfbin.cmd"));
         assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
-        // A pnpm transitive dependency, linked into its dependent's `.bin`.
+        // A virtual-store copy, whose bins are linked into its dependents'.
+        for store in [
+            "node_modules/.pnpm/crlfbin@1.0.0/node_modules",
+            "node_modules/.store/crlfbin@1.0.0/node_modules",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let pkg = installed_bin(root.path(), store);
+            assert!(is_linked_bin(PURL, &pkg, "cli.js").await, "{store}");
+        }
+    }
+
+    /// npm links a nested copy's bins into its own `node_modules/.bin`, so
+    /// the top-level copy's link says nothing about it.
+    #[tokio::test]
+    async fn is_linked_bin_looks_only_where_npm_links_the_copy() {
         let root = tempfile::tempdir().unwrap();
-        let pkg = installed_bin(root.path(), "node_modules/.pnpm/crlfbin@1.0.0/node_modules");
-        std::fs::create_dir_all(
-            root.path()
-                .join("node_modules/.pnpm/app@1.0.0/node_modules"),
-        )
-        .unwrap();
+        let pkg = installed_bin(root.path(), "node_modules/a/node_modules");
+        shim(root.path().join("node_modules/.bin/crlfbin"));
         assert!(!is_linked_bin(PURL, &pkg, "cli.js").await);
-        shim(
-            root.path()
-                .join("node_modules/.pnpm/app@1.0.0/node_modules/.bin/crlfbin"),
-        );
+        shim(root.path().join("node_modules/a/node_modules/.bin/crlfbin"));
+        assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
+        // Scoped: `node_modules/@s/crlfbin` links into `node_modules/.bin`.
+        let root = tempfile::tempdir().unwrap();
+        let pkg = installed_bin(root.path(), "node_modules/@s");
+        shim(root.path().join("node_modules/.bin/crlfbin"));
         assert!(is_linked_bin(PURL, &pkg, "cli.js").await);
     }
 
