@@ -12,7 +12,9 @@ the union of the shards is the old single `cargo test --workspace` run.
 
 Windows debug CI sets CI_TEST_TIMINGS to the checked-in runtime sample.
 Those shards balance measured test time plus linking work, with shard 1's
-unit tests reserved up front. Other runners retain the count-based split.
+unit tests reserved up front. Coverage shards do the same on their own
+Linux sample (scripts/ci-coverage-durations.json) unless CI_TEST_TIMINGS
+is set; an empty CI_TEST_TIMINGS, as on macOS, keeps the count split.
 
 CI_TEST_COVERAGE=1 runs the shard under cargo-llvm-cov for ci.yml's
 `coverage` job: `cargo llvm-cov --no-report` in place of `cargo test`, and
@@ -40,6 +42,10 @@ import re
 import subprocess
 import sys
 import time
+
+# The Linux runtime sample coverage shards balance on (the Windows one,
+# scripts/ci-test-durations.json, doesn't model them: #1768).
+COVERAGE_TIMINGS = Path(__file__).with_name("ci-coverage-durations.json")
 
 # Shard 1's share of the integration targets, relative to every other
 # shard's 1.0 (it also carries the unit tests and doctests).
@@ -132,9 +138,9 @@ def main(argv):
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
         check=True, capture_output=True, text=True).stdout)
     names = integration_targets(metadata)
-    timing_path = os.environ.get("CI_TEST_TIMINGS")
-    timings = json.loads(Path(timing_path).read_text(encoding="utf-8")) if timing_path else None
     coverage = os.environ.get("CI_TEST_COVERAGE") == "1"
+    timing_path = os.environ.get("CI_TEST_TIMINGS", COVERAGE_TIMINGS if coverage else None)
+    timings = json.loads(Path(timing_path).read_text(encoding="utf-8")) if timing_path else None
     print(f"ci-test-shard: shard {shard}/{count}: "
           f"{len(partition(names, count, timings)[shard - 1])} of {len(names)} integration targets", flush=True)
     status = 0

@@ -134,6 +134,45 @@ class Partition(unittest.TestCase):
         self.assertEqual(list(sample), ["_build_seconds", "integration"])
         self.assertEqual(sample["integration"], 2.0)
 
+    def test_coverage_shards_default_to_the_linux_sample(self):
+        # With the sample, the longest target gets shard 1 to itself; the
+        # count split gives shard 1 only `b`, by its smaller weight.
+        metadata = {"workspace_members": ["x"], "packages": [
+            {"id": "x", "targets": [{"name": n, "kind": ["test"]} for n in ("a", "b", "c")]}]}
+        sample = {"unit_seconds": 0.0, "compile_seconds": 0.0, "default_seconds": 1.0,
+                  "targets": {"a": 1.0, "b": 2.0, "c": 100.0}}
+        env = {k: v for k, v in shard.os.environ.items() if k not in ("CI_TEST_TIMINGS", "CI_TEST_COVERAGE")}
+        cases = [({"CI_TEST_COVERAGE": "1"}, ["c"]),
+                 ({"CI_TEST_COVERAGE": "1", "CI_TEST_TIMINGS": ""}, ["b"]),
+                 ({}, ["b"])]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample.json"
+            path.write_text(json.dumps(sample), encoding="utf-8")
+            for extra, expected in cases:
+                with self.subTest(env=extra), \
+                        patch.dict(shard.os.environ, {**env, **extra}, clear=True), \
+                        patch.object(shard, "COVERAGE_TIMINGS", path), \
+                        patch.object(shard.subprocess, "run", return_value=subprocess.CompletedProcess(
+                            [], 0, stdout=json.dumps(metadata))), \
+                        patch.object(shard, "run", return_value=0) as run:
+                    shard.main(["1", "2"])
+                    self.assertEqual(selected([run.call_args_list[0].args[0]]), expected)
+
+    def test_the_linux_coverage_sample_covers_the_checkout(self):
+        sample = json.loads(shard.COVERAGE_TIMINGS.read_text(encoding="utf-8"))
+        for key in ("unit_seconds", "compile_seconds", "default_seconds", "targets"):
+            self.assertIn(key, sample)
+        try:
+            out = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                                 cwd=ROOT, check=True, capture_output=True, text=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("cargo not available")
+        names = shard.integration_targets(json.loads(out))
+        # New targets fall back to default_seconds; a mostly-stale sample
+        # would quietly degrade into an unbalanced split.
+        missing = [n for n in names if n not in sample["targets"]]
+        self.assertLess(len(missing), len(names) // 10, missing)
+
     def test_negative_bad_shard(self):
         with self.assertRaises(ValueError):
             shard.invocations(3, 2, self.NAMES)
