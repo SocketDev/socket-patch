@@ -478,6 +478,65 @@ pub fn wired_checked(
     })
 }
 
+/// Refuse `plan` when, written over `read`, no pom of the reactor would
+/// name `c`'s suffixed version: every declaration was left as is and no
+/// root pinned (#513). Vendoring it would count the patch as applied while
+/// the build keeps resolving the base; the refusal carries the degraded
+/// reasons that left it unwired.
+pub fn refuse_unwired(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+    plan: &JvmPlan,
+) -> Result<(), JvmRefusal> {
+    let planned = |rel: &str| match plan.writes.iter().find(|w| w.rel == rel) {
+        Some(w) => Some(w.bytes.clone()),
+        None => read(rel),
+    };
+    if wired_checked(&planned, list, c)? {
+        return Ok(());
+    }
+    // Only the reasons that leave a declaration or a root alone; the
+    // repository and config notes (and a mixed root's Gradle warnings)
+    // say nothing about why the reactor is unwired.
+    const UNWIRING: [&str; 7] = [
+        "property_unresolved",
+        "conflicting_literal_version",
+        "conflicting_managed_version",
+        "management_unresolved",
+        "range",
+        "coordinates_overridden",
+        "classifier_declared",
+    ];
+    let why: Vec<&str> = plan
+        .warnings
+        .iter()
+        .filter(|w| w.code == DEGRADED)
+        .map(|w| w.detail.as_str())
+        .filter(|d| {
+            UNWIRING
+                .iter()
+                .any(|r| d.starts_with(&format!("reason: {r}: ")))
+        })
+        .collect();
+    let why = if why.is_empty() {
+        "no declaration or pin of the reactor can take it".to_string()
+    } else {
+        why.join("; ")
+    };
+    Err(JvmRefusal {
+        code: SHAPE_UNSUPPORTED,
+        detail: format!(
+            "reason: nothing_wired: no pom of the reactor would build {}:{}:{}, so Maven \
+             keeps resolving {} ({why})",
+            c.group_id,
+            c.artifact_id,
+            c.suffixed_version(),
+            c.version
+        ),
+    })
+}
+
 /// [`wired_checked`], and no declaration of `c`'s g:a is left at a version
 /// that may still read the base: the base itself, as a module or
 /// dependency added since vendoring declares it (#584), or a `${...}` the
@@ -5377,6 +5436,51 @@ mod tests {
         assert_eq!(text(&after, "a/pom.xml"), a);
         assert!(!root_pinned(&plan, &files));
         assert!(unwired(&after));
+    }
+
+    /// #513: a plan that leaves every declaration and root alone wires
+    /// nothing, so `vendor` refuses it with the reasons instead of
+    /// counting the patch as applied.
+    #[test]
+    fn a_plan_that_wires_nothing_is_refused() {
+        let parent = "<parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId>\
+            <version>3</version><relativePath/></parent>";
+        let mut files = external_reactor(parent, "");
+        let a = text(&files, "a/pom.xml").replace(
+            "</artifactId></dependency>",
+            "</artifactId><version>${ct.version}</version></dependency>",
+        );
+        files.insert("a/pom.xml".into(), a.into_bytes());
+        let plan = run(&files).unwrap();
+        let read = |p: &str| files.get(p).cloned();
+        let r = refuse_unwired(&read, &lister(&files), &patch().coords(), &plan).unwrap_err();
+        assert_eq!(r.code, SHAPE_UNSUPPORTED);
+        assert_eq!(refusal_reason(&r), "nothing_wired");
+        assert!(
+            r.detail.contains("reason: property_unresolved: "),
+            "{}",
+            r.detail
+        );
+        assert!(!r.detail.contains("maven_f_outside_root"), "{}", r.detail);
+        assert!(!r.detail.contains("maven_mirror_of_all"), "{}", r.detail);
+    }
+
+    /// The same check passes a plan that pins the root or rewrites a
+    /// declaration, and an already vendored reactor whose re-plan writes
+    /// nothing.
+    #[test]
+    fn a_wired_plan_is_not_refused() {
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", &dep("1.10.0"))),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (plan, after) = vendor(&files);
+        let read = |p: &str| files.get(p).cloned();
+        refuse_unwired(&read, &lister(&files), &patch().coords(), &plan).unwrap();
+        let again = run(&after).unwrap();
+        let read = |p: &str| after.get(p).cloned();
+        refuse_unwired(&read, &lister(&after), &patch().coords(), &again).unwrap();
     }
 
     /// #513 case 2: Maven 4.1.0 infers an empty `<parent/>` from
