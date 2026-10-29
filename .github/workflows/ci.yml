@@ -33,9 +33,12 @@ on:
         # Run only one OS's jobs (plus the clippy and release-readiness
         # preflights every leg waits on). A fix for a Windows-only nightly
         # failure dispatches `-f os=windows` instead of re-running ~95 Linux
-        # and macOS jobs its PR run and the merge queue already cover. Only
-        # a dispatch sets inputs.os; on every other event it is empty, so
-        # the `inputs.os != ...` terms below are always true there.
+        # and macOS jobs (~140 job-minutes) its PR run and the merge queue
+        # already cover. hosted-e2e is a Linux job and skips too. Only a
+        # dispatch sets inputs.os; on every other event it is empty, so the
+        # `inputs.os != ...` terms below are always true there. Each
+        # OS-filtered dispatch gets its own concurrency group, so
+        # dispatching one per OS runs them all.
         description: 'Only run jobs for this OS (all = the full nightly matrix)'
         type: choice
         default: all
@@ -56,7 +59,7 @@ permissions:
 # cancelled the real run, skipped every job, and left ci-ok green on a head
 # nothing had tested.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event.pull_request.draft && '-draft' || '' }}
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'push' && github.sha) || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event.pull_request.draft && '-draft' || '' }}${{ inputs.os && inputs.os != 'all' && format('-{0}', inputs.os) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Linux jobs run on Depot's runners (depot-ubuntu-*-4: 4 vCPU, like GitHub's
@@ -2895,7 +2898,11 @@ jobs:
   # every job above, so adding a job here is how it becomes merge-blocking.
   # Skipped jobs (the nightly `full` tier) pass; failed or cancelled ones fail.
   ci-ok:
-    name: ci-ok                 # registered as a required check; do not rename
+    # Registered as a required check; do not rename. A one-OS dispatch
+    # (inputs.os, #1818) skips the other OSes, so its verdict gets another
+    # name: a green `ci-ok` on the branch head must mean every PR-tier job
+    # passed, and a skipped required check would count as passing too.
+    name: ${{ inputs.os && inputs.os != 'all' && format('ci-ok ({0} only)', inputs.os) || 'ci-ok' }}
     if: always()
     needs: [clippy, node-addon, lint-ecosystems, release-readiness, test, test-release, coverage, docker-base, coverage-docker, coverage-merge, dispatch-tests, e2e-build, windows-compile-check, e2e-build-windows, e2e-build-macos, e2e, e2e-windows, e2e-extended, e2e-full, e2e-docker, yarn-classic-matrix, yarn-berry-e2e, yarn-berry-full, cargo-vex-matrix, cargo-vex-matrix-windows, cargo-vex-matrix-full, cargo-old-toolchains, hosted-e2e, e2e-macos, yarn-berry-e2e-macos, cargo-vex-matrix-macos]
     # GitHub-hosted, not Depot: the check is one 2 s python3 call that runs

@@ -298,6 +298,15 @@ class Scheduling(unittest.TestCase):
         # ci-ok green with every job skipped.
         group = re.search(r"^concurrency:\n  group: (.*)$", TEXT, re.M)[1]
         self.assertIn("github.event.pull_request.draft && '-draft'", group)
+        # One dispatch per OS must not cancel the pending one before it.
+        self.assertIn("${{ inputs.os && inputs.os != 'all' && format('-{0}', inputs.os) || '' }}", group)
+
+    def test_one_os_dispatch_cannot_post_a_green_ci_ok(self):
+        # A dispatch on a PR head that skipped the other OSes must not report
+        # under the required check's name (#1818); every other event does.
+        names = [line for line in JOBS["ci-ok"] if line.startswith("    name:")]
+        self.assertEqual(names, ["    name: ${{ inputs.os && inputs.os != 'all'"
+                                 " && format('ci-ok ({0} only)', inputs.os) || 'ci-ok' }}"])
 
     def test_row_reader_preserves_both_os_siblings(self):
         jobs = reader.jobs("""jobs:
