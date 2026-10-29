@@ -1516,7 +1516,7 @@ impl Reactor {
             next += 1;
             let mut modules = module_refs(&poms[&rel].doc);
             if discovery && poms[&rel].discovers_subprojects {
-                modules.extend(implicit_subprojects(read, list, &poms[&rel].dir));
+                modules.extend(implicit_subprojects(list, &poms[&rel].dir));
             }
             for module in modules {
                 let (module_rel, bytes) = resolve_module(read, &poms[&rel].dir, &rel, &module)?;
@@ -2040,17 +2040,19 @@ const POM_NAMESPACE: &str = "maven.apache.org/POM/";
 
 /// The subprojects Maven 4 discovers under the pom at `dir`: every direct
 /// subdirectory holding a `pom.xml`, hidden ones included, as
-/// `<subproject>` names relative to `dir`.
-fn implicit_subprojects(read: ReadFn<'_>, list: ListFn<'_>, dir: &str) -> Vec<String> {
+/// `<subproject>` names relative to `dir`. Probed through the listing, not
+/// a read: a directory the reader refuses (`.git/`) lists as empty, where
+/// reading its `pom.xml` would record a read error.
+fn implicit_subprojects(list: ListFn<'_>, dir: &str) -> Vec<String> {
     list(dir)
         .iter()
         .filter_map(|entry| entry.strip_suffix('/'))
         .filter(|name| {
-            let pom = match dir {
-                "" => format!("{name}/pom.xml"),
-                _ => format!("{dir}/{name}/pom.xml"),
+            let sub = match dir {
+                "" => name.to_string(),
+                _ => format!("{dir}/{name}"),
             };
-            read(&pom).is_some()
+            list(&sub).iter().any(|e| e == "pom.xml")
         })
         .map(str::to_string)
         .collect()
@@ -3489,23 +3491,8 @@ mod tests {
         defaults
     }
 
-    /// `files`' listing of `dir`, the way [`ListFn`] answers it.
     fn lister(files: &Fs) -> impl Fn(&str) -> Vec<String> + '_ {
-        move |dir: &str| {
-            let prefix = match dir.trim_end_matches('/') {
-                "" => String::new(),
-                d => format!("{d}/"),
-            };
-            let names: BTreeSet<String> = files
-                .keys()
-                .filter_map(|rel| rel.strip_prefix(&prefix))
-                .map(|rest| match rest.split_once('/') {
-                    Some((d, _)) => format!("{d}/"),
-                    None => rest.to_string(),
-                })
-                .collect();
-            names.into_iter().collect()
-        }
+        move |dir: &str| super::super::testing::list_of(files, dir)
     }
 
     fn run(files: &Fs) -> Result<JvmPlan, JvmRefusal> {
@@ -5549,6 +5536,34 @@ mod tests {
                 "b/pom.xml",
                 "a/sub/pom.xml"
             ]
+        );
+    }
+
+    /// #622: in a git checkout, discovery lists `.git/` like any directory.
+    /// Probing it must not record a read error (the reader refuses every
+    /// path through `.git`), or `vex` and `vendor --check` fail on it.
+    #[tokio::test]
+    async fn maven_4_subproject_discovery_in_a_git_checkout_stays_readable() {
+        let a = implicit_child("a", "jar", &dep("1.10.0"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::testing::populate(
+            root,
+            &[
+                ("pom.xml", IMPLICIT_ROOT),
+                ("a/pom.xml", &a),
+                (".git/HEAD", "ref: refs/heads/main\n"),
+            ],
+        );
+        let mut ledger = BTreeMap::new();
+        let plan = super::super::testing::vendor(root, Shape::MavenReactor, &patch(), &mut ledger)
+            .await
+            .unwrap();
+        assert!(plan.writes.iter().any(|w| w.rel == "a/pom.xml"));
+        let entry = ledger.values().next().unwrap();
+        assert_eq!(
+            super::super::apply::entry_wired_checked(root, entry),
+            Ok(true)
         );
     }
 
