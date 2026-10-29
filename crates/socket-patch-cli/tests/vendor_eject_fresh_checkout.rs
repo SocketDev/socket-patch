@@ -723,4 +723,22 @@ async fn rolled_back_eject_reports_nothing_vendored() {
         !stdout.contains("Vendored") && !stdout.contains("Next steps"),
         "nothing was vendored: {stdout}\n{stderr}"
     );
+
+    // #1782 review: the eject's group also holds ms's upstream restore, so
+    // it must never be committed past ms's failure. A commit would journal
+    // ms on the plain registry entry, and a kill at that point (here the
+    // journal failpoint) would make the next locked command roll it
+    // forward, unpatched.
+    let root = fresh("killed");
+    let (code, env) = run_json_with(
+        &root,
+        &server,
+        &["vendor"],
+        &[("SOCKET_PATCH_FAILPOINT", "group_commit_journal".to_string())],
+    );
+    assert_eq!(code, 1, "the failed eject never reaches a commit: {env:#}");
+    assert!(!root
+        .join(socket_patch_core::utils::group_commit::COMMIT_JOURNAL_REL)
+        .exists());
+    still_hosted(&root);
 }

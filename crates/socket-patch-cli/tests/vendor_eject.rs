@@ -75,6 +75,11 @@ impl Project {
     /// Run the binary against the mocks in the hermetic `SOCKET_*`
     /// environment.
     fn run(&self, args: &[&str]) -> (i32, String, String) {
+        self.run_with_env(args, &[])
+    }
+
+    /// [`Self::run`] with extra environment variables (a failpoint).
+    fn run_with_env(&self, args: &[&str], extra: &[(&str, &str)]) -> (i32, String, String) {
         let mut cmd = hermetic::binary_command();
         cmd.args(args)
             .arg("--cwd")
@@ -87,6 +92,9 @@ impl Project {
             .env("SOCKET_NPM_REGISTRY", &uri)
             .env("SOCKET_PATCH_SERVER_URL", &uri)
             .env("SOCKET_VENDOR_SOURCE", "service");
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
         let out = cmd.output().expect("spawn socket-patch");
         (
             out.status.code().unwrap_or(-1),
@@ -268,6 +276,95 @@ async fn eject_vendors_hosted_pins_and_revert_returns_to_upstream() {
     assert_eq!(entry["integrity"], UPSTREAM_INTEGRITY, "{lock:#}");
     assert!(!p.artifact().exists(), "the artifact is removed");
     assert!(!p.redirect_state().exists());
+}
+
+/// #1782: an eject that dies before its group commit (a SIGKILL, a Ctrl-C,
+/// a CI cancel) leaves the project hosted, exactly as found: the upstream
+/// restore is captured with the vendored wiring and lands only with the
+/// commit's journal. A re-run then sees the hosted pin and completes the
+/// eject, instead of answering `noManifest` over an unpatched lock.
+#[tokio::test]
+async fn eject_killed_before_its_commit_stays_hosted_and_reruns() {
+    let p = hosted_project(true).await;
+    mock_registry(&p).await;
+    mock_view(&p).await;
+    let before = p.lock_bytes();
+
+    let (code, stdout, stderr) = p.run_with_env(
+        &["vendor", "--json"],
+        &[("SOCKET_PATCH_FAILPOINT", "vendor_group_commit")],
+    );
+    assert_eq!(
+        code, 86,
+        "the failpoint kills the eject\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        p.lock_bytes(),
+        before,
+        "nothing reached the lock before the commit: it still pins the hosted tarball"
+    );
+    assert!(!p
+        .root()
+        .join(socket_patch_core::utils::group_commit::COMMIT_JOURNAL_REL)
+        .exists());
+    assert!(!p.root().join(".socket/vendor/state.json").exists());
+
+    let (code, env) = p.run_json(&["vendor"]);
+    assert_eq!(code, 0, "the re-run ejects: {env:#}");
+    assert_eq!(find_event(&env, "applied", None)["purl"], PURL, "{env:#}");
+    let lock = p.lock();
+    let resolved = lock["packages"]["node_modules/left-pad"]["resolved"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        resolved.contains(&format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")),
+        "{lock:#}"
+    );
+}
+
+/// #1782, the other half: an eject killed once its commit journal is
+/// durable is finished by the next command that takes the apply lock, so
+/// the restore and the vendored wiring land together (never a lock back
+/// on the registry with no vendored entry).
+#[tokio::test]
+async fn eject_killed_after_its_journal_rolls_forward() {
+    let p = hosted_project(true).await;
+    mock_registry(&p).await;
+    mock_view(&p).await;
+
+    let (code, stdout, stderr) = p.run_with_env(
+        &["vendor", "--json"],
+        &[("SOCKET_PATCH_FAILPOINT", "group_commit_journal")],
+    );
+    assert_eq!(
+        code, 86,
+        "the failpoint kills the eject\n{stdout}\n{stderr}"
+    );
+    assert!(p
+        .root()
+        .join(socket_patch_core::utils::group_commit::COMMIT_JOURNAL_REL)
+        .exists());
+
+    let (code, env) = p.run_json(&["vendor"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(!p
+        .root()
+        .join(socket_patch_core::utils::group_commit::COMMIT_JOURNAL_REL)
+        .exists());
+    let lock = p.lock();
+    let resolved = lock["packages"]["node_modules/left-pad"]["resolved"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        resolved.contains(&format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")),
+        "the replay wired the vendored artifact: {lock:#}"
+    );
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(p.root().join(".socket/vendor/state.json")).unwrap())
+            .unwrap();
+    assert!(state["entries"].get(PURL).is_some(), "{state:#}");
 }
 
 /// Hosted pins remain the input when an agent manifest is present. The
