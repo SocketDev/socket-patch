@@ -245,13 +245,22 @@ mod tests {
             &format!(r#"{NEW_DIST}, "extra": {{"source": {{}}}}"#),
         );
         // An edit that drops `source` names no dir beyond the Composer 1 note.
-        let composer1_only = hosted_reinstall_hint(&files, &[], "vendor");
+        let composer1_only = |dir: &str| {
+            format!(
+                " (e.g. `composer install`; on Composer 1 first remove the patched packages' \
+                 {dir}/<vendor>/<name> directories)"
+            )
+        };
         for edits in [vec![with_source.clone()], vec![source_after_extra]] {
             assert_eq!(
                 hosted_reinstall_hint(&files, &edits, "vendor"),
-                composer1_only
+                Some(composer1_only("vendor"))
             );
         }
+        assert_eq!(
+            hosted_reinstall_hint(&files, &[], "lib"),
+            Some(composer1_only("lib"))
+        );
 
         let dist_only = dist_edit("Acme/Lib", OLD_DIST, NEW_DIST);
         let removing = |dir: &str| {

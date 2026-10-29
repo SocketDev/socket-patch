@@ -99,8 +99,8 @@ fn format_fetch_failures(result: &FetchMissingBlobsResult) -> Vec<String> {
     lines
 }
 
-/// The manifest PURLs with no usable local source: some file the patch
-/// touches has a blob in `missing_blobs`.
+/// The manifest PURLs with no usable local source: the `after_hash` of
+/// some file the patch touches is in `missing_blobs` (absent on disk).
 fn patches_without_source<'m>(
     manifest: &'m PatchManifest,
     missing_blobs: &HashSet<String>,
@@ -281,8 +281,8 @@ mod tests {
         }
     }
 
-    /// A client for the arms that return before any fetch, built directly so no ambient token or socket-cli
-    /// config can leak into a unit test.
+    /// A client for the arms that return before any fetch, built directly
+    /// so no ambient token or socket-cli config can leak into a unit test.
     fn offline_client() -> ApiClient {
         ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
             api_url: "http://127.0.0.1:1".to_string(),

@@ -89,8 +89,8 @@ pub(crate) async fn bun_vendor_preflight_pairs(
 }
 
 /// `ledger` is the caller's own load, or `None` to load it here once the
-/// project is known to refuse. `None` when no npm purl is selected or the
-/// project is accepted.
+/// project is known to refuse. `None` when no npm purl is selected, a vlt
+/// lock routes the project away from Bun, or the project is accepted.
 async fn preflight_pairs(
     cwd: &Path,
     pairs: &[(&str, &str)],
