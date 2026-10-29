@@ -26,13 +26,23 @@
 //!   With no evidence at or above the patched version, the answer is
 //!   [`Selection::Unknown`]: a directory `replace` makes `go mod tidy` drop
 //!   the original's go.sum lines, so absence proves nothing.
+//!
+//! Either way, a zip line is no evidence when go.mod names that
+//! module@version as the target of a module-to-module `replace`
+//! (`replace other.com/fork v1.0.0 => example.com/upstream v1.0.0`): go
+//! records the target's go.sum lines under the target's own path, but the
+//! build list holds only the replaced module, and go doesn't apply a
+//! replace to a replacement. go also refuses a build that uses one
+//! module@version under two module paths, so the zip can't be from the
+//! target being built in its own right. Such a module is
+//! [`Selection::ReplaceTarget`] (#1823).
 
 use std::cmp::Ordering;
 use std::path::Path;
 
 use crate::utils::fs::read_regular_to_string;
 
-use super::go_mod_edit::{parse_required_versions, prunes_module_graph};
+use super::go_mod_edit::{parse_replace_entries, parse_required_versions, prunes_module_graph};
 use super::go_sum_edit::{go_semver_cmp, go_sum_lines};
 
 /// Whether the build list selects the patched version of a module.
@@ -47,6 +57,11 @@ pub enum Selection {
     NotInGraph,
     /// go.mod and go.sum hold no evidence either way.
     Unknown,
+    /// The build compiles the patched version only as the replacement of
+    /// this other module (go.mod's `replace <this> => <module> <version>`).
+    /// go doesn't chain replaces, so a replace of the module itself is
+    /// inert and the build links the unpatched code (#1823).
+    ReplaceTarget(String),
 }
 
 impl Selection {
@@ -71,24 +86,38 @@ pub fn selection(go_mod: &str, go_sum: Option<&str>, module: &str, version: &str
                 .collect()
         })
         .unwrap_or_default();
-    select(
-        prunes_module_graph(go_mod),
-        required.as_deref(),
-        &zips,
-        version,
-    )
+    select(go_mod, module, required.as_deref(), &zips, version)
 }
 
-/// [`selection`] from already-parsed parts: whether the graph is pruned,
-/// the module's `require` version, and the versions go.sum holds a zip line
-/// for.
-pub fn select(pruned: bool, required: Option<&str>, zips: &[&str], version: &str) -> Selection {
-    if pruned {
+/// [`selection`] from already-parsed parts: the root go.mod's text (whether
+/// the graph is pruned, and its replaces), the module's `require` version,
+/// and the versions go.sum holds a zip line for.
+pub fn select(
+    go_mod: &str,
+    module: &str,
+    required: Option<&str>,
+    zips: &[&str],
+    version: &str,
+) -> Selection {
+    // A zip line at the version a module-to-module replace targets is the
+    // replacement's, not the module's own (see the module docs).
+    let replaced = replaced_module(go_mod, module, version);
+    let zips: Vec<&str> = zips
+        .iter()
+        .copied()
+        .filter(|z| replaced.is_none() || *z != version)
+        .collect();
+    let zips = zips.as_slice();
+    let no_evidence = |fallback| match &replaced {
+        Some(via) => Selection::ReplaceTarget(via.clone()),
+        None => fallback,
+    };
+    if prunes_module_graph(go_mod) {
         return match required {
             Some(r) if r == version => Selection::Selected,
             Some(r) => Selection::Other(r.to_string()),
             None if zips.contains(&version) => Selection::Selected,
-            None => Selection::NotInGraph,
+            None => no_evidence(Selection::NotInGraph),
         };
     }
     let highest = required
@@ -104,8 +133,37 @@ pub fn select(pruned: bool, required: Option<&str>, zips: &[&str], version: &str
         // that lower version is the one built (go records no zip line for
         // the patched version only once a directory replace covers it).
         Some(h) if zips.contains(&h) => Selection::Other(h.to_string()),
-        _ => Selection::Unknown,
+        _ => no_evidence(Selection::Unknown),
     }
+}
+
+/// The module whose module-to-module `replace` in `go_mod` targets exactly
+/// `module@version`, if that replace is the one in effect: go.mod requires
+/// the replaced module, and no replace pinned to the required version
+/// shadows a version-less one (go prefers the versioned replace). `go mod
+/// tidy` keeps unused replaces, so one of a module the build doesn't use, or
+/// pinned to a version it doesn't require, explains nothing.
+fn replaced_module(go_mod: &str, module: &str, version: &str) -> Option<String> {
+    let required = parse_required_versions(go_mod);
+    let entries = parse_replace_entries(go_mod);
+    entries
+        .iter()
+        .filter(|e| e.module != module)
+        .filter(|e| {
+            e.rhs_module.as_deref() == Some(module) && e.rhs_version.as_deref() == Some(version)
+        })
+        .find(|e| {
+            let Some(req) = required.get(&e.module) else {
+                return false;
+            };
+            match e.version.as_deref() {
+                Some(v) => v == req,
+                None => !entries
+                    .iter()
+                    .any(|o| o.module == e.module && o.version.as_deref() == Some(req.as_str())),
+            }
+        })
+        .map(|e| e.module.clone())
 }
 
 /// [`selection`] for a project directory. In workspace mode the build
@@ -232,6 +290,90 @@ mod tests {
             );
         }
         assert!(!prunes_module_graph("module c\ngodebug default=go1.21\n"));
+    }
+
+    /// #1823: go records a module-to-module replace target's go.sum lines
+    /// under the target's path, but the build list holds only the replaced
+    /// module, so the zip line is no evidence the target itself is built.
+    #[test]
+    fn replace_target_zip_is_not_the_module_built() {
+        let s = sum(&[&format!("{UP} v1.0.0"), &format!("{UP} v1.0.0/go.mod")]);
+        let via = Selection::ReplaceTarget("other.com/fork".into());
+        for go in ["go 1.21", "go 1.16", ""] {
+            for replace in [
+                format!("replace other.com/fork v1.0.0 => {UP} v1.0.0"),
+                format!("replace other.com/fork => {UP} v1.0.0"),
+                format!("replace (\n\tother.com/fork => {UP} v1.0.0\n)"),
+            ] {
+                let m = format!("module c\n\n{go}\n\nrequire other.com/fork v1.0.0\n\n{replace}\n");
+                assert_eq!(
+                    selection(&m, Some(&s), UP, "v1.0.0"),
+                    via,
+                    "{go} / {replace}"
+                );
+            }
+        }
+    }
+
+    /// `go mod tidy` keeps unused replaces: one of a module go.mod doesn't
+    /// require, one pinned to another version than the required one, or a
+    /// version-less one a versioned replace shadows doesn't explain the zip.
+    #[test]
+    fn inactive_replace_target_keeps_the_zip_as_evidence() {
+        let s = sum(&[&format!("{UP} v1.0.0")]);
+        for go in ["go 1.21", "go 1.16"] {
+            for (require, replace) in [
+                ("", format!("replace other.com/fork => {UP} v1.0.0")),
+                (
+                    "require other.com/fork v1.0.0\n",
+                    format!("replace other.com/fork v0.5.0 => {UP} v1.0.0"),
+                ),
+                (
+                    "require other.com/fork v1.0.0\n",
+                    format!(
+                        "replace other.com/fork => {UP} v1.0.0\n\
+                         replace other.com/fork v1.0.0 => ../fork"
+                    ),
+                ),
+            ] {
+                let m = format!("module c\n\n{go}\n\n{require}\n{replace}\n");
+                assert_eq!(
+                    selection(&m, Some(&s), UP, "v1.0.0"),
+                    Selection::Selected,
+                    "{go} / {replace}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replace_target_at_another_version_keeps_its_own_evidence() {
+        // The fork targets v1.0.0; a zip line at v1.1.0 is the module's own.
+        let m = format!(
+            "module c\n\ngo 1.21\n\nrequire other.com/fork v1.0.0\n\n\
+             replace other.com/fork => {UP} v1.0.0\n"
+        );
+        let s = sum(&[&format!("{UP} v1.0.0"), &format!("{UP} v1.1.0")]);
+        assert_eq!(selection(&m, Some(&s), UP, "v1.1.0"), Selection::Selected);
+        // A require of the module still decides in a pruned graph.
+        let m = format!(
+            "module c\n\ngo 1.21\n\nrequire {UP} v1.2.0\n\n\
+             replace other.com/fork => {UP} v1.0.0\n"
+        );
+        assert_eq!(
+            selection(&m, Some(&s), UP, "v1.0.0"),
+            Selection::Other("v1.2.0".into())
+        );
+        // A directory replace of the fork, or a replace of the module
+        // itself, is not a module-to-module target.
+        for replace in [
+            "replace other.com/fork => ../fork".to_string(),
+            format!("replace {UP} v1.0.0 => ./.socket/go-patches/{UP}@v1.0.0"),
+        ] {
+            let m = format!("module c\n\ngo 1.21\n\n{replace}\n");
+            let s = sum(&[&format!("{UP} v1.0.0")]);
+            assert_eq!(selection(&m, Some(&s), UP, "v1.0.0"), Selection::Selected);
+        }
     }
 
     #[test]

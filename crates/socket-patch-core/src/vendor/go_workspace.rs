@@ -86,6 +86,60 @@ pub fn resolve_with(project_root: &Path, gowork: Option<&str>) -> GoWork {
     }
 }
 
+/// Why the `GOFLAGS` in effect (the environment, then the `go env -w`
+/// file) keeps a Socket replace in `project_root`'s go.mod or go.work from
+/// reaching the build, as a [`WorkspaceConflict::ModFile`]; `None` when go
+/// reads that go.mod (#1799).
+pub fn modfile_conflict(project_root: &Path) -> Option<WorkspaceConflict> {
+    modfile_setting(project_root).map(|setting| WorkspaceConflict::ModFile { setting })
+}
+
+/// [`modfile_conflict`]'s `setting`.
+pub fn modfile_setting(project_root: &Path) -> Option<String> {
+    use crate::utils::go_env::go_env;
+    modfile_setting_with(
+        project_root,
+        go_env("GOFLAGS").as_deref(),
+        go_env("GOWORK").as_deref(),
+    )
+}
+
+/// [`modfile_setting`] for explicit `GOFLAGS` and `GOWORK` values.
+///
+/// A relative `-modfile` is resolved against `project_root`, where go is
+/// taken to run. Any `-modfile` other than that go.mod makes go read
+/// another file (and its `.sum`); with a `go.work` in effect go refuses
+/// `-modfile` outright ("-modfile cannot be used in workspace mode"), and a
+/// `GOFLAGS` go cannot parse stops every go command.
+pub fn modfile_setting_with(
+    project_root: &Path,
+    goflags: Option<&str>,
+    gowork: Option<&str>,
+) -> Option<String> {
+    use crate::utils::go_env::{goflags_modfile, GoflagsModfile};
+    let modfile = match goflags_modfile(goflags?) {
+        GoflagsModfile::Default => return None,
+        GoflagsModfile::Refused(why) => return Some(format!("{why}, so go refuses to run")),
+        GoflagsModfile::File(file) => file,
+    };
+    // An invalid GOWORK is its own refusal; only a go.work go loads is
+    // workspace mode.
+    if matches!(resolve_with(project_root, gowork), GoWork::File(_)) {
+        return Some(format!(
+            "GOFLAGS sets -modfile={modfile}, which go refuses in workspace mode \
+             (\"-modfile cannot be used in workspace mode\"), so go refuses to build"
+        ));
+    }
+    let own = same_dir_key(&project_root.join("go.mod"));
+    if same_dir_key(&project_root.join(&modfile)) == own {
+        return None;
+    }
+    Some(format!(
+        "GOFLAGS sets -modfile={modfile}, so go builds from {modfile} instead of go.mod \
+         and ignores go.mod's replaces"
+    ))
+}
+
 /// The workspace go builds a project in, read once.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoWorkspace {
@@ -294,11 +348,20 @@ pub enum WorkspaceConflict {
     /// The module is itself a `use` member (`member`): go builds it from
     /// that directory and ignores every replace of it.
     MainModule { work_file: String, member: String },
-    /// The project is a go.work root with no module of its own: a replace
-    /// belongs in a member's go.mod (`members`, comma-separated).
-    NoModule { work_file: String, members: String },
+    /// The project is in a workspace but has no module of its own: a
+    /// replace belongs in a member's go.mod (`members`, comma-separated).
+    /// `own_work`: the project holds a go.work that `GOWORK` passes over.
+    NoModule {
+        work_file: String,
+        members: String,
+        own_work: bool,
+    },
     /// go refuses to load the workspace at all.
     Invalid { reason: String },
+    /// `GOFLAGS` sets `-modfile`, so go builds from another go.mod (or
+    /// refuses to build): `setting` says which, as [`modfile_setting`]
+    /// words it.
+    ModFile { setting: String },
 }
 
 impl WorkspaceConflict {
@@ -364,14 +427,32 @@ impl WorkspaceConflict {
                  builds {module} from that directory and ignores every replace of it; patch \
                  the source in {member}, or drop it from the `use` list of {work_file}"
             ),
-            WorkspaceConflict::NoModule { work_file, members } => format!(
+            WorkspaceConflict::NoModule {
+                work_file,
+                members,
+                own_work: false,
+            } => format!(
                 "has nowhere to go: this directory is in the {work_file} workspace but holds \
                  neither go.work nor a go.mod of its own; run socket-patch in the workspace \
                  root or in a member ({members})"
             ),
+            WorkspaceConflict::NoModule {
+                work_file,
+                members,
+                own_work: true,
+            } => format!(
+                "has nowhere to go: GOWORK selects {work_file}, so go doesn't read this \
+                 directory's go.work, and the directory holds no go.mod of its own; unset \
+                 GOWORK (or point it at this go.work), or run socket-patch in a member \
+                 ({members})"
+            ),
             WorkspaceConflict::Invalid { reason } => {
                 format!("cannot take effect: {reason}; fix the workspace setting and re-run")
             }
+            WorkspaceConflict::ModFile { setting } => format!(
+                "has no effect on the build of {module}: {setting}; fix GOFLAGS (`go env \
+                 -u GOFLAGS` if `go env -w` set it) and re-run"
+            ),
         }
     }
 }
@@ -638,9 +719,13 @@ impl GoWorkspace {
         [work, members]
     }
 
-    /// Whether go.work sits in `root`.
+    /// Whether this is `root`'s own `go.work`, the file the replace host
+    /// [`ReplaceHost::GoWork`] names. A `GOWORK` naming another file in
+    /// `root` (`ci.work`) is not: go doesn't read `root/go.work` then, so
+    /// a replace written there would do nothing (#1810).
     pub fn rooted_at(&self, root: &Path) -> bool {
-        same_dir_key(self.work_dir()) == same_dir_key(root)
+        self.work_file.file_name() == Some(std::ffi::OsStr::new("go.work"))
+            && same_dir_key(self.work_dir()) == same_dir_key(root)
     }
 
     /// Which file holds the Socket replace of `module` for the project at
@@ -747,6 +832,21 @@ impl GoWorkspace {
             });
         }
         let own = self.member_at(project_root);
+        // With no go.mod there is no file to write, even when the workspace
+        // already replaces the module the same way (#1810).
+        if own.is_none() && !project_root.join("go.mod").exists() {
+            let members: Vec<String> = self
+                .members_within(project_root)
+                .into_iter()
+                .map(|(dir, _)| dir)
+                .filter(|dir| !dir.is_empty())
+                .collect();
+            return Some(WorkspaceConflict::NoModule {
+                work_file: display,
+                members: members.join(", "),
+                own_work: !self.rooted_at(project_root) && project_root.join("go.work").is_file(),
+            });
+        }
         let our_target = lexical_target(own.map_or(project_root, |m| &m.dir), ours);
 
         // go reads go.work's replace for this exact version, then its
@@ -778,18 +878,6 @@ impl GoWorkspace {
         }
 
         if own.is_none() {
-            if !project_root.join("go.mod").exists() {
-                let members: Vec<String> = self
-                    .members_within(project_root)
-                    .into_iter()
-                    .map(|(dir, _)| dir)
-                    .filter(|dir| !dir.is_empty())
-                    .collect();
-                return Some(WorkspaceConflict::NoModule {
-                    work_file: display,
-                    members: members.join(", "),
-                });
-            }
             return Some(WorkspaceConflict::NotAMember { work_file: display });
         }
         let project = same_dir_key(project_root);
@@ -976,7 +1064,9 @@ pub async fn replace_host(project_root: &Path, module: &str) -> ReplaceHost {
 }
 
 /// The `go.work` in effect when it sits in `project_root`: the one whose
-/// replaces are the project's own.
+/// replaces are the project's own. Readers use it, so it includes a
+/// `GOWORK` file beside the root's go.work (go reads its replaces); the
+/// writers only ever write the root's go.work ([`GoWorkspace::rooted_at`]).
 pub fn root_work_file(project_root: &Path) -> Option<PathBuf> {
     match resolve(project_root) {
         GoWork::File(file)
@@ -1138,9 +1228,12 @@ mod tests {
             );
         }
         assert_eq!(resolve_with(&project, Some("off")), GoWork::None);
+        // Absolute on this platform (`/x` has no drive on Windows, where go
+        // rejects it as relative too).
+        let elsewhere = tmp.path().join("elsewhere").join("go.work");
         assert_eq!(
-            resolve_with(&project, Some("/elsewhere/go.work")),
-            GoWork::File(PathBuf::from("/elsewhere/go.work"))
+            resolve_with(&project, Some(&elsewhere.to_string_lossy())),
+            GoWork::File(elsewhere.clone())
         );
         for relative in ["go.work", "../go.work"] {
             assert!(
@@ -1152,6 +1245,48 @@ mod tests {
         std::fs::remove_file(&work).unwrap();
         std::fs::create_dir(&work).unwrap();
         assert_eq!(resolve_with(&project, None), GoWork::None);
+    }
+
+    /// #1799: `-modfile` keeps a go.mod replace from the build unless it
+    /// names the project's own go.mod; in workspace mode go refuses it.
+    #[test]
+    fn goflags_modfile_conflicts_unless_it_names_the_own_go_mod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        write(tmp.path(), "app/go.mod", "module example.com/app\n");
+        let conflict = |goflags: &str, gowork: Option<&str>| {
+            modfile_setting_with(&project, Some(goflags), gowork)
+        };
+        assert_eq!(modfile_setting_with(&project, None, None), None);
+        let own = project.join("go.mod").to_string_lossy().into_owned();
+        for same in [
+            "".to_string(),
+            "-mod=mod".to_string(),
+            "-modfile=".to_string(),
+            "-modfile=go.mod".to_string(),
+            "-modfile=./go.mod".to_string(),
+            format!("-modfile={own}"),
+        ] {
+            assert_eq!(conflict(&same, None), None, "{same}");
+        }
+        let why = conflict("-modfile=go.alt.mod", None).unwrap();
+        assert!(why.contains("go builds from go.alt.mod"), "{why}");
+        let why = conflict("-modfile", None).unwrap();
+        assert!(why.contains("go refuses to run"), "{why}");
+        // A relative GOWORK is go's own refusal, not workspace mode.
+        let why = conflict("-modfile=go.alt.mod", Some("rel/go.work")).unwrap();
+        assert!(why.contains("go builds from go.alt.mod"), "{why}");
+        assert_eq!(conflict("-modfile=go.mod", Some("rel/go.work")), None);
+
+        // Workspace mode: go refuses any -modfile, its own go.mod included.
+        write(tmp.path(), "go.work", "go 1.22\n\nuse ./app\n");
+        let why = conflict("-modfile=go.mod", None).unwrap();
+        assert!(why.contains("workspace mode"), "{why}");
+        assert_eq!(conflict("-modfile=go.mod", Some("off")), None);
+        assert_eq!(conflict("-modfile=", None), None);
+
+        let consequence = WorkspaceConflict::ModFile { setting: why }.consequence("m", "v1");
+        assert!(consequence.contains("go env -u GOFLAGS"), "{consequence}");
     }
 
     /// MVS runs over every member's requirements: another member raising
@@ -1476,7 +1611,10 @@ mod tests {
         ));
         match ws.conflict(&root.join("a"), DEP, "v1.0.0", &ours) {
             Some(c @ WorkspaceConflict::MainModule { .. }) => {
-                assert!(c.consequence(DEP, "v1.0.0").contains("ws/dep"), "{c:?}");
+                // Outside the project the member shows as a native path.
+                let member = Path::new("ws").join("dep");
+                let member = member.to_string_lossy();
+                assert!(c.consequence(DEP, "v1.0.0").contains(&*member), "{c:?}");
             }
             other => panic!("{other:?}"),
         }
@@ -1708,6 +1846,87 @@ mod tests {
                 .await
                 .replace_host(root, true, DEP),
             ReplaceHost::GoMod
+        );
+    }
+
+    /// `GOWORK` naming another file beside the root's go.work (#1810): the
+    /// root's go.work is not the workspace go reads, so the replace never
+    /// goes there. A root that is a member keeps its go.mod; one with no
+    /// module is refused. The root's go.work named by path still is it.
+    #[tokio::test]
+    async fn a_sibling_gowork_file_is_not_the_roots_go_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ci = root.join("ci.work");
+        let ci_env = Some(ci.to_str().unwrap());
+        write(root, "ci.work", "go 1.18\n\nuse (\n\t./a\n\t./b\n)\n");
+        write(root, "go.work", "go 1.18\n\nuse ./a\n");
+        member(root, "a", "1.21", &require("v1.0.0"));
+        member(root, "b", "1.21", &require("v1.0.0"));
+        let loaded = load_with(root, ci_env).await;
+        let Loaded::Workspace(ws) = &loaded else {
+            panic!("no workspace: {loaded:?}");
+        };
+        assert_eq!(same_dir_key(&ws.work_file), same_dir_key(&ci));
+        assert!(!ws.rooted_at(root));
+        assert_eq!(loaded.replace_host(root, false, DEP), ReplaceHost::GoMod);
+        let ours = replace(&format!(
+            "{DEP} v1.0.0 => ./.socket/go-patches/{DEP}@v1.0.0"
+        ));
+        assert!(matches!(
+            loaded.host_conflict(ReplaceHost::GoMod, root, DEP, "v1.0.0", &ours),
+            Some(WorkspaceConflict::NoModule { own_work: true, .. })
+        ));
+        // Refused even when ci.work already replaces it the same way:
+        // there is no go.mod to write.
+        write(
+            root,
+            "ci.work",
+            &format!(
+                "go 1.18\n\nuse (\n\t./a\n\t./b\n)\n\nreplace {DEP} v1.0.0 => \
+                 ./.socket/go-patches/{DEP}@v1.0.0\n"
+            ),
+        );
+        let loaded = load_with(root, ci_env).await;
+        assert!(matches!(
+            loaded.host_conflict(ReplaceHost::GoMod, root, DEP, "v1.0.0", &ours),
+            Some(WorkspaceConflict::NoModule { own_work: true, .. })
+        ));
+
+        // Without the root's go.work the same holds.
+        std::fs::remove_file(root.join("go.work")).unwrap();
+        let loaded = load_with(root, ci_env).await;
+        assert_eq!(loaded.replace_host(root, false, DEP), ReplaceHost::GoMod);
+        assert!(matches!(
+            loaded.host_conflict(ReplaceHost::GoMod, root, DEP, "v1.0.0", &ours),
+            Some(WorkspaceConflict::NoModule {
+                own_work: false,
+                ..
+            })
+        ));
+
+        // A root module ci.work uses keeps (and is patched by) its go.mod.
+        write(root, "go.work", "go 1.18\n\nuse (\n\t.\n\t./a\n\t./b\n)\n");
+        write(root, "ci.work", "go 1.18\n\nuse (\n\t.\n\t./a\n\t./b\n)\n");
+        write(
+            root,
+            "go.mod",
+            &format!("module example.com/root\n\ngo 1.21\n{}", require("v1.0.0")),
+        );
+        let loaded = load_with(root, ci_env).await;
+        assert_eq!(loaded.replace_host(root, true, DEP), ReplaceHost::GoMod);
+        assert_eq!(
+            load_with(root, None).await.replace_host(root, true, DEP),
+            ReplaceHost::GoWork,
+            "the root's own go.work shares it"
+        );
+        let own = root.join("go.work");
+        assert_eq!(
+            load_with(root, Some(own.to_str().unwrap()))
+                .await
+                .replace_host(root, true, DEP),
+            ReplaceHost::GoWork,
+            "GOWORK naming the root's go.work is the same workspace"
         );
     }
 
