@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-28T19Z (run 52), main `b4b6d98` (v5.0.1 `latest`). #1757 merged and closed #1756 (fresh trees pass on npm 6.14.18 / 10.9.4 / 12.2.1 linked). Run 52 filed #1791: a bin that v5.0.1 already broke stays broken on main (apply says already patched; repair / rollback keep the CRLF shebang). **Open npm bughunt issues: #1782 and #1791.** Every issue number marked `fail` in the matrix below other than these two is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
+Last updated: 2026-10-29T01Z (run 53), main `ecd4924` (v5.0.1 `latest`). #1792 merged and closed #1791 (verified: a v5.0.1-broken bin recovers on `apply`, and `rollback` is byte-exact). Run 53 filed #1804, a regression from #1792: with `bin-links=false` or a non-registry `directories.bin`-only package, npm keeps the CRLF shebang, but main writes the LF form, so rollback isn't byte-exact. **Open npm bughunt issues: #1782 and #1804.** Every issue number marked `fail` in the matrix below other than these two is closed; those marks are historical. Probe branches remain blocked (`git push --delete` refused).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -31,6 +31,14 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Linux | 6.14.18 / 10.9.4, patch that adds a file (empty `beforeHash`), incl. a path with a space and `é` (run 50) | pass: apply, `vex`, `vex` refuses when the added file is missing, `apply` re-creates it, `rollback` removes it and its new directory | pass (`npm ci` patched, `vex`, `rollback`) | pass (10.9.4; and npm 6.14.18 v1 lock: `rollback` byte-exact) | untested |
 | Linux | 10.9.4, user-patch consent with patch-package 8.0.0 (run 50) | pass: `--patch-dir fixes`, a root `patches/` with a workspace member's dep, and a member-owned `patches/` all skip `user_patch_conflict` | n/a | pass: same three shapes | n/a |
 | Linux | 10.9.9 / 11.21.1 suites (run 50) | n/a | pass: `e2e_vendor_npm_build` 43/43 (both) | pass: `e2e_redirect_npm_build` 30/30 plus the 6 `#[ignore]` real-npm legs via `--ignored` (both) | n/a |
+| Linux | 6.14.18 / 10.9.4 / 12.2.1, CRLF-shebang bin npm doesn't link (`--no-bin-links`; `directories.bin`-only `file:` tarball) (run 53) | **fail #1804** (main writes the LF `fixBin` form, `rollback` not byte-exact; `--no-bin-links` on all three, `directories.bin` on 10.9.4). `b4b6d98` / v5.0.1 pass | untested | untested | n/a |
+| Linux | 10.9.4, v5.0.1-broken CRLF bin upgraded to main (run 53) | pass (#1791 fixed: `apply` rewrites, bin runs, `apply --check`, `vex`, `repair`, byte-exact `rollback`) | n/a | n/a | n/a |
+
+## Run 53 (2026-10-29T01Z, main `ecd4924`)
+
+- Re-triage: #1791 was closed by #1792. Verified on npm 10.9.4 twice: a tree v5.0.1 broke recovers on main `apply` (the bin runs), and `rollback` restores the `npm install` bytes exactly.
+- Filed #1804. #1792's `is_listed_bin` writes `fixBin`'s LF form even where npm didn't link the bin and kept the CRLF shebang: `--no-bin-links` (npm 6.14.18 / 10.9.4 / 12.2.1), or a `directories.bin`-only package from a `file:` tarball (10.9.4). `apply` writes non-`afterHash` bytes, and `rollback` isn't byte-exact. First bad commit `6bdd67c`; `b4b6d98` and v5.0.1 pass.
+- #1782 not re-checked: the npm eject code is unchanged and the issue is claimed.
 
 ## Run 52 (2026-10-28T19Z, main `b4b6d98`)
 
@@ -268,6 +276,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-10-29T01Z:** re-check #1804 when fixed (`bin-links=false` in `.npmrc`, `directories.bin` with `file:` dir / git deps, and the #1791 recovery must still pass). A bundled dep with a CRLF bin: does npm `fixBin` it, and does main agree? Hosted / vendored `vex` with a CRLF bin (mock). Re-check #1782 when its fix lands.
 - **New 2026-10-28T19Z:** re-check #1791 when fixed (apply / repair / rollback over a v5.0.1-overwritten bin; also a non-bin file with a CRLF shebang must keep CRLF). Re-run the hosted / vendored `vex` halves of #1756 on `b4b6d98` with the mock (npm 8 / 12). Re-check #1782 when its fix lands (the kill-test plan below).
 - **New 2026-10-28T13Z:** re-check #1782 when fixed: kill the eject at each rename (an `LD_PRELOAD` rename shim works; strace `-P` doesn't match relative paths), and with SIGINT / SIGTERM. A multi-package eject: does the window grow per package? (`vendor --revert` / hosted `rollback` kill-tested in run 51: they converge.) Re-check #1756 when #1757 lands. (Add-a-file on npm 12 / linked: done, pass.)
 - **New 2026-10-28T07Z:** re-check #1756 when #1757 lands, including a bin already overwritten by v5.0.1 then rolled back with the fixed build; `vendor --check` on a shrinkwrap-only vendored lock (passes, while `vex` refuses `vex_npm_shrinkwrap_only`: parity question); an eject killed inside the write window (needs a slower hook than the download); patches that add a file on npm 12 / linked store; macOS / Windows for everything once probe branches work.
@@ -328,6 +337,8 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 8. Stale probe branches the proxy can't delete (2026-10-04T06Z: the session permission policy now refuses `git push --delete` outright, so no new probe branches are pushed until a maintainer allows it or deletes these) (`git push --delete` fails with "remote end hung up" / "Everything up-to-date"; re-checked 2026-10-03T12Z): `bughunt/npm/20260930-alias-linked`, `20260930-win-mac-e2e`, `20260930-win-old-npm`, `20261001-crlf-paths`, `20261001-optional-dep`, `20261001-v5-hosted-global`, `20261001-win-global`, `20261002-v5-agent-vendored-winmac`, `20261003-ws-link-agent`, `20261003-ws-link-mac`. A maintainer needs to delete them.
 
 ## Known non-bugs
+
+- A registry package that declares bins only via `directories.bin`: the packument carries the expanded `bin`, so npm links it and runs `fixBin`, and main's LF form is correct (run 53). Only non-registry installs hit #1804.
 
 - A Ctrl-C or kill during the eject's artifact *download* is safe: the download runs before the upstream restore, so the lock is still hosted (main `b787454`, 2026-10-28T13Z).
 - After vendoring, `npm shrinkwrap` renames package-lock.json to npm-shrinkwrap.json. `vendor --revert` then refuses with advice that names the rename ("was the wired lockfile renamed — e.g. by `npm shrinkwrap`"), and `vex` omits the patches (`vex_npm_shrinkwrap_only`, documented). Hosted `rollback` restores the renamed lock (npm 10.9.4, 2026-10-28T07Z).
