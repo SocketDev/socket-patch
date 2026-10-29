@@ -229,9 +229,13 @@ fn shim_names(path: &Path, below: &str) -> bool {
     if file.take(8192).read_to_end(&mut text).is_err() {
         return false;
     }
-    String::from_utf8_lossy(&text)
-        .replace('\\', "/")
-        .contains(below)
+    let text = String::from_utf8_lossy(&text).replace('\\', "/");
+    // A whole path segment run: `../crlfbin/cli.js`, not
+    // `../a-crlfbin/cli.js` or `../crlfbin/cli.json`.
+    let path_char = |c: char| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '@');
+    text.match_indices(below).any(|(at, _)| {
+        text[..at].ends_with('/') && !text[at + below.len()..].starts_with(path_char)
+    })
 }
 
 /// Whether the file at `normalized` holds exactly the recorded content
@@ -676,6 +680,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let pkg = installed_bin(root.path(), "node_modules");
         shim_to(root.path().join("crlfbin.cmd"), "scripts/crlfbin.js");
+        shim_to(
+            root.path().join("node_modules/.bin/crlfbin"),
+            "../a-crlfbin/cli.js",
+        );
+        assert!(!is_linked_bin(PURL, &pkg, "cli.js").await, "a-crlfbin");
+        shim_to(
+            root.path().join("node_modules/.bin/crlfbin"),
+            "../crlfbin/cli.json",
+        );
+        assert!(!is_linked_bin(PURL, &pkg, "cli.js").await, "cli.json");
         shim_to(
             root.path().join("node_modules/.bin/crlfbin"),
             "../other/cli.js",
