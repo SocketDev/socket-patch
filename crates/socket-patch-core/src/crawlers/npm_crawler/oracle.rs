@@ -973,6 +973,7 @@ impl LegacyNpmCrawler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_rng::Rng;
     use std::collections::BTreeMap;
 
     type Row = (String, String, String, Option<String>, PathBuf);
@@ -1029,7 +1030,7 @@ mod tests {
     // Symlinks, FIFOs and permission stripping are generated on Unix only.
     #[cfg_attr(not(unix), allow(dead_code))]
     struct Gen {
-        state: u64,
+        rng: Rng,
         /// Out-of-tree dir for symlink targets that get traversed.
         scratch: PathBuf,
         /// Real package dirs created so far (symlink targets).
@@ -1045,7 +1046,7 @@ mod tests {
     impl Gen {
         fn new(seed: u64, scratch: PathBuf) -> Self {
             Self {
-                state: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+                rng: Rng::new(seed),
                 scratch,
                 pkg_dirs: Vec::new(),
                 nm_dirs: Vec::new(),
@@ -1054,26 +1055,16 @@ mod tests {
             }
         }
 
-        fn next(&mut self) -> u64 {
-            // xorshift64*
-            let mut x = self.state;
-            x ^= x >> 12;
-            x ^= x << 25;
-            x ^= x >> 27;
-            self.state = x;
-            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-
         fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
+            self.rng.below(n)
         }
 
-        fn chance(&mut self, pct: usize) -> bool {
-            self.below(100) < pct
+        fn chance(&mut self, pct: u64) -> bool {
+            self.rng.chance(pct)
         }
 
         fn pick<'a>(&mut self, items: &'a [&'a str]) -> &'a str {
-            items[self.below(items.len())]
+            self.rng.pick(items)
         }
 
         fn uniq(&mut self) -> usize {

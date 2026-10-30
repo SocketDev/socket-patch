@@ -7,35 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::types::CrawledPackage;
 
-/// Deterministic xorshift64* generator (no `rand` dependency).
-pub(crate) struct Rng(u64);
-
-impl Rng {
-    pub(crate) fn new(seed: u64) -> Self {
-        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    pub(crate) fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    pub(crate) fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    pub(crate) fn chance(&mut self, pct: usize) -> bool {
-        self.below(100) < pct
-    }
-
-    pub(crate) fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
-        items[self.below(items.len())]
-    }
-}
+pub(crate) use crate::test_rng::Rng;
 
 /// Restores permissions a generator stripped before the tempdir is removed
 /// (declare it AFTER the tempdir so it drops first). Only Unix strips

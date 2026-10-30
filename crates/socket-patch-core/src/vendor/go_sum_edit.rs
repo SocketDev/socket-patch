@@ -777,13 +777,8 @@ mod tests {
     #[test]
     fn lines_form_matches_the_text_form_step_by_step() {
         for seed in 1..=3000u64 {
-            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-            let mut rng = move |n: usize| {
-                x ^= x >> 12;
-                x ^= x << 25;
-                x ^= x >> 27;
-                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n as u64) as usize
-            };
+            let mut r = crate::test_rng::Rng::new(seed);
+            let mut rng = move |n: usize| r.below(n);
             let start = random_go_sum(&mut rng);
             let mut text = start.clone();
             let mut editor = GoSumEditor::new(start.clone());
