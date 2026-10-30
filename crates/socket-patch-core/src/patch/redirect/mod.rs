@@ -8554,10 +8554,13 @@ fn rewrite_maven_pom(
     // would keep the unpatched upstream jar while the dep counts as
     // redirected and VEX attests it (#261). Refuse the whole root, untouched;
     // vendored mode's reactor planner rewrites each module's declaration.
-    if pom
-        .as_deref()
-        .is_some_and(crate::vendor::jvm::maven_reactor::declares_modules)
-    {
+    // Maven 4 subprojects found by discovery count too (#1809): the engine
+    // reads each direct subdirectory's `pom.xml` beside such a root.
+    if pom.is_some() && {
+        let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
+        let list = |dir: &str| gradle::key_list(files, dir);
+        crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
+    } {
         let gas: Vec<String> = maven
             .iter()
             .map(|dep| match &dep.namespace {
@@ -8568,7 +8571,7 @@ fn rewrite_maven_pom(
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_multimodule_unsupported".into(),
             detail: format!(
-                "pom.xml declares <modules>/<subprojects>; hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
+                "pom.xml heads a multi-module reactor (<modules>/<subprojects>, or Maven 4 subproject discovery); hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
                 gas.join(", ")
             ),
         });
@@ -10348,6 +10351,64 @@ mod tests {
             "single-module root still rewritten"
         );
         assert!(!warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"));
+    }
+
+    /// #1809: a Maven 4 (model 4.1.0) `pom`-packaged root that lists no
+    /// subprojects builds every direct subdirectory holding a `pom.xml`, so
+    /// it is a reactor like a declared one and refused untouched. Without
+    /// such a subdirectory, under a 4.0.0 model, or with discovery turned
+    /// off in `.mvn/maven.config`, it is a single pom and still rewritten.
+    #[test]
+    fn maven_4_implicit_subprojects_root_is_refused() {
+        let dep = "<dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n";
+        let root = |model: &str| {
+            format!(
+                "<project xmlns=\"http://maven.apache.org/POM/{model}\">\n  <modelVersion>{model}</modelVersion>\n  <groupId>com.example</groupId>\n  <artifactId>root</artifactId>\n  <version>1.0.0</version>\n  <packaging>pom</packaging>\n  {dep}</project>\n"
+            )
+        };
+        let child = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  <artifactId>child</artifactId>\n  <dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let tree = |model: &str, extra: &[(&str, &str)]| {
+            let mut files = BTreeMap::from([("pom.xml".to_string(), root(model))]);
+            files.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            rewrite_registry_redirect(&files, &[maven_override()])
+        };
+
+        let r = tree("4.1.0", &[("child/pom.xml", child)]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "an implicit reactor root must not be edited: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_multimodule_unsupported"]
+        );
+        assert!(r.warnings[0]
+            .detail
+            .contains("Maven 4 subproject discovery"));
+
+        let off = "-Dmaven.project.discoverSubprojects=false\n";
+        for (case, r) in [
+            ("no subproject", tree("4.1.0", &[])),
+            ("model 4.0.0", tree("4.0.0", &[("child/pom.xml", child)])),
+            (
+                "discovery off",
+                tree(
+                    "4.1.0",
+                    &[("child/pom.xml", child), (".mvn/maven.config", off)],
+                ),
+            ),
+        ] {
+            assert!(
+                r.files["pom.xml"].contains(MAVEN_SUFFIXED),
+                "{case}: a single pom is still rewritten"
+            );
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"),
+                "{case}"
+            );
+        }
     }
 
     /// A direct declaration whose groupId / artifactId is a property of

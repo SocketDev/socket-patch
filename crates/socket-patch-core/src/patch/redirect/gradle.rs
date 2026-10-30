@@ -602,7 +602,7 @@ pub fn wiring_files(files: &BTreeMap<String, String>) -> Vec<String> {
 }
 
 /// A [`crate::gradle::ListFn`] over the keys of `files`.
-fn key_list(files: &BTreeMap<String, String>, dir: &str) -> Vec<String> {
+pub(crate) fn key_list(files: &BTreeMap<String, String>, dir: &str) -> Vec<String> {
     let prefix = if dir.is_empty() {
         String::new()
     } else {

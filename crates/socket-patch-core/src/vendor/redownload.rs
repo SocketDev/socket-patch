@@ -566,7 +566,7 @@ async fn restore_maven_metadata(
     };
     let list = |dir: &str| reader.list(dir);
     // Re-planned through every build the root holds (#395).
-    let shape = super::jvm::detect(&read);
+    let shape = super::jvm::detect(&read, &list);
     let enabled = !entry
         .wiring
         .iter()

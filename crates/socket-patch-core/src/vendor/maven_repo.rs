@@ -291,7 +291,7 @@ fn legacy_root_detail() -> String {
 /// The planner shape of the project root (see [`super::jvm::detect`]).
 fn detect_shape(project_root: &Path) -> super::jvm::Shape {
     let reader = super::jvm::apply::ProjectReader::new(project_root);
-    super::jvm::detect(&|rel: &str| reader.read(rel))
+    super::jvm::detect(&|rel: &str| reader.read(rel), &|dir: &str| reader.list(dir))
 }
 
 /// The root's ledger still holds a pre-v5 single-pom entry (a
@@ -960,9 +960,12 @@ async fn vendor_maven_jvm(
     }
     let planned = match shape {
         // The pin records the gate's digest (every build source).
-        Shape::Sbt => {
-            super::jvm::sbt::plan_with_digest(&read, &patch, gate_pass.deps_digest.as_deref())
-        }
+        Shape::Sbt => super::jvm::sbt::plan_with_digest(
+            &read,
+            &list,
+            &patch,
+            gate_pass.deps_digest.as_deref(),
+        ),
         Shape::MavenReactor | Shape::Mixed => {
             let external = external_maven_poms(&read, &list, &patch, &local, service).await;
             super::jvm::plan_with_external(
