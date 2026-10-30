@@ -959,18 +959,26 @@ pub fn shadowing_stale_install_remedy(
 /// in its base interpreter, or the virtualenv's own copy. Each class gets
 /// its remedy (the own copies led by `For <dirs>:` when more than one class
 /// is present), and the text ends with the command that re-verifies.
+/// `lock_change` says what this run did to Pipfile.lock (`wired` by vendor,
+/// `rewritten` by hosted). A `name` that is not a distribution name prints
+/// as `<package>`: it lands unquoted in shell commands the user copies.
 pub async fn stale_install_detail(
     lock: Option<&Value>,
     name: &str,
     version: &str,
     sites: &[PathBuf],
     inherited: &HashSet<PathBuf>,
+    lock_change: &str,
 ) -> String {
-    let join = |dirs: &[&PathBuf]| {
-        dirs.iter()
-            .map(|d| d.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+    let join = |dirs: &[&PathBuf]| join_dirs(dirs.iter().copied());
+    let name = if !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        name
+    } else {
+        "<package>"
     };
     let (base, own): (Vec<&PathBuf>, Vec<&PathBuf>) =
         sites.iter().partition(|d| inherited.contains(*d));
@@ -998,7 +1006,7 @@ pub async fn stale_install_detail(
             String::new()
         };
         parts.push(format!(
-            "{lead}Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}."
+            "{lead}Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the {lock_change} Pipfile.lock only protects fresh installs. {remedy}."
         ));
     }
     for (dir, base_dir) in &shadowing {
@@ -1018,6 +1026,14 @@ pub async fn stale_install_detail(
     }
     parts.push("Then `socket-patch vex` re-verifies the installed files.".to_string());
     parts.join(" ")
+}
+
+/// `dirs` as the comma-separated list the stale-install warnings print.
+pub(crate) fn join_dirs<'a>(dirs: impl IntoIterator<Item = &'a PathBuf>) -> String {
+    dirs.into_iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The install-over command both base-interpreter remedies share.
@@ -1121,7 +1137,9 @@ mod tests {
         let inherited = HashSet::from([base_site.clone()]);
         let detail = |sites: Vec<PathBuf>| {
             let (lock, inherited) = (&lock, &inherited);
-            async move { stale_install_detail(Some(lock), "six", "1.16.0", &sites, inherited).await }
+            async move {
+                stale_install_detail(Some(lock), "six", "1.16.0", &sites, inherited, "wired").await
+            }
         };
         let own = format!(
             "Pipenv does not reinstall a release that is already present (`pipenv install`, \
@@ -1156,6 +1174,27 @@ mod tests {
         assert_eq!(
             detail(vec![plain.clone(), venv_site.clone(), base_site.clone()]).await,
             format!("For {}: {own} {shadow} {inherit} {tail}", plain.display())
+        );
+
+        // A decoded purl name that is not a distribution name never reaches
+        // the copy-paste shell commands.
+        let unsafe_name = stale_install_detail(
+            Some(&lock),
+            "six;rm -rf ~",
+            "1.16.0",
+            std::slice::from_ref(&plain),
+            &inherited,
+            "rewritten",
+        )
+        .await;
+        assert!(!unsafe_name.contains("rm -rf"), "{unsafe_name}");
+        assert!(
+            unsafe_name.contains("`pipenv run pip uninstall -y <package> && pipenv sync`"),
+            "{unsafe_name}"
+        );
+        assert!(
+            unsafe_name.contains("so the rewritten Pipfile.lock"),
+            "{unsafe_name}"
         );
     }
 

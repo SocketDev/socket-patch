@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use socket_patch_core::crawlers::PythonCrawler;
 use socket_patch_core::manifest::schema::PatchRecord;
-use socket_patch_core::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
 use socket_patch_core::vex::verify::judge_installed_record;
 
 use super::StaleInstallOutcome;
@@ -145,14 +145,20 @@ pub(super) async fn stale_install_warnings(
             let remedy = if let Some(env) = hatch_env {
                 socket_patch_core::crawlers::hatch_env::stale_install_remedy(&env.name)
             } else if pipenv_purls.contains(&purl) {
-                let name = parse_pypi_purl(strip_purl_qualifiers(&purl))
-                    .map_or_else(|| purl.clone(), |(name, _)| name.to_string());
+                let name = purl_parts(&purl)
+                    .map(|(_, name, _)| name)
+                    .or_else(|| {
+                        let rest = strip_purl_qualifiers(&purl).strip_prefix("pkg:pypi/")?;
+                        Some(rest.split('@').next().unwrap_or(rest).to_string())
+                    })
+                    .unwrap_or_default();
                 socket_patch_core::vendor::pypi_pipenv::stale_install_detail(
                     pipenv_lock.as_ref(),
                     &name,
                     &version,
                     std::slice::from_ref(&site),
                     &inherited,
+                    "rewritten",
                 )
                 .await
             } else {
@@ -357,6 +363,7 @@ mod tests {
             "1.16.0",
             std::slice::from_ref(&site),
             &Default::default(),
+            "rewritten",
         )
         .await;
         assert_eq!(
@@ -371,8 +378,30 @@ mod tests {
             detail.contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
             "{detail}"
         );
+        assert!(
+            detail.contains("so the rewritten Pipfile.lock only protects fresh installs"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("Then `socket-patch vex` re-verifies the installed files."),
+            "{detail}"
+        );
         assert!(!detail.contains("<purl>"), "{detail}");
         assert!(!detail.contains("<package>"), "{detail}");
+
+        // #790: a named category reaches the hosted remedy too.
+        let docs =
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {"requests": {}}, "docs": {"six": {}}}"#;
+        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(docs), &ledger).await;
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("-y six && pipenv sync --categories \"docs\"`"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`pipenv --rm && pipenv sync --categories \"packages docs\"`"),
+            "{detail}"
+        );
     }
 
     /// #1450: a `--site-packages` venv imports the upstream release from its

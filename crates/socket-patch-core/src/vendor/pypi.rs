@@ -802,11 +802,7 @@ async fn pipenv_stale_install_warning(
     let (name, version) = parse_pypi_purl(strip_purl_qualifiers(purl))
         .map(|(name, version)| (name.to_string(), version.to_string()))
         .unwrap_or_else(|| (purl.to_string(), String::new()));
-    let listed = stale_dirs
-        .iter()
-        .map(|d| d.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let listed = super::pypi_pipenv::join_dirs(&stale_dirs);
     // A base interpreter's copy a `--site-packages` venv inherits survives
     // both the uninstall-and-sync and the recreate-and-sync remedies (#1450).
     let inherited = crate::crawlers::python_crawler::inherited_base_site_dirs(&sites).await;
@@ -816,6 +812,7 @@ async fn pipenv_stale_install_warning(
         &version,
         &stale_dirs,
         &inherited,
+        "wired",
     )
     .await;
     let detail =
