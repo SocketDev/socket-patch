@@ -124,6 +124,7 @@ pub async fn run(args: RepairArgs) -> i32 {
                     );
                     crate::ui::print_json(&env.to_value());
                 } else if !args.common.silent {
+                    // The JSON reason keeps its period-less text.
                     println!("{msg}.");
                 }
                 return 0;

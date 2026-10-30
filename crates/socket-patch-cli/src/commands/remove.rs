@@ -1621,7 +1621,7 @@ async fn remove_hosted_only(
     };
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
-    let mut warnings = leg.warnings.clone();
+    let mut warnings = leg.warnings;
     if args.preserve_state && !leg.reverted.is_empty() {
         warnings.push(note_hosted_state_not_preservable(&args.common));
     }
@@ -1630,17 +1630,11 @@ async fn remove_hosted_only(
             .push(crate::json_envelope::RunWarning::new(code, detail));
     }
     // Human per-purl lines already printed inside `run_hosted_leg`.
-    let mut events: Vec<PatchEvent> = leg
-        .reverted
-        .iter()
-        .map(|purl| hosted_reverted_event(args.common.dry_run, purl))
-        .collect();
-    crate::commands::vendored_backend::tag_event_mode(
-        &mut events,
-        crate::commands::HOSTED_MODE_LABEL,
-    );
-    for ev in events {
-        env.record(ev);
+    for purl in &leg.reverted {
+        env.record(
+            hosted_reverted_event(args.common.dry_run, purl)
+                .with_details(serde_json::json!({ "mode": crate::commands::HOSTED_MODE_LABEL })),
+        );
     }
     if args.common.json {
         crate::ui::print_json(&env.to_value());
