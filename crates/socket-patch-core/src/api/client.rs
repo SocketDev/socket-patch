@@ -1428,8 +1428,9 @@ impl ApiClient {
         }
 
         // ── Step 2: download the prebuilt archive ──────────────────────────
-        match self.download_vendor_archive_retrying(&download_url).await {
-            (ServeDownload::Ok(bytes), _) => {
+        let downloaded = self.download_vendor_archive(&download_url, None).await;
+        match downloaded {
+            Ok(ServeDownload::Bytes(bytes)) => {
                 done(VendorServiceOutcome::Ready(FetchedVendorPackage {
                     yarn_berry10c0: result
                         .artifacts
@@ -1444,11 +1445,11 @@ impl ApiClient {
                     prestaged: Default::default(),
                 }))
             }
-            (ServeDownload::NotFound, _) => done(VendorServiceOutcome::Unavailable(
+            Ok(ServeDownload::NotFound) => done(VendorServiceOutcome::Unavailable(
                 "serve returned 404/410".into(),
             )),
-            (ServeDownload::Pending, _) => done(VendorServiceOutcome::Pending),
-            (ServeDownload::Failed(e), retryable) => (VendorServiceOutcome::Failed(e), retryable),
+            Ok(ServeDownload::Pending) => done(VendorServiceOutcome::Pending),
+            Err((e, retryable)) => (VendorServiceOutcome::Failed(e), retryable),
         }
     }
 
@@ -1535,25 +1536,13 @@ impl ApiClient {
         free_only: bool,
         vendor_url: Option<&str>,
     ) -> Result<std::collections::HashMap<String, PackageVendorResult>, (ApiError, bool)> {
-        let attempts = self.vendor_retry.attempts.max(1);
-        let mut attempt = 1;
-        loop {
-            match self
-                .request_vendor_references_once(uuids, free_only, vendor_url)
-                .await
-            {
-                Ok(results) => return Ok(results),
-                Err((e, Some(retry_after))) if attempt < attempts => {
-                    debug_log(&format!(
-                        "vendor package request attempt {attempt} failed: {e}"
-                    ));
-                    self.vendor_backoff(VENDOR_REFERENCES_KEY, attempt, retry_after)
-                        .await;
-                    attempt += 1;
-                }
-                Err((e, hint)) => return Err((e, hint.is_some())),
-            }
-        }
+        self.retry_vendor(
+            VENDOR_REFERENCES_KEY,
+            "vendor package request",
+            None,
+            || self.request_vendor_references_once(uuids, free_only, vendor_url),
+        )
+        .await
     }
 
     /// One package-reference POST: the requested UUIDs' results.
@@ -1628,72 +1617,75 @@ impl ApiClient {
         ))
     }
 
-    /// Step 2 of [`Self::fetch_vendor_package`], retried per the client's
-    /// [`VendorRetryPolicy`]; the flag says whether a final `Failed` was a
-    /// retryable (availability) failure.
-    async fn download_vendor_archive_retrying(&self, url: &str) -> (ServeDownload, bool) {
-        self.download_vendor_archive_from(url, 1).await
-    }
-
-    /// [`Self::download_vendor_archive_retrying`] starting at attempt
-    /// `attempt` — 2 when attempt 1 was made elsewhere and deferred (see
+    /// Run `once` until it succeeds, fails without a retry hint, or spends
+    /// the client's [`VendorRetryPolicy`] attempts, pausing before each
+    /// retry. `deferred` is a first attempt made elsewhere (see
     /// [`Self::download_artifact_resuming`]), so a split download still
     /// costs the policy's `attempts` requests, not one budget per split.
-    async fn download_vendor_archive_from(
+    /// `Err` carries whether the final failure was a retryable
+    /// (availability) one.
+    async fn retry_vendor<T, F, Fut>(
         &self,
-        url: &str,
-        mut attempt: u32,
-    ) -> (ServeDownload, bool) {
+        key: &str,
+        what: &str,
+        deferred: Option<DeferredAttempt>,
+        mut once: F,
+    ) -> Result<T, (ApiError, bool)>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, VendorAttemptError>>,
+    {
         let attempts = self.vendor_retry.attempts.max(1);
+        let mut attempt = 1;
+        let mut failed = deferred.map(|d| (d.error, d.retry_after));
         loop {
-            match self.download_vendor_archive_once(url).await {
-                (ServeDownload::Failed(e), Some(retry_after)) if attempt < attempts => {
-                    self.vendor_download_retry(url, attempt, &e, retry_after)
-                        .await;
-                    attempt += 1;
+            if let Some((e, retry_after)) = failed.take() {
+                debug_log(&format!("{what} attempt {attempt} failed: {e}"));
+                self.vendor_backoff(key, attempt, retry_after).await;
+                attempt += 1;
+            }
+            match once().await {
+                Err((e, Some(retry_after))) if attempt < attempts => {
+                    failed = Some((e, retry_after))
                 }
-                (outcome, hint) => return (outcome, hint.is_some()),
+                Ok(v) => return Ok(v),
+                Err((e, hint)) => return Err((e, hint.is_some())),
             }
         }
     }
 
-    /// Report attempt `attempt`'s retryable failure and pause before the
-    /// next one.
-    async fn vendor_download_retry(
+    /// Step 2 of [`Self::fetch_vendor_package`] (and the secondary artifact
+    /// downloads), retried per the client's [`VendorRetryPolicy`].
+    async fn download_vendor_archive(
         &self,
         url: &str,
-        attempt: u32,
-        e: &ApiError,
-        retry_after: Option<Duration>,
-    ) {
-        debug_log(&format!(
-            "vendor package download attempt {attempt} failed: {e}"
-        ));
-        self.vendor_backoff(url, attempt, retry_after).await;
+        deferred: Option<DeferredAttempt>,
+    ) -> Result<ServeDownload, (ApiError, bool)> {
+        self.retry_vendor(url, "vendor package download", deferred, || {
+            self.serve_get_once(url, MAX_VENDOR_PACKAGE_BYTES, "vendor package")
+        })
+        .await
     }
 
-    /// [`Self::download_vendor_archive_retrying`] without the flag.
-    async fn download_vendor_archive(&self, url: &str) -> ServeDownload {
-        self.download_vendor_archive_retrying(url).await.0
-    }
-
-    /// One GET of the grant-tokenized serve URL. The grant token in the path
-    /// is the authorization, so this uses a plain (no-auth) client. The hint
-    /// is `Some` iff a `Failed` outcome is retryable.
-    async fn download_vendor_archive_once(
+    /// One GET of a grant-tokenized serve URL, its body capped at
+    /// `max_bytes`; `noun` names the download in errors. The grant token in
+    /// the path is the authorization, so this uses a plain (no-auth) client.
+    async fn serve_get_once(
         &self,
         url: &str,
-    ) -> (ServeDownload, Option<Option<Duration>>) {
+        max_bytes: u64,
+        noun: &str,
+    ) -> Result<ServeDownload, VendorAttemptError> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return (
-                ServeDownload::Failed(ApiError::Other(format!(
+            return Err((
+                ApiError::Other(format!(
                     "refusing non-http(s) artifact URL `{}`",
                     redact_url(url)
-                ))),
+                )),
                 None,
-            );
+            ));
         }
-        debug_log(&format!("GET vendor package {url}"));
+        debug_log(&format!("GET {noun} {url}"));
         // Connect + response headers are bounded per attempt; the body read
         // below gets its own (larger) bound — archives can be big.
         let sent = tokio::time::timeout(
@@ -1707,22 +1699,22 @@ impl ApiClient {
         let resp = match sent {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                return (
-                    ServeDownload::Failed(ApiError::Network(format!(
-                        "Network error fetching vendor package: {}",
+                return Err((
+                    ApiError::Network(format!(
+                        "Network error fetching {noun}: {}",
                         network_error_detail(&e)
-                    ))),
+                    )),
                     Some(None),
-                )
+                ))
             }
             Err(_) => {
-                return (
-                    ServeDownload::Failed(ApiError::Network(format!(
-                        "Network error fetching vendor package: no response within {:?}",
+                return Err((
+                    ApiError::Network(format!(
+                        "Network error fetching {noun}: no response within {:?}",
                         self.vendor_retry.attempt_timeout
-                    ))),
+                    )),
                     Some(None),
-                )
+                ))
             }
         };
         let status = resp.status();
@@ -1730,47 +1722,41 @@ impl ApiClient {
             StatusCode::OK => {}
             // 404 (build_failed / not stored) and 410 (withdrawn) are terminal
             // misses; the caller decides build-fallback vs hard-fail.
-            StatusCode::NOT_FOUND | StatusCode::GONE => return (ServeDownload::NotFound, None),
+            StatusCode::NOT_FOUND | StatusCode::GONE => return Ok(ServeDownload::NotFound),
             // 408 = the archive is still building (Retry-After) — the
             // caller's pending policy, never retried here.
-            StatusCode::REQUEST_TIMEOUT => return (ServeDownload::Pending, None),
+            StatusCode::REQUEST_TIMEOUT => return Ok(ServeDownload::Pending),
             _ => {
                 let hint = self.vendor_retry_hint(status, resp.headers());
                 if let Some(err) = classify_auth_error(status, true) {
-                    return (ServeDownload::Failed(err), hint);
+                    return Err((err, hint));
                 }
                 let text = resp.text().await.unwrap_or_default();
-                return (
-                    ServeDownload::Failed(ApiError::Other(format!(
-                        "vendor package download failed with status {}: {text}",
-                        status.as_u16(),
-                    ))),
-                    hint,
-                );
+                let head = format!("{noun} download failed with status");
+                return Err((ApiError::Other(status_error(&head, status, &text)), hint));
             }
         }
         use crate::utils::http::{read_capped_typed, ReadCappedError};
         let body = tokio::time::timeout(
             self.vendor_retry.body_timeout,
-            read_capped_typed(resp, MAX_VENDOR_PACKAGE_BYTES, "vendor package"),
+            read_capped_typed(resp, max_bytes, noun),
         )
         .await
         .unwrap_or_else(|_| {
             Err(ReadCappedError::Truncated(format!(
-                "vendor package body not received within {:?}",
+                "{noun} body not received within {:?}",
                 self.vendor_retry.body_timeout
             )))
         });
         match body {
-            Ok(bytes) => (ServeDownload::Ok(bytes), None),
+            Ok(bytes) => Ok(ServeDownload::Bytes(bytes)),
             // A body cut off mid-transfer is a transport failure (retryable);
             // a size-cap breach is not (the same bytes would breach it again).
-            Err(ReadCappedError::Truncated(e)) => {
-                (ServeDownload::Failed(ApiError::Network(e)), Some(None))
-            }
-            Err(ReadCappedError::CapExceeded(e)) => {
-                (ServeDownload::Failed(ApiError::Network(e)), None)
-            }
+            Err(ReadCappedError::Truncated(e)) => Err((ApiError::Network(e), Some(None))),
+            Err(ReadCappedError::CapExceeded(_)) => Err((
+                ApiError::Other(format!("{noun} exceeds the {max_bytes}-byte limit")),
+                None,
+            )),
         }
     }
 
@@ -1780,7 +1766,7 @@ impl ApiClient {
     /// integrity. A 404/410/408 surfaces as an error (a secondary the
     /// reference promised should be present).
     pub(crate) async fn download_artifact(&self, url: &str) -> Result<Vec<u8>, ApiError> {
-        artifact_download_result(self.download_vendor_archive(url).await, url)
+        artifact_download_result(self.download_vendor_archive(url, None).await, url)
     }
 
     /// The first attempt of [`Self::download_artifact`] alone: `Ok` with
@@ -1794,13 +1780,17 @@ impl ApiClient {
         &self,
         url: &str,
     ) -> Result<Result<Vec<u8>, ApiError>, DeferredAttempt> {
-        match self.download_vendor_archive_once(url).await {
-            (ServeDownload::Failed(error), Some(retry_after))
-                if self.vendor_retry.attempts.max(1) > 1 =>
-            {
+        match self
+            .serve_get_once(url, MAX_VENDOR_PACKAGE_BYTES, "vendor package")
+            .await
+        {
+            Err((error, Some(retry_after))) if self.vendor_retry.attempts.max(1) > 1 => {
                 Err(DeferredAttempt { error, retry_after })
             }
-            (outcome, _) => Ok(artifact_download_result(outcome, url)),
+            outcome => Ok(artifact_download_result(
+                outcome.map_err(|(e, hint)| (e, hint.is_some())),
+                url,
+            )),
         }
     }
 
@@ -1813,9 +1803,7 @@ impl ApiClient {
         url: &str,
         deferred: DeferredAttempt,
     ) -> Result<Vec<u8>, ApiError> {
-        self.vendor_download_retry(url, 1, &deferred.error, deferred.retry_after)
-            .await;
-        artifact_download_result(self.download_vendor_archive_from(url, 2).await.0, url)
+        artifact_download_result(self.download_vendor_archive(url, Some(deferred)).await, url)
     }
 }
 
@@ -1834,18 +1822,21 @@ pub(crate) struct DeferredAttempt {
 // ── Free functions ────────────────────────────────────────────────────
 
 /// [`ApiClient::download_artifact`]'s mapping of a serve outcome.
-fn artifact_download_result(outcome: ServeDownload, url: &str) -> Result<Vec<u8>, ApiError> {
+fn artifact_download_result(
+    outcome: Result<ServeDownload, (ApiError, bool)>,
+    url: &str,
+) -> Result<Vec<u8>, ApiError> {
     match outcome {
-        ServeDownload::Ok(bytes) => Ok(bytes),
-        ServeDownload::NotFound => Err(ApiError::Other(format!(
+        Ok(ServeDownload::Bytes(bytes)) => Ok(bytes),
+        Ok(ServeDownload::NotFound) => Err(ApiError::Other(format!(
             "artifact not found: {}",
             redact_url(url)
         ))),
-        ServeDownload::Pending => Err(ApiError::Other(format!(
+        Ok(ServeDownload::Pending) => Err(ApiError::Other(format!(
             "artifact still building: {}",
             redact_url(url)
         ))),
-        ServeDownload::Failed(e) => Err(e),
+        Err((e, _)) => Err(e),
     }
 }
 
@@ -1964,14 +1955,13 @@ pub(crate) enum VendorServiceOutcome {
     Failed(ApiError),
 }
 
-/// Internal result of the step-2 archive GET.
+/// A serve GET's answer short of a failure.
 enum ServeDownload {
-    Ok(Vec<u8>),
+    Bytes(Vec<u8>),
     /// 404 / 410 — terminal miss.
     NotFound,
     /// 408 — still building, retryable.
     Pending,
-    Failed(ApiError),
 }
 
 /// Build the authenticated `reqwest::Client` ([`ApiClient`]'s `client`
@@ -2811,127 +2801,14 @@ impl PatchApi for ApiClient {
     }
 
     fn download_artifact<'a>(&'a self, url: &'a str, max_bytes: u64) -> ApiFuture<'a, Vec<u8>> {
-        Box::pin(self.download_artifact_capped(url, max_bytes))
-    }
-}
-
-/// Outcome of one capped artifact GET, and `Some(retry-after)` iff a
-/// failure is retryable.
-type CappedAttempt = (Result<Vec<u8>, ApiError>, Option<Option<Duration>>);
-
-impl ApiClient {
-    /// [`ApiClient::download_artifact`] with the caller's byte cap applied
-    /// while streaming (a declared `Content-Length` over it is refused
-    /// before the body is read), retrying transient failures on the vendor
-    /// retry policy.
-    async fn download_artifact_capped(
-        &self,
-        url: &str,
-        max_bytes: u64,
-    ) -> Result<Vec<u8>, ApiError> {
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err(ApiError::Other(format!(
-                "refusing non-http(s) artifact URL `{}`",
-                redact_url(url)
-            )));
-        }
-        let attempts = self.vendor_retry.attempts.max(1);
-        let mut attempt = 1;
-        loop {
-            match self.download_artifact_capped_once(url, max_bytes).await {
-                (Err(_), Some(retry_after)) if attempt < attempts => {
-                    self.vendor_backoff(url, attempt, retry_after).await;
-                    attempt += 1;
-                }
-                (outcome, _) => return outcome,
-            }
-        }
-    }
-
-    async fn download_artifact_capped_once(&self, url: &str, max_bytes: u64) -> CappedAttempt {
-        use crate::utils::http::{read_capped_typed, ReadCappedError};
-        let sent = tokio::time::timeout(
-            self.vendor_retry.attempt_timeout,
-            self.plain
-                .get(url)
-                .header(header::ACCEPT, "application/octet-stream")
-                .send(),
-        )
-        .await;
-        let resp = match sent {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                return (
-                    Err(ApiError::Network(format!(
-                        "Network error fetching artifact: {}",
-                        network_error_detail(&e)
-                    ))),
-                    Some(None),
-                )
-            }
-            Err(_) => {
-                return (
-                    Err(ApiError::Network(format!(
-                        "Network error fetching artifact: no response within {:?}",
-                        self.vendor_retry.attempt_timeout
-                    ))),
-                    Some(None),
-                )
-            }
-        };
-        let status = resp.status();
-        match status {
-            StatusCode::OK => {}
-            StatusCode::NOT_FOUND | StatusCode::GONE => {
-                return (
-                    Err(ApiError::Other(format!(
-                        "artifact not found: {}",
-                        redact_url(url)
-                    ))),
-                    None,
-                )
-            }
-            StatusCode::REQUEST_TIMEOUT => {
-                return (
-                    Err(ApiError::Other(format!(
-                        "artifact still building: {}",
-                        redact_url(url)
-                    ))),
-                    None,
-                )
-            }
-            _ => {
-                let hint = self.vendor_retry_hint(status, resp.headers());
-                let err = classify_auth_error(status, true).unwrap_or_else(|| {
-                    ApiError::Other(format!(
-                        "artifact download failed with status {}",
-                        status.as_u16()
-                    ))
-                });
-                return (Err(err), hint);
-            }
-        }
-        let body = tokio::time::timeout(
-            self.vendor_retry.body_timeout,
-            read_capped_typed(resp, max_bytes, "artifact"),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(ReadCappedError::Truncated(format!(
-                "artifact body not received within {:?}",
-                self.vendor_retry.body_timeout
-            )))
-        });
-        match body {
-            Ok(bytes) => (Ok(bytes), None),
-            Err(ReadCappedError::Truncated(e)) => (Err(ApiError::Network(e)), Some(None)),
-            Err(ReadCappedError::CapExceeded(_)) => (
-                Err(ApiError::Other(format!(
-                    "artifact exceeds the {max_bytes}-byte limit"
-                ))),
-                None,
-            ),
-        }
+        Box::pin(async move {
+            let outcome = self
+                .retry_vendor(url, "artifact download", None, || {
+                    self.serve_get_once(url, max_bytes, "artifact")
+                })
+                .await;
+            artifact_download_result(outcome, url)
+        })
     }
 }
 
@@ -5856,7 +5733,8 @@ mod vendor_retry_tests {
             .fetch_vendor_package(UUID_A, false, None, None)
             .await;
         assert!(
-            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Network(ref m)) if m.contains("too large")),
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Other(ref m))
+                if *m == format!("vendor package exceeds the {MAX_VENDOR_PACKAGE_BYTES}-byte limit")),
             "{outcome:?}"
         );
         assert_eq!(conns.load(Ordering::SeqCst), 1);
@@ -6018,13 +5896,13 @@ mod vendor_retry_tests {
             .await;
     }
 
-    /// Every vendor-service retry loop (the reference POST, the archive
+    /// Every vendor-service retry path (the reference POST, the archive
     /// GET, the capped artifact GET, and a deferred artifact GET resumed)
     /// waits out an HTTP-date `Retry-After` through `api::retry`: 2 s, not
     /// the policy's millisecond backoff. Before the shared parser, each
     /// read delta-seconds only and backed off 1-5 ms here.
     #[tokio::test]
-    async fn every_vendor_retry_loop_honors_an_http_date_retry_after() {
+    async fn every_vendor_retry_path_honors_an_http_date_retry_after() {
         let server = MockServer::start().await;
         mount_once_then(&server, "POST", POST_PATH, 429, granted(&server, UUID_A)).await;
         let bytes = || ResponseTemplate::new(200).set_body_bytes(BYTES.to_vec());
@@ -6044,8 +5922,8 @@ mod vendor_retry_tests {
         );
 
         let (c, slept) = hooked(&server.uri(), roomy(), 7);
-        let (outcome, _) = c.download_vendor_archive_retrying(&url("/archive")).await;
-        assert!(matches!(outcome, ServeDownload::Ok(ref b) if b == BYTES));
+        let got = c.download_artifact(&url("/archive")).await;
+        assert_eq!(got.expect("the retry succeeds"), BYTES);
         assert_eq!(
             *slept.lock().unwrap(),
             [Duration::from_secs(2)],
@@ -6053,7 +5931,7 @@ mod vendor_retry_tests {
         );
 
         let (c, slept) = hooked(&server.uri(), roomy(), 7);
-        let got = c.download_artifact_capped(&url("/capped"), 1 << 20).await;
+        let got = PatchApi::download_artifact(&c, &url("/capped"), 1 << 20).await;
         assert_eq!(got.expect("the retry succeeds"), BYTES);
         assert_eq!(
             *slept.lock().unwrap(),
