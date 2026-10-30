@@ -294,7 +294,7 @@ pub(crate) fn strip_comment(text: &str) -> &str {
 /// none of which this process sees. Such a line pins no knowable release
 /// (#1873).
 pub(crate) fn has_env_reference(code: &str) -> bool {
-    expand_env_vars(code, |_| Some("_".to_string())) != code
+    code.contains("${") && expand_env_vars(code, |_| Some("_".to_string())) != code
 }
 
 /// pip's `expand_env_variables`: each `${NAME}` whose `NAME` is
