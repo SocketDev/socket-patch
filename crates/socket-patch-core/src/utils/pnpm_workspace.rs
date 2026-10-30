@@ -304,8 +304,10 @@ fn lists_modeled_member(globs: &[String], rel: &[String]) -> bool {
 /// classes. Beside a class or brace set, a `+` (pnpm's quantifier:
 /// `packages/[ab]+` lists `packages/ab`) and a `\` (pnpm's escape:
 /// `packages/\[a]` lists only `packages/[a]`, the matcher's separator) are
-/// refused too, in the glob and in each brace alternative. A glob with
-/// none of `[ ] { }` reads as it did before #1846.
+/// refused too, in the glob and in each brace alternative. pnpm reads
+/// braces as picomatch does, not as the matcher's brace expansion, where
+/// [`plain_braces`] refuses. A glob with none of `[ ] { }` reads as it did
+/// before #1846.
 fn modeled(globs: &[String]) -> Result<(), String> {
     let plain_classes = |glob: &str| {
         let mut rest = glob;
@@ -337,6 +339,7 @@ fn modeled(globs: &[String]) -> Result<(), String> {
             return true;
         }
         !glob.contains(['+', '\\'])
+            && plain_braces(glob)
             && brace_alternatives(glob).is_some_and(|alternatives| {
                 alternatives.iter().all(|alternative| {
                     !alternative.contains(['(', ')', '+', '\\']) && plain_classes(alternative)
@@ -349,6 +352,55 @@ fn modeled(globs: &[String]) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// Whether every `{...}` group in `glob` expands to what pnpm lists
+/// (probed on pnpm 10.28.0). pnpm reads a sequence with a step or a
+/// multi-character end as a class (`{1..10}` lists `0` and `1`, not `10`),
+/// lets a `*` or `?` inside braces match a leading `.` (`{a,*}` lists
+/// `.h`), and drops an empty alternative (`packages/{a,}` lists only
+/// `packages/a`, not `packages`): all three are refused.
+fn plain_braces(glob: &str) -> bool {
+    let mut opens = Vec::new();
+    for (i, c) in glob.char_indices() {
+        match c {
+            '{' => opens.push(i),
+            '}' => {
+                let Some(open) = opens.pop() else {
+                    continue;
+                };
+                let body = &glob[open + 1..i];
+                if body.contains(['*', '?']) {
+                    return false;
+                }
+                let mut alternatives = Vec::new();
+                let (mut depth, mut start) = (0usize, 0usize);
+                for (j, c) in body.char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => depth = depth.saturating_sub(1),
+                        ',' if depth == 0 => {
+                            alternatives.push(&body[start..j]);
+                            start = j + 1;
+                        }
+                        _ => {}
+                    }
+                }
+                alternatives.push(&body[start..]);
+                if alternatives.len() > 1 {
+                    if alternatives.iter().any(|a| a.is_empty()) {
+                        return false;
+                    }
+                } else if body.contains("..")
+                    && !body.split("..").map(|end| end.chars().count()).eq([1, 1])
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// `glob` with each character class (closed and plain, as [`modeled`]
@@ -1348,6 +1400,8 @@ mod tests {
             (&["packages/*", "!packages/{a,c}"], &["ab", "b", "x"]),
             (&["packages/{[ab],x}"], &["a", "b", "x"]),
             (&["packages/[-a]"], &["a"]),
+            (&["packages/{c..a}"], &["a", "b", "c"]),
+            (&["packages/{a,{b,c}}"], &["a", "b", "c"]),
         ] {
             let expected: Vec<String> = expected.iter().map(|d| format!("packages/{d}")).collect();
             let patterns = globs(patterns);
@@ -1386,6 +1440,17 @@ mod tests {
             "packages/{a,b}+",
             "packages/\\[a]",
             "packages/{Z..a}",
+            // pnpm reads a stepped or multi-character sequence as a class,
+            // lets a wildcard inside braces match `.h`, and drops an empty
+            // alternative instead of listing `packages` itself.
+            "packages/{a..e..2}",
+            "packages/p{1..10}",
+            "packages/p{01..2}",
+            "packages/{a,*}",
+            "packages/{?h,x}",
+            "packages/{a,}",
+            "packages/{,a}",
+            "packages/{a,{b,}}",
             // A range from `-` spans `.` and `/`.
             "packages/[--9]h",
         ] {
