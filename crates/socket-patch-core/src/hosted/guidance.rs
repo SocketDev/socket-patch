@@ -562,28 +562,8 @@ pub fn npm_replace_registry_host_detail(
     hosts: &[&str],
     setting: &crate::patch::redirect::npmrc::EffectiveSetting,
 ) -> String {
-    use crate::patch::redirect::npmrc::SettingSource;
     let value = npm_setting_spelling("replace-registry-host", setting);
-    let (where_, fix) = match &setting.source {
-        SettingSource::Env(var) => (
-            format!("the environment variable {var} sets"),
-            format!(
-                "unset {var} (npm's environment layer overrides every .npmrc) or set it to \
-                 `npmjs`"
-            ),
-        ),
-        SettingSource::Project => (
-            "the project .npmrc sets".to_string(),
-            "change it to `replace-registry-host=npmjs` (npm's default) or remove it".to_string(),
-        ),
-        SettingSource::File { layer, path } => (
-            format!("the {layer} npm config ({}) sets", path.display()),
-            format!(
-                "set `replace-registry-host=npmjs` (npm's default) in the project .npmrc (it \
-                 outranks the {layer} config) or change the {layer} config"
-            ),
-        ),
-    };
+    let (where_, fix) = npm_setting_remedy("replace-registry-host", "npmjs", setting);
     format!(
         "the npm lockfile now resolves patched dependencies from the hosted patch server ({}), \
          but {where_} {value}, which makes npm >=8 rewrite those \
@@ -613,6 +593,36 @@ fn npm_setting_spelling(
     }
 }
 
+/// Where an npm `key` setting comes from (`"the project .npmrc sets"`)
+/// and how to reset it to its npm default `safe` there.
+fn npm_setting_remedy(
+    key: &str,
+    safe: &str,
+    setting: &crate::patch::redirect::npmrc::EffectiveSetting,
+) -> (String, String) {
+    use crate::patch::redirect::npmrc::SettingSource;
+    match &setting.source {
+        SettingSource::Env(var) => (
+            format!("the environment variable {var} sets"),
+            format!(
+                "unset {var} (npm's environment layer overrides every .npmrc) or set it to \
+                 `{safe}`"
+            ),
+        ),
+        SettingSource::Project => (
+            "the project .npmrc sets".to_string(),
+            format!("change it to `{key}={safe}` (npm's default) or remove it"),
+        ),
+        SettingSource::File { layer, path } => (
+            format!("the {layer} npm config ({}) sets", path.display()),
+            format!(
+                "set `{key}={safe}` (npm's default) in the project .npmrc (it outranks the \
+                 {layer} config) or change the {layer} config"
+            ),
+        ),
+    }
+}
+
 /// Warning code for a hosted npm pin that npm's
 /// `omit-lockfile-registry-resolved` setting strips on the next lock save
 /// (#1871).
@@ -628,29 +638,8 @@ pub fn npm_omit_lockfile_resolved_detail(
     hosts: &[&str],
     setting: &crate::patch::redirect::npmrc::EffectiveSetting,
 ) -> String {
-    use crate::patch::redirect::npmrc::SettingSource;
     let value = npm_setting_spelling("omit-lockfile-registry-resolved", setting);
-    let (where_, fix) = match &setting.source {
-        SettingSource::Env(var) => (
-            format!("the environment variable {var} sets"),
-            format!(
-                "unset {var} (npm's environment layer overrides every .npmrc) or set it to \
-                 `false`"
-            ),
-        ),
-        SettingSource::Project => (
-            "the project .npmrc sets".to_string(),
-            "change it to `omit-lockfile-registry-resolved=false` (npm's default) or remove it"
-                .to_string(),
-        ),
-        SettingSource::File { layer, path } => (
-            format!("the {layer} npm config ({}) sets", path.display()),
-            format!(
-                "set `omit-lockfile-registry-resolved=false` in the project .npmrc (it outranks \
-                 the {layer} config) or change the {layer} config"
-            ),
-        ),
-    };
+    let (where_, fix) = npm_setting_remedy("omit-lockfile-registry-resolved", "false", setting);
     format!(
         "the npm lockfile now resolves patched dependencies from the hosted patch server ({}), \
          but {where_} {value}, which makes npm >=8 drop the `resolved` URL of every registry \

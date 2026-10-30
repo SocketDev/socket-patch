@@ -1065,11 +1065,14 @@ async fn omit_lockfile_registry_resolved_is_warned() {
         "{stderr}"
     );
 
-    // npm reads the value through ini + nopt's Boolean: a bare key and any
-    // non-`false` string are true; `false`, `null` and `0` are not.
+    // npm reads the value through `parseField` + nopt's Boolean: a bare
+    // key, a blank value and any other string are true; `false`, `null`,
+    // `undefined` and `0` are not (measured on npm 10.9.4).
     for (line, warns) in [
         ("omit-lockfile-registry-resolved", true),
         ("omit-lockfile-registry-resolved=1", true),
+        ("omit-lockfile-registry-resolved=", true),
+        ("omit-lockfile-registry-resolved=undefined", false),
         ("omit-lockfile-registry-resolved=false", false),
         ("omit-lockfile-registry-resolved=null", false),
         ("omit-lockfile-registry-resolved=0", false),

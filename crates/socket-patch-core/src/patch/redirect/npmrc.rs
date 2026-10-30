@@ -730,57 +730,50 @@ pub fn effective_omit_lockfile_registry_resolved(
         &outer.omit_lockfile_registry_resolved,
         &outer.config_env,
     )
-    .filter(|s| npm_config_bool(&s.value))
+    .filter(npm_config_bool)
 }
 
-/// A Boolean npm config value as npm reads it: `ini` turns `true` /
-/// `false` / `null` into JSON values, then nopt's Boolean validation
-/// makes `false` and `null` false, a numeric string `!!Number(v)`, and
-/// every other string true (so `False` and `no` are TRUE to npm).
-pub fn npm_config_bool(value: &str) -> bool {
-    if value == "false" || value == "null" {
-        return false;
-    }
-    js_number(value).is_none_or(|n| n != 0.0)
-}
-
-/// JavaScript's `Number(s)` for a string, `None` where it is `NaN`.
-fn js_number(s: &str) -> Option<f64> {
-    let t = js_trim(s);
-    if t.is_empty() {
-        return Some(0.0);
-    }
-    let (sign, unsigned) = match t.as_bytes()[0] {
-        b'-' => (-1.0, &t[1..]),
-        b'+' => (1.0, &t[1..]),
-        _ => (1.0, t),
-    };
-    if unsigned == "Infinity" {
-        return Some(sign * f64::INFINITY);
-    }
-    for (prefix, radix) in [
-        ("0x", 16),
-        ("0X", 16),
-        ("0o", 8),
-        ("0O", 8),
-        ("0b", 2),
-        ("0B", 2),
-    ] {
-        if let Some(digits) = t.strip_prefix(prefix) {
-            // `Number` takes no sign before a radix prefix.
-            return u128::from_str_radix(digits, radix)
-                .ok()
-                .filter(|_| !digits.starts_with(['+', '-']))
-                .map(|n| n as f64);
+/// A Boolean npm config setting as npm reads it (`@npmcli/config`
+/// `parseField`, then nopt's Boolean validation; measured on npm 10.9.4).
+/// On the value as written (trimmed, before env replacement): empty is
+/// TRUE (like a bare `--flag`), `true` true, `false` / `null` /
+/// `undefined` false. Otherwise the env-replaced value is false when it is
+/// a numeric zero (or empty) and TRUE for any other string, so `False`,
+/// `no` and `undefined` reached through `${VAR}` are all true to npm.
+pub fn npm_config_bool(setting: &EffectiveSetting) -> bool {
+    match js_trim(&setting.raw) {
+        "" | "true" => true,
+        "false" | "null" | "undefined" => false,
+        _ => {
+            !matches!(setting.value.as_str(), "false" | "null") && !js_numeric_zero(&setting.value)
         }
     }
-    if !unsigned
-        .bytes()
-        .all(|b| b.is_ascii_digit() || b"eE+-.".contains(&b))
+}
+
+/// Whether JavaScript's `Number(s)` is zero: blank, or an optionally
+/// signed decimal zero (`0`, `-0.0`, `.0e5`), or an unsigned `0x0` /
+/// `0o0` / `0b0`.
+fn js_numeric_zero(s: &str) -> bool {
+    let t = js_trim(s);
+    if let Some(digits) = ["0x", "0X", "0o", "0O", "0b", "0B"]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))
     {
-        return None;
+        return !digits.is_empty() && digits.bytes().all(|b| b == b'0');
     }
-    t.parse::<f64>().ok()
+    if t.is_empty() {
+        return true;
+    }
+    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let (mantissa, exponent) = t.split_once(['e', 'E']).unwrap_or((t, "0"));
+    let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let zeros = |d: &str| d.bytes().all(|b| b == b'0');
+    !(int.is_empty() && frac.is_empty())
+        && zeros(int)
+        && zeros(frac)
+        && !exponent.is_empty()
+        && exponent.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Whether npm's `replace-registry-host=<value>` rewrites a `resolved` URL
@@ -1551,8 +1544,6 @@ mod tests {
         assert!(replace_registry_host_rewrites("[::1]", "[::1]"));
     }
 
-    /// #1233: npm env-replaces every config value (`@npmcli/config`
-    /// `parseField` -> `envReplace`), in every layer. A
     /// #1871: `omit-lockfile-registry-resolved` is read from every npm
     /// config layer in npm's order (env > project > user > global >
     /// builtin) and reported only when npm reads it as true.
@@ -1642,11 +1633,21 @@ mod tests {
         assert_eq!(outer.replace_registry_host, OuterSetting::default());
     }
 
-    /// nopt's Boolean validation after `ini`: only `false`, `null` and a
-    /// numeric zero are false.
+    /// npm's Boolean reading, as measured on npm 10.9.4 (`c.flat` after
+    /// `validate()`): keywords and blank on the written value, then nopt
+    /// on the env-replaced one.
     #[test]
-    fn npm_config_bool_matches_nopt() {
+    fn npm_config_bool_matches_npm() {
+        let bool_of = |raw: &str, value: &str| {
+            npm_config_bool(&EffectiveSetting {
+                value: value.into(),
+                raw: raw.into(),
+                source: SettingSource::Project,
+            })
+        };
         for v in [
+            "",
+            " ",
             "true",
             "1",
             "-1",
@@ -1656,24 +1657,48 @@ mod tests {
             "no",
             "off",
             "0x1",
-            "1e3",
+            "1e0",
             "Infinity",
             "-Infinity",
-            " 2 ",
             "[a, b]",
             "0x",
-            "-0x1",
+            "-0x0",
             ".",
+            "-",
+            "e5",
+            "0e",
+            "${UNSET}",
         ] {
-            assert!(npm_config_bool(v), "{v:?}");
+            assert!(bool_of(v, js_trim(v)), "{v:?}");
         }
         for v in [
-            "false", "null", "0", "", " ", "-0", "0.0", "0e5", "0x0", "0b0", "0o0", "+0",
+            "false",
+            "null",
+            "undefined",
+            "0",
+            "-0",
+            "+0",
+            "0.0",
+            ".0",
+            "0.",
+            "0e5",
+            "0E-1",
+            "0x0",
+            "0b00",
+            "0o0",
         ] {
-            assert!(!npm_config_bool(v), "{v:?}");
+            assert!(!bool_of(v, v), "{v:?}");
         }
+        // Keywords count only as written: `${V}` expanding to `false` /
+        // `null` is false (nopt), to `undefined` true, to blank false.
+        assert!(!bool_of("${V}", "false"));
+        assert!(!bool_of("${V}", "null"));
+        assert!(bool_of("${V}", "undefined"));
+        assert!(!bool_of("${V}", ""));
     }
 
+    /// #1233: npm env-replaces every config value (`@npmcli/config`
+    /// `parseField` -> `envReplace`), in every layer. A
     /// `replace-registry-host=${RRH}` with `RRH=always` is `always` to npm,
     /// so it must read as `always` here too, wherever it is set, while the
     /// spelling the user wrote is kept for the warning.
