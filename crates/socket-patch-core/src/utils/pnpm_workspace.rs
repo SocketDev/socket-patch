@@ -359,7 +359,10 @@ fn modeled(globs: &[String]) -> Result<(), String> {
 /// multi-character end as a class (`{1..10}` lists `0` and `1`, not `10`),
 /// lets a `*` or `?` inside braces match a leading `.` (`{a,*}` lists
 /// `.h`), and drops an empty alternative (`packages/{a,}` lists only
-/// `packages/a`, not `packages`): all three are refused.
+/// `packages/a`, not `packages`): all three are refused. So is a sequence
+/// whose ends are not both digits, both lowercase or both uppercase: it
+/// would step through punctuation (`{-..0}` through `.` and `/`, `{0..Z}`
+/// through `?`), which the walk reads as path syntax.
 fn plain_braces(glob: &str) -> bool {
     let mut opens = Vec::new();
     for (i, c) in glob.char_indices() {
@@ -391,9 +394,7 @@ fn plain_braces(glob: &str) -> bool {
                     if alternatives.iter().any(|a| a.is_empty()) {
                         return false;
                     }
-                } else if body.contains("..")
-                    && !body.split("..").map(|end| end.chars().count()).eq([1, 1])
-                {
+                } else if body.contains("..") && !same_kind_range(body) {
                     return false;
                 }
             }
@@ -401,6 +402,26 @@ fn plain_braces(glob: &str) -> bool {
         }
     }
     true
+}
+
+/// Whether a `{x..y}` body is a single-character sequence whose ends are
+/// both digits, both lowercase or both uppercase ASCII letters.
+fn same_kind_range(body: &str) -> bool {
+    let ends: Vec<&str> = body.split("..").collect();
+    let [from, to] = ends.as_slice() else {
+        return false;
+    };
+    let (mut from, mut to) = (from.chars(), to.chars());
+    match (from.next(), from.next(), to.next(), to.next()) {
+        (Some(a), None, Some(b), None) => [
+            char::is_ascii_digit,
+            char::is_ascii_lowercase,
+            char::is_ascii_uppercase,
+        ]
+        .iter()
+        .any(|kind| kind(&a) && kind(&b)),
+        _ => false,
+    }
 }
 
 /// `glob` with each character class (closed and plain, as [`modeled`]
@@ -1466,6 +1487,9 @@ mod tests {
             // alternative instead of listing `packages` itself.
             "packages/{a..e..2}",
             "packages/p{1..10}",
+            // A sequence across punctuation steps through path syntax.
+            "packages/{-..0}",
+            "packages/{0..Z}",
             "packages/p{01..2}",
             "packages/{a,*}",
             "packages/{?h,x}",
