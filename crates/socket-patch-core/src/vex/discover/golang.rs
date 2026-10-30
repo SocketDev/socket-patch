@@ -283,11 +283,26 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bo
         .iter()
         .flat_map(|(_, entries)| entries)
         .any(|e| e.owner == Some(ReplaceOwner::Hosted));
+    let mut sums = SumPins::default();
+    let mut root_sum = None;
+    if any_hosted {
+        match &workspace {
+            Some(ws) => sums = SumPins::read(ctx, out, &ws.sum_files).await,
+            None => {
+                root_sum = ctx.read_text(GO_SUM, out).await;
+                if let Some(text) = &root_sum {
+                    sums.add(text, true);
+                }
+            }
+        }
+    }
     // Module mode: whether a module-to-module replace is in effect can turn
-    // on modules only the dependencies require (#1840).
+    // on modules only the dependencies require (#1840), and which version
+    // the build selects on a go.sum zip line a downgrade may have left
+    // behind (#1862).
     let mut module_graph = None;
     if let (Some(text), None) = (&go_mod, &workspace) {
-        if go_build_list::may_need_module_graph(text) {
+        if go_build_list::may_need_module_graph(text, root_sum.as_deref()) {
             if let Some(root) = ctx.disk_root_reading(go_build_list::module_graph_reads(text)) {
                 module_graph = Some(go_build_list::module_graph(root, text).await);
             }
@@ -298,14 +313,6 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bo
         workspace.as_ref().map(|ws| &ws.model),
         module_graph.as_ref(),
     );
-    let mut sums = SumPins::default();
-    if any_hosted {
-        let sum_files = match &workspace {
-            Some(ws) => ws.sum_files.clone(),
-            None => vec![GO_SUM.to_string()],
-        };
-        sums = SumPins::read(ctx, out, &sum_files).await;
-    }
     for (file, entries) in &files {
         extract_file(out, file, entries, &graph, &sums);
     }
@@ -548,6 +555,24 @@ fn extract_file(
                              apply a replace to a replacement, so it uses the unpatched \
                              module",
                             entry.module, entry.module
+                        ),
+                    );
+                    continue;
+                }
+                // A go.sum zip line above go.mod's require that a downgrade
+                // may have left behind, with no module graph to settle it:
+                // the socket module's own zip line may be as stale (#1862).
+                if selected == Selection::Unproven {
+                    out.diag(
+                        DIAG_REF_INVALID,
+                        file,
+                        format!(
+                            "{file}: replace {} {version} is unproven: go.sum has a zip \
+                             line above go.mod's require (a dependency's raise, or a line \
+                             a downgrade left until `go mod tidy`) and a go.mod its module \
+                             graph needs is not in the module cache, so nothing shows the \
+                             build selects {version}",
+                            entry.module
                         ),
                     );
                     continue;

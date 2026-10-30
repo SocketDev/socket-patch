@@ -362,6 +362,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                         | GoDrift::WrongReplacePath { purl, .. }
                         | GoDrift::ResolvedVersionMismatch { purl, .. }
                         | GoDrift::UnprovenSelection { purl, .. }
+                        | GoDrift::UnprovenStaleSum { purl, .. }
                         | GoDrift::ReplaceTargetOnly { purl, .. } => purl.clone(),
                         GoDrift::OrphanReplace { module } => module.clone(),
                     };

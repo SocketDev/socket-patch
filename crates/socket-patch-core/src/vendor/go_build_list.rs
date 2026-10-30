@@ -27,6 +27,13 @@
 //!   [`Selection::Unknown`]: a directory `replace` makes `go mod tidy` drop
 //!   the original's go.sum lines, so absence proves nothing.
 //!
+//!   A zip line above go.mod's own `require` is either a dependency's
+//!   raise or a line `go get M@<lower>` left behind (go keeps the old
+//!   version's lines until `go mod tidy`), and the two files can't tell
+//!   which. Then the answer is MVS over the module graph read from the
+//!   module cache ([`module_graph`]), and [`Selection::Unproven`] when
+//!   that graph can't be read in full (#1862).
+//!
 //! Either way, a zip line is no evidence when go.mod names that
 //! module@version as the target of a module-to-module `replace`
 //! (`replace other.com/fork v1.0.0 => example.com/upstream v1.0.0`): go
@@ -73,6 +80,12 @@ pub enum Selection {
     /// go doesn't chain replaces, so a replace of the module itself is
     /// inert and the build links the unpatched code (#1823).
     ReplaceTarget(String),
+    /// An unpruned go.mod requires the module below a go.sum zip line,
+    /// at or under the patched version, and the module graph could not be
+    /// read in full. The line is a dependency's raise or one a downgrade
+    /// left behind, so nothing shows which version the build selects
+    /// (#1862). Fail closed: write, audit or attest nothing for it.
+    Unproven,
 }
 
 impl Selection {
@@ -165,6 +178,15 @@ pub fn select_in(
             None => no_evidence(Selection::NotInGraph),
         };
     }
+    if stale_zip_possible(required, zips, version) {
+        // MVS over every go.mod the build reads is go's own answer.
+        return match graph.filter(|g| g.complete).map(|g| g.selected.get(module)) {
+            Some(Some(s)) if s == version => Selection::Selected,
+            Some(Some(s)) => Selection::Other(s.clone()),
+            Some(None) => no_evidence(Selection::NotInGraph),
+            None => Selection::Unproven,
+        };
+    }
     let highest = required
         .into_iter()
         .chain(zips.iter().copied())
@@ -197,23 +219,59 @@ fn replaces_targeting<'a>(
     })
 }
 
+/// Whether an unpruned graph's go.sum may hold a zip line for the module
+/// that a downgrade left behind, in a way that decides the answer for the
+/// patched `version`: go.mod requires it at or below `version`, under some
+/// zip line. MVS never selects below go.mod's own require, so a patched
+/// version under it is settled either way.
+fn stale_zip_possible(required: Option<&str>, zips: &[&str], version: &str) -> bool {
+    required.is_some_and(|r| {
+        go_semver_cmp(version, r).is_ge() && zips.iter().any(|z| go_semver_cmp(z, r).is_gt())
+    })
+}
+
+/// The versions `go_sum` holds a zip line for, per module.
+fn zip_versions(go_sum: &str) -> BTreeMap<&str, Vec<&str>> {
+    let mut zips: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for line in go_sum_lines(go_sum) {
+        if !line.go_mod {
+            zips.entry(line.module).or_default().push(line.version);
+        }
+    }
+    zips
+}
+
 /// Whether [`select`]'s answer for `module@version` can turn on the
 /// [`ModuleGraph`]: an unpruned go.mod with a module-to-module replace
-/// targeting it. Only then is the graph worth reading.
-pub fn needs_module_graph(go_mod: &str, module: &str, version: &str) -> bool {
-    !prunes_module_graph(go_mod)
-        && replaces_targeting(&parse_replace_entries(go_mod), module, version)
-            .next()
-            .is_some()
+/// targeting it, or one whose `require` of it sits below a go.sum zip
+/// line (#1862). Only then is the graph worth reading.
+pub fn needs_module_graph(go_mod: &str, go_sum: Option<&str>, module: &str, version: &str) -> bool {
+    if prunes_module_graph(go_mod) {
+        return false;
+    }
+    let zips = go_sum.map(zip_versions).unwrap_or_default();
+    let required = parse_required_versions(go_mod).remove(module);
+    let module_zips = zips.get(module).map(Vec::as_slice).unwrap_or_default();
+    replaces_targeting(&parse_replace_entries(go_mod), module, version)
+        .next()
+        .is_some()
+        || stale_zip_possible(required.as_deref(), module_zips, version)
 }
 
 /// Whether any answer of [`select`] over `go_mod` can turn on the
 /// [`ModuleGraph`] ([`needs_module_graph`] for every module).
-pub fn may_need_module_graph(go_mod: &str) -> bool {
-    !prunes_module_graph(go_mod)
-        && parse_replace_entries(go_mod)
-            .iter()
-            .any(|e| !e.socket_owned() && e.rhs_module.is_some() && e.rhs_version.is_some())
+pub fn may_need_module_graph(go_mod: &str, go_sum: Option<&str>) -> bool {
+    if prunes_module_graph(go_mod) {
+        return false;
+    }
+    let zips = go_sum.map(zip_versions).unwrap_or_default();
+    parse_replace_entries(go_mod)
+        .iter()
+        .any(|e| !e.socket_owned() && e.rhs_module.is_some() && e.rhs_version.is_some())
+        || parse_required_versions(go_mod).iter().any(|(m, r)| {
+            zips.get(m.as_str())
+                .is_some_and(|z| z.iter().any(|z| go_semver_cmp(z, r).is_gt()))
+        })
 }
 
 /// The module whose module-to-module `replace` in `go_mod` targets exactly
@@ -298,10 +356,11 @@ pub fn module_graph_reads(go_mod: &str) -> Vec<String> {
 pub async fn module_graph_for(
     project_root: &Path,
     go_mod: &str,
+    go_sum: Option<&str>,
     module: &str,
     version: &str,
 ) -> Option<ModuleGraph> {
-    if !needs_module_graph(go_mod, module, version) {
+    if !needs_module_graph(go_mod, go_sum, module, version) {
         return None;
     }
     Some(module_graph(project_root, go_mod).await)
@@ -339,7 +398,7 @@ pub async fn project_selection(
     let go_sum = read_regular_to_string(&project_root.join("go.sum"))
         .await
         .ok();
-    let graph = module_graph_for(project_root, &go_mod, module, version).await;
+    let graph = module_graph_for(project_root, &go_mod, go_sum.as_deref(), module, version).await;
     Some(selection_in(
         &go_mod,
         go_sum.as_deref(),
@@ -399,11 +458,10 @@ mod tests {
     #[test]
     fn unpruned_require_is_a_lower_bound() {
         let m = format!("module c\n\ngo 1.16\n\nrequire {UP} v1.0.0\n");
+        // A zip line above it is a dependency's raise or one a downgrade
+        // left behind: only the module graph tells which (#1862).
         let s = sum(&[&format!("{UP} v1.0.1")]);
-        assert_eq!(
-            selection(&m, Some(&s), UP, "v1.0.0"),
-            Selection::Other("v1.0.1".into())
-        );
+        assert_eq!(selection(&m, Some(&s), UP, "v1.0.0"), Selection::Unproven);
         // A tidied directory replace drops the original's go.sum lines.
         assert_eq!(selection(&m, Some(""), UP, "v1.0.0"), Selection::Selected);
         // Only a lower bound below the patched version: can't tell.
@@ -648,11 +706,88 @@ mod tests {
             ),
         ] {
             let m = format!("module c\n\n{go}\n\n{replace}");
-            assert_eq!(needs_module_graph(&m, UP, "v1.0.0"), needed, "{m}");
-            assert_eq!(may_need_module_graph(&m), needed, "{m}");
+            assert_eq!(needs_module_graph(&m, None, UP, "v1.0.0"), needed, "{m}");
+            assert_eq!(may_need_module_graph(&m, None), needed, "{m}");
         }
         let m = format!("module c\n\ngo 1.16\n\n{fork}");
-        assert!(!needs_module_graph(&m, UP, "v1.1.0"));
+        assert!(!needs_module_graph(&m, None, UP, "v1.1.0"));
+    }
+
+    /// #1862: `go get M@<lower>` lowers go.mod's require but keeps the old
+    /// version's go.sum lines until `go mod tidy`.
+    fn downgraded(from: &str, to: &str) -> (String, String) {
+        let m = format!("module c\n\ngo 1.16\n\nrequire {UP} {to}\n");
+        let s = sum(&[
+            &format!("{UP} {to}"),
+            &format!("{UP} {to}/go.mod"),
+            &format!("{UP} {from}"),
+            &format!("{UP} {from}/go.mod"),
+        ]);
+        (m, s)
+    }
+
+    /// #1862 case 1: downgraded below the patched version, the stale zip
+    /// line at the patched version is no proof it is built.
+    #[test]
+    fn stale_zip_line_above_require_does_not_prove_the_patched_version() {
+        let (m, s) = downgraded("v1.0.0", "v0.9.0");
+        assert_eq!(selection(&m, Some(&s), UP, "v1.0.0"), Selection::Unproven);
+        // MVS over the module graph settles it: the build selects v0.9.0.
+        let g = graph(&[(UP, "v0.9.0")], true);
+        assert_eq!(
+            selection_in(&m, Some(&s), Some(&g), UP, "v1.0.0"),
+            Selection::Other("v0.9.0".into())
+        );
+        // An incomplete graph proves nothing.
+        let g = graph(&[(UP, "v0.9.0")], false);
+        assert_eq!(
+            selection_in(&m, Some(&s), Some(&g), UP, "v1.0.0"),
+            Selection::Unproven
+        );
+        assert!(needs_module_graph(&m, Some(&s), UP, "v1.0.0"));
+        assert!(may_need_module_graph(&m, Some(&s)));
+    }
+
+    /// #1862 case 2: downgraded to the patched version, the stale zip line
+    /// above it is no proof the build selects another.
+    #[test]
+    fn stale_zip_line_above_require_does_not_refuse_the_required_version() {
+        let (m, s) = downgraded("v1.1.0", "v1.0.0");
+        assert_eq!(selection(&m, Some(&s), UP, "v1.0.0"), Selection::Unproven);
+        let g = graph(&[(UP, "v1.0.0")], true);
+        assert_eq!(
+            selection_in(&m, Some(&s), Some(&g), UP, "v1.0.0"),
+            Selection::Selected
+        );
+        assert!(needs_module_graph(&m, Some(&s), UP, "v1.0.0"));
+    }
+
+    /// A dependency's raise looks the same in go.mod and go.sum, and the
+    /// graph tells the two apart.
+    #[test]
+    fn module_graph_confirms_a_dependency_raise() {
+        let (m, s) = downgraded("v1.0.1", "v1.0.0");
+        let g = graph(&[(UP, "v1.0.1")], true);
+        assert_eq!(
+            selection_in(&m, Some(&s), Some(&g), UP, "v1.0.1"),
+            Selection::Selected
+        );
+        assert_eq!(
+            selection_in(&m, Some(&s), Some(&g), UP, "v1.0.0"),
+            Selection::Other("v1.0.1".into())
+        );
+        // A patched version below go.mod's require is never selected, so
+        // there the files settle it without the graph.
+        assert_eq!(
+            selection(&m, Some(&s), UP, "v0.9.0"),
+            Selection::Other("v1.0.1".into())
+        );
+        assert!(!needs_module_graph(&m, Some(&s), UP, "v0.9.0"));
+        // Zip lines at or below require, or a pruned graph, need no graph.
+        let tidy = sum(&[&format!("{UP} v1.0.0")]);
+        assert!(!may_need_module_graph(&m, Some(&tidy)));
+        let pruned = m.replace("go 1.16", "go 1.21");
+        assert!(!may_need_module_graph(&pruned, Some(&s)));
     }
 
     /// Without the graph, go.mod's require of a lower version of the

@@ -562,14 +562,23 @@ async fn read_go_workspace(
                 }
             }
             // Module mode: whether a module-to-module replace is in effect
-            // can turn on modules only the dependencies require (#1840).
+            // can turn on modules only the dependencies require (#1840),
+            // and which version the build selects on a go.sum zip line a
+            // downgrade may have left behind (#1862).
             let mut module_graph = None;
             if loaded == Loaded::None {
                 touched.push(root.join("go.mod"));
+                touched.push(root.join("go.sum"));
                 let go_mod = crate::utils::fs::read_regular_to_string(&root.join("go.mod")).await;
+                let go_sum = crate::utils::fs::read_regular_to_string(&root.join("go.sum"))
+                    .await
+                    .ok();
                 if let Ok(go_mod) = go_mod {
                     let go_mod = crate::vendor::go_mod_edit::normalize_for_read(&go_mod);
-                    if crate::vendor::go_build_list::may_need_module_graph(&go_mod) {
+                    if crate::vendor::go_build_list::may_need_module_graph(
+                        &go_mod,
+                        go_sum.as_deref(),
+                    ) {
                         touched.extend(
                             crate::vendor::go_build_list::module_graph_reads(&go_mod)
                                 .into_iter()

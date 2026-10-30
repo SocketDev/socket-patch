@@ -9789,6 +9789,7 @@ fn rewrite_golang_target(
         return false;
     } else if selection != go_build_list::Selection::Selected
         && (in_workspace && selection == go_build_list::Selection::Unknown
+            || selection == go_build_list::Selection::Unproven
             || prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str())))
     {
         // Not selected by go.mod's require, no go.sum zip line at this
@@ -9797,10 +9798,21 @@ fn rewrite_golang_target(
         // module cache). Its replace would be inert, and confirming it
         // would attest a patch no build links. A workspace graph that
         // could not be read proves nothing either way, so there even our
-        // own pin is no proof the build selects this version.
+        // own pin is no proof the build selects this version. Nor is it
+        // over a go.sum zip line above go.mod's require that a downgrade
+        // may have left behind (#1862).
         result.warnings.push(RewriteWarning {
             code: "redirect_golang_not_in_module_graph".into(),
-            detail: if in_workspace && selection == go_build_list::Selection::Unknown {
+            detail: if selection == go_build_list::Selection::Unproven {
+                format!(
+                    "{fname}@{}: nothing shows the build selects this version — go.sum has \
+                     a zip line above go.mod's require (a dependency's raise, or a line a \
+                     downgrade left until `go mod tidy`) and a go.mod its module graph needs \
+                     is not in the module cache (`go mod download` fetches it); nothing \
+                     redirected",
+                    dep.version
+                )
+            } else if in_workspace && selection == go_build_list::Selection::Unknown {
                 format!(
                     "{fname}@{}: nothing shows the go.work workspace building this version \
                      — a go.mod its module graph needs is not in the module cache (`go mod \
