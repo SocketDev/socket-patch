@@ -73,6 +73,10 @@ struct PinScan {
     exact: Vec<PinSpan>,
     /// Some occurrence carries extras.
     extras: bool,
+    /// Some occurrence with extras pins exactly this version (`==` or
+    /// `===`), or is the file's one unpinned line for the package: the pin
+    /// hosted mode rewrites, which a wheel path line can't (#1794).
+    exact_extras: bool,
     /// Some occurrence names the package ambiguously on its own.
     range: bool,
     /// Some occurrence exactly pins a DIFFERENT version on its own
@@ -129,10 +133,18 @@ fn pin_refusal(scan: &PinScan, split_ok: bool) -> Option<PinRefusal> {
 fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
     let mut exact: Vec<PinSpan> = Vec::new();
     let mut found_extras = false;
+    let mut exact_extras = false;
     let mut found_range = false;
     let mut other_branches = false;
+    // Hosted mode also rewrites a file's one line for the package when it
+    // is unpinned (`six[foo]`), so that extras line counts as exact too.
+    let mut named_lines = 0usize;
+    let mut unpinned_extras = false;
     for ll in logical_lines(content) {
         let code = strip_comment(&ll.text);
+        if requirement_name(code).is_some_and(|name| canonicalize_pypi_name(name) == canon_name) {
+            named_lines += 1;
+        }
         let Some(req) = parse_requirement(code) else {
             // A line that names the package but is no requirement pip
             // reads cleanly is never a pin to rewrite (fail closed).
@@ -147,6 +159,11 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
         }
         if req.extras.is_some() {
             found_extras = true;
+            exact_extras |= req
+                .exact_version()
+                .is_some_and(|pinned| crate::utils::pep440::versions_equal(pinned, version))
+                || req.arbitrary_version() == Some(version);
+            unpinned_extras |= req.specifier.is_empty() && req.direct_reference.is_none();
             continue;
         }
         // pip resolves `==` under PEP 440 (`==1.16` installs 1.16.0).
@@ -182,6 +199,7 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
     PinScan {
         exact,
         extras: found_extras,
+        exact_extras: exact_extras || (unpinned_extras && named_lines == 1),
         range: found_range,
         other_branches,
     }
@@ -421,9 +439,10 @@ fn wired_pin_in(content: &str, canon_name: &str, record_uuid: &str) -> Option<(S
 /// the registry in a shape the wiring rewrites in place, with no vendor line
 /// for the package yet (#612, #1368). Vendored Pipenv and uv wire such a pin
 /// together with their lock, as hosted mode rewrites both; anything else (no
-/// pin, a range, extras, an include outside the root, an existing vendor
-/// line, a symlinked file the rewrite would replace) is left to the
-/// `pypi_multiple_lockfiles` warning.
+/// pin, a range, an include outside the root, an existing vendor line, a
+/// symlinked file the rewrite would replace) is left to the
+/// `pypi_multiple_lockfiles` warning, except an exact pin with extras, which
+/// refuses a fresh wiring ([`fresh_sibling_pin`]).
 pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: &str) -> bool {
     let Ok(files) = collect_requirements_files(root).await else {
         return false;
@@ -444,6 +463,69 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
             .flat_map(|f| f.records.iter())
             .all(|r| r.action == WiringAction::Rewritten)
         && refuse_symlinked(root, &rels).await.is_ok()
+}
+
+/// The refusal for a requirements pin with extras, which a vendored wheel
+/// path line cannot express.
+fn extras_refusal(rel: &str, canon_name: &str) -> (&'static str, String) {
+    (
+        "pypi_extras_unsupported",
+        format!(
+            "{rel}: the {canon_name} pin declares extras, which a vendored wheel path line \
+             cannot express; remove the extras or use agent mode \
+             (`scan --mode agent` + `socket-patch apply`) instead"
+        ),
+    )
+}
+
+/// [`sibling_pin_wirable`] for a lock about to be wired fresh, except
+/// that a requirements set pinning exactly `canon_name==version` with
+/// extras (`six[foo]==1.16.0`) refuses the package, as the
+/// requirements-only wiring does (#1794). The wiring can't rewrite that pin,
+/// and wiring the lock alone is no answer: after a hosted -> vendored
+/// switch it is the pin the upstream restore just un-hosted, so `pip
+/// install -r` would go from patched to unpatched. The refusal keeps the
+/// hosted pin instead (the takeover rolls its restore back). A set that
+/// already carries a vendor line for the package is left as it was.
+pub(super) async fn fresh_sibling_pin(
+    root: &Path,
+    canon_name: &str,
+    version: &str,
+) -> Result<bool, (&'static str, String)> {
+    let files = match collect_requirements_files(root).await {
+        Ok(files) => files,
+        // A root file the planner refuses to read (say UTF-16, #1120) is
+        // still one pip installs from.
+        Err(_) => {
+            let root_file = root.join(crate::formats::governing_locks::PYPI_REQUIREMENTS);
+            let text = crate::utils::fs::read_regular_to_bytes(&root_file)
+                .await
+                .ok()
+                .and_then(|bytes| crate::utils::requirements::decode(&bytes));
+            return match text {
+                Some(text) if scan_pins(&text, canon_name, version).exact_extras => {
+                    Err(extras_refusal(
+                        crate::formats::governing_locks::PYPI_REQUIREMENTS,
+                        canon_name,
+                    ))
+                }
+                _ => Ok(false),
+            };
+        }
+    };
+    if files
+        .iter()
+        .any(|f| vendored_uuid_for(&f.content, canon_name).is_some())
+    {
+        return Ok(false);
+    }
+    if let Some(file) = files
+        .iter()
+        .find(|f| scan_pins(&f.content, canon_name, version).exact_extras)
+    {
+        return Err(extras_refusal(&file.rel, canon_name));
+    }
+    Ok(sibling_pin_wirable(root, canon_name, version).await)
 }
 
 /// The `requirements_line` records of a mixed entry (a Pipenv or uv entry
@@ -846,17 +928,7 @@ async fn plan_requirements(
 
     for (file, scan) in files.iter().zip(scans) {
         match pin_refusal(&scan, split_ok) {
-            Some(PinRefusal::Extras) => {
-                return Err((
-                    "pypi_extras_unsupported",
-                    format!(
-                        "{}: the {canon_name} pin declares extras, which a vendored wheel path \
-                         line cannot express; remove the extras or use agent mode \
-                         (`scan --mode agent` + `socket-patch apply`) instead",
-                        file.rel
-                    ),
-                ));
-            }
+            Some(PinRefusal::Extras) => return Err(extras_refusal(&file.rel, canon_name)),
             Some(PinRefusal::NotPinned) => {
                 return Err((
                     "pypi_requirement_not_pinned",
@@ -1876,6 +1948,79 @@ mod tests {
             .await
             .unwrap();
         tmp
+    }
+
+    /// #1794: a requirements pin with extras of the release being vendored
+    /// (`==` or `===`, in the root or an include, UTF-8 or UTF-16) refuses
+    /// a fresh lock wiring with `pypi_extras_unsupported`, naming the file,
+    /// instead of reading as an unwirable loser, and so does the file's one
+    /// unpinned extras line (`six[foo]`), which hosted mode rewrites too.
+    /// Extras on another version or a range, two unpinned lines, a wirable pin, and a set that already carries a vendor
+    /// line for the package keep the old answer.
+    #[tokio::test]
+    async fn fresh_sibling_pin_refuses_an_exact_extras_pin() {
+        for (root, include, file) in [
+            ("idna==3.7\nsix[foo]==1.16.0\n", None, "requirements.txt"),
+            (
+                "Six[foo,bar] == 1.16 ; python_version >= \"3\"\n",
+                None,
+                "requirements.txt",
+            ),
+            ("six[foo]===1.16.0\n", None, "requirements.txt"),
+            ("-r base.txt\n", Some("six[foo]==1.16.0\n"), "base.txt"),
+            ("idna==3.7\nsix[foo]\n", None, "requirements.txt"),
+        ] {
+            let tmp = write_root(root).await;
+            if let Some(include) = include {
+                tokio::fs::write(tmp.path().join("base.txt"), include)
+                    .await
+                    .unwrap();
+            }
+            let (code, detail) = fresh_sibling_pin(tmp.path(), "six", "1.16.0")
+                .await
+                .unwrap_err();
+            assert_eq!(code, "pypi_extras_unsupported", "{root}: {detail}");
+            assert!(detail.starts_with(&format!("{file}: ")), "{root}: {detail}");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "six[foo]==1.16.0\r\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        tokio::fs::write(tmp.path().join("requirements.txt"), utf16)
+            .await
+            .unwrap();
+        let (code, _) = fresh_sibling_pin(tmp.path(), "six", "1.16.0")
+            .await
+            .unwrap_err();
+        assert_eq!(code, "pypi_extras_unsupported", "UTF-16");
+
+        for (root, wirable) in [
+            ("six[foo]==1.15.0\n", false),
+            ("six[foo]>=1.15\n", false),
+            ("six[foo]\nsix[bar]\n", false),
+            ("idna[foo]==1.16.0\nsix==1.16.0\n", true),
+            ("VENDORED", false),
+        ] {
+            let vendored =
+                format!("./{REL_WHEEL}  # socket-patch vendor: six==1.16.0\nsix[foo]==1.16.0\n");
+            let root = if root == "VENDORED" {
+                vendored.as_str()
+            } else {
+                root
+            };
+            let tmp = write_root(root).await;
+            assert_eq!(
+                fresh_sibling_pin(tmp.path(), "six", "1.16.0").await,
+                Ok(wirable),
+                "{root}"
+            );
+        }
     }
 
     /// #721: pip installs from a UTF-16 requirements file (what Windows

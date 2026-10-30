@@ -1117,12 +1117,13 @@ async fn pypi_prelude<'p>(
                     warnings.extend(project.warnings.iter().cloned());
                     // #1368: a `uv export` requirements file is an install
                     // path of its own; wire its pin with the lock.
-                    let sibling = super::pypi_requirements::sibling_pin_wirable(
+                    let sibling = super::pypi_requirements::fresh_sibling_pin(
                         project_root,
                         &canon_name,
                         version,
                     )
-                    .await;
+                    .await
+                    .map_err(|(code, detail)| refused(code, detail))?;
                     if sibling && dry_run {
                         warnings.push(sibling_dry_run_notice(flavor, &canon_name, version));
                     }
@@ -1157,12 +1158,13 @@ async fn pypi_prelude<'p>(
                     // #1758: the requirements.txt the pylock was locked
                     // from is an install path of its own; wire its pin
                     // with the lock.
-                    let sibling = super::pypi_requirements::sibling_pin_wirable(
+                    let sibling = super::pypi_requirements::fresh_sibling_pin(
                         project_root,
                         &canon_name,
                         version,
                     )
-                    .await;
+                    .await
+                    .map_err(|(code, detail)| refused(code, detail))?;
                     if sibling && dry_run {
                         warnings.push(sibling_dry_run_notice(flavor, &canon_name, version));
                     }
@@ -1351,14 +1353,18 @@ async fn pypi_prelude<'p>(
             // requirements.txt`) is an install path of its own; wire its
             // pin with the lock, or re-wire the one the superseded entry
             // wired.
-            let sibling =
+            let sibling = if target == PipenvTarget::Fresh && superseded.is_none() {
+                super::pypi_requirements::fresh_sibling_pin(project_root, &canon_name, version)
+                    .await
+                    .map_err(|(code, detail)| refused(code, detail))?
+            } else {
                 super::pypi_requirements::sibling_pin_wirable(project_root, &canon_name, version)
                     .await
-                    || superseded.as_ref().is_some_and(|prev| {
-                        prev.wiring
-                            .iter()
-                            .any(|r| r.kind == super::pypi_requirements::RECORD_KIND)
-                    });
+            } || superseded.as_ref().is_some_and(|prev| {
+                prev.wiring
+                    .iter()
+                    .any(|r| r.kind == super::pypi_requirements::RECORD_KIND)
+            });
             // #1368: a pylock `pipenv lock` wrote beside Pipfile.lock
             // (`use_pylock = true`) still pinning the registry release.
             let pylock_states =
