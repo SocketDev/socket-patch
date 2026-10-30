@@ -1732,11 +1732,17 @@ impl ApiClient {
                 if let Some(err) = classify_auth_error(status, true) {
                     return Err((err, hint));
                 }
-                // The caller's cap bounds an error body too.
-                let text = read_capped_typed(resp, max_bytes, noun)
-                    .await
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
+                // An error body is only shown, so a small cap and the body
+                // timeout bound it; a longer or stalled one is dropped.
+                let text = tokio::time::timeout(
+                    self.vendor_retry.body_timeout,
+                    read_capped_typed(resp, max_bytes.min(64 * 1024), noun),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
                 let head = format!("{noun} download failed with status");
                 return Err((ApiError::Other(status_error(&head, status, &text)), hint));
             }
@@ -2922,8 +2928,8 @@ mod patch_api_seam_tests {
             .is_err());
     }
 
-    /// An error body is read under the caller's cap too: its message
-    /// shows when it fits, and an oversized one is dropped unread.
+    /// An error body is read under the caller's cap (at most 64 KiB): its
+    /// message shows when it fits, and an oversized one is dropped unread.
     #[tokio::test]
     async fn trait_download_error_body_is_capped() {
         use wiremock::matchers::{method, path};
