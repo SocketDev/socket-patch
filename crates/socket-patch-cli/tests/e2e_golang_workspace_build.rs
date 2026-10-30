@@ -1405,8 +1405,17 @@ fn apply_never_writes_go_work_when_gowork_names_a_sibling_file() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let _guard = ChmodGuard(tmp.path().to_path_buf());
-    let w = stage_members(tmp.path(), UVER, UVER);
-    let m = Machine::new(tmp.path(), "sibling");
+    // go takes its working directory with symlinks resolved, so a GOWORK
+    // under an unresolved temp path (macOS's /var -> /private/var) holds
+    // no member go runs in. (Windows keeps the path: canonicalize would
+    // give a \\?\ path go can't use.)
+    let base = if cfg!(windows) {
+        tmp.path().to_path_buf()
+    } else {
+        tmp.path().canonicalize().unwrap()
+    };
+    let w = stage_members(&base, UVER, UVER);
+    let m = Machine::new(&base, "sibling");
     download(&w.root, &m, &w.proxy);
     write_local_patch(&w.root, VENDOR_UUID);
     let ci = w.root.join("ci.work");
@@ -1477,7 +1486,7 @@ fn apply_never_writes_go_work_when_gowork_names_a_sibling_file() {
     assert_eq!(read(&w.root.join("go.work")), work, "go.work untouched");
     assert_eq!(read(&ci), work, "ci.work untouched");
     for dir in ["a", "b"] {
-        let (stdout, stderr) = run_member(tmp.path(), &w.root, dir, &w.proxy, &gowork);
+        let (stdout, stderr) = run_member(&base, &w.root, dir, &w.proxy, &gowork);
         assert!(
             stdout.contains(&format!("{}: PATCHED", dir.to_uppercase())),
             "{dir}: {stdout}\n{stderr}"
