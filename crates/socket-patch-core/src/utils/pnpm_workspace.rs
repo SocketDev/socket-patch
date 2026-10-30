@@ -421,9 +421,10 @@ fn widen_classes(glob: &str) -> String {
     out
 }
 
-/// How many brace alternatives [`member_dirs`] walks, over all its globs.
-/// Each alternative is a walk of the tree, so this bounds the walks a
-/// scanned repo's `pnpm-workspace.yaml` can ask for.
+/// How many brace alternatives [`member_dirs`] walks, over all its globs
+/// that hold a brace set. Each alternative is a walk of the tree, so this
+/// bounds the walks a scanned repo's `pnpm-workspace.yaml` can add with
+/// braces; a glob without one is a single walk and is not counted.
 const MAX_WALKED_ALTERNATIVES: usize = 64;
 
 /// The workspace member directories `globs` name (see [`lists_member`]),
@@ -433,8 +434,8 @@ const MAX_WALKED_ALTERNATIVES: usize = 64;
 /// reached through a symbolic link is not a member. `Err` when a glob
 /// names more than [`MAX_MANIFESTS`] directories: the bounded walk stopped
 /// before listing them all, and part of the members is no answer. `Err`
-/// too when the globs expand to more than [`MAX_WALKED_ALTERNATIVES`]
-/// brace alternatives: each one is a walk of the tree, and an alternative
+/// too when the brace sets expand to more than [`MAX_WALKED_ALTERNATIVES`]
+/// alternatives: each one is a walk of the tree, and an alternative
 /// that matches nothing never reaches the directory bound.
 pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Result<Vec<String>, String> {
     modeled(globs)?;
@@ -447,7 +448,11 @@ pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Result<Vec<St
         let alternatives = brace_alternatives(glob).ok_or_else(|| {
             format!("`packages:` glob {glob:?} uses syntax socket-patch does not read")
         })?;
-        walked_alternatives += alternatives.len();
+        // A glob without a brace set is one walk, as it was before #1846:
+        // only the walks brace sets add count against the budget.
+        if alternatives.len() > 1 {
+            walked_alternatives += alternatives.len();
+        }
         if walked_alternatives > MAX_WALKED_ALTERNATIVES {
             return Err(format!(
                 "`packages:` glob {glob:?} expands to more than {MAX_WALKED_ALTERNATIVES} \
@@ -1514,6 +1519,10 @@ mod tests {
             member_dirs(&Wide(10), &few).unwrap(),
             vec!["packages/p00001", "packages/p00002"]
         );
+        // Globs without braces are one walk each and never count against
+        // the alternatives budget, however many the workspace lists.
+        let plain: Vec<String> = (0..100).map(|i| format!("packages/p{i:05}")).collect();
+        assert_eq!(member_dirs(&Wide(100), &plain).unwrap().len(), 100);
         // One bound covers every brace alternative: each of `a/*` and
         // `b/*` stays under it, together they do not (#1846).
         struct Two(usize);
