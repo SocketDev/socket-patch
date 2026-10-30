@@ -338,7 +338,10 @@ fn modeled(globs: &[String]) -> Result<(), String> {
         if !glob.contains(['[', ']', '{', '}']) {
             return true;
         }
+        // Classes are checked on the raw glob too: pnpm reads braces inside
+        // a class as class members (`[a{b,c}]` lists `,` and `{`).
         !glob.contains(['+', '\\'])
+            && plain_classes(glob)
             && plain_braces(glob)
             && brace_alternatives(glob).is_some_and(|alternatives| {
                 alternatives.iter().all(|alternative| {
@@ -391,7 +394,13 @@ fn plain_braces(glob: &str) -> bool {
                 }
                 alternatives.push(&body[start..]);
                 if alternatives.len() > 1 {
-                    if alternatives.iter().any(|a| a.is_empty()) {
+                    // pnpm expands a `..` beside a comma as a sequence too
+                    // (`{a,b..c}` lists `,` and `A`), so only a lone
+                    // same-kind sequence is read.
+                    if alternatives
+                        .iter()
+                        .any(|a| a.is_empty() || a.contains(".."))
+                    {
                         return false;
                     }
                 } else if body.contains("..") && !same_kind_range(body) {
@@ -1496,6 +1505,12 @@ mod tests {
             "packages/{a,}",
             "packages/{,a}",
             "packages/{a,{b,}}",
+            // A `..` beside a comma is a sequence to pnpm, and braces inside
+            // a class are class members.
+            "packages/{a,b..c}",
+            "packages/{a,..}",
+            "packages/{a,b..c,x}",
+            "packages/[a{b,c}]",
             // A range from `-` spans `.` and `/`.
             "packages/[--9]h",
         ] {
