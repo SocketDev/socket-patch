@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-10-30T01:50Z · main @ 5ca5623_
+_Last updated 2026-10-30T03:30Z · main @ 5ca5623_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -9,6 +9,7 @@ _Last updated 2026-10-30T01:50Z · main @ 5ca5623_
 | [#1849](https://github.com/SocketDev/socket-patch/pull/1849) | structural | A01 [#1832](https://github.com/SocketDev/socket-patch/issues/1832): `utils/cargo_build_cache.rs` | ready; CI and Bugbot green |
 | [#1864](https://github.com/SocketDev/socket-patch/pull/1864) | sweep | `cli/src/commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` (+ dead branch in `rollback.rs`) | ready; CI (82 checks) and Bugbot green |
 | [#1870](https://github.com/SocketDev/socket-patch/pull/1870) | structural | A27 [#1869](https://github.com/SocketDev/socket-patch/issues/1869): `api/client.rs`, one serve GET and one vendor retry loop | ready; CI (82 checks) and Bugbot green |
+| [#1875](https://github.com/SocketDev/socket-patch/pull/1875) | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI and Bugbot pending |
 
 #### Merged
 _None._
@@ -23,7 +24,7 @@ Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`:
 
 A02 [#1833](https://github.com/SocketDev/socket-patch/issues/1833) moved to the fixer's #1866. T03 [#1837](https://github.com/SocketDev/socket-patch/issues/1837) stays at 4, A05 [#1844](https://github.com/SocketDev/socket-patch/issues/1844) at ~2.
 
-The next run is a sweep (this one was structural). Next sweep files, in order: `cli/commands/remove.rs`, `repair.rs`, `rollback.rs`, `scan/discovery.rs` (check against #1856), then `core/constants.rs`, `core/lib.rs`, `core/utils/cargo_home.rs`, `core/utils/cargo_workspace.rs` (skip `cargo_build_cache.rs` while #1849 is open, and `api/client.rs` while #1870 is open). Skip `agent_download.rs`, `apply.rs`, `get.rs` and `vendor.rs` while #1698 is open.
+The next run is structural if a candidate scores 6 or more and its files are free (T09 is not yet), else a sweep. Next sweep files, in order: `scan/discovery.rs` (`rollback.rs` waits for #1864), then `core/constants.rs`, `core/lib.rs`, `core/utils/cargo_home.rs`, `core/utils/cargo_workspace.rs` (skip `cargo_build_cache.rs` while #1849 is open, and `api/client.rs` while #1870 is open). Skip `agent_download.rs`, `apply.rs`, `get.rs` and `vendor.rs` while #1698 is open.
 
 #### Notes
 - The PRs of the first thread (`arch-refactor/<issue>-*`) are listed in `review/2026-10-v1/register/90-refactor.md`.
@@ -34,4 +35,6 @@ The next run is a sweep (this one was structural). Next sweep files, in order: `
 - #1698 also touches `vendor.rs`, so the three `bun_vendor_preflight*` entry points (callers in `get.rs`, `agent_download.rs`, `vendor.rs`) and `StageOutcome::Unavailable`'s payload (caller `apply.rs`) wait until it merges. Check every caller file against open PRs, not only the swept file.
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0`: a default debug build of the CLI tests exhausts the session disk allowance. CI's clippy is `--workspace --all-features` without `--tests`; the integration tests carry pre-existing lints.
 - `ApiClient::with_vendor_retry` is the policy builder; a new private helper with that name collides (E0592). Grep a name before you introduce it.
+- `tests/repair` has 2 chmod-based tests that fail under the root sandbox (`repair_cleanup_failure_is_reported_in_json_and_silent_modes`, `repair_exits_zero_and_stays_quiet_when_lock_file_unremovable`); they pass in CI.
+- remove's ~900-line `run` split (audit note) is too big for a sweep; it wants an issue alongside T16/T17/T20.
 - A shared GET must keep every caller's bounds: folding an uncapped `resp.text()` error read into the capped `PatchApi` path is what /code-review caught on #1870.
