@@ -340,7 +340,8 @@ pub struct VendorRetryPolicy {
     /// connect + response headers (a black-holed or stalled host fails the
     /// attempt instead of hanging the run).
     pub attempt_timeout: Duration,
-    /// Bound on one archive GET's body read.
+    /// Bound on one serve GET's body read (the archive/artifact bytes, or
+    /// an error body).
     pub body_timeout: Duration,
 }
 
@@ -2955,6 +2956,67 @@ mod patch_api_seam_tests {
         );
         let err = api.download_artifact(&url, 8).await.unwrap_err();
         assert_eq!(err.to_string(), "artifact download failed with status 500");
+    }
+
+    /// An error body over 64 KiB is dropped even under a large caller cap,
+    /// so a hostile or broken server can't make the message huge.
+    #[tokio::test]
+    async fn trait_download_error_body_is_capped_at_64_kib() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/err.whl"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("x".repeat(70 * 1024)))
+            .mount(&server)
+            .await;
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            route: ApiRoute::Proxy,
+        })
+        .with_vendor_retry(VendorRetryPolicy::none());
+        let api: &dyn PatchApi = &client;
+        let url = format!("{}/err.whl", server.uri());
+        let err = api.download_artifact(&url, 1 << 20).await.unwrap_err();
+        assert_eq!(err.to_string(), "artifact download failed with status 500");
+    }
+
+    /// A stalled error body is dropped at the body timeout instead of
+    /// holding the attempt open.
+    #[tokio::test]
+    async fn trait_download_stalled_error_body_is_bounded_in_time() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 100\r\n\r\npartial",
+                )
+                .await;
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        });
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: format!("http://{addr}"),
+            api_token: None,
+            route: ApiRoute::Proxy,
+        })
+        .with_vendor_retry(VendorRetryPolicy {
+            body_timeout: Duration::from_millis(300),
+            ..VendorRetryPolicy::none()
+        });
+        let api: &dyn PatchApi = &client;
+        let started = std::time::Instant::now();
+        let err = api
+            .download_artifact(&format!("http://{addr}/err.whl"), 1 << 20)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(err.to_string(), "artifact download failed with status 503");
     }
 }
 
