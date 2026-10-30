@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -43,3 +43,11 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
   - about 12 trivial wrappers (identity `ranking::merged_coverage`, `org_slug`/`uses_public_proxy` over `route()`, `CargoCrawler::cargo_home`);
   - dead code: `get_api_client_from_env` (no caller), `blob_fetcher`'s `on_progress` parameter (every caller passes `None`), `CargoCrawler`'s `Default`;
   - about 140 deletable comment lines (mostly `vendor_prefetch`'s 110-line module doc and `client.rs` history notes).
+- **Tally for `crates/socket-patch-cli/src/commands/scan/` (8 files, 15.5K lines: `gc.rs`, `hosted.rs`, `hosted/{nuget,python,takeover}.rs`, `mod.rs`, `policy.rs`, `render.rs`):**
+  - about 90 single-caller functions (≈25 worth inlining; render's byte-tested builders stay);
+  - about 26 trivial wrappers or shims (`count`, `run_warning_of`, `emit_json_error`, 4 re-export shims in `mod.rs`, 3 policy getters over a `pub` field);
+  - dead code: `selection_args` (its only caller always takes the branch that ignores it), `run_redirect`'s non-JSON arm and `Option<Envelope>` (called only from the JSON arm);
+  - about 335 deletable comment lines.
+- **Giant functions (cont.):** `run_scan` is now 1,864 lines (C11/#843; it calls `discover_selected` twice in a row in its JSON arm), `run_redirect_selected_untracked` 1,233 {{T24}}.
+- **Engine code in `scan/`:** `hosted/takeover.rs` (a 425-line plan/stage/retract/finish engine over `GroupCommit`) and `hosted/nuget.rs` belong in core; scan imports `commands::vendor::{dispatch_revert_one, run_vendor_gc, unused_vendored_manifest_keys}`. C12. `takeover.rs` also parses core warning prose (`residual_only_keep`), and `npm_allow_remote_one_line` matches `guidance` sentences.
+- **Misplaced in `scan/mod.rs`:** the takeover section (L926-L1123, used only by `hosted.rs`) and `gradle_scan` (L1194-L1387, Maven-specific). `policy_bypass_warnings` is get-only policy evaluation that belongs in core `policy`.

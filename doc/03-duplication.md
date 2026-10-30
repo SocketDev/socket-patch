@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -39,3 +39,11 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 - **Serve-URL GET and retry loops:** `download_vendor_archive_once` vs `download_artifact_capped_once` (drifted cap-breach variant and status text); 4 retry loops under 2 policies. {{A27}}
 - **Service-archive integrity gate:** `vendor_prefetch::ride_along` re-implements `service_fetch::fetch_verified_archive`'s sha512 + `h1:` checks. Local note.
 - **Worst-severity label picker:** a fourth copy in core `client.rs::convert_search_result_to_batch_info` (handed to audit-cli-tests for {{T10}}).
+- **Disk vs in-memory hosted pipeline:** `scan/hosted.rs` repeats `hosted/memory/stages.rs` step for step; drifted on the governing-root refusal and warning order. Child of C12. {{T24}}
+- **Pipenv stale-install remedy:** hosted `scan/hosted/python.rs` and core `vendor/pypi.rs`; drifted on warning count, wording and name parsing. {{T26}}
+- **Vulnerability label (CVEs else advisory id):** scan render, get ×2, list; drifted on order, dedup and severity case. {{T28}}
+- **Hosted `redirect` JSON block:** disk `{mode, rewrittenFiles}` vs core's seven-key block, whose doc claims to be the only spelling. {{T29}}
+- **Snapshot/put-back of uncaptured files:** `scan/hosted.rs` and `vendor.rs` eject; hosted drops put-back errors. {{T30}}
+- **Root-marker predicate:** `scan/policy.rs` `lock_markers` and core `memory/roots.rs`; disk adds a manifest fallback. {{T31}}
+- **Agent dry-run preview event:** scan, get and agent_download, plus a fourth already-recorded check in scan. {{T32}}
+- **Patch selection:** a fifth copy in core `hosted/memory::select_with_policy`; the socket.yml floor 3×, the tier filter 4×. {{T15}}

@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -51,3 +51,9 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
   - Env mutation without a guard: `client` `test_get_api_client_from_env_no_token` (and it reads the user's socket-cli config).
   - Test scaffolding: four xorshift64* RNGs and eight legacy crawler oracles. {{A29}}
 - **Strong:** `vendor_prefetch`'s serial-differential tests and `client`'s wiremock retry tests assert request counts and outcomes, not mocks.
+- **Tally for `commands/scan/` (8 files): about 40 fake, duplicate or misplaced tests.**
+  - Can't fail: `scan/mod.rs` 3 `takeover_detail_*` tests' negative asserts (phrases the string never had), an `assert_ne!` between constants, `vex_error_warnings_append_to_scan_json` (tests `Vec::extend`); `hosted.rs` a constant tautology (L4534).
+  - Duplicates: `hosted.rs` L3836/L3853 exact; gc's composer/encoded/PEP 503 tests re-test core `PurlKey`; gc's corrupt-manifest tests ×2 repeat L966; render `highest_severity_picks_worst` copies core `ranking.rs`; `package_specs_match_names_and_purls` copies core `policy/tests.rs`.
+  - Misplaced: 17 tests of core code in `hosted.rs` (~700 lines, 15 of `hosted::guidance`, reached through a `cfg(test)` re-export of 20 items); 2 `Discovery` tests in `mod.rs`.
+  - Sentence matching: policy L988, render L856.
+- **Coverage gaps:** `takeover.rs` plan/stage/retract/finish and `hosted/nuget.rs` have no unit test; `redirect_takeover_not_pinned` is in no test; `scan`'s `path_outside_repo` and multi-directory `--json`/`--vex` refusals are untested; no test asserts disk and memory `redirect` keys agree {{T29}}.
