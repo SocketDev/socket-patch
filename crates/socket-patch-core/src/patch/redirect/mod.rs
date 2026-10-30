@@ -92,6 +92,8 @@ mod platform_wheel_tests;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
+#[cfg(test)]
+mod pypi_no_lockfile_tests;
 mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
 #[cfg(test)]
@@ -756,6 +758,7 @@ fn rewriter_groups<'a>(
             rewrite_hatch(files, overrides, result);
             rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
+            warn_no_pypi_wiring(files, overrides, result);
         }),
         Box::new(move |result| rewrite_cargo_with(files, overrides, cargo_outer, result)),
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
@@ -1019,6 +1022,86 @@ fn merge_group_outputs(prefix: &RewriteResult, outs: Vec<RewriteResult>) -> Opti
         merge_group_delta(&mut result, delta);
     }
     Some(result)
+}
+
+/// #638: the PyPI twin of `redirect_npm_no_lockfile` /
+/// `redirect_composer_no_lockfile`. A pypi patch reached the PyPI lane, but
+/// the project has no file any PyPI rewriter reads (a root
+/// `requirements.txt`, a tool lock, a PEP 751 / PEP 723 lock, or a Hatch
+/// configuration), so nothing can pin it. Said once per run, naming what
+/// was looked for; the per-patch `redirect_unconfirmed` row still follows.
+/// A file that IS present owns its deps' diagnostics instead.
+fn warn_no_pypi_wiring(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    if !overrides.iter().any(|dep| dep.ecosystem == "pypi") {
+        return;
+    }
+    let wired = files.keys().any(|key| {
+        key == crate::formats::governing_locks::PYPI_REQUIREMENTS
+            || crate::formats::governing_locks::PYPI_TOOL_LOCKS.contains(&key.as_str())
+            || crate::utils::python_lock::is_python_lock_name(key)
+    });
+    if wired || crate::utils::hatch::is_hatch(files) {
+        return;
+    }
+    result.warnings.push(RewriteWarning {
+        code: "redirect_pypi_no_lockfile".into(),
+        detail: format!(
+            "no readable requirements.txt, uv.lock, poetry.lock, pdm.lock, \
+             Pipfile.lock, pylock.toml / pylock.<name>.toml, PEP 723 script lock \
+             (<script>.py.lock) or Hatch configuration at the project root (hosted \
+             mode does not read other requirements files such as \
+             requirements-dev.txt); {}",
+            pypi_no_lockfile_remedy(files)
+        ),
+    });
+}
+
+/// What the project's own Python tooling suggests doing about
+/// `redirect_pypi_no_lockfile`: a Pipfile asks for `pipenv lock`; a
+/// pyproject naming its lock tool (a `[tool.<tool>]` table or its build
+/// backend) asks for that tool's lock; any other pyproject may be a plain
+/// pip project or a tool that writes no table of its own (`uv init`), so
+/// both remedies are offered.
+fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
+    const PIN: &str = "pin the package in a root requirements.txt";
+    if files.contains_key("Pipfile") {
+        return "run `pipenv lock` and commit Pipfile.lock, then re-run".into();
+    }
+    let Some(pyproject) = files.get("pyproject.toml") else {
+        return format!("{PIN} or commit the project's lock, then re-run");
+    };
+    let document = pyproject.parse::<toml_edit::DocumentMut>().ok();
+    let backend = document
+        .as_ref()
+        .and_then(|doc| doc.get("build-system"))
+        .and_then(|build| build.get("build-backend"))
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_default();
+    let names = |tool: &str| {
+        document
+            .as_ref()
+            .and_then(|doc| doc.get("tool"))
+            .is_some_and(|table| table.get(tool).is_some())
+            || backend.starts_with(&format!("{tool}."))
+            || backend.starts_with(&format!("{tool}_"))
+    };
+    for (tool, command) in [
+        ("uv", "uv lock"),
+        ("poetry", "poetry lock"),
+        ("pdm", "pdm lock"),
+    ] {
+        if names(tool) {
+            return format!("run `{command}` and commit its lock, then re-run");
+        }
+    }
+    format!(
+        "{PIN}, or, if a lock tool installs the project, generate and commit its \
+         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
+    )
 }
 
 fn rewrite_hatch(
