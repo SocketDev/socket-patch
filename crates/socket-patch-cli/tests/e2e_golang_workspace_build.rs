@@ -115,6 +115,42 @@ fn run_members(dir: &Path, machine: &Machine, env: &[(&str, &str)], want: &str, 
     }
 }
 
+/// Reinstall both members, then synchronize their requirements. Regenerating
+/// native workspace vendoring must also retain the patched runtime bytes.
+fn reinstall_workspace(root: &Path, machine: &Machine, env: &[(&str, &str)]) {
+    run_members(root, machine, env, "PATCHED", "before cache removal");
+    for args in [
+        vec!["clean", "-modcache", "-cache"],
+        vec!["mod", "download"],
+        vec!["work", "sync"],
+    ] {
+        let out = go(root, machine, &args, env);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    run_members(
+        root,
+        machine,
+        env,
+        "PATCHED",
+        "after reinstall and go work sync",
+    );
+    if golang_e2e_matrix::go_minor() >= 22 {
+        let out = go(root, machine, &["work", "vendor"], env);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        run_members(root, machine, env, "PATCHED", "after go work vendor");
+        // Later VEX tails deliberately inspect the module replacement itself.
+        std::fs::remove_dir_all(root.join("vendor")).unwrap();
+    }
+}
+
 /// Go extracts modules read-only; restore write bits so the tempdir drops.
 struct ChmodGuard(PathBuf);
 impl Drop for ChmodGuard {
@@ -484,6 +520,13 @@ fn go_work_vendored_members_build_patched_and_attest_without_manifest() {
         "vendored, go.work replace",
     );
 
+    reinstall_workspace(
+        root,
+        &Machine::new(tmp.path(), "vendored-reinstall"),
+        // Older Go work sync loads each member's original module metadata.
+        &day2(&ws.proxy),
+    );
+
     tail(&Tail {
         tmp: tmp.path(),
         ws: &ws,
@@ -697,6 +740,12 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
         &day2(&ws.proxy),
         "PATCHED",
         "hosted, go.work replace + go.work.sum",
+    );
+
+    reinstall_workspace(
+        root,
+        &Machine::new(tmp.path(), "hosted-reinstall"),
+        &day2(&ws.proxy),
     );
 
     tail(&Tail {

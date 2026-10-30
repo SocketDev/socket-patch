@@ -118,9 +118,14 @@ fn b64(bytes: &[u8]) -> String {
 /// Build the upstream module into a file proxy and `go mod download` it into
 /// a private GOMODCACHE. Returns `(consumer, modcache, proxy_url)`.
 fn stage(tmp: &Path) -> (PathBuf, PathBuf, String) {
+    let godir = golang_e2e_matrix::go_directive();
     let stage = tmp.join("stage").join(format!("{UMOD}@{UVER}"));
     std::fs::create_dir_all(&stage).unwrap();
-    std::fs::write(stage.join("go.mod"), format!("module {UMOD}\n\ngo 1.21\n")).unwrap();
+    std::fs::write(
+        stage.join("go.mod"),
+        format!("module {UMOD}\n\ngo {godir}\n"),
+    )
+    .unwrap();
     std::fs::write(stage.join("lib.go"), PRISTINE_LIB).unwrap();
 
     let pxv = tmp.join("proxy").join(UMOD).join("@v");
@@ -132,7 +137,7 @@ fn stage(tmp: &Path) -> (PathBuf, PathBuf, String) {
     .unwrap();
     std::fs::write(
         pxv.join(format!("{UVER}.mod")),
-        format!("module {UMOD}\n\ngo 1.21\n"),
+        format!("module {UMOD}\n\ngo {godir}\n"),
     )
     .unwrap();
     let zip_out = pxv.join(format!("{UVER}.zip"));
@@ -156,7 +161,7 @@ fn stage(tmp: &Path) -> (PathBuf, PathBuf, String) {
     std::fs::create_dir_all(&consumer).unwrap();
     std::fs::write(
         consumer.join("go.mod"),
-        format!("module example.com/consumer\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+        format!("module example.com/consumer\n\ngo {godir}\n\nrequire {UMOD} {UVER}\n"),
     )
     .unwrap();
     std::fs::write(
@@ -1033,6 +1038,85 @@ fn go_vendor_reports_applied_event() {
         &[],
     );
 
+    chmod_writable(tmp.path());
+}
+
+#[test]
+fn native_go_vendor_drift_and_tidy_rollback() {
+    if !golang_e2e_matrix::toolchain_ready("native vendor drift") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy) = stage(tmp.path());
+    let original_sums = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+    write_patch(&consumer);
+    let (code, so, se) = run_socket(&consumer, &["vendor", "--offline", "--json"], &modcache);
+    assert_eq!(code, 0, "{so} {se}");
+    let mut env = go_env(modcache.to_str().unwrap(), &proxy);
+    assert!(go(&consumer, &["mod", "tidy"], &env).status.success());
+    assert!(go(&consumer, &["mod", "vendor"], &env).status.success());
+    env.push(("GOFLAGS", ""));
+    let run = go(&consumer, &["run", "."], &env);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("OUT: PATCHED"));
+    for cmd in ["vendor", "apply"] {
+        let (code, so, se) = run_socket(
+            &consumer,
+            &[cmd, "--check", "--offline", "--json"],
+            &modcache,
+        );
+        assert_eq!(code, 0, "{cmd}: {so} {se}");
+    }
+    std::fs::write(
+        consumer.join("vendor").join(UMOD).join("lib.go"),
+        PRISTINE_LIB,
+    )
+    .unwrap();
+    for cmd in ["vendor", "apply"] {
+        let (code, so, se) = run_socket(
+            &consumer,
+            &[cmd, "--check", "--offline", "--json"],
+            &modcache,
+        );
+        assert_eq!(code, 1, "{cmd} must detect native vendor drift: {so} {se}");
+    }
+    let (code, so, se) = run_socket(
+        &consumer,
+        &[
+            "vex",
+            "--offline",
+            "--json",
+            "--product",
+            "pkg:golang/example.com/consumer@v1.0.0",
+            "--output",
+            "vex.json",
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 1, "native vendor drift must not attest: {so} {se}");
+    assert!(so.contains("go_vendor_content_mismatch"), "{so}");
+    let (code, so, se) = run_socket(
+        &consumer,
+        &["rollback", "--offline", "--ecosystems", "golang"],
+        &modcache,
+    );
+    assert_eq!(code, 0, "{so} {se}");
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.sum")).unwrap(),
+        original_sums
+    );
+    assert!(go(&consumer, &["mod", "vendor"], &env).status.success());
+    let run = go(&consumer, &["run", "."], &env);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("OUT: PRISTINE"));
     chmod_writable(tmp.path());
 }
 

@@ -207,6 +207,13 @@ pub async fn ensure_replace_entry(
     }
     let host = crate::vendor::go_workspace::replace_host(project_root, module).await;
     let host_path = project_root.join(host.file_name());
+    if !dry_run {
+        let content = read_regular_to_string(&host_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        upsert_replace_entry(&content, module, version, base_rel)?;
+        super::go_sum_backup::save(project_root, base_rel, module, version).await?;
+    }
     let upsert = plan_edit(&host_path, |c| {
         upsert_replace_entry(c, module, version, base_rel)
     })
@@ -270,6 +277,36 @@ pub async fn drop_replace_entry(
     owner: ReplaceOwner,
     dry_run: bool,
 ) -> Result<bool, String> {
+    let entries: Vec<_> = read_replace_entries(project_root)
+        .await
+        .into_iter()
+        .filter(|entry| entry.module == module && entry.owner == Some(owner))
+        .collect();
+    // A dry run makes the same checks (a conflicting or invalid saved
+    // checksum refuses) without writing go.sum, so it predicts the run.
+    let sums = if entries.is_empty() {
+        None
+    } else {
+        super::go_sum_backup::restore(project_root, &entries).await?
+    };
+    // go.sum changes only once the directive is gone, so a failed edit
+    // leaves both as they were.
+    let changed = remove_from_replace_files(project_root, module, owner, dry_run).await?;
+    if let (Some(sums), false) = (sums, dry_run) {
+        super::go_sum_backup::write(project_root, &sums).await?;
+    }
+    Ok(changed)
+}
+
+/// Remove `module`'s `owner` replace from the root `go.work` (when present)
+/// and the root `go.mod`, leaving go.sum alone. Returns whether a file
+/// changed.
+async fn remove_from_replace_files(
+    project_root: &Path,
+    module: &str,
+    owner: ReplaceOwner,
+    dry_run: bool,
+) -> Result<bool, String> {
     let work = project_root.join("go.work");
     let go_mod = go_mod_path(project_root);
     let has_work = work.is_file();
@@ -283,6 +320,29 @@ pub async fn drop_replace_entry(
         changed |= edit_file(&go_mod, dry_run, |c| remove_replace_entry(c, module, owner)).await?;
     }
     Ok(changed)
+}
+
+/// [`drop_replace_entry`] for failure cleanup that has removed, or is about
+/// to remove, the directive's target: the directive must not survive a
+/// refused go.sum restore (a conflicting or unreadable saved checksum), or
+/// every `go build` fails on the missing replacement directory. The restore
+/// is attempted first; when it refuses, the directive is still dropped and
+/// go.sum (and the saved lines) are left as they were. Returns whether the
+/// saved lines were restored.
+pub(crate) async fn drop_replace_entry_for_cleanup(
+    project_root: &Path,
+    module: &str,
+    owner: ReplaceOwner,
+) -> Result<bool, String> {
+    if drop_replace_entry(project_root, module, owner, false)
+        .await
+        .is_ok()
+    {
+        return Ok(true);
+    }
+    remove_from_replace_files(project_root, module, owner, false)
+        .await
+        .map(|_| false)
 }
 
 // ── file resolution + read/write ──────────────────────────────────────────────
@@ -513,19 +573,44 @@ pub fn parse_required_versions(content: &str) -> HashMap<String, String> {
 /// provides a package to the build. Without the directive go assumes 1.16,
 /// whose `require` set is only a set of lower bounds.
 pub fn prunes_module_graph(content: &str) -> bool {
-    let mut pruned = false;
+    matches!(go_directive_version(content), Some(GoDirective { major, minor, .. }) if major > 1 || major == 1 && minor >= 17)
+}
+
+/// The version a go.mod / go.work `go` directive declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GoDirective {
+    pub major: u32,
+    pub minor: u32,
+    /// False for a prerelease of `minor` (`1.22rc1`, `1.21beta1`), which Go
+    /// orders below the release it precedes (`1.22rc1 < 1.22`).
+    pub release: bool,
+}
+
+/// The last `go` directive in `content`, parsed as [`GoDirective`]: the
+/// minor version's leading digits, so `1.22rc1` reads as a 1.22 prerelease.
+/// `None` without a directive or with an unparseable version.
+pub(crate) fn go_directive_version(content: &str) -> Option<GoDirective> {
+    let mut found = None;
     let _ = for_each_directive_body(content, "go", |_, body| {
-        let mut parts = body.split_whitespace().next().unwrap_or("").split('.');
-        let major = parts.next().and_then(|p| p.parse::<u32>().ok());
-        let minor = parts.next().and_then(|p| {
-            let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse::<u32>().ok()
-        });
-        pruned = matches!((major, minor), (Some(m), _) if m > 1)
-            || matches!((major, minor), (Some(1), Some(n)) if n >= 17);
+        let version = body.split_whitespace().next().unwrap_or("");
+        let mut parts = version.splitn(2, '.');
+        found = parts
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+            .and_then(|major| {
+                let rest = parts.next().unwrap_or("0");
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                let minor = digits.parse::<u32>().ok()?;
+                let suffix = &rest[digits.len()..];
+                Some(GoDirective {
+                    major,
+                    minor,
+                    release: suffix.is_empty() || suffix.starts_with('.'),
+                })
+            });
         Ok(())
     });
-    pruned
+    found
 }
 
 /// The module path the go.mod `module` directive declares, in its

@@ -747,6 +747,46 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
         String::from_utf8_lossy(&patched.stdout)
     );
 
+    let native = go(&fx.consumer, &m2, &["mod", "vendor"], &as_pairs(&env));
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let consumed = fx.consumer.join("vendor").join(UMOD).join("lib.go");
+    std::fs::write(&consumed, PRISTINE_LIB).unwrap();
+    let native_run = go(
+        &fx.consumer,
+        &m2,
+        &["run", "-mod=vendor", "."],
+        &as_pairs(&env),
+    );
+    assert!(String::from_utf8_lossy(&native_run.stdout).contains("OUT: PRISTINE"));
+    let (code, so, se) = common::run_with_env(
+        &fx.consumer,
+        &[
+            "vex",
+            "--json",
+            "--product",
+            "pkg:golang/example.com/consumer@v1.0.0",
+            "--output",
+            "vex.json",
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        &[
+            ("GOFLAGS", "-mod=vendor"),
+            ("GOMODCACHE", m2.modcache.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, 1, "native vendor drift must not attest: {so} {se}");
+    assert!(so.contains("go_vendor_content_mismatch"), "{so}");
+    std::fs::remove_dir_all(fx.consumer.join("vendor")).unwrap();
+
     // ── manifest-less VEX over the committed state (no ledger) ───────────
     // The API stand-in owns its own runtime, so the tail runs off this
     // test's async runtime.

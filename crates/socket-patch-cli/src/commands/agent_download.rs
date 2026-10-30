@@ -1557,7 +1557,17 @@ pub(crate) fn record_apply_outcome(
     let Some(report) = report else {
         return;
     };
-    env.warnings.extend(report.warnings.iter().cloned());
+    // The caller may already carry the same run-level advisory (scan reports
+    // the gem `.bundle/config` / stale-plugin warnings from its own crawl).
+    let reported = env.warnings.len();
+    for warning in &report.warnings {
+        if !env.warnings[..reported]
+            .iter()
+            .any(|w| w.code == warning.code && w.detail == warning.detail)
+        {
+            env.warnings.push(warning.clone());
+        }
+    }
     let mut failed_any = false;
     for (purl, uuid) in recorded {
         if let Some(failure) = report
