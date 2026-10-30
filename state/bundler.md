@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-10-30 (run 58), main `5ca5623` (no gem code changes since `b291caa`; the new commit is a Gradle vendoring fix), latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta3. Run 58 covered the platform-gem `vendor` eject cycle on Bundler 2.2.33 / 2.3.27 / 2.4.22 / 2.6.9 (Ruby 3.1.6) and 2.5.22 (Ruby 3.3.6), plus the stale-install guard on a platform-suffixed install dir across 2.2 → 4.0. Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. A fresh container's Ruby 3.3.6 only has 2.5.22 / 4.0.18, so `gem install bundler -v 2.6.9` / `4.0.23` / `4.1.0.beta3` first and export `BUNDLER_VERSION`.
+Last updated: 2026-10-30 (run 59), main `5ca5623` (unchanged since run 58; no gem code changes since `b291caa`), latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta3. Run 59 closed backlog item 4 (Bundler 4.0.23 phantom platform lock entry: re-scan, remedy, re-converge, `vex`, `rollback` / `remove`) and the 2.6.9 hosted-unwind direct-dep and `group` cells. Run 59 used a standalone harness instead of a scratch Rust test: a Python mock (upstream compact index with ruby + `x86_64-linux` variants, patch registry, patches API) plus real `gem build` fixtures. Pass `--patch-server-url <mock>` to `rollback` / `remove` / `vex`, or a 127.0.0.1 pin isn't treated as hosted and the commands report `manifest_not_found`. Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. A fresh container's Ruby 3.3.6 only has 2.5.22 / 4.0.18, so `gem install bundler -v 2.6.9` / `4.0.23` / `4.1.0.beta3` first and export `BUNDLER_VERSION`. Bundler 2.6 has no `install -q` (use `--quiet`).
 
 ## Coverage matrix
 
@@ -23,8 +23,22 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | OS | Ruby | Bundler | Direct dep (`~>`) | Transitive dep | Transitive, Gemfile ends in a blank line | `group` block + options | CRLF Gemfile | Non-rubygems.org upstream refused | Mixed (no-CHECKSUMS) lock |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 3.3.6 | 4.0.17 | pass (exact pin, documented) | fixed #457 (#460) | pass | pass | pass | pass | n/a |
-| Linux | 3.3.6 | 2.6.9 | untested | fixed #457 (#460) | untested | untested | untested | untested | documented (Gemfile-only pin is out of reach) |
+| Linux | 3.3.6 | 2.6.9 | pass (exact pin, documented; mock upstream, no CHECKSUMS; run 59) | fixed #457 (#460) | untested | pass (`group :development, :test` + `require: false # keep`; run 59) | untested | n/a (no CHECKSUMS, so no sha to re-derive) | documented (Gemfile-only pin is out of reach) |
+| Linux | 3.3.6 | 4.0.23 | refused, documented (mock upstream on 127.0.0.1 with CHECKSUMS; run 59) | untested | untested | refused, documented (same) | untested | pass (`hosted_restore_refused` / `hosted_revert_failed`, nothing written; run 59) | n/a |
 | macOS / Windows | any | any | untested | untested (OS-independent) | untested | untested | untested | untested | untested |
+
+### Platform gem, converged before the stale-guard remedy (Bundler 4.0.23, Ruby 3.3.6, CHECKSUMS-less lock, run 59)
+
+| Step | Result |
+| --- | --- |
+| Hosted scan over a platform lock with CHECKSUMS | refused `redirect_gem_platform_unsupported` (documented) |
+| Hosted scan, CHECKSUMS stripped | redirect + `redirect_gem_stale_install` naming the `-x86_64-linux` gems/cache/spec paths: pass |
+| `bundle install` before the remedy | phantom `vuln-gem (1.0.0-x86_64-linux)` under the patch-registry remote; `bundle exec` loads VULNERABLE; fresh frozen install exits 16 (Bundler) |
+| Re-scan `--vex` / standalone `vex` over the phantom lock + stale install | stale warning again, exit 1 `no_applicable_patches`, no attestation: pass |
+| Remedy (delete the 3 listed paths) + `bundle install` | phantom entry dropped, lock converges to ruby `vuln-gem (1.0.0)`, PATCHED, fresh frozen install passes, `vex` attests: pass |
+| Non-frozen fresh install from the phantom lock (no stale install) | Bundler drops the phantom and installs the patched ruby gem: pass |
+| `rollback` / `remove` from the phantom lock | refused (`hosted_restore_refused` / `hosted_revert_failed`: "Socket GEM section does not lock exactly vuln-gem (1.0.0)"), nothing written, remedy names `git checkout`: pass (fail-closed) |
+| `rollback` / `remove` from the re-converged lock | restore + `reinstall_required`, fresh frozen install passes (VULNERABLE, as expected): pass |
 
 ### Other hosted shapes (run 4)
 
@@ -582,15 +596,17 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 
 ## Backlog
 
-1. Re-check #1831 once fixed (draft PR #1841): hosted redirect on a CRLF Gemfile keeps CRLF in the in-place and the append (transitive) arms; `rollback` / `remove` still byte-exact; an autocrlf re-checkout of a redirected LF Gemfile re-scans as a no-op.
+1. Re-check #1831 once fixed (PR #1841, ready for review, not merged): hosted redirect on a CRLF Gemfile keeps CRLF in the in-place and the append (transitive) arms; `rollback` / `remove` still byte-exact; an autocrlf re-checkout of a redirected LF Gemfile re-scans as a no-op.
 2. Re-run #1109 (`agent:needs-human`) when it's fixed.
 3. The gem suites on 4.1.0 final when it ships; a 2.2 / 2.4 leg (Ruby 3.1.6) on the next main that touches gem code.
-4. Platform gem on Bundler 4.x with a stale platform install that was converged *before* the remedy: the lock then records a phantom `x (V-x86_64-linux)` under the patch-registry remote (fresh frozen install exits 16, "possibly been yanked"). Check that the guard's delete-list remedy plus `bundle install` re-converges that lock, and that `rollback` / `remove` restore a frozen-installable pair from it.
+4. 2.6.9 hosted-unwind cells still untested: transitive with a trailing blank line, CRLF Gemfile (after #1841 lands). Also the 4.0.23 direct / `group` unwind with the upstream spelled `https://rubygems.org` + `SOCKET_RUBYGEMS_URL` (the e2e suites' trick).
 5. Vendored stub-vs-lock runtime-dependency drift, only if the service `gem-stub-gemspec` can declare other deps than the lifted GEM spec block (a file patch can't).
 6. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
 
 ## Known non-bugs
 
+- `rollback` / `remove` refuse to restore a gem whose upstream GEM remote isn't literally rubygems.org when the lock has CHECKSUMS, even with `SOCKET_RUBYGEMS_URL` pointing at that remote. `SOCKET_RUBYGEMS_URL` only sets where rubygems.org's sha is fetched from (the e2e suites spell the upstream as `https://rubygems.org` and serve it from the mock). `rubygems_locked` (`upstream/gem.rs:1480`) does accept the stand-in, but it only gates the stale-cache warning. Not filed (run 59).
+- A Bundler 4.x platform project that runs `bundle install` before applying the stale-install remedy locks a phantom `x (V-x86_64-linux)` under the patch-registry remote (a fresh frozen install exits 16). socket-patch keeps warning, never attests, and the remedy plus `bundle install` re-converges. `rollback` / `remove` refuse that lock fail-closed with a `git checkout` remedy. That's the documented behaviour (run 59).
 - The gem stale-install guard flags a pristine platform-suffixed install dir (`x-V-x86_64-linux`) after a hosted redirect to the ruby-platform patched gem, and the same-run `--vex` then exits 1 (`no_applicable_patches`). On Bundler 2.6.9 and 4.0.23 that's a true positive: `bundle install` keeps the installed platform copy and `bundle exec` loads the unpatched code. On 2.2–2.5 Bundler fetches the patched ruby gem instead, so the warning is conservative there; the guard can't know which Bundler will run, so this isn't filed (run 58).
 - After a hosted redirect of a platform-resolved gem converges, the lock holds only the ruby-platform patched gem, so a later eject or unwind (`vendor --revert` / `remove` / `rollback`) restores the plain `x (V)` upstream entry, not the original `x (V-x86_64-linux)` sibling, and the next install uses the ruby build. That follows from the documented hosted platform behaviour; frozen installs pass (run 57).
 - The `redirect_scanned_project` fixture deletes `vendor/` after its install (lock-only checkout), so a re-scan inside it reports `notInstalled: true` / `package_not_installed`. That's the fixture, not a crawler miss (run 57 near-miss).
