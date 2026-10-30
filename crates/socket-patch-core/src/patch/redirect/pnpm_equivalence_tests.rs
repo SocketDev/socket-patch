@@ -426,7 +426,7 @@ fn indexed_pnpm_rewrite_matches_golden_on_random_lock_sets() {
     // instead of quietly testing only the plain rewrite path.
     let mut outcomes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for seed in 1..=300u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut rng = Rng::new(seed);
         let lock_count = 1 + rng.below(3);
         let mut files = BTreeMap::new();
         let mut all: Vec<Pkg> = Vec::new();

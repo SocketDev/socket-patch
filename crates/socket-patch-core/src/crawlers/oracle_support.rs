@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 
 use super::types::CrawledPackage;
 
-pub(crate) use crate::test_rng::Rng;
-
 /// Restores permissions a generator stripped before the tempdir is removed
 /// (declare it AFTER the tempdir so it drops first). Only Unix strips
 /// permissions; everywhere else the plan is recorded and ignored.

@@ -2909,8 +2909,9 @@ mod tests {
         use super::super::oracle::LegacyMavenCrawler;
         use super::*;
         use crate::crawlers::oracle_support::{
-            mkdir, rows, symlink, write, write_bytes, PermGuard, Rng,
+            mkdir, rows, symlink, write, write_bytes, PermGuard,
         };
+        use crate::test_rng::Rng;
 
         const GROUPS: &[&str] = &["org/apache/commons", "com/google/guava", "io/netty"];
         const ARTIFACTS: &[&str] = &["commons-lang3", "guava", "netty-all", "dup"];

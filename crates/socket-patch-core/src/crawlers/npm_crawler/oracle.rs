@@ -1055,18 +1055,6 @@ mod tests {
             }
         }
 
-        fn below(&mut self, n: usize) -> usize {
-            self.rng.below(n)
-        }
-
-        fn chance(&mut self, pct: u64) -> bool {
-            self.rng.chance(pct)
-        }
-
-        fn pick<'a>(&mut self, items: &'a [&'a str]) -> &'a str {
-            self.rng.pick(items)
-        }
-
         fn uniq(&mut self) -> usize {
             self.uniq += 1;
             self.uniq
@@ -1118,7 +1106,7 @@ mod tests {
                 return;
             }
             let valid = format!(r#"{{"name": "{name}", "version": "{version}"}}"#);
-            match self.below(100) {
+            match self.rng.below(100) {
                 0..=69 => {
                     let _ = std::fs::write(&pj, valid);
                 }
@@ -1154,25 +1142,25 @@ mod tests {
 
         /// A package dir `nm/<dir_name>` (maybe with nested node_modules).
         fn package(&mut self, nm: &Path, depth: usize) {
-            let dir_name = self.pick(NAMES).to_string();
+            let dir_name = self.rng.pick(NAMES).to_string();
             // Mostly the dir's own name; sometimes an alias install.
-            let pkg_name = if self.chance(88) {
+            let pkg_name = if self.rng.chance(88) {
                 dir_name.clone()
             } else {
-                self.pick(NAMES).to_string()
+                self.rng.pick(NAMES).to_string()
             };
-            let version = self.pick(VERSIONS).to_string();
+            let version = self.rng.pick(VERSIONS).to_string();
             let dir = nm.join(&dir_name);
             if dir.exists() {
                 return;
             }
             self.package_json(&dir, &pkg_name, &version);
             self.pkg_dirs.push(dir.clone());
-            if depth < 3 && self.chance(30) {
-                let store_ok = self.chance(10);
+            if depth < 3 && self.rng.chance(30) {
+                let store_ok = self.rng.chance(10);
                 self.node_modules(&dir.join("node_modules"), depth + 1, store_ok);
             }
-            if self.chance(4) {
+            if self.rng.chance(4) {
                 self.plan_lock(&dir, 0o000);
             }
         }
@@ -1181,37 +1169,37 @@ mod tests {
             let _ = std::fs::create_dir_all(nm);
             self.nm_dirs.push(nm.to_path_buf());
             let mut store_pkgs: Vec<(String, PathBuf)> = Vec::new();
-            if store_ok && self.chance(60) {
+            if store_ok && self.rng.chance(60) {
                 store_pkgs = self.pnpm_store(&nm.join(".pnpm"), depth);
-            } else if self.chance(5) {
+            } else if self.rng.chance(5) {
                 let _ = std::fs::write(nm.join(".pnpm"), "not a store");
             }
-            if store_ok && self.chance(15) {
+            if store_ok && self.rng.chance(15) {
                 self.legacy_store(&nm.join(".registry.npmjs.org"), depth);
             }
-            if store_ok && self.chance(20) {
+            if store_ok && self.rng.chance(20) {
                 let vlt_pkgs = self.vlt_store(&nm.join(".vlt"), depth);
                 store_pkgs.extend(vlt_pkgs);
             }
-            let n = self.below(6);
+            let n = self.rng.below(6);
             for _ in 0..n {
-                match self.below(100) {
+                match self.rng.below(100) {
                     0..=54 => self.package(nm, depth),
                     55..=62 => {
                         // Symlinked entry: live, into the store, or dangling.
-                        let name = self.pick(NAMES);
+                        let name = self.rng.pick(NAMES);
                         let link = nm.join(name);
                         if link.symlink_metadata().is_ok() {
                             continue;
                         }
-                        let target = if !store_pkgs.is_empty() && self.chance(50) {
+                        let target = if !store_pkgs.is_empty() && self.rng.chance(50) {
                             {
-                                let i = self.below(store_pkgs.len());
+                                let i = self.rng.below(store_pkgs.len());
                                 store_pkgs[i].1.clone()
                             }
-                        } else if !self.pkg_dirs.is_empty() && self.chance(80) {
+                        } else if !self.pkg_dirs.is_empty() && self.rng.chance(80) {
                             {
-                                let i = self.below(self.pkg_dirs.len());
+                                let i = self.rng.below(self.pkg_dirs.len());
                                 self.pkg_dirs[i].clone()
                             }
                         } else {
@@ -1231,7 +1219,7 @@ mod tests {
                         // the tree, so the followed walk cannot cycle).
                         let id = self.uniq();
                         let target = self.scratch.join(format!("scope{id}"));
-                        let version = self.pick(VERSIONS).to_string();
+                        let version = self.rng.pick(VERSIONS).to_string();
                         self.package_json(&target.join("x"), "@link/x", &version);
                         let link = nm.join(format!("@link{}", self.uniq()));
                         Self::symlink(&target, &link);
@@ -1249,13 +1237,13 @@ mod tests {
                         self.package_json(&nm.join("node_modules").join("foo"), "foo", "1.0.0");
                     }
                     _ => {
-                        let scoped = self.pick(&["@s/a", "@s/b", "@t/c"]).to_string();
+                        let scoped = self.rng.pick(&["@s/a", "@s/b", "@t/c"]).to_string();
                         let dir = nm.join(&scoped);
                         if !dir.exists() {
-                            let version = self.pick(VERSIONS).to_string();
+                            let version = self.rng.pick(VERSIONS).to_string();
                             self.package_json(&dir, &scoped, &version);
                             self.pkg_dirs.push(dir.clone());
-                            if depth < 3 && self.chance(25) {
+                            if depth < 3 && self.rng.chance(25) {
                                 self.node_modules(&dir.join("node_modules"), depth + 1, false);
                             }
                         }
@@ -1265,11 +1253,11 @@ mod tests {
             // Root-linked direct deps: importer symlinks into the store.
             for (name, target) in store_pkgs {
                 let link = nm.join(&name);
-                if self.chance(50) && link.symlink_metadata().is_err() {
+                if self.rng.chance(50) && link.symlink_metadata().is_err() {
                     Self::symlink(&target, &link);
                 }
             }
-            if self.chance(3) {
+            if self.rng.chance(3) {
                 self.plan_lock(nm, 0o000);
             }
         }
@@ -1282,11 +1270,11 @@ mod tests {
             let _ = std::fs::create_dir_all(store);
             let _ = std::fs::write(store.join("vlt.json"), "{}");
             let mut own = Vec::new();
-            for _ in 0..1 + self.below(6) {
-                let name = self.pick(NAMES).to_string();
-                let version = self.pick(VERSIONS).to_string();
+            for _ in 0..1 + self.rng.below(6) {
+                let name = self.rng.pick(NAMES).to_string();
+                let version = self.rng.pick(VERSIONS).to_string();
                 let escaped = name.replace('/', "+");
-                let id = match self.below(10) {
+                let id = match self.rng.below(10) {
                     0 => format!("~npm~{escaped}@{version}~peer.{}", self.uniq()),
                     1 => format!("··{}@{version}", name.replace('/', "§")),
                     2 => format!("·npm·{}@{version}", name.replace('/', "§")),
@@ -1300,7 +1288,7 @@ mod tests {
                     continue;
                 }
                 let entry_nm = entry.join("node_modules");
-                if self.chance(5) {
+                if self.rng.chance(5) {
                     let _ = std::fs::create_dir_all(&entry);
                     let id = self.uniq();
                     let elsewhere = self.scratch.join(format!("vlt-nm{id}"));
@@ -1308,24 +1296,24 @@ mod tests {
                     Self::symlink(&elsewhere, &entry_nm);
                     continue;
                 }
-                let pkg_name = if self.chance(90) {
+                let pkg_name = if self.rng.chance(90) {
                     name.clone()
                 } else {
-                    self.pick(NAMES).to_string()
+                    self.rng.pick(NAMES).to_string()
                 };
                 let pkg = entry_nm.join(&name);
                 self.package_json(&pkg, &pkg_name, &version);
                 self.pkg_dirs.push(pkg.clone());
                 own.push((name.clone(), pkg.clone()));
-                for _ in 0..self.below(3) {
+                for _ in 0..self.rng.below(3) {
                     if let Some((dep, target)) = own.first().cloned() {
                         Self::symlink(&target, &entry_nm.join(&dep));
                     }
                 }
-                if depth < 2 && self.chance(25) {
+                if depth < 2 && self.rng.chance(25) {
                     self.node_modules(&pkg.join("node_modules"), depth + 1, false);
                 }
-                if self.chance(4) {
+                if self.rng.chance(4) {
                     self.plan_lock(&entry_nm, 0o000);
                 }
             }
@@ -1334,7 +1322,7 @@ mod tests {
 
         fn store_entry_name(&mut self, name: &str, version: &str) -> String {
             let escaped = name.replace('/', "+");
-            match self.below(10) {
+            match self.rng.below(10) {
                 0 => format!("{escaped}@{version}(peer@1.0.0)"),
                 1 => format!("{escaped}@{version}_peer@1.0.0"),
                 2 => format!("{escaped}@github.com+u+r@abc{}", self.uniq()),
@@ -1349,38 +1337,38 @@ mod tests {
             let _ = std::fs::create_dir_all(store);
             let _ = std::fs::write(store.join("lock.yaml"), "x");
             let mut own = Vec::new();
-            let n = 1 + self.below(6);
+            let n = 1 + self.rng.below(6);
             for _ in 0..n {
-                let name = self.pick(NAMES).to_string();
-                let version = self.pick(VERSIONS).to_string();
-                match self.below(100) {
+                let name = self.rng.pick(NAMES).to_string();
+                let version = self.rng.pick(VERSIONS).to_string();
+                match self.rng.below(100) {
                     0..=59 => {
                         let entry = store.join(self.store_entry_name(&name, &version));
                         let entry_nm = entry.join("node_modules");
-                        let pkg_name = if self.chance(90) {
+                        let pkg_name = if self.rng.chance(90) {
                             name.clone()
                         } else {
-                            self.pick(NAMES).to_string()
+                            self.rng.pick(NAMES).to_string()
                         };
                         let pkg = entry_nm.join(&name);
                         self.package_json(&pkg, &pkg_name, &version);
                         self.pkg_dirs.push(pkg.clone());
                         own.push((name.clone(), pkg.clone()));
                         // Dependencies: symlinks to sibling entries.
-                        for _ in 0..self.below(3) {
+                        for _ in 0..self.rng.below(3) {
                             if let Some((dep, target)) = own.first().cloned() {
                                 Self::symlink(&target, &entry_nm.join(format!("{dep}-dep")));
                             }
                         }
                         // Another real package in the entry (injected dep).
-                        if self.chance(20) {
+                        if self.rng.chance(20) {
                             self.package(&entry_nm, depth + 1);
                         }
                         // Bundled deps below the package itself.
-                        if depth < 2 && self.chance(25) {
+                        if depth < 2 && self.rng.chance(25) {
                             self.node_modules(&pkg.join("node_modules"), depth + 1, false);
                         }
-                        match self.below(100) {
+                        match self.rng.below(100) {
                             0..=3 => self.plan_lock(&entry_nm, 0o000),
                             4..=6 => self.plan_lock(&entry, 0o000),
                             7..=9 => self.plan_lock(&entry_nm, 0o300),
@@ -1456,12 +1444,12 @@ mod tests {
 
         /// A pnpm <=3 `.registry.npmjs.org` store.
         fn legacy_store(&mut self, store: &Path, depth: usize) {
-            for _ in 0..1 + self.below(4) {
-                let name = self.pick(NAMES).to_string();
-                let version = self.pick(VERSIONS).to_string();
+            for _ in 0..1 + self.rng.below(4) {
+                let name = self.rng.pick(NAMES).to_string();
+                let version = self.rng.pick(VERSIONS).to_string();
                 let home = store.join(&name).join(&version).join("node_modules");
                 self.package_json(&home.join(&name), &name, &version);
-                if depth < 2 && self.chance(20) {
+                if depth < 2 && self.rng.chance(20) {
                     self.package(&home, depth + 1);
                 }
             }
@@ -1469,19 +1457,19 @@ mod tests {
 
         fn workspace(&mut self, dir: &Path, depth: usize) {
             let _ = std::fs::create_dir_all(dir);
-            if self.chance(70) {
+            if self.rng.chance(70) {
                 self.node_modules(&dir.join("node_modules"), 0, true);
             }
             if depth >= 3 {
                 return;
             }
-            for _ in 0..self.below(5) {
-                let child = dir.join(format!("{}{}", self.pick(WS_NAMES), self.uniq()));
-                match self.below(100) {
+            for _ in 0..self.rng.below(5) {
+                let child = dir.join(format!("{}{}", self.rng.pick(WS_NAMES), self.uniq()));
+                match self.rng.below(100) {
                     0..=49 => self.workspace(&child, depth + 1),
                     50..=57 => {
                         // Skipped by name (dist/vendor/.git/tmp as-is).
-                        let skipped = dir.join(self.pick(&["dist", "vendor", ".git", "tmp"]));
+                        let skipped = dir.join(self.rng.pick(&["dist", "vendor", ".git", "tmp"]));
                         self.workspace(&skipped, depth + 1);
                     }
                     58..=63 => {
@@ -1505,7 +1493,7 @@ mod tests {
                     74..=79 => {
                         // Case variant (aliases node_modules on APFS/NTFS).
                         let _ = std::fs::create_dir_all(&child);
-                        let variant = self.pick(&["Node_Modules", "NODE_MODULES"]);
+                        let variant = self.rng.pick(&["Node_Modules", "NODE_MODULES"]);
                         self.node_modules(&child.join(variant), 1, false);
                     }
                     80..=85 => {
