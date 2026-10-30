@@ -9,7 +9,8 @@
 //! (Maven caches the pom of every artifact, parent and BOM it resolves):
 //!
 //! - **Seeds**: every `<dependency>` of the reactor (the root `pom.xml`,
-//!   its `<modules>` / `<subprojects>` recursively, every profile, and the
+//!   its `<modules>` / `<subprojects>` recursively (and the subprojects
+//!   Maven 4 discovers under a root listing none), every profile, and the
 //!   `<dependencies>` each inherits from its parents), any scope.
 //! - **Edges**: an artifact's own non-optional `compile` / `runtime`
 //!   dependencies (and those its parents declare), which is what Maven
@@ -30,7 +31,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::vendor::jvm::maven_reactor::{pom_model, PomDecl, PomModel};
+use crate::vendor::jvm::maven_reactor::{
+    implicit_subprojects, may_discover_subprojects, pom_model, PomDecl, PomModel, MAVEN_CONFIG,
+};
 
 /// `(groupId, artifactId, version)`.
 type Gav = (String, String, String);
@@ -225,12 +228,17 @@ impl Walk<'_> {
             local: true,
         }];
         let mut seen: HashSet<PathBuf> = HashSet::from([root]);
+        let config = crate::utils::fs::read_regular_to_bytes_sync(&self.cwd.join(MAVEN_CONFIG))
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
         while let Some(node) = pending.pop() {
             if seen.len() > MAX_REACTOR {
                 return None;
             }
             let dir = node.path.parent().unwrap_or(self.cwd).to_path_buf();
-            for module in node.model.modules.clone() {
+            let mut modules = node.model.modules.clone();
+            modules.extend(discovered_subprojects(&node.path, &dir, config.as_deref()));
+            for module in modules {
                 if module.is_empty() || module.contains("${") {
                     continue;
                 }
@@ -459,6 +467,40 @@ impl Walk<'_> {
         }
         Some(())
     }
+}
+
+/// The subprojects Maven 4 discovers under the pom at `path` (#1809): when
+/// it lists none ([`may_discover_subprojects`]), the direct subdirectories
+/// of `dir` holding a `pom.xml` ([`implicit_subprojects`]), as `<module>`
+/// names.
+fn discovered_subprojects(path: &Path, dir: &Path, config: Option<&str>) -> Vec<String> {
+    let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(path) else {
+        return Vec::new();
+    };
+    if !may_discover_subprojects(&String::from_utf8_lossy(&bytes), config) {
+        return Vec::new();
+    }
+    // The planners' listing: bare names, directories (followed through a
+    // link) ending in `/`.
+    let list = |rel: &str| -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir.join(rel)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                Some(if e.path().is_dir() {
+                    format!("{name}/")
+                } else {
+                    name
+                })
+            })
+            .collect()
+    };
+    let mut out = implicit_subprojects(&list, "");
+    out.sort();
+    out
 }
 
 /// The pom at `path` parsed, when it is readable.
@@ -752,6 +794,43 @@ mod tests {
             assert!(scope.admits(g, a, v), "{g}:{a}:{v}");
         }
         assert!(!scope.admits("new.group", "lib", "3"));
+    }
+
+    /// #1809: Maven 4 builds every direct subdirectory holding a `pom.xml`
+    /// of a 4.1.0 `pom`-packaged root that lists no subprojects, so their
+    /// dependencies seed the scope; with discovery turned off in
+    /// `.mvn/maven.config` they do not.
+    #[test]
+    fn maven_4_discovered_subprojects_seed_the_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cwd, repo) = (dir.path().join("p"), dir.path().join("m2"));
+        write(
+            &cwd,
+            "pom.xml",
+            "<project xmlns=\"http://maven.apache.org/POM/4.1.0\"><modelVersion>4.1.0</modelVersion>\
+             <groupId>com.example</groupId><artifactId>root</artifactId><version>1</version>\
+             <packaging>pom</packaging></project>",
+        );
+        write(
+            &cwd,
+            "a/pom.xml",
+            &format!(
+                "<project xmlns=\"http://maven.apache.org/POM/4.1.0\"><modelVersion>4.1.0</modelVersion>\
+                 <parent/><artifactId>a</artifactId>{}</project>",
+                deps(&[dep("org.example", "lib", Some("1.0"), "")])
+            ),
+        );
+        cache(&repo, "org.example", "lib", "1.0", "");
+        let scope = project_scope(&cwd, &repo).unwrap();
+        assert!(scope.admits("org.example", "lib", "1.0"));
+
+        write(
+            &cwd,
+            ".mvn/maven.config",
+            "-Dmaven.project.discoverSubprojects=false\n",
+        );
+        let scope = project_scope(&cwd, &repo).unwrap();
+        assert!(!scope.admits("org.example", "lib", "1.0"));
     }
 
     #[test]
