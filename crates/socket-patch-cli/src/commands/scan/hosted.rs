@@ -1,7 +1,6 @@
-//! The hosted-mode (`--mode hosted`) flow: rewrite ONLY the
-//! patched dependencies' lockfile / registry-config entries to point at
-//! Socket's hosted vendored patches. Self-contained — reuses `run`'s
-//! discovery, then returns without touching the apply/vendor branches.
+//! The hosted-mode (`--mode hosted`) flow: rewrite only the patched
+//! dependencies' lockfile and registry-config entries to point at Socket's
+//! hosted patches.
 
 use std::path::Path;
 use std::time::Duration;
@@ -31,18 +30,7 @@ mod python;
 mod takeover;
 
 use crate::commands::vlt_heal as vlt;
-
-#[cfg(test)]
-pub(crate) use socket_patch_core::hosted::guidance::{
-    npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
-    npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
-    npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
-    npm_allow_remote_user_set_detail, plan_workspace_trust, pnpm_heal_root,
-    pnpm_lock_carries_hosted_redirect, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
-    pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-    pnpm_trust_workspace_unreadable_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    TrustPlan,
-};
+use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
 
 /// Most hosted wheel-metadata downloads in flight at once, below the patch
 /// API's own in-flight cap: each one buffers a whole wheel (up to
@@ -60,23 +48,8 @@ fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
     api_concurrency(use_public_proxy).min(WHEEL_METADATA_CONCURRENCY)
 }
 
-/// The hosted-mode JSON error envelope, for bail-outs that return before the
-/// success envelope at the bottom of [`run_redirect_selected`] is built:
-/// the caller's envelope (`scan_result`: scan's discovery payload, or
-/// `get`'s narrowing events) marked `status: "error"` with the coded
-/// `error`, printed once. A `--json` consumer must always get parseable
-/// stdout — never empty output plus an exit code.
-fn emit_json_error(
-    common: &crate::args::GlobalArgs,
-    scan_result: Option<Envelope>,
-    code: &str,
-    message: &str,
-) {
-    emit_scan(&json_error_envelope(common, scan_result, code, message));
-}
-
-/// The envelope [`emit_json_error`] prints, built without printing it, so
-/// [`run_redirect_selected`] can send its failure telemetry first.
+/// The hosted-mode `--json` error envelope: the caller's envelope (scan's
+/// discovery payload, or `get`'s narrowing events) marked `status: "error"`.
 fn json_error_envelope(
     common: &crate::args::GlobalArgs,
     scan_result: Option<Envelope>,
@@ -90,16 +63,13 @@ fn json_error_envelope(
     env
 }
 
-/// The hosted run's `redirect` payload: `{mode: "hosted", rewrittenFiles}`
-/// (the files the rewrite changed — or would change, on a dry run). The
-/// per-patch outcomes are the envelope's events (`details.mode: "hosted"`)
-/// and its warnings the top-level `warnings`.
+/// The hosted run's `redirect` payload: the files the rewrite changed, or
+/// would change on a dry run.
 pub(super) fn redirect_block(rewritten: Vec<String>) -> serde_json::Value {
     serde_json::json!({ "mode": "hosted", "rewrittenFiles": rewritten })
 }
 
-/// The `redirect_prune_ignored` warning (`--prune` is a no-op in hosted
-/// mode; see the constants' doc in `run`'s module).
+/// `--prune` is a no-op in hosted mode.
 pub(super) fn prune_ignored_warning() -> RunWarning {
     RunWarning::new(
         super::REDIRECT_PRUNE_IGNORED,
@@ -112,12 +82,10 @@ pub(super) fn prune_ignored_warning() -> RunWarning {
 /// (their bytes are fetched at install time).
 pub(super) const VEX_HOSTED_UNVERIFIED: &str = "vex_hosted_unverified";
 
-/// Record a hosted run's per-patch outcomes into `env`, each event
-/// carrying `details.mode: "hosted"` and sorted by purl then uuid: `applied`
-/// (`verified` on a dry run) for each pin the rewrite confirmed, `skipped`
-/// with the skip's reason as `errorCode` (its detail, when it has one, as
-/// `reason`), and `skipped` / `redirect_unconfirmed` for each granted patch no lockfile entry pins
-/// (status and exit unchanged, pending #704).
+/// Record a hosted run's per-patch outcomes into `env`, sorted by purl then
+/// uuid: `applied` (`verified` on a dry run) for each confirmed pin, `skipped`
+/// with the skip's code, and `skipped` / `redirect_unconfirmed` for each
+/// granted patch no lockfile entry pins. None of them change status or exit.
 pub(super) fn record_hosted_events(
     env: &mut Envelope,
     confirmed: &[(String, String)],
@@ -134,8 +102,6 @@ pub(super) fn record_hosted_events(
         .iter()
         .map(|(purl, uuid)| PatchEvent::new(pinned, purl.as_str()).with_uuid(uuid.as_str()))
         .chain(skipped.iter().map(|s| {
-            // The skip's code is its `errorCode`; its detail (when the
-            // engine gave one) the `reason`.
             let mut event =
                 PatchEvent::new(PatchAction::Skipped, s.purl.as_str()).with_uuid(s.uuid.as_str());
             event.error_code = Some(s.reason.clone());
@@ -186,17 +152,8 @@ fn refuse(
     1
 }
 
-/// The apply lock for a WET hosted run: the same `<manifest dir>/apply.lock`
-/// `apply`/`rollback`/`remove`/`vendor` hold, so the takeover pre-reverts
-/// (lockfiles + the vendored ledger) and the lockfile writes never race
-/// them. `acquire`
-/// creates a missing `.socket/` and the guard's drop unlinks the lock file
-/// and prunes an otherwise-empty `.socket/`, so a run that ends up writing
-/// nothing leaves no residue. Contention / IO failures render through the
-/// shared [`crate::commands::lock_cli::lock_failure`] mapping — the
-/// `lock_held` / `lock_io` codes and the "(waited …)" clause match every
-/// other mutating command — into the caller's error envelope plus the
-/// stderr line and, for a live holder, the wait hint.
+/// The apply lock for a wet hosted run, so the takeover pre-reverts and the
+/// lockfile writes never race `apply`, `rollback`, `remove` or `vendor`.
 fn acquire_hosted_lock(
     common: &crate::args::GlobalArgs,
     scan_result: &mut Option<Envelope>,
@@ -248,9 +205,8 @@ struct StaleInstallOutcome {
 /// behind silently reinstates the stale bytes) — while a SHARED gem-env
 /// home affects every project on the machine, so that flavor prefers moving
 /// the project to a local bundle path and only conditionally names the
-/// shared files. `project_local` is the caller's call: under the project
-/// root, or under the project's own `.bundle/config` path even when that
-/// path sits outside the tree (#709).
+/// shared files. `project_local` also covers the project's own
+/// `.bundle/config` path when that path sits outside the tree.
 fn gem_stale_install_warning(
     purl: &str,
     gem_dir: &Path,
@@ -321,68 +277,27 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
     })
 }
 
-/// POSITIVE staleness evidence: at least one record file whose on-disk
-/// content was actually read and hashed to something other than its
-/// `afterHash` (`Ready` = pristine upstream bytes, `HashMismatch` = neither
-/// hash). Missing or unreadable files are NEVER evidence — `verify_file_patch`
-/// folds IO errors into `NotFound`, and a transiently unreadable file in an
-/// already-patched install must not produce a delete prescription.
-/// (`current_hash` is `Some` only when the bytes were really hashed, which
-/// also excludes the absent-new-file `Ready`.)
-///
-/// The probes take this from the same one-pass
-/// [`socket_patch_core::vex::verify::judge_installed_record`] that decides
-/// PATCHED (`stale_evidence`); this view of it is what the unit tests pin.
-#[cfg(test)]
-async fn installed_stale_positive_evidence(
-    package_dir: &Path,
-    record: &socket_patch_core::manifest::schema::PatchRecord,
-) -> bool {
-    socket_patch_core::vex::verify::judge_installed_record(package_dir, record)
-        .await
-        .stale_evidence
-}
-
 /// Post-rewrite stale-materialization probe for gem redirects: `bundle
 /// install` never refetches an already-materialized gem (see the "Gem
-/// stale-install guard" section of CLI_CONTRACT.md).
+/// stale-install guard" section of CLI_CONTRACT.md). Read-only: the remedy
+/// is prescribed, never applied.
 ///
-/// Judgment sources and rules:
-/// * Discovery is [`socket_patch_core::crawlers::RubyCrawler`] — the same
-///   installed-gem APIs `apply` uses, honoring `--global`/`--global-prefix`
-///   exactly like scan's own discovery; layouts the crawler grows into are
-///   covered automatically. A `.bundle/config` path the containment guard
-///   refuses as a write root is still READ here
-///   (`bundler_install_homes`): bundler installs into it. The `gem env`
-///   homes are judged only when bundler uses system gems (#1001).
-/// * Records are found BY UUID (the fetch key, stable across purl
-///   spellings) among this run's fetched records; v5 keeps no hosted
-///   ledger to fall back on, so a uuid whose `/patches/view` fetch failed
-///   is not judged (`record_fetch_failed` surfaces that failure). Record
-///   availability is part of the candidate filter, and the
-///   probe returns before any crawler work (or `gem env` subprocess spawn)
-///   when no judgment is possible.
-/// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle
-///   (decided, with STALE, by one pass of
-///   [`socket_patch_core::vex::verify::judge_installed_record`]).
-///   Judgments are grouped BY INSTALLED DIR: platform-variant purls of one
-///   gem resolve to the same dir, and if ANY variant's record proves the
-///   dir patched, the dir is patched — never warned.
-/// * STALE requires positive evidence (the `installed_stale_positive_evidence`
-///   rule) — never inferred from missing/unreadable files.
+/// * Records are found by uuid among this run's fetched records; a uuid
+///   whose fetch failed is not judged.
+/// * Judgments are grouped by installed dir: platform-variant purls of one
+///   gem share a dir, and if any variant's record proves it patched, it is
+///   never warned.
+/// * Stale needs positive evidence (`stale_evidence`: readable bytes that
+///   hash to something other than `afterHash`), never missing or unreadable
+///   files.
 /// * A committed `vendor/cache/<leaf>.gem` whose sha256 differs from the
-///   patched artifact's is stale too (bundler installs from it first, fresh
-///   checkouts included): folded into a project-local install warning's
-///   delete list, or warned standalone.
-///
-/// Read-only by contract: nothing is ever deleted — the remedy is
-/// prescribed to the user.
+///   patched artifact's is stale too (bundler installs from it first):
+///   folded into a project-local warning's delete list, or warned alone.
 async fn gem_stale_install_warnings(
     cwd: &Path,
     global: bool,
     global_prefix: Option<std::path::PathBuf>,
     confirmed: &[(String, String)],
-    // This run's fetched records, by uuid.
     records: &std::collections::BTreeMap<String, socket_patch_core::manifest::schema::PatchRecord>,
     gem_artifact_shas: &std::collections::BTreeMap<(String, String), String>,
 ) -> StaleInstallOutcome {
@@ -395,10 +310,8 @@ async fn gem_stale_install_warnings(
     let mut out = StaleInstallOutcome::default();
     let find_record =
         |uuid: &str| -> Option<&PatchRecord> { records.values().find(|r| r.uuid == uuid) };
-    // Record availability folds into the candidate filter (a zero-file map
-    // included: nothing to hash means no judgment either way) so the no-op
-    // cases return here, before the crawler is built. On `--dry-run` the
-    // caller skips the probe entirely — see the call site.
+    // Return before the crawler (and its `gem env` spawn) when nothing can
+    // be judged.
     let candidates: Vec<(&str, &PatchRecord)> = confirmed
         .iter()
         .filter(|(purl, _)| purl.starts_with("pkg:gem/"))
@@ -409,8 +322,7 @@ async fn gem_stale_install_warnings(
         return out;
     }
 
-    // Pass 1: resolve every candidate's installed materializations and judge
-    // them, grouped by installed dir (see the fn doc's variant rule).
+    // Pass 1: judge every candidate's installed dirs.
     struct DirJudgment {
         purl: String,
         leaf: String,
@@ -424,17 +336,10 @@ async fn gem_stale_install_warnings(
         global,
         global_prefix,
     };
-    // Only the homes `bundle install` installs into or reuses, each tagged
-    // project-local or shared by the crawler. That covers a `.bundle/config`
-    // path outside the project, which is refused as a write root but which
-    // bundler installs into and loads from (#709). It leaves out the
-    // `gem env` homes when an explicit Bundler `path` means bundler never
-    // reuses a copy there (#1001), and the project-local tag doesn't depend
-    // on how `--cwd` is spelled (#729).
+    // Only the homes `bundle install` installs into or reuses, including a
+    // `.bundle/config` path outside the project, which is refused as a write
+    // root but which bundler installs into and loads from.
     let homes = crawler.bundler_install_homes(&options).await;
-    // Every candidate's installed dir in every gem home, one blocking pass
-    // (and at most one listing) per home — the per-candidate lookups the
-    // loop below consumes, in the same (candidate, home) order.
     let stripped: Vec<String> = candidates
         .iter()
         .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
@@ -448,8 +353,7 @@ async fn gem_stale_install_warnings(
     }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
-    // Bundler's configured cache dir (`cache_path`, default vendor/cache):
-    // the committed archives `bundle install` installs from (#483).
+    // Bundler's configured cache dir (`cache_path`, default vendor/cache).
     let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
     for (index, (purl, record)) in candidates.iter().enumerate() {
         for (found, project_local) in &found_per_home {
@@ -490,35 +394,29 @@ async fn gem_stale_install_warnings(
         if j.patched || !j.positive {
             continue;
         }
-        let project_local = j.project_local;
-        let mut folded_cache: Option<std::path::PathBuf> = None;
-        if project_local {
-            let project_cache = app_cache.join(format!("{}.gem", j.leaf));
-            if project_cache.is_file() {
-                let proven_patched = match (
-                    gem_artifact_shas.get(&gem_sha_key(&j.purl)),
-                    file_sha256_hex(&project_cache).await,
-                ) {
-                    (Some(want), Some(got)) => &got == want,
-                    // Unknown sha (or unreadable archive): include it —
-                    // removal is safe either way, `bundle install` refetches.
-                    _ => false,
-                };
-                if !proven_patched {
-                    folded_cache = Some(project_cache);
-                }
-            }
-        }
+        let project_cache = app_cache.join(format!("{}.gem", j.leaf));
+        let folded_cache = if j.project_local && project_cache.is_file() {
+            let proven_patched = match (
+                gem_artifact_shas.get(&gem_sha_key(&j.purl)),
+                file_sha256_hex(&project_cache).await,
+            ) {
+                (Some(want), Some(got)) => &got == want,
+                // Unknown sha (or unreadable archive): include it —
+                // removal is safe either way, `bundle install` refetches.
+                _ => false,
+            };
+            (!proven_patched).then_some(project_cache)
+        } else {
+            None
+        };
         if folded_cache.is_some() {
-            if let Some((purl, _)) = candidates.iter().find(|(p, _)| *p == j.purl) {
-                cache_covered.insert(purl);
-            }
+            cache_covered.insert(j.purl.as_str());
         }
         out.warnings.push(gem_stale_install_warning(
             &j.purl,
             dir,
             &j.leaf,
-            project_local,
+            j.project_local,
             folded_cache.as_deref(),
         ));
         out.stale_purls.insert(j.purl.clone());
@@ -589,10 +487,9 @@ fn gem_sha_key(purl: &str) -> (String, String) {
         .unwrap_or_default()
 }
 
-/// `scan --mode hosted`: resolve hosted-patch references for the selected patches,
-/// then rewrite ONLY those dependencies' lockfile/registry-config entries to
-/// point at the hosted vendored patches (the byte-identical counterpart of the
-/// GitHub-app registry mode). No artifact bytes land in the repo.
+/// `scan --mode hosted --json`: select through `discover_selected`, then run
+/// [`run_redirect_selected`]. The human arm calls
+/// [`boxed_run_redirect_selected`] from `scan/mod.rs` directly.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_redirect(
     args: &ScanArgs,
@@ -600,12 +497,8 @@ pub(super) async fn run_redirect(
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
     policy: &super::policy::ScanPolicy,
-    // The scan envelope `run` builds for the `--json` path (`Some` in JSON
-    // mode, `None` for human output). The redirect outcome is recorded into
-    // it; `.take()` at each terminal (error or success) prints it.
-    mut scan_result: Option<Envelope>,
-    // Scan's pending telemetry, flushed by `discover_selected` before
-    // anything below writes to stdout.
+    mut scan_result: Envelope,
+    // Flushed by `discover_selected` before anything below writes to stdout.
     telemetry: &mut socket_patch_core::telemetry::PendingTelemetry,
     // Scan's npm crawl (`Some` only when an embedded `--vex` will run),
     // handed to the VEX step so it does not walk the tree for the npm
@@ -622,12 +515,10 @@ pub(super) async fn run_redirect(
     // The withdrawn-pin sweep's reference answers (see
     // `rollout::Gate::references`).
     references: Option<super::withdrawn::KnownReferences>,
-    // `--prune` / `--sync`, gated by the policy exactly as the human arm
-    // gates it (`patches.enabled: false` writes nothing, the GC included):
-    // only feeds the `redirect_prune_ignored` warning.
+    // `--prune` / `--sync` after the policy gate: only feeds the
+    // `redirect_prune_ignored` warning.
     prune: bool,
 ) -> i32 {
-    // Same discovery/selection as agent and vendored mode.
     let discovered = match discover_selected(
         api_client,
         all_packages_with_patches,
@@ -637,29 +528,19 @@ pub(super) async fn run_redirect(
         false,
         false,
         telemetry,
-        scan_result.as_mut(),
+        Some(&mut scan_result),
     )
     .await
     {
         Ok(d) => d,
-        // Hosted mode has no discovery envelope to fold the message into at
-        // this point (it builds its `redirect` result further down).
-        // `discover_selected` already printed the message to stderr; a
-        // `--json` run additionally gets the machine-readable envelope so
-        // stdout is never empty on failure.
+        // `discover_selected` already printed the message to stderr.
         Err((code, message)) => {
-            if args.common.json {
-                emit_json_error(
-                    &args.common,
-                    scan_result.take(),
-                    super::PATCH_DETAILS_FAILED,
-                    &message,
-                );
-            } else if code == 0 && !args.common.silent {
-                // Unreachable from scan (it never prompts, so selection
-                // cannot be cancelled); kept for a code-0 selection error.
-                eprintln!("No changes made.");
-            }
+            emit_scan(&json_error_envelope(
+                &args.common,
+                Some(scan_result),
+                super::PATCH_DETAILS_FAILED,
+                &message,
+            ));
             return code;
         }
     };
@@ -669,7 +550,7 @@ pub(super) async fn run_redirect(
         recorded,
         batch_failed,
         all_packages_with_patches,
-        scan_result.as_mut(),
+        Some(&mut scan_result),
     );
 
     // The redirect body consumes the selection only as (purl, uuid) pairs —
@@ -686,7 +567,7 @@ pub(super) async fn run_redirect(
         prune,
         api_client,
         &pairs,
-        scan_result,
+        Some(scan_result),
         npm_prior,
         Some(
             super::rollout::Gate::new(stage, rows)
@@ -758,36 +639,21 @@ fn discovery_after_writes<'d>(
     })
 }
 
-/// The hosted-redirect flow over an ALREADY-SELECTED `(purl, uuid)` set,
-/// on disk. The plan → rewrite → edits core is the shared hosted engine
-/// ([`socket_patch_core::hosted::engine`], over a
-/// [`ProjectView::Disk`](socket_patch_core::vendor::lock_inventory::ProjectView));
-/// what stays here is what needs the host: reference grants and the other
-/// network fetches, the apply lock (wet runs with a grant), the
-/// vendored→hosted takeover pre-revert (symlink-checked first), the
-/// `pipenv --version` probe, the symlink guard, the file writes, the gem /
-/// Python / vlt
-/// stale-install probes, and the optional VEX. Shared VERBATIM by `scan
-/// --mode hosted` (its `--json` arm through the `run_redirect` wrapper, its
-/// human arm through [`boxed_run_redirect_selected`] in `scan/mod.rs`; both
-/// select via `discover_selected`, with no prompt) and by `get --mode
-/// hosted` (which pins the advisory-resolved uuid), so all produce
-/// identical on-disk results for the same selection. v5 hosted mode keeps
-/// no ledger (the lockfiles are the only record); the VENDORED ledger the
-/// takeover needs is loaded HERE, under the apply lock whenever this run
-/// holds one (never handed in pre-loaded: a copy read before the lock could
-/// be saved over a concurrent writer's edits).
+/// The hosted-redirect flow over an already-selected `(purl, uuid)` set, on
+/// disk, shared by `scan --mode hosted` and `get --mode hosted`. The plan,
+/// rewrite and edits are core's [`socket_patch_core::hosted::engine`]; this
+/// keeps what needs the host: network fetches, the apply lock, the
+/// vendored→hosted takeover, the file writes, the stale-install probes and
+/// the optional VEX. The vendored ledger the takeover needs is loaded here,
+/// under the apply lock, so a copy read before the lock is never saved over
+/// a concurrent writer's edits.
 ///
-/// `scan_result` must be `Some` exactly when `common.json` is set (the
-/// human/JSON split keys on `common.json`; a `--json` caller passing `None`
-/// would get a bare scan envelope without its own payload).
-/// `prune_requested` only feeds the `redirect_prune_ignored` warning —
-/// `get` passes `false`.
+/// `scan_result` must be `Some` exactly when `common.json` is set.
+/// `prune_requested` only feeds the `redirect_prune_ignored` warning.
 ///
 /// Telemetry: a run with a non-empty selection reports `patch_applied`
-/// (`mode: "hosted"`, sent before the result prints) or, on a non-zero
-/// exit before that point, `patch_apply_failed`. `command` names the
-/// caller (`scan` / `get`) in the event's context.
+/// before the result prints or, on a non-zero exit before that,
+/// `patch_apply_failed`; `command` names the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_redirect_selected(
     common: &crate::args::GlobalArgs,
@@ -2189,13 +2055,6 @@ async fn put_back(written: &[(std::path::PathBuf, Option<Vec<u8>>)]) {
     }
 }
 
-// ── Human-output formatting ────────────────────────────────────────────────
-//
-// Pure `String` builders for everything the hosted flow prints in human
-// mode, so the exact text is unit-testable (see the tests module). JSON
-// output never goes through these: its `detail`/`reason` strings are the
-// stable, machine-facing spellings.
-
 /// Warning codes that report a SUCCESSFUL vendored→hosted migration. They
 /// stay in the JSON `warnings[]` (additive contract), but a human run
 /// prints them as plain progress lines ([`format_takeover_line`]), not as
@@ -2387,11 +2246,8 @@ fn describe_skip_reason(reason: &str) -> String {
 }
 
 /// How many of the lockfile rewriters' warnings can explain why a granted
-/// package has no lock entry: the count `format_unredirected` turns into its
-/// "(see the warning below)" hint. `redirect_bun_default_trust_lost` rides in
-/// the same vector but is about a pin that *was* written (Bun's default trust
-/// lost on the hosted URL, #371), so it never explains a missing entry. The
-/// uv < 0.5.6 advisories (#1569) likewise describe a written pin.
+/// package has no lock entry. Bun's lost default trust and the uv < 0.5.6
+/// advisories describe a pin that *was* written, so they don't count.
 fn lock_entry_warning_count(
     warnings: &[socket_patch_core::patch::redirect::RewriteWarning],
 ) -> usize {
@@ -2634,27 +2490,17 @@ fn created_settings_over_existing(
         })
 }
 
-/// [`created_settings_over_existing`]'s code for `socket-patch.sbt`.
-use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
-
 #[cfg(test)]
 mod tests {
     use super::{
         describe_skip_reason, format_error_line, format_next_steps, format_redirect_summary,
         format_takeover_line, format_unredirected, format_warning, join_names,
-        lock_entry_warning_count, pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder,
-        split_sentences, wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
+        lock_entry_warning_count, pnpm_trust_rerun_reminder, split_sentences, wrap_tokens,
+        wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{
         gem_stale_cache_warning, gem_stale_install_warning, gem_stale_install_warnings,
-        installed_stale_positive_evidence, npm_allow_remote_already_detail,
-        npm_allow_remote_configured_detail, npm_allow_remote_env_set_detail,
-        npm_allow_remote_manual_detail, npm_allow_remote_outer_set_detail,
-        npm_allow_remote_unreadable_detail, npm_allow_remote_user_set_detail, plan_workspace_trust,
-        pnpm_heal_root, pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major,
-        pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-        pnpm_trust_workspace_unreadable_detail, prune_ignored_warning, read_npmrc_for_allow_remote,
-        read_workspace_for_trust, record_hosted_events, redirect_block, TrustPlan,
+        prune_ignored_warning, record_hosted_events, redirect_block,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
 
@@ -2826,338 +2672,6 @@ mod tests {
         }
     }
 
-    /// Lock-head version sniff against real pnpm 7/8/9-12 heads: quoted `'9.0'` and `'6.0'`,
-    /// unquoted `5.4`; a headless/garbled lock yields `None` (hands-off).
-    #[test]
-    fn pnpm_lock_version_major_sniffs_real_lock_heads() {
-        assert_eq!(
-            pnpm_lock_version_major("lockfileVersion: '9.0'\n\nsettings:\n"),
-            Some(9),
-            "pnpm 9-12 emit a quoted '9.0'"
-        );
-        assert_eq!(
-            pnpm_lock_version_major("lockfileVersion: '6.0'\n\nsettings:\n"),
-            Some(6),
-            "pnpm 8 emits a quoted '6.0'"
-        );
-        assert_eq!(
-            pnpm_lock_version_major("lockfileVersion: 5.4\n\nspecifiers:\n"),
-            Some(5),
-            "pnpm 7 emits an unquoted 5.4"
-        );
-        // Not necessarily the first line (a comment/BOM-damaged head).
-        assert_eq!(
-            pnpm_lock_version_major("# managed\nlockfileVersion: \"9.0\"\n"),
-            Some(9)
-        );
-        assert_eq!(
-            pnpm_lock_version_major("importers:\n  .:\n"),
-            None,
-            "no version line → None, callers stay hands-off"
-        );
-        assert_eq!(
-            pnpm_lock_version_major("lockfileVersion: banana\n"),
-            None,
-            "unparseable version → None, never a guess"
-        );
-    }
-
-    /// No pnpm-workspace.yaml → create the root-only scaffold + trust key
-    /// (the exact bytes the vendor backend's scaffold precedent uses, with
-    /// `trustLockfile: true` in place of the override).
-    #[test]
-    fn plan_workspace_trust_creates_the_scaffold() {
-        match plan_workspace_trust(None) {
-            TrustPlan::Create(text) => {
-                assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true\n");
-            }
-            _ => panic!("no workspace file must plan a Create"),
-        }
-    }
-
-    /// #1096: an existing file with no keys at all (empty, comments only,
-    /// bare document markers) gains the root-only `packages` scaffold with
-    /// the trust key — pnpm 8.x–10.4 refuse a workspace file holding a key
-    /// but no `packages` — inside the document, every user byte intact.
-    #[test]
-    fn plan_workspace_trust_scaffolds_packages_in_a_keyless_file() {
-        const ADDED: &str = "packages:\n  - '.'\ntrustLockfile: true\n";
-        for (user, want) in [
-            ("", ADDED.to_string()),
-            ("\n", format!("{ADDED}\n")),
-            ("# settings\n", format!("# settings\n{ADDED}")),
-            ("---\n", format!("---\n{ADDED}")),
-            ("%YAML 1.2\n---\n", format!("%YAML 1.2\n---\n{ADDED}")),
-            ("---\n...\n", format!("---\n{ADDED}...\n")),
-        ] {
-            match plan_workspace_trust(Some(user)) {
-                TrustPlan::Scaffold(text) => assert_eq!(text, want, "{user:?}"),
-                _ => panic!("a keyless file must plan a Scaffold: {user:?}"),
-            }
-        }
-    }
-
-    /// An existing workspace file gains exactly one line after its last
-    /// non-empty line; every other byte — including a trailing blank line and
-    /// comments — is preserved so a revert can remove exactly that line.
-    #[test]
-    fn plan_workspace_trust_appends_preserving_user_bytes() {
-        let user = "# team workspace\npackages:\n  - 'apps/*'\n  - 'libs/*'\n\ncatalog:\n  react: ^18.0.0\n";
-        match plan_workspace_trust(Some(user)) {
-            TrustPlan::Append(text) => {
-                assert_eq!(
-                    text,
-                    "# team workspace\npackages:\n  - 'apps/*'\n  - 'libs/*'\n\ncatalog:\n  react: ^18.0.0\ntrustLockfile: true\n",
-                    "one line appended after the last non-empty line, all user bytes intact"
-                );
-            }
-            _ => panic!("a file without the key must plan an Append"),
-        }
-        // No trailing newline: the file's (lack of) trailing bytes stays put.
-        match plan_workspace_trust(Some("packages:\n  - '.'")) {
-            TrustPlan::Append(text) => {
-                assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true");
-            }
-            _ => panic!("expected Append"),
-        }
-    }
-
-    /// `trustLockfile: true` already present (any quoting) → nothing to do;
-    /// an explicit non-true value is the USER's security call and is
-    /// respected, never flipped.
-    #[test]
-    fn plan_workspace_trust_respects_existing_key() {
-        for spelled in [
-            "packages:\n  - '.'\ntrustLockfile: true\n",
-            "trustLockfile: 'true'\npackages:\n  - '.'\n",
-            "trustLockfile: \"true\"\n",
-        ] {
-            assert!(
-                matches!(plan_workspace_trust(Some(spelled)), TrustPlan::AlreadyTrue),
-                "already-true must be a no-op for {spelled:?}"
-            );
-        }
-        match plan_workspace_trust(Some("packages:\n  - '.'\ntrustLockfile: false\n")) {
-            TrustPlan::UserSet(value) => assert_eq!(value, "false"),
-            _ => panic!("an explicit false must be respected as UserSet"),
-        }
-        // An INDENTED trustLockfile under some other mapping is not the
-        // top-level setting pnpm reads — it must not be mistaken for one.
-        match plan_workspace_trust(Some(
-            "catalogMode:\n  trustLockfile: false\npackages:\n  - '.'\n",
-        )) {
-            TrustPlan::Append(text) => assert!(text.ends_with("trustLockfile: true\n")),
-            _ => panic!("an indented key must not block the top-level append"),
-        }
-    }
-
-    /// #402: every key spelling pnpm reads as `trustLockfile` is the
-    /// setting — an explicit value is respected, never duplicated.
-    #[test]
-    fn plan_workspace_trust_reads_quoted_and_spaced_keys() {
-        for spelled in [
-            "packages:\n  - '.'\n\"trustLockfile\": false\n",
-            "packages:\n  - '.'\ntrustLockfile : false\n",
-            "packages:\n  - '.'\n'trustLockfile':   false   # opt out\n",
-        ] {
-            match plan_workspace_trust(Some(spelled)) {
-                TrustPlan::UserSet(value) => assert_eq!(value, "false", "{spelled:?}"),
-                _ => panic!("an explicit false must be respected for {spelled:?}"),
-            }
-        }
-        for spelled in [
-            "'trustLockfile': true\npackages:\n  - '.'\n",
-            "\"trustLockfile\" : \"true\"\n",
-            "trustLockfile: true # set by hand\n",
-        ] {
-            assert!(
-                matches!(plan_workspace_trust(Some(spelled)), TrustPlan::AlreadyTrue),
-                "already-true must be a no-op for {spelled:?}"
-            );
-        }
-    }
-
-    /// #400: the key goes inside the document — before a `...` marker —
-    /// and shapes a line append would corrupt are never appended to.
-    #[test]
-    fn plan_workspace_trust_respects_the_document_shape() {
-        match plan_workspace_trust(Some("packages:\n  - '.'\n...\n")) {
-            TrustPlan::Append(text) => {
-                assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true\n...\n")
-            }
-            _ => panic!("a `...`-terminated block mapping must plan an Append"),
-        }
-        // The refusal reason reaches the warning with both manual recoveries.
-        let TrustPlan::Unsupported(why) = plan_workspace_trust(Some("{packages: [.]}\n")) else {
-            panic!("a flow-style document must be refused");
-        };
-        let detail = socket_patch_core::hosted::guidance::pnpm_trust_workspace_unsupported_detail(
-            "the hosted patch server (patch.test)",
-            &why,
-        );
-        assert!(detail.contains("flow-style"), "{detail}");
-        assert!(detail.contains("left untouched"), "{detail}");
-        assert!(detail.contains("--trust-lockfile"), "{detail}");
-        assert!(detail.contains("trustLockfile: true"), "{detail}");
-        assert!(detail.contains("pnpm clean --lockfile"), "{detail}");
-        for text in [
-            "{packages: [.]}\n",
-            "--- {packages: [.]}\n",
-            "packages:\n  - '.'\n---\ncatalog: {}\n",
-            "packages:\n  - '.'\n...\n---\ncatalog: {}\n",
-        ] {
-            assert!(
-                !matches!(
-                    plan_workspace_trust(Some(text)),
-                    TrustPlan::Append(_) | TrustPlan::Create(_)
-                ),
-                "{text:?} must not be appended to"
-            );
-        }
-    }
-
-    /// The warning variants: the configured text says trust is in place and
-    /// installs need no flags; the dry-run text says WOULD; both carry the
-    /// whole-lock tradeoff disclosure and the don't-rebuild caution; the
-    /// manual-guidance text keeps both verified recoveries. None may leak a
-    /// URL authority `@` (the userinfo-stripping contract).
-    #[test]
-    fn pnpm_trust_warning_variants_carry_the_load_bearing_sentences() {
-        let server = "the hosted patch server (patch.test)";
-        for created in [true, false] {
-            let configured = pnpm_trust_configured_detail(server, created, false);
-            assert!(configured.contains("trustLockfile: true"), "{configured}");
-            assert!(configured.contains("pnpm-workspace.yaml"), "{configured}");
-            assert!(
-                configured.contains("commit it alongside the lock"),
-                "{configured}"
-            );
-            assert!(configured.contains("no extra flags"), "{configured}");
-            assert!(!configured.contains("would be"), "{configured}");
-            let dry = pnpm_trust_configured_detail(server, created, true);
-            assert!(dry.contains("would be"), "{dry}");
-            // The summary line already says it is a dry run; a marker
-            // inside the noun phrase ("a new (--dry-run) pnpm-workspace")
-            // read as garbled.
-            assert!(!dry.contains("--dry-run"), "{dry}");
-            let want = if created {
-                "so `trustLockfile: true` would be written to a new pnpm-workspace.yaml — commit"
-            } else {
-                "so `trustLockfile: true` would be merged into the existing pnpm-workspace.yaml — commit"
-            };
-            assert!(dry.contains(want), "{dry}");
-            for text in [&configured, &dry] {
-                assert!(text.contains("ALL lockfile entries"), "{text}");
-                assert!(text.contains("minimumReleaseAge"), "{text}");
-                assert!(text.contains("sha512 integrity pins are"), "{text}");
-                assert!(text.contains("pnpm clean --lockfile"), "{text}");
-                assert!(text.contains("pnpm <=10"), "{text}");
-                assert!(
-                    text.contains("ERR_PNPM_TARBALL_URL_MISMATCH")
-                        && text.contains("ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION"),
-                    "{text}"
-                );
-                assert!(!text.contains('@'), "no URL authority may leak: {text}");
-                assert!(!text.contains(".npmrc"), "{text}");
-            }
-        }
-        let manual = pnpm_trust_manual_guidance(server);
-        assert!(manual.contains("--trust-lockfile"), "{manual}");
-        assert!(
-            manual.contains("trustLockfile: true") && manual.contains("pnpm-workspace.yaml"),
-            "{manual}"
-        );
-        assert!(manual.contains("pnpm clean --lockfile"), "{manual}");
-        assert!(manual.contains("pnpm <=10"), "{manual}");
-        assert!(!manual.contains('@'), "{manual}");
-    }
-
-    /// The legacy-lock (5.x/6.0 — pnpm 7/8) guidance must NEVER mention
-    /// `--trust-lockfile` (pnpm 7/8 reject the flag as an unknown option) nor
-    /// the `trustLockfile` setting (pnpm 7/8 ignore it); it must say installs
-    /// work unchanged with no trust step, keep the don't-regenerate caution,
-    /// and leak no URL authority.
-    #[test]
-    fn pnpm_trust_legacy_detail_never_recommends_the_trust_flag() {
-        let server = "the hosted patch server (patch.test)";
-        let legacy = pnpm_trust_legacy_detail(server);
-        assert!(
-            !legacy.contains("trust-lockfile"),
-            "pnpm 7/8 reject --trust-lockfile as an unknown option: {legacy}"
-        );
-        assert!(
-            !legacy.contains("trustLockfile"),
-            "pnpm 7/8 ignore the setting — recommending it is noise: {legacy}"
-        );
-        assert!(legacy.contains("pnpm 1–8"), "{legacy}");
-        assert!(legacy.contains("no trust step"), "{legacy}");
-        // The vulnerable-reinstall caution survives the split: regenerating
-        // the lock still silently discards the redirect.
-        assert!(legacy.contains("Do NOT regenerate"), "{legacy}");
-        assert!(legacy.contains("vulnerable upstream"), "{legacy}");
-        assert!(!legacy.contains('@'), "no URL authority may leak: {legacy}");
-    }
-
-    /// A PRESENT-but-unreadable pnpm-workspace.yaml must classify as `Err` —
-    /// never as `Ok(None)`, which plans a Create that overwrites the user's
-    /// file (destroying their `packages:` globs). Absent stays `Ok(None)`
-    /// (the only Create-safe state); readable stays `Ok(Some)`.
-    #[test]
-    fn read_workspace_for_trust_distinguishes_unreadable_from_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Absent → Ok(None).
-        assert!(matches!(
-            read_workspace_for_trust(&tmp.path().join("pnpm-workspace.yaml")),
-            Ok(None)
-        ));
-        // Readable → Ok(Some(text)).
-        let readable = tmp.path().join("readable.yaml");
-        std::fs::write(&readable, "packages:\n  - '.'\n").unwrap();
-        assert!(matches!(
-            read_workspace_for_trust(&readable),
-            Ok(Some(text)) if text.contains("packages")
-        ));
-        // Invalid UTF-8 → Err(InvalidData), cross-platform.
-        let invalid = tmp.path().join("invalid.yaml");
-        std::fs::write(&invalid, b"packages:\n  - 'apps/*'\n\xff\xfe\x80").unwrap();
-        let err = read_workspace_for_trust(&invalid)
-            .expect_err("invalid UTF-8 must classify as Err, never as absent→Create");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        // chmod 000 (unix): PermissionDenied → Err. Root ignores mode bits,
-        // so only the failing-read outcome is asserted strictly.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let locked = tmp.path().join("locked.yaml");
-            std::fs::write(&locked, "packages:\n  - '.'\n").unwrap();
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-            match read_workspace_for_trust(&locked) {
-                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
-                // Running as root: mode bits don't apply; the invalid-UTF-8
-                // case above already proved the Err classification.
-                Ok(Some(_)) => {}
-                Ok(None) => panic!("an unreadable file must never classify as absent"),
-            }
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        // The fallback detail names the file, the error, and both manual
-        // recoveries — and never plans a write (it returns prose only).
-        let server = "the hosted patch server (patch.test)";
-        let detail = pnpm_trust_workspace_unreadable_detail(
-            server,
-            &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
-        );
-        assert!(detail.contains("pnpm-workspace.yaml"), "{detail}");
-        assert!(detail.contains("could not be read"), "{detail}");
-        assert!(detail.contains("permission denied"), "{detail}");
-        assert!(detail.contains("left untouched"), "{detail}");
-        assert!(
-            detail.contains("--trust-lockfile") && detail.contains("trustLockfile: true"),
-            "{detail}"
-        );
-        assert!(detail.contains("pnpm clean --lockfile"), "{detail}");
-    }
-
     /// The early Pipenv probe start is exact: whenever it fires, the
     /// post-fetch gate is true for EVERY outcome of the wheel metadata
     /// fetch (any subset of the fetched wheels' URLs dropped).
@@ -3266,100 +2780,6 @@ mod tests {
         }
     }
 
-    /// Heal-on-rerun probe: a root lock ALREADY
-    /// carrying a granted hosted artifact URL from an earlier run — raw,
-    /// `\/`-escaped, or percent-encoded — is detected even when this run
-    /// spliced nothing, so the trust config can be (re)planned for a project
-    /// that missed it (opted-out first run, or a crash between the lock
-    /// write and the workspace write). A pristine lock, and a lock whose
-    /// only match is a NON-npm override's URL, must stay undetected.
-    #[test]
-    fn pnpm_lock_carries_hosted_redirect_detects_prior_run_splices() {
-        let url = "http://patch.test/patch/npm/in-proc-heal/1.0.0/tok/uuid/in-proc-heal-1.0.0.tgz";
-        let mut cargo = npm_override("http://patch.test/crates/heal-1.0.0.crate");
-        cargo.ecosystem = "cargo".to_string();
-        let overrides = vec![npm_override(url), cargo];
-
-        // The exact splice shape an earlier run wrote.
-        let redirected = format!(
-            "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
-             resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n"
-        );
-        assert!(pnpm_lock_carries_hosted_redirect(&redirected, &overrides));
-
-        // The percent-encoded spelling counts too (same predicate set as the
-        // confirmation probe).
-        let encoded = socket_patch_core::utils::uri::encode_uri_component(url);
-        let encoded_lock = format!("lockfileVersion: '9.0'\npackages:\n  x: {encoded}\n");
-        assert!(pnpm_lock_carries_hosted_redirect(&encoded_lock, &overrides));
-
-        // Pristine lock: nothing to heal.
-        assert!(!pnpm_lock_carries_hosted_redirect(
-            "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
-             resolution: {integrity: sha512-UPSTREAM==}\n",
-            &overrides
-        ));
-
-        // A non-npm override's URL in the text is not a pnpm redirect.
-        assert!(!pnpm_lock_carries_hosted_redirect(
-            "lockfileVersion: '9.0'\n# http://patch.test/crates/heal-1.0.0.crate\n",
-            &overrides
-        ));
-
-        // No grants at all → never engages.
-        assert!(!pnpm_lock_carries_hosted_redirect(&redirected, &[]));
-    }
-
-    /// Heal-on-rerun gate (`pnpm_heal_root`): a re-scan that spliced NOTHING
-    /// over a pre-redirected root v9 lock with a MISSING pnpm-workspace.yaml
-    /// must engage the trust block (heal → plan Create), while a legacy
-    /// pre-redirected lock, an unparseable-version lock, a pristine lock,
-    /// and a root lock this run DID splice all stay out of the heal path.
-    #[test]
-    fn pnpm_heal_root_re_engages_trust_planning_for_pre_redirected_v9_locks() {
-        let url = "http://patch.test/patch/npm/in-proc-heal/1.0.0/tok/uuid/in-proc-heal-1.0.0.tgz";
-        let overrides = vec![npm_override(url)];
-        let redirected_v9 = format!(
-            "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
-             resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n"
-        );
-
-        // The heal scenario: nothing spliced this run, root lock already
-        // redirected, workspace file missing → the gate engages and the
-        // planning it feeds produces the Create.
-        let healed = pnpm_heal_root(false, Some(&redirected_v9), &overrides)
-            .expect("a pre-redirected root v9 lock must re-engage the trust block");
-        assert_eq!(healed, &redirected_v9);
-        assert!(
-            matches!(plan_workspace_trust(None), TrustPlan::Create(_)),
-            "with the workspace file missing, the healed run must plan the Create"
-        );
-
-        // Root lock spliced THIS run: the splice path covers it — no heal.
-        assert!(pnpm_heal_root(true, Some(&redirected_v9), &overrides).is_none());
-
-        // Pristine v9 lock (no redirect landed): nothing to heal.
-        let pristine = "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
-                        resolution: {integrity: sha512-UPSTREAM==}\n"
-            .to_string();
-        assert!(pnpm_heal_root(false, Some(&pristine), &overrides).is_none());
-
-        // Legacy pre-redirected lock: pnpm 7/8 need no trust config — the
-        // heal gate must not drag a 5.x/6.0 lock into the v9 auto-config.
-        let redirected_v6 = format!(
-            "lockfileVersion: '6.0'\n\npackages:\n  /in-proc-heal@1.0.0:\n    \
-             resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n"
-        );
-        assert!(pnpm_heal_root(false, Some(&redirected_v6), &overrides).is_none());
-
-        // Unparseable version: fail closed, hands off.
-        let headless = format!("packages:\n  x:\n    resolution: {{tarball: {url}}}\n");
-        assert!(pnpm_heal_root(false, Some(&headless), &overrides).is_none());
-
-        // No root lock at all (e.g. Rush): nothing to heal.
-        assert!(pnpm_heal_root(false, None, &overrides).is_none());
-    }
-
     /// The hosted outcome recorded into a scan envelope: one event per
     /// selected patch, tagged `details.mode: "hosted"` and purl-sorted —
     /// `applied` for a confirmed pin (`verified` on a dry run), `skipped`
@@ -3430,12 +2850,6 @@ mod tests {
         assert_eq!(env.summary.verified, 1);
         assert_eq!(env.summary.applied, 0);
     }
-
-    // ── gem stale-install probe (redirect_gem_stale_install) ──────────
-    //
-    // Defect facts + verified/disproven remedies live in CLI_CONTRACT.md's
-    // "Gem stale-install guard" section; these tests pin the probe's
-    // judgment rules and the warning wording's load-bearing parts.
 
     use std::path::PathBuf;
 
@@ -3647,7 +3061,12 @@ mod tests {
     /// transiently unreadable file in a patched install must not produce
     /// a delete prescription.
     #[tokio::test]
-    async fn installed_stale_positive_evidence_requires_readable_mismatched_bytes() {
+    async fn stale_evidence_requires_readable_mismatched_bytes() {
+        async fn stale_evidence(dir: &std::path::Path, record: &PatchRecord) -> bool {
+            socket_patch_core::vex::verify::judge_installed_record(dir, record)
+                .await
+                .stale_evidence
+        }
         let tmp = tempfile::tempdir().unwrap();
         let record = gem_record();
 
@@ -3655,30 +3074,30 @@ mod tests {
         let upstream = tmp.path().join("upstream");
         std::fs::create_dir_all(upstream.join("lib")).unwrap();
         std::fs::write(upstream.join("lib").join("stale_unit.rb"), GEM_UPSTREAM).unwrap();
-        assert!(installed_stale_positive_evidence(&upstream, &record).await);
+        assert!(stale_evidence(&upstream, &record).await);
 
         // Tampered bytes (neither hash) → evidence.
         let tampered = tmp.path().join("tampered");
         std::fs::create_dir_all(tampered.join("lib")).unwrap();
         std::fs::write(tampered.join("lib").join("stale_unit.rb"), b"other").unwrap();
-        assert!(installed_stale_positive_evidence(&tampered, &record).await);
+        assert!(stale_evidence(&tampered, &record).await);
 
         // Patched bytes → no evidence.
         let patched = tmp.path().join("patched");
         std::fs::create_dir_all(patched.join("lib")).unwrap();
         std::fs::write(patched.join("lib").join("stale_unit.rb"), GEM_PATCHED).unwrap();
-        assert!(!installed_stale_positive_evidence(&patched, &record).await);
+        assert!(!stale_evidence(&patched, &record).await);
 
         // Missing file → no evidence (never a guess).
         let hollow = tmp.path().join("hollow");
         std::fs::create_dir_all(hollow.join("lib")).unwrap();
-        assert!(!installed_stale_positive_evidence(&hollow, &record).await);
+        assert!(!stale_evidence(&hollow, &record).await);
 
         // A DIRECTORY at the file path (the unreadable-NotFound class) →
         // no evidence.
         let blocked = tmp.path().join("blocked");
         std::fs::create_dir_all(blocked.join("lib").join("stale_unit.rb")).unwrap();
-        assert!(!installed_stale_positive_evidence(&blocked, &record).await);
+        assert!(!stale_evidence(&blocked, &record).await);
 
         // Absent new-file (empty beforeHash routes to Ready with NO
         // current_hash) → no evidence.
@@ -3688,7 +3107,7 @@ mod tests {
             .get_mut("lib/stale_unit.rb")
             .expect("fixture file entry")
             .before_hash = String::new();
-        assert!(!installed_stale_positive_evidence(&hollow, &new_file).await);
+        assert!(!stale_evidence(&hollow, &new_file).await);
     }
 
     /// The probe end to end over a real deployment layout: a STALE
@@ -3827,23 +3246,6 @@ mod tests {
             out.warnings
         );
         assert!(out.stale_purls.is_empty());
-    }
-
-    /// Records are found BY UUID — the fetch key, stable across purl
-    /// spellings — so a record keyed under a qualified purl still judges
-    /// the bare confirmed purl.
-    #[tokio::test]
-    async fn gem_stale_probe_record_lookup_is_uuid_keyed() {
-        let stale = tempfile::tempdir().unwrap();
-        materialize_gem(stale.path(), GEM_UPSTREAM);
-        let mut records = std::collections::BTreeMap::new();
-        records.insert(format!("{GEM_PURL}?platform=ruby"), gem_record());
-        let out = probe(stale.path(), &one_confirmed(), &records).await;
-        assert_eq!(
-            out.warnings.len(),
-            1,
-            "the uuid lookup must find the record under any purl spelling"
-        );
     }
 
     /// The probe links a record to a confirmed purl by uuid alone: a
@@ -4337,7 +3739,6 @@ mod tests {
             ]
         );
     }
-    // ── Human-output formatting ────────────────────────────────────────────
 
     #[test]
     fn redirect_summary_singular_plural_and_dry_run() {
@@ -4680,18 +4081,6 @@ mod tests {
     }
 
     #[test]
-    fn store_flag_note_only_for_pnpm_one_to_four_locks() {
-        assert!(pnpm_lock_may_need_store_flag("shrinkwrapVersion: 3\n"));
-        assert!(pnpm_lock_may_need_store_flag("lockfileVersion: 5.1\n"));
-        assert!(pnpm_lock_may_need_store_flag("lockfileVersion: '5.2'\n"));
-        assert!(!pnpm_lock_may_need_store_flag("lockfileVersion: 5.3\n"));
-        assert!(!pnpm_lock_may_need_store_flag("lockfileVersion: 5.4\n"));
-        assert!(!pnpm_lock_may_need_store_flag("lockfileVersion: '6.0'\n"));
-        assert!(!pnpm_lock_may_need_store_flag("lockfileVersion: '9.0'\n"));
-        assert!(!pnpm_lock_may_need_store_flag("packages: {}\n"));
-    }
-
-    #[test]
     fn join_names_lists_and_caps() {
         let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(join_names(&n(&[]), 6), "");
@@ -4772,145 +4161,14 @@ mod tests {
         );
     }
 
-    /// Every hosted npm redirect variant tells the user
-    /// that npm >= 12 refuses the redirected lock (EALLOWREMOTE) without
-    /// `allow-remote=all`, and carries the whole-tree tradeoff disclosure —
-    /// the auto-configured, already-set, explicit-other, opted-out and
-    /// unreadable variants alike.
-    #[test]
-    fn npm_allow_remote_warning_variants_carry_the_load_bearing_sentences() {
-        let hosts = ["patch.socket.dev"];
-        let variants = [
-            npm_allow_remote_configured_detail(&hosts, true, false),
-            npm_allow_remote_configured_detail(&hosts, false, false),
-            npm_allow_remote_configured_detail(&hosts, true, true),
-            npm_allow_remote_configured_detail(&hosts, false, true),
-            npm_allow_remote_already_detail(&hosts),
-            npm_allow_remote_user_set_detail(&hosts, "root"),
-            npm_allow_remote_manual_detail(&hosts),
-            npm_allow_remote_unreadable_detail(&hosts, "could not be read (denied)"),
-            npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"),
-            npm_allow_remote_outer_set_detail(
-                &hosts,
-                "user",
-                std::path::Path::new("/home/u/.npmrc"),
-                "none",
-            ),
-        ];
-        for d in &variants {
-            for needle in [
-                "patch.socket.dev",
-                "npm >=12",
-                "EALLOWREMOTE",
-                "lets npm install ANY url-resolved",
-                "sha512 integrity pins are still enforced",
-                "npm <=11 installs work unchanged",
-            ] {
-                assert!(d.contains(needle), "{needle:?} missing: {d}");
-            }
-        }
-        let [created, appended, dry_created, dry_appended, already, user_set, manual, unreadable, env_set, outer_set] =
-            &variants;
-        assert!(
-            env_set.contains("npm_config_allow_remote=none")
-                && env_set.contains("overrides every .npmrc")
-                && env_set.contains("would not take effect")
-                && env_set.contains("left untouched"),
-            "{env_set}"
-        );
-        assert!(
-            outer_set.contains("The user npm config (/home/u/.npmrc)")
-                && outer_set.contains("explicitly sets `allow-remote=none`")
-                && outer_set.contains("does not commit a project .npmrc that overrides it"),
-            "{outer_set}"
-        );
-        assert!(
-            created.contains("was written to a new project .npmrc"),
-            "{created}"
-        );
-        assert!(
-            appended.contains("was appended to the existing project .npmrc"),
-            "{appended}"
-        );
-        // The summary line already says it is a dry run (the pnpm
-        // trustLockfile twin's rule): no marker inside the noun phrase.
-        assert!(
-            dry_created.contains("would be written to a new project .npmrc")
-                && !dry_created.contains("(--dry-run)"),
-            "{dry_created}"
-        );
-        assert!(
-            dry_appended.contains("would be appended to the existing project .npmrc")
-                && !dry_appended.contains("(--dry-run)"),
-            "{dry_appended}"
-        );
-        for d in [created, appended, dry_created, dry_appended] {
-            assert!(
-                d.contains("--no-npm-allow-remote-config"),
-                "opt-out named: {d}"
-            );
-            assert!(d.contains("SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG"), "{d}");
-        }
-        assert!(
-            already.contains("already sets `allow-remote=all`"),
-            "{already}"
-        );
-        assert!(
-            user_set.contains("explicitly sets `allow-remote=root`"),
-            "{user_set}"
-        );
-        assert!(
-            user_set.contains("respected and left untouched"),
-            "{user_set}"
-        );
-        assert!(
-            user_set.contains("only admits direct dependencies"),
-            "{user_set}"
-        );
-        for d in [user_set, manual, unreadable, env_set, outer_set] {
-            assert!(
-                d.contains("npm ci --allow-remote=all"),
-                "manual remedy: {d}"
-            );
-        }
-        assert!(
-            unreadable.contains("could not be read (denied)"),
-            "{unreadable}"
-        );
-    }
-
-    /// The `.npmrc` read classifier: absent → plan a Create; readable →
-    /// plan against the text; a symlink or unreadable file → hands off
-    /// (never planned — a Create would clobber the user's config, and the
-    /// atomic writer would replace a link).
-    #[test]
-    fn read_npmrc_for_allow_remote_classifies_absent_readable_and_unsafe() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".npmrc");
-        assert_eq!(read_npmrc_for_allow_remote(&path), Ok(None));
-        std::fs::write(&path, "fund=false\n").unwrap();
-        assert_eq!(
-            read_npmrc_for_allow_remote(&path),
-            Ok(Some("fund=false\n".into()))
-        );
-        std::fs::write(&path, [0xff_u8, 0xfe]).unwrap();
-        assert!(read_npmrc_for_allow_remote(&path)
-            .unwrap_err()
-            .contains("could not be read"));
-        #[cfg(unix)]
-        {
-            std::fs::remove_file(&path).unwrap();
-            std::fs::write(tmp.path().join("real"), "fund=false\n").unwrap();
-            std::os::unix::fs::symlink(tmp.path().join("real"), &path).unwrap();
-            assert!(read_npmrc_for_allow_remote(&path)
-                .unwrap_err()
-                .contains("symbolic link"));
-        }
-    }
-
     #[test]
     fn npm_allow_remote_one_line_covers_every_variant() {
         use super::npm_allow_remote_one_line;
+        use socket_patch_core::hosted::guidance::{
+            npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
+            npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
+            npm_allow_remote_unreadable_detail, npm_allow_remote_user_set_detail,
+        };
         let hosts = ["patch.socket.dev"];
         let cases = [
             (

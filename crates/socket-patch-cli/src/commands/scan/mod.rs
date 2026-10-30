@@ -2777,7 +2777,7 @@ async fn run_scan(
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 &policy,
-                Some(env),
+                env,
                 telemetry,
                 npm_crawl.as_ref(),
                 &recorded,
