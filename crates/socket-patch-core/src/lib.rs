@@ -21,4 +21,6 @@ mod golden;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]
+mod test_env_tests;
+#[cfg(test)]
 mod test_rng;

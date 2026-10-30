@@ -28,16 +28,20 @@ impl EnvGuard {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
-        let mut saved = Vec::new();
+        // Saved before each change, so a panic partway through (a key with
+        // `=` in it) still restores the vars already changed.
+        let mut guard = Self { saved: Vec::new() };
         for (key, value) in pairs {
             let key = key.as_ref();
-            saved.push((key.to_os_string(), std::env::var_os(key)));
+            guard
+                .saved
+                .push((key.to_os_string(), std::env::var_os(key)));
             match value {
                 Some(v) => std::env::set_var(key, v),
                 None => std::env::remove_var(key),
             }
         }
-        Self { saved }
+        guard
     }
 }
 
@@ -58,51 +62,4 @@ impl Drop for EnvGuard {
 pub(crate) fn with_env<T>(pairs: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
     let _env = EnvGuard::many(pairs.iter().copied());
     f()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const KEY: &str = "SOCKET_PATCH_TEST_ENV_GUARD_PROBE";
-
-    #[test]
-    #[serial_test::serial]
-    fn restores_set_unset_and_repeated_keys_on_drop() {
-        std::env::set_var(KEY, "orig");
-        {
-            let _a = EnvGuard::set(KEY, "a");
-            assert_eq!(std::env::var(KEY).as_deref(), Ok("a"));
-            let _b = EnvGuard::many([(KEY, None::<&str>), (KEY, Some("c"))]);
-            assert_eq!(std::env::var(KEY).as_deref(), Ok("c"));
-        }
-        assert_eq!(std::env::var(KEY).as_deref(), Ok("orig"));
-
-        std::env::remove_var(KEY);
-        drop(EnvGuard::set(KEY, "x"));
-        assert_eq!(std::env::var_os(KEY), None);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn with_env_restores_after_a_panic() {
-        std::env::remove_var(KEY);
-        let caught = std::panic::catch_unwind(|| {
-            with_env(&[(KEY, Some("leak"))], || panic!("assertion failed"))
-        });
-        assert!(caught.is_err());
-        assert_eq!(std::env::var_os(KEY), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn keeps_a_non_utf8_previous_value() {
-        use std::os::unix::ffi::OsStrExt;
-        let raw = OsStr::from_bytes(b"\xff\xfe");
-        std::env::set_var(KEY, raw);
-        drop(EnvGuard::unset(KEY));
-        assert_eq!(std::env::var_os(KEY).as_deref(), Some(raw));
-        std::env::remove_var(KEY);
-    }
 }

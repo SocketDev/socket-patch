@@ -2387,7 +2387,7 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
     }
     // A `false` per-package cutoff on the command line exempts urllib3
     // from `UV_EXCLUDE_NEWER`.
-    let _env = EnvGuard::set("UV_EXCLUDE_NEWER", "2023-01-01T00:00:00Z".to_string());
+    let _env = EnvGuard::set("UV_EXCLUDE_NEWER", "2023-01-01T00:00:00Z");
     let input = tree(&[(
         "pylock.toml",
         with_flags(" --exclude-newer-package urllib3=false"),
@@ -2396,7 +2396,7 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
     drop(_env);
     // Empty is unset, and `false` turns the cutoff off.
     for value in ["", "false"] {
-        let _env = EnvGuard::set("UV_EXCLUDE_NEWER", value.to_string());
+        let _env = EnvGuard::set("UV_EXCLUDE_NEWER", value);
         let input = tree(&[("pylock.toml", uv_pylock(false))]);
         assert_pypi_round_trip("UV_EXCLUDE_NEWER off", &input, &[urllib3_dep()], None).await;
     }

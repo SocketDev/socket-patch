@@ -3294,8 +3294,8 @@ mod tests {
     async fn binary_url_uses_the_resolved_proxy_when_org_resolution_fails() {
         const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let _env = isolate_org_resolution_env();
-        let saved_proxy = std::env::var("SOCKET_PROXY_URL").ok();
-        std::env::set_var("SOCKET_PROXY_URL", "http://env-proxy.test:9999/");
+        let _proxy =
+            crate::test_env::EnvGuard::set("SOCKET_PROXY_URL", "http://env-proxy.test:9999/");
 
         let (client, use_public_proxy) = get_api_client_with_overrides(ApiClientEnvOverrides {
             api_url: Some("http://127.0.0.1:1".into()),
@@ -3308,11 +3308,6 @@ mod tests {
         // must not move it.
         std::env::remove_var("SOCKET_PROXY_URL");
         let (url, use_auth) = client.binary_url("blob", HASH);
-
-        match saved_proxy {
-            Some(v) => std::env::set_var("SOCKET_PROXY_URL", v),
-            None => std::env::remove_var("SOCKET_PROXY_URL"),
-        }
 
         assert!(use_public_proxy);
         assert!(client.api_token().is_none(), "a proxy client has no bearer");

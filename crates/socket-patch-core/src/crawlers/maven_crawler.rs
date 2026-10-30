@@ -2588,8 +2588,8 @@ mod tests {
         // Point the home directory at an empty dir so a developer's own
         // `~/.m2/settings.xml` <localRepository> can't change the result.
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path().to_str().unwrap());
-        let _profile = EnvGuard::set("USERPROFILE", home.path().to_str().unwrap());
+        let _home = EnvGuard::set("HOME", home.path());
+        let _profile = EnvGuard::set("USERPROFILE", home.path());
 
         let repo = MavenCrawler::m2_repo_path();
         assert_ne!(
@@ -2847,7 +2847,7 @@ mod tests {
             .await
             .unwrap();
         let missing = project.path().join("no-such-m2-repo");
-        let _local = EnvGuard::set("MAVEN_REPO_LOCAL", missing.to_str().unwrap());
+        let _local = EnvGuard::set("MAVEN_REPO_LOCAL", &missing);
 
         let crawler = MavenCrawler::new();
         let options = CrawlerOptions {

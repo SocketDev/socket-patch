@@ -692,7 +692,7 @@ mod tests {
         let deno_home = tempfile::tempdir().unwrap();
         let jsr = deno_home.path().join("npm").join("jsr.io");
         stage(&jsr, "@std", "path", "0.220.0").await;
-        let _g = EnvGuard::set("DENO_DIR", deno_home.path().to_str().unwrap());
+        let _g = EnvGuard::set("DENO_DIR", deno_home.path());
 
         let crawler = DenoCrawler;
         let opts = CrawlerOptions {
@@ -719,7 +719,7 @@ mod tests {
         stage(&jsr, "@std", "path", "0.220.0").await;
         stage(&jsr, "@std", "fs", "1.0.0").await;
         stage(&jsr, "@other", "x", "2.0.0").await;
-        let _g = EnvGuard::set("DENO_DIR", deno_home.path().to_str().unwrap());
+        let _g = EnvGuard::set("DENO_DIR", deno_home.path());
 
         let opts = CrawlerOptions {
             cwd: project.path().to_path_buf(),
@@ -810,7 +810,7 @@ mod tests {
         let jsr = deno_home.path().join("npm").join("jsr.io");
         stage(&jsr, "@std", "path", "0.220.0").await;
         stage(&jsr, "@std", "fs", "1.0.0").await;
-        let _g = EnvGuard::set("DENO_DIR", deno_home.path().to_str().unwrap());
+        let _g = EnvGuard::set("DENO_DIR", deno_home.path());
         let opts = CrawlerOptions {
             cwd: project.path().to_path_buf(),
             global: false,

@@ -7887,7 +7887,7 @@ G=
             .join("site-packages");
         tokio::fs::create_dir_all(&sp).await.unwrap();
 
-        let _pyenv_root = EnvGuard::set("PYENV_ROOT", dir.path().to_str().unwrap());
+        let _pyenv_root = EnvGuard::set("PYENV_ROOT", dir.path());
         let results = get_global_python_site_packages().await;
         assert!(
             results.contains(&sp),
