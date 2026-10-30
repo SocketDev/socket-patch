@@ -1429,7 +1429,7 @@ mod tests {
             // GOWORK naming a file elsewhere (absolute on every platform:
             // `/x` has no drive on Windows, so go rejects it as relative).
             let elsewhere = f.project.parent().unwrap().join("elsewhere/go.work");
-            let _gowork = EnvGuard::set("GOWORK", &elsewhere.to_string_lossy());
+            let _gowork = EnvGuard::set("GOWORK", &elsewhere);
             assert_eq!(f.crawl().await, walked);
         }
 
@@ -1515,31 +1515,7 @@ mod tests {
 
     // ---- get_gomodcache env tests ----
 
-    /// Save and restore an env var around a test body.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::EnvGuard;
 
     #[test]
     #[serial_test::serial]

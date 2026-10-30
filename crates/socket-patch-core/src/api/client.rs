@@ -3293,7 +3293,7 @@ mod tests {
     #[serial_test::serial]
     async fn binary_url_uses_the_resolved_proxy_when_org_resolution_fails() {
         const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let _env = OrgResolutionEnvGuard::isolate();
+        let _env = isolate_org_resolution_env();
         let saved_proxy = std::env::var("SOCKET_PROXY_URL").ok();
         std::env::set_var("SOCKET_PROXY_URL", "http://env-proxy.test:9999/");
 
@@ -3320,33 +3320,17 @@ mod tests {
         assert!(!use_auth, "the bearer must never target the proxy");
     }
 
-    /// Guard that snapshots the env vars that can short-circuit org
-    /// auto-resolution, forces the "no ambient slug / offline flag /
-    /// socket-cli config" state, and restores the snapshot on drop (panic
-    /// included). Keeps the resolution tests below honest on a dev machine
-    /// with `socket login` state or ambient SOCKET_* vars.
-    struct OrgResolutionEnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-    impl OrgResolutionEnvGuard {
-        fn isolate() -> Self {
-            let names = ["SOCKET_ORG_SLUG", "SOCKET_OFFLINE", "SOCKET_NO_CONFIG"];
-            let saved = names.iter().map(|&n| (n, std::env::var(n).ok())).collect();
-            std::env::remove_var("SOCKET_ORG_SLUG");
-            std::env::remove_var("SOCKET_OFFLINE");
-            std::env::set_var("SOCKET_NO_CONFIG", "1");
-            Self { saved }
-        }
-    }
-    impl Drop for OrgResolutionEnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in self.saved.drain(..) {
-                match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
+    /// Forces the "no ambient slug / offline flag / socket-cli config"
+    /// state for the env vars that can short-circuit org auto-resolution;
+    /// the returned guard restores them on drop (panic included). Keeps
+    /// the resolution tests below honest on a dev machine with `socket
+    /// login` state or ambient SOCKET_* vars.
+    fn isolate_org_resolution_env() -> crate::test_env::EnvGuard {
+        crate::test_env::EnvGuard::many([
+            ("SOCKET_ORG_SLUG", None),
+            ("SOCKET_OFFLINE", None),
+            ("SOCKET_NO_CONFIG", Some("1")),
+        ])
     }
 
     /// The network half of `resolve_org_slug`: `GET /v0/organizations`
@@ -3360,7 +3344,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = OrgResolutionEnvGuard::isolate();
+        let _env = isolate_org_resolution_env();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v0/organizations"))
@@ -3403,7 +3387,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let _env = OrgResolutionEnvGuard::isolate();
+        let _env = isolate_org_resolution_env();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v0/organizations"))
@@ -3445,7 +3429,7 @@ mod tests {
 
         const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         const UUID: &str = "11111111-2222-4333-8444-555555555555";
-        let _env = OrgResolutionEnvGuard::isolate();
+        let _env = isolate_org_resolution_env();
         let token = format!("sktsec_{}_api", "x".repeat(44));
         let proxy = "http://proxy.example.test";
 
@@ -4207,7 +4191,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn vendor_package_url_after_failed_org_resolution_targets_proxy_host() {
-        let _env = OrgResolutionEnvGuard::isolate();
+        let _env = isolate_org_resolution_env();
         let (client, _) = get_api_client_with_overrides(ApiClientEnvOverrides {
             api_url: Some("http://127.0.0.1:1".into()),
             api_token: Some("sktsec_x_api".into()),

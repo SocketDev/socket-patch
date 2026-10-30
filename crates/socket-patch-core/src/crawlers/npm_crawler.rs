@@ -5875,29 +5875,8 @@ mod tests {
         }
     }
 
-    /// Save and restore an env var around a test body (drop-safe).
     #[cfg(target_os = "macos")]
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    #[cfg(target_os = "macos")]
-    impl EnvGuard {
-        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::EnvGuard;
 
     /// Pins the literal volta (`.volta/tools/image/node/*/lib/
     /// node_modules`) and fnm (`.fnm/node-versions/*/installation/lib/

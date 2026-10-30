@@ -184,32 +184,11 @@ fn assert_round_trip(
     );
 }
 
-/// Sets env vars for the guard's lifetime (tests using it are `#[serial]`).
-struct EnvGuard(Vec<(String, Option<String>)>);
-
-impl EnvGuard {
-    fn set(vars: &[(&str, String)]) -> Self {
-        let saved = vars
-            .iter()
-            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
-            .collect();
-        for (k, v) in vars {
-            std::env::set_var(k, v);
-        }
-        EnvGuard(saved)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (k, v) in self.0.drain(..) {
-            match v {
-                Some(v) => std::env::set_var(&k, v),
-                None => std::env::remove_var(&k),
-            }
-        }
-    }
-}
+/// The core unit tests' env guard, compiled into this test binary too.
+#[allow(dead_code)]
+#[path = "../src/test_env.rs"]
+mod test_env;
+use test_env::EnvGuard;
 
 /// Serve an npm version document for every single-override npm case.
 async fn npm_mock(case: &Case) -> MockServer {
@@ -259,7 +238,7 @@ async fn npm_flavor(flavor: &str, not_invertible: &[&str]) {
             continue;
         }
         let server = npm_mock(&case).await;
-        let _env = EnvGuard::set(&[("SOCKET_NPM_REGISTRY", server.uri())]);
+        let _env = EnvGuard::set("SOCKET_NPM_REGISTRY", server.uri());
         let (after, statuses) = run_case(&case).await;
         assert_round_trip(&case, &after, &statuses);
         ran += 1;
@@ -300,7 +279,7 @@ async fn package_lock_layouts_round_trip() {
             serde_json::Value::Array(basic.overrides.clone()),
         );
         let server = npm_mock(&case).await;
-        let _env = EnvGuard::set(&[("SOCKET_NPM_REGISTRY", server.uri())]);
+        let _env = EnvGuard::set("SOCKET_NPM_REGISTRY", server.uri());
         let (after, statuses) = run_case(&case).await;
         assert_round_trip(&case, &after, &statuses);
     }
@@ -376,7 +355,7 @@ async fn cargo_goldens_round_trip() {
                 .mount(&server)
                 .await;
         }
-        let _env = EnvGuard::set(&[("SOCKET_CRATES_INDEX", server.uri())]);
+        let _env = EnvGuard::set("SOCKET_CRATES_INDEX", server.uri());
         let (after, statuses) = run_case(&case).await;
         assert_round_trip(&case, &after, &statuses);
         ran += 1;
@@ -413,7 +392,7 @@ async fn golang_goldens_round_trip() {
                 .mount(&server)
                 .await;
         }
-        let _env = EnvGuard::set(&[("SOCKET_GOSUMDB_URL", server.uri())]);
+        let _env = EnvGuard::set("SOCKET_GOSUMDB_URL", server.uri());
         let (after, statuses) = run_case(&case).await;
         assert_round_trip(&case, &after, &statuses);
         ran += 1;
@@ -550,7 +529,7 @@ async fn gem_mock(case: &Case) -> MockServer {
 
 async fn gem_run(case: &Case) -> (BTreeMap<String, String>, Vec<(String, PinStatus)>) {
     let server = gem_mock(case).await;
-    let _env = EnvGuard::set(&[("SOCKET_RUBYGEMS_URL", server.uri())]);
+    let _env = EnvGuard::set("SOCKET_RUBYGEMS_URL", server.uri());
     run_case(case).await
 }
 
@@ -753,7 +732,7 @@ async fn gem_refusals_leave_everything_hosted() {
     // The registry does not know the gem.
     {
         let server = MockServer::start().await;
-        let _env = EnvGuard::set(&[("SOCKET_RUBYGEMS_URL", server.uri())]);
+        let _env = EnvGuard::set("SOCKET_RUBYGEMS_URL", server.uri());
         let (after, statuses) = run_case(&case).await;
         assert_refused(&case, &after, &statuses, "Gemfile.lock", "404");
     }
@@ -870,7 +849,7 @@ async fn composer_run(
     tweak: impl Fn(&mut serde_json::Value),
 ) -> (BTreeMap<String, String>, Vec<(String, PinStatus)>) {
     let server = composer_mock(case, tweak).await;
-    let _env = EnvGuard::set(&[("SOCKET_PACKAGIST_URL", server.uri())]);
+    let _env = EnvGuard::set("SOCKET_PACKAGIST_URL", server.uri());
     run_case(case).await
 }
 
@@ -1203,9 +1182,12 @@ async fn pypi_mock(releases: &[Release<'_>]) -> (MockServer, EnvGuard) {
             .await;
     }
     // The host's user- and system-level uv settings stay out of the tests.
-    let env = EnvGuard::set(&[
-        ("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri())),
-        ("UV_NO_CONFIG", "1".to_string()),
+    let env = EnvGuard::many([
+        (
+            "SOCKET_PYPI_JSON_API",
+            Some(format!("{}/pypi", server.uri())),
+        ),
+        ("UV_NO_CONFIG", Some("1".to_string())),
     ]);
     (server, env)
 }
@@ -2398,14 +2380,14 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
         ),
         ("UV_CONFIG_FILE", "ci/uv.toml", "UV_CONFIG_FILE"),
     ] {
-        let _env = EnvGuard::set(&[(var, value.to_string())]);
+        let _env = EnvGuard::set(var, value);
         let input = tree(&[("pylock.toml", uv_pylock(false))]);
         let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
         assert!(why.contains(expect), "{why}");
     }
     // A `false` per-package cutoff on the command line exempts urllib3
     // from `UV_EXCLUDE_NEWER`.
-    let _env = EnvGuard::set(&[("UV_EXCLUDE_NEWER", "2023-01-01T00:00:00Z".to_string())]);
+    let _env = EnvGuard::set("UV_EXCLUDE_NEWER", "2023-01-01T00:00:00Z".to_string());
     let input = tree(&[(
         "pylock.toml",
         with_flags(" --exclude-newer-package urllib3=false"),
@@ -2414,7 +2396,7 @@ async fn pip_compile_pylock_build_filters_refuse_the_filtered_entry() {
     drop(_env);
     // Empty is unset, and `false` turns the cutoff off.
     for value in ["", "false"] {
-        let _env = EnvGuard::set(&[("UV_EXCLUDE_NEWER", value.to_string())]);
+        let _env = EnvGuard::set("UV_EXCLUDE_NEWER", value.to_string());
         let input = tree(&[("pylock.toml", uv_pylock(false))]);
         assert_pypi_round_trip("UV_EXCLUDE_NEWER off", &input, &[urllib3_dep()], None).await;
     }
@@ -2774,7 +2756,7 @@ async fn vlt_goldens_round_trip() {
             continue;
         }
         let server = vlt_mock(&case).await;
-        let _env = EnvGuard::set(&[("SOCKET_NPM_REGISTRY", server.uri())]);
+        let _env = EnvGuard::set("SOCKET_NPM_REGISTRY", server.uri());
         let (after, statuses) = run_case(&case).await;
         assert_round_trip(&case, &after, &statuses);
         ran += 1;
@@ -2915,7 +2897,7 @@ async fn nuget_goldens_round_trip() {
         }
         let mut case = case;
         let server = nuget_mock(&mut case).await;
-        let _env = EnvGuard::set(&[("SOCKET_NUGET_URL", server.uri())]);
+        let _env = EnvGuard::set("SOCKET_NUGET_URL", server.uri());
         let (after, statuses) = run_case(&case).await;
         assert_round_trip(&case, &after, &statuses);
         ran += 1;
@@ -2933,7 +2915,7 @@ async fn nuget_non_invertible_goldens_restore_or_refuse_as_documented() {
             .unwrap();
         let mut case = case;
         let server = nuget_mock(&mut case).await;
-        let _env = EnvGuard::set(&[("SOCKET_NUGET_URL", server.uri())]);
+        let _env = EnvGuard::set("SOCKET_NUGET_URL", server.uri());
         let (after, statuses) = run_case(&case).await;
         let [(_, status)] = &statuses[..] else {
             panic!("{name}: {statuses:?}");

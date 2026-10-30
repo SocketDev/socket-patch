@@ -1487,24 +1487,7 @@ mod tests {
     /// Run `f` with `HOME`/`USERPROFILE` set to `home`/`profile`
     /// (`None` = unset), restoring both.
     fn with_home_env<T>(home: Option<&str>, profile: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let prev_home = std::env::var_os("HOME");
-        let prev_profile = std::env::var_os("USERPROFILE");
-        let set = |name: &str, v: Option<&str>| match v {
-            Some(v) => std::env::set_var(name, v),
-            None => std::env::remove_var(name),
-        };
-        set("HOME", home);
-        set("USERPROFILE", profile);
-        let out = f();
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_profile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
-        out
+        crate::test_env::with_env(&[("HOME", home), ("USERPROFILE", profile)], f)
     }
 
     /// Regression: a set-but-empty `HOME` (stripped CI/container/sudo

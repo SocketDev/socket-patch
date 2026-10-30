@@ -2506,31 +2506,7 @@ mod tests {
 
     // ---- m2_repo_path env tests ----
 
-    /// Save and restore an env var around a test body.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::EnvGuard;
 
     /// B66: with no usable home the default used to be the literal
     /// RELATIVE `~/.m2/repository`, which resolves against the working
@@ -2584,7 +2560,7 @@ mod tests {
         let _args = EnvGuard::unset("MAVEN_ARGS");
         let _opts = EnvGuard::set(
             "MAVEN_OPTS",
-            &format!("-Dmaven.repo.local={}", repo_local.path().display()),
+            format!("-Dmaven.repo.local={}", repo_local.path().display()),
         );
 
         let repo = MavenCrawler::m2_repo_path();

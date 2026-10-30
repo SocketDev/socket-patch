@@ -943,31 +943,7 @@ mod tests {
 
     // ── deno_dir / cache-root resolution ───────────────────────────
 
-    /// Save and restore an env var around a closure body.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::EnvGuard;
 
     /// #444: only Deno's `bin/.<tool>/node_modules` whose config leaves
     /// `nodeModulesDir` unset (or `none`/`false`), with no `package.json`,

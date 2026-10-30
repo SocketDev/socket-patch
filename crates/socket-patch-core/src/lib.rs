@@ -19,4 +19,6 @@ pub mod vex;
 #[cfg(test)]
 mod golden;
 #[cfg(test)]
+mod test_env;
+#[cfg(test)]
 mod test_rng;

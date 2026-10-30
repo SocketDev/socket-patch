@@ -2644,27 +2644,7 @@ mod tests {
 
     // ── coverage: refusal and edge arms ──────────────────────────────────────
 
-    /// Save/restore guard for env-var tests (same shape as the maven crawler's
-    /// tests); every user must also be `#[serial_test::serial]`.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::EnvGuard;
 
     fn service_cfg(
         api_url: Option<&str>,
@@ -3298,7 +3278,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        let _reg = EnvGuard::set("SOCKET_MAVEN_REGISTRY", &server.uri());
+        let _reg = EnvGuard::set("SOCKET_MAVEN_REGISTRY", server.uri());
         let cfg = service_cfg(None, crate::vendor::VendorSource::Service, false);
         let bytes = b"upstream";
         let route = "/org/example/foo/1/foo-1.jar";
