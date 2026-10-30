@@ -366,8 +366,8 @@ pub fn source_constraint_advisory(
 pub enum LockWriter {
     /// The `(major, minor)` of the Poetry that wrote it.
     Poetry(u64, u64),
-    /// An unstamped lock in a format only Poetry < 1.3 writes: `"0"` (the
-    /// legacy `[metadata.hashes]` layout), `"1.0"` or `"1.1"`.
+    /// A lock in a format only Poetry < 1.3 writes, stamped or not: `"0"`
+    /// (the legacy `[metadata.hashes]` layout), `"1.0"` or `"1.1"`.
     Format(&'static str),
 }
 
@@ -402,7 +402,7 @@ pub fn lock_writer(lock_text: &str, known_format: Option<&str>) -> Option<LockWr
     let format = match known_format {
         Some(format) => Some(format),
         None => {
-            parsed = lock_text.parse::<DocumentMut>().ok();
+            parsed = crate::utils::lock_fragments::parse_lock(lock_text).ok();
             parsed.as_ref().and_then(|lock| lock_version(lock).ok())
         }
     };
@@ -1492,7 +1492,13 @@ grouped = {version = "*", source = "pypi"}
             ("1.2.2", Some(Format("1.1"))),
             ("1.3.2", Some(Poetry(1, 3))),
             ("1.4.2", Some(Poetry(1, 4))),
+            ("1.5.1", Some(Poetry(1, 5))),
+            ("1.6.1", Some(Poetry(1, 6))),
+            ("1.7.1", Some(Poetry(1, 7))),
             ("1.8.5", Some(Poetry(1, 8))),
+            ("2.0.1", Some(Poetry(2, 0))),
+            ("2.1.4", Some(Poetry(2, 1))),
+            ("2.2.1", Some(Poetry(2, 2))),
             ("2.3.4", Some(Poetry(2, 3))),
             ("2.4.3", Some(Poetry(2, 4))),
         ] {
