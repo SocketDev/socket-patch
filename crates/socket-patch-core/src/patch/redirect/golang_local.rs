@@ -182,6 +182,7 @@ pub async fn reuse_go_redirect(
     purl: &str,
     project_root: &Path,
     files: &HashMap<String, PatchFileInfo>,
+    dry_run: bool,
 ) -> Option<ApplyResult> {
     let (module, version) = parse_golang_purl(purl)?;
     if !are_safe_redirect_coords(&module, &version) || files.is_empty() {
@@ -229,7 +230,12 @@ pub async fn reuse_go_redirect(
         )
         .await
     {
-        return Some(already_patched_result(purl, &copy, files));
+        let mut result = already_patched_result(purl, &copy, files);
+        if !dry_run {
+            repair_root_go_mod_mirror(&mut result, project_root, &module, &version, GO_PATCHES_DIR)
+                .await;
+        }
+        return Some(result);
     }
     Some(synthesized_result(purl, &copy, Vec::new(), false, Some(format!(
         "the local Go patch copy or replace for {module} {version} is out of sync and the upstream module is not installed; restore the committed patch files or download the upstream module before reapplying"
@@ -369,19 +375,7 @@ pub async fn apply_go_redirect<'a>(
     // on most "deps changed" builds).
     if redirect_in_sync(&copy_dir, files, project_root, module, version, base_rel).await {
         let mut result = already_patched_result(purl, &copy_dir, files);
-        // A root go.mod mirror of the go.work replace that went missing is
-        // written back without rebuilding the copy: a failed rebuild would
-        // tear down the go.work replace the workspace builds through.
-        let expected = replace_target_path(base_rel, module, version);
-        if !root_go_mod_mirror_ok(project_root, module, version, &expected).await {
-            if let Err(e) =
-                go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false)
-                    .await
-            {
-                result.success = false;
-                result.error = Some(format!("failed to update go.mod: {e}"));
-            }
-        }
+        repair_root_go_mod_mirror(&mut result, project_root, module, version, base_rel).await;
         return result;
     }
 
@@ -871,6 +865,28 @@ async fn redirect_in_sync(
     })
 }
 
+/// Write back a root go.mod mirror of the go.work replace that went missing,
+/// without rebuilding the copy: a failed rebuild would tear down the go.work
+/// replace the workspace builds through.
+async fn repair_root_go_mod_mirror(
+    result: &mut ApplyResult,
+    project_root: &Path,
+    module: &str,
+    version: &str,
+    base_rel: &str,
+) {
+    let expected = replace_target_path(base_rel, module, version);
+    if root_go_mod_mirror_ok(project_root, module, version, &expected).await {
+        return;
+    }
+    if let Err(e) =
+        go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false).await
+    {
+        result.success = false;
+        result.error = Some(format!("failed to update go.mod: {e}"));
+    }
+}
+
 /// False when the replace host is `go.work` and the root `go.mod` that
 /// mirrors it (`ReplaceHost::mirrors_root_go_mod`) lacks a
 /// socket-owned `replace` pinning `version` to `expected`: a `GOWORK=off`
@@ -1206,6 +1222,21 @@ mod tests {
             .unwrap()
             .contains(&line));
         assert!(std::fs::read_to_string(root.join("go.work"))
+            .unwrap()
+            .contains(&line));
+        verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap();
+
+        // A cache-less reapply reuses the copy and repairs the mirror the
+        // same way; a dry run leaves go.mod alone.
+        std::fs::write(root.join("go.mod"), &gomod).unwrap();
+        let result = reuse_go_redirect(PURL, root, &files, true).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(std::fs::read_to_string(root.join("go.mod")).unwrap(), gomod);
+        let result = reuse_go_redirect(PURL, root, &files, false).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(std::fs::read_to_string(root.join("go.mod"))
             .unwrap()
             .contains(&line));
         verify_go_redirect_state(root, &manifest, &desired)
@@ -1716,7 +1747,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(reuse_go_redirect(PURL, root, &files).await.is_none());
+        assert!(reuse_go_redirect(PURL, root, &files, false).await.is_none());
     }
 
     #[tokio::test]

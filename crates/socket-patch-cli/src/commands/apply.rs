@@ -2413,6 +2413,7 @@ async fn apply_patches_inner(
                     purl,
                     &args.common.cwd,
                     &record.files,
+                    args.common.dry_run,
                 )
                 .await
             {
