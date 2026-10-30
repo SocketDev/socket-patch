@@ -524,6 +524,14 @@ fn expand_braces(pattern: &str) -> Vec<String> {
     out
 }
 
+/// [`expand_braces`] for a caller that walks each alternative itself:
+/// `None` when the pattern has more alternatives than the matcher expands,
+/// so a walk over the ones it returned would miss some.
+pub(crate) fn brace_alternatives(pattern: &str) -> Option<Vec<String>> {
+    let alternatives = expand_braces(pattern.trim());
+    (alternatives.len() < MAX_BRACE_EXPANSIONS).then_some(alternatives)
+}
+
 fn expand_braces_into(pattern: &str, out: &mut Vec<String>) {
     if out.len() >= MAX_BRACE_EXPANSIONS {
         return;

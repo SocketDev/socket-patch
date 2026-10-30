@@ -624,10 +624,12 @@ async fn lockless_npm_project(base: &Path, mut dir: PathBuf) -> Option<PathBuf> 
 ///
 /// Unlike the hosted refusals, this errs toward "not a member": a member's
 /// copies are in its workspace's lock, so they never get this far, while a
-/// project wrongly kept the scan root's fails that root's run. pnpm globs
-/// the pnpm matcher does not model (braces, classes) go through the
-/// shared workspace grammar; a `pnpm-workspace.yaml` that cannot be read,
-/// which pnpm cannot install from either, lists nothing.
+/// project wrongly kept the scan root's fails that root's run. So a
+/// `pnpm-workspace.yaml` that cannot be read, which pnpm cannot install
+/// from either, or whose `packages:` use glob syntax the pnpm reader does
+/// not model ([`lists_member`]), lists nothing.
+///
+/// [`lists_member`]: crate::utils::pnpm_workspace::lists_member
 async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
     let lists = |patterns: &[String], rel: &[String]| {
         WorkspacesDialect::ALL
@@ -661,39 +663,13 @@ async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
                 .ok()
                 .and_then(|yaml| read_package_globs(&yaml).ok().flatten())
                 .is_some_and(|globs| {
-                    crate::utils::pnpm_workspace::lists_member(&globs, &rel)
-                        .unwrap_or_else(|_| pnpm_lists_unmodeled(&globs, &rel))
+                    crate::utils::pnpm_workspace::lists_member(&globs, &rel).unwrap_or(false)
                 });
         if listed {
             return Some(ancestor.to_path_buf());
         }
     }
     None
-}
-
-/// Whether pnpm lists `rel` under `packages:` globs that use syntax its
-/// own matcher here does not model (braces, classes): the shared workspace
-/// grammar matches each glob, read pnpm's way. A `!` glob excludes whatever
-/// its order, wildcards never match a dot directory, and `node_modules`,
-/// `test` and `tests` directories are never members.
-fn pnpm_lists_unmodeled(globs: &[String], rel: &[String]) -> bool {
-    use crate::utils::workspace_globs::Negation;
-    const PNPM: WorkspacesDialect = WorkspacesDialect {
-        negation: Negation::LastMatchWins,
-        extglob: false,
-        picomatch: false,
-        dot: false,
-    };
-    if rel
-        .iter()
-        .any(|seg| crate::utils::pnpm_workspace::MEMBER_SKIP.contains(&seg.as_str()))
-    {
-        return false;
-    }
-    let matches = |glob: &str| workspaces_include_as(&[glob.to_string()], rel, PNPM);
-    let (negated, listed): (Vec<&String>, Vec<&String>) =
-        globs.iter().partition(|glob| glob.starts_with('!'));
-    listed.iter().any(|glob| matches(glob)) && !negated.iter().any(|glob| matches(&glob[1..]))
 }
 
 /// The hosted refusal for [`member_stray_lock`].
@@ -1354,6 +1330,47 @@ mod tests {
             nested_npm_project(root, Path::new("/elsewhere/node_modules/x")).await,
             None
         );
+    }
+
+    /// #1846: hosted reads pnpm brace and class globs through the same
+    /// reader as `pnpm_workspace::member_dirs`, so both name the same
+    /// members; syntax that reader refuses lists nothing here.
+    #[tokio::test]
+    async fn pnpm_brace_and_class_globs_list_what_member_dirs_lists() {
+        use crate::utils::cargo_workspace::DiskTree;
+        let dirs = ["a", "b", "c", "ab"];
+        for (glob, listed) in [
+            ("packages/{a,b}", &["packages/a", "packages/b"][..]),
+            (
+                "packages/[ab]*",
+                &["packages/a", "packages/ab", "packages/b"],
+            ),
+            ("packages/[!a]*", &[]),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            write(root, "package.json", r#"{"name":"root"}"#);
+            write(root, PNPM_WORKSPACE, &format!("packages:\n  - '{glob}'\n"));
+            for dir in dirs {
+                write(root, &format!("packages/{dir}/package.json"), "{}");
+            }
+            let globs = vec![glob.to_string()];
+            let members = crate::utils::pnpm_workspace::member_dirs(&DiskTree(root), &globs);
+            if listed.is_empty() {
+                assert!(members.is_err(), "{glob}");
+            } else {
+                assert_eq!(members.unwrap(), listed, "{glob}");
+            }
+            for dir in dirs {
+                let rel = format!("packages/{dir}");
+                let expected = listed.contains(&rel.as_str()).then(|| root.to_path_buf());
+                assert_eq!(
+                    listing_workspace(root, &root.join(&rel)).await,
+                    expected,
+                    "{glob} {rel}"
+                );
+            }
+        }
     }
 
     /// #1554: a project installed without a lock (`package-lock=false`,

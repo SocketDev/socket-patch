@@ -26,12 +26,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::formats::pnpm::workspace::read_package_globs;
+use crate::formats::pnpm::workspace::{lock_text_has_member_importers, read_package_globs};
 use crate::utils::cargo_workspace::{
     expand_glob_bounded, DirTree, DiskTree, MemoryTree, MAX_MANIFESTS,
 };
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync};
-use crate::utils::workspace_globs::{glob_matches_no_dot, split_negation};
+use crate::utils::workspace_globs::{brace_alternatives, glob_matches_no_dot, split_negation};
 use crate::vendor::lock_inventory::view::ProjectView;
 
 /// pnpm's workspace and settings file.
@@ -262,37 +262,6 @@ pub fn shared_lockfile_disabled(workspace: &str, npmrc: Option<&str>) -> bool {
     .is_some_and(|setting| setting.as_bool() == Some(false))
 }
 
-/// Whether a root lock is a SHARED workspace lock: its `importers:` names a
-/// project other than the root (`.`). Such a lock is what pnpm installs
-/// every member from, whatever the settings say now, so member locks
-/// beside it are stale leftovers.
-pub fn root_lock_lists_members(lock: &str) -> bool {
-    let mut in_importers = false;
-    for line in lock.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if !line.starts_with([' ', '\t']) && !line.trim().is_empty() {
-            in_importers = line.trim_end() == "importers:";
-            continue;
-        }
-        if !in_importers {
-            continue;
-        }
-        // An importer key sits at exactly two spaces.
-        let Some(key) = line
-            .strip_prefix("  ")
-            .filter(|k| !k.starts_with([' ', '#']))
-        else {
-            continue;
-        };
-        let key = key.split(':').next().unwrap_or("").trim();
-        let key = key.trim_matches(['\'', '"']);
-        if !key.is_empty() && key != "." {
-            return true;
-        }
-    }
-    false
-}
-
 /// Whether pnpm's project finder lists the directory at `rel` (relative
 /// to the workspace root, one entry per component) under `globs`
 /// (`pnpm-workspace.yaml` `packages:`, as [`read_package_globs`] reads them), as
@@ -303,30 +272,84 @@ pub fn root_lock_lists_members(lock: &str) -> bool {
 /// `.`, so `**` does not list `.github/actions/demo` (see
 /// [`glob_matches_no_dot`]). The root itself (`rel` empty) is never one.
 ///
-/// `Err` when a pattern uses glob syntax the shared matcher does not model
-/// (braces, classes, extglobs): the caller must not guess either way.
+/// Brace sets and plain character classes match as pnpm reads them
+/// (#1846). `Err` when a pattern uses glob syntax the shared matcher does
+/// not read pnpm's way ([`modeled`]): the caller must not guess either way.
 /// Both membership questions, "is this directory a member" and "which
 /// members' locks does pnpm install from", answer through here.
 pub(crate) fn lists_member(globs: &[String], rel: &[String]) -> Result<bool, String> {
     modeled(globs)?;
+    Ok(lists_modeled_member(globs, rel))
+}
+
+/// [`lists_member`] over globs [`modeled`] already accepted.
+fn lists_modeled_member(globs: &[String], rel: &[String]) -> bool {
     if rel.is_empty() || rel.iter().any(|seg| MEMBER_SKIP.contains(&seg.as_str())) {
-        return Ok(false);
+        return false;
     }
     let (negated, listed): (Vec<_>, Vec<_>) = globs
         .iter()
         .map(|g| split_negation(g))
         .partition(|(negated, _)| *negated);
-    Ok(listed.iter().any(|(_, g)| glob_matches_no_dot(g, rel))
-        && !negated.iter().any(|(_, g)| glob_matches_no_dot(g, rel)))
+    listed.iter().any(|(_, g)| glob_matches_no_dot(g, rel))
+        && !negated.iter().any(|(_, g)| glob_matches_no_dot(g, rel))
 }
 
 /// `Err` naming the first glob that uses syntax the shared matcher does
-/// not model (braces, classes, extglobs).
+/// not read the way pnpm does (probed on pnpm 10.28.0, #1846): extglob and
+/// regex groups, more brace alternatives than the matcher expands, and any
+/// character class but a closed one of letters, digits, `_`, a literal
+/// `-` and ranges not starting at `-`. pnpm reads `[!a]` as `[a]`, lets `[^a]` and `[.]` match a
+/// leading `.` that the matcher keeps wildcards off, and reads POSIX
+/// classes. Beside a class or brace set, a `+` (pnpm's quantifier:
+/// `packages/[ab]+` lists `packages/ab`) and a `\` (pnpm's escape:
+/// `packages/\[a]` lists only `packages/[a]`, the matcher's separator) are
+/// refused too, in the glob and in each brace alternative. pnpm reads
+/// braces as picomatch does, not as the matcher's brace expansion, where
+/// [`plain_braces`] refuses. A glob with none of `[ ] { }` reads as it did
+/// before #1846.
 fn modeled(globs: &[String]) -> Result<(), String> {
-    match globs
-        .iter()
-        .find(|g| g.contains(['{', '}', '[', ']', '(', ')']))
-    {
+    let plain_classes = |glob: &str| {
+        let mut rest = glob;
+        while let Some(open) = rest.find('[') {
+            let Some(len) = rest[open + 1..].find(']') else {
+                return false;
+            };
+            let body = &rest[open + 1..open + 1 + len];
+            // Every allowed character sorts above `/` except `-`, so only a
+            // range starting at `-` (`[--9]`) could match `.` or `/`.
+            if body.is_empty()
+                || body.starts_with(['!', '^'])
+                || body.contains("--")
+                || !body
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return false;
+            }
+            rest = &rest[open + 2 + len..];
+        }
+        true
+    };
+    let read = |glob: &String| {
+        if glob.contains(['(', ')']) {
+            return false;
+        }
+        if !glob.contains(['[', ']', '{', '}']) {
+            return true;
+        }
+        // Classes are checked on the raw glob too: pnpm reads braces inside
+        // a class as class members (`[a{b,c}]` lists `,` and `{`).
+        !glob.contains(['+', '\\'])
+            && plain_classes(glob)
+            && plain_braces(glob)
+            && brace_alternatives(glob).is_some_and(|alternatives| {
+                alternatives.iter().all(|alternative| {
+                    !alternative.contains(['(', ')', '+', '\\']) && plain_classes(alternative)
+                })
+            })
+    };
+    match globs.iter().find(|g| !read(g)) {
         Some(glob) => Err(format!(
             "`packages:` glob {glob:?} uses syntax socket-patch does not read"
         )),
@@ -334,25 +357,149 @@ fn modeled(globs: &[String]) -> Result<(), String> {
     }
 }
 
+/// Whether every `{...}` group in `glob` expands to what pnpm lists
+/// (probed on pnpm 10.28.0). pnpm reads a sequence with a step or a
+/// multi-character end as a class (`{1..10}` lists `0` and `1`, not `10`),
+/// lets a `*` or `?` inside braces match a leading `.` (`{a,*}` lists
+/// `.h`), and drops an empty alternative (`packages/{a,}` lists only
+/// `packages/a`, not `packages`): all three are refused. So is a sequence
+/// whose ends are not both digits, both lowercase or both uppercase: it
+/// would step through punctuation (`{-..0}` through `.` and `/`, `{0..Z}`
+/// through `?`), which the walk reads as path syntax.
+fn plain_braces(glob: &str) -> bool {
+    let mut opens = Vec::new();
+    for (i, c) in glob.char_indices() {
+        match c {
+            '{' => opens.push(i),
+            '}' => {
+                let Some(open) = opens.pop() else {
+                    continue;
+                };
+                let body = &glob[open + 1..i];
+                if body.contains(['*', '?']) {
+                    return false;
+                }
+                let mut alternatives = Vec::new();
+                let (mut depth, mut start) = (0usize, 0usize);
+                for (j, c) in body.char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => depth = depth.saturating_sub(1),
+                        ',' if depth == 0 => {
+                            alternatives.push(&body[start..j]);
+                            start = j + 1;
+                        }
+                        _ => {}
+                    }
+                }
+                alternatives.push(&body[start..]);
+                if alternatives.len() > 1 {
+                    // pnpm expands a `..` beside a comma as a sequence too
+                    // (`{a,b..c}` lists `,` and `A`), so only a lone
+                    // same-kind sequence is read.
+                    if alternatives
+                        .iter()
+                        .any(|a| a.is_empty() || a.contains(".."))
+                    {
+                        return false;
+                    }
+                } else if body.contains("..") && !same_kind_range(body) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether a `{x..y}` body is a single-character sequence whose ends are
+/// both digits, both lowercase or both uppercase ASCII letters.
+fn same_kind_range(body: &str) -> bool {
+    let ends: Vec<&str> = body.split("..").collect();
+    let [from, to] = ends.as_slice() else {
+        return false;
+    };
+    let (mut from, mut to) = (from.chars(), to.chars());
+    match (from.next(), from.next(), to.next(), to.next()) {
+        (Some(a), None, Some(b), None) => [
+            char::is_ascii_digit,
+            char::is_ascii_lowercase,
+            char::is_ascii_uppercase,
+        ]
+        .iter()
+        .any(|kind| kind(&a) && kind(&b)),
+        _ => false,
+    }
+}
+
+/// `glob` with each character class (closed and plain, as [`modeled`]
+/// leaves them) widened to `?`, which the tree walk reads: every
+/// directory the class matches, and others [`lists_member`] then drops.
+fn widen_classes(glob: &str) -> String {
+    let mut out = String::with_capacity(glob.len());
+    let mut rest = glob;
+    while let Some(open) = rest.find('[') {
+        let close = rest[open..]
+            .find(']')
+            .map_or(rest.len(), |len| open + len + 1);
+        out.push_str(&rest[..open]);
+        out.push('?');
+        rest = &rest[close..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// How many brace alternatives [`member_dirs`] walks, over all its globs
+/// that hold a brace set. Each alternative is a walk of the tree, so this
+/// bounds the walks a scanned repo's `pnpm-workspace.yaml` can add with
+/// braces; a glob without one is a single walk and is not counted.
+const MAX_WALKED_ALTERNATIVES: usize = 64;
+
 /// The workspace member directories `globs` name (see [`lists_member`]),
 /// root-relative and sorted. The positive globs are expanded against the
 /// tree for candidates, and [`lists_member`] decides each one, so this
 /// lists exactly the existing directories it calls members. A directory
 /// reached through a symbolic link is not a member. `Err` when a glob
 /// names more than [`MAX_MANIFESTS`] directories: the bounded walk stopped
-/// before listing them all, and part of the members is no answer.
+/// before listing them all, and part of the members is no answer. `Err`
+/// too when the brace sets expand to more than [`MAX_WALKED_ALTERNATIVES`]
+/// alternatives: each one is a walk of the tree, and an alternative
+/// that matches nothing never reaches the directory bound.
 pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Result<Vec<String>, String> {
     modeled(globs)?;
     let mut candidates = std::collections::BTreeSet::new();
+    let mut walked_alternatives = 0usize;
     for glob in globs.iter().filter(|g| !g.starts_with('!')) {
-        let (dirs, truncated) = expand_glob_bounded(tree, glob, MEMBER_SKIP);
-        if truncated {
+        // The tree walk reads neither braces nor classes: it walks each
+        // brace alternative with its classes widened ([`widen_classes`]).
+        // One bound covers every alternative of every glob.
+        let alternatives = brace_alternatives(glob).ok_or_else(|| {
+            format!("`packages:` glob {glob:?} uses syntax socket-patch does not read")
+        })?;
+        // A glob without a brace set is one walk, as it was before #1846:
+        // only the walks brace sets add count against the budget.
+        if alternatives.len() > 1 {
+            walked_alternatives += alternatives.len();
+        }
+        if walked_alternatives > MAX_WALKED_ALTERNATIVES {
             return Err(format!(
-                "`packages:` glob {glob:?} names more than {MAX_MANIFESTS} directories, \
-                 more than socket-patch walks"
+                "`packages:` glob {glob:?} expands to more than {MAX_WALKED_ALTERNATIVES} \
+                 brace alternatives, more than socket-patch walks"
             ));
         }
-        candidates.extend(dirs);
+        for alternative in alternatives {
+            let walked = widen_classes(&alternative);
+            let (dirs, truncated) = expand_glob_bounded(tree, &walked, MEMBER_SKIP);
+            candidates.extend(dirs);
+            if truncated || candidates.len() >= MAX_MANIFESTS {
+                return Err(format!(
+                    "`packages:` glob {glob:?} names more than {MAX_MANIFESTS} directories, \
+                     more than socket-patch walks"
+                ));
+            }
+        }
     }
     let mut dirs = Vec::new();
     for dir in candidates {
@@ -361,7 +508,7 @@ pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Result<Vec<St
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        if lists_member(globs, &rel)? {
+        if lists_modeled_member(globs, &rel) {
             dirs.push(dir);
         }
     }
@@ -473,7 +620,10 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
         return Members::Shared;
     }
     let root_lock = view.read_text(PNPM_LOCK).await.ok();
-    if root_lock.as_deref().is_some_and(root_lock_lists_members) {
+    if root_lock
+        .as_deref()
+        .is_some_and(lock_text_has_member_importers)
+    {
         return Members::Shared;
     }
     let globs = match read_package_globs(&workspace) {
@@ -1216,24 +1366,6 @@ mod tests {
     }
 
     #[test]
-    fn a_root_lock_listing_member_importers_is_shared() {
-        let root_only = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a:\n        specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n";
-        assert!(!root_lock_lists_members(root_only));
-        assert!(!root_lock_lists_members(
-            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n"
-        ));
-        assert!(!root_lock_lists_members(
-            "lockfileVersion: 5.4\n\ndependencies:\n  a: 1.0.0\n"
-        ));
-        assert!(root_lock_lists_members(
-            "lockfileVersion: '9.0'\r\n\r\nimporters:\r\n\r\n  .: {}\r\n\r\n  packages/a:\r\n    dependencies: {}\r\n"
-        ));
-        assert!(root_lock_lists_members(
-            "lockfileVersion: '6.0'\nimporters:\n  '.': {}\n  'packages/a': {}\n"
-        ));
-    }
-
-    #[test]
     fn member_dirs_expand_globs_minus_negations_and_ignored_trees() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1290,7 +1422,106 @@ mod tests {
             member_dirs(&DiskTree(root), &globs(&["packages/.*"])),
             Ok(vec!["packages/.hidden".to_string()])
         );
-        assert!(member_dirs(&DiskTree(root), &globs(&["packages/{a,b}"])).is_err());
+        assert!(member_dirs(&DiskTree(root), &globs(&["packages/@(a|b)"])).is_err());
+    }
+
+    /// #1846: brace sets and plain character classes list what pnpm lists
+    /// (probed on pnpm 10.28.0 with `pnpm list -r`), in both trees. Syntax
+    /// pnpm reads its own way is refused, never guessed: it reads `[!a]`
+    /// as `[a]`, lets `[^a]` and `[.]` match a leading dot, and reads POSIX
+    /// classes and extglob groups the shared matcher does not model here.
+    #[test]
+    fn member_dirs_read_braces_and_classes_as_pnpm_does() {
+        let dirs = ["a", "b", "c", "ab", "x", ".h"];
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut project = crate::vendor::lock_inventory::MemoryProject::new();
+        for dir in dirs {
+            std::fs::create_dir_all(root.join("packages").join(dir)).unwrap();
+            project.insert_text(format!("packages/{dir}/package.json"), "{}");
+        }
+        let globs = |g: &[&str]| g.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        for (patterns, expected) in [
+            (&["packages/{a,b}"][..], &["a", "b"][..]),
+            (&["packages/[ab]*"], &["a", "ab", "b"]),
+            (&["packages/{a..c}"], &["a", "b", "c"]),
+            (&["packages/[a-b]"], &["a", "b"]),
+            (&["packages/{a,.h}"], &[".h", "a"]),
+            (&["packages/*", "!packages/[ab]"], &["ab", "c", "x"]),
+            (&["packages/*", "!packages/{a,c}"], &["ab", "b", "x"]),
+            (&["packages/{[ab],x}"], &["a", "b", "x"]),
+            (&["packages/[-a]"], &["a"]),
+            (&["packages/{c..a}"], &["a", "b", "c"]),
+            (&["packages/{a,{b,c}}"], &["a", "b", "c"]),
+        ] {
+            let expected: Vec<String> = expected.iter().map(|d| format!("packages/{d}")).collect();
+            let patterns = globs(patterns);
+            assert_eq!(
+                member_dirs(&DiskTree(root), &patterns).as_ref(),
+                Ok(&expected),
+                "{patterns:?}"
+            );
+            assert_eq!(
+                member_dirs(&MemoryTree(&project), &patterns).as_ref(),
+                Ok(&expected),
+                "{patterns:?}"
+            );
+            for dir in dirs {
+                let rel = vec!["packages".to_string(), dir.to_string()];
+                let listed = expected.contains(&format!("packages/{dir}"));
+                assert_eq!(
+                    lists_member(&patterns, &rel),
+                    Ok(listed),
+                    "{patterns:?} {dir}"
+                );
+            }
+        }
+        for unmodeled in [
+            "packages/[!a]*",
+            "packages/[^a]*",
+            "packages/[.]h",
+            "packages/[[:alpha:]]",
+            "packages/@(a|b)",
+            "packages/(a|b)",
+            "packages/[ab",
+            // pnpm reads `+` beside a class or brace set as a quantifier
+            // (`[ab]+` lists `ab`) and `\` as an escape (`\[a]` lists only
+            // a directory named `[a]`), also when a sequence spells them.
+            "packages/[ab]+",
+            "packages/{a,b}+",
+            "packages/\\[a]",
+            "packages/{Z..a}",
+            // pnpm reads a stepped or multi-character sequence as a class,
+            // lets a wildcard inside braces match `.h`, and drops an empty
+            // alternative instead of listing `packages` itself.
+            "packages/{a..e..2}",
+            "packages/p{1..10}",
+            // A sequence across punctuation steps through path syntax.
+            "packages/{-..0}",
+            "packages/{0..Z}",
+            "packages/p{01..2}",
+            "packages/{a,*}",
+            "packages/{?h,x}",
+            "packages/{a,}",
+            "packages/{,a}",
+            "packages/{a,{b,}}",
+            // A `..` beside a comma is a sequence to pnpm, and braces inside
+            // a class are class members.
+            "packages/{a,b..c}",
+            "packages/{a,..}",
+            "packages/{a,b..c,x}",
+            "packages/[a{b,c}]",
+            // A range from `-` spans `.` and `/`.
+            "packages/[--9]h",
+        ] {
+            let patterns = globs(&[unmodeled]);
+            assert!(
+                member_dirs(&DiskTree(root), &patterns).is_err(),
+                "{unmodeled}"
+            );
+            let rel = vec!["packages".to_string(), "a".to_string()];
+            assert!(lists_member(&patterns, &rel).is_err(), "{unmodeled}");
+        }
     }
 
     #[test]
@@ -1316,6 +1547,40 @@ mod tests {
         assert!(err.contains("packages/**"), "{err}");
         let listed = member_dirs(&Wide(10), &globs).unwrap();
         assert_eq!(listed.len(), 11, "packages itself plus its ten children");
+        // Every brace alternative is a walk, and one that matches nothing
+        // never reaches the directory bound: past the alternatives budget
+        // the answer is an error before any walk.
+        let many = vec!["**/{a..z}{a..z}".to_string()];
+        let err = member_dirs(&Wide(10), &many).unwrap_err();
+        assert!(err.contains("brace alternatives"), "{err}");
+        let few = vec!["packages/{p00001,p00002}".to_string()];
+        assert_eq!(
+            member_dirs(&Wide(10), &few).unwrap(),
+            vec!["packages/p00001", "packages/p00002"]
+        );
+        // Globs without braces are one walk each and never count against
+        // the alternatives budget, however many the workspace lists.
+        let plain: Vec<String> = (0..100).map(|i| format!("packages/p{i:05}")).collect();
+        assert_eq!(member_dirs(&Wide(100), &plain).unwrap().len(), 100);
+        // One bound covers every brace alternative: each of `a/*` and
+        // `b/*` stays under it, together they do not (#1846).
+        struct Two(usize);
+        impl DirTree for Two {
+            fn is_real_dir(&self, rel: &str) -> bool {
+                !rel.is_empty()
+            }
+            fn child_dirs(&self, rel: &str) -> Option<Vec<String>> {
+                Some(match rel {
+                    "" => vec!["a".to_string(), "b".to_string()],
+                    "a" | "b" => (0..self.0).map(|i| format!("p{i:05}")).collect(),
+                    _ => Vec::new(),
+                })
+            }
+        }
+        let globs = vec!["{a,b}/*".to_string()];
+        let half = MAX_MANIFESTS / 2 + 1;
+        assert!(member_dirs(&Two(half), &globs).is_err());
+        assert_eq!(member_dirs(&Two(10), &globs).unwrap().len(), 20);
     }
 
     #[test]
@@ -1646,11 +1911,29 @@ mod tests {
         assert_eq!(governed("packages/.hidden"), None);
         write(&root, PNPM_WORKSPACE, "packages:\n  - '.github/**'\n");
         assert_eq!(governed(".github/actions/demo"), file);
-        // Glob syntax this matcher does not model (braces, classes,
-        // extglobs) and a file that does not parse fail closed: governed.
+        // Brace sets and character classes are read (#1846).
+        write(
+            &root,
+            PNPM_WORKSPACE,
+            "packages:\n  - '{apps,packages}/*'\n",
+        );
+        assert_eq!(governed("examples/demo"), None);
+        write(
+            &root,
+            PNPM_WORKSPACE,
+            "packages:\n  - '{examples,packages}/*'\n",
+        );
+        assert_eq!(governed("examples/demo"), file);
+        write(&root, PNPM_WORKSPACE, "packages:\n  - '[ab]*/*'\n");
+        assert_eq!(governed("examples/demo"), None);
+        write(&root, PNPM_WORKSPACE, "packages:\n  - '[e-f]xamples/*'\n");
+        assert_eq!(governed("examples/demo"), file);
+        // Glob syntax this matcher does not model (extglobs, negated and
+        // POSIX classes) and a file that does not parse fail closed:
+        // governed.
         for ws in [
-            "packages:\n  - 'packages/{a,b}'\n",
-            "packages:\n  - 'packages/[ab]'\n",
+            "packages:\n  - '[!a]*/*'\n",
+            "packages:\n  - '[[:alpha:]]*/*'\n",
             "packages:\n  - '+(examples|packages)/*'\n",
             "packages: [unclosed\n",
             "packages:\n  - 1\n  - [nested]\n",
