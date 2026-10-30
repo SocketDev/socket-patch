@@ -859,4 +859,52 @@ mod tests {
             "\u{feff}\u{feff}lockfileVersion: '9.0'\n"
         ));
     }
+
+    /// Lock-head version sniff against real pnpm 7/8/9-12 heads: quoted `'9.0'` and `'6.0'`,
+    /// unquoted `5.4`; a headless/garbled lock yields `None` (hands-off).
+    #[test]
+    fn lock_version_major_sniffs_real_lock_heads() {
+        assert_eq!(
+            lock_version_major("lockfileVersion: '9.0'\n\nsettings:\n"),
+            Some(9),
+            "pnpm 9-12 emit a quoted '9.0'"
+        );
+        assert_eq!(
+            lock_version_major("lockfileVersion: '6.0'\n\nsettings:\n"),
+            Some(6),
+            "pnpm 8 emits a quoted '6.0'"
+        );
+        assert_eq!(
+            lock_version_major("lockfileVersion: 5.4\n\nspecifiers:\n"),
+            Some(5),
+            "pnpm 7 emits an unquoted 5.4"
+        );
+        // Not necessarily the first line (a comment/BOM-damaged head).
+        assert_eq!(
+            lock_version_major("# managed\nlockfileVersion: \"9.0\"\n"),
+            Some(9)
+        );
+        assert_eq!(
+            lock_version_major("importers:\n  .:\n"),
+            None,
+            "no version line → None, callers stay hands-off"
+        );
+        assert_eq!(
+            lock_version_major("lockfileVersion: banana\n"),
+            None,
+            "unparseable version → None, never a guess"
+        );
+    }
+
+    #[test]
+    fn may_need_store_flag_only_for_pnpm_one_to_four_locks() {
+        assert!(may_need_store_flag("shrinkwrapVersion: 3\n"));
+        assert!(may_need_store_flag("lockfileVersion: 5.1\n"));
+        assert!(may_need_store_flag("lockfileVersion: '5.2'\n"));
+        assert!(!may_need_store_flag("lockfileVersion: 5.3\n"));
+        assert!(!may_need_store_flag("lockfileVersion: 5.4\n"));
+        assert!(!may_need_store_flag("lockfileVersion: '6.0'\n"));
+        assert!(!may_need_store_flag("lockfileVersion: '9.0'\n"));
+        assert!(!may_need_store_flag("packages: {}\n"));
+    }
 }
