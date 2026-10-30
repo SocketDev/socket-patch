@@ -391,7 +391,7 @@ fn segment_is_pattern(seg: &str) -> bool {
     seg.contains(['*', '?'])
         || seg.match_indices('[').any(|(at, _)| {
             let body = &seg[at + 1..];
-            let body = body.strip_prefix(['!', '^']).unwrap_or(body);
+            let body = body.strip_prefix('!').unwrap_or(body);
             body.char_indices().skip(1).any(|(_, c)| c == ']')
         })
 }
@@ -678,7 +678,15 @@ mod tests {
 
     #[test]
     fn member_patterns_are_wildcards_or_closed_classes() {
-        for pattern in ["crates/*", "a?", "crates/[ab]", "x[!a]y", "x[^a]", "[]]"] {
+        for pattern in [
+            "crates/*",
+            "a?",
+            "crates/[ab]",
+            "x[!a]y",
+            "x[^a]",
+            "x[^]",
+            "[]]",
+        ] {
             assert!(is_member_pattern(pattern), "{pattern}");
         }
         for pattern in ["crates/a", "odd[dir", "x[]", "x[!]", "a]b["] {
