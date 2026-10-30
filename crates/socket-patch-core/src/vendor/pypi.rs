@@ -244,6 +244,24 @@ async fn requirements_pins_target(project_root: &Path, target: Option<(&str, &st
     }
 }
 
+/// #1873: refuse wiring a lock beside a requirements set that names the
+/// target through a `${NAME}` pip expands where it runs (`six==${SIXV}`).
+/// The release it installs is unknowable here, so naming requirements.txt
+/// a loser would let the lock wiring report the package patched while pip
+/// installs it from the registry.
+async fn refuse_templated_pin(
+    project_root: &Path,
+    target: Option<(&str, &str)>,
+) -> Result<(), (&'static str, String)> {
+    let Some((name, _)) = target else {
+        return Ok(());
+    };
+    match super::pypi_requirements::templated_pin(project_root, name).await {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
 /// with locks (precedence follows migration direction / ecosystem currency:
@@ -396,6 +414,7 @@ async fn detect_pypi_flavor(
             }
             None => false,
         };
+        refuse_templated_pin(project_root, target).await?;
         if !wired_with_lock && exists(PYPI_REQUIREMENTS).await {
             present.push(PYPI_REQUIREMENTS);
         }
@@ -449,6 +468,9 @@ async fn detect_pypi_flavor(
         }
         _ => false,
     };
+    if governing.is_some() {
+        refuse_templated_pin(project_root, target).await?;
+    }
     if governing.is_some()
         && !wired_with_lock
         && requirements_pins_target(project_root, target).await
@@ -4192,6 +4214,21 @@ mod tests {
                 loud[0].detail
             );
         }
+    }
+
+    /// #1873: beside a governing tool lock, a requirements pin templated
+    /// with pip's `${VAR}` refuses instead of being named a loser: the
+    /// release it installs is unknown.
+    #[tokio::test]
+    async fn governing_lock_refuses_an_env_templated_requirements_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "Pipfile", "[packages]\nsix = \"==1.16.0\"\n").await;
+        touch(tmp.path(), "Pipfile.lock", "{}").await;
+        touch(tmp.path(), "requirements.txt", "six==${SIXV}\n").await;
+        let (code, detail) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+            .await
+            .unwrap_err();
+        assert_eq!(code, "pypi_requirement_env_templated", "{detail}");
     }
 
     /// #912: a pylock-only Pipenv checkout can't be vendored — Pipenv drops

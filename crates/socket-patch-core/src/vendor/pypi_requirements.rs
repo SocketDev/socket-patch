@@ -27,8 +27,8 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::{self, terminator};
 use crate::utils::requirements::{
-    expand_env_vars, hash_options, logical_lines, parse_requirement, requirement_name,
-    requires_hashes, shlex_split, split_comment, strip_comment, vendor_tag,
+    expand_env_vars, has_env_reference, hash_options, logical_lines, parse_requirement,
+    requirement_name, requires_hashes, shlex_split, split_comment, strip_comment, vendor_tag,
 };
 
 use super::common::refuse_symlinked;
@@ -79,6 +79,8 @@ struct PinScan {
     /// environment-marker branch; whether that is ambiguous depends on the
     /// target pins of the whole requirement set ([`marker_split_ok`]).
     other_branches: bool,
+    /// Some occurrence carries a `${NAME}` pip expands where it runs.
+    templated: bool,
 }
 
 /// Whether the other version's marker branches (if any) in a requirement
@@ -105,13 +107,16 @@ fn marker_split_ok(scans: &[PinScan]) -> bool {
 /// all carry a marker (`split_ok` from [`marker_split_ok`]).
 #[derive(Debug, PartialEq, Eq)]
 enum PinRefusal {
+    Templated,
     Extras,
     NotPinned,
     UnmarkedSplit,
 }
 
 fn pin_refusal(scan: &PinScan, split_ok: bool) -> Option<PinRefusal> {
-    if scan.extras {
+    if scan.templated {
+        Some(PinRefusal::Templated)
+    } else if scan.extras {
         Some(PinRefusal::Extras)
     } else if scan.range {
         Some(PinRefusal::NotPinned)
@@ -131,8 +136,18 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
     let mut found_extras = false;
     let mut found_range = false;
     let mut other_branches = false;
+    let mut found_templated = false;
     for ll in logical_lines(content) {
         let code = strip_comment(&ll.text);
+        if has_env_reference(code)
+            && requirement_name(code).is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
+        {
+            // pip expands `${NAME}` where it runs, so the release this
+            // line installs is unknowable here, and rewriting it would
+            // drop the template for every other environment (#1873).
+            found_templated = true;
+            continue;
+        }
         let Some(req) = parse_requirement(code) else {
             // A line that names the package but is no requirement pip
             // reads cleanly is never a pin to rewrite (fail closed).
@@ -184,6 +199,7 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
         extras: found_extras,
         range: found_range,
         other_branches,
+        templated: found_templated,
     }
 }
 
@@ -207,7 +223,9 @@ fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
     let split_ok = marker_split_ok(std::slice::from_ref(&scan));
     match pin_refusal(&scan, split_ok) {
         Some(PinRefusal::Extras) => return PinSearch::Extras,
-        Some(PinRefusal::NotPinned | PinRefusal::UnmarkedSplit) => return PinSearch::Range,
+        Some(PinRefusal::Templated | PinRefusal::NotPinned | PinRefusal::UnmarkedSplit) => {
+            return PinSearch::Range
+        }
         None => {}
     }
     match scan.exact.into_iter().next() {
@@ -444,6 +462,37 @@ pub(super) async fn sibling_pin_wirable(root: &Path, canon_name: &str, version: 
             .flat_map(|f| f.records.iter())
             .all(|r| r.action == WiringAction::Rewritten)
         && refuse_symlinked(root, &rels).await.is_ok()
+}
+
+/// #1873: refuse a requirements line naming `canon_name` through a
+/// `${NAME}` pip expands where it runs (`six==${SIXV}`). What it installs
+/// is unknowable here, so the vendor neither rewrites it nor names the file
+/// a loser beside a lock that it wires alone.
+fn templated_refusal(rel: &str, canon_name: &str) -> (&'static str, String) {
+    (
+        "pypi_requirement_env_templated",
+        format!(
+            "{rel}: the {canon_name} requirement uses a ${{NAME}} environment variable pip \
+             expands at install time, so the release it installs is unknown; pin it \
+             literally or use agent mode (`scan --mode agent` + `socket-patch apply`) \
+             instead"
+        ),
+    )
+}
+
+/// [`templated_refusal`] for the first requirements file in the tree pip
+/// reads from `root` that names `canon_name` through a `${NAME}`.
+pub(super) async fn templated_pin(root: &Path, canon_name: &str) -> Option<(&'static str, String)> {
+    let files = collect_requirements_files(root).await.ok()?;
+    files.iter().find_map(|f| {
+        logical_lines(&f.content).into_iter().find_map(|ll| {
+            let code = strip_comment(&ll.text);
+            (has_env_reference(code)
+                && requirement_name(code)
+                    .is_some_and(|name| canonicalize_pypi_name(name) == canon_name))
+            .then(|| templated_refusal(&f.rel, canon_name))
+        })
+    })
 }
 
 /// The `requirements_line` records of a mixed entry (a Pipenv or uv entry
@@ -846,6 +895,7 @@ async fn plan_requirements(
 
     for (file, scan) in files.iter().zip(scans) {
         match pin_refusal(&scan, split_ok) {
+            Some(PinRefusal::Templated) => return Err(templated_refusal(&file.rel, canon_name)),
             Some(PinRefusal::Extras) => {
                 return Err((
                     "pypi_extras_unsupported",
@@ -2169,6 +2219,56 @@ mod tests {
             assert!(outcome.success, "{pin}");
             assert_eq!(read_root(tmp.path()).await, original, "{pin}");
         }
+    }
+
+    /// #1873: pip expands `${NAME}` on every line where it runs, so what
+    /// `six==${SIXV}` installs is unknowable here. Vendor refuses it with
+    /// its own code (it used to say "not pinned", or beside a pylock leave
+    /// it on PyPI while the lock wiring reported the package patched) and
+    /// never rewrites the template away, in the root or an include. A
+    /// `${...}` pip does not expand (lowercase) is no template.
+    #[tokio::test]
+    async fn refuses_an_env_templated_pin() {
+        for (root, base) in [
+            ("requests==2.31.0\nsix==${SIXV}\n", None),
+            ("six == ${SIXV}  # templated\n", None),
+            ("six==1.16.0 --hash=sha256:${SIX_SHA}\n", None),
+            ("-r base.txt\nidna==3.7\n", Some("six==${SIXV}\n")),
+        ] {
+            let tmp = write_root(root).await;
+            if let Some(base) = base {
+                tokio::fs::write(tmp.path().join("base.txt"), base)
+                    .await
+                    .unwrap();
+            }
+            let err = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.0, "pypi_requirement_env_templated",
+                "{root:?}: {}",
+                err.1
+            );
+            assert_eq!(read_root(tmp.path()).await, root, "nothing written");
+            assert!(!sibling_pin_wirable(tmp.path(), "six", "1.16.0").await);
+            assert_eq!(
+                templated_pin(tmp.path(), "six").await.map(|r| r.0),
+                Some("pypi_requirement_env_templated"),
+                "{root:?}"
+            );
+            // Another package's line is untouched by the refusal.
+            assert!(templated_pin(tmp.path(), "idna").await.is_none());
+        }
+        let tmp = write_root("requests==${REQV}\nsix==1.16.0\n").await;
+        assert!(templated_pin(tmp.path(), "six").await.is_none());
+        wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        assert_eq!(
+            find_pin("six==${sixv}\n", "six", "1.16.0"),
+            PinSearch::Range,
+            "a lowercase reference stays literal and is no pin"
+        );
     }
 
     #[tokio::test]

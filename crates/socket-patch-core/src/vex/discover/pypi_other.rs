@@ -287,6 +287,15 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
         return;
     }
     let Some((name, location)) = requirement_location(code) else {
+        if requirements::has_env_reference(code) {
+            // pip expands `${NAME}` where it runs, so a registry line
+            // carrying one may install any release of the package it
+            // names: evidence against every wiring of it (#1873).
+            if let Some(name) = requirements::requirement_name(code) {
+                out.resolved_elsewhere_any_version(file, pypi_name_purl(name));
+            }
+            return;
+        }
         // A registry requirement; a pin that can only install one release
         // is evidence against another lock's wiring of that release.
         registry_pin(file, code, out);
@@ -1868,6 +1877,51 @@ mod tests {
             "six===1.16\n",
             "other==1.16.0\n",
         ] {
+            let out = discover(line).await;
+            assert_eq!(out.refs.len(), 1, "{line:?}: {:#?}", out.diagnostics);
+        }
+    }
+
+    /// REGRESSION (#1873): pip expands `${NAME}` on every requirements
+    /// line where it runs (a Docker `ARG`, a CI step), so `six==${SIXV}`
+    /// may install any release, including the wired one, from PyPI. It
+    /// contests a lock's wiring of six whatever this process's environment
+    /// holds. A lowercase `${...}` stays literal in pip and pins nothing.
+    #[tokio::test]
+    async fn issue_1873_env_templated_pin_contests_wiring() {
+        const WHL: &str = "six-1.16.0-py2.py3-none-any.whl";
+        let vendored = vendored_wheel(UUID_A, WHL);
+        let wired = pipfile_lock(serde_json::json!({ "default": {
+            "six": { "file": format!("./{vendored}"), "hashes": [format!("sha256:{SHA}")] },
+        }}));
+        let discover = |requirements: &'static str| {
+            let wired = wired.clone();
+            async move {
+                let p = Project::new();
+                p.write("Pipfile.lock", &wired)
+                    .write("Pipfile", "[packages]\nsix = \"*\"\n")
+                    .write("requirements.txt", requirements);
+                p.discover().await
+            }
+        };
+        for line in [
+            "six==${SP_TEST_1873_SIXV}\n",
+            "idna==3.7\nSix == ${SIXV}  # templated\n",
+            "six${SIX_SPEC}\n",
+            "six==1.16.0 --hash=sha256:${SIX_SHA}\n",
+        ] {
+            let out = discover(line).await;
+            assert!(out.refs.is_empty(), "{line:?}: {:#?}", out.refs);
+            let c = out
+                .vendored_contest("pkg:pypi/six@1.16.0", UUID_A)
+                .unwrap_or_else(|| panic!("{line:?}: not contested"));
+            assert_eq!(
+                c.other,
+                std::path::Path::new("requirements.txt"),
+                "{line:?}"
+            );
+        }
+        for line in ["six==${sixv}\n", "idna==${IDNAV}\n"] {
             let out = discover(line).await;
             assert_eq!(out.refs.len(), 1, "{line:?}: {:#?}", out.diagnostics);
         }
