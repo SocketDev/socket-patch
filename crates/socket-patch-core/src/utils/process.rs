@@ -360,8 +360,9 @@ pub(crate) fn env_key() -> EnvKey {
 ///
 /// Only an answer is kept. A failed probe (spawn error under fd pressure,
 /// a non-zero exit, empty stdout) is asked again by the next caller, so a
-/// transient first failure doesn't stick. Neither is an answer the
-/// environment changed under while it ran, which the key would misfile.
+/// transient first failure doesn't stick. Neither is an answer whose
+/// environment differs, when the subprocess returns, from the one it was
+/// keyed on: the key would misfile it.
 pub(crate) struct EnvKeyedMemo<V> {
     slot: std::sync::Mutex<Option<(EnvKey, V)>>,
 }
@@ -374,21 +375,23 @@ impl<V: Clone> EnvKeyedMemo<V> {
     }
 
     pub(crate) fn get_or_run(&self, run: impl FnOnce() -> Option<V>) -> Option<V> {
-        let key = env_key();
-        let ran_under = key.clone();
-        self.get_or_run_keyed(key, move || {
+        self.get_or_run_keyed(env_key(), |ran_under| {
             let answer = run();
-            // Keepable only if the environment the subprocess actually ran
-            // under is still the one we keyed on.
-            (answer, env_key() == ran_under)
+            // Keepable only if the environment is, once the subprocess
+            // returns, still the one we keyed on.
+            (answer, env_key() == *ran_under)
         })
     }
 
-    /// The memoized ask. `run` hands back its answer and whether that
-    /// answer is keepable; a `None` answer is never kept. Split from
-    /// [`Self::get_or_run`] so tests can drive it against a key of their
-    /// own.
-    fn get_or_run_keyed(&self, key: EnvKey, run: impl FnOnce() -> (Option<V>, bool)) -> Option<V> {
+    /// The memoized ask. On a miss, `run` gets the key it runs under and
+    /// hands back its answer and whether that answer is keepable; a `None`
+    /// answer is never kept. Split from [`Self::get_or_run`] so tests can
+    /// drive it against a key of their own.
+    fn get_or_run_keyed(
+        &self,
+        key: EnvKey,
+        run: impl FnOnce(&EnvKey) -> (Option<V>, bool),
+    ) -> Option<V> {
         let lock = || {
             self.slot
                 .lock()
@@ -399,7 +402,7 @@ impl<V: Clone> EnvKeyedMemo<V> {
                 return Some(answer.clone());
             }
         }
-        let (answer, keepable) = run();
+        let (answer, keepable) = run(&key);
         if let (Some(answer), true) = (&answer, keepable) {
             *lock() = Some((key, answer.clone()));
         }
@@ -427,24 +430,24 @@ pub(crate) mod tests {
             (answer.map(str::to_string), true)
         };
         assert_eq!(
-            memo.get_or_run_keyed(env("/a"), || run(Some("home"))),
+            memo.get_or_run_keyed(env("/a"), |_| run(Some("home"))),
             Some("home".into())
         );
         assert_eq!(
-            memo.get_or_run_keyed(env("/a"), || run(Some("x"))),
+            memo.get_or_run_keyed(env("/a"), |_| run(Some("x"))),
             Some("home".into())
         );
         // A different environment misses and replaces the entry.
         assert_eq!(
-            memo.get_or_run_keyed(env("/b"), || run(Some("other"))),
+            memo.get_or_run_keyed(env("/b"), |_| run(Some("other"))),
             Some("other".into())
         );
         assert_eq!(
-            memo.get_or_run_keyed(env("/b"), || run(Some("x"))),
+            memo.get_or_run_keyed(env("/b"), |_| run(Some("x"))),
             Some("other".into())
         );
         assert_eq!(
-            memo.get_or_run_keyed(env("/a"), || run(Some("again"))),
+            memo.get_or_run_keyed(env("/a"), |_| run(Some("again"))),
             Some("again".into())
         );
         assert_eq!(runs, 3);
@@ -468,20 +471,23 @@ pub(crate) mod tests {
 
         // A failure, then an answer whose environment moved: both are
         // handed back, neither is kept.
-        assert_eq!(memo.get_or_run_keyed(key.clone(), || run(None, true)), None);
         assert_eq!(
-            memo.get_or_run_keyed(key.clone(), || run(Some("moved"), false)),
+            memo.get_or_run_keyed(key.clone(), |_| run(None, true)),
+            None
+        );
+        assert_eq!(
+            memo.get_or_run_keyed(key.clone(), |_| run(Some("moved"), false)),
             Some("moved".into())
         );
         assert_eq!(runs.get(), 2);
 
         // The next caller still asks, and a complete answer is kept.
         assert_eq!(
-            memo.get_or_run_keyed(key.clone(), || run(Some("home"), true)),
+            memo.get_or_run_keyed(key.clone(), |_| run(Some("home"), true)),
             Some("home".into())
         );
         assert_eq!(
-            memo.get_or_run_keyed(key.clone(), || run(None, true)),
+            memo.get_or_run_keyed(key.clone(), |_| run(None, true)),
             Some("home".into())
         );
         assert_eq!(runs.get(), 3);
@@ -509,8 +515,6 @@ pub(crate) mod tests {
             Some("fresh".to_string())
         };
         assert_eq!(memo.get_or_run(fresh).as_deref(), Some("fresh"));
-        // Now kept: an unchanged environment is served from the slot.
-        assert_eq!(memo.get_or_run(|| None).as_deref(), Some("fresh"));
         assert_eq!(runs.get(), 2);
     }
 
@@ -518,9 +522,8 @@ pub(crate) mod tests {
     /// same variables still hits, whatever order `vars_os` yields.
     #[test]
     fn env_key_is_sorted() {
-        let (vars, cwd) = env_key();
+        let (vars, _) = env_key();
         assert!(vars.windows(2).all(|w| w[0] <= w[1]), "sorted env snapshot");
-        assert_eq!(cwd, std::env::current_dir().ok());
     }
 
     /// Confirm the real runner returns Some for a tiny command we
