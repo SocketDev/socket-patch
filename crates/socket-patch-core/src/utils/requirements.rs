@@ -288,11 +288,13 @@ pub(crate) fn strip_comment(text: &str) -> &str {
     split_comment(text).0
 }
 
-/// A line's code as pip parses it: [`expand_env_vars`] over the process
-/// environment. pip expands every line, not only `-r` / `-c` targets, so
-/// `six==${SIXV}` with `SIXV=1.16.0` is the exact pin `six==1.16.0` (#1873).
-pub(crate) fn expand_process_env(code: &str) -> String {
-    expand_env_vars(code, |name| std::env::var(name).ok())
+/// Whether pip's [`expand_env_vars`] would substitute anything in `code`.
+/// pip expands every line, not only `-r` / `-c` targets, so `six==${SIXV}`
+/// pins whatever `SIXV` holds where pip runs: a Docker `ARG`, a CI step,
+/// none of which this process sees. Such a line pins no knowable release
+/// (#1873).
+pub(crate) fn has_env_reference(code: &str) -> bool {
+    expand_env_vars(code, |_| Some("_".to_string())) != code
 }
 
 /// pip's `expand_env_variables`: each `${NAME}` whose `NAME` is

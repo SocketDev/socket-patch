@@ -3289,63 +3289,44 @@ async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
     assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
 }
 
-/// #1873: pip expands `${NAME}` on every requirements line, so
-/// `six==${SIXV}` with `SIXV=1.16.0` installs exactly six 1.16.0. Beside a
-/// `pip lock` pylock.toml, vendor wires that line with the lock (it used
-/// to wire only the lock, name requirements.txt an unpatched loser and
-/// exit 0), and the revert restores the templated line as written. A
-/// pylock-only wiring the templated pin later contests fails `vendor
-/// --check`, as a literal pin does.
+/// #1873: pip expands `${NAME}` on every requirements line where it runs,
+/// so what `six==${SIXV}` installs is unknowable to vendor. Beside a `pip
+/// lock` pylock.toml, vendor refuses it and writes nothing (it used to wire
+/// only the lock, name requirements.txt an unpatched loser and exit 0),
+/// whatever this process's environment holds. A pylock-only wiring the
+/// templated line later contests fails `vendor --check`.
 #[tokio::test]
-async fn pip_lock_vendor_wires_an_env_templated_requirements_pin() {
+async fn pip_lock_vendor_refuses_an_env_templated_requirements_pin() {
     const TEMPLATED: &str = "idna==3.7\nsix==${SP_E2E_1873_SIXV}\n";
-    let env = [("SP_E2E_1873_SIXV", "1.16.0")];
-    let (_tmp, root) = project();
-    stage_pip_lock(&root);
-    std::fs::write(root.join("requirements.txt"), TEMPLATED).unwrap();
-    stage_manifest(&root);
-    let needle = format!(".socket/vendor/pypi/{UUID}/");
-
-    let (code, out) = run_cli(&root, &["vendor"], &env);
-    assert_eq!(code, 0, "{out:#}");
-    assert!(
-        !out.to_string().contains("pypi_multiple_lockfiles"),
-        "requirements.txt is wired, not an unpatched loser: {out:#}"
-    );
-    for file in ["requirements.txt", "pylock.toml"] {
+    for env in [&[("SP_E2E_1873_SIXV", "1.16.0")][..], &[][..]] {
+        let (_tmp, root) = project();
+        stage_pip_lock(&root);
+        std::fs::write(root.join("requirements.txt"), TEMPLATED).unwrap();
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, out) = run_cli(&root, &["vendor"], env);
+        assert_ne!(code, 0, "{env:?}: {out:#}");
         assert!(
-            std::fs::read_to_string(root.join(file))
-                .unwrap()
-                .contains(&needle),
-            "{file} is wired: {out:#}"
+            out.to_string().contains("pypi_requirement_env_templated"),
+            "{env:?}: {out:#}"
         );
+        assert_eq!(tree(&root), before, "{env:?}: nothing written");
     }
-    let (code, out) = run_cli(&root, &["vendor", "--check"], &env);
-    assert_eq!(code, 0, "both install sources are wired: {out:#}");
 
-    let (code, out) = run_cli(&root, &["vendor", "--revert"], &env);
-    assert_eq!(code, 0, "{out:#}");
-    assert_eq!(
-        std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
-        TEMPLATED,
-        "the templated line is restored as written"
-    );
-    assert_eq!(
-        std::fs::read(root.join("pylock.toml")).unwrap(),
-        PIP_LOCK.as_bytes()
-    );
-
-    // A pylock-only wiring (vendored before six was pinned) is contested
-    // once the templated pin reads as six==1.16.0.
+    // A pylock-only wiring (vendored before six was named) is contested
+    // once the templated line names six.
+    let env = [("SP_E2E_1873_SIXV", "1.16.0")];
     let (_tmp, root) = project();
     stage_pip_lock(&root);
     std::fs::write(root.join("requirements.txt"), "idna==3.7\n").unwrap();
     stage_manifest(&root);
     let (code, out) = run_cli(&root, &["vendor"], &env);
     assert_eq!(code, 0, "{out:#}");
+    let (code, out) = run_cli(&root, &["vendor", "--check"], &env);
+    assert_eq!(code, 0, "{out:#}");
     std::fs::write(root.join("requirements.txt"), TEMPLATED).unwrap();
     let (code, out) = run_cli(&root, &["vendor", "--check"], &env);
-    assert_eq!(code, 1, "pip installs six from PyPI: {out:#}");
+    assert_eq!(code, 1, "pip may install six from PyPI: {out:#}");
     assert!(out.to_string().contains("contested"), "{out:#}");
 }
 
