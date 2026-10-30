@@ -138,6 +138,13 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   E404: the hosted run reads it from the same env / project / user / global /
   builtin layers and warns `redirect_npm_replace_registry_host` (set
   `replace-registry-host=npmjs` in the project `.npmrc`, or use vendored mode).
+  npm >= 8's `omit-lockfile-registry-resolved=true` makes the next lock save
+  (any `npm install`) drop the hosted pins' `resolved` URLs but keep their
+  patched `integrity`, so every cold-cache install fails EINTEGRITY: the hosted
+  run reads it from the same layers and warns
+  `redirect_npm_omit_lockfile_registry_resolved` (set
+  `omit-lockfile-registry-resolved=false` in the project `.npmrc`, or use
+  vendored mode; a hosted re-run re-pins a stripped lock).
   npm 12 runs a dependency's install script only when `package.json`
   `allowScripts` approves it, and matches a version-pinned key
   (`"esbuild@0.19.12": true`, what `npm approve-scripts` writes) only against a

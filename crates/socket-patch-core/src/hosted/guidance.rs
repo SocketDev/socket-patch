@@ -563,17 +563,7 @@ pub fn npm_replace_registry_host_detail(
     setting: &crate::patch::redirect::npmrc::EffectiveSetting,
 ) -> String {
     use crate::patch::redirect::npmrc::SettingSource;
-    // Name the spelling the user can find (`${RRH}`), and what npm makes
-    // of it.
-    let value = if setting.raw.trim() == setting.value {
-        format!("`replace-registry-host={}`", setting.value)
-    } else {
-        format!(
-            "`replace-registry-host={}` (npm expands it to `{}`)",
-            setting.raw.trim(),
-            setting.value
-        )
-    };
+    let value = npm_setting_spelling("replace-registry-host", setting);
     let (where_, fix) = match &setting.source {
         SettingSource::Env(var) => (
             format!("the environment variable {var} sets"),
@@ -602,6 +592,75 @@ pub fn npm_replace_registry_host_detail(
          fails). To install the hosted patches, {fix}; or switch this project to vendored \
          patches (`socket-patch scan --mode vendored`), whose `file:` resolutions npm never \
          rewrites",
+        hosts.join(", "),
+    )
+}
+
+/// `key=value` as the user wrote it (`${RRH}`), and what npm expands it
+/// to when that differs.
+fn npm_setting_spelling(
+    key: &str,
+    setting: &crate::patch::redirect::npmrc::EffectiveSetting,
+) -> String {
+    if setting.raw.trim() == setting.value {
+        format!("`{key}={}`", setting.value)
+    } else {
+        format!(
+            "`{key}={}` (npm expands it to `{}`)",
+            setting.raw.trim(),
+            setting.value
+        )
+    }
+}
+
+/// Warning code for a hosted npm pin that npm's
+/// `omit-lockfile-registry-resolved` setting strips on the next lock save
+/// (#1871).
+pub const NPM_OMIT_LOCKFILE_RESOLVED_CODE: &str = "redirect_npm_omit_lockfile_registry_resolved";
+
+/// npm (>= 8) `omit-lockfile-registry-resolved=true` drops `resolved` from
+/// every registry dependency the next time npm saves the lock, but keeps
+/// the patched `integrity`: npm then fetches the registry tarball and the
+/// install fails EINTEGRITY (closed: never unpatched bytes). Like
+/// `replace-registry-host`, the setting is the user's, so the warning
+/// names where it is set and the remedies instead of overriding it.
+pub fn npm_omit_lockfile_resolved_detail(
+    hosts: &[&str],
+    setting: &crate::patch::redirect::npmrc::EffectiveSetting,
+) -> String {
+    use crate::patch::redirect::npmrc::SettingSource;
+    let value = npm_setting_spelling("omit-lockfile-registry-resolved", setting);
+    let (where_, fix) = match &setting.source {
+        SettingSource::Env(var) => (
+            format!("the environment variable {var} sets"),
+            format!(
+                "unset {var} (npm's environment layer overrides every .npmrc) or set it to \
+                 `false`"
+            ),
+        ),
+        SettingSource::Project => (
+            "the project .npmrc sets".to_string(),
+            "change it to `omit-lockfile-registry-resolved=false` (npm's default) or remove it"
+                .to_string(),
+        ),
+        SettingSource::File { layer, path } => (
+            format!("the {layer} npm config ({}) sets", path.display()),
+            format!(
+                "set `omit-lockfile-registry-resolved=false` in the project .npmrc (it outranks \
+                 the {layer} config) or change the {layer} config"
+            ),
+        ),
+    };
+    format!(
+        "the npm lockfile now resolves patched dependencies from the hosted patch server ({}), \
+         but {where_} {value}, which makes npm >=8 drop the `resolved` URL of every registry \
+         dependency the next time it saves the lockfile (any `npm install`, even one that \
+         changes nothing) while keeping the patched `integrity`: npm then fetches the \
+         registry tarball, so every `npm ci` / `npm install` without a warm cache fails \
+         EINTEGRITY and `socket-patch vex` no longer finds the hosted patches. To keep the \
+         hosted patches, {fix}; or switch this project to vendored patches (`socket-patch \
+         scan --mode vendored`), whose `file:` resolutions npm keeps. Re-running the hosted \
+         scan re-pins a lockfile npm has stripped",
         hosts.join(", "),
     )
 }
