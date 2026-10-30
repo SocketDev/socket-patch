@@ -97,7 +97,6 @@ fn pyproject_without_a_lock_names_the_lock_step() {
     let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
     let result = rewrite_registry_redirect(&files(&[("pyproject.toml", UV_PROJECT)]), &overrides);
     let detail = &no_lockfile_warnings(&result)[0].detail;
-    assert!(detail.contains("pyproject.toml"), "{detail}");
     assert!(detail.contains("uv lock"), "{detail}");
 
     let result = rewrite_registry_redirect(&BTreeMap::new(), &overrides);
@@ -157,4 +156,80 @@ fn no_warning_without_a_pypi_patch_in_the_lane() {
         "{:?}",
         codes(&result)
     );
+}
+
+/// The remedy follows the project's own tooling: a Pipfile asks for
+/// `pipenv lock`; a pyproject naming uv, Poetry or PDM (a `[tool.*]` table
+/// or its build backend) asks for that tool's lock alone; a pyproject that
+/// names none (plain pip/setuptools, or `uv init`'s table-less layout)
+/// offers a root requirements.txt pin and the lock commands.
+#[test]
+fn the_remedy_names_the_projects_own_lock_step() {
+    let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
+    let detail_for = |entries: &[(&str, &str)]| {
+        let result = rewrite_registry_redirect(&files(entries), &overrides);
+        let warnings = no_lockfile_warnings(&result);
+        assert_eq!(warnings.len(), 1, "{entries:?}: {:?}", codes(&result));
+        warnings[0].detail.clone()
+    };
+
+    let pipenv = detail_for(&[("Pipfile", "[packages]\nsix = \"==1.16.0\"\n")]);
+    assert!(pipenv.contains("`pipenv lock`"), "{pipenv}");
+    assert!(!pipenv.contains("uv lock"), "{pipenv}");
+
+    let cases = [
+        ("[tool.poetry]\nname = \"app\"\n", "poetry lock"),
+        (
+            "[project]\nname = \"app\"\n\n[build-system]\nbuild-backend = \"poetry.core.masonry.api\"\n",
+            "poetry lock",
+        ),
+        ("[project]\nname = \"app\"\n\n[tool.pdm]\ndistribution = false\n", "pdm lock"),
+        (
+            "[project]\nname = \"app\"\n\n[build-system]\nbuild-backend = \"pdm.backend\"\n",
+            "pdm lock",
+        ),
+        ("[project]\nname = \"app\"\n\n[tool.uv]\npackage = false\n", "uv lock"),
+        (
+            "[project]\nname = \"app\"\n\n[build-system]\nbuild-backend = \"uv_build\"\n",
+            "uv lock",
+        ),
+    ];
+    for (pyproject, command) in cases {
+        let detail = detail_for(&[("pyproject.toml", pyproject)]);
+        assert!(
+            detail.contains(&format!("`{command}`")),
+            "{pyproject}: {detail}"
+        );
+        for other in ["uv lock", "poetry lock", "pdm lock"] {
+            if other != command {
+                assert!(!detail.contains(other), "{pyproject}: {detail}");
+            }
+        }
+    }
+
+    let setuptools = detail_for(&[(
+        "pyproject.toml",
+        "[project]\nname = \"app\"\n\n[build-system]\nbuild-backend = \"setuptools.build_meta\"\n",
+    )]);
+    assert!(
+        setuptools.contains("root requirements.txt") && setuptools.contains("`uv lock`"),
+        "{setuptools}"
+    );
+}
+
+/// The detail names every input that would have silenced it, matching
+/// CLI_CONTRACT.md.
+#[test]
+fn the_detail_names_every_input_looked_for() {
+    let overrides = [six("aaaaaaaa-0000-4000-8000-000000000638")];
+    let result = rewrite_registry_redirect(&BTreeMap::new(), &overrides);
+    let detail = &no_lockfile_warnings(&result)[0].detail;
+    for input in [
+        "pylock.<name>.toml",
+        ".py.lock",
+        "Hatch configuration",
+        "readable",
+    ] {
+        assert!(detail.contains(input), "{input}: {detail}");
+    }
 }

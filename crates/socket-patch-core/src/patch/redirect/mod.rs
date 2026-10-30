@@ -1040,30 +1040,68 @@ fn warn_no_pypi_wiring(
         return;
     }
     let wired = files.keys().any(|key| {
-        let name = key.rsplit('/').next().unwrap_or(key);
         key == crate::formats::governing_locks::PYPI_REQUIREMENTS
-            || crate::formats::governing_locks::PYPI_TOOL_LOCKS.contains(&name)
-            || crate::utils::python_lock::is_python_lock_name(name)
+            || crate::formats::governing_locks::PYPI_TOOL_LOCKS.contains(&key.as_str())
+            || crate::utils::python_lock::is_python_lock_name(key)
     });
     if wired || crate::utils::hatch::is_hatch(files) {
         return;
     }
-    let remedy = if files.contains_key("pyproject.toml") {
-        "pyproject.toml declares the dependencies but no lock is present; \
-         generate and commit the lock its tool installs from (`uv lock`, \
-         `poetry lock`, `pdm lock`) and re-run"
-    } else {
-        "pin the package in a root requirements.txt or commit the project's \
-         lock and re-run"
-    };
     result.warnings.push(RewriteWarning {
         code: "redirect_pypi_no_lockfile".into(),
         detail: format!(
-            "no requirements.txt, uv.lock, poetry.lock, pdm.lock, Pipfile.lock or \
-             pylock.toml present at the project root (hosted mode does not read \
-             other requirements files such as requirements-dev.txt); {remedy}"
+            "no readable requirements.txt, uv.lock, poetry.lock, pdm.lock, \
+             Pipfile.lock, pylock.toml / pylock.<name>.toml, PEP 723 script lock \
+             (<script>.py.lock) or Hatch configuration at the project root (hosted \
+             mode does not read other requirements files such as \
+             requirements-dev.txt); {}",
+            pypi_no_lockfile_remedy(files)
         ),
     });
+}
+
+/// What the project's own Python tooling suggests doing about
+/// `redirect_pypi_no_lockfile`: a Pipfile asks for `pipenv lock`; a
+/// pyproject naming its lock tool (a `[tool.<tool>]` table or its build
+/// backend) asks for that tool's lock; any other pyproject may be a plain
+/// pip project or a tool that writes no table of its own (`uv init`), so
+/// both remedies are offered.
+fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
+    const PIN: &str = "pin the package in a root requirements.txt";
+    if files.contains_key("Pipfile") {
+        return "run `pipenv lock` and commit Pipfile.lock, then re-run".into();
+    }
+    let Some(pyproject) = files.get("pyproject.toml") else {
+        return format!("{PIN} or commit the project's lock, then re-run");
+    };
+    let document = pyproject.parse::<toml_edit::DocumentMut>().ok();
+    let backend = document
+        .as_ref()
+        .and_then(|doc| doc.get("build-system"))
+        .and_then(|build| build.get("build-backend"))
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_default();
+    let names = |tool: &str| {
+        document
+            .as_ref()
+            .and_then(|doc| doc.get("tool"))
+            .is_some_and(|table| table.get(tool).is_some())
+            || backend.starts_with(&format!("{tool}."))
+            || backend.starts_with(&format!("{tool}_"))
+    };
+    for (tool, command) in [
+        ("uv", "uv lock"),
+        ("poetry", "poetry lock"),
+        ("pdm", "pdm lock"),
+    ] {
+        if names(tool) {
+            return format!("run `{command}` and commit its lock, then re-run");
+        }
+    }
+    format!(
+        "{PIN}, or, if a lock tool installs the project, generate and commit its \
+         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
+    )
 }
 
 fn rewrite_hatch(
