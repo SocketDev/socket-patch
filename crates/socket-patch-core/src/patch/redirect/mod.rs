@@ -92,6 +92,8 @@ mod platform_wheel_tests;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
+#[cfg(test)]
+mod pypi_no_lockfile_tests;
 mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
 #[cfg(test)]
@@ -756,6 +758,7 @@ fn rewriter_groups<'a>(
             rewrite_hatch(files, overrides, result);
             rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
+            warn_no_pypi_wiring(files, overrides, result);
         }),
         Box::new(move |result| rewrite_cargo_with(files, overrides, cargo_outer, result)),
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
@@ -1019,6 +1022,48 @@ fn merge_group_outputs(prefix: &RewriteResult, outs: Vec<RewriteResult>) -> Opti
         merge_group_delta(&mut result, delta);
     }
     Some(result)
+}
+
+/// #638: the PyPI twin of `redirect_npm_no_lockfile` /
+/// `redirect_composer_no_lockfile`. A pypi patch reached the PyPI lane, but
+/// the project has no file any PyPI rewriter reads (a root
+/// `requirements.txt`, a tool lock, a PEP 751 / PEP 723 lock, or a Hatch
+/// configuration), so nothing can pin it. Said once per run, naming what
+/// was looked for; the per-patch `redirect_unconfirmed` row still follows.
+/// A file that IS present owns its deps' diagnostics instead.
+fn warn_no_pypi_wiring(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    if !overrides.iter().any(|dep| dep.ecosystem == "pypi") {
+        return;
+    }
+    let wired = files.keys().any(|key| {
+        let name = key.rsplit('/').next().unwrap_or(key);
+        key == crate::formats::governing_locks::PYPI_REQUIREMENTS
+            || crate::formats::governing_locks::PYPI_TOOL_LOCKS.contains(&name)
+            || crate::utils::python_lock::is_python_lock_name(name)
+    });
+    if wired || crate::utils::hatch::is_hatch(files) {
+        return;
+    }
+    let remedy = if files.contains_key("pyproject.toml") {
+        "pyproject.toml declares the dependencies but no lock is present; \
+         generate and commit the lock its tool installs from (`uv lock`, \
+         `poetry lock`, `pdm lock`) and re-run"
+    } else {
+        "pin the package in a root requirements.txt or commit the project's \
+         lock and re-run"
+    };
+    result.warnings.push(RewriteWarning {
+        code: "redirect_pypi_no_lockfile".into(),
+        detail: format!(
+            "no requirements.txt, uv.lock, poetry.lock, pdm.lock, Pipfile.lock or \
+             pylock.toml present at the project root (hosted mode does not read \
+             other requirements files such as requirements-dev.txt); {remedy}"
+        ),
+    });
 }
 
 fn rewrite_hatch(
