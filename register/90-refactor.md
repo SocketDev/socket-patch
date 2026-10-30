@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-10-30T07:25Z · main @ 5ca5623_
+_Last updated 2026-10-30T09:35Z · main @ 5ca5623_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -12,6 +12,7 @@ _Last updated 2026-10-30T07:25Z · main @ 5ca5623_
 | [#1875](https://github.com/SocketDev/socket-patch/pull/1875) | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI (82 checks) and Bugbot green |
 | [#1884](https://github.com/SocketDev/socket-patch/pull/1884) | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 [#1859](https://github.com/SocketDev/socket-patch/issues/1859); tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI (82 checks) and Bugbot green |
 | [#1892](https://github.com/SocketDev/socket-patch/pull/1892) | sweep | `cli/src/commands/scan/gc.rs` | ready; CI (82 checks) and Bugbot green |
+| [#1897](https://github.com/SocketDev/socket-patch/pull/1897) | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot pending |
 
 #### Merged
 _None._
@@ -26,7 +27,7 @@ Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`:
 
 A03 [#1834](https://github.com/SocketDev/socket-patch/issues/1834) is the fixer's #1876. T28 [#1880](https://github.com/SocketDev/socket-patch/issues/1880) and T23 [#1860](https://github.com/SocketDev/socket-patch/issues/1860) wait on #1864 (`list.rs`) and #1698 (`get.rs`).
 
-The next run is structural if a candidate scores 6 or more and its files are free, else a sweep. Next sweep files, in order: `scan/hosted.rs` (region, `partial@L<n>`), `scan/hosted/{nuget,takeover}.rs` (`python.rs` is in #1883), then `scan/policy.rs` and `scan/render.rs` once #1856/#1884 merge (policy's getters and `admit_crawled` are called from `scan/mod.rs`), then `core/constants.rs`, `core/lib.rs`, `core/utils/cargo_home.rs`, `core/utils/cargo_workspace.rs`. Skip `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` while #1698 is open, `rollback.rs` while #1864 is open, `cargo_build_cache.rs` (#1849) and `api/client.rs` (#1870).
+The next run is structural if a candidate scores 6 or more and its files are free, else a sweep. Next sweep files, in order: `scan/hosted/{nuget,takeover}.rs` (`python.rs` is in #1883), then `scan/policy.rs` and `scan/render.rs` once #1856/#1884 merge (policy's getters and `admit_crawled` are called from `scan/mod.rs`), then `core/constants.rs`, `core/utils/cargo_home.rs`. `core/lib.rs` is in #1891 and `core/utils/cargo_workspace.rs` in #1866. Skip `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` while #1698 is open, `rollback.rs` while #1864 is open, `cargo_build_cache.rs` (#1849) and `api/client.rs` (#1870).
 
 #### Notes
 - The PRs of the first thread (`arch-refactor/<issue>-*`) are listed in `review/2026-10-v1/register/90-refactor.md`.
@@ -44,3 +45,5 @@ The next run is structural if a candidate scores 6 or more and its files are fre
 - A test of a re-export or forwarding wrapper belongs beside the real function: move it to the defining crate and rebuild it on that module's helpers, instead of deleting coverage the target lacks (`ui::shell_word` had no test).
 - `scan/gc.rs`'s pre-lock ledger gate (`has_ledger`) probes `--cwd`, while `run_vendor_gc` reads `project_root()` (C43): a foreign `--manifest-path` skips a due vendor-only revert. Pre-existing; it wants an issue. The preview path also drops `cargo_cache_patch_kept` warnings.
 - Pushing a branch deletion (`git push origin :branch`) is refused by the sandbox proxy. Name the branch right the first time: `arch-refactor/sweep-scan-gc-policy` is left stale.
+- `scan::hosted::run_redirect` runs only under `--json` (scan/mod.rs calls it inside `if args.common.json`); the human arm goes through `boxed_run_redirect_selected`. `run_redirect_selected` still takes `Option<Envelope>` keyed on `common.json`; making it a value touches `get.rs` (#1698) and the T24 body.
+- The gem stale probe (`scan/hosted.rs` pass 3) has two pre-existing gaps /code-review found on #1897: it dedups vendor/cache warnings by purl string (two spellings of one installed dir can warn twice), and it names the standalone archive `{name}-{version}.gem`, missing a platform gem's suffix. Both change output, so they want an issue.
