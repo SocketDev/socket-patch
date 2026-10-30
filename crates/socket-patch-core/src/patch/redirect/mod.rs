@@ -2719,7 +2719,7 @@ fn cargo_lockless_other_dependencies(
                 .into_iter()
                 .flat_map(|a| a.iter().filter_map(toml_edit::Value::as_str));
             for member in members {
-                let named = if member.contains(['*', '?']) {
+                let named = if crate::utils::cargo_workspace::is_member_pattern(member) {
                     format!("the workspace members pattern `{member}`")
                 } else if crate::utils::cargo_workspace::normalize_rel(dir, member)
                     .is_some_and(|d| known.contains(format!("{d}/Cargo.toml").as_str()))
@@ -15629,6 +15629,15 @@ mod tests {
         ));
         assert!(
             detail.contains("the workspace members pattern `crates/*`"),
+            "{detail}"
+        );
+        // A `[..]` class is a pattern too (#1833), not a literal member.
+        let detail = refused(one(
+            "[workspace]\nmembers = [\"crates/[ab]\"]\n\n[package]\nname = \"app\"\n\
+             version = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        ));
+        assert!(
+            detail.contains("the workspace members pattern `crates/[ab]`"),
             "{detail}"
         );
     }

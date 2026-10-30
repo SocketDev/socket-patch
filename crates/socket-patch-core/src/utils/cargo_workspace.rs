@@ -380,6 +380,30 @@ pub(crate) fn expand_glob_bounded(
     (out, truncated)
 }
 
+/// Whether a `members` entry is a glob rather than a literal path: some
+/// segment holds `*`, `?` or a `[..]` class that closes. A `[` that never
+/// closes is not a class.
+pub(crate) fn is_member_pattern(pattern: &str) -> bool {
+    pattern.split('/').any(segment_is_pattern)
+}
+
+fn segment_is_pattern(seg: &str) -> bool {
+    seg.contains(['*', '?'])
+        || seg.match_indices('[').any(|(at, _)| {
+            let body = &seg[at + 1..];
+            let body = body.strip_prefix(['!', '^']).unwrap_or(body);
+            body.char_indices().skip(1).any(|(_, c)| c == ']')
+        })
+}
+
+/// `seg` as [`segment_glob_matches`] should read it for cargo. Cargo's
+/// `glob` crate negates a class only on `!`, so a `^` opening a class is a
+/// member; the shared matcher also negates on `^`, so a NUL member (which
+/// no directory name holds) goes ahead of it.
+fn cargo_segment(seg: &str) -> Vec<char> {
+    seg.replace("[^", "[\0^").chars().collect()
+}
+
 fn expand_from(
     tree: &dyn DirTree,
     at: String,
@@ -394,7 +418,7 @@ fn expand_from(
         out.push(at);
         return;
     };
-    if !seg.contains(['*', '?', '[']) {
+    if !segment_is_pattern(seg) {
         let next = join_rel(&at, seg);
         if tree.is_real_dir(&next) {
             expand_from(tree, next, tail, skip, out);
@@ -418,7 +442,7 @@ fn expand_from(
         }
         return;
     }
-    let pattern: Vec<char> = seg.chars().collect();
+    let pattern = cargo_segment(seg);
     for child in children {
         let name: Vec<char> = child.chars().collect();
         if segment_glob_matches(&pattern, &name) {
@@ -608,7 +632,8 @@ mod tests {
 
     /// #1833: cargo expands `members` with the `glob` crate, so `[ab]`,
     /// `[a-b]` and `[!x]` classes name the directories they match, as `*`
-    /// and `?` do.
+    /// and `?` do. The crate negates only on `!`: `[^x]` is the class of
+    /// `^` and `x`.
     #[test]
     fn member_globs_read_character_classes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -618,14 +643,19 @@ mod tests {
             write(root, &format!("tools/{name}/Cargo.toml"), &pkg(name));
             write(root, &format!("libs/{name}/Cargo.toml"), &pkg(name));
         }
+        write(root, "carets/xtra/Cargo.toml", &pkg("xtra"));
+        write(root, "carets/^hat/Cargo.toml", &pkg("hat"));
         write(
             root,
             "Cargo.toml",
-            "[workspace]\nmembers = [\"crates/[ab]*\", \"tools/[a-b]?*\", \"libs/[!a]*\"]\n",
+            "[workspace]\nmembers = [\"crates/[ab]*\", \"tools/[a-b]?*\", \"libs/[!a]*\", \
+             \"carets/[^x]*\"]\n",
         );
         assert_eq!(
             member_manifests(root),
             vec![
+                "carets/^hat/Cargo.toml",
+                "carets/xtra/Cargo.toml",
                 "crates/alpha/Cargo.toml",
                 "crates/beta/Cargo.toml",
                 "libs/beta/Cargo.toml",
@@ -636,23 +666,24 @@ mod tests {
         );
     }
 
-    /// A segment whose `[` never closes is a literal name, as `*`-free
-    /// segments are, and a `[[]` class matches a literal `[`.
+    /// A `[[]` class matches a literal `[`.
     #[test]
-    fn an_unclosed_bracket_is_literal() {
+    fn a_bracket_class_matches_a_literal_bracket() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        write(root, "odd[dir/Cargo.toml", &pkg("odd"));
         write(root, "x[1/Cargo.toml", &pkg("x"));
-        write(
-            root,
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"odd[dir\", \"x[[]?\"]\n",
-        );
-        assert_eq!(
-            member_manifests(root),
-            vec!["odd[dir/Cargo.toml", "x[1/Cargo.toml"]
-        );
+        write(root, "Cargo.toml", "[workspace]\nmembers = [\"x[[]?\"]\n");
+        assert_eq!(member_manifests(root), vec!["x[1/Cargo.toml"]);
+    }
+
+    #[test]
+    fn member_patterns_are_wildcards_or_closed_classes() {
+        for pattern in ["crates/*", "a?", "crates/[ab]", "x[!a]y", "x[^a]", "[]]"] {
+            assert!(is_member_pattern(pattern), "{pattern}");
+        }
+        for pattern in ["crates/a", "odd[dir", "x[]", "x[!]", "a]b["] {
+            assert!(!is_member_pattern(pattern), "{pattern}");
+        }
     }
 
     /// V-7: the memoized member walk returns exactly what the per-call
