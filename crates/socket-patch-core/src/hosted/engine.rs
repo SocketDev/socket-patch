@@ -751,11 +751,8 @@ pub async fn read_candidate_files(
                 pom,
                 config.map(String::as_str),
             ) {
-                for entry in view.list_dir("").await.unwrap_or_default() {
-                    let rel = format!("{}/pom.xml", entry.name);
-                    if out.files.contains_key(&rel) || !view.exists(&rel).await {
-                        continue;
-                    }
+                for dir in crate::vendor::jvm::maven_reactor::implicit_subprojects_in(view).await {
+                    let rel = format!("{dir}/pom.xml");
                     let text = read_advisory(view, unreadable, &rel).await;
                     out.files.insert(rel, text.unwrap_or_default());
                 }
@@ -3275,10 +3272,23 @@ fn confirm(
     fn is_npm_manifest(name: &str) -> bool {
         name == "package.json" || name.ends_with("/package.json")
     }
+    // A Maven reactor root the pom rewriter refused pins nothing, so a
+    // suffixed version an earlier release left in it, or in `.mvn/`,
+    // proves nothing (#1809); nor do the module poms read beside a Maven 4
+    // root, advisory input only.
+    let maven_reactor_refused = rewrite
+        .warnings
+        .iter()
+        .any(|w| w.code == "redirect_maven_multimodule_unsupported");
+    let is_unpinned_maven = |name: &str| {
+        name.ends_with("/pom.xml")
+            || maven_reactor_refused && (name == "pom.xml" || name.starts_with(".mvn/"))
+    };
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
         .filter(|(name, _)| !is_npm_manifest(name))
+        .filter(|(name, _)| !is_unpinned_maven(name))
         .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
@@ -5353,6 +5363,21 @@ snapshots:
         let (read, done) = gradle_rewrite_in(&ProjectView::Disk(tmp.path())).await;
         refused(&read, &done);
         assert!(!read.files.contains_key("src/pom.xml"));
+
+        // A suffixed version an earlier release pinned into the root, or one
+        // a module names, confirms nothing: the refused root pins nothing.
+        let stale = root.replace("1.10.0", "1.10.0-socket.4d5e6f70");
+        let named = child.replace(
+            "</artifactId>",
+            "</artifactId>\n  <properties><v>1.10.0-socket.4d5e6f70</v></properties>",
+        );
+        for (r, c) in [(stale.as_str(), child), (root, named.as_str())] {
+            let mut p = MemoryProject::new();
+            p.insert_text("pom.xml", r);
+            p.insert_text("a/pom.xml", c);
+            let (read, done) = gradle_rewrite(&p).await;
+            refused(&read, &done);
+        }
 
         // Without a subproject the root is a single pom, pinned as before.
         std::fs::remove_dir_all(tmp.path().join("a")).unwrap();

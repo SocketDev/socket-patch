@@ -98,6 +98,28 @@ pub fn may_discover_subprojects(pom: &str, maven_config: Option<&str>) -> bool {
         && Doc::parse(pom.to_string()).is_ok_and(|doc| discovers_subprojects(&doc))
 }
 
+/// [`implicit_subprojects`] of the root over a [`ProjectView`]: the direct
+/// subdirectories (a link to one included) holding a regular `pom.xml`,
+/// `.git` never, for the hosted engine and VEX discovery.
+pub async fn implicit_subprojects_in(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in view.list_dir("").await.unwrap_or_default() {
+        if entry.name == GIT_DIR || !(entry.is_dir || view.is_symlink(&entry.name)) {
+            continue;
+        }
+        if view.is_file(&format!("{}/{}", entry.name, layout::POM_FILE)) {
+            out.push(entry.name);
+        }
+    }
+    out
+}
+
+/// A checkout's git directory: never a subproject, whatever it holds (the
+/// planner's reader refuses every path through it).
+const GIT_DIR: &str = ".git";
+
 /// Maven 4's opt-out among the `.mvn/maven.config` user properties, read
 /// with Java's `Boolean.parseBoolean`: once set, anything but `true` turns
 /// discovery off.
@@ -2143,6 +2165,7 @@ pub fn implicit_subprojects(list: ListFn<'_>, dir: &str) -> Vec<String> {
     list(dir)
         .iter()
         .filter_map(|entry| entry.strip_suffix('/'))
+        .filter(|name| *name != GIT_DIR)
         .filter(|name| {
             let sub = match dir {
                 "" => name.to_string(),

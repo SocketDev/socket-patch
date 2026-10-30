@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::vendor::jvm::maven_reactor::{
-    may_discover_subprojects, pom_model, PomDecl, PomModel, MAVEN_CONFIG,
+    implicit_subprojects, may_discover_subprojects, pom_model, PomDecl, PomModel, MAVEN_CONFIG,
 };
 
 /// `(groupId, artifactId, version)`.
@@ -469,10 +469,10 @@ impl Walk<'_> {
     }
 }
 
-/// The pom at `path` parsed, when it is readable.
 /// The subprojects Maven 4 discovers under the pom at `path` (#1809): when
-/// it lists none ([`may_discover_subprojects`]), every direct subdirectory
-/// of `dir` holding a `pom.xml`, as `<module>` names.
+/// it lists none ([`may_discover_subprojects`]), the direct subdirectories
+/// of `dir` holding a `pom.xml` ([`implicit_subprojects`]), as `<module>`
+/// names.
 fn discovered_subprojects(path: &Path, dir: &Path, config: Option<&str>) -> Vec<String> {
     let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(path) else {
         return Vec::new();
@@ -480,18 +480,30 @@ fn discovered_subprojects(path: &Path, dir: &Path, config: Option<&str>) -> Vec<
     if !may_discover_subprojects(&String::from_utf8_lossy(&bytes), config) {
         return Vec::new();
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    // The planners' listing: bare names, directories (followed through a
+    // link) ending in `/`.
+    let list = |rel: &str| -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir.join(rel)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                Some(if e.path().is_dir() {
+                    format!("{name}/")
+                } else {
+                    name
+                })
+            })
+            .collect()
     };
-    let mut out: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().join("pom.xml").is_file())
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .collect();
+    let mut out = implicit_subprojects(&list, "");
     out.sort();
     out
 }
 
+/// The pom at `path` parsed, when it is readable.
 fn read_model(path: &Path, include_profiles: bool) -> Option<Arc<PomModel>> {
     crate::utils::fs::read_regular_to_bytes_sync(path)
         .ok()

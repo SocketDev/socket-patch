@@ -164,22 +164,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let gas = group_by_ga(&pom.deps);
     let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw)
         || (crate::vendor::jvm::maven_reactor::may_discover_subprojects(&raw, config.as_deref())
-            && discovers_a_subproject(ctx).await);
+            && !crate::vendor::jvm::maven_reactor::implicit_subprojects_in(&ctx.view)
+                .await
+                .is_empty());
     extract_hosted(ctx, &pom, &gas, &hosted, reactor, out).await;
     if !vendored.is_empty() {
         extract_vendored(ctx, &pom.deps, &gas, &vendored, out).await;
     }
-}
-
-/// Whether a direct subdirectory of the root holds a `pom.xml`: a module
-/// Maven 4 discovers under a root that lists none (#1809).
-async fn discovers_a_subproject(ctx: &DiscoverCtx<'_>) -> bool {
-    for entry in ctx.view.list_dir("").await.unwrap_or_default() {
-        if ctx.view.exists(&format!("{}/{POM}", entry.name)).await {
-            return true;
-        }
-    }
-    false
 }
 
 // ── hosted ───────────────────────────────────────────────────────────────
