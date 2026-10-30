@@ -7875,25 +7875,7 @@ G=
     async fn test_pyenv_root_env_var_site_packages_discovered() {
         // Save/restore guard so a panicking assertion cannot leak the
         // override into other #[serial] env-var tests.
-        struct EnvGuard {
-            key: &'static str,
-            prev: Option<String>,
-        }
-        impl EnvGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let prev = std::env::var(key).ok();
-                std::env::set_var(key, value);
-                Self { key, prev }
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.prev {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
+        use crate::test_env::EnvGuard;
 
         let dir = tempfile::tempdir().unwrap();
         let sp = dir
@@ -7905,7 +7887,7 @@ G=
             .join("site-packages");
         tokio::fs::create_dir_all(&sp).await.unwrap();
 
-        let _pyenv_root = EnvGuard::set("PYENV_ROOT", dir.path().to_str().unwrap());
+        let _pyenv_root = EnvGuard::set("PYENV_ROOT", dir.path());
         let results = get_global_python_site_packages().await;
         assert!(
             results.contains(&sp),
@@ -8104,25 +8086,7 @@ G=
     #[test]
     #[serial_test::serial]
     fn site_query_memo_follows_the_environment() {
-        struct EnvGuard {
-            key: &'static str,
-            prev: Option<std::ffi::OsString>,
-        }
-        impl EnvGuard {
-            fn set(key: &'static str, value: &Path) -> Self {
-                let prev = std::env::var_os(key);
-                std::env::set_var(key, value);
-                Self { key, prev }
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.prev {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
+        use crate::test_env::EnvGuard;
         let memoized = || SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query);
 
         let base_a = tempfile::tempdir().unwrap();

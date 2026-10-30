@@ -352,34 +352,11 @@ fn get_yarn_global_prefix_with_mock_runner_success() {
     );
 }
 
-/// Sets environment variables for a test and puts the old values back on
-/// drop, a panic included.
-struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl EnvGuard {
-    fn set(vars: &[(&'static str, &Path)]) -> Self {
-        let saved = vars
-            .iter()
-            .map(|(k, v)| {
-                let old = std::env::var_os(k);
-                std::env::set_var(k, v);
-                (*k, old)
-            })
-            .collect();
-        EnvGuard(saved)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (k, v) in self.0.drain(..) {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-}
+/// The core unit tests' env guard, compiled into this test binary too.
+#[allow(dead_code)]
+#[path = "../src/test_env.rs"]
+mod test_env;
+use test_env::EnvGuard;
 
 /// #437: yarn 1.0.0 - 1.0.2 has no `yarn global dir` (it exits 1), so
 /// the folder yarn 1.0.x itself uses stands in for the answer it can't
@@ -392,7 +369,10 @@ fn get_yarn_global_prefix_with_falls_back_for_yarn_1_0() {
     let home = tempfile::tempdir().unwrap();
     let global = home.path().join(".config/yarn/global/node_modules");
     std::fs::create_dir_all(global.join("left-pad")).unwrap();
-    let _env = EnvGuard::set(&[("HOME", home.path()), ("FAKEROOTKEY", Path::new("1"))]);
+    let _env = EnvGuard::many([
+        ("HOME", Some(home.path())),
+        ("FAKEROOTKEY", Some(Path::new("1"))),
+    ]);
     let runner = common::MockCommandRunner::new()
         .with_response("yarn", &["global", "dir"], None)
         .with_response("yarn", &["--version"], Some("1.0.2\n"));

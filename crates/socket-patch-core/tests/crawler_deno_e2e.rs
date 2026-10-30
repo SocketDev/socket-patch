@@ -18,28 +18,11 @@ fn options_at(root: &Path) -> CrawlerOptions {
     }
 }
 
-/// Save/restore an env var around a test body, restoring even if the
-/// body panics mid-assert (important: these tests are `#[serial]`, so a
-/// leaked `DENO_DIR` would poison sibling tests' default-resolution).
-struct EnvGuard {
-    key: &'static str,
-    prev: Option<String>,
-}
-impl EnvGuard {
-    fn set(key: &'static str, value: &Path) -> Self {
-        let prev = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        Self { key, prev }
-    }
-}
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
+/// The core unit tests' env guard, compiled into this test binary too.
+#[allow(dead_code)]
+#[path = "../src/test_env.rs"]
+mod test_env;
+use test_env::EnvGuard;
 
 /// Stage a JSR package: `<root>/<scope>/<name>/<version>/mod.ts`.
 async fn stage_jsr_pkg(root: &Path, scope: &str, name: &str, version: &str) -> std::path::PathBuf {

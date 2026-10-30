@@ -1233,7 +1233,7 @@ mod tests {
                 mkdir(&cache);
                 write(&project.join("go.mod"), "module example.com/app\n");
                 let env = (
-                    EnvGuard::set("GOMODCACHE", cache.to_str().unwrap()),
+                    EnvGuard::set("GOMODCACHE", &cache),
                     EnvGuard::unset("GOWORK"),
                 );
                 Fixture {
@@ -1429,7 +1429,7 @@ mod tests {
             // GOWORK naming a file elsewhere (absolute on every platform:
             // `/x` has no drive on Windows, so go rejects it as relative).
             let elsewhere = f.project.parent().unwrap().join("elsewhere/go.work");
-            let _gowork = EnvGuard::set("GOWORK", &elsewhere.to_string_lossy());
+            let _gowork = EnvGuard::set("GOWORK", &elsewhere);
             assert_eq!(f.crawl().await, walked);
         }
 
@@ -1515,31 +1515,7 @@ mod tests {
 
     // ---- get_gomodcache env tests ----
 
-    /// Save and restore an env var around a test body.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::EnvGuard;
 
     #[test]
     #[serial_test::serial]
@@ -1561,7 +1537,7 @@ mod tests {
         // usable entry for the module cache).
         let gopath_list = std::env::join_paths(["".as_ref(), gopath_a.path().as_os_str()]).unwrap();
         let _gomodcache = EnvGuard::set("GOMODCACHE", "");
-        let _gopath = EnvGuard::set("GOPATH", gopath_list.to_str().unwrap());
+        let _gopath = EnvGuard::set("GOPATH", &gopath_list);
         let _home = EnvGuard::set("HOME", "/nonexistent-home-unused");
         let _userprofile = EnvGuard::unset("USERPROFILE");
         assert_eq!(
@@ -1574,7 +1550,7 @@ mod tests {
         // Case B: GOMODCACHE and GOPATH both set-but-empty fall all the way
         // through to the $HOME/go/pkg/mod default.
         let _gopath_empty = EnvGuard::set("GOPATH", "");
-        let _home_b = EnvGuard::set("HOME", home_b.path().to_str().unwrap());
+        let _home_b = EnvGuard::set("HOME", home_b.path());
         assert_eq!(
             GoCrawler::get_gomodcache(),
             Some(home_b.path().join("go").join("pkg").join("mod")),
@@ -1602,7 +1578,7 @@ mod tests {
         let gopath = dir.path().join("gopath");
         let _gomodcache = EnvGuard::unset("GOMODCACHE");
         let _gopath = EnvGuard::unset("GOPATH");
-        let _goenv = EnvGuard::set("GOENV", file.to_str().unwrap());
+        let _goenv = EnvGuard::set("GOENV", &file);
 
         std::fs::write(&file, format!("GOMODCACHE={}\n", cache.display())).unwrap();
         assert_eq!(GoCrawler::get_gomodcache(), Some(cache.clone()));
@@ -1614,7 +1590,7 @@ mod tests {
         );
 
         let env_cache = dir.path().join("env-cache");
-        let _env = EnvGuard::set("GOMODCACHE", env_cache.to_str().unwrap());
+        let _env = EnvGuard::set("GOMODCACHE", &env_cache);
         assert_eq!(GoCrawler::get_gomodcache(), Some(env_cache));
     }
 

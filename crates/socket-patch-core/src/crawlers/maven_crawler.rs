@@ -2506,31 +2506,7 @@ mod tests {
 
     // ---- m2_repo_path env tests ----
 
-    /// Save and restore an env var around a test body.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::EnvGuard;
 
     /// B66: with no usable home the default used to be the literal
     /// RELATIVE `~/.m2/repository`, which resolves against the working
@@ -2584,7 +2560,7 @@ mod tests {
         let _args = EnvGuard::unset("MAVEN_ARGS");
         let _opts = EnvGuard::set(
             "MAVEN_OPTS",
-            &format!("-Dmaven.repo.local={}", repo_local.path().display()),
+            format!("-Dmaven.repo.local={}", repo_local.path().display()),
         );
 
         let repo = MavenCrawler::m2_repo_path();
@@ -2612,8 +2588,8 @@ mod tests {
         // Point the home directory at an empty dir so a developer's own
         // `~/.m2/settings.xml` <localRepository> can't change the result.
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path().to_str().unwrap());
-        let _profile = EnvGuard::set("USERPROFILE", home.path().to_str().unwrap());
+        let _home = EnvGuard::set("HOME", home.path());
+        let _profile = EnvGuard::set("USERPROFILE", home.path());
 
         let repo = MavenCrawler::m2_repo_path();
         assert_ne!(
@@ -2871,7 +2847,7 @@ mod tests {
             .await
             .unwrap();
         let missing = project.path().join("no-such-m2-repo");
-        let _local = EnvGuard::set("MAVEN_REPO_LOCAL", missing.to_str().unwrap());
+        let _local = EnvGuard::set("MAVEN_REPO_LOCAL", &missing);
 
         let crawler = MavenCrawler::new();
         let options = CrawlerOptions {
