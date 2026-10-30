@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -47,3 +47,11 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
 - **Root-marker predicate:** `scan/policy.rs` `lock_markers` and core `memory/roots.rs`; disk adds a manifest fallback. {{T31}}
 - **Agent dry-run preview event:** scan, get and agent_download, plus a fourth already-recorded check in scan. {{T32}}
 - **Patch selection:** a fifth copy in core `hosted/memory::select_with_policy`; the socket.yml floor 3×, the tier filter 4×. {{T15}}
+- **Maven `${…}` interpolation:** 5 copies; only `formats::maven` caps output length. {{A30}}
+- **A POM's own coordinates:** 3 readers, drifted on parent-version inheritance and `${` handling. {{A31}}
+- **Env-keyed subprocess memo:** composer, python and ruby; python caches answers computed under a changed env. {{A32}}
+- **Coursier-root predicate:** `coursier_spelled` vs `JvmCacheLayout::classify`. {{A33}}
+- **Go coordinate gate:** 4 identical copies. {{A34}}
+- **JVM cache plumbing:** gradle roots ×2, hash-dir listing ×3, wrapper init.d ×2, `-D` parsing ×2. {{A35}}
+- **platformdirs user dirs:** 5 copies, drifted on Windows fallback and macOS `XDG_*`. {{A36}}
+- **Small crawler twins (local notes):** `strip_windows_verbatim_prefix` (hatch_env, python_crawler), hatch `envs` table choice (hatch_env, `utils::hatch`), PEP 503 name (hatch_env `project_name`, {{A25}}), `is_real_dir` ×3, `is_anchored` (composer, relpath).

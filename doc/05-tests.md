@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -51,6 +51,12 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
   - Env mutation without a guard: `client` `test_get_api_client_from_env_no_token` (and it reads the user's socket-cli config).
   - Test scaffolding: four xorshift64* RNGs and eight legacy crawler oracles. {{A29}}
 - **Strong:** `vendor_prefetch`'s serial-differential tests and `client`'s wiremock retry tests assert request counts and outcomes, not mocks.
+- **Tally for `crawlers/` (13 files): about 45 fake, duplicate or weak tests.**
+  - Can't fail: `coursier_cache` `host_os_is_one_of_the_tables`; `deno` `default_and_new_construct_cleanly`; go and maven `test_crawl_all_deduplication` (one package staged); go `test_crawl_all_skips_cache_dir` (no `@` dir under `cache/`); maven `comment_pom_falls_back_to_path` (the fallback never runs).
+  - Recomputes the expected value: `hatch_env` `default_data_dir_and_config_dirs_env_virtual`.
+  - Vacuous FIFO tests: `coursier_cache` `repo_roots_read_poms_fifo_safe` and half of `ivy_cache` `readers_are_fifo_safe` never open the FIFO.
+  - Duplicates of e2e tests: `fuzzy_match` ×9, `go_crawler` ×8, `composer_crawler` ×5.
+  - Oracles that share the production helpers they check (composer, go): {{A29}}. `EnvGuard` copied 11×: {{A37}}.
 - **Tally for `commands/scan/` (8 files): about 40 fake, duplicate or misplaced tests.**
   - Can't fail: `scan/mod.rs` 3 `takeover_detail_*` tests' negative asserts (phrases the string never had), an `assert_ne!` between constants, `vex_error_warnings_append_to_scan_json` (tests `Vec::extend`); `hosted.rs` a constant tautology (L4534).
   - Duplicates: `hosted.rs` L3836/L3853 exact; gc's composer/encoded/PEP 503 tests re-test core `PurlKey`; gc's corrupt-manifest tests ×2 repeat L966; render `highest_severity_picks_worst` copies core `ranking.rs`; `package_specs_match_names_and_purls` copies core `policy/tests.rs`.

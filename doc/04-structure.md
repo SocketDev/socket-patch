@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -43,6 +43,13 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-cli-tests._
   - about 12 trivial wrappers (identity `ranking::merged_coverage`, `org_slug`/`uses_public_proxy` over `route()`, `CargoCrawler::cargo_home`);
   - dead code: `get_api_client_from_env` (no caller), `blob_fetcher`'s `on_progress` parameter (every caller passes `None`), `CargoCrawler`'s `Default`;
   - about 140 deletable comment lines (mostly `vendor_prefetch`'s 110-line module doc and `client.rs` history notes).
+- **Tally for `crawlers/` (13 files, 13.3K lines: `composer_crawler.rs` → `maven_crawler.rs`, without `maven_crawler/` and `maven_scope.rs`):**
+  - about 45 single-caller functions worth inlining;
+  - about 47 trivial wrappers (the `scan_maven_repo` four-layer chain, `is_safe_*` one-line forwarders, test-only async shims);
+  - dead code: maven `is_ro_root` (free fn), `gradle_m2_ignored`, `maven_local_undetermined`; `jvm_cache::project_dependency_set` (iterates `&[]`); `DerivedIndex::incomplete`; ivy's ignored `_os` parameter; `fuzzy_match`'s `limit` (one caller passes `usize::MAX`);
+  - about 330 deletable comment lines.
+- **Crawlers are stateless unit structs** with `new()` + `Default`. {{A38}}
+- **Codecs inside crawlers:** `deno_crawler`'s `deno.lock` readers (used by vex, hosted and vendor) belong in `formats/deno`, `gradle_cache::parse_properties` in `formats/`, the POM line scanner in `formats::maven` ({{A31}}), and `JvmEnv`/`M2Gate` in `jvm_cache` ({{A35}}).
 - **Tally for `crates/socket-patch-cli/src/commands/scan/` (8 files, 15.5K lines: `gc.rs`, `hosted.rs`, `hosted/{nuget,python,takeover}.rs`, `mod.rs`, `policy.rs`, `render.rs`):**
   - about 90 single-caller functions (≈25 worth inlining; render's byte-tested builders stay);
   - about 26 trivial wrappers or shims (`count`, `run_warning_of`, `emit_json_error`, 4 re-export shims in `mod.rs`, 3 policy getters over a `pub` field);
