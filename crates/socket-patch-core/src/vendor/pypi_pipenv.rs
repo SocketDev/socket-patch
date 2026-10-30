@@ -971,7 +971,11 @@ pub async fn stale_install_detail(
     lock_change: &str,
 ) -> String {
     let join = |dirs: &[&PathBuf]| join_dirs(dirs.iter().copied());
-    let name = if !name.is_empty()
+    // PEP 508: letters, digits, `.`, `_` and `-`, starting and ending with a
+    // letter or digit (so a `-`-led name can't read as a pip option).
+    let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    let name = if edge(name.chars().next())
+        && edge(name.chars().last())
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -1188,6 +1192,18 @@ mod tests {
         )
         .await;
         assert!(!unsafe_name.contains("rm -rf"), "{unsafe_name}");
+        // Nor does a name pip would read as an option.
+        let option = stale_install_detail(
+            Some(&lock),
+            "--pre",
+            "1.16.0",
+            std::slice::from_ref(&plain),
+            &inherited,
+            "rewritten",
+        )
+        .await;
+        assert!(!option.contains("--pre"), "{option}");
+        assert!(option.contains("uninstall -y <package> &&"), "{option}");
         assert!(
             unsafe_name.contains("`pipenv run pip uninstall -y <package> && pipenv sync`"),
             "{unsafe_name}"
