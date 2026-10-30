@@ -12,7 +12,7 @@ _Last updated 2026-10-30T09:35Z · main @ 5ca5623_
 | [#1875](https://github.com/SocketDev/socket-patch/pull/1875) | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI (82 checks) and Bugbot green |
 | [#1884](https://github.com/SocketDev/socket-patch/pull/1884) | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 [#1859](https://github.com/SocketDev/socket-patch/issues/1859); tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI (82 checks) and Bugbot green |
 | [#1892](https://github.com/SocketDev/socket-patch/pull/1892) | sweep | `cli/src/commands/scan/gc.rs` | ready; CI (82 checks) and Bugbot green |
-| [#1897](https://github.com/SocketDev/socket-patch/pull/1897) | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot pending |
+| [#1897](https://github.com/SocketDev/socket-patch/pull/1897) | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI (82 checks) and Bugbot green |
 
 #### Merged
 _None._
