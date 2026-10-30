@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item, Table};
 
+use crate::utils::workspace_globs::segment_glob_matches;
 use crate::vendor::lock_inventory::view::{MemoryProject, ProjectView};
 use crate::vendor::parse_memo::ParseMemo;
 
@@ -349,10 +350,12 @@ pub(crate) fn normalize_rel(base: &str, rel: &str) -> Option<String> {
 /// directory.
 const CARGO_SKIP: &[&str] = &["target"];
 
-/// Expand a cargo `members` / `exclude` glob (`*`, `?`, `**`) to the
-/// repo-relative directories it names. A wildcard segment never matches a
-/// dot-directory (unless the segment itself starts with `.`, as `.*` does)
-/// or a name in `skip`; a literal segment names any real directory.
+/// Expand a cargo `members` / `exclude` glob (`*`, `?`, `[..]` classes,
+/// `**`) to the repo-relative directories it names. A wildcard segment
+/// never matches a dot-directory (unless the segment itself starts with
+/// `.`, as `.*` does) or a name in `skip`; a literal segment names any
+/// real directory. A segment matches as `workspace_globs` reads one, so a
+/// `[` that never closes is a literal character.
 pub(crate) fn expand_glob(tree: &dyn DirTree, pattern: &str, skip: &[&str]) -> Vec<String> {
     expand_glob_bounded(tree, pattern, skip).0
 }
@@ -391,7 +394,7 @@ fn expand_from(
         out.push(at);
         return;
     };
-    if !seg.contains(['*', '?']) {
+    if !seg.contains(['*', '?', '[']) {
         let next = join_rel(&at, seg);
         if tree.is_real_dir(&next) {
             expand_from(tree, next, tail, skip, out);
@@ -415,23 +418,12 @@ fn expand_from(
         }
         return;
     }
+    let pattern: Vec<char> = seg.chars().collect();
     for child in children {
-        if wildcard_match(seg.as_bytes(), child.as_bytes()) {
+        let name: Vec<char> = child.chars().collect();
+        if segment_glob_matches(&pattern, &name) {
             expand_from(tree, join_rel(&at, &child), tail, skip, out);
         }
-    }
-}
-
-fn wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
-    match (pattern.first(), name.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => {
-            wildcard_match(&pattern[1..], name)
-                || (!name.is_empty() && wildcard_match(pattern, &name[1..]))
-        }
-        (Some(b'?'), Some(_)) => wildcard_match(&pattern[1..], &name[1..]),
-        (Some(p), Some(n)) if p == n => wildcard_match(&pattern[1..], &name[1..]),
-        _ => false,
     }
 }
 
@@ -614,13 +606,53 @@ mod tests {
         assert_eq!(member_manifests(root), vec!["crates/a/Cargo.toml"]);
     }
 
+    /// #1833: cargo expands `members` with the `glob` crate, so `[ab]`,
+    /// `[a-b]` and `[!x]` classes name the directories they match, as `*`
+    /// and `?` do.
     #[test]
-    fn wildcard_matching() {
-        assert!(wildcard_match(b"a*c", b"abbc"));
-        assert!(wildcard_match(b"*", b""));
-        assert!(wildcard_match(b"a?c", b"abc"));
-        assert!(!wildcard_match(b"a?c", b"ac"));
-        assert!(!wildcard_match(b"a*d", b"abc"));
+    fn member_globs_read_character_classes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["alpha", "beta", "gamma"] {
+            write(root, &format!("crates/{name}/Cargo.toml"), &pkg(name));
+            write(root, &format!("tools/{name}/Cargo.toml"), &pkg(name));
+            write(root, &format!("libs/{name}/Cargo.toml"), &pkg(name));
+        }
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/[ab]*\", \"tools/[a-b]?*\", \"libs/[!a]*\"]\n",
+        );
+        assert_eq!(
+            member_manifests(root),
+            vec![
+                "crates/alpha/Cargo.toml",
+                "crates/beta/Cargo.toml",
+                "libs/beta/Cargo.toml",
+                "libs/gamma/Cargo.toml",
+                "tools/alpha/Cargo.toml",
+                "tools/beta/Cargo.toml",
+            ]
+        );
+    }
+
+    /// A segment whose `[` never closes is a literal name, as `*`-free
+    /// segments are, and a `[[]` class matches a literal `[`.
+    #[test]
+    fn an_unclosed_bracket_is_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "odd[dir/Cargo.toml", &pkg("odd"));
+        write(root, "x[1/Cargo.toml", &pkg("x"));
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"odd[dir\", \"x[[]?\"]\n",
+        );
+        assert_eq!(
+            member_manifests(root),
+            vec!["odd[dir/Cargo.toml", "x[1/Cargo.toml"]
+        );
     }
 
     /// V-7: the memoized member walk returns exactly what the per-call
