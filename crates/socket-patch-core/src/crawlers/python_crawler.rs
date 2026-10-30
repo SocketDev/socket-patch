@@ -8094,6 +8094,32 @@ G=
         assert_eq!(runs.load(Ordering::SeqCst), 5);
     }
 
+    /// The site query memo keeps an answer only if the environment it ran
+    /// under is still the one it was keyed on: an answer computed while the
+    /// environment changed (another thread swapped `PATH`) is handed back
+    /// but not filed under the old key, so the next ask runs again.
+    #[test]
+    #[serial_test::serial]
+    fn site_query_memo_drops_an_answer_the_environment_changed_under() {
+        const VAR: &str = "SOCKET_PATCH_TEST_SITE_QUERY_KEEP_RULE";
+        std::env::remove_var(VAR);
+        let memo: KeyedMemo<SiteQueryKey, String> = KeyedMemo::new();
+        let runs = std::cell::Cell::new(0);
+        let answer = memo.get_or_run(site_query_key(), || {
+            runs.set(runs.get() + 1);
+            std::env::set_var(VAR, "moved");
+            Some("ran under a moved environment".to_string())
+        });
+        std::env::remove_var(VAR);
+        assert_eq!(answer.as_deref(), Some("ran under a moved environment"));
+        let again = memo.get_or_run(site_query_key(), || {
+            runs.set(runs.get() + 1);
+            Some("fresh".to_string())
+        });
+        assert_eq!(again.as_deref(), Some("fresh"));
+        assert_eq!(runs.get(), 2);
+    }
+
     /// DC-6: the memoized site query is wired to the whole environment.
     /// Under two different `PYTHONUSERBASE` values (the interpreter's
     /// `getusersitepackages` follows it) the memoized answer equals the
