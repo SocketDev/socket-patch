@@ -17,7 +17,7 @@
 //! layer. Upstream Go ships it with the same values as the built-in
 //! defaults, and locating it would mean running `go`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The effective value of Go setting `key`: a non-empty environment variable
 /// wins, else the Go environment file's non-empty value, else `None` (the
@@ -35,6 +35,41 @@ pub(crate) fn go_env_with(key: &str, env: impl Fn(&str) -> Option<String>) -> Op
     let file = go_env_file(&env)?;
     let text = crate::utils::fs::read_regular_to_string_sync(&file).ok()?;
     lookup_in_env_file(&text, key).filter(|v| !v.is_empty())
+}
+
+/// go's GOPATH list (`cfg.BuildContext.GOPATH`): the setting split on the
+/// OS list separator, empty entries kept, or go's default `$HOME/go` when
+/// it is unset. `go_env` resolves a setting as [`go_env`] does (`None` for
+/// unset or empty).
+pub(crate) fn gopath_entries(
+    go_env: &dyn Fn(&str) -> Option<String>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    match go_env("GOPATH") {
+        Some(gopath) => std::env::split_paths(&gopath).collect(),
+        None => home.map(|h| h.join("go")).into_iter().collect(),
+    }
+}
+
+/// go's module cache (`cfg.GOMODCACHE`): GOMODCACHE, else `pkg/mod` under
+/// the FIRST [`gopath_entries`] entry, the one place both the crawler and
+/// the installed-tool audit read it from (#1834). go reads only that first
+/// entry, so an empty one (`GOPATH=:/a`) leaves go with no module cache
+/// ("module cache not found"), and go refuses a relative cache path: both
+/// are `None` here, never a path under the working directory.
+pub(crate) fn gomodcache(
+    go_env: &dyn Fn(&str) -> Option<String>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let cache = match go_env("GOMODCACHE") {
+        Some(cache) => PathBuf::from(cache),
+        None => gopath_entries(go_env, home)
+            .into_iter()
+            .next()?
+            .join("pkg")
+            .join("mod"),
+    };
+    cache.is_absolute().then_some(cache)
 }
 
 /// What a `GOFLAGS` setting makes go do about `-modfile`.
@@ -182,6 +217,38 @@ mod tests {
         assert_eq!(lookup_in_env_file(text, "lower"), None);
         assert_eq!(lookup_in_env_file(text, "NOEQUALS"), None);
         assert_eq!(lookup_in_env_file(text, "GONOPROXY"), None);
+    }
+
+    /// One GOPATH / GOMODCACHE rule for every caller, checked against go
+    /// 1.24's `go env GOMODCACHE` and `go mod download` (#1834).
+    #[cfg(unix)]
+    #[test]
+    fn gomodcache_follows_go() {
+        let home = Some(Path::new("/home/u"));
+        let cache = |pairs: &[(&str, &str)]| gomodcache(&env_of(pairs), home);
+        let p = |s: &str| Some(PathBuf::from(s));
+        // GOMODCACHE set: it wins.
+        assert_eq!(cache(&[("GOMODCACHE", "/c"), ("GOPATH", "/a")]), p("/c"));
+        // Multi-entry GOPATH: only the first entry counts.
+        assert_eq!(cache(&[("GOPATH", "/a:/b")]), p("/a/pkg/mod"));
+        // No GOPATH: go's default `$HOME/go`.
+        assert_eq!(cache(&[]), p("/home/u/go/pkg/mod"));
+        assert_eq!(gomodcache(&env_of(&[]), None), None);
+        // An empty first entry: go has no module cache, not the next entry
+        // and not the home default.
+        assert_eq!(cache(&[("GOPATH", ":")]), None);
+        assert_eq!(cache(&[("GOPATH", ":/b")]), None);
+        // go refuses relative paths.
+        assert_eq!(cache(&[("GOMODCACHE", "rel")]), None);
+        assert_eq!(cache(&[("GOPATH", "rel:/b")]), None);
+        assert_eq!(gomodcache(&env_of(&[]), Some(Path::new("rel"))), None);
+
+        let entries = |pairs: &[(&str, &str)]| gopath_entries(&env_of(pairs), home);
+        assert_eq!(
+            entries(&[("GOPATH", "/a::/b")]),
+            ["/a", "", "/b"].map(PathBuf::from)
+        );
+        assert_eq!(entries(&[]), [PathBuf::from("/home/u/go")]);
     }
 
     /// `-modfile` read from GOFLAGS as go reads it (#1799).

@@ -178,33 +178,16 @@ impl GoCrawler {
     // Private helpers
     // ------------------------------------------------------------------
 
-    /// Get `GOMODCACHE`, falling back to `$GOPATH/pkg/mod/` or `$HOME/go/pkg/mod/`.
-    /// Each setting resolves as go resolves it: the environment, then the
-    /// `go env -w` file ([`crate::utils::go_env`]), so a cache configured
-    /// with `go env -w GOMODCACHE=…` is the one crawled (#344).
+    /// The module cache go itself uses ([`crate::utils::go_env::gomodcache`]):
+    /// `GOMODCACHE`, else the first `GOPATH` entry's `pkg/mod`, else
+    /// `$HOME/go/pkg/mod`. Each setting resolves as go resolves it: the
+    /// environment, then the `go env -w` file ([`crate::utils::go_env`]), so
+    /// a cache configured with `go env -w GOMODCACHE=…` is the one crawled
+    /// (#344). `None` when go has no module cache.
     pub(crate) fn get_gomodcache() -> Option<PathBuf> {
-        if let Some(cache) = crate::utils::go_env::go_env("GOMODCACHE") {
-            return Some(PathBuf::from(cache));
-        }
-        if let Some(gopath) = crate::utils::go_env::go_env("GOPATH") {
-            // GOPATH may list several directories separated by the OS path
-            // separator (`:` on Unix, `;` on Windows). Go uses the FIRST
-            // entry for the module cache, so split rather than treating the
-            // whole value as a single path.
-            if let Some(first) = std::env::split_paths(&gopath).find(|p| !p.as_os_str().is_empty())
-            {
-                return Some(first.join("pkg").join("mod"));
-            }
-        }
-        // A set-but-empty HOME/USERPROFILE counts as unset, matching the
-        // GOMODCACHE and GOPATH guards above: honoring `""` would yield the
-        // RELATIVE path `go/pkg/mod`, pointing the crawl at a directory
-        // inside the user's project instead of a real module cache.
-        Some(
-            crate::utils::fs::home_dir()?
-                .join("go")
-                .join("pkg")
-                .join("mod"),
+        crate::utils::go_env::gomodcache(
+            &crate::utils::go_env::go_env,
+            crate::utils::fs::home_dir().as_deref(),
         )
     }
 
@@ -1555,21 +1538,32 @@ mod tests {
         // No `go env -w` file: the developer's own must not leak in.
         let _goenv = EnvGuard::set("GOENV", "off");
 
-        // Case A: empty GOMODCACHE falls through to GOPATH, and the empty
-        // FIRST GOPATH entry is skipped in favor of the next non-empty one
-        // (GOPATH is an OS-separator-delimited list; Go uses the first
-        // usable entry for the module cache).
-        let gopath_list = std::env::join_paths(["".as_ref(), gopath_a.path().as_os_str()]).unwrap();
+        // Case A: empty GOMODCACHE falls through to GOPATH. go reads only
+        // the FIRST GOPATH entry for the module cache, so a non-empty first
+        // entry locates it and an empty one leaves go with no module cache
+        // at all ("module cache not found"): never the next entry (#1834).
         let _gomodcache = EnvGuard::set("GOMODCACHE", "");
-        let _gopath = EnvGuard::set("GOPATH", gopath_list.to_str().unwrap());
         let _home = EnvGuard::set("HOME", "/nonexistent-home-unused");
         let _userprofile = EnvGuard::unset("USERPROFILE");
+        let first_a =
+            std::env::join_paths([gopath_a.path().as_os_str(), home_b.path().as_os_str()]).unwrap();
+        let _gopath = EnvGuard::set("GOPATH", first_a.to_str().unwrap());
         assert_eq!(
             GoCrawler::get_gomodcache(),
             Some(gopath_a.path().join("pkg").join("mod")),
-            "empty GOMODCACHE must fall through to GOPATH, skipping the \
-             empty first GOPATH entry"
+            "empty GOMODCACHE must fall through to the first GOPATH entry"
         );
+        for list in [
+            std::env::join_paths(["".as_ref(), gopath_a.path().as_os_str()]).unwrap(),
+            std::env::join_paths(["", ""]).unwrap(),
+        ] {
+            let _gopath = EnvGuard::set("GOPATH", list.to_str().unwrap());
+            assert_eq!(
+                GoCrawler::get_gomodcache(),
+                None,
+                "an empty first GOPATH entry ({list:?}) leaves go no module cache"
+            );
+        }
 
         // Case B: GOMODCACHE and GOPATH both set-but-empty fall all the way
         // through to the $HOME/go/pkg/mod default.
@@ -1589,6 +1583,12 @@ mod tests {
             None,
             "all-empty env must yield None, never a CWD-relative path"
         );
+
+        // Case D: go refuses a relative GOMODCACHE ("must be absolute
+        // path"), so there is no cache to crawl rather than one under CWD.
+        let _home_d = EnvGuard::set("HOME", home_b.path().to_str().unwrap());
+        let _relative = EnvGuard::set("GOMODCACHE", "rel/cache");
+        assert_eq!(GoCrawler::get_gomodcache(), None);
     }
 
     /// #344: GOMODCACHE / GOPATH written with `go env -w` (the `$GOENV`
