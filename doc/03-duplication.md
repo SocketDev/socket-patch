@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -35,3 +35,7 @@ _Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
 - **uuid-only `PatchRecord`:** core `ledgers::uuid_only_record` beside 3 literals (list.rs L81, commands/mod.rs L388, core vendor/mod.rs L943). Local notes.
 - **`--global`/`--global-prefix` flag text:** `commands::global_scope_flag` vs `ui::global_scope_arg`, drifted when both are set. Local note on `commands/mod.rs`.
 - **purl shape rule:** CLI `scan/discovery::crawled_from_purl` and core `hosted::memory::discover::supplement_purl` (identical today; the core test asserts literals, not the CLI function). Part of {{A14}}.
+- **Civil-date math:** `days_from_civil` in `api/date.rs` and `formats/cargo/floor.rs`, the inverse in `vex/time.rs` (which claims to be the only copy). Same values today. {{A26}}
+- **Serve-URL GET and retry loops:** `download_vendor_archive_once` vs `download_artifact_capped_once` (drifted cap-breach variant and status text); 4 retry loops under 2 policies. {{A27}}
+- **Service-archive integrity gate:** `vendor_prefetch::ride_along` re-implements `service_fetch::fetch_verified_archive`'s sha512 + `h1:` checks. Local note.
+- **Worst-severity label picker:** a fourth copy in core `client.rs::convert_search_result_to_batch_info` (handed to audit-cli-tests for {{T10}}).

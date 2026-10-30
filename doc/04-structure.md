@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -37,3 +37,9 @@ _Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
 - **Giant functions (cont.):** `rollback::run` (~1,210 lines), `rollback::rollback_patches_inner` (~830), `remove::run` (~920). C11/#843 covers `run_scan` only.
 - **`rollback.rs` is `remove`'s helper library:** remove imports 12 items from it (text helpers such as `join_clauses`/`as_question` belong in `ui`; hosted ones such as `retire_legacy_redirect_ledger` in `hosted_unwind`). Local notes.
 - **`scan/discovery.rs` is a grab-bag:** discovery, update detection, severity helpers and hosted/vendored nested-project policy (`nested_project_skips`, which belongs in `scan/hosted.rs`). Local note; C11.
+- **`api/` is not a leaf layer:** `vendor_prefetch` belongs in `vendor/`, the pypi wheel gate sits in `client.rs`, and `api::types` imports `patch::redirect`. {{A28}}
+- **Tally for `api/` (8 files, 12.0K lines) and `crawlers/cargo_crawler*` (1.7K):**
+  - about 20 single-caller functions worth inlining (`fetch_binary`/`binary_url`, `format_fetch_result_for`, the `download_vendor_archive*` chain, `verify_crate_at_path`);
+  - about 12 trivial wrappers (identity `ranking::merged_coverage`, `org_slug`/`uses_public_proxy` over `route()`, `CargoCrawler::cargo_home`);
+  - dead code: `get_api_client_from_env` (no caller), `blob_fetcher`'s `on_progress` parameter (every caller passes `None`), `CargoCrawler`'s `Default`;
+  - about 140 deletable comment lines (mostly `vendor_prefetch`'s 110-line module doc and `client.rs` history notes).

@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -44,3 +44,10 @@ _Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
   - Duplicates of core tests: discovery's 5 `severity_order` tests (core `ranking.rs`), 4 `candidate_supersedes` and 1 `unsupported_layout_warnings` test of core functions; ~5 remove `remove_matching` tests repeat core `Target` tests.
   - Subset or overclaiming tests: lock_cli ×4, repair ×3, mod.rs ×3 (only `is_err()` or a `.contains` that a sibling message also satisfies).
 - **Coverage gaps:** no test of `remove --preserve-state --dry-run` over a vendored entry {{T16}}; no test that `scan --json` keeps stderr empty on a held lock {{T09}}; no bidi/zero-width test for `list` {{T23}}.
+- **Tally for `api/` and `cargo_crawler*`: about 40 fake, duplicate or misplaced tests.**
+  - Tautologies: `ranking` `merged_coverage_is_the_advisory_count` (identity fn) and `same_patch_dates_across_different_packages_do_not_interact` (the key has no purl); `date` `parsed_order_is_chronological_in_both_formats`'s monotonic assert (its own loop counter); `types` `published_at_is_per_patch_not_per_package` (its own fixture); `tests/api_timeout_e2e.rs` const == literal.
+  - Duplicates: `types` ×10 serde serialize/roundtrip tests; `ranking` ×4 rung tests; `blob_fetcher` ×5 format tests.
+  - Misplaced: `client.rs` tests `is_hex` ×5, `severity_order` ×2, `is_uuid_shaped` ×2; `cargo_crawler` tests `package_name_version` ×7 (covered in `formats/cargo/manifest.rs`).
+  - Env mutation without a guard: `client` `test_get_api_client_from_env_no_token` (and it reads the user's socket-cli config).
+  - Test scaffolding: four xorshift64* RNGs and eight legacy crawler oracles. {{A29}}
+- **Strong:** `vendor_prefetch`'s serial-differential tests and `client`'s wiremock retry tests assert request counts and outcomes, not mocks.

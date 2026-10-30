@@ -1,6 +1,6 @@
 ## Part 2
 
-_Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
+_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 
  Common mechanisms:For each cross-cutting concern: the **canonical mechanism** (the one way the code should do it, with a permalink to its home), the **deviations** found (file, what it does instead, its register token), and a count. Concerns: error types and context; error codes and exit codes; swallowed errors and panics in non-test code; stdout/stderr and the `ui` layer; the JSON envelope; human text, color and progress; logging; env and config reading; paths and containment; file I/O (atomic writes, BOM/CRLF); HTTP clients, timeouts and retries; process spawning and deadlines; concurrency.
 
@@ -22,3 +22,5 @@ _Last checked against main @ c8e26f6 on 2026-10-29 by audit-cli-tests._
 - **Terminal-safe text** (proposed canonical: core `policy::strip_unsafe`, keeping `\n`/`\t`). `list::sanitize` and `StatusPrinter::println` keep bidi and zero-width characters. {{T23}}
 - **Shell-quoted remedies** (canonical: `ui::shell_word`). `scan/discovery.rs` keeps a POSIX-only copy. {{T18}}
 - **Telemetry auth**: repair copies core's token chain (`api_token_available`) to avoid building a client, while remove builds one eagerly (an org lookup and a proxy notice before any local work). Local notes; related to C10/#793.
+- **HTTP retries** (proposed canonical: one retry helper in `api/retry.rs` driven by one policy). `api/client.rs` runs two policies that disagree on statuses, counts, jitter and an over-cap `Retry-After` (executed: JSON gives up, vendor retries after 4 s), through four hand-written loops; blob GETs and the upstream registry client (#1650) retry nothing. {{A27}}
+- **Debug output** (canonical: `api::client::debug_log` → `[socket-patch debug]` on stderr, deferrable per task). `vendor/pypi.rs` reuses its deferral; other modules print through `env_compat::debug_message` directly. Not yet surveyed beyond `api/`.
