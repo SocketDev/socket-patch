@@ -3708,3 +3708,29 @@ async fn lookup_matches_by_purl_identity() {
     assert!(lookup(&entries, "pkg:composer/psr/log@3.0.3").is_none());
     assert!(lookup(&entries, "pkg:pypi/typing_extensions@4.12.2").is_some());
 }
+
+#[test]
+fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() {
+    let layout = |code: &'static str| UnsupportedNpmLayout {
+        code,
+        detail: "probe detail text".to_string(),
+    };
+    let warnings = unsupported_layout_warnings(&[
+        layout("vendor_yarn_berry_unsupported"),
+        layout("vendor_pnpm_pnp_unsupported"),
+        layout("vendor_future_layout_unsupported"),
+    ]);
+    let codes: Vec<&str> = warnings.iter().map(|(code, _)| code.as_str()).collect();
+    assert_eq!(
+        codes,
+        [
+            "yarn_pnp_unsupported",
+            "pnpm_pnp_unsupported",
+            "vendor_future_layout_unsupported"
+        ]
+    );
+    // Known codes get scan's phrasing; an unknown one keeps the probe's.
+    assert_ne!(warnings[0].1, "probe detail text");
+    assert_ne!(warnings[1].1, "probe detail text");
+    assert_eq!(warnings[2].1, "probe detail text");
+}
