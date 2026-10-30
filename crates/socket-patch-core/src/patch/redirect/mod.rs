@@ -9724,6 +9724,8 @@ fn rewrite_golang_target(
                 "the go.work workspace selects"
             } else if scan.required.as_deref() == Some(selected.as_str()) {
                 "go.mod requires"
+            } else if graph.as_ref().is_some_and(|g| g.complete) {
+                "the module graph selects"
             } else {
                 "go.sum shows the build selects"
             };
@@ -9805,12 +9807,10 @@ fn rewrite_golang_target(
             code: "redirect_golang_not_in_module_graph".into(),
             detail: if selection == go_build_list::Selection::Unproven {
                 format!(
-                    "{fname}@{}: nothing shows the build selects this version — go.sum has \
-                     a zip line above go.mod's require (a dependency's raise, or a line a \
-                     downgrade left until `go mod tidy`) and a go.mod its module graph needs \
-                     is not in the module cache (`go mod download` fetches it); nothing \
-                     redirected",
-                    dep.version
+                    "{fname}@{}: nothing shows the build selects this version — {}; \
+                     nothing redirected",
+                    dep.version,
+                    go_build_list::UNPROVEN_REASON
                 )
             } else if in_workspace && selection == go_build_list::Selection::Unknown {
                 format!(

@@ -1045,11 +1045,9 @@ async fn generate_vex(
                     entry.module
                 ),
                 Some(Selection::Unproven) => format!(
-                    "nothing shows the build selects {} {version}: go.sum has a zip line \
-                     above go.mod's require (a dependency's raise, or a line a downgrade \
-                     left until `go mod tidy`), and a go.mod its module graph needs is not \
-                     in the module cache (`go mod download` fetches it)",
-                    entry.module
+                    "nothing shows the build selects {} {version}: {}",
+                    entry.module,
+                    socket_patch_core::vendor::go_build_list::UNPROVEN_REASON
                 ),
                 Some(Selection::Unknown)
                     if socket_patch_core::vendor::go_workspace::resolve(&root)

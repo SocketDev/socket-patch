@@ -162,10 +162,8 @@ impl std::fmt::Display for Drift {
             } => write!(
                 f,
                 "{purl}: nothing shows the build selects the patched version \
-                 {patched_version}: go.sum has a zip line above go.mod's require (a \
-                 dependency's raise, or a line a downgrade left until `go mod tidy`), and a \
-                 go.mod its module graph needs is not in the module cache (`go mod download` \
-                 fetches it); go may link the UNPATCHED module"
+                 {patched_version}: {}; go may link the UNPATCHED module",
+                go_build_list::UNPROVEN_REASON
             ),
             Drift::ReplaceTargetOnly {
                 purl,
@@ -737,11 +735,8 @@ pub(crate) async fn selection_refusal(
              link the unpatched module; nothing written"
         )),
         Selection::Unproven => Some(format!(
-            "nothing shows the build selects {module} {version}: go.mod requires a lower \
-             version and go.sum has a zip line above it, which is a dependency's raise or \
-             a line `go get` left behind after a downgrade, and a go.mod the module graph \
-             needs is not in the module cache; nothing written (run `go mod download`, or \
-             `go mod tidy` to drop stale go.sum lines)"
+            "nothing shows the build selects {module} {version}: {}; nothing written",
+            go_build_list::UNPROVEN_REASON
         )),
         Selection::Selected | Selection::Unknown => None,
     }
