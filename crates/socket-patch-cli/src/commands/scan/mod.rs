@@ -67,10 +67,9 @@ use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
     preverify_vendor_baselines, vendored_ledger_supplement, LockfileSupplement,
 };
-// Shared with `get --mode hosted|vendored` (commands::get): the advisory-
-// pinned entry into the hosted engine, the vendor step + its dry-run
-// preview. `pub(crate)` re-exports because the submodules themselves stay
-// private to scan.
+// Shared with `get --mode hosted|vendored` (commands::get): the lockfile
+// and vendored-ledger crawl supplements. `pub(crate)` re-exports because
+// the submodules themselves stay private to scan.
 pub(crate) use self::discovery::{
     lockfile_supplement as project_lockfile_supplement,
     vendored_ledger_supplement as project_vendored_supplement,

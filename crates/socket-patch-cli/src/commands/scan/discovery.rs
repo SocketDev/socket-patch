@@ -1748,26 +1748,6 @@ mod tests {
         assert_eq!(ids.count, 1);
     }
 
-    /// A batch-shaped patch with explicit advisory lists and NO publish
-    /// date, so only the severity and advisory-count rungs can decide.
-    fn info_with_advisories(
-        uuid: &str,
-        severity: Option<&str>,
-        ghsas: &[&str],
-        cves: &[&str],
-    ) -> BatchPatchInfo {
-        BatchPatchInfo {
-            uuid: uuid.to_string(),
-            purl: "pkg:npm/foo@1.0".to_string(),
-            tier: "free".to_string(),
-            cve_ids: cves.iter().map(|s| (*s).to_string()).collect(),
-            ghsa_ids: ghsas.iter().map(|s| (*s).to_string()).collect(),
-            severity: severity.map(str::to_string),
-            title: String::new(),
-            published_at: None,
-        }
-    }
-
     #[test]
     fn detect_updates_flags_merged_patch_superseding_applied_single() {
         // End-to-end through detect_updates: the manifest holds the
@@ -1778,13 +1758,18 @@ mod tests {
         let pkgs = vec![BatchPackagePatches {
             purl: "pkg:npm/foo@1.0".to_string(),
             patches: vec![
-                info_with_advisories("uuid-single", Some("high"), &["GHSA-3333-3333-3333"], &[]),
-                info_with_advisories(
-                    "uuid-merged",
-                    Some("high"),
-                    &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
-                    &[],
-                ),
+                BatchPatchInfo {
+                    severity: Some("high".to_string()),
+                    ..patch_with("uuid-single", &[], &["GHSA-3333-3333-3333"])
+                },
+                BatchPatchInfo {
+                    severity: Some("high".to_string()),
+                    ..patch_with(
+                        "uuid-merged",
+                        &[],
+                        &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
+                    )
+                },
             ],
         }];
         let updates = detect_updates(Some(&m), &pkgs);
