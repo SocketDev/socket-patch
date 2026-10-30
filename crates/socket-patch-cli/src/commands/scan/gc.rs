@@ -651,7 +651,8 @@ mod tests {
     /// Manifest keys and crawled purls are compared by `PurlKey`: the
     /// API's encoded, mixed-case, padded-composer and qualified spellings
     /// of an installed release keep their entries; a gone release of the
-    /// same package still prunes.
+    /// same package still prunes, and with nothing installed every one of
+    /// them prunes.
     #[test]
     fn detect_prunable_matches_by_purl_key() {
         let m = manifest_with(&[
@@ -660,6 +661,7 @@ mod tests {
             ("pkg:pypi/typing_extensions@4.12.2", "uuid-c"),
             ("pkg:composer/psr/log@3.0.2.0", "uuid-d"),
             ("pkg:composer/psr/cache@v3.0.2", "uuid-e"),
+            ("pkg:composer/psr/container@1.0.0.0", "uuid-i"),
             ("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-f"),
             ("pkg:pypi/six@1.16.0?artifact_id=sdist", "uuid-g"),
             ("pkg:composer/symfony/console@6.4.1.0", "uuid-h"),
@@ -670,6 +672,7 @@ mod tests {
             "pkg:pypi/typing-extensions@4.12.2",
             "pkg:composer/psr/log@3.0.2",
             "pkg:composer/psr/cache@3.0.2",
+            "pkg:composer/psr/container@1.0",
             "pkg:pypi/six@1.16.0",
             "pkg:composer/symfony/console@6.4.10",
         ]);
@@ -677,6 +680,11 @@ mod tests {
             detect_prunable(&m, &s, &no_vendored()),
             vec!["pkg:composer/symfony/console@6.4.1.0".to_string()]
         );
+        let mut gone = detect_prunable(&m, &scanned(&[]), &no_vendored());
+        gone.sort();
+        let mut all: Vec<String> = m.patches.keys().cloned().collect();
+        all.sort();
+        assert_eq!(gone, all);
     }
 
     /// Only ecosystems this build crawls are judged: a `pkg:<type>/` with
@@ -767,9 +775,10 @@ mod tests {
         (manifest_path, socket_dir, blob_path)
     }
 
-    /// A manifest that exists but cannot be loaded is not "no manifest". Both passes skip the manifest half (nothing is pruned or
-    /// swept without a referenced set) and say why with the shared load
-    /// code, instead of a clean summary that reads as nothing to prune.
+    /// A manifest that exists but cannot be loaded is not "no manifest".
+    /// Both passes skip the manifest half (nothing is pruned or swept
+    /// without a referenced set) and say why with the shared load code,
+    /// instead of a clean summary that reads as nothing to prune.
     #[tokio::test]
     async fn apply_gc_reports_an_unloadable_manifest() {
         for (seed, code) in [
@@ -818,6 +827,9 @@ mod tests {
                 assert!(gc.skipped.is_none(), "dry_run={dry_run}: {gc:?}");
                 assert!(gc.pruned.is_empty(), "dry_run={dry_run}: {gc:?}");
                 assert_eq!(gc.blobs.blobs_removed, 0, "dry_run={dry_run}: {gc:?}");
+                assert_eq!(gc.diffs.blobs_removed, 0, "dry_run={dry_run}: {gc:?}");
+                assert_eq!(gc.packages.blobs_removed, 0, "dry_run={dry_run}: {gc:?}");
+                assert_eq!(gc.total_bytes(), 0, "dry_run={dry_run}: {gc:?}");
                 assert!(
                     blob.exists(),
                     "dry_run={dry_run}: no sweep without a manifest"
