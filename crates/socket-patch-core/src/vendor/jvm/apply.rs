@@ -849,6 +849,150 @@ pub async fn sweep_replaced_tree<'e>(
     Ok(!removed.is_empty())
 }
 
+/// A file or directory in a vendored tree that its index does not list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnindexedEntry {
+    /// Project-relative, for messages.
+    pub rel: String,
+    /// The entry itself, inside its resolved in-checkout tree directory
+    /// (never resolved through the entry, so a stray symlink is the link).
+    pub path: PathBuf,
+    /// The tree directory is reached through a symlink, so its entries
+    /// may belong to another tree: [`sweep_unindexed`] refuses them.
+    pub linked: bool,
+}
+
+/// What `dirs` (vendored tree directories) hold beyond the files `indexed`
+/// lists: a Finder `.DS_Store`, an editor backup, a stray directory. The
+/// Gradle settings script and `vendor --check` refuse any of them, so a
+/// re-vendor and `repair` sweep them (#656). A missing directory holds
+/// nothing.
+pub fn unindexed_in(
+    root: &Path,
+    dirs: &[String],
+    indexed: &BTreeSet<String>,
+) -> Result<Vec<UnindexedEntry>, String> {
+    let reader = ProjectReader::new(root);
+    let mut stray = Vec::new();
+    for dir in dirs {
+        let path = reader.resolve(dir)?;
+        let linked = reader
+            .canonical
+            .as_ref()
+            .is_none_or(|root| path != dir.split('/').fold(root.clone(), |p, s| p.join(s)));
+        let items = match std::fs::read_dir(&path) {
+            Ok(items) => items,
+            Err(e) if is_missing(&e) => continue,
+            Err(e) => return Err(format!("cannot list {dir}: {e}")),
+        };
+        for item in items {
+            let item = item.map_err(|e| format!("cannot list {dir}: {e}"))?;
+            let name = item.file_name();
+            let rel = format!("{dir}/{}", name.to_string_lossy());
+            if !indexed.contains(&rel) {
+                stray.push(UnindexedEntry {
+                    rel,
+                    path: path.join(name),
+                    linked,
+                });
+            }
+        }
+    }
+    stray.sort_by(|a, b| a.rel.cmp(&b.rel));
+    stray.dedup();
+    Ok(stray)
+}
+
+/// The vendored tree directories `indexed` lists files in.
+pub fn indexed_tree_dirs(indexed: &BTreeSet<String>) -> Vec<String> {
+    let dirs: BTreeSet<String> = indexed
+        .iter()
+        .filter(|rel| safe_rel(rel))
+        .filter_map(|rel| rel.rsplit_once('/').map(|(dir, _)| dir))
+        .filter(|dir| {
+            layout::VENDOR_TREES
+                .iter()
+                .any(|tree| dir.strip_prefix(tree).is_some_and(|r| r.starts_with('/')))
+        })
+        .map(str::to_string)
+        .collect();
+    dirs.into_iter().collect()
+}
+
+/// [`unindexed_in`] over the directories `indexed` lists files in.
+pub fn unindexed_tree_entries(
+    root: &Path,
+    indexed: &BTreeSet<String>,
+) -> Result<Vec<UnindexedEntry>, String> {
+    unindexed_in(root, &indexed_tree_dirs(indexed), indexed)
+}
+
+/// Through a linked tree directory a stray may be another artifact's
+/// file, so [`sweep_unindexed`] refuses it and leaves the call to the
+/// user. A dry run checks this too, so it never previews a sweep the real
+/// run refuses.
+pub fn refuse_linked(stray: &[UnindexedEntry]) -> Result<(), String> {
+    match stray.iter().find(|s| s.linked) {
+        Some(s) => Err(format!(
+            "{} is in a vendored tree directory reached through a symlink; delete it by \
+             hand if it is not another artifact's file",
+            s.rel
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Delete `stray` now, outside any group commit: nothing names these
+/// entries, so there is nothing to journal, and a captured removal would
+/// be read back through a stray symlink at the commit. A symlink goes,
+/// not its target; a directory goes with everything in it (the tree is
+/// socket-patch's own). One already gone counts as removed.
+pub async fn sweep_unindexed(stray: &[UnindexedEntry]) -> Result<(), String> {
+    refuse_linked(stray)?;
+    for entry in stray {
+        let gone = match tokio::fs::symlink_metadata(&entry.path).await {
+            Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&entry.path).await,
+            // A Windows directory symlink or junction is unlinked with
+            // `remove_dir` (which leaves its target alone), not
+            // `remove_file`.
+            #[cfg(windows)]
+            Ok(meta) if std::os::windows::fs::FileTypeExt::is_symlink_dir(&meta.file_type()) => {
+                tokio::fs::remove_dir(&entry.path).await
+            }
+            Ok(_) => tokio::fs::remove_file(&entry.path).await,
+            Err(e) => Err(e),
+        };
+        match gone {
+            Ok(()) => {}
+            Err(e) if is_missing(&e) => {}
+            Err(e) => return Err(format!("failed to remove unindexed {}: {e}", entry.rel)),
+        }
+    }
+    Ok(())
+}
+
+/// The tree files `entry` records, the index [`unindexed_tree_entries`]
+/// holds its directories to. The ledger is committed and tamper-able, so
+/// only records inside the entry's own version directories count: a
+/// forged marker elsewhere names no directory to sweep.
+pub fn recorded_tree_files(entry: &VendorEntry) -> BTreeSet<String> {
+    let Ok((g, a, v)) = entry_gav(entry) else {
+        return BTreeSet::new();
+    };
+    let c = Coords {
+        group_id: &g,
+        artifact_id: &a,
+        version: &v,
+        uuid: &entry.uuid,
+    };
+    entry
+        .wiring
+        .iter()
+        .filter(|w| w.kind == TREE_KIND && record_allowed(w, &c))
+        .map(|w| w.file.clone())
+        .collect()
+}
+
 /// Whether the project still wires the JVM `entry` for `vex` (see
 /// [`entry_wired_checked`]).
 pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
@@ -1070,19 +1214,14 @@ pub fn check_entry(
     if maven && gradle {
         tree_dirs.push(gradle::tree_dir(&c));
     }
-    for tree_dir in tree_dirs {
-        let dir = reader.resolve(&tree_dir)?;
-        for item in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-            let item = item.map_err(|e| e.to_string())?;
-            let rel = format!("{tree_dir}/{}", item.file_name().to_string_lossy());
-            if !entry
-                .wiring
-                .iter()
-                .any(|w| w.kind == TREE_KIND && w.file == rel)
-            {
-                return Err(format!("unindexed vendored file: {rel}"));
-            }
-        }
+    let indexed: BTreeSet<String> = entry
+        .wiring
+        .iter()
+        .filter(|w| w.kind == TREE_KIND)
+        .map(|w| w.file.clone())
+        .collect();
+    if let Some(stray) = unindexed_in(root, &tree_dirs, &indexed)?.first() {
+        return Err(format!("unindexed vendored file: {}", stray.rel));
     }
     // The sbt tree is the reactor's suffixed layout, so a Maven local
     // repository may cache the same suffixed GAV.
@@ -1724,5 +1863,85 @@ mod tests {
         assert!(!root.join(tree_file("a-1-socket.1d3c1fd2.jar")).exists());
         assert!(root.join(tree_file("a-1-socket.1d3c1fd2.pom")).is_file());
         assert!(!sweep_replaced_tree(root, &prev, [&live]).await.unwrap());
+    }
+
+    /// #656: the sweep removes what the index does not list from the
+    /// entry's own tree (files, a stray directory, a symlink but not its
+    /// target) and nothing a forged ledger marker points elsewhere at.
+    #[tokio::test]
+    async fn sweep_unindexed_removes_only_strays_in_the_own_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let marker = tree_file(layout::MARKER_FILE);
+        let jar = tree_file("a-1-socket.1d3c1fd2.jar");
+        let peer = ".socket/vendor/maven2/g/b/1-socket.1d3c1fd2/b-1-socket.1d3c1fd2.jar";
+        for (rel, bytes) in [(&marker[..], "{}"), (&jar, "JAR"), (peer, "PEER")] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let own = root.join(tree_file(""));
+        std::fs::write(own.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir_all(own.join("backup")).unwrap();
+        std::fs::write(own.join("backup/old.jar"), "x").unwrap();
+        let outside = root.join("keep.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, own.join("link")).unwrap();
+
+        // A forged marker one level up would make `g/` a "tree" whose
+        // other artifacts are all unindexed.
+        let forged = format!(".socket/vendor/maven2/g/{}", layout::MARKER_FILE);
+        let indexed = recorded_tree_files(&entry(vec![
+            record(TREE_KIND, &marker),
+            record(TREE_KIND, &jar),
+            record(TREE_KIND, &forged),
+        ]));
+        assert_eq!(indexed, BTreeSet::from([marker.clone(), jar.clone()]));
+        let mut want = vec![tree_file(".DS_Store"), tree_file("backup")];
+        if cfg!(unix) {
+            want.push(tree_file("link"));
+        }
+        want.sort();
+        let stray = unindexed_tree_entries(root, &indexed).unwrap();
+        let rels: Vec<String> = stray.iter().map(|s| s.rel.clone()).collect();
+        assert_eq!(rels, want);
+
+        sweep_unindexed(&stray).await.unwrap();
+        assert!(unindexed_tree_entries(root, &indexed).unwrap().is_empty());
+        assert!(root.join(&jar).is_file() && root.join(&marker).is_file());
+        assert!(root.join(peer).is_file(), "another tree is never swept");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        sweep_unindexed(&stray)
+            .await
+            .expect("already gone is removed");
+    }
+
+    /// A tree directory reached through an in-checkout symlink may be
+    /// another artifact's: its entries are listed (so `--check` still
+    /// fails) but never swept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_unindexed_refuses_a_linked_tree_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let peer = root.join(".socket/vendor/maven2/g/b/1-socket.1d3c1fd2");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::write(peer.join("b-1-socket.1d3c1fd2.jar"), "PEER").unwrap();
+        let own = root.join(tree_file("x"));
+        let own = own.parent().unwrap();
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&peer, own).unwrap();
+        let indexed = BTreeSet::from([tree_file(layout::MARKER_FILE)]);
+        let stray = unindexed_tree_entries(root, &indexed).unwrap();
+        assert_eq!(stray.len(), 1);
+        assert!(stray[0].linked);
+        let err = refuse_linked(&stray).unwrap_err();
+        assert!(
+            err.contains("through a symlink"),
+            "a dry run refuses too: {err}"
+        );
+        assert_eq!(sweep_unindexed(&stray).await.unwrap_err(), err);
+        assert!(peer.join("b-1-socket.1d3c1fd2.jar").is_file());
     }
 }
