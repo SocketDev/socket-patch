@@ -1019,6 +1019,10 @@ mod tests {
         let encoded_lock = format!("lockfileVersion: '9.0'\npackages:\n  x: {encoded}\n");
         assert!(pnpm_lock_carries_hosted_redirect(&encoded_lock, &overrides));
 
+        let escaped = url.replace('/', "\\/");
+        let escaped_lock = format!("lockfileVersion: '9.0'\npackages:\n  x: {escaped}\n");
+        assert!(pnpm_lock_carries_hosted_redirect(&escaped_lock, &overrides));
+
         // Pristine lock: nothing to heal.
         assert!(!pnpm_lock_carries_hosted_redirect(
             "lockfileVersion: '9.0'\n\npackages:\n  in-proc-heal@1.0.0:\n    \
