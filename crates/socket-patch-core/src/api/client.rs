@@ -1717,6 +1717,7 @@ impl ApiClient {
                 ))
             }
         };
+        use crate::utils::http::{read_capped_typed, ReadCappedError};
         let status = resp.status();
         match status {
             StatusCode::OK => {}
@@ -1731,12 +1732,15 @@ impl ApiClient {
                 if let Some(err) = classify_auth_error(status, true) {
                     return Err((err, hint));
                 }
-                let text = resp.text().await.unwrap_or_default();
+                // The caller's cap bounds an error body too.
+                let text = read_capped_typed(resp, max_bytes, noun)
+                    .await
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
                 let head = format!("{noun} download failed with status");
                 return Err((ApiError::Other(status_error(&head, status, &text)), hint));
             }
         }
-        use crate::utils::http::{read_capped_typed, ReadCappedError};
         let body = tokio::time::timeout(
             self.vendor_retry.body_timeout,
             read_capped_typed(resp, max_bytes, noun),
@@ -2916,6 +2920,35 @@ mod patch_api_seam_tests {
             .download_artifact("file:///etc/passwd", 64)
             .await
             .is_err());
+    }
+
+    /// An error body is read under the caller's cap too: its message
+    /// shows when it fits, and an oversized one is dropped unread.
+    #[tokio::test]
+    async fn trait_download_error_body_is_capped() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/err.whl"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(r#"{"message":"store down"}"#))
+            .mount(&server)
+            .await;
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            route: ApiRoute::Proxy,
+        })
+        .with_vendor_retry(VendorRetryPolicy::none());
+        let api: &dyn PatchApi = &client;
+        let url = format!("{}/err.whl", server.uri());
+        let err = api.download_artifact(&url, 64).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "artifact download failed with status 500: store down"
+        );
+        let err = api.download_artifact(&url, 8).await.unwrap_err();
+        assert_eq!(err.to_string(), "artifact download failed with status 500");
     }
 }
 
