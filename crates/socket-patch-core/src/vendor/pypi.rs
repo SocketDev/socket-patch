@@ -4216,6 +4216,21 @@ mod tests {
         }
     }
 
+    /// #1873: beside a governing tool lock, a requirements pin templated
+    /// with pip's `${VAR}` refuses instead of being named a loser: the
+    /// release it installs is unknown.
+    #[tokio::test]
+    async fn governing_lock_refuses_an_env_templated_requirements_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "Pipfile", "[packages]\nsix = \"==1.16.0\"\n").await;
+        touch(tmp.path(), "Pipfile.lock", "{}").await;
+        touch(tmp.path(), "requirements.txt", "six==${SIXV}\n").await;
+        let (code, detail) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+            .await
+            .unwrap_err();
+        assert_eq!(code, "pypi_requirement_env_templated", "{detail}");
+    }
+
     /// #912: a pylock-only Pipenv checkout can't be vendored — Pipenv drops
     /// the `archive` entry the wiring writes and installs the upstream
     /// release — so it refuses with a `pipenv lock` pointer. Without a
