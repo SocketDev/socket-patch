@@ -562,38 +562,8 @@ pub fn npm_replace_registry_host_detail(
     hosts: &[&str],
     setting: &crate::patch::redirect::npmrc::EffectiveSetting,
 ) -> String {
-    use crate::patch::redirect::npmrc::SettingSource;
-    // Name the spelling the user can find (`${RRH}`), and what npm makes
-    // of it.
-    let value = if setting.raw.trim() == setting.value {
-        format!("`replace-registry-host={}`", setting.value)
-    } else {
-        format!(
-            "`replace-registry-host={}` (npm expands it to `{}`)",
-            setting.raw.trim(),
-            setting.value
-        )
-    };
-    let (where_, fix) = match &setting.source {
-        SettingSource::Env(var) => (
-            format!("the environment variable {var} sets"),
-            format!(
-                "unset {var} (npm's environment layer overrides every .npmrc) or set it to \
-                 `npmjs`"
-            ),
-        ),
-        SettingSource::Project => (
-            "the project .npmrc sets".to_string(),
-            "change it to `replace-registry-host=npmjs` (npm's default) or remove it".to_string(),
-        ),
-        SettingSource::File { layer, path } => (
-            format!("the {layer} npm config ({}) sets", path.display()),
-            format!(
-                "set `replace-registry-host=npmjs` (npm's default) in the project .npmrc (it \
-                 outranks the {layer} config) or change the {layer} config"
-            ),
-        ),
-    };
+    let value = npm_setting_spelling("replace-registry-host", setting);
+    let (where_, fix) = npm_setting_remedy("replace-registry-host", "npmjs", setting);
     format!(
         "the npm lockfile now resolves patched dependencies from the hosted patch server ({}), \
          but {where_} {value}, which makes npm >=8 rewrite those \
@@ -602,6 +572,84 @@ pub fn npm_replace_registry_host_detail(
          fails). To install the hosted patches, {fix}; or switch this project to vendored \
          patches (`socket-patch scan --mode vendored`), whose `file:` resolutions npm never \
          rewrites",
+        hosts.join(", "),
+    )
+}
+
+/// `key=value` as the user wrote it (`${RRH}`), and what npm expands it
+/// to when that differs.
+fn npm_setting_spelling(
+    key: &str,
+    setting: &crate::patch::redirect::npmrc::EffectiveSetting,
+) -> String {
+    if setting.raw.trim() == setting.value {
+        format!("`{key}={}`", setting.value)
+    } else {
+        format!(
+            "`{key}={}` (npm expands it to `{}`)",
+            setting.raw.trim(),
+            setting.value
+        )
+    }
+}
+
+/// Where an npm `key` setting comes from (`"the project .npmrc sets"`)
+/// and how to reset it to its npm default `safe` there.
+fn npm_setting_remedy(
+    key: &str,
+    safe: &str,
+    setting: &crate::patch::redirect::npmrc::EffectiveSetting,
+) -> (String, String) {
+    use crate::patch::redirect::npmrc::SettingSource;
+    match &setting.source {
+        SettingSource::Env(var) => (
+            format!("the environment variable {var} sets"),
+            format!(
+                "unset {var} (npm's environment layer overrides every .npmrc) or set it to \
+                 `{safe}`"
+            ),
+        ),
+        SettingSource::Project => (
+            "the project .npmrc sets".to_string(),
+            format!("change it to `{key}={safe}` (npm's default) or remove it"),
+        ),
+        SettingSource::File { layer, path } => (
+            format!("the {layer} npm config ({}) sets", path.display()),
+            format!(
+                "set `{key}={safe}` (npm's default) in the project .npmrc (it outranks the \
+                 {layer} config) or change the {layer} config"
+            ),
+        ),
+    }
+}
+
+/// Warning code for a hosted npm pin that npm's
+/// `omit-lockfile-registry-resolved` setting strips on the next lock save
+/// (#1871).
+pub const NPM_OMIT_LOCKFILE_RESOLVED_CODE: &str = "redirect_npm_omit_lockfile_registry_resolved";
+
+/// npm (>= 8) `omit-lockfile-registry-resolved=true` drops `resolved` from
+/// every registry dependency the next time npm saves the lock, but keeps
+/// the patched `integrity`: npm then fetches the registry tarball and the
+/// install fails EINTEGRITY (closed: never unpatched bytes). Like
+/// `replace-registry-host`, the setting is the user's, so the warning
+/// names where it is set and the remedies instead of overriding it.
+pub fn npm_omit_lockfile_resolved_detail(
+    hosts: &[&str],
+    setting: &crate::patch::redirect::npmrc::EffectiveSetting,
+) -> String {
+    let value = npm_setting_spelling("omit-lockfile-registry-resolved", setting);
+    let (where_, fix) = npm_setting_remedy("omit-lockfile-registry-resolved", "false", setting);
+    format!(
+        "the npm lockfile now resolves patched dependencies from the hosted patch server ({}), \
+         but {where_} {value}, which makes npm >=8 drop the `resolved` URL of every registry \
+         dependency the next time it saves the lockfile (any `npm install`, even one that \
+         changes nothing) while keeping the patched `integrity`: npm then fetches the \
+         registry tarball, so every `npm ci` / `npm install` without a warm cache fails \
+         EINTEGRITY and `socket-patch vex` no longer finds the hosted patches. To keep the \
+         hosted patches, {fix}; or switch this project to vendored patches (`socket-patch \
+         scan --mode vendored`), whose `file:` resolutions npm keeps. Re-running the hosted \
+         scan re-pins a lockfile npm has stripped",
         hosts.join(", "),
     )
 }

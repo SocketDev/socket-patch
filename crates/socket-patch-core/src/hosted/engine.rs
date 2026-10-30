@@ -30,8 +30,9 @@ use crate::constants::npm_family::{
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
-    effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
-    NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
+    effective_omit_lockfile_registry_resolved, effective_replace_registry_host,
+    plan_npmrc_allow_remote_with, replace_registry_host_rewrites, NpmrcPlan, OuterAllowRemote,
+    NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
 };
 use crate::patch::redirect::presence::groups_present;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
@@ -48,15 +49,17 @@ use super::guidance::{
     npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
-    npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
-    plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
-    pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
+    npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_omit_lockfile_resolved_detail,
+    npm_replace_registry_host_detail, plan_workspace_trust, pnpm_heal_root,
+    pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
+    pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
     pnpm_trust_keyless_members_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
     pnpm_trust_not_needed_detail, pnpm_trust_policy_preamble, pnpm_trust_rush_detail,
     pnpm_trust_scaffolded_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
-    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    TrustPlan, NPM_LOCKS, NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE,
+    PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
+    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -3177,6 +3180,16 @@ fn npm_allow_remote(
                 npm_replace_registry_host_detail(&blocked, &setting),
             ));
         }
+    }
+    // #1871: npm >= 8's `omit-lockfile-registry-resolved` strips every
+    // registry dependency's `resolved` (the hosted pins included) on the
+    // next lock save, keeping the patched `integrity`. Reported, never
+    // overridden, like `replace-registry-host`.
+    if let Some(setting) = effective_omit_lockfile_registry_resolved(project, &outer) {
+        npm_warnings.push(warning(
+            NPM_OMIT_LOCKFILE_RESOLVED_CODE,
+            npm_omit_lockfile_resolved_detail(&npm_hosts, &setting),
+        ));
     }
     (npm_warnings, npmrc_config_write)
 }
