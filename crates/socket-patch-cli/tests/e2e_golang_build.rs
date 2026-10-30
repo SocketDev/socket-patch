@@ -1789,3 +1789,170 @@ fn goflags_modfile_keeps_the_go_mod_replace_from_the_build() {
 
     chmod_writable(tmp.path());
 }
+
+// ── a go.sum line a downgrade left behind (#1862) ──
+
+/// A go 1.16 consumer of the upstream at `from`, downgraded to `to` by
+/// `go get`, which lowers the require but keeps `from`'s go.sum lines
+/// until `go mod tidy`.
+fn downgraded_consumer(consumer: &Path, from: &str, to: &str, env: &[(&str, &str)]) {
+    std::fs::write(
+        consumer.join("go.mod"),
+        format!("module example.com/consumer\n\ngo 1.16\n\nrequire {UMOD} {from}\n"),
+    )
+    .unwrap();
+    for args in [vec!["mod", "tidy"], vec!["get", &format!("{UMOD}@{to}")]] {
+        let out = go(consumer, &args, env);
+        assert!(
+            out.status.success(),
+            "go {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    assert!(go_mod.contains(&format!("{UMOD} {to}")), "{go_mod}");
+    let sum = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+    assert!(
+        sum.contains(&format!("{UMOD} {from} h1:")),
+        "go get must keep the stale zip line:\n{sum}"
+    );
+}
+
+/// Publish the upstream at `version` with a greeting of `greeting`.
+fn publish_upstream(tmp: &Path, version: &str, greeting: &str) {
+    publish(
+        tmp,
+        UMOD,
+        version,
+        &[
+            ("go.mod", &format!("module {UMOD}\n\ngo 1.16\n")),
+            (
+                "lib.go",
+                &format!(
+                    "package upstream\n\nfunc Greeting() string {{ return \"{greeting}\" }}\n"
+                ),
+            ),
+        ],
+    );
+}
+
+/// #1862 case 1: downgraded below the patched version, the build links
+/// the older module. The stale zip line at the patched version must not
+/// pass for proof it is built: apply refuses, and a replace written
+/// before the downgrade fails `apply --check` (with or without the module
+/// cache to read the graph from) and is left out of VEX.
+#[test]
+fn downgrade_below_the_patch_leaves_its_replace_unattested() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(downgrade-below)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "go 1.16");
+    publish_upstream(tmp.path(), "v0.9.0", "OLDER");
+    let env = go_env(modcache.to_str().unwrap(), &proxy_url);
+    let readonly = readonly_env(&env);
+    let empty_cache = tmp.path().join("empty-modcache");
+    std::fs::create_dir_all(&empty_cache).unwrap();
+
+    // A fresh apply after the downgrade refuses and writes nothing.
+    downgraded_consumer(&consumer, UVER, "v0.9.0", &env);
+    write_patch(&consumer);
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_ne!(code, 0, "apply must refuse the inert replace:\n{so}\n{se}");
+    assert!(
+        so.contains(&format!("the build selects {UMOD} v0.9.0")),
+        "{so}\n{se}"
+    );
+    assert!(replace_lines(&consumer.join("go.mod")).is_empty());
+    // Applied before the downgrade: the replace is inert afterwards.
+    std::fs::write(
+        consumer.join("go.mod"),
+        format!("module example.com/consumer\n\ngo 1.16\n\nrequire {UMOD} {UVER}\n"),
+    )
+    .unwrap();
+    let tidy = go(&consumer, &["mod", "tidy"], &env);
+    assert!(tidy.status.success());
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(code, 0, "apply at the required version:\n{so}\n{se}");
+    assert!(go_out(&consumer, &readonly).contains("OUT: PATCHED"));
+    let socket_replace = replace_lines(&consumer.join("go.mod"));
+    assert_eq!(socket_replace.len(), 1, "{socket_replace:?}");
+    let get = go(&consumer, &["get", &format!("{UMOD}@v0.9.0")], &env);
+    assert!(
+        get.status.success(),
+        "{}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    // The directory replace dropped the original's go.sum lines; an
+    // untidied go.sum from before the apply still carries them.
+    let mut sum = std::fs::read_to_string(consumer.join("go.sum")).unwrap();
+    if !sum.contains(&format!("{UMOD} {UVER} h1:")) {
+        let pristine = tmp.path().join("pristine");
+        consumer_module(
+            &pristine,
+            "example.com/pristine",
+            modcache.to_str().unwrap(),
+            &proxy_url,
+        );
+        sum.push_str(&std::fs::read_to_string(pristine.join("go.sum")).unwrap());
+        std::fs::write(consumer.join("go.sum"), sum).unwrap();
+    }
+    assert_eq!(replace_lines(&consumer.join("go.mod")), socket_replace);
+    assert!(go_out(&consumer, &readonly).contains("OUT: OLDER"));
+
+    let (code, so, se) = check(&consumer, &modcache);
+    assert_eq!(
+        code, 1,
+        "apply --check must flag the inert replace:\n{so}\n{se}"
+    );
+    assert!(
+        format!("{so}{se}").contains("is not the version the build selects (v0.9.0)"),
+        "{so}\n{se}"
+    );
+    let (code, so, se) = check(&consumer, &empty_cache);
+    assert_eq!(code, 1, "without the cache too:\n{so}\n{se}");
+    assert!(
+        format!("{so}{se}").contains("nothing shows the build selects the patched version"),
+        "{so}\n{se}"
+    );
+    let r = VexRun {
+        offline: true,
+        product: Some("pkg:golang/example.com/consumer".into()),
+        ..VexRun::default()
+    }
+    .env("GOMODCACHE", &modcache)
+    .env("GOFLAGS", "");
+    let out = run_vex(&vex_e2e_common::binary(), &consumer, &r);
+    assert_absent(out.doc.as_ref(), UPURL);
+    vex_e2e_common::assert_not_attested(&out.envelope, UPURL, "go_version_not_selected");
+
+    chmod_writable(tmp.path());
+}
+
+/// #1862 case 2: downgraded to the patched version, the build links it.
+/// The stale zip line above it must not refuse the patch.
+#[test]
+fn downgrade_to_the_patch_applies_and_checks_in_sync() {
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build(downgrade-to)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "go 1.16");
+    publish_upstream(tmp.path(), "v1.1.0", "NEWER");
+    let env = go_env(modcache.to_str().unwrap(), &proxy_url);
+    let readonly = readonly_env(&env);
+
+    downgraded_consumer(&consumer, "v1.1.0", UVER, &env);
+    assert!(go_out(&consumer, &readonly).contains("OUT: PRISTINE"));
+    write_patch(&consumer);
+    let (code, so, se) = apply_json(&consumer, &modcache);
+    assert_eq!(
+        code, 0,
+        "apply must patch the selected version:\n{so}\n{se}"
+    );
+    assert!(go_out(&consumer, &readonly).contains("OUT: PATCHED"));
+    let (code, so, se) = check(&consumer, &modcache);
+    assert_eq!(code, 0, "apply --check:\n{so}\n{se}");
+
+    chmod_writable(tmp.path());
+}
