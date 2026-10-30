@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-10-30T03:30Z · main @ 5ca5623_
+_Last updated 2026-10-30T05:30Z · main @ 5ca5623_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -10,6 +10,7 @@ _Last updated 2026-10-30T03:30Z · main @ 5ca5623_
 | [#1864](https://github.com/SocketDev/socket-patch/pull/1864) | sweep | `cli/src/commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` (+ dead branch in `rollback.rs`) | ready; CI (82 checks) and Bugbot green |
 | [#1870](https://github.com/SocketDev/socket-patch/pull/1870) | structural | A27 [#1869](https://github.com/SocketDev/socket-patch/issues/1869): `api/client.rs`, one serve GET and one vendor retry loop | ready; CI (82 checks) and Bugbot green |
 | [#1875](https://github.com/SocketDev/socket-patch/pull/1875) | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI (82 checks) and Bugbot green |
+| [#1884](https://github.com/SocketDev/socket-patch/pull/1884) | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 [#1859](https://github.com/SocketDev/socket-patch/issues/1859); tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI and Bugbot pending |
 
 #### Merged
 _None._
@@ -18,13 +19,13 @@ _None._
 Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`:
 1. T09 [#1858](https://github.com/SocketDev/socket-patch/issues/1858), lock acquire open-coded 9×: D2.6 C2, risk M. **~7** (blocked while #1864 touches `lock_cli.rs` and #1698 touches `vendor.rs` / `get.rs` / `agent_download.rs`)
 2. T01 [#1835](https://github.com/SocketDev/socket-patch/issues/1835), `get <uuid>` re-implements `download_and_apply_patches_into`: D2.2 C2, risk M. **~6.4** (blocked by #1698)
-3. T16 [#1861](https://github.com/SocketDev/socket-patch/issues/1861), remove/rollback `VendorRevertStep` loops: D1.75 C2, risk M. **~5.5** (files free)
-4. A03 [#1834](https://github.com/SocketDev/socket-patch/issues/1834), GOMODCACHE rule twice: D1 C1, risk L. **4**
-5. A26 [#1867](https://github.com/SocketDev/socket-patch/issues/1867), civil-date math in three modules: D1 C1, risk L. **4**
+3. T25 [#1877](https://github.com/SocketDev/socket-patch/issues/1877), `--vex` embed hand-written ~8×: D2 C2, risk M. **~6** (blocked by #1698: `apply.rs`, `vendor.rs`)
+4. T16 [#1861](https://github.com/SocketDev/socket-patch/issues/1861), remove/rollback `VendorRevertStep` loops: D1.75 C2, risk M. **~5.5** (blocked by #1864, #1875, #1698)
+5. A20 [#1848](https://github.com/SocketDev/socket-patch/issues/1848), URL credential stripper ×2: D1 C1, risk L. **4** (files free); A26 [#1867](https://github.com/SocketDev/socket-patch/issues/1867) also 4.
 
-A02 [#1833](https://github.com/SocketDev/socket-patch/issues/1833) moved to the fixer's #1866. T03 [#1837](https://github.com/SocketDev/socket-patch/issues/1837) stays at 4, A05 [#1844](https://github.com/SocketDev/socket-patch/issues/1844) at ~2.
+A03 [#1834](https://github.com/SocketDev/socket-patch/issues/1834) is the fixer's #1876. T28 [#1880](https://github.com/SocketDev/socket-patch/issues/1880) and T23 [#1860](https://github.com/SocketDev/socket-patch/issues/1860) wait on #1864 (`list.rs`) and #1698 (`get.rs`).
 
-The next run is structural if a candidate scores 6 or more and its files are free (T09 is not yet), else a sweep. Next sweep files, in order: `scan/discovery.rs` (`rollback.rs` waits for #1864), then `core/constants.rs`, `core/lib.rs`, `core/utils/cargo_home.rs`, `core/utils/cargo_workspace.rs` (skip `cargo_build_cache.rs` while #1849 is open, and `api/client.rs` while #1870 is open). Skip `agent_download.rs`, `apply.rs`, `get.rs` and `vendor.rs` while #1698 is open.
+The next run is structural if a candidate scores 6 or more and its files are free, else a sweep. Next sweep files, in order: `scan/gc.rs`, `scan/hosted.rs` (region, `partial@L<n>`), `scan/hosted/{nuget,python,takeover}.rs`, `scan/policy.rs`, `scan/render.rs` (skip `scan/mod.rs` while #1856 is open), then `core/constants.rs`, `core/lib.rs`, `core/utils/cargo_home.rs`, `core/utils/cargo_workspace.rs`. Skip `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` while #1698 is open, `rollback.rs` while #1864 is open, `cargo_build_cache.rs` (#1849) and `api/client.rs` (#1870).
 
 #### Notes
 - The PRs of the first thread (`arch-refactor/<issue>-*`) are listed in `review/2026-10-v1/register/90-refactor.md`.
@@ -38,3 +39,5 @@ The next run is structural if a candidate scores 6 or more and its files are fre
 - `tests/repair` has 2 chmod-based tests that fail under the root sandbox (`repair_cleanup_failure_is_reported_in_json_and_silent_modes`, `repair_exits_zero_and_stays_quiet_when_lock_file_unremovable`); they pass in CI.
 - remove's ~900-line `run` split (audit note) is too big for a sweep; it wants an issue alongside T16/T17/T20.
 - A shared GET must keep every caller's bounds: folding an uncapped `resp.text()` error read into the capped `PatchApi` path is what /code-review caught on #1870.
+- `ui::shell_word` has no escaping for an embedded `"` on Windows, and cmd still expands `%VAR%` inside its double quotes. Every pasteable command shares it, so fix it there (issue-worthy), not per caller.
+- A test of a re-export or forwarding wrapper belongs beside the real function: move it to the defining crate and rebuild it on that module's helpers, instead of deleting coverage the target lacks (`ui::shell_word` had no test).
