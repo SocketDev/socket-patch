@@ -5,6 +5,7 @@
 use socket_patch_core::manifest::cleanup_blobs::{ArtifactReferences, CleanupResult};
 use socket_patch_core::manifest::operations::{manifest_exists, read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::{purl_keys_cover, VENDOR_STATE_REL};
 use std::collections::HashSet;
@@ -12,10 +13,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
-use crate::commands::lock_cli::lock_failure;
+use crate::commands::lock_cli::{acquire_with_status, lock_failure};
 use crate::commands::vendor::{run_vendor_gc, VendorGcSummary};
 use crate::json_envelope::{Envelope, GcReport, PatchAction, PatchEvent};
-use crate::ui::sweep_failure;
+use crate::ui::{plural, sweep_failure};
 
 /// Aggregated outcome of a GC pass (or preview), recorded into the `scan
 /// --json` envelope by [`GcSummary::record_into`]. See CLI_CONTRACT.md for
@@ -24,47 +25,40 @@ use crate::ui::sweep_failure;
 pub(super) struct GcSummary {
     /// PURLs removed from the manifest (apply mode) or eligible to be
     /// removed (preview mode).
-    pub(super) pruned: Vec<String>,
-    pub(super) blobs: CleanupResult,
-    pub(super) diffs: CleanupResult,
-    pub(super) packages: CleanupResult,
+    pruned: Vec<String>,
+    blobs: CleanupResult,
+    diffs: CleanupResult,
+    packages: CleanupResult,
     /// Vendored entries reverted (or revertable, preview mode) because
     /// their patch is gone from the manifest or their dependency left the
-    /// lockfile graph — see `vendor::run_vendor_gc`. Sorted.
+    /// lockfile graph. Sorted.
     vendored_reverted: Vec<String>,
-    /// Vendored entries the wet pass drift-kept
-    /// (`RevertOutcome::kept_artifact`): a revert was due, but the lock
-    /// entries drifted since vendoring, so everything was retained. Sorted.
-    /// Always empty in preview mode (drift is only detected by a wet
-    /// wiring replay), where such entries show in `vendored_reverted`.
+    /// Vendored entries the wet pass drift-kept: a revert was due, but the
+    /// lock entries drifted since vendoring, so everything was retained.
+    /// Sorted. Always empty in preview mode (drift is only detected by a
+    /// wet wiring replay), where such entries show in `vendored_reverted`.
     vendored_kept: Vec<String>,
-    /// Vendored entries whose wet revert FAILED: the ledger entry and the
-    /// artifacts were kept, nothing reclaimed. Sorted. Always empty in
-    /// preview mode (nothing is reverted there).
+    /// Vendored entries whose wet revert failed: the ledger entry and the
+    /// artifacts were kept. Sorted. Always empty in preview mode.
     vendored_failed: Vec<String>,
     /// Orphan `.socket/vendor/<eco>/<uuid>` dirs swept (or sweepable).
     vendor_orphan_dirs: usize,
     /// Set when a wet pass could not take the apply lock and so skipped
-    /// its whole mutating half: `lock_held` (another run holds it) or
-    /// `lock_io` (the lock file could not be created or opened), as
-    /// `lock_cli::lock_failure` renders them. Never set in preview mode.
+    /// its whole mutating half (`lock_held` or `lock_io`). Never set in
+    /// preview mode.
     skipped: Option<(&'static str, String)>,
     /// Post-revert/prune rewrites that failed (`vendor_state_write_failed`
-    /// / `manifest_write_failed` + detail) and orphan sweeps that could not
-    /// finish (`cleanup_failed`: the pass aborted, or left orphans it could
-    /// not unlink — the removed counts above are what it did reclaim). The
-    /// mutations already happened on disk, so the stale record is reported,
-    /// not the pass failed. Also the vendored reverts' reinstall advisories
-    /// (`vendor_bun_reinstall_required`, `vendor_vlt_reinstall_required`)
-    /// and no other revert warning. And `manifest_invalid` /
-    /// `manifest_unreadable` when the manifest half could not load the
-    /// manifest (#1063). Serialized as additive
-    /// `warnings[]` on the apply shape only.
+    /// / `manifest_write_failed`) and orphan sweeps that could not finish
+    /// (`cleanup_failed`: the removed counts above are what it did
+    /// reclaim). The mutations already happened on disk, so the stale
+    /// record is reported, not the pass failed. Also the vendored reverts'
+    /// reinstall advisories, and `manifest_invalid` / `manifest_unreadable`
+    /// when the manifest half could not load the manifest.
     warnings: Vec<(&'static str, String)>,
 }
 
 impl GcSummary {
-    pub(super) fn total_bytes(&self) -> u64 {
+    fn total_bytes(&self) -> u64 {
         self.blobs.bytes_freed + self.diffs.bytes_freed + self.packages.bytes_freed
     }
 
@@ -90,9 +84,7 @@ impl GcSummary {
     }
 
     /// Fold a vendored-state GC pass into this summary: purl lists sorted,
-    /// its failed post-revert rewrites join `warnings`. (`skipped` is this
-    /// pass's alone — the vendored half runs under this pass's lock and
-    /// never takes one itself.)
+    /// its failed post-revert rewrites join `warnings`.
     fn absorb_vendor_gc(&mut self, v: VendorGcSummary) {
         self.vendored_reverted = v
             .dropped_reverted
@@ -193,12 +185,9 @@ impl GcSummary {
 pub(super) const GC_SKIPPED: &str = "gc_skipped";
 
 /// The orphan blob/diff/package sweep against the (post-prune) manifest.
-/// `dry_run = true` for the preview path; `dry_run = false` for the apply
-/// path — `ArtifactReferences::sweep` natively supports dry-run, so
-/// the same function works for both. A pass that failed outright counts
-/// as empty; that failure (or a wet pass's unremovable orphans) rides
-/// `warnings` as `cleanup_failed` so the output never reads as a clean
-/// all-zero sweep.
+/// A pass that failed outright counts as empty; that failure (or a wet
+/// pass's unremovable orphans) rides `warnings` as `cleanup_failed` so the
+/// output never reads as a clean all-zero sweep.
 async fn run_gc(
     manifest: &PatchManifest,
     pruned: Vec<String>,
@@ -244,42 +233,25 @@ pub(super) async fn run_apply_gc(
 ) -> GcSummary {
     // Existence gate BEFORE the lock: `acquire` creates `.socket/`, and a
     // pristine checkout with neither a manifest nor a ledger must not gain
-    // one. Either store alone is enough to proceed; the authoritative reads
-    // happen under the lock.
-    // A manifest that cannot be stated is not absent (#998): the pass goes
+    // one. A manifest that cannot be stated is not absent: the pass goes
     // on and reports it, as the locked read's load error or, when
     // `.socket/` itself is unusable, as the lock failure.
     let has_manifest = manifest_exists(manifest_path).await.unwrap_or(true);
-    let has_ledger = tokio::fs::metadata(common.cwd.join(VENDOR_STATE_REL))
-        .await
-        .is_ok_and(|m| m.is_file());
-    if !has_manifest && !has_ledger {
+    if !has_manifest && !has_ledger(common).await {
         return GcSummary::default();
     }
 
-    // Both halves are read-modify-writes the apply lock serializes
-    // everywhere else; unlocked, a stale read would clobber a live holder's
-    // write and the sweep would delete its fresh blobs. Contention or a lock
-    // I/O fault skips the pass (recorded, not failed). One acquire for both
-    // halves: flock is per open file description, so a nested acquire in
-    // the vendored half would read as a live holder.
-    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    let _guard = match crate::commands::lock_cli::acquire_with_status(socket_dir, timeout) {
+    // One acquire for both halves: flock is per open file description, so
+    // a nested acquire in the vendored half would read as a live holder.
+    let _guard = match lock(common, socket_dir) {
         Ok(g) => g,
-        Err(e) => {
-            return GcSummary {
-                skipped: Some(lock_failure(&e, timeout)),
-                ..Default::default()
-            };
-        }
+        Err(skipped) => return *skipped,
     };
 
-    // Vendored-state GC FIRST (see the fn doc), under this guard.
     let vendor_gc = run_vendor_gc(common, manifest_path, /*dry_run=*/ false).await;
 
-    // Authoritative read under the lock. Missing ⇒ nothing to prune, and
-    // the blob sweep has no referenced-set to work from; unreadable ⇒ the
-    // same, but said (#1063).
+    // Missing or unreadable ⇒ nothing to prune, and the blob sweep has no
+    // referenced set to work from.
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => return GcSummary::vendor_only(vendor_gc),
@@ -292,16 +264,14 @@ pub(super) async fn run_apply_gc(
     }
     let mut write_failure = None;
     if !prunable.is_empty() {
-        // A failed write leaves the on-disk manifest stale (the entries
-        // are still listed as pruned — they are gone from the in-memory
-        // copy the sweep below works from), so it is reported, not
-        // swallowed.
+        // The entries stay listed as pruned: they are gone from the
+        // in-memory copy the sweep below works from.
         if let Err(e) = write_manifest(manifest_path, &manifest).await {
             write_failure = Some((
                 "manifest_write_failed",
                 format!(
                     "pruned {} but could not update {}: {e}",
-                    count(prunable.len(), "manifest entry", "manifest entries"),
+                    plural(prunable.len(), "manifest entry", "manifest entries"),
                     manifest_path.display()
                 ),
             ));
@@ -314,10 +284,33 @@ pub(super) async fn run_apply_gc(
     gc
 }
 
+/// Whether the vendored-state ledger exists. Checked before the lock,
+/// whose acquire would create `.socket/`.
+async fn has_ledger(common: &GlobalArgs) -> bool {
+    tokio::fs::metadata(common.cwd.join(VENDOR_STATE_REL))
+        .await
+        .is_ok_and(|m| m.is_file())
+}
+
+/// Take the apply lock for a wet pass. Both halves are read-modify-writes
+/// the lock serializes everywhere else; unlocked, a stale read would
+/// clobber a live holder's write and the sweep would delete its fresh
+/// blobs. Contention or a lock I/O fault skips the pass: `Err` is the
+/// summary recording why.
+fn lock(common: &GlobalArgs, socket_dir: &Path) -> Result<LockGuard, Box<GcSummary>> {
+    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
+    acquire_with_status(socket_dir, timeout).map_err(|e| {
+        Box::new(GcSummary {
+            skipped: Some(lock_failure(&e, timeout)),
+            ..Default::default()
+        })
+    })
+}
+
 /// Drop from `prunable` every Cargo entry whose agent-mode patch is still
-/// on disk in a copy the crawl no longer reports (#1278): the project
-/// crawl is scoped to the crates `Cargo.lock` resolves, but a crate bumped
-/// or dropped from the lock keeps its patched copy in the machine-wide
+/// on disk in a copy the crawl no longer reports: the project crawl is
+/// scoped to the crates `Cargo.lock` resolves, but a crate bumped or
+/// dropped from the lock keeps its patched copy in the machine-wide
 /// `$CARGO_HOME/registry/src` cache, which nothing deletes. Its manifest
 /// record holds the only before-blobs that can restore that copy, so it is
 /// kept, with one `cargo_cache_patch_kept` warning per entry naming the
@@ -367,23 +360,12 @@ pub(super) async fn run_vendor_only_gc(
     if common.dry_run {
         return GcSummary::vendor_only(run_vendor_gc(common, manifest_path, true).await);
     }
-    // Same pre-lock existence gate as `run_apply_gc`: no ledger, no pass
-    // (and no `.socket/` created by the lock acquire).
-    let has_ledger = tokio::fs::metadata(common.cwd.join(VENDOR_STATE_REL))
-        .await
-        .is_ok_and(|m| m.is_file());
-    if !has_ledger {
+    if !has_ledger(common).await {
         return GcSummary::default();
     }
-    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    let _guard = match crate::commands::lock_cli::acquire_with_status(socket_dir, timeout) {
+    let _guard = match lock(common, socket_dir) {
         Ok(g) => g,
-        Err(e) => {
-            return GcSummary {
-                skipped: Some(lock_failure(&e, timeout)),
-                ..Default::default()
-            };
-        }
+        Err(skipped) => return *skipped,
     };
     GcSummary::vendor_only(run_vendor_gc(common, manifest_path, false).await)
 }
@@ -397,7 +379,6 @@ async fn preview_apply_gc(
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<PurlKey>,
 ) -> GcSummary {
-    // Read-only preview of the vendored-state GC (lists, never reverts).
     let vendor_gc = run_vendor_gc(common, manifest_path, /*dry_run=*/ true).await;
 
     let mut manifest = match read_manifest(manifest_path).await {
@@ -426,11 +407,8 @@ async fn preview_apply_gc(
         }
     }
     let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
-    // The wet pass keeps a Cargo entry whose shared-cache copy is still
-    // patched; so does the preview.
     let _ = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
-    // Likewise drop the prunable entries in memory before the sweep: the
-    // cleanup helpers derive the referenced set from this manifest.
+    // The sweep derives the referenced set from this in-memory manifest.
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
@@ -459,11 +437,6 @@ pub(super) async fn gc_into(
     gc.record_into(env, dry_run);
 }
 
-/// `1 manifest entry` / `2 manifest entries` (and friends).
-fn count(n: usize, one: &str, many: &str) -> String {
-    crate::ui::plural(n, one, many)
-}
-
 /// The main human GC line for a pass that pruned or swept something
 /// (`None` when it did nothing). `preview`: the `--dry-run` wording.
 pub(super) fn format_gc_line(gc: &GcSummary, preview: bool) -> Option<String> {
@@ -471,8 +444,8 @@ pub(super) fn format_gc_line(gc: &GcSummary, preview: bool) -> Option<String> {
     if gc.pruned.is_empty() && files == 0 {
         return None;
     }
-    let entries = count(gc.pruned.len(), "manifest entry", "manifest entries");
-    let files_s = count(files, "orphan file", "orphan files");
+    let entries = plural(gc.pruned.len(), "manifest entry", "manifest entries");
+    let files_s = plural(files, "orphan file", "orphan files");
     let bytes = socket_patch_core::manifest::cleanup_blobs::format_bytes(gc.total_bytes());
     Some(if preview {
         format!("[dry-run] GC would prune {entries} and remove {files_s} ({bytes}).")
@@ -481,12 +454,9 @@ pub(super) fn format_gc_line(gc: &GcSummary, preview: bool) -> Option<String> {
     })
 }
 
-/// Human-readable line(s) for the vendored-state half of a GC pass (and
-/// the lock-skip reason / failed rewrites, when the pass could not run or
-/// persist in full), in order; empty when there is nothing to report.
-/// Split out so the contract's human GC vocabulary (`GC: skipped:
-/// <message>.`, one `GC: <detail>.` per warning, `GC: failed to revert N
-/// vendored entry/entries: …`) is unit-testable without capturing stdout.
+/// Human-readable lines for the vendored-state half of a GC pass, plus
+/// the lock-skip reason and warnings, in order; empty when there is
+/// nothing to report.
 pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some((_, message)) = &gc.skipped {
@@ -498,12 +468,12 @@ pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     if !gc.vendored_reverted.is_empty() || gc.vendor_orphan_dirs > 0 {
         lines.push(format!(
             "GC: reverted {}; swept {}.",
-            count(
+            plural(
                 gc.vendored_reverted.len(),
                 "vendored entry",
                 "vendored entries"
             ),
-            count(
+            plural(
                 gc.vendor_orphan_dirs,
                 "orphan vendor dir",
                 "orphan vendor dirs"
@@ -519,7 +489,7 @@ pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
             "GC: kept {}: lock entries were re-resolved since vendoring, so their \
              artifacts and manifest/ledger entries were retained; undo the drift and \
              re-run `vendor --revert` to finish.",
-            count(
+            plural(
                 gc.vendored_kept.len(),
                 "drifted vendored entry",
                 "drifted vendored entries"
@@ -532,7 +502,7 @@ pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     if !gc.vendored_failed.is_empty() {
         lines.push(format!(
             "GC: failed to revert {}: {}.",
-            count(
+            plural(
                 gc.vendored_failed.len(),
                 "vendored entry",
                 "vendored entries"
@@ -543,7 +513,6 @@ pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     lines
 }
 
-/// Print [`format_gc_vendored_lines`].
 pub(super) fn print_gc_vendored_line(gc: &GcSummary) {
     for line in format_gc_vendored_lines(gc) {
         println!("{line}");
@@ -579,20 +548,14 @@ pub(super) fn print_human_gc(gc: &GcSummary, preview: bool) {
     if let Some(line) = format_gc_line(gc, preview) {
         println!("\n{line}");
     }
+    let prefix = if preview { "[dry-run] " } else { "" };
     for line in format_gc_vendored_lines(gc) {
-        if preview {
-            println!("[dry-run] {line}");
-        } else {
-            println!("{line}");
-        }
+        println!("{prefix}{line}");
     }
 }
 
-/// PURL strings present in the manifest but absent from `scanned_purls`.
-/// These are candidates for pruning during `scan`'s GC pass — they
-/// correspond to packages that were once patched but are no longer
-/// installed (or no longer reachable to the crawler). Pure / no I/O so
-/// it's unit-testable.
+/// PURL strings present in the manifest but absent from `scanned_purls`:
+/// packages that were once patched but are no longer installed.
 ///
 /// Comparison is by [`PurlKey`] on both sides: a manifest may hold several
 /// qualified release variants of one installed package, API keys are
@@ -627,8 +590,8 @@ fn detect_prunable(
 
 #[cfg(test)]
 mod tests {
-
-    // ---- human GC lines ------------------------------------------------------
+    use super::*;
+    use crate::commands::scan::tests::manifest_with;
 
     fn summary(pruned: usize, files: usize, bytes: u64) -> GcSummary {
         GcSummary {
@@ -659,38 +622,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn format_gc_vendored_lines_counts() {
-        assert!(format_gc_vendored_lines(&GcSummary::default()).is_empty());
-        let gc = GcSummary {
-            vendored_reverted: vec!["a".into()],
-            vendor_orphan_dirs: 2,
-            vendored_kept: vec!["b".into(), "c".into()],
-            ..Default::default()
-        };
-        let lines = format_gc_vendored_lines(&gc);
-        assert_eq!(
-            lines[0],
-            "GC: reverted 1 vendored entry; swept 2 orphan vendor dirs."
-        );
-        assert!(
-            lines[1].starts_with("GC: kept 2 drifted vendored entries: lock entries"),
-            "{lines:?}"
-        );
-        let gc = GcSummary {
-            vendor_orphan_dirs: 1,
-            ..Default::default()
-        };
-        assert_eq!(
-            format_gc_vendored_lines(&gc),
-            vec!["GC: reverted 0 vendored entries; swept 1 orphan vendor dir."]
-        );
-    }
-    use super::*;
-    use crate::commands::scan::tests::manifest_with;
-
-    // ---- detect_prunable ---------------------------------------------------
-
     fn scanned(purls: &[&str]) -> HashSet<String> {
         purls.iter().map(|s| (*s).to_string()).collect()
     }
@@ -711,157 +642,62 @@ mod tests {
     }
 
     #[test]
-    fn detect_prunable_empty_manifest_empty_scanned() {
-        let m = PatchManifest::new();
-        assert!(detect_prunable(&m, &scanned(&[]), &no_vendored()).is_empty());
-    }
-
-    #[test]
-    fn detect_prunable_empty_manifest_nonempty_scanned() {
-        let m = PatchManifest::new();
-        // No manifest entries → nothing to prune even if the crawl found
-        // packages that don't appear in the manifest.
-        assert!(detect_prunable(&m, &scanned(&["pkg:npm/foo@1"]), &no_vendored()).is_empty());
-    }
-
-    #[test]
-    fn detect_prunable_all_entries_present_in_scan() {
-        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
-        let s = scanned(&["pkg:npm/foo@1.0", "pkg:npm/bar@2.0"]);
-        assert!(detect_prunable(&m, &s, &no_vendored()).is_empty());
-    }
-
-    #[test]
     fn detect_prunable_returns_missing_entries() {
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
-        // foo is still installed, bar is gone.
-        let s = scanned(&["pkg:npm/foo@1.0"]);
-        let mut out = detect_prunable(&m, &s, &no_vendored());
-        out.sort();
+        let out = detect_prunable(&m, &scanned(&["pkg:npm/foo@1.0"]), &no_vendored());
         assert_eq!(out, vec!["pkg:npm/bar@2.0".to_string()]);
     }
 
+    /// Manifest keys and crawled purls are compared by `PurlKey`: the
+    /// API's encoded, mixed-case, padded-composer and qualified spellings
+    /// of an installed release keep their entries; a gone release of the
+    /// same package still prunes, and with nothing installed every one of
+    /// them prunes.
     #[test]
-    fn detect_prunable_returns_everything_when_scan_is_empty() {
-        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
-        let mut out = detect_prunable(&m, &scanned(&[]), &no_vendored());
-        out.sort();
-        assert_eq!(
-            out,
-            vec!["pkg:npm/bar@2.0".to_string(), "pkg:npm/foo@1.0".to_string()],
-        );
-    }
-
-    /// A composer manifest key in the API's padded spelling (`@3.0.2.0`) or a
-    /// `v` tag is the SAME release the crawler reports as `@3.0.2`: prune must
-    /// keep it. A composer release that really is gone is still pruned.
-    #[test]
-    fn detect_prunable_keeps_equivalent_composer_spellings() {
+    fn detect_prunable_matches_by_purl_key() {
         let m = manifest_with(&[
-            ("pkg:composer/psr/log@3.0.2.0", "uuid-a"),
-            ("pkg:composer/psr/cache@v3.0.2", "uuid-b"),
-            ("pkg:composer/psr/container@1.0.0.0", "uuid-c"),
-            ("pkg:composer/symfony/console@6.4.1.0", "uuid-d"),
+            ("pkg:npm/%40scope/x@1.0.0", "uuid-a"),
+            ("pkg:nuget/Newtonsoft.Json@13.0.3", "uuid-b"),
+            ("pkg:pypi/typing_extensions@4.12.2", "uuid-c"),
+            ("pkg:composer/psr/log@3.0.2.0", "uuid-d"),
+            ("pkg:composer/psr/cache@v3.0.2", "uuid-e"),
+            ("pkg:composer/psr/container@1.0.0.0", "uuid-i"),
+            ("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-f"),
+            ("pkg:pypi/six@1.16.0?artifact_id=sdist", "uuid-g"),
+            ("pkg:composer/symfony/console@6.4.1.0", "uuid-h"),
         ]);
         let s = scanned(&[
+            "pkg:npm/@scope/x@1.0.0",
+            "pkg:nuget/newtonsoft.json@13.0.3",
+            "pkg:pypi/typing-extensions@4.12.2",
             "pkg:composer/psr/log@3.0.2",
             "pkg:composer/psr/cache@3.0.2",
             "pkg:composer/psr/container@1.0",
+            "pkg:pypi/six@1.16.0",
             "pkg:composer/symfony/console@6.4.10",
         ]);
         assert_eq!(
             detect_prunable(&m, &s, &no_vendored()),
             vec!["pkg:composer/symfony/console@6.4.1.0".to_string()]
         );
+        let mut gone = detect_prunable(&m, &scanned(&[]), &no_vendored());
+        gone.sort();
+        let mut all: Vec<String> = m.patches.keys().cloned().collect();
+        all.sort();
+        assert_eq!(gone, all);
     }
 
-    #[test]
-    fn detect_prunable_keeps_pypi_variants_of_installed_base() {
-        // Manifest holds three qualified release variants; the crawler
-        // reports only the base PURL. None should be pruned — they all
-        // belong to the installed package.
-        let m = manifest_with(&[
-            ("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-a"),
-            ("pkg:pypi/six@1.16.0?artifact_id=wheel-b", "uuid-b"),
-            ("pkg:pypi/six@1.16.0?artifact_id=sdist", "uuid-c"),
-        ]);
-        let out = detect_prunable(&m, &scanned(&["pkg:pypi/six@1.16.0"]), &no_vendored());
-        assert!(
-            out.is_empty(),
-            "variants of an installed base must not be pruned; got {out:?}"
-        );
-    }
-
-    #[test]
-    fn detect_prunable_removes_all_variants_of_uninstalled_base() {
-        // The package is no longer installed (empty crawl): every
-        // release variant is prunable.
-        let m = manifest_with(&[
-            ("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-a"),
-            ("pkg:pypi/six@1.16.0?artifact_id=sdist", "uuid-c"),
-        ]);
-        let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
-        assert_eq!(out.len(), 2, "all variants of a gone package should prune");
-    }
-
-    #[test]
-    fn detect_prunable_exempts_vendored_purls() {
-        // A vendored package is consumed from the committed artifact —
-        // the crawler not seeing an installed copy is its normal state.
-        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
-        let vendored: HashSet<PurlKey> = [PurlKey::new("pkg:npm/foo@1.0")].into_iter().collect();
-        let out = detect_prunable(&m, &scanned(&[]), &vendored);
-        assert_eq!(
-            out,
-            vec!["pkg:npm/bar@2.0".to_string()],
-            "vendored foo exempt, non-vendored bar prunable"
-        );
-    }
-
-    #[test]
-    fn detect_prunable_encoded_manifest_key_not_pruned() {
-        // The API serves scoped purls percent-encoded and they land in the
-        // manifest verbatim; the crawler reports the literal `@scope` form.
-        // The comparison must bridge the two spellings.
-        let m = manifest_with(&[("pkg:npm/%40scope/x@1.0.0", "uuid-a")]);
-        let s = scanned(&["pkg:npm/@scope/x@1.0.0"]);
-        assert!(
-            detect_prunable(&m, &s, &no_vendored()).is_empty(),
-            "encoded manifest key must match the decoded scanned purl"
-        );
-        // A genuinely-gone encoded entry still prunes.
-        let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
-        assert_eq!(out, vec!["pkg:npm/%40scope/x@1.0.0".to_string()]);
-    }
-
+    /// Only ecosystems this build crawls are judged: a `pkg:<type>/` with
+    /// no crawler (a newer CLI's ecosystem in a committed manifest) is
+    /// never looked for, so its absence proves nothing. Maven and NuGet
+    /// are crawled, so they prune like npm.
     #[test]
     fn detect_prunable_keeps_entries_of_uncrawled_ecosystems() {
-        // A manifest key whose `pkg:<type>/` this build has no crawler for
-        // (a newer CLI's ecosystem in a COMMITTED manifest, read by an older
-        // binary) is never looked for by the crawl, so its absence from
-        // `scanned_purls` says nothing about whether it is installed.
         let m = manifest_with(&[
             ("pkg:hex/plug@1.14.0", "uuid-a"),
-            ("pkg:npm/gone@1.0.0", "uuid-b"),
-        ]);
-        let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
-        assert_eq!(
-            out,
-            vec!["pkg:npm/gone@1.0.0".to_string()],
-            "only the crawled-ecosystem orphan may prune; got {out:?}"
-        );
-    }
-
-    #[test]
-    fn detect_prunable_judges_maven_and_nuget_like_any_ecosystem() {
-        // Maven/NuGet are first-class ecosystems: every scan crawls them,
-        // so their manifest entries ARE judged — absent from the scan
-        // means genuinely uninstalled, and they prune like any other
-        // ecosystem.
-        let m = manifest_with(&[
-            ("pkg:maven/com.example/lib@1.0.0", "uuid-a"),
-            ("pkg:nuget/Some.Package@1.0.0", "uuid-b"),
-            ("pkg:npm/gone@1.0.0", "uuid-c"),
+            ("pkg:maven/com.example/lib@1.0.0", "uuid-b"),
+            ("pkg:nuget/Some.Package@1.0.0", "uuid-c"),
+            ("pkg:npm/gone@1.0.0", "uuid-d"),
         ]);
         let mut out = detect_prunable(&m, &scanned(&[]), &no_vendored());
         out.sort();
@@ -871,50 +707,31 @@ mod tests {
                 "pkg:maven/com.example/lib@1.0.0".to_string(),
                 "pkg:npm/gone@1.0.0".to_string(),
                 "pkg:nuget/Some.Package@1.0.0".to_string(),
-            ],
-            "maven/nuget orphans must prune like any other ecosystem's"
+            ]
         );
     }
 
-    /// B20: the NuGet global-cache crawl spells the purl lowercase
-    /// (`newtonsoft.json`) while the manifest key is the API's mixed-case
-    /// `Newtonsoft.Json`; NuGet names and versions are case-insensitive, so
-    /// the installed package keeps its entry. Same for a PEP 503 spelling.
+    /// A vendored package is consumed from the committed artifact, so no
+    /// installed copy is its normal state. The ledger holds
+    /// qualifier-stripped bases, so a qualified variant is exempt too.
     #[test]
-    fn detect_prunable_keeps_case_and_pep503_spellings_of_installed_packages() {
+    fn detect_prunable_exempts_vendored_purls() {
         let m = manifest_with(&[
-            ("pkg:nuget/Newtonsoft.Json@13.0.3", "uuid-a"),
-            ("pkg:pypi/typing_extensions@4.12.2", "uuid-b"),
-            ("pkg:nuget/Gone.Package@1.0.0", "uuid-c"),
+            ("pkg:npm/foo@1.0", "uuid-a"),
+            ("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-b"),
+            ("pkg:npm/bar@2.0", "uuid-c"),
         ]);
-        let s = scanned(&[
-            "pkg:nuget/newtonsoft.json@13.0.3",
-            "pkg:pypi/typing-extensions@4.12.2",
-        ]);
+        let vendored: HashSet<PurlKey> = [
+            PurlKey::new("pkg:npm/foo@1.0"),
+            PurlKey::new("pkg:pypi/six@1.16.0"),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
-            detect_prunable(&m, &s, &no_vendored()),
-            vec!["pkg:nuget/Gone.Package@1.0.0".to_string()]
+            detect_prunable(&m, &scanned(&[]), &vendored),
+            vec!["pkg:npm/bar@2.0".to_string()]
         );
     }
-
-    #[test]
-    fn detect_prunable_exempts_qualified_variant_of_vendored_base() {
-        // The ledger key set carries qualifier-stripped bases, so a
-        // qualified manifest variant of a vendored package is exempt via
-        // its base purl.
-        let m = manifest_with(&[("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-a")]);
-        let vendored: HashSet<PurlKey> =
-            [PurlKey::new("pkg:pypi/six@1.16.0")].into_iter().collect();
-        let out = detect_prunable(&m, &scanned(&[]), &vendored);
-        assert!(
-            out.is_empty(),
-            "qualified variant of a vendored base must not prune; got {out:?}"
-        );
-    }
-
-    // ---- preview_apply_gc / run_apply_gc parity ----------------------------
-    // The dry-run preview MUST report the same orphan blobs/archives the
-    // real (wet) prune would remove.
 
     /// Write a manifest holding a single entry that references one afterHash
     /// blob, plant that blob on disk, and return `(manifest_path, socket_dir,
@@ -958,10 +775,10 @@ mod tests {
         (manifest_path, socket_dir, blob_path)
     }
 
-    /// #1063: a manifest that exists but cannot be loaded is not "no
-    /// manifest". Both passes skip the manifest half (nothing is pruned or
-    /// swept without a referenced set) and say why with the shared load
-    /// code, instead of a clean summary that reads as nothing to prune.
+    /// A manifest that exists but cannot be loaded is not "no manifest".
+    /// Both passes skip the manifest half (nothing is pruned or swept
+    /// without a referenced set) and say why with the shared load code,
+    /// instead of a clean summary that reads as nothing to prune.
     #[tokio::test]
     async fn apply_gc_reports_an_unloadable_manifest() {
         for (seed, code) in [
@@ -983,6 +800,7 @@ mod tests {
                 std::fs::write(&blob, b"orphan?").unwrap();
                 let manifest_path = socket_dir.join("manifest.json");
                 seed(&manifest_path);
+                let before = std::fs::read(&manifest_path).ok();
 
                 let common = gc_common(tmp.path());
                 let gc = if dry_run {
@@ -1009,58 +827,20 @@ mod tests {
                 assert!(gc.skipped.is_none(), "dry_run={dry_run}: {gc:?}");
                 assert!(gc.pruned.is_empty(), "dry_run={dry_run}: {gc:?}");
                 assert_eq!(gc.blobs.blobs_removed, 0, "dry_run={dry_run}: {gc:?}");
+                assert_eq!(gc.diffs.blobs_removed, 0, "dry_run={dry_run}: {gc:?}");
+                assert_eq!(gc.packages.blobs_removed, 0, "dry_run={dry_run}: {gc:?}");
+                assert_eq!(gc.total_bytes(), 0, "dry_run={dry_run}: {gc:?}");
                 assert!(
                     blob.exists(),
                     "dry_run={dry_run}: no sweep without a manifest"
                 );
+                assert_eq!(
+                    std::fs::read(&manifest_path).ok(),
+                    before,
+                    "dry_run={dry_run}: the manifest is not rewritten"
+                );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn preview_apply_gc_reports_blobs_of_prunable_entry() {
-        // The package is not installed (empty scan), so its entry is prunable
-        // and its only blob is reclaimable. A correct PREVIEW must count that
-        // blob even though it is still referenced by the not-yet-pruned entry.
-        let tmp = tempfile::tempdir().unwrap();
-        let after_hash = "a".repeat(64);
-        let (manifest_path, socket_dir, blob_path) =
-            seed_manifest_with_blob(tmp.path(), "pkg:npm/gone@1.0.0", &after_hash);
-
-        let scanned: HashSet<String> = HashSet::new();
-        let preview = preview_apply_gc(
-            &gc_common(tmp.path()),
-            &manifest_path,
-            &socket_dir,
-            &scanned,
-            &no_vendored(),
-        )
-        .await;
-
-        assert_eq!(
-            preview.pruned,
-            vec!["pkg:npm/gone@1.0.0".to_string()],
-            "preview must list the uninstalled entry as prunable"
-        );
-        assert_eq!(
-            preview.blobs.blobs_removed, 1,
-            "preview must count the prunable entry's blob as an orphan \
-             (regression: it was masked because the entry still referenced it)"
-        );
-        assert!(
-            preview.total_bytes() > 0,
-            "bytesFreed must be > 0 when an orphan blob would be freed"
-        );
-        // Preview is non-mutating: blob and manifest untouched.
-        assert!(
-            blob_path.exists(),
-            "dry-run preview must not delete the blob"
-        );
-        let m = read_manifest(&manifest_path).await.unwrap().unwrap();
-        assert!(
-            m.patches.contains_key("pkg:npm/gone@1.0.0"),
-            "dry-run preview must not prune the manifest entry"
-        );
     }
 
     #[tokio::test]
@@ -1210,9 +990,11 @@ mod tests {
         );
     }
 
+    /// The preview lists the uninstalled entry and counts its blob, though
+    /// the not-yet-pruned entry still references it, and frees exactly what
+    /// the wet run frees, without mutating anything.
     #[tokio::test]
     async fn preview_and_apply_gc_agree_on_orphan_counts() {
-        // The preview's reclaimable counts must equal what the wet run frees.
         let after_hash = "b".repeat(64);
 
         let tmp_preview = tempfile::tempdir().unwrap();
@@ -1227,7 +1009,12 @@ mod tests {
             &no_vendored(),
         )
         .await;
+        assert_eq!(preview.pruned, vec!["pkg:npm/gone@1.0.0".to_string()]);
+        assert_eq!(preview.blobs.blobs_removed, 1);
+        assert_eq!(preview.total_bytes(), 64);
         assert!(blob_p.exists(), "preview must not mutate");
+        let m = read_manifest(&mp_p).await.unwrap().unwrap();
+        assert!(m.patches.contains_key("pkg:npm/gone@1.0.0"));
 
         let tmp_wet = tempfile::tempdir().unwrap();
         let (mp_w, sd_w, blob_w) =
@@ -1259,10 +1046,6 @@ mod tests {
             "wet run must prune the entry"
         );
     }
-
-    // ---- missing/corrupt manifest fail-safe ---------------------------------
-    // An unreadable manifest must abort the GC pass, NOT be treated as an
-    // empty referenced-set (which would sweep EVERY blob in `.socket/blobs`).
 
     /// Tempdir with a `.socket/blobs/<hash>` blob planted but NO manifest
     /// written; returns `(manifest_path, socket_dir, blob_path)`.
@@ -1352,45 +1135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_apply_gc_deletes_nothing_when_manifest_corrupt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (manifest_path, socket_dir, blob_path) =
-            seed_blob_without_manifest(tmp.path(), &"e".repeat(64));
-        std::fs::write(&manifest_path, "{ not json").unwrap();
-
-        let gc = run_apply_gc(
-            &gc_common(tmp.path()),
-            &manifest_path,
-            &socket_dir,
-            &scanned(&[]),
-            &no_vendored(),
-        )
-        .await;
-
-        assert!(
-            gc.pruned.is_empty(),
-            "nothing to prune from a corrupt manifest; pruned {:?}",
-            gc.pruned
-        );
-        assert_eq!(
-            gc.blobs.blobs_removed, 0,
-            "a corrupt manifest must NOT read as an empty referenced-set"
-        );
-        assert_eq!(gc.total_bytes(), 0, "no bytes may be freed");
-        assert!(
-            blob_path.exists(),
-            "the blob must survive a GC pass with an unreadable manifest"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&manifest_path).unwrap(),
-            "{ not json",
-            "the aborted pass must not rewrite the corrupt manifest"
-        );
-    }
-
-    #[tokio::test]
-    async fn preview_apply_gc_reports_zero_and_mutates_nothing_when_manifest_missing_or_corrupt() {
-        // Missing manifest.
+    async fn preview_apply_gc_reports_zero_and_mutates_nothing_when_manifest_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let (manifest_path, socket_dir, blob_path) =
             seed_blob_without_manifest(tmp.path(), &"e".repeat(64));
@@ -1419,35 +1164,7 @@ mod tests {
         assert_eq!(json["events"], serde_json::json!([]));
         assert_eq!(json["gc"]["removedBlobs"], serde_json::json!(0));
         assert_eq!(json["gc"]["bytesFreed"], serde_json::json!(0));
-
-        // Corrupt manifest, fresh tempdir.
-        let tmp = tempfile::tempdir().unwrap();
-        let (manifest_path, socket_dir, blob_path) =
-            seed_blob_without_manifest(tmp.path(), &"e".repeat(64));
-        std::fs::write(&manifest_path, "{ not json").unwrap();
-        let gc = preview_apply_gc(
-            &gc_common(tmp.path()),
-            &manifest_path,
-            &socket_dir,
-            &scanned(&[]),
-            &no_vendored(),
-        )
-        .await;
-        assert!(gc.pruned.is_empty(), "pruned {:?}", gc.pruned);
-        assert_eq!(
-            gc.blobs.blobs_removed, 0,
-            "preview of a corrupt manifest must report zero orphans"
-        );
-        assert_eq!(gc.total_bytes(), 0);
-        assert!(blob_path.exists(), "preview must not delete the blob");
-        assert_eq!(
-            std::fs::read_to_string(&manifest_path).unwrap(),
-            "{ not json",
-            "preview must not rewrite the corrupt manifest"
-        );
     }
-
-    // ---- lockfile-unused vendored entry in the preview ----------------------
 
     #[tokio::test]
     async fn preview_counts_blobs_of_lockfile_unused_vendored_entry() {
@@ -1540,8 +1257,6 @@ mod tests {
             "preview must not rewrite the vendor ledger"
         );
     }
-
-    // ---- drift-kept vendored entry in the wet pass ---------------------------
 
     /// A vendored entry whose lock fragment DRIFTED since vendoring (fork
     /// re-resolve): the in-use probe calls it unused, but the wet revert
@@ -1791,10 +1506,10 @@ mod tests {
         assert_eq!(clean["gc"]["bytesFreed"], 0);
     }
 
-    /// The human GC vocabulary the contract pins (`GC: skipped (<code>):
-    /// <message>.`, one `GC: <detail>.` per warning, `GC: failed to revert N
-    /// vendored entry/entries: …`), rendered in order; a clean pass prints
-    /// nothing.
+    /// The human GC vocabulary the contract pins (`GC: skipped:
+    /// <message>.`, one `GC: <detail>.` per warning, the reverted/swept
+    /// counts, the drift-keep hint, `GC: failed to revert N vendored
+    /// entry/entries: …`), rendered in order; a clean pass prints nothing.
     #[test]
     fn gc_vendored_lines_render_the_contract_vocabulary() {
         assert!(format_gc_vendored_lines(&GcSummary::default()).is_empty());
@@ -1834,6 +1549,22 @@ mod tests {
             vec![
                 "GC: reverted 1 vendored entry; swept 1 orphan vendor dir.".to_string(),
                 "GC: failed to revert 1 vendored entry: pkg:npm/c@1.0.0.".to_string(),
+            ]
+        );
+
+        let many = GcSummary::vendor_only(VendorGcSummary {
+            kept: vec!["pkg:npm/a@1.0.0".into(), "pkg:npm/b@1.0.0".into()],
+            orphan_dirs: 2,
+            ..Default::default()
+        });
+        assert_eq!(
+            format_gc_vendored_lines(&many),
+            vec![
+                "GC: reverted 0 vendored entries; swept 2 orphan vendor dirs.".to_string(),
+                "GC: kept 2 drifted vendored entries: lock entries were re-resolved since \
+                 vendoring, so their artifacts and manifest/ledger entries were retained; \
+                 undo the drift and re-run `vendor --revert` to finish."
+                    .to_string(),
             ]
         );
     }
