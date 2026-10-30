@@ -1,7 +1,6 @@
-//! The hosted-mode (`--mode hosted`) flow: rewrite ONLY the
-//! patched dependencies' lockfile / registry-config entries to point at
-//! Socket's hosted vendored patches. Self-contained — reuses `run`'s
-//! discovery, then returns without touching the apply/vendor branches.
+//! The hosted-mode (`--mode hosted`) flow: rewrite only the patched
+//! dependencies' lockfile and registry-config entries to point at Socket's
+//! hosted patches.
 
 use std::path::Path;
 use std::time::Duration;
@@ -31,6 +30,7 @@ mod python;
 mod takeover;
 
 use crate::commands::vlt_heal as vlt;
+use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
 
 /// Most hosted wheel-metadata downloads in flight at once, below the patch
 /// API's own in-flight cap: each one buffers a whole wheel (up to
@@ -48,23 +48,8 @@ fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
     api_concurrency(use_public_proxy).min(WHEEL_METADATA_CONCURRENCY)
 }
 
-/// The hosted-mode JSON error envelope, for bail-outs that return before the
-/// success envelope at the bottom of [`run_redirect_selected`] is built:
-/// the caller's envelope (`scan_result`: scan's discovery payload, or
-/// `get`'s narrowing events) marked `status: "error"` with the coded
-/// `error`, printed once. A `--json` consumer must always get parseable
-/// stdout — never empty output plus an exit code.
-fn emit_json_error(
-    common: &crate::args::GlobalArgs,
-    scan_result: Option<Envelope>,
-    code: &str,
-    message: &str,
-) {
-    emit_scan(&json_error_envelope(common, scan_result, code, message));
-}
-
-/// The envelope [`emit_json_error`] prints, built without printing it, so
-/// [`run_redirect_selected`] can send its failure telemetry first.
+/// The hosted-mode `--json` error envelope: the caller's envelope (scan's
+/// discovery payload, or `get`'s narrowing events) marked `status: "error"`.
 fn json_error_envelope(
     common: &crate::args::GlobalArgs,
     scan_result: Option<Envelope>,
@@ -78,16 +63,13 @@ fn json_error_envelope(
     env
 }
 
-/// The hosted run's `redirect` payload: `{mode: "hosted", rewrittenFiles}`
-/// (the files the rewrite changed — or would change, on a dry run). The
-/// per-patch outcomes are the envelope's events (`details.mode: "hosted"`)
-/// and its warnings the top-level `warnings`.
+/// The hosted run's `redirect` payload: the files the rewrite changed, or
+/// would change on a dry run.
 pub(super) fn redirect_block(rewritten: Vec<String>) -> serde_json::Value {
     serde_json::json!({ "mode": "hosted", "rewrittenFiles": rewritten })
 }
 
-/// The `redirect_prune_ignored` warning (`--prune` is a no-op in hosted
-/// mode; see the constants' doc in `run`'s module).
+/// `--prune` is a no-op in hosted mode.
 pub(super) fn prune_ignored_warning() -> RunWarning {
     RunWarning::new(
         super::REDIRECT_PRUNE_IGNORED,
@@ -100,12 +82,10 @@ pub(super) fn prune_ignored_warning() -> RunWarning {
 /// (their bytes are fetched at install time).
 pub(super) const VEX_HOSTED_UNVERIFIED: &str = "vex_hosted_unverified";
 
-/// Record a hosted run's per-patch outcomes into `env`, each event
-/// carrying `details.mode: "hosted"` and sorted by purl then uuid: `applied`
-/// (`verified` on a dry run) for each pin the rewrite confirmed, `skipped`
-/// with the skip's reason as `errorCode` (its detail, when it has one, as
-/// `reason`), and `skipped` / `redirect_unconfirmed` for each granted patch no lockfile entry pins
-/// (status and exit unchanged, pending #704).
+/// Record a hosted run's per-patch outcomes into `env`, sorted by purl then
+/// uuid: `applied` (`verified` on a dry run) for each confirmed pin, `skipped`
+/// with the skip's code, and `skipped` / `redirect_unconfirmed` for each
+/// granted patch no lockfile entry pins. None of them change status or exit.
 pub(super) fn record_hosted_events(
     env: &mut Envelope,
     confirmed: &[(String, String)],
@@ -122,8 +102,6 @@ pub(super) fn record_hosted_events(
         .iter()
         .map(|(purl, uuid)| PatchEvent::new(pinned, purl.as_str()).with_uuid(uuid.as_str()))
         .chain(skipped.iter().map(|s| {
-            // The skip's code is its `errorCode`; its detail (when the
-            // engine gave one) the `reason`.
             let mut event =
                 PatchEvent::new(PatchAction::Skipped, s.purl.as_str()).with_uuid(s.uuid.as_str());
             event.error_code = Some(s.reason.clone());
@@ -174,17 +152,8 @@ fn refuse(
     1
 }
 
-/// The apply lock for a WET hosted run: the same `<manifest dir>/apply.lock`
-/// `apply`/`rollback`/`remove`/`vendor` hold, so the takeover pre-reverts
-/// (lockfiles + the vendored ledger) and the lockfile writes never race
-/// them. `acquire`
-/// creates a missing `.socket/` and the guard's drop unlinks the lock file
-/// and prunes an otherwise-empty `.socket/`, so a run that ends up writing
-/// nothing leaves no residue. Contention / IO failures render through the
-/// shared [`crate::commands::lock_cli::lock_failure`] mapping — the
-/// `lock_held` / `lock_io` codes and the "(waited …)" clause match every
-/// other mutating command — into the caller's error envelope plus the
-/// stderr line and, for a live holder, the wait hint.
+/// The apply lock for a wet hosted run, so the takeover pre-reverts and the
+/// lockfile writes never race `apply`, `rollback`, `remove` or `vendor`.
 fn acquire_hosted_lock(
     common: &crate::args::GlobalArgs,
     scan_result: &mut Option<Envelope>,
@@ -236,9 +205,8 @@ struct StaleInstallOutcome {
 /// behind silently reinstates the stale bytes) — while a SHARED gem-env
 /// home affects every project on the machine, so that flavor prefers moving
 /// the project to a local bundle path and only conditionally names the
-/// shared files. `project_local` is the caller's call: under the project
-/// root, or under the project's own `.bundle/config` path even when that
-/// path sits outside the tree (#709).
+/// shared files. `project_local` also covers the project's own
+/// `.bundle/config` path when that path sits outside the tree.
 fn gem_stale_install_warning(
     purl: &str,
     gem_dir: &Path,
@@ -309,68 +277,27 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
     })
 }
 
-/// POSITIVE staleness evidence: at least one record file whose on-disk
-/// content was actually read and hashed to something other than its
-/// `afterHash` (`Ready` = pristine upstream bytes, `HashMismatch` = neither
-/// hash). Missing or unreadable files are NEVER evidence — `verify_file_patch`
-/// folds IO errors into `NotFound`, and a transiently unreadable file in an
-/// already-patched install must not produce a delete prescription.
-/// (`current_hash` is `Some` only when the bytes were really hashed, which
-/// also excludes the absent-new-file `Ready`.)
-///
-/// The probes take this from the same one-pass
-/// [`socket_patch_core::vex::verify::judge_installed_record`] that decides
-/// PATCHED (`stale_evidence`); this view of it is what the unit tests pin.
-#[cfg(test)]
-async fn installed_stale_positive_evidence(
-    package_dir: &Path,
-    record: &socket_patch_core::manifest::schema::PatchRecord,
-) -> bool {
-    socket_patch_core::vex::verify::judge_installed_record(package_dir, record)
-        .await
-        .stale_evidence
-}
-
 /// Post-rewrite stale-materialization probe for gem redirects: `bundle
 /// install` never refetches an already-materialized gem (see the "Gem
-/// stale-install guard" section of CLI_CONTRACT.md).
+/// stale-install guard" section of CLI_CONTRACT.md). Read-only: the remedy
+/// is prescribed, never applied.
 ///
-/// Judgment sources and rules:
-/// * Discovery is [`socket_patch_core::crawlers::RubyCrawler`] — the same
-///   installed-gem APIs `apply` uses, honoring `--global`/`--global-prefix`
-///   exactly like scan's own discovery; layouts the crawler grows into are
-///   covered automatically. A `.bundle/config` path the containment guard
-///   refuses as a write root is still READ here
-///   (`bundler_install_homes`): bundler installs into it. The `gem env`
-///   homes are judged only when bundler uses system gems (#1001).
-/// * Records are found BY UUID (the fetch key, stable across purl
-///   spellings) among this run's fetched records; v5 keeps no hosted
-///   ledger to fall back on, so a uuid whose `/patches/view` fetch failed
-///   is not judged (`record_fetch_failed` surfaces that failure). Record
-///   availability is part of the candidate filter, and the
-///   probe returns before any crawler work (or `gem env` subprocess spawn)
-///   when no judgment is possible.
-/// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle
-///   (decided, with STALE, by one pass of
-///   [`socket_patch_core::vex::verify::judge_installed_record`]).
-///   Judgments are grouped BY INSTALLED DIR: platform-variant purls of one
-///   gem resolve to the same dir, and if ANY variant's record proves the
-///   dir patched, the dir is patched — never warned.
-/// * STALE requires positive evidence (the `installed_stale_positive_evidence`
-///   rule) — never inferred from missing/unreadable files.
+/// * Records are found by uuid among this run's fetched records; a uuid
+///   whose fetch failed is not judged.
+/// * Judgments are grouped by installed dir: platform-variant purls of one
+///   gem share a dir, and if any variant's record proves it patched, it is
+///   never warned.
+/// * Stale needs positive evidence (`stale_evidence`: readable bytes that
+///   hash to something other than `afterHash`), never missing or unreadable
+///   files.
 /// * A committed `vendor/cache/<leaf>.gem` whose sha256 differs from the
-///   patched artifact's is stale too (bundler installs from it first, fresh
-///   checkouts included): folded into a project-local install warning's
-///   delete list, or warned standalone.
-///
-/// Read-only by contract: nothing is ever deleted — the remedy is
-/// prescribed to the user.
+///   patched artifact's is stale too (bundler installs from it first):
+///   folded into a project-local warning's delete list, or warned alone.
 async fn gem_stale_install_warnings(
     cwd: &Path,
     global: bool,
     global_prefix: Option<std::path::PathBuf>,
     confirmed: &[(String, String)],
-    // This run's fetched records, by uuid.
     records: &std::collections::BTreeMap<String, socket_patch_core::manifest::schema::PatchRecord>,
     gem_artifact_shas: &std::collections::BTreeMap<(String, String), String>,
 ) -> StaleInstallOutcome {
@@ -383,10 +310,8 @@ async fn gem_stale_install_warnings(
     let mut out = StaleInstallOutcome::default();
     let find_record =
         |uuid: &str| -> Option<&PatchRecord> { records.values().find(|r| r.uuid == uuid) };
-    // Record availability folds into the candidate filter (a zero-file map
-    // included: nothing to hash means no judgment either way) so the no-op
-    // cases return here, before the crawler is built. On `--dry-run` the
-    // caller skips the probe entirely — see the call site.
+    // Return before the crawler (and its `gem env` spawn) when nothing can
+    // be judged.
     let candidates: Vec<(&str, &PatchRecord)> = confirmed
         .iter()
         .filter(|(purl, _)| purl.starts_with("pkg:gem/"))
@@ -397,8 +322,7 @@ async fn gem_stale_install_warnings(
         return out;
     }
 
-    // Pass 1: resolve every candidate's installed materializations and judge
-    // them, grouped by installed dir (see the fn doc's variant rule).
+    // Pass 1: judge every candidate's installed dirs.
     struct DirJudgment {
         purl: String,
         leaf: String,
@@ -412,17 +336,10 @@ async fn gem_stale_install_warnings(
         global,
         global_prefix,
     };
-    // Only the homes `bundle install` installs into or reuses, each tagged
-    // project-local or shared by the crawler. That covers a `.bundle/config`
-    // path outside the project, which is refused as a write root but which
-    // bundler installs into and loads from (#709). It leaves out the
-    // `gem env` homes when an explicit Bundler `path` means bundler never
-    // reuses a copy there (#1001), and the project-local tag doesn't depend
-    // on how `--cwd` is spelled (#729).
+    // Only the homes `bundle install` installs into or reuses, including a
+    // `.bundle/config` path outside the project, which is refused as a write
+    // root but which bundler installs into and loads from.
     let homes = crawler.bundler_install_homes(&options).await;
-    // Every candidate's installed dir in every gem home, one blocking pass
-    // (and at most one listing) per home — the per-candidate lookups the
-    // loop below consumes, in the same (candidate, home) order.
     let stripped: Vec<String> = candidates
         .iter()
         .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
@@ -436,8 +353,7 @@ async fn gem_stale_install_warnings(
     }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
-    // Bundler's configured cache dir (`cache_path`, default vendor/cache):
-    // the committed archives `bundle install` installs from (#483).
+    // Bundler's configured cache dir (`cache_path`, default vendor/cache).
     let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
     for (index, (purl, record)) in candidates.iter().enumerate() {
         for (found, project_local) in &found_per_home {
@@ -478,35 +394,29 @@ async fn gem_stale_install_warnings(
         if j.patched || !j.positive {
             continue;
         }
-        let project_local = j.project_local;
-        let mut folded_cache: Option<std::path::PathBuf> = None;
-        if project_local {
-            let project_cache = app_cache.join(format!("{}.gem", j.leaf));
-            if project_cache.is_file() {
-                let proven_patched = match (
-                    gem_artifact_shas.get(&gem_sha_key(&j.purl)),
-                    file_sha256_hex(&project_cache).await,
-                ) {
-                    (Some(want), Some(got)) => &got == want,
-                    // Unknown sha (or unreadable archive): include it —
-                    // removal is safe either way, `bundle install` refetches.
-                    _ => false,
-                };
-                if !proven_patched {
-                    folded_cache = Some(project_cache);
-                }
-            }
-        }
+        let project_cache = app_cache.join(format!("{}.gem", j.leaf));
+        let folded_cache = if j.project_local && project_cache.is_file() {
+            let proven_patched = match (
+                gem_artifact_shas.get(&gem_sha_key(&j.purl)),
+                file_sha256_hex(&project_cache).await,
+            ) {
+                (Some(want), Some(got)) => &got == want,
+                // Unknown sha (or unreadable archive): include it —
+                // removal is safe either way, `bundle install` refetches.
+                _ => false,
+            };
+            (!proven_patched).then_some(project_cache)
+        } else {
+            None
+        };
         if folded_cache.is_some() {
-            if let Some((purl, _)) = candidates.iter().find(|(p, _)| *p == j.purl) {
-                cache_covered.insert(purl);
-            }
+            cache_covered.insert(j.purl.as_str());
         }
         out.warnings.push(gem_stale_install_warning(
             &j.purl,
             dir,
             &j.leaf,
-            project_local,
+            j.project_local,
             folded_cache.as_deref(),
         ));
         out.stale_purls.insert(j.purl.clone());
@@ -577,10 +487,9 @@ fn gem_sha_key(purl: &str) -> (String, String) {
         .unwrap_or_default()
 }
 
-/// `scan --mode hosted`: resolve hosted-patch references for the selected patches,
-/// then rewrite ONLY those dependencies' lockfile/registry-config entries to
-/// point at the hosted vendored patches (the byte-identical counterpart of the
-/// GitHub-app registry mode). No artifact bytes land in the repo.
+/// `scan --mode hosted --json`: select through `discover_selected`, then run
+/// [`run_redirect_selected`]. The human arm calls
+/// [`boxed_run_redirect_selected`] from `scan/mod.rs` directly.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_redirect(
     args: &ScanArgs,
@@ -588,12 +497,8 @@ pub(super) async fn run_redirect(
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
     policy: &super::policy::ScanPolicy,
-    // The scan envelope `run` builds for the `--json` path (`Some` in JSON
-    // mode, `None` for human output). The redirect outcome is recorded into
-    // it; `.take()` at each terminal (error or success) prints it.
-    mut scan_result: Option<Envelope>,
-    // Scan's pending telemetry, flushed by `discover_selected` before
-    // anything below writes to stdout.
+    mut scan_result: Envelope,
+    // Flushed by `discover_selected` before anything below writes to stdout.
     telemetry: &mut socket_patch_core::telemetry::PendingTelemetry,
     // Scan's npm crawl (`Some` only when an embedded `--vex` will run),
     // handed to the VEX step so it does not walk the tree for the npm
@@ -610,12 +515,10 @@ pub(super) async fn run_redirect(
     // The withdrawn-pin sweep's reference answers (see
     // `rollout::Gate::references`).
     references: Option<super::withdrawn::KnownReferences>,
-    // `--prune` / `--sync`, gated by the policy exactly as the human arm
-    // gates it (`patches.enabled: false` writes nothing, the GC included):
-    // only feeds the `redirect_prune_ignored` warning.
+    // `--prune` / `--sync` after the policy gate: only feeds the
+    // `redirect_prune_ignored` warning.
     prune: bool,
 ) -> i32 {
-    // Same discovery/selection as agent and vendored mode.
     let discovered = match discover_selected(
         api_client,
         all_packages_with_patches,
@@ -625,29 +528,19 @@ pub(super) async fn run_redirect(
         false,
         false,
         telemetry,
-        scan_result.as_mut(),
+        Some(&mut scan_result),
     )
     .await
     {
         Ok(d) => d,
-        // Hosted mode has no discovery envelope to fold the message into at
-        // this point (it builds its `redirect` result further down).
-        // `discover_selected` already printed the message to stderr; a
-        // `--json` run additionally gets the machine-readable envelope so
-        // stdout is never empty on failure.
+        // `discover_selected` already printed the message to stderr.
         Err((code, message)) => {
-            if args.common.json {
-                emit_json_error(
-                    &args.common,
-                    scan_result.take(),
-                    super::PATCH_DETAILS_FAILED,
-                    &message,
-                );
-            } else if code == 0 && !args.common.silent {
-                // Unreachable from scan (it never prompts, so selection
-                // cannot be cancelled); kept for a code-0 selection error.
-                eprintln!("No changes made.");
-            }
+            emit_scan(&json_error_envelope(
+                &args.common,
+                Some(scan_result),
+                super::PATCH_DETAILS_FAILED,
+                &message,
+            ));
             return code;
         }
     };
@@ -657,7 +550,7 @@ pub(super) async fn run_redirect(
         recorded,
         batch_failed,
         all_packages_with_patches,
-        scan_result.as_mut(),
+        Some(&mut scan_result),
     );
 
     // The redirect body consumes the selection only as (purl, uuid) pairs —
@@ -674,7 +567,7 @@ pub(super) async fn run_redirect(
         prune,
         api_client,
         &pairs,
-        scan_result,
+        Some(scan_result),
         npm_prior,
         Some(
             super::rollout::Gate::new(stage, rows)
@@ -746,36 +639,21 @@ fn discovery_after_writes<'d>(
     })
 }
 
-/// The hosted-redirect flow over an ALREADY-SELECTED `(purl, uuid)` set,
-/// on disk. The plan → rewrite → edits core is the shared hosted engine
-/// ([`socket_patch_core::hosted::engine`], over a
-/// [`ProjectView::Disk`](socket_patch_core::vendor::lock_inventory::ProjectView));
-/// what stays here is what needs the host: reference grants and the other
-/// network fetches, the apply lock (wet runs with a grant), the
-/// vendored→hosted takeover pre-revert (symlink-checked first), the
-/// `pipenv --version` probe, the symlink guard, the file writes, the gem /
-/// Python / vlt
-/// stale-install probes, and the optional VEX. Shared VERBATIM by `scan
-/// --mode hosted` (its `--json` arm through the `run_redirect` wrapper, its
-/// human arm through [`boxed_run_redirect_selected`] in `scan/mod.rs`; both
-/// select via `discover_selected`, with no prompt) and by `get --mode
-/// hosted` (which pins the advisory-resolved uuid), so all produce
-/// identical on-disk results for the same selection. v5 hosted mode keeps
-/// no ledger (the lockfiles are the only record); the VENDORED ledger the
-/// takeover needs is loaded HERE, under the apply lock whenever this run
-/// holds one (never handed in pre-loaded: a copy read before the lock could
-/// be saved over a concurrent writer's edits).
+/// The hosted-redirect flow over an already-selected `(purl, uuid)` set, on
+/// disk, shared by `scan --mode hosted` and `get --mode hosted`. The plan,
+/// rewrite and edits are core's [`socket_patch_core::hosted::engine`]; this
+/// keeps what needs the host: network fetches, the apply lock, the
+/// vendored→hosted takeover, the file writes, the stale-install probes and
+/// the optional VEX. The vendored ledger the takeover needs is loaded here,
+/// under the apply lock, so a copy read before the lock is never saved over
+/// a concurrent writer's edits.
 ///
-/// `scan_result` must be `Some` exactly when `common.json` is set (the
-/// human/JSON split keys on `common.json`; a `--json` caller passing `None`
-/// would get a bare scan envelope without its own payload).
-/// `prune_requested` only feeds the `redirect_prune_ignored` warning —
-/// `get` passes `false`.
+/// `scan_result` must be `Some` exactly when `common.json` is set.
+/// `prune_requested` only feeds the `redirect_prune_ignored` warning.
 ///
 /// Telemetry: a run with a non-empty selection reports `patch_applied`
-/// (`mode: "hosted"`, sent before the result prints) or, on a non-zero
-/// exit before that point, `patch_apply_failed`. `command` names the
-/// caller (`scan` / `get`) in the event's context.
+/// before the result prints or, on a non-zero exit before that,
+/// `patch_apply_failed`; `command` names the caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_redirect_selected(
     common: &crate::args::GlobalArgs,
@@ -2177,13 +2055,6 @@ async fn put_back(written: &[(std::path::PathBuf, Option<Vec<u8>>)]) {
     }
 }
 
-// ── Human-output formatting ────────────────────────────────────────────────
-//
-// Pure `String` builders for everything the hosted flow prints in human
-// mode, so the exact text is unit-testable (see the tests module). JSON
-// output never goes through these: its `detail`/`reason` strings are the
-// stable, machine-facing spellings.
-
 /// Warning codes that report a SUCCESSFUL vendored→hosted migration. They
 /// stay in the JSON `warnings[]` (additive contract), but a human run
 /// prints them as plain progress lines ([`format_takeover_line`]), not as
@@ -2375,11 +2246,8 @@ fn describe_skip_reason(reason: &str) -> String {
 }
 
 /// How many of the lockfile rewriters' warnings can explain why a granted
-/// package has no lock entry: the count `format_unredirected` turns into its
-/// "(see the warning below)" hint. `redirect_bun_default_trust_lost` rides in
-/// the same vector but is about a pin that *was* written (Bun's default trust
-/// lost on the hosted URL, #371), so it never explains a missing entry. The
-/// uv < 0.5.6 advisories (#1569) likewise describe a written pin.
+/// package has no lock entry. Bun's lost default trust and the uv < 0.5.6
+/// advisories describe a pin that *was* written, so they don't count.
 fn lock_entry_warning_count(
     warnings: &[socket_patch_core::patch::redirect::RewriteWarning],
 ) -> usize {
@@ -2622,9 +2490,6 @@ fn created_settings_over_existing(
         })
 }
 
-/// [`created_settings_over_existing`]'s code for `socket-patch.sbt`.
-use socket_patch_core::hosted::engine::SBT_OWNED_FILE_UNREADABLE;
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2635,8 +2500,7 @@ mod tests {
     };
     use super::{
         gem_stale_cache_warning, gem_stale_install_warning, gem_stale_install_warnings,
-        installed_stale_positive_evidence, prune_ignored_warning, record_hosted_events,
-        redirect_block,
+        prune_ignored_warning, record_hosted_events, redirect_block,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
 
@@ -2987,12 +2851,6 @@ mod tests {
         assert_eq!(env.summary.applied, 0);
     }
 
-    // ── gem stale-install probe (redirect_gem_stale_install) ──────────
-    //
-    // Defect facts + verified/disproven remedies live in CLI_CONTRACT.md's
-    // "Gem stale-install guard" section; these tests pin the probe's
-    // judgment rules and the warning wording's load-bearing parts.
-
     use std::path::PathBuf;
 
     use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -3203,7 +3061,12 @@ mod tests {
     /// transiently unreadable file in a patched install must not produce
     /// a delete prescription.
     #[tokio::test]
-    async fn installed_stale_positive_evidence_requires_readable_mismatched_bytes() {
+    async fn stale_evidence_requires_readable_mismatched_bytes() {
+        async fn stale_evidence(dir: &std::path::Path, record: &PatchRecord) -> bool {
+            socket_patch_core::vex::verify::judge_installed_record(dir, record)
+                .await
+                .stale_evidence
+        }
         let tmp = tempfile::tempdir().unwrap();
         let record = gem_record();
 
@@ -3211,30 +3074,30 @@ mod tests {
         let upstream = tmp.path().join("upstream");
         std::fs::create_dir_all(upstream.join("lib")).unwrap();
         std::fs::write(upstream.join("lib").join("stale_unit.rb"), GEM_UPSTREAM).unwrap();
-        assert!(installed_stale_positive_evidence(&upstream, &record).await);
+        assert!(stale_evidence(&upstream, &record).await);
 
         // Tampered bytes (neither hash) → evidence.
         let tampered = tmp.path().join("tampered");
         std::fs::create_dir_all(tampered.join("lib")).unwrap();
         std::fs::write(tampered.join("lib").join("stale_unit.rb"), b"other").unwrap();
-        assert!(installed_stale_positive_evidence(&tampered, &record).await);
+        assert!(stale_evidence(&tampered, &record).await);
 
         // Patched bytes → no evidence.
         let patched = tmp.path().join("patched");
         std::fs::create_dir_all(patched.join("lib")).unwrap();
         std::fs::write(patched.join("lib").join("stale_unit.rb"), GEM_PATCHED).unwrap();
-        assert!(!installed_stale_positive_evidence(&patched, &record).await);
+        assert!(!stale_evidence(&patched, &record).await);
 
         // Missing file → no evidence (never a guess).
         let hollow = tmp.path().join("hollow");
         std::fs::create_dir_all(hollow.join("lib")).unwrap();
-        assert!(!installed_stale_positive_evidence(&hollow, &record).await);
+        assert!(!stale_evidence(&hollow, &record).await);
 
         // A DIRECTORY at the file path (the unreadable-NotFound class) →
         // no evidence.
         let blocked = tmp.path().join("blocked");
         std::fs::create_dir_all(blocked.join("lib").join("stale_unit.rb")).unwrap();
-        assert!(!installed_stale_positive_evidence(&blocked, &record).await);
+        assert!(!stale_evidence(&blocked, &record).await);
 
         // Absent new-file (empty beforeHash routes to Ready with NO
         // current_hash) → no evidence.
@@ -3244,7 +3107,7 @@ mod tests {
             .get_mut("lib/stale_unit.rb")
             .expect("fixture file entry")
             .before_hash = String::new();
-        assert!(!installed_stale_positive_evidence(&hollow, &new_file).await);
+        assert!(!stale_evidence(&hollow, &new_file).await);
     }
 
     /// The probe end to end over a real deployment layout: a STALE
@@ -3383,23 +3246,6 @@ mod tests {
             out.warnings
         );
         assert!(out.stale_purls.is_empty());
-    }
-
-    /// Records are found BY UUID — the fetch key, stable across purl
-    /// spellings — so a record keyed under a qualified purl still judges
-    /// the bare confirmed purl.
-    #[tokio::test]
-    async fn gem_stale_probe_record_lookup_is_uuid_keyed() {
-        let stale = tempfile::tempdir().unwrap();
-        materialize_gem(stale.path(), GEM_UPSTREAM);
-        let mut records = std::collections::BTreeMap::new();
-        records.insert(format!("{GEM_PURL}?platform=ruby"), gem_record());
-        let out = probe(stale.path(), &one_confirmed(), &records).await;
-        assert_eq!(
-            out.warnings.len(),
-            1,
-            "the uuid lookup must find the record under any purl spelling"
-        );
     }
 
     /// The probe links a record to a confirmed purl by uuid alone: a
@@ -3893,7 +3739,6 @@ mod tests {
             ]
         );
     }
-    // ── Human-output formatting ────────────────────────────────────────────
 
     #[test]
     fn redirect_summary_singular_plural_and_dry_run() {
