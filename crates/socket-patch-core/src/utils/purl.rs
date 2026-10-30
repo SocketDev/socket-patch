@@ -237,7 +237,7 @@ fn parse_namespaced<'a>(purl: &'a str, prefix: &str) -> Option<NamespacedPurlPar
 /// Parse a PyPI PURL to extract name and version.
 ///
 /// e.g., `"pkg:pypi/requests@2.28.0?artifact_id=abc"` -> `Some(("requests", "2.28.0"))`
-pub(crate) fn parse_pypi_purl(purl: &str) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
+pub fn parse_pypi_purl(purl: &str) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
     parse_name_version(purl, "pkg:pypi/")
 }
 

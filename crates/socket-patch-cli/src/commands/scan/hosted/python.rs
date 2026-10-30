@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use socket_patch_core::crawlers::PythonCrawler;
 use socket_patch_core::manifest::schema::PatchRecord;
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use socket_patch_core::vex::verify::judge_installed_record;
 
 use super::StaleInstallOutcome;
@@ -145,52 +145,16 @@ pub(super) async fn stale_install_warnings(
             let remedy = if let Some(env) = hatch_env {
                 socket_patch_core::crawlers::hatch_env::stale_install_remedy(&env.name)
             } else if pipenv_purls.contains(&purl) {
-                let name = strip_purl_qualifiers(&purl)
-                    .strip_prefix("pkg:pypi/")
-                    .and_then(|rest| rest.split('@').next())
-                    .unwrap_or("<package>")
-                    .to_string();
-                if inherited.contains(&site) {
-                    let remedy =
-                        socket_patch_core::vendor::pypi_pipenv::base_site_stale_install_remedy(
-                            pipenv_lock.as_ref(),
-                            &name,
-                            &site.display().to_string(),
-                        );
-                    format!(
-                        "{remedy}; then `socket-patch vex --product <purl>` re-verifies the \
-                         installed files."
-                    )
-                } else if let Some(base) =
-                    socket_patch_core::crawlers::python_crawler::inherited_same_release(
-                        &site, &name, &version,
-                    )
-                    .await
-                {
-                    let remedy =
-                        socket_patch_core::vendor::pypi_pipenv::shadowing_stale_install_remedy(
-                            pipenv_lock.as_ref(),
-                            &name,
-                            &site.display().to_string(),
-                            &base.display().to_string(),
-                        );
-                    format!(
-                        "{remedy}; then `socket-patch vex --product <purl>` re-verifies the \
-                         installed files."
-                    )
-                } else {
-                    let remedy = socket_patch_core::vendor::pypi_pipenv::stale_install_remedy(
-                        pipenv_lock.as_ref(),
-                        &name,
-                    );
-                    format!(
-                        "Pipenv does not reinstall a release that is already present (`pipenv \
-                         install`, `pipenv install --deploy` and `pipenv sync` all keep those \
-                         bytes), so the rewritten Pipfile.lock only protects fresh installs. \
-                         {remedy}; then `socket-patch vex --product <purl>` re-verifies the \
-                         installed files."
-                    )
-                }
+                let name = parse_pypi_purl(strip_purl_qualifiers(&purl))
+                    .map_or_else(|| purl.clone(), |(name, _)| name.to_string());
+                socket_patch_core::vendor::pypi_pipenv::stale_install_detail(
+                    pipenv_lock.as_ref(),
+                    &name,
+                    &version,
+                    std::slice::from_ref(&site),
+                    &inherited,
+                )
+                .await
             } else {
                 "Reinstall from the rewritten lock in this interpreter and verify with \
                  `socket-patch vex`. Poetry before 1.4 may keep same-version packages: \
@@ -361,12 +325,13 @@ mod tests {
         assert_eq!(out.warnings[0]["code"], "redirect_pypi_stale_install");
     }
 
-    /// #790: the Pipenv remedy names the lock category that pins the
-    /// package. Plain `pipenv sync` installs only `default`, so for a
-    /// `[dev-packages]` entry it uninstalled the package and left it
-    /// uninstalled.
+    /// #1878: hosted words the Pipenv remedy through core's shared
+    /// `stale_install_detail`, as vendored does: the lock categories pick
+    /// the `pipenv sync` arguments (core's tests cover each category), and
+    /// the re-verify step names a runnable command, with no `<purl>` or
+    /// `<package>` placeholder left in.
     #[tokio::test]
-    async fn pipenv_remedy_resyncs_the_category_that_pins_the_package() {
+    async fn pipenv_remedy_is_the_shared_core_wording() {
         let tmp = tempfile::tempdir().unwrap();
         let site = tmp.path().join("site-packages");
         std::fs::create_dir_all(site.join("six-1.16.0.dist-info")).unwrap();
@@ -380,42 +345,34 @@ mod tests {
         let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
         let pipenv = BTreeSet::from(["six-uuid".to_string()]);
-        let detail = |lock: &str| {
-            let lock = lock.to_string();
-            let (common, confirmed, ledger, pipenv) = (&common, &confirmed, &ledger, &pipenv);
-            async move {
-                let out =
-                    stale_install_warnings(common, confirmed, pipenv, Some(&lock), ledger).await;
-                assert_eq!(out.warnings.len(), 1);
-                out.warnings[0]["detail"].as_str().unwrap().to_string()
-            }
-        };
-
-        let develop = detail(
-            r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {"file": "x"}}}"#,
+        let text =
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {"file": "x"}}}"#;
+        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(text), &ledger).await;
+        assert_eq!(out.warnings.len(), 1);
+        let detail = out.warnings[0]["detail"].as_str().unwrap();
+        let lock: serde_json::Value = serde_json::from_str(text).unwrap();
+        let shared = socket_patch_core::vendor::pypi_pipenv::stale_install_detail(
+            Some(&lock),
+            "six",
+            "1.16.0",
+            std::slice::from_ref(&site),
+            &Default::default(),
         )
         .await;
-        assert!(
-            develop.contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
-            "{develop}"
+        assert_eq!(
+            detail,
+            format!(
+                "{purl} was switched to a hosted patch, but installed files in {} still differ \
+                 from the patched hashes. {shared} The installed files were left unchanged.",
+                site.display()
+            )
         );
         assert!(
-            develop.contains("`pipenv --rm && pipenv sync --dev`"),
-            "{develop}"
+            detail.contains("`pipenv run pip uninstall -y six && pipenv sync --dev`"),
+            "{detail}"
         );
-
-        let docs = detail(
-            r#"{"_meta": {"pipfile-spec": 6}, "default": {"requests": {}}, "docs": {"six": {}}}"#,
-        )
-        .await;
-        assert!(
-            docs.contains("-y six && pipenv sync --categories \"docs\"`"),
-            "{docs}"
-        );
-        assert!(
-            docs.contains("`pipenv --rm && pipenv sync --categories \"packages docs\"`"),
-            "{docs}"
-        );
+        assert!(!detail.contains("<purl>"), "{detail}");
+        assert!(!detail.contains("<package>"), "{detail}");
     }
 
     /// #1450: a `--site-packages` venv imports the upstream release from its

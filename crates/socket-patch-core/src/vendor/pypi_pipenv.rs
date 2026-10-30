@@ -2,7 +2,8 @@
 //! Vendoring requires Pipenv 2018 or later; earlier installers cannot consume
 //! portable relative wheel paths with integrity hashes.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
@@ -950,6 +951,75 @@ pub fn shadowing_stale_install_remedy(
     )
 }
 
+/// The remedy text for upstream copies of `name` `version` still installed
+/// in `sites`, shared by the hosted (`redirect_pypi_stale_install`) and
+/// vendored (`pypi_pipenv_stale_install`) warnings. Each site falls in one
+/// class: a base interpreter dir in `inherited` that a `--site-packages`
+/// virtualenv imports (#1450), a virtualenv copy that hides the same release
+/// in its base interpreter, or the virtualenv's own copy. Each class gets
+/// its remedy (the own copies led by `For <dirs>:` when more than one class
+/// is present), and the text ends with the command that re-verifies.
+pub async fn stale_install_detail(
+    lock: Option<&Value>,
+    name: &str,
+    version: &str,
+    sites: &[PathBuf],
+    inherited: &HashSet<PathBuf>,
+) -> String {
+    let join = |dirs: &[&PathBuf]| {
+        dirs.iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (base, own): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        sites.iter().partition(|d| inherited.contains(*d));
+    // A venv copy that hides the same release in its base interpreter: the
+    // uninstall-and-sync remedy would only expose that base copy.
+    let mut shadowing = Vec::new();
+    let mut plain = Vec::new();
+    for dir in own {
+        match crate::crawlers::python_crawler::inherited_same_release(dir, name, version).await {
+            Some(base_dir) => shadowing.push((dir, base_dir)),
+            None => plain.push(dir),
+        }
+    }
+    let several = [!plain.is_empty(), !shadowing.is_empty(), !base.is_empty()]
+        .iter()
+        .filter(|kind| **kind)
+        .count()
+        > 1;
+    let mut parts = Vec::new();
+    if !plain.is_empty() {
+        let remedy = stale_install_remedy(lock, name);
+        let lead = if several {
+            format!("For {}: ", join(&plain))
+        } else {
+            String::new()
+        };
+        parts.push(format!(
+            "{lead}Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}."
+        ));
+    }
+    for (dir, base_dir) in &shadowing {
+        let remedy = shadowing_stale_install_remedy(
+            lock,
+            name,
+            &dir.display().to_string(),
+            &base_dir.display().to_string(),
+        );
+        parts.push(format!("{remedy}."));
+    }
+    if !base.is_empty() {
+        parts.push(format!(
+            "{}.",
+            base_site_stale_install_remedy(lock, name, &join(&base))
+        ));
+    }
+    parts.push("Then `socket-patch vex` re-verifies the installed files.".to_string());
+    parts.join(" ")
+}
+
 /// The install-over command both base-interpreter remedies share.
 fn install_over_command(lock: Option<&Value>, name: &str) -> String {
     let (package, _) = lock_sections(lock, name);
@@ -997,6 +1067,97 @@ mod tests {
     use super::*;
     use crate::formats::pipenv::format_entry;
     use crate::vendor::state::VendorArtifact;
+
+    /// #1878: hosted and vendored word the Pipenv stale-install remedy
+    /// through one helper. Each site class gets its own remedy: the
+    /// virtualenv's own copy (uninstall and sync, led by `For <dirs>:` when
+    /// other classes are present), a virtualenv copy that hides the same
+    /// release in its base interpreter, and an inherited base site dir
+    /// (both install over the copy inside the virtualenv).
+    #[tokio::test]
+    async fn stale_install_detail_words_each_site_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let venv = root.join(".venv");
+        let base = root.join("base");
+        let (home, venv_site, base_site) = if cfg!(windows) {
+            (
+                base.clone(),
+                venv.join("Lib").join("site-packages"),
+                base.join("Lib").join("site-packages"),
+            )
+        } else {
+            (
+                base.join("bin"),
+                venv.join("lib").join("python3.12").join("site-packages"),
+                base.join("lib").join("python3.12").join("site-packages"),
+            )
+        };
+        std::fs::create_dir_all(&home).unwrap();
+        for site in [&venv_site, &base_site] {
+            let di = site.join("six-1.16.0.dist-info");
+            std::fs::create_dir_all(&di).unwrap();
+            std::fs::write(
+                di.join("METADATA"),
+                "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(base_site.parent().unwrap().join("os.py"), "").unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!(
+                "home = {}\ninclude-system-site-packages = true\nversion = 3.12.4\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        let plain = root.join("plain").join("site-packages");
+        std::fs::create_dir_all(&plain).unwrap();
+        let lock: Value = serde_json::from_str(
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {"six": {"version": "==1.16.0"}}}"#,
+        )
+        .unwrap();
+        let inherited = HashSet::from([base_site.clone()]);
+        let detail = |sites: Vec<PathBuf>| {
+            let (lock, inherited) = (&lock, &inherited);
+            async move { stale_install_detail(Some(lock), "six", "1.16.0", &sites, inherited).await }
+        };
+        let own = format!(
+            "Pipenv does not reinstall a release that is already present (`pipenv install`, \
+             `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired \
+             Pipfile.lock only protects fresh installs. {}.",
+            stale_install_remedy(Some(&lock), "six")
+        );
+        let shadow = format!(
+            "{}.",
+            shadowing_stale_install_remedy(
+                Some(&lock),
+                "six",
+                &venv_site.display().to_string(),
+                &base_site.display().to_string(),
+            )
+        );
+        let inherit = format!(
+            "{}.",
+            base_site_stale_install_remedy(Some(&lock), "six", &base_site.display().to_string())
+        );
+        let tail = "Then `socket-patch vex` re-verifies the installed files.";
+
+        assert_eq!(detail(vec![plain.clone()]).await, format!("{own} {tail}"));
+        assert_eq!(
+            detail(vec![venv_site.clone()]).await,
+            format!("{shadow} {tail}")
+        );
+        assert_eq!(
+            detail(vec![base_site.clone()]).await,
+            format!("{inherit} {tail}")
+        );
+        assert_eq!(
+            detail(vec![plain.clone(), venv_site.clone(), base_site.clone()]).await,
+            format!("For {}: {own} {shadow} {inherit} {tail}", plain.display())
+        );
+    }
 
     /// A whole lock as Pipenv writes it, `json.dumps(indent=4,
     /// sort_keys=True) + "\n"`, through the same renderer the splices use.
