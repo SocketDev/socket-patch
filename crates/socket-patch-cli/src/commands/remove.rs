@@ -33,8 +33,8 @@ use crate::ui::{plural, sweep_failure};
 /// Vendor-ledger entries matching a remove target
 /// ([`socket_patch_core::ledgers::Ledgers::matching`]), sorted by key for
 /// deterministic event order. With the manifest, an entry the matched
-/// manifest keys claim matches whatever patch generation it recorded
-/// (#999); the ledger-only path passes `None`.
+/// manifest keys claim matches whatever patch generation it recorded;
+/// the ledger-only path passes `None`.
 fn vendor_entries_matching(
     state: &VendorState,
     manifest: Option<&PatchManifest>,
@@ -72,29 +72,10 @@ fn remove_matching(
     removed
 }
 
-/// Emit the `not_found` envelope (or stderr line) for an identifier that
-/// matched nothing in any store, tracking the failure. `dry_run` rides the
-/// envelope so a preview's failures still report `dryRun: true` (matching
-/// apply's error envelopes and remove's own success envelope).
-async fn emit_not_found(json: bool, dry_run: bool, identifier: &str, telemetry: &TelemetryAuth) {
-    let msg = format!("No patch found matching identifier: {identifier}");
-    track_patch_remove_failed(&msg, telemetry).await;
-    if json {
-        let mut env = Envelope::new(Command::Remove);
-        env.dry_run = dry_run;
-        env.status = Status::NotFound;
-        env.error = Some(EnvelopeError::new("not_found", msg));
-        println!("{}", env.to_pretty_json());
-    } else {
-        eprintln!("Error: {msg}");
-    }
-}
-
-/// Print the hosted leg's run-level advisories (`Warning: …`) on
-/// stderr — never under `--silent` / `--json` (JSON carries them in the
-/// envelope's `warnings[]`). Printed as soon as the leg returns, so a
-/// human run that then fails still says what it did to the files.
-fn print_hosted_leg_warnings(common: &GlobalArgs, warnings: &[(String, String)]) {
+/// Print run-level advisories (`Warning: …`) on stderr — never under
+/// `--silent` / `--json` (JSON carries them in the envelope's
+/// `warnings[]`).
+fn print_run_warnings(common: &GlobalArgs, warnings: &[(String, String)]) {
     if common.silent || common.json {
         return;
     }
@@ -124,7 +105,7 @@ fn emit_error_envelope(json: bool, dry_run: bool, code: &str, message: String) {
         let mut env = Envelope::new(Command::Remove);
         env.dry_run = dry_run;
         env.mark_error(EnvelopeError::new(code, message));
-        println!("{}", env.to_pretty_json());
+        crate::ui::print_json(&env.to_value());
     } else {
         eprintln!("Error: {}", crate::ui::sentence_case(&message));
     }
@@ -288,11 +269,7 @@ pub struct RemoveArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    // clap's default bool parser accepts only the literal strings
-    // `true`/`false` from the env binding, so `SOCKET_SKIP_ROLLBACK=1` (or
-    // an exported-but-empty `SOCKET_SKIP_ROLLBACK=`) aborted every
-    // `remove` invocation.
+    // clap's default bool parser rejects `SOCKET_SKIP_ROLLBACK=1`.
     /// Skip rolling back files before removing (only update the manifest).
     #[arg(
         long = "skip-rollback",
@@ -317,10 +294,6 @@ pub struct RemoveArgs {
     )]
     pub preserve_state: bool,
 }
-
-/// The last line of a human `remove --dry-run` (the wording `repair
-/// --dry-run` ends with too).
-const DRY_RUN_FOOTER: &str = "Dry run: no changes made.";
 
 pub async fn run(args: RemoveArgs) -> i32 {
     apply_env_toggles(&args.common);
@@ -366,7 +339,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // only.
     let project_state = crate::commands::project_state_in_scope(&args.common);
     // Only a missing file is "no manifest"; one remove cannot even stat is
-    // unreadable, not a bare project (#998).
+    // unreadable, not a bare project.
     let manifest_missing = match manifest_exists(&manifest_path).await {
         Ok(present) => !present,
         Err(e) => {
@@ -385,7 +358,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     } else {
         Default::default()
     };
-    // Leftover `resolutions` selectors (#1203) unwind like pins: the
+    // Leftover `resolutions` selectors unwind like pins: the
     // restore retires them from the manifest.
     let hosted_pins: Vec<HostedPin> = hosted_inventory.unwindable();
     if manifest_missing {
@@ -469,7 +442,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // the vendored leg. An unreadable ledger degrades to "nothing vendored"
     // for the rollback and fails closed at the vendored leg — exactly where
     // the run is about to mutate vendored state.
-    // From the manifest's project, like the manifest itself (#745).
     let vendor_state_result = if project_state {
         load_state(&args.common.project_root()).await
     } else {
@@ -541,13 +513,17 @@ pub async fn run(args: RemoveArgs) -> i32 {
             return remove_hosted_only(&args, hosted_matches, &telemetry).await;
         }
 
-        emit_not_found(
-            args.common.json,
-            args.common.dry_run,
-            &args.identifier,
-            &telemetry,
-        )
-        .await;
+        let msg = format!("No patch found matching identifier: {}", args.identifier);
+        track_patch_remove_failed(&msg, &telemetry).await;
+        if args.common.json {
+            let mut env = Envelope::new(Command::Remove);
+            env.dry_run = args.common.dry_run;
+            env.status = Status::NotFound;
+            env.error = Some(EnvelopeError::new("not_found", msg));
+            crate::ui::print_json(&env.to_value());
+        } else {
+            eprintln!("Error: {msg}");
+        }
         return 1;
     }
 
@@ -616,9 +592,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // ── nested in-place rollback ────────────────────────────────────────
     // Vendor-owned purls are excluded from the in-place restore (the
     // vendored leg below reverts them) unless their Cargo shared-cache copy
-    // still carries an agent-mode patch (#336); an unreadable ledger degrades to
+    // still carries an agent-mode patch; an unreadable ledger degrades to
     // "nothing vendored" here and fails closed at that leg. Under global
-    // scope the project's ledger still owns its own NuGet install (#489).
+    // scope the project's ledger still owns its own NuGet install.
     // The identifier is the scope, so `--ecosystems` does not narrow it.
     let vendored_keys: HashSet<PurlKey> = if project_state {
         vendor_state_result
@@ -639,7 +615,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // `summary.rolledBack` counts them). A dry run restores nothing, so it
     // records none.
     let mut rolled_back_events: Vec<PatchEvent> = Vec::new();
-    // Copies a global run left to the project's vendor ledger (#489): each
+    // Copies a global run left to the project's vendor ledger: each
     // a `skipped` / `vendored` event, since no vendored leg reports them.
     let mut project_owned: Vec<PatchEvent> = Vec::new();
     // In-scope manifest entries the nested rollback SKIPPED because the
@@ -753,7 +729,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                             .with_details(serde_json::json!({ "path": r.package_path }))
                     })
                     .collect();
-                print_hosted_leg_warnings(&args.common, &rollback_warnings);
+                print_run_warnings(&args.common, &rollback_warnings);
 
                 if loud {
                     // Vendor-owned targets say nothing here: the vendored
@@ -885,19 +861,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
             // `run_hosted_leg` printed one line per restored purl.
             printed_progress |= loud && !leg.reverted.is_empty();
-            let hosted_action = if args.common.dry_run {
-                PatchAction::Verified
-            } else {
-                PatchAction::Removed
-            };
-            for purl in &leg.reverted {
-                hosted_reverted_events.push(
-                    PatchEvent::new(hosted_action, purl.clone()).with_reason(
-                        "hosted_reverted",
-                        "hosted lockfile pin restored to the upstream registry on remove",
-                    ),
-                );
-            }
+            hosted_reverted_events.extend(
+                leg.reverted
+                    .iter()
+                    .map(|purl| hosted_reverted_event(args.common.dry_run, purl)),
+            );
         }
     }
 
@@ -952,7 +920,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
             env.status = Status::PartialFailure;
             env.error = Some(EnvelopeError::new("vendor_revert_kept", msg));
-            println!("{}", env.to_pretty_json());
+            crate::ui::print_json(&env.to_value());
         } else {
             eprintln!("Error: {msg}");
         }
@@ -1113,7 +1081,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // The dry-run footer closes the whole preview, the blob-cleanup
     // preview above included.
     if loud && args.common.dry_run {
-        println!("\n{DRY_RUN_FOOTER}");
+        println!("\nDry run: no changes made.");
     }
 
     if args.common.json {
@@ -1186,10 +1154,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 .iter()
                 .chain(&hosted_leg_warnings)
                 .chain(&cleanup_warnings)
-                .map(|(code, detail)| crate::json_envelope::RunWarning {
-                    code: code.clone(),
-                    detail: detail.clone(),
-                }),
+                .map(|(code, detail)| crate::json_envelope::RunWarning::new(code, detail)),
         );
         // The in-place restores ran before the manifest mutation.
         for ev in rolled_back_events {
@@ -1226,29 +1191,17 @@ pub async fn run(args: RemoveArgs) -> i32 {
         if !vendor_leg.kept.is_empty() {
             env.status = Status::PartialFailure;
         }
-        println!("{}", env.to_pretty_json());
+        crate::ui::print_json(&env.to_value());
     }
 
     if !args.common.dry_run {
         track_patch_removed(removed.len(), &telemetry).await;
     }
-    if vendor_leg.kept.is_empty() {
-        0
-    } else {
-        // Errors print even under --silent; the per-key drift-keep lines
-        // above are gated, so name the outcome once here.
-        if !args.common.json {
-            eprintln!(
-                "Error: {}",
-                kept_error_line(&vendor_leg.kept_causes, "manifest record")
-            );
-        }
-        1
-    }
+    kept_exit_code(&args.common, &vendor_leg.kept_causes, "manifest record")
 }
 
 /// The top-level error when every matching vendored entry was kept: the
-/// drift wording and its normalize remedy only for drift-keeps (#1184).
+/// drift wording and its normalize remedy only for drift-keeps.
 fn all_kept_message(identifier: &str, causes: &[KeepCause]) -> String {
     if causes.iter().all(|c| *c == KeepCause::Drift) {
         return format!(
@@ -1312,7 +1265,7 @@ struct RemoveVendorLeg {
     kept_causes: Vec<KeepCause>,
     /// `Removed`/`vendor_orphan_removed` events (dry runs too, as in
     /// `vendor --revert`): uuid dirs of the reverted packages that no
-    /// ledger entry owns, swept after the reverts (#1610).
+    /// ledger entry owns, swept after the reverts.
     orphans: Vec<PatchEvent>,
     /// Entries actually reverted and dropped from the ledger (wet runs).
     reverted_count: usize,
@@ -1477,7 +1430,7 @@ async fn revert_vendored_matches(
 
 /// Sweep the uuid dirs under `.socket/vendor/` that no ledger entry owns
 /// and `target` names (a git merge of two vendor runs keeps both sides'
-/// dirs, #1610), as `vendor --revert` does: into `leg.orphans`, with a
+/// dirs), as `vendor --revert` does: into `leg.orphans`, with a
 /// `skipped` advisory for each one a lockfile still points into (kept) or
 /// that could not be deleted. Runs only after a vendored revert, past the
 /// remove's last abort point. `--preserve-state` keeps local state,
@@ -1529,61 +1482,69 @@ async fn sweep_target_orphans(
     leg.orphans = sweep.removed.iter().map(orphan_removed_event).collect();
 }
 
-/// Why a hosted unwind stopped: a pin the upstream restore refused (or a
-/// write failure). Each caller renders its own message (the
-/// manifest-backed path adds that the manifest was not touched).
-struct HostedUnwindError {
-    why: String,
-}
-
 /// Restore the hosted pins in `hosted_matches` to their upstream registry
 /// entries. Nothing is written unless every pin resolved (the restore is
-/// all-or-nothing per pin, and a refused pin fails the remove). Shared by
-/// the manifest-backed and hosted-only remove paths.
+/// all-or-nothing per pin, and a refused pin fails the remove). The error
+/// is the first refusal (or write failure), naming the pin and its remedy.
 async fn unwind_hosted(
     common: &GlobalArgs,
     hosted_matches: &[HostedPin],
-) -> Result<HostedLegOutcome, HostedUnwindError> {
+) -> Result<HostedLegOutcome, String> {
     let leg = run_hosted_leg(common, hosted_matches).await;
     // Printed as soon as the leg returns, so a human run that then fails
     // still says what it did to the files.
-    print_hosted_leg_warnings(common, &leg.warnings);
+    print_run_warnings(common, &leg.warnings);
     if let Some((_, why)) = leg.failed.first().cloned() {
-        return Err(HostedUnwindError { why });
+        return Err(why);
     }
     if let Some(warning) = super::rollback::retire_legacy_redirect_ledger(common).await {
-        print_hosted_leg_warnings(common, std::slice::from_ref(&warning));
+        print_run_warnings(common, std::slice::from_ref(&warning));
     }
     Ok(leg)
-}
-
-/// Error code + message for a stopped hosted unwind.
-fn hosted_unwind_error(err: HostedUnwindError, manifest_backed: bool) -> (&'static str, String) {
-    // `why` already names the pin (the restore's refusal) or the write
-    // that failed, with its remedy.
-    let HostedUnwindError { why } = err;
-    (
-        "hosted_revert_failed",
-        if manifest_backed {
-            format!("{why}. The manifest was not modified.")
-        } else {
-            why
-        },
-    )
 }
 
 /// Report a stopped hosted unwind. JSON carries the whole message in the
 /// error envelope. A human run already saw `Error: <why>` — the hosted leg
 /// prints each refusal as it happens — so only the manifest-backed path's
-/// extra fact is added; printing the refusal again would show the same
-/// error twice (B77).
-fn emit_hosted_unwind_error(common: &GlobalArgs, err: HostedUnwindError, manifest_backed: bool) {
-    let (code, msg) = hosted_unwind_error(err, manifest_backed);
+/// extra fact is added.
+fn emit_hosted_unwind_error(common: &GlobalArgs, why: String, manifest_backed: bool) {
     if common.json {
-        emit_error_envelope(true, common.dry_run, code, msg);
+        let msg = if manifest_backed {
+            format!("{why}. The manifest was not modified.")
+        } else {
+            why
+        };
+        emit_error_envelope(true, common.dry_run, "hosted_revert_failed", msg);
     } else if manifest_backed {
         eprintln!("The manifest was not modified.");
     }
+}
+
+/// The `Removed`/`hosted_reverted` event for a restored hosted pin
+/// (`Verified` on a dry run).
+fn hosted_reverted_event(dry_run: bool, purl: &str) -> PatchEvent {
+    let action = if dry_run {
+        PatchAction::Verified
+    } else {
+        PatchAction::Removed
+    };
+    PatchEvent::new(action, purl.to_string()).with_reason(
+        "hosted_reverted",
+        "hosted lockfile pin restored to the upstream registry on remove",
+    )
+}
+
+/// The exit code of a remove whose vendored revert kept entries (1), or 0.
+/// The per-key keep lines are gated by `--silent`, but this error line is
+/// not; `retained` names the record kept beside the vendored state.
+fn kept_exit_code(common: &GlobalArgs, causes: &[KeepCause], retained: &str) -> i32 {
+    if causes.is_empty() {
+        return 0;
+    }
+    if !common.json {
+        eprintln!("Error: {}", kept_error_line(causes, retained));
+    }
+    1
 }
 
 /// Remove path for identifiers that match ONLY hosted lockfile pins (no
@@ -1660,34 +1621,29 @@ async fn remove_hosted_only(
     };
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
-    let action = if args.common.dry_run {
-        PatchAction::Verified
-    } else {
-        PatchAction::Removed
-    };
     let mut warnings = leg.warnings.clone();
     if args.preserve_state && !leg.reverted.is_empty() {
         warnings.push(note_hosted_state_not_preservable(&args.common));
     }
-    for (code, detail) in &warnings {
-        env.warnings.push(crate::json_envelope::RunWarning {
-            code: code.clone(),
-            detail: detail.clone(),
-        });
+    for (code, detail) in warnings {
+        env.warnings
+            .push(crate::json_envelope::RunWarning::new(code, detail));
     }
     // Human per-purl lines already printed inside `run_hosted_leg`.
-    for purl in &leg.reverted {
-        env.record(
-            PatchEvent::new(action, purl.clone())
-                .with_reason(
-                    "hosted_reverted",
-                    "hosted lockfile pin restored to the upstream registry on remove",
-                )
-                .with_details(serde_json::json!({ "mode": crate::commands::HOSTED_MODE_LABEL })),
-        );
+    let mut events: Vec<PatchEvent> = leg
+        .reverted
+        .iter()
+        .map(|purl| hosted_reverted_event(args.common.dry_run, purl))
+        .collect();
+    crate::commands::vendored_backend::tag_event_mode(
+        &mut events,
+        crate::commands::HOSTED_MODE_LABEL,
+    );
+    for ev in events {
+        env.record(ev);
     }
     if args.common.json {
-        println!("{}", env.to_pretty_json());
+        crate::ui::print_json(&env.to_value());
     }
     if !args.common.dry_run {
         track_patch_removed(leg.reverted.len(), telemetry).await;
@@ -1814,24 +1770,12 @@ async fn remove_ledger_only(
         }
     }
     if args.common.json {
-        println!("{}", env.to_pretty_json());
+        crate::ui::print_json(&env.to_value());
     }
     if !args.common.dry_run {
         track_patch_removed(leg.reverted_count, telemetry).await;
     }
-    if leg.kept.is_empty() {
-        0
-    } else {
-        // Errors print even under --silent; the per-key drift-keep lines
-        // are gated, so name the outcome once here.
-        if !args.common.json {
-            eprintln!(
-                "Error: {}",
-                kept_error_line(&leg.kept_causes, "ledger record")
-            );
-        }
-        1
-    }
+    kept_exit_code(&args.common, &leg.kept_causes, "ledger record")
 }
 
 #[cfg(test)]
@@ -1839,11 +1783,6 @@ mod tests {
     use super::*;
     use socket_patch_core::manifest::schema::PatchRecord;
     use std::collections::HashMap;
-
-    #[test]
-    fn dry_run_footer_matches_repair() {
-        assert_eq!(DRY_RUN_FOOTER, "Dry run: no changes made.");
-    }
 
     fn make_record(uuid: &str) -> PatchRecord {
         PatchRecord {
@@ -1979,8 +1918,8 @@ mod tests {
     }
 
     /// The shared target grammar: a bare name and a versionless purl
-    /// select every recorded version (`remove six` used to be "No patch
-    /// found"), and a name stays exact (`six` is not `sixer`).
+    /// select every recorded version, and a name stays exact (`six` is not
+    /// `sixer`).
     #[test]
     fn remove_by_name_or_versionless_purl_removes_every_version() {
         for token in ["six", "pkg:pypi/six"] {
@@ -2159,14 +2098,23 @@ mod tests {
                 "  - pkg:npm/a@1",
             ]
         );
-        let without = format_not_installed_warning(&[], &["pkg:npm/b@1", "pkg:npm/c@1"]);
-        assert_eq!(without.len(), 4);
-        assert!(without[1].starts_with("Warning: 2 removed patches had no matching installed"));
-        assert!(without[1].contains("their rollback was skipped"));
-        assert!(without[1].contains("reinstall the packages to restore their original files"));
-        let one = format_not_installed_warning(&[], &["pkg:npm/b@1"]);
-        assert!(one[1].contains("reinstall the package to restore its original files"));
-        assert!(!without[1].contains("was kept in .socket/blobs"));
+        assert_eq!(
+            format_not_installed_warning(&[], &["pkg:npm/b@1", "pkg:npm/c@1"]),
+            vec![
+                "",
+                "Warning: 2 removed patches had no matching installed package, so their \
+                 rollback was skipped (a crawler miss would look the same); no local revert \
+                 data exists, so reinstall the packages to restore their original files:",
+                "  - pkg:npm/b@1",
+                "  - pkg:npm/c@1",
+            ]
+        );
+        assert_eq!(
+            format_not_installed_warning(&[], &["pkg:npm/b@1"])[1],
+            "Warning: 1 removed patch had no matching installed package, so its rollback \
+             was skipped (a crawler miss would look the same); no local revert data exists, \
+             so reinstall the package to restore its original files:"
+        );
         assert!(format_not_installed_warning(&[], &[]).is_empty());
     }
 
