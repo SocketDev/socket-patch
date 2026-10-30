@@ -288,6 +288,13 @@ pub(crate) fn strip_comment(text: &str) -> &str {
     split_comment(text).0
 }
 
+/// A line's code as pip parses it: [`expand_env_vars`] over the process
+/// environment. pip expands every line, not only `-r` / `-c` targets, so
+/// `six==${SIXV}` with `SIXV=1.16.0` is the exact pin `six==1.16.0` (#1873).
+pub(crate) fn expand_process_env(code: &str) -> String {
+    expand_env_vars(code, |name| std::env::var(name).ok())
+}
+
 /// pip's `expand_env_variables`: each `${NAME}` whose `NAME` is
 /// `[A-Z0-9_]+` is replaced by `lookup(NAME)`; an unset or empty variable
 /// leaves the reference as written. pip expands after stripping comments

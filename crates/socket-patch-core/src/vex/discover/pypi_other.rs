@@ -269,6 +269,8 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 /// One logical requirements line (see the module docs for the two shapes).
 fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Discovery) {
     let (code, comment) = split_comment(line);
+    // pip expands `${NAME}` on every line before parsing it (#1873).
+    let code = requirements::expand_process_env(code);
     let code = code.trim();
     if let Some(location) = editable_location(code) {
         // pip installs an editable source checkout of whatever package it
@@ -1867,6 +1869,58 @@ mod tests {
             // pip compares `===` as a string: no release is spelled `1.16`.
             "six===1.16\n",
             "other==1.16.0\n",
+        ] {
+            let out = discover(line).await;
+            assert_eq!(out.refs.len(), 1, "{line:?}: {:#?}", out.diagnostics);
+        }
+    }
+
+    /// REGRESSION (#1873): pip expands `${NAME}` on every requirements
+    /// line before parsing it, so `six==${SIXV}` with `SIXV=1.16.0` is the
+    /// exact pin `six==1.16.0` and contests a pylock-only wiring of that
+    /// release. An unset or empty variable stays literal (pip refuses the
+    /// line), and one holding another release pins that release.
+    #[tokio::test]
+    async fn issue_1873_env_templated_pin_contests_wiring() {
+        std::env::set_var("SP_TEST_1873_SIXV", "1.16.0");
+        std::env::set_var("SP_TEST_1873_OTHER", "1.17.0");
+        std::env::set_var("SP_TEST_1873_EMPTY", "");
+        std::env::remove_var("SP_TEST_1873_UNSET");
+        const WHL: &str = "six-1.16.0-py2.py3-none-any.whl";
+        let vendored = vendored_wheel(UUID_A, WHL);
+        let wired = pipfile_lock(serde_json::json!({ "default": {
+            "six": { "file": format!("./{vendored}"), "hashes": [format!("sha256:{SHA}")] },
+        }}));
+        let discover = |requirements: &'static str| {
+            let wired = wired.clone();
+            async move {
+                let p = Project::new();
+                p.write("Pipfile.lock", &wired)
+                    .write("Pipfile", "[packages]\nsix = \"*\"\n")
+                    .write("requirements.txt", requirements);
+                p.discover().await
+            }
+        };
+        for line in [
+            "six==${SP_TEST_1873_SIXV}\n",
+            "idna==3.7\nsix == ${SP_TEST_1873_SIXV}  # templated\n",
+        ] {
+            let out = discover(line).await;
+            assert!(out.refs.is_empty(), "{line:?}: {:#?}", out.refs);
+            let c = out
+                .vendored_contest("pkg:pypi/six@1.16.0", UUID_A)
+                .unwrap_or_else(|| panic!("{line:?}: not contested"));
+            assert_eq!(
+                c.other,
+                std::path::Path::new("requirements.txt"),
+                "{line:?}"
+            );
+        }
+        for line in [
+            "six==${SP_TEST_1873_OTHER}\n",
+            "six==${SP_TEST_1873_EMPTY}\n",
+            "six==${SP_TEST_1873_UNSET}\n",
+            "six==${sp_test_1873_sixv}\n",
         ] {
             let out = discover(line).await;
             assert_eq!(out.refs.len(), 1, "{line:?}: {:#?}", out.diagnostics);

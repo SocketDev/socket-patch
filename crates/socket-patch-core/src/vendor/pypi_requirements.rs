@@ -27,8 +27,8 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::{self, terminator};
 use crate::utils::requirements::{
-    expand_env_vars, hash_options, logical_lines, parse_requirement, requirement_name,
-    requires_hashes, shlex_split, split_comment, strip_comment, vendor_tag,
+    expand_env_vars, expand_process_env, hash_options, logical_lines, parse_requirement,
+    requirement_name, requires_hashes, shlex_split, split_comment, strip_comment, vendor_tag,
 };
 
 use super::common::refuse_symlinked;
@@ -132,11 +132,12 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
     let mut found_range = false;
     let mut other_branches = false;
     for ll in logical_lines(content) {
-        let code = strip_comment(&ll.text);
-        let Some(req) = parse_requirement(code) else {
+        let code = expand_process_env(strip_comment(&ll.text));
+        let Some(req) = parse_requirement(&code) else {
             // A line that names the package but is no requirement pip
             // reads cleanly is never a pin to rewrite (fail closed).
-            if requirement_name(code).is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
+            if requirement_name(&code)
+                .is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
             {
                 found_range = true;
             }
@@ -191,7 +192,7 @@ fn scan_pins(content: &str, canon_name: &str, version: &str) -> PinScan {
 /// spec, extras or marker): a file that pins it is an install source of it.
 pub(super) fn names_package(content: &str, canon_name: &str) -> bool {
     logical_lines(content).into_iter().any(|ll| {
-        requirement_name(strip_comment(&ll.text))
+        requirement_name(&expand_process_env(strip_comment(&ll.text)))
             .is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
     })
 }
@@ -2168,6 +2169,51 @@ mod tests {
             let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
             assert!(outcome.success, "{pin}");
             assert_eq!(read_root(tmp.path()).await, original, "{pin}");
+        }
+    }
+
+    /// #1873: pip expands `${NAME}` on every line, so `six==${SIXV}` with
+    /// `SIXV=1.16.0` is the exact pin `six==1.16.0`. Vendor wires it (it
+    /// used to refuse it as "not pinned", or beside a pylock leave it on
+    /// PyPI while the lock wiring reported the package patched), and the
+    /// revert restores the templated line as written.
+    #[tokio::test]
+    async fn wires_and_reverts_an_env_templated_pin() {
+        std::env::set_var("SP_TEST_1873_PLAN_SIXV", "1.16.0");
+        std::env::set_var("SP_TEST_1873_PLAN_OTHER", "1.17.0");
+        for pin in [
+            "six==${SP_TEST_1873_PLAN_SIXV}",
+            "six == ${SP_TEST_1873_PLAN_SIXV}  # templated",
+        ] {
+            let original = format!("requests==2.31.0\n{pin}\n");
+            let tmp = write_root(&original).await;
+            assert!(
+                sibling_pin_wirable(tmp.path(), "six", "1.16.0").await,
+                "{pin}"
+            );
+            let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+                .await
+                .unwrap_or_else(|err| panic!("{pin}: {err:?}"));
+            assert_eq!(
+                read_root(tmp.path()).await,
+                format!("requests==2.31.0\n{}\n", expected_unhashed_line()),
+                "{pin}"
+            );
+            let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+            assert!(outcome.success, "{pin}");
+            assert_eq!(read_root(tmp.path()).await, original, "{pin}");
+        }
+        // A variable holding another release pins that release; an unset
+        // one stays literal, which pip refuses: neither is this pin.
+        for pin in [
+            "six==${SP_TEST_1873_PLAN_OTHER}",
+            "six==${SP_TEST_1873_PLAN_UNSET}",
+        ] {
+            let tmp = write_root(&format!("{pin}\n")).await;
+            assert!(
+                !sibling_pin_wirable(tmp.path(), "six", "1.16.0").await,
+                "{pin}"
+            );
         }
     }
 
