@@ -1,13 +1,11 @@
 //! Discovery-side helpers for `scan`: lockfile / vendored-ledger crawl
 //! supplements, update detection against the existing manifest, vendor
-//! baseline pre-verification, and the table's vuln-ID / severity helpers.
+//! baseline pre-verification, and the table's vuln-ID helper.
 
 use futures_util::StreamExt;
 use socket_patch_core::api::client::hold_back_debug;
-use socket_patch_core::api::ranking::cmp_batch_infos;
-use socket_patch_core::api::types::{
-    BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
-};
+use socket_patch_core::api::ranking::{batch_supersedes, cmp_batch_infos};
+use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
@@ -18,9 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::args::GlobalArgs;
 
-/// Surfaced in `scan --json` output. Tells a bot which PURLs in the discovery
-/// would replace an existing manifest entry with a newer UUID. Stable schema —
-/// see CLI_CONTRACT.md (`scan` JSON output / `updates` field).
+/// A PURL whose newest patch would replace the recorded one: the `scan
+/// --json` `updates` field (CLI_CONTRACT.md).
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(super) struct UpdateInfo {
     pub(super) purl: String,
@@ -45,8 +42,6 @@ pub(crate) struct LockfileSupplement {
     /// crawl is empty too, so otherwise the project scans as a silent no-op.
     pub(crate) unsupported: Vec<socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout>,
 }
-
-pub(crate) use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 
 /// Inventory the project's lockfile(s) and fabricate crawl entries for
 /// dependencies that are not installed. The fabricated `path` is the
@@ -426,12 +421,7 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     (mismatched, views)
 }
 
-pub(super) use socket_patch_core::ledgers::merge_ledger_records_for_updates;
-
-/// Cross-reference an existing manifest against discovery results to find
-/// PURLs whose newest available patch UUID differs from the locally-recorded
-/// one. Used by both the discovery JSON path and the table-print path.
-/// Pure / no I/O so it's unit-testable.
+/// The PURLs whose newest available patch UUID differs from the recorded one.
 pub(super) fn detect_updates(
     existing_manifest: Option<&PatchManifest>,
     packages: &[BatchPackagePatches],
@@ -491,7 +481,7 @@ pub(super) fn detect_updates(
         // still offered, only report a candidate that genuinely supersedes
         // it. If it is no longer offered, any different candidate is flagged.
         if let Some(applied) = pkg.patches.iter().find(|p| p.uuid == existing.uuid) {
-            if !candidate_supersedes(candidate, applied) {
+            if !batch_supersedes(candidate, applied) {
                 continue;
             }
         }
@@ -502,13 +492,6 @@ pub(super) fn detect_updates(
         });
     }
     updates
-}
-
-/// Whether `candidate` genuinely supersedes the applied patch (see
-/// [`socket_patch_core::api::ranking::batch_supersedes`]): the guard that
-/// keeps an equal sibling from showing as a perpetual `[UPDATE]`.
-fn candidate_supersedes(candidate: &BatchPatchInfo, applied: &BatchPatchInfo) -> bool {
-    socket_patch_core::api::ranking::batch_supersedes(candidate, applied)
 }
 
 /// The scan table's VULNERABILITIES data for one package, built from the
@@ -525,11 +508,8 @@ pub(super) struct VulnIds {
     pub count: usize,
 }
 
-/// Collect a package's vulnerability ids across all its patches, for the
-/// scan table's VULNERABILITIES column. The output is sorted and deduped,
-/// so the rendered table is stable (the per-patch lists and set-based
-/// dedup are otherwise nondeterministic in order). Pure / no I/O so it's
-/// unit-testable.
+/// A package's vulnerability ids across all its patches, sorted and
+/// deduped so the rendered table is stable.
 ///
 /// A GHSA id is usually an alias of a CVE listed beside it, but the batch
 /// endpoint gives the two lists without their pairing, so listing both made
@@ -568,13 +548,6 @@ pub(super) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> VulnIds {
         all: cves.into_iter().chain(ghsas).collect(),
         count,
     }
-}
-
-/// Severity ordering for the scan table's SEVERITY column: lower = worse.
-/// Delegates to the workspace-wide ladder so the table, the selector and
-/// the API client can never disagree about what `moderate` means.
-pub(super) fn severity_order(s: &str) -> u8 {
-    socket_patch_core::api::ranking::severity_order(Some(s))
 }
 
 /// Warning code: a hosted or vendored scan left patched npm packages that
@@ -702,7 +675,7 @@ pub(crate) async fn nested_project_skips(
             } else {
                 ("are", "they are")
             };
-            let word = shell_word(&dir);
+            let word = crate::ui::shell_word(&dir);
             // #1554: a project installed without a lockfile has none for a
             // hosted or vendored run of its own to rewire either.
             let detail = if locked {
@@ -730,40 +703,14 @@ pub(crate) async fn nested_project_skips(
     (skipped, warnings)
 }
 
-/// `word` as one POSIX shell word: single-quoted unless it is plain.
-fn shell_word(word: &str) -> String {
-    let plain = !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_./-:@%+=,".contains(c));
-    if plain {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// #1534: the PATH in the `nested_project_skipped` remedy survives a
-    /// copy-paste into a POSIX shell.
-    #[test]
-    fn shell_word_quotes_only_what_the_shell_would_split() {
-        assert_eq!(shell_word("tools/x"), "tools/x");
-        assert_eq!(shell_word("/repo/@scope/x-1.0"), "/repo/@scope/x-1.0");
-        assert_eq!(shell_word("tools/my x"), "'tools/my x'");
-        assert_eq!(shell_word("it's"), r"'it'\''s'");
-        assert_eq!(shell_word("$HOME"), "'$HOME'");
-        assert_eq!(shell_word(""), "''");
-    }
     use socket_patch_core::api::types::BatchPatchInfo;
+    use socket_patch_core::ledgers::merge_ledger_records_for_updates;
     use std::borrow::Cow;
 
     use crate::commands::scan::tests::manifest_with;
-
-    // ---- lockfile_only_packages --------------------------------------------
 
     fn lock_entry(ecosystem: &'static str, purl: &str) -> LockfileEntry {
         use socket_patch_core::vendor::lock_inventory::{LockIntegrity, SourceKind};
@@ -812,45 +759,6 @@ mod tests {
             assert!(!lockfile_only_contains(&purls, api), "{api}");
         }
     }
-
-    // ---- severity_order ----------------------------------------------------
-
-    #[test]
-    fn severity_order_critical_is_zero() {
-        assert_eq!(severity_order("critical"), 0);
-    }
-
-    #[test]
-    fn severity_order_is_case_insensitive() {
-        assert_eq!(severity_order("Critical"), 0);
-        assert_eq!(severity_order("CRITICAL"), 0);
-        assert_eq!(severity_order("High"), 1);
-    }
-
-    #[test]
-    fn severity_order_known_levels() {
-        assert_eq!(severity_order("high"), 1);
-        assert_eq!(severity_order("medium"), 2);
-        assert_eq!(severity_order("low"), 3);
-    }
-
-    #[test]
-    fn severity_order_moderate_is_medium_tier() {
-        // GHSA emits `moderate` for the medium tier and scan passes raw API
-        // severities through, so it must rank as medium, not unknown.
-        assert_eq!(severity_order("moderate"), severity_order("medium"));
-        assert!(severity_order("moderate") < severity_order("low"));
-        assert_eq!(severity_order("Moderate"), severity_order("medium"));
-    }
-
-    #[test]
-    fn severity_order_unknown_is_four() {
-        assert_eq!(severity_order("unknown"), 4);
-        assert_eq!(severity_order(""), 4);
-        assert_eq!(severity_order("informational"), 4);
-    }
-
-    // ---- detect_updates -----------------------------------------------------
 
     fn batch_with(purl: &str, uuids: &[&str]) -> BatchPackagePatches {
         BatchPackagePatches {
@@ -1108,7 +1016,6 @@ mod tests {
         assert_eq!(updates[0].new_uuid, "uuid-new");
     }
 
-    // ---- merge_ledger_records_for_updates -----------------------------------
     // Hosted mode records patches ONLY in the lockfiles (the hosted pins) and
     // vendored mode ONLY in the vendor ledger — these pin that manifest-less
     // projects still surface `updates[]` (the documented CI signal) through
@@ -1260,7 +1167,6 @@ mod tests {
         );
     }
 
-    // ---- vendored_ledger_supplement (corrupt-ledger fallback) ---------------
     // Vendored purls enter `scanned_purls` via this supplement, which shields
     // their manifest entries from `scan --prune`. A corrupt ledger must fall
     // back to the committed artifact dirs rather than return empty.
@@ -1686,8 +1592,6 @@ mod tests {
         );
     }
 
-    // ---- collect_vuln_ids --------------------------------------------------
-
     /// Build a single-patch package whose patch carries the given CVE and
     /// GHSA identifier lists.
     fn batch_with_vulns(purl: &str, cves: &[&str], ghsas: &[&str]) -> BatchPackagePatches {
@@ -1828,128 +1732,20 @@ mod tests {
         assert_eq!(ids.count, 1);
     }
 
-    // ---- unsupported_layout_warnings -----------------------------------
-
     #[test]
-    fn unsupported_layout_warnings_forwards_unknown_codes_verbatim() {
-        use socket_patch_core::vendor::lock_inventory::UnsupportedNpmLayout;
-
-        // Forward-compat contract: a refusal code this match doesn't know
-        // yet must surface verbatim — code AND the probe's own detail —
-        // rather than being swallowed back into silence.
-        let unknown = UnsupportedNpmLayout {
-            code: "vendor_future_layout_unsupported",
-            detail: "probe detail text".to_string(),
-        };
-        assert_eq!(
-            unsupported_layout_warnings(std::slice::from_ref(&unknown)),
-            vec![(
-                "vendor_future_layout_unsupported".to_string(),
-                "probe detail text".to_string(),
-            )],
-        );
-
-        // Contrast: a KNOWN code is rewritten — renamed to apply's refusal
-        // errorCode and scan-phrased, not the probe's vendor-phrased text.
-        let known = UnsupportedNpmLayout {
-            code: "vendor_yarn_berry_unsupported",
-            detail: "probe detail text".to_string(),
-        };
-        let rewritten = unsupported_layout_warnings(std::slice::from_ref(&known));
-        assert_eq!(rewritten.len(), 1);
-        assert_eq!(rewritten[0].0, "yarn_pnp_unsupported");
-        assert_ne!(rewritten[0].1, "probe detail text");
-    }
-
-    // ---- candidate_supersedes (advisory-count rung) -------------------------
-
-    /// A batch-shaped patch with explicit advisory lists and NO publish
-    /// date, so only the severity and advisory-count rungs can decide.
-    fn info_with_advisories(
-        uuid: &str,
-        severity: Option<&str>,
-        ghsas: &[&str],
-        cves: &[&str],
-    ) -> BatchPatchInfo {
-        BatchPatchInfo {
-            uuid: uuid.to_string(),
+    fn collect_vuln_ids_dedups_across_patches() {
+        // u2's GHSA is the alias of its one CVE, so it is not counted.
+        let pkg = BatchPackagePatches {
             purl: "pkg:npm/foo@1.0".to_string(),
-            tier: "free".to_string(),
-            cve_ids: cves.iter().map(|s| (*s).to_string()).collect(),
-            ghsa_ids: ghsas.iter().map(|s| (*s).to_string()).collect(),
-            severity: severity.map(str::to_string),
-            title: String::new(),
-            published_at: None,
-        }
-    }
-
-    #[test]
-    fn candidate_supersedes_on_broader_ghsa_merge_coverage() {
-        // Same severity, no dates: only the advisory count separates them.
-        // A merged patch (>= 2 GHSAs) genuinely supersedes a single one.
-        let merged = info_with_advisories(
-            "uuid-merged",
-            Some("high"),
-            &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
-            &[],
-        );
-        let single =
-            info_with_advisories("uuid-single", Some("high"), &["GHSA-3333-3333-3333"], &[]);
-        assert!(
-            candidate_supersedes(&merged, &single),
-            "broader merge coverage is a genuine supersede"
-        );
-        // Swapped: fewer advisories at equal severity cannot supersede.
-        assert!(
-            !candidate_supersedes(&single, &merged),
-            "narrower coverage must never supersede"
-        );
-    }
-
-    #[test]
-    fn a_more_severe_single_candidate_supersedes_a_lower_severity_merge() {
-        // Same rule as selection: severity beats advisory count, so the
-        // [UPDATE] marker names the patch scan would install.
-        let merged = info_with_advisories(
-            "uuid-merged",
-            Some("low"),
-            &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
-            &[],
-        );
-        let critical =
-            info_with_advisories("uuid-crit", Some("critical"), &["GHSA-3333-3333-3333"], &[]);
-        assert!(!candidate_supersedes(&merged, &critical));
-        assert!(candidate_supersedes(&critical, &merged));
-    }
-
-    #[test]
-    fn a_larger_merge_supersedes_a_smaller_merge_at_equal_severity() {
-        let smaller = info_with_advisories("small", Some("high"), &["GHSA-a", "GHSA-b"], &[]);
-        let larger =
-            info_with_advisories("large", Some("high"), &["GHSA-a", "GHSA-b", "GHSA-c"], &[]);
-        assert!(candidate_supersedes(&larger, &smaller));
-        assert!(!candidate_supersedes(&smaller, &larger));
-    }
-
-    #[test]
-    fn candidate_supersedes_cve_aliases_do_not_inflate_ghsa_coverage() {
-        // Both sides name a GHSA, so the CVE lists are aliases and must not
-        // count: both unmerged, same severity, no dates -> not a supersede
-        // in either direction (the date rung requires two REAL dates).
-        let candidate = info_with_advisories(
-            "uuid-cand",
-            Some("high"),
-            &["GHSA-xxxx-xxxx-xxxx"],
-            &["CVE-2026-1", "CVE-2026-2"],
-        );
-        let applied = info_with_advisories(
-            "uuid-appl",
-            Some("high"),
-            &["GHSA-yyyy-yyyy-yyyy"],
-            &["CVE-2026-3"],
-        );
-        assert!(!candidate_supersedes(&candidate, &applied));
-        assert!(!candidate_supersedes(&applied, &candidate));
+            patches: vec![
+                patch_with("u1", &["CVE-2024-1"], &[]),
+                patch_with("u2", &["CVE-2024-1"], &["GHSA-aaaa-aaaa-aaaa"]),
+            ],
+        };
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(ids.primary, strs(&["CVE-2024-1"]));
+        assert_eq!(ids.all, strs(&["CVE-2024-1", "GHSA-aaaa-aaaa-aaaa"]));
+        assert_eq!(ids.count, 1);
     }
 
     #[test]
@@ -1962,13 +1758,18 @@ mod tests {
         let pkgs = vec![BatchPackagePatches {
             purl: "pkg:npm/foo@1.0".to_string(),
             patches: vec![
-                info_with_advisories("uuid-single", Some("high"), &["GHSA-3333-3333-3333"], &[]),
-                info_with_advisories(
-                    "uuid-merged",
-                    Some("high"),
-                    &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
-                    &[],
-                ),
+                BatchPatchInfo {
+                    severity: Some("high".to_string()),
+                    ..patch_with("uuid-single", &[], &["GHSA-3333-3333-3333"])
+                },
+                BatchPatchInfo {
+                    severity: Some("high".to_string()),
+                    ..patch_with(
+                        "uuid-merged",
+                        &[],
+                        &["GHSA-1111-1111-1111", "GHSA-2222-2222-2222"],
+                    )
+                },
             ],
         }];
         let updates = detect_updates(Some(&m), &pkgs);
@@ -1977,7 +1778,6 @@ mod tests {
         assert_eq!(updates[0].new_uuid, "uuid-merged");
     }
 
-    // ---- preverify_vendor_baselines --------------------------------------
     // The HashMismatch positive path is covered end-to-end by
     // tests/scan_vendor_e2e.rs; these pin the three SKIP shapes: the two
     // pre-fetch skips (lockfile-only, no crawled counterpart) and the
@@ -2532,40 +2332,5 @@ mod tests {
         // embedded patches never reached the network.
         assert_eq!(mock.received_requests().await.unwrap().len(), 2);
         drop(mock);
-    }
-
-    #[test]
-    fn collect_vuln_ids_dedups_across_patches() {
-        // The same CVE appears on two patches of one package; it must be
-        // reported once.
-        let pkg = BatchPackagePatches {
-            purl: "pkg:npm/foo@1.0".to_string(),
-            patches: vec![
-                BatchPatchInfo {
-                    uuid: "u1".to_string(),
-                    purl: "pkg:npm/foo@1.0".to_string(),
-                    tier: "free".to_string(),
-                    cve_ids: vec!["CVE-2024-1".to_string()],
-                    ghsa_ids: vec![],
-                    severity: None,
-                    title: String::new(),
-                    published_at: None,
-                },
-                BatchPatchInfo {
-                    uuid: "u2".to_string(),
-                    purl: "pkg:npm/foo@1.0".to_string(),
-                    tier: "free".to_string(),
-                    cve_ids: vec!["CVE-2024-1".to_string()],
-                    ghsa_ids: vec!["GHSA-aaaa-aaaa-aaaa".to_string()],
-                    severity: None,
-                    title: String::new(),
-                    published_at: None,
-                },
-            ],
-        };
-        // (u2's GHSA is the alias of its one CVE, so it is not counted.)
-        let ids = collect_vuln_ids(&pkg);
-        assert_eq!(ids.primary, vec!["CVE-2024-1".to_string()]);
-        assert_eq!(ids.count, 1);
     }
 }

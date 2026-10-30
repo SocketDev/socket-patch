@@ -422,4 +422,23 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn shell_word_quotes_only_what_the_shell_would_split() {
+        assert_eq!(shell_word("tools/x"), "tools/x");
+        assert_eq!(shell_word("/repo/@scope/x-1.0"), "/repo/@scope/x-1.0");
+        if cfg!(windows) {
+            assert_eq!(shell_word(r"C:\repo\x"), r"C:\repo\x");
+            assert_eq!(shell_word("tools/my x"), "\"tools/my x\"");
+            assert_eq!(shell_word("100%"), "\"100%\"");
+            assert_eq!(shell_word(r"my dir\"), r#""my dir\\""#);
+            assert_eq!(shell_word(""), "\"\"");
+        } else {
+            assert_eq!(shell_word("tools/my x"), "'tools/my x'");
+            assert_eq!(shell_word("100%"), "'100%'");
+            assert_eq!(shell_word("it's"), r"'it'\''s'");
+            assert_eq!(shell_word("$HOME"), "'$HOME'");
+            assert_eq!(shell_word(""), "''");
+        }
+    }
 }
