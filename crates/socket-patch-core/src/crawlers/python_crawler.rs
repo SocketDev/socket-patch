@@ -7946,8 +7946,9 @@ G=
         use super::super::oracle::{self, LegacyPythonCrawler};
         use super::*;
         use crate::crawlers::oracle_support::{
-            fifo, map_rows, mkdir, rows, symlink, write, write_bytes, PermGuard, Rng,
+            fifo, map_rows, mkdir, rows, symlink, write, write_bytes, PermGuard,
         };
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &["requests", "Flask_Cors", "zope.interface", "dup", "Dup"];
         const VERSIONS: &[&str] = &["1.0", "2.31.0", "1.0+local", "3.0a1"];

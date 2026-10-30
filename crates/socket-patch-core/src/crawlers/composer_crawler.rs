@@ -2376,7 +2376,8 @@ mod tests {
     mod equivalence {
         use super::super::oracle::LegacyComposerCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{map_rows, mkdir, rows, symlink, write, Rng};
+        use crate::crawlers::oracle_support::{map_rows, mkdir, rows, symlink, write};
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &[
             "monolog/monolog",

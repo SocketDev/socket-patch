@@ -2543,13 +2543,8 @@ replace (
     /// Random go.mod-grammar text: directive keywords (and near misses),
     /// block opens/closes (balanced or not), comments, blank lines, CRLF.
     fn random_go_mod(seed: u64) -> String {
-        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let mut next = move |n: usize| {
-            x ^= x >> 12;
-            x ^= x << 25;
-            x ^= x >> 27;
-            (x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n as u64) as usize
-        };
+        let mut rng = crate::test_rng::Rng::new(seed);
+        let mut next = move |n: usize| rng.below(n);
         const PIECES: &[&str] = &[
             "replace",
             "require",

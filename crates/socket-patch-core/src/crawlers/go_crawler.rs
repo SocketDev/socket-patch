@@ -1696,9 +1696,8 @@ mod tests {
     mod equivalence {
         use super::super::oracle::LegacyGoCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{
-            map_rows, mkdir, rows, symlink, write, PermGuard, Rng,
-        };
+        use crate::crawlers::oracle_support::{map_rows, mkdir, rows, symlink, write, PermGuard};
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &[
             "github.com",
