@@ -394,7 +394,7 @@ async fn get_module_cache_paths_home_go_pkg_mod_fallback() {
 }
 
 /// A set-but-EMPTY `HOME` must count as unset, matching the empty guard on
-/// `GOMODCACHE` and the empty-entry filter on `GOPATH`: honoring `""` makes
+/// `GOMODCACHE` and `GOPATH` (`utils::go_env::gomodcache`): honoring `""` makes
 /// the last-resort fallback return the RELATIVE path `go/pkg/mod`, pointing
 /// every crawl and lookup at `<cwd>/go/pkg/mod` inside the user's project
 /// instead of a real module cache.

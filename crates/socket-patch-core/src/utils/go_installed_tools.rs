@@ -173,6 +173,8 @@ pub fn bin_dirs_with(
             dirs.push(p);
         }
     };
+    // An empty setting counts as unset, as `go_env` already reports it.
+    let go_env = &|k: &str| go_env(k).filter(|v| !v.is_empty());
     let user_cache = crate::utils::go_env::gomodcache(go_env, home.as_deref());
     let gopaths: Vec<PathBuf> = crate::utils::go_env::gopath_entries(go_env, home.as_deref())
         .into_iter()
@@ -554,6 +556,11 @@ mod tests {
             )
             .dirs,
             vec![PathBuf::from("/b/bin")]
+        );
+        // An empty GOBIN counts as unset.
+        assert_eq!(
+            bin_dirs_with(&[user], &env(vec![("GOBIN", "")]), home.clone()).dirs,
+            vec![PathBuf::from("/home/u/go/bin")]
         );
         // A --global-prefix tree: never the user's own tools.
         assert_eq!(
