@@ -1357,10 +1357,12 @@ async fn npm_agent_recovers_crlf_bin_left_by_raw_write() {
 
 /// Regression (#1804): npm rewrites the shebang only of bins it links.
 /// With `--no-bin-links`, or for a `directories.bin`-only package
-/// installed from a `file:` tarball (npm doesn't expand that field from a
-/// tarball's `package.json`), the installed bin keeps its CRLF shebang.
+/// installed from a `file:` tarball (npm 10 doesn't expand that field from
+/// a tarball's `package.json`), the installed bin keeps its CRLF shebang.
 /// `apply` writes the patch's recorded bytes, `apply --check` agrees, and
-/// `rollback` restores what `npm install` wrote, byte for byte.
+/// `rollback` restores what `npm install` wrote, byte for byte. npm 11
+/// does link the `directories.bin` file and rewrites its shebang; there
+/// the same steps must round-trip npm's bytes instead.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-bound real-npm install; runs on the e2e CI matrix leg"]
@@ -1385,10 +1387,23 @@ async fn npm_agent_keeps_crlf_shebang_of_bin_npm_did_not_link() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = crlf_bin_project_with(tmp.path(), manifest, rel, flags);
         let cli = proj.join("node_modules/crlfbin").join(rel);
+        let link = proj
+            .join("node_modules/.bin")
+            .join(Path::new(rel).file_name().unwrap());
+        let linked = link.symlink_metadata().is_ok();
+        assert!(
+            !(linked && flags.contains(&"--no-bin-links")),
+            "{rel}: npm linked a bin under --no-bin-links"
+        );
+        let (before, after) = if linked {
+            (NPM_BIN_BEFORE, NPM_BIN_AFTER)
+        } else {
+            (CRLF_BIN_BEFORE, CRLF_BIN_AFTER)
+        };
         assert_eq!(
             std::fs::read(&cli).unwrap(),
-            CRLF_BIN_BEFORE,
-            "{rel}: npm left the shebang alone"
+            before,
+            "{rel}: npm rewrites the shebang only if it linked the bin (linked: {linked})"
         );
 
         let (code, stdout, stderr) = run_socket(&proj, &["apply", "--offline"]);
@@ -1396,7 +1411,7 @@ async fn npm_agent_keeps_crlf_shebang_of_bin_npm_did_not_link() {
             code, 0,
             "{rel}: apply\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
-        assert_eq!(std::fs::read(&cli).unwrap(), CRLF_BIN_AFTER, "{rel}: apply");
+        assert_eq!(std::fs::read(&cli).unwrap(), after, "{rel}: apply");
 
         let (code, stdout, stderr) = run_socket(&proj, &["apply", "--check", "--offline"]);
         assert_eq!(
@@ -1411,7 +1426,7 @@ async fn npm_agent_keeps_crlf_shebang_of_bin_npm_did_not_link() {
         );
         assert_eq!(
             std::fs::read(&cli).unwrap(),
-            CRLF_BIN_BEFORE,
+            before,
             "{rel}: rollback is byte-exact"
         );
     }
