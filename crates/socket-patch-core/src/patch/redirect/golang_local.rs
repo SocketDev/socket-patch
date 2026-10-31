@@ -88,6 +88,15 @@ pub enum Drift {
         purl: String,
         patched_version: String,
     },
+    /// A go 1.16-or-older go.mod requires the module below a go.sum zip
+    /// line, and the module cache lacks a go.mod its graph needs. The line
+    /// is a dependency's raise or one `go get` left behind after a
+    /// downgrade, so nothing shows the build selects the patched version
+    /// (#1862).
+    UnprovenStaleSum {
+        purl: String,
+        patched_version: String,
+    },
     /// go.mod builds the patched version only as the target of another
     /// module's `replace` (`replace <via> => <module> <version>`). go
     /// doesn't apply a replace to a replacement, so the Socket `replace` is
@@ -146,6 +155,15 @@ impl std::fmt::Display for Drift {
                  {patched_version}: a go.mod its module graph needs is in neither a \
                  replacement directory nor the module cache (`go mod download` fetches it), \
                  and go may link the UNPATCHED module"
+            ),
+            Drift::UnprovenStaleSum {
+                purl,
+                patched_version,
+            } => write!(
+                f,
+                "{purl}: nothing shows the build selects the patched version \
+                 {patched_version}: {}; go may link the UNPATCHED module",
+                go_build_list::UNPROVEN_REASON
             ),
             Drift::ReplaceTargetOnly {
                 purl,
@@ -603,6 +621,10 @@ pub async fn verify_go_redirect_state(
                     patched_version: version.to_string(),
                 })
             }
+            Some(Selection::Unproven) => drifts.push(Drift::UnprovenStaleSum {
+                purl: purl.clone(),
+                patched_version: version.to_string(),
+            }),
             Some(Selection::ReplaceTarget(via)) => drifts.push(Drift::ReplaceTargetOnly {
                 purl: purl.clone(),
                 patched_version: version.to_string(),
@@ -711,6 +733,10 @@ pub(crate) async fn selection_refusal(
              (go.mod's replace of {via}), and go doesn't apply a \
              replace to a replacement: its replace would be ignored and the build would \
              link the unpatched module; nothing written"
+        )),
+        Selection::Unproven => Some(format!(
+            "nothing shows the build selects {module} {version}: {}; nothing written",
+            go_build_list::UNPROVEN_REASON
         )),
         Selection::Selected | Selection::Unknown => None,
     }

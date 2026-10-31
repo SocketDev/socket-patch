@@ -124,7 +124,7 @@ use super::{
 };
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::go_env::{go_env, goflags_modfile, GoflagsModfile};
-use crate::vendor::go_build_list::{self, Selection};
+use crate::vendor::go_build_list::{self, ModuleGraph, Selection};
 use crate::vendor::go_mod_edit::{
     self, block_structure_error, hosted_module_uuid, normalize_for_read, ReplaceEntry,
     ReplaceOwner, HOSTED_GO_MODULE_PREFIX,
@@ -283,15 +283,36 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bo
         .iter()
         .flat_map(|(_, entries)| entries)
         .any(|e| e.owner == Some(ReplaceOwner::Hosted));
-    let graph = Graph::new(go_mod.as_deref(), workspace.as_ref().map(|ws| &ws.model));
     let mut sums = SumPins::default();
+    let mut root_sum = None;
     if any_hosted {
-        let sum_files = match &workspace {
-            Some(ws) => ws.sum_files.clone(),
-            None => vec![GO_SUM.to_string()],
-        };
-        sums = SumPins::read(ctx, out, &sum_files).await;
+        match &workspace {
+            Some(ws) => sums = SumPins::read(ctx, out, &ws.sum_files).await,
+            None => {
+                root_sum = ctx.read_text(GO_SUM, out).await;
+                if let Some(text) = &root_sum {
+                    sums.add(text, true);
+                }
+            }
+        }
     }
+    // Module mode: whether a module-to-module replace is in effect can turn
+    // on modules only the dependencies require (#1840), and which version
+    // the build selects on a go.sum zip line a downgrade may have left
+    // behind (#1862).
+    let mut module_graph = None;
+    if let (Some(text), None) = (&go_mod, &workspace) {
+        if go_build_list::may_need_module_graph(text, root_sum.as_deref()) {
+            if let Some(root) = ctx.disk_root_reading(go_build_list::module_graph_reads(text)) {
+                module_graph = Some(go_build_list::module_graph(root, text).await);
+            }
+        }
+    }
+    let graph = Graph::new(
+        go_mod.as_deref(),
+        workspace.as_ref().map(|ws| &ws.model),
+        module_graph.as_ref(),
+    );
     for (file, entries) in &files {
         extract_file(out, file, entries, &graph, &sums);
     }
@@ -304,10 +325,16 @@ struct Graph<'a> {
     required: HashMap<String, String>,
     root: Option<&'a str>,
     workspace: Option<&'a GoWorkspace>,
+    /// The root module's unpruned graph from the module cache, when read.
+    module_graph: Option<&'a ModuleGraph>,
 }
 
 impl<'a> Graph<'a> {
-    fn new(go_mod: Option<&'a str>, workspace: Option<&'a GoWorkspace>) -> Self {
+    fn new(
+        go_mod: Option<&'a str>,
+        workspace: Option<&'a GoWorkspace>,
+        module_graph: Option<&'a ModuleGraph>,
+    ) -> Self {
         let required = match workspace {
             Some(ws) => {
                 let mut max: HashMap<String, String> = HashMap::new();
@@ -331,6 +358,7 @@ impl<'a> Graph<'a> {
             required,
             root: go_mod,
             workspace,
+            module_graph,
         }
     }
 
@@ -342,8 +370,9 @@ impl<'a> Graph<'a> {
             Some(ws) => ws.selection(module, version),
             None => {
                 let root = self.root.unwrap_or_default();
-                go_build_list::select(
+                go_build_list::select_in(
                     root,
+                    self.module_graph,
                     module,
                     self.required.get(module).map(String::as_str),
                     zips,
@@ -351,6 +380,15 @@ impl<'a> Graph<'a> {
                 )
             }
         }
+    }
+
+    /// Whether a complete module-mode graph shows the build selects a
+    /// version of `module` other than `version`.
+    fn module_graph_selects_other(&self, module: &str, version: &str) -> bool {
+        self.module_graph
+            .filter(|g| g.complete)
+            .and_then(|g| g.selected.get(module))
+            .is_some_and(|s| s != version)
     }
 
     /// Whether the workspace module graph proves the build selects exactly
@@ -511,8 +549,12 @@ fn extract_file(
                 let pin = sums.pin(rhs, rhs_version);
                 // Outside a workspace the socket module's zip line shows it
                 // is the one built; in one, another member may raise the
-                // module above the replaced version all the same.
-                let proven = matches!(pin, SumPin::Zip(_)) && graph.workspace.is_none();
+                // module above the replaced version all the same. A complete
+                // module graph outranks it: the line may be one a downgrade
+                // or a later raise left behind (#1862).
+                let proven = matches!(pin, SumPin::Zip(_))
+                    && graph.workspace.is_none()
+                    && !graph.module_graph_selects_other(&entry.module, version);
                 // A module go builds only as another module's replacement
                 // is never redirected by its own replace, whatever the sum
                 // files hold: go doesn't chain replaces (#1823).
@@ -526,6 +568,22 @@ fn extract_file(
                              apply a replace to a replacement, so it uses the unpatched \
                              module",
                             entry.module, entry.module
+                        ),
+                    );
+                    continue;
+                }
+                // A go.sum zip line above go.mod's require that a downgrade
+                // may have left behind, with no module graph to settle it:
+                // the socket module's own zip line may be as stale (#1862).
+                if selected == Selection::Unproven {
+                    out.diag(
+                        DIAG_REF_INVALID,
+                        file,
+                        format!(
+                            "{file}: replace {} {version} is unproven: {}, so nothing \
+                             shows the build selects {version}",
+                            entry.module,
+                            go_build_list::UNPROVEN_REASON
                         ),
                     );
                     continue;
@@ -2105,7 +2163,7 @@ mod tests {
                 .collect(),
             ),
         };
-        let graph = Graph::new(None, Some(&ws));
+        let graph = Graph::new(None, Some(&ws), None);
         let entry = |version: &str| ReplaceEntry {
             module: MODULE.to_string(),
             version: Some(version.to_string()),
@@ -2128,11 +2186,66 @@ mod tests {
         assert!(out.diagnostics[0].detail.contains("is inert"));
         // Without the graph nothing proves the raise.
         let ws = GoWorkspace { graph: None, ..ws };
-        let graph = Graph::new(None, Some(&ws));
+        let graph = Graph::new(None, Some(&ws), None);
         let mut out = Discovery::default();
         assert_eq!(
             replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out),
             None
         );
+    }
+    /// #1862: in a go 1.16 module the Socket module's zip line can outlive
+    /// the build's use of it (a later raise or downgrade). A complete
+    /// module graph outranks it, and without one a zip line above go.mod's
+    /// require proves nothing.
+    #[test]
+    fn module_graph_outranks_a_stale_socket_zip_line() {
+        use super::*;
+        let sver = "v1.4.2-socketpatch.1";
+        let go_mod = format!(
+            "module example.com/app\n\ngo 1.16\n\nrequire {MODULE} {VERSION}\n\n\
+             replace {MODULE} {VERSION} => {} {sver}\n",
+            gopatch(UUID_A)
+        );
+        let mut sums = SumPins::default();
+        sums.add(
+            &format!("{}{MODULE} v1.5.0 {ZIP_H1}\n", go_sum_for(UUID_A, sver)),
+            true,
+        );
+        let entries = go_mod_edit::parse_replace_entries(&go_mod);
+        let cases = [
+            (Some(true), "the build selects v1.5.0"),
+            (Some(false), "is unproven"),
+            (None, "is unproven"),
+        ];
+        for (complete, why) in cases {
+            let mg = complete.map(|complete| ModuleGraph {
+                selected: [(MODULE.to_string(), "v1.5.0".to_string())]
+                    .into_iter()
+                    .collect(),
+                complete,
+            });
+            let graph = Graph::new(Some(&go_mod), None, mg.as_ref());
+            let mut out = Discovery::default();
+            extract_file(&mut out, GO_MOD, &entries, &graph, &sums);
+            assert!(out.refs.is_empty(), "{complete:?}: {:?}", out.refs);
+            assert_eq!(out.diagnostics.len(), 1, "{:?}", out.diagnostics);
+            assert!(
+                out.diagnostics[0].detail.contains(why),
+                "{complete:?}: {}",
+                out.diagnostics[0].detail
+            );
+        }
+        // The graph selecting the replaced version keeps the patch.
+        let mg = ModuleGraph {
+            selected: [(MODULE.to_string(), VERSION.to_string())]
+                .into_iter()
+                .collect(),
+            complete: true,
+        };
+        let graph = Graph::new(Some(&go_mod), None, Some(&mg));
+        let mut out = Discovery::default();
+        extract_file(&mut out, GO_MOD, &entries, &graph, &sums);
+        assert_eq!(out.refs.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(out.refs[0].purl, PURL);
     }
 }
