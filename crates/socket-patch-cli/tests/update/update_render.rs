@@ -117,9 +117,9 @@ async fn update_dry_run_human_reports_update_available() {
 // ---------------------------------------------------------------------------
 // Interactive decline — PTY-driven: ui::confirm
 // auto-proceeds with default-yes on non-TTY stdin (and under --yes/--json),
-// so only a real terminal reaches the cancel branch. Runner copied from
-// interactive_prompts_e2e.rs, adapted to spawn the
-// STAGED binary with injected env — so even a decline-regression that
+// so only a real terminal reaches the cancel branch. The test spawns the
+// STAGED binary (`hermetic::pty_command(&install.bin)`) with injected
+// env — so even a decline-regression that
 // proceeds to a swap can only ever touch the tempdir copy, and the dead
 // SOCKET_UPDATE_BASE_URL kills such a run at download.
 // ---------------------------------------------------------------------------

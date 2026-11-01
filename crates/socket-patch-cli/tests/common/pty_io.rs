@@ -8,8 +8,9 @@
 //! away, exactly as a real user's early keystrokes are. These helpers send
 //! the scripted answer only once a prompt is on screen.
 //!
-//! Pull in with `#[path = "common/pty_io.rs"] mod pty_io;` and use it via
-//! `crate::pty_io::...`.
+//! Pull in with `#[path = "common/pty_io.rs"] mod pty_io;` next to the
+//! crate's `mod common` (the runner spawns through `common::hermetic`), and
+//! use it via `crate::pty_io::...`.
 
 #![allow(dead_code)]
 
@@ -120,8 +121,10 @@ pub fn run(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, S
 /// Run `cmd` (a `hermetic::pty_command`) with `args` in `cwd` on a
 /// 24x80 PTY, `env` applied last so it survives the scrub. `answers[0]`
 /// is written once any prompt is on screen; `answers[i]` once the `[Y/n] `
-/// confirm hint has appeared `i` times. The writer then closes, and the
-/// child is killed if it is still running after `timeout`.
+/// confirm hint has appeared `i` times (so only `answers[0]` may answer a
+/// menu, and the rest answer `[Y/n]` confirms in order). Then the writer is
+/// dropped, which portable_pty does by sending a newline and EOF. A child
+/// still running after `timeout` gets SIGHUP (`ChildKiller::kill`).
 ///
 /// `TERM` is pinned: `console`/`dialoguer` derive key handling and
 /// rendering from it, and bare CI shells leave it unset or `dumb`.
@@ -158,10 +161,13 @@ pub fn run_command(
 
     let output = PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
 
+    // Cancelled once the child is reaped, so it never signals a reused pid.
+    let (reaped, watchdog) = std::sync::mpsc::channel::<()>();
     let mut killer = child.clone_killer();
     std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        let _ = killer.kill();
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watchdog.recv_timeout(timeout) {
+            let _ = killer.kill();
+        }
     });
 
     let mut writer = pair.master.take_writer().expect("take writer");
@@ -177,6 +183,7 @@ pub fn run_command(
     drop(writer);
 
     let status = child.wait().expect("child.wait");
+    drop(reaped);
     drop(pair.master);
     let output = output.finish();
     PtyRun {
