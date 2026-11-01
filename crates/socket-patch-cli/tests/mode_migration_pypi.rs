@@ -3751,7 +3751,7 @@ async fn pypi_unwinds_name_the_reinstall_a_plain_sync_skips() {
             "pip",
             stage_requirements,
             stage_requirements,
-            "`pip install --force-reinstall --no-deps six==1.16.0`",
+            "`pip uninstall -y six`",
         ),
         (
             "pipenv",

@@ -153,7 +153,7 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
             .restored()
             .filter(|pin| pin.purl.starts_with("pkg:pypi/"))
             .filter_map(|pin| {
-                let tool = pin.files.iter().find_map(|f| Tool::of_file(f))?;
+                let tool = Tool::of_files(&pin.files)?;
                 Some((pin.purl.clone(), tool))
             })
             .collect();

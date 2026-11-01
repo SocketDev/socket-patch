@@ -26,7 +26,7 @@ pub(crate) const HOSTED_CODE: &str = "redirect_pypi_reinstall_required";
 
 /// Appended to rollback's generic reinstall note next to either advisory.
 pub(crate) const NOTE_QUALIFIER: &str =
-    " (pip, PDM, uv and Pipenv keep a same-version install through a plain install: \
+    " (pip, PDM, uv and Pipenv keep a same-version install through a plain install or sync: \
      run the reinstall the pypi_reinstall_required warning names)";
 
 /// True when `codes` carry a PyPI reinstall advisory.
@@ -58,54 +58,54 @@ impl Tool {
     }
 
     /// The tool of a hosted pin's wiring file (`pdm.lock`, `Pipfile.lock`,
-    /// `uv.lock`, or a pip requirements file — `*.txt`, or a pip-tools
-    /// `*.in` — in any directory).
+    /// `uv.lock`, in any directory, or a file the hosted restore reads as a
+    /// pip requirements file).
     pub(crate) fn of_file(rel: &str) -> Option<Tool> {
-        let name = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
-        match name {
+        match rel.rsplit(['/', '\\']).next().unwrap_or(rel) {
             "pdm.lock" => Some(Tool::Pdm),
             "Pipfile.lock" => Some(Tool::Pipenv),
             "uv.lock" => Some(Tool::Uv),
-            _ => {
-                let lower = name.to_ascii_lowercase();
-                (lower.ends_with(".txt") || lower.ends_with(".in")).then_some(Tool::Pip)
-            }
+            _ => socket_patch_core::patch::redirect::upstream::is_requirements_file(rel)
+                .then_some(Tool::Pip),
         }
+    }
+
+    /// The tool of a hosted pin wired by `files`. A lock tool wins over a
+    /// requirements file next to it (a `uv export` requirements.txt beside
+    /// `uv.lock`): the project installs through the lock, whose sync is
+    /// what keeps the patched build.
+    pub(crate) fn of_files<S: AsRef<str>>(files: &[S]) -> Option<Tool> {
+        files
+            .iter()
+            .filter_map(|f| Tool::of_file(f.as_ref()))
+            .min_by_key(|tool| *tool == Tool::Pip)
     }
 }
 
-/// The distribution name and version of a `pkg:pypi/<name>@<version>`
-/// purl (`version` empty when the purl has none).
-fn pypi_name(purl: &str) -> Option<(&str, &str)> {
-    let rest = strip_purl_qualifiers(purl).strip_prefix("pkg:pypi/")?;
-    let (name, version) = rest.split_once('@').unwrap_or((rest, ""));
-    (!name.is_empty()).then_some((name, version))
+/// The distribution name of a `pkg:pypi/<name>@<version>` purl.
+fn pypi_name(purl: &str) -> Option<&str> {
+    strip_purl_qualifiers(purl)
+        .strip_prefix("pkg:pypi/")
+        .and_then(|rest| rest.split('@').next())
+        .filter(|name| !name.is_empty())
 }
 
 /// The reinstall that brings back the upstream release of `name` under
 /// `tool`. `pipfile_lock` is the project's parsed `Pipfile.lock` (it picks
 /// the `pipenv sync` categories), when readable.
-fn remedy(
-    tool: Tool,
-    name: &str,
-    version: &str,
-    pipfile_lock: Option<&serde_json::Value>,
-) -> String {
+fn remedy(tool: Tool, name: &str, pipfile_lock: Option<&serde_json::Value>) -> String {
     match tool {
-        Tool::Pip => {
-            let spec = if version.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name}=={version}")
-            };
-            format!(
-                "pip keeps the installed {name} because the restored requirement pins the same \
-                 version (`pip install -r` reports `Requirement already satisfied`, and `pip \
-                 freeze` still names the patched build): in each environment that installed it, \
-                 run `pip install --force-reinstall --no-deps {spec}` (under `uv pip`: `uv pip \
-                 install --reinstall-package {name} {spec}`)"
-            )
-        }
+        // Uninstall, then reinstall from the requirements file: unlike a
+        // pinned `--force-reinstall`, that keeps the file's own version
+        // range, index and `--hash` options.
+        Tool::Pip => format!(
+            "pip keeps the installed {name} because the patched build still satisfies the \
+             restored requirement (`pip install -r` reports `Requirement already satisfied`, \
+             and `pip freeze` still names the patched build): in each environment that \
+             installed it, run `pip uninstall -y {name}` and then reinstall from the \
+             requirements file (`pip install -r requirements.txt`; under `uv pip`: `uv pip \
+             uninstall {name} && uv pip install -r requirements.txt`)"
+        ),
         Tool::Pdm => format!(
             "PDM keeps the installed {name} because the restored lock pins the same version \
              (`pdm sync` / `pdm install` report nothing to do): run `pdm sync --reinstall` (or \
@@ -132,7 +132,7 @@ pub(crate) async fn advisory(
     let mut parts: Vec<(String, String)> = Vec::new();
     let mut pipfile_lock: Option<Option<serde_json::Value>> = None;
     for (purl, tool) in unwound {
-        let Some((name, version)) = pypi_name(purl) else {
+        let Some(name) = pypi_name(purl) else {
             continue;
         };
         let lock = if *tool == Tool::Pipenv {
@@ -154,7 +154,7 @@ pub(crate) async fn advisory(
         if parts.iter().any(|(p, _)| p == &base) {
             continue;
         }
-        parts.push((base, remedy(*tool, name, version, lock)));
+        parts.push((base, remedy(*tool, name, lock)));
     }
     if parts.is_empty() {
         return None;
@@ -215,10 +215,19 @@ mod tests {
     fn requirements_wiring_is_pip() {
         assert_eq!(Tool::of_flavor("requirements"), Some(Tool::Pip));
         assert_eq!(Tool::of_file("requirements.txt"), Some(Tool::Pip));
-        assert_eq!(Tool::of_file("reqs/dev.TXT"), Some(Tool::Pip));
-        assert_eq!(Tool::of_file("app\\requirements.in"), Some(Tool::Pip));
+        assert_eq!(Tool::of_file("reqs/dev.txt"), Some(Tool::Pip));
+        // Only what the hosted restore itself reads as requirements.
+        assert_eq!(Tool::of_file("requirements.in"), None);
         assert_eq!(Tool::of_file("pylock.toml"), None);
         assert_eq!(Tool::of_flavor("python-lock"), None);
+        // A `uv export` requirements.txt beside uv.lock: uv's sync is the
+        // install that keeps the patched build.
+        assert_eq!(
+            Tool::of_files(&["requirements.txt", "uv.lock"]),
+            Some(Tool::Uv)
+        );
+        assert_eq!(Tool::of_files(&["requirements.txt"]), Some(Tool::Pip));
+        assert_eq!(Tool::of_files::<&str>(&[]), None);
     }
 
     #[tokio::test]
@@ -231,12 +240,13 @@ mod tests {
         .await
         .expect("an advisory");
         assert!(detail.contains("pkg:pypi/six@1.16.0: pip"), "{detail}");
+        assert!(detail.contains("`pip uninstall -y six`"), "{detail}");
         assert!(
-            detail.contains("`pip install --force-reinstall --no-deps six==1.16.0`"),
+            detail.contains("`pip install -r requirements.txt`"),
             "{detail}"
         );
         assert!(
-            detail.contains("`uv pip install --reinstall-package six six==1.16.0`"),
+            detail.contains("`uv pip uninstall six && uv pip install -r requirements.txt`"),
             "{detail}"
         );
         assert!(!detail.contains("artifact_id"), "{detail}");
