@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -64,3 +64,13 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 - **Giant functions (cont.):** `run_scan` is now 1,864 lines (C11/#843; it calls `discover_selected` twice in a row in its JSON arm), `run_redirect_selected_untracked` 1,233 {{T24}}.
 - **Engine code in `scan/`:** `hosted/takeover.rs` (a 425-line plan/stage/retract/finish engine over `GroupCommit`) and `hosted/nuget.rs` belong in core; scan imports `commands::vendor::{dispatch_revert_one, run_vendor_gc, unused_vendored_manifest_keys}`. C12. `takeover.rs` also parses core warning prose (`residual_only_keep`), and `npm_allow_remote_one_line` matches `guidance` sentences.
 - **Misplaced in `scan/mod.rs`:** the takeover section (L926-L1123, used only by `hosted.rs`) and `gradle_scan` (L1194-L1387, Maven-specific). `policy_bypass_warnings` is get-only policy evaluation that belongs in core `policy`.
+- **Vendored GC bypasses the shared revert:** `run_vendor_gc` drives `dispatch_revert_one` by hand and drops each failure's error. {{T37}}
+- **Go consumer-sync audit:** invoked and rendered at 8 sites through two channels. {{T40}}
+- **Tally for `commands/scan/{rollout,rollout_args,socket_yml_args,vendor_flow,withdrawn}.rs`, `update.rs`, `user_patches.rs`, `vendor.rs`, `vendor_orphans.rs`, `vendored_backend/` (11 files, 14.2K lines):**
+  - about 50 single-caller functions (≈20 worth inlining: `ledger_key_for`, `vendor_under_lock`, `is_gone`, `download_status`, `revert_vendor_entry`, `workspace_copy_issue`, …);
+  - about 25 trivial wrappers (4 `boxed_*` forwarders, `sweep_orphan_vendor_dirs`, `dispatch_revert_one`, `gc_note`, `Gate::with_*` builders);
+  - long functions: `vendor_records_reusing` ~1,258 lines (C12), `VendoredBackend::repair` ~570, `run_eject` ~554, `run` ~306;
+  - mode bools: `dispatch_vendor_one(dry_run, force)`, `revert(stop_on_failure)` (true only from remove), `discover_selected(.., false, false, false)`;
+  - engine code in the CLI: `migrate_legacy_manifest_records`, `scan_vendor_references`, the orphan sweep, `Gate::may_admit` (C12);
+  - about 200 deletable comment lines (misplaced docs on `symlinked_wiring_warnings` and the gem block, 4 repeated Windows-stack docs).
+

@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -69,3 +69,9 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
   - Misplaced: 17 tests of core code in `hosted.rs` (~700 lines, 15 of `hosted::guidance`, reached through a `cfg(test)` re-export of 20 items); 2 `Discovery` tests in `mod.rs`.
   - Sentence matching: policy L988, render L856.
 - **Coverage gaps:** `takeover.rs` plan/stage/retract/finish and `hosted/nuget.rs` have no unit test; `redirect_takeover_not_pinned` is in no test; `scan`'s `path_outside_repo` and multi-directory `--json`/`--vex` refusals are untested; no test asserts disk and memory `redirect` keys agree {{T29}}.
+- **Tally for the 11 files above (`scan/vendor_flow.rs` … `vendored_backend/repair.rs`): about 30 fake, duplicate or misplaced tests.**
+  - Vacuous: `service_mode_gate_admits_maven` and `nuget_and_maven_reverts_route_to_real_backends` assert only inside `if let`; `checking_latest_status_line` compares a const with its literal; `binary_bun_references_are_scanned_without_a_ledger` asserts a file nothing creates is absent.
+  - On their own stub: `preview_marks_a_refused_takeover_would_refuse` passes a refusal map in and reads it back; 12 preview tests assert on a test-only JSON shape (`preview_vendor_json`).
+  - Misplaced: 11 `scan/rollout.rs` tests exercise only core `rollout/stage.rs` (which has none); vendor.rs tests core `covers_purl` ×2, `vendor_entry_in_use`, `Envelope::record` and `vendor_orphans`.
+  - Duplicates: two FIFO snapshot tests; `parses_numbers_and_none` vs `cli_parse_scan.rs`; `update.rs` re-tests `ui::sentence_case`.
+

@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -46,6 +46,12 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 - **Snapshot/put-back of uncaptured files:** `scan/hosted.rs` and `vendor.rs` eject; hosted drops put-back errors. {{T30}}
 - **Root-marker predicate:** `scan/policy.rs` `lock_markers` and core `memory/roots.rs`; disk adds a manifest fallback. {{T31}}
 - **Agent dry-run preview event:** scan, get and agent_download, plus a fourth already-recorded check in scan. {{T32}}
+- **Vendored refusal preview:** scan's planning pass and `preview_vendor` each run every preflight; planning lacks the PyPI refusals. {{T35}}
+- **Vendor candidate selection:** `plan_service_downloads` re-walks the vendor loop; the plan skips the vlt refusal and the ambiguous-variant check. {{T36}}
+- **User-patches gate loop:** 5 copies (3 in `user_patches.rs`, scan, vendor); drifted on ecosystem filter, uuid and dedup. {{T38}}
+- **Reference status vocabulary:** 4 string interpreters; the two reuse caches disagree on which answers are settled. {{T39}}
+- **"Wiring with no ledger entry" remedy:** 5 copies under 2 codes. {{T41}}
+- **Ledger-ownership predicate:** 4 copies; rollback ignores the ecosystem. {{T42}}
 - **Patch selection:** a fifth copy in core `hosted/memory::select_with_policy`; the socket.yml floor 3×, the tier filter 4×. {{T15}}
 - **Maven `${…}` interpolation:** 5 copies; only `formats::maven` caps output length. {{A30}}
 - **A POM's own coordinates:** 3 readers, drifted on parent-version inheritance and `${` handling. {{A31}}

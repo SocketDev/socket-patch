@@ -1,5 +1,5 @@
 ### CLI and tests audit (T rows)
-_Last updated 2026-10-30T04:05Z · main @ 5ca5623 · owner: audit-cli-tests_
+_Last updated 2026-11-01T04:10Z · main @ cbbbdb9 · owner: audit-cli-tests_
 
 | ID | P | Problem | Issues | Status |
 |---|---|---|---|---|
@@ -37,6 +37,14 @@ _Last updated 2026-10-30T04:05Z · main @ 5ca5623 · owner: audit-cli-tests_
 | T32 | 3 | The agent dry-run preview event is built 3× (scan/mod.rs L2896-L2917, get.rs L1868-L1894, agent_download.rs L1089) and the already-recorded check re-derived a 4th time (scan/mod.rs L3322) beside `decide_patch_action`. |  | to verify |
 | T33 | 3 | Suspected: the hosted takeover plans one ledger entry (`lookup_entry`, takeover.rs L119) but `finish` removes every `PurlKey::same` entry (L410-L414), so a second variant of the release would leave the ledger unreverted. Unexecuted. |  | to verify |
 | T34 | 3 | Warning text is sentence-cased and wrapped only in `scan/hosted.rs` (`format_warning`/`wrap_words`, L2213-L2307); ~84 other `Warning: {detail}` prints do neither, and policy vs rollout warnings use two prefixes. Belongs in `ui::text`. Part of T21. |  | to verify |
+| T35 | 2 | scan's vendored planning (`preflight_refused_purls`) and preview (`preview_vendor`) each run the whole refusal preflight set; planning skips `pypi_refusals`, so a refused PyPI patch takes a `--max-new-patches` slot; a dry run runs every preflight twice. Overlaps T05. | #1908 | filed #1908 |
+| T36 | 2 | `vendor.rs` `plan_service_downloads` ([L2786-L2930](https://github.com/SocketDev/socket-patch/blob/cbbbdb90b336f8eb69886ea23a687a3a09fb108d/crates/socket-patch-cli/src/commands/vendor.rs#L2786-L2930)) re-walks the vendor loop's candidate selection (L3303-L3420); the plan skips the vlt refusal and `vendor_variant_ambiguous`. Related to T06. | #1909 | filed #1909 |
+| T37 | 2 | `run_vendor_gc` (`scan --prune`) reverts via `dispatch_revert_one` by hand instead of `VendoredBackend::revert`: drops `outcome.error` (gc.rs claims it was printed), saves the ledger once, reports reference keeps as drift, ignores `still_wired`, no `go_undo_warnings`. Child of T16. | #1910 | filed #1910 |
+| T38 | 3 | The user-patches gate loop is written 5× (`partition`, `evidence`, `skip_protected`, scan/mod.rs L2244, vendor.rs L2434); scan skips the ecosystem filter and uuid, vendor dedups unsorted and prints per conflict; eject checks it 3×. | #1911 | filed #1911 |
+| T39 | 3 | `PackageVendorResult.status` is an untyped string read 4× (core client.rs L1340, vendor_prefetch L439, scan/withdrawn.rs L57-L91, scan/hosted.rs L2343); the two reuse caches disagree on "settled" (`build_failed`). | #1912 | filed #1912 |
+| T40 | 3 | The Go consumer-sync audit is invoked and rendered at 8 sites (vendor.rs L1302, L4209; apply.rs L374, L2831; rollback.rs L3387; scan/hosted.rs L1878; vendored_backend L233; vex.rs L956); forward vendor sends it to `warnings[]`, `vendor --revert` to Skipped events; a reverted Go entry with no Go records left is not audited (unexecuted). |  | to verify |
+| T41 | 3 | The "lockfile wiring with no ledger entry" remedy is written 5× ([repair.rs L210-L218](https://github.com/SocketDev/socket-patch/blob/cbbbdb90b336f8eb69886ea23a687a3a09fb108d/crates/socket-patch-cli/src/commands/vendored_backend/repair.rs#L210-L218), vendor.rs L1403, L3137, rollback.rs L937, L1526) under two codes (`vendor_ledger_missing` vs `vendor_ledger_entry_missing`); only one names the uuid, only rollback the merge case. Check whether the two codes are deliberate. Near T17. |  | to verify |
+| T42 | 3 | The "(eco, uuid) owned by no ledger entry" predicate is written 4× (vendor_orphans.rs L54-L62, vendored_backend/repair.rs L192-L206 and L698-L704, rollback.rs L919-L930); rollback treats a uuid under any ecosystem as owned. Unexecuted. |  | to verify |
 
 #### Handed off
 _None._
