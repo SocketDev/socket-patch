@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-11-01T15:15Z · main @ cbbbdb9_
+_Last updated 2026-11-01T17:15Z · main @ cbbbdb9_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -21,21 +21,19 @@ _Last updated 2026-11-01T15:15Z · main @ cbbbdb9_
 | #1929 | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI (82 checks) and Bugbot green |
 | #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; CI (82 checks) and Bugbot green |
 | #1939 | sweep | `cli/src/commands/vendored_backend/{mod,repair}.rs` | ready; CI (82 checks) and Bugbot green |
+| #1944 | structural | T51 #1941: 11 `tests/apply` suites + `common/envelope.rs` onto `apply_fixture` (test-only, −635 net) | ready; CI and Bugbot pending |
 
 #### Merged
 _None._
 
 #### Queue
-Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`. As of 2026-11-01T13Z, the audit's A53-A57 (#1931-#1935) are new: A54 is in #1936; A53 #1931 (~9) and A57 #1935 wait on `ruby_crawler.rs` (#1882, #1895); A55 #1933 (~11, risk M) waits on `redirect/mod.rs` (#1841, #1843, #1866, #1885, #1886, #1893); A56 #1934 is a fixer bug (free, ~5). Every older one scoring 6 or more is blocked by an open PR (nothing merged since 2026-10-29); T38-T45 (#1908-#1912, #1924-#1927) touch `scan/mod.rs`, `vendor.rs`, `rollback.rs` or `remove.rs`, all held. A46 #1917, A44 #1918 score ~4:
-1. A30 [#1887](https://github.com/SocketDev/socket-patch/issues/1887), Maven `${…}` interpolation ×5: **~8.7** (blocked by #1886: `maven_scope.rs`, `maven_reactor.rs`).
-2. T09 [#1858](https://github.com/SocketDev/socket-patch/issues/1858), lock acquire open-coded 9×: **~7** (blocked by #1864 `lock_cli.rs`, #1698 `vendor.rs`/`get.rs`/`agent_download.rs`).
-3. A41 [#1899](https://github.com/SocketDev/socket-patch/issues/1899), npm store-child classification ×3: D2 C2, risk M, **~6** (blocked by #1891, #1829 and #1906: `npm_crawler.rs`).
-4. A43 [#1900](https://github.com/SocketDev/socket-patch/issues/1900), package.json `workspaces` read 5×: **~6** (blocked by #1863 `governing_root.rs`, #1698 `vendor/mod.rs`).
-5. T01 [#1835](https://github.com/SocketDev/socket-patch/issues/1835) (~6.4) and T25 [#1877](https://github.com/SocketDev/socket-patch/issues/1877) (~6): blocked by #1698.
+Structural, scored `3·B + 2·U + 2·D + 2·C − risk`. Nothing merged since 2026-10-29, so most candidates ≥6 stay blocked: A30 #1887 (~8.7, #1886), T09 #1858 (~7, #1864/#1698), A41 #1899 (~6, #1891/#1829/#1906), A43 #1900 (~6, #1863/#1698), T01 #1835 / T25 #1877 (#1698), A53 #1931 / A57 #1935 (`ruby_crawler.rs`, #1882/#1895/#1943), A55 #1933 (`redirect/mod.rs`). Free test-only candidates from the audit's T50-T55:
+1. T52 [#1942](https://github.com/SocketDev/socket-patch/issues/1942), PTY runner ×7, only 2 pin TERM: **~7** (check PTY suite files against open PRs).
+2. T50 [#1940](https://github.com/SocketDev/socket-patch/issues/1940), toolchain e2e gate ×10 drifted: **~7**, but e2e_golang* are held by #1698/#1843/#1893/#1894: land the free suites' slice.
+3. T55 (no issue yet), test helpers across binaries (`stderr_chatter` 5×, dir snapshot ~8×): ~6 once filed; includes a `run_bin_with_env` `extras` param so `apply_fixture::run_gem` stops copying it.
+A26 #1867, A46 #1917, A44 #1918 score ~4.
 
-A05/A32 are the fixer's (#1898/#1895); A42 #1901 and A45 #1902 likewise. A26 [#1867](https://github.com/SocketDev/socket-patch/issues/1867) scores 4 (files free).
-
-The next run is structural if a candidate scoring 6 or more has free files, else a sweep. Next sweep files, in order: `vlt_preflight.rs` (callers in `vendor.rs`, #1698), `vex_consumed.rs`, `vex_sources.rs` (free; check callers), `scan/policy.rs` and `scan/render.rs` once #1856/#1884 merge; core `utils/lock_fragments.rs` (wait on #1898); next free: `python_lock.rs` (2,283), `python_script.rs` (1,768), then `api/{blob_fetcher,date,retry,types}.rs` and the crawler rows. `purl_key_nuget_vendor_tests.rs` waits on #1907 (`purl_key.rs` mounts it); scan `policy`/`rollout`/`rollout_args`/`socket_yml_args`/`withdrawn` have free files but their callers sit in `scan/mod.rs` (#1856, #1884, #1897). Left from #1923: delete `toml_edit_ext` (move `ensure_table`/`has_table` beside their one caller each; `utils/mod.rs` held by #1914, `vendor/pypi.rs` by the pypi PRs) and fold `uv_workspace`'s two-call pattern (`governing_root.rs` #1863, `vendor/pypi.rs`). `process.rs` waits on #1895, `pdm_lock.rs` on #1898, `poetry_lock.rs` on #1865/#1898, `pnpm_workspace.rs` on #1863. Left from #1920: inline the 7 `build_*_purl` wrappers and `parse_jsr_purl` (callers held by #1882/#1886/#1891/#1698), move purl's PurlKey asserts to `purl_key.rs` (#1907), drop pipenv `installed_major`'s `_root` (callers in #1897 and the `vendor/pypi.rs` PRs). Waiting on PRs: `utils/fs.rs` and core `lib.rs` (#1891), `go_env.rs`/`go_installed_tools.rs` (#1876), `cargo_workspace.rs` (#1866), `cargo_build_cache.rs` (#1849), `group_commit.rs` is free but 2,163 lines (sweep a region). Skip `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` while #1698 is open, `rollback.rs` while #1864 is open. Left from #1914: delete the String `read_capped` wrapper (callers in `maven_repo.rs`, held by #1886/#1891; or rename `read_capped_typed`, touching `api/client.rs`, held by #1870/#1891); `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` waits on #1898. Left from #1907: `CargoCrawler::cargo_home` forwarder (#1882), digest's `vendor/jvm` copies (#1886), async `fs::is_symlink` (#1891).
+Next sweep files, in order: `vex_consumed.rs`, `vex_sources.rs` (free; check callers); `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `python_lock.rs` (2,283), `python_script.rs` (1,768), `api/{blob_fetcher,date,retry,types}.rs`, crawler rows; `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907).
 
 #### Notes
 - First-thread PRs: `review/2026-10-v1/register/90-refactor.md`.
@@ -56,6 +54,7 @@ The next run is structural if a candidate scoring 6 or more has free files, else
 - `hatch::require_pip_installer_documents` ignores the hatch.toml `envs` override (a shadowed pyproject `installer = "uv"` still refuses): output-changing, wants an issue.
 - `npm_range_admits(">=", v)` (an operator with no version) reads as `*` and admits everything, where npm admits nothing: output-changing, wants an issue (found by /code-review on #1920).
 - Commit *every* edit before a mutation test.
+- Test runners that pin `--cwd` must not also set the child's cwd to the project, or a crawler reading the process cwd passes (found by /code-review on #1944).
 - Wants an issue: npm `upstream_registry_fallback` (`redirect/upstream/npm.rs` ~L158) strips only userinfo, so a registry `?token=` reaches output and `--json` (fix: `redact_urls_in`, output-changing).
 - Wants an issue: `vlt_heal::artifact_preflight` swallows a `load_state` error and `rollback_heal` drops a lock read error with `.ok()` (output-changing).
 - Left from #1929: `UpdateArgs.pin_version` as `semver::Version` waits on `lib.rs` (#1842); `sweep_orphan_vendor_dirs` forwarder on `vendor.rs` (#1698).
