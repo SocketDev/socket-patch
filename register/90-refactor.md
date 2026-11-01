@@ -40,7 +40,7 @@ The next run is structural if a candidate scoring 6 or more has free files, else
 - Check every "redundant filter" note against all consumers (the `args.rs` proxy filter is load-bearing).
 - Clap field doc comments are `--help` output: sweeps leave them alone.
 - `--cwd` defaults to `.`, whose `ancestors()` stop at `.`: absolutize before walking up; test by chdir under `#[serial]` and passing `"."`.
-- `vendor/cargo_config.rs` (~L165-L190) keeps a third, async copy of the `.cargo/config` pick, with canonical dedup. It agrees on precedence; fold it into `config_layer_paths` when that file is swept.
+- `vendor/cargo_config.rs` (~L165-L190) has a third `.cargo/config` pick: fold into `config_layer_paths` when swept.
 - Check every caller file against open PRs, not only the swept file.
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` (disk). CI's clippy has no `--tests`.
 - Grep a name before introducing it (E0592).
@@ -50,7 +50,7 @@ The next run is structural if a candidate scoring 6 or more has free files, else
 - `scan/gc.rs`'s `has_ledger` gate probes `--cwd` but `run_vendor_gc` reads `project_root()` (C43): a foreign `--manifest-path` skips a due vendor-only revert. Wants an issue.
 - The sandbox proxy refuses branch deletions: name branches right the first time (`arch-refactor/sweep-scan-gc-policy` is stale).
 - `run_redirect_selected` still takes `Option<Envelope>` keyed on `common.json`; making it a value touches `get.rs` (#1698) and T24.
-- Gem stale probe (`scan/hosted.rs` pass 3), pre-existing, output-changing: dedups warnings by purl string, and names a platform gem's archive without its suffix. Wants an issue.
+- Wants an issue: gem stale probe (`scan/hosted.rs` pass 3) dedups warnings by purl string and drops a platform gem's suffix (output-changing).
 - Making a `pub` core item private can leave rustdoc links to it; unlink in the same commit.
 - `hatch::require_pip_installer_documents` ignores the hatch.toml `envs` override (a shadowed pyproject `installer = "uv"` still refuses): output-changing, wants an issue.
 - `npm_range_admits(">=", v)` (an operator with no version) reads as `*` and admits everything, where npm admits nothing: output-changing, wants an issue (found by /code-review on #1920).
