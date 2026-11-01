@@ -5369,7 +5369,7 @@ mod plan_gate_tests {
             records.insert(purl.to_string(), record(uuid));
         }
         let planned = plan_service_downloads(
-            &gates(root, &records),
+            &gates(root, &records, &HashSet::new()),
             &VendorState::default(),
             &all_packages,
             &HashMap::new(),
@@ -5434,7 +5434,7 @@ mod plan_gate_tests {
         std::os::unix::fs::symlink(&other, eco_dir.join(UUID_B)).unwrap();
 
         let planned = plan_service_downloads(
-            &gates(root, &records),
+            &gates(root, &records, &HashSet::new()),
             &VendorState::default(),
             &all_packages,
             &HashMap::new(),
@@ -5479,13 +5479,15 @@ mod plan_gate_tests {
         let all_packages = vec![(purl.to_string(), StagedSource::Installed(store.clone()))];
         let records = HashMap::from([(purl.to_string(), record(UUID_A))]);
         let pairs = [(purl, UUID_A)];
+        let none = HashSet::new();
         let plan = |vlt_refusals: Vec<_>| {
+            let none = &none;
             let all_packages = &all_packages;
             let records = &records;
             async move {
                 let gates = CandidateGates {
                     vlt_refusals: &vlt_refusals,
-                    ..gates(root, records)
+                    ..gates(root, records, none)
                 };
                 plan_service_downloads(
                     &gates,
@@ -6069,17 +6071,8 @@ mod variant_probe_tests {
             (&sdist_only, picked, refused, vec![]),
         ];
         for (all_packages, ledger, refused, expected) in cases {
-            let gates = CandidateGates {
-                cwd: root,
-                force: false,
-                records: &records,
-                refused: &refused,
-                bun_refusal: None,
-                vlt_refusals: &[],
-                hosted_pinned: &|_| false,
-            };
             let planned = plan_service_downloads(
-                &gates,
+                &super::plan_gate_tests::gates(root, &records, &refused),
                 &ledger,
                 all_packages,
                 &variant_groups,
