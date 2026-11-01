@@ -136,19 +136,21 @@ pub async fn npm_family_governing_root(root: &Path) -> Option<(PathBuf, Refusal)
     };
     if let Some(lock) = pnpm_lock_elsewhere(root).await {
         let dir = lock.parent().unwrap_or(&lock);
+        // Canonical, like the other branches' roots: a relative
+        // `lockfile-dir` (`../..`) would otherwise name a `..` path.
+        let pnpm_dir = tokio::fs::canonicalize(dir)
+            .await
+            .unwrap_or_else(|_| dir.to_path_buf());
         // A `package.json` workspace root nested inside the pnpm lock's
         // directory is nearer the member and owns its lock (Bugbot on
         // #901); otherwise pnpm's workspace or `lockfile-dir` governs.
         if let Some((ws_root, refusal)) = workspace {
-            let pnpm_dir = tokio::fs::canonicalize(dir)
-                .await
-                .unwrap_or_else(|_| dir.to_path_buf());
             if ws_root != pnpm_dir && ws_root.starts_with(&pnpm_dir) {
                 return Some((ws_root, refusal));
             }
         }
         return Some((
-            dir.to_path_buf(),
+            pnpm_dir,
             Refusal {
                 code: PNPM_LOCKFILE_ELSEWHERE.to_string(),
                 message: format!(

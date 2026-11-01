@@ -1426,3 +1426,43 @@ fn vendor_outside_a_workspace_keeps_the_no_manifest_exit() {
     let (code, env) = vendor_cli(fx.root(), &["--check"]);
     assert_eq!(code, 0, "{env:#}");
 }
+
+/// A non-npm project nested in a pnpm workspace (a Python service beside
+/// the JS packages) is its own project, not a member: its `vendor` forms
+/// keep their exit 0.
+#[test]
+fn vendor_in_a_non_npm_dir_under_a_pnpm_workspace_is_not_refused() {
+    let fx = npm_fixture_with_purls(&[]);
+    std::fs::remove_file(fx.manifest_path()).unwrap();
+    std::fs::write(
+        fx.root().join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\n",
+    )
+    .unwrap();
+    std::fs::write(fx.root().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    let service = fx.root().join("services/api");
+    std::fs::create_dir_all(&service).unwrap();
+    std::fs::write(
+        service.join("pyproject.toml"),
+        "[project]\nname = \"api\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    for extra in [&[][..], &["--check"][..], &["--revert"][..]] {
+        let (code, env) = vendor_cli(&service, extra);
+        assert_eq!(code, 0, "{extra:?}: {env:#}");
+    }
+}
+
+/// `--revert` in a member that keeps its own manifest (apply mode) is the
+/// documented clean no-op, not the member refusal.
+#[test]
+fn vendor_revert_in_a_member_with_its_own_manifest_is_not_refused() {
+    let fx = npm_fixture_with_purls(&[]);
+    let member = make_workspace_member(&fx);
+    std::fs::create_dir_all(member.join(".socket")).unwrap();
+    std::fs::write(member.join(".socket/manifest.json"), b"{\"patches\":{}}\n").unwrap();
+
+    let (code, env) = vendor_cli(&member, &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+}

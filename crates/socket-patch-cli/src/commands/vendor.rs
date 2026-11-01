@@ -1152,7 +1152,7 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     // A workspace member's ledger lives at the root: reverting the
     // member's empty one would report success and unwire nothing (#1921).
-    if args.revert {
+    if args.revert && matches!(manifest_exists(&manifest_path).await, Ok(false)) {
         if let Some(message) = member_refusal(&args.common.cwd, "vendor --revert").await {
             return emit_eject_refusal(&args.common, MEMBER_REFUSAL_CODE, &message);
         }
@@ -1290,20 +1290,20 @@ async fn run_check(args: &VendorArgs) -> i32 {
     if state.entries.is_empty() && jvm_orphan.is_some() {
         return emit_eject_refusal(&args.common, "vendor_ledger_missing", JVM_ORPHAN_DETAIL);
     }
-    // A workspace member verifies nothing of its own: the root's ledger
-    // and artifacts are the ones the install uses, so a pass here would
-    // hide a tampered root (#1921).
-    if state.entries.is_empty() && jvm_orphan.is_none() {
-        let manifest_path = args.common.resolved_manifest_path();
-        if !matches!(manifest_exists(&manifest_path).await, Ok(true)) {
-            if let Some(message) = member_refusal(root, "vendor --check").await {
-                return emit_eject_refusal(&args.common, MEMBER_REFUSAL_CODE, &message);
-            }
-        }
-    }
     let manifest_path = args.common.resolved_manifest_path();
     let manifest = match read_manifest(&manifest_path).await {
-        Ok(m) => m.unwrap_or_default(),
+        Ok(Some(m)) => m,
+        // A workspace member verifies nothing of its own: the root's
+        // ledger and artifacts are the ones the install uses, so a pass
+        // here would hide a tampered root (#1921).
+        Ok(None) => {
+            if state.entries.is_empty() && jvm_orphan.is_none() {
+                if let Some(message) = member_refusal(root, "vendor --check").await {
+                    return emit_eject_refusal(&args.common, MEMBER_REFUSAL_CODE, &message);
+                }
+            }
+            Default::default()
+        }
         Err(e) => {
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
             return emit_eject_refusal(&args.common, &err.code, &err.message);
@@ -1498,8 +1498,6 @@ fn artifacts_gitignore_checked(mut ecosystems: impl Iterator<Item = Ecosystem>) 
     })
 }
 
-/// A refused eject: the JSON error envelope (`status: error`) or an
-/// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
 /// The refusal code of a vendor run from a workspace member: the same one
 /// vendored `scan` / `get` use for a member with no lock of its own.
 const MEMBER_REFUSAL_CODE: &str = "vendor_lockfile_missing";
@@ -1509,8 +1507,13 @@ const MEMBER_REFUSAL_CODE: &str = "vendor_lockfile_missing";
 /// Callers ask only when `dir` has no hosted pins and no manifest; this
 /// also requires an empty (or absent) vendor ledger, so the run would
 /// otherwise exit 0 having looked at nothing (#1921). An unreadable
-/// ledger is left to the caller's own refusal.
+/// ledger is left to the caller's own refusal. Only an npm project (a
+/// directory holding `package.json`) is a member: another ecosystem's
+/// project nested under a pnpm workspace is its own project.
 async fn member_refusal(dir: &Path, form: &str) -> Option<String> {
+    if !dir.join("package.json").is_file() {
+        return None;
+    }
     if !load_state(dir).await.ok()?.entries.is_empty() {
         return None;
     }
@@ -1521,16 +1524,18 @@ async fn member_refusal(dir: &Path, form: &str) -> Option<String> {
 
 fn member_refusal_message(dir: &Path, root: &Path, form: &str) -> String {
     format!(
-        "{} is a workspace member with no lockfile, manifest or vendor ledger of its \
-         own: the workspace root {} installs it and holds its patches, which `{form}` \
-         run here cannot see; run socket-patch from {} (the workspace root); nothing \
-         was written",
+        "{} is a workspace member with no manifest or vendor ledger of its own: \
+         the workspace root {} installs it from its lock and holds its patches, which \
+         `{form}` run here cannot see; run socket-patch from {} (the workspace root); \
+         nothing was written",
         dir.display(),
         root.display(),
         root.display()
     )
 }
 
+/// A refused eject: the JSON error envelope (`status: error`) or an
+/// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
 fn emit_eject_refusal(common: &GlobalArgs, code: &str, message: &str) -> i32 {
     if common.json {
         let mut env = Envelope::new(Command::Vendor);
