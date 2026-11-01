@@ -7,7 +7,6 @@
 //! other.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use socket_patch_core::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_LOCK};
 use socket_patch_core::hosted::vlt::{self as hosted_vlt, Preflight};
@@ -29,30 +28,12 @@ pub(crate) struct RewriteHeal {
     /// Set when the heal ran (it may invalidate store entries): the store's
     /// bundled copies after it, discovery's only read of the installed tree
     /// (`Discovery::vlt_bundled_copies`). `None` when nothing was healed.
-    pub(crate) healed_store: Option<std::collections::BTreeMap<String, String>>,
+    pub(crate) healed_store: Option<BTreeMap<String, String>>,
 }
 
 pub(crate) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
-/// A bundled copy of a redirected package that no rewire reaches (#471).
+/// A bundled copy of a redirected package that no rewire reaches.
 pub(crate) const BUNDLED_INSTANCE_SKIPPED: &str = "redirect_vlt_bundled_instance_skipped";
-
-/// The uuids of `deps` whose purl a vlt vendored ledger entry claims: a
-/// hosted takeover reverts them to a registry node before the rewrite.
-async fn vlt_vendored_uuids(cwd: &Path, deps: &[(&str, &DepOverride)]) -> BTreeSet<String> {
-    let Ok(state) = socket_patch_core::vendor::load_state(cwd).await else {
-        return BTreeSet::new();
-    };
-    deps.iter()
-        .filter(|(purl, _)| {
-            socket_patch_core::vendor::lookup_entry(
-                &state.entries,
-                socket_patch_core::utils::purl::strip_purl_qualifiers(purl),
-            )
-            .is_some_and(|e| e.ecosystem == "npm" && e.flavor.as_deref() == Some("vlt"))
-        })
-        .map(|(_, dep)| dep.patch_uuid.clone())
-        .collect()
-}
 
 /// Fetch each in-scope artifact the way vlt does (once per distinct URL,
 /// `offline` making no request) and decide which deps may be pinned in
@@ -70,7 +51,23 @@ pub(crate) async fn artifact_preflight(
     if files.is_empty() {
         return Preflight::default();
     }
-    let vendored = vlt_vendored_uuids(&common.cwd, deps).await;
+    // The uuids of `deps` whose purl a vlt vendored ledger entry claims: a
+    // hosted takeover reverts them to a registry node before the rewrite.
+    let vendored: BTreeSet<String> = match socket_patch_core::vendor::load_state(&common.cwd).await
+    {
+        Ok(state) => deps
+            .iter()
+            .filter(|(purl, _)| {
+                socket_patch_core::vendor::lookup_entry(
+                    &state.entries,
+                    socket_patch_core::utils::purl::strip_purl_qualifiers(purl),
+                )
+                .is_some_and(|e| e.ecosystem == "npm" && e.flavor.as_deref() == Some("vlt"))
+            })
+            .map(|(_, dep)| dep.patch_uuid.clone())
+            .collect(),
+        Err(_) => BTreeSet::new(),
+    };
     let Some(plan) = hosted_vlt::plan(&view, &files, deps, &vendored) else {
         return Preflight::default();
     };
@@ -85,7 +82,7 @@ pub(crate) async fn artifact_preflight(
 /// The origins the vlt heal treats as Socket-owned in the final lock: the
 /// patch server plus `--api-url`. Unlike discovery's
 /// [`crate::commands::hosted_unwind::patch_server_origins`], it also counts the
-/// `--api-url` origin (as it has since vlt support landed, #269), so a
+/// `--api-url` origin, so a
 /// setup serving the hosted tarballs from the API origin is healed too.
 /// Discovery-facing code must use the `hosted_unwind` helper, not this one.
 fn vlt_heal_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
@@ -96,10 +93,6 @@ fn vlt_heal_origins(common: &crate::args::GlobalArgs) -> Vec<String> {
         .filter(|url| !url.trim().is_empty())
         .cloned()
         .collect()
-}
-
-fn cleanup_disabled(common: &crate::args::GlobalArgs) -> bool {
-    common.dry_run || common.no_vlt_install_cleanup
 }
 
 /// How a heal ended, for the advisory wording.
@@ -146,7 +139,7 @@ async fn heal_targets(
     if stale.is_empty() {
         return tally;
     }
-    if cleanup_disabled(common) {
+    if common.dry_run || common.no_vlt_install_cleanup {
         tally.stale_left = stale.len();
         tally
             .stale_uuids
@@ -392,7 +385,7 @@ pub(crate) async fn heal_after_rewrite(
             out.stale_purls.insert(purl.clone());
         }
     }
-    // A bundled copy of a patched package (#471) has no lock node, so the
+    // A bundled copy of a patched package has no lock node, so the
     // redirect never reaches it: say so, and keep its purl out of the
     // in-run attestation (lockfile discovery contests it the same way).
     if inputs.final_lock.is_some() {
@@ -422,12 +415,6 @@ pub(crate) async fn heal_after_rewrite(
             }));
             out.stale_purls.insert(purl.clone());
         }
-    }
-    // A heal implies a final lock, so the block above recorded the store;
-    // never report a heal without it.
-    if healed && out.healed_store.is_none() {
-        out.healed_store =
-            Some(socket_patch_core::vendor::vlt_bundled::bundled_copies(&common.cwd).await);
     }
     out
 }
