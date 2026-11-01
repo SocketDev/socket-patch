@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -86,3 +86,7 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
   - crossed vlt module names between CLI and core {{T49}}; `vex_copy_sets` (used by apply) belongs in `ecosystem_dispatch`;
   - vex omission reasons are untyped strings {{T45}};
   - about 340 deletable comment lines (90 in `ecosystem_dispatch.rs`, 45 in `json_envelope.rs`).
+- **Ruby/gem placement:** ~1.26K lines of Bundler settings live in `crawlers/ruby_crawler.rs` and `formats/gem/{manifest,mirror}` import them; `formats/gem/hosted.rs` is redirect logic that imports `patch::redirect` {{A57}}. `ruby_crawler.rs`: 24 single-caller fns, ~12 wrappers (4 `cfg(test)` seams over one impl), ~150 deletable comment lines; `discover_bundle_stores_impl` takes 8 positional args and reads the app config up to 4×.
+- **`fd_limit_is_tight` sits in `crawlers::walk_pool`** while `utils::concurrent` imports it 3× {{A09}}; `formats/cargo` imports `vendor::{cargo_tag, lock_inventory}` and `formats/composer` imports `crawlers::composer_crawler` (E20).
+- **Missing validation at a splice:** hosted composer writes the server url and sha1 through an expanding regex with no checks (executed) {{A56}}.
+- **Global probe cwd:** the `gem env` probe runs in the project directory under `--global` {{A63}}.

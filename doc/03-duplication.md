@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -76,3 +76,10 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 - **`--ecosystems` selected check:** ≥7 copies with two readings of an empty list (latent). {{T47}}
 - **Core rules re-derived in `vex_consumed`/vex:** Go hosted uuid suffix, Maven `-socket.{hex8}` (no lowercasing), cargo registry prefix ×3, the product-manifest probe table (drifted: no csproj/gemspec hint). {{T48}}
 - **Error envelope builder:** written 5× (usage_error, lock_cli, rollback, remove, scan/hosted); human branch drifted on sentence case and hints. {{T20}}
+- **Bundler path tier rule:** ×2 in `ruby_crawler` plus 3 partial copies; discovery ignores a falsy `disable_shared_gems` (executed). {{A53}}
+- **"Is this source crates.io":** ×4 rules; `CargoLock::entries`' substring test accepts a lookalike host (executed). {{A55}}
+- **Gemfile.lock read beside its model:** `BUNDLED WITH` ×2, CHECKSUMS ×5 (one accepts any `sha256=`), upstream gem section model ×1. {{A58}}
+- **Ruby string literals:** 4 readers and 6 quote loops, drifted on `%q`, escapes and `#{`. {{A59}}
+- **sbt/scala evidence:** path table ×2, vex re-implements the sbt gate; streaming file sha256 ×2 drifted on symlinks and cap. {{A60,A61}}
+- **JSON text scanners:** ×4 (composer ×2, vlt, bun); bun.lock line split ×3. {{A62}}
+- **`.bundle/config` key reader:** ×2 (crawler, `formats/gem/mirror`), drifted on separator, quoted keys and legacy normalization. {{A57}}

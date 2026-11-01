@@ -579,27 +579,27 @@ crates/socket-patch-core/src/crawlers/pnpm_layout.rs	340	audit-core	cbbbdb9 2026
 crates/socket-patch-core/src/crawlers/python_crawler.rs	8143	audit-core	cbbbdb9 2026-11-01	-	dead pub find_pipenv_virtualenv_site_packages, test-only find_poetry_virtualenv_site_packages; inline find_python_command, package_manager_recorded_site_packages, add_hatch_site_packages, pdm_config_bool, in_project_venv_exists, absolute_env_dir; dotenv codec->formats; ~120 comment lines; del 4 tests, 7 dup e2e; A47 A49 A50
 crates/socket-patch-core/src/crawlers/python_crawler/oracle.rs	101	audit-core	cbbbdb9 2026-11-01	-	A29 oracle: purl_lookup/match_listing copied verbatim into find_by_purls; skips visible() shadowing; last caller of read_egg_info_metadata (dead once the oracle goes)
 crates/socket-patch-core/src/crawlers/python_crawler/pdm_site.rs	371	audit-core	cbbbdb9 2026-11-01	-	inline runtime_probe_command, runtime_site_dir; timeout param has one production value; probe-cwd policy is a third one (private tempdir) beside SystemCommandRunner and neutral_probe_dir; tests real
-crates/socket-patch-core/src/crawlers/ruby_crawler.rs	6457	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/sbt_evidence.rs	636	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/sbt_evidence/tests.rs	527	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/scala_evidence.rs	901	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/types.rs	652	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/walk_pool.rs	541	audit-core	-	-	
-crates/socket-patch-core/src/formats/bun/mod.rs	175	audit-core	-	-	
-crates/socket-patch-core/src/formats/cargo/floor.rs	290	audit-core	-	-	
-crates/socket-patch-core/src/formats/cargo/hosted.rs	273	audit-core	-	-	
-crates/socket-patch-core/src/formats/cargo/manifest.rs	114	audit-core	-	-	
-crates/socket-patch-core/src/formats/cargo/mod.rs	540	audit-core	-	-	
-crates/socket-patch-core/src/formats/cargo/source_replacement.rs	313	audit-core	-	-	
-crates/socket-patch-core/src/formats/composer/hosted.rs	307	audit-core	-	-	
-crates/socket-patch-core/src/formats/composer/mod.rs	195	audit-core	-	-	
-crates/socket-patch-core/src/formats/composer/source.rs	687	audit-core	-	-	
-crates/socket-patch-core/src/formats/gem/gemfile.rs	543	audit-core	-	-	
-crates/socket-patch-core/src/formats/gem/gemspec.rs	589	audit-core	-	-	
-crates/socket-patch-core/src/formats/gem/hosted.rs	822	audit-core	-	-	
-crates/socket-patch-core/src/formats/gem/manifest.rs	1360	audit-core	-	-	
-crates/socket-patch-core/src/formats/gem/mirror.rs	571	audit-core	-	-	
-crates/socket-patch-core/src/formats/gem/mod.rs	721	audit-core	-	-	
+crates/socket-patch-core/src/crawlers/ruby_crawler.rs	6457	audit-core	cbbbdb9 2026-11-01	-	inline from_ambient_env, app_config_sets_path, run_gem_env, gem_env_cell, strip_bundle_config_comment, bundler_config_files; discover_bundle_stores_impl reads app config up to 4x, take BundlerEnv not 8 args (drop 3 too_many_arguments); merge async verify_gem_at_path into _sync; ~150 comment lines; test_deduplication stages 1 store; dup test L4504; see A53,A57,A63
+crates/socket-patch-core/src/crawlers/sbt_evidence.rs	636	audit-core	cbbbdb9 2026-11-01	-	make scan, pinned_artifact_hashes, MAX_* (except MAX_FILE_BYTES), SKIP_DIRS private; newest_evidence -> local; resolution() recomputes declared_projects scan already has; drop L213 len pre-check; move cfg(test) stage_fixture to test support; see A60,A61,A35,A49
+crates/socket-patch-core/src/crawlers/sbt_evidence/tests.rs	527	audit-core	cbbbdb9 2026-11-01	-	one shared set_mtime (also stage_fixture, scala_evidence tests); caps test checks err.contains("cap") (String errors); gaps: MAX_ENTRIES, MAX_TOTAL_BYTES, build-source budget, MAX_HASHED_ARTIFACTS
+crates/socket-patch-core/src/crawlers/scala_evidence.rs	901	audit-core	cbbbdb9 2026-11-01	-	delete dead pub resolution() + its assert L588; make parse_bloop, resolution_of, Bloop*, MAX_* private; drop sort() after BTreeSet collect L256; call env_compat::debug_log, not jvm_cache wrapper; trim #1270 history L763-766; failure reason dropped (A60)
+crates/socket-patch-core/src/crawlers/types.rs	652	audit-core	cbbbdb9 2026-11-01	-	CrawlerOptions Default is test-only (silent empty cwd): cfg(test) or delete; test_all_count is cfg scaffolding = len assert; delete test_cli_name, test_display_name, 7 test_*_properties, 8 test_from_purl_* (subsumed by table tests); empty {} blocks L215-222
+crates/socket-patch-core/src/crawlers/walk_pool.rs	541	audit-core	cbbbdb9 2026-11-01	-	fold walk_threads/descriptor_budget/walk_ceiling into pool_threads (.min(MAX) redundant); ~8 history comment lines L23-32, L57-59; par_map guard test misses par_chunks/join/scope; RAYON_NUM_THREADS untrimmed; fd_limit_is_tight belongs in utils::concurrent (A09)
+crates/socket-patch-core/src/formats/bun/mod.rs	175	audit-core	cbbbdb9 2026-11-01	-	trim history module doc L4-9 to one line; drop (#1606) in parse_shared doc; doc claims hosted redirect uses parse_shared but only vendor/bun_lock and lock_inventory/bun do; see A62
+crates/socket-patch-core/src/formats/cargo/floor.rs	290	audit-core	cbbbdb9 2026-11-01	-	vendor/cargo.rs L76-93 re-composes declared_cargo_minor by hand (lazy toolchain reads): take lazy readers or say why; days_from_civil -> A26
+crates/socket-patch-core/src/formats/cargo/hosted.rs	273	audit-core	cbbbdb9 2026-11-01	-	plan_hosted assumes LF (caller to_lf): debug_assert or doc it; hoist checksum match out of Some/None source arms L147-184; halve comment L209-220; splice loop also hand-written in redirect/upstream/cargo, upstream/pypi, vendor/pypi_uv, formats/nuget
+crates/socket-patch-core/src/formats/cargo/manifest.rs	114	audit-core	cbbbdb9 2026-11-01	-	clean
+crates/socket-patch-core/src/formats/cargo/mod.rs	540	audit-core	cbbbdb9 2026-11-01	-	crates.io substring test L483 (A55); make unused_patches private; keep one of vendored_in_use/vendored_copy_claim; inline locked_packages; drop banners; imports vendor::{cargo_tag,lock_inventory} (E20)
+crates/socket-patch-core/src/formats/cargo/source_replacement.rs	313	audit-core	cbbbdb9 2026-11-01	-	pub items with no outside-crate caller -> pub(crate); otherwise clean; sole config-chain walker target (A01)
+crates/socket-patch-core/src/formats/composer/hosted.rs	307	audit-core	cbbbdb9 2026-11-01	-	unvalidated sha1/url spliced via expanding regex (A56); vendored check L232 hand prefix -> parse_vendor_path; make COMPOSER_DIST_*_RE, json_object_end_from, append_composer_shasum private; inline find_composer_member; drop type_re aliases L178-180; rewritten discarded when already_redirected
+crates/socket-patch-core/src/formats/composer/mod.rs	195	audit-core	cbbbdb9 2026-11-01	-	entries() hand-builds purl beside purl::composer_purl (A14); imports crawlers::composer_crawler::normalize_version (E37); make dist_vendor_path private; drop packages getter and banners
+crates/socket-patch-core/src/formats/composer/source.rs	687	audit-core	cbbbdb9 2026-11-01	-	delete cfg(test) plan_source_drop; dedupe object_open match L336/L384; split warn from plan in first loop; scanner is the target formats/json home (A62)
+crates/socket-patch-core/src/formats/gem/gemfile.rs	543	audit-core	cbbbdb9 2026-11-01	-	four quote/escape state machines (code_of L60, split_args L87, leading_quoted L124, without_statement_end L330) -> one code-char iterator; exact_version re-runs code_of; generic Ruby lexing -> formats/gem/ruby.rs (A59)
+crates/socket-patch-core/src/formats/gem/gemspec.rs	589	audit-core	cbbbdb9 2026-11-01	-	raw-line scans miss =begin/heredoc (A54); BUNDLED WITH reader dup of hosted (A58); relative_dir duplicates relpath::resolve_rel+is_anchored; make dev_dependency_requirements, bundler_merges_dev_dependencies private; move GEMSPECS_KEY/candidate_listing to hosted/engine; Box::leak in tests; drop redundant trim '\r'
+crates/socket-patch-core/src/formats/gem/hosted.rs	822	audit-core	cbbbdb9 2026-11-01	-	use line_endings::split_lines not gem_lock_line_content slicing (A04); drop lock_changed &mut bool; split ~200-line 7-arg converge_gem_lock_source; rationale comments repeated (L129/L144, L23/L206/L223) ~12 lines; bundled_before_2_2 dup (A58); checksum_entry_span untested; is redirect logic (A57/E20)
+crates/socket-patch-core/src/formats/gem/manifest.rs	1360	audit-core	cbbbdb9 2026-11-01	-	Unsupported+GemfileCall arm L144 unreachable; collapse 3 public/_lexical/_by triples to one SameDir param; twin_manifest_refusal -> const; inline describe (1 caller) and reuse knob text; config_gemfile/config_lockfile one-liners; classify_lexical vs with_lockfile_lexical disagree on absolute values
+crates/socket-patch-core/src/formats/gem/mirror.rs	571	audit-core	cbbbdb9 2026-11-01	-	delete dup test a_host_mirror_captures_the_patch_registry; hoist loop-invariant asserts in each_remedy_converges; inline source_host; config line reader -> shared settings parser (A57)
+crates/socket-patch-core/src/formats/gem/mod.rs	721	audit-core	cbbbdb9 2026-11-01	-	keep one of GemfileLock::parse / free parse; dependencies keeps LAST section while direct/pinned take union: derive both from one; add bundled_with + checksum line_nos to model (A58); inline parse_checksum; problems as enum not strings
 crates/socket-patch-core/src/formats/governing_locks.rs	265	audit-core	-	-	
 crates/socket-patch-core/src/formats/json.rs	32	audit-core	-	-	
 crates/socket-patch-core/src/formats/maven/mod.rs	753	audit-core	-	-	
