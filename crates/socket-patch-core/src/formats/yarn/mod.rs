@@ -11,7 +11,7 @@
 //! * the stanza view the hosted berry writers re-key and re-order
 //!   entries in ([`stanzas`]);
 //! * a `.yarnrc.yml` setting as yarn resolves it ([`rc`]), and a yarn
-//!   classic `.yarnrc` line as yarn 1 tokenizes it ([`classic_rc`]);
+//!   classic `.yarnrc` as yarn 1 reads it (`classic_rc`);
 //! * the berry pinned-entry renderer ([`berry_entry`]) and the walk that
 //!   drops the entries a pin leaves unreachable ([`berry_prune`]).
 //!

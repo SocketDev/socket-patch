@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use super::npmrc::NpmConfigEnv;
 use crate::formats::text::strip_bom;
-use crate::formats::yarn::classic_rc;
+use crate::formats::yarn::classic_rc::{self, RcScalar};
 
 const KEY: &str = "yarn-offline-mirror";
 
@@ -130,11 +130,18 @@ fn unquote_rc_value(raw: &str) -> &str {
     raw
 }
 
-/// The last `yarn-offline-mirror` value in a `.yarnrc` (`key value` or
-/// `key: value` lines, key optionally quoted, `#` comments); later lines
-/// override earlier ones.
+/// The `yarn-offline-mirror` value of a `.yarnrc`, read as yarn 1 reads
+/// the file ([`classic_rc`]): `false` disables the mirror, and a value
+/// yarn can't resolve as a path (`true`, a number) or a file yarn can't
+/// read sets nothing.
 pub fn yarnrc_value(text: &str) -> Option<MirrorValue> {
-    classic_rc::setting(text, KEY).map(mirror_value)
+    match classic_rc::scalar(text, KEY)? {
+        RcScalar::Str(value) if value == "false" => Some(MirrorValue::Disabled),
+        RcScalar::Str(value) => Some(MirrorValue::Path(value)),
+        RcScalar::Bool(false) => Some(MirrorValue::Disabled),
+        // yarn's `path.resolve` throws on a `true` or a number.
+        RcScalar::Bool(true) | RcScalar::Num(_) => None,
+    }
 }
 
 /// The last top-level `yarn-offline-mirror` value in an `.npmrc` (ini
@@ -358,7 +365,7 @@ const GLOBAL_FOLDER_KEY: &str = "global-folder";
 /// folder, so all of them count.
 ///
 /// Values read as in `yarn@1.22.22`: a `.yarnrc` value is one token of
-/// yarn's rc grammar ([`classic_rc::token`]) resolved against the folder of
+/// yarn's rc grammar (`formats::yarn::classic_rc`) resolved against the folder of
 /// its file (`RELATIVE_KEYS`); an `.npmrc` value has its `${NAME}`
 /// references expanded ([`yarn_env_replace`]); env and `.npmrc` values
 /// then go through `resolveWithHome` (`~/` is yarn's `userHome`, else the

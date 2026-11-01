@@ -338,12 +338,18 @@ struct YarnrcModulesFolder {
 }
 
 /// The `--modules-folder` and command-scoped `--install.modules-folder`
-/// values of a yarn classic `.yarnrc`, read through the one `.yarnrc`
-/// reader ([`crate::formats::yarn::classic_rc`]): for each key the last
-/// setting wins, and an empty value or one yarn can't tokenize sets
-/// nothing.
+/// values of a yarn classic `.yarnrc`, read as yarn 1 reads the file
+/// ([`crate::formats::yarn::classic_rc`]). A key whose value is empty, not
+/// a string, or in a file yarn can't read is unset (an empty value set
+/// last still overrides an earlier one, as in yarn).
 fn parse_yarnrc_modules_folder(rc: &str) -> YarnrcModulesFolder {
-    let read = |key| classic_rc::value(rc, key).filter(|v| !v.is_empty());
+    let Some(mut settings) = classic_rc::settings(rc) else {
+        return YarnrcModulesFolder::default();
+    };
+    let mut read = |key| match settings.remove(key) {
+        Some(classic_rc::RcScalar::Str(value)) if !value.is_empty() => Some(value),
+        _ => None,
+    };
     YarnrcModulesFolder {
         general: read("--modules-folder"),
         install: read("--install.modules-folder"),
