@@ -20,8 +20,9 @@ fn options_at(root: &Path) -> CrawlerOptions {
 
 /// Keeps the machine's Coursier / Ivy caches out of a test that pins the
 /// exact repo list (a JVM marker or `--global` also crawls them): `HOME`
-/// points at an empty directory and the variables naming a cache are unset
-/// until drop, which restores them. Only inside `#[serial]` tests.
+/// and `USERPROFILE` point at an empty directory and the variables naming
+/// a cache are unset until drop, which restores them (also when the test
+/// panics). Only inside `#[serial]` tests.
 struct NoJvmCaches {
     _home: tempfile::TempDir,
     saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
@@ -50,6 +51,17 @@ impl NoJvmCaches {
         std::env::set_var("HOME", home.path());
         std::env::set_var("USERPROFILE", home.path());
         Self { _home: home, saved }
+    }
+
+    /// [`Self::new`] with the account home at `home` instead. Both `HOME`
+    /// and `USERPROFILE` move: on Windows Maven's `user.home` is
+    /// `USERPROFILE` first, so a test that only moves `HOME` reads the
+    /// runner's real profile there.
+    fn with_home(home: &Path) -> Self {
+        let guard = Self::new();
+        std::env::set_var("HOME", home);
+        std::env::set_var("USERPROFILE", home);
+        guard
     }
 }
 
@@ -267,12 +279,9 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
         .await
         .unwrap();
 
+    let _home = NoJvmCaches::with_home(tmp.path());
     let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
-    let prev_m2 = std::env::var("M2_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
     std::env::remove_var("MAVEN_REPO_LOCAL");
-    std::env::remove_var("M2_HOME");
-    std::env::set_var("HOME", tmp.path());
 
     let crawler = MavenCrawler;
     let paths = crawler
@@ -282,14 +291,6 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
 
     if let Some(v) = prev_local {
         std::env::set_var("MAVEN_REPO_LOCAL", v);
-    }
-    if let Some(v) = prev_m2 {
-        std::env::set_var("M2_HOME", v);
-    }
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
     }
 
     // Production returns exactly the single resolved repo path — assert the
@@ -338,12 +339,9 @@ async fn get_maven_repo_paths_global_mode_with_maven_repo_local() {
 #[serial]
 async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
+    let _home = NoJvmCaches::with_home(tmp.path()); // No .m2/ inside
     let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
-    let prev_m2 = std::env::var("M2_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
     std::env::remove_var("MAVEN_REPO_LOCAL");
-    std::env::remove_var("M2_HOME");
-    std::env::set_var("HOME", tmp.path()); // No .m2/ inside
 
     let crawler = MavenCrawler;
     let opts = CrawlerOptions {
@@ -355,14 +353,6 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
 
     if let Some(v) = prev_local {
         std::env::set_var("MAVEN_REPO_LOCAL", v);
-    }
-    if let Some(v) = prev_m2 {
-        std::env::set_var("M2_HOME", v);
-    }
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
     }
 
     assert!(
