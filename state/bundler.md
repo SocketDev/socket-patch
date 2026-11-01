@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled Bundler (RubyGems) bug-hunt routine (label pm:bundler).
 
-Last updated: 2026-11-01 (run 60), main `cbbbdb9` (one pip-only commit since `5ca5623`; no gem code changes since `b291caa`), latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta3 (no newer release on rubygems.org as of run 60). Run 60 covered the hosted lifecycle when a user adds CHECKSUMS after a converged redirect (`bundle lock --add-checksums`), on 2.6.9, 4.0.23 and 4.1.0.beta3, via a scratch test in `e2e_redirect_gem_build.rs` (upstream respelled `https://rubygems.org` in the pair after the scan, `BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/=<mock>/upstream/` for Bundler, `SOCKET_RUBYGEMS_URL=<mock>/upstream` for socket-patch). Run 59 closed backlog item 4 (Bundler 4.0.23 phantom platform lock entry: re-scan, remedy, re-converge, `vex`, `rollback` / `remove`) and the 2.6.9 hosted-unwind direct-dep and `group` cells. Run 59 used a standalone harness instead of a scratch Rust test: a Python mock (upstream compact index with ruby + `x86_64-linux` variants, patch registry, patches API) plus real `gem build` fixtures. Pass `--patch-server-url <mock>` to `rollback` / `remove` / `vex`, or a 127.0.0.1 pin isn't treated as hosted and the commands report `manifest_not_found`. Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. A fresh container's Ruby 3.3.6 only has 2.5.22 / 4.0.18, so `gem install bundler -v 2.6.9` / `4.0.23` / `4.1.0.beta3` first and export `BUNDLER_VERSION`. Bundler 2.6 has no `install -q` (use `--quiet`).
+Last updated: 2026-11-01 (run 61), main `cbbbdb9` (unchanged since run 60; no gem code changes since `b291caa`), latest release v5.0.1 (npm; no git tags). Newest Bundler: 4.0.23 stable, 4.1.0.beta3. Run 61 covered `bundle lock --add-checksums` on an unconverged redirect, a superseding patch generation over a user-checksummed lock, and the transitive unwind with a trailing blank line (all pass; see the run-61 table). Run 60 covered the hosted lifecycle when a user adds CHECKSUMS after a converged redirect (`bundle lock --add-checksums`), on 2.6.9, 4.0.23 and 4.1.0.beta3, via a scratch test in `e2e_redirect_gem_build.rs` (upstream respelled `https://rubygems.org` in the pair after the scan, `BUNDLE_MIRROR__HTTPS://RUBYGEMS__ORG/=<mock>/upstream/` for Bundler, `SOCKET_RUBYGEMS_URL=<mock>/upstream` for socket-patch). Run 59 closed backlog item 4 (Bundler 4.0.23 phantom platform lock entry: re-scan, remedy, re-converge, `vex`, `rollback` / `remove`) and the 2.6.9 hosted-unwind direct-dep and `group` cells. Run 59 used a standalone harness instead of a scratch Rust test: a Python mock (upstream compact index with ruby + `x86_64-linux` variants, patch registry, patches API) plus real `gem build` fixtures. Pass `--patch-server-url <mock>` to `rollback` / `remove` / `vex`, or a 127.0.0.1 pin isn't treated as hosted and the commands report `manifest_not_found`. Ruby 3.1.6 is in the sandbox (`/opt/rbenv/versions/3.1.6/bin`); `gem install bundler -v 1.17.3` / `2.1.4` there and export `BUNDLER_VERSION` + `SOCKET_PATCH_BUNDLER_E2E_VERSION`. A fresh container's Ruby 3.3.6 only has 2.5.22 / 4.0.18, so `gem install bundler -v 2.6.9` / `4.0.23` / `4.1.0.beta3` first and export `BUNDLER_VERSION`. Bundler 2.6 has no `install -q` (use `--quiet`).
 
 ## Coverage matrix
 
@@ -23,8 +23,8 @@ Cells are "pass", "fail #N" or "untested". Hosted and vendored cells use a local
 | OS | Ruby | Bundler | Direct dep (`~>`) | Transitive dep | Transitive, Gemfile ends in a blank line | `group` block + options | CRLF Gemfile | Non-rubygems.org upstream refused | Mixed (no-CHECKSUMS) lock |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Linux | 3.3.6 | 4.0.17 | pass (exact pin, documented) | fixed #457 (#460) | pass | pass | pass | pass | n/a |
-| Linux | 3.3.6 | 2.6.9 | pass (exact pin, documented; mock upstream, no CHECKSUMS; run 59) | fixed #457 (#460) | untested | pass (`group :development, :test` + `require: false # keep`; run 59) | untested | n/a (no CHECKSUMS, so no sha to re-derive) | documented (Gemfile-only pin is out of reach) |
-| Linux | 3.3.6 | 4.0.23 | refused, documented (mock upstream on 127.0.0.1 with CHECKSUMS; run 59); pass with the upstream spelled `https://rubygems.org` + `SOCKET_RUBYGEMS_URL` (run 60) | untested | untested | pass with the rubygems.org spelling (run 60) | untested | pass (`hosted_restore_refused` / `hosted_revert_failed`, nothing written; run 59) | n/a |
+| Linux | 3.3.6 | 2.6.9 | pass (exact pin, documented; mock upstream, no CHECKSUMS; run 59) | fixed #457 (#460) | pass (run 61) | pass (`group :development, :test` + `require: false # keep`; run 59) | untested | n/a (no CHECKSUMS, so no sha to re-derive) | documented (Gemfile-only pin is out of reach) |
+| Linux | 3.3.6 | 4.0.23 | refused, documented (mock upstream on 127.0.0.1 with CHECKSUMS; run 59); pass with the upstream spelled `https://rubygems.org` + `SOCKET_RUBYGEMS_URL` (run 60) | pass (no CHECKSUMS, run 61) | pass (no CHECKSUMS, run 61; also 4.1.0.beta3) | pass with the rubygems.org spelling (run 60) | untested | pass (`hosted_restore_refused` / `hosted_revert_failed`, nothing written; run 59) | n/a |
 | macOS / Windows | any | any | untested | untested (OS-independent) | untested | untested | untested | untested | untested |
 
 ### Platform gem, converged before the stale-guard remedy (Bundler 4.0.23, Ruby 3.3.6, CHECKSUMS-less lock, run 59)
@@ -604,13 +604,21 @@ Also on 4.0.17: BOM `Gemfile` passes; symlinked `Gemfile` / lock is refused (pas
 | windows-latest, deny-write ACE on the gem dir | 3.4.9 | pass | n/a | n/a | pass (exit 1 `partial_failure`, nothing written) | n/a | pass (refuses) | n/a | pass (fails closed; the ACE also blocks Ruby's own load) |
 | macos-14 system Ruby 2.6 / Bundler 1.17, `-g` inside a project | 2.6 | pass | pass (project `vendor/bundle` untouched) | untested | pass | pass | pass | n/a | n/a |
 
+### User-added CHECKSUMS around a hosted redirect (Linux, Ruby 3.3.6, run 61)
+
+| Cell | 2.6.9 | 4.0.23 | 4.1.0.beta3 |
+| --- | --- | --- | --- |
+| `bundle lock --add-checksums` on an unconverged pair → re-scan no-op → frozen fresh install PATCHED → `vex` matrix | pass | pass | pass |
+| Superseding generation over a converged + user-checksummed lock (sha swapped, `bundle lock` identical, frozen install gen 2) | pass | pass | untested |
+| Same, `vex` refuses with the gen-1 install materialized, attests gen 2 on a fresh install | untested | pass | untested |
+
 ## Backlog
 
-1. Re-check #1831 once fixed (PR #1841, ready for review, not merged as of run 60): hosted redirect on a CRLF Gemfile keeps CRLF in the in-place and the append (transitive) arms; `rollback` / `remove` still byte-exact; an autocrlf re-checkout of a redirected LF Gemfile re-scans as a no-op.
+1. Re-check #1831 once fixed (PR #1841, not merged as of run 61): hosted redirect on a CRLF Gemfile keeps CRLF in the in-place and the append (transitive) arms; `rollback` / `remove` still byte-exact; an autocrlf re-checkout of a redirected LF Gemfile re-scans as a no-op.
 2. Re-run #1109 (`agent:needs-human`) when it's fixed.
 3. The gem suites on 4.1.0 final when it ships; a 2.2 / 2.4 leg (Ruby 3.1.6) on the next main that touches gem code.
-4. 2.6.9 hosted-unwind cells still untested: transitive with a trailing blank line (needs a transitive fixture: the `e2e_redirect_gem_build.rs` fixture only declares the gem directly; a standalone Python mock like run 59's is the cheaper route), CRLF Gemfile (after #1841 lands).
-5. CHECKSUMS-added-after-redirect follow-ups: a superseding patch generation on that lock, and a user `bundle lock --add-checksums` before converging (unconverged pair).
+4. CRLF Gemfile hosted unwind on 2.6.9 / 4.0.23 (after #1841 lands).
+5. Superseding generation over a user-checksummed lock on 4.1.0.beta3, plus the 2.6.9 `vex` leg.
 6. Vendored stub-vs-lock runtime-dependency drift, only if the service `gem-stub-gemspec` can declare other deps than the lifted GEM spec block (a file patch can't).
 7. macOS / Windows probes stay blocked until a maintainer deletes the leftover `bughunt/bundler/*` branches and push-triggered runs work again (none has triggered since 2026-10-05).
 
