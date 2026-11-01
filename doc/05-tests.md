@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -57,6 +57,12 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
   - Vacuous FIFO tests: `coursier_cache` `repo_roots_read_poms_fifo_safe` and half of `ivy_cache` `readers_are_fifo_safe` never open the FIFO.
   - Duplicates of e2e tests: `fuzzy_match` ×9, `go_crawler` ×8, `composer_crawler` ×5.
   - Oracles that share the production helpers they check (composer, go): {{A29}}. `EnvGuard` copied 11×: {{A37}}.
+- **Tally for `crawlers/maven_*` rest and `npm_crawler*`: about 30 fake, duplicate or misplaced tests.**
+  - Can't fail or pass for the wrong reason: npm `test_macos_get_global_node_modules_paths_no_panic`; `test_find_by_purls_rejects_traversal_in_name` (`pkg:npm/../evil` fails purl parsing, the guard never runs); L7920 fan-out asserts an empty result a missed store also gives.
+  - Duplicates: ~6 `find_by_purls`/crawl tests, 9 `decode_pnpm_store_entry_*` tests (one table), `test_is_safe_npm_component` (repeats `path_safety`).
+  - Misplaced: `scala_cache_tests` tests `gradle_cache::installed_copies` and `jvm_cache::locate_artifact`, and tests the oracle itself. `Hermetic` is a 12th env guard {{A37}}.
+  - `npm_crawler/oracle.rs` (1.9K lines): imports 10+ production helpers, is no longer verbatim, and covers none of the `.bun`/`.deno`/global-virtual-store layouts; retire it {{A29}}.
+- **Coverage gaps:** `bun_uses_global_store` and `crawl_all_with_roots` have no unit test; `maven_scope`'s `MAX_NODES`/`MAX_REACTOR` caps are untested; no crawler test uses a relative cwd {{A45}}.
 - **Tally for `commands/scan/` (8 files): about 40 fake, duplicate or misplaced tests.**
   - Can't fail: `scan/mod.rs` 3 `takeover_detail_*` tests' negative asserts (phrases the string never had), an `assert_ne!` between constants, `vex_error_warnings_append_to_scan_json` (tests `Vec::extend`); `hosted.rs` a constant tautology (L4534).
   - Duplicates: `hosted.rs` L3836/L3853 exact; gc's composer/encoded/PEP 503 tests re-test core `PurlKey`; gc's corrupt-manifest tests ×2 repeat L966; render `highest_severity_picks_worst` copies core `ranking.rs`; `package_specs_match_names_and_purls` copies core `policy/tests.rs`.

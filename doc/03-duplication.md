@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -54,4 +54,9 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
 - **Go coordinate gate:** 4 identical copies. {{A34}}
 - **JVM cache plumbing:** gradle roots ×2, hash-dir listing ×3, wrapper init.d ×2, `-D` parsing ×2. {{A35}}
 - **platformdirs user dirs:** 5 copies, drifted on Windows fallback and macOS `XDG_*`. {{A36}}
+- **Effective-POM walk:** `maven_scope` and `maven_reactor` each follow parents and BOM imports; drifted on local-parent matching and cycle guards. {{A40}}
+- **npm store classification:** 3 copies inside `npm_crawler` (resolver, scan, peer finder), drifted on stores inside store entries. {{A41}}
+- **Yarn-classic `.yarnrc` tokenizer:** crawler vs hosted redirect, drifted on single quotes. {{A42}}
+- **package.json `workspaces`:** 5 readers, drifted on non-string items and `null`. {{A43}}
+- **`.modules.yaml` reader:** `npm_crawler` vs `formats::pnpm`, plus a copied YAML unquote. {{A44}}
 - **Small crawler twins (local notes):** `strip_windows_verbatim_prefix` (hatch_env, python_crawler), hatch `envs` table choice (hatch_env, `utils::hatch`), PEP 503 name (hatch_env `project_name`, {{A25}}), `is_real_dir` ×3, `is_anchored` (composer, relpath).

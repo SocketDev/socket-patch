@@ -48,6 +48,7 @@ _Filled in as the audit progresses. Each bullet carries its register token._
   - The cargo workspace glob has no character classes {{A02}}.
   - Both bugs were shown by running the code.
   - The API client retries under two policies that disagree: a `Retry-After: 60` ends a JSON call but is retried after 4 s by the vendor path {{A27}}.
+  - Under the default `--cwd .` the npm crawler never reads a parent `.yarnrc` modules folder: the crawlers get `cwd` unabsolutized and walk lexical ancestors of `.` (executed) {{A45}}.
 - **`utils/` is a mix of ecosystem-specific code and true utilities.** Some of it imports `vendor::*` {{A08}}.
 - **Shared helpers exist but are bypassed or dead.** A purl split is written ~12× {{A14}}, uuid shape 4× {{A15}}, and the shared poetry-writer and credential-strip helpers have no caller while copies serve production {{A18,A20}}.
 - **CLI commands carry second copies of shared engines.** `get <uuid>` re-implements the agent download engine {{T01}}, five callers glue the Bun and vlt preflights by hand {{T05}}, and remove and rollback render vendored reverts in two drifted loops {{T16}}. The copies have drifted in user-visible text and JSON {{T02,T04}}.

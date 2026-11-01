@@ -563,14 +563,14 @@ crates/socket-patch-core/src/crawlers/ivy_cache.rs	696	audit-core	5ca5623 2026-1
 crates/socket-patch-core/src/crawlers/jvm_cache.rs	413	audit-core	5ca5623 2026-10-30	-	delete dead project_dependency_set + ProjectDependencySet (iterates &[]) and its test + module-doc bullet; debug_log 1-line wrapper; all_local_roots_with gradle loop copies JvmEnv::gradle_roots (A35); Coursier/Ivy arms of locate_artifact reached only from tests
 crates/socket-patch-core/src/crawlers/listing.rs	108	audit-core	5ca5623 2026-10-30	-	clean
 crates/socket-patch-core/src/crawlers/maven_crawler.rs	3145	audit-core	5ca5623 2026-10-30	-	delete dead free is_ro_root, gradle_m2_ignored, maven_local_undetermined; get_maven_repo_paths{,_with}/get_jvm_cache_roots test-only (stale doc L978); collapse scan_maven_repo->_chunked->_trusting->_filtered; dead branches L281/L332/L1437; (S,S,S) x10 -> Gav; ~95 comment lines; 4 weak tests; JvmEnv/M2Gate -> jvm_cache, files21 -> gradle_cache (A35); A30, A31, A33
-crates/socket-patch-core/src/crawlers/maven_crawler/local_repo_tests.rs	309	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/maven_crawler/oracle.rs	181	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/maven_crawler/scala_cache_tests.rs	535	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/maven_pom_equivalence_tests.rs	154	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/maven_scope.rs	900	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/mod.rs	99	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/npm_crawler.rs	8796	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/npm_crawler/oracle.rs	1938	audit-core	-	-	
+crates/socket-patch-core/src/crawlers/maven_crawler/local_repo_tests.rs	309	audit-core	cbbbdb9 2026-11-01	-	clean; real behavior tests; `write` helper twins scala_cache_tests.rs L15; drop "Trigger N" #423 labels (~4 lines)
+crates/socket-patch-core/src/crawlers/maven_crawler/oracle.rs	181	audit-core	cbbbdb9 2026-11-01	-	test-only; imports production parse_pom_group_artifact_version/parse_path_coordinates (circular, A29); inline scan_maven_repo L78 wrapper; crawl_all and crawl_all_content_first L24-L62 are one loop with a flag; "verbatim" doc narration ~8 lines
+crates/socket-patch-core/src/crawlers/maven_crawler/scala_cache_tests.rs	535	audit-core	cbbbdb9 2026-11-01	-	`Hermetic` L254 is a 12th env guard (A37); the_oracle_covers_maven2_roots_only tests the oracle itself, delete with it (A29); move installed_copies_expands_an_ivy_artifact_dir to gradle_cache.rs and locate_artifact_reads_coursier_and_ivy_caches to jvm_cache.rs; drop `ours` Vec<&_> L339
+crates/socket-patch-core/src/crawlers/maven_pom_equivalence_tests.rs	154	audit-core	cbbbdb9 2026-11-01	-	move into maven_crawler/ beside its subject; #257 blessing narration L1-L5 (~3 lines); goldens are real
+crates/socket-patch-core/src/crawlers/maven_scope.rs	900	audit-core	cbbbdb9 2026-11-01	-	inline admit L398, interpolate->interpolate_at L491 forwarder; `prefetch` is serial, rename or inline into run; drop the bare block in visit L416-L459; reactor_chains take/put-back L255,L281; normalize L537 is A19; interpolation A30; effective-POM walk twins maven_reactor (A40); no test of MAX_NODES/MAX_REACTOR caps
+crates/socket-patch-core/src/crawlers/mod.rs	99	audit-core	cbbbdb9 2026-11-01	-	clean
+crates/socket-patch-core/src/crawlers/npm_crawler.rs	8796	audit-core	cbbbdb9 2026-11-01	-	detail in run entry; ~45 single-caller fns; wrappers: get_*_global_prefix->_with (e2e-only pub), StoreEntry::{pnpm,npm,vlt} one fn, 3 run_walk shims; parse_npm_root_output==parse_pnpm_root_output; redefines ListedEntry/list_dir_sync (use crawlers::listing); ~440 comment lines (13 banners, stale check_package refs); 25 tests fake/dup; A41-A44
+crates/socket-patch-core/src/crawlers/npm_crawler/oracle.rs	1938	audit-core	cbbbdb9 2026-11-01	-	test-only; retire (A29): imports 10+ production helpers, not verbatim (alias logic #356 added later), covers no .bun/.deno/gvs/.modules.yaml layouts, own xorshift + 5 helpers that oracle_support.rs already has; drops 2 cfg(test) shims in npm_crawler.rs
 crates/socket-patch-core/src/crawlers/nuget_crawler.rs	2784	audit-core	-	-	
 crates/socket-patch-core/src/crawlers/nuget_crawler/oracle.rs	208	audit-core	-	-	
 crates/socket-patch-core/src/crawlers/oracle_support.rs	171	audit-core	-	-	

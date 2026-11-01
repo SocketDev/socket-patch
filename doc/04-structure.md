@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -49,6 +49,12 @@ _Last checked against main @ 5ca5623 on 2026-10-30 by audit-core._
   - dead code: maven `is_ro_root` (free fn), `gradle_m2_ignored`, `maven_local_undetermined`; `jvm_cache::project_dependency_set` (iterates `&[]`); `DerivedIndex::incomplete`; ivy's ignored `_os` parameter; `fuzzy_match`'s `limit` (one caller passes `usize::MAX`);
   - about 330 deletable comment lines.
 - **Crawlers are stateless unit structs** with `new()` + `Default`. {{A38}}
+- **Tally for `crawlers/maven_*` rest, `mod.rs` and `npm_crawler*` (8 files, 12.9K lines):**
+  - about 50 single-caller functions (≈10 worth inlining: `admit`, `interpolate`, `decode_bun_store_entry_name`, `pnpm_current_lockfile_sync`, …);
+  - about 20 trivial wrappers (`get_*_global_prefix` → `_with`, 3 `run_walk` shims, `crawl_all` → `crawl_all_with_roots`, `StoreEntry::{pnpm,npm,vlt}`);
+  - `npm_crawler` redefines `ListedEntry`/`list_dir_sync` beside `crawlers/listing.rs`; its global-prefix probes (L2296-L2565), Bun store-liveness (L676-L1400) and Deno cache (L1883-L2122) blocks belong in submodules or `deno_crawler`;
+  - about 450 deletable comment lines (13 banners, perf history, stale `check_package` references).
+- **Crawlers read unabsolutized `--cwd`:** lexical `ancestors()` walks of `.` stop at once. {{A45}}
 - **Codecs inside crawlers:** `deno_crawler`'s `deno.lock` readers (used by vex, hosted and vendor) belong in `formats/deno`, `gradle_cache::parse_properties` in `formats/`, the POM line scanner in `formats::maven` ({{A31}}), and `JvmEnv`/`M2Gate` in `jvm_cache` ({{A35}}).
 - **Tally for `crates/socket-patch-cli/src/commands/scan/` (8 files, 15.5K lines: `gc.rs`, `hosted.rs`, `hosted/{nuget,python,takeover}.rs`, `mod.rs`, `policy.rs`, `render.rs`):**
   - about 90 single-caller functions (≈25 worth inlining; render's byte-tested builders stay);
