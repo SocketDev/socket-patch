@@ -39,13 +39,12 @@ The next run is structural if a candidate scoring 6 or more has free files, else
 - First-thread PRs: `review/2026-10-v1/register/90-refactor.md`.
 - Check every "redundant filter" note against all consumers (the `args.rs` proxy filter is load-bearing).
 - Clap field doc comments are `--help` output: sweeps leave them alone.
-- `--cwd` defaults to `.`, whose `ancestors()` stop at `.`: absolutize before walking up; test by chdir under `#[serial]` and passing `"."`.
+- `--cwd` defaults to `.`: absolutize before walking `ancestors()`; test via chdir under `#[serial]`.
 - `vendor/cargo_config.rs` (~L165-L190) has a third `.cargo/config` pick: fold into `config_layer_paths` when swept.
 - Check every caller file against open PRs, not only the swept file.
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` (disk). CI's clippy has no `--tests`.
 - Grep a name before introducing it (E0592).
 - Root-sandbox failures that pass in CI: 2 chmod tests in `tests/repair`, and core `copy_tree` symlinked-root, `vlt_heal` unremovable-lock, `pypi_poetry`/`pypi_requirements` wire-failure tests.; `in_process_redirect`'s 3 chmod tests
-- remove's ~900-line `run` split wants an issue (T16/T17/T20), not a sweep.
 - Wants an issue: `ui::shell_word` does not escape `"` or `%VAR%` for Windows cmd; fix it there, not per caller.
 - `scan/gc.rs`'s `has_ledger` gate probes `--cwd` but `run_vendor_gc` reads `project_root()` (C43): a foreign `--manifest-path` skips a due vendor-only revert. Wants an issue.
 - The sandbox proxy refuses branch deletions: name branches right the first time (`arch-refactor/sweep-scan-gc-policy` is stale).
