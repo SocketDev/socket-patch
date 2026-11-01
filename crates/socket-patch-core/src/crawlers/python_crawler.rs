@@ -5114,6 +5114,52 @@ mod tests {
         assert!(found.contains(&managed_site), "{found:?}");
     }
 
+    /// #1916: "is this lockless project Poetry's" reads the parsed
+    /// `[tool.poetry]` table, the same rule as Poetry env discovery. A
+    /// Poetry plugin table such as `[tool.poetry-dynamic-versioning]`
+    /// (common with non-Poetry backends) or a commented-out header does
+    /// not hand a lockless uv project to Poetry, so its
+    /// `UV_PROJECT_ENVIRONMENT` is still crawled.
+    #[tokio::test]
+    async fn poetry_plugin_table_does_not_claim_a_lockless_uv_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        let site = fake_venv(&project, "env");
+        let stray = fake_venv(&project, ".venv");
+        let env = env_of(&[("UV_PROJECT_ENVIRONMENT", "env".to_string())]);
+
+        for pyproject in [
+            "[project]\nname = \"app\"\ndynamic = [\"version\"]\n\
+             [tool.poetry-dynamic-versioning]\nenable = true\n",
+            "[project]\nname = \"app\"\n# [tool.poetry]\n",
+            "[project]\nname = \"app\"\n[tool.poetry_bumpversion]\nfile = \"x\"\n",
+        ] {
+            std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env).await,
+                vec![site.clone()],
+                "{pyproject}"
+            );
+        }
+
+        // A real `[tool.poetry]` table, or only a subtable of it, is still
+        // Poetry's.
+        for pyproject in [
+            "[tool.poetry]\nname = \"app\"\n",
+            "[project]\nname = \"app\"\n[tool.poetry.dependencies]\npython = \"^3.12\"\n",
+            "[project]\nname = \"app\"\n[tool.poetry-dynamic-versioning]\n\
+             enable = true\n[tool.poetry]\npackage-mode = false\n",
+        ] {
+            std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env).await,
+                vec![stray.clone()],
+                "{pyproject}"
+            );
+        }
+    }
+
     /// #525: uv syncs a project into `UV_PROJECT_ENVIRONMENT` (absolute, or
     /// relative to the project) instead of `./.venv`, ignoring an
     /// activated venv; the variable means nothing outside a uv project.
