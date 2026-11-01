@@ -1,5 +1,4 @@
-//! Read-only check of NuGet's global packages folder for hosted redirects
-//! (#352).
+//! Read-only check of NuGet's global packages folder for hosted redirects.
 //!
 //! A hosted NuGet patch keeps the upstream id and version, and NuGet
 //! restores a package already extracted into its global packages folder
