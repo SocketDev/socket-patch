@@ -91,4 +91,4 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 - **Missing validation at a splice:** hosted composer writes the server url and sha1 through an expanding regex with no checks (executed) {{A56}}.
 - **Global probe cwd:** the `gem env` probe runs in the project directory under `--global` {{A63}}.
 - **`formats` → `vendor` imports:** `formats/nuget/lock.rs` (`normalize_nuget_version`), `formats/pipenv.rs` (`parse_pipfile_lock`), `formats/yarn/copy.rs` (`vlt_lock_text` validators) {{A08}}. `formats::sbt::{Ga,JvmResolution,gate}` serve scala-cli too: target `formats::jvm` {{A35}}.
-- **`formats/*` tally (audit-core, 2026-11-01 19:20Z, 33 files, 15.8K lines):** ~55 single-caller fns, ~30 wrappers, ~95 deletable comment lines; dead: `PnpmLock::text`, `registry::PNPM_MARKER`, `GateWarning::MetaBuildOnly`, `rc::raw_list_setting`, `ResolutionDoc::from_json`.
+- **`formats/*` tally (audit-core, 2026-11-01 19:03Z, 33 files, 15.8K lines):** ~55 single-caller fns, ~30 wrappers, ~95 deletable comment lines; dead: `PnpmLock::text`, `registry::PNPM_MARKER`, `GateWarning::MetaBuildOnly`, `rc::raw_list_setting`, `ResolutionDoc::from_json`.
