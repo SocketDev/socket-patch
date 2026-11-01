@@ -886,14 +886,15 @@ async fn repair_workspace_copies(
 /// the token-shape stderr advisory, so it must happen at most once, and
 /// not at all in a run with nothing to fetch.
 async fn ensure_client<'c>(common: &GlobalArgs, slot: &'c mut Option<ApiClient>) -> &'c ApiClient {
-    if slot.is_none() {
-        *slot = Some(
+    let client = match slot.take() {
+        Some(client) => client,
+        None => {
             get_api_client_with_overrides(common.api_client_overrides())
                 .await
-                .0,
-        );
-    }
-    slot.as_ref().unwrap()
+                .0
+        }
+    };
+    slot.insert(client)
 }
 
 /// Fetch one patch view by uuid (proxy-aware) and shape it as a manifest
@@ -998,7 +999,8 @@ mod tests {
     /// A FIFO under a wiring-file name (here the paired `<script>.py` of a
     /// `*.py.lock`, which the lister cannot filter because it derives the
     /// script name without stat'ing it) must not wedge the scan: a plain
-    /// `read_to_string` blocks in open(2) waiting for a writer.
+    /// `read_to_string` blocks in open(2) waiting for a writer. Every
+    /// reference read must go through the FIFO-safe reader and skip it.
     #[cfg(unix)]
     #[tokio::test]
     async fn scan_skips_fifo_wiring_files() {
@@ -1153,7 +1155,9 @@ mod tests {
     /// Every file a vendored run writes is scanned, and a reference to the
     /// uuid dir itself counts. NuGet's feed and Maven's repository name the
     /// dir (Windows backslashes and a trailing slash included); a Hatch
-    /// environment in `hatch.toml` names a wheel.
+    /// environment in `hatch.toml` names a wheel. Every caller (repair, the
+    /// orphan sweeps, the `vendor` stranded-reference gate, rollback's
+    /// ledger-less gate) reads this one scan.
     #[tokio::test]
     async fn scan_recovers_unit_dir_and_hatch_toml_references() {
         let tmp = tempfile::tempdir().unwrap();
