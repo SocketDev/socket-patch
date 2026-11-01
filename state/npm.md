@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-11-01T01Z (run 59), main `cbbbdb9` (v5.0.1 `latest`). Run 59: main has only a PyPI fix since run 58, so #1827, #1850 and #1871 stay open (not re-run). New cells, all pass: hosted / vendored cycles under `install-strategy=linked`, with a dual shrinkwrap + package-lock, and in workspace members (CRLF bin; npm 8.19.4 / 10.9.4 / 12.2.1); `get --mode hosted` and `remove`; concurrent scans (`lock_held`). Filed #1904 (vendored scan from a workspace member dir: generic `vendor_lockfile_missing` remedy that loops). **Open npm bughunt issues: #1827, #1850, #1871 and #1904.** Every other issue number marked `fail` in the matrix below is closed; those marks are historical. Probe branches are still blocked (`git push --delete` is refused by the session policy).
+Last updated: 2026-11-01T07Z (run 60), main `cbbbdb9` (v5.0.1 `latest`). Run 60: main is unchanged since run 59, so #1827, #1850, #1871 and #1904 stay open (not re-run; PR #1913 for #1904 is open). New cells: `vendor` eject and `vendor --check` run from a workspace member dir exit 0 without reading the root (**filed #1921**, also on PR #1913's head); vendored cycle and `get --mode vendored` + `remove` under `install-strategy=linked` (10.9.9 / 12.2.1) pass; npm 6.14.18 v1 hosted cycle passes (cold-cache EINTEGRITY as documented), v1 vendored refused as documented. **Open npm bughunt issues: #1827, #1850, #1871, #1904 and #1921.** Every other issue number marked `fail` in the matrix below is closed; those marks are historical. Probe branches are still blocked (`git push --delete` is refused by the session policy).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -46,6 +46,14 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Linux | 8.19.4 / 10.9.4 / 12.2.1, dual shrinkwrap + package-lock, and patched deps in workspace members (run 59) | n/a | pass: cycle (both locks byte-exact) | pass: cycle | n/a |
 | Linux | 10.9.4 / 12.2.1, `get <uuid> --mode hosted --json`, scoped `get`, `remove`; concurrent scans (run 59) | n/a | pass: concurrent scans (`lock_held`) | pass | n/a |
 | Linux | 8.19.4 / 10.9.4 / 12.2.1, run from a workspace member dir (run 59) | patches the member copy into `packages/a/.socket/` (agent semantics) | **fail #1904** (generic `vendor_lockfile_missing` remedy that loops; v5.0.1 too) | pass (`redirect_workspace_lockfile_elsewhere` names the root) | n/a |
+| Linux | 8.19.4 / 10.9.9 / 12.2.1, `vendor` eject and `vendor --check` from a workspace member dir (run 60) | n/a | **fail #1921** (`vendor --check` exit 0 over a tampered root artifact; main, v5.0.1, PR #1913 head) | **fail #1921** (eject: "nothing to vendor", exit 0, root lock still hosted) | n/a |
+| Linux | 6.14.18 (v1) / 10.9.9 / 12.2.1 linked (run 60) | n/a | pass: linked cycle, `get <uuid> --mode vendored` + `remove` (lock byte-exact, `npm ci` restores upstream). v1 vendored refused (documented) | pass: npm 6 v1 cycle (warm cache installs patched; cold cache EINTEGRITY + `redirect_npm_legacy_client` warning, documented) | n/a |
+
+## Run 60 (2026-11-01T07Z, main `cbbbdb9`)
+
+- Filed #1921: `vendor` (eject) and `vendor --check` from a workspace member dir read only the member dir and exit 0 ("nothing to vendor" / zero entries verified), even over a tampered root artifact. Reproduces on npm 8.19.4 / 10.9.9 / 12.2.1, main, v5.0.1 and PR #1913's head. `vex` from the member fails closed with a generic message (diagnostics only, noted in #1921).
+- Pass: vendored linked cycle and `get --mode vendored` + `remove` under linked (10.9.9 / 12.2.1); npm 6 v1 hosted cycle.
+- Mock: a simpler Python patch-API mock against real npmjs `left-pad@1.3.0` (no registry mock needed); flags `--api-url`, `--org`, `--api-token fake`, `--patch-server-url` on the same port.
 
 ## Run 59 (2026-11-01T01Z, main `cbbbdb9`)
 
@@ -322,6 +330,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-11-01T07Z:** re-check #1921 / #1904 (PR #1913) / #1871 / #1827 / #1850 when main changes them. #1921 siblings: `repair`, `rollback`, `remove` and `apply --check` from a member dir (do they exit 0 too?); a member dir inside a vendored project with its own unhoisted copy; yarn / Bun members (hand over if confirmed). Hosted rollback with a `registry=` mirror dropped (Known non-bug, #918 / #1130). macOS / Windows once probe branches work.
 - **New 2026-11-01T01Z:** re-check #1904 / #1871 / #1827 / #1850 when main changes them. #1904 siblings: `vendor` eject and the hosted → vendored takeover from a member dir; yarn / Bun members (hand over if confirmed). Hosted rollback with a `registry=` mirror + `replace-registry-host=never` and npmjs unreachable. `get --mode vendored` / `remove` under linked; npm 6 v1 cells with the new mock; macOS / Windows once probe branches work.
 - **New 2026-10-30T07Z:** re-check #1871 / #1827 / #1850 when main changes them. Next new cells: hosted + vendored CRLF bin in a dual shrinkwrap + package-lock project and in a workspace member; `get <uuid> --mode hosted` and `remove` over a CRLF-bin pin; hosted pins with `npm ci --install-strategy=linked` (does `vex` see the `.store` copy with the LF form?); macOS / Windows once probe branches work.
 - **New 2026-10-30T01Z:** re-check #1871 when fixed (project / user / env `npm_config_omit_lockfile_registry_resolved` layers, a workspace-member pin, and the dual shrinkwrap + package-lock state). Re-check #1827 / #1850 once main changes them. Still open: CACHEDIR.TAG inside a workspace member (agent walk prune, same class as #1827), hosted / vendored `vex` with a CRLF bin, and macOS / Windows once probe branches work.
@@ -390,6 +399,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- npm 6.14.18 with a lockfileVersion 1 hosted pin installs the patched bytes when the npm cache already holds the patched tarball (cacache lookup by integrity); with a cold cache it fails EINTEGRITY as documented (`redirect_npm_legacy_client`). Not a bug (run 60).
 - Hosted `rollback` / `remove` of a package-lock pin reads the version document only from the default registry (npmjs or `SOCKET_NPM_REGISTRY`), not from a project `.npmrc` `registry=` / `@scope:registry=`. A package only that registry serves refuses `hosted_restore_refused` with a `git checkout` remedy and an untouched lock. Deliberate (#918 kept `fetch_dists` for package-lock; #1130 tracks the restore design) (run 59).
 - npm does not install the dependencies of a `file:` link target outside the project root, so there's no out-of-root copy to patch (npm 10.9.4 / 12.2.1, run 59).
 - Hosted `rollback` against a package the upstream registry (`registry.npmjs.org` or `SOCKET_NPM_REGISTRY`) doesn't serve fails `hosted_restore_refused` with a `git checkout` remedy; a pre-existing project `.npmrc` keeps the `allow-remote=all` line hosted mode added (documented `npm_allow_remote_left`) (run 58).
