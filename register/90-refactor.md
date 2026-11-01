@@ -18,7 +18,7 @@ _Last updated 2026-11-01T11:15Z · main @ cbbbdb9_
 | [#1914](https://github.com/SocketDev/socket-patch/pull/1914) | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI (82 checks) and Bugbot green |
 | [#1920](https://github.com/SocketDev/socket-patch/pull/1920) | sweep | core `utils/{notice,npm_range,package_manager,pep440,pipenv,purl}.rs` (+ `target.rs` callers) | ready; CI (82 checks) and Bugbot green |
 | [#1923](https://github.com/SocketDev/socket-patch/pull/1923) | sweep + A20 [#1848](https://github.com/SocketDev/socket-patch/issues/1848) | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` (+ `vex/product.rs`, `redirect/upstream/npm.rs`, advisory lint moved to `vendor/service_fetch.rs`) | ready; CI (82 checks) and Bugbot green |
-| [#1929](https://github.com/SocketDev/socket-patch/pull/1929) | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI and Bugbot pending |
+| [#1929](https://github.com/SocketDev/socket-patch/pull/1929) | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI (80 checks) and Bugbot green |
 
 #### Merged
 _None._
