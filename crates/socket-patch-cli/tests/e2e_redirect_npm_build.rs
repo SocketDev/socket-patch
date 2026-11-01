@@ -1372,24 +1372,26 @@ async fn npm_agent_keeps_crlf_shebang_of_bin_npm_did_not_link() {
         npm_e2e_common::skip(SUITE, "npm not on PATH");
         return;
     }
-    for (manifest, rel, flags) in [
+    // The link name npm would create: the `bin` key for a `bin` map, the
+    // file name for a `directories.bin` entry.
+    for (manifest, rel, link_name, flags) in [
         (
             r#"{"name":"crlfbin","version":"1.0.0","bin":{"crlfbin":"cli.js"}}"#,
             "cli.js",
+            "crlfbin",
             &["--no-bin-links"][..],
         ),
         (
             r#"{"name":"crlfbin","version":"1.0.0","directories":{"bin":"bin"}}"#,
             "bin/cli.js",
+            "cli.js",
             &[][..],
         ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let proj = crlf_bin_project_with(tmp.path(), manifest, rel, flags);
         let cli = proj.join("node_modules/crlfbin").join(rel);
-        let link = proj
-            .join("node_modules/.bin")
-            .join(Path::new(rel).file_name().unwrap());
+        let link = proj.join("node_modules/.bin").join(link_name);
         let linked = link.symlink_metadata().is_ok();
         assert!(
             !(linked && flags.contains(&"--no-bin-links")),
