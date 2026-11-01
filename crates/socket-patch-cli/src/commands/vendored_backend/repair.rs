@@ -23,12 +23,10 @@ use crate::json_envelope::{Envelope, PatchAction, PatchEvent};
 use crate::ui::plural;
 
 /// One broken vendored unit queued for re-vendoring.
-#[derive(Clone)]
 struct Candidate {
     purl: String,
     entry: VendorEntry,
     record: PatchRecord,
-    detached: bool,
     reason: &'static str,
 }
 
@@ -171,23 +169,19 @@ fn format_redownload_preview(items: &[(String, &str, &str)]) -> Vec<String> {
         plural(items.len(), "vendored artifact", "vendored artifacts")
     )];
     lines.extend(items.iter().map(|(purl, reason, path)| {
-        format!("  - {purl} ({}: {path})", rebuild_reason_label(reason))
+        let label = match *reason {
+            "vendor_artifact_missing" => "missing",
+            "vendor_artifact_corrupt" => "corrupt",
+            other => other,
+        };
+        format!("  - {purl} ({label}: {path})")
     }));
     lines
 }
 
-/// Plain words for a rebuild candidate's reason code.
-fn rebuild_reason_label(code: &str) -> &str {
-    match code {
-        "vendor_artifact_missing" => "missing",
-        "vendor_artifact_corrupt" => "corrupt",
-        other => other,
-    }
-}
-
 /// The [`scan_vendor_references`] triples whose `(ecosystem, uuid)` no
 /// entry of `state` owns: lockfile wiring the ledger lost (state.json
-/// deleted, or a git merge kept one side of it, #991). `vendor --check`
+/// deleted, or a git merge kept one side of it). `vendor --check`
 /// fails on them and an unscoped `rollback` refuses them.
 pub(crate) async fn unledgered_vendor_references(
     project_root: &Path,
@@ -203,18 +197,6 @@ pub(crate) async fn unledgered_vendor_references(
                 .any(|entry| entry.ecosystem == *eco && entry.uuid == *uuid)
         })
         .collect()
-}
-
-/// The `vendor_ledger_missing` detail for a lockfile reference no ledger
-/// entry owns.
-fn format_ledger_missing(eco: &str, uuid: &str) -> String {
-    format!(
-        "a lockfile references .socket/vendor/{eco}/{uuid}/ but the vendor ledger \
-         (.socket/vendor/state.json) has no entry for it, and repair does not rebuild the \
-         ledger from lockfiles; restore state.json from version control and re-run \
-         `socket-patch repair`, or restore the lockfile (`git checkout -- <lockfile>`) and \
-         re-vendor"
-    )
 }
 
 /// Recover artifacts left aside by older releases when a repair was interrupted.
@@ -440,11 +422,11 @@ impl VendoredBackend<'_> {
             };
             let health = check_vendored_artifact(&common.cwd, &entry, &record).await;
             // An npm-family `<uuid>/.gitignore` and `.gitattributes` are not
-            // part of the artifact: a missing, edited or pre-#1541 one is
+            // part of the artifact: a missing, edited or older one is
             // simply rewritten, and git must still commit the artifact with
-            // them (#1581). A broken artifact gets both after its redownload.
+            // them. A broken artifact gets both after its redownload.
             if !common.dry_run
-                && (health == ArtifactHealth::Healthy || workspace_copy_issue(&health))
+                && (health == ArtifactHealth::Healthy || health.is_workspace_copy_issue())
             {
                 if let Err(e) =
                     vendor::redownload::restore_npm_uuid_metadata(&entry, &common.cwd).await
@@ -462,7 +444,7 @@ impl VendoredBackend<'_> {
                     continue;
                 }
             }
-            if health == ArtifactHealth::Healthy || workspace_copy_issue(&health) {
+            if health == ArtifactHealth::Healthy || health.is_workspace_copy_issue() {
                 let mut healed = entry.clone();
                 match repair_workspace_copies(&common.cwd, &mut healed, common.dry_run).await {
                     Ok(true) => {
@@ -511,14 +493,14 @@ impl VendoredBackend<'_> {
                         continue;
                     }
                 }
-                if workspace_copy_issue(&health) {
+                if health.is_workspace_copy_issue() {
                     continue;
                 }
             }
             match health {
                 ArtifactHealth::Healthy => {
                     // A yarn classic block a pre-v5 vendor left naming a
-                    // dependency with no lock block (#1379): the artifact
+                    // dependency with no lock block: the artifact
                     // is fine, but repair can't resolve the descriptor.
                     if entry.ecosystem == "npm" {
                         if let Some(detail) =
@@ -552,7 +534,7 @@ impl VendoredBackend<'_> {
                         }
                     }
                     // A stray file in the tree (a Finder `.DS_Store`) fails
-                    // the Gradle build (#656); the index says what belongs
+                    // the Gradle build; the index says what belongs
                     // there, so it goes offline too.
                     if vendor::jvm::apply::is_jvm_entry(&entry) {
                         let indexed = vendor::jvm::apply::recorded_tree_files(&entry);
@@ -680,12 +662,10 @@ impl VendoredBackend<'_> {
                     } else {
                         "vendor_artifact_corrupt"
                     };
-                    let detached = entry.detached;
                     candidates.push(Candidate {
                         purl: purl.clone(),
                         entry,
                         record,
-                        detached,
                         reason,
                     });
                 }
@@ -706,7 +686,13 @@ impl VendoredBackend<'_> {
             }
             // No ledger entry means no purl to name: the event carries the
             // uuid and the referenced path instead.
-            let detail = format_ledger_missing(eco, uuid);
+            let detail = format!(
+                "a lockfile references .socket/vendor/{eco}/{uuid}/ but the vendor ledger \
+                 (.socket/vendor/state.json) has no entry for it, and repair does not rebuild \
+                 the ledger from lockfiles; restore state.json from version control and \
+                 re-run `socket-patch repair`, or restore the lockfile \
+                 (`git checkout -- <lockfile>`) and re-vendor"
+            );
             if !common.json {
                 eprintln!("Error: Cannot repair vendored artifact {path}: {detail}");
             }
@@ -765,12 +751,8 @@ impl VendoredBackend<'_> {
             );
         }
 
-        if api_client.is_none() && !common.offline {
-            *api_client = Some(
-                get_api_client_with_overrides(common.api_client_overrides())
-                    .await
-                    .0,
-            );
+        if !common.offline {
+            ensure_client(common, api_client).await;
         }
         let use_public_proxy = api_client
             .as_ref()
@@ -797,7 +779,7 @@ impl VendoredBackend<'_> {
                                 &mut state,
                                 &candidate.purl,
                                 candidate.entry.clone(),
-                                candidate.detached,
+                                candidate.entry.detached,
                                 &candidate.record,
                             )
                             .await
@@ -871,10 +853,6 @@ async fn npm_artifact_committable(
     }
 }
 
-fn workspace_copy_issue(health: &ArtifactHealth) -> bool {
-    health.is_workspace_copy_issue()
-}
-
 /// Preserve package originals while adopting/rebuilding every member-relative
 /// copy from a canonical tarball whose whole-file fingerprint is trusted.
 async fn repair_workspace_copies(
@@ -904,12 +882,22 @@ async fn repair_workspace_copies(
     Ok(changed)
 }
 
+/// The phase's one API client, built on first need: construction prints
+/// the token-shape stderr advisory, so it must happen at most once, and
+/// not at all in a run with nothing to fetch.
+async fn ensure_client<'c>(common: &GlobalArgs, slot: &'c mut Option<ApiClient>) -> &'c ApiClient {
+    if slot.is_none() {
+        *slot = Some(
+            get_api_client_with_overrides(common.api_client_overrides())
+                .await
+                .0,
+        );
+    }
+    slot.as_ref().unwrap()
+}
+
 /// Fetch one patch view by uuid (proxy-aware) and shape it as a manifest
-/// record; `None` offline or on any API failure. `client_cache` holds the
-/// one API client the whole vendored-artifact phase shares — construction
-/// re-prints the token-shape stderr advisory, so N uuid lookups must not
-/// print it N times. Built lazily: a run with nothing to look up never
-/// constructs (or warns) at all.
+/// record; `None` offline or on any API failure.
 async fn fetch_record_by_uuid(
     common: &GlobalArgs,
     client_cache: &mut Option<ApiClient>,
@@ -918,16 +906,7 @@ async fn fetch_record_by_uuid(
     if common.offline {
         return None;
     }
-    if client_cache.is_none() {
-        *client_cache = Some(
-            get_api_client_with_overrides(common.api_client_overrides())
-                .await
-                .0,
-        );
-    }
-    let client = client_cache
-        .as_ref()
-        .expect("client_cache was just initialized above");
+    let client = ensure_client(common, client_cache).await;
     let patch = client.fetch_patch(uuid).await.ok()??;
     Some(socket_patch_core::manifest::records::record_from_patch_response(&patch))
 }
@@ -1018,12 +997,11 @@ mod tests {
 
     /// A FIFO under a wiring-file name (here the paired `<script>.py` of a
     /// `*.py.lock`, which the lister cannot filter because it derives the
-    /// script name without stat'ing it) must not wedge `repair`: a
-    /// plain `read_to_string` blocks in open(2) waiting for a writer. Every
-    /// reference read must go through the FIFO-safe reader and skip it.
+    /// script name without stat'ing it) must not wedge the scan: a plain
+    /// `read_to_string` blocks in open(2) waiting for a writer.
     #[cfg(unix)]
     #[tokio::test]
-    async fn repair_returns_with_fifo_script() {
+    async fn scan_skips_fifo_wiring_files() {
         use std::time::Duration;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1172,12 +1150,10 @@ mod tests {
         );
     }
 
-    /// #832, #958: every file a vendored run writes is scanned, and a
-    /// reference to the uuid dir itself counts. NuGet's feed and Maven's
-    /// repository name the dir (Windows backslashes and a trailing slash
-    /// included); a Hatch environment in `hatch.toml` names a wheel. Every
-    /// caller (repair, the orphan sweeps, the `vendor` stranded-reference
-    /// gate, rollback's ledger-less gate) reads this one scan.
+    /// Every file a vendored run writes is scanned, and a reference to the
+    /// uuid dir itself counts. NuGet's feed and Maven's repository name the
+    /// dir (Windows backslashes and a trailing slash included); a Hatch
+    /// environment in `hatch.toml` names a wheel.
     #[tokio::test]
     async fn scan_recovers_unit_dir_and_hatch_toml_references() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1319,12 +1295,6 @@ mod tests {
             "non-vendor .socket mentions must be rejected: {refs:?}"
         );
     }
-}
-
-/// Exact-string tests for the vendored-repair human lines.
-#[cfg(test)]
-mod ui_format_tests {
-    use super::*;
 
     #[test]
     fn repair_failure_line_has_error_prefix() {
@@ -1364,6 +1334,5 @@ mod ui_format_tests {
                 "  - pkg:gem/b@1 (missing: p/b)",
             ]
         );
-        assert_eq!(rebuild_reason_label("something_else"), "something_else");
     }
 }
