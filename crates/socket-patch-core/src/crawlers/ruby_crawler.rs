@@ -47,7 +47,7 @@ impl RubyCrawler {
             options,
             std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
-            ambient_path_system_env().as_deref(),
+            &BundlerEnvPathFlags::ambient(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
@@ -74,7 +74,7 @@ impl RubyCrawler {
             options,
             None,
             bundle_path_env,
-            None,
+            &BundlerEnvPathFlags::default(),
             app_config_env,
             home_env,
             global_config,
@@ -93,7 +93,7 @@ impl RubyCrawler {
         options: &CrawlerOptions,
         gemfile_env: Option<&OsStr>,
         bundle_path_env: Option<&OsStr>,
-        path_system_env: Option<&OsStr>,
+        env_flags: &BundlerEnvPathFlags,
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
         global_config: Option<&Path>,
@@ -111,7 +111,7 @@ impl RubyCrawler {
             &options.cwd,
             gemfile_env,
             bundle_path_env,
-            path_system_env,
+            env_flags,
             app_config_env,
             home_env,
             global_config,
@@ -169,7 +169,7 @@ impl RubyCrawler {
             options,
             std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
-            ambient_path_system_env().as_deref(),
+            &BundlerEnvPathFlags::ambient(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
@@ -397,7 +397,7 @@ impl RubyCrawler {
         cwd: &Path,
         gemfile_env: Option<&OsStr>,
         bundle_path_env: Option<&OsStr>,
-        path_system_env: Option<&OsStr>,
+        env_flags: &BundlerEnvPathFlags,
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
         global_config: Option<&Path>,
@@ -456,19 +456,18 @@ impl RubyCrawler {
         // counts for a Ruby project. (A recorded local path never coexists
         // with it: [`parse_bundle_config_path`] already drops it.)
         let path_tier = if has_manifest {
-            Self::bundler_path_tier(
-                cwd,
-                bundle_path_env,
-                path_system_env,
-                app_config_env,
-                global_config,
-                ignore_config,
-            )
-            .await
+            BundlerPathTiers {
+                local: read_app_config(cwd, app_config_env, ignore_config).await,
+                env: env_flags.tier(bundle_path_env),
+                global: read_global_config(global_config, ignore_config).await,
+            }
+            .deciding()
         } else {
             None
         };
-        let uses_system_gems = path_tier.is_some_and(|tier| tier.system);
+        let uses_system_gems = path_tier
+            .as_ref()
+            .is_some_and(|(_, tier)| tier.uses_system_gems());
 
         let mut roots: Vec<PathBuf> = Vec::new();
         let mut skipped_config_path = None;
@@ -509,16 +508,15 @@ impl RubyCrawler {
             // is the user's own machine state, so it is trusted like the
             // env var: no containment guard. Bundler's `Settings#path`
             // takes the FIRST tier that sets `path`, `path.system`, or
-            // `disable_shared_gems`, so a local or env setting shadows it
-            // entirely — even an empty env
-            // `BUNDLE_PATH`, which adds no root above but still stops
-            // Bundler (`explicit_path` is `""`). An env
-            // `BUNDLE_PATH__SYSTEM` or `BUNDLE_DISABLE_SHARED_GEMS` already
-            // dropped `global_config`, see
-            // [`global_path_config_unless_env_path_settings`].
-            let shadowed = bundle_path_env.is_some()
-                || (!ignore_config && Self::app_config_sets_path(cwd, app_config_env).await);
-            if !shadowed {
+            // `disable_shared_gems`, so it applies only when the global
+            // tier is the deciding one: any local or env setting shadows
+            // it entirely — even an empty env `BUNDLE_PATH`, which adds no
+            // root above but still stops Bundler (`explicit_path` is `""`),
+            // or an env flag set to `"false"`.
+            if path_tier
+                .as_ref()
+                .is_some_and(|(level, _)| *level == BundlerPathLevel::Global)
+            {
                 let text = read_global_config(global_config, false).await;
                 let value = match text {
                     Some(text) => {
@@ -544,7 +542,10 @@ impl RubyCrawler {
             // once Bundler installed there. Like the explicit roots it keeps
             // the `gem env` fallback on, since default gems stay in the
             // system homes.
-            if !path_tier.is_some_and(|tier| tier.system || tier.explicit_path) {
+            if !path_tier
+                .as_ref()
+                .is_some_and(|(_, tier)| tier.uses_system_gems() || tier.path.is_some())
+            {
                 let dot_bundle = cwd.join(".bundle");
                 roots.push(normalize_lexically(&dot_bundle).unwrap_or(dot_bundle));
             }
@@ -591,7 +592,7 @@ impl RubyCrawler {
             cwd,
             std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
-            ambient_path_system_env().as_deref(),
+            &BundlerEnvPathFlags::ambient(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(cwd).as_deref(),
@@ -614,7 +615,7 @@ impl RubyCrawler {
             cwd,
             None,
             bundle_path_env,
-            None,
+            &BundlerEnvPathFlags::default(),
             app_config_env,
             home_env,
             global_config,
@@ -624,8 +625,7 @@ impl RubyCrawler {
     }
 
     /// [`Self::discover_bundle_stores_with_env`] with an env
-    /// `BUNDLE_PATH__SYSTEM` value, which also drops the global config
-    /// the way [`ambient_global_config_unless_ignored`] does.
+    /// `BUNDLE_PATH__SYSTEM` value.
     #[cfg(test)]
     async fn discover_bundle_stores_with_path_system_env(
         cwd: &Path,
@@ -633,19 +633,35 @@ impl RubyCrawler {
         path_system_env: Option<&OsStr>,
         global_config: Option<&Path>,
     ) -> BundleStoreDiscovery {
-        let global_config = global_path_config_unless_env_path_settings(
-            global_config.map(Path::to_path_buf),
-            path_system_env,
-            None,
-        );
+        Self::discover_bundle_stores_with_env_flags(
+            cwd,
+            bundle_path_env,
+            &BundlerEnvPathFlags {
+                path_system: path_system_env.map(OsStr::to_os_string),
+                disable_shared_gems: None,
+            },
+            global_config,
+        )
+        .await
+    }
+
+    /// [`Self::discover_bundle_stores_with_env`] with the env tier's
+    /// `path.system` and `disable_shared_gems` flags.
+    #[cfg(test)]
+    async fn discover_bundle_stores_with_env_flags(
+        cwd: &Path,
+        bundle_path_env: Option<&OsStr>,
+        env_flags: &BundlerEnvPathFlags,
+        global_config: Option<&Path>,
+    ) -> BundleStoreDiscovery {
         Self::discover_bundle_stores_impl(
             cwd,
             None,
             bundle_path_env,
-            path_system_env,
+            env_flags,
             None,
             None,
-            global_config.as_deref(),
+            global_config,
             false,
         )
         .await
@@ -665,10 +681,11 @@ impl RubyCrawler {
     /// and rollback write through) — only of verification. Empty in global /
     /// `--global-prefix` mode and whenever no config root was refused.
     pub async fn verification_only_gem_paths(&self, options: &CrawlerOptions) -> Vec<PathBuf> {
-        self.verification_only_gem_paths_with_env(
+        Self::verification_only_gem_paths_impl(
             options,
             std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
+            &BundlerEnvPathFlags::ambient(),
             std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
@@ -691,18 +708,41 @@ impl RubyCrawler {
         global_config: Option<&Path>,
         ignore_config: bool,
     ) -> Vec<PathBuf> {
+        Self::verification_only_gem_paths_impl(
+            options,
+            gemfile_env,
+            bundle_path_env,
+            &BundlerEnvPathFlags::default(),
+            app_config_env,
+            home_env,
+            global_config,
+            ignore_config,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn verification_only_gem_paths_impl(
+        options: &CrawlerOptions,
+        gemfile_env: Option<&OsStr>,
+        bundle_path_env: Option<&OsStr>,
+        env_flags: &BundlerEnvPathFlags,
+        app_config_env: Option<&OsStr>,
+        home_env: Option<&OsStr>,
+        global_config: Option<&Path>,
+        ignore_config: bool,
+    ) -> Vec<PathBuf> {
         if options.global || options.global_prefix.is_some() {
             return Vec::new();
         }
         // Under `BUNDLE_IGNORE_CONFIG` bundler never reads the config path,
-        // so nothing is refused and there is nothing extra to verify.
-        // `path.system` only drops the default root, never the refused
-        // config root this reads, so the env flag is not needed here.
+        // so nothing is refused and there is nothing extra to verify. The
+        // env flags only decide which other stores are already crawled.
         let discovery = Self::discover_bundle_stores_impl(
             &options.cwd,
             gemfile_env,
             bundle_path_env,
-            None,
+            env_flags,
             app_config_env,
             home_env,
             global_config,
@@ -857,53 +897,6 @@ impl RubyCrawler {
             paths.push(flat_gems);
         }
         paths
-    }
-
-    /// Whether the app config file sets `path`, `path.system`, or
-    /// `disable_shared_gems` at all, including an empty string — any one
-    /// makes bundler stop at that tier (`Settings#path`), so the global
-    /// config's path never applies.
-    async fn app_config_sets_path(cwd: &Path, app_config_env: Option<&OsStr>) -> bool {
-        let config = bundler_app_config_dir(cwd, app_config_env).join("config");
-        crate::utils::fs::read_regular_to_string(&config)
-            .await
-            .is_ok_and(|text| config_path_tier(&text).is_some())
-    }
-
-    /// The Bundler tier that decides the install path. `Settings#path`
-    /// takes the FIRST of the local app config, the environment and the
-    /// global config that sets `path`, `path.system` or
-    /// `disable_shared_gems` (even to an empty or false value); `None` when
-    /// no tier does. Callers already pass no `global_config` when the env
-    /// tier sets `path.system` or `disable_shared_gems` (see
-    /// [`global_path_config_unless_env_path_settings`]).
-    async fn bundler_path_tier(
-        cwd: &Path,
-        bundle_path_env: Option<&OsStr>,
-        path_system_env: Option<&OsStr>,
-        app_config_env: Option<&OsStr>,
-        global_config: Option<&Path>,
-        ignore_config: bool,
-    ) -> Option<BundlerPathTier> {
-        if !ignore_config {
-            let config = bundler_app_config_dir(cwd, app_config_env).join("config");
-            if let Ok(text) = crate::utils::fs::read_regular_to_string(&config).await {
-                if let Some(tier) = config_path_tier(&text) {
-                    return Some(tier);
-                }
-            }
-        }
-        if bundle_path_env.is_some() || path_system_env.is_some() {
-            return Some(BundlerPathTier {
-                explicit_path: bundle_path_env.is_some(),
-                system: path_system_env.is_some_and(|v| bundler_truthy(&v.to_string_lossy())),
-            });
-        }
-        let global = global_config?;
-        let text = crate::utils::fs::read_regular_to_string(global)
-            .await
-            .ok()?;
-        config_path_tier(&text)
     }
 
     /// The `BUNDLE_PATH` recorded in bundler's app config file — the value
@@ -1316,6 +1309,63 @@ impl BundlerPathSettings {
             std::env::var_os("BUNDLE_DEPLOYMENT").as_deref(),
         )
     }
+
+    /// Whether this tier decides the install path: `Settings#path` stops at
+    /// the first tier that sets `path`, `path.system` or
+    /// `disable_shared_gems`, even to an empty or false value.
+    fn decides_path(&self) -> bool {
+        self.path.is_some() || self.path_system.is_some() || self.disable_shared_gems.is_some()
+    }
+
+    /// Whether this tier, when it decides, sends Bundler to the system gem
+    /// home: `Path.new(path, system_path || !disable_shared_gems)`, with
+    /// both flags through Bundler's `to_bool` ([`bundler_truthy`]). The
+    /// system home then ignores every bundle path, explicit or default.
+    fn uses_system_gems(&self) -> bool {
+        self.path_system.as_deref().is_some_and(bundler_truthy)
+            || self
+                .disable_shared_gems
+                .as_deref()
+                .is_some_and(|v| !bundler_truthy(v))
+    }
+}
+
+/// The env tier's `path.system` and `disable_shared_gems` flags
+/// (`BUNDLE_PATH__SYSTEM`, `BUNDLE_DISABLE_SHARED_GEMS`), for the
+/// install-root probe, which takes the env `BUNDLE_PATH` separately because
+/// it resolves it as a path.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BundlerEnvPathFlags {
+    path_system: Option<std::ffi::OsString>,
+    disable_shared_gems: Option<std::ffi::OsString>,
+}
+
+impl BundlerEnvPathFlags {
+    fn ambient() -> Self {
+        Self {
+            path_system: std::env::var_os("BUNDLE_PATH__SYSTEM"),
+            disable_shared_gems: std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS"),
+        }
+    }
+
+    /// The env tier these flags and `bundle_path_env` make up. Its
+    /// `deployment` is left unset: the probe only reads the deciding tier.
+    fn tier(&self, bundle_path_env: Option<&OsStr>) -> BundlerPathSettings {
+        BundlerPathSettings::from_env(
+            bundle_path_env,
+            self.path_system.as_deref(),
+            self.disable_shared_gems.as_deref(),
+            None,
+        )
+    }
+}
+
+/// Which of Bundler's settings tiers decided the install path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundlerPathLevel {
+    Local,
+    Env,
+    Global,
 }
 
 /// The settings tiers Bundler's `Settings#path` reads, highest first: the
@@ -1325,6 +1375,40 @@ pub(crate) struct BundlerPathTiers {
     pub(crate) local: Option<String>,
     pub(crate) env: BundlerPathSettings,
     pub(crate) global: Option<String>,
+}
+
+impl BundlerPathTiers {
+    /// Every present tier's settings, highest first.
+    fn settings(self) -> Vec<(BundlerPathLevel, BundlerPathSettings)> {
+        [
+            self.local.as_deref().map(|text| {
+                (
+                    BundlerPathLevel::Local,
+                    BundlerPathSettings::from_config_text(text),
+                )
+            }),
+            Some((BundlerPathLevel::Env, self.env)),
+            self.global.as_deref().map(|text| {
+                (
+                    BundlerPathLevel::Global,
+                    BundlerPathSettings::from_config_text(text),
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The tier that decides the install path, the one rule every caller
+    /// reads it through: `Settings#path` takes the FIRST tier that
+    /// [`BundlerPathSettings::decides_path`] alone; `None` when no tier
+    /// does.
+    fn deciding(self) -> Option<(BundlerPathLevel, BundlerPathSettings)> {
+        self.settings()
+            .into_iter()
+            .find(|(_, tier)| tier.decides_path())
+    }
 }
 
 /// Whether Bundler installs into an explicit `path` instead of the system
@@ -1345,36 +1429,14 @@ pub(crate) struct BundlerPathTiers {
 /// which one applies depends on the Bundler that runs, which a scan can't
 /// read.
 pub(crate) fn bundler_sets_explicit_path(tiers: BundlerPathTiers) -> bool {
-    let settings: Vec<BundlerPathSettings> = [
-        tiers
-            .local
-            .as_deref()
-            .map(BundlerPathSettings::from_config_text),
-        Some(tiers.env),
-        tiers
-            .global
-            .as_deref()
-            .map(BundlerPathSettings::from_config_text),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    for tier in &settings {
-        if tier.path.is_none() && tier.path_system.is_none() && tier.disable_shared_gems.is_none() {
-            continue;
-        }
-        // Both flags go through Bundler's `to_bool` coercion.
-        let system = tier.path_system.as_deref().is_some_and(bundler_truthy)
-            || tier
-                .disable_shared_gems
-                .as_deref()
-                .is_some_and(|v| !bundler_truthy(v));
-        return !system && tier.path.as_deref().is_some_and(|p| !p.is_empty());
+    let settings = tiers.settings();
+    if let Some((_, tier)) = settings.iter().find(|(_, tier)| tier.decides_path()) {
+        return !tier.uses_system_gems() && tier.path.as_deref().is_some_and(|p| !p.is_empty());
     }
     // `path = "vendor/bundle" if self[:deployment]`, after the tier loop.
     settings
         .iter()
-        .find_map(|tier| tier.deployment.as_deref())
+        .find_map(|(_, tier)| tier.deployment.as_deref())
         .is_some_and(bundler_truthy)
 }
 
@@ -2140,42 +2202,15 @@ pub(crate) fn bundler_global_config_file(
 }
 
 /// [`ambient_bundler_global_config_file`], or `None` under
-/// `BUNDLE_IGNORE_CONFIG` or when the environment sets `path.system` or
-/// `disable_shared_gems` — for the install-root probe, which takes no
-/// `ignore_config` flag of its own.
+/// `BUNDLE_IGNORE_CONFIG` — for the install-root probe, which takes no
+/// `ignore_config` flag of its own. Env flags that shadow it are applied
+/// by the tier resolver ([`BundlerPathTiers::deciding`]).
 fn ambient_global_config_unless_ignored(root: &Path) -> Option<PathBuf> {
     if bundler_ignores_config() {
         None
     } else {
-        global_path_config_unless_env_path_settings(
-            ambient_bundler_global_config_file(root),
-            std::env::var_os("BUNDLE_PATH__SYSTEM").as_deref(),
-            std::env::var_os("BUNDLE_DISABLE_SHARED_GEMS").as_deref(),
-        )
+        ambient_bundler_global_config_file(root)
     }
-}
-
-/// The global config file for the install-root probe, or `None` when the
-/// env tier sets `path.system` or `disable_shared_gems`. Bundler's
-/// `Settings#path` stops at the first tier that sets either flag or `path`,
-/// and the env tier sits above the global one, so any flag value (even
-/// `"false"` or empty) shadows a global `path` — the env `BUNDLE_PATH` part
-/// of that rule is applied in [`RubyCrawler::discover_bundle_stores_impl`].
-fn global_path_config_unless_env_path_settings(
-    global_config: Option<PathBuf>,
-    path_system_env: Option<&OsStr>,
-    disable_shared_gems_env: Option<&OsStr>,
-) -> Option<PathBuf> {
-    if path_system_env.is_some() || disable_shared_gems_env.is_some() {
-        None
-    } else {
-        global_config
-    }
-}
-
-/// The ambient `BUNDLE_PATH__SYSTEM` (Bundler's env-tier `path.system`).
-fn ambient_path_system_env() -> Option<std::ffi::OsString> {
-    std::env::var_os("BUNDLE_PATH__SYSTEM")
 }
 
 /// Bundler's boolean coercion for a setting value (`Settings#to_bool`):
@@ -2392,34 +2427,6 @@ fn parse_bundle_config_path_with(contents: &str, unquote: fn(&str) -> &str) -> O
     } else {
         path
     }
-}
-
-/// The part of Bundler's `Settings::Path` the crawler needs from the tier
-/// that decides the install path.
-#[derive(Debug, Clone, Copy)]
-struct BundlerPathTier {
-    /// The tier sets `path`, even to an empty string (`explicit_path`).
-    explicit_path: bool,
-    /// The tier's `path.system` is truthy (`system_path`).
-    system: bool,
-}
-
-/// For one Bundler config file: `None` when it sets none of `path`,
-/// `path.system` and `disable_shared_gems` (Bundler reads on to the next
-/// tier), else what it says about the path.
-fn config_path_tier(contents: &str) -> Option<BundlerPathTier> {
-    let sets_path = [
-        "BUNDLE_PATH",
-        "BUNDLE_PATH__SYSTEM",
-        "BUNDLE_DISABLE_SHARED_GEMS",
-    ]
-    .iter()
-    .any(|key| bundle_config_setting_including_empty(contents, key).is_some());
-    sets_path.then(|| BundlerPathTier {
-        explicit_path: bundle_config_setting_including_empty(contents, "BUNDLE_PATH").is_some(),
-        system: bundle_config_setting_including_empty(contents, "BUNDLE_PATH__SYSTEM")
-            .is_some_and(|v| bundler_truthy(&v)),
-    })
 }
 
 /// The effective `<key>:` value of a bundler app config file (flat YAML
@@ -4445,34 +4452,84 @@ mod tests {
     /// value, even `"false"` or empty — shadows a global `path`: Bundler's
     /// `Settings#path` stops at the env tier (checked against Bundler
     /// 4.0.17: `explicit_path` is `nil` for each value).
-    #[test]
-    fn env_path_flags_shadow_the_global_config_path() {
-        let global = Some(PathBuf::from("/home/u/.bundle/config"));
+    #[tokio::test]
+    async fn env_path_flags_shadow_the_global_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let store = root
+            .join("vendor")
+            .join("gems")
+            .join("ruby")
+            .join("3.3.0")
+            .join("gems");
+        std::fs::create_dir_all(store.join("colorize-0.8.1")).unwrap();
+        std::fs::write(root.join("Gemfile"), "gem \"colorize\"\n").unwrap();
+        let global = dir.path().join("global-config");
+        std::fs::write(&global, "---\nBUNDLE_PATH: \"vendor/gems\"\n").unwrap();
+        let g = Some(global.as_path());
+        let flags =
+            |path_system: Option<&str>, disable_shared_gems: Option<&str>| BundlerEnvPathFlags {
+                path_system: path_system.map(Into::into),
+                disable_shared_gems: disable_shared_gems.map(Into::into),
+            };
+
         for value in ["true", "false", ""] {
-            assert_eq!(
-                global_path_config_unless_env_path_settings(
-                    global.clone(),
-                    Some(OsStr::new(value)),
-                    None
-                ),
-                None,
-                "BUNDLE_PATH__SYSTEM={value}"
-            );
-            assert_eq!(
-                global_path_config_unless_env_path_settings(
-                    global.clone(),
-                    None,
-                    Some(OsStr::new(value))
-                ),
-                None,
-                "BUNDLE_DISABLE_SHARED_GEMS={value}"
-            );
+            for env in [flags(Some(value), None), flags(None, Some(value))] {
+                let stores =
+                    RubyCrawler::discover_bundle_stores_with_env_flags(&root, None, &env, g)
+                        .await
+                        .stores;
+                assert!(stores.is_empty(), "{env:?}: {stores:?}");
+            }
         }
         // Unset: the global file still applies.
-        assert_eq!(
-            global_path_config_unless_env_path_settings(global.clone(), None, None),
-            global
-        );
+        let stores = RubyCrawler::discover_bundle_stores_with_env_flags(
+            &root,
+            None,
+            &BundlerEnvPathFlags::default(),
+            g,
+        )
+        .await
+        .stores;
+        assert_eq!(stores, vec![store]);
+    }
+
+    /// #1931, env variant: `BUNDLE_DISABLE_SHARED_GEMS=false` in the
+    /// environment sends Bundler to the system gems, so a leftover
+    /// `vendor/bundle` is dropped, as for an env `BUNDLE_PATH__SYSTEM=true`.
+    /// A truthy env flag keeps it.
+    #[tokio::test]
+    async fn env_falsy_disable_shared_gems_drops_leftover_vendor_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = stage_leftover_vendor_bundle(dir.path()).await;
+        let flags = |value: &str| BundlerEnvPathFlags {
+            path_system: None,
+            disable_shared_gems: Some(value.into()),
+        };
+        for value in ["false", "no", "0", ""] {
+            let discovery = RubyCrawler::discover_bundle_stores_with_env_flags(
+                dir.path(),
+                None,
+                &flags(value),
+                None,
+            )
+            .await;
+            assert!(
+                discovery.stores.is_empty(),
+                "{value}: {:?}",
+                discovery.stores
+            );
+            assert!(!discovery.default_root_has_stores, "{value}");
+        }
+        let discovery = RubyCrawler::discover_bundle_stores_with_env_flags(
+            dir.path(),
+            None,
+            &flags("true"),
+            None,
+        )
+        .await;
+        assert_eq!(discovery.stores, vec![store]);
+        assert!(discovery.default_root_has_stores);
     }
 
     #[tokio::test]
@@ -5170,6 +5227,97 @@ mod tests {
                 .await;
         assert!(discovery.stores.is_empty(), "{:?}", discovery.stores);
         assert!(!discovery.default_root_has_stores);
+    }
+
+    /// #1931: a falsy `disable_shared_gems` in the deciding tier sends
+    /// Bundler to the system gems exactly like a truthy `path.system`
+    /// (`system_scope = !disable_shared_gems`), so a leftover
+    /// `vendor/bundle` is unused: it must not be crawled, and must not
+    /// switch off the `gem env` homes. Local and global tiers.
+    #[tokio::test]
+    async fn falsy_disable_shared_gems_drops_leftover_vendor_bundle() {
+        for value in ["false", "no", "0", ""] {
+            let setting = format!("---\nBUNDLE_DISABLE_SHARED_GEMS: \"{value}\"\n");
+
+            let dir = tempfile::tempdir().unwrap();
+            stage_leftover_vendor_bundle(dir.path()).await;
+            tokio::fs::create_dir_all(dir.path().join(".bundle"))
+                .await
+                .unwrap();
+            tokio::fs::write(dir.path().join(".bundle").join("config"), &setting)
+                .await
+                .unwrap();
+            let discovery =
+                RubyCrawler::discover_bundle_stores_with_env(dir.path(), None, None, None, None)
+                    .await;
+            assert!(
+                discovery.stores.is_empty(),
+                "local {value}: {:?}",
+                discovery.stores
+            );
+            assert!(!discovery.default_root_has_stores, "local {value}");
+
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("proj");
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            stage_leftover_vendor_bundle(&root).await;
+            let global = dir.path().join("global-config");
+            tokio::fs::write(&global, &setting).await.unwrap();
+            let discovery = RubyCrawler::discover_bundle_stores_with_env(
+                &root,
+                None,
+                None,
+                None,
+                Some(&global),
+            )
+            .await;
+            assert!(
+                discovery.stores.is_empty(),
+                "global {value}: {:?}",
+                discovery.stores
+            );
+            assert!(!discovery.default_root_has_stores, "global {value}");
+        }
+    }
+
+    /// #1931 controls: a truthy `disable_shared_gems` keeps Bundler off the
+    /// system gems, so the leftover store stays; a falsy flag in a tier a
+    /// higher tier shadows does not count.
+    #[tokio::test]
+    async fn truthy_or_shadowed_disable_shared_gems_keeps_vendor_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        tokio::fs::create_dir_all(root.join(".bundle"))
+            .await
+            .unwrap();
+        let store = stage_leftover_vendor_bundle(&root).await;
+        tokio::fs::write(
+            root.join(".bundle").join("config"),
+            "---\nBUNDLE_DISABLE_SHARED_GEMS: \"true\"\n",
+        )
+        .await
+        .unwrap();
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, None).await;
+        assert_eq!(discovery.stores, vec![store.clone()]);
+        assert!(discovery.default_root_has_stores);
+
+        // A local `path.system: false` decides, so the global falsy flag
+        // is never read.
+        tokio::fs::write(
+            root.join(".bundle").join("config"),
+            "---\nBUNDLE_PATH__SYSTEM: \"false\"\n",
+        )
+        .await
+        .unwrap();
+        let global = dir.path().join("global-config");
+        tokio::fs::write(&global, "---\nBUNDLE_DISABLE_SHARED_GEMS: \"false\"\n")
+            .await
+            .unwrap();
+        let discovery =
+            RubyCrawler::discover_bundle_stores_with_env(&root, None, None, None, Some(&global))
+                .await;
+        assert_eq!(discovery.stores, vec![store]);
     }
 
     /// #915 controls: only the tier Bundler actually reads decides. A
