@@ -6,12 +6,14 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::preserve_line_endings;
 use crate::vendor::common::{pep508_name, pyproject_dependency_specs, DeclTable};
 
+pub const PYPROJECT: &str = "pyproject.toml";
+pub const HATCH_TOML: &str = "hatch.toml";
 /// The two documents the hatch planner reads and rewrites, in the order
 /// [`plan`] and [`rewrite_all`] parse them.
-pub const HATCH_FILES: [&str; 2] = ["pyproject.toml", "hatch.toml"];
+pub const HATCH_FILES: [&str; 2] = [PYPROJECT, HATCH_TOML];
 
 /// The first character of `root`'s path that Hatch's `{root:uri}` expands
-/// into a broken file URL (#547). Hatchling's `path_to_uri` escapes only
+/// into a broken file URL. Hatchling's `path_to_uri` escapes only
 /// the space, so pip percent-decodes a `%XX` escape, cuts the path at a
 /// `#` fragment or `?` query, and the PEP 508 parser stops at a `;`, a tab
 /// or any other whitespace or control character. Hatch builds the URL from
@@ -43,14 +45,16 @@ pub fn root_uri_unsafe_char(root: &std::path::Path) -> Option<char> {
         })
 }
 
+/// pyproject's `[tool.hatch]` table.
+fn tool_hatch(document: &DocumentMut) -> Option<&Item> {
+    document.get("tool")?.get("hatch")
+}
+
 pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {
-    files.contains_key("hatch.toml")
-        || files.get("pyproject.toml").is_some_and(|text| {
+    files.contains_key(HATCH_TOML)
+        || files.get(PYPROJECT).is_some_and(|text| {
             text.parse::<DocumentMut>().is_ok_and(|document| {
-                document
-                    .get("tool")
-                    .and_then(|tool| tool.get("hatch"))
-                    .is_some()
+                tool_hatch(&document).is_some()
                     || document
                         .get("build-system")
                         .and_then(|build| build.get("build-backend"))
@@ -68,22 +72,11 @@ pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {
 /// environment and a hatch.toml `lock-envs` overrides pyproject's (the rule
 /// [`environment_specs`] applies to dependencies).
 fn locks_environments(files: &BTreeMap<String, String>) -> bool {
-    let external = parsed(files, HATCH_FILES[1]);
-    let project = parsed(files, HATCH_FILES[0]);
-    let key = |name: &str| -> Option<Item> {
-        if let Some(item) = external.as_ref().and_then(|doc| doc.get(name)) {
-            return Some(item.clone());
-        }
-        project
-            .as_ref()
-            .and_then(|doc| doc.get("tool"))
-            .and_then(|tool| tool.get("hatch"))
-            .and_then(|hatch| hatch.get(name))
-            .cloned()
-    };
-    key("lock-envs").and_then(|item| item.as_bool()) == Some(true)
+    let external = parsed(files, HATCH_TOML);
+    let project = parsed(files, PYPROJECT);
+    let key = |name| merged_key(project.as_ref(), external.as_ref(), name).1;
+    key("lock-envs").and_then(Item::as_bool) == Some(true)
         || key("envs")
-            .as_ref()
             .and_then(Item::as_table_like)
             .is_some_and(|envs| {
                 envs.iter().any(|(_, env)| {
@@ -93,7 +86,7 @@ fn locks_environments(files: &BTreeMap<String, String>) -> bool {
             })
 }
 
-/// Whether `path` is a PEP 751 lock Hatch derives from pyproject (#479):
+/// Whether `path` is a PEP 751 lock Hatch derives from pyproject:
 /// a `pylock.toml` / `pylock.<name>.toml` in a Hatch project whose
 /// environments are locked. Hatch regenerates it from pyproject whenever
 /// the dependency hash changes, so it is not an independent install
@@ -129,7 +122,7 @@ pub(crate) fn dependency_specs<'d>(
         .into_iter()
         .flat_map(pyproject_dependency_specs)
         .map(|(table, spec)| HatchSpec {
-            file: HATCH_FILES[0],
+            file: PYPROJECT,
             table,
             spec,
         })
@@ -146,14 +139,22 @@ pub(crate) fn environments<'d>(
     pyproject: Option<&'d DocumentMut>,
     hatch_toml: Option<&'d DocumentMut>,
 ) -> (&'static str, Option<&'d Item>) {
-    match hatch_toml.filter(|d| d.contains_key("envs")) {
-        Some(doc) => (HATCH_FILES[1], doc.get("envs")),
+    merged_key(pyproject, hatch_toml, "envs")
+}
+
+/// The Hatch setting `key` and the [`HATCH_FILES`] entry holding it: a
+/// hatch.toml top-level key replaces pyproject's `[tool.hatch]` key of the
+/// same name, whatever its value.
+fn merged_key<'d>(
+    pyproject: Option<&'d DocumentMut>,
+    hatch_toml: Option<&'d DocumentMut>,
+    key: &str,
+) -> (&'static str, Option<&'d Item>) {
+    match hatch_toml.and_then(|d| d.get(key)) {
+        Some(item) => (HATCH_TOML, Some(item)),
         None => (
-            HATCH_FILES[0],
-            pyproject
-                .and_then(|d| d.get("tool"))
-                .and_then(|t| t.get("hatch"))
-                .and_then(|h| h.get("envs")),
+            PYPROJECT,
+            pyproject.and_then(tool_hatch).and_then(|h| h.get(key)),
         ),
     }
 }
@@ -191,8 +192,8 @@ fn parsed(files: &BTreeMap<String, String>, file: &str) -> Option<DocumentMut> {
 }
 
 pub fn has_environment_dependency(files: &BTreeMap<String, String>, name: &str) -> bool {
-    let external = parsed(files, HATCH_FILES[1]);
-    let project = parsed(files, HATCH_FILES[0]);
+    let external = parsed(files, HATCH_TOML);
+    let project = parsed(files, PYPROJECT);
     environment_specs(project.as_ref(), external.as_ref())
         .iter()
         .any(|s| canonicalize_pypi_name(pep508_name(s.spec)) == canonicalize_pypi_name(name))
@@ -270,7 +271,8 @@ pub struct HatchEdit {
     /// The direct-reference permission a project-table reference needs
     /// (`allow-direct-references = true`, see [`permission_keys`]) rather
     /// than a requirement; `original` is the setting it replaced, empty
-    /// when there was none.
+    /// when there was none. [`plan`]'s permission instead records the
+    /// whole file before and after granting it.
     pub permission: bool,
 }
 
@@ -294,6 +296,14 @@ struct Target<'a> {
     edits: Vec<HatchEdit>,
 }
 
+impl Target<'_> {
+    /// A vendored wheel's `{root:uri}` reference, which only Hatch's pip
+    /// installer and the tables Hatch formats can take.
+    fn root_relative(&self) -> bool {
+        self.url.starts_with("{root:uri}")
+    }
+}
+
 /// The dependencies one walk of the Hatch documents rewrites, at most one
 /// per canonical name. Requirements of different names never touch each
 /// other's strings, so each target's outcome is the one a [`plan`] of it
@@ -310,7 +320,35 @@ struct Round<'a> {
     uv_sources: HashSet<String>,
 }
 
-impl Round<'_> {
+impl<'a> Round<'a> {
+    /// A round over `targets` (canonical name, version, url), whose names
+    /// are distinct.
+    fn new(targets: impl IntoIterator<Item = (String, &'a str, &'a str)>) -> Self {
+        let targets: Vec<Target<'a>> = targets
+            .into_iter()
+            .map(|(name, version, url)| Target {
+                name,
+                version,
+                url,
+                error: None,
+                matched: 0,
+                project_matched: 0,
+                edits: Vec::new(),
+            })
+            .collect();
+        let index = targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| (target.name.clone(), index))
+            .collect();
+        Round {
+            targets,
+            index,
+            apply: false,
+            uv_sources: HashSet::new(),
+        }
+    }
+
     /// A structural error stops the walk, as it stops a single [`plan`]:
     /// every target that has not already failed fails with it.
     fn fail_rest(&mut self, error: &str) {
@@ -376,7 +414,7 @@ fn rewrite_array(
 }
 
 fn rewrite_project(document: &mut DocumentMut, round: &mut Round) -> Result<(), String> {
-    let file = HATCH_FILES[0];
+    let file = PYPROJECT;
     if let Some(project) = document.get_mut("project") {
         if project
             .get("dynamic")
@@ -420,7 +458,7 @@ fn rewrite_project(document: &mut DocumentMut, round: &mut Round) -> Result<(), 
         {
             for index in rewrite_array(dependencies, round, file, true)? {
                 let target = &mut round.targets[index];
-                if target.url.starts_with("{root:uri}") {
+                if target.root_relative() {
                     target.error.get_or_insert_with(|| "Hatch does not expand root placeholders in dependency groups; use environment dependencies or agent mode".into());
                 }
             }
@@ -429,7 +467,7 @@ fn rewrite_project(document: &mut DocumentMut, round: &mut Round) -> Result<(), 
     Ok(())
 }
 
-/// #673: Hatch's uv installer runs `uv pip install -e .`, which resolves a
+/// Hatch's uv installer runs `uv pip install -e .`, which resolves a
 /// project requirement through `[tool.uv.sources]` instead of its direct
 /// reference: a url or path source installs the unpatched copy, a git
 /// source makes every install fail on conflicting URLs. Environment
@@ -477,7 +515,7 @@ fn uv_source_names(
             .is_some_and(|table| table.contains_key("index")),
     };
     documents
-        .get(HATCH_FILES[0])
+        .get(PYPROJECT)
         .and_then(|document| document.get("tool"))
         .and_then(|tool| tool.get("uv"))
         .and_then(|uv| uv.get("sources"))
@@ -533,12 +571,15 @@ fn walk(
     documents: &mut BTreeMap<&'static str, DocumentMut>,
     round: &mut Round,
 ) -> Result<(), String> {
-    if let Some(project) = documents.get_mut(HATCH_FILES[0]) {
+    if let Some(project) = documents.get_mut(PYPROJECT) {
         rewrite_project(project, round)?;
     }
     // Hatch merges external configuration by top-level key, not recursively.
-    let external_keys = external_keys(documents);
-    if let Some(document) = documents.get_mut(HATCH_FILES[0]) {
+    let external_keys: Vec<String> = documents
+        .get(HATCH_TOML)
+        .map(|d| d.iter().map(|(k, _)| k.to_owned()).collect())
+        .unwrap_or_default();
+    if let Some(document) = documents.get_mut(PYPROJECT) {
         if let Some(hatch) = document.get_mut("tool").and_then(|tool| {
             tool.as_table_like_mut()
                 .and_then(|table| table.get_mut("hatch"))
@@ -549,7 +590,7 @@ fn walk(
                     table.remove(key);
                 }
             }
-            rewrite_environments(&mut effective, round, HATCH_FILES[0])?;
+            rewrite_environments(&mut effective, round, PYPROJECT)?;
             if round.apply {
                 if let Some(table) = effective.as_table_like() {
                     for (key, item) in table.iter() {
@@ -559,9 +600,9 @@ fn walk(
             }
         }
     }
-    if let Some(document) = documents.get_mut(HATCH_FILES[1]) {
+    if let Some(document) = documents.get_mut(HATCH_TOML) {
         let mut hatch = Item::Table(document.as_table().clone());
-        rewrite_environments(&mut hatch, round, HATCH_FILES[1])?;
+        rewrite_environments(&mut hatch, round, HATCH_TOML)?;
         if round.apply {
             *document.as_table_mut() = hatch
                 .as_table()
@@ -572,23 +613,20 @@ fn walk(
     Ok(())
 }
 
-fn external_keys(documents: &BTreeMap<&'static str, DocumentMut>) -> Vec<String> {
+/// Whether hatch.toml carries `metadata`, which then holds the
+/// direct-reference permission instead of pyproject.
+fn external_metadata(documents: &BTreeMap<&'static str, DocumentMut>) -> bool {
     documents
-        .get(HATCH_FILES[1])
-        .map(|d| d.iter().map(|(k, _)| k.to_owned()).collect())
-        .unwrap_or_default()
+        .get(HATCH_TOML)
+        .is_some_and(|d| d.contains_key("metadata"))
 }
 
 /// Run one [`Round`] over `documents`: check, then apply what passed.
 fn run_round(documents: &mut BTreeMap<&'static str, DocumentMut>, round: &mut Round) {
-    if round
-        .targets
-        .iter()
-        .any(|t| t.url.starts_with("{root:uri}"))
-    {
+    if round.targets.iter().any(Target::root_relative) {
         if let Err(error) = require_pip_installer_documents(documents.values()) {
             for target in &mut round.targets {
-                if target.url.starts_with("{root:uri}") {
+                if target.root_relative() {
                     target.error = Some(error.clone());
                 }
             }
@@ -611,7 +649,7 @@ fn run_round(documents: &mut BTreeMap<&'static str, DocumentMut>, round: &mut Ro
     // A project-table match needs Hatch's direct-reference permission, which
     // no requirement rewrite touches: whether it can be granted is judged
     // once, on a copy.
-    let external = external_keys(documents).iter().any(|key| key == "metadata");
+    let external = external_metadata(documents);
     let permission_file = permission_file(external);
     let needs_permission = |target: &Target| target.error.is_none() && target.project_matched > 0;
     if round.targets.iter().any(needs_permission) {
@@ -674,9 +712,9 @@ fn permission_setting(document: &DocumentMut, external: bool) -> Option<Item> {
 
 fn permission_file(external: bool) -> &'static str {
     if external {
-        HATCH_FILES[1]
+        HATCH_TOML
     } else {
-        HATCH_FILES[0]
+        PYPROJECT
     }
 }
 
@@ -741,27 +779,13 @@ pub fn rewrite_all(files: &BTreeMap<String, String>, deps: &[HatchDep]) -> Hatch
     let mut steps: Vec<Result<Vec<HatchEdit>, String>> =
         deps.iter().map(|_| Ok(Vec::new())).collect();
     for positions in rounds {
-        let mut round = Round {
-            targets: positions
-                .iter()
-                .map(|&position| Target {
-                    name: names[position].clone(),
-                    version: deps[position].version,
-                    url: deps[position].url,
-                    error: None,
-                    matched: 0,
-                    project_matched: 0,
-                    edits: Vec::new(),
-                })
-                .collect(),
-            index: positions
-                .iter()
-                .enumerate()
-                .map(|(index, &position)| (names[position].clone(), index))
-                .collect(),
-            apply: false,
-            uv_sources: HashSet::new(),
-        };
+        let mut round = Round::new(positions.iter().map(|&position| {
+            (
+                names[position].clone(),
+                deps[position].version,
+                deps[position].url,
+            )
+        }));
         run_round(&mut documents, &mut round);
         for (position, target) in positions.into_iter().zip(round.targets) {
             steps[position] = match target.error {
@@ -780,15 +804,9 @@ pub fn rewrite_all(files: &BTreeMap<String, String>, deps: &[HatchDep]) -> Hatch
     HatchBatch { files, steps }
 }
 
-pub struct HatchPermission {
-    pub file: String,
-    pub original: String,
-    pub new: String,
-}
-
 pub struct HatchPlan {
     pub files: BTreeMap<String, String>,
-    pub permission: Option<HatchPermission>,
+    pub permission: Option<HatchEdit>,
 }
 
 pub fn rewrite(
@@ -857,7 +875,7 @@ pub(crate) fn drop_direct_reference_permission(doc: &mut DocumentMut, keys: &[&s
 }
 
 pub fn has_project_direct_references(files: &BTreeMap<String, String>) -> bool {
-    let Some(document) = parsed(files, HATCH_FILES[0]) else {
+    let Some(document) = parsed(files, PYPROJECT) else {
         return false;
     };
     pyproject_dependency_specs(&document)
@@ -873,26 +891,14 @@ pub fn has_project_direct_references(files: &BTreeMap<String, String>) -> bool {
 /// (`installer = "uv"` or a non-empty `uv-path`): uv does not enforce local
 /// wheel fragment hashes, so a vendored wheel needs pip.
 pub fn require_pip_installer(files: &BTreeMap<String, String>) -> Result<(), String> {
-    let mut documents = Vec::new();
-    for file in HATCH_FILES {
-        if let Some(text) = files.get(file) {
-            documents.push(
-                text.parse::<DocumentMut>()
-                    .map_err(|error| format!("{file}: {error}"))?,
-            );
-        }
-    }
-    require_pip_installer_documents(documents.iter())
+    require_pip_installer_documents(parse_documents(files)?.values())
 }
 
 fn require_pip_installer_documents<'a>(
     documents: impl Iterator<Item = &'a DocumentMut>,
 ) -> Result<(), String> {
     for document in documents {
-        let hatch = document
-            .get("tool")
-            .and_then(|tool| tool.get("hatch"))
-            .unwrap_or(document.as_item());
+        let hatch = tool_hatch(document).unwrap_or(document.as_item());
         if hatch
             .get("envs")
             .and_then(Item::as_table_like)
@@ -920,20 +926,7 @@ pub fn plan(
 ) -> Result<HatchPlan, String> {
     let name = canonicalize_pypi_name(name);
     let mut documents = parse_documents(files)?;
-    let mut round = Round {
-        targets: vec![Target {
-            name: name.clone(),
-            version,
-            url,
-            error: None,
-            matched: 0,
-            project_matched: 0,
-            edits: Vec::new(),
-        }],
-        index: HashMap::from([(name, 0)]),
-        apply: false,
-        uv_sources: HashSet::new(),
-    };
+    let mut round = Round::new([(name, version, url)]);
     run_round(&mut documents, &mut round);
     let target = round.targets.pop().ok_or("missing Hatch target")?;
     if let Some(error) = target.error {
@@ -942,19 +935,18 @@ pub fn plan(
     // `run_round` granted the permission in the rewritten documents; the
     // vendored ledger also records it alone over the original text.
     let permission = if target.project_matched > 0 {
-        let external = external_keys(&documents)
-            .iter()
-            .any(|key| key == "metadata");
+        let external = external_metadata(&documents);
         let file = permission_file(external);
         let original = files[file].clone();
         let mut permission_only = original
             .parse::<DocumentMut>()
             .map_err(|error| error.to_string())?;
         enable_permission(&mut permission_only, external)?;
-        Some(HatchPermission {
+        Some(HatchEdit {
             file: file.into(),
             new: preserve_line_endings(&original, permission_only.to_string()),
             original,
+            permission: true,
         })
     } else {
         None
@@ -969,7 +961,7 @@ pub fn plan(
 mod tests {
     use super::*;
 
-    /// #479 (Bugbot): Hatch merges hatch.toml over `[tool.hatch]` by
+    /// Hatch merges hatch.toml over `[tool.hatch]` by
     /// top-level key, so a shadowed `locked` / `lock-envs` does not make a
     /// pylock Hatch-derived, and one set in hatch.toml does.
     #[test]
@@ -1054,7 +1046,7 @@ mod tests {
         }
     }
 
-    /// #650: a superseding patch (a new patch uuid for the same package and
+    /// A superseding patch (a new patch uuid for the same package and
     /// version) re-pins socket-patch's OWN earlier hosted direct reference —
     /// in `pyproject.toml` (project and env tables) and in `hatch.toml` —
     /// instead of refusing it as an unknown user source.
@@ -1105,7 +1097,7 @@ mod tests {
         }
     }
 
-    /// #475: Hatch (via pip/uv) selects a release under PEP 440, so
+    /// Hatch (via pip/uv) selects a release under PEP 440, so
     /// `==1.26.18.0` and `==01.26.18` are exact pins of 1.26.18.
     #[test]
     fn pep440_equivalent_pins_are_exact_declarations() {
@@ -1194,7 +1186,7 @@ mod tests {
         }
     }
 
-    /// #673: Hatch's uv installer runs `uv pip install -e .`, which applies
+    /// Hatch's uv installer runs `uv pip install -e .`, which applies
     /// the project's `[tool.uv.sources]` over a direct reference in the
     /// project tables, so a url, path or git source would keep the
     /// unpatched copy (or break every install). Environment dependencies
@@ -1253,7 +1245,7 @@ mod tests {
         // file setting; an empty source array is not index-only.
         let sourced = |source: &str| -> BTreeMap<&'static str, DocumentMut> {
             [(
-                HATCH_FILES[0],
+                PYPROJECT,
                 format!("[project]\ndependencies = [\"six==1.16.0\"]\n[tool.uv.sources]\nsix = {source}\n")
                     .parse()
                     .unwrap(),
@@ -1447,7 +1439,7 @@ mod tests {
     const HOSTED_A: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/11111111-1111-4111-8111-111111111111/aaaaaaaa-0000-4000-8000-000000000001/six-1.16.0-py2.py3-none-any.whl#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HOSTED_B: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-0000-4000-8000-000000000004/six-1.16.0-py2.py3-none-any.whl#sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    /// #1471: one batch over many deps gives exactly what rewriting them
+    /// One batch over many deps gives exactly what rewriting them
     /// one at a time gives — successes, per-dependency refusals (inexact
     /// pin, no declaration), extras and markers, a name repeated with a
     /// superseding url (runs after the first, in input order), and a name
@@ -1524,7 +1516,7 @@ mod tests {
         assert!(empty.files.is_empty() && empty.steps.is_empty());
     }
 
-    /// #1471: hatch.toml's `envs` replaces pyproject's, a refusal found in
+    /// hatch.toml's `envs` replaces pyproject's, a refusal found in
     /// a later table leaves that dep's earlier declarations untouched, and
     /// a structural refusal fails every dep not already refused (each with
     /// the message a lone `rewrite` gives it).
@@ -1627,7 +1619,7 @@ mod tests {
             .all(|step| step.as_ref().unwrap_err().starts_with("hatch.toml:")));
     }
 
-    /// #1471: a re-run whose only change is restoring the direct-reference
+    /// A re-run whose only change is restoring the direct-reference
     /// permission the user removed still rewrites the file and records the
     /// permission edit, and an already-granted permission records nothing.
     #[test]
@@ -1667,7 +1659,7 @@ mod tests {
         assert_eq!(edits[1].original, "allow-direct-references = false");
     }
 
-    /// #1471: when no dep is wired, nothing is written, even for a
+    /// When no dep is wired, nothing is written, even for a
     /// hatch.toml whose render is not byte-identical (mixed line endings).
     #[test]
     fn batch_rewrite_writes_nothing_when_every_dep_is_refused() {
@@ -1686,7 +1678,7 @@ mod tests {
         assert!(rewrite_all(&mixed, &[]).files.is_empty());
     }
 
-    /// #1471: vendored `{root:uri}` deps keep their pip-installer and
+    /// Vendored `{root:uri}` deps keep their pip-installer and
     /// dependency-group refusals inside a batch, beside hosted deps that
     /// still wire.
     #[test]

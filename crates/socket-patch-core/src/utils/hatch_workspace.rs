@@ -1,4 +1,4 @@
-//! Hatch workspaces (Hatch 1.16+, #505): an environment's
+//! Hatch workspaces (Hatch 1.16+): an environment's
 //! `workspace.members` installs each member editable together with the
 //! member's `[project]` dependencies, and its raw optional dependencies
 //! whenever the member's `features` or any requirement the environment
@@ -21,7 +21,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::read_regular_to_string_sync;
-use crate::utils::hatch::{environments, HATCH_FILES};
+use crate::utils::hatch::{environments, HATCH_FILES, HATCH_TOML, PYPROJECT};
 use crate::utils::repo_root;
 use crate::vendor::common::pep508_name;
 
@@ -98,16 +98,17 @@ fn absolute(path: &Path) -> Option<PathBuf> {
 fn roots(real: &Path, lexical: &Path) -> Vec<PathBuf> {
     let home = repo_root::home();
     let mut roots: Vec<PathBuf> = repo_root::search_dirs(real).into_iter().skip(1).collect();
-    let at_checkout = lexical.join(".git").exists();
-    for dir in lexical.ancestors().skip(1).take_while(|_| !at_checkout) {
-        if home.as_deref() == Some(dir) {
-            break;
-        }
-        if !roots.iter().any(|root| root == dir) {
-            roots.push(dir.to_path_buf());
-        }
-        if dir.join(".git").exists() {
-            break;
+    if !lexical.join(".git").exists() {
+        for dir in lexical.ancestors().skip(1) {
+            if home.as_deref() == Some(dir) {
+                break;
+            }
+            if !roots.iter().any(|root| root == dir) {
+                roots.push(dir.to_path_buf());
+            }
+            if dir.join(".git").exists() {
+                break;
+            }
         }
     }
     let Some(checkout) = repo_root::find_git_repo(real).map(|repo| repo.root) else {
@@ -162,8 +163,8 @@ fn parse(dir: &Path, file: &str) -> Option<DocumentMut> {
 /// table naming its `path`. An environment that inherits a workspace from
 /// its template lists the same members as the template, which is found.
 fn listing_environments(root: &Path, member: &Path) -> Vec<String> {
-    let external = parse(root, HATCH_FILES[1]);
-    let project = parse(root, HATCH_FILES[0]);
+    let external = parse(root, HATCH_TOML);
+    let project = parse(root, PYPROJECT);
     let (_, envs) = environments(project.as_ref(), external.as_ref());
     let Some(envs) = envs.and_then(Item::as_table_like) else {
         return Vec::new();
@@ -201,29 +202,26 @@ fn listing_environments(root: &Path, member: &Path) -> Vec<String> {
     found
 }
 
-/// A member spec with the context fields Hatch formats in it (`{root}`,
-/// `{home}`) filled in; `None` when another field remains.
-fn expand(root: &Path, spec: &str) -> Option<String> {
-    let mut spec = spec.replace("{root}", &root.to_string_lossy());
-    if spec.contains("{home}") {
-        let home = crate::utils::fs::home_dir()?;
-        spec = spec.replace("{home}", &home.to_string_lossy());
-    }
-    (!spec.contains('{')).then_some(spec)
-}
-
 /// The members (directories, as reached) the member spec `spec` of the
 /// workspace at `root` lists, as Hatch's `find_members` resolves it: the
-/// spec is joined to the root and normalized, and the part below the root
+/// context fields Hatch formats (`{root}`, `{home}`) are filled in (a spec
+/// with any other field lists nothing), the spec is joined to the root and normalized, and the part below the root
 /// and the spec's shared prefix is matched one directory level at a time
 /// (a component with `*`, `?` or `[` as an fnmatch pattern Python searches
 /// for, so it may match a suffix of the directory name; symlinked
 /// directories are followed), less any an `exclude` pattern matches by
 /// its path relative to that prefix or its absolute path.
 fn members_of(root: &Path, spec: &str, exclude: &[&str]) -> Vec<PathBuf> {
-    let Some(spec) = expand(root, spec).filter(|spec| !spec.is_empty()) else {
+    let mut spec = spec.replace("{root}", &root.to_string_lossy());
+    if spec.contains("{home}") {
+        let Some(home) = crate::utils::fs::home_dir() else {
+            return Vec::new();
+        };
+        spec = spec.replace("{home}", &home.to_string_lossy());
+    }
+    if spec.is_empty() || spec.contains('{') {
         return Vec::new();
-    };
+    }
     let Some(target) = absolute(&root.join(spec)) else {
         return Vec::new();
     };
@@ -411,7 +409,7 @@ mod tests {
         format!("{ROOT}[tool.hatch.envs.default.workspace]\nmembers = {members}\n")
     }
 
-    /// #505: a member listed by a glob, a plain path, a `{path = ..}`
+    /// A member listed by a glob, a plain path, a `{path = ..}`
     /// table, an array of tables or a `{root}` spec is consumed for its
     /// `[project]` dependencies; a project the workspace does not list, or
     /// none at all, is not.
@@ -454,7 +452,7 @@ mod tests {
         assert_eq!(consumer(&dir, MEMBER, "six"), None);
     }
 
-    /// #505 (review): a workspace root beside the member, listing it
+    /// A workspace root beside the member, listing it
     /// through a `../` spec, is found anywhere in the checkout.
     #[test]
     fn sibling_roots_listing_the_member_through_parent_specs() {
@@ -469,7 +467,7 @@ mod tests {
         assert_eq!(consumer(&dir, MEMBER, "six"), None);
     }
 
-    /// #505 and review: once a workspace lists the member, every optional
+    /// Once a workspace lists the member, every optional
     /// dependency counts as read raw, whatever reaches it (the entry's
     /// `features`, a `lib1[sec]` in an environment, its template, a
     /// dependency group, the root or another member, a mixed-case key);
@@ -492,7 +490,7 @@ mod tests {
         }
     }
 
-    /// #505: a workspace declared in hatch.toml counts, and a hatch.toml
+    /// A workspace declared in hatch.toml counts, and a hatch.toml
     /// `envs` table hides pyproject's environments.
     #[test]
     fn hatch_toml_workspaces_replace_pyproject_envs() {
@@ -543,7 +541,7 @@ mod tests {
         assert_eq!(consumer(&top, MEMBER, "six"), None);
     }
 
-    /// Bugbot: a member Hatch reaches through a symlinked directory is
+    /// A member Hatch reaches through a symlinked directory is
     /// still listed, whichever spelling the scan was given.
     #[cfg(unix)]
     #[test]
