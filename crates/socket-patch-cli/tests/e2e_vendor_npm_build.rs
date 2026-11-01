@@ -1460,3 +1460,115 @@ fn npm_linked_strategy_transitive_package_is_patched_rolled_back_and_vendored() 
         lock_before
     );
 }
+
+/// #1937: npm 7-12 never write `resolved` for a `file:` resolution in a v2
+/// lock's legacy `dependencies` mirror, so a plain `npm install` after
+/// vendoring leaves the mirror node with only `version` and the patched
+/// `integrity`. Every explicit reversal (`rollback`, `remove`, `vendor
+/// --revert`) must still restore BOTH lock halves and delete the artifact;
+/// it used to restore the `packages` entry, drift-keep the mirror node, and
+/// exit 1 over a half-reverted lock that npm 6 fails EINTEGRITY on.
+#[test]
+fn npm_v2_revert_after_npm_install_restores_both_lock_halves() {
+    let suite = "e2e_vendor_npm_build (v2 mirror after npm install)";
+    let Some(major) = npm_major_or_skip(suite) else {
+        return;
+    };
+    if major < 7 {
+        println!("N/A {suite}: npm {major} keeps the mirror `resolved`");
+        return;
+    }
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    let reversals: [&[&str]; 3] = [
+        &["rollback"],
+        &["remove", purl.as_str()],
+        &["vendor", "--revert"],
+    ];
+    for reversal in reversals {
+        let label = reversal.join(" ");
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("package.json"),
+            r#"{"name":"vendor-v2-mirror","version":"0.0.0","private":true}"#,
+        )
+        .unwrap();
+        let cache = tmp.path().join("npm-cache");
+        let cache_arg = cache.to_str().unwrap();
+        let spec = format!("{DEP}@{DEP_VERSION}");
+        let install = npm(
+            &proj,
+            &[
+                "install",
+                &spec,
+                "--save-exact",
+                "--lockfile-version",
+                "2",
+                "--no-audit",
+                "--no-fund",
+                "--cache",
+                cache_arg,
+            ],
+        );
+        if !install.status.success() {
+            npm_e2e_common::skip(suite, &npm_e2e_common::output_text(&install));
+            return;
+        }
+        assert_eq!(npm_e2e_common::lockfile_version(&proj), Some(2));
+        let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+        let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+        stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, TAIL_GHSA);
+        let lock_path = proj.join("package-lock.json");
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        let cwd = proj.to_str().unwrap();
+
+        let (code, stdout, stderr) =
+            run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+        assert_eq!(code, 0, "{label}: vendor failed.\n{stdout}\n{stderr}");
+
+        // The ordinary next step: npm re-saves the lock and drops the
+        // mirror node's `resolved`.
+        let reinstall = npm(
+            &proj,
+            &["install", "--no-audit", "--no-fund", "--cache", cache_arg],
+        );
+        assert!(
+            reinstall.status.success(),
+            "{label}: {}",
+            npm_e2e_common::output_text(&reinstall)
+        );
+        let resaved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        assert_eq!(resaved["lockfileVersion"], 2, "{label}: {resaved}");
+        if resaved["dependencies"][DEP].get("resolved").is_some() {
+            println!("N/A {suite}: npm {major} kept the mirror `resolved`");
+            return;
+        }
+
+        let mut args = reversal.to_vec();
+        args.extend(["--json", "--offline", "--cwd", cwd]);
+        let (code, stdout, stderr) = run_socket(&proj, &args);
+        assert_eq!(code, 0, "{label} failed.\n{stdout}\n{stderr}");
+        assert!(
+            !stdout.contains("vendor_lock_entry_drifted"),
+            "{label}: nothing drifted.\n{stdout}"
+        );
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        let key = format!("node_modules/{DEP}");
+        assert_eq!(
+            after["packages"][&key], before["packages"][&key],
+            "{label}: packages entry restored"
+        );
+        assert_eq!(
+            after["dependencies"][DEP], before["dependencies"][DEP],
+            "{label}: the legacy mirror node is restored too"
+        );
+        assert!(
+            !proj.join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "{label}: the vendored artifact is removed"
+        );
+    }
+}
