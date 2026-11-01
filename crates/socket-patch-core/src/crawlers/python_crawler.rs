@@ -1044,8 +1044,9 @@ async fn uv_project_environment_site_packages(
 }
 
 /// Whether a manager other than uv records or locks the project at `cwd`:
-/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`) or
-/// PDM project.
+/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`, read
+/// by [`declares_tool_poetry`], so a plugin table such as
+/// `[tool.poetry-dynamic-versioning]` does not count) or PDM project.
 async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
     let other_lock = [
         "poetry.lock",
@@ -1061,7 +1062,7 @@ async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
         || is_pdm_project(cwd).await
         || read_regular_to_string(&cwd.join("pyproject.toml"))
             .await
-            .is_ok_and(|text| text.contains("[tool.poetry"))
+            .is_ok_and(|text| declares_tool_poetry(&text))
 }
 
 /// Whether only uv installs for `cwd`, so its env is only ever uv's own: a
