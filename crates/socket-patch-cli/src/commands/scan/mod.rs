@@ -3426,10 +3426,11 @@ async fn run_scan(
             // rendered as `[would-refuse]` lines so a preview never
             // advertises vendoring the wet run would refuse.
             let preview = if vendor {
-                let mut preview = match vendor_preview.take() {
-                    Some(preview) => preview,
-                    None => preview_vendor(&args.common, &selected).await,
-                };
+                // `vendor` is never report-only, so the planning pass
+                // above always computed it.
+                let mut preview = vendor_preview
+                    .take()
+                    .expect("the vendored planning pass computed the preview");
                 preview.retain_selected(&selected);
                 Some(preview)
             } else {

@@ -214,8 +214,8 @@ impl VendorPreview {
 ///
 /// The one answer to "which selected patches would the wet run refuse?":
 /// the dry-run rows and the rollout planning pass
-/// ([`VendorPreview::refused_purls`]) both read it, so the two cannot
-/// drift (#1908). Resolves the run's `--patch-server-url` origins and the
+/// ([`VendorPreview::refused_purls`]) both read it, so a patch the dry run
+/// shows as would-refuse never takes a `--max-new-patches` slot (#1908). Resolves the run's `--patch-server-url` origins and the
 /// gem takeover refusals itself.
 pub(crate) async fn preview_vendor(
     common: &GlobalArgs,
@@ -1394,7 +1394,7 @@ mod migration_tests {
 
 #[cfg(test)]
 mod preview_tests {
-    use super::{preview_vendor_with as preview_vendor, PreviewVerdict};
+    use super::{preview_vendor_with, PreviewVerdict};
     use crate::json_envelope::{Command, Envelope};
     use socket_patch_core::api::types::PatchSearchResult;
     use std::collections::HashMap;
@@ -1412,7 +1412,7 @@ mod preview_tests {
         origins: &[String],
         takeover: &HashMap<String, (&'static str, String)>,
     ) -> serde_json::Value {
-        let preview = preview_vendor(cwd, selected, origins, takeover).await;
+        let preview = preview_vendor_with(cwd, selected, origins, takeover).await;
         let patches: Vec<serde_json::Value> = preview
             .rows
             .iter()
@@ -1450,7 +1450,7 @@ mod preview_tests {
     async fn preview_records_verdicts_as_vendored_events() {
         let tmp = tempfile::tempdir().unwrap();
         seed_entry(tmp.path(), NPM, UUID);
-        let preview = preview_vendor(
+        let preview = preview_vendor_with(
             tmp.path(),
             &[sel(UUID, NPM), sel(UUID, PYPI)],
             &[],
