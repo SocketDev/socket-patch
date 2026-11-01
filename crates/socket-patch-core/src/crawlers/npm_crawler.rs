@@ -346,10 +346,7 @@ fn parse_yarnrc_modules_folder(rc: &str) -> YarnrcModulesFolder {
     let Some(mut settings) = classic_rc::settings(rc) else {
         return YarnrcModulesFolder::default();
     };
-    let mut read = |key| match settings.remove(key) {
-        Some(classic_rc::RcScalar::Str(value)) if !value.is_empty() => Some(value),
-        _ => None,
-    };
+    let mut read = |key| classic_rc::take_str(&mut settings, key).filter(|v| !v.is_empty());
     YarnrcModulesFolder {
         general: read("--modules-folder"),
         install: read("--install.modules-folder"),

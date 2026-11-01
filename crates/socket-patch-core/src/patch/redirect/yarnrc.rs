@@ -118,8 +118,8 @@ fn mirror_value(raw: &str) -> MirrorValue {
     }
 }
 
-/// Strip one pair of matching quotes, as yarn's `.yarnrc` parser and npm's
-/// ini parser both do.
+/// Strip one pair of matching quotes, as npm's ini parser does (`.npmrc`
+/// only: a `.yarnrc` is read through `formats::yarn::classic_rc`).
 fn unquote_rc_value(raw: &str) -> &str {
     let raw = raw.trim();
     for q in ['"', '\''] {
@@ -131,12 +131,13 @@ fn unquote_rc_value(raw: &str) -> &str {
 }
 
 /// The `yarn-offline-mirror` value of a `.yarnrc`, read as yarn 1 reads
-/// the file (`formats::yarn::classic_rc`): `false` disables the mirror,
-/// and a value yarn can't resolve as a path (`true`, a number) or a file
-/// yarn can't read sets nothing.
+/// the file (`formats::yarn::classic_rc`): a boolean `false` disables
+/// the mirror, and a value yarn can't resolve as a path (`true`, a
+/// number) or a file yarn can't read sets nothing.
 pub fn yarnrc_value(text: &str) -> Option<MirrorValue> {
     match classic_rc::scalar(text, KEY)? {
-        RcScalar::Str(value) if value == "false" => Some(MirrorValue::Disabled),
+        // Only the boolean turns the mirror off: yarn resolves a string
+        // `"false"` (or a YAML-read `false`) as a mirror path.
         RcScalar::Str(value) => Some(MirrorValue::Path(value)),
         RcScalar::Bool(false) => Some(MirrorValue::Disabled),
         // yarn's `path.resolve` throws on a `true` or a number.
@@ -398,8 +399,11 @@ pub fn configured_yarn_global_folders(
     for path in rc_files("yarnrc", &["yarn_"]) {
         let Some(text) = read(&path) else { continue };
         let Some(dir) = path.parent() else { continue };
+        let Some(mut settings) = classic_rc::settings(&text) else {
+            continue;
+        };
         for key in [GLOBAL_FOLDER_KEY, "--global-folder"] {
-            push(classic_rc::value(&text, key), &|value| {
+            push(classic_rc::take_str(&mut settings, key), &|value| {
                 Some(dir.join(value))
             });
         }

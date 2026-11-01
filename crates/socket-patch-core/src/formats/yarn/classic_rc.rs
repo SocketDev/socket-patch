@@ -4,7 +4,7 @@
 //! file neither grammar reads makes yarn exit with an error, so it sets
 //! nothing here.
 //!
-//! Every `.yarnrc` reader goes through [`scalar`] or [`value`], so the npm
+//! Every `.yarnrc` reader goes through [`settings`] or [`scalar`], so the npm
 //! crawler's `--modules-folder` read and the hosted redirect's
 //! `global-folder` and `yarn-offline-mirror` reads cannot disagree on a
 //! file (#1901).
@@ -41,10 +41,10 @@ pub fn settings(text: &str) -> Option<HashMap<String, RcScalar>> {
     top_level(strip_bom(text))
 }
 
-/// The string value of `key_name` (see [`scalar`]). A boolean or number
-/// is not a path or name yarn can use, so it is `None` too.
-pub fn value(text: &str, key_name: &str) -> Option<String> {
-    match scalar(text, key_name)? {
+/// Take `key_name`'s string value out of [`settings`]. A boolean or
+/// number is not a path or name yarn can use, so it is `None` too.
+pub fn take_str(settings: &mut HashMap<String, RcScalar>, key_name: &str) -> Option<String> {
+    match settings.remove(key_name)? {
         RcScalar::Str(value) => Some(value),
         RcScalar::Bool(_) | RcScalar::Num(_) => None,
     }
@@ -84,10 +84,11 @@ fn tokenize(mut input: &str) -> Vec<Token> {
                 let chop = if bytes.get(1) == Some(&b'\n') { 2 } else { 1 };
                 (Some(Token::Newline), chop)
             }
-            b'#' => {
-                let end = input.find(['\n', '\r']).unwrap_or(input.len());
-                (Some(Token::Comment), end.max(1))
-            }
+            // A comment runs to the next `\n`: a lone `\r` doesn't end it.
+            b'#' => (
+                Some(Token::Comment),
+                input.find('\n').unwrap_or(input.len()),
+            ),
             b' ' if last_newline => {
                 let size = bytes.iter().take_while(|b| **b == b' ').count();
                 if size % 2 == 1 {
@@ -128,17 +129,13 @@ fn tokenize(mut input: &str) -> Vec<Token> {
             }
             _ => (Some(Token::Invalid), 0),
         };
-        match token {
-            Some(Token::Invalid) | None if chop == 0 => {
-                out.push(Token::Invalid);
-                break;
-            }
-            Some(token) => {
-                last_newline = token == Token::Newline;
-                out.push(token);
-            }
-            None => last_newline = false,
+        if chop == 0 {
+            out.push(Token::Invalid);
+            break;
         }
+        out.extend(token);
+        // yarn starts an indent only after `\n` or `\r\n`, not a lone `\r`.
+        last_newline = input.starts_with('\n') || input.starts_with("\r\n");
         input = &input[chop..];
     }
     out.push(Token::Eof);
@@ -198,7 +195,7 @@ fn parse_block(
                 while *at(*pos) == Token::Comma {
                     *pos += 1;
                     match at(*pos) {
-                        Token::Str(key) => keys.push(key.clone()),
+                        Token::Str(key) if !key.is_empty() => keys.push(key.clone()),
                         _ => return None,
                     }
                     *pos += 1;
@@ -241,20 +238,49 @@ fn parse_block(
     Some(())
 }
 
-/// yarn's YAML fallback: the file's root mapping, every scalar a string.
-/// A root that is not a mapping sets nothing; a YAML error means yarn
-/// rethrows the lockfile error (`None`).
+/// yarn's YAML fallback (js-yaml `safeLoad`, FAILSAFE schema): the
+/// file's root mapping, every scalar a string and an empty value null
+/// (unset). A root that is not a mapping sets nothing. Where js-yaml
+/// throws (a duplicate key, a tag the FAILSAFE schema doesn't know, a
+/// syntax error), yarn rethrows the lockfile error: `None`.
 fn yaml_fallback(text: &str) -> Option<HashMap<String, RcScalar>> {
     let mut options = Options::default();
     options.emit_comments = false;
     let mut out = HashMap::new();
+    let mut keys = std::collections::HashSet::new();
+    // Anchored scalars, for an alias to read.
+    let mut anchors: HashMap<usize, Option<String>> = HashMap::new();
     let mut depth = 0usize;
     let mut documents = 0usize;
     let mut root_is_mapping = false;
     let mut pending_key: Option<String> = None;
     let mut at_key = true;
+    // A root-level key or value: a scalar (`None` for null or a
+    // collection).
+    let mut root_node = |node: Option<String>,
+                         pending_key: &mut Option<String>,
+                         at_key: &mut bool,
+                         out: &mut HashMap<String, RcScalar>|
+     -> Option<()> {
+        if *at_key {
+            // A non-scalar key is not a setting name; js-yaml would read
+            // it as "[object Object]", which no caller asks for.
+            let key = node.unwrap_or_default();
+            if !keys.insert(key.clone()) {
+                return None;
+            }
+            *pending_key = Some(key);
+        } else if let Some(key) = pending_key.take() {
+            match node {
+                Some(value) => out.insert(key, RcScalar::Str(value)),
+                None => out.remove(&key),
+            };
+        }
+        *at_key = !*at_key;
+        Some(())
+    };
     for event in Parser::new_from_str_with_options(text, options) {
-        let (event, _) = event.ok()?;
+        let (event, span) = event.ok()?;
         match event {
             Event::DocumentStart(..) => {
                 documents += 1;
@@ -262,29 +288,39 @@ fn yaml_fallback(text: &str) -> Option<HashMap<String, RcScalar>> {
                     return None;
                 }
             }
-            Event::MappingStart(..) | Event::SequenceStart(..) => {
+            Event::MappingStart(_, _, ref tag) | Event::SequenceStart(_, _, ref tag) => {
+                let is_map = matches!(event, Event::MappingStart(..));
+                let known = if is_map { "map" } else { "seq" };
+                if tag
+                    .as_ref()
+                    .is_some_and(|t| !t.is_yaml_core_schema_tag(known))
+                {
+                    return None;
+                }
                 if depth == 0 {
-                    root_is_mapping = matches!(event, Event::MappingStart(..));
-                } else if depth == 1 {
-                    if let Some(key) = pending_key.take() {
-                        out.remove(&key);
-                    }
-                    at_key = !at_key;
+                    root_is_mapping = is_map;
+                } else if depth == 1 && root_is_mapping {
+                    root_node(None, &mut pending_key, &mut at_key, &mut out)?;
                 }
                 depth += 1;
             }
             Event::MappingEnd | Event::SequenceEnd => depth = depth.saturating_sub(1),
-            Event::Scalar(text, ..) if depth == 1 && root_is_mapping => {
-                if at_key {
-                    pending_key = Some(text.into_owned());
-                } else if let Some(key) = pending_key.take() {
-                    out.insert(key, RcScalar::Str(text.into_owned()));
+            Event::Scalar(text, _, anchor, tag) => {
+                if tag.is_some_and(|t| !t.is_yaml_core_schema_tag("str")) {
+                    return None;
                 }
-                at_key = !at_key;
+                // An empty node is null; a written `~` is the string `~`.
+                let node = (!span.is_empty()).then(|| text.into_owned());
+                if anchor != 0 {
+                    anchors.insert(anchor, node.clone());
+                }
+                if depth == 1 && root_is_mapping {
+                    root_node(node, &mut pending_key, &mut at_key, &mut out)?;
+                }
             }
-            Event::Alias(_) if depth == 1 => {
-                pending_key = None;
-                at_key = !at_key;
+            Event::Alias(anchor) if depth == 1 && root_is_mapping => {
+                let node = anchors.get(&anchor).cloned().flatten();
+                root_node(node, &mut pending_key, &mut at_key, &mut out)?;
             }
             _ => {}
         }
@@ -295,6 +331,10 @@ fn yaml_fallback(text: &str) -> Option<HashMap<String, RcScalar>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn value(rc: &str, key: &str) -> Option<String> {
+        take_str(&mut settings(rc)?, key)
+    }
 
     fn v(rc: &str) -> Option<String> {
         value(rc, "--modules-folder")
@@ -394,6 +434,41 @@ mod tests {
             scalar("--modules-folder false\n", "--modules-folder"),
             Some(RcScalar::Bool(false))
         );
+    }
+
+    /// js-yaml's FAILSAFE reading: an empty value is null (unset), a
+    /// written `~` or `false` is a string, an alias reads its anchor, and
+    /// a duplicate key or an unknown tag fails the whole file.
+    #[test]
+    fn yaml_fallback_follows_js_yaml_failsafe() {
+        // `'x'` forces the YAML fallback in each file.
+        assert_eq!(v("a: 'x'\n--modules-folder:\n"), None);
+        assert_eq!(v("a: 'x'\n--modules-folder: ~\n").as_deref(), Some("~"));
+        assert_eq!(
+            scalar("a: 'x'\n--modules-folder: false\n", "--modules-folder"),
+            Some(RcScalar::Str("false".into()))
+        );
+        assert_eq!(
+            v("a: &x 'deps'\n--modules-folder: *x\n").as_deref(),
+            Some("deps")
+        );
+        assert_eq!(v("--modules-folder: 'a'\n--modules-folder: 'b'\n"), None);
+        assert_eq!(v("--modules-folder: !!int 'deps'\n"), None);
+        assert_eq!(
+            v("--modules-folder: !!str 'deps'\n").as_deref(),
+            Some("deps")
+        );
+    }
+
+    /// Only `\n` or `\r\n` start an indent, and a comment runs to `\n`.
+    #[test]
+    fn lone_cr_follows_yarns_tokenizer() {
+        assert_eq!(
+            v("a b\r  c d\r--modules-folder deps\n").as_deref(),
+            Some("deps")
+        );
+        assert_eq!(v("# c\r--modules-folder deps\r"), None);
+        assert_eq!(v("--modules-folder, \"\" deps\n"), None);
     }
 
     /// A key holding a nested block is not a scalar setting.
