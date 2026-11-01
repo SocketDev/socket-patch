@@ -1468,6 +1468,8 @@ fn npm_linked_strategy_transitive_package_is_patched_rolled_back_and_vendored() 
 /// --revert`) must still restore BOTH lock halves and delete the artifact;
 /// it used to restore the `packages` entry, drift-keep the mirror node, and
 /// exit 1 over a half-reverted lock that npm 6 fails EINTEGRITY on.
+/// Re-vendoring first (the old remedy) must not record the patched mirror
+/// node as its pre-vendor original either.
 #[test]
 fn npm_v2_revert_after_npm_install_restores_both_lock_halves() {
     let suite = "e2e_vendor_npm_build (v2 mirror after npm install)";
@@ -1479,13 +1481,18 @@ fn npm_v2_revert_after_npm_install_restores_both_lock_halves() {
         return;
     }
     let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
-    let reversals: [&[&str]; 3] = [
-        &["rollback"],
-        &["remove", purl.as_str()],
-        &["vendor", "--revert"],
+    let reversals: [(bool, &[&str]); 4] = [
+        (false, &["rollback"]),
+        (false, &["remove", purl.as_str()]),
+        (false, &["vendor", "--revert"]),
+        (true, &["vendor", "--revert"]),
     ];
-    for reversal in reversals {
-        let label = reversal.join(" ");
+    for (i, (revendor, reversal)) in reversals.into_iter().enumerate() {
+        let label = format!(
+            "{}{}",
+            if revendor { "re-vendor, " } else { "" },
+            reversal.join(" ")
+        );
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
@@ -1543,8 +1550,16 @@ fn npm_v2_revert_after_npm_install_restores_both_lock_halves() {
             serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
         assert_eq!(resaved["lockfileVersion"], 2, "{label}: {resaved}");
         if resaved["dependencies"][DEP].get("resolved").is_some() {
+            // Only a property of the npm release, so it shows on the first
+            // case; a later case flipping is a test bug, not an N/A.
+            assert_eq!(i, 0, "{label}: npm {major} kept the mirror `resolved`");
             println!("N/A {suite}: npm {major} kept the mirror `resolved`");
             return;
+        }
+        if revendor {
+            let (code, stdout, stderr) =
+                run_socket(&proj, &["vendor", "--json", "--offline", "--cwd", cwd]);
+            assert_eq!(code, 0, "{label}: re-vendor failed.\n{stdout}\n{stderr}");
         }
 
         let mut args = reversal.to_vec();
