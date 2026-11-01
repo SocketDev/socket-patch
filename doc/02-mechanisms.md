@@ -1,6 +1,6 @@
 ## Part 2
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Common mechanisms:For each cross-cutting concern: the **canonical mechanism** (the one way the code should do it, with a permalink to its home), the **deviations** found (file, what it does instead, its register token), and a count. Concerns: error types and context; error codes and exit codes; swallowed errors and panics in non-test code; stdout/stderr and the `ui` layer; the JSON envelope; human text, color and progress; logging; env and config reading; paths and containment; file I/O (atomic writes, BOM/CRLF); HTTP clients, timeouts and retries; process spawning and deadlines; concurrency.
 
@@ -11,6 +11,7 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 - **Line endings** (canonical: `utils::line_endings`). Four sites re-derive CRLF detection or the terminator, plus three `eol_eq` copies. {{A04}}
 - **Durable directory sync**: `group_commit::sync_dir` duplicates the fsync in `fs.rs`. {{A12}}
 - **Env-var registry** (proposed canonical: derive every scrub/hermetic list from clap's `Arg::get_env()` over `cli_command()`). Today `args.rs` keeps hand lists that already miss `SOCKET_NO_SOCKET_YML`. {{T03}}
+- **Test child and parse environment** (proposed canonical: `tests/common/hermetic.rs`, `command` for children and `try_parse` for in-process parses, sweeping by prefix rather than hand lists). Deviations: 4 parse-suite scrub variants and 3 unscrubbed parse suites {{T56}}; color/`CI` env and HOME left ambient on most paths {{T59}}.
 - **Lock acquisition in the CLI** (proposed canonical: one `lock_cli` helper taking `GlobalArgs`). The acquire/timeout/`lock_failure` sequence is open-coded 9× beside the 5 `acquire_or_emit` callers and the timeout conversion 14×; `lock_held` has 3 human renderings and scan/hosted prints it under `--json`. {{T09}}
 - **`--json` writes** (canonical: `ui::print_json`). It has 3 callers; 43 production sites in 9 commands print `println!("{}", env.to_pretty_json())` and `usage_error` hand-writes a third copy. Byte-equivalent today. {{T43}}
 - **URL credential stripping** (proposed canonical: `utils::redact`). The live copy is `vex::product::strip_url_userinfo`; redact's own `strip_url_credentials` is dead. {{A20}}

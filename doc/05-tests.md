@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -94,4 +94,10 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
   - Network where a tempdir is cheap: `in_process_variant_apply_failure` pip-installs `six` from PyPI.
   - Duplicates: ~8 across `cli_dry_run_paths_e2e`, `output_modes_e2e`, `apply_failure_paths`, `apply_render`, `list_render`.
   - Scaffolding: toolchain gate ×15 {{T50}}, apply fixtures re-written in 9 suites {{T51}}, PTY runner ×7 {{T52}}, `--json` reader ratchet gaps {{T54}}, `stderr_chatter`/snapshot/venv copies {{T55}}.
+- **Tally for `tests/cli_*.rs`, `command_module_layering.rs`, `tests/common/*` (32 files, 14.4K lines, audit-cli-tests 2026-11-01 22:02Z): about 150 fake, duplicate or weak tests, ~120 of them in the 10 `cli_parse_*` suites (293 tests).**
+  - Not hermetic (executed): `cli_parse_list`/`remove` fail under an ambient `SOCKET_JSON`; `CLICOLOR_FORCE=1` fails a list binary test {{T56,T59}}.
+  - Claims more than it checks: get/repair/vendor/vex `Snap` "every field" mirrors miss 1-9 `GlobalArgs` fields (executed); `cli_parse_main` `--help` test passes with 6 of 9 subcommands removed; `cli_get_silent` never reads stderr; `cli_sigpipe` passes if `list` stops writing; the yarn-classic hosted "reverted" cell asserts only `code != 0`.
+  - Can't fail: `save_and_clear_covers_every_bound_global_env_var` iterates the list it checks; `hermetic::HOSTILE_SEEDS` seed and remove the same list {{T59}}; the redirect test's "forbidden" mock in `cli_scan_silent` is outranked by the prebuilt mount (executed).
+  - Duplicates: ~85 per-subcommand `GlobalArgs` flag tests beside `cli_global_args` {{T57}}; `cli_parse_remove`'s 5 binary tests copy `remove/remove_invariants`; 7 exit-code-only `run()` tests in `cli_parse_list`.
+  - Scaffolding: dead `stderr_chatter` filter ×11 and `has_command`/`sha256_hex` copies {{T55}}; 21 `common` selftests re-run in ~104 binaries {{T58}}.
 - **Coverage gaps:** a lockfile-only calm skip and a genuine miss serialize identically (`skipped`/`package_not_installed`), and an apply no-matching-variant miss emits no event, so the JSON tests can't check either (executed; C13); no offline round-trip test of the cargo matrix's `Cargo.lock` codec.
