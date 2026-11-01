@@ -3297,13 +3297,17 @@ async fn run_scan(
     };
 
     // The rollout plan (§5.2): deferred NEW rows leave the selection here.
-    // Vendored eligibility is the wet run's Bun / vlt / npm-lock / gem
-    // takeover preflight; the agent partition above already removed what
-    // cannot land in place.
+    // Vendored eligibility is the dry-run preview's would-refuse verdicts
+    // (the wet run's preflights and takeover gates), computed once and
+    // reused by the dry-run rendering below; the agent partition above
+    // already removed what cannot land in place.
+    let mut vendor_preview = None;
     let selected = if report_only {
         selected
     } else if vendor {
-        let refused = vendor_flow::preflight_refused_purls(&args.common, &selected).await;
+        let preview = preview_vendor(&args.common, &selected).await;
+        let refused = preview.refused_purls();
+        vendor_preview = Some(preview);
         stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
         let deferred = stage.deferred_keys();
         selected
@@ -3422,20 +3426,12 @@ async fn run_scan(
             // rendered as `[would-refuse]` lines so a preview never
             // advertises vendoring the wet run would refuse.
             let preview = if vendor {
-                let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
-                    &args.common,
-                    selected.iter().map(|p| p.purl.as_str()),
-                )
-                .await;
-                Some(
-                    preview_vendor(
-                        &args.common.cwd,
-                        &selected,
-                        &crate::commands::hosted_unwind::patch_server_origins(&args.common),
-                        &takeover,
-                    )
-                    .await,
-                )
+                let mut preview = match vendor_preview.take() {
+                    Some(preview) => preview,
+                    None => preview_vendor(&args.common, &selected).await,
+                };
+                preview.retain_selected(&selected);
+                Some(preview)
             } else {
                 None
             };

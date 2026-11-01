@@ -110,6 +110,30 @@ impl VendorPreview {
             .count()
     }
 
+    /// The purls the wet run would refuse: the rollout planning pass, so a
+    /// refused NEW patch holds no `--max-new-patches` slot (it still
+    /// reaches the engine, which reports the refusal).
+    pub(crate) fn refused_purls(&self) -> HashSet<String> {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r.verdict, PreviewVerdict::WouldRefuse { .. }))
+            .map(|r| r.purl.clone())
+            .collect()
+    }
+
+    /// Keep only the rows of `selected` (the patches the rollout plan left
+    /// in the run), so a preview computed before planning renders exactly
+    /// what this run would vendor. Every verdict is per patch, so a row
+    /// does not depend on which other patches were previewed with it.
+    pub(crate) fn retain_selected(&mut self, selected: &[PatchSearchResult]) {
+        let keep: HashSet<(&str, &str)> = selected
+            .iter()
+            .map(|p| (p.purl.as_str(), p.uuid.as_str()))
+            .collect();
+        self.rows
+            .retain(|r| keep.contains(&(r.purl.as_str(), r.uuid.as_str())));
+    }
+
     /// Record the preview into a dry-run envelope, every event carrying
     /// `details.mode: "vendored"`: `verified` for a patch the wet run would
     /// vendor (`oldUuid` on a re-vendor), `skipped` / `already_vendored`
@@ -178,19 +202,38 @@ impl VendorPreview {
 /// before any download, or whose hosted pnpm pin the takeover would fail
 /// to replace ([`hosted_pnpm_refusals`]: the pnpm backend's lock-text
 /// refusal, #853), and would-refuse for PyPI purls the PyPI backend's
-/// wiring guards refuse ([`pypi_refusals`], #891). `origins` are the
-/// run's `--patch-server-url` origins. The preview stays a ledger
+/// wiring guards refuse ([`pypi_refusals`], #891), plus the gem
+/// hosted→vendored takeover refusals
+/// ([`crate::commands::vendor::gem_takeover_preview_refusals`]). The preview stays a ledger
 /// classification otherwise (engine refusals outside the preflights are
 /// not predicted), and a would-refuse never flips the run's status or exit
 /// code. The preflights (the only disk access besides the ledger; the PyPI
 /// one may also probe `pipenv --version` and list Hatch environments, as
 /// the wet run's guards do) run only when the selection holds an npm or
 /// PyPI purl.
-/// `takeover_refusals` adds the hosted→vendored takeover refusals the
-/// caller resolved (the gem gates of
-/// [`crate::commands::vendor::gem_takeover_preview_refusals`]), keyed by
-/// the selected purl, as would-refuse rows too.
+///
+/// The one answer to "which selected patches would the wet run refuse?":
+/// the dry-run rows and the rollout planning pass
+/// ([`VendorPreview::refused_purls`]) both read it, so the two cannot
+/// drift (#1908). Resolves the run's `--patch-server-url` origins and the
+/// gem takeover refusals itself.
 pub(crate) async fn preview_vendor(
+    common: &GlobalArgs,
+    selected: &[PatchSearchResult],
+) -> VendorPreview {
+    let origins = crate::commands::hosted_unwind::patch_server_origins(common);
+    let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
+        common,
+        selected.iter().map(|p| p.purl.as_str()),
+    )
+    .await;
+    preview_vendor_with(&common.cwd, selected, &origins, &takeover).await
+}
+
+/// [`preview_vendor`] over caller-resolved `origins` (the run's
+/// `--patch-server-url` origins) and `takeover_refusals` (keyed by the
+/// selected purl, each a would-refuse row); the unit tests seed both.
+async fn preview_vendor_with(
     cwd: &Path,
     selected: &[PatchSearchResult],
     origins: &[String],
@@ -339,43 +382,6 @@ pub(crate) fn merge_vendor_envelope(env: &mut Envelope, venv: Envelope) {
     {
         env.mark_partial_failure();
     }
-}
-
-/// The purls of `selected` the wet run's Bun, vlt or npm package-lock
-/// preflight, the hosted pnpm takeover's lock-text gates, or the gem
-/// hosted→vendored takeover gate, would refuse before any download (the
-/// `would_refuse` rows of [`preview_vendor_json`]): the vendored planning
-/// pass, so a refused NEW patch holds no rollout slot.
-pub(super) async fn preflight_refused_purls(
-    common: &GlobalArgs,
-    selected: &[PatchSearchResult],
-) -> HashSet<String> {
-    let cwd = common.cwd.as_path();
-    let state = load_state(cwd).await;
-    let refusal =
-        bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
-    let vlt_refusals =
-        vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
-    let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
-    let origins = crate::commands::hosted_unwind::patch_server_origins(common);
-    let pnpm_refusals =
-        hosted_pnpm_refusals(cwd, selected, &origins, &state.unwrap_or_default()).await;
-    let gem_refusals = crate::commands::vendor::gem_takeover_preview_refusals(
-        common,
-        selected.iter().map(|p| p.purl.as_str()),
-    )
-    .await;
-    selected
-        .iter()
-        .filter(|p| {
-            refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl))
-                || vlt_refusal_for(&vlt_refusals, &p.purl).is_some()
-                || (p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some())
-                || pnpm_refusals.contains_key(&p.purl)
-                || gem_refusals.contains_key(&p.purl)
-        })
-        .map(|p| p.purl.clone())
-        .collect()
 }
 
 /// The npm package-lock backend's project-level refusal (a lock that is
@@ -768,8 +774,8 @@ async fn run_vendor_json_path(
     // The planning pass: a patch the preflight refuses holds no slot (it
     // still reaches the engine, which reports the refusal).
     let writers = writers_of(&rows);
-    let origins = crate::commands::hosted_unwind::patch_server_origins(&args.common);
-    let refused = preflight_refused_purls(&args.common, &writers).await;
+    let mut preview = preview_vendor(&args.common, &writers).await;
+    let refused = preview.refused_purls();
     stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
     let deferred = stage.deferred_keys();
     let selected: Vec<PatchSearchResult> = writers
@@ -782,14 +788,8 @@ async fn run_vendor_json_path(
         // No downloads, no backends: classify against the ledger
         // and preview the GC, exactly like agent mode's dry run (and the
         // human arm, which previews the same GC through `finish_human`).
-        let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
-            &args.common,
-            selected.iter().map(|p| p.purl.as_str()),
-        )
-        .await;
-        preview_vendor(&args.common.cwd, &selected, &origins, &takeover)
-            .await
-            .record_into(env);
+        preview.retain_selected(&selected);
+        preview.record_into(env);
         if prune {
             gc_into(
                 &args.common,
@@ -1394,7 +1394,7 @@ mod migration_tests {
 
 #[cfg(test)]
 mod preview_tests {
-    use super::{preview_vendor, PreviewVerdict};
+    use super::{preview_vendor_with as preview_vendor, PreviewVerdict};
     use crate::json_envelope::{Command, Envelope};
     use socket_patch_core::api::types::PatchSearchResult;
     use std::collections::HashMap;
@@ -1916,6 +1916,37 @@ wheels = [
             "would_vendor",
             "{preview}"
         );
+    }
+
+    /// #1908: the rollout planning pass reads the same verdicts as the
+    /// preview, so a PyPI patch the backend refuses before any download
+    /// (here `pypi_uv_no_sources`) holds no `--max-new-patches` slot, while
+    /// the same project without the setting stays eligible.
+    #[tokio::test]
+    async fn planning_pass_excludes_a_pypi_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("uv.lock"), UV_LOCK).unwrap();
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            format!("{UV_PYPROJECT}\n[tool.uv]\nno-sources = true\n"),
+        )
+        .unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            silent: true,
+            ..Default::default()
+        };
+        let refused = super::preview_vendor(&common, &[sel(UUID, SIX)])
+            .await
+            .refused_purls();
+        assert!(refused.contains(SIX), "{refused:?}");
+
+        // Control: without the setting the patch keeps its slot.
+        std::fs::write(tmp.path().join("pyproject.toml"), UV_PYPROJECT).unwrap();
+        let refused = super::preview_vendor(&common, &[sel(UUID, SIX)])
+            .await
+            .refused_purls();
+        assert!(refused.is_empty(), "{refused:?}");
     }
 
     /// #891: a PyPI purl with a live hosted pin is not judged by the PyPI
