@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -71,3 +71,8 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 - **pnpm YAML top-level scalar:** 3 readers drifted on quotes and empty values. {{A44}}
 - **Python env-dir naming:** Poetry, Pipenv and Hatch share one sanitize + urlsafe-b64(sha256)[..8] rule written 3 times; Windows verbatim-prefix strip ×3. {{A49}}
 - **Python site rules inside `python_crawler`:** user site ×2, site-packages-under-prefix ×3 (lib64), PDM config read twice. {{A50}}
+- **"Copy may still hold the patch":** `ecosystem_dispatch` cargo GC vs rollback's other-scope check, drifted on `MissingBlob` with a third hash. Target: core `VerifyRollbackResult::may_hold_patch`. {{T44}}
+- **Go "replace may be ignored" mapping:** vex.rs vs core `golang_local` audit and apply refusal, drifted on `Unknown` inside go.work. {{T46}}
+- **`--ecosystems` selected check:** ≥7 copies with two readings of an empty list (latent). {{T47}}
+- **Core rules re-derived in `vex_consumed`/vex:** Go hosted uuid suffix, Maven `-socket.{hex8}` (no lowercasing), cargo registry prefix ×3, the product-manifest probe table (drifted: no csproj/gemspec hint). {{T48}}
+- **Error envelope builder:** written 5× (usage_error, lock_cli, rollback, remove, scan/hosted); human branch drifted on sentence case and hints. {{T20}}

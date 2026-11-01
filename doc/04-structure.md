@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -80,4 +80,9 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
   - mode bools: `dispatch_vendor_one(dry_run, force)`, `revert(stop_on_failure)` (true only from remove), `discover_selected(.., false, false, false)`;
   - engine code in the CLI: `migrate_legacy_manifest_records`, `scan_vendor_references`, the orphan sweep, `Gate::may_admit` (C12);
   - about 200 deletable comment lines (misplaced docs on `symlinked_wiring_warnings` and the gem block, 4 repeated Windows-stack docs).
-
+- **CLI vex, vlt, dispatch, envelope and ui files (17 files, ~15.0K lines, audit-cli-tests 2026-11-01):**
+  - about 64 single-caller fns and 26 trivial wrappers; the worst are `ecosystem_dispatch.rs` (9 lookup wrappers over `dispatch_find_with_npm_links`, `passthrough_purls` is `to_vec`) and `vex.rs` (`generate_vex` is 575 lines with a `calm_when_nothing` mode bool);
+  - engine code in the CLI: VEX attestation planning (`vex_sources.rs` L353-L973, ~620 lines), vex Go gates and `synthesize_go_patches` (~250 lines, {{T46}}), cargo/JVM/Bundler copy rules in `ecosystem_dispatch.rs` (~300 lines), all C12;
+  - crossed vlt module names between CLI and core {{T49}}; `vex_copy_sets` (used by apply) belongs in `ecosystem_dispatch`;
+  - vex omission reasons are untyped strings {{T45}};
+  - about 340 deletable comment lines (90 in `ecosystem_dispatch.rs`, 45 in `json_envelope.rs`).

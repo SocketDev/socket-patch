@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -80,4 +80,8 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
   - On their own stub: `preview_marks_a_refused_takeover_would_refuse` passes a refusal map in and reads it back; 12 preview tests assert on a test-only JSON shape (`preview_vendor_json`).
   - Misplaced: 11 `scan/rollout.rs` tests exercise only core `rollout/stage.rs` (which has none); vendor.rs tests core `covers_purl` ×2, `vendor_entry_in_use`, `Envelope::record` and `vendor_orphans`.
   - Duplicates: two FIFO snapshot tests; `parses_numbers_and_none` vs `cli_parse_scan.rs`; `update.rs` re-tests `ui::sentence_case`.
-
+- **Tally for the 17 CLI files audited 2026-11-01 (`vex.rs` … `update_notifier.rs`): about 45 fake, duplicate or misplaced tests.**
+  - Fails on a TTY (executed): `ui/prompt.rs` `confirm_waits_agrees_with_confirm_over_the_flag_cube` panics when stdin is a terminal.
+  - Can't fail: `passthrough_purls_is_identity`, `non_interactive_notes_share_one_wording`, `merge_first_wins_dedups_identical_path`.
+  - Claims more than it checks: the global-prefix banner test asserts an empty map and captures no stderr; 5 `json_envelope` tests say "every" over hand lists that miss `RolledBack`/`Update`; the omission-phrase test's hand list misses `gradle_unpatched_copy` {{T45}}.
+  - Misplaced: 14 `is_uuid_shaped` tests in `lib.rs` (core already tests it), `go_redirect_coord_guard` re-tests core, vex_consumed tests ecosystem_dispatch and npm_crawler.
