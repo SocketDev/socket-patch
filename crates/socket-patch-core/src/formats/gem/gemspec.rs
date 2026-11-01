@@ -63,7 +63,7 @@ pub(crate) fn is_gemspec_file(name: &str) -> bool {
 /// without the section (bundler < 1.10) or with an unreadable version does
 /// not.
 pub(crate) fn bundler_merges_dev_dependencies(lock: &str) -> bool {
-    let mut lines = lock.lines();
+    let mut lines = lock.lines().map(|l| l.trim_end_matches('\r'));
     let Some(version) = lines
         .by_ref()
         .find(|l| *l == "BUNDLED WITH")
@@ -327,8 +327,8 @@ pub(crate) fn locked_exact_requirement(
     if !bundler_merges_dev_dependencies(lock) {
         return Ok(exact);
     }
-    let Some((decl, _, _)) = code_lines(gemfile).find(|(_, line, _)| {
-        crate::vendor::gem::gem_declaration_any(line.trim_start()).is_some_and(|d| d.name == name)
+    let Some((decl, _, _)) = code_lines(gemfile).find(|(_, _, code)| {
+        crate::vendor::gem::gem_declaration_any(code.trim_start()).is_some_and(|d| d.name == name)
     }) else {
         return Ok(exact);
     };
