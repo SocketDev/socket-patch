@@ -5308,13 +5308,17 @@ mod plan_gate_tests {
         ));
     }
 
-    /// Gates with no refusals, no hosted pins and no `--force`.
-    fn gates<'a>(root: &'a Path, records: &'a HashMap<String, PatchRecord>) -> CandidateGates<'a> {
+    /// Gates with no preflight refusals, no hosted pins and no `--force`.
+    pub(super) fn gates<'a>(
+        root: &'a Path,
+        records: &'a HashMap<String, PatchRecord>,
+        refused: &'a HashSet<String>,
+    ) -> CandidateGates<'a> {
         CandidateGates {
             cwd: root,
             force: false,
             records,
-            refused: Box::leak(Box::default()),
+            refused,
             bun_refusal: None,
             vlt_refusals: &[],
             hosted_pinned: &|_| false,
