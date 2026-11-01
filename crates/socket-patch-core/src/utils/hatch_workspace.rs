@@ -21,7 +21,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::read_regular_to_string_sync;
-use crate::utils::hatch::{environments, HATCH_FILES, HATCH_TOML, PYPROJECT};
+use crate::utils::hatch::{merged_key, HATCH_FILES, HATCH_TOML, PYPROJECT};
 use crate::utils::repo_root;
 use crate::vendor::common::pep508_name;
 
@@ -165,7 +165,7 @@ fn parse(dir: &Path, file: &str) -> Option<DocumentMut> {
 fn listing_environments(root: &Path, member: &Path) -> Vec<String> {
     let external = parse(root, HATCH_TOML);
     let project = parse(root, PYPROJECT);
-    let (_, envs) = environments(project.as_ref(), external.as_ref());
+    let (_, envs) = merged_key(project.as_ref(), external.as_ref(), "envs");
     let Some(envs) = envs.and_then(Item::as_table_like) else {
         return Vec::new();
     };
@@ -205,8 +205,9 @@ fn listing_environments(root: &Path, member: &Path) -> Vec<String> {
 /// The members (directories, as reached) the member spec `spec` of the
 /// workspace at `root` lists, as Hatch's `find_members` resolves it: the
 /// context fields Hatch formats (`{root}`, `{home}`) are filled in (a spec
-/// with any other field lists nothing), the spec is joined to the root and normalized, and the part below the root
-/// and the spec's shared prefix is matched one directory level at a time
+/// with any other field lists nothing), the spec is joined to the root and
+/// normalized, and the part below the root and the spec's shared prefix is
+/// matched one directory level at a time
 /// (a component with `*`, `?` or `[` as an fnmatch pattern Python searches
 /// for, so it may match a suffix of the directory name; symlinked
 /// directories are followed), less any an `exclude` pattern matches by

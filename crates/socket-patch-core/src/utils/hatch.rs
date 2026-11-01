@@ -131,21 +131,10 @@ pub(crate) fn dependency_specs<'d>(
     specs
 }
 
-/// The `envs` item Hatch reads and the [`HATCH_FILES`] entry holding it:
-/// hatch.toml's when that document has an `envs` key (Hatch merges an
-/// external config by TOP-LEVEL key, so it replaces pyproject's whole
-/// table), else pyproject's `[tool.hatch.envs]`.
-pub(crate) fn environments<'d>(
-    pyproject: Option<&'d DocumentMut>,
-    hatch_toml: Option<&'d DocumentMut>,
-) -> (&'static str, Option<&'d Item>) {
-    merged_key(pyproject, hatch_toml, "envs")
-}
-
 /// The Hatch setting `key` and the [`HATCH_FILES`] entry holding it: a
 /// hatch.toml top-level key replaces pyproject's `[tool.hatch]` key of the
 /// same name, whatever its value.
-fn merged_key<'d>(
+pub(crate) fn merged_key<'d>(
     pyproject: Option<&'d DocumentMut>,
     hatch_toml: Option<&'d DocumentMut>,
     key: &str,
@@ -167,7 +156,7 @@ fn environment_specs<'d>(
     pyproject: Option<&'d DocumentMut>,
     hatch_toml: Option<&'d DocumentMut>,
 ) -> Vec<HatchSpec<'d>> {
-    let (file, envs) = environments(pyproject, hatch_toml);
+    let (file, envs) = merged_key(pyproject, hatch_toml, "envs");
     envs.and_then(Item::as_table_like)
         .into_iter()
         .flat_map(|envs| envs.iter())
@@ -271,8 +260,7 @@ pub struct HatchEdit {
     /// The direct-reference permission a project-table reference needs
     /// (`allow-direct-references = true`, see [`permission_keys`]) rather
     /// than a requirement; `original` is the setting it replaced, empty
-    /// when there was none. [`plan`]'s permission instead records the
-    /// whole file before and after granting it.
+    /// when there was none.
     pub permission: bool,
 }
 
@@ -804,9 +792,17 @@ pub fn rewrite_all(files: &BTreeMap<String, String>, deps: &[HatchDep]) -> Hatch
     HatchBatch { files, steps }
 }
 
+/// The whole permission file before and after granting the
+/// direct-reference permission alone.
+pub struct HatchPermission {
+    pub file: String,
+    pub original: String,
+    pub new: String,
+}
+
 pub struct HatchPlan {
     pub files: BTreeMap<String, String>,
-    pub permission: Option<HatchEdit>,
+    pub permission: Option<HatchPermission>,
 }
 
 pub fn rewrite(
@@ -942,11 +938,10 @@ pub fn plan(
             .parse::<DocumentMut>()
             .map_err(|error| error.to_string())?;
         enable_permission(&mut permission_only, external)?;
-        Some(HatchEdit {
+        Some(HatchPermission {
             file: file.into(),
             new: preserve_line_endings(&original, permission_only.to_string()),
             original,
-            permission: true,
         })
     } else {
         None
