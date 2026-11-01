@@ -2036,16 +2036,12 @@ mod tests {
     // temp `node_modules`, so a regression in the macro plumbing (wrong
     // crawler/path method, dropped result, swapped merge) is caught.
 
-    use std::io::Write as _;
-
     /// Lay down `node_modules/<name>/package.json` under `root` with the
     /// given version, returning the package directory the crawler should
     /// resolve the PURL to.
     fn write_npm_package(root: &std::path::Path, name: &str, version: &str) -> PathBuf {
         let pkg_dir = root.join("node_modules").join(name);
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        let mut f = std::fs::File::create(pkg_dir.join("package.json")).unwrap();
-        write!(f, r#"{{"name":"{name}","version":"{version}"}}"#).unwrap();
+        write_package_json(&pkg_dir, name, version);
         pkg_dir
     }
 
@@ -2282,19 +2278,12 @@ mod tests {
         .unwrap();
     }
 
-    async fn manifest_copies(
-        common: &crate::args::GlobalArgs,
-        purl: &str,
-    ) -> HashMap<String, Vec<PathBuf>> {
-        find_manifest_package_copies_reusing(&[purl.to_string()], common, true, None).await
-    }
-
     /// The every-copy lookup `vex` judges hosted npm purls by takes alias
     /// installs as copies beside the own-name one: scoped keys, nested trees
     /// and scoped targets count; hidden dirs, other versions and symlinks do
-    /// not.
+    /// not. No second alias walk backs this lookup up.
     #[tokio::test]
-    async fn npm_alias_copies_finds_only_alias_installs() {
+    async fn manifest_copies_take_npm_alias_installs_only() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let nm = root.join("node_modules");
@@ -2335,7 +2324,7 @@ mod tests {
     /// crawler enumerates is searched, and `--global-prefix` searches the
     /// prefix.
     #[tokio::test]
-    async fn npm_alias_copies_walks_every_workspace_members_tree() {
+    async fn manifest_copies_walk_every_npm_workspace_members_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_package_json(&root.join("node_modules/left-pad"), "left-pad", "1.3.0");
@@ -2361,7 +2350,9 @@ mod tests {
         );
 
         let purl = "pkg:npm/left-pad@1.3.0";
-        let got = manifest_copies(&npm_scope(root), purl).await;
+        let got =
+            find_manifest_package_copies_reusing(&[purl.to_string()], &npm_scope(root), true, None)
+                .await;
         assert_eq!(
             sorted(got[purl].clone()),
             sorted(vec![
@@ -2378,7 +2369,9 @@ mod tests {
             global_prefix: Some(prefix.clone()),
             ..npm_scope(root)
         };
-        let got = manifest_copies(&under_prefix, purl).await;
+        let got =
+            find_manifest_package_copies_reusing(&[purl.to_string()], &under_prefix, true, None)
+                .await;
         assert_eq!(
             sorted(got[purl].clone()),
             vec![prefix.join("dep/node_modules/deep"), prefix.join("lp")]
