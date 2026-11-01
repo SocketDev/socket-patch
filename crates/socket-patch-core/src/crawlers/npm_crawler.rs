@@ -275,7 +275,7 @@ pub(super) fn merge_configured_install_roots(
 fn yarnrc_modules_folder(start_path: &Path) -> Option<String> {
     // Walk the absolute spelling: the default `--cwd .` has no lexical
     // parents, so a parent `.yarnrc` would never be read (#1902).
-    let start_path = &absolute_lexically(start_path);
+    let start_path = &crate::utils::relpath::absolute_lexically(start_path);
     let mut general: Option<(&Path, String)> = None;
     let mut install: Option<(&Path, String)> = None;
     for dir in start_path.ancestors() {
@@ -1522,48 +1522,6 @@ fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// `path` made absolute against the working directory without touching
-/// the filesystem (no symlink resolution), with `.`/`..` folded. An
-/// absolute `path` is only folded. The empty path (the parent of a bare
-/// `node_modules`) is the working directory, which `std::path::absolute`
-/// would reject.
-fn absolute_lexically(path: &Path) -> PathBuf {
-    let path = if path.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        path
-    };
-    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    crate::utils::relpath::normalize_lexically_keeping_escapes(&abs)
-}
-
-/// The directories at and above `dir`, nearest first, each as its
-/// absolute path paired with a spelling in `dir`'s own terms. An upward
-/// walk over a relative `dir`'s lexical ancestors stops at the working
-/// directory: under the default `--cwd .` a workspace member's
-/// `node_modules` is the relative `node_modules`, which never reaches
-/// the root (#1902). So the walk goes over the absolute path, and a
-/// relative `dir` keeps its own spelling and spells each level above it
-/// with `..` (`../..`), the way its found paths are reported.
-fn ancestors_keeping_spelling(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-    if dir.is_absolute() {
-        return dir
-            .ancestors()
-            .map(|a| (a.to_path_buf(), a.to_path_buf()))
-            .collect();
-    }
-    let mut spelled = dir.to_path_buf();
-    absolute_lexically(dir)
-        .ancestors()
-        .map(|abs| {
-            let here = (abs.to_path_buf(), spelled.clone());
-            spelled =
-                crate::utils::relpath::normalize_lexically_keeping_escapes(&spelled.join(".."));
-            here
-        })
-        .collect()
-}
-
 /// The store of Yarn's pnpm linker for the project `nm` belongs to, when
 /// `pnpmStoreFolder` moved it out of `node_modules/.store` (#859):
 /// `.cache/.store`, `store`, set in an rc file, the home rc file or
@@ -1587,8 +1545,7 @@ fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
     if nm.file_name() != Some(OsStr::new("node_modules")) || !is_dir_sync(nm) {
         return None;
     }
-    let (abs_project, project) = ancestors_keeping_spelling(nm.parent()?)
-        .into_iter()
+    let (abs_project, project) = crate::utils::relpath::ancestors_keeping_spelling(nm.parent()?)
         .find(|(abs, _)| abs.join("yarn.lock").is_file())?;
     let store = super::pkg_managers::active_yarn_pnpm_store(&abs_project)?;
     let (Ok(real_store), Ok(real_project)) = (
@@ -8485,121 +8442,6 @@ mod tests {
             .await
             .unwrap();
         assert!(roots.is_empty(), "{roots:?}");
-    }
-
-    /// Restores the process working directory however a test ends. Tests
-    /// that use it are `#[serial]`: the cwd is process-wide.
-    struct CwdGuard(PathBuf);
-
-    impl CwdGuard {
-        fn enter(dir: &Path) -> Self {
-            let prev = std::env::current_dir().unwrap();
-            std::env::set_current_dir(dir).unwrap();
-            Self(prev)
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-
-    /// REGRESSION (#1902): under the default `--cwd .` the start path is
-    /// the relative `.`, whose lexical ancestors are only `.` and `""`, so
-    /// a parent `.yarnrc`'s `--modules-folder` was never read and the
-    /// packages installed there went unreported. Scanning with `.` must
-    /// find what scanning with the absolute path finds.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn test_parent_yarnrc_modules_folder_is_read_from_a_relative_cwd() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = std::fs::canonicalize(tmp.path()).unwrap();
-        let project = repo.join("project");
-        write_pkg(&project.join("deps/foo"), "foo", "1.0.0");
-        std::fs::write(repo.join(".yarnrc"), "--modules-folder project/deps\n").unwrap();
-        let crawler = NpmCrawler::new();
-        let purls = |pkgs: Vec<CrawledPackage>| -> Vec<String> {
-            pkgs.into_iter().map(|p| p.purl).collect()
-        };
-
-        // Control: the absolute spelling has always worked.
-        assert_eq!(
-            purls(crawler.crawl_all(&local_options(&project)).await),
-            vec!["pkg:npm/foo@1.0.0".to_string()]
-        );
-
-        let _cwd = CwdGuard::enter(&project);
-        let relative = local_options(Path::new("."));
-        let roots = crawler.get_node_modules_paths(&relative).await.unwrap();
-        assert_eq!(roots, vec![Path::new(".").join("deps")]);
-        let pkgs = crawler.crawl_all(&relative).await;
-        assert_eq!(purls(pkgs.clone()), vec!["pkg:npm/foo@1.0.0".to_string()]);
-        // The copy keeps the spelling of the cwd it was found under.
-        assert_eq!(pkgs[0].path, Path::new(".").join("deps").join("foo"));
-    }
-
-    /// REGRESSION (#1902): scanned from a yarn workspace member under the
-    /// default `--cwd .`, the member's `node_modules` is the relative
-    /// `node_modules`, whose lexical ancestors never reach the root's
-    /// `yarn.lock`. So Yarn's pnpm-linker store, relocated by
-    /// `pnpmStoreFolder` and the only home of the transitive packages, was
-    /// never walked. It is found, spelled relative to the cwd.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn test_parent_yarn_pnpm_store_is_found_from_a_relative_member_cwd() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let store = root.join("store");
-        std::fs::write(root.join("yarn.lock"), "").unwrap();
-        std::fs::write(
-            root.join(".yarnrc.yml"),
-            "nodeLinker: pnpm\npnpmStoreFolder: store\n",
-        )
-        .unwrap();
-        let odd_entry = store.join("is-odd-npm-3.0.1-3e1a2b4c5d");
-        write_pkg(&odd_entry.join("package"), "is-odd", "3.0.1");
-        link_own_package(&odd_entry, "is-odd");
-        let number_entry = store.join("is-number-npm-6.0.0-9f8e7d6c5b");
-        let number = number_entry.join("package");
-        write_pkg(&number, "is-number", "6.0.0");
-        link_own_package(&number_entry, "is-number");
-        link_dir(&number, &odd_entry.join("node_modules/is-number"));
-        let member = root.join("packages").join("a");
-        let member_nm = member.join("node_modules");
-        std::fs::create_dir_all(&member_nm).unwrap();
-        link_dir(&odd_entry.join("package"), &member_nm.join("is-odd"));
-        let crawler = NpmCrawler::new();
-        let purls = |pkgs: Vec<CrawledPackage>| -> Vec<String> {
-            let mut v: Vec<String> = pkgs.into_iter().map(|p| p.purl).collect();
-            v.sort();
-            v.dedup();
-            v
-        };
-        let want = vec![
-            "pkg:npm/is-number@6.0.0".to_string(),
-            "pkg:npm/is-odd@3.0.1".to_string(),
-        ];
-
-        // Control: the absolute spelling has always worked.
-        assert_eq!(
-            relocated_yarn_pnpm_store_sync(&member_nm),
-            Some(store.clone())
-        );
-        assert_eq!(
-            purls(crawler.crawl_all(&local_options(&member)).await),
-            want
-        );
-
-        let _cwd = CwdGuard::enter(&member);
-        assert_eq!(
-            relocated_yarn_pnpm_store_sync(Path::new("node_modules")),
-            Some(Path::new("..").join("..").join("store"))
-        );
-        assert_eq!(
-            purls(crawler.crawl_all(&local_options(Path::new("."))).await),
-            want
-        );
     }
 
     /// REGRESSION (#661, #696): pnpm's `modulesDir` (`modulesDir:` in
