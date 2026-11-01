@@ -1051,6 +1051,11 @@ pub async fn run(args: VendorArgs) -> i32 {
     // pins. A missing manifest is a no-op; detached vendored projects keep
     // their records in the ledger instead.
     if !args.revert && !manifest_present {
+        // A workspace member has nothing of its own: the root's lock holds
+        // the pins, so "nothing to vendor" would be a false success (#1921).
+        if let Some(message) = member_refusal(&args.common.cwd, "vendor").await {
+            return emit_eject_refusal(&args.common, MEMBER_REFUSAL_CODE, &message);
+        }
         // A requested `--vex` still attests what the `.socket/vendor`
         // ledgers and lockfiles already wire. Same contract as `apply --vex`
         // with no manifest: nothing referenced anywhere keeps exit 0; any
@@ -1144,6 +1149,14 @@ pub async fn run(args: VendorArgs) -> i32 {
             telemetry,
         ))
     };
+
+    // A workspace member's ledger lives at the root: reverting the
+    // member's empty one would report success and unwire nothing (#1921).
+    if args.revert {
+        if let Some(message) = member_refusal(&args.common.cwd, "vendor --revert").await {
+            return emit_eject_refusal(&args.common, MEMBER_REFUSAL_CODE, &message);
+        }
+    }
 
     // Same lock as apply/rollback: vendor mutates the same lockfiles and
     // `.socket/` tree, so a separate lock would allow an apply↔vendor race.
@@ -1276,6 +1289,17 @@ async fn run_check(args: &VendorArgs) -> i32 {
                                      .socket/vendor/state.json from version control";
     if state.entries.is_empty() && jvm_orphan.is_some() {
         return emit_eject_refusal(&args.common, "vendor_ledger_missing", JVM_ORPHAN_DETAIL);
+    }
+    // A workspace member verifies nothing of its own: the root's ledger
+    // and artifacts are the ones the install uses, so a pass here would
+    // hide a tampered root (#1921).
+    if state.entries.is_empty() && jvm_orphan.is_none() {
+        let manifest_path = args.common.resolved_manifest_path();
+        if !matches!(manifest_exists(&manifest_path).await, Ok(true)) {
+            if let Some(message) = member_refusal(root, "vendor --check").await {
+                return emit_eject_refusal(&args.common, MEMBER_REFUSAL_CODE, &message);
+            }
+        }
     }
     let manifest_path = args.common.resolved_manifest_path();
     let manifest = match read_manifest(&manifest_path).await {
@@ -1476,6 +1500,37 @@ fn artifacts_gitignore_checked(mut ecosystems: impl Iterator<Item = Ecosystem>) 
 
 /// A refused eject: the JSON error envelope (`status: error`) or an
 /// `Error:` line (printed even under `--silent`). Exit 1; nothing touched.
+/// The refusal code of a vendor run from a workspace member: the same one
+/// vendored `scan` / `get` use for a member with no lock of its own.
+const MEMBER_REFUSAL_CODE: &str = "vendor_lockfile_missing";
+
+/// The refusal for `form` run in `dir` when `dir` is a workspace member
+/// whose lock lives at an ancestor root (npm, yarn, Bun, pnpm or vlt).
+/// Callers ask only when `dir` has no hosted pins and no manifest; this
+/// also requires an empty (or absent) vendor ledger, so the run would
+/// otherwise exit 0 having looked at nothing (#1921). An unreadable
+/// ledger is left to the caller's own refusal.
+async fn member_refusal(dir: &Path, form: &str) -> Option<String> {
+    if !load_state(dir).await.ok()?.entries.is_empty() {
+        return None;
+    }
+    let (root, _) =
+        socket_patch_core::hosted::governing_root::npm_family_governing_root(dir).await?;
+    Some(member_refusal_message(dir, &root, form))
+}
+
+fn member_refusal_message(dir: &Path, root: &Path, form: &str) -> String {
+    format!(
+        "{} is a workspace member with no lockfile, manifest or vendor ledger of its \
+         own: the workspace root {} installs it and holds its patches, which `{form}` \
+         run here cannot see; run socket-patch from {} (the workspace root); nothing \
+         was written",
+        dir.display(),
+        root.display(),
+        root.display()
+    )
+}
+
 fn emit_eject_refusal(common: &GlobalArgs, code: &str, message: &str) -> i32 {
     if common.json {
         let mut env = Envelope::new(Command::Vendor);

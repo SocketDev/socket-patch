@@ -1086,6 +1086,14 @@ worse, lets a warm cache silently serve unpatched bytes):
   entries, `No manifest to vendor from; N vendored entr(y is|ies are) tracked in the ledger —
   `socket-patch repair` verifies (it|them).` — and it never re-vendors from the ledger. This no-op
   and `--revert` build no API client (v5.0), so no token advisory prints there.
+  **Workspace members (#1921)**: when `--cwd` has no hosted pins, no manifest and an empty (or
+  absent) vendor ledger, and is an npm, yarn, Bun, pnpm or vlt workspace member installed from an
+  ancestor root's lock (the layouts hosted mode refuses with `redirect_workspace_lockfile_elsewhere`
+  / `redirect_pnpm_lockfile_elsewhere`), `vendor`, `vendor --revert` and `vendor --check` refuse
+  instead of the exit-0 no-op: `vendor_lockfile_missing`, exit 1, top-level `error` (human:
+  `Error (vendor_lockfile_missing): …` on stderr), naming the workspace root to run from; nothing
+  is read past the refusal or written. `--check` asks only when its project (the manifest's) has
+  no ledger entries and no manifest.
 * **remove reverts vendoring**: `remove <purl|uuid>` on a vendored patch restores the recorded
   lockfile fragments, deletes the artifact, and drops the ledger entry (envelope events
   `removed`/`vendor_reverted`, which do NOT bump `summary.removed` — that count stays "manifest
