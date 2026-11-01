@@ -47,15 +47,11 @@ impl StatusLine<io::Stderr> {
         let human = !json && !silent;
         let live = human
             && io::stderr().is_terminal()
-            && super::stderr_vt()
-            && !term_is_dumb()
+            && super::vt().1
+            && !std::env::var("TERM").is_ok_and(|t| t == "dumb")
             && !socket_patch_core::utils::env_compat::is_debug_enabled();
         StatusLine::new(io::stderr(), live, human, super::stderr_width())
     }
-}
-
-fn term_is_dumb() -> bool {
-    std::env::var("TERM").is_ok_and(|t| t == "dumb")
 }
 
 impl<W: Write> StatusLine<W> {
@@ -173,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn user_report_regression_final_line_has_no_stale_tail() {
+    fn finish_with_after_a_longer_status_leaves_no_tail() {
         // The reported garble: "Found 7 patches for 1 packagesatch 7/7)".
         let mut s = live();
         s.set("Querying API for patches... (batch 7/7)");
@@ -186,12 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn shorter_after_longer_leaves_no_residue() {
-        let mut s = live();
-        s.set("Scanning global packages...");
-        s.finish_with("Found 2 packages");
-        assert_eq!(render(bytes(&s).as_bytes()), vec!["Found 2 packages"]);
-
+    fn shorter_set_after_longer_leaves_no_tail() {
         let mut s = live();
         s.set("Querying API for patches... (batch 10/10)");
         s.set("Short");
