@@ -331,15 +331,18 @@ mod tests {
 
     #[tokio::test]
     async fn exact_cap_boundary_is_allowed() {
-        let resp = respond_raw(
-            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n\
-              10\r\n0123456789abcdef\r\n0\r\n\r\n",
-        )
-        .await;
-        assert_eq!(
-            read_capped_typed(resp, 16, "test payload").await.unwrap(),
-            b"0123456789abcdef"
-        );
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\ncontent-length: 16\r\nconnection: close\r\n\r\n\
+               0123456789abcdef"[..],
+            &b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n\
+               10\r\n0123456789abcdef\r\n0\r\n\r\n"[..],
+        ] {
+            let resp = respond_raw(raw).await;
+            assert_eq!(
+                read_capped_typed(resp, 16, "test payload").await.unwrap(),
+                b"0123456789abcdef"
+            );
+        }
     }
 
     // `tests/tls-ca/` holds a private CA (`ca.pem`) and a leaf for
