@@ -58,17 +58,13 @@ pub fn try_linked_level(root: &Path, path: &Path) -> std::io::Result<Option<Path
 }
 
 /// Whether `path` is itself a symlink or a Windows junction (lstat; a
-/// missing or unreadable path is not). The one link predicate:
-/// [`crate::utils::fs::is_symlink`] and every link probe in the vendor
-/// backends delegate here.
+/// missing or unreadable path is not).
 pub fn is_link(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
-/// The refusal text for writing or deleting `what` through the linked
-/// `link`. Every guarded writer and deleter shares it, so callers and tests
-/// can match on [`LINKED_LEVEL_MARKER`].
-pub fn linked_level_refusal(action: &str, what: &Path, link: &Path) -> std::io::Error {
+/// The refusal for writing or deleting `what` through the linked `link`.
+fn linked_level_refusal(action: &str, what: &Path, link: &Path) -> std::io::Error {
     std::io::Error::other(format!(
         "refusing to {action} {}: {} {LINKED_LEVEL_MARKER}, and its target is not \
          socket-patch's to change",
@@ -87,20 +83,6 @@ pub fn ensure_unlinked(root: &Path, path: &Path, action: &str) -> std::io::Resul
         Some(link) => Err(linked_level_refusal(action, path, &link)),
         None => Ok(()),
     }
-}
-
-/// The nearest ancestor of `path` (inclusive) literally named `.socket`.
-pub fn nearest_socket_dir(path: &Path) -> Option<&Path> {
-    path.ancestors().find(|a| {
-        a.file_name()
-            .is_some_and(|n| n == crate::constants::SOCKET_DIR)
-    })
-}
-
-/// The project root a path under `.socket/` belongs to: the parent of
-/// [`nearest_socket_dir`]. `None` when `path` is not under a `.socket/`.
-pub fn socket_project_root(path: &Path) -> Option<&Path> {
-    nearest_socket_dir(path).and_then(Path::parent)
 }
 
 /// Whether `dir` really (canonically) lives inside `root`. Both must
@@ -181,17 +163,6 @@ mod tests {
             try_linked_level(root, &root.join("missing/deeper")).unwrap(),
             None
         );
-    }
-
-    #[test]
-    fn socket_project_root_is_the_parent_of_the_nearest_socket_dir() {
-        let p = Path::new("/a/b/.socket/vendor/state.json");
-        assert_eq!(socket_project_root(p), Some(Path::new("/a/b")));
-        assert_eq!(
-            socket_project_root(Path::new("/a/b/.socket")),
-            Some(Path::new("/a/b"))
-        );
-        assert_eq!(socket_project_root(Path::new("/a/b/state.json")), None);
     }
 
     #[cfg(unix)]

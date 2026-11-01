@@ -1,16 +1,9 @@
 //! The cargo home cargo itself would use: `$CARGO_HOME`, else
 //! `<home>/.cargo` with `<home>` resolved the way cargo's `home` crate
-//! resolves it.
-//!
-//! [`super::fs::home_dir`] reads only `HOME` / `USERPROFILE`, but cargo
-//! falls back to the account's passwd entry on Unix when `HOME` is unset
-//! (`env -i`, systemd units, stripped CI and container entrypoints). A
-//! crawler that stopped at `home_dir` probed no registry cache there and
-//! reported the crate lockfile-only while cargo built the unpatched copy
-//! from the passwd home's `~/.cargo` (#1135). The cargo-home readers (the
-//! crawler, the `[patch]` config chain, the build-cache cleaner and the
-//! self-update channel check) go through [`cargo_home`] so they agree with
-//! cargo and with each other.
+//! resolves it. Unlike [`super::fs::home_dir`], that falls back to the
+//! account's passwd entry on Unix when `HOME` is unset (`env -i`, systemd
+//! units, stripped CI and container entrypoints), so every cargo-home reader
+//! goes through [`cargo_home`] to probe the registry cache cargo builds from.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -124,8 +117,8 @@ mod tests {
         assert_eq!(got, Some(PathBuf::from("/home/u/.cargo")));
     }
 
-    /// #1135: with `HOME` and `CARGO_HOME` unset cargo builds from the
-    /// passwd home's `~/.cargo`, so the crawler must probe it too.
+    /// With `HOME` and `CARGO_HOME` unset cargo builds from the passwd
+    /// home's `~/.cargo`, so the crawler must probe it too.
     #[test]
     fn unset_home_var_falls_back_to_passwd_home() {
         let got = resolve(None, None, || Some("/root".into()));
@@ -169,7 +162,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// #1135 through the process environment: `HOME`, `USERPROFILE` and
+    /// Through the process environment: `HOME`, `USERPROFILE` and
     /// `CARGO_HOME` all unset, or `HOME` empty, still finds the passwd
     /// home's `.cargo`.
     #[cfg(unix)]
