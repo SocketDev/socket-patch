@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-11-01T03:35Z · main @ cbbbdb9_
+_Last updated 2026-11-01T05:25Z · main @ cbbbdb9_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -15,12 +15,13 @@ _Last updated 2026-11-01T03:35Z · main @ cbbbdb9_
 | [#1897](https://github.com/SocketDev/socket-patch/pull/1897) | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot green; burn-down final review done |
 | [#1903](https://github.com/SocketDev/socket-patch/pull/1903) | sweep | `cli/src/commands/scan/hosted/{nuget,takeover}.rs` | ready; CI (82 checks) and Bugbot green |
 | [#1907](https://github.com/SocketDev/socket-patch/pull/1907) | sweep | core `constants.rs`, `utils/{cargo_home,composer_version,concurrent,containment,digest,durability,env_compat,failpoint}.rs` (+ `socket_dir.rs`, `purl_key.rs` tests) | ready; CI (82 checks) and Bugbot green |
+| [#1914](https://github.com/SocketDev/socket-patch/pull/1914) | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI and Bugbot pending |
 
 #### Merged
 _None._
 
 #### Queue
-Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`. Every one scoring 6 or more is blocked by an open PR as of 2026-11-01T03Z:
+Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`. Every one scoring 6 or more is blocked by an open PR as of 2026-11-01T05Z (nothing merged since 2026-10-29):
 1. A30 [#1887](https://github.com/SocketDev/socket-patch/issues/1887), Maven `${…}` interpolation ×5: **~8.7** (blocked by #1886: `maven_scope.rs`, `maven_reactor.rs`).
 2. T09 [#1858](https://github.com/SocketDev/socket-patch/issues/1858), lock acquire open-coded 9×: **~7** (blocked by #1864 `lock_cli.rs`, #1698 `vendor.rs`/`get.rs`/`agent_download.rs`).
 3. A41 [#1899](https://github.com/SocketDev/socket-patch/issues/1899), npm store-child classification ×3: D2 C2, risk M, **~6** (blocked by #1891, #1829 and #1906: `npm_crawler.rs`).
@@ -29,7 +30,7 @@ Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`. Every one sc
 
 A05 is the fixer's #1898, A32 its #1895. A42 [#1901](https://github.com/SocketDev/socket-patch/issues/1901) (~4) waits on `npm_crawler.rs`; A45 [#1902](https://github.com/SocketDev/socket-patch/issues/1902) is a P1 bug (~5) for the fixer. A20 [#1848](https://github.com/SocketDev/socket-patch/issues/1848) and A26 [#1867](https://github.com/SocketDev/socket-patch/issues/1867) score 4 (files free).
 
-The next run is structural if a candidate scoring 6 or more has free files, else a sweep. Next sweep files, in order: `scan/policy.rs` and `scan/render.rs` once #1856/#1884 merge; core `utils/http.rs`, `utils/line_endings.rs` (clean), `utils/lock_fragments.rs` (wait on #1898), `utils/mod.rs`, then `utils/hatch.rs`/`hatch_workspace.rs`. Waiting on PRs: `utils/fs.rs` and core `lib.rs` (#1891), `go_env.rs`/`go_installed_tools.rs` (#1876), `cargo_workspace.rs` (#1866), `cargo_build_cache.rs` (#1849), `group_commit.rs` is free but 2,163 lines (sweep a region). `scan/hosted/python.rs` is in #1883. Skip `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` while #1698 is open, `rollback.rs` while #1864 is open. Left from #1907: `CargoCrawler::cargo_home` forwarder (#1882), digest's `vendor/jvm` copies (#1886), async `fs::is_symlink` (#1891).
+The next run is structural if a candidate scoring 6 or more has free files, else a sweep. Next sweep files, in order: `scan/policy.rs` and `scan/render.rs` once #1856/#1884 merge; core `utils/lock_fragments.rs` (wait on #1898), then `utils/notice.rs`, `npm_range.rs`, `package_manager.rs` onward if audited. Waiting on PRs: `utils/fs.rs` and core `lib.rs` (#1891), `go_env.rs`/`go_installed_tools.rs` (#1876), `cargo_workspace.rs` (#1866), `cargo_build_cache.rs` (#1849), `group_commit.rs` is free but 2,163 lines (sweep a region). `scan/hosted/python.rs` is in #1883. Skip `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` while #1698 is open, `rollback.rs` while #1864 is open. Left from #1914: delete the String `read_capped` wrapper (callers in `maven_repo.rs`, held by #1886/#1891; or rename `read_capped_typed`, touching `api/client.rs`, held by #1870/#1891); `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` waits on #1898. Left from #1907: `CargoCrawler::cargo_home` forwarder (#1882), digest's `vendor/jvm` copies (#1886), async `fs::is_symlink` (#1891).
 
 #### Notes
 - The PRs of the first thread (`arch-refactor/<issue>-*`) are listed in `review/2026-10-v1/register/90-refactor.md`.
@@ -53,3 +54,5 @@ The next run is structural if a candidate scoring 6 or more has free files, else
 - Never restore a file with `git checkout <file>` after a mutation test while the sweep is uncommitted: it reverts the whole file to HEAD. Commit first, then mutate and `git checkout HEAD -- <file>`.
 - Making a `pub` core item private can leave public docs linking it (`rustdoc::private_intra_doc_links`); CI doesn't run rustdoc, but /code-review checks. Unlink in the same commit.
 - Folding an "is anything pending?" check ahead of a take splits one atomic step into two: keep take-then-act (durability `barrier`).
+- `hatch::require_pip_installer_documents` checks `envs` in pyproject and hatch.toml separately, ignoring that a hatch.toml `envs` key hides pyproject's: a pyproject `installer = "uv"` shadowed by hatch.toml still refuses vendored wheels and switches on the uv-sources refusal. Pre-existing and output-changing; it wants an issue (found by /code-review on #1914).
+- `HatchPlan.permission` holds whole file texts while a `HatchEdit` holds one setting line: the audit note "merge HatchPermission into HatchEdit" blurs the two, so it was reverted on review.
