@@ -49,6 +49,10 @@ use socket_patch_core::vendor::{RevertOutcome, VendorEntry, VendorState, RESIDUA
 /// the purl stays vendored.
 const KEPT_VENDORED: &str = "redirect_takeover_kept_vendored";
 
+/// The warning code of a takeover refused because its revert failed or
+/// would keep vendored wiring.
+const REVERT_FAILED: &str = "redirect_vendored_revert_failed";
+
 /// The skip reason of a staged takeover whose purl the hosted rewrite did
 /// not pin, when no rewriter warning names the cause.
 const NOT_PINNED: &str = "redirect_takeover_not_pinned";
@@ -157,7 +161,7 @@ impl Takeover {
                             "vendored_revert_failed",
                         ));
                         out.warnings.push(serde_json::json!({
-                            "code": "redirect_vendored_revert_failed",
+                            "code": REVERT_FAILED,
                             "detail": format!(
                                 "{purl} has socket-owned vendored `[patch.crates-io]` \
                                  wiring but no usable vendored ledger entry \
@@ -244,7 +248,7 @@ impl Takeover {
                 crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, false).await;
             let refusal = if !outcome.success {
                 Some(serde_json::json!({
-                    "code": "redirect_vendored_revert_failed",
+                    "code": REVERT_FAILED,
                     "detail": format!(
                         "{purl} is vendored and its vendored state could not be \
                          reverted ({}); NOT switched to hosted — run `socket-patch vendor \
@@ -265,7 +269,7 @@ impl Takeover {
                         |(name, version)| format!("`{name}=={version}`"),
                     );
                 Some(serde_json::json!({
-                    "code": "redirect_vendored_revert_failed",
+                    "code": REVERT_FAILED,
                     "detail": format!(
                         "{purl} is vendored and another project file still installs from its \
                          vendored wheel ({residual}), so it is left in place; NOT switched to hosted — \
@@ -274,20 +278,14 @@ impl Takeover {
                          `scan --mode hosted`, and only then re-export the file from the rewired lock"
                     ),
                 }))
-            } else if outcome.kept_artifact
-                || outcome.drift_skipped()
-                || outcome
-                    .warnings
-                    .iter()
-                    .any(|w| w.code == RESIDUAL_REFERENCE_CODE)
-            {
-                // A wiring record drifted and was left in place, so the
-                // project may still resolve through the vendored artifact
-                // and the ledger entry holds the only recorded originals
-                // (the RevertOutcome contract): keep both and refuse,
-                // exactly as `vendor --revert` reports it skipped.
+            } else if outcome.kept_artifact || outcome.drift_skipped() {
+                // A wiring record drifted or the revert kept the artifact,
+                // so the project may still resolve through it and the
+                // ledger entry holds the only recorded originals (the
+                // RevertOutcome contract): keep both and refuse, exactly as
+                // `vendor --revert` reports it skipped.
                 Some(serde_json::json!({
-                    "code": "redirect_vendored_revert_failed",
+                    "code": REVERT_FAILED,
                     "detail": format!(
                         "{purl} is vendored and part of its vendored wiring was edited since \
                          vendoring, so it is left in place; NOT switched to hosted — restore or \
@@ -329,10 +327,7 @@ impl Takeover {
     /// hosted rewrite leaves on the registry (`alias_skipped`, the
     /// rewrite's `RewriteResult::alias_skipped_entries`). Committing that
     /// takeover would un-patch the alias copy, so it is retracted like a
-    /// purl with no pin at all. Both sides key an entry by its lock key
-    /// line as `formats::yarn::blocks` reads it; an alias entry the vendored
-    /// wiring never touched was unpatched before the run, so it does not
-    /// count.
+    /// purl with no pin at all.
     pub(super) fn unpinned(
         &self,
         confirmed: &[(String, String)],
@@ -342,14 +337,9 @@ impl Takeover {
             .iter()
             .filter(|s| {
                 !confirmed.iter().any(|(_, uuid)| *uuid == s.uuid)
-                    || alias_skipped.get(&s.uuid).is_some_and(|skipped| {
-                        s.entry.wiring.iter().any(|w| {
-                            std::path::Path::new(&w.file)
-                                .file_name()
-                                .is_some_and(|f| f == "yarn.lock")
-                                && w.key.as_ref().is_some_and(|k| skipped.contains(k))
-                        })
-                    })
+                    || alias_skipped
+                        .get(&s.uuid)
+                        .is_some_and(|skipped| unwires_alias_copy(&s.entry, skipped))
             })
             .map(|s| s.uuid.clone())
             .collect()
@@ -507,6 +497,19 @@ async fn explain(
         Some(w) => (w.code.clone(), vec![w.clone()]),
         None => (NOT_PINNED.to_string(), Vec::new()),
     }
+}
+
+/// Whether `entry`'s vendored wiring repointed a yarn.lock entry among
+/// `skipped`. Both sides key an entry by its lock key line as
+/// `formats::yarn::blocks` reads it; an alias entry the vendored wiring
+/// never touched was unpatched before the run, so it does not count.
+fn unwires_alias_copy(entry: &VendorEntry, skipped: &BTreeSet<String>) -> bool {
+    entry.wiring.iter().any(|w| {
+        std::path::Path::new(&w.file)
+            .file_name()
+            .is_some_and(|f| f == "yarn.lock")
+            && w.key.as_ref().is_some_and(|k| skipped.contains(k))
+    })
 }
 
 /// The [`KEPT_VENDORED`] warning for `purl`, naming the `code` that kept it.
