@@ -1,9 +1,6 @@
-//! The one walk from a directory up to its enclosing git checkout.
+//! The walk from a directory up to its enclosing git checkout.
 //!
-//! Every feature that needs "the repository this directory belongs to"
-//! (`socket.yml` lookup, VEX product detection, the JVM build-root check)
-//! goes through [`search_dirs`] / [`find_git_repo`], so they agree on the
-//! rules git itself uses:
+//! [`search_dirs`] / [`find_git_repo`] follow the rules git itself uses:
 //!
 //! - the nearest ancestor (inclusive) holding `.git` wins — a directory,
 //!   or a FILE as in linked worktrees and submodules (`gitdir: …`), or a
@@ -27,11 +24,6 @@ pub struct GitRepo {
 }
 
 impl GitRepo {
-    /// The `.git` entry at the root.
-    pub fn dot_git(&self) -> PathBuf {
-        self.root.join(".git")
-    }
-
     /// The checkout's git `config` file: `.git/config` for a plain
     /// checkout; for a `.git` FILE (`gitdir: <dir>`, relative to the
     /// root), the config of that git dir — or, for a linked worktree whose
@@ -39,7 +31,7 @@ impl GitRepo {
     /// is where `git worktree add` keeps the remotes. `None` when it
     /// cannot be resolved to a regular file.
     pub fn config_path(&self) -> Option<PathBuf> {
-        let dot_git = self.dot_git();
+        let dot_git = self.root.join(".git");
         let git_dir = if dot_git.is_dir() {
             dot_git
         } else {
@@ -237,8 +229,8 @@ mod tests {
         assert_eq!(find(&plain, Some(&base), &[]), None);
     }
 
-    /// B22: a dotfiles repository at `$HOME` must not become the
-    /// repository of every project below it.
+    /// A dotfiles repository at `$HOME` must not become the repository of
+    /// every project below it.
     #[test]
     fn walk_never_enters_home_unless_it_starts_there() {
         let tmp = tempfile::tempdir().unwrap();
@@ -344,7 +336,7 @@ mod tests {
             fs::canonicalize(main_git.join("config")).unwrap()
         );
         // A dangling pointer resolves to nothing.
-        fs::write(repo.dot_git(), "gitdir: /nonexistent/x\n").unwrap();
+        fs::write(repo.root.join(".git"), "gitdir: /nonexistent/x\n").unwrap();
         assert_eq!(repo.config_path(), None);
     }
 
