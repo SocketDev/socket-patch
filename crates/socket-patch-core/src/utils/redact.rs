@@ -366,6 +366,8 @@ mod tests {
         );
         let plain = "https://h/x?author=a&keyword=b&design=c&monkey=d";
         assert_eq!(redact_url(plain), plain, "a marker inside another word");
+        let empty = "https://h/x?token=&key&v=1";
+        assert_eq!(redact_url(empty), empty, "no value to redact");
     }
 
     /// An ssh login name is not a secret; an ssh password is.
