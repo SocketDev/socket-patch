@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-11-01T21:30Z · main @ cbbbdb9_
+_Last updated 2026-11-01T23:15Z · main @ cbbbdb9_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -12,7 +12,7 @@ _Last updated 2026-11-01T21:30Z · main @ cbbbdb9_
 | #1875 | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI (82 checks) and Bugbot green |
 | #1884 | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 #1859; tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI (82 checks) and Bugbot green |
 | #1892 | sweep | `cli/src/commands/scan/gc.rs` | ready; CI (82 checks) and Bugbot green |
-| #1897 | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot green; burn-down final review done |
+| #1897 | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot green |
 | #1903 | sweep | `cli/src/commands/scan/hosted/{nuget,takeover}.rs` | ready; CI (82 checks) and Bugbot green |
 | #1907 | sweep | core `constants.rs`, `utils/{cargo_home,composer_version,concurrent,containment,digest,durability,env_compat,failpoint}.rs` (+ `socket_dir.rs`, `purl_key.rs` tests) | ready; CI (82 checks) and Bugbot green |
 | #1914 | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI (82 checks) and Bugbot green |
@@ -24,6 +24,7 @@ _Last updated 2026-11-01T21:30Z · main @ cbbbdb9_
 | #1944 | structural | T51 #1941: 11 `tests/apply` suites + `common/envelope.rs` onto `apply_fixture` (test-only, −635 net) | ready; Bugbot clean, 80/82 green; `hosted-e2e` red on a live patch.socket.dev 403 (minimist tgz), not this diff; re-run once |
 | #1955 | structural | T52 #1942: 7 PTY runners → `common/pty_io::{run,run_command}` (test-only, +172/−567) | ready; CI (82 checks) and Bugbot green |
 | #1948 | sweep | `cli/src/commands/{vex_consumed,vex_sources}.rs` (+ 2 tests moved to `ecosystem_dispatch.rs`) | ready; CI (ci-ok) and Bugbot green |
+| #1961 | sweep | `cli/src/ui/{mod,prompt,status}.rs` (`test_support.rs` clean) | ready; CI (82 checks) and Bugbot green |
 
 #### Merged
 _None._
@@ -34,11 +35,11 @@ Structural, scored `3·B + 2·U + 2·D + 2·C − risk`. Nothing merged since 20
 2. T55 (no issue yet), test helpers across binaries (`stderr_chatter` 5×, dir snapshot ~8×): ~6 once filed; includes a `run_bin_with_env` `extras` param so `apply_fixture::run_gem` stops copying it.
 A26 #1867, A46 #1917, A44 #1918 score ~4.
 
-Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `python_lock.rs` (2,283), `python_script.rs` (1,768), `api/{blob_fetcher,date,retry,types}.rs`, crawler rows; `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (callers in `vendor.rs`/`apply.rs`/`vex.rs`, #1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948).
+Next sweep files, in order: `update_notifier.rs`, `path_scope.rs`, `main.rs`+`interrupt.rs`, `json_envelope.rs`; `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `python_lock.rs` (2,283), `python_script.rs` (1,768), `api/{blob_fetcher,date,retry,types}.rs`, crawler rows; `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `ui/text.rs` sweep and the text-shaping move out of `ui/mod.rs` (#1884), `StatusLine::stderr(json, silent)` → one `report` bool (scan/mod.rs, lock_cli.rs) (#1961); `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (callers in `vendor.rs`/`apply.rs`/`vex.rs`, #1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948).
 
 #### Notes
 - First-thread PRs: `review/2026-10-v1/register/90-refactor.md`.
-- Check every "redundant filter" note against all consumers (the `args.rs` proxy filter is load-bearing).
+- Check every "redundant filter" note against all consumers and derived `GlobalArgs` (the `args.rs` proxy filter, `select_one`'s `quiet()`).
 - Clap field doc comments are `--help` output: sweeps leave them alone.
 - `--cwd` defaults to `.`: absolutize before walking `ancestors()`; test via chdir under `#[serial]`.
 - `vendor/cargo_config.rs` (~L165-L190) has a third `.cargo/config` pick: fold into `config_layer_paths` when swept.
