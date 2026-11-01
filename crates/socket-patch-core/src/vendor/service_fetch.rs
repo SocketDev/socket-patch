@@ -824,4 +824,46 @@ mod tests {
             );
         }
     }
+
+    /// The `vendor_prebuilt_downloaded` advisory, which quotes the
+    /// grant-tokenized service URL, is built in exactly one place
+    /// (`VerifiedArchive::downloaded_warning`); a backend that spells its
+    /// own copy again fails here.
+    #[test]
+    fn the_service_download_advisory_has_one_builder() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        let mut builders = Vec::new();
+        for path in files {
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.ends_with("tests.rs") || rel.contains("test_support") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n");
+            let production = text
+                .find("#[cfg(test)]\nmod tests {")
+                .map_or(text.as_str(), |at| &text[..at]);
+            for _ in production.matches("\"vendor_prebuilt_downloaded\",") {
+                builders.push(rel.clone());
+            }
+        }
+        assert_eq!(builders, vec!["vendor/service_fetch.rs".to_string()]);
+    }
 }
