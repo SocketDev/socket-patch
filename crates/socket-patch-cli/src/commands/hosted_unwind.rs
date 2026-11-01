@@ -148,13 +148,13 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
     // install or sync (#477, #1953): name the reinstall that restores the
     // upstream bytes.
     if outcome.flush_error.is_none() {
-        use crate::commands::pypi_reinstall::{advisory, Tool, HOSTED_CODE};
-        let unwound: Vec<(String, Tool)> = outcome
+        use crate::commands::pypi_reinstall::{advisory, Tool, Unwound, HOSTED_CODE};
+        let unwound: Vec<Unwound> = outcome
             .restored()
             .filter(|pin| pin.purl.starts_with("pkg:pypi/"))
             .filter_map(|pin| {
                 let tool = Tool::of_files(&pin.files)?;
-                Some((pin.purl.clone(), tool))
+                Some(Unwound::new(&pin.purl, tool, &pin.files))
             })
             .collect();
         if let Some(detail) = advisory(&common.cwd, &unwound).await {

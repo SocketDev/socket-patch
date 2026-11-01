@@ -3751,7 +3751,7 @@ async fn pypi_unwinds_name_the_reinstall_a_plain_sync_skips() {
             "pip",
             stage_requirements,
             stage_requirements,
-            "`pip uninstall -y six`",
+            "`pip install -r requirements.txt`",
         ),
         (
             "pipenv",

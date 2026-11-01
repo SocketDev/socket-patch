@@ -5006,6 +5006,11 @@ pub(crate) async fn run_vendor_gc(
                     &common.cwd,
                     &purl,
                     entry.flavor.as_deref(),
+                    &entry
+                        .wiring
+                        .iter()
+                        .map(|w| w.file.clone())
+                        .collect::<Vec<_>>(),
                     &mut outcome.warnings,
                 )
                 .await;
