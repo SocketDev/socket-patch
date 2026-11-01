@@ -571,14 +571,14 @@ crates/socket-patch-core/src/crawlers/maven_scope.rs	900	audit-core	cbbbdb9 2026
 crates/socket-patch-core/src/crawlers/mod.rs	99	audit-core	cbbbdb9 2026-11-01	-	clean
 crates/socket-patch-core/src/crawlers/npm_crawler.rs	8796	audit-core	cbbbdb9 2026-11-01	-	detail in run entry; ~45 single-caller fns; wrappers: get_*_global_prefix->_with (e2e-only pub), StoreEntry::{pnpm,npm,vlt} one fn, 3 run_walk shims; parse_npm_root_output==parse_pnpm_root_output; redefines ListedEntry/list_dir_sync (use crawlers::listing); ~440 comment lines (13 banners, stale check_package refs); 25 tests fake/dup; A41-A44
 crates/socket-patch-core/src/crawlers/npm_crawler/oracle.rs	1938	audit-core	cbbbdb9 2026-11-01	-	test-only; retire (A29): imports 10+ production helpers, not verbatim (alias logic #356 added later), covers no .bun/.deno/gvs/.modules.yaml layouts, own xorshift + 5 helpers that oracle_support.rs already has; drops 2 cfg(test) shims in npm_crawler.rs
-crates/socket-patch-core/src/crawlers/nuget_crawler.rs	2784	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/nuget_crawler/oracle.rs	208	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/oracle_support.rs	171	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/pkg_managers.rs	1486	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/pnpm_layout.rs	340	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/python_crawler.rs	8143	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/python_crawler/oracle.rs	101	audit-core	-	-	
-crates/socket-patch-core/src/crawlers/python_crawler/pdm_site.rs	371	audit-core	-	-	
+crates/socket-patch-core/src/crawlers/nuget_crawler.rs	2784	audit-core	cbbbdb9 2026-11-01	-	inline classify_package_entry, find_by_purls_sync; fold nuget_home into global_packages_folder (reads NUGET_PACKAGES twice, var vs var_os); drop test-only wrappers scan_package_dir/verify_nuget_package/is_dotnet_project; one emit helper for 3 CrawledPackage+seen sites; ~75 comment lines; del test_deduplication; ~8 tests dup crawler_nuget_e2e; NugetEnv guard (A37); A46
+crates/socket-patch-core/src/crawlers/nuget_crawler/oracle.rs	208	audit-core	cbbbdb9 2026-11-01	-	A29 oracle, drifted: no #1202 version normalization, calls production get_nuget_package_paths, never covers the restore scope; delete under #1868
+crates/socket-patch-core/src/crawlers/oracle_support.rs	171	audit-core	cbbbdb9 2026-11-01	-	write is a 1-line wrapper over write_bytes; map_rows rebuilds rows' tuple (add row(p)); PermGuard fields unnamed; also used by vex/verify.rs, so move with test_rng into one test_support module (A51)
+crates/socket-patch-core/src/crawlers/pkg_managers.rs	1486	audit-core	cbbbdb9 2026-11-01	-	inline YarnEnv::current, home_node_linker, injected, pnpm_pnp_layout; live_pnp_marker copies view.rs L858 (A52); 4 pub->pub(crate); stale Pnpm variant doc; ~45 comment lines (module+detect docs repeat steps); del dup YarnEnv::current test L823 and can't-fail node_modules_as_file_is_not_misclassified_vlt; table-ize 7 yarn_berry_* tests; A48
+crates/socket-patch-core/src/crawlers/pnpm_layout.rs	340	audit-core	cbbbdb9 2026-11-01	-	inline installed_store, configured_modules_dirs_in, setting_from (precedence dup of modules_dir_setting), npmrc_modules_dir (forwards to patch::redirect); unquote_yaml_scalar -> formats/pnpm (A44); empty modulesDir on disk untested; ~4 comment lines; A48
+crates/socket-patch-core/src/crawlers/python_crawler.rs	8143	audit-core	cbbbdb9 2026-11-01	-	dead pub find_pipenv_virtualenv_site_packages, test-only find_poetry_virtualenv_site_packages; inline find_python_command, package_manager_recorded_site_packages, add_hatch_site_packages, pdm_config_bool, in_project_venv_exists, absolute_env_dir; dotenv codec->formats; ~120 comment lines; del 4 tests, 7 dup e2e; A47 A49 A50
+crates/socket-patch-core/src/crawlers/python_crawler/oracle.rs	101	audit-core	cbbbdb9 2026-11-01	-	A29 oracle: purl_lookup/match_listing copied verbatim into find_by_purls; skips visible() shadowing; last caller of read_egg_info_metadata (dead once the oracle goes)
+crates/socket-patch-core/src/crawlers/python_crawler/pdm_site.rs	371	audit-core	cbbbdb9 2026-11-01	-	inline runtime_probe_command, runtime_site_dir; timeout param has one production value; probe-cwd policy is a third one (private tempdir) beside SystemCommandRunner and neutral_probe_dir; tests real
 crates/socket-patch-core/src/crawlers/ruby_crawler.rs	6457	audit-core	-	-	
 crates/socket-patch-core/src/crawlers/sbt_evidence.rs	636	audit-core	-	-	
 crates/socket-patch-core/src/crawlers/sbt_evidence/tests.rs	527	audit-core	-	-	
@@ -738,7 +738,7 @@ crates/socket-patch-core/src/policy/report.rs	84	audit-core	-	-
 crates/socket-patch-core/src/policy/socket_yml.rs	1284	audit-core	-	-	
 crates/socket-patch-core/src/policy/tests.rs	698	audit-core	-	-	
 crates/socket-patch-core/src/rollout.rs	721	audit-core	-	-	
-crates/socket-patch-core/src/rollout/stage.rs	530	audit-core	-	-	
+crates/socket-patch-core/src/rollout/stage.rs	530	audit-core	-	-	pending audit; handover 2026-11-01: no own tests, take the 11 from CLI scan/rollout.rs L370-L859; Gate::may_admit predicate belongs on Stage
 crates/socket-patch-core/src/telemetry.rs	1842	audit-core	-	-	
 crates/socket-patch-core/src/test_rng.rs	35	audit-core	-	-	
 crates/socket-patch-core/src/update/channel.rs	1536	audit-core	-	-	

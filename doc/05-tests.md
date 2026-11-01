@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -63,6 +63,12 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
   - Misplaced: `scala_cache_tests` tests `gradle_cache::installed_copies` and `jvm_cache::locate_artifact`, and tests the oracle itself. `Hermetic` is a 12th env guard {{A37}}.
   - `npm_crawler/oracle.rs` (1.9K lines): imports 10+ production helpers, is no longer verbatim, and covers none of the `.bun`/`.deno`/global-virtual-store layouts; retire it {{A29}}.
 - **Coverage gaps:** `bun_uses_global_store` and `crawl_all_with_roots` have no unit test; `maven_scope`'s `MAX_NODES`/`MAX_REACTOR` caps are untested; no crawler test uses a relative cwd {{A45}}.
+- **Tally for `nuget_crawler*`, `pkg_managers`, `pnpm_layout`, `python_crawler*`: about 36 fake, duplicate or weak tests.**
+  - Can't fail: python `test_find_python_command` (passes with no Python) and `test_home_dir_detection` (tests `utils::fs`); nuget `test_deduplication` (one package); `node_modules_as_file_is_not_misclassified_vlt`.
+  - Misnamed: `hatch_discovery_does_not_block_on_fifo_configuration` exercises Poetry. `legacy_fallback_reuses_one_listing_across_purls` never checks reuse.
+  - Duplicates: ~8 nuget and 5 python tests repeat `tests/crawler_*_e2e.rs`; `test_parse_pypi_purl*` repeat `utils/purl.rs`; 7 `yarn_berry_*` tests are one table.
+  - Not hermetic: 12 PnP tests fail under a user Yarn linker setting (executed); 5 python `crawl_all` tests read `VIRTUAL_ENV`. {{A48}}
+  - Scaffolding: 3 more env guards in `python_crawler`, `NugetEnv` {{A37}}; ~25 `mkfifo` helpers {{A51}}; dist-info fixture writer ×3 across crates. Oracles for nuget and python drifted from production {{A29}}.
 - **Tally for `commands/scan/` (8 files): about 40 fake, duplicate or misplaced tests.**
   - Can't fail: `scan/mod.rs` 3 `takeover_detail_*` tests' negative asserts (phrases the string never had), an `assert_ne!` between constants, `vex_error_warnings_append_to_scan_json` (tests `Vec::extend`); `hosted.rs` a constant tautology (L4534).
   - Duplicates: `hosted.rs` L3836/L3853 exact; gc's composer/encoded/PEP 503 tests re-test core `PurlKey`; gc's corrupt-manifest tests ×2 repeat L966; render `highest_severity_picks_worst` copies core `ranking.rs`; `package_specs_match_names_and_purls` copies core `policy/tests.rs`.

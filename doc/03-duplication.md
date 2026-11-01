@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -66,3 +66,8 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 - **package.json `workspaces`:** 5 readers, drifted on non-string items and `null`. {{A43}}
 - **`.modules.yaml` reader:** `npm_crawler` vs `formats::pnpm`, plus a copied YAML unquote. {{A44}}
 - **Small crawler twins (local notes):** `strip_windows_verbatim_prefix` (hatch_env, python_crawler), hatch `envs` table choice (hatch_env, `utils::hatch`), PEP 503 name (hatch_env `project_name`, {{A25}}), `is_real_dir` ×3, `is_anchored` (composer, relpath).
+- **NuGet project-tree walk and project-file test:** crawler restore scope vs `vendor::nuget_config`, drifted on extension case and non-UTF-8 names. {{A46}}
+- **"Declares `[tool.poetry]`":** TOML parse vs substring vs `has_table`; the substring copy drops a lockless uv env (executed). {{A47}}
+- **pnpm YAML top-level scalar:** 3 readers drifted on quotes and empty values. {{A44}}
+- **Python env-dir naming:** Poetry, Pipenv and Hatch share one sanitize + urlsafe-b64(sha256)[..8] rule written 3 times; Windows verbatim-prefix strip ×3. {{A49}}
+- **Python site rules inside `python_crawler`:** user site ×2, site-packages-under-prefix ×3 (lib64), PDM config read twice. {{A50}}

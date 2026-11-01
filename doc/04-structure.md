@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -56,6 +56,13 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
   - about 450 deletable comment lines (13 banners, perf history, stale `check_package` references).
 - **Crawlers read unabsolutized `--cwd`:** lexical `ancestors()` walks of `.` stop at once. {{A45}}
 - **Codecs inside crawlers:** `deno_crawler`'s `deno.lock` readers (used by vex, hosted and vendor) belong in `formats/deno`, `gradle_cache::parse_properties` in `formats/`, the POM line scanner in `formats::maven` ({{A31}}), and `JvmEnv`/`M2Gate` in `jvm_cache` ({{A35}}).
+- **Tally for `crawlers/` `nuget_crawler*`, `oracle_support`, `pkg_managers`, `pnpm_layout`, `python_crawler*` (8 files, 13.6K lines):**
+  - about 80 single-caller functions (≈25 worth inlining: `classify_package_entry`, `YarnEnv::current`, `installed_store`, `pnpm_pnp_layout`, `find_python_command`, `runtime_site_dir`, …);
+  - about 17 trivial wrappers (test-only `NuGetCrawler::scan_package_dir`/`is_dotnet_project`, `npmrc_modules_dir`, `hatch_env_site_packages`);
+  - dead code: `find_pipenv_virtualenv_site_packages` (no caller), `find_poetry_virtualenv_site_packages` and the async metadata readers (test/oracle-only), `#[cfg(test)] poetry_virtualenvs_root` in production code;
+  - about 250 deletable comment lines;
+  - `python_crawler` (3.8K production lines) mixes a dist-info codec, a 290-line python-dotenv codec (belongs in `formats/pipenv`) and four env-placement models (PDM, uv, Pipenv, Poetry; target `crawlers/python_env/`).
+- **`crawlers/pkg_managers` crawls nothing:** Yarn rc/env resolution belongs in `formats::yarn`, `YarnPnpLoader` in `vex`. {{A52}}
 - **Tally for `crates/socket-patch-cli/src/commands/scan/` (8 files, 15.5K lines: `gc.rs`, `hosted.rs`, `hosted/{nuget,python,takeover}.rs`, `mod.rs`, `policy.rs`, `render.rs`):**
   - about 90 single-caller functions (≈25 worth inlining; render's byte-tested builders stay);
   - about 26 trivial wrappers or shims (`count`, `run_warning_of`, `emit_json_error`, 4 re-export shims in `mod.rs`, 3 policy getters over a `pub` field);
