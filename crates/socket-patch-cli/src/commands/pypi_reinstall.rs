@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advisory_names_pips_forced_reinstall() {
+    async fn advisory_names_pips_uninstall_and_reinstall() {
         let tmp = tempfile::tempdir().unwrap();
         let detail = advisory(
             tmp.path(),
