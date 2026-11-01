@@ -185,8 +185,14 @@ pub(crate) struct LockElsewhere {
     code: &'static str,
     /// The directory to run from.
     pub(crate) dir: PathBuf,
-    /// What [`Self::dir`] is, for the "run from" hint.
+    /// What [`Self::dir`] is, for the "run from" hint (`workspace root`;
+    /// worded like [`MemberStrayLock::root_kind`]).
     pub(crate) dir_kind: &'static str,
+    /// Whether a vendored run from [`Self::dir`] would wire the project:
+    /// `true` for a workspace root, which installs its members, and
+    /// `false` for a pnpm `lockfile-dir` outside any pnpm workspace, which
+    /// holds only the lock.
+    pub(crate) vendorable_dir: bool,
     /// Which lock installs the project, without a remedy.
     pub(crate) detail: String,
 }
@@ -197,7 +203,7 @@ impl LockElsewhere {
         Refusal {
             code: self.code.to_string(),
             message: format!(
-                "{}, which a hosted run here cannot see; run socket-patch from {} ({}); \
+                "{}, which a hosted run here cannot see; run socket-patch from {} (the {}); \
                  nothing was written",
                 self.detail,
                 self.dir.display(),
@@ -243,8 +249,9 @@ pub(crate) async fn npm_lock_elsewhere(root: &Path) -> Option<LockElsewhere> {
             root.display(),
             lock.display()
         ),
+        vendorable_dir: dir.join(PNPM_WORKSPACE).is_file(),
         dir,
-        dir_kind: "the directory holding pnpm-lock.yaml",
+        dir_kind: "directory holding pnpm-lock.yaml",
     })
 }
 
@@ -348,7 +355,8 @@ async fn package_json_workspace_elsewhere(root: &Path) -> Option<LockElsewhere> 
             join_paths(&ancestor, &locks),
         ),
         dir: ancestor,
-        dir_kind: "the workspace root",
+        dir_kind: "workspace root",
+        vendorable_dir: true,
     })
 }
 
@@ -987,7 +995,8 @@ async fn vlt_workspace_elsewhere(root: &Path) -> Option<LockElsewhere> {
             ancestor.join(VLT_LOCK).display(),
         ),
         dir: ancestor,
-        dir_kind: "the workspace root",
+        dir_kind: "workspace root",
+        vendorable_dir: true,
     })
 }
 
