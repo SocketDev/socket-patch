@@ -514,7 +514,7 @@ crates/socket-patch-core/src/utils/http.rs	546	audit-core	b291caa 2026-10-29	PR 
 crates/socket-patch-core/src/utils/line_endings.rs	238	audit-core	b291caa 2026-10-29	clean	clean (callers re-derive it: A04)
 crates/socket-patch-core/src/utils/lock_fragments.rs	654	audit-core	b291caa 2026-10-29	-	pairing loop x3 (pair_fragments L191, finish L306, rewrite_batch L476) has drifted on which text it checks: one helper; finish carries before: Result and re-raises after render; extend_span &mut out-param: return range; compute edits eagerly, shrink FragmentRewrite to {text, edits}; L434 CRLF test re-derives LineEndings::of (A04); make pub(crate); A05
 crates/socket-patch-core/src/utils/mod.rs	45	audit-core	b291caa 2026-10-29	PR #1914	sort hatch/hatch_workspace into order; lock_fragments, pdm_lock, hatch_workspace pub -> pub(crate) (exposes dead items to the lint)
-crates/socket-patch-core/src/utils/notice.rs	99	audit-core	b291caa 2026-10-29	PR #1920	inline is_muted into notice_once
+crates/socket-patch-core/src/utils/notice.rs	99	audit-core	b291caa 2026-10-29	PR #1920	inline is_muted into notice_once; but CLI re-derives the --silent warning rule (T21): expose one pub predicate instead
 crates/socket-patch-core/src/utils/npm_range.rs	117	audit-core	b291caa 2026-10-29	PR #1920	operator char set written twice (L41, L56): one const fn
 crates/socket-patch-core/src/utils/package_manager.rs	31	audit-core	b291caa 2026-10-29	PR #1920	one-fn module; yarn major parse duplicated in update/channel.rs:361-367 (no trim) and vendor/mod.rs:274-279: add yarn_major() here (A13)
 crates/socket-patch-core/src/utils/pdm_lock.rs	1315	audit-core	b291caa 2026-10-29	-	delete dead wheel_matches (0 callers); rewrite_pdm_lock, pdm_lock_edits test-only: cfg(test); rewrite_pdm_lock_in private; lock_version list in 3 matches -> one table; sha256 check x2 + vendor/pypi_pdm.rs:367 copy -> files_all_sha256(); unit filter x2; orphan doc L841; delete dup test pairing_refuses_a_fragment_shape_change; unsafe_sources test asserts only is_err; ~10 #refs
@@ -600,39 +600,39 @@ crates/socket-patch-core/src/formats/gem/hosted.rs	822	audit-core	cbbbdb9 2026-1
 crates/socket-patch-core/src/formats/gem/manifest.rs	1360	audit-core	cbbbdb9 2026-11-01	-	Unsupported+GemfileCall arm L144 unreachable; collapse 3 public/_lexical/_by triples to one SameDir param; twin_manifest_refusal -> const; inline describe (1 caller) and reuse knob text; config_gemfile/config_lockfile one-liners; classify_lexical vs with_lockfile_lexical disagree on absolute values
 crates/socket-patch-core/src/formats/gem/mirror.rs	571	audit-core	cbbbdb9 2026-11-01	-	delete dup test a_host_mirror_captures_the_patch_registry; hoist loop-invariant asserts in each_remedy_converges; inline source_host; config line reader -> shared settings parser (A57)
 crates/socket-patch-core/src/formats/gem/mod.rs	721	audit-core	cbbbdb9 2026-11-01	-	keep one of GemfileLock::parse / free parse; dependencies keeps LAST section while direct/pinned take union: derive both from one; add bundled_with + checksum line_nos to model (A58); inline parse_checksum; problems as enum not strings
-crates/socket-patch-core/src/formats/governing_locks.rs	265	audit-core	-	-	
-crates/socket-patch-core/src/formats/json.rs	32	audit-core	-	-	
-crates/socket-patch-core/src/formats/maven/mod.rs	753	audit-core	-	-	
-crates/socket-patch-core/src/formats/mod.rs	102	audit-core	-	-	
-crates/socket-patch-core/src/formats/nuget/lock.rs	425	audit-core	-	-	
-crates/socket-patch-core/src/formats/nuget/mod.rs	667	audit-core	-	-	
-crates/socket-patch-core/src/formats/nuget/package.rs	291	audit-core	-	-	
-crates/socket-patch-core/src/formats/pipenv.rs	363	audit-core	-	-	
-crates/socket-patch-core/src/formats/pnpm/grammar.rs	476	audit-core	-	-	
-crates/socket-patch-core/src/formats/pnpm/hosted.rs	426	audit-core	-	-	
-crates/socket-patch-core/src/formats/pnpm/lines.rs	405	audit-core	-	-	
-crates/socket-patch-core/src/formats/pnpm/mod.rs	862	audit-core	-	-	
-crates/socket-patch-core/src/formats/pnpm/version.rs	391	audit-core	-	-	
-crates/socket-patch-core/src/formats/pnpm/workspace.rs	613	audit-core	-	-	
-crates/socket-patch-core/src/formats/registry.rs	445	audit-core	-	-	
-crates/socket-patch-core/src/formats/sbt/build.rs	943	audit-core	-	-	
-crates/socket-patch-core/src/formats/sbt/evidence.rs	1339	audit-core	-	-	
-crates/socket-patch-core/src/formats/sbt/gate.rs	447	audit-core	-	-	
-crates/socket-patch-core/src/formats/sbt/mod.rs	99	audit-core	-	-	
-crates/socket-patch-core/src/formats/sbt/owned_file.rs	1369	audit-core	-	-	
-crates/socket-patch-core/src/formats/text.rs	161	audit-core	-	-	
-crates/socket-patch-core/src/formats/xml.rs	233	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/berry_entry.rs	528	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/berry_gates.rs	375	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/berry_prune.rs	293	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/blocks.rs	332	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/classic_deps.rs	623	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/copy.rs	596	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/mod.rs	127	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/patterns.rs	350	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/rc.rs	855	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/source.rs	350	audit-core	-	-	
-crates/socket-patch-core/src/formats/yarn/stanzas.rs	293	audit-core	-	-	
+crates/socket-patch-core/src/formats/governing_locks.rs	265	audit-core	cbbbdb9 2026-11-01	-	cut history in module doc L4-11; L53 literal "yarn.lock": use one const in constants::npm_family (A71); all items pub with no CLI caller: pub(crate)
+crates/socket-patch-core/src/formats/json.rs	32	audit-core	cbbbdb9 2026-11-01	-	clean; A62 target (JSON scanners, BOM-tolerant parse)
+crates/socket-patch-core/src/formats/maven/mod.rs	753	audit-core	cbbbdb9 2026-11-01	-	is_maven_coordinate L562 = is_property_name L554: keep one; may_name, PomScope::{is_ignored,in_profile,elements} private; properties() L271 re-implements inside(); dep versions skip interpolate (executed, #1887 comment); cut banner L9, "Bugbot:" L720-722; move maven_config_properties tests from vendor/jvm/maven_reactor.rs here
+crates/socket-patch-core/src/formats/mod.rs	102	audit-core	cbbbdb9 2026-11-01	-	cut roadmap note L17-19; drop `pub use registry::registry` shim
+crates/socket-patch-core/src/formats/nuget/lock.rs	425	audit-core	cbbbdb9 2026-11-01	-	resolve_relative re-implements utils::relpath, drifted (A19); strip_xml_comments re-implements xml::blank_non_markup minus CDATA; normalize_nuget_version imported from vendor::nuget_feed: move here (A08); PACKAGES_LOCK x3 (A71); L346 assert! -> assert_eq!; A46
+crates/socket-patch-core/src/formats/nuget/mod.rs	667	audit-core	cbbbdb9 2026-11-01	-	visit threads &mut open_mapping and parse_config L193-211 diffs mappings.len(): return what was recorded; move attr tokenizer, decode_entities, attr encoder to formats::xml (#1950); config reader -> nuget/config.rs; cut banner L20
+crates/socket-patch-core/src/formats/nuget/package.rs	291	audit-core	cbbbdb9 2026-11-01	-	L130-135 binds a tuple to destructure it: bind sig; zip(_, descriptor_free) helper never sets flag 0x08 (unverified), so data-descriptor branch L102-111 likely untested: add a 0x08 fixture asserting the hash
+crates/socket-patch-core/src/formats/pipenv.rs	363	audit-core	cbbbdb9 2026-11-01	-	whitespace-skip loop x4 (L30-87): one closure; properties() is a 5th JSON member scanner (A62); L100 imports vendor::lock_inventory::pypi::parse_pipfile_lock (A08); L116-118 parse-and-discard needs a why or removal
+crates/socket-patch-core/src/formats/pnpm/grammar.rs	476	audit-core	cbbbdb9 2026-11-01	-	Resolution::restore L278-303 copies rewrite quoting+join L242-269: one render(); inline supported_suffix, entry_field, resolution_raw_lines, unsupported_early_shrinkwrap; head sniffs (A71); gap: resolution() splice grammar untested
+crates/socket-patch-core/src/formats/pnpm/hosted.rs	426	audit-core	cbbbdb9 2026-11-01	-	plan_hosted L170-405 ~235 lines: extract vendored-key sniff L345-378; L183-186 lock names dup constants::npm_family (A71); move test-only pnpm_unrewritten_instances L407-426 to redirect tests; inline hits, into_rewritten
+crates/socket-patch-core/src/formats/pnpm/lines.rs	405	audit-core	cbbbdb9 2026-11-01	-	unquote_value L193-203 = grammar::unquote = governing_root::unquote_scalar (A44); inline rest_suffix, is_plain_safe; split_lines one-line wrapper (re-implemented in workspace tests L379); share the `---` separator predicate with grammar::main_document
+crates/socket-patch-core/src/formats/pnpm/mod.rs	862	audit-core	cbbbdb9 2026-11-01	-	delete dead PnpmLock::text; wired_integrity test-only; vendored_npm_uuid, strip_pnpm_peer_suffix private; inline is_pnpm_lock, packages, split_pnpm_key, has_packages_section, insert_entry; cut L342-346 (dup doc), history L804-805, 3 banners; BOM test L807 only compares to plain twin: assert values; A64, A71
+crates/socket-patch-core/src/formats/pnpm/version.rs	391	audit-core	cbbbdb9 2026-11-01	-	inline version_span; modules_yaml_package_manager L103-112 re-implements workspace::yaml_top_level_value, drifted on first vs last key (executed, A44/#1918)
+crates/socket-patch-core/src/formats/pnpm/workspace.rs	613	audit-core	cbbbdb9 2026-11-01	-	yaml_top_level_value L62-68 trim_matches strips unbalanced quotes though single_quoted/double_quoted exist here (A44); top_level_key strips BOM on every line, doc says first; lock_has_member_importers (A67, #1952); inline glob_scalar
+crates/socket-patch-core/src/formats/registry.rs	445	audit-core	cbbbdb9 2026-11-01	-	delete dead PNPM_MARKER and the pnpm-lock.yml row it alone reaches; paths_with/probe_paths/wiring_paths: one paths(eco, role); L255 re-derives basename(); test the_reference_scan_and_the_symlink_check_read_the_same_files near-tautological: assert every REGISTRY ecosystem is listed
+crates/socket-patch-core/src/formats/sbt/build.rs	943	audit-core	cbbbdb9 2026-11-01	-	make parse_version, sbt_line, MIN_SUPPORTED, FIRST_UNTESTED, ReadText private; dependency_literals is a bool-mode wrapper over literals_of; stale doc L413 ("kinds"); declared_newer L468 dedup() is adjacent-only, returns dup versions (executed on copy): collect into BTreeSet<String>; A70; is_sbt_build marker list (E69)
+crates/socket-patch-core/src/formats/sbt/evidence.rs	1339	audit-core	cbbbdb9 2026-11-01	-	sbt_id, parse_into private; delete ResolutionDoc::from_json (no prod caller); WireFindings L598-608/WireResolution copy model structs: derive serde (~30 lines); test configs_cover_the_library_scopes re-reads a const; resolution_doc_round_trips dups redirect/sbt.rs L983; rustfmt tests L873-943, L1190-1200; A60
+crates/socket-patch-core/src/formats/sbt/gate.rs	447	audit-core	cbbbdb9 2026-11-01	-	delete never-constructed GateWarning::MetaBuildOnly and its match in vendor/jvm/sbt_gate.rs L369; check_new always Ok(vec![]): Result<(),_>; check_existing returns <=1: Option; inline normalize_version (wraps maven::split_socket_version); doc says sbt but coursier_gate uses it (A35)
+crates/socket-patch-core/src/formats/sbt/mod.rs	99	audit-core	cbbbdb9 2026-11-01	-	Ga/JvmResolution serve scala-cli too: move with gate to formats::jvm (A35); otherwise clean
+crates/socket-patch-core/src/formats/sbt/owned_file.rs	1369	audit-core	cbbbdb9 2026-11-01	-	inline pub bare_sha256 (wrapper); drop SbtLine re-export; HEADER_PREFIX, repo_rel private; suffixed_version and L570-579 build a dummy Coords and re-split: free hex8/suffixed_version in vendor::jvm (E63); L654-661 hand hex check (A06); tests suffixed_version_matches_the_maven_rule (asserts a const), assemble_reproduces_the_goldens (tests a helper); A70
+crates/socket-patch-core/src/formats/text.rs	161	audit-core	cbbbdb9 2026-11-01	-	PENDING_INLINE_BOMS lists vendor/yarn_classic_lock.rs which has no inline BOM left: delete entry; guard is one-sided: add reverse check that each pending file still matches
+crates/socket-patch-core/src/formats/xml.rs	233	audit-core	cbbbdb9 2026-11-01	-	attr matches inside quoted values, no entity decode (executed, #1950); test attr_reads_whole_quoted_names_only misses `t=" name='x'" name="y"`; vague L38 "like the vendor backend"
+crates/socket-patch-core/src/formats/yarn/berry_entry.rs	528	audit-core	cbbbdb9 2026-11-01	-	inline unscoped, field_name, yaml_scalar; drop `let bin = &bin;` L212; dependency_name L147/field_name L251 re-parse body_field_line grammar (A68); with_implicit_node_gyp and render_pinned_entry share the split-sort-flatten tail
+crates/socket-patch-core/src/formats/yarn/berry_gates.rs	375	audit-core	cbbbdb9 2026-11-01	-	inline Yarnrc::from_option; trim cache_key doc L182-185; 4 tests L328-374 test rc::raw_setting not the gate: move to rc.rs (L357 dups rc case); vendor/yarn_berry_lock L1305-1354 wraps each gate instead of check(), re-declares YARN_LOCK/YARNRC, maps codes by suffix string
+crates/socket-patch-core/src/formats/yarn/berry_prune.rs	293	audit-core	cbbbdb9 2026-11-01	-	dependency_descriptors private; inline referenced; patch_inner peels one layer and decodes only %3A: use patterns::patch_layers (A68); key rebuild L162-174 dups stanzas L128-131: shared join_berry_key
+crates/socket-patch-core/src/formats/yarn/blocks.rs	332	audit-core	cbbbdb9 2026-11-01	-	is_body_field, berry_metadata private/pub(super); inline is_key_line, is_body_line; broken [berry_pin_needs_manifest] doc link L272-276; gaps: no unit tests for live_blocks, classic_field, berry_lock_locks
+crates/socket-patch-core/src/formats/yarn/classic_deps.rs	623	audit-core	cbbbdb9 2026-11-01	-	inline carried_descriptors, name_is_locked, manifest_descriptors, block_dep_entries, literal_dep_maps; dep_maps_match runs with_manifest_dep_maps and its caller (redirect L4912) reruns it; quote_yarn_key private; doc L196-197 claims tokenizer agrees with split_key_patterns, false (executed, #1901); delete test unlocked_descriptors_in_matches_the_block_scan
+crates/socket-patch-core/src/formats/yarn/copy.rs	596	audit-core	cbbbdb9 2026-11-01	-	inline berry_copy_path, package_version, tarball_manifest_name; merge read_path two matches; imports npm-name/semver validators from vendor::vlt_lock_text L279/L288: move to formats (A08); classic identity dup of source.rs (A66, #1951)
+crates/socket-patch-core/src/formats/yarn/mod.rs	127	audit-core	cbbbdb9 2026-11-01	-	cut history L104-108; stale L11-12 (vendored uses stanzas too); test the_router_and_the_readers_agree_on_a_deep_marker cannot fail (is_berry_lock = grammar(sniff)) and is_berry_lock_reads_the_whole_file repeats it: merge to one sniff test; A69
+crates/socket-patch-core/src/formats/yarn/patterns.rs	350	audit-core	cbbbdb9 2026-11-01	-	split_pattern = split_classic_pattern + non-empty filter; inline parse_berry_locator, classic_pattern_real_name; pattern_real_name reads berry `x@npm:^1.3.0` as alias of `^1.3.0` (executed): yarn_berry_lock L1535 should use berry_npm_alias_target, then delete it; split_key_patterns ignores escapes (#1901); trim history L223
+crates/socket-patch-core/src/formats/yarn/rc.rs	855	audit-core	cbbbdb9 2026-11-01	-	delete raw_list_setting (no prod caller); list_setting, ListSetting, parse_dotenv, DEFAULT_ENV_FILES private; empty `if !root_is_mapping {}` L168: invert; inline line_scan; rewrap L352; pkg_managers re-composes raw_setting+expand_env and the rc walk x3 (A52)
+crates/socket-patch-core/src/formats/yarn/source.rs	350	audit-core	cbbbdb9 2026-11-01	-	inline is_codeload_tarball; classic_block_is_git, yarn_classic_range_is_git private; classic_file_directory uses cargo_workspace::normalize_rel: use utils::relpath; classic_copy_real_name/classic_file_directory duplicate copy.rs (A66, #1951)
+crates/socket-patch-core/src/formats/yarn/stanzas.rs	293	audit-core	cbbbdb9 2026-11-01	-	inline entries_sorted, reposition; merge_same_resolution re-renders berry_field(&stanza_lines(s)) per stanza per index: use blocks::berry_stanza_field; stanza_lines, on_disk one-line wrappers; stale header L3-4
 crates/socket-patch-core/src/golden.rs	210	audit-core	-	-	
 crates/socket-patch-core/src/gradle/dsl.rs	819	audit-core	-	-	
 crates/socket-patch-core/src/gradle/graph.rs	2852	audit-core	-	-	

@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -86,6 +86,7 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
   - Claims more than it checks: the global-prefix banner test asserts an empty map and captures no stderr; 5 `json_envelope` tests say "every" over hand lists that miss `RolledBack`/`Update`; the omission-phrase test's hand list misses `gradle_unpatched_copy` {{T45}}.
   - Misplaced: 14 `is_uuid_shaped` tests in `lib.rs` (core already tests it), `go_redirect_coord_guard` re-tests core, vex_consumed tests ecosystem_dispatch and npm_crawler.
 - **Core crawlers and formats (audit-core, 2026-11-01 12:54Z):** `crawlers/types.rs` ~17 duplicate tests (per-ecosystem `from_purl`/properties tests subsumed by table tests; `test_all_count` is cfg scaffolding); `ruby_crawler` `test_deduplication` stages one store so dedup never runs, plus 1 duplicate; `gem/mirror` 1 duplicate table row. A ruby `crawl_all` test fails under `BUNDLE_PATH__SYSTEM=true` (executed; added to #1919, {{A48}}). Gaps: gemspec `=begin`/heredoc {{A54}}, sbt evidence caps, `checksum_entry_span`, `bundler_uses_system_gems`.
+- **Core formats (audit-core, 2026-11-01 19:20Z):** ~15 fake or duplicate tests: `yarn/mod.rs` deep-marker test can't fail, `berry_gates` tests target `rc::raw_setting` (4), `classic_deps` wrapper-vs-wrapped, sbt `configs_cover_the_library_scopes` and `suffixed_version_matches_the_maven_rule` assert consts, `resolution_doc_round_trips` ×2, pnpm BOM test only compares twins, `registry` symlink-check test near-tautological, `text::PENDING_INLINE_BOMS` one-sided. Gaps: pnpm `resolution()`, yarn `live_blocks`/`classic_field`, NuGet data-descriptor zip branch.
 - **Tally for `tests/apply/*`, `tests/cargo_e2e_matrix`, `tests/cli/*` (32 files, 14.8K lines, audit-cli-tests 2026-11-01 15:52Z): about 75 fake, duplicate or weak tests.**
   - Pass with their flag removed (executed): `singleton_mismatch_strict_refuses` (no `--strict`), `apply_stderr_warning_gates_on_silent` (no `--silent`), `failing_fallback_home_copy_write_is_nonfatal_when_store_patched` (no `--strict`); `top_level_help_prints_all_subcommands` stays green with the apply/scan rows deleted.
   - Can't fail: `apply_network` asserts no `"patched"` action (no such `PatchAction`) ×2; telemetry `post_count == 0` after `received.is_empty()` ×2; prompts_tty `assert_cursor_restored` (self-admitted).

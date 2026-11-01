@@ -83,3 +83,7 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 - **sbt/scala evidence:** path table ×2, vex re-implements the sbt gate; streaming file sha256 ×2 drifted on symlinks and cap. {{A60,A61}}
 - **JSON text scanners:** ×4 (composer ×2, vlt, bun); bun.lock line split ×3. {{A62}}
 - **`.bundle/config` key reader:** ×2 (crawler, `formats/gem/mirror`), drifted on separator, quoted keys and legacy normalization. {{A57}}
+- **pnpm lock documents and heads:** the pnpm 11 env document is kept by `PnpmLock::parse` and dropped by `InstalledPackages` (executed) {{A64}}; `.modules.yaml` read ×3, drifted on duplicate keys (executed) {{A44}}; member-importers rule ×2 (executed) {{A67}}; `lockfileVersion` head sniff ×5 {{A71}}.
+- **XML attributes:** `xml::attr` vs NuGet's quote-aware tokenizer; `decode_entities` and the attribute encoder live in NuGet/redirect (executed) {{A65}}.
+- **Yarn copies and lines:** classic `file:`/url identity ×2 (executed) {{A66}}; berry dependency-line and `patch:` parsers ×2 {{A68}}; grammar decided by head-only or substring reads {{A69}}; yarn-1 tokenizer ×4 (extends #1901, {{A42}}).
+- **sbt declarations:** Rust preflight and the generated Scala verifier disagree on `%` name suffixes {{A70}}; Maven dependency versions skip `interpolate` (executed, on #1887) {{A30}}.
