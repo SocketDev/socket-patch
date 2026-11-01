@@ -15,7 +15,7 @@ _Last updated 2026-11-01T05:25Z · main @ cbbbdb9_
 | [#1897](https://github.com/SocketDev/socket-patch/pull/1897) | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot green; burn-down final review done |
 | [#1903](https://github.com/SocketDev/socket-patch/pull/1903) | sweep | `cli/src/commands/scan/hosted/{nuget,takeover}.rs` | ready; CI (82 checks) and Bugbot green |
 | [#1907](https://github.com/SocketDev/socket-patch/pull/1907) | sweep | core `constants.rs`, `utils/{cargo_home,composer_version,concurrent,containment,digest,durability,env_compat,failpoint}.rs` (+ `socket_dir.rs`, `purl_key.rs` tests) | ready; CI (82 checks) and Bugbot green |
-| [#1914](https://github.com/SocketDev/socket-patch/pull/1914) | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI and Bugbot pending |
+| [#1914](https://github.com/SocketDev/socket-patch/pull/1914) | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI (82 checks) and Bugbot green |
 
 #### Merged
 _None._
