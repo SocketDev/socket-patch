@@ -20,7 +20,7 @@ _Last updated 2026-11-01T15:15Z · main @ cbbbdb9_
 | #1923 | sweep + A20 #1848 | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` (+ `vex/product.rs`, `redirect/upstream/npm.rs`, advisory lint moved to `vendor/service_fetch.rs`) | ready; CI (82 checks) and Bugbot green |
 | #1929 | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI (82 checks) and Bugbot green |
 | #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; CI (82 checks) and Bugbot green |
-| #1939 | sweep | `cli/src/commands/vendored_backend/{mod,repair}.rs` | ready; CI and Bugbot pending |
+| #1939 | sweep | `cli/src/commands/vendored_backend/{mod,repair}.rs` | ready; CI (82 checks) and Bugbot green |
 
 #### Merged
 _None._
