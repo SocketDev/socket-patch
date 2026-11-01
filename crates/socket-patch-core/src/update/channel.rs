@@ -857,6 +857,20 @@ mod tests {
     }
 
     #[test]
+    fn channel_ids_are_the_telemetry_names() {
+        for (channel, id) in [
+            (InstallChannel::Standalone, "standalone"),
+            (InstallChannel::Npm, "npm"),
+            (InstallChannel::Pypi, "pypi"),
+            (InstallChannel::Cargo, "cargo"),
+            (InstallChannel::LauncherCache, "launcher_cache"),
+            (InstallChannel::Homebrew, "homebrew"),
+        ] {
+            assert_eq!(channel.id(), id);
+        }
+    }
+
+    #[test]
     fn channel_label_covers_every_channel() {
         // Exact strings: these feed the "--update refused: managed by <label>"
         // message, so a drift here is user-visible wording.

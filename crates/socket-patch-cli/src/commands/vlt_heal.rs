@@ -7,6 +7,7 @@
 //! other.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use socket_patch_core::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_LOCK};
 use socket_patch_core::hosted::vlt::{self as hosted_vlt, Preflight};
@@ -35,6 +36,24 @@ pub(crate) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
 /// A bundled copy of a redirected package that no rewire reaches.
 pub(crate) const BUNDLED_INSTANCE_SKIPPED: &str = "redirect_vlt_bundled_instance_skipped";
 
+/// The uuids of `deps` whose purl a vlt vendored ledger entry claims: a
+/// hosted takeover reverts them to a registry node before the rewrite.
+async fn vlt_vendored_uuids(cwd: &Path, deps: &[(&str, &DepOverride)]) -> BTreeSet<String> {
+    let Ok(state) = socket_patch_core::vendor::load_state(cwd).await else {
+        return BTreeSet::new();
+    };
+    deps.iter()
+        .filter(|(purl, _)| {
+            socket_patch_core::vendor::lookup_entry(
+                &state.entries,
+                socket_patch_core::utils::purl::strip_purl_qualifiers(purl),
+            )
+            .is_some_and(|e| e.ecosystem == "npm" && e.flavor.as_deref() == Some("vlt"))
+        })
+        .map(|(_, dep)| dep.patch_uuid.clone())
+        .collect()
+}
+
 /// Fetch each in-scope artifact the way vlt does (once per distinct URL,
 /// `offline` making no request) and decide which deps may be pinned in
 /// `vlt-lock.json` ([`socket_patch_core::hosted::vlt`]). Projects without
@@ -51,23 +70,7 @@ pub(crate) async fn artifact_preflight(
     if files.is_empty() {
         return Preflight::default();
     }
-    // The uuids of `deps` whose purl a vlt vendored ledger entry claims: a
-    // hosted takeover reverts them to a registry node before the rewrite.
-    let vendored: BTreeSet<String> = match socket_patch_core::vendor::load_state(&common.cwd).await
-    {
-        Ok(state) => deps
-            .iter()
-            .filter(|(purl, _)| {
-                socket_patch_core::vendor::lookup_entry(
-                    &state.entries,
-                    socket_patch_core::utils::purl::strip_purl_qualifiers(purl),
-                )
-                .is_some_and(|e| e.ecosystem == "npm" && e.flavor.as_deref() == Some("vlt"))
-            })
-            .map(|(_, dep)| dep.patch_uuid.clone())
-            .collect(),
-        Err(_) => BTreeSet::new(),
-    };
+    let vendored = vlt_vendored_uuids(&common.cwd, deps).await;
     let Some(plan) = hosted_vlt::plan(&view, &files, deps, &vendored) else {
         return Preflight::default();
     };
@@ -416,6 +419,8 @@ pub(crate) async fn heal_after_rewrite(
             out.stale_purls.insert(purl.clone());
         }
     }
+    // Heal targets come from the final lock, so the block above saw it.
+    debug_assert!(!healed || out.healed_store.is_some());
     out
 }
 
