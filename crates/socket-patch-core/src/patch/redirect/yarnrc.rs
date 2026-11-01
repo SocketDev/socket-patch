@@ -131,9 +131,9 @@ fn unquote_rc_value(raw: &str) -> &str {
 }
 
 /// The `yarn-offline-mirror` value of a `.yarnrc`, read as yarn 1 reads
-/// the file ([`classic_rc`]): `false` disables the mirror, and a value
-/// yarn can't resolve as a path (`true`, a number) or a file yarn can't
-/// read sets nothing.
+/// the file (`formats::yarn::classic_rc`): `false` disables the mirror,
+/// and a value yarn can't resolve as a path (`true`, a number) or a file
+/// yarn can't read sets nothing.
 pub fn yarnrc_value(text: &str) -> Option<MirrorValue> {
     match classic_rc::scalar(text, KEY)? {
         RcScalar::Str(value) if value == "false" => Some(MirrorValue::Disabled),
@@ -364,9 +364,9 @@ const GLOBAL_FOLDER_KEY: &str = "global-folder";
 /// precedence, but a folder any layer names was set up as a yarn global
 /// folder, so all of them count.
 ///
-/// Values read as in `yarn@1.22.22`: a `.yarnrc` value is one token of
-/// yarn's rc grammar (`formats::yarn::classic_rc`) resolved against the folder of
-/// its file (`RELATIVE_KEYS`); an `.npmrc` value has its `${NAME}`
+/// Values read as in `yarn@1.22.22`: a `.yarnrc` value is a string as
+/// yarn reads the file (`formats::yarn::classic_rc`), resolved against
+/// the folder of its file (`RELATIVE_KEYS`); an `.npmrc` value has its `${NAME}`
 /// references expanded ([`yarn_env_replace`]); env and `.npmrc` values
 /// then go through `resolveWithHome` (`~/` is yarn's `userHome`, else the
 /// cwd). Empty values set nothing.
