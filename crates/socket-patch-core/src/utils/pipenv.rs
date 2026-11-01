@@ -42,7 +42,7 @@ fn parse_major(output: &str) -> Option<u32> {
 /// when none is found, it does not answer within 10 s, exits non-zero or
 /// prints something unrecognizable. [`MAJOR_OVERRIDE_ENV`] short-circuits
 /// the probe.
-pub async fn installed_major(root: &Path) -> Option<u32> {
+pub async fn installed_major(_root: &Path) -> Option<u32> {
     if let Some(forced) = std::env::var(MAJOR_OVERRIDE_ENV)
         .ok()
         .and_then(|value| parse_override(&value))
@@ -56,7 +56,6 @@ pub async fn installed_major(root: &Path) -> Option<u32> {
     // NEUTRAL directory: with the scanned repository as cwd, Pipenv would read
     // its `.env`, `Pipfile` and `.venv` pointer — committed, attacker-shaped
     // inputs that must not influence (or slow down) a version check.
-    let _ = root;
     command
         .arg("--version")
         .current_dir(std::env::temp_dir())

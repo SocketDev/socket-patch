@@ -561,6 +561,46 @@ mod tests {
         );
     }
 
+    /// Each builder's spelling parses back to its parts, including a
+    /// literal (already decoded) `+` version.
+    #[test]
+    fn builders_round_trip_through_their_parsers() {
+        let version = "1.0.0+meta";
+        assert_eq!(
+            nv(parse_cargo_purl(&build_cargo_purl("wasi", version))),
+            Some(("wasi".into(), version.into()))
+        );
+        assert_eq!(
+            nv(parse_gem_purl(&build_gem_purl("rails", version))),
+            Some(("rails".into(), version.into()))
+        );
+        assert_eq!(
+            nv(parse_nuget_purl(&build_nuget_purl("Foo.Bar", version))),
+            Some(("Foo.Bar".into(), version.into()))
+        );
+        assert_eq!(
+            nv(parse_golang_purl(&build_golang_purl(
+                "golang.org/x/text",
+                version
+            ))),
+            Some(("golang.org/x/text".into(), version.into()))
+        );
+        assert_eq!(
+            nv3(parse_maven_purl(&build_maven_purl("org.x", "lib", version))),
+            Some(("org.x".into(), "lib".into(), version.into()))
+        );
+        assert_eq!(
+            nsv(parse_composer_purl(&build_composer_purl(
+                "psr", "log", version
+            ))),
+            Some((("psr".into(), "log".into()), version.into()))
+        );
+        assert_eq!(
+            jsr_parts(&build_jsr_purl("@std", "path", version)),
+            Some(("@std".into(), "path".into(), version.into()))
+        );
+    }
+
     /// The namespace and name halves are decoded too — and the split runs on
     /// the ENCODED text, so an escaped separator stays INSIDE the component
     /// it was written in instead of creating a new one (the path-safety
