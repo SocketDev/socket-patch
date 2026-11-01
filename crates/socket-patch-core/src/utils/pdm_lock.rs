@@ -1,11 +1,10 @@
-#[cfg(test)]
 use toml_edit::DocumentMut;
 use toml_edit::{value, Array, InlineTable, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::lock_fragments::{
-    extend_span, finish, fragments_of, next_header_end, pair_fragments, rewrite_batch,
-    FragmentRewrite, LockParse,
+    extend_span, fragments_of, next_header_end, pair_fragments, rewrite_all, rewrite_in,
+    FragmentRewrite, FragmentsIn, LockFormat, LockParse,
 };
 pub use crate::utils::lock_fragments::{LockBatch, LockStep};
 use crate::utils::python_lock::is_prior_hosted_url;
@@ -144,71 +143,92 @@ pub fn rewrite_pdm_lock(
     Ok(rewrite_pdm_lock_with_edits(text, name, version, source, filename, sha256)?.text)
 }
 
-/// A successful [`rewrite_pdm_lock_with_edits`]; its
-/// [`edits`](FragmentRewrite::edits) are exactly
-/// `pdm_lock_edits(original, &text, name)`.
-pub type PdmLockRewrite<'a> = FragmentRewrite<'a>;
-
 /// [`rewrite_pdm_lock`], also handing back what the caller needs to record
-/// the rewrite's fragment edits ([`PdmLockRewrite::edits`]).
+/// the rewrite's fragment edits ([`FragmentRewrite::edits`], exactly
+/// `pdm_lock_edits(original, &text, name)`).
 pub fn rewrite_pdm_lock_with_edits<'a>(
     text: &'a str,
-    name: &'a str,
+    name: &str,
     version: &str,
     source: (&str, &str),
     filename: &str,
     sha256: &str,
-) -> Result<PdmLockRewrite<'a>, String> {
-    rewrite_pdm_lock_in(
-        &mut PdmLockParse::default(),
-        text,
+) -> Result<FragmentRewrite<'a>, String> {
+    let dep = PdmLockDep {
         name,
         version,
         source,
         filename,
         sha256,
-    )
+    };
+    rewrite_pdm_lock_dep(&mut LockParse::default(), text, &dep)
 }
 
-/// The parse of the `pdm.lock` text last seen or produced, carried between
-/// calls (see [`LockParse`]).
-pub type PdmLockParse = LockParse;
-
-/// [`rewrite_pdm_lock_with_edits`], reusing (and refreshing) `parse`.
-pub fn rewrite_pdm_lock_in<'a>(
-    parse: &mut PdmLockParse,
+/// [`rewrite_pdm_lock_dep`] with the dep spelled out.
+#[cfg(test)]
+fn rewrite_pdm_lock_in<'a>(
+    parse: &mut LockParse,
     text: &'a str,
-    name: &'a str,
+    name: &str,
     version: &str,
     source: (&str, &str),
     filename: &str,
     sha256: &str,
-) -> Result<PdmLockRewrite<'a>, String> {
-    let (kind, location) = source;
-    check_pdm_artifact(name, version, kind, filename, sha256)?;
-    let doc = parse.take(text, "PDM")?;
-    let edits = match plan_pdm_rewrite(&doc, name, version, kind, location) {
-        Ok(edits) => edits,
-        Err(detail) => {
-            // Nothing was mutated: the parse still describes `text`.
-            parse.restore(doc);
-            return Err(detail);
-        }
-    };
-    // The original's fragments come from the same parse; an error surfaces
-    // where a fresh parse would raise it, after the rewrite.
-    let before = pdm_lock_fragments_in(&doc, text, name);
-    let mut lock = doc.into_mut();
-    mutate_pdm_lock(&mut lock, edits, source, filename, sha256)?;
-    finish(
-        "PDM",
-        parse,
-        text,
+) -> Result<FragmentRewrite<'a>, String> {
+    let dep = PdmLockDep {
         name,
-        lock.to_string(),
-        before,
-        pdm_lock_fragments_in::<String>,
-    )
+        version,
+        source,
+        filename,
+        sha256,
+    };
+    rewrite_pdm_lock_dep(parse, text, &dep)
+}
+
+/// [`rewrite_pdm_lock_with_edits`] for `dep`, reusing (and refreshing)
+/// `parse`.
+fn rewrite_pdm_lock_dep<'a>(
+    parse: &mut LockParse,
+    text: &'a str,
+    dep: &PdmLockDep,
+) -> Result<FragmentRewrite<'a>, String> {
+    // PDM refuses a package its lock lacks: its plan is never `None`.
+    rewrite_in(&Pdm, parse, text, dep)?.ok_or_else(|| "missing PDM package".into())
+}
+
+/// `pdm.lock` as the shared [`lock_fragments`](crate::utils::lock_fragments)
+/// driver rewrites it.
+#[derive(Default)]
+struct Pdm;
+
+impl LockFormat for Pdm {
+    const WHAT: &'static str = "PDM";
+    const FRAGMENTS_IN: FragmentsIn = pdm_lock_fragments_in::<String>;
+    type Dep<'a> = PdmLockDep<'a>;
+    /// The `(package index, inline files, legacy files key)` of each unit.
+    type Plan = Vec<(usize, bool, String)>;
+
+    fn name<'d>(dep: &'d PdmLockDep) -> &'d str {
+        dep.name
+    }
+
+    fn check(dep: &PdmLockDep) -> Result<(), String> {
+        check_pdm_artifact(
+            dep.name,
+            dep.version,
+            dep.source.0,
+            dep.filename,
+            dep.sha256,
+        )
+    }
+
+    fn plan(&self, lock: &Table, dep: &PdmLockDep) -> Result<Option<Self::Plan>, String> {
+        plan_pdm_rewrite(lock, dep.name, dep.version, dep.source.0, dep.source.1).map(Some)
+    }
+
+    fn mutate(lock: &mut DocumentMut, plan: Self::Plan, dep: &PdmLockDep) -> Result<(), String> {
+        mutate_pdm_lock(lock, plan, dep.source, dep.filename, dep.sha256)
+    }
 }
 
 /// The rewrite's own refusals, settled before the lock is read.
@@ -270,7 +290,7 @@ fn mutate_pdm_lock(
 }
 
 /// One dep of a [`rewrite_pdm_lock_all`]: the arguments of
-/// [`rewrite_pdm_lock_in`] past the lock text.
+/// [`rewrite_pdm_lock_with_edits`] past the lock text.
 pub struct PdmLockDep<'a> {
     pub name: &'a str,
     pub version: &'a str,
@@ -279,78 +299,14 @@ pub struct PdmLockDep<'a> {
     pub sha256: &'a str,
 }
 
-/// Every dep's [`rewrite_pdm_lock_in`] over `text`, each against the
-/// previous one's output: one parse and one render of the lock for all of
-/// them when the batch can vouch for the step-by-step result, else step by
-/// step. A dep's step is never [`LockStep::NotFound`]: PDM refuses a
-/// package its lock lacks.
+/// Every dep's rewrite over `text`, each against the previous one's output
+/// (see [`rewrite_all`]). A dep's step is never [`LockStep::NotFound`]: PDM
+/// refuses a package its lock lacks.
 pub fn rewrite_pdm_lock_all(text: &str, deps: &[PdmLockDep]) -> LockBatch {
-    rewrite_pdm_lock_batch(text, deps).unwrap_or_else(|| rewrite_pdm_lock_steps(text, deps))
+    rewrite_all(&Pdm, text, deps)
 }
 
-/// [`rewrite_pdm_lock_all`] over one parse and one render, or `None` (see
-/// [`rewrite_batch`]).
-fn rewrite_pdm_lock_batch(text: &str, deps: &[PdmLockDep]) -> Option<LockBatch> {
-    let names: Vec<&str> = deps.iter().map(|dep| dep.name).collect();
-    rewrite_batch(
-        text,
-        &names,
-        |index, lock| {
-            let dep = &deps[index];
-            check_pdm_artifact(
-                dep.name,
-                dep.version,
-                dep.source.0,
-                dep.filename,
-                dep.sha256,
-            )?;
-            let units = plan_pdm_rewrite(lock, dep.name, dep.version, dep.source.0, dep.source.1)?;
-            Ok(Some((units, index)))
-        },
-        |lock, (units, index)| {
-            let dep = &deps[index];
-            mutate_pdm_lock(lock, units, dep.source, dep.filename, dep.sha256)
-        },
-        pdm_lock_fragments_in::<String>,
-    )
-}
-
-/// [`rewrite_pdm_lock_all`] one dep at a time.
-fn rewrite_pdm_lock_steps(text: &str, deps: &[PdmLockDep]) -> LockBatch {
-    let mut content = text.to_string();
-    let mut parse = PdmLockParse::default();
-    let mut steps = Vec::with_capacity(deps.len());
-    for dep in deps {
-        let rewrite = rewrite_pdm_lock_in(
-            &mut parse,
-            &content,
-            dep.name,
-            dep.version,
-            dep.source,
-            dep.filename,
-            dep.sha256,
-        );
-        let step = match rewrite.and_then(|rewrite| Ok((rewrite.edits()?, rewrite.text))) {
-            Ok((edits, rewritten)) => {
-                let step = if rewritten == content {
-                    LockStep::Unchanged
-                } else {
-                    LockStep::Rewritten(edits)
-                };
-                content = rewritten;
-                step
-            }
-            Err(detail) => LockStep::Refused(detail),
-        };
-        steps.push(step);
-    }
-    LockBatch {
-        text: content,
-        steps,
-    }
-}
-
-/// Every refusal of [`rewrite_pdm_lock_in`], read from the parsed lock before
+/// Every refusal of [`rewrite_pdm_lock_with_edits`], read from the parsed lock before
 /// it mutates anything: the `(package index, inline files, legacy files key)`
 /// of each unit to rewrite.
 fn plan_pdm_rewrite(
@@ -825,7 +781,7 @@ pub(crate) mod tests {
                 rewritten += 1;
                 let want = pdm_lock_edits(&text, &rewrite.text, "urllib3");
                 assert_eq!(rewrite.edits(), want, "{name} crlf={crlf}");
-                let rederived = PdmLockRewrite {
+                let rederived = FragmentRewrite {
                     known_edits: None,
                     ..rewrite
                 };
@@ -914,17 +870,6 @@ pub(crate) mod tests {
                 }
             }
         }
-    }
-
-    /// #694: the shared pairing refuses fragments that changed shape.
-    #[test]
-    fn pairing_refuses_a_fragment_shape_change() {
-        let original = fixture("2.29.2");
-        let before = pdm_lock_fragments(&original, "urllib3").unwrap();
-        assert_eq!(
-            pair_fragments("PDM", &original, &before, &original, Vec::new()),
-            Err("PDM package fragments changed shape".to_string())
-        );
     }
 
     #[test]
@@ -1108,7 +1053,7 @@ pub(crate) mod parse_reuse_tests {
                         lock = lock.replace('\n', "\r\n");
                     }
                     let mut got_text = lock;
-                    let mut parse = PdmLockParse::default();
+                    let mut parse = LockParse::default();
                     for (name, version, (kind, location), sha) in steps(extra).iter() {
                         let filename = location.rsplit('/').next().unwrap();
                         let source = (kind.as_str(), location.as_str());
@@ -1135,7 +1080,7 @@ pub(crate) mod parse_reuse_tests {
     #[test]
     fn reused_parse_misses_on_changed_text() {
         let lock = grown(&fixtures().pop().unwrap().1.replace("\r\n", "\n"), 2);
-        let mut parse = PdmLockParse::default();
+        let mut parse = LockParse::default();
         let url = "https://patch.socket.dev/patch/pypi/pkg0/a/pkg0-1.26.18-py3-none-any.whl";
         let first = rewrite_pdm_lock_in(
             &mut parse,
@@ -1160,7 +1105,7 @@ pub(crate) mod parse_reuse_tests {
         );
         assert_eq!(got.err().as_deref(), Some("missing PDM package"));
         // `parsed` likewise re-parses changed text.
-        let names = |parse: &mut PdmLockParse, text: &str| -> Vec<String> {
+        let names = |parse: &mut LockParse, text: &str| -> Vec<String> {
             parse.parsed(text).unwrap()["package"]
                 .as_array_of_tables()
                 .unwrap()
@@ -1180,6 +1125,7 @@ mod batch_equivalence_tests {
     //! every dep's step are the step-by-step ones.
     use super::parse_reuse_tests::{fixtures, grown};
     use super::*;
+    use crate::utils::lock_fragments::{assert_batch_matches_steps, rewrite_steps};
 
     const SHA: &str = "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07";
 
@@ -1270,7 +1216,7 @@ mod batch_equivalence_tests {
                     for (mix, (deps, batchable)) in mixes(extra).into_iter().enumerate() {
                         let deps = lock_deps(&deps);
                         let what = format!("{fixture} extra={extra} {style} mix={mix}");
-                        let first = rewrite_pdm_lock_steps(&lock, &deps);
+                        let first = rewrite_steps(&Pdm, &lock, &deps);
                         let lands = first
                             .steps
                             .iter()
@@ -1279,14 +1225,11 @@ mod batch_equivalence_tests {
                         for (rerun, text) in
                             [lock.clone(), first.text.clone()].into_iter().enumerate()
                         {
-                            let steps = rewrite_pdm_lock_steps(&text, &deps);
-                            let batch = rewrite_pdm_lock_batch(&text, &deps);
-                            if let Some(batch) = &batch {
+                            let (_, batch) = assert_batch_matches_steps::<Pdm>(&text, &deps, &what);
+                            if batch.is_some() {
                                 batched += 1;
                                 rendered += usize::from(lands);
-                                assert_eq!(batch, &steps, "{what}");
                             }
-                            assert_eq!(rewrite_pdm_lock_all(&text, &deps), steps, "{what}");
                             if !lands {
                                 continue; // an unsupported generation: all refused
                             }

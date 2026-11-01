@@ -6,12 +6,13 @@
 //! them, and splice the changed ones into the ORIGINAL text, so untouched
 //! bytes survive and rollback can replay the recorded fragments in reverse.
 //! What differs per format (which fragments a package owns, what the rewrite
-//! refuses) stays in `poetry_lock` / `pdm_lock`; everything around it lives
+//! refuses, how it mutates the lock) is a [`LockFormat`] in `poetry_lock` /
+//! `pdm_lock`; the drivers around it ([`rewrite_in`], [`rewrite_all`]) live
 //! here, once.
 
 use std::sync::Arc;
 
-use toml_edit::Table;
+use toml_edit::{DocumentMut, Table};
 
 use crate::utils::line_endings::majority_terminator;
 use crate::vendor::parse_memo::ParseMemo;
@@ -149,7 +150,7 @@ pub struct FragmentRewrite<'a> {
     /// The rewritten lock text.
     pub text: String,
     pub(crate) original: &'a str,
-    pub(crate) name: &'a str,
+    pub(crate) name: String,
     /// The format's lock name, for error messages.
     pub(crate) what: &'static str,
     pub(crate) fragments_in: FragmentsIn,
@@ -169,7 +170,7 @@ impl FragmentRewrite<'_> {
         if let Some(edits) = &self.known_edits {
             return Ok(edits.clone());
         }
-        let after = fragments_of(&self.text, self.name, self.fragments_in)?;
+        let after = fragments_of(&self.text, &self.name, self.fragments_in)?;
         pair_fragments(self.what, self.original, &self.before, &self.text, after)
     }
 }
@@ -195,20 +196,46 @@ pub(crate) fn pair_fragments(
     rewritten: &str,
     after: Vec<String>,
 ) -> Result<Vec<(String, String)>, String> {
+    let edits = changed_pairs(what, before, after, |_, new| new)?;
+    for (old, new) in &edits {
+        sole_in(what, original, old)?;
+        sole_in(what, rewritten, new)?;
+    }
+    Ok(edits)
+}
+
+/// The `(old, new)` pairs of `before` and `after` (each `new` passed through
+/// `spell` with its `old`) that differ, in order; an error when the two
+/// sides have a different number of fragments. Every pairing in this module
+/// goes through here.
+fn changed_pairs(
+    what: &str,
+    before: &[String],
+    after: Vec<String>,
+    mut spell: impl FnMut(&str, String) -> String,
+) -> Result<Vec<(String, String)>, String> {
     if before.len() != after.len() {
         return Err(format!("{what} package fragments changed shape"));
     }
-    let mut edits = Vec::new();
-    for (old, new) in before.iter().zip(after) {
-        if *old == new {
-            continue;
-        }
-        if original.matches(old.as_str()).count() != 1 || rewritten.matches(&new).count() != 1 {
-            return Err(format!("ambiguous {what} rollback fragment"));
-        }
-        edits.push((old.clone(), new));
+    Ok(before
+        .iter()
+        .zip(after)
+        .map(|(old, new)| {
+            let new = spell(old, new);
+            (old.clone(), new)
+        })
+        .filter(|(old, new)| old != new)
+        .collect())
+}
+
+/// `Ok` when `fragment` occurs exactly once in `text` (non-overlapping), so
+/// a splice of it, or its rollback, cannot hit the wrong place.
+fn sole_in(what: &str, text: &str, fragment: &str) -> Result<(), String> {
+    if text.matches(fragment).count() == 1 {
+        Ok(())
+    } else {
+        Err(format!("ambiguous {what} rollback fragment"))
     }
-    Ok(edits)
 }
 
 /// Widen `span` over `table`'s own span and every key, value and sub-table
@@ -291,7 +318,7 @@ pub(crate) fn finish<'a>(
     what: &'static str,
     parse: &mut LockParse,
     text: &'a str,
-    name: &'a str,
+    name: &str,
     rendered: String,
     before: Result<Vec<String>, String>,
     fragments_in: FragmentsIn,
@@ -303,34 +330,19 @@ pub(crate) fn finish<'a>(
     let after_doc = toml_edit::Document::parse(rendered).map_err(|e| e.to_string())?;
     let rendered = after_doc.raw();
     let after = fragments_in(&after_doc, rendered, name)?;
-    if before.len() != after.len() {
-        return Err(format!("{what} package fragments changed shape"));
-    }
     let file_terminator = majority_terminator(text);
-    let after: Vec<String> = before
-        .iter()
-        .zip(after)
-        .map(|(old, new)| respell(old, &new, file_terminator))
-        .collect();
-    let mut edits = Vec::new();
-    for (old, new) in before.iter().zip(after) {
-        if *old == new {
-            continue;
-        }
-        if text.matches(old.as_str()).count() != 1 {
-            return Err(format!("ambiguous {what} rollback fragment"));
-        }
-        edits.push((old.clone(), new));
+    let edits = changed_pairs(what, &before, after, |old, new| {
+        respell(old, &new, file_terminator)
+    })?;
+    for (old, _) in &edits {
+        sole_in(what, text, old)?;
     }
     let mut result = text.to_string();
     for (old, new) in &edits {
         result = result.replacen(old, new, 1);
     }
-    if edits
-        .iter()
-        .any(|(_, new)| result.matches(new.as_str()).count() != 1)
-    {
-        return Err(format!("ambiguous {what} rollback fragment"));
+    for (_, new) in &edits {
+        sole_in(what, &result, new)?;
     }
     let known_edits = (result == rendered).then_some(edits);
     if known_edits.is_some() {
@@ -340,7 +352,7 @@ pub(crate) fn finish<'a>(
     Ok(FragmentRewrite {
         text: result,
         original: text,
-        name,
+        name: name.to_string(),
         what,
         fragments_in,
         before,
@@ -409,14 +421,135 @@ pub struct LockBatch {
     pub steps: Vec<LockStep>,
 }
 
+/// One lock format's rewrite, as [`rewrite_in`] and [`rewrite_all`] drive
+/// it: what a dep is, what it refuses before and after the lock is read,
+/// and how a planned dep mutates the lock.
+pub(crate) trait LockFormat {
+    /// The format's lock name, for error messages ("Poetry", "PDM").
+    const WHAT: &'static str;
+    /// Takes a dep's fragments of a (spanned) lock parse.
+    const FRAGMENTS_IN: FragmentsIn;
+    /// One dep's rewrite arguments.
+    type Dep<'a>;
+    /// Where a dep's rewrite lands, settled before anything is mutated.
+    type Plan;
+    /// The dep's package name.
+    fn name<'d>(dep: &'d Self::Dep<'_>) -> &'d str;
+    /// The dep's own refusals, settled before the lock is read.
+    fn check(dep: &Self::Dep<'_>) -> Result<(), String>;
+    /// Every refusal (`Err`) and not-found verdict (`Ok(None)`) that comes
+    /// before the first mutation, read from the parsed lock.
+    fn plan(&self, lock: &Table, dep: &Self::Dep<'_>) -> Result<Option<Self::Plan>, String>;
+    /// Apply a planned dep to the parsed lock.
+    fn mutate(lock: &mut DocumentMut, plan: Self::Plan, dep: &Self::Dep<'_>) -> Result<(), String>;
+}
+
+/// One dep's rewrite of `text`, reusing (and refreshing) `parse`: `Ok(None)`
+/// when the lock has no unit for the dep, `Err` for a refusal, which leaves
+/// the lock as it was.
+pub(crate) fn rewrite_in<'a, F: LockFormat>(
+    format: &F,
+    parse: &mut LockParse,
+    text: &'a str,
+    dep: &F::Dep<'_>,
+) -> Result<Option<FragmentRewrite<'a>>, String> {
+    F::check(dep)?;
+    let name = F::name(dep);
+    let doc = parse.take(text, F::WHAT)?;
+    let plan = match format.plan(&doc, dep) {
+        Ok(Some(plan)) => plan,
+        verdict => {
+            // Nothing was mutated: the parse still describes `text`.
+            parse.restore(doc);
+            return verdict.map(|_| None);
+        }
+    };
+    // The original's fragments come from the same parse; an error surfaces
+    // where a fresh parse would raise it, after the rewrite.
+    let before = (F::FRAGMENTS_IN)(&doc, text, name);
+    let mut lock = doc.into_mut();
+    F::mutate(&mut lock, plan, dep)?;
+    finish(
+        F::WHAT,
+        parse,
+        text,
+        name,
+        lock.to_string(),
+        before,
+        F::FRAGMENTS_IN,
+    )
+    .map(Some)
+}
+
+/// Every dep's [`rewrite_in`] over `text`, each against the previous one's
+/// output: one parse and one render of the lock for all of them when
+/// [`rewrite_batch`] can vouch for the step-by-step result, else step by
+/// step.
+pub(crate) fn rewrite_all<F: LockFormat>(format: &F, text: &str, deps: &[F::Dep<'_>]) -> LockBatch {
+    rewrite_batch(format, text, deps).unwrap_or_else(|| rewrite_steps(format, text, deps))
+}
+
+/// [`rewrite_all`] one dep at a time.
+pub(crate) fn rewrite_steps<F: LockFormat>(
+    format: &F,
+    text: &str,
+    deps: &[F::Dep<'_>],
+) -> LockBatch {
+    let mut content = text.to_string();
+    let mut parse = LockParse::default();
+    let mut steps = Vec::with_capacity(deps.len());
+    for dep in deps {
+        let mut landed = None;
+        let step = match rewrite_in(format, &mut parse, &content, dep) {
+            Ok(Some(rewrite)) if rewrite.text != content => match rewrite.edits() {
+                Ok(edits) => {
+                    landed = Some(rewrite.text);
+                    LockStep::Rewritten(edits)
+                }
+                Err(detail) => LockStep::Refused(detail),
+            },
+            Ok(Some(_)) => LockStep::Unchanged,
+            Ok(None) => LockStep::NotFound,
+            Err(detail) => LockStep::Refused(detail),
+        };
+        if let Some(text) = landed {
+            content = text;
+        }
+        steps.push(step);
+    }
+    LockBatch {
+        text: content,
+        steps,
+    }
+}
+
+/// The equivalence every format's batch tests pin (#760, #762): whenever
+/// [`rewrite_batch`] answers for `deps` over `text`, its text and every
+/// dep's step are [`rewrite_steps`]' ones, and [`rewrite_all`] is always the
+/// step-by-step result. Hands back that result and the batch's answer.
+#[cfg(test)]
+pub(crate) fn assert_batch_matches_steps<F: LockFormat + Default>(
+    text: &str,
+    deps: &[F::Dep<'_>],
+    what: &str,
+) -> (LockBatch, Option<LockBatch>) {
+    let steps = rewrite_steps(&F::default(), text, deps);
+    let batch = rewrite_batch(&F::default(), text, deps);
+    if let Some(batch) = &batch {
+        assert_eq!(batch, &steps, "{what}");
+    }
+    assert_eq!(rewrite_all(&F::default(), text, deps), steps, "{what}");
+    (steps, batch)
+}
+
 /// Every dep's rewrite of `text` over ONE parse and ONE render, with exactly
 /// the outcome the step-by-step rewrite (one [`finish`] per dep, each parsing
 /// the previous dep's output) would have had; `None` whenever this cannot
 /// vouch for that, and the caller then goes step by step.
 ///
-/// `plan(i, lock)` settles dep `i` against the document as the previous deps
-/// left it, so a refusal or not-found verdict is the one the step-by-step
-/// rewrite would reach; `mutate` then applies a planned dep. Each rewritten
+/// Each dep is checked and planned against the document as the previous
+/// deps left it, so a refusal or not-found verdict is the one the
+/// step-by-step rewrite would reach; a planned dep is then mutated in. Each rewritten
 /// dep's fragments are taken from the original text and from the single
 /// rendering, and spliced into the original text. That is only the
 /// step-by-step result when the deps rewrite distinct packages (a second
@@ -424,23 +557,24 @@ pub struct LockBatch {
 /// lock has one line-ending style (a mixed lock's majority, which spells
 /// each spliced fragment, can shift as deps land), and the combined splice
 /// must reproduce the rendering byte for byte.
-pub(crate) fn rewrite_batch<P>(
+pub(crate) fn rewrite_batch<F: LockFormat>(
+    format: &F,
     text: &str,
-    names: &[&str],
-    mut plan: impl FnMut(usize, &Table) -> Result<Option<P>, String>,
-    mut mutate: impl FnMut(&mut toml_edit::DocumentMut, P) -> Result<(), String>,
-    fragments_in: FragmentsIn,
+    deps: &[F::Dep<'_>],
 ) -> Option<LockBatch> {
     if text.contains("\r\n") && text.replace("\r\n", "").contains('\n') {
         return None;
     }
+    let names: Vec<&str> = deps.iter().map(F::name).collect();
+    let fragments_in = F::FRAGMENTS_IN;
     let original = parse_lock(text).ok()?;
     let mut lock = (*original).clone().into_mut();
     let mut steps = Vec::with_capacity(names.len());
     let mut rewritten: Vec<(usize, Vec<String>)> = Vec::new();
     let mut packages = std::collections::BTreeSet::new();
-    for (index, name) in names.iter().enumerate() {
-        match plan(index, lock.as_table()) {
+    for (index, (dep, name)) in deps.iter().zip(&names).enumerate() {
+        let plan = F::check(dep).and_then(|()| format.plan(lock.as_table(), dep));
+        match plan {
             Err(detail) => steps.push(LockStep::Refused(detail)),
             Ok(None) => steps.push(LockStep::NotFound),
             Ok(Some(planned)) => {
@@ -450,7 +584,7 @@ pub(crate) fn rewrite_batch<P>(
                     return None;
                 }
                 let before = fragments_in(&original, text, name).ok()?;
-                mutate(&mut lock, planned).ok()?;
+                F::mutate(&mut lock, planned, dep).ok()?;
                 rewritten.push((index, before));
                 steps.push(LockStep::Unchanged);
             }
@@ -473,16 +607,10 @@ pub(crate) fn rewrite_batch<P>(
     let mut edits_of: Vec<(usize, Vec<(String, String)>)> = Vec::new();
     for (index, before) in &rewritten {
         let after = fragments_in(&after_doc, rendered, names[*index]).ok()?;
-        if before.len() != after.len() {
-            return None;
-        }
-        let mut edits = Vec::new();
-        for (old, new) in before.iter().zip(after) {
-            let new = respell(old, &new, file_terminator);
-            if *old != new {
-                edits.push((old.clone(), new));
-            }
-        }
+        let edits = changed_pairs("", before, after, |old, new| {
+            respell(old, &new, file_terminator)
+        })
+        .ok()?;
         edits_of.push((*index, edits));
     }
     // Where each changed fragment sits in `text`, all found in one pass; a
@@ -591,6 +719,8 @@ mod tests {
         assert_eq!(sole_occurrences("aaa", &["aa"]), None);
     }
 
+    /// #694: the shared pairing refuses fragments that changed shape, for
+    /// every format.
     #[test]
     fn pair_fragments_refuses_a_shape_change() {
         for what in ["Poetry", "PDM"] {
