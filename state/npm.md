@@ -1,6 +1,6 @@
 [agent] Progress ledger for the scheduled npm bug-hunt routine (label pm:npm).
 
-Last updated: 2026-10-30T07Z (run 58), main `5ca5623` (v5.0.1 `latest`). Run 58: main unchanged since run 57, so #1827, #1850 and #1871 are still open (not re-run). New cells, all pass: hosted and vendored scan → fresh `npm ci` → `vex` → byte-exact `rollback` with a CRLF-shebang `bin` (npm `fixBin` LF form accepted by `vex`; a stale original install is refused `not_applied`) on npm 8.19.4 / 10.9.4 / 12.2.1. No new issues. **Open npm bughunt issues: #1827, #1850 and #1871.** Every other issue number marked `fail` in the matrix below is closed; those marks are historical. Probe branches are still blocked (`git push --delete` is refused by the session policy).
+Last updated: 2026-11-01T01Z (run 59), main `cbbbdb9` (v5.0.1 `latest`). Run 59: main has only a PyPI fix since run 58, so #1827, #1850 and #1871 stay open (not re-run). New cells, all pass: hosted / vendored cycles under `install-strategy=linked`, with a dual shrinkwrap + package-lock, and in workspace members (CRLF bin; npm 8.19.4 / 10.9.4 / 12.2.1); `get --mode hosted` and `remove`; concurrent scans (`lock_held`). Filed #1904 (vendored scan from a workspace member dir: generic `vendor_lockfile_missing` remedy that loops). **Open npm bughunt issues: #1827, #1850, #1871 and #1904.** Every other issue number marked `fail` in the matrix below is closed; those marks are historical. Probe branches are still blocked (`git push --delete` is refused by the session policy).
 ## Coverage matrix
 
 Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. Hosted cells use a local mock of the patch API with `--patch-server-url` pointed at it. Agent and vendored cells use the same mock or a hand-staged `.socket/`. "Cycle" means scan → fresh `npm ci` → `vex` → `rollback` byte-exact. "Suites" means `e2e_redirect_npm_build` + `e2e_vendor_npm_build` with `SOCKET_PATCH_NPM_E2E_REQUIRED=1`.
@@ -41,6 +41,17 @@ Cells are "pass", "fail #N" or "untested". Every cell uses a real npm install. H
 | Linux | 10.9.4 / 12.2.1, hosted pins vs npm tree commands (run 56) | n/a | n/a | pass: `dedupe`, `prune`, `install --prefer-dedupe`, `install --package-lock-only`, `uninstall <other>`, `audit fix`, `install --force` and `shrinkwrap` keep the pin. `npm update` and `npm install <pkg>@<same ver>` re-resolve to the registry; `vex` then refuses (exit 2) and a re-scan re-pins (npm behaviour; see Known non-bugs). Root `bundleDependencies: true` and `bundledDependencies` spelling: pinned, `npm ci` patched, `vex`. npm 12 `allow-remote=root` with a transitive pin: warned, not rewritten, `npm ci` EALLOWREMOTE (documented) | n/a |
 | Linux | 10.9.4, workspace member in a hidden dir, vendored (run 56) | n/a | **fail #1827** (commented): `vex` warns on a reverted visible copy but not on a reverted hidden copy | n/a | n/a |
 | Linux | 8.19.4 / 10.9.4 / 12.2.1, CRLF-shebang `bin` from the registry (run 58) | n/a | pass: scan → `npm ci` (fixBin LF form runs) → `vex` → `vendor --check` → byte-exact `rollback` | pass: scan → `npm ci` → `vex` (stale tree refused `not_applied`) → byte-exact `rollback` | untested |
+
+| Linux | 10.9.4 / 12.2.1, `install-strategy=linked` with a CRLF bin (run 59) | n/a | pass: cycle (`.store` copies patched, `vex`, `vendor --check`, byte-exact rollback) | pass: cycle | n/a |
+| Linux | 8.19.4 / 10.9.4 / 12.2.1, dual shrinkwrap + package-lock, and patched deps in workspace members (run 59) | n/a | pass: cycle (both locks byte-exact) | pass: cycle | n/a |
+| Linux | 10.9.4 / 12.2.1, `get <uuid> --mode hosted --json`, scoped `get`, `remove`; concurrent scans (run 59) | n/a | pass: concurrent scans (`lock_held`) | pass | n/a |
+| Linux | 8.19.4 / 10.9.4 / 12.2.1, run from a workspace member dir (run 59) | patches the member copy into `packages/a/.socket/` (agent semantics) | **fail #1904** (generic `vendor_lockfile_missing` remedy that loops; v5.0.1 too) | pass (`redirect_workspace_lockfile_elsewhere` names the root) | n/a |
+
+## Run 59 (2026-11-01T01Z, main `cbbbdb9`)
+
+- Rebuilt the mock (registry + patch API in one Python file; gzip with `mtime=0`). The linked, dual-lock, workspace-member, `get` / `remove` and concurrency cells all pass on npm 8.19.4 / 10.9.4 / 12.2.1.
+- Filed #1904: vendored scan / get from a workspace member dir refuses with the generic "no lockfile … run install first", while hosted names the root.
+- Known non-bug: hosted rollback of a package served only by a project `@scope:registry` refuses (by design, #918 / #1130).
 
 ## Run 58 (2026-10-30T07Z, main `5ca5623`)
 
@@ -311,6 +322,7 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Backlog
 
+- **New 2026-11-01T01Z:** re-check #1904 / #1871 / #1827 / #1850 when main changes them. #1904 siblings: `vendor` eject and the hosted → vendored takeover from a member dir; yarn / Bun members (hand over if confirmed). Hosted rollback with a `registry=` mirror + `replace-registry-host=never` and npmjs unreachable. `get --mode vendored` / `remove` under linked; npm 6 v1 cells with the new mock; macOS / Windows once probe branches work.
 - **New 2026-10-30T07Z:** re-check #1871 / #1827 / #1850 when main changes them. Next new cells: hosted + vendored CRLF bin in a dual shrinkwrap + package-lock project and in a workspace member; `get <uuid> --mode hosted` and `remove` over a CRLF-bin pin; hosted pins with `npm ci --install-strategy=linked` (does `vex` see the `.store` copy with the LF form?); macOS / Windows once probe branches work.
 - **New 2026-10-30T01Z:** re-check #1871 when fixed (project / user / env `npm_config_omit_lockfile_registry_resolved` layers, a workspace-member pin, and the dual shrinkwrap + package-lock state). Re-check #1827 / #1850 once main changes them. Still open: CACHEDIR.TAG inside a workspace member (agent walk prune, same class as #1827), hosted / vendored `vex` with a CRLF bin, and macOS / Windows once probe branches work.
 - **New 2026-10-29T19Z:** re-check #1850 when fixed (scan and `get --dry-run`, a mix of in-sync, re-vendor and would-refuse rows); re-check #1827 (agent, hosted `vex`, vendored drift warning). Next new cells: `npm update` / `npm install <pkg>` right after a vendored scan (does `vendor --check` flag the lost wiring?), hosted pins with `omit-lockfile-registry-resolved` plus `npm update`, CACHEDIR.TAG inside a workspace member (agent walk prune, same class as #1827), and macOS / Windows once probe branches work.
@@ -378,6 +390,8 @@ The same `name@version` gets a new patch UUID with different bytes. Mock: left-p
 
 ## Known non-bugs
 
+- Hosted `rollback` / `remove` of a package-lock pin reads the version document only from the default registry (npmjs or `SOCKET_NPM_REGISTRY`), not from a project `.npmrc` `registry=` / `@scope:registry=`. A package only that registry serves refuses `hosted_restore_refused` with a `git checkout` remedy and an untouched lock. Deliberate (#918 kept `fetch_dists` for package-lock; #1130 tracks the restore design) (run 59).
+- npm does not install the dependencies of a `file:` link target outside the project root, so there's no out-of-root copy to patch (npm 10.9.4 / 12.2.1, run 59).
 - Hosted `rollback` against a package the upstream registry (`registry.npmjs.org` or `SOCKET_NPM_REGISTRY`) doesn't serve fails `hosted_restore_refused` with a `git checkout` remedy; a pre-existing project `.npmrc` keeps the `allow-remote=all` line hosted mode added (documented `npm_allow_remote_left`) (run 58).
 - A project `.npmrc` that is a symlink is never written through: the hosted run pins the lock, leaves the link and its target untouched, and warns `redirect_npm_allow_remote` ("is a symbolic link … add `allow-remote=all` to it yourself"). npm 12 `npm ci` then fails closed with EALLOWREMOTE. Deliberate (run 56).
 - `npm update` (and `npm install <pkg>@<same version>`) re-resolves a hosted pin to the registry `resolved`. That's npm behaviour: socket-patch keeps no hosted state outside the lock, so `vex` refuses (exit 2, nothing to attest) and a re-scan re-pins (run 56).
