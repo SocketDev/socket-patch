@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-11-01T20:00Z · main @ cbbbdb9_
+_Last updated 2026-11-01T21:30Z · main @ cbbbdb9_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -22,6 +22,7 @@ _Last updated 2026-11-01T20:00Z · main @ cbbbdb9_
 | #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; CI (82 checks) and Bugbot green |
 | #1939 | sweep | `cli/src/commands/vendored_backend/{mod,repair}.rs` | ready; CI (82 checks) and Bugbot green |
 | #1944 | structural | T51 #1941: 11 `tests/apply` suites + `common/envelope.rs` onto `apply_fixture` (test-only, −635 net) | ready; Bugbot clean, 80/82 green; `hosted-e2e` red on a live patch.socket.dev 403 (minimist tgz), not this diff; re-run once |
+| #1955 | structural | T52 #1942: 7 PTY runners → `common/pty_io::{run,run_command}` (test-only, +172/−567) | ready; CI (82 checks) and Bugbot green |
 | #1948 | sweep | `cli/src/commands/{vex_consumed,vex_sources}.rs` (+ 2 tests moved to `ecosystem_dispatch.rs`) | ready; CI (ci-ok) and Bugbot green |
 
 #### Merged
@@ -29,9 +30,8 @@ _None._
 
 #### Queue
 Structural, scored `3·B + 2·U + 2·D + 2·C − risk`. Nothing merged since 2026-10-29, so most candidates ≥6 stay blocked: A30 #1887 (~8.7, #1886), T09 #1858 (~7, #1864/#1698), A41 #1899 (~6, #1891/#1829/#1906), A43 #1900 (~6, #1863/#1698), T01 #1835 / T25 #1877 (#1698), A53 #1931 / A57 #1935 (`ruby_crawler.rs`, #1882/#1895/#1943), A55 #1933 (`redirect/mod.rs`). Free test-only candidates from the audit's T50-T55:
-1. T52 [#1942](https://github.com/SocketDev/socket-patch/issues/1942), PTY runner ×7, only 2 pin TERM: **~7** (check PTY suite files against open PRs).
-2. T50 [#1940](https://github.com/SocketDev/socket-patch/issues/1940), toolchain e2e gate ×10 drifted: **~7**, but e2e_golang* are held by #1698/#1843/#1893/#1894: land the free suites' slice.
-3. T55 (no issue yet), test helpers across binaries (`stderr_chatter` 5×, dir snapshot ~8×): ~6 once filed; includes a `run_bin_with_env` `extras` param so `apply_fixture::run_gem` stops copying it.
+1. T50 [#1940](https://github.com/SocketDev/socket-patch/issues/1940), toolchain e2e gate ×10 drifted: **~7**, but e2e_golang* are held by #1698/#1843/#1893/#1894: land the free suites' slice.
+2. T55 (no issue yet), test helpers across binaries (`stderr_chatter` 5×, dir snapshot ~8×): ~6 once filed; includes a `run_bin_with_env` `extras` param so `apply_fixture::run_gem` stops copying it.
 A26 #1867, A46 #1917, A44 #1918 score ~4.
 
 Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `python_lock.rs` (2,283), `python_script.rs` (1,768), `api/{blob_fetcher,date,retry,types}.rs`, crawler rows; `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (callers in `vendor.rs`/`apply.rs`/`vex.rs`, #1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948).
@@ -63,3 +63,4 @@ Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884
 - Left from #1936: `vendor/gem.rs` `plan_gemfile_edit`, `vex/discover/gem.rs` (~L252) and `redirect/upstream/gem.rs` (~L661) still hand-scan `=begin`; route them through `manifest::code_lines` (the pin writer refuses a Gemfile whose duplicate `gem` line sits in `=begin`). `code_lines`'s heredoc heuristic reads `x <<FLAG` (a shift) as a heredoc and closes a plain `<<ID` at an indented terminator.
 - Left from #1939: `remove.rs` L1327 doc still names the deleted `revert_vendor_entry` (#1875); `commands/repair.rs` ~L429 copies the build-once client (use `vendored_backend::repair::ensure_client`, #1875); `ApplyRequest.manifest` → `&HashMap` (drop `records_manifest`) and `stop_on_failure` wait on #1698/#1864/#1875; split `repair()`'s phases.
 - /code-review pushes back on inlining a single-caller fn that is the only unit-test seam for a constant (`fetch_concurrency`'s ceiling) or that names a phase of a 350-line fn (`build_candidates`): keep those.
+- Left from #1955 (pre-existing in every old PTY copy): the watchdog kills with SIGHUP (`ChildKiller::kill`), not SIGKILL; prompt waits are a fixed 10 s regardless of the run's timeout; dropping the writer sends `\n`+EOF, so an empty-input run still presses Enter.
