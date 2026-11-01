@@ -21,7 +21,7 @@ _Last updated 2026-11-01T17:15Z · main @ cbbbdb9_
 | #1929 | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI (82 checks) and Bugbot green |
 | #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; CI (82 checks) and Bugbot green |
 | #1939 | sweep | `cli/src/commands/vendored_backend/{mod,repair}.rs` | ready; CI (82 checks) and Bugbot green |
-| #1944 | structural | T51 #1941: 11 `tests/apply` suites + `common/envelope.rs` onto `apply_fixture` (test-only, −635 net) | ready; CI and Bugbot pending |
+| #1944 | structural | T51 #1941: 11 `tests/apply` suites + `common/envelope.rs` onto `apply_fixture` (test-only, −635 net) | ready; Bugbot clean, 80/82 green; `hosted-e2e` red on a live patch.socket.dev 403 (minimist tgz), not this diff; re-run once |
 
 #### Merged
 _None._
