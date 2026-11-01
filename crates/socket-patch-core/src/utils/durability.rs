@@ -164,14 +164,11 @@ pub(crate) fn moved(from: &Path, to: &Path) {
 /// that carries on, or the one the apply lock's release runs) syncs it
 /// again rather than skipping it.
 pub(crate) async fn barrier() -> std::io::Result<()> {
-    {
-        let pending = pending();
-        if pending.files.is_empty() && pending.dirs.is_empty() {
-            return Ok(());
-        }
-    }
+    let Some((files, dirs)) = take_pending() else {
+        return Ok(());
+    };
     crate::utils::failpoint::hit("durability_barrier");
-    tokio::task::spawn_blocking(barrier_blocking)
+    tokio::task::spawn_blocking(move || sync_or_restore(files, dirs))
         .await
         .map_err(|_| std::io::Error::other("background task failed"))?
 }
@@ -181,9 +178,14 @@ pub(crate) async fn barrier() -> std::io::Result<()> {
 /// point (a rebuild that left every lockfile and the ledger unchanged) is
 /// synced before the command returns.
 pub(crate) fn barrier_blocking() -> std::io::Result<()> {
-    let Some((files, dirs)) = take_pending() else {
-        return Ok(());
-    };
+    match take_pending() {
+        Some((files, dirs)) => sync_or_restore(files, dirs),
+        None => Ok(()),
+    }
+}
+
+/// Sync what a barrier took, putting it back as pending if that fails.
+fn sync_or_restore(files: Vec<PathBuf>, dirs: BTreeSet<PathBuf>) -> std::io::Result<()> {
     let result = sync_all_blocking(&files, &dirs);
     if result.is_err() {
         restore_pending(files, dirs);

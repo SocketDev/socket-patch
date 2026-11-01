@@ -33,6 +33,8 @@ const API_CONCURRENCY: usize = 32;
 /// ([`api_concurrency_for`]): a window never runs fewer requests in flight
 /// than this (or than it has requests), however small it is.
 const API_CONCURRENCY_FLOOR: usize = 8;
+// `usize::clamp` panics on a floor above the ceiling.
+const _: () = assert!(API_CONCURRENCY_FLOOR <= API_CONCURRENCY);
 
 /// Requests each in-flight slot should have queued before an authenticated
 /// window widens past [`API_CONCURRENCY_FLOOR`]: a window of `n` requests
@@ -63,7 +65,7 @@ pub const API_CONCURRENCY_ENV: &str = "SOCKET_API_CONCURRENCY";
 const REGISTRY_CONCURRENCY: usize = 4;
 
 /// The in-flight cap for pristine registry downloads; see
-/// [`REGISTRY_CONCURRENCY`]. No env override — a tight `RLIMIT_NOFILE`
+/// `REGISTRY_CONCURRENCY`. No env override — a tight `RLIMIT_NOFILE`
 /// still forces one at a time, for the reason [`api_concurrency`] gives.
 pub fn registry_concurrency() -> usize {
     if crate::crawlers::walk_pool::fd_limit_is_tight() {
@@ -114,8 +116,8 @@ fn api_concurrency_under(use_public_proxy: bool, fd_limit_is_tight: bool) -> usi
 /// public proxy (`true`) or the authenticated API (`false`).
 ///
 /// On the authenticated API it adapts to the window:
-/// `requests / REQUESTS_PER_SLOT`, clamped between [`API_CONCURRENCY_FLOOR`]
-/// and [`API_CONCURRENCY`], so a big window fills the cap and a small one
+/// `requests / REQUESTS_PER_SLOT`, clamped between `API_CONCURRENCY_FLOOR`
+/// and `API_CONCURRENCY`, so a big window fills the cap and a small one
 /// stays at the floor. Everything else is [`api_concurrency`]'s: the public
 /// proxy's fixed cap, [`API_CONCURRENCY_ENV`] (which replaces the adaptive
 /// value outright), and a tight `RLIMIT_NOFILE` forcing 1.

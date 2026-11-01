@@ -73,10 +73,10 @@ fn linked_level_refusal(action: &str, what: &Path, link: &Path) -> std::io::Erro
     ))
 }
 
-/// The substring every [`linked_level_refusal`] carries.
+/// The substring every linked-level refusal carries.
 pub const LINKED_LEVEL_MARKER: &str = "is a symlink";
 
-/// Err with [`linked_level_refusal`] when any level of `path` below `root`
+/// Err with a refusal carrying [`LINKED_LEVEL_MARKER`] when any level of `path` below `root`
 /// is a link, before the caller writes or deletes anything.
 pub fn ensure_unlinked(root: &Path, path: &Path, action: &str) -> std::io::Result<()> {
     match linked_level(root, path) {

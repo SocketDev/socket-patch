@@ -1,6 +1,6 @@
 //! The cargo home cargo itself would use: `$CARGO_HOME`, else
 //! `<home>/.cargo` with `<home>` resolved the way cargo's `home` crate
-//! resolves it. Unlike [`super::fs::home_dir`], that falls back to the
+//! resolves it. Unlike `fs::home_dir`, that falls back to the
 //! account's passwd entry on Unix when `HOME` is unset (`env -i`, systemd
 //! units, stripped CI and container entrypoints), so every cargo-home reader
 //! goes through [`cargo_home`] to probe the registry cache cargo builds from.
