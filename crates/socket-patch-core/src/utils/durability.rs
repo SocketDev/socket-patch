@@ -14,7 +14,7 @@
 //!   `.cargo/config.toml`, the requirement/Pipfile/pyproject surfaces, and
 //!   the ledgers (`.socket/vendor/state.json`, `redirect-state.json`).
 //!   [`super::fs::atomic_write_bytes`] fsyncs the staged file and its
-//!   directory, as it always did.
+//!   directory.
 //! * **Content-verified artifacts** — what vendoring produces under
 //!   `.socket/vendor/<eco>/<uuid>/`: the patched copy trees, the `.tgz` /
 //!   `.whl` / `.gem` / `.crate` / `.nupkg` / `.jar` + `.pom` artifacts and
@@ -38,7 +38,7 @@
 //!
 //! # Why a crash cannot corrupt a project
 //!
-//! A crash (or power loss) can now lose artifact bytes that a durable write
+//! A crash (or power loss) can lose artifact bytes that a durable write
 //! would have kept: a renamed-over artifact may come back empty, truncated,
 //! or missing after a reboot. That is safe because nothing trusts an
 //! artifact's bytes without re-verifying them, on every run:
@@ -69,9 +69,9 @@
 //!    field makes the package manager refuse it; the re-run deferral that
 //!    skips the pristine download hashes a file artifact before trusting
 //!    it. (Some backends' in-sync checks look only for the artifact's
-//!    presence — pypi's among them, unchanged by this module — which is
-//!    why point 1 never leaves an artifact the committed state names
-//!    unsynced.) The marker is never a trust input at all.
+//!    presence, pypi's among them, which is why point 1 never leaves an
+//!    artifact the committed state names unsynced.) The marker is never a
+//!    trust input at all.
 //!
 //! So a crash can only lose an artifact nothing durable names yet, which
 //! the next run rebuilds exactly as it would one deleted by hand.
@@ -117,17 +117,14 @@ impl Pending {
                 touched = true;
             }
         }
-        let dirs: Vec<PathBuf> = self
+        let renamed: Vec<(PathBuf, PathBuf)> = self
             .dirs
             .iter()
-            .filter(|d| d.starts_with(from))
-            .cloned()
+            .filter_map(|d| Some((d.clone(), to.join(d.strip_prefix(from).ok()?))))
             .collect();
-        for dir in dirs {
-            self.dirs.remove(&dir);
-            if let Ok(rest) = dir.strip_prefix(from) {
-                self.dirs.insert(to.join(rest));
-            }
+        for (old, new) in renamed {
+            self.dirs.remove(&old);
+            self.dirs.insert(new);
             touched = true;
         }
         if touched {
@@ -162,28 +159,21 @@ pub(crate) fn moved(from: &Path, to: &Path) {
 /// pending. An artifact removed since it was written (a failed package's
 /// unwind) is skipped; any other fsync failure is returned, and the caller
 /// — a durable commit point — must not proceed, since what it would name
-/// may not be on disk. A directory sync stays best-effort, as it always
-/// was for the durable writer. A failed barrier keeps everything it took
-/// pending, so the next barrier (a caller that carries on, or the one the
-/// apply lock's release runs) syncs it again rather than skipping it.
+/// may not be on disk. A directory sync stays best-effort. A failed
+/// barrier keeps everything it took pending, so the next barrier (a caller
+/// that carries on, or the one the apply lock's release runs) syncs it
+/// again rather than skipping it.
 pub(crate) async fn barrier() -> std::io::Result<()> {
-    let Some((files, dirs)) = take_pending() else {
-        return Ok(());
-    };
-    crate::utils::failpoint::hit("durability_barrier");
-    let synced = tokio::task::spawn_blocking(move || {
-        let result = sync_all_blocking(&files, &dirs);
-        (result, files, dirs)
-    })
-    .await;
-    match synced {
-        Ok((Ok(()), _, _)) => Ok(()),
-        Ok((Err(e), files, dirs)) => {
-            restore_pending(files, dirs);
-            Err(e)
+    {
+        let pending = pending();
+        if pending.files.is_empty() && pending.dirs.is_empty() {
+            return Ok(());
         }
-        Err(_) => Err(std::io::Error::other("background task failed")),
     }
+    crate::utils::failpoint::hit("durability_barrier");
+    tokio::task::spawn_blocking(barrier_blocking)
+        .await
+        .map_err(|_| std::io::Error::other("background task failed"))?
 }
 
 /// [`barrier`], blocking — for the apply lock's release, which runs it
@@ -223,8 +213,8 @@ fn restore_pending(files: Vec<PathBuf>, dirs: BTreeSet<PathBuf>) {
 /// read-only descriptor. Windows' `FlushFileBuffers` needs a handle with
 /// write access — a read-only reopen fails with `ERROR_ACCESS_DENIED`, and
 /// a write reopen fails on a read-only artifact — so there the stage + rename
-/// writer fsyncs every stage through its own handle before the rename, as
-/// the durable writer always did, and the barrier has no file left to sync
+/// writer fsyncs every stage through its own handle before the rename, and
+/// the barrier has no file left to sync
 /// (directories are not synced off Unix either). Everything is still
 /// recorded, so the barrier runs at the same points on every platform.
 pub(crate) const DEFERS_FILE_SYNC: bool = cfg!(unix);
@@ -232,10 +222,7 @@ pub(crate) const DEFERS_FILE_SYNC: bool = cfg!(unix);
 /// Plain-fsync every file and directory, then flush each device's cache
 /// once where the platform needs a separate call for that. Off Unix both
 /// were already synced when they were written ([`DEFERS_FILE_SYNC`]).
-pub(crate) fn sync_all_blocking(
-    files: &[PathBuf],
-    dirs: &BTreeSet<PathBuf>,
-) -> std::io::Result<()> {
+fn sync_all_blocking(files: &[PathBuf], dirs: &BTreeSet<PathBuf>) -> std::io::Result<()> {
     // One open handle per device for the final cache flush.
     let mut flush: BTreeMap<u64, std::fs::File> = BTreeMap::new();
     let mut seen: BTreeSet<&Path> = BTreeSet::new();
@@ -354,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_skips_vanished_files_and_syncs_the_rest() {
+    fn sync_skips_vanished_files() {
         let tmp = tempfile::tempdir().unwrap();
         let kept = tmp.path().join("kept");
         std::fs::write(&kept, b"x").unwrap();
