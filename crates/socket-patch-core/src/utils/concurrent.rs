@@ -17,48 +17,40 @@
 //! [`crate::api::client::hold_back_debug`] and releases it at the fold, so
 //! each request's lines print where the serial loop's would have and a
 //! window the caller drops (the batch fallback) announces nothing the
-//! serial loop would not have announced. Relying on the order the futures
-//! happen to be first-polled in would work today and is exactly what
-//! `hold_back_debug` exists to stop depending on.
+//! serial loop would not have announced.
 
 use std::future::Future;
 
 use futures_util::stream::{self, Stream, StreamExt};
 
-/// In-flight request cap for the authenticated patch API: the ceiling a
-/// large window reaches ([`api_concurrency_for`]), and the whole cap for
-/// the windows that do not size themselves. Measured with no 429s up to
-/// 32 in flight; on a monorepo hosted scan at 100 ms of latency, 32
-/// instead of 8 cut the wall from ~20 s to ~9 s with identical output,
-/// the network having run at ~7 of 8 slots.
-pub const API_CONCURRENCY: usize = 32;
+/// In-flight request cap for the authenticated patch API, and the most
+/// [`API_CONCURRENCY_ENV`] can ask for: the ceiling a large window reaches
+/// ([`api_concurrency_for`]), and the whole cap for the windows that do not
+/// size themselves. The patch API answered 32 in flight with no 429s.
+const API_CONCURRENCY: usize = 32;
 
 /// Floor of the authenticated API's per-window cap
 /// ([`api_concurrency_for`]): a window never runs fewer requests in flight
 /// than this (or than it has requests), however small it is.
-pub const API_CONCURRENCY_FLOOR: usize = 8;
+const API_CONCURRENCY_FLOOR: usize = 8;
 
 /// Requests each in-flight slot should have queued before an authenticated
 /// window widens past [`API_CONCURRENCY_FLOOR`]: a window of `n` requests
 /// runs `n / REQUESTS_PER_SLOT` at once, between the floor and
 /// [`API_CONCURRENCY`]. Each connection then pipelines several requests,
 /// instead of a short window opening a connection per request.
-pub const REQUESTS_PER_SLOT: usize = 4;
+const REQUESTS_PER_SLOT: usize = 4;
 
 /// In-flight request cap on the public patch proxy, which serializes
 /// anonymous callers behind one shared server-side semaphore — stay
 /// polite there.
-pub const PROXY_API_CONCURRENCY: usize = 4;
+pub(crate) const PROXY_API_CONCURRENCY: usize = 4;
 
 /// Operator override for the caps above: the escape hatch for an endpoint
 /// that caps in-flight requests per client (a self-hosted `--api-url`, a
 /// corporate reverse proxy, a WAF or CDN). `1` makes the loops strictly
 /// serial.
 pub const API_CONCURRENCY_ENV: &str = "SOCKET_API_CONCURRENCY";
-
-/// Largest value [`API_CONCURRENCY_ENV`] can ask for — the most in-flight
-/// requests the patch API was measured to answer without a 429.
-const MAX_API_CONCURRENCY: usize = 32;
 
 /// In-flight cap for pristine downloads from the PUBLIC package registries
 /// (npmjs.org, PyPI, crates.io, RubyGems, the Go proxy, Maven Central).
@@ -68,7 +60,7 @@ const MAX_API_CONCURRENCY: usize = 32;
 /// hatch for an operator's *patch API* — turning it up must not turn a
 /// public registry up with it. 4 keeps the lockfile-only ladder latency-
 /// flat without bursting at anyone.
-pub const REGISTRY_CONCURRENCY: usize = 4;
+const REGISTRY_CONCURRENCY: usize = 4;
 
 /// The in-flight cap for pristine registry downloads; see
 /// [`REGISTRY_CONCURRENCY`]. No env override — a tight `RLIMIT_NOFILE`
@@ -84,7 +76,7 @@ pub fn registry_concurrency() -> usize {
 /// authenticated API (`false`).
 ///
 /// [`API_CONCURRENCY_ENV`] overrides it, clamped to
-/// `1..=MAX_API_CONCURRENCY`; an unset, empty or unparsable value leaves
+/// `1..=API_CONCURRENCY`; an unset, empty or unparsable value leaves
 /// the default in place. On the public proxy the override can only LOWER
 /// the cap: that server's semaphore is shared across anonymous callers, so
 /// widening it is not one client's call to make.
@@ -140,16 +132,12 @@ fn api_concurrency_for_under(
     requests: usize,
     fd_limit_is_tight: bool,
 ) -> usize {
-    if fd_limit_is_tight || use_public_proxy || api_concurrency_override().is_some() {
+    if fd_limit_is_tight || use_public_proxy {
         return api_concurrency_under(use_public_proxy, fd_limit_is_tight);
     }
-    adaptive_concurrency(requests, API_CONCURRENCY_FLOOR, API_CONCURRENCY)
-}
-
-/// `requests / REQUESTS_PER_SLOT`, clamped to `floor..=ceiling` (a floor
-/// above the ceiling yields the ceiling).
-fn adaptive_concurrency(requests: usize, floor: usize, ceiling: usize) -> usize {
-    (requests / REQUESTS_PER_SLOT).clamp(floor.min(ceiling), ceiling)
+    api_concurrency_override().unwrap_or_else(|| {
+        (requests / REQUESTS_PER_SLOT).clamp(API_CONCURRENCY_FLOOR, API_CONCURRENCY)
+    })
 }
 
 /// [`API_CONCURRENCY_ENV`] as a usable limit, or `None` when it is unset,
@@ -163,7 +151,7 @@ fn api_concurrency_override() -> Option<usize> {
         return None;
     }
     match trimmed.parse::<usize>() {
-        Ok(limit) if limit > 0 => Some(limit.min(MAX_API_CONCURRENCY)),
+        Ok(limit) if limit > 0 => Some(limit.min(API_CONCURRENCY)),
         _ => {
             crate::utils::env_compat::debug_log(
                 "debug",
@@ -347,7 +335,7 @@ mod tests {
         assert_eq!(api_concurrency(false), 16);
         assert_eq!(api_concurrency(true), PROXY_API_CONCURRENCY);
         std::env::set_var(API_CONCURRENCY_ENV, "9999");
-        assert_eq!(api_concurrency(false), MAX_API_CONCURRENCY);
+        assert_eq!(api_concurrency(false), API_CONCURRENCY);
         assert_eq!(api_concurrency(true), PROXY_API_CONCURRENCY);
 
         // Unusable values leave the defaults alone rather than failing the
@@ -364,19 +352,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn adaptive_cap_scales_with_the_window_between_floor_and_ceiling() {
-        assert_eq!(adaptive_concurrency(0, 8, 32), 8);
-        assert_eq!(adaptive_concurrency(31, 8, 32), 8);
-        assert_eq!(adaptive_concurrency(40, 8, 32), 10);
-        assert_eq!(adaptive_concurrency(127, 8, 32), 31);
-        assert_eq!(adaptive_concurrency(128, 8, 32), 32);
-        assert_eq!(adaptive_concurrency(100_000, 8, 32), 32);
-        // A floor above the ceiling never lifts the cap past the ceiling.
-        assert_eq!(adaptive_concurrency(0, 16, 8), 8);
-        assert_eq!(adaptive_concurrency(1000, 8, 8), 8);
-    }
-
     /// The per-window cap: adaptive on the authenticated API, and exactly
     /// [`api_concurrency`] whenever the proxy, the env override or a tight
     /// descriptor limit decides. Serial: SOCKET_* env is process-global.
@@ -385,15 +360,20 @@ mod tests {
     fn per_window_cap_adapts_only_where_nothing_else_decides() {
         let orig = std::env::var(API_CONCURRENCY_ENV).ok();
         std::env::remove_var(API_CONCURRENCY_ENV);
-        for n in [0, 1, 7, 8, 31, 32, 33, 64, 127, 128, 129, 560, 100_000] {
-            assert_eq!(
-                api_concurrency_for_under(false, n, false),
-                adaptive_concurrency(n, API_CONCURRENCY_FLOOR, API_CONCURRENCY),
-                "{n}"
-            );
-            let cap = api_concurrency_for_under(false, n, false);
-            assert!(cap <= api_concurrency(false), "{n}");
-            assert!(cap >= API_CONCURRENCY_FLOOR.min(API_CONCURRENCY), "{n}");
+        // `n / 4` requests per slot, between a floor of 8 and a cap of 32.
+        for (n, cap) in [
+            (0, 8),
+            (1, 8),
+            (31, 8),
+            (32, 8),
+            (40, 10),
+            (127, 31),
+            (128, 32),
+            (129, 32),
+            (560, 32),
+            (100_000, 32),
+        ] {
+            assert_eq!(api_concurrency_for_under(false, n, false), cap, "{n}");
             assert_eq!(
                 api_concurrency_for_under(true, n, false),
                 PROXY_API_CONCURRENCY
@@ -417,10 +397,8 @@ mod tests {
             }
         }
         std::env::set_var(API_CONCURRENCY_ENV, "eight");
-        assert_eq!(
-            api_concurrency_for_under(false, 1000, false),
-            adaptive_concurrency(1000, API_CONCURRENCY_FLOOR, API_CONCURRENCY)
-        );
+        assert_eq!(api_concurrency_for_under(false, 1000, false), 32);
+        assert_eq!(api_concurrency_for_under(false, 40, false), 10);
         match orig {
             Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
             None => std::env::remove_var(API_CONCURRENCY_ENV),
