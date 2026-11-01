@@ -155,7 +155,7 @@ impl<'a> VendoredBackend<'a> {
                 VendorRevertStep::Failed(_) | VendorRevertStep::LedgerWriteFailed(_)
             );
             // The wiring is back on the registry while the installed tree
-            // may still hold the vendored build, which PDM, uv and Pipenv
+            // may still hold the vendored build, which pip, PDM, uv and Pipenv
             // keep through a plain sync (#477): name the reinstall.
             let unwired = matches!(
                 result.step,

@@ -144,8 +144,9 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
             }
         }
     }
-    // PDM, uv and Pipenv keep a same-version install through a plain sync
-    // (#477): name the reinstall that restores the upstream bytes.
+    // pip, PDM, uv and Pipenv keep a same-version install through a plain
+    // install or sync (#477, #1953): name the reinstall that restores the
+    // upstream bytes.
     if outcome.flush_error.is_none() {
         use crate::commands::pypi_reinstall::{advisory, Tool, HOSTED_CODE};
         let unwound: Vec<(String, Tool)> = outcome

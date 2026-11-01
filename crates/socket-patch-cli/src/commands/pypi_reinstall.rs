@@ -9,9 +9,13 @@
 //! installs the patch, and why the reverse (URL / file → registry) never
 //! does: `pdm sync`, `uv sync` and `pipenv sync` all report nothing to do
 //! and keep the patched build, whose `direct_url.json` still names the
-//! patch server or the deleted `.socket/vendor/` wheel. So the generic
-//! "until the next package-manager install" note is wrong for them, and
-//! the advisory names the reinstall that does restore the upstream bytes.
+//! patch server or the deleted `.socket/vendor/` wheel. Plain pip does the
+//! same for a requirements file (#1953): once the line is back to
+//! `name==version`, `pip install -r` reports `Requirement already
+//! satisfied` and keeps the patched wheel, and `pip freeze` keeps emitting
+//! its URL. So the generic "until the next package-manager install" note
+//! is wrong for them, and the advisory names the reinstall that does
+//! restore the upstream bytes.
 
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 
@@ -22,7 +26,7 @@ pub(crate) const HOSTED_CODE: &str = "redirect_pypi_reinstall_required";
 
 /// Appended to rollback's generic reinstall note next to either advisory.
 pub(crate) const NOTE_QUALIFIER: &str =
-    " (PDM, uv and Pipenv keep a same-version install through a plain sync: \
+    " (pip, PDM, uv and Pipenv keep a same-version install through a plain install: \
      run the reinstall the pypi_reinstall_required warning names)";
 
 /// True when `codes` carry a PyPI reinstall advisory.
@@ -33,6 +37,9 @@ pub(crate) fn advised<'a>(mut codes: impl Iterator<Item = &'a str>) -> bool {
 /// The Python tool whose sync keeps a same-version install.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum Tool {
+    /// A requirements file installed with `pip install -r` (or
+    /// `uv pip install -r`).
+    Pip,
     Pdm,
     Pipenv,
     Uv,
@@ -42,6 +49,7 @@ impl Tool {
     /// The tool of a vendored PyPI ledger entry's flavor.
     pub(crate) fn of_flavor(flavor: &str) -> Option<Tool> {
         match flavor {
+            "requirements" => Some(Tool::Pip),
             "pdm" => Some(Tool::Pdm),
             "pipenv" => Some(Tool::Pipenv),
             "uv" => Some(Tool::Uv),
@@ -50,30 +58,54 @@ impl Tool {
     }
 
     /// The tool of a hosted pin's wiring file (`pdm.lock`, `Pipfile.lock`,
-    /// `uv.lock`, in any directory).
+    /// `uv.lock`, or a pip requirements file — `*.txt`, or a pip-tools
+    /// `*.in` — in any directory).
     pub(crate) fn of_file(rel: &str) -> Option<Tool> {
-        match rel.rsplit(['/', '\\']).next().unwrap_or(rel) {
+        let name = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+        match name {
             "pdm.lock" => Some(Tool::Pdm),
             "Pipfile.lock" => Some(Tool::Pipenv),
             "uv.lock" => Some(Tool::Uv),
-            _ => None,
+            _ => {
+                let lower = name.to_ascii_lowercase();
+                (lower.ends_with(".txt") || lower.ends_with(".in")).then_some(Tool::Pip)
+            }
         }
     }
 }
 
-/// The distribution name of a `pkg:pypi/<name>@<version>` purl.
-fn pypi_name(purl: &str) -> Option<&str> {
-    strip_purl_qualifiers(purl)
-        .strip_prefix("pkg:pypi/")
-        .and_then(|rest| rest.split('@').next())
-        .filter(|name| !name.is_empty())
+/// The distribution name and version of a `pkg:pypi/<name>@<version>`
+/// purl (`version` empty when the purl has none).
+fn pypi_name(purl: &str) -> Option<(&str, &str)> {
+    let rest = strip_purl_qualifiers(purl).strip_prefix("pkg:pypi/")?;
+    let (name, version) = rest.split_once('@').unwrap_or((rest, ""));
+    (!name.is_empty()).then_some((name, version))
 }
 
 /// The reinstall that brings back the upstream release of `name` under
 /// `tool`. `pipfile_lock` is the project's parsed `Pipfile.lock` (it picks
 /// the `pipenv sync` categories), when readable.
-fn remedy(tool: Tool, name: &str, pipfile_lock: Option<&serde_json::Value>) -> String {
+fn remedy(
+    tool: Tool,
+    name: &str,
+    version: &str,
+    pipfile_lock: Option<&serde_json::Value>,
+) -> String {
     match tool {
+        Tool::Pip => {
+            let spec = if version.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}=={version}")
+            };
+            format!(
+                "pip keeps the installed {name} because the restored requirement pins the same \
+                 version (`pip install -r` reports `Requirement already satisfied`, and `pip \
+                 freeze` still names the patched build): in each environment that installed it, \
+                 run `pip install --force-reinstall --no-deps {spec}` (under `uv pip`: `uv pip \
+                 install --reinstall-package {name} {spec}`)"
+            )
+        }
         Tool::Pdm => format!(
             "PDM keeps the installed {name} because the restored lock pins the same version \
              (`pdm sync` / `pdm install` report nothing to do): run `pdm sync --reinstall` (or \
@@ -92,7 +124,7 @@ fn remedy(tool: Tool, name: &str, pipfile_lock: Option<&serde_json::Value>) -> S
 }
 
 /// The advisory detail for `unwound` (`(purl, tool)` pairs), or `None` when
-/// none of them is a PyPI package under PDM, uv or Pipenv.
+/// none of them is a PyPI package under pip, PDM, uv or Pipenv.
 pub(crate) async fn advisory(
     project_root: &std::path::Path,
     unwound: &[(String, Tool)],
@@ -100,7 +132,7 @@ pub(crate) async fn advisory(
     let mut parts: Vec<(String, String)> = Vec::new();
     let mut pipfile_lock: Option<Option<serde_json::Value>> = None;
     for (purl, tool) in unwound {
-        let Some(name) = pypi_name(purl) else {
+        let Some((name, version)) = pypi_name(purl) else {
             continue;
         };
         let lock = if *tool == Tool::Pipenv {
@@ -122,14 +154,14 @@ pub(crate) async fn advisory(
         if parts.iter().any(|(p, _)| p == &base) {
             continue;
         }
-        parts.push((base, remedy(*tool, name, lock)));
+        parts.push((base, remedy(*tool, name, version, lock)));
     }
     if parts.is_empty() {
         return None;
     }
     Some(format!(
-        "the restored lock pins the same version as the patched build still installed, and \
-         a plain sync keeps it: {}",
+        "the restored lock or requirement pins the same version as the patched build still \
+         installed, and a plain sync or install keeps it: {}",
         parts
             .iter()
             .map(|(purl, remedy)| format!("{purl}: {remedy}"))
@@ -140,7 +172,7 @@ pub(crate) async fn advisory(
 
 /// Push the vendored revert's advisory onto `warnings` when the reverted
 /// ledger entry `key` (lockfile flavor `flavor`) is a PyPI package under
-/// PDM, uv or Pipenv. The caller decides the revert unwired the entry.
+/// pip (a requirements file), PDM, uv or Pipenv. The caller decides the revert unwired the entry.
 pub(crate) async fn push_vendor_advisory(
     project_root: &std::path::Path,
     key: &str,
@@ -172,7 +204,42 @@ mod tests {
         assert_eq!(Tool::of_file("pdm.lock"), Some(Tool::Pdm));
         assert_eq!(Tool::of_file("app/Pipfile.lock"), Some(Tool::Pipenv));
         assert_eq!(Tool::of_file("uv.lock"), Some(Tool::Uv));
-        assert_eq!(Tool::of_file("requirements.txt"), None);
+        assert_eq!(Tool::of_file("pyproject.toml"), None);
+    }
+
+    /// #1953: plain pip keeps a same-version install through
+    /// `pip install -r` (`Requirement already satisfied`), so a vendored
+    /// `requirements` entry and a hosted pin in any requirements file get
+    /// the pip remedy.
+    #[test]
+    fn requirements_wiring_is_pip() {
+        assert_eq!(Tool::of_flavor("requirements"), Some(Tool::Pip));
+        assert_eq!(Tool::of_file("requirements.txt"), Some(Tool::Pip));
+        assert_eq!(Tool::of_file("reqs/dev.TXT"), Some(Tool::Pip));
+        assert_eq!(Tool::of_file("app\\requirements.in"), Some(Tool::Pip));
+        assert_eq!(Tool::of_file("pylock.toml"), None);
+        assert_eq!(Tool::of_flavor("python-lock"), None);
+    }
+
+    #[tokio::test]
+    async fn advisory_names_pips_forced_reinstall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let detail = advisory(
+            tmp.path(),
+            &[("pkg:pypi/six@1.16.0?artifact_id=x".into(), Tool::Pip)],
+        )
+        .await
+        .expect("an advisory");
+        assert!(detail.contains("pkg:pypi/six@1.16.0: pip"), "{detail}");
+        assert!(
+            detail.contains("`pip install --force-reinstall --no-deps six==1.16.0`"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("`uv pip install --reinstall-package six six==1.16.0`"),
+            "{detail}"
+        );
+        assert!(!detail.contains("artifact_id"), "{detail}");
     }
 
     #[tokio::test]

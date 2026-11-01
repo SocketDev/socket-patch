@@ -4870,7 +4870,7 @@ pub(crate) struct VendorGcSummary {
     /// The wet reverts' reinstall advisories (`code`, `detail`): Bun's
     /// `vendor_bun_reinstall_required` (#764) and vlt's
     /// `vendor_vlt_reinstall_required`, and, for a manifest-dropped PyPI
-    /// entry under PDM, uv or Pipenv, `vendor_pypi_reinstall_required`
+    /// entry under pip, PDM, uv or Pipenv, `vendor_pypi_reinstall_required`
     /// (#477). Every other reverting command surfaces these, and the GC
     /// must not drop them.
     pub advisories: Vec<(&'static str, String)>,
@@ -4999,7 +4999,7 @@ pub(crate) async fn run_vendor_gc(
             let mut outcome = dispatch_revert_one(&entry, &common.cwd, false).await;
             // The patch left the manifest while the package stays locked:
             // the restored lock pins the version the vendored build is
-            // installed as, which PDM, uv and Pipenv keep (#477), and a
+            // installed as, which pip, PDM, uv and Pipenv keep (#477), and a
             // patched gem archive in Bundler's cache installs again (#1594).
             if outcome.success && !outcome.kept_artifact {
                 crate::commands::pypi_reinstall::push_vendor_advisory(
