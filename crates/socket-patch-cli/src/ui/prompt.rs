@@ -127,7 +127,8 @@ pub enum SelectError {
 /// - Empty `options`: `Err(Cancelled)` — there is nothing to select, and
 ///   `Ok(0)` would hand callers an out-of-bounds index.
 /// - stdin not a terminal: the first option, with
-///   [`NON_INTERACTIVE_SELECT_FIRST`] unless `--silent`.
+///   [`NON_INTERACTIVE_SELECT_FIRST`] unless `--silent` or the process is
+///   quiet ([`super::quiet`]).
 /// - Interactive: Esc/q/Ctrl-C cancel; the cursor is always restored.
 pub fn select_one(
     prompt: &str,
@@ -141,7 +142,7 @@ pub fn select_one(
         return Err(SelectError::Cancelled);
     }
     if !io::stdin().is_terminal() {
-        if !common.silent {
+        if !common.silent && !super::quiet() {
             eprintln!("{NON_INTERACTIVE_SELECT_FIRST}");
         }
         return Ok(0);

@@ -116,24 +116,26 @@ pub(crate) fn quiet() -> bool {
     socket_patch_core::utils::notice::is_quiet()
 }
 
-/// Whether escape sequences written to a terminal on (stdout, stderr)
-/// render. Unix terminals always do. On Windows: whether the console
-/// accepted VT processing, probed once; console's color probe is what
-/// switches VT on, so its answer is exactly "escapes will render". `false`
-/// for a stream that is not a console (it is then not a terminal either,
-/// and escapes in a pipe are the reader's business).
+/// Whether escape sequences written to a terminal render, as
+/// `(stdout, stderr)`: whether the Windows console accepted VT processing,
+/// probed once. console's color probe is what switches VT on, so its
+/// answer is exactly "escapes will render". `false` for a stream that is
+/// not a console (it is then not a terminal either, and escapes in a pipe
+/// are the reader's business).
+#[cfg(windows)]
 pub(crate) fn vt() -> (bool, bool) {
-    #[cfg(windows)]
-    {
-        static VT: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-        return *VT.get_or_init(|| {
-            (
-                console::Term::stdout().features().colors_supported(),
-                console::Term::stderr().features().colors_supported(),
-            )
-        });
-    }
-    #[cfg(not(windows))]
+    static VT: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *VT.get_or_init(|| {
+        (
+            console::Term::stdout().features().colors_supported(),
+            console::Term::stderr().features().colors_supported(),
+        )
+    })
+}
+
+/// Unix terminals always render escape sequences.
+#[cfg(not(windows))]
+pub(crate) fn vt() -> (bool, bool) {
     (true, true)
 }
 
@@ -158,18 +160,22 @@ pub(crate) fn color_enabled(is_tty: bool, env: impl Fn(&str) -> Option<String>) 
     set("TERM").is_none_or(|v| v != "dumb")
 }
 
+fn env_var(k: &str) -> Option<String> {
+    std::env::var(k).ok()
+}
+
 /// [`color_enabled`] for stdout; a terminal must also render escapes
 /// ([`vt`]).
 pub(crate) fn stdout_color() -> bool {
     let tty = std::io::stdout().is_terminal();
-    color_enabled(tty, |k| std::env::var(k).ok()) && (!tty || vt().0)
+    color_enabled(tty, env_var) && (!tty || vt().0)
 }
 
 /// [`color_enabled`] for stderr; a terminal must also render escapes
 /// ([`vt`]).
 pub(crate) fn stderr_color() -> bool {
     let tty = std::io::stderr().is_terminal();
-    color_enabled(tty, |k| std::env::var(k).ok()) && (!tty || vt().1)
+    color_enabled(tty, env_var) && (!tty || vt().1)
 }
 
 /// Columns of the terminal on stderr (status lines, prompts): its size,
@@ -189,13 +195,7 @@ fn width_of(term: &console::Term) -> usize {
     term.size_checked()
         .map(|(_, cols)| cols as usize)
         .filter(|&c| c > 0)
-        .or_else(|| {
-            std::env::var("COLUMNS")
-                .ok()?
-                .parse()
-                .ok()
-                .filter(|&c| c > 0)
-        })
+        .or_else(|| env_var("COLUMNS")?.parse().ok().filter(|&c| c > 0))
         .unwrap_or(80)
 }
 
