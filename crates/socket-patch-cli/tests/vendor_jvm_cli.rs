@@ -359,6 +359,86 @@ fn cold_cache_rerun_vex_repair_and_revert() {
     }
 }
 
+/// #656: a file the index does not list in the vendored tree (a Finder
+/// `.DS_Store`) fails the Gradle build and `vendor --check`. Re-running
+/// `vendor`, the remedy the build error names, and `repair` both sweep
+/// it instead of reporting the tree in sync.
+#[test]
+fn stray_tree_files_are_swept_by_vendor_and_repair() {
+    for shape in [Shape::Reactor, Shape::Gradle] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture(root, shape, &[("foo", FOO_UUID)]);
+        ok(root, &["vendor"]);
+        let vendored = snapshot(root);
+        let tree = if shape == Shape::Reactor {
+            "proj/.socket/vendor/maven2/org/example/foo/1.0-socket.1d3c1fd2"
+        } else {
+            "proj/.socket/vendor/gradle/org/example/foo/1.0"
+        };
+        let stray = root.join(tree).join(".DS_Store");
+
+        std::fs::write(&stray, b"\0\0\0\x01Bud1").unwrap();
+        // A stray symlink goes, not its target: vendor deletes it
+        // directly, outside its group commit.
+        let target = root.join("proj/keep.txt");
+        std::fs::write(&target, b"keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, root.join(tree).join("link")).unwrap();
+        let (code, env) = socket(root, &["vendor", "--check"]);
+        assert_eq!(code, Some(1), "{env}");
+        let env = ok(root, &["vendor", "--dry-run"]);
+        assert!(
+            !events(&env).iter().any(|(_, _, c)| c == "already_vendored"),
+            "the dry run previews the sweep: {env}"
+        );
+        assert!(stray.exists(), "a dry run writes nothing");
+        let env = ok(root, &["vendor"]);
+        assert!(
+            !events(&env).iter().any(|(_, _, c)| c == "already_vendored"),
+            "{env}"
+        );
+        assert!(!stray.exists(), "vendor sweeps the stray file: {env}");
+        assert!(std::fs::symlink_metadata(root.join(tree).join("link")).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::remove_file(&target).unwrap();
+        ok(root, &["vendor", "--check"]);
+        let env = ok(root, &["vendor"]);
+        assert_eq!(
+            events(&env),
+            [(
+                purl("foo"),
+                "skipped".to_string(),
+                "already_vendored".to_string()
+            )],
+            "in sync after the sweep: {env}"
+        );
+
+        std::fs::write(&stray, b"\0\0\0\x01Bud1").unwrap();
+        std::fs::create_dir_all(root.join(tree).join("backup")).unwrap();
+        std::fs::write(root.join(tree).join("backup/old.jar"), b"x").unwrap();
+        let env = ok(root, &["repair", "--dry-run"]);
+        assert_eq!(
+            env["events"][0]["details"]["wouldRemoveUnindexed"],
+            serde_json::json!([
+                format!("{}/.DS_Store", tree.strip_prefix("proj/").unwrap()),
+                format!("{}/backup", tree.strip_prefix("proj/").unwrap()),
+            ]),
+            "{env}"
+        );
+        assert!(stray.exists(), "repair --dry-run writes nothing");
+        let env = ok(root, &["repair"]);
+        assert_eq!(env["events"][0]["action"], "rebuilt", "{env}");
+        assert!(!stray.exists() && !root.join(tree).join("backup").exists());
+        ok(root, &["vendor", "--check"]);
+        let mut repaired = snapshot(root);
+        let mut want = vendored.clone();
+        repaired.remove(".socket/vendor/state.json");
+        want.remove(".socket/vendor/state.json");
+        assert_eq!(repaired, want);
+    }
+}
+
 /// `rollback --preserve-state` keeps the tree and the ledger entry.
 #[test]
 fn preserve_state_keeps_the_tree() {
