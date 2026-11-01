@@ -444,9 +444,13 @@ pub fn rewrite_poetry_lock(
     .map(|rewrite| rewrite.text))
 }
 
+/// A successful [`rewrite_poetry_lock_with_edits`]; its
+/// [`edits`](FragmentRewrite::edits) are exactly
+/// `poetry_lock_edits(original, &text, name)`.
+pub type PoetryLockRewrite<'a> = FragmentRewrite<'a>;
+
 /// [`rewrite_poetry_lock`], also handing back what the caller needs to
-/// record the rewrite's fragment edits ([`FragmentRewrite::edits`], exactly
-/// `poetry_lock_edits(original, &text, name)`).
+/// record the rewrite's fragment edits ([`PoetryLockRewrite::edits`]).
 pub fn rewrite_poetry_lock_with_edits<'a>(
     text: &'a str,
     name: &str,
@@ -455,23 +459,27 @@ pub fn rewrite_poetry_lock_with_edits<'a>(
     source_url: &str,
     filename: &str,
     sha256: &str,
-) -> Result<Option<FragmentRewrite<'a>>, String> {
-    let dep = PoetryLockDep {
+) -> Result<Option<PoetryLockRewrite<'a>>, String> {
+    rewrite_poetry_lock_in(
+        &mut PoetryLockParse::default(),
+        text,
         name,
         version,
         source_type,
         source_url,
         filename,
         sha256,
-    };
-    rewrite_in(&Poetry::default(), &mut LockParse::default(), text, &dep)
+    )
 }
 
+/// The parse of the `poetry.lock` text a [`rewrite_poetry_lock_in`] call
+/// last saw or produced, handed to the next call (see [`LockParse`]).
+pub type PoetryLockParse = LockParse;
+
 /// [`rewrite_poetry_lock_with_edits`], reusing (and refreshing) `parse`.
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn rewrite_poetry_lock_in<'a>(
-    parse: &mut LockParse,
+pub fn rewrite_poetry_lock_in<'a>(
+    parse: &mut PoetryLockParse,
     text: &'a str,
     name: &str,
     version: &str,
@@ -479,7 +487,7 @@ fn rewrite_poetry_lock_in<'a>(
     source_url: &str,
     filename: &str,
     sha256: &str,
-) -> Result<Option<FragmentRewrite<'a>>, String> {
+) -> Result<Option<PoetryLockRewrite<'a>>, String> {
     let dep = PoetryLockDep {
         name,
         version,
@@ -544,7 +552,7 @@ impl LockFormat for Poetry {
             // Poetry compares the lock's `sha256:<hex>` against `hashlib`'s
             // lowercase hexdigest as strings, so an uppercase digest would
             // fail every install.
-            &dep.sha256.to_ascii_lowercase(),
+            dep.sha256.to_ascii_lowercase(),
         )
     }
 
@@ -648,7 +656,7 @@ fn mutate_poetry_lock(
 }
 
 /// One dep of a [`rewrite_poetry_lock_all`]: the arguments of
-/// [`rewrite_poetry_lock_with_edits`] past the lock text.
+/// [`rewrite_poetry_lock_in`] past the lock text.
 pub struct PoetryLockDep<'a> {
     pub name: &'a str,
     pub version: &'a str,
@@ -678,7 +686,7 @@ pub fn rewrite_poetry_lock_all_with_version(
     (batch, poetry.lock_version.into_inner())
 }
 
-/// Every refusal and not-applicable verdict of [`rewrite_poetry_lock_with_edits`]
+/// Every refusal and not-applicable verdict of [`rewrite_poetry_lock_in`]
 /// that precedes its first mutation, read from the parsed lock.
 fn plan_poetry_rewrite(
     lock: &Table,
@@ -686,7 +694,7 @@ fn plan_poetry_rewrite(
     version: &str,
     source_type: &str,
     source_url: &str,
-    sha256: &str,
+    sha256: String,
 ) -> Result<Option<PoetryLockPlan>, String> {
     let format = lock_version(lock)?.to_string();
     if format == "0" && source_type == "url" {
@@ -753,7 +761,7 @@ fn plan_poetry_rewrite(
         effective_url,
         index: indices[0],
         package_name,
-        sha256: sha256.to_string(),
+        sha256,
     }))
 }
 

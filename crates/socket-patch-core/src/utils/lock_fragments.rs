@@ -607,7 +607,7 @@ pub(crate) fn rewrite_batch<F: LockFormat>(
     let mut edits_of: Vec<(usize, Vec<(String, String)>)> = Vec::new();
     for (index, before) in &rewritten {
         let after = fragments_in(&after_doc, rendered, names[*index]).ok()?;
-        let edits = changed_pairs("", before, after, |old, new| {
+        let edits = changed_pairs(F::WHAT, before, after, |old, new| {
             respell(old, &new, file_terminator)
         })
         .ok()?;

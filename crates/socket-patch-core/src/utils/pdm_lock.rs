@@ -144,8 +144,7 @@ pub fn rewrite_pdm_lock(
 }
 
 /// [`rewrite_pdm_lock`], also handing back what the caller needs to record
-/// the rewrite's fragment edits ([`FragmentRewrite::edits`], exactly
-/// `pdm_lock_edits(original, &text, name)`).
+/// the rewrite's fragment edits ([`PdmLockRewrite::edits`]).
 pub fn rewrite_pdm_lock_with_edits<'a>(
     text: &'a str,
     name: &str,
@@ -153,28 +152,37 @@ pub fn rewrite_pdm_lock_with_edits<'a>(
     source: (&str, &str),
     filename: &str,
     sha256: &str,
-) -> Result<FragmentRewrite<'a>, String> {
-    let dep = PdmLockDep {
+) -> Result<PdmLockRewrite<'a>, String> {
+    rewrite_pdm_lock_in(
+        &mut PdmLockParse::default(),
+        text,
         name,
         version,
         source,
         filename,
         sha256,
-    };
-    rewrite_pdm_lock_dep(&mut LockParse::default(), text, &dep)
+    )
 }
 
-/// [`rewrite_pdm_lock_dep`] with the dep spelled out.
-#[cfg(test)]
-fn rewrite_pdm_lock_in<'a>(
-    parse: &mut LockParse,
+/// A successful [`rewrite_pdm_lock_with_edits`]; its
+/// [`edits`](FragmentRewrite::edits) are exactly
+/// `pdm_lock_edits(original, &text, name)`.
+pub type PdmLockRewrite<'a> = FragmentRewrite<'a>;
+
+/// The parse of the `pdm.lock` text last seen or produced, carried between
+/// calls (see [`LockParse`]).
+pub type PdmLockParse = LockParse;
+
+/// [`rewrite_pdm_lock_with_edits`], reusing (and refreshing) `parse`.
+pub fn rewrite_pdm_lock_in<'a>(
+    parse: &mut PdmLockParse,
     text: &'a str,
     name: &str,
     version: &str,
     source: (&str, &str),
     filename: &str,
     sha256: &str,
-) -> Result<FragmentRewrite<'a>, String> {
+) -> Result<PdmLockRewrite<'a>, String> {
     let dep = PdmLockDep {
         name,
         version,
@@ -182,18 +190,9 @@ fn rewrite_pdm_lock_in<'a>(
         filename,
         sha256,
     };
-    rewrite_pdm_lock_dep(parse, text, &dep)
-}
-
-/// [`rewrite_pdm_lock_with_edits`] for `dep`, reusing (and refreshing)
-/// `parse`.
-fn rewrite_pdm_lock_dep<'a>(
-    parse: &mut LockParse,
-    text: &'a str,
-    dep: &PdmLockDep,
-) -> Result<FragmentRewrite<'a>, String> {
-    // PDM refuses a package its lock lacks: its plan is never `None`.
-    rewrite_in(&Pdm, parse, text, dep)?.ok_or_else(|| "missing PDM package".into())
+    // PDM refuses a package its lock lacks (its plan is never `None`); the
+    // fallback only keeps that a refusal should the plan ever change.
+    rewrite_in(&Pdm, parse, text, &dep)?.ok_or_else(|| "missing PDM package".into())
 }
 
 /// `pdm.lock` as the shared [`lock_fragments`](crate::utils::lock_fragments)
@@ -290,7 +289,7 @@ fn mutate_pdm_lock(
 }
 
 /// One dep of a [`rewrite_pdm_lock_all`]: the arguments of
-/// [`rewrite_pdm_lock_with_edits`] past the lock text.
+/// [`rewrite_pdm_lock_in`] past the lock text.
 pub struct PdmLockDep<'a> {
     pub name: &'a str,
     pub version: &'a str,
@@ -306,7 +305,7 @@ pub fn rewrite_pdm_lock_all(text: &str, deps: &[PdmLockDep]) -> LockBatch {
     rewrite_all(&Pdm, text, deps)
 }
 
-/// Every refusal of [`rewrite_pdm_lock_with_edits`], read from the parsed lock before
+/// Every refusal of [`rewrite_pdm_lock_in`], read from the parsed lock before
 /// it mutates anything: the `(package index, inline files, legacy files key)`
 /// of each unit to rewrite.
 fn plan_pdm_rewrite(

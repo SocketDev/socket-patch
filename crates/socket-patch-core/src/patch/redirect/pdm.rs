@@ -4,8 +4,7 @@ use serde_json::json;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::lock_fragments::LockParse;
-use crate::utils::pdm_lock::{rewrite_pdm_lock_all, LockBatch, LockStep, PdmLockDep};
+use crate::utils::pdm_lock::{rewrite_pdm_lock_all, LockBatch, LockStep, PdmLockDep, PdmLockParse};
 
 pub(super) fn rewrite(
     files: &BTreeMap<String, String>,
@@ -23,7 +22,7 @@ pub(super) fn rewrite(
     // lock DOES contain but the plan refuses (source conflict, unsupported
     // format, forked variants, bad hashes) withholds siblings. No rewrite
     // adds or drops a package, so the probe reads the original lock.
-    let mut parse = LockParse::default();
+    let mut parse = PdmLockParse::default();
     let intake: Vec<(&DepOverride, Result<Artifact, String>)> = overrides
         .iter()
         .filter(|dep| dep.ecosystem == "pypi")
@@ -110,7 +109,7 @@ pub(super) fn rewrite(
 /// sibling rewriters rather than vetoing them. A malformed lock, or one with no
 /// package array, returns `true` so the genuine refusal still surfaces from
 /// `rewrite_pdm_lock` (and, when pdm drives, withholds the siblings).
-fn lock_contains(parse: &mut LockParse, text: &str, name: &str) -> bool {
+fn lock_contains(parse: &mut PdmLockParse, text: &str, name: &str) -> bool {
     let Ok(lock) = parse.parsed(text) else {
         return true;
     };
