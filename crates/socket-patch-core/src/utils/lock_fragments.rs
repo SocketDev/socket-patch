@@ -549,9 +549,9 @@ pub(crate) fn assert_batch_matches_steps<F: LockFormat + Default>(
 ///
 /// Each dep is checked and planned against the document as the previous
 /// deps left it, so a refusal or not-found verdict is the one the
-/// step-by-step rewrite would reach; a planned dep is then mutated in. Each rewritten
-/// dep's fragments are taken from the original text and from the single
-/// rendering, and spliced into the original text. That is only the
+/// step-by-step rewrite would reach; a planned dep is then mutated in.
+/// Each rewritten dep's fragments are taken from the original text and from
+/// the single rendering, and spliced into the original text. That is only the
 /// step-by-step result when the deps rewrite distinct packages (a second
 /// rewrite of a package would start from the first one's output) and the
 /// lock has one line-ending style (a mixed lock's majority, which spells
