@@ -10,7 +10,8 @@
 //!   package a copy keyed by another dependency name holds ([`copy`]);
 //! * the stanza view the hosted berry writers re-key and re-order
 //!   entries in ([`stanzas`]);
-//! * a `.yarnrc.yml` setting as yarn resolves it ([`rc`]);
+//! * a `.yarnrc.yml` setting as yarn resolves it ([`rc`]), and a yarn
+//!   classic `.yarnrc` line as yarn 1 tokenizes it ([`classic_rc`]);
 //! * the berry pinned-entry renderer ([`berry_entry`]) and the walk that
 //!   drops the entries a pin leaves unreachable ([`berry_prune`]).
 //!
@@ -24,6 +25,7 @@ pub mod berry_gates;
 pub(crate) mod berry_prune;
 pub(crate) mod blocks;
 pub(crate) mod classic_deps;
+pub(crate) mod classic_rc;
 pub(crate) mod copy;
 pub(crate) mod patterns;
 pub mod rc;

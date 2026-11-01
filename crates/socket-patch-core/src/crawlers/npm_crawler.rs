@@ -9,6 +9,7 @@ use super::pnpm_layout::MODULES_YAML as PNPM_MODULES_YAML;
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
 use crate::formats::text::strip_bom;
+use crate::formats::yarn::classic_rc;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync};
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
@@ -337,57 +338,16 @@ struct YarnrcModulesFolder {
 }
 
 /// The `--modules-folder` and command-scoped `--install.modules-folder`
-/// values of a yarn classic `.yarnrc`. The file is yarn's lockfile
-/// syntax: one `key value` pair per line, either side optionally
-/// double-quoted, an optional `:` after the key, `#` comment lines. For
-/// each key the last setting wins.
+/// values of a yarn classic `.yarnrc`, read through the one `.yarnrc`
+/// reader ([`crate::formats::yarn::classic_rc`]): for each key the last
+/// setting wins, and an empty value or one yarn can't tokenize sets
+/// nothing.
 fn parse_yarnrc_modules_folder(rc: &str) -> YarnrcModulesFolder {
-    let mut found = YarnrcModulesFolder::default();
-    for line in strip_bom(rc).lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, rest)) = split_yarnrc_token(line, true) else {
-            continue;
-        };
-        let slot = match key.as_str() {
-            "--modules-folder" => &mut found.general,
-            "--install.modules-folder" => &mut found.install,
-            _ => continue,
-        };
-        let rest = rest.trim_start();
-        let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
-        if let Some((value, _)) = split_yarnrc_token(rest, false) {
-            if !value.is_empty() {
-                *slot = Some(value);
-            }
-        }
+    let read = |key| classic_rc::value(rc, key).filter(|v| !v.is_empty());
+    YarnrcModulesFolder {
+        general: read("--modules-folder"),
+        install: read("--install.modules-folder"),
     }
-    found
-}
-
-/// Split the leading token off `s`: a double-quoted string (with `\"` and
-/// `\\` escapes) or a run of non-whitespace — for a key (`is_key`) also
-/// ending at a `:`, which a value may contain (`C:\deps`). Returns the
-/// unquoted token and the remainder.
-fn split_yarnrc_token(s: &str, is_key: bool) -> Option<(String, &str)> {
-    if let Some(quoted) = s.strip_prefix('"') {
-        let mut value = String::new();
-        let mut chars = quoted.char_indices();
-        while let Some((i, c)) = chars.next() {
-            match c {
-                '\\' => value.push(chars.next()?.1),
-                '"' => return Some((value, &quoted[i + 1..])),
-                c => value.push(c),
-            }
-        }
-        return None;
-    }
-    let end = s
-        .find(|c: char| c.is_whitespace() || (is_key && c == ':'))
-        .unwrap_or(s.len());
-    (end > 0).then(|| (s[..end].to_string(), &s[end..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -8180,10 +8140,9 @@ mod tests {
             parse("--modules-folder \"C:\\\\deps\"\n").as_deref(),
             Some("C:\\deps")
         );
-        assert_eq!(
-            parse("--modules-folder C:\\deps\n").as_deref(),
-            Some("C:\\deps")
-        );
+        // An unquoted `C:\deps` is a token yarn can't read (a bare word
+        // ends at `:`, and `\` starts no token): not a setting.
+        assert_eq!(parse("--modules-folder C:\\deps\n"), None);
         assert_eq!(
             parse("--modules-folder a\n--modules-folder b\n").as_deref(),
             Some("b")
@@ -8203,6 +8162,54 @@ mod tests {
                 "{rc:?}"
             );
         }
+    }
+
+    /// REGRESSION (#1901): the crawler reads a `.yarnrc` line the way
+    /// yarn's tokenizer (and the hosted redirect's reader) does. A
+    /// single-quoted value loses its quotes, and a value yarn can't
+    /// tokenize (`~/x`) sets nothing, so the crawl never roots at a folder
+    /// yarn does not install into.
+    #[test]
+    fn yarnrc_modules_folder_reads_like_yarn() {
+        let parse = |rc: &str| parse_yarnrc_modules_folder(rc).general;
+        assert_eq!(parse("--modules-folder 'deps'\n").as_deref(), Some("deps"));
+        assert_eq!(
+            parse("\"--modules-folder\" 'my deps'\n").as_deref(),
+            Some("my deps")
+        );
+        assert_eq!(
+            parse_yarnrc_modules_folder("--install.modules-folder 'vm'\n").install,
+            Some("vm".into())
+        );
+        for rc in [
+            "--modules-folder ~/x\n",
+            "--modules-folder deps\n--modules-folder ~/x\n",
+            "--modules-folder 'unterminated\n",
+        ] {
+            assert_eq!(parse(rc), None, "{rc:?}");
+        }
+        // A double-quoted value is JSON: its escapes are decoded.
+        assert_eq!(
+            parse("--modules-folder \"a\\u0062\"\n").as_deref(),
+            Some("ab")
+        );
+    }
+
+    /// REGRESSION (#1901): a single-quoted `--modules-folder` is a crawl
+    /// root at its unquoted path.
+    #[tokio::test]
+    async fn test_yarnrc_single_quoted_modules_folder_is_a_crawl_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        std::fs::write(root.join(".yarnrc"), "--modules-folder 'deps'\n").unwrap();
+        write_pkg(&root.join("deps/left-pad"), "left-pad", "1.3.0");
+        let found = NpmCrawler::new().crawl_all(&local_options(root)).await;
+        assert!(
+            found.iter().any(|p| p.purl == "pkg:npm/left-pad@1.3.0"),
+            "{:?}",
+            found.iter().map(|p| &p.purl).collect::<Vec<_>>()
+        );
     }
 
     fn local_options(cwd: &Path) -> CrawlerOptions {

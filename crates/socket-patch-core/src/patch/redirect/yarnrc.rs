@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use super::npmrc::NpmConfigEnv;
 use crate::formats::text::strip_bom;
+use crate::formats::yarn::classic_rc;
 
 const KEY: &str = "yarn-offline-mirror";
 
@@ -133,35 +134,7 @@ fn unquote_rc_value(raw: &str) -> &str {
 /// `key: value` lines, key optionally quoted, `#` comments); later lines
 /// override earlier ones.
 pub fn yarnrc_value(text: &str) -> Option<MirrorValue> {
-    yarnrc_setting(text, KEY).map(mirror_value)
-}
-
-/// The last raw `key` value in a `.yarnrc` (see [`yarnrc_value`]).
-fn yarnrc_setting<'a>(text: &'a str, key_name: &str) -> Option<&'a str> {
-    let mut found = None;
-    for line in strip_bom(text).lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, rest) = match line.strip_prefix('"') {
-            Some(quoted) => match quoted.split_once('"') {
-                Some((key, rest)) => (key, rest),
-                None => continue,
-            },
-            // yarn's `.yarnrc` parser also ends an unquoted key at `:`, so
-            // `key: value` and `key:value` set the key like `key value`.
-            None => match line.split_once(|c: char| c.is_whitespace() || c == ':') {
-                Some((key, rest)) => (key, rest),
-                None => (line, ""),
-            },
-        };
-        if key == key_name {
-            let rest = rest.trim_start();
-            found = Some(rest.strip_prefix(':').unwrap_or(rest));
-        }
-    }
-    found
+    classic_rc::setting(text, KEY).map(mirror_value)
 }
 
 /// The last top-level `yarn-offline-mirror` value in an `.npmrc` (ini
@@ -385,7 +358,7 @@ const GLOBAL_FOLDER_KEY: &str = "global-folder";
 /// folder, so all of them count.
 ///
 /// Values read as in `yarn@1.22.22`: a `.yarnrc` value is one token of
-/// yarn's rc grammar ([`yarnrc_token`]) resolved against the folder of
+/// yarn's rc grammar ([`classic_rc::token`]) resolved against the folder of
 /// its file (`RELATIVE_KEYS`); an `.npmrc` value has its `${NAME}`
 /// references expanded ([`yarn_env_replace`]); env and `.npmrc` values
 /// then go through `resolveWithHome` (`~/` is yarn's `userHome`, else the
@@ -419,10 +392,9 @@ pub fn configured_yarn_global_folders(
         let Some(text) = read(&path) else { continue };
         let Some(dir) = path.parent() else { continue };
         for key in [GLOBAL_FOLDER_KEY, "--global-folder"] {
-            push(
-                yarnrc_setting(&text, key).and_then(yarnrc_token),
-                &|value| Some(dir.join(value)),
-            );
+            push(classic_rc::value(&text, key), &|value| {
+                Some(dir.join(value))
+            });
         }
     }
     for path in rc_files("npmrc", &["yarn_", "npm_config_"]) {
@@ -435,53 +407,6 @@ pub fn configured_yarn_global_folders(
         );
     }
     out
-}
-
-/// The value token that starts `rest` (what follows a key in a `.yarnrc`
-/// line), read like yarn's lockfile tokenizer: a double-quoted string is
-/// JSON (escapes decoded), a bare word starts with a letter, `/`, `.` or
-/// `-` and ends at a space, `:` or `,` (so a trailing `# comment` is not
-/// part of it), and a run of digits is a number. A single-quoted string
-/// is what yarn's YAML fallback reads in a `"key": '…'` line. Anything
-/// else (`~/x`) is a token yarn can't read: `None`.
-fn yarnrc_token(rest: &str) -> Option<String> {
-    let rest = rest.trim_start_matches([' ', '\t']);
-    if let Some(quoted) = rest.strip_prefix('\'') {
-        let mut out = String::new();
-        let mut chars = quoted.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '\'' if chars.peek() == Some(&'\'') => {
-                    chars.next();
-                    out.push('\'');
-                }
-                '\'' => return Some(out),
-                c => out.push(c),
-            }
-        }
-        return None;
-    }
-    if rest.starts_with('"') {
-        let bytes = rest.as_bytes();
-        let mut end = rest.len();
-        for i in 1..bytes.len() {
-            let escaped = bytes[i - 1] == b'\\' && (i < 2 || bytes[i - 2] != b'\\');
-            if bytes[i] == b'"' && !escaped {
-                end = i + 1;
-                break;
-            }
-        }
-        return serde_json::from_str(&rest[..end]).ok();
-    }
-    let first = rest.chars().next()?;
-    let word = if first.is_ascii_digit() {
-        rest.split(|c: char| !c.is_ascii_digit()).next()
-    } else if first.is_ascii_alphabetic() || matches!(first, '/' | '.' | '-') {
-        rest.split([':', ' ', ',', '\r', '\n']).next()
-    } else {
-        None
-    };
-    word.map(str::to_string)
 }
 
 /// An `.npmrc` value as the `ini` parser yarn 1 bundles decodes it: a
