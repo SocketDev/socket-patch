@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-10-30T09:35Z · main @ 5ca5623_
+_Last updated 2026-11-01T01:15Z · main @ cbbbdb9_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -12,22 +12,23 @@ _Last updated 2026-10-30T09:35Z · main @ 5ca5623_
 | [#1875](https://github.com/SocketDev/socket-patch/pull/1875) | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI (82 checks) and Bugbot green |
 | [#1884](https://github.com/SocketDev/socket-patch/pull/1884) | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 [#1859](https://github.com/SocketDev/socket-patch/issues/1859); tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI (82 checks) and Bugbot green |
 | [#1892](https://github.com/SocketDev/socket-patch/pull/1892) | sweep | `cli/src/commands/scan/gc.rs` | ready; CI (82 checks) and Bugbot green |
-| [#1897](https://github.com/SocketDev/socket-patch/pull/1897) | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI (82 checks) and Bugbot green |
+| [#1897](https://github.com/SocketDev/socket-patch/pull/1897) | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot green; burn-down final review done |
+| [#1903](https://github.com/SocketDev/socket-patch/pull/1903) | sweep | `cli/src/commands/scan/hosted/{nuget,takeover}.rs` | ready; CI and Bugbot pending |
 
 #### Merged
 _None._
 
 #### Queue
-Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`:
-1. T09 [#1858](https://github.com/SocketDev/socket-patch/issues/1858), lock acquire open-coded 9×: D2.6 C2, risk M. **~7** (blocked while #1864 touches `lock_cli.rs` and #1698 touches `vendor.rs` / `get.rs` / `agent_download.rs`)
-2. T01 [#1835](https://github.com/SocketDev/socket-patch/issues/1835), `get <uuid>` re-implements `download_and_apply_patches_into`: D2.2 C2, risk M. **~6.4** (blocked by #1698)
-3. T25 [#1877](https://github.com/SocketDev/socket-patch/issues/1877), `--vex` embed hand-written ~8×: D2 C2, risk M. **~6** (blocked by #1698: `apply.rs`, `vendor.rs`)
-4. T16 [#1861](https://github.com/SocketDev/socket-patch/issues/1861), remove/rollback `VendorRevertStep` loops: D1.75 C2, risk M. **~5.5** (blocked by #1864, #1875, #1698)
-5. A30 [#1887](https://github.com/SocketDev/socket-patch/issues/1887), Maven `${…}` interpolation ×5: D3.35 C2, risk M. **~8.7** (blocked by #1886: `maven_scope.rs`, `maven_reactor.rs`). A05 [#1844](https://github.com/SocketDev/socket-patch/issues/1844) (~8, blocked by #1865: `poetry_lock.rs`) and A32 [#1888](https://github.com/SocketDev/socket-patch/issues/1888) (~6, blocked by #1882: all three crawlers) also wait. A20 [#1848](https://github.com/SocketDev/socket-patch/issues/1848) and A26 [#1867](https://github.com/SocketDev/socket-patch/issues/1867) score 4 (files free).
+Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`. Every one scoring 6 or more is blocked by an open PR as of 2026-11-01:
+1. A30 [#1887](https://github.com/SocketDev/socket-patch/issues/1887), Maven `${…}` interpolation ×5: **~8.7** (blocked by #1886: `maven_scope.rs`, `maven_reactor.rs`).
+2. T09 [#1858](https://github.com/SocketDev/socket-patch/issues/1858), lock acquire open-coded 9×: **~7** (blocked by #1864 `lock_cli.rs`, #1698 `vendor.rs`/`get.rs`/`agent_download.rs`).
+3. A41 [#1899](https://github.com/SocketDev/socket-patch/issues/1899), npm store-child classification ×3: D2 C2, risk M, **~6** (blocked by #1891 and #1829: `npm_crawler.rs`).
+4. A43 [#1900](https://github.com/SocketDev/socket-patch/issues/1900), package.json `workspaces` read 5×: **~6** (blocked by #1863 `governing_root.rs`, #1698 `vendor/mod.rs`).
+5. T01 [#1835](https://github.com/SocketDev/socket-patch/issues/1835) (~6.4) and T25 [#1877](https://github.com/SocketDev/socket-patch/issues/1877) (~6): blocked by #1698.
 
-A03 [#1834](https://github.com/SocketDev/socket-patch/issues/1834) is the fixer's #1876. T28 [#1880](https://github.com/SocketDev/socket-patch/issues/1880) and T23 [#1860](https://github.com/SocketDev/socket-patch/issues/1860) wait on #1864 (`list.rs`) and #1698 (`get.rs`).
+A05 is the fixer's #1898, A32 its #1895. A42 [#1901](https://github.com/SocketDev/socket-patch/issues/1901) (~4) waits on `npm_crawler.rs`; A45 [#1902](https://github.com/SocketDev/socket-patch/issues/1902) is a P1 bug (~5) for the fixer. A20 [#1848](https://github.com/SocketDev/socket-patch/issues/1848) and A26 [#1867](https://github.com/SocketDev/socket-patch/issues/1867) score 4 (files free).
 
-The next run is structural if a candidate scores 6 or more and its files are free, else a sweep. Next sweep files, in order: `scan/hosted/{nuget,takeover}.rs` (`python.rs` is in #1883), then `scan/policy.rs` and `scan/render.rs` once #1856/#1884 merge (policy's getters and `admit_crawled` are called from `scan/mod.rs`), then `core/constants.rs`, `core/utils/cargo_home.rs`. `core/lib.rs` is in #1891 and `core/utils/cargo_workspace.rs` in #1866. Skip `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` while #1698 is open, `rollback.rs` while #1864 is open, `cargo_build_cache.rs` (#1849) and `api/client.rs` (#1870).
+The next run is structural if a candidate scoring 6 or more has free files, else a sweep. Next sweep files, in order: `scan/policy.rs` and `scan/render.rs` once #1856/#1884 merge, then core `constants.rs`, then `utils/cargo_home.rs` (its `CargoCrawler::cargo_home` forwarder waits on #1882), `utils/composer_version.rs`, `utils/concurrent.rs`, `utils/containment.rs`, `utils/digest.rs`. `scan/hosted/python.rs` is in #1883; `utils/fs.rs` and core `lib.rs` are in #1891, `go_env.rs`/`go_installed_tools.rs` in #1876, `cargo_workspace.rs` in #1866. Skip `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` while #1698 is open, `rollback.rs` while #1864 is open.
 
 #### Notes
 - The PRs of the first thread (`arch-refactor/<issue>-*`) are listed in `review/2026-10-v1/register/90-refactor.md`.
@@ -47,3 +48,4 @@ The next run is structural if a candidate scores 6 or more and its files are fre
 - Pushing a branch deletion (`git push origin :branch`) is refused by the sandbox proxy. Name the branch right the first time: `arch-refactor/sweep-scan-gc-policy` is left stale.
 - `scan::hosted::run_redirect` runs only under `--json` (scan/mod.rs calls it inside `if args.common.json`); the human arm goes through `boxed_run_redirect_selected`. `run_redirect_selected` still takes `Option<Envelope>` keyed on `common.json`; making it a value touches `get.rs` (#1698) and the T24 body.
 - The gem stale probe (`scan/hosted.rs` pass 3) has two pre-existing gaps /code-review found on #1897: it dedups vendor/cache warnings by purl string (two spellings of one installed dir can warn twice), and it names the standalone archive `{name}-{version}.gem`, missing a platform gem's suffix. Both change output, so they want an issue.
+- A dead-branch proof needs the earlier branch's exact condition: in takeover's `stage`, the residual-reference conjunct of the keep-wiring branch was dead only because `residual_only_keep` returns `Some` whenever nothing drifted. Core's `kept_for_residual_reference` also requires `kept_artifact`, which a dry-run pypi revert doesn't set, so swapping it in would not have been behavior-neutral.
