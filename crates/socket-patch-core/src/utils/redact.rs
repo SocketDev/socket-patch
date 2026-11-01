@@ -19,9 +19,9 @@
 //! path levels, the uuid and the file name stay, so the text still says
 //! where the request went.
 //!
-//! [`strip_url_userinfo`] is the identifier form: it drops the userinfo
-//! outright, for a URL that is recorded as data (a VEX product `@id`, an
-//! upstream registry named in `--json` output) rather than shown.
+//! `strip_url_userinfo` is the identifier form: it drops the userinfo
+//! outright, for a URL that is recorded as data (a VEX product `@id`)
+//! rather than shown.
 //!
 //! Split by hand because the URLs here are often not well-formed enough
 //! for a parser to accept (scp-like remotes, text that merely contains a
@@ -210,7 +210,7 @@ pub fn redact_url(url: &str) -> Cow<'_, str> {
 /// Remove a `user[:password]@` prefix from a remote URL.
 ///
 /// * `scheme://[userinfo@]host[:port]/path` — the userinfo is everything
-///   up to the LAST `@` of the authority (the part before the first `/`
+///   up to the LAST `@` of the authority (up to the first `/`, `?` or `#`
 ///   after `://`), since an unencoded `@` in a password still precedes
 ///   the host's.
 /// * scp-style `[user@]host:path` (git treats a `:` before any `/` as
@@ -218,11 +218,9 @@ pub fn redact_url(url: &str) -> Cow<'_, str> {
 ///   but only when a `:` follows it; otherwise the `@` belongs to the
 ///   path (`host:repo@v1`) or the string is not a remote URL at all.
 pub(crate) fn strip_url_userinfo(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let (scheme, rest) = url.split_at(scheme_end + 3);
-        let authority_end = rest.find('/').unwrap_or(rest.len());
-        return match rest[..authority_end].rfind('@') {
-            Some(at) => format!("{scheme}{}", &rest[at + 1..]),
+    if url.contains("://") {
+        return match userinfo_span(url) {
+            Some(r) => format!("{}{}", &url[..r.start], &url[r.end + 1..]),
             None => url.to_string(),
         };
     }
@@ -394,6 +392,8 @@ mod tests {
             ),
             ("https://u:p@host/x?y#z", "https://host/x?y#z"),
             ("https://u@host?x", "https://host?x"),
+            ("https://host?scope=@acme", "https://host?scope=@acme"),
+            ("https://host#a@b", "https://host#a@b"),
             ("https://u:p@w@host/x@y", "https://host/x@y"),
             ("git@git.corp:team/repo.git", "git.corp:team/repo.git"),
             ("host:repo@v1", "host:repo@v1"),
