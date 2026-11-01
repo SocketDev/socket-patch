@@ -20,13 +20,16 @@
 
 #![cfg(unix)]
 
-use crate::common::hermetic::{self, Extra};
-use crate::common::{binary, git_sha256, hermetic_command};
-
 use std::path::{Path, PathBuf};
 
-const BASE_PURL: &str = "pkg:gem/rack@3.1.0";
-const QUALIFIED_PURL: &str = "pkg:gem/rack@3.1.0?platform=ruby";
+use serde_json::json;
+
+use super::apply_fixture::{
+    one_file, patch_record, run_gem, stage_blob, write_manifest, GEM_BASE_PURL as BASE_PURL,
+    GEM_QUALIFIED_PURL as QUALIFIED_PURL,
+};
+use crate::common::git_sha256;
+
 const SKIP_CODE: &str = "gem_fallback_home_skipped";
 
 const ORIGINAL: &[u8] = b"module Rack\n  VERSION = 'VULNERABLE'\nend\n";
@@ -65,31 +68,6 @@ fn stage_copy(root: &Path, bytes: &[u8]) -> PathBuf {
     file
 }
 
-fn stage_manifest(root: &Path, purl: &str) {
-    let before_hash = git_sha256(ORIGINAL);
-    let after_hash = git_sha256(&patched_bytes());
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(socket.join("blobs")).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        format!(
-            r#"{{ "patches": {{
-                "{purl}": {{
-                    "uuid": "66616c6c-6261-4b63-8368-6f6d65000000",
-                    "exportedAt": "2024-01-01T00:00:00Z",
-                    "files": {{ "lib/rack.rb": {{
-                        "beforeHash": "{before_hash}", "afterHash": "{after_hash}"
-                    }}}},
-                    "vulnerabilities": {{}}, "description": "fallback-home fixture",
-                    "license": "MIT", "tier": "free"
-                }}
-            }}}}"#
-        ),
-    )
-    .unwrap();
-    std::fs::write(socket.join("blobs").join(&after_hash), patched_bytes()).unwrap();
-}
-
 struct Fixture {
     project: tempfile::TempDir,
     store_file: Option<PathBuf>,
@@ -116,7 +94,15 @@ fn build_fixture(with_store: bool, home_bytes: &[u8], purl: &str) -> Fixture {
     std::fs::create_dir_all(&bin_dir).unwrap();
     install_fake_gem(&bin_dir, &home);
 
-    stage_manifest(root, purl);
+    let patched = patched_bytes();
+    write_manifest(
+        root,
+        json!({ purl: patch_record(
+            "66616c6c-6261-4b63-8368-6f6d65000000",
+            one_file("lib/rack.rb", ORIGINAL, &patched),
+        )}),
+    );
+    stage_blob(root, &git_sha256(&patched), &patched);
     Fixture {
         project,
         store_file,
@@ -130,21 +116,15 @@ fn build_fixture(with_store: bool, home_bytes: &[u8], purl: &str) -> Fixture {
 /// the fake-gem bin dir only, and BUNDLE_PATH set to the store root when
 /// present.
 fn run_apply(fx: &Fixture, extra: &[&str]) -> (i32, String, String) {
-    let mut cmd = hermetic_command(&binary());
-    cmd.args(["apply", "--offline", "--ecosystems", "gem", "--cwd"])
-        .arg(fx.project.path())
-        .args(extra);
-    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
-    cmd.env("PATH", &fx.bin_dir);
+    let cwd = fx.project.path().to_str().unwrap();
+    let mut argv = vec!["apply", "--offline", "--ecosystems", "gem", "--cwd", cwd];
+    argv.extend_from_slice(extra);
+    let bin_dir = fx.bin_dir.to_str().unwrap();
+    let mut env = vec![("PATH", bin_dir)];
     if let Some(store_root) = &fx.store_root {
-        cmd.env("BUNDLE_PATH", store_root);
+        env.push(("BUNDLE_PATH", store_root.to_str().unwrap()));
     }
-    let out = cmd.output().expect("run socket-patch apply");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
+    run_gem(fx.project.path(), &argv, &env)
 }
 
 fn parse_env(stdout: &str) -> serde_json::Value {
@@ -348,4 +328,33 @@ fn failing_fallback_home_copy_write_is_nonfatal_when_store_patched() {
         code, 0,
         "apply exited 0 on this tree, so --check must too.\nstdout={stdout}\nstderr={stderr}"
     );
+}
+
+/// The human render of (a): the per-copy warning names the skipped
+/// copy's path and says why the skip is safe.
+#[test]
+fn mismatched_fallback_home_copy_warns_on_human_stderr() {
+    let foreign = b"totally different bytes\n";
+    let fx = build_fixture(true, foreign, QUALIFIED_PURL);
+
+    let (code, _stdout, stderr) = run_apply(&fx, &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("Warning: ") && stderr.contains("was not patched"),
+        "the best-effort skip must print its human warning; stderr={stderr}"
+    );
+    let home = fx.project.path().join("gem-home");
+    assert!(
+        stderr.contains(&format!("gem-env home copy at {}", home.display())),
+        "the warning must name the fallback-home copy; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("bundle-path copy — the one bundler loads — is patched"),
+        "the warning must explain why the skip is safe; stderr={stderr}"
+    );
+    assert_eq!(
+        std::fs::read(fx.store_file.as_ref().unwrap()).unwrap(),
+        patched_bytes()
+    );
+    assert_eq!(std::fs::read(&fx.home_file).unwrap(), foreign);
 }

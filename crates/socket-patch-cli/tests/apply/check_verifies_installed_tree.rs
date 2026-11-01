@@ -11,9 +11,12 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::common;
-use common::envelope::events;
-use common::{git_sha256, parse_json_envelope, run_with_env};
+use super::apply_fixture::{
+    install_gem, install_npm_pkg, one_file, patch_record, stage_blob, write_manifest,
+    write_root_package_json,
+};
+use crate::common::envelope::events;
+use crate::common::{git_sha256, parse_json_envelope, run_with_env};
 
 const PURL: &str = "pkg:npm/check-target@1.0.0";
 const ORIGINAL: &[u8] = b"module.exports = 'vulnerable';\n";
@@ -22,7 +25,7 @@ const PATCHED: &[u8] = b"module.exports = 'patched';\n";
 fn run_check(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
     let mut argv = vec!["apply", "--check", "--offline"];
     argv.extend_from_slice(extra);
-    run_with_env(cwd, &argv, &[("SOCKET_TELEMETRY_DISABLED", "1")])
+    run_with_env(cwd, &argv, &[])
 }
 
 /// An npm agent project: `.socket/manifest.json` patching
@@ -31,38 +34,16 @@ fn run_check(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
 fn project(installed: Option<&[u8]>) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    std::fs::write(
-        root.join("package.json"),
-        r#"{ "name": "check-root", "version": "0.0.0" }"#,
-    )
-    .unwrap();
-    std::fs::create_dir_all(root.join(".socket")).unwrap();
-    let manifest = json!({ "patches": { PURL: {
-        "uuid": "27272727-2727-4272-8272-272727272727",
-        "exportedAt": "2024-01-01T00:00:00Z",
-        "files": { "index.js": {
-            "beforeHash": git_sha256(ORIGINAL),
-            "afterHash": git_sha256(PATCHED),
-        }},
-        "vulnerabilities": {},
-        "description": "apply --check fixture",
-        "license": "MIT",
-        "tier": "free",
-    }}});
-    std::fs::write(
-        root.join(".socket/manifest.json"),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
+    write_root_package_json(root);
+    write_manifest(
+        root,
+        json!({ PURL: patch_record(
+            "27272727-2727-4272-8272-272727272727",
+            one_file("index.js", ORIGINAL, PATCHED),
+        )}),
+    );
     if let Some(bytes) = installed {
-        let pkg = root.join("node_modules/check-target");
-        std::fs::create_dir_all(&pkg).unwrap();
-        std::fs::write(
-            pkg.join("package.json"),
-            r#"{ "name": "check-target", "version": "1.0.0" }"#,
-        )
-        .unwrap();
-        std::fs::write(pkg.join("index.js"), bytes).unwrap();
+        install_npm_pkg(root, "check-target", "1.0.0", Some(bytes));
     }
     tmp
 }
@@ -216,33 +197,16 @@ fn gem_project(installed: &[u8]) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(root.join("Gemfile"), b"source 'https://rubygems.org'\n").unwrap();
-    let file = root.join("vendor/bundle/ruby/3.4.0/gems/nokogiri-1.16.5/lib/nokogiri.rb");
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, installed).unwrap();
+    install_gem(root, "nokogiri-1.16.5", "lib/nokogiri.rb", installed);
     std::fs::create_dir_all(root.join("vendor/bundle/ruby/3.4.0/specifications")).unwrap();
-    std::fs::create_dir_all(root.join(".socket/blobs")).unwrap();
-    let manifest = json!({ "patches": { GEM_LINUX: {
-        "uuid": "41414141-4141-4141-8141-414141414141",
-        "exportedAt": "2024-01-01T00:00:00Z",
-        "files": { "lib/nokogiri.rb": {
-            "beforeHash": git_sha256(GEM_ORIGINAL),
-            "afterHash": git_sha256(GEM_PATCHED),
-        }},
-        "vulnerabilities": {},
-        "description": "apply --check gem variant fixture",
-        "license": "MIT",
-        "tier": "free",
-    }}});
-    std::fs::write(
-        root.join(".socket/manifest.json"),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        root.join(".socket/blobs").join(git_sha256(GEM_PATCHED)),
-        GEM_PATCHED,
-    )
-    .unwrap();
+    write_manifest(
+        root,
+        json!({ GEM_LINUX: patch_record(
+            "41414141-4141-4141-8141-414141414141",
+            one_file("lib/nokogiri.rb", GEM_ORIGINAL, GEM_PATCHED),
+        )}),
+    );
+    stage_blob(root, &git_sha256(GEM_PATCHED), GEM_PATCHED);
     tmp
 }
 
@@ -274,7 +238,7 @@ fn check_fails_on_a_qualified_gem_matching_no_variant() {
     let (code, stdout, stderr) = run_with_env(
         tmp.path(),
         &["apply", "--offline", "--ecosystems", "gem"],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+        &[],
     );
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
 }
@@ -387,7 +351,7 @@ fn printed_remedy(stderr: &str) -> Vec<String> {
 fn run_remedy_then_check(cwd: &Path, remedy: &[String], check: &[&str]) -> (i32, String) {
     let mut argv: Vec<&str> = remedy.iter().map(String::as_str).collect();
     argv.push("--offline");
-    let (code, stdout, stderr) = run_with_env(cwd, &argv, &[("SOCKET_TELEMETRY_DISABLED", "1")]);
+    let (code, stdout, stderr) = run_with_env(cwd, &argv, &[]);
     assert_eq!(
         code, 0,
         "the printed remedy runs\nstdout={stdout}\nstderr={stderr}"

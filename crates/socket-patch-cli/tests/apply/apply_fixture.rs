@@ -1,5 +1,4 @@
-//! Fixtures and runners shared by `apply_failure_paths.rs` (the `--json`
-//! contracts) and `apply_render.rs` (the human output) (#1089).
+//! Fixtures and runners shared by every suite of the `apply` test binary.
 //!
 //! Binary-driven throughout (`common::run_with_env`, `SOCKET_*`-scrubbed
 //! children), hand-written camelCase manifests, git-sha256 oracle,
@@ -10,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::common::hermetic::{self, Extra};
-use crate::common::{binary, git_sha256, hermetic_command, run_with_env};
+use crate::common::{binary, git_sha256, hermetic_command, jvm_env, run_with_env, write_blob};
 
 pub const GO_PURL: &str = "pkg:golang/example.com/mod@v1.0.0";
 pub const GO_COPY_DIR: &str = ".socket/go-patches/example.com/mod@v1.0.0";
@@ -46,7 +45,12 @@ pub fn patch_record(uuid: &str, files: Value) -> Value {
 
 /// The `files` map of a one-file patch from `before` to `after` bytes.
 pub fn one_file(path: &str, before: &[u8], after: &[u8]) -> Value {
-    json!({ path: { "beforeHash": git_sha256(before), "afterHash": git_sha256(after) } })
+    hashed_file(path, &git_sha256(before), &git_sha256(after))
+}
+
+/// [`one_file`] from the two hashes.
+pub fn hashed_file(path: &str, before_hash: &str, after_hash: &str) -> Value {
+    json!({ path: { "beforeHash": before_hash, "afterHash": after_hash } })
 }
 
 /// Write `.socket/manifest.json`, creating `.socket/blobs/` alongside as
@@ -62,9 +66,7 @@ pub fn write_manifest(root: &Path, patches: Value) {
 }
 
 pub fn stage_blob(root: &Path, hash: &str, content: &[u8]) {
-    let blobs = root.join(".socket").join("blobs");
-    std::fs::create_dir_all(&blobs).expect("create blobs dir");
-    std::fs::write(blobs.join(hash), content).expect("stage blob");
+    write_blob(&root.join(".socket"), hash, content);
 }
 
 /// Install a fake npm package at `<root>/node_modules/<name>` with the
@@ -83,6 +85,25 @@ pub fn install_npm_pkg(root: &Path, name: &str, version: &str, index_js: Option<
         std::fs::write(&index, bytes).expect("write index.js");
     }
     index
+}
+
+/// Link `link` to the directory `target`: a symlink on Unix, a junction
+/// on Windows.
+pub fn link_dir(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let link: PathBuf = link.components().collect();
+        let target: PathBuf = target.components().collect();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+    }
 }
 
 pub fn write_root_package_json(root: &Path) {
@@ -242,22 +263,28 @@ pub const NOKOGIRI_DARWIN_BEFORE: &[u8] = b"# nokogiri.rb from the arm64-darwin 
 pub const NOKOGIRI_LINUX_MARKER: &[u8] = b"\n# SOCKET-LINUX-PATCH\n";
 pub const NOKOGIRI_DARWIN_MARKER: &[u8] = b"\n# DARWIN-MARKER\n";
 
-/// Run `socket-patch apply --offline --ecosystems gem <extra>` in `cwd`
-/// with the hermetic `SOCKET_*` environment (`hermetic_command`) and the
-/// ambient `BUNDLE_*` scrubbed, so only the argv decides behavior.
-pub fn run_gem_apply(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
+/// Run `socket-patch <args>` in `cwd` like `common::run_with_env`, with
+/// the ambient `BUNDLE_*` also scrubbed so only the argv and `env` decide
+/// what Bundler state the gem crawler reads.
+pub fn run_gem(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
-    cmd.arg("apply")
-        .args(["--offline", "--ecosystems", "gem"])
-        .args(extra)
-        .current_dir(cwd);
+    cmd.args(args).current_dir(cwd);
+    jvm_env::isolate_cli(&mut cmd);
     hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
-    let out = cmd.output().expect("run socket-patch apply");
+    cmd.envs(env.iter().copied());
+    let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
+}
+
+/// [`run_gem`] of `apply --offline --ecosystems gem <extra>`.
+pub fn run_gem_apply(cwd: &Path, extra: &[&str]) -> (i32, String, String) {
+    let mut argv = vec!["apply", "--offline", "--ecosystems", "gem"];
+    argv.extend_from_slice(extra);
+    run_gem(cwd, &argv, &[])
 }
 
 /// `pkg:gem/nokogiri@1.16.5?platform=<platform>`.

@@ -10,12 +10,9 @@
 //!   * non-JSON runs print ONE stderr warning, gated on `!--silent`
 //!     (`--silent` = errors only — a bare crawler eprintln violated that).
 
-use crate::common::hermetic::{self, Extra};
-use crate::common::{binary, git_sha256, hermetic_command};
-
 use std::path::Path;
 
-const PURL: &str = "pkg:gem/rack@3.1.0";
+use super::apply_fixture::{run_gem, write_gem_patch};
 const CODE: &str = "gem_bundle_config_path_ignored";
 
 /// Project fixture: Gemfile + `.bundle/config` pointing `BUNDLE_PATH` at
@@ -36,43 +33,11 @@ fn build_project(root: &Path, outside: &Path, with_store: bool) {
     std::fs::create_dir_all(outside.join("specifications")).unwrap();
 
     if with_store {
-        let original = b"module Rack\n  VERSION = 'VULNERABLE'\nend\n";
-        let mut patched = original.to_vec();
-        patched.extend_from_slice(b"# SOCKET-PATCHED\n");
-        let before_hash = git_sha256(original);
-        let after_hash = git_sha256(&patched);
-
-        let gem_lib = root
-            .join("vendor")
-            .join("bundle")
-            .join("ruby")
-            .join("3.2.0")
-            .join("gems")
-            .join("rack-3.1.0")
-            .join("lib");
-        std::fs::create_dir_all(&gem_lib).unwrap();
-        std::fs::write(gem_lib.join("rack.rb"), original).unwrap();
-
-        let socket = root.join(".socket");
-        std::fs::create_dir_all(socket.join("blobs")).unwrap();
-        std::fs::write(
-            socket.join("manifest.json"),
-            format!(
-                r#"{{ "patches": {{
-                    "{PURL}": {{
-                        "uuid": "636f6e66-6967-4761-8264-000000000000",
-                        "exportedAt": "2024-01-01T00:00:00Z",
-                        "files": {{ "lib/rack.rb": {{
-                            "beforeHash": "{before_hash}", "afterHash": "{after_hash}"
-                        }}}},
-                        "vulnerabilities": {{}}, "description": "config-warning fixture",
-                        "license": "MIT", "tier": "free"
-                    }}
-                }}}}"#
-            ),
-        )
-        .unwrap();
-        std::fs::write(socket.join("blobs").join(&after_hash), &patched).unwrap();
+        write_gem_patch(
+            root,
+            "636f6e66-6967-4761-8264-000000000000",
+            b"# SOCKET-PATCHED\n",
+        );
     }
 }
 
@@ -82,16 +47,10 @@ fn build_project(root: &Path, outside: &Path, with_store: bool) {
 fn run(root: &Path, args: &[&str]) -> (i32, String, String) {
     let empty_path = root.join("empty-bin");
     std::fs::create_dir_all(&empty_path).unwrap();
-    let mut cmd = hermetic_command(&binary());
-    cmd.args(args).arg("--cwd").arg(root);
-    hermetic::scrub_extra(&mut cmd, &[Extra::Bundle]);
-    cmd.env("PATH", &empty_path);
-    let out = cmd.output().expect("run socket-patch");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
+    let mut argv = args.to_vec();
+    let cwd = root.display().to_string();
+    argv.extend(["--cwd", cwd.as_str()]);
+    run_gem(root, &argv, &[("PATH", empty_path.to_str().unwrap())])
 }
 
 fn assert_warning_in(env: &serde_json::Value, value_fragment: &str, ctx: &str) {

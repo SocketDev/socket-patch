@@ -15,98 +15,33 @@
 //! crawler won't match, which trips the "no packages found / offline"
 //! branches and exercises the invariants without needing a real fixture.
 
+use std::path::Path;
+
+use serde_json::json;
+
+use super::apply_fixture::{
+    hashed_file, install_npm_pkg, one_file, patch_record, stage_blob, write_manifest,
+    write_root_package_json,
+};
 use crate::common::{binary, git_sha256, hermetic_command};
 
-use std::path::{Path, PathBuf};
-
-use sha2::{Digest, Sha256};
-
-/// Minimal manifest with one synthetic patch entry. The PURL points at a
-/// package that won't be found on disk; the `afterHash` blob is missing
-/// from `.socket/blobs/`. This forces every branch we want to test —
-/// `--offline` bails out, and the no-mutation invariant holds because
-/// nothing actually runs.
-const MANIFEST_JSON: &str = r#"{
-  "patches": {
-    "pkg:npm/__invariant_test_pkg__@9.9.9": {
-      "uuid": "11111111-1111-4111-8111-111111111111",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {
-        "package/index.js": {
-          "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-          "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111"
-        }
-      },
-      "vulnerabilities": {},
-      "description": "synthetic invariant test patch",
-      "license": "MIT",
-      "tier": "free"
-    }
-  }
-}"#;
-
+/// One synthetic npm patch whose package is not installed and whose
+/// `afterHash` blob is missing from `.socket/blobs/`, so `--offline` bails
+/// and nothing else runs. `.socket/blobs/` holds a sentinel apply must not
+/// touch.
 fn write_project(root: &Path) {
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(&socket).expect("create .socket");
-    std::fs::write(socket.join("manifest.json"), MANIFEST_JSON).expect("write manifest");
-    // Pre-create the blobs dir with a sentinel file so the recursive
-    // hash has something stable to chew on. Apply must not delete or
-    // alter this file.
-    let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).expect("create blobs dir");
-    std::fs::write(blobs.join("sentinel"), b"do not modify me").expect("write sentinel");
-    // Empty node_modules so the npm crawler returns nothing.
+    write_root_package_json(root);
     std::fs::create_dir_all(root.join("node_modules")).expect("create node_modules");
-    // A package.json so the crawler considers this a project root.
-    std::fs::write(
-        root.join("package.json"),
-        r#"{"name":"invariant-test","version":"0.0.0"}"#,
-    )
-    .expect("write package.json");
-}
-
-/// Recursive, stable hash of every regular file under `dir`. Combines
-/// each file's relative path and bytes into a single SHA-256 so any
-/// change — adding, removing, or rewriting a file — flips the digest.
-///
-/// Nothing is excluded: the advisory `apply.lock` that `apply` takes
-/// exists only while the command holds it (the guard unlinks it on
-/// exit), so a snapshot taken after the run must not see it either. A
-/// lock file surviving a run is itself a regression this hash catches.
-fn dir_hash(dir: &Path) -> String {
-    let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
-    collect_files(dir, dir, &mut files);
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut hasher = Sha256::new();
-    for (rel, bytes) in files {
-        hasher.update(rel.to_string_lossy().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(&bytes);
-        hasher.update(b"\0");
-    }
-    hex::encode(hasher.finalize())
-}
-
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if file_type.is_dir() {
-            collect_files(root, &path, out);
-        } else if file_type.is_file() {
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-            if let Ok(bytes) = std::fs::read(&path) {
-                out.push((rel, bytes));
-            }
-        }
-    }
+    write_manifest(
+        root,
+        json!({
+            "pkg:npm/__invariant_test_pkg__@9.9.9": patch_record(
+                "11111111-1111-4111-8111-111111111111",
+                hashed_file("package/index.js", &"0".repeat(64), &"1".repeat(64)),
+            )
+        }),
+    );
+    stage_blob(root, "sentinel", b"do not modify me");
 }
 
 fn run_apply(cwd: &Path, extra: &[&str]) -> (i32, String) {
@@ -154,59 +89,22 @@ const SCOPED_PATCHED: &[u8] = b"module.exports = function safe() { return 'ok'; 
 /// Used to prove the offline no-local-source guard is scoped to the
 /// patches the run can actually apply (`--ecosystems` filter).
 fn write_mixed_scope_project(root: &Path) {
-    let before = git_sha256(SCOPED_ORIGINAL);
-    let after = git_sha256(SCOPED_PATCHED);
-
-    std::fs::write(
-        root.join("package.json"),
-        r#"{"name":"scope-test","version":"0.0.0"}"#,
-    )
-    .expect("write package.json");
-
-    let pkg = root.join("node_modules").join("scopedpkg");
-    std::fs::create_dir_all(&pkg).expect("create package dir");
-    std::fs::write(
-        pkg.join("package.json"),
-        r#"{"name":"scopedpkg","version":"1.0.0"}"#,
-    )
-    .expect("write pkg package.json");
-    std::fs::write(pkg.join("index.js"), SCOPED_ORIGINAL).expect("write index.js");
-
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(socket.join("blobs")).expect("create blobs");
-    std::fs::write(socket.join("blobs").join(&after), SCOPED_PATCHED).expect("write blob");
-    let manifest = format!(
-        r#"{{
-  "patches": {{
-    "{SCOPED_NPM_PURL}": {{
-      "uuid": "33333333-3333-4333-8333-333333333333",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{
-        "package/index.js": {{ "beforeHash": "{before}", "afterHash": "{after}" }}
-      }},
-      "vulnerabilities": {{}},
-      "description": "in-scope npm patch with local sources",
-      "license": "MIT",
-      "tier": "free"
-    }},
-    "pkg:pypi/__ghost_pkg__@9.9.9": {{
-      "uuid": "44444444-4444-4444-8444-444444444444",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{
-        "ghost.py": {{
-          "beforeHash": "2222222222222222222222222222222222222222222222222222222222222222",
-          "afterHash":  "3333333333333333333333333333333333333333333333333333333333333333"
-        }}
-      }},
-      "vulnerabilities": {{}},
-      "description": "out-of-scope pypi patch with NO local source",
-      "license": "MIT",
-      "tier": "free"
-    }}
-  }}
-}}"#
+    write_root_package_json(root);
+    install_npm_pkg(root, "scopedpkg", "1.0.0", Some(SCOPED_ORIGINAL));
+    write_manifest(
+        root,
+        json!({
+            SCOPED_NPM_PURL: patch_record(
+                "33333333-3333-4333-8333-333333333333",
+                one_file("package/index.js", SCOPED_ORIGINAL, SCOPED_PATCHED),
+            ),
+            "pkg:pypi/__ghost_pkg__@9.9.9": patch_record(
+                "44444444-4444-4444-8444-444444444444",
+                hashed_file("ghost.py", &"2".repeat(64), &"3".repeat(64)),
+            ),
+        }),
     );
-    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
+    stage_blob(root, &git_sha256(SCOPED_PATCHED), SCOPED_PATCHED);
 }
 
 /// Regression: the `--offline` no-local-source guard (and the download
@@ -311,14 +209,14 @@ fn offline_with_missing_source_emits_partial_failure() {
 #[test]
 fn apply_does_not_mutate_socket_dir_offline() {
     // Even on the failure path (offline + missing source), apply must
-    // not touch `.socket/`. The directory hash should match exactly.
+    // not touch `.socket/`: every file's bytes must match exactly.
     let tmp = tempfile::tempdir().expect("tempdir");
     write_project(tmp.path());
 
     let socket = tmp.path().join(".socket");
-    let before = dir_hash(&socket);
+    let before = snapshot_dir(&socket);
     let (code, stdout) = run_apply(tmp.path(), &["--offline", "--silent"]);
-    let after = dir_hash(&socket);
+    let after = snapshot_dir(&socket);
 
     // The run must have actually taken the failure path we care about —
     // otherwise an apply that errored out *before* reaching any write
@@ -332,23 +230,7 @@ fn apply_does_not_mutate_socket_dir_offline() {
         v["status"], "partialFailure",
         "expected the offline partialFailure path, got {v}"
     );
-    assert_eq!(
-        before, after,
-        "apply --offline must not mutate .socket/; hash changed"
-    );
-    // Belt-and-suspenders against a dir_hash blind spot: read the two
-    // payload files back and confirm they are byte-identical to what
-    // `write_project` laid down.
-    assert_eq!(
-        std::fs::read(socket.join("blobs").join("sentinel")).expect("sentinel survives"),
-        b"do not modify me",
-        "apply must not rewrite the blobs sentinel"
-    );
-    assert_eq!(
-        std::fs::read_to_string(socket.join("manifest.json")).expect("manifest survives"),
-        MANIFEST_JSON,
-        "apply must not rewrite manifest.json"
-    );
+    assert_eq!(before, after, "apply --offline must not mutate .socket/");
 }
 
 #[test]
@@ -360,15 +242,12 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
     write_project(tmp.path());
 
     let socket = tmp.path().join(".socket");
-    let before = dir_hash(&socket);
+    let before = snapshot_dir(&socket);
     let (code, stdout) = run_apply(tmp.path(), &["--silent"]);
-    let after = dir_hash(&socket);
+    let after = snapshot_dir(&socket);
 
-    // Previously this test discarded the result entirely (`let _ = ...`),
-    // so a build that crashed, hung, exited 0, or wrote garbage to stdout
-    // would still "pass" as long as it happened not to touch `.socket/`.
-    // Pin the contract: the no-usable-source run reports partialFailure
-    // and exits non-zero, AND leaves `.socket/` untouched.
+    // Pin the bail itself, or a run that died early would leave
+    // `.socket/` untouched and pass vacuously.
     assert_eq!(
         code, 1,
         "no-match / unfetchable run must exit 1; stdout=\n{stdout}"
@@ -399,20 +278,7 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
     );
     assert_eq!(
         before, after,
-        "apply must not mutate .socket/ on the no-match path; hash changed"
-    );
-    assert_eq!(
-        std::fs::read(socket.join("blobs").join("sentinel")).expect("sentinel survives"),
-        b"do not modify me",
-        "apply must not rewrite the blobs sentinel on the no-match path"
-    );
-    // Belt-and-suspenders against a dir_hash blind spot (same as the
-    // offline test): the manifest must be byte-identical to what
-    // `write_project` laid down.
-    assert_eq!(
-        std::fs::read_to_string(socket.join("manifest.json")).expect("manifest survives"),
-        MANIFEST_JSON,
-        "apply must not rewrite manifest.json on the no-match path"
+        "apply must not mutate .socket/ on the no-match path"
     );
 }
 
@@ -538,60 +404,23 @@ fn apply_with_unreadable_socket_dir_fails_closed() {
 ///   - `scopedpkg@1.0.0` is installed on disk and fully applicable;
 ///   - `__ghost_pkg__@9.9.9` matches nothing on disk.
 fn write_partial_match_project(root: &Path) {
-    let before = git_sha256(SCOPED_ORIGINAL);
-    let after = git_sha256(SCOPED_PATCHED);
-    let ghost_after = git_sha256(b"ghost patched\n");
-
-    std::fs::write(
-        root.join("package.json"),
-        r#"{"name":"partial-match-test","version":"0.0.0"}"#,
-    )
-    .expect("write package.json");
-
-    let pkg = root.join("node_modules").join("scopedpkg");
-    std::fs::create_dir_all(&pkg).expect("create package dir");
-    std::fs::write(
-        pkg.join("package.json"),
-        r#"{"name":"scopedpkg","version":"1.0.0"}"#,
-    )
-    .expect("write pkg package.json");
-    std::fs::write(pkg.join("index.js"), SCOPED_ORIGINAL).expect("write index.js");
-
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(socket.join("blobs")).expect("create blobs");
-    std::fs::write(socket.join("blobs").join(&after), SCOPED_PATCHED).expect("write blob");
-    std::fs::write(socket.join("blobs").join(&ghost_after), b"ghost patched\n")
-        .expect("write ghost blob");
-    let before_ghost = git_sha256(b"ghost original\n");
-    let manifest = format!(
-        r#"{{
-  "patches": {{
-    "{SCOPED_NPM_PURL}": {{
-      "uuid": "33333333-3333-4333-8333-333333333333",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{
-        "package/index.js": {{ "beforeHash": "{before}", "afterHash": "{after}" }}
-      }},
-      "vulnerabilities": {{}},
-      "description": "installed npm patch with local sources",
-      "license": "MIT",
-      "tier": "free"
-    }},
-    "pkg:npm/__ghost_pkg__@9.9.9": {{
-      "uuid": "44444444-4444-4444-8444-444444444444",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{
-        "package/index.js": {{ "beforeHash": "{before_ghost}", "afterHash": "{ghost_after}" }}
-      }},
-      "vulnerabilities": {{}},
-      "description": "npm patch whose package is not installed",
-      "license": "MIT",
-      "tier": "free"
-    }}
-  }}
-}}"#
+    write_root_package_json(root);
+    install_npm_pkg(root, "scopedpkg", "1.0.0", Some(SCOPED_ORIGINAL));
+    write_manifest(
+        root,
+        json!({
+            SCOPED_NPM_PURL: patch_record(
+                "33333333-3333-4333-8333-333333333333",
+                one_file("package/index.js", SCOPED_ORIGINAL, SCOPED_PATCHED),
+            ),
+            "pkg:npm/__ghost_pkg__@9.9.9": patch_record(
+                "44444444-4444-4444-8444-444444444444",
+                one_file("package/index.js", b"ghost original\n", b"ghost patched\n"),
+            ),
+        }),
     );
-    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
+    stage_blob(root, &git_sha256(SCOPED_PATCHED), SCOPED_PATCHED);
+    stage_blob(root, &git_sha256(b"ghost patched\n"), b"ghost patched\n");
 }
 
 /// PINS the current (asymmetric) unmatched-purl exit semantics so any
