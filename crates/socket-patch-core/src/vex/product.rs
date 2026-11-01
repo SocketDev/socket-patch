@@ -378,8 +378,9 @@ fn xml_element_texts<const N: usize>(xml: &str, paths: [&[&str]; N]) -> [Option<
 /// heredoc bodies and anything after `__END__` are not code, and the last
 /// assignment wins (#1573).
 fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
-    let mut lines: Vec<&str> = Vec::new();
-    crate::formats::gem::manifest::for_each_code_line(content, |_, c| lines.push(c));
+    let lines: Vec<&str> = crate::formats::gem::manifest::code_lines(content)
+        .map(|(_, _, code)| code)
+        .collect();
     // The `spec` of `Gem::Specification.new do |spec|`, when the file names
     // it, so a helper's `ext.name = …` elsewhere can't pass for the spec's.
     let receiver = lines

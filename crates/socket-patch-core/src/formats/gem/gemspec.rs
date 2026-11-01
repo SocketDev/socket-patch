@@ -19,6 +19,7 @@
 //! caller cannot know what bundler would lock.
 
 use super::gemfile::{code_of, leading_quoted, split_args};
+use super::manifest::code_lines;
 
 /// The `gemspec` files of one directory: `(file name, text)`, the text
 /// `None` when the file exists but could not be read. `Err` when the
@@ -62,7 +63,7 @@ pub(crate) fn is_gemspec_file(name: &str) -> bool {
 /// without the section (bundler < 1.10) or with an unreadable version does
 /// not.
 pub(crate) fn bundler_merges_dev_dependencies(lock: &str) -> bool {
-    let mut lines = lock.lines().map(|l| l.trim_end_matches('\r'));
+    let mut lines = lock.lines();
     let Some(version) = lines
         .by_ref()
         .find(|l| *l == "BUNDLED WITH")
@@ -95,9 +96,8 @@ pub(crate) struct GemspecDirective {
 /// `path:` / `name:`, a `glob:`, an absolute or escaping path).
 pub(crate) fn gemspec_directives(gemfile: &str) -> Result<Vec<GemspecDirective>, String> {
     let mut out = Vec::new();
-    for (line, text) in gemfile.split('\n').enumerate() {
-        let trimmed = text.trim_start();
-        let Some(rest) = trimmed.strip_prefix("gemspec") else {
+    for (line, text, code) in code_lines(gemfile) {
+        let Some(rest) = code.trim_start().strip_prefix("gemspec") else {
             continue;
         };
         // `gemspec`, `gemspec path: "x"`, `gemspec(path: "x")`; never
@@ -234,15 +234,11 @@ pub(crate) fn dev_dependency_requirements(
     gem: &str,
 ) -> Result<Option<Vec<String>>, String> {
     let mut found: Option<Vec<String>> = None;
-    for (i, text) in gemspec.split('\n').enumerate() {
-        let trimmed = text.trim();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        let Some(at) = trimmed.find("add_development_dependency") else {
+    for (i, text, code) in code_lines(gemspec) {
+        let Some(at) = code.find("add_development_dependency") else {
             continue;
         };
-        let after = &trimmed[at + "add_development_dependency".len()..];
+        let after = &code[at + "add_development_dependency".len()..];
         // Every literal spelling [`literal`] reads: quoted, or `%q` with any
         // of its bracket pairs.
         let mentions = [
@@ -255,7 +251,7 @@ pub(crate) fn dev_dependency_requirements(
         ]
         .iter()
         .any(|(open, close)| after.contains(&format!("{open}{gem}{close}")));
-        let unreadable = || format!("line {}: `{trimmed}`", i + 1);
+        let unreadable = || format!("line {}: `{}`", i + 1, text.trim());
         let Some(reqs) = read_dev_call(after) else {
             if mentions {
                 return Err(unreadable());
@@ -331,10 +327,8 @@ pub(crate) fn locked_exact_requirement(
     if !bundler_merges_dev_dependencies(lock) {
         return Ok(exact);
     }
-    let Some(decl) = gemfile.split('\n').position(|line| {
-        let trimmed = line.trim_start();
-        !trimmed.starts_with('#')
-            && crate::vendor::gem::gem_declaration_any(trimmed).is_some_and(|d| d.name == name)
+    let Some((decl, _, _)) = code_lines(gemfile).find(|(_, line, _)| {
+        crate::vendor::gem::gem_declaration_any(line.trim_start()).is_some_and(|d| d.name == name)
     }) else {
         return Ok(exact);
     };
@@ -551,6 +545,31 @@ mod tests {
             dev_dependency_requirements("# s.add_development_dependency \"v\", \"x\"\n", "v"),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn begin_blocks_heredocs_and_end_data_are_not_code() {
+        let gemfile =
+            "=begin\ngemspec path: \"old\"\n=end\nX = <<~RUBY\n  gemspec path: ROOT\nRUBY\n\
+                       gemspec path: \"core\"\n__END__\ngemspec glob: \"*\"\n";
+        assert_eq!(
+            gemspec_directives(gemfile),
+            Ok(vec![GemspecDirective {
+                line: 6,
+                dir: "core".into(),
+                name: None
+            }])
+        );
+        let spec = "=begin\n  s.add_development_dependency \"vuln-gem\", \"~> 2\"\n=end\n\
+                    DOC = <<-EOS\n  s.add_development_dependency \"vuln-gem\", VERSION\n  EOS\n";
+        assert_eq!(dev_dependency_requirements(spec, "vuln-gem"), Ok(None));
+        // A `gem` line inside a `=begin` block is not the declaration the
+        // directive must precede.
+        let gemfile =
+            "=begin\ngem \"vuln-gem\", \"0.9\"\n=end\ngemspec\ngem \"vuln-gem\", \"1.0.0\"\n";
+        let got =
+            locked_exact_requirement(gemfile, LOCK_27, "vuln-gem", "1.0.0", &mut one(GEMSPEC));
+        assert_eq!(got.as_deref(), Ok(">= 0, = 1.0.0"));
     }
 
     #[test]
