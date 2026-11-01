@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -86,3 +86,11 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
   - Claims more than it checks: the global-prefix banner test asserts an empty map and captures no stderr; 5 `json_envelope` tests say "every" over hand lists that miss `RolledBack`/`Update`; the omission-phrase test's hand list misses `gradle_unpatched_copy` {{T45}}.
   - Misplaced: 14 `is_uuid_shaped` tests in `lib.rs` (core already tests it), `go_redirect_coord_guard` re-tests core, vex_consumed tests ecosystem_dispatch and npm_crawler.
 - **Core crawlers and formats (audit-core, 2026-11-01 12:54Z):** `crawlers/types.rs` ~17 duplicate tests (per-ecosystem `from_purl`/properties tests subsumed by table tests; `test_all_count` is cfg scaffolding); `ruby_crawler` `test_deduplication` stages one store so dedup never runs, plus 1 duplicate; `gem/mirror` 1 duplicate table row. A ruby `crawl_all` test fails under `BUNDLE_PATH__SYSTEM=true` (executed; added to #1919, {{A48}}). Gaps: gemspec `=begin`/heredoc {{A54}}, sbt evidence caps, `checksum_entry_span`, `bundler_uses_system_gems`.
+- **Tally for `tests/apply/*`, `tests/cargo_e2e_matrix`, `tests/cli/*` (32 files, 14.8K lines, audit-cli-tests 2026-11-01 16Z): about 75 fake, duplicate or weak tests.**
+  - Pass with their flag removed (executed): `singleton_mismatch_strict_refuses` (no `--strict`), `apply_stderr_warning_gates_on_silent` (no `--silent`), `failing_fallback_home_copy_write_is_nonfatal_when_store_patched` (no `--strict`); `top_level_help_prints_all_subcommands` stays green with the apply/scan rows deleted.
+  - Can't fail: `apply_network` asserts no `"patched"` action (no such `PatchAction`) ×2; telemetry `post_count == 0` after `received.is_empty()` ×2; prompts_tty `assert_cursor_restored` (self-admitted).
+  - Misnamed: `apply_does_not_mutate_socket_dir_when_no_packages_match` hits `sources_download_failed` over the live proxy {{T53}}; `scan/get_skips_telemetry_in_airgap_mode` refuse `offline_unsupported` before telemetry exists; 5 `in_process_*` suites spawn the binary.
+  - Network where a tempdir is cheap: `in_process_variant_apply_failure` pip-installs `six` from PyPI.
+  - Duplicates: ~8 across `cli_dry_run_paths_e2e`, `output_modes_e2e`, `apply_failure_paths`, `apply_render`, `list_render`.
+  - Scaffolding: toolchain gate ×15 {{T50}}, apply fixtures re-written in 9 suites {{T51}}, PTY runner ×7 {{T52}}, `--json` reader ratchet gaps {{T54}}, `stderr_chatter`/snapshot/venv copies {{T55}}.
+- **Coverage gaps:** a lockfile-only calm skip and a genuine miss serialize identically (`skipped`/`package_not_installed`), and an apply no-matching-variant miss emits no event, so the JSON tests can't check either (executed; C13); no offline round-trip test of the cargo matrix's `Cargo.lock` codec.
