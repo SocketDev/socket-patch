@@ -1,5 +1,5 @@
 ### CLI and tests audit (T rows)
-_Last updated 2026-11-01T16:05Z · main @ cbbbdb9 · owner: audit-cli-tests_
+_Last updated 2026-11-01T15:52Z · main @ cbbbdb9 · owner: audit-cli-tests_
 
 | ID | P | Problem | Issues | Status |
 |---|---|---|---|---|
