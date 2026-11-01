@@ -3,8 +3,7 @@
 //! the vendored backend refuses installers older than 2018, so both ask
 //! [`installed_major`] once per command.
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Pins the answer without spawning anything: CI images without pipenv on
 /// PATH, or a project installed with a different release than the machine's
@@ -39,17 +38,6 @@ fn parse_major(output: &str) -> Option<u32> {
     major.parse().ok()
 }
 
-/// The `pipenv` executable, searched on ABSOLUTE `PATH` entries only: the
-/// CLI runs inside the project being scanned, so a relative entry (`.`, an
-/// empty component) would execute a `pipenv` planted in that repository. On Windows every `PATHEXT` extension is tried,
-/// so `pipenv.exe` and the `pipenv.bat` / `pipenv.cmd` shims (pyenv-win,
-/// hand-written wrappers) are both found. The rule lives in
-/// [`crate::utils::process::resolve_tool_with`], shared with every other
-/// tool the CLI spawns inside a project (`git`, `vlt`, `node`).
-fn resolve_on_path(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    crate::utils::process::resolve_tool_with("pipenv", var)
-}
-
 /// The major of the `pipenv` on PATH (`11`, `2018`, `2026`, …), or `None`
 /// when none is found, it does not answer within 10 s, exits non-zero or
 /// prints something unrecognizable. [`MAJOR_OVERRIDE_ENV`] short-circuits
@@ -61,10 +49,8 @@ pub async fn installed_major(root: &Path) -> Option<u32> {
     {
         return Some(forced);
     }
-    let program = resolve_on_path(&|name| std::env::var_os(name))?;
-    // The RESOLVED path is spawned; a Windows `.bat` / `.cmd` shim is run by
-    // `std` itself through cmd.exe with correct quoting (see the shared
-    // launcher's docs).
+    // Absolute PATH entries only, so a repo-planted `pipenv` never runs.
+    let program = crate::utils::process::resolve_tool("pipenv")?;
     let mut command = crate::utils::process::command_for(&program);
     // The version banner does not depend on a project, so the probe runs in a
     // NEUTRAL directory: with the scanned repository as cwd, Pipenv would read
@@ -122,68 +108,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_on_path_skips_relative_entries_and_finds_absolute_ones() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let leaf = if cfg!(windows) {
-            "pipenv.exe"
-        } else {
-            "pipenv"
-        };
-        std::fs::write(bin.join(leaf), b"").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join(leaf), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
-        // A repo-planted `pipenv` under a RELATIVE entry must never win.
-        let planted = tmp.path().join("planted");
-        std::fs::create_dir_all(&planted).unwrap();
-        std::fs::write(planted.join(leaf), b"").unwrap();
-        let joined = std::env::join_paths([
-            std::path::PathBuf::from("."),
-            std::path::PathBuf::from(""),
-            std::path::PathBuf::from("planted"),
-            bin.clone(),
-        ])
-        .unwrap();
-        let var = |name: &str| (name == "PATH").then(|| joined.clone());
-        assert_eq!(resolve_on_path(&var), Some(bin.join(leaf)));
-
-        let only_relative = std::env::join_paths([
-            std::path::PathBuf::from("."),
-            std::path::PathBuf::from("planted"),
-        ])
-        .unwrap();
-        let var = |name: &str| (name == "PATH").then(|| only_relative.clone());
-        assert_eq!(resolve_on_path(&var), None);
-        let none = |_: &str| None::<OsString>;
-        assert_eq!(resolve_on_path(&none), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolve_on_path_skips_non_executable_files() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let bin = tmp.path().join("bin");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(data.join("pipenv"), b"not a program").unwrap();
-        std::fs::set_permissions(data.join("pipenv"), std::fs::Permissions::from_mode(0o644))
-            .unwrap();
-        std::fs::write(bin.join("pipenv"), b"").unwrap();
-        std::fs::set_permissions(bin.join("pipenv"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
-        let joined = std::env::join_paths([data.clone(), bin.clone()]).unwrap();
-        let var = |name: &str| (name == "PATH").then(|| joined.clone());
-        assert_eq!(resolve_on_path(&var), Some(bin.join("pipenv")));
-    }
-
-    #[test]
     fn override_accepts_a_major_or_a_full_release() {
         assert_eq!(parse_override("11"), Some(11));
         assert_eq!(parse_override(" 2026 "), Some(2026));
@@ -192,33 +116,5 @@ mod tests {
         assert_eq!(parse_override("eleven"), None);
         assert_eq!(parse_override(""), None);
         assert_eq!(parse_override("-11"), None);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn resolve_on_path_honours_pathext_shims() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("pipenv.bat"), b"@echo pipenv, version 2024.4.1").unwrap();
-        let joined = std::env::join_paths([bin.clone()]).unwrap();
-        let var = |name: &str| match name {
-            "PATH" => Some(joined.clone()),
-            "PATHEXT" => Some(OsString::from(".COM;.EXE;.BAT;.CMD")),
-            _ => None,
-        };
-        let found = resolve_on_path(&var).unwrap();
-        assert_eq!(found, bin.join("pipenv.bat"));
-        // Spawned directly: std runs the .bat through cmd.exe itself, and the
-        // banner parses like a real pipenv's.
-        let out = crate::utils::process::command_for(&found)
-            .arg("--version")
-            .output()
-            .expect("std spawns a .bat shim");
-        assert!(out.status.success(), "{out:?}");
-        assert_eq!(
-            parse_major(&String::from_utf8_lossy(&out.stdout)),
-            Some(2024)
-        );
     }
 }

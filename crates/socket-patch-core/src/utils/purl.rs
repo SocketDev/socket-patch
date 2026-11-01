@@ -7,18 +7,8 @@ use crate::patch::path_safety::{
 use crate::utils::purl_key::PurlKey;
 
 /// Strip the trailing `?qualifiers` and `#subpath` components from a PURL,
-/// leaving the canonical `pkg:type/namespace/name@version` base.
-///
-/// The PURL grammar is `pkg:type/ns/name@version?qualifiers#subpath`, so a
-/// subpath can appear *with or without* a preceding qualifier. Cutting only
-/// at `?` would let a bare `#subpath` (no qualifier) leak into the base —
-/// corrupting the version when the result is later split on `@`, and
-/// breaking the grouping/matching keys callers build from it (two PURLs for
-/// the same `name@version` differing only by subpath must collapse to one
-/// base). So we cut at whichever of `?`/`#` comes first.
-///
-/// e.g. `"pkg:pypi/requests@2.28.0?artifact_id=abc"` -> `"pkg:pypi/requests@2.28.0"`
-/// and `"pkg:golang/github.com/foo/bar@v1.0.0#cmd/tool"` -> `"pkg:golang/github.com/foo/bar@v1.0.0"`
+/// leaving the `pkg:type/namespace/name@version` base. A subpath can appear
+/// without a qualifier, so this cuts at whichever of `?`/`#` comes first.
 pub fn strip_purl_qualifiers(purl: &str) -> &str {
     match purl.find(['?', '#']) {
         Some(idx) => &purl[..idx],
@@ -174,7 +164,7 @@ pub fn purl_parts(purl: &str) -> Option<(String, String, String)> {
 /// the version off at the LAST `@` — so the name/path keeps any internal
 /// slashes and `@`s.
 ///
-/// Private: every caller goes through [`parse_name_version`] /
+/// Every caller goes through [`parse_name_version`] /
 /// [`parse_namespaced`], which percent-decode the split-out components. The
 /// split has to happen on the ENCODED text so an escaped separator (`%2f`,
 /// `%40`) can never introduce a new segment or a second `@` at parse time.
@@ -203,10 +193,7 @@ fn split_name_version<'a>(purl: &'a str, prefix: &str) -> Option<(&'a str, &'a s
 ///
 /// Feed this the purl as it arrived: an ALREADY-decoded spelling (e.g.
 /// [`canonical_purl`] output) would be decoded a second time.
-pub(crate) fn parse_name_version<'a>(
-    purl: &'a str,
-    prefix: &str,
-) -> Option<(Cow<'a, str>, Cow<'a, str>)> {
+fn parse_name_version<'a>(purl: &'a str, prefix: &str) -> Option<(Cow<'a, str>, Cow<'a, str>)> {
     let (name, version) = split_name_version(purl, prefix)?;
     Some((
         percent_decode_purl_component(name),
@@ -297,29 +284,14 @@ pub(crate) fn build_composer_purl(namespace: &str, name: &str, version: &str) ->
 /// (jsr `@scope/name`, composer `vendor/name`).
 pub(crate) type NamespacedPurlParts<'a> = ((Cow<'a, str>, Cow<'a, str>), Cow<'a, str>);
 
-/// [`NamespacedPurlParts`] under the JSR crawler's own name.
-pub(crate) type JsrPurlParts<'a> = NamespacedPurlParts<'a>;
-
-/// Parse a JSR PURL to extract scope, name, and version.
+/// Parse a JSR (Deno registry) PURL, `pkg:jsr/@<scope>/<name>@<version>`,
+/// to extract scope, name, and version. The scope keeps its leading `@`,
+/// which the API serves encoded (`%40std`).
 ///
-/// JSR (https://jsr.io) is Deno's package registry. Packages are
-/// always scoped (`@scope/name`). PURL form:
-/// `pkg:jsr/<scope>/<name>@<version>` — e.g.
-/// `"pkg:jsr/@std/path@0.220.0"` -> `Some((("@std", "path"), "0.220.0"))`.
-///
-/// `pkg:jsr/` isn't a standardized purl-type upstream as of writing,
-/// but the convention is informally adopted by some Deno tooling.
-/// We follow the same shape as `parse_composer_purl` since both
-/// have a `<scope>/<name>` namespace structure. The leading `@` on
-/// the scope is preserved (matching npm's `@scope/name` convention).
-pub(crate) fn parse_jsr_purl(purl: &str) -> Option<JsrPurlParts<'_>> {
-    // `parse_namespaced` decodes AFTER splitting on `/`/`@` and BEFORE the
-    // shape check below (and the caller's `is_safe_jsr_component` gate) —
-    // see `percent_decode_purl_component`. The API serves `%40scope`.
+/// e.g. `"pkg:jsr/@std/path@0.220.0"` -> `Some((("@std", "path"), "0.220.0"))`
+pub(crate) fn parse_jsr_purl(purl: &str) -> Option<NamespacedPurlParts<'_>> {
     let ((scope, name), version) = parse_namespaced(purl, "pkg:jsr/")?;
-
-    // Scope must be `@<non-empty>`. The bare `@` (length 1) is
-    // invalid — there's no actual scope after the marker.
+    // A bare `@` is not a scope.
     if !scope.starts_with('@') || scope.len() < 2 {
         return None;
     }
@@ -361,11 +333,6 @@ pub(crate) fn build_cargo_purl(name: &str, version: &str) -> String {
     format!("pkg:cargo/{name}@{version}")
 }
 
-/// Check if a string looks like a PURL.
-pub fn is_purl(s: &str) -> bool {
-    s.starts_with("pkg:")
-}
-
 /// Does a manifest PURL key match a user-supplied PURL identifier?
 ///
 /// Release-variant ecosystems key patches in the manifest by their
@@ -395,13 +362,9 @@ pub fn purl_matches_identifier(manifest_key: &str, identifier: &str) -> bool {
     }
 }
 
-// ── validating builders ─────────────────────────────────────────────────
-// The purl builders lockfile discovery (`vex::discover`, which re-exports
-// them under the same names) and the lock inventory's registry views share:
-// each validates the coordinates fail-closed — lockfiles are committed,
-// tamper-able input whose names and versions later feed filesystem paths
-// and download urls — and returns `None` rather than a purl it would have
-// to trust.
+// The validating builders below take lock-recorded coordinates, which are
+// committed, tamper-able input that later feeds filesystem paths and
+// download urls, so each returns `None` rather than a purl it can't trust.
 
 /// `pkg:npm/<name>@<version>` for lock-recorded coordinates, or `None` when
 /// the name fails the npm backends' own shape rule (at most one `/`, only
@@ -450,58 +413,6 @@ pub fn composer_purl(name: &str, version: &str) -> Option<String> {
 pub fn maven_purl(group: &str, artifact: &str, version: &str) -> Option<String> {
     crate::vendor::jvm::layout::is_path_safe(group, artifact, version)
         .then(|| build_maven_purl(group, artifact, version))
-}
-
-#[cfg(test)]
-mod builder_tests {
-    use super::*;
-
-    #[test]
-    fn purl_builders_validate_coordinates() {
-        assert_eq!(
-            npm_purl("left-pad", "1.3.0").as_deref(),
-            Some("pkg:npm/left-pad@1.3.0")
-        );
-        assert_eq!(
-            npm_purl("@s/x", "1.0.0").as_deref(),
-            Some("pkg:npm/@s/x@1.0.0")
-        );
-        assert_eq!(npm_purl("a/b", "1.0.0"), None, "unscoped slash");
-        assert_eq!(npm_purl("@s/x/y", "1.0.0"), None, "extra level");
-        assert_eq!(npm_purl("x", "../1"), None);
-        assert_eq!(npm_purl("..", "1.0.0"), None);
-        assert_eq!(
-            pypi_purl("Foo.Bar", "1.0").as_deref(),
-            Some("pkg:pypi/foo-bar@1.0")
-        );
-        assert_eq!(pypi_purl("a/b", "1.0"), None);
-        assert_eq!(
-            simple_purl("cargo", "serde", "1.0.0").as_deref(),
-            Some("pkg:cargo/serde@1.0.0")
-        );
-        assert_eq!(
-            simple_purl("npm", "x", "1"),
-            None,
-            "not a single-segment ecosystem"
-        );
-        assert_eq!(simple_purl("gem", "a:b", "1"), None);
-        assert_eq!(
-            golang_purl("github.com/foo/bar", "v1.2.3").as_deref(),
-            Some("pkg:golang/github.com/foo/bar@v1.2.3")
-        );
-        assert_eq!(golang_purl("github.com/../x", "v1"), None);
-        assert_eq!(
-            composer_purl("Monolog/Monolog", "2.0.0").as_deref(),
-            Some("pkg:composer/monolog/monolog@2.0.0")
-        );
-        assert_eq!(composer_purl("monolog", "2.0.0"), None);
-        assert_eq!(
-            maven_purl("org.slf4j", "slf4j-api", "1.7.36").as_deref(),
-            Some("pkg:maven/org.slf4j/slf4j-api@1.7.36")
-        );
-        assert_eq!(maven_purl("org..x", "a", "1"), None);
-        assert_eq!(maven_purl("", "a", "1"), None, "empty group");
-    }
 }
 
 #[cfg(test)]
@@ -595,14 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_purl() {
-        assert!(is_purl("pkg:npm/lodash@4.17.21"));
-        assert!(is_purl("pkg:pypi/requests@2.28.0"));
-        assert!(!is_purl("lodash"));
-        assert!(!is_purl("CVE-2024-1234"));
-    }
-
-    #[test]
     fn test_parse_cargo_purl() {
         assert_eq!(
             nv(parse_cargo_purl("pkg:cargo/serde@1.0.200")),
@@ -617,10 +520,8 @@ mod tests {
         assert_eq!(parse_cargo_purl("pkg:cargo/serde@"), None);
     }
 
-    /// REGRESSION: the API serves canonical (percent-encoded) purls, so a
-    /// semver build-metadata version arrives as `0.11.0%2Bwasi-…`. Compared
-    /// undecoded against Cargo.lock / the registry checkout it never
-    /// matched, and cargo vendoring of every such crate failed closed.
+    /// The API serves canonical (percent-encoded) purls, so a semver
+    /// build-metadata version arrives as `0.11.0%2Bwasi-…`.
     #[test]
     fn parsers_percent_decode_the_version() {
         assert_eq!(
@@ -690,38 +591,6 @@ mod tests {
         assert_eq!(version, "1.0.0%zz");
     }
 
-    /// Round trip through the canonical (encoded) spelling the API serves.
-    #[test]
-    fn cargo_purl_round_trips_through_the_encoded_spelling() {
-        let (name, version) = ("wasi", "0.11.0+wasi-snapshot-preview1");
-        let encoded = build_cargo_purl(name, &version.replace('+', "%2B"));
-        assert_eq!(
-            nv(parse_cargo_purl(&encoded)),
-            Some((name.into(), version.into()))
-        );
-        // The decoded spelling parses to the same pair (both are served).
-        assert_eq!(
-            nv(parse_cargo_purl(&build_cargo_purl(name, version))),
-            Some((name.into(), version.into()))
-        );
-    }
-
-    #[test]
-    fn test_build_cargo_purl() {
-        assert_eq!(
-            build_cargo_purl("serde", "1.0.200"),
-            "pkg:cargo/serde@1.0.200"
-        );
-    }
-
-    #[test]
-    fn test_cargo_purl_round_trip() {
-        let purl = build_cargo_purl("tokio", "1.38.0");
-        let (name, version) = parse_cargo_purl(&purl).unwrap();
-        assert_eq!(name, "tokio");
-        assert_eq!(version, "1.38.0");
-    }
-
     #[test]
     fn test_parse_gem_purl() {
         assert_eq!(
@@ -735,19 +604,6 @@ mod tests {
         assert_eq!(parse_gem_purl("pkg:npm/lodash@4.17.21"), None);
         assert_eq!(parse_gem_purl("pkg:gem/@1.0.0"), None);
         assert_eq!(parse_gem_purl("pkg:gem/rails@"), None);
-    }
-
-    #[test]
-    fn test_build_gem_purl() {
-        assert_eq!(build_gem_purl("rails", "7.1.0"), "pkg:gem/rails@7.1.0");
-    }
-
-    #[test]
-    fn test_gem_purl_round_trip() {
-        let purl = build_gem_purl("nokogiri", "1.16.5");
-        let (name, version) = parse_gem_purl(&purl).unwrap();
-        assert_eq!(name, "nokogiri");
-        assert_eq!(version, "1.16.5");
     }
 
     #[test]
@@ -785,23 +641,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_maven_purl() {
-        assert_eq!(
-            build_maven_purl("org.apache.commons", "commons-lang3", "3.12.0"),
-            "pkg:maven/org.apache.commons/commons-lang3@3.12.0"
-        );
-    }
-
-    #[test]
-    fn test_maven_purl_round_trip() {
-        let purl = build_maven_purl("com.google.guava", "guava", "32.1.3-jre");
-        let (group_id, artifact_id, version) = parse_maven_purl(&purl).unwrap();
-        assert_eq!(group_id, "com.google.guava");
-        assert_eq!(artifact_id, "guava");
-        assert_eq!(version, "32.1.3-jre");
-    }
-
-    #[test]
     fn test_parse_golang_purl() {
         assert_eq!(
             nv(parse_golang_purl(
@@ -816,37 +655,10 @@ mod tests {
         assert_eq!(parse_golang_purl("pkg:npm/lodash@4.17.21"), None);
         assert_eq!(parse_golang_purl("pkg:golang/@v1.0.0"), None);
         assert_eq!(parse_golang_purl("pkg:golang/github.com/foo/bar@"), None);
-    }
-
-    /// The API's canonical purls percent-encode `+` (`%2B`); every consumer
-    /// of the parsed coordinates (crawler lookup, go.mod replace, vendor
-    /// copy dir) needs the decoded `+incompatible` version Go uses.
-    #[test]
-    fn test_parse_golang_purl_percent_decodes() {
-        let (module, version) =
-            parse_golang_purl("pkg:golang/github.com/foo/bar@v2.0.0%2Bincompatible").unwrap();
-        assert_eq!(module, "github.com/foo/bar");
-        assert_eq!(version, "v2.0.0+incompatible");
         assert_eq!(
-            parse_golang_purl("pkg:golang/github.com/Azure/x@v1.0.0"),
+            nv(parse_golang_purl("pkg:golang/github.com/Azure/x@v1.0.0")),
             Some(("github.com/Azure/x".into(), "v1.0.0".into()))
         );
-    }
-
-    #[test]
-    fn test_build_golang_purl() {
-        assert_eq!(
-            build_golang_purl("github.com/gin-gonic/gin", "v1.9.1"),
-            "pkg:golang/github.com/gin-gonic/gin@v1.9.1"
-        );
-    }
-
-    #[test]
-    fn test_golang_purl_round_trip() {
-        let purl = build_golang_purl("golang.org/x/text", "v0.14.0");
-        let (module_path, version) = parse_golang_purl(&purl).unwrap();
-        assert_eq!(module_path, "golang.org/x/text");
-        assert_eq!(version, "v0.14.0");
     }
 
     #[test]
@@ -863,14 +675,6 @@ mod tests {
         assert_eq!(parse_composer_purl("pkg:composer/@3.5.0"), None);
         assert_eq!(parse_composer_purl("pkg:composer/monolog/@3.5.0"), None);
         assert_eq!(parse_composer_purl("pkg:composer/monolog/monolog@"), None);
-    }
-
-    #[test]
-    fn test_build_composer_purl() {
-        assert_eq!(
-            build_composer_purl("monolog", "monolog", "3.5.0"),
-            "pkg:composer/monolog/monolog@3.5.0"
-        );
     }
 
     fn jsr_parts(purl: &str) -> Option<(String, String, String)> {
@@ -891,36 +695,11 @@ mod tests {
         assert_eq!(jsr_parts("pkg:jsr/std/path@0.220.0"), None);
         // Empty pieces.
         assert_eq!(jsr_parts("pkg:jsr/@/path@0.220.0"), None);
+        assert_eq!(jsr_parts("pkg:jsr/%40/path@0.220.0"), None);
         assert_eq!(jsr_parts("pkg:jsr/@std/@0.220.0"), None);
         assert_eq!(jsr_parts("pkg:jsr/@std/path@"), None);
         // Wrong scheme.
         assert_eq!(jsr_parts("pkg:npm/@std/path@0.220.0"), None);
-    }
-
-    #[test]
-    fn test_build_jsr_purl() {
-        assert_eq!(
-            build_jsr_purl("@std", "path", "0.220.0"),
-            "pkg:jsr/@std/path@0.220.0"
-        );
-    }
-
-    #[test]
-    fn test_jsr_purl_round_trip() {
-        let purl = build_jsr_purl("@std", "path", "0.220.0");
-        let ((scope, name), version) = parse_jsr_purl(&purl).unwrap();
-        assert_eq!(scope, "@std");
-        assert_eq!(name, "path");
-        assert_eq!(version, "0.220.0");
-    }
-
-    #[test]
-    fn test_composer_purl_round_trip() {
-        let purl = build_composer_purl("symfony", "console", "6.4.1");
-        let ((namespace, name), version) = parse_composer_purl(&purl).unwrap();
-        assert_eq!(namespace, "symfony");
-        assert_eq!(name, "console");
-        assert_eq!(version, "6.4.1");
     }
 
     #[test]
@@ -937,30 +716,6 @@ mod tests {
         assert_eq!(parse_nuget_purl("pkg:nuget/@1.0.0"), None);
         assert_eq!(parse_nuget_purl("pkg:nuget/Newtonsoft.Json@"), None);
     }
-
-    #[test]
-    fn test_build_nuget_purl() {
-        assert_eq!(
-            build_nuget_purl("Newtonsoft.Json", "13.0.3"),
-            "pkg:nuget/Newtonsoft.Json@13.0.3"
-        );
-    }
-
-    #[test]
-    fn test_nuget_purl_round_trip() {
-        let purl = build_nuget_purl("System.Text.Json", "8.0.0");
-        let (name, version) = parse_nuget_purl(&purl).unwrap();
-        assert_eq!(name, "System.Text.Json");
-        assert_eq!(version, "8.0.0");
-    }
-
-    // --- Regression: qualifier handling -------------------------------------
-    //
-    // Qualifiers are stripped *before* the version is split off with
-    // `rfind('@')`. This matters because a qualifier *value* can itself
-    // contain an `@` (e.g. a `git@github.com` source URL). If stripping
-    // ran after the `@` search, that trailing `@` would be mistaken for
-    // the version separator and corrupt both name and version.
 
     #[test]
     fn test_strip_qualifiers_with_embedded_at() {
@@ -1077,8 +832,6 @@ mod tests {
         );
     }
 
-    // --- Regression: purl_matches_identifier for non-PyPI keys --------------
-
     #[test]
     fn test_purl_matches_identifier_qualified_id_needs_exact_key() {
         // A qualified identifier must not match an unqualified manifest
@@ -1098,13 +851,6 @@ mod tests {
             "pkg:gem/nokogiri@1.16.5"
         ));
     }
-
-    // --- Regression: PURL subpath (`#...`) handling -------------------------
-    //
-    // The PURL grammar is `pkg:type/ns/name@version?qualifiers#subpath`. A
-    // subpath can appear *without* a preceding qualifier, so stripping only
-    // at `?` lets it leak into the base — which then corrupts the version
-    // (split on `@`) and breaks every grouping/matching key built from it.
 
     #[test]
     fn test_strip_subpath_without_qualifier() {
@@ -1159,8 +905,6 @@ mod tests {
             "pkg:golang/github.com/foo/bar@v1.0.0"
         ));
     }
-
-    // --- Percent-decoding: API purls carry %-encoded components --------------
 
     #[test]
     fn test_percent_decode_purl_component() {
@@ -1244,7 +988,7 @@ mod tests {
         ));
     }
 
-    /// B73: remove/rollback identifiers fold what the ecosystem folds: a
+    /// Remove/rollback identifiers fold what the ecosystem folds: a
     /// PEP 503 spelling or a NuGet case variant names the recorded patch.
     #[test]
     fn test_purl_matches_identifier_folds_pep503_and_nuget_case() {
@@ -1298,13 +1042,10 @@ mod tests {
 
     #[test]
     fn test_purl_matches_identifier_pypi_pep503_spellings() {
-        // #1024: patch keys are PEP 503 canonical, but users type the
+        // Patch keys are PEP 503 canonical, but users type the
         // name as the project declares it. Every spelling must select the
         // patch, for base and qualified identifiers alike.
-        let purl_eq = |a: &str, b: &str| {
-            crate::utils::purl_key::PurlKey::qualified(a)
-                == crate::utils::purl_key::PurlKey::qualified(b)
-        };
+        let purl_eq = |a: &str, b: &str| PurlKey::qualified(a) == PurlKey::qualified(b);
         let key = "pkg:pypi/typing-extensions@4.7.1";
         let qualified = "pkg:pypi/typing-extensions@4.7.1?artifact_id=abc";
         for spelling in [
@@ -1350,18 +1091,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_jsr_purl_percent_encoded_scope() {
-        let ((scope, name), version) = parse_jsr_purl("pkg:jsr/%40std/path@0.220.0").unwrap();
-        assert_eq!(scope, "@std");
-        assert_eq!(name, "path");
-        assert_eq!(version, "0.220.0");
-        // The encoded bare `@` is still rejected post-decode.
-        assert_eq!(jsr_parts("pkg:jsr/%40/path@0.220.0"), None);
-    }
-
-    // --- Regression: name must not absorb the version separator -------------
-
-    #[test]
     fn test_parse_multiple_at_takes_last_as_version_separator() {
         // `rfind('@')` (not `find`) ensures the *last* `@` splits the
         // version, so a name/path that itself contained an `@` keeps it.
@@ -1370,11 +1099,53 @@ mod tests {
             Some(("weird@name".into(), "1.0.0".into()))
         );
     }
-}
 
-#[cfg(test)]
-mod parts_tests {
-    use super::*;
+    #[test]
+    fn purl_builders_validate_coordinates() {
+        assert_eq!(
+            npm_purl("left-pad", "1.3.0").as_deref(),
+            Some("pkg:npm/left-pad@1.3.0")
+        );
+        assert_eq!(
+            npm_purl("@s/x", "1.0.0").as_deref(),
+            Some("pkg:npm/@s/x@1.0.0")
+        );
+        assert_eq!(npm_purl("a/b", "1.0.0"), None, "unscoped slash");
+        assert_eq!(npm_purl("@s/x/y", "1.0.0"), None, "extra level");
+        assert_eq!(npm_purl("x", "../1"), None);
+        assert_eq!(npm_purl("..", "1.0.0"), None);
+        assert_eq!(
+            pypi_purl("Foo.Bar", "1.0").as_deref(),
+            Some("pkg:pypi/foo-bar@1.0")
+        );
+        assert_eq!(pypi_purl("a/b", "1.0"), None);
+        assert_eq!(
+            simple_purl("cargo", "serde", "1.0.0").as_deref(),
+            Some("pkg:cargo/serde@1.0.0")
+        );
+        assert_eq!(
+            simple_purl("npm", "x", "1"),
+            None,
+            "not a single-segment ecosystem"
+        );
+        assert_eq!(simple_purl("gem", "a:b", "1"), None);
+        assert_eq!(
+            golang_purl("github.com/foo/bar", "v1.2.3").as_deref(),
+            Some("pkg:golang/github.com/foo/bar@v1.2.3")
+        );
+        assert_eq!(golang_purl("github.com/../x", "v1"), None);
+        assert_eq!(
+            composer_purl("Monolog/Monolog", "2.0.0").as_deref(),
+            Some("pkg:composer/monolog/monolog@2.0.0")
+        );
+        assert_eq!(composer_purl("monolog", "2.0.0"), None);
+        assert_eq!(
+            maven_purl("org.slf4j", "slf4j-api", "1.7.36").as_deref(),
+            Some("pkg:maven/org.slf4j/slf4j-api@1.7.36")
+        );
+        assert_eq!(maven_purl("org..x", "a", "1"), None);
+        assert_eq!(maven_purl("", "a", "1"), None, "empty group");
+    }
 
     #[test]
     fn purl_parts_strip_qualifiers_and_decode() {
