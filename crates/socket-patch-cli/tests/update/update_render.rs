@@ -127,69 +127,8 @@ async fn update_dry_run_human_reports_update_available() {
 #[cfg(unix)]
 mod pty {
     use super::*;
-    use portable_pty::{native_pty_system, PtySize};
-    use std::path::Path;
+    use crate::pty_io;
     use std::time::Duration;
-
-    /// Spawn `bin` inside a PTY under the standard SOCKET_* scrub, apply
-    /// `env` last (so injections survive), send `input`, and collect all
-    /// output until exit (watchdog-killed after `timeout`).
-    fn run_in_pty_env(
-        bin: &Path,
-        args: &[&str],
-        cwd: &Path,
-        env: &[(&str, &str)],
-        input: &str,
-        timeout: Duration,
-    ) -> (i32, String) {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-
-        // The hermetic environment: SOCKET_YES would skip the very prompt
-        // this test drives, and the update notifier is forced off (this
-        // suite hands the child a REAL terminal, so the stderr-TTY guard
-        // does not protect it).
-        let mut cmd = crate::common::hermetic::pty_command(bin);
-        for a in args {
-            cmd.arg(a);
-        }
-        cmd.cwd(cwd);
-        // Caller env lands last so explicit injections survive the scrub.
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
-        drop(pair.slave);
-
-        let reader_handle =
-            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
-
-        let mut killer = child.clone_killer();
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            let _ = killer.kill();
-        });
-
-        let mut writer = pair.master.take_writer().expect("take writer");
-        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
-        drop(writer);
-
-        let status = child.wait().expect("child.wait");
-        drop(pair.master);
-        let output = reader_handle.finish();
-        (
-            status.exit_code() as i32,
-            String::from_utf8_lossy(&output).to_string(),
-        )
-    }
 
     /// Declining the reinstall confirm must cancel with exit 1 and
     /// "Cancelled; no changes made.", leaving the installed binary byte-identical.
@@ -204,15 +143,15 @@ mod pty {
         let install = staged_install();
         let state_dir = install.state_dir.display().to_string();
 
-        let (code, output) = run_in_pty_env(
-            &install.bin,
+        let pty_io::PtyRun { code, output, .. } = pty_io::run_command(
+            crate::common::hermetic::pty_command(&install.bin),
             &["--update", CURRENT, "--force"],
             &install.workdir,
             &[
                 ("SOCKET_UPDATE_BASE_URL", DEAD_ENDPOINT),
                 ("SOCKET_UPDATE_STATE_DIR", state_dir.as_str()),
             ],
-            "n\n",
+            &[b"n\n"],
             Duration::from_secs(15),
         );
 
