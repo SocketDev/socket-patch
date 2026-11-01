@@ -1,5 +1,5 @@
 ### Core audit (A rows)
-_Last updated 2026-11-01T01:20Z · main @ cbbbdb9 · owner: audit-core_
+_Last updated 2026-11-01T00:49Z · main @ cbbbdb9 · owner: audit-core_
 
 | ID | P | Problem | Issues | Status |
 |---|---|---|---|---|
