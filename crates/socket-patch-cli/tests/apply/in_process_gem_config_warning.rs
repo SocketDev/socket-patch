@@ -50,7 +50,11 @@ fn run(root: &Path, args: &[&str]) -> (i32, String, String) {
     let mut argv = args.to_vec();
     let cwd = root.display().to_string();
     argv.extend(["--cwd", cwd.as_str()]);
-    run_gem(root, &argv, &[("PATH", empty_path.to_str().unwrap())])
+    run_gem(
+        Path::new("."),
+        &argv,
+        &[("PATH", empty_path.to_str().unwrap())],
+    )
 }
 
 fn assert_warning_in(env: &serde_json::Value, value_fragment: &str, ctx: &str) {

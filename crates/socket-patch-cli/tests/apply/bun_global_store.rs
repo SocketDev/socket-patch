@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::apply_fixture::{link_dir, one_file, patch_record, stage_blob, write_manifest};
+use super::apply_fixture::{index_js_patches, link_dir, stage_blob, write_manifest};
 use crate::common::envelope::event_for;
 use crate::common::{git_sha256, parse_json_envelope, run_with_env};
 
@@ -71,16 +71,7 @@ fn stage(tmp: &Path, bytes: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 fn write_patches(root: &Path, purls: &[&str]) {
-    let patches = purls
-        .iter()
-        .enumerate()
-        .map(|(i, purl)| {
-            let uuid = format!("63563563-0000-4000-8000-00000000000{i}");
-            let record = patch_record(&uuid, one_file("package/index.js", BEFORE, AFTER));
-            (purl.to_string(), record)
-        })
-        .collect();
-    write_manifest(root, Value::Object(patches));
+    write_manifest(root, index_js_patches(purls, "63563563", BEFORE, AFTER));
     for bytes in [BEFORE, AFTER] {
         stage_blob(root, &git_sha256(bytes), bytes);
     }

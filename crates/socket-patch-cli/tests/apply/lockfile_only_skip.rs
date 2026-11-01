@@ -10,11 +10,10 @@
 
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::apply_fixture::{
-    install_npm_pkg, one_file, patch_record, run_apply, stage_blob, write_manifest, MM_AFTER,
-    MM_BEFORE,
+    index_js_patches, install_npm_pkg, run_apply, stage_blob, write_manifest, MM_AFTER, MM_BEFORE,
 };
 use crate::common::envelope::event_for;
 use crate::common::{git_sha256, parse_json_envelope};
@@ -22,16 +21,10 @@ use crate::common::{git_sha256, parse_json_envelope};
 /// `.socket/manifest.json` holding one record per purl, with the after
 /// blob staged so the offline source guard is never what fires.
 fn write_patches(root: &Path, purls: &[&str]) {
-    let patches = purls
-        .iter()
-        .enumerate()
-        .map(|(i, purl)| {
-            let uuid = format!("40340340-0000-4000-8000-00000000000{i}");
-            let record = patch_record(&uuid, one_file("package/index.js", MM_BEFORE, MM_AFTER));
-            (purl.to_string(), record)
-        })
-        .collect();
-    write_manifest(root, Value::Object(patches));
+    write_manifest(
+        root,
+        index_js_patches(purls, "40340340", MM_BEFORE, MM_AFTER),
+    );
     stage_blob(root, &git_sha256(MM_AFTER), MM_AFTER);
 }
 

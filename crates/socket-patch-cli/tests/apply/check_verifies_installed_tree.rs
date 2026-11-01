@@ -197,8 +197,10 @@ fn gem_project(installed: &[u8]) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(root.join("Gemfile"), b"source 'https://rubygems.org'\n").unwrap();
-    install_gem(root, "nokogiri-1.16.5", "lib/nokogiri.rb", installed);
-    std::fs::create_dir_all(root.join("vendor/bundle/ruby/3.4.0/specifications")).unwrap();
+    let file = install_gem(root, "nokogiri-1.16.5", "lib/nokogiri.rb", installed);
+    // `<ruby>/gems/<leaf>/lib/nokogiri.rb` -> `<ruby>/specifications`.
+    let ruby_dir = file.ancestors().nth(4).unwrap();
+    std::fs::create_dir_all(ruby_dir.join("specifications")).unwrap();
     write_manifest(
         root,
         json!({ GEM_LINUX: patch_record(
@@ -362,19 +364,13 @@ fn run_remedy_then_check(cwd: &Path, remedy: &[String], check: &[&str]) -> (i32,
 
 /// Stores the patched bytes as the after-hash blob, so `apply --offline`
 /// can heal the tree.
-fn store_after_blob(project_root: &Path) {
-    let blobs = project_root.join(".socket/blobs");
-    std::fs::create_dir_all(&blobs).unwrap();
-    std::fs::write(blobs.join(git_sha256(PATCHED)), PATCHED).unwrap();
-}
-
 /// #1219: a `--cwd` check's remedy keeps `--cwd`. Before, it said plain
 /// `socket-patch apply`, which from the parent dir found no manifest,
 /// exited 0 and left the project unpatched.
 #[test]
 fn check_remedy_keeps_cwd_and_heals_the_checked_tree() {
     let tmp = project(Some(ORIGINAL));
-    store_after_blob(tmp.path());
+    stage_blob(tmp.path(), &git_sha256(PATCHED), PATCHED);
     let parent = tmp.path().parent().unwrap();
     let dir = tmp.path().file_name().unwrap().to_str().unwrap();
 
@@ -397,7 +393,7 @@ fn check_remedy_keeps_cwd_and_heals_the_checked_tree() {
 #[test]
 fn check_remedy_keeps_global_prefix_and_heals_the_checked_tree() {
     let tmp = project(None);
-    store_after_blob(tmp.path());
+    stage_blob(tmp.path(), &git_sha256(PATCHED), PATCHED);
     let prefix = tmp.path().join("global lib").join("node_modules");
     let index = prefix.join("check-target/index.js");
     std::fs::create_dir_all(index.parent().unwrap()).unwrap();

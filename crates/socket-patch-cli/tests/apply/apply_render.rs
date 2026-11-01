@@ -7,7 +7,7 @@
 //! `Would remove` announcement, "No patches to apply.", the
 //! no-matching-package error block, the dry-run summary counts,
 //! `--verbose` per-file labels, the pnpm/bun/vlt layout notes, the
-//! yarn-PnP refusal, the gem fallback-home skip warning, the gem
+//! yarn-PnP refusal, the gem
 //! variant mismatch warning and no-matching-variant error, the
 //! `--dry-run --vex` skip line, and the staging layer's offline
 //! no-local-source report and download result line.

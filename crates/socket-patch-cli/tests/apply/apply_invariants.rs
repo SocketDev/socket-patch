@@ -20,7 +20,7 @@ use std::path::Path;
 use serde_json::json;
 
 use super::apply_fixture::{
-    hashed_file, install_npm_pkg, one_file, patch_record, stage_blob, write_manifest,
+    hashed_file, install_npm_pkg, one_file, patch_record, run_apply, stage_blob, write_manifest,
     write_root_package_json,
 };
 use crate::common::{binary, git_sha256, hermetic_command};
@@ -42,20 +42,6 @@ fn write_project(root: &Path) {
         }),
     );
     stage_blob(root, "sentinel", b"do not modify me");
-}
-
-fn run_apply(cwd: &Path, extra: &[&str]) -> (i32, String) {
-    let mut args = vec!["apply", "--json"];
-    args.extend_from_slice(extra);
-    let out = hermetic_command(&binary())
-        .args(&args)
-        .current_dir(cwd)
-        .output()
-        .expect("run socket-patch");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-    )
 }
 
 /// Every counter in the envelope's `summary` block must be exactly 0.
@@ -119,9 +105,10 @@ fn offline_ecosystems_filter_ignores_out_of_scope_missing_source() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_mixed_scope_project(tmp.path());
 
-    let (code, stdout) = run_apply(
+    let (code, stdout, _) = run_apply(
         tmp.path(),
-        &["--offline", "--silent", "--ecosystems", "npm"],
+        &["--json", "--offline", "--silent", "--ecosystems", "npm"],
+        &[],
     );
     let v: serde_json::Value =
         serde_json::from_str(&stdout).expect("apply --json must emit valid JSON");
@@ -156,7 +143,7 @@ fn offline_ecosystems_filter_ignores_out_of_scope_missing_source() {
     // still fire — the guard is scoped, not disabled.
     let tmp2 = tempfile::tempdir().expect("tempdir");
     write_mixed_scope_project(tmp2.path());
-    let (code2, stdout2) = run_apply(tmp2.path(), &["--offline", "--silent"]);
+    let (code2, stdout2, _) = run_apply(tmp2.path(), &["--json", "--offline", "--silent"], &[]);
     assert_eq!(
         code2, 1,
         "with no ecosystem filter the sourceless pypi patch is in scope and \
@@ -172,7 +159,7 @@ fn offline_with_missing_source_emits_partial_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_project(tmp.path());
 
-    let (code, stdout) = run_apply(tmp.path(), &["--offline", "--silent"]);
+    let (code, stdout, _) = run_apply(tmp.path(), &["--json", "--offline", "--silent"], &[]);
 
     // Exit code 1 is contract: any patch without a usable source under
     // `--offline` flips the run to partialFailure.
@@ -215,7 +202,7 @@ fn apply_does_not_mutate_socket_dir_offline() {
 
     let socket = tmp.path().join(".socket");
     let before = snapshot_dir(&socket);
-    let (code, stdout) = run_apply(tmp.path(), &["--offline", "--silent"]);
+    let (code, stdout, _) = run_apply(tmp.path(), &["--json", "--offline", "--silent"], &[]);
     let after = snapshot_dir(&socket);
 
     // The run must have actually taken the failure path we care about —
@@ -243,7 +230,7 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
 
     let socket = tmp.path().join(".socket");
     let before = snapshot_dir(&socket);
-    let (code, stdout) = run_apply(tmp.path(), &["--silent"]);
+    let (code, stdout, _) = run_apply(tmp.path(), &["--json", "--silent"], &[]);
     let after = snapshot_dir(&socket);
 
     // Pin the bail itself, or a run that died early would leave
@@ -290,7 +277,7 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
 fn apply_with_no_socket_dir_emits_no_manifest_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Note: NO .socket/ directory at all — completely fresh tree.
-    let (code, stdout) = run_apply(tmp.path(), &[]);
+    let (code, stdout, _) = run_apply(tmp.path(), &["--json"], &[]);
     assert_eq!(code, 0, "no-manifest is not an error; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope must be valid JSON");
     assert_eq!(v["command"], "apply");
@@ -380,7 +367,7 @@ fn apply_with_unreadable_socket_dir_fails_closed() {
         return;
     }
 
-    let (code, stdout) = run_apply(tmp.path(), &[]);
+    let (code, stdout, _) = run_apply(tmp.path(), &["--json"], &[]);
     restore();
 
     assert_ne!(
@@ -451,7 +438,7 @@ fn unmatched_purl_exit_semantics_are_pinned() {
     // with the miss visible only as a skipped event.
     let tmp = tempfile::tempdir().expect("tempdir");
     write_partial_match_project(tmp.path());
-    let (code, stdout) = run_apply(tmp.path(), &["--offline", "--silent"]);
+    let (code, stdout, _) = run_apply(tmp.path(), &["--json", "--offline", "--silent"], &[]);
     let v: serde_json::Value =
         serde_json::from_str(&stdout).expect("apply --json must emit valid JSON");
     assert_eq!(code, 0, "mixed manifest pins exit 0 today; envelope:\n{v}");
@@ -482,7 +469,7 @@ fn unmatched_purl_exit_semantics_are_pinned() {
     let tmp2 = tempfile::tempdir().expect("tempdir");
     write_partial_match_project(tmp2.path());
     std::fs::remove_dir_all(tmp2.path().join("node_modules")).expect("uninstall scopedpkg");
-    let (code2, stdout2) = run_apply(tmp2.path(), &["--offline", "--silent"]);
+    let (code2, stdout2, _) = run_apply(tmp2.path(), &["--json", "--offline", "--silent"], &[]);
     let v2: serde_json::Value =
         serde_json::from_str(&stdout2).expect("apply --json must emit valid JSON");
     assert_eq!(

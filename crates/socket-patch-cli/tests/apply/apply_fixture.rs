@@ -53,6 +53,22 @@ pub fn hashed_file(path: &str, before_hash: &str, after_hash: &str) -> Value {
     json!({ path: { "beforeHash": before_hash, "afterHash": after_hash } })
 }
 
+/// One `package/index.js` record from `before` to `after` per purl, the
+/// i-th with uuid `<prefix>-0000-4000-8000-<i, 12 digits>`.
+pub fn index_js_patches(purls: &[&str], uuid_prefix: &str, before: &[u8], after: &[u8]) -> Value {
+    let files = one_file("package/index.js", before, after);
+    Value::Object(
+        purls
+            .iter()
+            .enumerate()
+            .map(|(i, purl)| {
+                let uuid = format!("{uuid_prefix}-0000-4000-8000-{i:012}");
+                (purl.to_string(), patch_record(&uuid, files.clone()))
+            })
+            .collect(),
+    )
+}
+
 /// Write `.socket/manifest.json`, creating `.socket/blobs/` alongside as
 /// a real project has it.
 pub fn write_manifest(root: &Path, patches: Value) {
@@ -253,7 +269,9 @@ pub fn write_sourceless_npm_patches(root: &Path, n: u32) {
 // ═══════════ gem release-variant mismatch fixtures ═══════════
 //
 // Shared by `cli_gem_variant_mismatch_policy.rs` (the `--json`
-// contracts) and `apply_render.rs` (the human output).
+// contracts) and `apply_render.rs` (the human output). `run_gem` also
+// runs the gem_stale_bundler_plugin, in_process_gem_config_warning and
+// in_process_gem_fallback_home children.
 
 /// The rack singleton's on-disk bytes after a local edit: they match
 /// neither the record's beforeHash nor its afterHash.
@@ -265,7 +283,9 @@ pub const NOKOGIRI_DARWIN_MARKER: &[u8] = b"\n# DARWIN-MARKER\n";
 
 /// Run `socket-patch <args>` in `cwd` like `common::run_with_env`, with
 /// the ambient `BUNDLE_*` also scrubbed so only the argv and `env` decide
-/// what Bundler state the gem crawler reads.
+/// what Bundler state the gem crawler reads. Suites that pin `--cwd`
+/// pass `Path::new(".")` so the child stays in the runner's directory and
+/// a crawler reading the process cwd instead of `--cwd` finds nothing.
 pub fn run_gem(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = hermetic_command(&binary());
     cmd.args(args).current_dir(cwd);

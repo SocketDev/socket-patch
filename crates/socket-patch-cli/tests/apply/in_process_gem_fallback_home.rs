@@ -124,7 +124,7 @@ fn run_apply(fx: &Fixture, extra: &[&str]) -> (i32, String, String) {
     if let Some(store_root) = &fx.store_root {
         env.push(("BUNDLE_PATH", store_root.to_str().unwrap()));
     }
-    run_gem(fx.project.path(), &argv, &env)
+    run_gem(Path::new("."), &argv, &env)
 }
 
 fn parse_env(stdout: &str) -> serde_json::Value {
