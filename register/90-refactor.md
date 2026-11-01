@@ -1,30 +1,31 @@
 ### Refactor routine
-_Last updated 2026-11-01T11:15Z · main @ cbbbdb9_
+_Last updated 2026-11-01T13:25Z · main @ cbbbdb9_
 
 #### In flight
 | PR | Kind | Scope | State |
 |---|---|---|---|
-| [#1842](https://github.com/SocketDev/socket-patch/pull/1842) | sweep | `cli/src/args.rs` (+ the Deno guard moved into `lib.rs`) | ready |
-| [#1855](https://github.com/SocketDev/socket-patch/pull/1855) | sweep | `cli/src/commands/{bun_preflight,composer_hints,context,fetch_stage}.rs` | ready; Bugbot clean; CI lost Depot runners twice (0 steps), needs a fresh run |
-| [#1849](https://github.com/SocketDev/socket-patch/pull/1849) | structural | A01 [#1832](https://github.com/SocketDev/socket-patch/issues/1832): `utils/cargo_build_cache.rs` | ready; CI and Bugbot green |
-| [#1864](https://github.com/SocketDev/socket-patch/pull/1864) | sweep | `cli/src/commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` (+ dead branch in `rollback.rs`) | ready; CI (82 checks) and Bugbot green |
-| [#1870](https://github.com/SocketDev/socket-patch/pull/1870) | structural | A27 [#1869](https://github.com/SocketDev/socket-patch/issues/1869): `api/client.rs`, one serve GET and one vendor retry loop | ready; CI (82 checks) and Bugbot green |
-| [#1875](https://github.com/SocketDev/socket-patch/pull/1875) | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI (82 checks) and Bugbot green |
-| [#1884](https://github.com/SocketDev/socket-patch/pull/1884) | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 [#1859](https://github.com/SocketDev/socket-patch/issues/1859); tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI (82 checks) and Bugbot green |
-| [#1892](https://github.com/SocketDev/socket-patch/pull/1892) | sweep | `cli/src/commands/scan/gc.rs` | ready; CI (82 checks) and Bugbot green |
-| [#1897](https://github.com/SocketDev/socket-patch/pull/1897) | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot green; burn-down final review done |
-| [#1903](https://github.com/SocketDev/socket-patch/pull/1903) | sweep | `cli/src/commands/scan/hosted/{nuget,takeover}.rs` | ready; CI (82 checks) and Bugbot green |
-| [#1907](https://github.com/SocketDev/socket-patch/pull/1907) | sweep | core `constants.rs`, `utils/{cargo_home,composer_version,concurrent,containment,digest,durability,env_compat,failpoint}.rs` (+ `socket_dir.rs`, `purl_key.rs` tests) | ready; CI (82 checks) and Bugbot green |
-| [#1914](https://github.com/SocketDev/socket-patch/pull/1914) | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI (82 checks) and Bugbot green |
-| [#1920](https://github.com/SocketDev/socket-patch/pull/1920) | sweep | core `utils/{notice,npm_range,package_manager,pep440,pipenv,purl}.rs` (+ `target.rs` callers) | ready; CI (82 checks) and Bugbot green |
-| [#1923](https://github.com/SocketDev/socket-patch/pull/1923) | sweep + A20 [#1848](https://github.com/SocketDev/socket-patch/issues/1848) | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` (+ `vex/product.rs`, `redirect/upstream/npm.rs`, advisory lint moved to `vendor/service_fetch.rs`) | ready; CI (82 checks) and Bugbot green |
-| [#1929](https://github.com/SocketDev/socket-patch/pull/1929) | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI (82 checks) and Bugbot green |
+| #1842 | sweep | `cli/src/args.rs` (+ the Deno guard moved into `lib.rs`) | ready |
+| #1855 | sweep | `cli/src/commands/{bun_preflight,composer_hints,context,fetch_stage}.rs` | ready; Bugbot clean; CI lost Depot runners twice (0 steps), needs a fresh run |
+| #1849 | structural | A01 #1832: `utils/cargo_build_cache.rs` | ready; CI and Bugbot green |
+| #1864 | sweep | `cli/src/commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` (+ dead branch in `rollback.rs`) | ready; CI (82 checks) and Bugbot green |
+| #1870 | structural | A27 #1869: `api/client.rs`, one serve GET and one vendor retry loop | ready; CI (82 checks) and Bugbot green |
+| #1875 | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI (82 checks) and Bugbot green |
+| #1884 | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 #1859; tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI (82 checks) and Bugbot green |
+| #1892 | sweep | `cli/src/commands/scan/gc.rs` | ready; CI (82 checks) and Bugbot green |
+| #1897 | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot green; burn-down final review done |
+| #1903 | sweep | `cli/src/commands/scan/hosted/{nuget,takeover}.rs` | ready; CI (82 checks) and Bugbot green |
+| #1907 | sweep | core `constants.rs`, `utils/{cargo_home,composer_version,concurrent,containment,digest,durability,env_compat,failpoint}.rs` (+ `socket_dir.rs`, `purl_key.rs` tests) | ready; CI (82 checks) and Bugbot green |
+| #1914 | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI (82 checks) and Bugbot green |
+| #1920 | sweep | core `utils/{notice,npm_range,package_manager,pep440,pipenv,purl}.rs` (+ `target.rs` callers) | ready; CI (82 checks) and Bugbot green |
+| #1923 | sweep + A20 #1848 | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` (+ `vex/product.rs`, `redirect/upstream/npm.rs`, advisory lint moved to `vendor/service_fetch.rs`) | ready; CI (82 checks) and Bugbot green |
+| #1929 | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI (82 checks) and Bugbot green |
+| #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; CI (82 checks) and Bugbot green |
 
 #### Merged
 _None._
 
 #### Queue
-Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`. Every one scoring 6 or more is blocked by an open PR as of 2026-11-01T11Z (nothing merged since 2026-10-29). The audit's new T38-T45 issues ([#1908](https://github.com/SocketDev/socket-patch/issues/1908)-[#1912](https://github.com/SocketDev/socket-patch/issues/1912), [#1924](https://github.com/SocketDev/socket-patch/issues/1924)-[#1927](https://github.com/SocketDev/socket-patch/issues/1927)) all touch `scan/mod.rs`, `vendor.rs`, `rollback.rs` or `remove.rs`, which open PRs hold. A46 #1917 and A44 #1918 score ~4:
+Structural candidates, scored `3·B + 2·U + 2·D + 2·C − risk`. As of 2026-11-01T13Z, the audit's A53-A57 (#1931-#1935) are new: A54 is in #1936; A53 #1931 (~9) and A57 #1935 wait on `ruby_crawler.rs` (#1882, #1895); A55 #1933 (~11, risk M) waits on `redirect/mod.rs` (#1841, #1843, #1866, #1885, #1886, #1893); A56 #1934 is a fixer bug (free, ~5). Every older one scoring 6 or more is blocked by an open PR (nothing merged since 2026-10-29); T38-T45 (#1908-#1912, #1924-#1927) touch `scan/mod.rs`, `vendor.rs`, `rollback.rs` or `remove.rs`, all held. A46 #1917, A44 #1918 score ~4:
 1. A30 [#1887](https://github.com/SocketDev/socket-patch/issues/1887), Maven `${…}` interpolation ×5: **~8.7** (blocked by #1886: `maven_scope.rs`, `maven_reactor.rs`).
 2. T09 [#1858](https://github.com/SocketDev/socket-patch/issues/1858), lock acquire open-coded 9×: **~7** (blocked by #1864 `lock_cli.rs`, #1698 `vendor.rs`/`get.rs`/`agent_download.rs`).
 3. A41 [#1899](https://github.com/SocketDev/socket-patch/issues/1899), npm store-child classification ×3: D2 C2, risk M, **~6** (blocked by #1891, #1829 and #1906: `npm_crawler.rs`).
@@ -58,3 +59,4 @@ The next run is structural if a candidate scoring 6 or more has free files, else
 - Wants an issue: `vlt_heal::artifact_preflight` swallows a `load_state` error and `rollback_heal` drops a lock read error with `.ok()` (output-changing).
 - Left from #1929: `UpdateArgs.pin_version` as `semver::Version` waits on `lib.rs` (#1842); `sweep_orphan_vendor_dirs` forwarder on `vendor.rs` (#1698).
 - Wants an issue: `strip_url_userinfo`'s scp branch keeps credentials in `u:p@host:team@2024/r.git` (changes VEX `@id` bytes).
+- Left from #1936: `vendor/gem.rs` `plan_gemfile_edit`, `vex/discover/gem.rs` (~L252) and `redirect/upstream/gem.rs` (~L661) still hand-scan `=begin`; route them through `manifest::code_lines` (the pin writer refuses a Gemfile whose duplicate `gem` line sits in `=begin`). `code_lines`'s heredoc heuristic reads `x <<FLAG` (a shift) as a heredoc and closes a plain `<<ID` at an indented terminator.
