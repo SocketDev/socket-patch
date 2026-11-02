@@ -26,7 +26,7 @@ publication guarantee.
 | Native production installs | npm/shrinkwrap, pnpm, Yarn Classic, Yarn Berry with node-modules, Bun, pip requirements, uv, and Bundler |
 | Conditional production proof | vlt: validates the served encoding before attempting installation |
 | Catalog canaries | Cargo, Maven, NuGet, and Composer: detect when a free fixture becomes available; do not prove an install |
-| Go | Validates the required hosted reference shape; see [Go support](../ecosystems.md#go-directory-replaces-and-gosum) |
+| Go | pgx/v5 v5.7.0: get and scan, decoder regression, fresh-cache readonly build; requires the `/v5` hosted artifact |
 | Unsupported mode | Deno hosted refusal |
 
 Poetry, PDM, and Pipenv production installers are covered by their

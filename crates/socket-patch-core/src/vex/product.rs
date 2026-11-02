@@ -378,8 +378,9 @@ fn xml_element_texts<const N: usize>(xml: &str, paths: [&[&str]; N]) -> [Option<
 /// heredoc bodies and anything after `__END__` are not code, and the last
 /// assignment wins (#1573).
 fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
-    let mut lines: Vec<&str> = Vec::new();
-    crate::formats::gem::manifest::for_each_code_line(content, |_, c| lines.push(c));
+    let lines: Vec<&str> = crate::formats::gem::manifest::code_lines(content)
+        .map(|(_, _, code)| code)
+        .collect();
     // The `spec` of `Gem::Specification.new do |spec|`, when the file names
     // it, so a helper's `ext.name = …` elsewhere can't pass for the spec's.
     let receiver = lines
@@ -710,7 +711,7 @@ fn remote_url_to_purl(url: &str) -> String {
             }
         }
     }
-    strip_url_userinfo(url)
+    crate::utils::redact::strip_url_userinfo(url)
 }
 
 /// Cut a URL at its first `?` or `#`. A trailing bare `?`/`#` goes too.
@@ -718,32 +719,6 @@ fn strip_url_query_fragment(url: &str) -> &str {
     match url.find(['?', '#']) {
         Some(idx) => &url[..idx],
         None => url,
-    }
-}
-
-/// Remove a `user[:password]@` prefix from a remote URL.
-///
-/// * `scheme://[userinfo@]host[:port]/path` — the userinfo is everything
-///   up to the LAST `@` of the authority (the part before the first `/`
-///   after `://`), since an unencoded `@` in a password still precedes
-///   the host's.
-/// * scp-style `[user@]host:path` (git treats a `:` before any `/` as
-///   this form) — everything up to the last `@` before the first `/`,
-///   but only when a `:` follows it; otherwise the `@` belongs to the
-///   path (`host:repo@v1`) or the string is not a remote URL at all.
-pub(crate) fn strip_url_userinfo(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let (scheme, rest) = url.split_at(scheme_end + 3);
-        let authority_end = rest.find('/').unwrap_or(rest.len());
-        return match rest[..authority_end].rfind('@') {
-            Some(at) => format!("{scheme}{}", &rest[at + 1..]),
-            None => url.to_string(),
-        };
-    }
-    let prefix_end = url.find('/').unwrap_or(url.len());
-    match url[..prefix_end].rfind('@') {
-        Some(at) if url[at + 1..prefix_end].contains(':') => url[at + 1..].to_string(),
-        _ => url.to_string(),
     }
 }
 

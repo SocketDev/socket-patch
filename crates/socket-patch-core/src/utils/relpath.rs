@@ -148,8 +148,92 @@ pub(crate) fn normalize_lexically_keeping_escapes(path: &Path) -> PathBuf {
     out
 }
 
+/// `path` made absolute against the working directory without touching
+/// the filesystem (no symlink resolution), with `.`/`..` folded. The
+/// empty path (the parent of a bare `node_modules`) is the working
+/// directory, which `std::path::absolute` would reject.
+///
+/// For upward config walks: a relative path's lexical ancestors stop at
+/// the working directory, so under the default `--cwd .` a parent's
+/// `.yarnrc` or `pnpm-workspace.yaml` would never be read (#1902).
+pub(crate) fn absolute_lexically(path: &Path) -> PathBuf {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    normalize_lexically_keeping_escapes(&abs)
+}
+
+/// The directories at and above `dir`, nearest first, each as its
+/// absolute path ([`absolute_lexically`]) paired with a spelling in
+/// `dir`'s own terms, for an upward walk whose finds are reported the
+/// way `dir` is spelled. A relative `dir` keeps its lexical ancestors
+/// (`./packages/a`, `./packages`, `.`), then spells each level above the
+/// working directory with `..` (`./..`, `./../..`). So one directory
+/// gets one spelling whichever descendant the walk starts from. An
+/// absolute `dir` walks its own lexical ancestors.
+pub(crate) fn ancestors_keeping_spelling(dir: &Path) -> impl Iterator<Item = (PathBuf, PathBuf)> {
+    let relative = !dir.is_absolute();
+    let abs = if relative {
+        absolute_lexically(dir)
+    } else {
+        dir.to_path_buf()
+    };
+    let abs_levels =
+        std::iter::successors(Some(abs), |p: &PathBuf| p.parent().map(Path::to_path_buf));
+    let spelled = std::iter::successors(Some(dir.to_path_buf()), move |p: &PathBuf| {
+        if !relative {
+            return p.parent().map(Path::to_path_buf);
+        }
+        match p.components().next_back() {
+            Some(Component::Normal(_)) => p.parent().map(Path::to_path_buf),
+            _ => Some(p.join("..")),
+        }
+    });
+    abs_levels.zip(spelled)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ancestors_keeping_spelling_climbs_past_the_working_directory() {
+        let cwd = absolute_lexically(Path::new("."));
+        let walk = |dir: &str| -> Vec<(PathBuf, PathBuf)> {
+            ancestors_keeping_spelling(Path::new(dir)).take(4).collect()
+        };
+        let up = |n: usize| cwd.ancestors().nth(n).unwrap().to_path_buf();
+        let p = PathBuf::from;
+        // One directory, one spelling, from either start.
+        assert_eq!(
+            walk("./packages/a"),
+            vec![
+                (cwd.join("packages/a"), p("./packages/a")),
+                (cwd.join("packages"), p("./packages")),
+                (up(0), p(".")),
+                (up(1), p("./..")),
+            ]
+        );
+        assert_eq!(walk(".")[1], (up(1), p("./..")));
+        // The parent of a bare `node_modules` is the empty path.
+        assert_eq!(
+            walk(""),
+            vec![
+                (up(0), p("")),
+                (up(1), p("..")),
+                (up(2), p("../..")),
+                (up(3), p("../../..")),
+            ]
+        );
+        assert_eq!(walk("../x")[1], (up(1), p("..")));
+        assert_eq!(walk("../x")[2], (up(2), p("../..")));
+        // An absolute start walks its own ancestors, ending at the root.
+        let abs: Vec<_> = ancestors_keeping_spelling(&cwd).collect();
+        assert_eq!(abs.len(), cwd.ancestors().count());
+        assert!(abs.iter().all(|(a, s)| a == s));
+    }
+
     use super::*;
 
     #[test]

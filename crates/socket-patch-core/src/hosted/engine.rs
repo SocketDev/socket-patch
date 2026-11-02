@@ -30,8 +30,9 @@ use crate::constants::npm_family::{
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
-    effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
-    NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
+    effective_omit_lockfile_registry_resolved, effective_replace_registry_host,
+    plan_npmrc_allow_remote_with, replace_registry_host_rewrites, NpmrcPlan, OuterAllowRemote,
+    NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
 };
 use crate::patch::redirect::presence::groups_present;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
@@ -48,15 +49,17 @@ use super::guidance::{
     npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
-    npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
-    plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
-    pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
+    npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_omit_lockfile_resolved_detail,
+    npm_replace_registry_host_detail, plan_workspace_trust, pnpm_heal_root,
+    pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
+    pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
     pnpm_trust_keyless_members_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
     pnpm_trust_not_needed_detail, pnpm_trust_policy_preamble, pnpm_trust_rush_detail,
     pnpm_trust_scaffolded_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
-    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    TrustPlan, NPM_LOCKS, NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE,
+    PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
+    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -495,7 +498,7 @@ async fn read_go_workspace(
     out: &mut CandidateFiles,
 ) {
     use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
-    let (root, loaded, modfile) = match view {
+    let (root, loaded, modfile, module_graph) = match view {
         ProjectView::Memory(_) => 'memory: {
             let Some(work) = read_advisory(view, unreadable, "go.work").await else {
                 return;
@@ -507,6 +510,7 @@ async fn read_go_workspace(
                 break 'memory (
                     std::path::PathBuf::new(),
                     Loaded::Invalid(format!("go.work: {problem}, so go refuses to build")),
+                    None,
                     None,
                 );
             }
@@ -540,7 +544,7 @@ async fn read_go_workspace(
                 members,
                 graph: None,
             };
-            (std::path::PathBuf::new(), Loaded::Workspace(ws), None)
+            (std::path::PathBuf::new(), Loaded::Workspace(ws), None, None)
         }
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let Some(root) = view.disk_root_reading(std::iter::empty::<&std::path::Path>()) else {
@@ -560,19 +564,39 @@ async fn read_go_workspace(
                     touched.push(member.dir.join("go.sum"));
                 }
             }
+            // Module mode: whether a module-to-module replace is in effect
+            // can turn on modules only the dependencies require (#1840).
+            let mut module_graph = None;
+            if loaded == Loaded::None {
+                touched.push(root.join("go.mod"));
+                let go_mod = crate::utils::fs::read_regular_to_string(&root.join("go.mod")).await;
+                if let Ok(go_mod) = go_mod {
+                    let go_mod = crate::vendor::go_mod_edit::normalize_for_read(&go_mod);
+                    if crate::vendor::go_build_list::may_need_module_graph(&go_mod) {
+                        touched.extend(
+                            crate::vendor::go_build_list::module_graph_reads(&go_mod)
+                                .into_iter()
+                                .map(|rel| root.join(rel)),
+                        );
+                        module_graph =
+                            Some(crate::vendor::go_build_list::module_graph(&root, &go_mod).await);
+                    }
+                }
+            }
             view.disk_root_reading(&touched);
             // `-modfile` in GOFLAGS sends the build to another go.mod (#1799).
             let modfile = go_workspace::modfile_setting(&root);
-            (root, loaded, modfile)
+            (root, loaded, modfile, module_graph)
         }
     };
-    if loaded == Loaded::None && modfile.is_none() {
+    if loaded == Loaded::None && modfile.is_none() && module_graph.is_none() {
         return;
     }
     let hosted = crate::patch::redirect::HostedGoWorkspace {
         root,
         loaded,
         modfile,
+        module_graph,
     };
     if let Ok(json) = serde_json::to_string(&hosted) {
         out.files
@@ -693,26 +717,25 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, NPMRC_REL).await;
         // A `file:` directory copy is locked under the DEPENDENCY name, so
         // the classic rewriter reads which package it is from the
-        // directory's `package.json` (#1236). Advisory: never rewritten,
-        // and an unreadable one only leaves that copy unnamed.
-        let dirs: BTreeSet<String> = out
+        // directory's `package.json` (#1236), at the path vendored and VEX
+        // read it from (#1951): outside the root too, never at an absolute
+        // path. Advisory: never rewritten, and an unreadable one only
+        // leaves that copy unnamed.
+        let manifests: BTreeSet<String> = out
             .files
             .get("yarn.lock")
             .map(|lock| {
+                use crate::formats::yarn::copy::{classic_copy_ref, CopyRef};
                 crate::vendor::lock_inventory::yarn::classic_entries(lock)
                     .iter()
-                    .filter_map(|e| {
-                        crate::formats::yarn::source::classic_file_directory(&e.patterns)
+                    .filter_map(|e| match classic_copy_ref(&e.patterns, None)? {
+                        copy @ CopyRef::Directory(_) => copy.read_path(),
+                        _ => None,
                     })
                     .collect()
             })
             .unwrap_or_default();
-        for dir in dirs {
-            let rel = if dir.is_empty() {
-                "package.json".to_string()
-            } else {
-                format!("{dir}/package.json")
-            };
+        for rel in manifests {
             if out.files.contains_key(&rel) {
                 continue;
             }
@@ -737,6 +760,27 @@ pub async fn read_candidate_files(
     // whether it takes effect at all, and whether it belongs in go.work.
     if candidates.iter().any(|c| c.dep.ecosystem == "golang") {
         read_go_workspace(view, unreadable, &mut out).await;
+    }
+
+    // A Maven 4 root that discovers its subprojects (#1809): each direct
+    // subdirectory holding a `pom.xml` is a module, which the pom rewriter
+    // must see to refuse the root as a reactor (it pins only the root pom).
+    // Advisory: keyed `<dir>/pom.xml`, never rewritten, and one that cannot
+    // be read still counts as present.
+    if candidates.iter().any(|c| c.dep.ecosystem == "maven") {
+        if let Some(pom) = out.files.get("pom.xml") {
+            let config = out.files.get(crate::patch::redirect::MVN_CONFIG);
+            if crate::vendor::jvm::maven_reactor::may_discover_subprojects(
+                pom,
+                config.map(String::as_str),
+            ) {
+                for dir in crate::vendor::jvm::maven_reactor::implicit_subprojects_in(view).await {
+                    let rel = format!("{dir}/pom.xml");
+                    let text = read_advisory(view, unreadable, &rel).await;
+                    out.files.insert(rel, text.unwrap_or_default());
+                }
+            }
+        }
     }
 
     // NuGet merges the user config and every parent directory's config
@@ -1343,8 +1387,8 @@ pub fn wheel_targets<'a>(
     candidates: &'a [Candidate],
     files: &BTreeMap<String, String>,
 ) -> Vec<(&'a DepOverride, &'a str)> {
-    use crate::utils::python_lock::{ArtifactSource, PythonLockProbe};
-    let mut probes: Option<Vec<PythonLockProbe>> = None;
+    use crate::utils::python_lock::{ArtifactSource, PythonLockSession};
+    let mut probes: Option<Vec<(&str, PythonLockSession)>> = None;
     let mut out = Vec::new();
     for dep in candidates
         .iter()
@@ -1369,15 +1413,19 @@ pub fn wheel_targets<'a>(
                     .filter(|(path, _)| {
                         *path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path)
                     })
-                    .map(|(_, text)| PythonLockProbe::new(text))
+                    .map(|(_, text)| (text.as_str(), PythonLockSession::new(text)))
                     .collect()
             })
             .iter()
-            .any(|probe| {
-                probe.rewrites(
-                    &dep.name,
-                    &dep.version,
-                    ArtifactSource::Url(&dep.artifact_url),
+            .any(|(text, session)| {
+                matches!(
+                    session.plan(
+                        text,
+                        &dep.name,
+                        &dep.version,
+                        ArtifactSource::Url(&dep.artifact_url),
+                    ),
+                    Ok(Some(_))
                 )
             });
         if native_target {
@@ -2991,13 +3039,8 @@ fn read_advisory_text(view: &ProjectView<'_>, rel: &str) -> Option<String> {
 /// root: with a keyless pnpm-workspace.yaml that marks a pnpm <= 10.4
 /// install (see [`crate::formats::pnpm::workspace::lock_has_member_importers`]).
 fn lock_lists_members(view: &ProjectView<'_>) -> bool {
-    read_advisory_text(view, "pnpm-lock.yaml").is_some_and(|text| {
-        let doc =
-            crate::formats::pnpm::grammar::main_document(crate::formats::text::strip_bom(&text));
-        crate::formats::pnpm::workspace::lock_has_member_importers(
-            &crate::formats::pnpm::lines::split_lines(doc),
-        )
-    })
+    read_advisory_text(view, "pnpm-lock.yaml")
+        .is_some_and(|text| crate::formats::pnpm::workspace::lock_text_has_member_importers(&text))
 }
 
 /// The ancestor `pnpm-workspace.yaml` governing a disk project's pnpm
@@ -3178,6 +3221,16 @@ fn npm_allow_remote(
             ));
         }
     }
+    // #1871: npm >= 8's `omit-lockfile-registry-resolved` strips every
+    // registry dependency's `resolved` (the hosted pins included) on the
+    // next lock save, keeping the patched `integrity`. Reported, never
+    // overridden, like `replace-registry-host`.
+    if let Some(setting) = effective_omit_lockfile_registry_resolved(project, &outer) {
+        npm_warnings.push(warning(
+            NPM_OMIT_LOCKFILE_RESOLVED_CODE,
+            npm_omit_lockfile_resolved_detail(&npm_hosts, &setting),
+        ));
+    }
     (npm_warnings, npmrc_config_write)
 }
 
@@ -3251,10 +3304,23 @@ fn confirm(
     fn is_npm_manifest(name: &str) -> bool {
         name == "package.json" || name.ends_with("/package.json")
     }
+    // A Maven reactor root the pom rewriter refused pins nothing, so a
+    // suffixed version an earlier release left in it, or in `.mvn/`,
+    // proves nothing (#1809); nor do the module poms read beside a Maven 4
+    // root, advisory input only.
+    let maven_reactor_refused = rewrite
+        .warnings
+        .iter()
+        .any(|w| w.code == "redirect_maven_multimodule_unsupported");
+    let is_unpinned_maven = |name: &str| {
+        name.ends_with("/pom.xml")
+            || maven_reactor_refused && (name == "pom.xml" || name.starts_with(".mvn/"))
+    };
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
         .filter(|(name, _)| !is_npm_manifest(name))
+        .filter(|(name, _)| !is_unpinned_maven(name))
         .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
         .map(|(name, content)| (name.as_str(), rewrite.files.get(name).unwrap_or(content)))
         .chain(
@@ -4329,6 +4395,57 @@ mod tests {
         (read, done)
     }
 
+    /// #1951: the hosted run reads a yarn classic `file:` directory copy's
+    /// `package.json` where vendored and VEX read it
+    /// ([`crate::formats::yarn::copy::CopyRef::read_path`]): from outside
+    /// the root too, since yarn 1 installs `file:../ext/lpdir` all the same,
+    /// but never at an absolute path a lock names (#1516).
+    #[tokio::test]
+    async fn issue_1951_yarn_classic_copy_manifests_read_as_vendored_reads_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let manifest = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        for dir in ["app/lpdir", "ext/lpdir", "abs/lpdir"] {
+            let dir = tmp.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("package.json"), manifest).unwrap();
+        }
+        let abs = tmp.path().join("abs/lpdir");
+        let abs = abs.to_str().unwrap().replace('\\', "/");
+        std::fs::write(
+            root.join("yarn.lock"),
+            format!(
+                "# yarn lockfile v1\n\n\n\
+                 left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+                 resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n\n\
+                 \"lp2@file:./lpdir\":\n  version \"1.3.0\"\n\n\
+                 \"lp3@file:../ext/lpdir\":\n  version \"1.3.0\"\n\n\
+                 \"lp4@file:{abs}\":\n  version \"1.3.0\"\n"
+            ),
+        )
+        .unwrap();
+        let candidates = vec![left_pad_candidate()];
+        let read =
+            read_candidate_files(&ProjectView::Disk(&root), &BTreeSet::new(), &candidates).await;
+        assert_eq!(
+            read.files.get("lpdir/package.json").map(String::as_str),
+            Some(manifest)
+        );
+        assert_eq!(
+            read.files
+                .get("../ext/lpdir/package.json")
+                .map(String::as_str),
+            Some(manifest),
+            "{:?}",
+            read.files.keys()
+        );
+        assert!(
+            !read.files.keys().any(|k| k.contains("abs/lpdir")),
+            "{:?}",
+            read.files.keys()
+        );
+    }
+
     #[tokio::test]
     async fn issue_490_the_root_manifest_overrides_reach_the_npm_rewriter() {
         let redirected = |done: &Rewritten| {
@@ -5288,6 +5405,69 @@ snapshots:
         let (_, done) = gradle_rewrite(&p).await;
         assert!(done.rewrite.confirmed_gradle_uuids.contains(GRADLE_UUID));
         assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+    }
+
+    /// #1809: a Maven 4 root whose subprojects Maven discovers (model
+    /// 4.1.0, `pom` packaging, no list) is a reactor once a direct
+    /// subdirectory holds a `pom.xml`. The engine reads that pom beside
+    /// the root, on disk and in memory, so the pom rewriter refuses the
+    /// root instead of pinning only it while the module keeps its version.
+    #[tokio::test]
+    async fn a_maven_4_implicit_reactor_root_is_refused() {
+        let root = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  <modelVersion>4.1.0</modelVersion>\n  <groupId>x</groupId>\n  <artifactId>y</artifactId>\n  <version>1</version>\n  <packaging>pom</packaging>\n  <dependencies>\n    <dependency>\n      <groupId>com.socketfixture</groupId>\n      <artifactId>victim</artifactId>\n      <version>1.10.0</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let child = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  <artifactId>a</artifactId>\n</project>\n";
+        let refused = |read: &CandidateFiles, done: &Rewritten| {
+            assert!(
+                read.files.contains_key("a/pom.xml"),
+                "{:?}",
+                read.files.keys()
+            );
+            assert!(!done.rewrite.files.contains_key("pom.xml"));
+            assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+            assert!(done
+                .rewrite
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_multimodule_unsupported"));
+        };
+
+        let mut p = MemoryProject::new();
+        p.insert_text("pom.xml", root);
+        p.insert_text("a/pom.xml", child);
+        let (read, done) = gradle_rewrite(&p).await;
+        refused(&read, &done);
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pom.xml"), root).unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        std::fs::write(tmp.path().join("a/pom.xml"), child).unwrap();
+        // A directory without a pom is no subproject.
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        let (read, done) = gradle_rewrite_in(&ProjectView::Disk(tmp.path())).await;
+        refused(&read, &done);
+        assert!(!read.files.contains_key("src/pom.xml"));
+
+        // A suffixed version an earlier release pinned into the root, or one
+        // a module names, confirms nothing: the refused root pins nothing.
+        let stale = root.replace("1.10.0", "1.10.0-socket.4d5e6f70");
+        let named = child.replace(
+            "</artifactId>",
+            "</artifactId>\n  <properties><v>1.10.0-socket.4d5e6f70</v></properties>",
+        );
+        for (r, c) in [(stale.as_str(), child), (root, named.as_str())] {
+            let mut p = MemoryProject::new();
+            p.insert_text("pom.xml", r);
+            p.insert_text("a/pom.xml", c);
+            let (read, done) = gradle_rewrite(&p).await;
+            refused(&read, &done);
+        }
+
+        // Without a subproject the root is a single pom, pinned as before.
+        std::fs::remove_dir_all(tmp.path().join("a")).unwrap();
+        let (read, done) = gradle_rewrite_in(&ProjectView::Disk(tmp.path())).await;
+        assert!(!read.files.keys().any(|k| k.ends_with("/pom.xml")));
+        assert!(done.rewrite.files["pom.xml"].contains("1.10.0-socket.4d5e6f70"));
+        assert_eq!(done.confirmed.len(), 1);
     }
 
     /// An sbt build beside a Gradle build: the Gradle planner pinning a

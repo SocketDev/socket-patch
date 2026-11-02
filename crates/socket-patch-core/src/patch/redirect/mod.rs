@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::formats::yarn::berry_gates::{self, Yarnrc};
 use crate::utils::digest::is_hex64_lower;
+use crate::utils::line_endings;
 #[cfg(test)]
 use crate::utils::line_endings::LineEndings;
 use crate::vendor::common::{parse_json_text, JsonLayout};
@@ -92,6 +93,8 @@ mod platform_wheel_tests;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
+#[cfg(test)]
+mod pypi_no_lockfile_tests;
 mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
 #[cfg(test)]
@@ -756,6 +759,7 @@ fn rewriter_groups<'a>(
             rewrite_hatch(files, overrides, result);
             rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
+            warn_no_pypi_wiring(files, overrides, result);
         }),
         Box::new(move |result| rewrite_cargo_with(files, overrides, cargo_outer, result)),
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
@@ -1019,6 +1023,86 @@ fn merge_group_outputs(prefix: &RewriteResult, outs: Vec<RewriteResult>) -> Opti
         merge_group_delta(&mut result, delta);
     }
     Some(result)
+}
+
+/// #638: the PyPI twin of `redirect_npm_no_lockfile` /
+/// `redirect_composer_no_lockfile`. A pypi patch reached the PyPI lane, but
+/// the project has no file any PyPI rewriter reads (a root
+/// `requirements.txt`, a tool lock, a PEP 751 / PEP 723 lock, or a Hatch
+/// configuration), so nothing can pin it. Said once per run, naming what
+/// was looked for; the per-patch `redirect_unconfirmed` row still follows.
+/// A file that IS present owns its deps' diagnostics instead.
+fn warn_no_pypi_wiring(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    if !overrides.iter().any(|dep| dep.ecosystem == "pypi") {
+        return;
+    }
+    let wired = files.keys().any(|key| {
+        key == crate::formats::governing_locks::PYPI_REQUIREMENTS
+            || crate::formats::governing_locks::PYPI_TOOL_LOCKS.contains(&key.as_str())
+            || crate::utils::python_lock::is_python_lock_name(key)
+    });
+    if wired || crate::utils::hatch::is_hatch(files) {
+        return;
+    }
+    result.warnings.push(RewriteWarning {
+        code: "redirect_pypi_no_lockfile".into(),
+        detail: format!(
+            "no readable requirements.txt, uv.lock, poetry.lock, pdm.lock, \
+             Pipfile.lock, pylock.toml / pylock.<name>.toml, PEP 723 script lock \
+             (<script>.py.lock) or Hatch configuration at the project root (hosted \
+             mode does not read other requirements files such as \
+             requirements-dev.txt); {}",
+            pypi_no_lockfile_remedy(files)
+        ),
+    });
+}
+
+/// What the project's own Python tooling suggests doing about
+/// `redirect_pypi_no_lockfile`: a Pipfile asks for `pipenv lock`; a
+/// pyproject naming its lock tool (a `[tool.<tool>]` table or its build
+/// backend) asks for that tool's lock; any other pyproject may be a plain
+/// pip project or a tool that writes no table of its own (`uv init`), so
+/// both remedies are offered.
+fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
+    const PIN: &str = "pin the package in a root requirements.txt";
+    if files.contains_key("Pipfile") {
+        return "run `pipenv lock` and commit Pipfile.lock, then re-run".into();
+    }
+    let Some(pyproject) = files.get("pyproject.toml") else {
+        return format!("{PIN} or commit the project's lock, then re-run");
+    };
+    let document = pyproject.parse::<toml_edit::DocumentMut>().ok();
+    let backend = document
+        .as_ref()
+        .and_then(|doc| doc.get("build-system"))
+        .and_then(|build| build.get("build-backend"))
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_default();
+    let names = |tool: &str| {
+        document
+            .as_ref()
+            .and_then(|doc| doc.get("tool"))
+            .is_some_and(|table| table.get(tool).is_some())
+            || backend.starts_with(&format!("{tool}."))
+            || backend.starts_with(&format!("{tool}_"))
+    };
+    for (tool, command) in [
+        ("uv", "uv lock"),
+        ("poetry", "poetry lock"),
+        ("pdm", "pdm lock"),
+    ] {
+        if names(tool) {
+            return format!("run `{command}` and commit its lock, then re-run");
+        }
+    }
+    format!(
+        "{PIN}, or, if a lock tool installs the project, generate and commit its \
+         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
+    )
 }
 
 fn rewrite_hatch(
@@ -2719,7 +2803,7 @@ fn cargo_lockless_other_dependencies(
                 .into_iter()
                 .flat_map(|a| a.iter().filter_map(toml_edit::Value::as_str));
             for member in members {
-                let named = if member.contains(['*', '?']) {
+                let named = if crate::utils::cargo_workspace::is_member_pattern(member) {
                     format!("the workspace members pattern `{member}`")
                 } else if crate::utils::cargo_workspace::normalize_rel(dir, member)
                     .is_some_and(|d| known.contains(format!("{d}/Cargo.toml").as_str()))
@@ -4590,7 +4674,7 @@ fn rewrite_yarn_classic_with(
         .zip(&heads)
         .map(|(b, (patterns, _))| {
             let version = classic_field(&b.lines, "version")?;
-            let (name, source) = crate::formats::yarn::source::classic_copy_real_name(
+            let (name, source) = crate::formats::yarn::copy::classic_copy_name(
                 patterns,
                 classic_field(&b.lines, "resolved"),
                 version,
@@ -6492,14 +6576,12 @@ fn plan_python_metadata_with(
     } else {
         crate::utils::python_script::refuse_uv_no_sources(
             &dep.name,
-            None,
             Some(&original),
             project_file(crate::utils::python_script::UV_TOML),
         )
         .and_then(|()| {
             crate::utils::python_script::refuse_uv_no_binary(
                 &dep.name,
-                None,
                 Some(&original),
                 project_file(crate::utils::python_script::UV_TOML),
             )
@@ -7649,7 +7731,8 @@ pub(crate) fn gem_index_url_pattern(dep: &DepOverride, index_url: &str) -> Strin
 /// divergence the rewriter itself created. Trailing whitespace is trimmed (a
 /// block appended to a newline-less file adds a final newline the other
 /// spelling never had). `\r?` mirrors the block recognizer in `rewrite_gem`:
-/// a `core.autocrlf` checkout rewrites run 1's LF block to CRLF, and a block
+/// a CRLF manifest gets a CRLF block (#1831) and a `core.autocrlf` checkout
+/// rewrites run 1's LF block to CRLF, and a block
 /// the recognizer accepts must also be erased here or the re-run is trapped
 /// behind the divergence warning before it can reach the recognizer.
 fn gem_spelling_residue(content: &str, deps: &[&DepOverride]) -> String {
@@ -7950,10 +8033,11 @@ fn rewrite_gem(
             // Wildcard the rotating segments instead (mirrors the CHECKSUMS
             // at-target guard below).
             let url_pat = gem_index_url_pattern(dep, &ov.index_url);
-            // `\r?\n`: the rewriter emits LF, but a `core.autocrlf` checkout
-            // rewrites the working tree to CRLF — the guard must still
-            // recognize the block there, or the indented `gem` line inside
-            // it falls through to `gem_line_re` and gets wrapped again.
+            // `\r?\n`: the rewriter writes a CRLF Gemfile's block in CRLF
+            // (#1831), and a `core.autocrlf` checkout rewrites an LF one to
+            // CRLF — the guard must recognize the block either way, or the
+            // indented `gem` line inside it falls through to `gem_line_re`
+            // and gets wrapped again.
             let block_re = Regex::new(
                 &(String::from(r#"(?m)^source "("#)
                     + &url_pat
@@ -8004,8 +8088,24 @@ fn rewrite_gem(
                     let raw_tail = m
                         .get(2)
                         .expect("gem_line_re always captures group 2 (tail)")
-                        .as_str()
-                        .to_string();
+                        .as_str();
+                    // The CR of a CRLF line is its ending, not part of the
+                    // declaration: the block's own lines take that ending
+                    // and the CR goes back at its end (#1831). An
+                    // unterminated last line (a lone trailing CR included)
+                    // takes the file's.
+                    let terminated = range.end < gf.len();
+                    let cr = if terminated && raw_tail.ends_with('\r') {
+                        "\r"
+                    } else {
+                        ""
+                    };
+                    let raw_tail = raw_tail.strip_suffix('\r').unwrap_or(raw_tail).to_string();
+                    let nl = match (cr, terminated) {
+                        ("\r", _) => "\r\n",
+                        (_, true) => "\n",
+                        _ => line_endings::terminator(gf),
+                    };
                     // A parenthesized call keeps its closing `)` in the tail:
                     // strip it (dropping any comment with it), or fail closed
                     // when it is absent (the call continues past this line).
@@ -8075,12 +8175,12 @@ fn rewrite_gem(
                     let opts = gemfile::trailing_options(&tail);
                     let block = if opts.is_empty() {
                         format!(
-                            "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
+                            "source \"{}\" do{nl}  gem \"{}\", \"{}\"{nl}end",
                             ov.index_url, dep.name, dep.version
                         )
                     } else {
                         format!(
-                            "source \"{}\" do\n  gem \"{}\", \"{}\", {opts}\nend",
+                            "source \"{}\" do{nl}  gem \"{}\", \"{}\", {opts}{nl}end",
                             ov.index_url, dep.name, dep.version
                         )
                     };
@@ -8089,6 +8189,7 @@ fn rewrite_gem(
                     // duplicate earlier in the file and corrupt it (and the
                     // block may carry user text a regex replacement would
                     // `$`-expand).
+                    let block = format!("{block}{cr}");
                     gf.replace_range(range, &block);
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
@@ -8131,9 +8232,11 @@ fn rewrite_gem(
                     });
                     continue;
                 } else {
-                    // Genuinely undeclared (a transitive dep): append a block.
+                    // Genuinely undeclared (a transitive dep): append a block
+                    // in the file's line endings (#1831).
+                    let eol = line_endings::terminator(gf);
                     let block = format!(
-                        "source \"{}\" do\n  gem \"{}\", \"{}\"\nend",
+                        "source \"{}\" do{eol}  gem \"{}\", \"{}\"{eol}end",
                         ov.index_url, dep.name, dep.version
                     );
                     // Always one blank line before the block: the in-place
@@ -8141,13 +8244,12 @@ fn rewrite_gem(
                     // declaration, so this is what lets `rollback` /
                     // `remove` prove the block is this append and drop it
                     // instead of restoring a direct exact pin (#457).
-                    let eol = if gf.contains("\r\n") { "\r\n" } else { "\n" };
                     let sep = if gf.is_empty() || gf.ends_with('\n') {
                         eol.to_string()
                     } else {
                         eol.repeat(2)
                     };
-                    *gf = format!("{gf}{sep}{block}\n");
+                    *gf = format!("{gf}{sep}{block}{eol}");
                     gemfile_changed = true;
                     result.edits.push(FileEdit {
                         path: gemfile_name.into(),
@@ -8554,10 +8656,13 @@ fn rewrite_maven_pom(
     // would keep the unpatched upstream jar while the dep counts as
     // redirected and VEX attests it (#261). Refuse the whole root, untouched;
     // vendored mode's reactor planner rewrites each module's declaration.
-    if pom
-        .as_deref()
-        .is_some_and(crate::vendor::jvm::maven_reactor::declares_modules)
-    {
+    // Maven 4 subprojects found by discovery count too (#1809): the engine
+    // reads each direct subdirectory's `pom.xml` beside such a root.
+    if pom.is_some() && {
+        let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
+        let list = |dir: &str| gradle::key_list(files, dir);
+        crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
+    } {
         let gas: Vec<String> = maven
             .iter()
             .map(|dep| match &dep.namespace {
@@ -8568,7 +8673,7 @@ fn rewrite_maven_pom(
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_multimodule_unsupported".into(),
             detail: format!(
-                "pom.xml declares <modules>/<subprojects>; hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
+                "pom.xml heads a multi-module reactor (<modules>/<subprojects>, or Maven 4 subproject discovery); hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
                 gas.join(", ")
             ),
         });
@@ -9371,6 +9476,10 @@ pub struct HostedGoWorkspace {
     /// [`crate::vendor::go_workspace::modfile_setting`] words it (#1799).
     #[serde(default)]
     pub modfile: Option<String>,
+    /// The root module's unpruned module graph from the module cache, when
+    /// a module-to-module replace makes it matter (#1840).
+    #[serde(default)]
+    pub module_graph: Option<crate::vendor::go_build_list::ModuleGraph>,
 }
 
 fn rewrite_golang(
@@ -9410,6 +9519,9 @@ fn rewrite_golang(
         return;
     }
     let mut mod_target = has_go_mod.then(|| GoTarget::new(files, "go.mod", "go.sum", true));
+    if let Some(target) = mod_target.as_mut() {
+        target.graph = workspace.as_ref().and_then(|ws| ws.module_graph.clone());
+    }
     let mut work_target = root_work.map(|_| GoTarget::new(files, "go.work", "go.work.sum", false));
 
     for dep in &golang {
@@ -9591,6 +9703,9 @@ struct GoTarget {
     go_sum: crate::vendor::go_sum_edit::GoSumEditor,
     mod_changed: bool,
     sum_changed: bool,
+    /// The module graph [`HostedGoWorkspace::module_graph`] read for this
+    /// go.mod.
+    graph: Option<crate::vendor::go_build_list::ModuleGraph>,
 }
 
 impl GoTarget {
@@ -9614,6 +9729,7 @@ impl GoTarget {
             go_sum,
             mod_changed: false,
             sum_changed: false,
+            graph: None,
         }
     }
 
@@ -9654,6 +9770,7 @@ fn rewrite_golang_target(
         go_sum,
         mod_changed,
         sum_changed,
+        graph,
         ..
     } = target;
     let in_workspace = selection.is_some();
@@ -9694,7 +9811,14 @@ fn rewrite_golang_target(
     let selection = selection.unwrap_or_else(|| {
         let zips = go_sum.zip_versions(fname);
         let zips: Vec<&str> = zips.iter().map(String::as_str).collect();
-        go_build_list::select(go_mod, fname, scan.required.as_deref(), &zips, &dep.version)
+        go_build_list::select_in(
+            go_mod,
+            graph.as_ref(),
+            fname,
+            scan.required.as_deref(),
+            &zips,
+            &dep.version,
+        )
     });
     // A pin the build provably doesn't use: a selected version other than
     // the patched one, or a module go builds only as the target of another
@@ -9728,9 +9852,16 @@ fn rewrite_golang_target(
         }),
         _ => None,
     };
+    // A replace target the files only suspect (a go 1.16 graph whose
+    // go.mod files the module cache lacks, #1840) refuses a new pin but
+    // never removes one that may be working.
+    let proven = !matches!(selection, go_build_list::Selection::ReplaceTarget(_))
+        || go_build_list::proves_replace_target(go_mod, graph.as_ref());
     if let Some(warning) = inert {
         result.warnings.push(warning);
-        let stale_hosted = prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
+        let stale_hosted = prior
+            .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted))
+            .filter(|_| proven);
         if let Some(stale) = stale_hosted {
             if let Ok(Some(new)) =
                 go_mod_edit::remove_replace_entry(go_mod, fname, go_mod_edit::ReplaceOwner::Hosted)
@@ -10348,6 +10479,64 @@ mod tests {
             "single-module root still rewritten"
         );
         assert!(!warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"));
+    }
+
+    /// #1809: a Maven 4 (model 4.1.0) `pom`-packaged root that lists no
+    /// subprojects builds every direct subdirectory holding a `pom.xml`, so
+    /// it is a reactor like a declared one and refused untouched. Without
+    /// such a subdirectory, under a 4.0.0 model, or with discovery turned
+    /// off in `.mvn/maven.config`, it is a single pom and still rewritten.
+    #[test]
+    fn maven_4_implicit_subprojects_root_is_refused() {
+        let dep = "<dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n";
+        let root = |model: &str| {
+            format!(
+                "<project xmlns=\"http://maven.apache.org/POM/{model}\">\n  <modelVersion>{model}</modelVersion>\n  <groupId>com.example</groupId>\n  <artifactId>root</artifactId>\n  <version>1.0.0</version>\n  <packaging>pom</packaging>\n  {dep}</project>\n"
+            )
+        };
+        let child = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  <artifactId>child</artifactId>\n  <dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let tree = |model: &str, extra: &[(&str, &str)]| {
+            let mut files = BTreeMap::from([("pom.xml".to_string(), root(model))]);
+            files.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            rewrite_registry_redirect(&files, &[maven_override()])
+        };
+
+        let r = tree("4.1.0", &[("child/pom.xml", child)]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "an implicit reactor root must not be edited: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_multimodule_unsupported"]
+        );
+        assert!(r.warnings[0]
+            .detail
+            .contains("Maven 4 subproject discovery"));
+
+        let off = "-Dmaven.project.discoverSubprojects=false\n";
+        for (case, r) in [
+            ("no subproject", tree("4.1.0", &[])),
+            ("model 4.0.0", tree("4.0.0", &[("child/pom.xml", child)])),
+            (
+                "discovery off",
+                tree(
+                    "4.1.0",
+                    &[("child/pom.xml", child), (".mvn/maven.config", off)],
+                ),
+            ),
+        ] {
+            assert!(
+                r.files["pom.xml"].contains(MAVEN_SUFFIXED),
+                "{case}: a single pom is still rewritten"
+            );
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"),
+                "{case}"
+            );
+        }
     }
 
     /// A direct declaration whose groupId / artifactId is a property of
@@ -13751,6 +13940,90 @@ mod tests {
         }
     }
 
+    /// #1951: the hosted rewriter reads which package a yarn classic
+    /// `file:` / url copy holds through the same reader vendored and VEX use
+    /// ([`crate::formats::yarn::copy::classic_copy_ref`] and
+    /// [`crate::formats::yarn::copy::CopyRef::identity`]), so the modes
+    /// identify the same copies. (A copy no reader identifies is a separate
+    /// rule: vendored keeps it as a possible copy, #1516.) yarn 1 installs
+    /// `file:../ext/lpdir` from outside the root as readily as from inside
+    /// it, so that copy is read and named; an absolute `file:` path is never
+    /// read (a lock is untrusted input, #1516); a codeload tarball names no
+    /// registry package.
+    #[test]
+    fn issue_1951_yarn_classic_copy_named_as_vendored_reads_it() {
+        use crate::formats::yarn::copy::classic_copy_ref;
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let registry_block = "left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        let left_pad = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        let manifests = BTreeMap::from([
+            (
+                "../ext/lpdir/package.json".to_string(),
+                left_pad.to_string(),
+            ),
+            ("/abs/lpdir/package.json".to_string(), left_pad.to_string()),
+            ("lpdir/package.json".to_string(), left_pad.to_string()),
+        ]);
+        let codeload = "https://codeload.github.com/stevemao/left-pad/tar.gz/abc";
+        for (case, patterns, resolved, named) in [
+            ("in-root directory", "lp2@file:./lpdir", None, true),
+            ("out-of-root directory", "lp2@file:../ext/lpdir", None, true),
+            ("absolute directory", "lp2@file:/abs/lpdir", None, false),
+            (
+                "codeload tarball",
+                "lp2@stevemao/left-pad#v1.3.0",
+                Some(codeload),
+                false,
+            ),
+        ] {
+            // The package vendored and VEX identify this copy as.
+            let pats = vec![patterns.to_string()];
+            let vendored = classic_copy_ref(&pats, resolved).and_then(|copy| {
+                let bytes = copy
+                    .read_path()
+                    .and_then(|rel| manifests.get(&rel))
+                    .map(|t| t.as_bytes());
+                copy.identity("1.3.0", bytes)
+            });
+            assert_eq!(
+                vendored.is_some(),
+                named,
+                "{case}: vendored reads {vendored:?}"
+            );
+
+            let mut block = format!("\"{patterns}\":\n  version \"1.3.0\"\n");
+            if let Some(url) = resolved {
+                block.push_str(&format!("  resolved \"{url}\"\n"));
+            }
+            let mut files = manifests.clone();
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{registry_block}\n{block}"),
+            );
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+                "{case}: the registry block is still pinned: {:?}",
+                r.warnings
+            );
+            let hosted = r.warnings.iter().any(|w| w.detail.contains("lp2@"));
+            assert_eq!(hosted, named, "{case}: {:?}", r.warnings);
+            assert_eq!(
+                r.bundled_skipped_uuids.contains(&ovr.patch_uuid),
+                named,
+                "{case}"
+            );
+        }
+    }
+
     /// #363: yarn 1 fetches a git-pattern block with its git fetcher from
     /// the block's `resolved`, so a hosted tarball there makes every later
     /// install fail. The block stays byte-identical with a named warning,
@@ -15629,6 +15902,15 @@ mod tests {
         ));
         assert!(
             detail.contains("the workspace members pattern `crates/*`"),
+            "{detail}"
+        );
+        // A `[..]` class is a pattern too (#1833), not a literal member.
+        let detail = refused(one(
+            "[workspace]\nmembers = [\"crates/[ab]\"]\n\n[package]\nname = \"app\"\n\
+             version = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        ));
+        assert!(
+            detail.contains("the workspace members pattern `crates/[ab]`"),
             "{detail}"
         );
     }
@@ -18019,6 +18301,124 @@ mod tests {
         );
     }
 
+    /// #1831: the Socket source block takes the CRLF endings of the Gemfile
+    /// it is written into, for a rewritten direct declaration (plain, with
+    /// options, parenthesized, inside a user `source … do` block, on an
+    /// unterminated last line) and for the block appended for a transitive
+    /// gem. The re-run over the result is a no-op.
+    #[test]
+    fn gemfile_source_block_keeps_crlf_line_endings() {
+        let direct = gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails"]);
+        let transitive = gem_lock_resolving(
+            &[
+                ("puma", "6.0.0", &["rails (>= 0)"]),
+                ("rails", "7.0.0", &[]),
+            ],
+            &["puma"],
+        );
+        let head = "source \"https://rubygems.org\"\r\n\r\n";
+        let block = "source \"https://patch.test/gem/tok/uuid/\" do\r\n  gem \"rails\", \"7.0.0\"";
+        for (gemfile, lock, want) in [
+            (
+                format!("{head}gem \"rails\"\r\n"),
+                &direct,
+                format!("{block}\r\nend\r\n"),
+            ),
+            (
+                format!("{head}gem \"rails\", require: false # boot\r\n"),
+                &direct,
+                format!("{block}, require: false # boot\r\nend\r\n"),
+            ),
+            (
+                format!("{head}gem(\"rails\")\r\n"),
+                &direct,
+                format!("{block}\r\nend\r\n"),
+            ),
+            (
+                format!("{head}source \"https://gems.example\" do\r\n  gem \"rails\"\r\nend\r\n"),
+                &direct,
+                format!("do\r\n{block}\r\nend\r\nend\r\n"),
+            ),
+            (
+                format!("{head}gem \"rails\""),
+                &direct,
+                format!("{block}\r\nend"),
+            ),
+            // A lone CR at the end of the file is not a line ending.
+            (
+                format!("{head}gem \"rails\"\r"),
+                &direct,
+                format!("{block}\r\nend"),
+            ),
+            (
+                format!("{head}gem \"puma\"\r\n"),
+                &transitive,
+                format!("gem \"puma\"\r\n\r\n{block}\r\nend\r\n"),
+            ),
+            (
+                format!("{head}gem \"puma\""),
+                &transitive,
+                format!("gem \"puma\"\r\n\r\n{block}\r\nend\r\n"),
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.clone());
+            files.insert("Gemfile.lock".to_string(), lock.to_string());
+            let res = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            let out = res
+                .files
+                .get("Gemfile")
+                .unwrap_or_else(|| panic!("{gemfile:?} is redirected: {:?}", res.warnings));
+            assert_eq!(
+                LineEndings::of(out),
+                LineEndings::Crlf,
+                "{gemfile:?}: mixed line endings: {out:?}"
+            );
+            assert!(out.ends_with(&want), "{gemfile:?}: {out:?}");
+
+            files.insert("Gemfile".to_string(), out.clone());
+            files.insert(
+                "Gemfile.lock".to_string(),
+                res.files
+                    .get("Gemfile.lock")
+                    .cloned()
+                    .unwrap_or_else(|| lock.to_string()),
+            );
+            let again = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            assert!(
+                !again.files.contains_key("Gemfile"),
+                "{gemfile:?}: re-run rewrote the Gemfile: {:?}",
+                again.files.get("Gemfile")
+            );
+        }
+    }
+
+    /// #1831: an LF Gemfile still gets an LF block, and a line ending in LF
+    /// inside a mostly-CRLF file keeps its own LF (the block takes the
+    /// ending of the line it replaces).
+    #[test]
+    fn gemfile_source_block_keeps_lf_line_endings() {
+        let direct = gem_lock_resolving(&[("rails", "7.0.0", &[])], &["rails"]);
+        for (gemfile, want) in [
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rails\"\n",
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend\n",
+            ),
+            (
+                "source \"https://rubygems.org\"\r\n\r\ngem \"rails\"\n",
+                "source \"https://patch.test/gem/tok/uuid/\" do\n  gem \"rails\", \"7.0.0\"\nend\n",
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("Gemfile".to_string(), gemfile.to_string());
+            files.insert("Gemfile.lock".to_string(), direct.clone());
+            let res = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            let out = res.files.get("Gemfile").expect("redirected");
+            assert!(out.ends_with(want), "{gemfile:?}: {out:?}");
+            assert!(!out.contains("\r\r"), "{out:?}");
+        }
+    }
+
     /// A gem-level source option (`git:` / `path:` / `github:` / `source:`)
     /// preserved into the Socket source block OVERRIDES it in bundler's DSL,
     /// leaving the redirect a silent no-op that still gets attested. Fail
@@ -18762,10 +19162,12 @@ mod tests {
                 r.warnings
             );
             let out = r.files.get("Gemfile").expect("declaration rewritten");
+            // A CRLF declaration's block takes its CRLF (#1831).
+            let nl = if decl.ends_with('\r') { "\r\n" } else { "\n" };
             let want = if opts.is_empty() {
-                "  gem \"vuln-gem\", \"1.0.0\"\nend".to_string()
+                format!("  gem \"vuln-gem\", \"1.0.0\"{nl}end")
             } else {
-                format!("  gem \"vuln-gem\", \"1.0.0\", {opts}\nend")
+                format!("  gem \"vuln-gem\", \"1.0.0\", {opts}{nl}end")
             };
             assert!(out.contains(&want), "{decl:?}: {out}");
         }
@@ -23878,6 +24280,7 @@ packages:
                 ),
             }),
             modfile: None,
+            module_graph: None,
         };
         (
             GO_WORKSPACE_KEY.to_string(),
@@ -24100,6 +24503,7 @@ packages:
                 graph: None,
             }),
             modfile: None,
+            module_graph: None,
         };
         again.insert(
             GO_WORKSPACE_KEY.to_string(),
@@ -24116,6 +24520,126 @@ packages:
         );
     }
 
+    /// #1840: in a go 1.16 module the fork replace applies to a fork only a
+    /// dependency requires. The module graph read from the module cache
+    /// decides: with the fork in it the pin is refused; with a stale fork
+    /// replace nothing requires, the module is built in its own right and
+    /// the pin is written.
+    #[test]
+    fn golang_go116_module_graph_decides_the_fork_replace() {
+        use crate::vendor::go_build_list::ModuleGraph;
+        use crate::vendor::go_workspace::Loaded;
+        let go_mod = "module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n\
+                      replace other.com/fork => github.com/foo/bar v1.4.2\n";
+        let graph = |modules: &[(&str, &str)]| ModuleGraph {
+            selected: modules
+                .iter()
+                .map(|(m, v)| (m.to_string(), v.to_string()))
+                .collect(),
+            complete: true,
+        };
+        for (module_graph, inert) in [
+            (None, true),
+            (
+                Some(graph(&[
+                    ("example.com/mid", "v1.0.0"),
+                    ("other.com/fork", "v1.4.2"),
+                ])),
+                true,
+            ),
+            (
+                Some(graph(&[
+                    ("example.com/mid", "v1.0.0"),
+                    ("github.com/foo/bar", "v1.4.2"),
+                ])),
+                false,
+            ),
+        ] {
+            let mut files = golang_files();
+            files.insert("go.mod".to_string(), go_mod.to_string());
+            let hosted = HostedGoWorkspace {
+                root: std::path::PathBuf::new(),
+                loaded: Loaded::None,
+                modfile: None,
+                module_graph: module_graph.clone(),
+            };
+            files.insert(
+                GO_WORKSPACE_KEY.to_string(),
+                serde_json::to_string(&hosted).unwrap(),
+            );
+            let ovr = golang_override();
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            if inert {
+                assert!(out.files.is_empty(), "{module_graph:?}: {:?}", out.files);
+                assert_eq!(
+                    out.warnings
+                        .iter()
+                        .map(|w| w.code.as_str())
+                        .collect::<Vec<_>>(),
+                    ["redirect_golang_not_in_module_graph"],
+                    "{module_graph:?}"
+                );
+            } else {
+                assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+                assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+            }
+        }
+    }
+
+    /// #1840: without a complete module graph a go 1.16 fork replace is
+    /// only suspected to make the hosted pin inert, so the pin is neither
+    /// confirmed nor removed; a graph that shows the fork removes it.
+    #[test]
+    fn golang_go116_suspected_replace_target_keeps_the_hosted_pin() {
+        use crate::vendor::go_build_list::ModuleGraph;
+        use crate::vendor::go_workspace::Loaded;
+        let pin = format!(
+            "replace github.com/foo/bar v1.4.2 => {} v1.4.2-socketpatch.1",
+            golang_socket_module()
+        );
+        let go_mod = format!(
+            "module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n\
+             replace other.com/fork => github.com/foo/bar v1.4.2\n\n{pin}\n"
+        );
+        let fork = ModuleGraph {
+            selected: [("other.com/fork".to_string(), "v1.4.2".to_string())].into(),
+            complete: true,
+        };
+        let partial = ModuleGraph {
+            selected: Default::default(),
+            complete: false,
+        };
+        for (module_graph, removed) in [(None, false), (Some(partial), false), (Some(fork), true)] {
+            let mut files = golang_files();
+            files.insert("go.mod".to_string(), go_mod.clone());
+            let hosted = HostedGoWorkspace {
+                root: std::path::PathBuf::new(),
+                loaded: Loaded::None,
+                modfile: None,
+                module_graph: module_graph.clone(),
+            };
+            files.insert(
+                GO_WORKSPACE_KEY.to_string(),
+                serde_json::to_string(&hosted).unwrap(),
+            );
+            let ovr = golang_override();
+            let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(out.confirmed_golang_uuids.is_empty(), "{module_graph:?}");
+            assert_eq!(
+                out.warnings[0].code, "redirect_golang_not_in_module_graph",
+                "{module_graph:?}: {:?}",
+                out.warnings
+            );
+            match out.files.get("go.mod") {
+                Some(text) => {
+                    assert!(removed, "{module_graph:?}: {text}");
+                    assert!(!text.contains(&pin), "{text}");
+                }
+                None => assert!(!removed, "{module_graph:?}"),
+            }
+        }
+    }
+
     /// #1799: `-modfile` in GOFLAGS sends the build to another go.mod, so
     /// the hosted pin is refused, nothing written or confirmed.
     #[test]
@@ -24127,6 +24651,7 @@ packages:
             root: std::path::PathBuf::new(),
             loaded: Loaded::None,
             modfile: Some("GOFLAGS sets -modfile=go.alt.mod, so go builds from go.alt.mod".into()),
+            module_graph: None,
         };
         files.insert(
             GO_WORKSPACE_KEY.to_string(),

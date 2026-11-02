@@ -25,6 +25,10 @@
 
 #![allow(dead_code)]
 
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/fs_tree.rs"]
+mod fs_tree;
+
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -506,19 +510,6 @@ pub fn sha1_hex(bytes: &[u8]) -> String {
 
 // ── files ───────────────────────────────────────────────────────────────
 
-pub fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// A "fresh checkout" of `proj` in `dst`: only the committable files —
 /// `pom.xml`, `.mvn/` and `.socket/` (never `target/`).
 pub fn fresh_checkout(proj: &Path, dst: &Path) {
@@ -526,7 +517,7 @@ pub fn fresh_checkout(proj: &Path, dst: &Path) {
     std::fs::copy(proj.join("pom.xml"), dst.join("pom.xml")).unwrap();
     for dir in [".mvn", ".socket"] {
         if proj.join(dir).is_dir() {
-            copy_dir_recursive(&proj.join(dir), &dst.join(dir));
+            fs_tree::copy_tree(&proj.join(dir), &dst.join(dir));
         }
     }
     assert!(!dst.join("target").exists());

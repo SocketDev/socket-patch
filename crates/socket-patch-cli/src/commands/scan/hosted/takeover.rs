@@ -43,11 +43,15 @@ use socket_patch_core::patch::redirect::RewriteWarning;
 use socket_patch_core::utils::group_commit::{GroupCommit, Savepoint};
 use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
-use socket_patch_core::vendor::{RevertOutcome, VendorEntry, VendorState};
+use socket_patch_core::vendor::{RevertOutcome, VendorEntry, VendorState, RESIDUAL_REFERENCE_CODE};
 
 /// The warning that announces a staged takeover the run did not complete:
 /// the purl stays vendored.
-pub(super) const KEPT_VENDORED: &str = "redirect_takeover_kept_vendored";
+const KEPT_VENDORED: &str = "redirect_takeover_kept_vendored";
+
+/// The warning code of a takeover refused because its revert failed or
+/// would keep vendored wiring.
+const REVERT_FAILED: &str = "redirect_vendored_revert_failed";
 
 /// The skip reason of a staged takeover whose purl the hosted rewrite did
 /// not pin, when no rewriter warning names the cause.
@@ -138,10 +142,8 @@ impl Takeover {
                 // npm purl in this state falls through to the rewriters' own
                 // per-flavor diagnostics.)
                 None => {
-                    let Some((_, name, version)) = purl
-                        .starts_with("pkg:cargo/")
-                        .then(|| purl_parts(purl))
-                        .flatten()
+                    let Some((_, name, version)) =
+                        purl_parts(purl).filter(|(ty, _, _)| ty == "cargo")
                     else {
                         continue;
                     };
@@ -159,7 +161,7 @@ impl Takeover {
                             "vendored_revert_failed",
                         ));
                         out.warnings.push(serde_json::json!({
-                            "code": "redirect_vendored_revert_failed",
+                            "code": REVERT_FAILED,
                             "detail": format!(
                                 "{purl} has socket-owned vendored `[patch.crates-io]` \
                                  wiring but no usable vendored ledger entry \
@@ -172,14 +174,14 @@ impl Takeover {
                 }
             }
         }
-        // NON-UTF-8 PRE-CHECK (#721) — the GUARD's undecodable-file rule
+        // NON-UTF-8 PRE-CHECK — the GUARD's undecodable-file rule
         // (`engine::undecodable_guard`), checked before any revert is
         // staged (and under --dry-run too), on the project as it is on disk.
         if !out.attempts.is_empty() {
             let view = socket_patch_core::vendor::lock_inventory::ProjectView::Disk(&common.cwd);
             let read = socket_patch_core::hosted::engine::read_candidate_files(
                 &view,
-                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
                 candidates,
             )
             .await;
@@ -246,7 +248,7 @@ impl Takeover {
                 crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, false).await;
             let refusal = if !outcome.success {
                 Some(serde_json::json!({
-                    "code": "redirect_vendored_revert_failed",
+                    "code": REVERT_FAILED,
                     "detail": format!(
                         "{purl} is vendored and its vendored state could not be \
                          reverted ({}); NOT switched to hosted — run `socket-patch vendor \
@@ -257,15 +259,40 @@ impl Takeover {
             } else if let Some(residual) = residual_only_keep(&outcome) {
                 // Nothing drifted: another project file (an exported
                 // requirements file) still installs from the vendored
-                // wheel (#1184). Name it, not a drift.
-                Some(residual_takeover_warning(&purl, &residual))
-            } else if revert_keeps_wiring(&outcome) {
-                // A wiring record drifted and was left in place, so the
-                // project may still resolve through the vendored artifact
-                // and the ledger entry holds the only recorded originals
-                // (the RevertOutcome contract): keep both and refuse,
-                // exactly as `vendor --revert` reports it skipped.
-                Some(drifted_takeover_warning(&purl))
+                // wheel. Name it, not a drift.
+                let pin = purl
+                    .strip_prefix("pkg:pypi/")
+                    .map(|rest| rest.split(['?', '#']).next().unwrap_or(rest))
+                    .and_then(|rest| rest.split_once('@'))
+                    .map_or_else(
+                        || "the registry release".to_string(),
+                        |(name, version)| format!("`{name}=={version}`"),
+                    );
+                Some(serde_json::json!({
+                    "code": REVERT_FAILED,
+                    "detail": format!(
+                        "{purl} is vendored and another project file still installs from its \
+                         vendored wheel ({residual}), so it is left in place; NOT switched to hosted — \
+                         first replace the wheel path in that file with {pin} by hand (the lock is \
+                         still vendored, so a re-export now would name the wheel again), re-run \
+                         `scan --mode hosted`, and only then re-export the file from the rewired lock"
+                    ),
+                }))
+            } else if outcome.kept_artifact || outcome.drift_skipped() {
+                // A wiring record drifted or the revert kept the artifact,
+                // so the project may still resolve through it and the
+                // ledger entry holds the only recorded originals (the
+                // RevertOutcome contract): keep both and refuse, exactly as
+                // `vendor --revert` reports it skipped.
+                Some(serde_json::json!({
+                    "code": REVERT_FAILED,
+                    "detail": format!(
+                        "{purl} is vendored and part of its vendored wiring was edited since \
+                         vendoring, so it is left in place; NOT switched to hosted — restore or \
+                         remove that wiring (`socket-patch vendor --revert` lists it), then re-run \
+                         `scan --mode hosted`"
+                    ),
+                }))
             } else {
                 None
             };
@@ -299,8 +326,8 @@ impl Takeover {
     /// `npm:` alias entry the vendored wiring had repointed, which the
     /// hosted rewrite leaves on the registry (`alias_skipped`, the
     /// rewrite's `RewriteResult::alias_skipped_entries`). Committing that
-    /// takeover would un-patch the alias copy (#1158), so it is retracted
-    /// like a purl with no pin at all.
+    /// takeover would un-patch the alias copy, so it is retracted like a
+    /// purl with no pin at all.
     pub(super) fn unpinned(
         &self,
         confirmed: &[(String, String)],
@@ -310,7 +337,9 @@ impl Takeover {
             .iter()
             .filter(|s| {
                 !confirmed.iter().any(|(_, uuid)| *uuid == s.uuid)
-                    || unwires_alias_copy(&s.entry, alias_skipped.get(&s.uuid))
+                    || alias_skipped
+                        .get(&s.uuid)
+                        .is_some_and(|skipped| unwires_alias_copy(&s.entry, skipped))
             })
             .map(|s| s.uuid.clone())
             .collect()
@@ -435,11 +464,11 @@ const LANDED_PIN_ADVISORIES: &[&str] = &[
 /// Why the rewrite did not pin a staged purl: the skip reason, and the
 /// rewriter warnings that say so. In order: for a PyPI entry, the reach the
 /// hosted rewriter lacks (`preflight_pypi_takeover`: a requirements entry
-/// wired outside the root file #699, a uv entry pinned down from another
-/// locked version #723, a Poetry 0.x lock #945); a rewriter warning naming
-/// the package; the rewrite's first warning (a lock-level refusal names no
-/// package), skipping [`LANDED_PIN_ADVISORIES`] and the uv < 0.5.6
-/// advisories (#1569); else [`NOT_PINNED`].
+/// wired outside the root file, a uv entry pinned down from another locked
+/// version, a Poetry 0.x lock); a rewriter warning naming the package; the
+/// rewrite's first warning (a lock-level refusal names no package),
+/// skipping [`LANDED_PIN_ADVISORIES`] and the uv < 0.5.6 advisories; else
+/// [`NOT_PINNED`].
 async fn explain(
     root: &std::path::Path,
     entry: &VendorEntry,
@@ -451,7 +480,7 @@ async fn explain(
     }
     // The uv < 0.5.6 advisories ride on a pin that landed, and their
     // wording ("wheel", "uv", "sync") can read as another package's name,
-    // so neither pass may pick one (#1569).
+    // so neither pass may pick one.
     let candidates = || {
         warnings.iter().filter(|w| {
             !socket_patch_core::patch::redirect::UV_OLD_RELEASE_ADVISORIES
@@ -471,15 +500,10 @@ async fn explain(
 }
 
 /// Whether `entry`'s vendored wiring repointed a yarn.lock entry among
-/// `skipped`, the alias entries the hosted rewrite left untouched for its
-/// uuid. Both sides key an entry by its lock key line as the shared
-/// `formats::yarn::blocks` scanner reads it. An alias entry the vendored wiring
-/// never touched (yarn berry vendoring skips aliases too) was unpatched
-/// before the run, so the takeover does not change it.
-fn unwires_alias_copy(entry: &VendorEntry, skipped: Option<&BTreeSet<String>>) -> bool {
-    let Some(skipped) = skipped else {
-        return false;
-    };
+/// `skipped`. Both sides key an entry by its lock key line as
+/// `formats::yarn::blocks` reads it; an alias entry the vendored wiring
+/// never touched was unpatched before the run, so it does not count.
+fn unwires_alias_copy(entry: &VendorEntry, skipped: &BTreeSet<String>) -> bool {
     entry.wiring.iter().any(|w| {
         std::path::Path::new(&w.file)
             .file_name()
@@ -509,7 +533,7 @@ fn is_berry_entry(entry: &VendorEntry) -> bool {
 /// it is BEFORE any yarn-berry entry's revert. The revert re-renders
 /// `package.json` in its majority line ending, so a mixed manifest would
 /// pass the hosted rewriter's own check afterwards, while both modes refuse
-/// to rewrite a mixed one (#628): the takeover keeps such a package
+/// to rewrite a mixed one: the takeover keeps such a package
 /// vendored. The gate itself is the rewriter's
 /// (`preflight_yarn_berry_hosted`, over the shared `berry_gates`).
 async fn berry_project_gate(common: &crate::args::GlobalArgs) -> Option<RewriteWarning> {
@@ -554,17 +578,6 @@ fn names_package(detail: &str, name: &str) -> bool {
     })
 }
 
-/// Whether a takeover revert left vendored wiring in place: a drift-skipped
-/// record, or a reverted file that still references the artifact dir.
-fn revert_keeps_wiring(outcome: &RevertOutcome) -> bool {
-    outcome.kept_artifact
-        || outcome.drift_skipped()
-        || outcome
-            .warnings
-            .iter()
-            .any(|w| w.code == "vendor_revert_residual_reference")
-}
-
 /// The `vendor_revert_residual_reference` detail of a revert whose ONLY
 /// keep signal is a file that still references the artifact.
 fn residual_only_keep(outcome: &RevertOutcome) -> Option<String> {
@@ -574,7 +587,7 @@ fn residual_only_keep(outcome: &RevertOutcome) -> Option<String> {
     outcome
         .warnings
         .iter()
-        .find(|w| w.code == socket_patch_core::vendor::RESIDUAL_REFERENCE_CODE)
+        .find(|w| w.code == RESIDUAL_REFERENCE_CODE)
         .map(|w| {
             // `kept <dir>: <file> still resolves through it, and deleting …`:
             // only the clause naming the file; the revert's own remedy is
@@ -588,47 +601,6 @@ fn residual_only_keep(outcome: &RevertOutcome) -> Option<String> {
                 .unwrap_or(detail)
                 .to_string()
         })
-}
-
-/// The refusal for a takeover whose vendored wheel another project file
-/// still installs from.
-///
-/// The order matters: the refusal leaves the lock vendored, so re-exporting
-/// from it now would name the wheel again. The file is pinned by hand
-/// first; only after the hosted scan has rewired the lock is a re-export
-/// safe.
-fn residual_takeover_warning(purl: &str, residual: &str) -> serde_json::Value {
-    let pin = purl
-        .strip_prefix("pkg:pypi/")
-        .map(|rest| rest.split(['?', '#']).next().unwrap_or(rest))
-        .and_then(|rest| rest.split_once('@'))
-        .map_or_else(
-            || "the registry release".to_string(),
-            |(name, version)| format!("`{name}=={version}`"),
-        );
-    serde_json::json!({
-        "code": "redirect_vendored_revert_failed",
-        "detail": format!(
-            "{purl} is vendored and another project file still installs from its \
-             vendored wheel ({residual}), so it is left in place; NOT switched to hosted — \
-             first replace the wheel path in that file with {pin} by hand (the lock is \
-             still vendored, so a re-export now would name the wheel again), re-run \
-             `scan --mode hosted`, and only then re-export the file from the rewired lock"
-        ),
-    })
-}
-
-/// The refusal for a takeover whose vendored wiring drifted since vendoring.
-fn drifted_takeover_warning(purl: &str) -> serde_json::Value {
-    serde_json::json!({
-        "code": "redirect_vendored_revert_failed",
-        "detail": format!(
-            "{purl} is vendored and part of its vendored wiring was edited since \
-             vendoring, so it is left in place; NOT switched to hosted — restore or \
-             remove that wiring (`socket-patch vendor --revert` lists it), then re-run \
-             `scan --mode hosted`"
-        ),
-    })
 }
 
 #[cfg(test)]
@@ -680,7 +652,7 @@ mod tests {
         assert_eq!(explained, vec![warn("redirect_lock_refused")]);
     }
 
-    /// #1569: another pin's uv advisory says "wheel" and "uv sync", whole
+    /// Another pin's uv advisory says "wheel" and "uv sync", whole
     /// words that are also package names; it never explains a staged
     /// package that was not pinned, by name or as the lock-wide fallback.
     #[tokio::test]

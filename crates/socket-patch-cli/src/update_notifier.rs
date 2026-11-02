@@ -31,26 +31,26 @@ use crate::args::GlobalArgs;
 /// Everything the guard stack looks at, captured up front so the decision
 /// logic is a pure, table-testable function.
 #[derive(Debug, Clone)]
-pub struct GuardCtx {
+struct GuardCtx {
     /// `SOCKET_NO_UPDATE_CHECK` truthy — the kill switch. Wins over
     /// everything, including the force knob.
-    pub opted_out: bool,
-    pub offline: bool,
-    pub silent: bool,
-    pub json: bool,
+    opted_out: bool,
+    offline: bool,
+    silent: bool,
+    json: bool,
     /// `CI`/`GITHUB_ACTIONS` say a robot is watching. Always silences —
     /// the force knob does NOT bypass it (tests neutralize with `CI=""`).
-    pub ci: bool,
-    pub stderr_tty: bool,
+    ci: bool,
+    stderr_tty: bool,
     /// `SOCKET_UPDATE_NOTIFIER_FORCE` truthy — undocumented test hook that
     /// bypasses ONLY the stderr-TTY guard (e2e children write to pipes).
-    pub forced: bool,
-    pub state_dir_resolvable: bool,
+    forced: bool,
+    state_dir_resolvable: bool,
 }
 
 /// Why the notifier stayed quiet (debug-logged under `--debug`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason {
+enum SkipReason {
     OptedOut,
     Offline,
     Silent,
@@ -77,7 +77,7 @@ impl SkipReason {
 /// The single place notifier-guard precedence is defined:
 /// opt-out, offline, `--silent`, `--json`, and CI always silence;
 /// the force knob bypasses the TTY guard alone.
-pub fn should_check(ctx: &GuardCtx) -> Result<(), SkipReason> {
+fn should_check(ctx: &GuardCtx) -> Result<(), SkipReason> {
     if ctx.opted_out {
         return Err(SkipReason::OptedOut);
     }
@@ -102,28 +102,23 @@ pub fn should_check(ctx: &GuardCtx) -> Result<(), SkipReason> {
     Ok(())
 }
 
-/// `CI` set to anything non-empty except an explicit falsy counts;
-/// `GITHUB_ACTIONS` counts whenever non-empty. Deliberately short list —
-/// the TTY guard covers other vendors' runners anyway.
-fn in_ci() -> bool {
-    let ci = std::env::var("CI").unwrap_or_default();
-    if !ci.is_empty() && !matches!(ci.trim().to_ascii_lowercase().as_str(), "0" | "false") {
-        return true;
-    }
-    !std::env::var("GITHUB_ACTIONS")
-        .unwrap_or_default()
-        .is_empty()
-}
-
 impl GuardCtx {
     /// Capture the real environment + the parsed global flags.
-    pub fn capture(common: &GlobalArgs) -> Self {
+    fn capture(common: &GlobalArgs) -> Self {
+        let ci = std::env::var("CI").unwrap_or_default();
         GuardCtx {
             opted_out: env_truthy("SOCKET_NO_UPDATE_CHECK"),
             offline: common.offline,
             silent: common.silent,
             json: common.json,
-            ci: in_ci(),
+            // `CI` set to anything non-empty except an explicit falsy counts;
+            // `GITHUB_ACTIONS` counts whenever non-empty. Deliberately short
+            // list — the TTY guard covers other vendors' runners anyway.
+            ci: (!ci.is_empty()
+                && !matches!(ci.trim().to_ascii_lowercase().as_str(), "0" | "false"))
+                || !std::env::var("GITHUB_ACTIONS")
+                    .unwrap_or_default()
+                    .is_empty(),
             // The notice prints on stderr; stdout may be legitimately piped
             // (`list | jq`) in a perfectly interactive session.
             stderr_tty: std::io::stderr().is_terminal(),
@@ -205,11 +200,10 @@ async fn refresh_latest(debug: bool) -> Option<semver::Version> {
     }
 
     let endpoints = UpdateEndpoints::from_env();
-    let override_ms = std::env::var("SOCKET_UPDATE_TIMEOUT_MS")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .and_then(|v| v.parse::<u64>().ok());
-    let budget = Duration::from_millis(override_ms.unwrap_or(2000));
+    let budget = millis_or(
+        std::env::var("SOCKET_UPDATE_TIMEOUT_MS").ok().as_deref(),
+        2000,
+    );
     let timeouts = UpdateTimeouts {
         connect: budget,
         metadata: budget,
@@ -235,19 +229,6 @@ async fn refresh_latest(debug: bool) -> Option<semver::Version> {
     fetched
 }
 
-/// The channel-aware upgrade command for the notice's second line —
-/// pointing an npm-installed user at `--update` would only route them into
-/// its managed-install refusal.
-fn upgrade_command() -> &'static str {
-    match core_update::resolve_install_path() {
-        Ok(p) => {
-            let env = ChannelEnv::from_env();
-            upgrade_hint_for(detect_channel(&p, &env), &p, &env)
-        }
-        Err(_) => upgrade_hint(InstallChannel::Standalone),
-    }
-}
-
 /// Render the two-line notice. Pure for unit tests. The caller prints a
 /// blank line before it (it follows the command's own output, often an
 /// `Error: ...` line, and must not read as part of that error).
@@ -264,36 +245,10 @@ fn format_notice(
     )
 }
 
-const DEFAULT_GRACE_MS: u64 = 500;
-
-/// How long `finish` waits for the background fetch before abandoning it.
-///
-/// 500 ms in production — deliberately tight so a real command never stalls
-/// on the notifier. The catch: `main` calls `std::process::exit` the instant
-/// `finish` returns, which kills a still-running detached fetch before its
-/// state write (or even its outbound request) can land. On a fast host the
-/// loopback fetch finishes in milliseconds and comfortably beats the ceiling;
-/// on a slow one (a loaded Windows CI runner, fsync latency, a cold TLS/HTTP
-/// client) the fetch can miss the 500 ms window, the task is killed, and its
-/// `latestSeen` write / `expect`-counted request simply never happens — an
-/// e2e that asserts on that observable effect then fails intermittently.
-///
-/// `SOCKET_UPDATE_GRACE_MS` lets the e2e suite lift the ceiling so the fetch
-/// is awaited to completion instead of raced. Same shape as the
-/// `SOCKET_UPDATE_TIMEOUT_MS` fetch-budget hook; the default is preserved, so
-/// production behavior is byte-identical.
-fn grace_budget() -> Duration {
-    grace_budget_from(std::env::var("SOCKET_UPDATE_GRACE_MS").ok().as_deref())
-}
-
-/// Pure core of [`grace_budget`]: parse the raw env value, falling back to
-/// the production default on absence, emptiness, or garbage.
-fn grace_budget_from(raw: Option<&str>) -> Duration {
-    let ms = raw
-        .filter(|v| !v.is_empty())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_GRACE_MS);
-    Duration::from_millis(ms)
+/// A millisecond env knob's value (`SOCKET_UPDATE_TIMEOUT_MS`,
+/// `SOCKET_UPDATE_GRACE_MS`): `default` when unset, empty or not a number.
+fn millis_or(raw: Option<&str>, default: u64) -> Duration {
+    Duration::from_millis(raw.and_then(|v| v.parse().ok()).unwrap_or(default))
 }
 
 /// Join the background fetch within the grace budget and print the notice
@@ -305,7 +260,16 @@ pub async fn finish(notifier: Option<Notifier>) {
     };
     let fetched = match notifier.task {
         Some(handle) => {
-            match tokio::time::timeout(grace_budget(), handle).await {
+            // 500 ms keeps a real command from stalling on the notifier. The
+            // e2e suite lifts it with SOCKET_UPDATE_GRACE_MS: `main` exits as
+            // soon as this returns, killing a fetch that a slow runner had
+            // not finished, so asserting on its effect would be flaky.
+            match tokio::time::timeout(
+                millis_or(std::env::var("SOCKET_UPDATE_GRACE_MS").ok().as_deref(), 500),
+                handle,
+            )
+            .await
+            {
                 Ok(Ok(result)) => result,
                 // Timed out (the task keeps running until process exit —
                 // its own state write may still land) or panicked; either
@@ -336,16 +300,20 @@ pub async fn finish(notifier: Option<Notifier>) {
         return;
     }
 
+    // The channel-aware upgrade command: pointing an npm-installed user at
+    // `--update` would only route them into its managed-install refusal.
+    let hint = match core_update::resolve_install_path() {
+        Ok(p) => {
+            let env = ChannelEnv::from_env();
+            upgrade_hint_for(detect_channel(&p, &env), &p, &env)
+        }
+        Err(_) => upgrade_hint(InstallChannel::Standalone),
+    };
     // Separator: the notice follows the command's own output.
     eprintln!();
     eprintln!(
         "{}",
-        format_notice(
-            &current,
-            &latest,
-            upgrade_command(),
-            crate::ui::stderr_color()
-        )
+        format_notice(&current, &latest, hint, crate::ui::stderr_color())
     );
 
     let mut state = core_update::load_state();
@@ -442,49 +410,28 @@ mod tests {
     }
 
     #[test]
-    fn grace_budget_defaults_preserved_and_override_honored() {
-        // Absence, emptiness, and garbage all keep the tight production
-        // ceiling — the override never silently changes shipped behavior.
-        assert_eq!(grace_budget_from(None), Duration::from_millis(500));
-        assert_eq!(grace_budget_from(Some("")), Duration::from_millis(500));
-        assert_eq!(
-            grace_budget_from(Some("not-a-number")),
-            Duration::from_millis(500)
-        );
-        // A valid value lifts the ceiling (the e2e suite's escape hatch).
-        assert_eq!(
-            grace_budget_from(Some("30000")),
-            Duration::from_millis(30_000)
-        );
-        assert_eq!(grace_budget_from(Some("0")), Duration::from_millis(0));
+    fn millis_knob_falls_back_unless_a_number() {
+        let ms = Duration::from_millis;
+        assert_eq!(millis_or(None, 500), ms(500));
+        assert_eq!(millis_or(Some(""), 500), ms(500));
+        assert_eq!(millis_or(Some("not-a-number"), 500), ms(500));
+        assert_eq!(millis_or(Some("30000"), 500), ms(30_000));
+        assert_eq!(millis_or(Some("0"), 500), ms(0));
     }
 
     #[test]
-    fn notice_names_versions_hint_and_optout() {
+    fn notice_is_two_prefixed_lines_with_a_green_version() {
         let current = semver::Version::new(3, 3, 0);
         let latest = semver::Version::new(3, 4, 0);
-        let plain = format_notice(&current, &latest, "socket-patch --update", false);
-        assert!(plain.contains("3.3.0"), "{plain}");
-        assert!(plain.contains("3.4.0"), "{plain}");
-        assert!(plain.contains("socket-patch --update"), "{plain}");
-        assert!(plain.contains("SOCKET_NO_UPDATE_CHECK=1"), "{plain}");
-        assert!(
-            !plain.contains("\u{1b}["),
-            "no ANSI codes without a terminal: {plain}"
-        );
-        let colored = format_notice(&current, &latest, "socket-patch --update", true);
-        assert!(colored.contains("\u{1b}["), "{colored}");
-        // Exactly two lines (the caller prints the separating blank line),
-        // both prefixed for grep-ability.
-        assert_eq!(
-            plain,
-            "[socket-patch] Update available: 3.3.0 \u{2192} 3.4.0\n\
-             [socket-patch] Run `socket-patch --update` to upgrade \
-             (set SOCKET_NO_UPDATE_CHECK=1 to hide)"
-        );
-        for line in plain.lines() {
-            assert!(line.starts_with("[socket-patch]"), "{line}");
-        }
-        assert_eq!(plain.lines().count(), 2);
+        let expected = |new: &str| {
+            format!(
+                "[socket-patch] Update available: 3.3.0 \u{2192} {new}\n\
+                 [socket-patch] Run `socket-patch --update` to upgrade \
+                 (set SOCKET_NO_UPDATE_CHECK=1 to hide)"
+            )
+        };
+        let notice = |color| format_notice(&current, &latest, "socket-patch --update", color);
+        assert_eq!(notice(false), expected("3.4.0"));
+        assert_eq!(notice(true), expected("\u{1b}[32m3.4.0\u{1b}[0m"));
     }
 }

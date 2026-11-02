@@ -1,9 +1,9 @@
 //! The project a command reads, loaded lazily and at most once per run:
 //! the patch stores ([`LoadedLedgers`]: manifest + both ledgers), the lock
 //! set (the lockfile inventory and its refused npm layouts) and the
-//! lockfile wiring discovery. `scan`, `vendor`, `vex`, `list` and `get`
-//! read these through one [`ProjectContext`] instead of each re-loading
-//! and re-merging them its own way.
+//! lockfile wiring discovery. `scan`, `list`, `get` and `apply` read these
+//! through one [`ProjectContext`] instead of each re-loading and re-merging
+//! them its own way.
 //!
 //! The lock set and the discovery read `--cwd` through one
 //! [`DiskSnapshot`], so each lock and config file is read once and both see
@@ -46,8 +46,8 @@ pub(crate) struct ProjectContext<'a> {
 }
 
 impl<'a> ProjectContext<'a> {
-    /// Every command's context: the ledgers always load from the manifest's
-    /// project, so `--manifest-path` never mixes two projects' state (#745).
+    /// The ledgers always load from the manifest's project, so
+    /// `--manifest-path` never mixes two projects' state.
     pub(crate) fn new(common: &'a GlobalArgs) -> Self {
         Self {
             common,
@@ -59,7 +59,6 @@ impl<'a> ProjectContext<'a> {
         }
     }
 
-    /// The three stores, each with its own load outcome.
     pub(crate) async fn loaded(&self) -> &LoadedLedgers {
         self.ledgers
             .get_or_init(|| async {
@@ -73,7 +72,6 @@ impl<'a> ProjectContext<'a> {
         self.loaded().await.view()
     }
 
-    /// The lockfile inventory of `--cwd`.
     pub(crate) async fn locks(&self) -> &LockSet {
         self.locks
             .get_or_init(|| async {
@@ -90,7 +88,7 @@ impl<'a> ProjectContext<'a> {
             .await
     }
 
-    /// The lockfile wiring discovery of `--cwd` ([`super::discover_wiring`]).
+    /// The lockfile wiring discovery of `--cwd` ([`super::discover_wiring_in`]).
     pub(crate) async fn discovery(&self) -> &Discovery {
         &self.recorded_discovery().await.0
     }

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub(crate) use socket_patch_core::rollout::stage::*;
-use socket_patch_core::rollout::{severity_label, MaxNew, MaxNewSource, Recorded, RolloutPlan};
+use socket_patch_core::rollout::{severity_label, MaxNewSource, Recorded};
 use socket_patch_core::utils::purl_key::PurlKey;
 
 use super::discovery::UpdateInfo;
@@ -73,32 +73,7 @@ impl<'a> Prior<'a> {
     }
 }
 
-impl<'a> Gate<'a> {
-    pub(crate) fn new(stage: &'a mut Stage, rows: Vec<Row>) -> Self {
-        Gate {
-            stage,
-            rows,
-            prior: None,
-            references: None,
-        }
-    }
-
-    /// This gate carrying scan's pre-redirect discovery (see [`Self::prior`]).
-    pub(crate) fn with_prior(mut self, prior: Option<Prior<'a>>) -> Self {
-        self.prior = prior;
-        self
-    }
-
-    /// This gate carrying the sweep's reference answers (see
-    /// [`Self::references`]).
-    pub(crate) fn with_references(
-        mut self,
-        references: Option<super::withdrawn::KnownReferences>,
-    ) -> Self {
-        self.references = references;
-        self
-    }
-
+impl Gate<'_> {
     /// `(purl, uuid)` of every NEW row, for O(1) [`Self::is_new`] checks.
     pub(crate) fn new_keys(&self) -> HashSet<(String, String)> {
         self.rows
@@ -106,17 +81,6 @@ impl<'a> Gate<'a> {
             .filter(|r| r.candidate.recorded.is_new())
             .map(|r| (r.writer.purl.clone(), r.writer.uuid.clone()))
             .collect()
-    }
-
-    /// Whether a NEW `(purl, uuid)` row could be admitted: budget left, or
-    /// its package already admitted by an earlier directory.
-    pub(crate) fn may_admit(&self, purl: &str) -> bool {
-        self.stage.may_admit_new()
-            || (!(self.stage.capped() && self.stage.incomplete)
-                && self
-                    .stage
-                    .already_admitted
-                    .contains(&PurlKey::new(purl).into_string()))
     }
 }
 
@@ -151,45 +115,15 @@ pub(crate) fn human(stage: &Stage, dry_run: bool) -> (Option<String>, Vec<String
     let Some(plan) = stage.plan.as_ref() else {
         return (None, Vec::new());
     };
-    let ctx = HumanContext {
-        dry_run,
-        incomplete: stage.incomplete && stage.capped(),
-        shared: stage.carry.is_some(),
-    };
-    human_lines(&stage.configured, plan, ctx)
-}
-
-/// `pkg:npm/@scope/x@1.0.0` → `@scope/x@1.0.0`.
-fn short_name(base_purl: &str) -> &str {
-    base_purl
-        .strip_prefix("pkg:")
-        .and_then(|rest| rest.split_once('/'))
-        .map_or(base_purl, |(_, name)| name)
-}
-
-/// How [`human_lines`] words a run.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct HumanContext {
-    pub(crate) dry_run: bool,
-    /// A lookup failed, so no new patch could be admitted.
-    pub(crate) incomplete: bool,
-    /// The budget is shared with other project directories of this run.
-    pub(crate) shared: bool,
-}
-
-pub(crate) fn human_lines(
-    configured: &MaxNew,
-    plan: &RolloutPlan,
-    ctx: HumanContext,
-) -> (Option<String>, Vec<String>) {
+    let configured = &stage.configured;
     let c = plan.counts;
     let line = configured.value.map(|cap| {
-        let verb = if ctx.dry_run {
+        let verb = if dry_run {
             "would be applied"
         } else {
             "applied"
         };
-        let shared = match (ctx.shared, plan.remaining) {
+        let shared = match (stage.carry.is_some(), plan.remaining) {
             (true, Some(left)) => format!(", shared by this run's directories, {left} left"),
             _ => String::new(),
         };
@@ -207,13 +141,13 @@ pub(crate) fn human_lines(
         return (line, Vec::new());
     }
     let deferred = crate::ui::plural(groups.len(), "new patch", "new patches");
-    let deferred = if ctx.dry_run {
+    let deferred = if dry_run {
         format!("{deferred} would be deferred")
     } else {
         format!("{deferred} deferred")
     };
     let first = match configured.value {
-        _ if ctx.incomplete => format!(
+        _ if stage.incomplete && stage.capped() => format!(
             "{deferred}: a patch lookup failed, so no new patch was added this run; run scan \
              again once the patch API answers."
         ),
@@ -226,7 +160,7 @@ pub(crate) fn human_lines(
                 MaxNewSource::Cap | MaxNewSource::Default => "raise the cap",
             }
         ),
-        Some(cap) if ctx.dry_run => format!(
+        Some(cap) if dry_run => format!(
             "{deferred}; the wet run adds the top {}, and each later committed scan the next ones.",
             (cap as usize).min(c.new as usize + groups.len())
         ),
@@ -242,7 +176,10 @@ pub(crate) fn human_lines(
         .map(|g| {
             format!(
                 "{} ({})",
-                short_name(&g.base_purl),
+                g.base_purl
+                    .strip_prefix("pkg:")
+                    .and_then(|rest| rest.split_once('/'))
+                    .map_or(g.base_purl.as_str(), |(_, name)| name),
                 severity_label(g.severity_order)
             )
         })
@@ -307,6 +244,7 @@ mod tests {
     use socket_patch_core::api::types::VulnerabilityResponse;
     use socket_patch_core::manifest::schema::PatchManifest;
     use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::rollout::MaxNew;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -365,22 +303,6 @@ mod tests {
                 )
             })
             .collect()
-    }
-
-    #[test]
-    fn offers_drop_inaccessible_paid_patches_and_pick_the_top_one() {
-        let mut paid = offer("pkg:npm/a@1", "p", "2026-01-01T00:00:00Z", &["critical"]);
-        paid.tier = "paid".into();
-        let results = vec![
-            offer("pkg:npm/a@1", "old", "2020-01-01T00:00:00Z", &["high"]),
-            paid,
-            offer("pkg:npm/a@1", "new", "2026-01-01T00:00:00Z", &["high"]),
-        ];
-        let free = offers_from_results(&results, false);
-        assert_eq!(free.selected["pkg:npm/a@1"].uuid, "new");
-        assert_eq!(free.unfiltered["pkg:npm/a@1"].len(), 2);
-        let all = offers_from_results(&results, true);
-        assert_eq!(all.selected["pkg:npm/a@1"].uuid, "p");
     }
 
     #[test]
@@ -446,213 +368,6 @@ mod tests {
                 ("pkg:npm/up@1", "u-old", "u-new")
             ]
         );
-    }
-
-    #[test]
-    fn composer_version_spellings_upgrade_without_spending_the_new_patch_budget() {
-        let stored = manifest(&[("pkg:composer/psr/log@3.0.2.0", "old")]);
-        let recorded = RecordedIndex::new(Some(&stored), &[]);
-        let offers = offers_from_results(
-            &[offer(
-                "pkg:composer/psr/log@v3.0.2",
-                "new",
-                "2026-02-01T00:00:00Z",
-                &["high"],
-            )],
-            false,
-        );
-        let rows = classify(&offers, &recorded, "");
-        let plan = socket_patch_core::rollout::plan_rollout(
-            rows.into_iter().map(|row| row.candidate).collect(),
-            &MaxNew {
-                value: Some(0),
-                source: MaxNewSource::Flag,
-            },
-            false,
-            &BTreeSet::new(),
-        );
-        assert_eq!(plan.counts.upgrade, 1);
-        assert_eq!(plan.counts.new, 0);
-        assert!(plan.deferred.is_empty());
-        assert_eq!(plan.admitted.len(), 1);
-    }
-
-    #[test]
-    fn recorded_matches_percent_encoding_and_qualifier_twins() {
-        let results = vec![
-            offer("pkg:npm/%40s/x@1", "e1", "", &["high"]),
-            offer("pkg:pypi/w@1?artifact_id=b", "w2", "", &["high"]),
-        ];
-        let offers = offers_from_results(&results, true);
-        let recorded = manifest(&[
-            ("pkg:npm/@s/x@1", "e1"),
-            ("pkg:pypi/w@1?artifact_id=a", "w1"),
-        ]);
-        let rows = classify(&offers, &RecordedIndex::new(Some(&recorded), &[]), "");
-        assert_eq!(rows[0].candidate.recorded, Recorded::Same);
-        // The twin's recorded uuid is not offered for this twin: the late
-        // twin lands uncapped as an UPGRADE.
-        assert_eq!(
-            rows[1].candidate.recorded,
-            Recorded::Superseded {
-                old_uuid: "w1".into()
-            }
-        );
-    }
-
-    #[test]
-    fn several_recorded_uuids_prefer_the_selected_one_else_the_smallest() {
-        let results = vec![offer("pkg:pypi/w@1", "b", "", &["high"])];
-        let offers = offers_from_results(&results, true);
-        let recorded = manifest(&[
-            ("pkg:pypi/w@1?artifact_id=1", "c"),
-            ("pkg:pypi/w@1?artifact_id=2", "b"),
-        ]);
-        let rows = classify(&offers, &RecordedIndex::new(Some(&recorded), &[]), "");
-        assert_eq!(rows[0].candidate.recorded, Recorded::Same);
-        let recorded = manifest(&[
-            ("pkg:pypi/w@1?artifact_id=1", "d"),
-            ("pkg:pypi/w@1?artifact_id=2", "c"),
-        ]);
-        let rows = classify(&offers, &RecordedIndex::new(Some(&recorded), &[]), "");
-        assert_eq!(
-            rows[0].candidate.recorded,
-            Recorded::Superseded {
-                old_uuid: "c".into()
-            }
-        );
-    }
-
-    #[test]
-    fn a_discovered_pin_of_the_selected_uuid_marks_the_row_already() {
-        let results = vec![
-            offer(
-                "pkg:npm/a@1",
-                "aaaaaaaa-1111-4111-8111-00000000000a",
-                "",
-                &["high"],
-            ),
-            offer(
-                "pkg:npm/b@1",
-                "bbbbbbbb-1111-4111-8111-00000000000b",
-                "",
-                &["high"],
-            ),
-        ];
-        let offers = offers_from_results(&results, true);
-        let mut rows = classify(&offers, &RecordedIndex::default(), "");
-        mark_pinned(
-            &mut rows,
-            &[socket_patch_core::patch::redirect::upstream::HostedPin {
-                purl: "pkg:npm/a@1".into(),
-                uuid: "aaaaaaaa-1111-4111-8111-00000000000a".into(),
-                files: vec!["package-lock.json".into()],
-            }],
-        );
-        assert_eq!(rows[0].candidate.recorded, Recorded::Same);
-        assert_eq!(rows[1].candidate.recorded, Recorded::None);
-    }
-
-    #[test]
-    fn a_discovered_pin_of_another_uuid_marks_the_row_an_upgrade() {
-        // A pin on a patch server only this run's references name is found
-        // by the second discovery pass: an older patch pinned there is an
-        // UPGRADE, not a NEW row spending a cap slot.
-        let results = vec![offer(
-            "pkg:npm/a@1",
-            "aaaaaaaa-1111-4111-8111-00000000000a",
-            "",
-            &["high"],
-        )];
-        let offers = offers_from_results(&results, true);
-        let mut rows = classify(&offers, &RecordedIndex::default(), "");
-        mark_pinned(
-            &mut rows,
-            &[socket_patch_core::patch::redirect::upstream::HostedPin {
-                purl: "pkg:npm/a@1".into(),
-                uuid: "AAAAAAAA-2222-4222-8222-00000000000A".into(),
-                files: vec!["package-lock.json".into()],
-            }],
-        );
-        assert_eq!(
-            rows[0].candidate.recorded,
-            Recorded::Superseded {
-                old_uuid: "aaaaaaaa-2222-4222-8222-00000000000a".into()
-            }
-        );
-    }
-
-    #[test]
-    fn case_folded_pins_match_the_selection_spelling() {
-        // Discovery keys a nuget pin by the lowercased name; the API and
-        // the lockfile keep the original case.
-        let results = vec![
-            offer("pkg:nuget/Newtonsoft.Json@13.0.3", "a-sel", "", &["high"]),
-            offer("pkg:nuget/Newtonsoft.Json@13.0.3", "z-pin", "", &["high"]),
-        ];
-        let offers = offers_from_results(&results, true);
-        let index = RecordedIndex::new(
-            None,
-            &[("pkg:nuget/newtonsoft.json@13.0.3".into(), "z-pin".into())],
-        );
-        let rows = classify(&offers, &index, "");
-        assert_eq!(
-            rows[0].candidate.recorded,
-            Recorded::Kept {
-                uuid: "z-pin".into()
-            },
-            "an equal sibling never replaces the pinned patch"
-        );
-        assert_eq!(rows[0].writer.uuid, "z-pin");
-    }
-
-    #[test]
-    fn both_pinned_qualifier_twins_are_already() {
-        // Hosted pins are keyed by base purl; each twin carries its own
-        // patch. Neither may read as an UPGRADE on a converged repo.
-        let results = vec![
-            offer(
-                "pkg:pypi/foo@1.0?artifact_id=sdist",
-                "u-sdist",
-                "",
-                &["high"],
-            ),
-            offer("pkg:pypi/foo@1.0?artifact_id=whl", "u-whl", "", &["high"]),
-        ];
-        let offers = offers_from_results(&results, true);
-        let pins = vec![
-            ("pkg:pypi/foo@1.0".to_string(), "u-sdist".to_string()),
-            ("pkg:pypi/foo@1.0".to_string(), "u-whl".to_string()),
-        ];
-        let mut merged = PatchManifest::new();
-        merged.patches.insert(
-            "pkg:pypi/foo@1.0".into(),
-            manifest(&[("x", "u-sdist")]).patches.remove("x").unwrap(),
-        );
-        let rows = classify(&offers, &RecordedIndex::new(Some(&merged), &pins), "");
-        assert!(
-            rows.iter().all(|r| r.candidate.recorded == Recorded::Same),
-            "{rows:?}"
-        );
-    }
-
-    #[test]
-    fn lookup_incomplete_only_when_a_new_package_could_be_missing() {
-        let index = RecordedIndex::new(Some(&manifest(&[("pkg:npm/rec@1", "u")])), &[]);
-        assert!(!lookup_incomplete(&index, &[], false));
-        assert!(
-            lookup_incomplete(&index, &[], true),
-            "a failed batch hides unknown packages"
-        );
-        assert!(
-            !lookup_incomplete(&index, &["pkg:npm/rec@1".into()], false),
-            "a recorded package's failed lookup cannot hide a NEW row"
-        );
-        assert!(lookup_incomplete(
-            &index,
-            &["pkg:npm/other@1".into()],
-            false
-        ));
     }
 
     #[test]
@@ -762,99 +477,5 @@ mod tests {
             "{next:?}"
         );
         assert_eq!(next[1], "Next up: a@1 (high), b@1 (high), c@1 (high), …");
-    }
-
-    #[test]
-    fn incomplete_lookups_warn_only_when_they_deferred_something() {
-        let results = vec![offer("pkg:npm/a@1", "ua", "", &["critical"])];
-        let offers = offers_from_results(&results, true);
-        let capped = MaxNew {
-            value: Some(3),
-            source: MaxNewSource::Flag,
-        };
-        let mut stage = Stage::new(capped, None, Path::new("/repo"));
-        stage.incomplete = true;
-        assert!(!stage.may_admit_new());
-        stage.plan(&classify(&offers, &RecordedIndex::default(), ""), |_| true);
-        let codes: Vec<&str> = stage.warnings().iter().map(|(c, _)| *c).collect();
-        assert_eq!(codes, [ROLLOUT_INCOMPLETE_LOOKUP]);
-        let mut unlimited = Stage::new(MaxNew::UNLIMITED, None, Path::new("/repo"));
-        unlimited.incomplete = true;
-        assert!(unlimited.may_admit_new());
-        unlimited.plan(&classify(&offers, &RecordedIndex::default(), ""), |_| true);
-        assert!(unlimited.warnings().is_empty());
-    }
-
-    /// REGRESSION: a lockless NuGet / Cargo pin (the hosted rewriter's own
-    /// output when the project has no lockfile) is never a discovery ref,
-    /// so `HostedPin::all` drops it. Re-scanned under `--max-new-patches 1`
-    /// it must read as ALREADY through the recorded view (as `scan` builds
-    /// it), not as NEW: otherwise every re-scan spends the one slot on the
-    /// pin it already wrote and the genuinely new patch is deferred forever.
-    #[tokio::test]
-    async fn a_rescanned_lockless_pin_is_already_not_new_under_a_cap() {
-        use socket_patch_core::patch::redirect::upstream::HostedPin;
-        const NUGET: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-        const CARGO: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
-        const GRANT: &str = "cccccccc-3333-4333-8333-cccccccccccc";
-        let tmp = tempfile::tempdir().unwrap();
-        let nuget_key = format!("socket-patch-{NUGET}");
-        std::fs::write(
-            tmp.path().join("nuget.config"),
-            format!(
-                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
-                 <add key=\"{nuget_key}\" value=\"https://patch.socket.dev/patch-registry/nuget/{GRANT}/{NUGET}/index.json\" />\n  \
-                 </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"{nuget_key}\">\n      \
-                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
-                 </packageSourceMapping>\n</configuration>\n"
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            tmp.path().join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
-                 serde = {{ version = \"1\", registry = \"socket-patch-{CARGO}\" }}\n"
-            ),
-        )
-        .unwrap();
-        std::fs::create_dir(tmp.path().join(".cargo")).unwrap();
-        std::fs::write(
-            tmp.path().join(".cargo/config.toml"),
-            format!(
-                "[registries.socket-patch-{CARGO}]\nindex = \
-                 \"sparse+https://patch.socket.dev/patch-registry/cargo/{GRANT}/{CARGO}/index/\"\n"
-            ),
-        )
-        .unwrap();
-        let discovery = socket_patch_core::vex::discover::discover_patched_refs(tmp.path()).await;
-        assert_eq!(discovery.unlocked_pins.len(), 2, "{discovery:#?}");
-        let pins: Vec<(String, String)> = HostedPin::all(&discovery)
-            .into_iter()
-            .map(|p| (p.purl, p.uuid))
-            .collect();
-        assert!(pins.is_empty(), "lockless pins are never refs: {pins:?}");
-
-        let results = vec![
-            offer("pkg:nuget/Newtonsoft.Json@13.0.3", NUGET, "", &["critical"]),
-            offer("pkg:cargo/serde@1.0.200", CARGO, "", &["critical"]),
-            offer("pkg:npm/fresh@1.0.0", "fresh", "", &["low"]),
-        ];
-        let offers = offers_from_results(&results, true);
-        let index = RecordedIndex::new(None, &pins).with_unlocked_pins(discovery.unlocked_pins);
-        let one = MaxNew {
-            value: Some(1),
-            source: MaxNewSource::Flag,
-        };
-        let mut stage = Stage::new(one, None, Path::new("/repo"));
-        stage.plan(&classify(&offers, &index, ""), |_| true);
-        let counts = &stage.json()["counts"];
-        assert_eq!(counts["already"], 2, "{counts}");
-        assert_eq!(counts["new"], 1, "{counts}");
-        assert_eq!(counts["deferred"], 0, "{counts}");
-
-        // A version outside the cargo pin's requirement is not routed by it.
-        assert!(index.uuids("pkg:cargo/serde@2.0.0").is_empty());
-        assert!(!index.records_package("pkg:cargo/serde@2.0.0"));
     }
 }

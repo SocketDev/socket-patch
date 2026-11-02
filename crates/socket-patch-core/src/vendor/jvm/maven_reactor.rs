@@ -71,6 +71,64 @@ pub fn declares_modules(pom: &str) -> bool {
     }
 }
 
+/// Whether the project's root pom heads a multi-module reactor: it
+/// declares `<modules>`/`<subprojects>` ([`declares_modules`]), or Maven 4
+/// discovers a subproject under it ([`may_discover_subprojects`] and a
+/// direct subdirectory holding a `pom.xml`). The rule the reactor planner
+/// builds by, for every caller that only asks "reactor or single pom?".
+pub fn is_reactor_root(read: ReadFn<'_>, list: ListFn<'_>) -> bool {
+    let Some(pom) = read(layout::POM_FILE) else {
+        return false;
+    };
+    let pom = String::from_utf8_lossy(&pom);
+    if declares_modules(&pom) {
+        return true;
+    }
+    let config = read(MAVEN_CONFIG).map(|b| String::from_utf8_lossy(&b).into_owned());
+    may_discover_subprojects(&pom, config.as_deref()) && !implicit_subprojects(list, "").is_empty()
+}
+
+/// Whether Maven 4 discovers the subprojects of the root `pom` on its own
+/// ([`discovers_subprojects`]) under the root's `.mvn/maven.config`
+/// (`maven_config`), which may turn discovery off. The subprojects are
+/// then the direct subdirectories holding a `pom.xml`
+/// ([`implicit_subprojects`]).
+pub fn may_discover_subprojects(pom: &str, maven_config: Option<&str>) -> bool {
+    discovery_on(&maven_config.map(cli_properties).unwrap_or_default())
+        && Doc::parse(pom.to_string()).is_ok_and(|doc| discovers_subprojects(&doc))
+}
+
+/// [`implicit_subprojects`] of the root over a [`ProjectView`]: the direct
+/// subdirectories (a link to one included) holding a regular `pom.xml`,
+/// `.git` never, for the hosted engine and VEX discovery.
+pub async fn implicit_subprojects_in(
+    view: &crate::vendor::lock_inventory::ProjectView<'_>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in view.list_dir("").await.unwrap_or_default() {
+        if entry.name == GIT_DIR || !(entry.is_dir || view.is_symlink(&entry.name)) {
+            continue;
+        }
+        if view.is_file(&format!("{}/{}", entry.name, layout::POM_FILE)) {
+            out.push(entry.name);
+        }
+    }
+    out
+}
+
+/// A checkout's git directory: never a subproject, whatever it holds (the
+/// planner's reader refuses every path through it).
+const GIT_DIR: &str = ".git";
+
+/// Maven 4's opt-out among the `.mvn/maven.config` user properties, read
+/// with Java's `Boolean.parseBoolean`: once set, anything but `true` turns
+/// discovery off.
+fn discovery_on(cli_props: &BTreeMap<String, String>) -> bool {
+    cli_props
+        .get(DISCOVER_SUBPROJECTS)
+        .is_none_or(|v| v.eq_ignore_ascii_case("true"))
+}
+
 /// The tree directory of `c`'s suffixed version.
 pub fn tree_dir(c: &Coords<'_>) -> String {
     c.tree_dir(TREE_ROOT, &c.suffixed_version())
@@ -1566,11 +1624,7 @@ impl Reactor {
         let cli_props = read(MAVEN_CONFIG)
             .map(|bytes| cli_properties(&String::from_utf8_lossy(&bytes)))
             .unwrap_or_default();
-        // Maven 4's opt-out, read with Java's `Boolean.parseBoolean`: once
-        // set, anything but `true` turns discovery off.
-        let discovery = cli_props
-            .get(DISCOVER_SUBPROJECTS)
-            .is_none_or(|v| v.eq_ignore_ascii_case("true"));
+        let discovery = discovery_on(&cli_props);
         let mut poms = BTreeMap::new();
         poms.insert("pom.xml".to_string(), Pom::parse("pom.xml", root)?);
         let mut reactor = vec!["pom.xml".to_string()];
@@ -2107,10 +2161,11 @@ const POM_NAMESPACE: &str = "maven.apache.org/POM/";
 /// `<subproject>` names relative to `dir`. Probed through the listing, not
 /// a read: a directory the reader refuses (`.git/`) lists as empty, where
 /// reading its `pom.xml` would record a read error.
-fn implicit_subprojects(list: ListFn<'_>, dir: &str) -> Vec<String> {
+pub fn implicit_subprojects(list: ListFn<'_>, dir: &str) -> Vec<String> {
     list(dir)
         .iter()
         .filter_map(|entry| entry.strip_suffix('/'))
+        .filter(|name| *name != GIT_DIR)
         .filter(|name| {
             let sub = match dir {
                 "" => name.to_string(),
@@ -5986,7 +6041,7 @@ mod tests {
             </configuration></plugin></plugins></build></project>";
         assert!(!declares_modules(ear));
         let read = |p: &str| (p == "pom.xml").then(|| ear.as_bytes().to_vec());
-        let builds = super::super::detect_builds(&read);
+        let builds = super::super::detect_builds(&read, &super::super::no_list);
         assert_eq!(builds.maven, Some(super::super::MavenShape::Single));
         // A single pom is a reactor of one (#973).
         assert_eq!(builds.shape(), Shape::MavenReactor);

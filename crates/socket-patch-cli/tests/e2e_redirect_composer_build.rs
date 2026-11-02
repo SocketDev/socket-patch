@@ -53,6 +53,9 @@
 //! release. `#[ignore]`-gated like the vendored twin: the unpinned `test` job
 //! skips it; the e2e job runs it with a pinned toolchain via `--ignored`.
 
+#[allow(clippy::duplicate_mod)]
+#[path = "common/fs_tree.rs"]
+mod fs_tree;
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "common/rollback_json.rs"]
@@ -638,7 +641,7 @@ fn assert_manifestless_hosted_vex(fx: &Fixture, fresh: &Path, tag: &str) {
     std::fs::copy(fresh.join("composer.json"), reverted.join("composer.json")).unwrap();
     std::fs::write(reverted.join("composer.lock"), &fx.registry_lock).unwrap();
     if fresh.join(".socket").is_dir() {
-        composer_e2e_common::copy_dir_recursive(&fresh.join(".socket"), &reverted.join(".socket"));
+        fs_tree::copy_tree(&fresh.join(".socket"), &reverted.join(".socket"));
     }
     let install = composer(
         &reverted,

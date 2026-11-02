@@ -908,7 +908,8 @@ async fn filter_to_installed_purls(
         }
     }
 
-    let warnings = super::scan::unsupported_layout_warnings(&pnp_diags);
+    let warnings =
+        socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings(&pnp_diags);
     let pnp_yarn = pnp_diags
         .iter()
         .any(|d| d.code == "vendor_yarn_berry_unsupported");
@@ -2284,18 +2285,7 @@ async fn run_get_vendored(
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
     if args.common.dry_run {
-        let takeover = super::vendor::gem_takeover_preview_refusals(
-            &args.common,
-            selected.iter().map(|p| p.purl.as_str()),
-        )
-        .await;
-        let preview = super::scan::preview_vendor(
-            &args.common.cwd,
-            selected,
-            &super::hosted_unwind::patch_server_origins(&args.common),
-            &takeover,
-        )
-        .await;
+        let preview = super::scan::preview_vendor(&args.common, selected).await;
         if args.common.json {
             preview.record_into(&mut env);
             emit(&env);
@@ -3537,6 +3527,35 @@ mod tests {
             None
         });
         assert_eq!(outcomes(&env), vec![o("failed", "", "", "apply_failed")]);
+    }
+
+    #[test]
+    fn record_apply_outcome_skips_warnings_the_caller_already_reported() {
+        // scan reports the gem config / stale-plugin advisories from its own
+        // crawl; the nested apply's copies must not repeat them. Identical
+        // entries within the report (one per patched copy) all stay.
+        let mut env = Envelope::new(JsonCommand::Scan);
+        env.warn("gem_bundle_config_path_ignored", "outside");
+        let report = ApplyRunReport {
+            applied: vec!["pkg:npm/a@1.0.0".into()],
+            warnings: vec![
+                RunWarning::new("gem_bundle_config_path_ignored", "outside"),
+                RunWarning::new("content_mismatch_overwritten", "w"),
+                RunWarning::new("content_mismatch_overwritten", "w"),
+            ],
+            ..ApplyRunReport::default()
+        };
+        let recs = recorded(&[("pkg:npm/a@1.0.0", "ua")]);
+        record_apply_outcome(&mut env, &recs, Some(&report), |_| None);
+        let codes: Vec<&str> = env.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec![
+                "gem_bundle_config_path_ignored",
+                "content_mismatch_overwritten",
+                "content_mismatch_overwritten"
+            ]
+        );
     }
 
     // --- write_blob_entry ------------------------------------------------

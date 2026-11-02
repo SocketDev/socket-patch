@@ -90,19 +90,6 @@ async fn fail(args: &UpdateArgs, code: &str, message: &str) -> i32 {
     1
 }
 
-/// A stable machine name for `channel` (telemetry), unlike the
-/// human-facing [`channel_label`] (`cargo install`, `the RubyGems launcher`).
-fn channel_id(channel: InstallChannel) -> &'static str {
-    match channel {
-        InstallChannel::Standalone => "standalone",
-        InstallChannel::Npm => "npm",
-        InstallChannel::Pypi => "pypi",
-        InstallChannel::Cargo => "cargo",
-        InstallChannel::LauncherCache => "launcher_cache",
-        InstallChannel::Homebrew => "homebrew",
-    }
-}
-
 /// The no-op message when there is nothing to install: a pin already
 /// satisfied, the latest release already running, or a build newer than
 /// the latest release (`latest` never downgrades).
@@ -167,32 +154,14 @@ fn installed_message(
     }
 }
 
-/// The status line shown while the release downloads and installs.
-fn download_status(target: &semver::Version, asset: &str) -> String {
-    format!("Downloading socket-patch {target} ({asset})...")
-}
-
 /// Record a non-fatal advisory: stderr for humans, `warnings[]` on the
-/// envelope for machines. `--json` suppresses the stderr line (stdout is
-/// the machine channel and stderr must stay clean), so a warning that only
-/// ever went to stderr would vanish entirely for JSON consumers — the
-/// managed-install override in particular is the "your package manager
-/// will silently revert this" signal, and a silent override is the bug
-/// class the channel suite exists to catch. Same stderr-or-envelope
-/// split `vendor`/`remove` use for their run-level advisories (the
-/// rendered stderr line keeps update's own `Warning: <detail>` wording).
+/// envelope for machines, which never see stderr under `--json`.
 fn note_warning(warnings: &mut Vec<RunWarning>, quiet: bool, code: &str, detail: String) {
     if !quiet {
         eprintln!("Warning: {}", crate::ui::sentence_case(&detail));
     }
-    warnings.push(RunWarning {
-        code: code.to_string(),
-        detail,
-    });
+    warnings.push(RunWarning::new(code, detail));
 }
-
-/// The status line while `--update` asks which release is the latest.
-const CHECKING_LATEST: &str = "Checking for the latest socket-patch release...";
 
 pub async fn run(args: UpdateArgs) -> i32 {
     apply_env_toggles(&args.common);
@@ -268,7 +237,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
             // each with its own connect and read budget): say what is
             // happening instead of a blank terminal.
             let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
-            status.set(CHECKING_LATEST);
+            status.set("Checking for the latest socket-patch release...");
             let latest = fetch_latest_version(&endpoints, &timeouts).await;
             status.finish();
             match latest {
@@ -369,7 +338,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
     //    download can take a while (300 s budget), so a terminal gets a
     //    status line instead of a silent pause after the prompt.
     let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
-    status.set(download_status(&target_version, &asset));
+    status.set(format!(
+        "Downloading socket-patch {target_version} ({asset})..."
+    ));
     let result = core_update::perform_update(UpdateRequest {
         target_triple: UPDATE_TARGET,
         version: &target_version,
@@ -400,7 +371,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
     // Before the result prints, like `fail`'s failure event.
     track_cli_updated(
         &target_version.to_string(),
-        channel_id(channel),
+        channel.id(),
         pinned,
         args.force,
         &args.common.telemetry_auth(),
@@ -440,14 +411,6 @@ pub async fn run(args: UpdateArgs) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn checking_latest_status_line() {
-        assert_eq!(
-            CHECKING_LATEST,
-            "Checking for the latest socket-patch release..."
-        );
-    }
 
     fn v(s: &str) -> semver::Version {
         semver::Version::parse(s).unwrap()
@@ -527,21 +490,6 @@ mod tests {
             installed_message(&v("4.0.0"), &v("4.0.0"), p),
             "Reinstalled socket-patch 4.0.0 (/opt/sp/socket-patch)"
         );
-    }
-
-    #[test]
-    fn download_status_and_error_capitalization() {
-        assert_eq!(
-            download_status(&v("9.9.9"), "socket-patch-x.tar.gz"),
-            "Downloading socket-patch 9.9.9 (socket-patch-x.tar.gz)..."
-        );
-        assert_eq!(
-            crate::ui::sentence_case("could not check for updates: x"),
-            "Could not check for updates: x"
-        );
-        assert_eq!(crate::ui::sentence_case(""), "");
-        assert_eq!(crate::ui::sentence_case("éclair"), "Éclair");
-        assert_eq!(crate::ui::sentence_case("Already"), "Already");
     }
 
     #[test]

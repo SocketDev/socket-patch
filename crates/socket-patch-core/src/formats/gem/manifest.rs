@@ -396,7 +396,7 @@ impl GemfileLockfile {
 /// ([`eval_gemfile_paths`]).
 pub fn gemfile_lockfile(contents: &str) -> Option<GemfileLockfile> {
     let mut found: Option<GemfileLockfile> = None;
-    for_each_code_line(contents, |line, code| {
+    for (_, line, code) in code_lines(contents) {
         let lead = code.len() - code.trim_start().len();
         for at in ident_positions(code, "lockfile") {
             let this = if at == lead {
@@ -412,7 +412,7 @@ pub fn gemfile_lockfile(contents: &str) -> Option<GemfileLockfile> {
                 Some(prev) => prev.merge(this),
             });
         }
-    });
+    }
     found
 }
 
@@ -421,7 +421,7 @@ pub fn gemfile_lockfile(contents: &str) -> Option<GemfileLockfile> {
 /// A computed path is left out.
 pub fn eval_gemfile_paths(contents: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for_each_code_line(contents, |_, code| {
+    for (_, _, code) in code_lines(contents) {
         for at in ident_positions(code, "eval_gemfile") {
             let arg = code[at + "eval_gemfile".len()..].trim_start();
             let arg = arg.strip_prefix('(').map(str::trim_start).unwrap_or(arg);
@@ -429,7 +429,7 @@ pub fn eval_gemfile_paths(contents: &str) -> Vec<String> {
                 out.push(value.to_string());
             }
         }
-    });
+    }
     out
 }
 
@@ -465,16 +465,19 @@ fn plain_literal(s: &str) -> Option<(&str, &str)> {
     (!value.contains('\\') && !interpolated).then_some((value, rest))
 }
 
-/// Run `f(line, code)` over each line of Ruby source that holds code:
-/// `code` is the line before any `#` comment. Skips `=begin`/`=end`
-/// blocks and heredoc bodies, and stops at `__END__`. A leading BOM is
-/// dropped, as Ruby does.
-pub(crate) fn for_each_code_line<'a>(contents: &'a str, mut f: impl FnMut(&'a str, &'a str)) {
+/// Each line of Ruby source that holds code: `(0-based line index, line,
+/// code)`, `code` being the line before any `#` comment. Skips
+/// `=begin`/`=end` blocks and heredoc bodies, and stops at `__END__`. A
+/// leading BOM is dropped, as Ruby does.
+pub(crate) fn code_lines(contents: &str) -> impl Iterator<Item = (usize, &str, &str)> {
     use crate::formats::gem::gemfile::code_of;
-    let contents = crate::formats::text::strip_bom(contents);
+    let mut lines = crate::formats::text::strip_bom(contents)
+        .lines()
+        .enumerate();
     let mut in_comment_block = false;
     let mut heredocs: Vec<String> = Vec::new();
-    for line in contents.lines() {
+    std::iter::from_fn(move || loop {
+        let (i, line) = lines.next()?;
         if let Some(id) = heredocs.first() {
             if line.trim() == id {
                 heredocs.remove(0);
@@ -490,12 +493,13 @@ pub(crate) fn for_each_code_line<'a>(contents: &'a str, mut f: impl FnMut(&'a st
             continue;
         }
         if line.trim_end() == "__END__" {
-            break;
+            return None;
         }
         let code = code_of(line).unwrap_or(line);
         heredocs.extend(heredoc_ids(code));
-        f(line, code);
-    }
+        return Some((i, line, code));
+    })
+    .fuse()
 }
 
 /// The byte offsets in `code` where `name` appears as a bare identifier

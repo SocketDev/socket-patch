@@ -15,6 +15,10 @@ use socket_patch_core::vendor::test_support::service_fixture::{
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/fs_tree.rs"]
+mod fs_tree;
+
 #[path = "../common/jvm_env.rs"]
 pub mod jvm_env;
 
@@ -535,7 +539,7 @@ pub async fn mount_view_from_source(
     let (name, version) = package.rsplit_once('@').unwrap();
     let name = name.replace("%40", "@");
     let layout = package_layout(purl);
-    copy_tree(installed.unwrap_or(layout.path()), &source);
+    fs_tree::copy_tree(installed.unwrap_or(layout.path()), &source);
     if let Some(gemspec) = gemspec {
         std::fs::create_dir_all(tmp.path().join("specifications")).unwrap();
         std::fs::write(
@@ -717,19 +721,6 @@ fn fabricate_files21_named(
         std::fs::write(hash_dir.join(leaf), bytes).unwrap();
     }
     dir
-}
-
-fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let dest = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &dest);
-        } else {
-            std::fs::copy(entry.path(), dest).unwrap();
-        }
-    }
 }
 
 pub async fn mount_download(server: &MockServer, purl: &str, uuid: &str, leaf: &str, bytes: &[u8]) {

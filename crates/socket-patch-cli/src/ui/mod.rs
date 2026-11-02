@@ -1,10 +1,9 @@
 //! Terminal UI: everything that decides *how* human output looks.
 //!
-//! - [`StatusLine`]: the one self-rewriting progress line.
+//! - [`StatusLine`]: the self-rewriting progress line.
 //! - [`confirm`], [`select_one`]: prompts.
-//! - [`print_json`]: the one `--json` document writer.
-//! - [`plural`], [`truncate`], [`sentence_case`]: text shaping.
-//! - [`next_steps`]: the one "Next steps:" block (hosted and vendored).
+//! - [`print_json`]: the `--json` document writer.
+//! - `text`: wording and shaping shared by several commands.
 //! - [`color_enabled`], [`paint`], [`severity`], [`pad`]: color policy and
 //!   ANSI-aware column alignment.
 //! - [`init`] / [`quiet`]: the process-wide `--silent`/`--json` switch,
@@ -46,7 +45,7 @@ pub(crate) fn global_scope_arg(common: &GlobalArgs) -> Option<String> {
 /// (leading space, empty for a default run): `--cwd`, `--manifest-path`,
 /// `-g` / `--global-prefix` and `--ecosystems`, each only when it differs
 /// from its default. A remedy a command prints repeats them, so running it
-/// verbatim acts on the tree the command just reported on (#464, #1219).
+/// verbatim acts on the tree the command just reported on.
 pub(crate) fn scope_args(common: &GlobalArgs) -> String {
     let mut out = String::new();
     if common.cwd != std::path::Path::new(".") {
@@ -69,7 +68,6 @@ pub(crate) fn scope_args(common: &GlobalArgs) -> String {
 }
 
 /// Where a physical copy lives, relative to `cwd` when it is inside it.
-/// Shared by `apply` and `rollback`.
 pub(crate) fn display_copy_path(package_path: &str, cwd: &std::path::Path) -> String {
     let path = std::path::Path::new(package_path);
     let canonical = std::fs::canonicalize(path).ok();
@@ -118,13 +116,14 @@ pub(crate) fn quiet() -> bool {
     socket_patch_core::utils::notice::is_quiet()
 }
 
-/// Whether the Windows console behind stdout and stderr accepted VT
-/// (escape-sequence) processing, probed once. console's color probe is
-/// what switches VT on, so its answer is exactly "escapes will render".
-/// `false` for a stream that is not a console (it is then not a terminal
-/// either, and escapes in a pipe are the reader's business).
+/// Whether escape sequences written to a terminal render, as
+/// `(stdout, stderr)`: whether the Windows console accepted VT processing,
+/// probed once. console's color probe is what switches VT on, so its
+/// answer is exactly "escapes will render". `false` for a stream that is
+/// not a console (it is then not a terminal either, and escapes in a pipe
+/// are the reader's business).
 #[cfg(windows)]
-fn vt_probe() -> (bool, bool) {
+pub(crate) fn vt() -> (bool, bool) {
     static VT: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
     *VT.get_or_init(|| {
         (
@@ -134,29 +133,10 @@ fn vt_probe() -> (bool, bool) {
     })
 }
 
-/// Whether escape sequences written to a terminal on stdout render: on
-/// Windows, whether VT processing could be enabled ([`vt_probe`]).
-#[cfg(windows)]
-fn stdout_vt() -> bool {
-    vt_probe().0
-}
-
-/// [`stdout_vt`] for stderr (also gates the live [`StatusLine`]).
-#[cfg(windows)]
-pub(crate) fn stderr_vt() -> bool {
-    vt_probe().1
-}
-
 /// Unix terminals always render escape sequences.
 #[cfg(not(windows))]
-fn stdout_vt() -> bool {
-    true
-}
-
-/// Unix terminals always render escape sequences.
-#[cfg(not(windows))]
-pub(crate) fn stderr_vt() -> bool {
-    true
+pub(crate) fn vt() -> (bool, bool) {
+    (true, true)
 }
 
 /// The color policy, pure over its inputs:
@@ -185,17 +165,17 @@ fn env_var(k: &str) -> Option<String> {
 }
 
 /// [`color_enabled`] for stdout; a terminal must also render escapes
-/// ([`stdout_vt`]).
+/// ([`vt`]).
 pub(crate) fn stdout_color() -> bool {
     let tty = std::io::stdout().is_terminal();
-    color_enabled(tty, env_var) && (!tty || stdout_vt())
+    color_enabled(tty, env_var) && (!tty || vt().0)
 }
 
 /// [`color_enabled`] for stderr; a terminal must also render escapes
-/// ([`stderr_vt`]).
+/// ([`vt`]).
 pub(crate) fn stderr_color() -> bool {
     let tty = std::io::stderr().is_terminal();
-    color_enabled(tty, env_var) && (!tty || stderr_vt())
+    color_enabled(tty, env_var) && (!tty || vt().1)
 }
 
 /// Columns of the terminal on stderr (status lines, prompts): its size,
@@ -235,7 +215,7 @@ pub fn severity(s: &str, on: bool) -> String {
     let code = match s.to_lowercase().as_str() {
         "critical" => "91",
         "high" => "31",
-        // GHSA emits `moderate`; same tier as medium (see get.rs severity_rank).
+        // GHSA emits `moderate`; same tier as medium (core `ranking::severity_order`).
         "medium" | "moderate" => "33",
         "low" => "36",
         _ => return s.to_string(),

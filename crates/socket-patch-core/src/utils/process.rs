@@ -339,9 +339,192 @@ fn run_resolved_within(
     }
 }
 
+/// What a probe subprocess inherits: the (sorted) environment and the
+/// working directory. Sorted so a `remove_var`/`set_var` round-trip that
+/// restores an identical environment still matches (`vars_os` yields
+/// `environ`'s order, which such a round-trip permutes).
+pub(crate) type EnvKey = (Vec<(OsString, OsString)>, Option<PathBuf>);
+
+/// The [`EnvKey`] of the process right now.
+pub(crate) fn env_key() -> EnvKey {
+    let mut vars: Vec<_> = std::env::vars_os().collect();
+    vars.sort();
+    (vars, std::env::current_dir().ok())
+}
+
+/// A process-wide memo of one subprocess answer, reused only while the
+/// whole environment (every variable, and the working directory) is exactly
+/// what it was when the answer was produced: the subprocess's only inputs
+/// the CLI controls. A different environment re-runs it and replaces the
+/// entry; concurrent first callers may each run it.
+///
+/// Only an answer is kept. A failed probe (spawn error under fd pressure,
+/// a non-zero exit, empty stdout) is asked again by the next caller, so a
+/// transient first failure doesn't stick. Neither is an answer whose
+/// environment differs, when the subprocess returns, from the one it was
+/// keyed on: the key would misfile it.
+pub(crate) struct EnvKeyedMemo<V> {
+    slot: std::sync::Mutex<Option<(EnvKey, V)>>,
+}
+
+impl<V: Clone> EnvKeyedMemo<V> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn get_or_run(&self, run: impl FnOnce() -> Option<V>) -> Option<V> {
+        self.get_or_run_keyed(env_key(), |ran_under| {
+            let answer = run();
+            // Keepable only if the environment is, once the subprocess
+            // returns, still the one we keyed on.
+            (answer, env_key() == *ran_under)
+        })
+    }
+
+    /// The memoized ask. On a miss, `run` gets the key it runs under and
+    /// hands back its answer and whether that answer is keepable; a `None`
+    /// answer is never kept. Split from [`Self::get_or_run`] so tests can
+    /// drive it against a key of their own.
+    fn get_or_run_keyed(
+        &self,
+        key: EnvKey,
+        run: impl FnOnce(&EnvKey) -> (Option<V>, bool),
+    ) -> Option<V> {
+        let lock = || {
+            self.slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some((cached_key, answer)) = lock().as_ref() {
+            if *cached_key == key {
+                return Some(answer.clone());
+            }
+        }
+        let (answer, keepable) = run(&key);
+        if let (Some(answer), true) = (&answer, keepable) {
+            *lock() = Some((key, answer.clone()));
+        }
+        answer
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The memo re-runs only when the environment changed.
+    #[test]
+    fn env_keyed_memo_reuses_only_an_identical_environment() {
+        let env = |path: &str| -> EnvKey {
+            (
+                vec![(OsString::from("PATH"), OsString::from(path))],
+                Some(PathBuf::from("/cwd")),
+            )
+        };
+        let memo = EnvKeyedMemo::new();
+        let mut runs = 0;
+        let mut run = |answer: Option<&str>| {
+            runs += 1;
+            (answer.map(str::to_string), true)
+        };
+        assert_eq!(
+            memo.get_or_run_keyed(env("/a"), |_| run(Some("home"))),
+            Some("home".into())
+        );
+        assert_eq!(
+            memo.get_or_run_keyed(env("/a"), |_| run(Some("x"))),
+            Some("home".into())
+        );
+        // A different environment misses and replaces the entry.
+        assert_eq!(
+            memo.get_or_run_keyed(env("/b"), |_| run(Some("other"))),
+            Some("other".into())
+        );
+        assert_eq!(
+            memo.get_or_run_keyed(env("/b"), |_| run(Some("x"))),
+            Some("other".into())
+        );
+        assert_eq!(
+            memo.get_or_run_keyed(env("/a"), |_| run(Some("again"))),
+            Some("again".into())
+        );
+        assert_eq!(runs, 3);
+    }
+
+    /// A failed probe is not kept: the asker gets its own `None` and the
+    /// next caller asks again. Neither is an answer the environment
+    /// changed under.
+    #[test]
+    fn env_keyed_memo_asks_again_after_a_failed_probe() {
+        let key: EnvKey = (
+            vec![(OsString::from("PATH"), OsString::from("/a"))],
+            Some(PathBuf::from("/cwd")),
+        );
+        let memo = EnvKeyedMemo::new();
+        let runs = std::cell::Cell::new(0);
+        let run = |answer: Option<&str>, keepable: bool| {
+            runs.set(runs.get() + 1);
+            (answer.map(str::to_string), keepable)
+        };
+
+        // A failure, then an answer whose environment moved: both are
+        // handed back, neither is kept.
+        assert_eq!(
+            memo.get_or_run_keyed(key.clone(), |_| run(None, true)),
+            None
+        );
+        assert_eq!(
+            memo.get_or_run_keyed(key.clone(), |_| run(Some("moved"), false)),
+            Some("moved".into())
+        );
+        assert_eq!(runs.get(), 2);
+
+        // The next caller still asks, and a complete answer is kept.
+        assert_eq!(
+            memo.get_or_run_keyed(key.clone(), |_| run(Some("home"), true)),
+            Some("home".into())
+        );
+        assert_eq!(
+            memo.get_or_run_keyed(key.clone(), |_| run(None, true)),
+            Some("home".into())
+        );
+        assert_eq!(runs.get(), 3);
+    }
+
+    /// The keep rule end to end: an answer computed while the real process
+    /// environment changed is handed back but not kept, so the next ask
+    /// in the original environment runs again.
+    #[test]
+    #[serial_test::serial]
+    fn env_keyed_memo_drops_an_answer_the_environment_changed_under() {
+        const VAR: &str = "SOCKET_PATCH_TEST_ENV_KEYED_MEMO_KEEP_RULE";
+        std::env::remove_var(VAR);
+        let memo = EnvKeyedMemo::new();
+        let runs = std::cell::Cell::new(0);
+        let answer = memo.get_or_run(|| {
+            runs.set(runs.get() + 1);
+            std::env::set_var(VAR, "moved");
+            Some("moved".to_string())
+        });
+        std::env::remove_var(VAR);
+        assert_eq!(answer.as_deref(), Some("moved"));
+        let fresh = || {
+            runs.set(runs.get() + 1);
+            Some("fresh".to_string())
+        };
+        assert_eq!(memo.get_or_run(fresh).as_deref(), Some("fresh"));
+        assert_eq!(runs.get(), 2);
+    }
+
+    /// The memo key is order-insensitive: an environment restored to the
+    /// same variables still hits, whatever order `vars_os` yields.
+    #[test]
+    fn env_key_is_sorted() {
+        let (vars, _) = env_key();
+        assert!(vars.windows(2).all(|w| w[0] <= w[1]), "sorted env snapshot");
+    }
 
     /// Confirm the real runner returns Some for a tiny command we
     /// know is on every Unix PATH — `echo`. Skipped on Windows where

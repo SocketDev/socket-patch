@@ -20,28 +20,11 @@ use common::hermetic;
 use std::path::Path;
 use std::process::Output;
 
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use common::scan_proxy::{assert_proxy_served_scans, start_proxy};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Start a mock Socket public proxy answering the scan's `POST /patch/batch`
-/// with an empty (no-patch) result, so no scan in this file ever leaves
-/// localhost.
-async fn start_proxy() -> MockServer {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/patch/batch"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "packages": [],
-            "canAccessPaidPatches": false,
-        })))
-        .mount(&server)
-        .await;
-    server
-}
 
 /// Run the binary as a blocking subprocess (off the async runtime so the
 /// in-test proxy can service its requests concurrently), pinned to `proxy_url`.
@@ -82,20 +65,6 @@ async fn run(args: &[&str], cwd: &Path, m2_repo: &Path, proxy_url: &str) -> Outp
     })
     .await
     .expect("socket-patch subprocess task panicked")
-}
-
-/// Hermeticity guard: every scan in a test must have routed its patch lookup
-/// through the in-test proxy. Fewer recorded requests than scans means at
-/// least one binary invocation talked to the live API (or skipped the lookup
-/// outright) despite the pinning.
-async fn assert_proxy_served_scans(server: &MockServer, scans: usize) {
-    let requests = server.received_requests().await.unwrap_or_default();
-    assert!(
-        requests.len() >= scans,
-        "expected all {scans} scan invocations to hit the in-test proxy; \
-         recorded only {} request(s)",
-        requests.len()
-    );
 }
 
 // ---------------------------------------------------------------------------

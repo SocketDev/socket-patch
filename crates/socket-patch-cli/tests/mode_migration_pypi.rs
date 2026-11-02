@@ -3289,6 +3289,69 @@ async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
     assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
 }
 
+/// #1851: requirements.txt pins six only through a `-r` include outside
+/// the project root, beside the `pip lock` pylock.toml. `pip install -r
+/// requirements.txt` installs that pin, and vendor can't edit the
+/// include, so vendoring six refuses with `pypi_requirements_outside_root`
+/// (as it does without the pylock) and writes nothing. Before the fix only
+/// the pylock was wired and the run exited 0. A pylock already wired
+/// beside such a pin (vendored before the fix, or a pin added later)
+/// fails `vendor --check` as contested instead of passing.
+#[tokio::test]
+async fn pip_lock_beside_an_out_of_root_include_pin_refuses() {
+    let (tmp, root) = project();
+    stage_pip_lock(&root);
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("base.txt"), "six==1.16.0\n").unwrap();
+    std::fs::write(
+        root.join("requirements.txt"),
+        "-r ../shared/base.txt\nidna==3.7\n",
+    )
+    .unwrap();
+    stage_manifest(&root);
+
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_ne!(code, 0, "{env:#}");
+    assert!(
+        env.to_string().contains("pypi_requirements_outside_root"),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("pylock.toml")).unwrap(),
+        PIP_LOCK.as_bytes(),
+        "the pylock is not wired: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("requirements.txt")).unwrap(),
+        b"-r ../shared/base.txt\nidna==3.7\n"
+    );
+    assert_eq!(
+        std::fs::read(shared.join("base.txt")).unwrap(),
+        b"six==1.16.0\n"
+    );
+
+    // The include pins another release: six is wired in the pylock only.
+    std::fs::write(shared.join("base.txt"), "six==1.15.0\n").unwrap();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        std::fs::read_to_string(root.join("pylock.toml"))
+            .unwrap()
+            .contains(&format!(".socket/vendor/pypi/{UUID}/")),
+        "{env:#}"
+    );
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+
+    // Once the include pins the vendored release, pip installs the
+    // upstream six again: the pylock wiring is contested.
+    std::fs::write(shared.join("base.txt"), "six==1.16.0\n").unwrap();
+    let (code, env) = run_cli(&root, &["vendor", "--check"], &[]);
+    assert_ne!(code, 0, "the out-of-root pin contests the pylock: {env:#}");
+    assert!(env.to_string().contains("contested"), "{env:#}");
+}
+
 /// #1758: a pylock vendored while requirements.txt did not pin six yet
 /// (a project vendored before the fix wired only the pylock). Once the
 /// file pins six==1.16.0, the next `vendor` wires it to the committed
@@ -3336,6 +3399,46 @@ async fn pip_lock_rerun_wires_a_requirements_pin_added_later() {
         std::fs::read(root.join("pylock.toml")).unwrap(),
         PIP_LOCK.as_bytes(),
         "{env:#}"
+    );
+}
+
+/// #1794: the extras refusal guards a FRESH lock wiring only. A pylock
+/// already wired to the vendored wheel (by a run before the extras pin
+/// was added, or by a release before the refusal) re-runs in sync instead
+/// of failing every later `vendor`, and the extras pin stays a named
+/// loser as before.
+#[tokio::test]
+async fn pip_lock_rerun_keeps_a_wired_lock_beside_an_extras_pin() {
+    let (_tmp, root) = project();
+    stage_pip_lock(&root);
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\n").unwrap();
+    stage_manifest(&root);
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let wired = std::fs::read_to_string(root.join("pylock.toml")).unwrap();
+    assert!(
+        wired.contains(&format!(".socket/vendor/pypi/{UUID}/")),
+        "{wired}"
+    );
+
+    std::fs::write(
+        root.join("requirements.txt"),
+        "idna==3.7\nsix[foo]==1.16.0\n",
+    )
+    .unwrap();
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 0, "an in-sync lock is not refused: {env:#}");
+    assert!(
+        !env.to_string().contains("pypi_extras_unsupported"),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pylock.toml")).unwrap(),
+        wired
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("requirements.txt")).unwrap(),
+        "idna==3.7\nsix[foo]==1.16.0\n"
     );
 }
 
@@ -3411,6 +3514,86 @@ async fn pip_lock_hosted_to_vendored_keeps_the_requirements_patched() {
         assert_eq!(
             code, 0,
             "{switch:?}: both install sources are wired: {env:#}"
+        );
+    }
+}
+
+/// #1794: a `requirements.txt` pin with extras (`six[foo]==1.16.0`) can't
+/// be written as a vendored wheel path line, so the pylock beside it can't
+/// be vendored alone: the switch's upstream restore had just un-hosted the
+/// requirements pin, and `pip install -r requirements.txt` would then go
+/// from patched to unpatched. The switch refuses the purl with the
+/// requirements wiring's own code, and the restore is rolled back, so both
+/// files keep their hosted pin byte for byte. Before the fix both files
+/// were un-hosted, only pylock.toml was wired, and the run exited 0.
+#[tokio::test]
+async fn pip_lock_hosted_to_vendored_refuses_an_extras_pin() {
+    for takeover in [false, true] {
+        let server = MockServer::start().await;
+        let hosted_url = mount_hosted_api(&server, true).await;
+        mount_patch_view(&server).await;
+        let uri = server.uri();
+        let switch: Vec<&str> = if takeover {
+            vec![
+                "scan",
+                "--mode",
+                "vendored",
+                "--yes",
+                "--api-url",
+                &uri,
+                "--org",
+                ORG,
+                "--api-token",
+                "fake-token",
+                "--patch-server-url",
+                &uri,
+                "--vendor-url",
+                &uri,
+            ]
+        } else {
+            let mut args = vec!["vendor", "--patch-server-url", &uri, "--vendor-url", &uri];
+            args.extend(api_args(&uri));
+            args
+        };
+        let (_tmp, root) = project();
+        std::fs::write(
+            root.join("requirements.txt"),
+            "idna==3.7\nsix[foo]==1.16.0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pylock.toml"), PIP_LOCK).unwrap();
+        let files = ["requirements.txt", "pylock.toml"];
+        let (code, env) = hosted_scan(&root, &server);
+        assert_eq!(code, 0, "hosted scan: {env:#}");
+        let hosted: Vec<String> = files
+            .iter()
+            .map(|file| std::fs::read_to_string(root.join(file)).unwrap())
+            .collect();
+        for (file, text) in files.iter().zip(&hosted) {
+            assert!(
+                text.contains(&hosted_url),
+                "hosted mode pins {file}:\n{text}\n{env:#}"
+            );
+        }
+
+        stage_manifest(&root);
+        prebuilt_common::mount_project(&server, &root).await;
+        let (code, env) = run_cli(&root, &switch, &[]);
+        assert_eq!(code, 1, "{switch:?}: the purl is refused: {env:#}");
+        assert!(
+            env.to_string().contains("pypi_extras_unsupported"),
+            "{switch:?}: refused with the requirements wiring's code: {env:#}"
+        );
+        for (file, before) in files.iter().zip(&hosted) {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert_eq!(
+                &text, before,
+                "{switch:?}: {file} keeps its hosted pin byte for byte\n{env:#}"
+            );
+        }
+        assert!(
+            !root.join(".socket/vendor/pypi").exists(),
+            "{switch:?}: nothing is vendored"
         );
     }
 }
@@ -3618,14 +3801,21 @@ async fn mount_pypi_json(server: &MockServer) {
 /// restored lock still pins (they reinstall a same-version package only
 /// when the LOCKED candidate is a differing URL or file), so after an
 /// unwind a plain `pdm sync` / `uv sync` / `pipenv sync` keeps the patched
-/// build. Every unwind — hosted and vendored `rollback` and `remove`, and
+/// build. #1953: so does `pip install -r requirements.txt`. Every unwind — hosted and vendored `rollback` and `remove`, and
 /// `vendor --revert` — must name the reinstall that restores the upstream
 /// bytes, and rollback's generic note must defer to it.
 #[tokio::test]
 async fn pypi_unwinds_name_the_reinstall_a_plain_sync_skips() {
     type Stage = fn(&Path) -> &'static [&'static str];
-    let tools: [(&str, Stage, Stage, &str); 3] = [
+    let tools: [(&str, Stage, Stage, &str); 4] = [
         ("pdm", stage_pdm, stage_pdm, "`pdm sync --reinstall`"),
+        // #1953: `pip install -r` keeps a same-version install too.
+        (
+            "pip",
+            stage_requirements,
+            stage_requirements,
+            "`pip install -r requirements.txt`",
+        ),
         (
             "pipenv",
             stage_pipenv,
@@ -4182,4 +4372,71 @@ async fn hatch_vendored_rerun_refuses_after_relocation_to_unsafe_root() {
         std::fs::read_to_string(moved.join(files[0])).unwrap(),
         wired
     );
+}
+
+/// #638: a pip project whose venv holds a patched package but which has no
+/// root requirements.txt or Python lock (its pins live in
+/// requirements-dev.txt or requirements/base.txt, it has no requirements
+/// file at all, or it is a uv project whose uv.lock is not committed). The
+/// hosted `--json` envelope used to carry no warning at all; it now says
+/// `redirect_pypi_no_lockfile` once, beside the per-purl
+/// `redirect_unconfirmed` row, and writes nothing. The exit code stays 0
+/// (the hosted exit policy is #704).
+#[tokio::test]
+async fn hosted_scan_without_a_python_lock_warns_no_lockfile() {
+    let pins = "six==1.16.0\nidna==3.7\n";
+    let project_toml = "[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n";
+    for (layout, files) in [
+        ("requirements-dev.txt", vec![("requirements-dev.txt", pins)]),
+        (
+            "requirements/base.txt",
+            vec![("requirements/base.txt", pins)],
+        ),
+        ("no requirements file", vec![]),
+        (
+            "pyproject.toml without uv.lock",
+            vec![("pyproject.toml", project_toml)],
+        ),
+    ] {
+        let (_tmp, root) = project();
+        for (rel, text) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let venv = root.join("../installed-venv");
+        venv_installed_from_patch_a(&venv);
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let uri = server.uri();
+        let (code, env) = run_cli(
+            &root,
+            &hosted_scan_args(&uri),
+            &[("VIRTUAL_ENV", venv.to_str().unwrap())],
+        );
+        assert_eq!(code, 0, "{layout}: {env:#}");
+        assert_eq!(hosted_pinned(&env), 0, "{layout}: {env:#}");
+        let skipped = hosted_skipped(&env);
+        assert!(
+            skipped
+                .iter()
+                .any(|row| row["purl"] == PURL && row["reason"] == "redirect_unconfirmed"),
+            "{layout}: {env:#}"
+        );
+        let warnings: Vec<&Value> = env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["code"] == "redirect_pypi_no_lockfile")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{layout}: {env:#}");
+        let detail = warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("requirements.txt") && detail.contains("uv.lock"),
+            "{layout}: {detail}"
+        );
+        assert_eq!(tree(&root), before, "{layout}: hosted wrote nothing");
+    }
 }

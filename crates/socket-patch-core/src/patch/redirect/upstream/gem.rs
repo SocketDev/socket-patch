@@ -47,7 +47,8 @@
 //!   rewriter could not have written in place (a blank line before it —
 //!   the in-place match swallows every blank line before the declaration,
 //!   and the append always writes one; it goes with the block) that
-//!   another locked spec depends on. Otherwise the gem is kept as a
+//!   another locked spec depends on (a spec sub-line, or a Bundler 4.1
+//!   `OVERRIDES` `with:` target, #1989). Otherwise the gem is kept as a
 //!   direct pin: a stray exact pin installs the same bytes, while dropping
 //!   a real declaration would stop `Bundler.require` loading the gem.
 //! * a `CHECKSUMS` entry the rewriter ADDED is only recognizable next to
@@ -62,7 +63,7 @@ use super::{Ctx, FormatResult, HostedPin, UpstreamClient, View};
 use crate::formats::gem::{
     bundler_manifest_for, parse_spec, same_remote, split_checksum_entry, BUNDLER_LOCKS,
 };
-use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::utils::line_endings::{self, to_lf, LineEndings};
 use crate::vendor::gem::{gem_declaration_any, quoted_literal};
 
 /// The default upstream `GEM` remote.
@@ -173,11 +174,34 @@ fn dependency_line<'l>(lines: &[&'l str], name: &str) -> Option<(usize, &'l str)
     })
 }
 
-/// Whether another locked spec depends on `name` (a 6-space sub-line).
+/// Whether another locked spec depends on `name`: a 6-space sub-line, or
+/// the `with:` target of a Bundler 4.1 `OVERRIDES` entry (#1989). An
+/// `override "other", with: "name", in: "parent"` keeps `parent`'s
+/// original edge to `other` in the specs, so no sub-line names `name`.
 fn is_subdependency(lines: &[&str], name: &str) -> bool {
     lines
         .iter()
         .any(|l| indented(l, 6).is_some_and(|d| d.split([' ', '(']).next() == Some(name)))
+        || override_targets(lines).any(|t| t == name)
+}
+
+/// The `with:` values of the lock's `OVERRIDES` entries
+/// (`  "other", with: "name", in: "parent"`).
+fn override_targets<'l>(lines: &'l [&'l str]) -> impl Iterator<Item = &'l str> + 'l {
+    let range = named_section(lines, "OVERRIDES").unwrap_or((0, 0));
+    lines[range.0..range.1].iter().filter_map(|l| {
+        let entry = indented(l, 2)?.trim_end();
+        // Bundler writes `"<target>", with: "<gem>", in: "<parent>"`
+        // (`Override#to_lock`: `inspect`ed values joined by `, `). A
+        // `version:` value may itself hold `, `, so splitting on it can
+        // break that value apart, but never the `with:` one: a gem name
+        // holds no `"`, `,` or space.
+        entry.split(", ").find_map(|arg| {
+            arg.strip_prefix("with: \"")?
+                .strip_suffix('"')
+                .filter(|v| !v.contains('"'))
+        })
+    })
 }
 
 /// How the lock wires patch `uuid`.
@@ -1178,7 +1202,14 @@ fn line_before_start(text: &str, at: usize) -> usize {
 }
 
 fn restore_manifest(text: &str, block: &Block, gem: &Gem<'_>, decl: &Decl) -> String {
-    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    // The restored line takes the block's ending: the rewriter writes it in
+    // the ending of the line it replaced (#1831). A block in LF, the only
+    // spelling before #1831, takes the ending of the lines around it.
+    let eol = if text[block.start..block.end].contains("\r\n") {
+        "\r\n"
+    } else {
+        line_endings::terminator(&format!("{}{}", &text[..block.start], &text[block.end..]))
+    };
     let mut start = block.start;
     let replacement = match decl {
         // The append's own blank separator goes with it.
@@ -1785,7 +1816,7 @@ mod tests {
             run(&t, &direct),
             "group :test do\n  gem \"rails\", \"7.0.0\", require: false\nend\n"
         );
-        // CRLF manifest (the rewriter wrote its block in LF).
+        // CRLF manifest, its block in LF (written before #1831).
         let t = format!("source \"https://rubygems.org\"\r\ngem \"puma\"\r\n{block}\n");
         assert_eq!(
             run(&t, &direct),
@@ -1861,6 +1892,46 @@ mod tests {
             "rails"
         ));
         assert!(!is_subdependency(&["    rails (7.0.0)"], "rails"));
+    }
+
+    /// #1989: Bundler 4.1's `override "other", with: "rails", in: "puma"`
+    /// keeps `puma`'s original edge to `other` in the specs and records
+    /// the replacement only in `OVERRIDES`, so its `with:` target is a
+    /// dependency of another spec although no sub-line names it.
+    #[test]
+    fn an_overrides_with_target_is_a_subdependency() {
+        let lock = |overrides: &str| {
+            format!(
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n      \
+                 other (>= 1)\n    rails (7.0.0)\n\nDEPENDENCIES\n  puma\n\nOVERRIDES\n\
+                 {overrides}\nBUNDLED WITH\n   4.1.0.beta3\n"
+            )
+        };
+        let has = |overrides: &str| {
+            let text = lock(overrides);
+            let lines: Vec<&str> = text.split('\n').collect();
+            is_subdependency(&lines, "rails")
+        };
+        assert!(has("  \"other\", with: \"rails\", in: \"puma\"\n"));
+        assert!(has("  \"other\", in: \"puma\", with: \"rails\"\n"));
+        // A replacement version requirement, as Bundler 4.1 locks it.
+        assert!(has(
+            "  \"other\", with: \"rails\", in: \"puma\", version: \">= 7, < 8\"\n"
+        ));
+        assert!(has(
+            "  \"x\", with: \"y\", in: \"z\"\n  \"other\", with: \"rails\", in: \"puma\"\n"
+        ));
+        // `rails` as the overridden name, the parent, or a prefix is not
+        // a `with:` target.
+        assert!(!has("  \"rails\", with: \"other\", in: \"puma\"\n"));
+        assert!(!has("  \"other\", with: \"x\", in: \"rails\"\n"));
+        assert!(!has("  \"other\", with: \"rails-html\", in: \"puma\"\n"));
+        // `with: nil` drops the dependency: no target.
+        assert!(!has("  \"rails\", with: nil, in: \"puma\"\n"));
+        assert!(!has(""));
+        // A `with:` entry outside the OVERRIDES section is not read.
+        let lines = ["DEPENDENCIES", "  \"other\", with: \"rails\", in: \"puma\""];
+        assert!(!is_subdependency(&lines, "rails"));
     }
 
     /// #457: what the hosted rewriter itself writes for a TRANSITIVE gem
@@ -2009,6 +2080,71 @@ mod tests {
             "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n      rails (>= 7)\n    \
              rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma (= 6.0.0)\n\nCHECKSUMS\n  \
              puma (6.0.0) sha256={}\n  rails (7.0.0) sha256={upstream_sha}\n\nBUNDLED WITH\n   4.0.17\n",
+            "a".repeat(64)
+        );
+        let files = BTreeMap::from([
+            ("Gemfile".to_string(), manifest.to_string()),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]);
+        let r = crate::patch::redirect::rewrite_registry_redirect(
+            &files,
+            &[crate::patch::redirect::DepOverride {
+                ecosystem: "gem".into(),
+                name: "rails".into(),
+                namespace: None,
+                version: "7.0.0".into(),
+                token: "tok".into(),
+                patch_uuid: UUID.into(),
+                artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
+                registry_override: Some(crate::patch::redirect::RegistryOverride {
+                    kind: "rubygems-compact-index".into(),
+                    index_url: IDX.into(),
+                    identifiers: crate::patch::redirect::RegistryOverrideIdentifiers {
+                        name: "rails".into(),
+                        version: "7.0.0".into(),
+                        gem_checksum_sha256: Some("f".repeat(64)),
+                        ..Default::default()
+                    },
+                }),
+                integrity: Default::default(),
+            }],
+        );
+        let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
+        assert!(hosted_lock.contains("  rails (= 7.0.0)!"), "{hosted_lock}");
+        let (next_lock, next_manifest, _) = restore_one(
+            &gem(),
+            Some(hosted_lock),
+            Some(hosted_manifest),
+            "Gemfile",
+            &global_sources(hosted_manifest),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .expect("the redirect is found");
+        assert_eq!(next_manifest.as_deref(), Some(manifest));
+        assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
+    }
+
+    /// #1989: a gem reached only through a Bundler 4.1 `override …, with:`
+    /// is transitive too. The lock keeps the parent's original edge, so no
+    /// spec sub-line names it; the restore must still drop the appended
+    /// block and its DEPENDENCIES entry, not write a new exact pin.
+    #[tokio::test]
+    async fn override_target_redirect_round_trips_through_restore() {
+        let client = super::super::UpstreamClient::new(true);
+        let upstream_sha = "2".repeat(64);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let ctx = ctx_with(&client);
+        let manifest = "source \"https://rubygems.org\"\n\ngem \"puma\"\n\n\
+                        override \"other\", with: \"rails\", in: \"puma\"\n";
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n      other\n    \
+             rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n\nOVERRIDES\n  \
+             \"other\", with: \"rails\", in: \"puma\"\n\nCHECKSUMS\n  puma (6.0.0) sha256={}\n  \
+             rails (7.0.0) sha256={upstream_sha}\n\nBUNDLED WITH\n   4.1.0.beta3\n",
             "a".repeat(64)
         );
         let files = BTreeMap::from([

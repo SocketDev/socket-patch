@@ -13,13 +13,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
 use socket_patch_cli::commands::list::{run, ListArgs};
 
+#[path = "common/clap_parse.rs"]
+mod clap_parse;
 #[path = "common/mod.rs"]
 mod common;
-use common::hermetic::binary_command;
-use socket_patch_cli::{Cli, Commands};
+use clap_parse::try_parse_keeping_opt_outs as try_parse;
+use common::hermetic;
+use hermetic::binary_command;
+use socket_patch_cli::Commands;
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
@@ -31,7 +34,7 @@ use socket_patch_core::manifest::schema::{
 fn parse_list(extra: &[&str]) -> ListArgs {
     let mut argv = vec!["socket-patch", "list"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::List(a) => a,
         _ => panic!("expected List"),
@@ -44,10 +47,12 @@ fn parse_list(extra: &[&str]) -> ListArgs {
 
 #[test]
 fn defaults_match_contract() {
+    // The `run()` tests below need the forced opt-outs, so parses here see
+    // `SOCKET_TELEMETRY_DISABLED=1`.
     let args = parse_list(&[]);
-    assert_eq!(args.common.cwd, PathBuf::from("."));
-    assert_eq!(args.common.manifest_path, ".socket/manifest.json");
-    assert!(!args.common.json);
+    let mut want = clap_parse::global_defaults();
+    want.no_telemetry = true;
+    assert_eq!(clap_parse::Globals(args.common), want);
 }
 
 #[test]
@@ -70,7 +75,7 @@ fn json_flag_sets_true() {
 
 #[test]
 fn unknown_flag_is_rejected() {
-    let err = match Cli::try_parse_from(["socket-patch", "list", "--nope"]) {
+    let err = match try_parse(&["socket-patch", "list", "--nope"]) {
         Ok(_) => panic!("unknown flag must fail"),
         Err(e) => e,
     };

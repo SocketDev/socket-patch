@@ -3,79 +3,13 @@
 //! Unix only (`portable_pty`); the built binary runs in the hermetic
 //! environment.
 
-use std::path::Path;
 use std::time::Duration;
 
-use portable_pty::{native_pty_system, PtySize};
 use wiremock::MockServer;
 
 use crate::common;
+use crate::pty_io;
 use crate::scan_fixture::*;
-
-/// Spawn the binary in a PTY, send `input`, and collect all output
-/// until exit (the `interactive_prompts_e2e.rs` harness pattern:
-/// reader thread + kill-after-timeout watchdog, no polling).
-fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
-    run_in_pty_with(args, cwd, &[], input, timeout)
-}
-
-/// [`run_in_pty`] with extra child `env`.
-fn run_in_pty_with(
-    args: &[&str],
-    cwd: &Path,
-    env: &[(&str, &str)],
-    input: &str,
-    timeout: Duration,
-) -> (i32, String) {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-
-    // The hermetic environment (`tests/common/hermetic.rs`), which also
-    // forces the update notifier off: this child gets a REAL terminal,
-    // so the stderr-TTY guard does not protect it.
-    let mut cmd = common::hermetic::pty_binary_command();
-    for a in args {
-        cmd.arg(a);
-    }
-    cmd.cwd(cwd);
-    // These tests assert VT rendering, even when the parent has TERM=dumb.
-    cmd.env("TERM", "xterm-256color");
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
-    drop(pair.slave);
-
-    let reader_handle =
-        crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
-
-    let mut killer = child.clone_killer();
-    std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        let _ = killer.kill();
-    });
-
-    let mut writer = pair.master.take_writer().expect("take writer");
-    crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
-    drop(writer);
-
-    let status = child.wait().expect("child.wait");
-    drop(pair.master);
-
-    let output = reader_handle.finish();
-    (
-        status.exit_code() as i32,
-        String::from_utf8_lossy(&output).to_string(),
-    )
-}
 
 /// v5 scan never prompts, even on a TTY: agent mode applies with no
 /// input at all.
@@ -93,7 +27,7 @@ async fn scan_on_a_tty_applies_without_prompting() {
     let uri = mock.uri();
     let cwd = tmp.path().to_path_buf();
     let (code, output) = tokio::task::spawn_blocking(move || {
-        run_in_pty(
+        pty_io::run(
             &[&["scan", "--mode", "agent"][..], &api_args(&uri)].concat(),
             &cwd,
             "",
@@ -151,7 +85,7 @@ async fn scan_json_on_a_tty_never_opens_the_select_menu() {
     let uri = mock.uri();
     let cwd = tmp.path().to_path_buf();
     let (code, output) = tokio::task::spawn_blocking(move || {
-        run_in_pty(
+        pty_io::run(
             &[
                 &["scan", "--json", "--mode", "agent", "--dry-run"][..],
                 &api_args(&uri),
@@ -203,7 +137,7 @@ async fn scan_progress_on_a_tty_renders_without_stale_tail() {
     let uri = mock.uri();
     let cwd = tmp.path().to_path_buf();
     let (code, output) = tokio::task::spawn_blocking(move || {
-        run_in_pty(
+        pty_io::run(
             &[&["scan"][..], &api_args(&uri)].concat(),
             &cwd,
             "n\n",
@@ -221,7 +155,7 @@ async fn scan_progress_on_a_tty_renders_without_stale_tail() {
         "expected a live status update; raw={output:?}"
     );
     // ...and the screen shows only clean result lines.
-    let screen = crate::pty_io::render(output.as_bytes());
+    let screen = pty_io::render(output.as_bytes());
     assert!(
         screen.iter().any(|l| l == "Found 1 package (1 npm)"),
         "screen:\n{}",
@@ -260,19 +194,21 @@ async fn scan_debug_mode_on_a_tty_keeps_debug_lines_off_the_status() {
     let uri = mock.uri();
     let cwd = tmp.path().to_path_buf();
     let (code, output) = tokio::task::spawn_blocking(move || {
-        run_in_pty_with(
+        let run = pty_io::run_command(
+            common::hermetic::pty_binary_command(),
             &[&["scan"][..], &api_args(&uri)].concat(),
             &cwd,
             &[("SOCKET_DEBUG", "1")],
-            "n\n",
+            &[b"n\n"],
             Duration::from_secs(60),
-        )
+        );
+        (run.code, run.output)
     })
     .await
     .expect("spawn_blocking join");
     assert_eq!(code, 0, "output:\n{output}");
 
-    let screen = crate::pty_io::render(output.as_bytes());
+    let screen = pty_io::render(output.as_bytes());
     let debug: Vec<&String> = screen
         .iter()
         .filter(|l| l.contains("[socket-patch debug]"))
