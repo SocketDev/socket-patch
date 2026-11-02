@@ -8,91 +8,23 @@
 //! `--batch-size` has no parse-time default: unset, `scan` picks it per
 //! endpoint at run time (500 on the authenticated API, 100 on the public
 //! proxy), so an explicit value must stay distinguishable from none.
+//!
+//! Several tests set `SOCKET_*` vars, and clap reads them during every
+//! parse, so every test that parses is `#[serial]`.
 
+#[path = "common/clap_parse.rs"]
+mod clap_parse;
 #[path = "common/hermetic.rs"]
 mod hermetic;
 
-use clap::Parser;
+use hermetic::try_parse;
 use socket_patch_cli::commands::scan::{resolve_mode_flags, ScanArgs, ScanMode};
 use socket_patch_cli::{Cli, Commands};
-
-/// Every `ScanArgs`/`GlobalArgs`/`VexEmbedArgs` field that has an `env =
-/// "SOCKET_*"` binding. clap reads these at parse time whenever the matching
-/// flag is absent, so an ambient value silently overrides the code-level
-/// `default_value`. That defeats the entire purpose of these snapshot tests:
-/// a regression that flips a `default_value` (e.g. `--batch-size` → `50`) would stay GREEN on any machine
-/// whose shell/CI happens to export the old value, and the "default" tests
-/// would be asserting the environment, not the parser. We therefore clear
-/// the whole set before every parse and restore it after, under `#[serial]`
-/// so the process-global mutation can't race a concurrent test.
-///
-/// Keep this list in sync with `env = "SOCKET_*"` attrs in
-/// `src/args.rs`, `src/commands/scan/mod.rs`, and `src/commands/vex.rs`.
-const SCAN_ENV_VARS: &[&str] = &[
-    "SOCKET_ALL_RELEASES",
-    "SOCKET_API_TOKEN",
-    "SOCKET_API_URL",
-    "SOCKET_BATCH_SIZE",
-    "SOCKET_CWD",
-    "SOCKET_SCAN_PACKAGES",
-    "SOCKET_DEBUG",
-    "SOCKET_DRY_RUN",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_MAX_NEW_PATCHES",
-    "SOCKET_MIN_SEVERITY",
-    "SOCKET_NO_SOCKET_YML",
-    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
-    "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
-    "SOCKET_NO_VLT_INSTALL_CLEANUP",
-    "SOCKET_OFFLINE",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PATCH_SERVER_URL",
-    "SOCKET_PROXY_URL",
-    "SOCKET_SILENT",
-    "SOCKET_STRICT",
-    "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_VENDOR_SOURCE",
-    "SOCKET_VENDOR_URL",
-    "SOCKET_VERBOSE",
-    "SOCKET_VEX",
-    "SOCKET_VEX_COMPACT",
-    "SOCKET_VEX_DOC_ID",
-    "SOCKET_VEX_NO_VERIFY",
-    "SOCKET_VEX_OUTPUT",
-    "SOCKET_VEX_PRODUCT",
-    "SOCKET_YES",
-];
-
-/// Run `f` with every `SOCKET_*` var removed from the environment, then
-/// restore the originals. Must be called only from `#[serial]` tests —
-/// env state is process-global.
-fn with_clean_env<T>(f: impl FnOnce() -> T) -> T {
-    let saved: Vec<(&str, Option<String>)> = SCAN_ENV_VARS
-        .iter()
-        .map(|k| (*k, std::env::var(k).ok()))
-        .collect();
-    for k in SCAN_ENV_VARS {
-        std::env::remove_var(k);
-    }
-    let result = f();
-    for (k, orig) in saved {
-        match orig {
-            Some(v) => std::env::set_var(k, v),
-            None => std::env::remove_var(k),
-        }
-    }
-    result
-}
 
 fn parse_scan(extra: &[&str]) -> ScanArgs {
     let mut argv = vec!["socket-patch", "scan"];
     argv.extend_from_slice(extra);
-    let cli = with_clean_env(|| Cli::try_parse_from(&argv)).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::Scan(a) => a,
         _ => panic!("expected Scan"),
@@ -102,7 +34,7 @@ fn parse_scan(extra: &[&str]) -> ScanArgs {
 fn try_parse_scan(extra: &[&str]) -> Result<ScanArgs, clap::Error> {
     let mut argv = vec!["socket-patch", "scan"];
     argv.extend_from_slice(extra);
-    let cli = with_clean_env(|| Cli::try_parse_from(&argv))?;
+    let cli = try_parse(&argv)?;
     match cli.command {
         Commands::Scan(a) => Ok(a),
         _ => panic!("expected Scan"),
@@ -656,74 +588,6 @@ fn removed_mode_booleans_are_usage_errors() {
     }
 }
 
-// --- scrub-list completeness guard -----------------------------------------
-
-/// Full-surface snapshot of a parsed `ScanArgs`, for env-leak detection.
-/// The flattened `GlobalArgs` participates via its `Debug` impl so every
-/// field — including ones added after this file was written — is covered
-/// without being named here; the scan-local and vex-embed fields (no
-/// `Debug` derive) are formatted individually.
-fn snap(a: &ScanArgs) -> String {
-    format!(
-        "{:?} paths={:?} batch_size={:?} prune={} sync={} \
-         mode={:?} all_releases={} vex={:?} vex_product={:?} \
-         vex_no_verify={} vex_doc_id={:?} vex_compact={}",
-        a.common,
-        a.paths,
-        a.batch_size,
-        a.prune,
-        a.sync,
-        a.mode,
-        a.all_releases,
-        a.vex.vex,
-        a.vex.vex_product,
-        a.vex.vex_no_verify,
-        a.vex.vex_doc_id,
-        a.vex.vex_compact,
-    )
-}
-
-#[test]
-#[serial_test::serial]
-fn scrub_covers_every_scan_env_var_clap_consults() {
-    // `SCAN_ENV_VARS` claims to cover every `SOCKET_*` var clap consults
-    // while parsing `scan`. The production oracles are
-    // `GLOBAL_ARG_ENV_VARS` (the flattened `GlobalArgs`, consulted by every
-    // subcommand the moment a binding lands) and `LOCAL_ARG_ENV_VARS`
-    // (subcommand-local bindings — scan's own plus other subcommands',
-    // which the scan parse never reads, so probing them is harmless). For
-    // each var: plant `garbage`, parse under the scrub, and require the
-    // exact clean-parse result. A var missing from the scrub fails loudly
-    // either way — validated flags (bools, ints, `--ecosystems`,
-    // `--vendor-source`) abort the parse; free-form strings/paths leak a
-    // visibly non-default value into the snapshot.
-    let baseline = snap(&parse_scan(&[]));
-    for &var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS
-        .iter()
-        .chain(socket_patch_cli::args::LOCAL_ARG_ENV_VARS)
-    {
-        let prev = std::env::var(var).ok();
-        std::env::set_var(var, "garbage");
-        let parsed = with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan"]));
-        match prev {
-            Some(v) => std::env::set_var(var, v),
-            None => std::env::remove_var(var),
-        }
-        let args = match parsed {
-            Ok(cli) => match cli.command {
-                Commands::Scan(a) => a,
-                _ => panic!("expected Scan"),
-            },
-            Err(e) => panic!("ambient {var}=garbage aborted the scrubbed parse: {e}"),
-        };
-        assert_eq!(
-            snap(&args),
-            baseline,
-            "ambient {var}=garbage leaked into the scrubbed parse",
-        );
-    }
-}
-
 #[test]
 #[serial_test::serial]
 fn non_canonical_mode_values_are_rejected() {
@@ -731,8 +595,7 @@ fn non_canonical_mode_values_are_rejected() {
     // and the v3/v4 value aliases `host` / `redirect` / `vendor` were
     // removed in v5.0.
     for value in ["apply", "host", "redirect", "vendor"] {
-        let parsed =
-            with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan", "--mode", value]));
+        let parsed = try_parse(&["socket-patch", "scan", "--mode", value]);
         let Err(err) = parsed else {
             panic!("--mode {value} must be rejected");
         };
@@ -750,7 +613,7 @@ fn non_canonical_mode_values_are_rejected() {
 #[serial_test::serial]
 fn removed_legacy_scan_flags_are_rejected() {
     for flag in ["--redirect", "--detached"] {
-        let parsed = with_clean_env(|| Cli::try_parse_from(["socket-patch", "scan", flag]));
+        let parsed = try_parse(&["socket-patch", "scan", flag]);
         let Err(err) = parsed else {
             panic!("{flag} must be rejected");
         };
@@ -768,14 +631,11 @@ fn mode_help_lists_only_canonical_names() {
     use clap::CommandFactory;
     // clap embeds live env values into help as `[env: VAR=value]` at
     // command-build/render time, so the whole build+render runs clean.
-    let (short, long) = with_clean_env(|| {
-        let mut cmd = Cli::command();
-        let scan = cmd.find_subcommand_mut("scan").expect("scan subcommand");
-        (
-            scan.render_help().to_string(),
-            scan.render_long_help().to_string(),
-        )
-    });
+    hermetic::scrub_process_socket_env();
+    let mut cmd = Cli::command();
+    let scan = cmd.find_subcommand_mut("scan").expect("scan subcommand");
+    let short = scan.render_help().to_string();
+    let long = scan.render_long_help().to_string();
 
     // Short help (`scan -h`) renders the compact bracketed list. Assert on
     // the exact rendered segment so any extra value inside the brackets
@@ -808,12 +668,10 @@ fn no_vlt_install_cleanup_flag_and_env_parse() {
             .common
             .no_vlt_install_cleanup
     );
-    let from_env = with_clean_env(|| {
-        std::env::set_var("SOCKET_NO_VLT_INSTALL_CLEANUP", "1");
-        let cli = Cli::try_parse_from(["socket-patch", "scan", "--mode", "hosted"]);
-        std::env::remove_var("SOCKET_NO_VLT_INSTALL_CLEANUP");
-        cli
-    })
+    let from_env = clap_parse::try_parse_with_env(
+        &[("SOCKET_NO_VLT_INSTALL_CLEANUP", "1")],
+        &["socket-patch", "scan", "--mode", "hosted"],
+    )
     .expect("parse");
     match from_env.command {
         Commands::Scan(a) => assert!(a.common.no_vlt_install_cleanup),
@@ -880,22 +738,13 @@ fn max_new_patches_env_is_read_at_run_time() {
     let got = flag.resolve(Some("7"), None).unwrap();
     assert_eq!((got.value, got.source), (Some(1), MaxNewSource::Flag));
 }
-/// Parse `scan` under a clean env plus `env`, restoring it afterwards.
+
 fn parse_scan_with_env(extra: &[&str], env: &[(&str, &str)]) -> Result<ScanArgs, clap::Error> {
-    with_clean_env(|| {
-        for (k, v) in env {
-            std::env::set_var(k, v);
-        }
-        let mut argv = vec!["socket-patch", "scan"];
-        argv.extend_from_slice(extra);
-        let cli = Cli::try_parse_from(&argv);
-        for (k, _) in env {
-            std::env::remove_var(k);
-        }
-        cli.map(|c| match c.command {
-            Commands::Scan(a) => a,
-            _ => panic!("expected Scan"),
-        })
+    let mut argv = vec!["socket-patch", "scan"];
+    argv.extend_from_slice(extra);
+    clap_parse::try_parse_with_env(env, &argv).map(|c| match c.command {
+        Commands::Scan(a) => a,
+        _ => panic!("expected Scan"),
     })
 }
 
@@ -922,17 +771,16 @@ fn no_socket_yml_flag_and_env() {
 fn min_severity_flag_and_env() {
     use socket_patch_core::policy::OverrideSource;
     let overrides = |extra: &[&str], env: &[(&str, &str)]| {
+        // `overrides` reads `SOCKET_MIN_SEVERITY` itself, at run time.
         let args = parse_scan_with_env(extra, env).expect("parse");
-        with_clean_env(|| {
-            for (k, v) in env {
-                std::env::set_var(k, v);
-            }
-            let out = args.socket_yml.overrides();
-            for (k, _) in env {
-                std::env::remove_var(k);
-            }
-            out
-        })
+        for (k, v) in env {
+            std::env::set_var(k, v);
+        }
+        let out = args.socket_yml.overrides();
+        for (k, _) in env {
+            std::env::remove_var(k);
+        }
+        out
     };
     assert_eq!(parse_scan(&[]).socket_yml.min_severity, None);
     assert_eq!(overrides(&[], &[]).unwrap().min_severity, None);

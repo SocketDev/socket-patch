@@ -7,18 +7,22 @@
 //! These tests deliberately avoid spawning the binary so they run in the
 //! default `cargo test` set (no `--ignored` required) and stay fast.
 
-use clap::Parser;
 use socket_patch_cli::commands::remove::{run, RemoveArgs};
-use socket_patch_cli::{Cli, Commands};
+use socket_patch_cli::Commands;
 use std::path::PathBuf;
 
+#[path = "common/clap_parse.rs"]
+mod clap_parse;
 #[path = "common/hermetic.rs"]
 mod hermetic;
+
+use clap_parse::{global_defaults, Globals};
+use hermetic::try_parse;
 
 fn parse_remove(extra: &[&str]) -> RemoveArgs {
     let mut argv = vec!["socket-patch", "remove"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::Remove(a) => a,
         _ => panic!("expected Remove"),
@@ -33,13 +37,8 @@ fn parse_remove(extra: &[&str]) -> RemoveArgs {
 fn defaults_with_purl_positional() {
     let args = parse_remove(&["pkg:npm/foo@1"]);
     assert_eq!(args.identifier, "pkg:npm/foo@1");
-    assert_eq!(args.common.cwd, PathBuf::from("."));
-    assert_eq!(args.common.manifest_path, ".socket/manifest.json");
     assert!(!args.skip_rollback);
-    assert!(!args.common.yes);
-    assert!(!args.common.global);
-    assert_eq!(args.common.global_prefix, None);
-    assert!(!args.common.json);
+    assert_eq!(Globals(args.common), global_defaults());
 }
 
 #[test]
@@ -49,13 +48,8 @@ fn positional_uuid_stored_in_identifier() {
     // Everything else still at default — `remove` does not auto-detect the
     // identifier shape at parse time; the runtime branch on `pkg:` happens
     // inside `run()`.
-    assert_eq!(args.common.cwd, PathBuf::from("."));
-    assert_eq!(args.common.manifest_path, ".socket/manifest.json");
     assert!(!args.skip_rollback);
-    assert!(!args.common.yes);
-    assert!(!args.common.global);
-    assert_eq!(args.common.global_prefix, None);
-    assert!(!args.common.json);
+    assert_eq!(Globals(args.common), global_defaults());
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +147,7 @@ fn all_flags_combined() {
 
 #[test]
 fn missing_required_positional_is_error() {
-    let result = Cli::try_parse_from(["socket-patch", "remove"]);
+    let result = try_parse(&["socket-patch", "remove"]);
     let err = match result {
         Ok(_) => panic!("remove without identifier must fail"),
         Err(e) => e,
@@ -163,7 +157,7 @@ fn missing_required_positional_is_error() {
 
 #[test]
 fn unknown_flag_is_error() {
-    let result = Cli::try_parse_from([
+    let result = try_parse(&[
         "socket-patch",
         "remove",
         "pkg:npm/foo@1",

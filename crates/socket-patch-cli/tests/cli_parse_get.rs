@@ -5,148 +5,35 @@
 //! removed in v5 and must stay parse errors. Changing any assertion here is a
 //! breaking change to the CLI surface — see
 //! `crates/socket-patch-cli/CLI_CONTRACT.md`.
-//!
-//! ## Hermeticity
-//!
-//! Every flag and default below is also wired to an `#[arg(env = "SOCKET_*")]`
-//! source. clap reads those env vars during `try_parse_from`, so an ambient
-//! `SOCKET_*` variable in the developer's shell or in CI would silently
-//! satisfy these assertions even if the corresponding CLI default
-//! (`default_value`/`default_value_t`) regressed or a flag's action broke —
-//! the env value would mask the bug and the test would pass for the wrong
-//! reason. To make the assertions test *argv parsing* rather than the
-//! ambient environment, every parse runs with the full set of `SOCKET_*`
-//! vars scrubbed (see [`EnvScrub`]). Because the environment is process-
-//! global, every test is `#[serial_test::serial]` so the scrub/restore
-//! dance can't race a concurrent parse.
 
-use clap::Parser;
 use socket_patch_cli::commands::get::GetArgs;
-use socket_patch_cli::{Cli, Commands};
+use socket_patch_cli::Commands;
 use std::path::PathBuf;
 
-/// Every `SOCKET_*` env var that clap consults while parsing `get` (its own
-/// flags plus the flattened `GlobalArgs`). If any of these leaks in from the
-/// ambient environment it can mask a broken default or a regressed flag, so
-/// the parse helpers below remove them for the duration of the parse.
-const SOCKET_ENV_VARS: &[&str] = &[
-    // GlobalArgs
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_API_TOKEN",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_VENDOR_SOURCE",
-    "SOCKET_VENDOR_URL",
-    "SOCKET_PATCH_SERVER_URL",
-    "SOCKET_OFFLINE",
-    "SOCKET_STRICT",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
-    "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
-    "SOCKET_NO_VLT_INSTALL_CLEANUP",
-    // GetArgs-specific
-    "SOCKET_SAVE_ONLY",
-    "SOCKET_ALL_RELEASES",
-];
+#[path = "common/clap_parse.rs"]
+mod clap_parse;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
-/// RAII guard that removes every [`SOCKET_ENV_VARS`] entry on construction and
-/// restores the prior value on drop. Holding one of these around a clap parse
-/// guarantees the parse sees only what's on the argv, not the developer's
-/// shell. Pair with `#[serial_test::serial]` so the global env mutation never
-/// races another test.
-struct EnvScrub(Vec<(&'static str, Option<String>)>);
+use clap_parse::Globals;
+use hermetic::try_parse;
 
-impl EnvScrub {
-    fn new() -> Self {
-        let saved = SOCKET_ENV_VARS
-            .iter()
-            .map(|&k| {
-                let prev = std::env::var(k).ok();
-                std::env::remove_var(k);
-                (k, prev)
-            })
-            .collect();
-        EnvScrub(saved)
-    }
-}
-
-impl Drop for EnvScrub {
-    fn drop(&mut self) {
-        for (k, v) in &self.0 {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-}
-
-/// Parse `socket-patch get <extra...>` and return the `GetArgs`, with the
-/// ambient `SOCKET_*` environment scrubbed so the result reflects only the
-/// argv. The scrub guard is held across the parse and dropped before the
-/// caller's assertions run (which only inspect the returned struct).
 fn parse_get(extra: &[&str]) -> GetArgs {
-    let _scrub = EnvScrub::new();
     let mut argv = vec!["socket-patch", "get"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::Get(a) => a,
         _ => panic!("expected Get"),
     }
 }
 
-/// Owned, comparable snapshot of *every* parsed field in `GetArgs` — its own
-/// flags plus every field of the flattened `GlobalArgs`. `GetArgs` itself does
-/// not derive `PartialEq` (it's production code we may not touch), so this
-/// mirror exists purely so a single `assert_eq!` can police the entire parsed
-/// surface at once.
-///
-/// This is what makes the per-flag tests honest. A field-at-a-time assertion
-/// (`assert!(a.package)`) only proves the flag set *its* field; it says nothing
-/// about whether the same flag also flipped an unrelated one. A clap-derive
-/// copy/paste regression (e.g. `--package` accidentally wired to `save_only`)
-/// would set both and still pass a single-field check. Comparing the whole
-/// snapshot against the independently-declared defaults — with only the field
-/// under test mutated — fails loudly the instant any other field moves.
+/// Every parsed field of `GetArgs`. The per-flag tests compare the whole
+/// snapshot, so a flag wired to a second field fails too.
 #[derive(Debug, Clone, PartialEq)]
 struct Snap {
     identifier: String,
-    cwd: PathBuf,
-    manifest_path: String,
-    api_url: Option<String>,
-    api_token: Option<String>,
-    org: Option<String>,
-    proxy_url: Option<String>,
-    ecosystems: Option<Vec<String>>,
-    vendor_source: String,
-    vendor_url: Option<String>,
-    patch_server_url: Option<String>,
-    offline: bool,
-    strict: bool,
-    allow_patch_conflicts: bool,
-    global: bool,
-    global_prefix: Option<PathBuf>,
-    json: bool,
-    verbose: bool,
-    silent: bool,
-    dry_run: bool,
-    yes: bool,
-    lock_timeout: Option<u64>,
-    debug: bool,
-    no_telemetry: bool,
+    common: Globals,
     id: bool,
     cve: bool,
     ghsa: bool,
@@ -159,29 +46,7 @@ struct Snap {
 fn snapshot(a: &GetArgs) -> Snap {
     Snap {
         identifier: a.identifier.clone(),
-        cwd: a.common.cwd.clone(),
-        manifest_path: a.common.manifest_path.clone(),
-        api_url: a.common.api_url.clone(),
-        api_token: a.common.api_token.clone(),
-        org: a.common.org.clone(),
-        proxy_url: a.common.proxy_url.clone(),
-        ecosystems: a.common.ecosystems.clone(),
-        vendor_source: a.common.vendor_source.clone(),
-        vendor_url: a.common.vendor_url.clone(),
-        patch_server_url: a.common.patch_server_url.clone(),
-        offline: a.common.offline,
-        strict: a.common.strict,
-        allow_patch_conflicts: a.common.allow_patch_conflicts,
-        global: a.common.global,
-        global_prefix: a.common.global_prefix.clone(),
-        json: a.common.json,
-        verbose: a.common.verbose,
-        silent: a.common.silent,
-        dry_run: a.common.dry_run,
-        yes: a.common.yes,
-        lock_timeout: a.common.lock_timeout,
-        debug: a.common.debug,
-        no_telemetry: a.common.no_telemetry,
+        common: Globals(a.common.clone()),
         id: a.id,
         cve: a.cve,
         ghsa: a.ghsa,
@@ -192,39 +57,11 @@ fn snapshot(a: &GetArgs) -> Snap {
     }
 }
 
-/// Independent oracle: the snapshot a correct parse of `get <identifier>` (with
-/// no other flags) must produce. The values are transcribed by hand from the
-/// `default_value`/`default_value_t` declarations on `GetArgs`/`GlobalArgs` and
-/// the `DEFAULT_*` constants in `socket-patch-core` — NOT read back from a live
-/// parse — so this can actually disagree with the implementation if a default
-/// regresses. Every per-flag test starts from this and mutates exactly the one
-/// field the flag is supposed to touch.
+/// The snapshot of `get <identifier>` with no other flag, written by hand.
 fn expected_defaults(identifier: &str) -> Snap {
     Snap {
         identifier: identifier.to_string(),
-        cwd: PathBuf::from("."),
-        manifest_path: ".socket/manifest.json".to_string(),
-        api_url: None, // no clap default — resolved in core
-        api_token: None,
-        org: None,
-        proxy_url: None, // no clap default — resolved in core
-        ecosystems: None,
-        vendor_source: "service".to_string(),
-        vendor_url: None,
-        patch_server_url: None,
-        offline: false,
-        strict: false,
-        allow_patch_conflicts: false,
-        global: false,
-        global_prefix: None,
-        json: false,
-        verbose: false,
-        silent: false,
-        dry_run: false,
-        yes: false,
-        lock_timeout: None,
-        debug: false,
-        no_telemetry: false,
+        common: clap_parse::global_defaults(),
         id: false,
         cve: false,
         ghsa: false,
@@ -238,32 +75,22 @@ fn expected_defaults(identifier: &str) -> Snap {
 // --- Defaults ----------------------------------------------------------------
 
 #[test]
-#[serial_test::serial]
 fn defaults_with_only_required_identifier() {
     let a = parse_get(&["some-id"]);
-    // Pin the *entire* default surface in one shot against the independent
-    // oracle. This covers every field (manifest_path,
-    // proxy_url, offline, verbose, silent, dry_run, lock_timeout,
-    // debug, no_telemetry, ecosystems) — any of which could regress to a
-    // non-default and go unnoticed under a field-cherry-picked assertion.
     assert_eq!(snapshot(&a), expected_defaults("some-id"));
 }
 
 #[test]
-#[serial_test::serial]
 fn all_releases_flag_sets_all_releases() {
     let a = parse_get(&["some-id", "--all-releases"]);
     let mut want = expected_defaults("some-id");
     want.all_releases = true;
-    // Full-snapshot equality: proves the flag set `all_releases` AND left every
-    // other field at its default (env scrubbed, so the `true` is the flag's).
     assert_eq!(snapshot(&a), want);
 }
 
 // --- Positional --------------------------------------------------------------
 
 #[test]
-#[serial_test::serial]
 fn positional_identifier_stored() {
     let a = parse_get(&["pkg:npm/foo@1.0"]);
     // The positional lands in `identifier` and nothing else shifts.
@@ -273,7 +100,6 @@ fn positional_identifier_stored() {
 // --- Short flags -------------------------------------------------------------
 
 #[test]
-#[serial_test::serial]
 fn short_p_sets_package() {
     let a = parse_get(&["some-id", "-p"]);
     let mut want = expected_defaults("some-id");
@@ -282,7 +108,6 @@ fn short_p_sets_package() {
 }
 
 #[test]
-#[serial_test::serial]
 fn long_package_sets_package() {
     let a = parse_get(&["some-id", "--package"]);
     let mut want = expected_defaults("some-id");
@@ -291,63 +116,56 @@ fn long_package_sets_package() {
 }
 
 #[test]
-#[serial_test::serial]
 fn short_y_sets_yes() {
     let a = parse_get(&["some-id", "-y"]);
     let mut want = expected_defaults("some-id");
-    want.yes = true;
+    want.common.yes = true;
     assert_eq!(snapshot(&a), want);
 }
 
 #[test]
-#[serial_test::serial]
 fn long_yes_sets_yes() {
     let a = parse_get(&["some-id", "--yes"]);
     let mut want = expected_defaults("some-id");
-    want.yes = true;
+    want.common.yes = true;
     assert_eq!(snapshot(&a), want);
 }
 
 #[test]
-#[serial_test::serial]
 fn short_g_sets_global() {
     let a = parse_get(&["some-id", "-g"]);
     let mut want = expected_defaults("some-id");
-    want.global = true;
+    want.common.global = true;
     assert_eq!(snapshot(&a), want);
 }
 
 #[test]
-#[serial_test::serial]
 fn long_global_sets_global() {
     let a = parse_get(&["some-id", "--global"]);
     let mut want = expected_defaults("some-id");
-    want.global = true;
+    want.common.global = true;
     assert_eq!(snapshot(&a), want);
 }
 
 // --- Long-only flags ---------------------------------------------------------
 
 #[test]
-#[serial_test::serial]
 fn cwd_flag_sets_cwd() {
     let a = parse_get(&["some-id", "--cwd", "/tmp/project"]);
     let mut want = expected_defaults("some-id");
-    want.cwd = PathBuf::from("/tmp/project");
+    want.common.cwd = PathBuf::from("/tmp/project");
     assert_eq!(snapshot(&a), want);
 }
 
 #[test]
-#[serial_test::serial]
 fn org_flag_sets_org() {
     let a = parse_get(&["some-id", "--org", "acme"]);
     let mut want = expected_defaults("some-id");
-    want.org = Some("acme".to_string());
+    want.common.org = Some("acme".to_string());
     assert_eq!(snapshot(&a), want);
 }
 
 #[test]
-#[serial_test::serial]
 fn id_flag_sets_id() {
     let a = parse_get(&["some-id", "--id"]);
     let mut want = expected_defaults("some-id");
@@ -356,7 +174,6 @@ fn id_flag_sets_id() {
 }
 
 #[test]
-#[serial_test::serial]
 fn cve_flag_sets_cve() {
     let a = parse_get(&["some-id", "--cve"]);
     let mut want = expected_defaults("some-id");
@@ -365,7 +182,6 @@ fn cve_flag_sets_cve() {
 }
 
 #[test]
-#[serial_test::serial]
 fn ghsa_flag_sets_ghsa() {
     let a = parse_get(&["some-id", "--ghsa"]);
     let mut want = expected_defaults("some-id");
@@ -374,47 +190,42 @@ fn ghsa_flag_sets_ghsa() {
 }
 
 #[test]
-#[serial_test::serial]
 fn api_url_flag_sets_api_url() {
     let a = parse_get(&["some-id", "--api-url", "https://api.example.com"]);
     let mut want = expected_defaults("some-id");
-    want.api_url = Some("https://api.example.com".to_string());
+    want.common.api_url = Some("https://api.example.com".to_string());
     assert_eq!(snapshot(&a), want);
 }
 
 #[test]
-#[serial_test::serial]
 fn api_token_flag_sets_api_token() {
     let a = parse_get(&["some-id", "--api-token", "sktsec_abc"]);
     let mut want = expected_defaults("some-id");
-    want.api_token = Some("sktsec_abc".to_string());
+    want.common.api_token = Some("sktsec_abc".to_string());
     assert_eq!(snapshot(&a), want);
 }
 
 #[test]
-#[serial_test::serial]
 fn global_prefix_flag_sets_global_prefix() {
     let a = parse_get(&["some-id", "--global-prefix", "/usr/local/lib"]);
     let mut want = expected_defaults("some-id");
-    want.global_prefix = Some(PathBuf::from("/usr/local/lib"));
+    want.common.global_prefix = Some(PathBuf::from("/usr/local/lib"));
     // `--global-prefix` must NOT imply `--global`; full-snapshot equality keeps
     // `global` pinned at its default.
     assert_eq!(snapshot(&a), want);
 }
 
 #[test]
-#[serial_test::serial]
 fn json_flag_sets_json() {
     let a = parse_get(&["some-id", "--json"]);
     let mut want = expected_defaults("some-id");
-    want.json = true;
+    want.common.json = true;
     assert_eq!(snapshot(&a), want);
 }
 
 // --- save-only ------------------------------------------------------------------
 
 #[test]
-#[serial_test::serial]
 fn save_only_flag_sets_save_only() {
     let a = parse_get(&["some-id", "--save-only"]);
     let mut want = expected_defaults("some-id");
@@ -423,12 +234,10 @@ fn save_only_flag_sets_save_only() {
 }
 
 #[test]
-#[serial_test::serial]
 fn removed_no_apply_alias_is_a_usage_error() {
     // v5 removed the hidden `--no-apply` alias; `--save-only` (or
     // SOCKET_SAVE_ONLY) is the only spelling.
-    let _scrub = EnvScrub::new();
-    let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--no-apply"]) {
+    let err = match try_parse(&["socket-patch", "get", "some-id", "--no-apply"]) {
         Ok(_) => panic!("--no-apply should no longer parse"),
         Err(e) => e,
     };
@@ -445,11 +254,8 @@ fn removed_no_apply_alias_is_a_usage_error() {
 // enforced inside `run()`, not by clap — pinned in get_modes_e2e.rs).
 // The hidden VALUE aliases (`host`/`redirect` for hosted, `vendor` for
 // vendored) ride along from the shared enum and are part of the contract.
-// `--mode` deliberately has no `SOCKET_*` env binding (matching scan), so
-// no scrub-list entry is needed.
 
 #[test]
-#[serial_test::serial]
 fn mode_defaults_to_none() {
     // No `--mode` → `None` (agent behavior). Whole-snapshot: the absent
     // flag must leave every field at its default, `mode` included.
@@ -459,7 +265,6 @@ fn mode_defaults_to_none() {
 }
 
 #[test]
-#[serial_test::serial]
 fn mode_hosted_parses() {
     let a = parse_get(&["some-id", "--mode", "hosted"]);
     let mut want = expected_defaults("some-id");
@@ -471,7 +276,6 @@ fn mode_hosted_parses() {
 }
 
 #[test]
-#[serial_test::serial]
 fn mode_vendored_parses() {
     let a = parse_get(&["some-id", "--mode", "vendored"]);
     let mut want = expected_defaults("some-id");
@@ -480,7 +284,6 @@ fn mode_vendored_parses() {
 }
 
 #[test]
-#[serial_test::serial]
 fn mode_agent_parses() {
     let a = parse_get(&["some-id", "--mode", "agent"]);
     let mut want = expected_defaults("some-id");
@@ -489,13 +292,11 @@ fn mode_agent_parses() {
 }
 
 #[test]
-#[serial_test::serial]
 fn removed_mode_value_aliases_are_rejected() {
     // v5.0 dropped the hidden `host` / `redirect` / `vendor` value aliases
     // (shared with `scan --mode`); only the canonical names parse.
-    let _scrub = EnvScrub::new();
     for alias in ["host", "redirect", "vendor"] {
-        let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--mode", alias]) {
+        let err = match try_parse(&["socket-patch", "get", "some-id", "--mode", alias]) {
             Ok(_) => panic!("--mode {alias} should fail to parse"),
             Err(e) => e,
         };
@@ -511,14 +312,12 @@ fn removed_mode_value_aliases_are_rejected() {
 }
 
 #[test]
-#[serial_test::serial]
 fn mode_rejects_unknown_value() {
     // The shared value_enum restricts `--mode` to the three known names.
     // `apply` is not a scan-mode name anywhere, so it must be rejected
     // exactly like a bogus value.
-    let _scrub = EnvScrub::new();
     for bad in ["bogus", "apply"] {
-        let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--mode", bad]) {
+        let err = match try_parse(&["socket-patch", "get", "some-id", "--mode", bad]) {
             Ok(_) => panic!("--mode {bad} should fail to parse"),
             Err(e) => e,
         };
@@ -536,11 +335,9 @@ fn mode_rejects_unknown_value() {
 // --- removed `download` alias -------------------------------------------------
 
 #[test]
-#[serial_test::serial]
 fn removed_download_alias_is_a_usage_error() {
     // v5 removed the `download` alias for `get`.
-    let _scrub = EnvScrub::new();
-    let err = match Cli::try_parse_from(["socket-patch", "download", "some-id"]) {
+    let err = match try_parse(&["socket-patch", "download", "some-id"]) {
         Ok(_) => panic!("`download` should no longer parse"),
         Err(e) => e,
     };
@@ -550,10 +347,8 @@ fn removed_download_alias_is_a_usage_error() {
 // --- Error paths -------------------------------------------------------------
 
 #[test]
-#[serial_test::serial]
 fn missing_required_identifier_errors() {
-    let _scrub = EnvScrub::new();
-    let err = match Cli::try_parse_from(["socket-patch", "get"]) {
+    let err = match try_parse(&["socket-patch", "get"]) {
         Err(e) => e,
         Ok(_) => panic!("expected parse error for missing required positional"),
     };
@@ -561,10 +356,8 @@ fn missing_required_identifier_errors() {
 }
 
 #[test]
-#[serial_test::serial]
 fn unknown_flag_errors() {
-    let _scrub = EnvScrub::new();
-    let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--bogus"]) {
+    let err = match try_parse(&["socket-patch", "get", "some-id", "--bogus"]) {
         Err(e) => e,
         Ok(_) => panic!("expected parse error for unknown flag"),
     };
@@ -572,65 +365,19 @@ fn unknown_flag_errors() {
 }
 
 #[test]
-#[serial_test::serial]
 fn removed_one_off_flag_is_unknown() {
-    let _scrub = EnvScrub::new();
-    let err = match Cli::try_parse_from(["socket-patch", "get", "some-id", "--one-off"]) {
+    let err = match try_parse(&["socket-patch", "get", "some-id", "--one-off"]) {
         Err(e) => e,
         Ok(_) => panic!("expected parse error for the v5-removed --one-off"),
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
-// --- Hermeticity of the scrub itself -------------------------------------------
-
 #[test]
-#[serial_test::serial]
-fn scrub_covers_every_global_env_var_clap_consults() {
-    // [`SOCKET_ENV_VARS`] claims to list "every SOCKET_* env var that clap
-    // consults while parsing `get`". `GlobalArgs` is flattened in whole, so
-    // the production `GLOBAL_ARG_ENV_VARS` list is the oracle — a flag added
-    // to `GlobalArgs` with an env binding is consulted here the moment it
-    // lands, and if the scrub list lags behind, an ambient value either
-    // aborts every parse in this file (validated flags: bools, ints,
-    // `--ecosystems`, `--vendor-source`) or silently leaks into the parsed
-    // args (string flags), voiding the hermeticity the module doc promises.
-    // `garbage` is rejected by every validating parser and visibly non-default
-    // for every string/path/option flag, so a missing scrub entry fails
-    // loudly either way.
-    for &var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
-        let prev = std::env::var(var).ok();
-        std::env::set_var(var, "garbage");
-        let parsed = {
-            let _scrub = EnvScrub::new();
-            Cli::try_parse_from(["socket-patch", "get", "some-id"])
-        };
-        match prev {
-            Some(v) => std::env::set_var(var, v),
-            None => std::env::remove_var(var),
-        }
-        let a = match parsed {
-            Ok(cli) => match cli.command {
-                Commands::Get(a) => a,
-                _ => panic!("expected Get"),
-            },
-            Err(e) => panic!("ambient {var}=garbage aborted the scrubbed parse: {e}"),
-        };
-        assert_eq!(
-            snapshot(&a),
-            expected_defaults("some-id"),
-            "ambient {var}=garbage leaked into the scrubbed parse",
-        );
-    }
-}
-
-#[test]
-#[serial_test::serial]
 fn no_vlt_install_cleanup_flag_parses_for_hosted_get() {
-    assert!(!parse_get(&["some-id"]).common.no_vlt_install_cleanup);
-    assert!(
-        parse_get(&["some-id", "--mode", "hosted", "--no-vlt-install-cleanup"])
-            .common
-            .no_vlt_install_cleanup
-    );
+    let a = parse_get(&["some-id", "--mode", "hosted", "--no-vlt-install-cleanup"]);
+    let mut want = expected_defaults("some-id");
+    want.mode = Some(socket_patch_cli::commands::scan::ScanMode::Hosted);
+    want.common.no_vlt_install_cleanup = true;
+    assert_eq!(snapshot(&a), want);
 }
