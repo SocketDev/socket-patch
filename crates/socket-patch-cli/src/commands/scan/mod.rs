@@ -1677,7 +1677,7 @@ async fn run_project_dirs(
         Err(message) => return usage("invalid_env", &message),
     };
     let root = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
-    let carry = rollout_args::RolloutCarry::new(configured, root);
+    let carry = rollout::RolloutCarry::new(configured, root);
     let mut code = 0;
     for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
@@ -3259,11 +3259,12 @@ async fn run_scan(
             &pairs,
             None,
             npm_crawl.as_ref(),
-            Some(
-                rollout::Gate::new(&mut stage, rows)
-                    .with_prior(prior_discovery)
-                    .with_references(sweep_references),
-            ),
+            Some(rollout::Gate {
+                stage: &mut stage,
+                rows,
+                prior: prior_discovery,
+                references: sweep_references,
+            }),
             "scan",
         )
         .await;
